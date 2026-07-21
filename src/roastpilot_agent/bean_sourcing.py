@@ -2022,12 +2022,20 @@ class _ExtractedBeanIdentity(BaseModel):
 
     The four ``*_evidence`` fields (#590 slice D2a) are a PARALLEL, optional
     verbatim quote alongside each TYPED field (``altitude_m``,
-    ``processing``, ``bean_species``, ``is_blend``). ALL FOUR are
-    CAPTURED-BUT-UNCONSUMED at runtime (#590 slice E2 concludes lexical
-    typed-field certification exhausted) — see
-    :func:`_draft_from_identity`'s docstring for each field's own
-    dormant/parked gate and evidence. The live verification surface is
-    exactly D1's free-text containment plus the ``description`` exemption.
+    ``processing``, ``bean_species``, ``is_blend``). ALL FOUR are now
+    CAPTURED-BUT-UNCONSUMED at runtime — PARKED PERMANENTLY (#590 slice
+    E2 concludes lexical certification exhausted for
+    ``processing``/``bean_species``/``is_blend``; #617's terminal probe
+    concludes the same for ``altitude_m``, whose fail-closed whitelist
+    grammar (:func:`_altitude_whitelist_match`) built and stayed
+    unit-tested but never reached a leak-free state across two post-
+    enable review rounds) — see :func:`_draft_from_identity`'s docstring
+    for each field's own gate and evidence. The live verification surface
+    is D1's free-text containment plus the ``description`` exemption;
+    every typed field's evidence quote is captured on this extraction
+    schema for operator surfacing (a follow-up UI/API slice, #627) and
+    eval capture (#612) instead — ``BeanProfileDraft`` itself carries no
+    evidence fields today, so the API does not yet return them.
     """
 
     name: str | None = None
@@ -2060,9 +2068,14 @@ class _ExtractedBeanIdentity(BaseModel):
     with its own ``"origin_estimated"`` provenance is a richer follow-up,
     deferred to #590 — no new schema fields here."""
     altitude_m_evidence: str | None = Field(default=None, max_length=500)
-    """A verbatim span supporting ``altitude_m`` (#590 D2a). Checked by
-    :func:`_quote_supports_altitude`, DORMANT pending D2d. Bounded to
-    :data:`_MAX_JSON_LD_FIELD_CHARS`-sized (500 chars), D2a's LOW."""
+    """A verbatim span supporting ``altitude_m`` (#590 D2a). Feeds
+    :func:`_quote_supports_altitude`'s fail-closed whitelist grammar
+    (:func:`_altitude_whitelist_match`), but that gate ships DORMANT
+    (:data:`_ALTITUDE_CITATION_GATE_ENABLED`) — captured but UNCONSUMED
+    at runtime, PARKED PERMANENTLY on the #617 terminal probe's two
+    plausible certify-leaks; see that constant's docstring. Bounded to
+    :data:`_MAX_JSON_LD_FIELD_CHARS`-sized (500 chars), D2a's
+    LOW."""
     description: str | None = None
     is_blend: bool | None = None
     """Tri-state, not a plain ``bool`` with a False default (#587 P2): the
@@ -2524,31 +2537,103 @@ _BEAN_SPECIES_DISPLAY_SPELLINGS: dict[str, str] = {
     "excelsa": "excelsa",
 }
 
-#: Ships DORMANT (#590 D2c, #615) — the five hardening folds (cue
-#: adjacency, suffix-only glued-m, non-metre unit rejection, the
-#: segmenter's thousands-period exception, range-endpoint rejection)
-#: stand, but round-6 (Codex) review found 6 MORE shape bypasses (a
-#: field-delimiter-blind adjacency, above/below/at-least bounds, an
-#: un-isolated plain-digit identifier, a quote-scoped unit check a
-#: cropped quote defeats, a unit-mediated range, a decimal-split
-#: segment) — the guard-stack design FAILS OPEN on novel text shapes.
-#: Enablement moves to a fail-CLOSED whitelist redesign (D2d, #615).
+#: PARKED PERMANENTLY (#617, terminal probe) — ``altitude_m`` joins the
+#: other three typed fields (``processing``, ``bean_species``,
+#: ``is_blend``) as a fourth permanently-parked lexical citation gate.
+#: The guard-stack matcher (#590 D2b/D2c) FAILED OPEN twice (#615/#616);
+#: its fail-CLOSED whitelist replacement (#617 D2d-b,
+#: :func:`_altitude_whitelist_match`) then FAILED OPEN across TWO more
+#: post-enable review rounds — five shape-grammar leaks folded, then
+#: three parameter-level leaks folded (conjunction/comma-compound
+#: headings, the quote-span margin, the generic-unit context-word set) —
+#: and the pre-declared TERMINAL probe still found two MORE plausible
+#: leaks in the just-tightened mechanisms: compound headings joined by
+#: ``;``/``/``/``|`` still anchor (the comma sweep covered only the one
+#: character actually repro'd, not the class), and the quote-span
+#: margin still bridges through ``)``/``]``/``|`` (the clause-break set
+#: was a hand-picked subset of the module's own boundary-punctuation
+#: set, :data:`_CONTAINMENT_PUNCTUATION_TRANSLATION`, not that full
+#: set). This demonstrates the SAME structural problem the #617 D2d
+#: redesign was meant to solve for the guard-stack: an enumerative
+#: denylist of "characters/words that break a clause" cannot be
+#: completed with confidence — every round finds one more separator
+#: class. Per the pre-declared stopping rule, this is now PERMANENT: no
+#: further tightening rounds inside this arc. The whole grammar
+#: (:func:`_altitude_whitelist_match` and everything it calls) stays
+#: built and unit-tested — a strictly-better-though-dormant matcher than
+#: the retired guard-stack — with the terminal probe's own repros now
+#: captured as executable-spec tests documenting the two leaks (see the
+#: "#617 terminal probe" test section). ``altitude_m_evidence`` is
+#: captured (#590 D2a) on this extraction schema for operator surfacing
+#: (a follow-up UI/API slice, #627) and eval capture (#612) — same
+#: disposition as the other three fields; ``BeanProfileDraft`` itself
+#: carries no evidence fields today, so the operator does not yet see
+#: any of them. ``altitude_m`` itself always demotes to
+#: ``"origin_estimated"``. A future revisit starts
+#: from EITHER the probe's own class-sweep design (use
+#: :data:`_CONTAINMENT_PUNCTUATION_TRANSLATION`'s full punctuation set,
+#: not a hand-picked subset, as the phrase/clause-boundary definition)
+#: OR a non-lexical mechanism (e.g. an entailment judge) — never by
+#: growing this whitelist further.
 _ALTITUDE_CITATION_GATE_ENABLED: Final = False
 
-#: Elevation cues an ``altitude_m`` evidence quote must carry, ADJACENT to
-#: the value's digit-run token (:func:`_cue_binds_to_value`). NOT bare
-#: ``"m"``; NOT standalone ``"above"``/``"sea"``/``"level"`` — "above sea
-#: level" is a COMPLETE phrase instead, see
-#: :func:`_altitude_evidence_supports_value`. Matched as a WHOLE alpha run
-#: (:func:`_token_carries_altitude_cue`) — a substring like ``"meter"``
-#: inside ``"parameter"`` does not count.
-_ALTITUDE_CUES: frozenset[str] = frozenset(
-    {"masl", "meters", "metres", "meter", "metre", "altitude", "elevation", "asl", "msnm"}
+#: SELF-SUFFICIENT trailing units (#617 fold 2, post-review) — these are
+#: altitude-specific abbreviations with no other common reading, so a
+#: matched shape certifies on the shape alone, no nearby cue required.
+#: The complete "above sea level" phrase (:data:`_ABOVE_SEA_LEVEL_WORDS`)
+#: is a separate, also self-sufficient, accepted trailing form.
+_ALTITUDE_SELF_SUFFICIENT_UNIT_TOKENS: frozenset[str] = frozenset({"masl", "asl", "msnm"})
+
+#: GENERIC trailing units (#617 fold 2, post-review) — "m"/"metre(s)"/
+#: "meter(s)" are ordinary length units with countless non-altitude
+#: readings ("1,800 metres of shelving", "1800 meter reading", "£1,800m
+#: revenue"), so a shape built on one of these ALSO requires an
+#: altitude-context word within :data:`_ALTITUDE_CONTEXT_WINDOW_WORDS`
+#: raw words of the shape (:func:`_altitude_shape_has_context_word`) —
+#: the same "cue must sit near the value" law
+#: :data:`_PROCESS_CONTEXT_WORDS` applies to processing claims.
+_ALTITUDE_GENERIC_UNIT_TOKENS: frozenset[str] = frozenset(
+    {"m", "metres", "meters", "metre", "meter"}
 )
 
-#: Non-metre length units that REJECT an altitude reading regardless of a
-#: nearby cue (fold 3) — "Elevation: 1,800 ft" must never certify 1800
-#: metres. Single-word only; "sq ft" is a forward-looking gap (LOW, #615).
+#: Trailing units :func:`_match_altitude_unit` accepts glued
+#: (``"1850m"``) or one space away (``"1800 metres"``) — #617 D2d-b. The
+#: UNION of the self-sufficient and generic sets above; which subset a
+#: given match came from decides whether a context word is required.
+_ALTITUDE_UNIT_TOKENS: frozenset[str] = (
+    _ALTITUDE_SELF_SUFFICIENT_UNIT_TOKENS | _ALTITUDE_GENERIC_UNIT_TOKENS
+)
+
+#: The complete 3-word trailing phrase :func:`_match_above_sea_level`
+#: accepts in place of a unit token (#617 D2d-b) — the words alone never
+#: count. Self-sufficient (no context word required): the phrase itself
+#: already names an altitude reading.
+_ABOVE_SEA_LEVEL_WORDS: tuple[str, str, str] = ("above", "sea", "level")
+
+#: Altitude-context words a GENERIC-unit shape
+#: (:data:`_ALTITUDE_GENERIC_UNIT_TOKENS`) must have within
+#: :data:`_ALTITUDE_CONTEXT_WINDOW_WORDS` raw words (#617 fold 2, post-
+#: review) — mirrors :data:`_PROCESS_CONTEXT_WORDS`'s "cue must sit near
+#: the claim" pattern. "grown at 1,850m" / "elevation of 1.850m" verify;
+#: "1,800 metres of shelving" / "1800 meter reading" (no cue nearby)
+#: demote. Tightened (#617 fold 4-FIX-3, second review round): "sea"
+#: REMOVED — "1,800 metres from the sea" (a distance-from-the-coast
+#: reading, not an altitude) certified on "sea" alone; the ACCEPTED
+#: "above sea level" phrase (:data:`_ABOVE_SEA_LEVEL_WORDS`) is already
+#: separately self-sufficient and never needs this set at all. "growing"
+#: REMOVED (present-participle business copy — "growing business with
+#: 1,800 metres of shelving" — certified on it); "grown" (the past
+#: participle used in genuine provenance statements, "grown at 1,850m")
+#: stays.
+_ALTITUDE_CONTEXT_WORDS: frozenset[str] = frozenset(
+    {"altitude", "altitudes", "elevation", "elevations", "grown", "asl", "masl"}
+)
+
+#: Non-metre length units that REJECT an altitude reading when adjacent to
+#: a matched shape (#617 D2d-b context guard) — "1800 ft" already fails to
+#: match any shape ("ft" isn't a metre unit); this set additionally
+#: rejects a CLEAN metres shape sitting beside a competing non-metre
+#: reading. Single-word only; "sq ft" is a forward-looking gap (LOW).
 _NON_METRE_UNIT_TOKENS: frozenset[str] = frozenset(
     {
         "ft",
@@ -2569,9 +2654,74 @@ _NON_METRE_UNIT_TOKENS: frozenset[str] = frozenset(
     }
 )
 
-#: Qualifiers that certify a stated BOUND, not a scalar reading (fold 5) —
-#: "up to 1,800 masl" / "1,800 masl max" state a ceiling, not exactly 1800m.
-_ALTITUDE_BOUND_QUALIFIERS: frozenset[str] = frozenset({"max", "maximum", "plus"})
+#: PRE-qualifiers — words stating a bound when they sit BEFORE a matched
+#: shape (#617 D2d-b context guard), within 2 raw words before only: "up
+#: to 1,800 masl", "grown above 1,800 masl", "at least 1,800 masl"
+#: ("least" alone suffices; bare "at" is EXCLUDED — "grown at 1,800 masl"
+#: is ordinary phrasing). BEFORE-only avoids false-firing on trailing
+#: prose like "...above the valley floor"; the accepted trailing phrase
+#: "above sea level" is a different code path
+#: (:func:`_match_above_sea_level`) that never reaches the context guard.
+#: "from" added post-review (fold 3): "Grown from 1,200 masl" states a
+#: floor, not a scalar reading.
+_ALTITUDE_PRE_BOUND_QUALIFIER_WORDS: frozenset[str] = frozenset(
+    {"above", "below", "over", "under", "up", "least", "from"}
+)
+
+#: POST-qualifiers — words stating a bound AFTER a matched shape (#617
+#: D2d-b context guard), within 2 raw words after only: "1,800 masl max"
+#: / "1,800 masl or more". "higher"/"lower" added post-review (fold 3):
+#: "1,800 masl and higher" states an open-ended bound — note "and" alone
+#: (a range JOINER) does not fire here since nothing after it starts with
+#: a digit; "higher" must independently be recognized as a qualifier.
+_ALTITUDE_POST_BOUND_QUALIFIER_WORDS: frozenset[str] = frozenset(
+    {"max", "maximum", "min", "minimum", "plus", "more", "higher", "lower"}
+)
+
+#: Words that join two digit runs into a RANGE (#617 D2d-b context
+#: guard) — "1,600 masl to 1,800 masl". "or" added post-review (fold 3):
+#: "1,600 or 1,800 masl" is the same disjunctive-range shape as "to"/"and".
+_ALTITUDE_RANGE_JOINER_WORDS: frozenset[str] = frozenset({"to", "and", "or"})
+
+#: Characters that join two digit runs into a RANGE as their OWN
+#: whitespace-delimited word (#617 D2d-b), e.g. "1,600 masl - 1,800 masl".
+#: A joiner GLUED with no surrounding whitespace ("1,600–1,800") never
+#: reaches this check — :func:`_breaks_altitude_word_boundary` already
+#: treats these chars as boundary-breaking, so a number glued to one can
+#: never start a NUMBER match (same rule that kills "SKU-1800"). A comma
+#: is handled SEPARATELY (:func:`_altitude_word_is_comma_glued_digit_run`,
+#: fold 3) rather than added here, because "1,600," is itself the far
+#: digit run AND the joiner glued together, not a standalone joiner word.
+_ALTITUDE_RANGE_JOINER_CHARS: frozenset[str] = frozenset({"-", "–", "/"})
+
+#: How many raw words outward the context guard inspects (#617 D2d-b) —
+#: enough for a bound qualifier at distance <= 2, or a range joiner
+#: followed by a unit word then the far digit run.
+_ALTITUDE_CONTEXT_WINDOW_WORDS: Final[int] = 4
+
+#: A small allowance (raw characters) between the matched shape and the
+#: model's evidence quote's own raw span (#617 fold 1,
+#: :func:`_shape_overlaps_quote_span`) — enough to absorb a trimmed
+#: leading/trailing punctuation mark (a closing quote mark, a full stop),
+#: NOT enough to reach a different clause of a long sentence ("...which
+#: also produces excellent honey-processed lots, grows at 1,900
+#: masl..." must still demote when the quote names only the unrelated
+#: clause). Shrunk 10 -> 2 chars (#617 fold 4-FIX-2, second review
+#: round): 10 chars let "This farm has a lovely tasting room, 1800masl
+#: of area" certify off a quote naming only "a lovely tasting room" — a
+#: ", " gap is only 2 characters, well inside the old margin. The gap is
+#: now ALSO required to contain no clause-breaking character
+#: (:data:`_ALTITUDE_CLAUSE_BREAK_CHARS`) regardless of its length — the
+#: margin exists to absorb trimmed punctuation, never to bridge a clause
+#: boundary.
+_ALTITUDE_QUOTE_SPAN_MARGIN_CHARS: Final[int] = 2
+
+#: Characters that end one clause and begin another (#617 fold 4-FIX-2)
+#: — if the small gap :data:`_ALTITUDE_QUOTE_SPAN_MARGIN_CHARS` allows
+#: between the quote's own span and the matched shape contains ANY of
+#: these, the two are in different clauses and must not be treated as
+#: overlapping, however short the gap.
+_ALTITUDE_CLAUSE_BREAK_CHARS: frozenset[str] = frozenset({",", ";", ":", "-", "–", "—"})
 
 #: Roast-target fields a vendor page never states — always
 #: ``"origin_estimated"`` in the drafted :attr:`BeanProfileDraft.field_sources`.
@@ -2734,264 +2884,6 @@ def _elides_as_thousands_separator(text: str, i: int) -> bool:
     return run_start == 0 or not text[run_start - 1].isalnum()
 
 
-def _numeric_tokens(text: str) -> frozenset[str]:
-    """Extract every contiguous digit run in ``text`` as a token (#590
-    D2b) — a comma/period is elided only when a VALID thousands
-    separator (:func:`_elides_as_thousands_separator`). No regex.
-
-    Args:
-        text: The raw (not pre-normalized) evidence-quote text.
-
-    Returns:
-        The set of digit-run tokens found, e.g. ``{"1800"}``.
-    """
-    tokens: set[str] = set()
-    current: list[str] = []
-    for i, char in enumerate(text):
-        if char.isdigit():
-            current.append(char)
-        elif char in ",." and current and _elides_as_thousands_separator(text, i):
-            continue
-        elif current:
-            tokens.add("".join(current))
-            current = []
-    if current:
-        tokens.add("".join(current))
-    return frozenset(tokens)
-
-
-def _alpha_runs(token: str) -> list[str]:
-    """Split ``token`` into maximal alphabetic runs, casefolded, dropping
-    digit runs (#590 D2b). No regex.
-
-    Args:
-        token: One :func:`_proximity_tokens` token (already alphanumeric).
-
-    Returns:
-        The casefolded alphabetic runs, in order.
-    """
-    runs: list[str] = []
-    current: list[str] = []
-    for char in token:
-        if char.isalpha():
-            current.append(char.casefold())
-        elif current:
-            runs.append("".join(current))
-            current = []
-    if current:
-        runs.append("".join(current))
-    return runs
-
-
-def _token_carries_altitude_cue(token: str) -> bool:
-    """Whether ``token`` carries an elevation cue as a WHOLE alphabetic
-    run, not a substring (#590 D2b — ``"meter"`` used to match inside
-    ``"parameter"``/``"diameter"``). ``"1800masl"`` still counts.
-
-    Args:
-        token: One :func:`_proximity_tokens` token.
-
-    Returns:
-        ``True`` if any alpha run EQUALS an :data:`_ALTITUDE_CUES` member.
-    """
-    return any(run in _ALTITUDE_CUES for run in _alpha_runs(token))
-
-
-def _proximity_tokens_with_starts(text: str) -> list[tuple[str, int]]:
-    """Tokenize ``text`` on punctuation AND whitespace, preserving a VALID
-    thousands separator (:func:`_elides_as_thousands_separator`). No
-    regex. The core scanner behind :func:`_proximity_tokens`, ALSO
-    recording each token's start index so :func:`_is_isolated_value_token`
-    (fold 2) can inspect the raw character before it without re-scanning.
-
-    Args:
-        text: The raw (not pre-normalized) evidence-quote text.
-
-    Returns:
-        ``(token, start_index)`` pairs, boundary characters dropped.
-    """
-    tokens: list[tuple[str, int]] = []
-    current: list[str] = []
-    start = 0
-    for i, char in enumerate(text):
-        if char.isalnum():
-            if not current:
-                start = i
-            current.append(char)
-        elif (
-            char in ",."
-            and current
-            and current[-1].isdigit()
-            and _elides_as_thousands_separator(text, i)
-        ):
-            continue
-        elif current:
-            tokens.append(("".join(current), start))
-            current = []
-    if current:
-        tokens.append(("".join(current), start))
-    return tokens
-
-
-def _proximity_tokens(text: str) -> list[str]:
-    """Thin wrapper over :func:`_proximity_tokens_with_starts` dropping
-    the start-index half — the plain token list every other caller uses.
-
-    Args:
-        text: The raw (not pre-normalized) evidence-quote text.
-
-    Returns:
-        The alphanumeric-run tokens, boundary characters dropped.
-    """
-    return [token for token, _ in _proximity_tokens_with_starts(text)]
-
-
-def _is_isolated_value_token(raw_text: str, start: int) -> bool:
-    """Whether the character before ``raw_text[start]`` is a safe LEFT
-    boundary for a value token — start-of-text, whitespace, or opening
-    punctuation — NOT a hyphen/underscore/alphanumeric glued on (fold 2).
-    Catches "SKU-1800m": the hyphen is an ordinary :func:`_proximity_tokens`
-    boundary, indistinguishable from a space unless checked against the
-    raw text directly.
-
-    Args:
-        raw_text: The raw (not pre-normalized) text the token came from.
-        start: The token's start index in ``raw_text``.
-
-    Returns:
-        ``True`` if the value token is not glued to a preceding identifier.
-    """
-    if start == 0:
-        return True
-    before = raw_text[start - 1]
-    return before.isspace() or before in "([{\"':"
-
-
-def _above_sea_level_cue_indices(tokens: list[str]) -> list[int]:
-    """Index positions of the contiguous 3-token phrase "above sea level"
-    within ``tokens`` (#590 D2b fix 1) — checked as a COMPLETE phrase,
-    never as 3 independent single-word cues.
-
-    Args:
-        tokens: The proximity token list (:func:`_proximity_tokens`).
-
-    Returns:
-        BOTH edge anchors — the "above" and "level" token indices — of
-        every match, so :func:`_cue_binds_to_value` can bind from
-        whichever side of the phrase a value token sits on.
-    """
-    return [
-        edge
-        for i in range(len(tokens) - 2)
-        if tokens[i].casefold() == "above"
-        and tokens[i + 1].casefold() == "sea"
-        and tokens[i + 2].casefold() == "level"
-        for edge in (i, i + 2)
-    ]
-
-
-def _is_glued_metre_suffix(token: str, target: str) -> bool:
-    """Whether ``token`` is EXACTLY the value's digit run with a bare "m"
-    glued on, SUFFIX-only (fold 2) — e.g. ``"1850m"``. A PREFIX form like
-    ``"M1800"`` must not match: :func:`_alpha_runs` discards position, so
-    this checks the raw token directly.
-
-    Args:
-        token: One :func:`_proximity_tokens` token whose digit run already
-            equals ``target``.
-        target: The claimed altitude value, as a string.
-
-    Returns:
-        ``True`` if ``token`` casefolds to exactly ``f"{target}m"``.
-    """
-    return token.casefold() == f"{target}m"
-
-
-def _digit_token_has_non_metre_unit(tokens: list[str], digit_index: int) -> bool:
-    """Whether the value token at ``digit_index`` carries or is directly
-    followed by a NON-METRE length unit (:data:`_NON_METRE_UNIT_TOKENS`,
-    fold 3) — a reading in feet/yards/kilometres/miles must never certify
-    a metres claim, regardless of a nearby cue. Checks the digit token's
-    trailing alpha run (glued, e.g. ``"1800ft"``) and the immediately
-    following token (space-separated, e.g. ``"1,800 ft"``).
-
-    Args:
-        tokens: The full :func:`_proximity_tokens` token list.
-        digit_index: The value-matching digit token's index.
-
-    Returns:
-        ``True`` if a non-metre unit is glued onto or immediately follows
-        the value token.
-    """
-    trailing_runs = _alpha_runs(tokens[digit_index])
-    if trailing_runs and trailing_runs[-1] in _NON_METRE_UNIT_TOKENS:
-        return True
-    next_index = digit_index + 1
-    return next_index < len(tokens) and tokens[next_index].casefold() in _NON_METRE_UNIT_TOKENS
-
-
-def _cue_binds_to_value(digit_index: int, cue_index: int) -> bool:
-    """Whether the cue at ``cue_index`` BINDS to the value at
-    ``digit_index`` — STRICT ADJACENCY only (distance <= 1; fold 1,
-    tightened post-security-review: the deleted ±4 stopword-bridge let a
-    cue bind an unrelated number sharing only a connective word,
-    e.g. "altitude of about 1,800 reviews"). This also demotes a
-    unit-less cue-first form like "altitude of 1800" — accepted, since
-    the compact form the prompt itself uses ("1,850m") still binds at
-    distance 0 via :func:`_is_glued_metre_suffix`.
-
-    Args:
-        digit_index: The value-matching digit token's index.
-        cue_index: The candidate cue token's index.
-
-    Returns:
-        ``True`` if the cue is immediately adjacent to the value.
-    """
-    return abs(digit_index - cue_index) <= 1
-
-
-def _altitude_evidence_supports_value(value: int, raw_quote: str) -> bool:
-    """Whether ``raw_quote`` supports ``value`` for ``altitude_m`` via an
-    ADJACENT digit-run + elevation cue (:func:`_token_carries_altitude_cue`,
-    :func:`_above_sea_level_cue_indices`, or an ISOLATED suffix-glued "m",
-    fold 2) that :func:`_cue_binds_to_value` to a :func:`_proximity_tokens`
-    token whose digit run equals ``value`` — excluding any value token
-    carrying a NON-METRE unit (:func:`_digit_token_has_non_metre_unit`,
-    fold 3) regardless of how good a nearby cue looks.
-
-    Args:
-        value: The claimed altitude in metres.
-        raw_quote: The evidence quote, NOT pre-normalized.
-
-    Returns:
-        ``True`` if a value-matching digit token has a bound cue,
-        ``False`` otherwise.
-    """
-    target = str(value)
-    tokens_with_starts = _proximity_tokens_with_starts(raw_quote)
-    tokens = [token for token, _ in tokens_with_starts]
-    digit_indices = [
-        i
-        for i, token in enumerate(tokens)
-        if target in _numeric_tokens(token) and not _digit_token_has_non_metre_unit(tokens, i)
-    ]
-    if not digit_indices:
-        return False
-    cue_indices = [i for i, token in enumerate(tokens) if _token_carries_altitude_cue(token)]
-    cue_indices += _above_sea_level_cue_indices(tokens)
-    # A glued "m" (e.g. "1,850m") is unambiguous ONLY when not itself
-    # glued onto a preceding identifier ("SKU-1800m", fold 2).
-    cue_indices += [
-        i
-        for i in digit_indices
-        if _is_glued_metre_suffix(tokens[i], target)
-        and _is_isolated_value_token(raw_quote, tokens_with_starts[i][1])
-    ]
-    if not cue_indices:
-        return False
-    return any(_cue_binds_to_value(d, c) for d in digit_indices for c in cue_indices)
-
-
 #: Hard sentence/line boundaries a corpus is segmented on for authenticity
 #: checking (#590 D2b fix 3) — a NEW, stricter check used only for the
 #: D2b altitude quote; D1's free-text checks are untouched.
@@ -3066,103 +2958,506 @@ def _find_authentic_segment(quote: str, corpus: str) -> str | None:
     return None
 
 
-def _looks_like_a_value_token(token: str) -> bool:
-    """Whether ``token`` STARTS with a digit — a plain number ("1600") and
-    a unit-glued one ("1800m") both count, so the range check (fold 4)
-    does not miss an endpoint that carries its own unit.
+def _breaks_altitude_word_boundary(char: str) -> bool:
+    """Whether ``char`` glues onto an identifier: a letter, digit,
+    underscore, or range-joiner char (:data:`_ALTITUDE_RANGE_JOINER_CHARS`,
+    #617 D2d-b). Applied symmetrically on the leading side of a NUMBER
+    (:func:`_altitude_number_at`) and the trailing side of a UNIT
+    (:func:`_match_altitude_unit`) — kills "SKU-1800", "1800m2", and a
+    glued range ("1,600–1,800 masl") with one rule.
 
     Args:
-        token: One :func:`_proximity_tokens` token.
+        char: A single character adjacent to the candidate shape.
 
     Returns:
-        ``True`` if ``token`` is non-empty and starts with a digit.
+        ``True`` if ``char`` breaks the word-boundary requirement.
     """
-    return bool(token) and token[0].isdigit()
+    return char.isalpha() or char.isdigit() or char == "_" or char in _ALTITUDE_RANGE_JOINER_CHARS
 
 
-def _value_is_range_endpoint(value: int, segment: str) -> bool:
-    """Whether ``value``'s digit token, in ``segment`` (the FULL authentic
-    segment, not a model-cropped quote), is a RANGE endpoint or a stated
-    BOUND — checked in BOTH directions (fold 4: backward-only missed a
-    FORWARD range like "1,800m to 2,000m"): adjacent to another value
-    token; adjacent to "to"/"and" adjacent to a value token; "up to";
-    or a bound qualifier within 2 tokens forward ("1,800 masl max", fold
-    5). Catches a range/ceiling cropped to a quote naming only one bound.
+def _altitude_number_at(segment: str, start: int) -> tuple[int, str] | None:
+    """Parse a NUMBER run beginning EXACTLY at ``start`` (#617 D2d-b) —
+    digits with optional valid thousands grouping
+    (:func:`_elides_as_thousands_separator`). Precondition:
+    ``segment[start]`` is a digit. Returns ``None`` unless ``start`` is at
+    a clean word boundary (:func:`_breaks_altitude_word_boundary`) — kills
+    "SKU-1800"/"v1.800"/"M1800" at the source.
 
     Args:
-        value: The claimed altitude in metres.
-        segment: The raw single-segment corpus text (not pre-normalized).
+        segment: The raw authentic segment being scanned.
+        start: The candidate NUMBER's first character index (a digit).
 
     Returns:
-        ``True`` if any occurrence of ``value``'s digit token in
-        ``segment`` is a range endpoint or a stated bound.
+        ``(end, digits)`` — ``end`` one past the last digit consumed,
+        ``digits`` with every valid separator elided — or ``None``.
     """
-    target = str(value)
-    tokens = _proximity_tokens(segment)
-    last_index = len(tokens) - 1
-    for i, token in enumerate(tokens):
-        if target not in _numeric_tokens(token):
+    if start > 0 and _breaks_altitude_word_boundary(segment[start - 1]):
+        return None
+    length = len(segment)
+    digits = [segment[start]]
+    i = start + 1
+    while i < length and segment[i].isdigit():
+        digits.append(segment[i])
+        i += 1
+    while i < length and segment[i] in ",." and _elides_as_thousands_separator(segment, i):
+        i += 1
+        digits.extend(segment[i : i + 3])
+        i += 3
+    return i, "".join(digits)
+
+
+def _read_alpha_run(segment: str, start: int) -> str:
+    """The maximal casefolded alphabetic run beginning at ``start`` (#617
+    D2d-b) — used only to read a candidate UNIT, never the digit side.
+
+    Args:
+        segment: The raw authentic segment being scanned.
+        start: The candidate run's first character index.
+
+    Returns:
+        The casefolded run of consecutive alphabetic characters, empty if
+        ``segment[start]`` is out of range or not alphabetic.
+    """
+    length = len(segment)
+    end = start
+    while end < length and segment[end].isalpha():
+        end += 1
+    return segment[start:end].casefold()
+
+
+def _match_above_sea_level(segment: str, start: int) -> int | None:
+    """Match the exact 3-word phrase "above sea level" beginning at
+    ``start`` (#617 D2d-b), single-space-separated, case-insensitive,
+    ending at a clean word boundary.
+
+    Args:
+        segment: The raw authentic segment being scanned.
+        start: The candidate phrase's first character index.
+
+    Returns:
+        The index one past "level", or ``None`` if it does not match.
+    """
+    index = start
+    length = len(segment)
+    for position, word in enumerate(_ABOVE_SEA_LEVEL_WORDS):
+        run = _read_alpha_run(segment, index)
+        if run != word:
+            return None
+        index += len(run)
+        if position < len(_ABOVE_SEA_LEVEL_WORDS) - 1:
+            if index >= length or segment[index] != " ":
+                return None
+            index += 1
+    if index < length and _breaks_altitude_word_boundary(segment[index]):
+        return None
+    return index
+
+
+def _match_altitude_unit(segment: str, number_end: int) -> tuple[int, bool] | None:
+    """Match a trailing UNIT immediately after a parsed NUMBER (#617
+    D2d-b) — glued (``"1850m"``), one space away (``"1800 metres"``), or
+    the complete "above sea level" phrase one space away
+    (:func:`_match_above_sea_level`). Either form must end at a clean word
+    boundary — kills "1800m2" and "1800masl-x".
+
+    Args:
+        segment: The raw authentic segment being scanned.
+        number_end: The index one past the parsed NUMBER's last digit.
+
+    Returns:
+        ``(end, requires_context)`` — ``end`` is the index one past the
+        matched UNIT (or phrase); ``requires_context`` is ``True`` when
+        the match came from :data:`_ALTITUDE_GENERIC_UNIT_TOKENS` (#617
+        fold 2 — the caller must then also find an altitude-context word
+        nearby, :func:`_altitude_shape_has_context_word`) and ``False``
+        for a self-sufficient unit or the "above sea level" phrase.
+        ``None`` if neither form matches here.
+    """
+    length = len(segment)
+    glued_run = _read_alpha_run(segment, number_end)
+    if glued_run and glued_run in _ALTITUDE_UNIT_TOKENS:
+        end = number_end + len(glued_run)
+        if end >= length or not _breaks_altitude_word_boundary(segment[end]):
+            return end, glued_run in _ALTITUDE_GENERIC_UNIT_TOKENS
+    if number_end < length and segment[number_end] == " ":
+        after_space = number_end + 1
+        word_run = _read_alpha_run(segment, after_space)
+        if word_run and word_run in _ALTITUDE_UNIT_TOKENS:
+            end = after_space + len(word_run)
+            if end >= length or not _breaks_altitude_word_boundary(segment[end]):
+                return end, word_run in _ALTITUDE_GENERIC_UNIT_TOKENS
+        phrase_end = _match_above_sea_level(segment, after_space)
+        if phrase_end is not None:
+            return phrase_end, False
+    return None
+
+
+def _iter_altitude_shapes(segment: str, target_digits: str) -> list[tuple[int, int, bool]]:
+    """Every accepted ``NUMBER UNIT`` shape in ``segment`` whose digits
+    equal ``target_digits`` (#617 D2d-b step 2), left-to-right. Returns
+    EVERY occurrence, not just the first, so
+    :func:`_altitude_whitelist_match` can keep looking past an earlier
+    rejected one.
+
+    Args:
+        segment: The raw authentic segment being scanned.
+        target_digits: The claimed altitude value, as a digit string.
+
+    Returns:
+        ``(start, end, requires_context)`` spans of every matched shape,
+        in order — see :func:`_match_altitude_unit` for
+        ``requires_context``.
+    """
+    length = len(segment)
+    shapes: list[tuple[int, int, bool]] = []
+    index = 0
+    while index < length:
+        if not segment[index].isdigit():
+            index += 1
             continue
-        # "" sentinels are safe: they match none of the checks below.
-        before = tokens[i - 2] if i >= 2 else ""
-        previous = tokens[i - 1].casefold() if i >= 1 else ""
-        up_to = previous == "to" and before.casefold() == "up"
-        precedes = _looks_like_a_value_token(tokens[i - 1] if i >= 1 else "") or (
-            previous in ("to", "and") and (_looks_like_a_value_token(before) or up_to)
-        )
-        after = tokens[i + 2] if i + 2 <= last_index else ""
-        following = tokens[i + 1].casefold() if i < last_index else ""
-        follows = (
-            _looks_like_a_value_token(tokens[i + 1] if i < last_index else "")
-            or following in _ALTITUDE_BOUND_QUALIFIERS
-            or (following in ("to", "and") and _looks_like_a_value_token(after))
-            or after.casefold() in _ALTITUDE_BOUND_QUALIFIERS
-        )
-        if precedes or follows:
-            return True
+        parsed = _altitude_number_at(segment, index)
+        if parsed is None:
+            index += 1
+            continue
+        number_end, digits = parsed
+        if digits == target_digits:
+            unit_match = _match_altitude_unit(segment, number_end)
+            if unit_match is not None:
+                unit_end, requires_context = unit_match
+                shapes.append((index, unit_end, requires_context))
+        index = number_end if number_end > index else index + 1
+    return shapes
+
+
+def _raw_words_around(segment: str, start: int, end: int) -> tuple[list[str], list[str]]:
+    """The raw whitespace-delimited words immediately outside the matched
+    shape ``segment[start:end]`` (#617 D2d-b step 3), outward order
+    (index 0 = closest).
+
+    Args:
+        segment: The raw authentic segment the shape was matched in.
+        start: The matched shape's start index.
+        end: The matched shape's end index (one past its last character).
+
+    Returns:
+        ``(before, after)`` word lists, each ordered closest-first.
+    """
+    before = segment[:start].split()
+    before.reverse()
+    after = segment[end:].split()
+    return before, after
+
+
+def _altitude_shape_has_context_word(segment: str, start: int, end: int) -> bool:
+    """Whether an altitude-context word (:data:`_ALTITUDE_CONTEXT_WORDS`,
+    #617 fold 2) sits within :data:`_ALTITUDE_CONTEXT_WINDOW_WORDS` raw
+    words of the matched shape, either side — required for a GENERIC-unit
+    shape to certify (:func:`_match_altitude_unit`'s ``requires_context``).
+
+    Args:
+        segment: The raw authentic segment the shape was matched in.
+        start: The matched shape's start index.
+        end: The matched shape's end index (one past its last character).
+
+    Returns:
+        ``True`` if a context word is within the window either side.
+    """
+    before, after = _raw_words_around(segment, start, end)
+    window = before[:_ALTITUDE_CONTEXT_WINDOW_WORDS] + after[:_ALTITUDE_CONTEXT_WINDOW_WORDS]
+    return any(word.casefold() in _ALTITUDE_CONTEXT_WORDS for word in window)
+
+
+def _altitude_word_is_range_joiner(word: str) -> bool:
+    """Whether ``word`` joins two digit runs into a RANGE (#617 D2d-b
+    step 3): a joiner char standing alone
+    (:data:`_ALTITUDE_RANGE_JOINER_CHARS`) or a joiner word
+    (:data:`_ALTITUDE_RANGE_JOINER_WORDS`).
+
+    Args:
+        word: One raw word from :func:`_raw_words_around`.
+
+    Returns:
+        ``True`` if ``word`` is a range joiner.
+    """
+    return word in _ALTITUDE_RANGE_JOINER_CHARS or word.casefold() in _ALTITUDE_RANGE_JOINER_WORDS
+
+
+def _altitude_word_is_comma_glued_digit_run(word: str) -> bool:
+    """Whether ``word`` is a digit run with a trailing comma glued
+    directly onto it (#617 fold 3) — e.g. ``"1,600,"`` in "1,600, 1,800
+    masl". This is the SAME range-joining event as "1,600 to 1,800 masl",
+    just with the joiner comma glued onto the digit instead of sitting as
+    its own word, so it is checked as an immediate-adjacency condition
+    (the far digit run and the joiner are literally the same token) —
+    unlike the word/char joiners above, which look for a SEPARATE far
+    digit run later in the window.
+
+    Args:
+        word: One raw word from :func:`_raw_words_around`.
+
+    Returns:
+        ``True`` if ``word`` ends with a comma glued onto a digit.
+    """
+    return len(word) > 1 and word[-1] == "," and word[-2].isdigit()
+
+
+def _altitude_context_guard_rejects(segment: str, start: int, end: int) -> bool:
+    """The small, finite context guard around an already-matched shape
+    (#617 D2d-b step 3), checked on the RAW segment (never a cropped
+    quote). Rejects when, within :data:`_ALTITUDE_CONTEXT_WINDOW_WORDS`
+    raw words either side:
+
+    - a range joiner (:func:`_altitude_word_is_range_joiner`) is followed
+      later in the same outward window by a word starting with a digit
+      (catches a unit-mediated range like "1,600 masl to 1,800 masl");
+    - a comma-glued digit run
+      (:func:`_altitude_word_is_comma_glued_digit_run`) sits in the
+      immediately adjacent word, either direction ("1,600, 1,800 masl");
+    - a PRE-qualifier (:data:`_ALTITUDE_PRE_BOUND_QUALIFIER_WORDS`) sits
+      within 2 words BEFORE the shape, or a POST-qualifier
+      (:data:`_ALTITUDE_POST_BOUND_QUALIFIER_WORDS`) within 2 words
+      AFTER — direction-scoped so ordinary trailing prose ("...above the
+      valley floor") never false-fires;
+    - a non-metre unit (:data:`_NON_METRE_UNIT_TOKENS`) sits in the
+      immediately adjacent word, either direction.
+
+    Args:
+        segment: The raw authentic segment the shape was matched in.
+        start: The matched shape's start index.
+        end: The matched shape's end index (one past its last character).
+
+    Returns:
+        ``True`` if the shape is rejected (a bound, range, or non-metre
+        unit collision); ``False`` if it is clean.
+    """
+    before, after = _raw_words_around(segment, start, end)
+    for words, qualifiers in (
+        (before, _ALTITUDE_PRE_BOUND_QUALIFIER_WORDS),
+        (after, _ALTITUDE_POST_BOUND_QUALIFIER_WORDS),
+    ):
+        window = words[:_ALTITUDE_CONTEXT_WINDOW_WORDS]
+        for position, word in enumerate(window):
+            if position < 2 and word.casefold() in qualifiers:
+                return True
+            if position < 1 and (
+                word.casefold() in _NON_METRE_UNIT_TOKENS
+                or _altitude_word_is_comma_glued_digit_run(word)
+            ):
+                return True
+            if _altitude_word_is_range_joiner(word):
+                remainder = window[position + 1 :]
+                if any(bool(w) and w[0].isdigit() for w in remainder):
+                    return True
     return False
 
 
-def _quote_supports_altitude(value: int | None, quote: str | None, corpus: str) -> bool:
-    """Whether ``quote`` genuinely supports ``value`` for ``altitude_m``
-    (#590 D2b/D2c — ships DORMANT, see
-    :data:`_ALTITUDE_CITATION_GATE_ENABLED`; ``processing``/``bean_species``
-    have the SAME machinery in the separate
-    :func:`_quote_supports_processing`/:func:`_quote_supports_bean_species`
-    gates, both also PARKED PERMANENTLY, #590 slice E2). Three
-    conditions: (1) an AUTHENTIC single-segment page span
-    (:func:`_find_authentic_segment`), (2) the value is not a RANGE
-    endpoint on that segment (:func:`_value_is_range_endpoint`, fold 5),
-    and (3) a BOUND elevation cue (:func:`_altitude_evidence_supports_value`).
-    Fails SOFT on any defect — never raises out of a draft.
+def _raw_word_spans(text: str) -> list[tuple[str, int, int]]:
+    """Whitespace-delimited words of ``text``, each returned casefolded
+    for comparison but with a span computed ONLY from the SAME
+    punctuation translation :func:`_normalize_for_containment` uses (#617
+    fold 1; casefold-desync fix, Codex PR #626 round 2) — the
+    translation maps each punctuation character to a space, 1-for-1, so
+    it alone keeps the result the SAME LENGTH as ``text`` and every
+    word's raw ``[start, end)`` span genuinely in ``text``'s own
+    coordinates. ``casefold()`` is DELIBERATELY NOT applied before
+    computing spans: unlike the punctuation translation, casefold can
+    EXPAND some characters into more codepoints than they started with
+    (German "ß" -> "ss", Turkish "İ" -> "i" + a combining dot above), so
+    a span computed from a pre-casefolded copy can silently drift past
+    ``text``'s own length — an ordinary "Große Kaffee" or "İ Kenya"
+    heading used to raise ``IndexError`` out of
+    :func:`_heading_compound_marker_prefix_counts`'s fixed-size array
+    (a genuine desync, not just a crash — the same drift would have
+    silently corrupted :func:`_locate_quote_span`'s spans too, without
+    raising anything, had that path not been index-array-based). Each
+    token is casefolded INDIVIDUALLY here, strictly AFTER its span is
+    already fixed from the raw text — casefolding only ever changes the
+    token's own comparison string, never the bookkeeping around it.
 
     Args:
-        value: The extracted ``altitude_m`` value. ``None`` never supports.
-        quote: The model's verbatim ``altitude_m_evidence`` span, or
-            ``None``.
-        corpus: The page's RAW verification corpus (not pre-normalized —
-            :func:`_find_authentic_segment` needs the original sentence
-            boundaries).
+        text: The raw text to tokenize (a quote, a segment, or a
+            heading).
 
     Returns:
-        ``True`` only when the quote is an authentic single-segment span,
-        not a range endpoint on that segment, AND independently supports
-        ``value``; ``False`` otherwise.
+        ``(word, start, end)`` triples, in order — ``word`` is
+        casefolded; ``start``/``end`` are raw offsets into ``text``.
+    """
+    pretransform = text.translate(_CONTAINMENT_PUNCTUATION_TRANSLATION)
+    spans: list[tuple[str, int, int]] = []
+    start: int | None = None
+    for i, char in enumerate(pretransform):
+        if char.isspace():
+            if start is not None:
+                spans.append((text[start:i].casefold(), start, i))
+                start = None
+        elif start is None:
+            start = i
+    if start is not None:
+        spans.append((text[start:].casefold(), start, len(text)))
+    return spans
+
+
+def _locate_quote_span(quote: str, segment: str) -> tuple[int, int] | None:
+    """The RAW ``[start, end)`` character span in ``segment`` that
+    ``quote`` — already known to authenticate via
+    :func:`_find_authentic_segment` — corresponds to (#617 fold 1).
+    Located by finding ``quote``'s word sequence as a contiguous sublist
+    of ``segment``'s words (the SAME whole-phrase semantics
+    :func:`_contains_whole_phrase` uses to authenticate it in the first
+    place), then reading the first and last matched word's raw
+    positions.
+
+    Args:
+        quote: The raw evidence quote.
+        segment: The raw authentic segment containing it.
+
+    Returns:
+        ``(start, end)``, or ``None`` if the word sequence cannot be
+        located — should not happen given prior authentication, but
+        checked defensively; fails toward "no overlap" (never toward a
+        false certify), same fail-soft direction as the rest of the gate.
+    """
+    quote_words = [word for word, _, _ in _raw_word_spans(quote) if word]
+    if not quote_words:
+        return None
+    segment_spans = _raw_word_spans(segment)
+    segment_words = [word for word, _, _ in segment_spans]
+    count = len(quote_words)
+    for i in range(len(segment_words) - count + 1):
+        if segment_words[i : i + count] == quote_words:
+            return segment_spans[i][1], segment_spans[i + count - 1][2]
+    return None
+
+
+def _shape_overlaps_quote_span(
+    segment: str, shape_start: int, shape_end: int, quote_start: int, quote_end: int
+) -> bool:
+    """Whether the matched shape ``[shape_start, shape_end)`` intersects
+    the quote's own raw span, or sits within a small, CLAUSE-CLEAN gap of
+    it (#617 fold 1, tightened fold 4-FIX-2, second review round) — a
+    genuine overlap (the shape sits inside the quote, or vice versa)
+    always counts; a NON-overlapping gap counts ONLY when it is no
+    longer than :data:`_ALTITUDE_QUOTE_SPAN_MARGIN_CHARS` raw characters
+    AND contains no clause-breaking character
+    (:data:`_ALTITUDE_CLAUSE_BREAK_CHARS`) — the margin absorbs a trimmed
+    punctuation mark (a closing quote, a full stop), never a clause
+    boundary like ", " ("...tasting room, 1800masl of area" must not
+    certify off a quote naming only "a lovely tasting room").
+
+    Args:
+        segment: The raw authentic segment both spans live in — needed
+            to inspect the actual gap characters, not just their count.
+        shape_start: The matched shape's start index.
+        shape_end: The matched shape's end index (one past its last
+            character).
+        quote_start: The quote's own raw start index
+            (:func:`_locate_quote_span`).
+        quote_end: The quote's own raw end index.
+
+    Returns:
+        ``True`` if the two spans genuinely overlap, or are close with a
+        clause-clean gap between them.
+    """
+    if shape_start < quote_end and shape_end > quote_start:
+        return True
+    if shape_end <= quote_start:
+        gap = segment[shape_end:quote_start]
+    else:
+        gap = segment[quote_end:shape_start]
+    if len(gap) > _ALTITUDE_QUOTE_SPAN_MARGIN_CHARS:
+        return False
+    return not any(char in _ALTITUDE_CLAUSE_BREAK_CHARS for char in gap)
+
+
+def _altitude_whitelist_match(value: int, quote: str, main_region_text: str) -> bool:
+    """Whether ``main_region_text`` contains a POSITIVELY RECOGNIZED
+    altitude reading of ``value`` metres, authenticated against ``quote``
+    (#617 D2d-b). Certify ONLY on a shape the grammar recognizes;
+    everything else demotes by construction. Fails SOFT, never raises.
+
+    1. ``quote`` authenticates within a single segment of
+       ``main_region_text`` (:func:`_find_authentic_segment``), and its
+       own raw span within that segment is located
+       (:func:`_locate_quote_span`, #617 fold 1) — a quote naming no
+       genuine span at all never certifies.
+    2. The raw segment is scanned (:func:`_iter_altitude_shapes`) for
+       every accepted shape naming ``value``'s digits — this alone closes
+       every SKU/version/decimal/price-cents bypass in the accumulated
+       spec, since none can ever produce a recognized shape.
+    3. The matched shape must OVERLAP the quote's own span
+       (:func:`_shape_overlaps_quote_span`, #617 fold 1) — a quote citing
+       an unrelated, merely-authentic clause of the same segment while
+       the number sits elsewhere no longer certifies.
+    4. A GENERIC-unit shape (:data:`_ALTITUDE_GENERIC_UNIT_TOKENS`) must
+       also have an altitude-context word nearby
+       (:func:`_altitude_shape_has_context_word`, #617 fold 2) — a
+       self-sufficient unit (masl/asl/msnm, or the "above sea level"
+       phrase) needs none.
+    5. The matched shape survives the context guard
+       (:func:`_altitude_context_guard_rejects`) — an earlier rejected
+       occurrence does not stop a later, clean one from certifying.
+
+    Deliberately accepted OVER-DEMOTES (never a certify-bypass per the
+    #617 stopping rule): cue-first unit-less forms ("Altitude: 1,800");
+    a bare generic-unit reading with no altitude-context word nearby
+    ("1850m" standing entirely alone).
+
+    Args:
+        value: The claimed ``altitude_m`` value, in metres.
+        quote: The model's verbatim evidence span (non-blank).
+        main_region_text: :func:`_main_product_region`'s output — never
+            the whole page corpus.
+
+    Returns:
+        ``True`` only when all conditions hold.
+    """
+    try:
+        segment = _find_authentic_segment(quote, main_region_text)
+        if segment is None:
+            return False
+        # _find_authentic_segment already proved this same quote is a contiguous word
+        # sublist of this same segment, via equivalent whole-phrase matching semantics
+        # (see _locate_quote_span's docstring) — the None branch below is unreachable
+        # through this call path, kept only as a fail-soft defensive guard.
+        quote_span = _locate_quote_span(quote, segment)
+        if quote_span is None:  # pragma: no cover - defensive
+            return False
+        quote_start, quote_end = quote_span
+        target_digits = str(value)
+        for start, end, requires_context in _iter_altitude_shapes(segment, target_digits):
+            if not _shape_overlaps_quote_span(segment, start, end, quote_start, quote_end):
+                continue
+            if requires_context and not _altitude_shape_has_context_word(segment, start, end):
+                continue
+            if not _altitude_context_guard_rejects(segment, start, end):
+                return True
+        return False
+    except Exception:  # pragma: no cover - defensive: gate must fail soft, never raise
+        return False
+
+
+def _quote_supports_altitude(value: int | None, quote: str | None, main_region_text: str) -> bool:
+    """Whether ``quote`` genuinely supports ``value`` for ``altitude_m``
+    (#617 D2d-b) — the ``None``/blank guard around
+    :func:`_altitude_whitelist_match`.
+
+    Args:
+        value: The extracted ``altitude_m`` value. ``None`` never
+            supports.
+        quote: The model's verbatim ``altitude_m_evidence`` span, or
+            ``None``.
+        main_region_text: :func:`_main_product_region`'s output — NOT the
+            whole page corpus.
+
+    Returns:
+        ``True`` only when :func:`_altitude_whitelist_match` certifies.
     """
     if value is None or not quote:
         return False
-    try:
-        raw_quote = quote.strip()
-        if not raw_quote:
-            return False
-        segment = _find_authentic_segment(raw_quote, corpus)
-        if segment is None:
-            return False  # not a genuine single-segment page quote
-        if _value_is_range_endpoint(value, segment):
-            return False  # a range's endpoint, not a scalar reading
-        return _altitude_evidence_supports_value(value, raw_quote)
-    except Exception:  # pragma: no cover - defensive: citation gate must fail soft, never raise
+    raw_quote = quote.strip()
+    if not raw_quote:
         return False
+    return _altitude_whitelist_match(value, raw_quote, main_region_text)
 
 
 def _normalize_optional_text(value: str | None) -> str | None:
@@ -3291,6 +3586,64 @@ def _line_is_sentinel(line: str) -> bool:
     )
 
 
+#: Words a heading's REMAINDER (its own text minus the matched anchor
+#: span) must not contain for the heading to still anchor (#617 fold 4,
+#: post-review) — "## Kenya AA & Friends" or "## Kenya AA and Friends"
+#: names a COMPOUND section, not the single product "Kenya AA" alone, so
+#: it must not open a main-region match that then admits a sibling
+#: product's data (e.g. that sibling's altitude).
+_HEADING_CONJUNCTION_WORDS: frozenset[str] = frozenset({"and", "with", "plus"})
+
+#: Symbols with the same compound-section meaning as
+#: :data:`_HEADING_CONJUNCTION_WORDS` (#617 fold 4) — "## Kenya AA &
+#: Friends" / "## Kenya AA + Friends".
+_HEADING_CONJUNCTION_SYMBOLS: frozenset[str] = frozenset({"&", "+"})
+
+
+def _heading_compound_marker_prefix_counts(
+    heading_text: str, heading_word_spans: list[tuple[str, int, int]]
+) -> list[int]:
+    """Precompute, ONCE per heading, a prefix-count array over the RAW
+    heading text recording how many "compound marker" positions (#617
+    perf fold, Codex PR #626) sit strictly before each raw index — a
+    comma (checked on the raw, untranslated text: normalization erases
+    it before tokenizing), or a conjunction word/symbol token
+    (:data:`_HEADING_CONJUNCTION_WORDS`, :data:`_HEADING_CONJUNCTION_SYMBOLS`,
+    marked at that token's own raw start position).
+
+    Building this array ONCE, rather than materializing a fresh
+    remainder slice (list or string) per anchor OCCURRENCE, is what
+    makes :func:`_heading_matches_anchor` linear: a crafted heading like
+    ``"a,a,a,..."`` with a 1-character anchor produces O(n) occurrences,
+    and the old per-occurrence slice-and-scan did O(n) work for each —
+    O(n²) total, an event-loop stall synchronously held behind
+    ``draft_bean_from_url``'s start-lock. Every occurrence now costs O(1)
+    array lookups instead (:func:`_heading_matches_anchor`).
+
+    Args:
+        heading_text: The raw heading line's text.
+        heading_word_spans: :func:`_raw_word_spans` applied to
+            ``heading_text`` — computed once by the caller and reused
+            here, never re-tokenized.
+
+    Returns:
+        ``bad_before``, length ``len(heading_text) + 1`` — ``bad_before[i]``
+        is the count of marker positions strictly less than ``i``.
+    """
+    length = len(heading_text)
+    marker_at = [False] * length
+    for word, raw_start, _ in heading_word_spans:
+        if word in _HEADING_CONJUNCTION_WORDS or word in _HEADING_CONJUNCTION_SYMBOLS:
+            marker_at[raw_start] = True
+    for i, char in enumerate(heading_text):
+        if char == ",":
+            marker_at[i] = True
+    bad_before = [0] * (length + 1)
+    for i in range(length):
+        bad_before[i + 1] = bad_before[i] + (1 if marker_at[i] else 0)
+    return bad_before
+
+
 def _heading_matches_anchor(heading_text: str, anchors_normalized: list[str]) -> bool:
     """Whether ``heading_text`` (raw) whole-phrase-CONTAINS any of
     ``anchors_normalized`` (#590 slice E1) — ONE-DIRECTIONAL ONLY (Codex
@@ -3304,11 +3657,62 @@ def _heading_matches_anchor(heading_text: str, anchors_normalized: list[str]) ->
     E-2, same pattern as the altitude whitelist): a heading that
     ABBREVIATES a suffix-laden anchor (e.g. "## Kenya Kiambu AA" vs
     anchor "Kenya Kiambu AA 250g Whole Bean") no longer matches — the
-    safe direction only; widening is evidence-gated, not assumed."""
+    safe direction only; widening is evidence-gated, not assumed.
+
+    #617 fold 4 (post-review): a match is accepted only when the
+    heading's REMAINDER — its own text minus the matched anchor span —
+    carries no conjunction word/symbol
+    (:data:`_HEADING_CONJUNCTION_WORDS`, :data:`_HEADING_CONJUNCTION_SYMBOLS`)
+    or comma. "## Kenya AA & Friends" no longer anchors for "Kenya AA"
+    (the remainder "& Friends" names a compound section); "## Kenya AA,
+    Sumatra Mandailing" no longer anchors either (#617 fold 4-FIX-1 — a
+    comma normalizes to a space before tokenizing, erasing the signal
+    unless checked on the RAW text); "## Kenya Kiambu — Single Origin" is
+    UNCHANGED (its remainder "single origin" carries neither — the em
+    dash is a DIFFERENT character, already punctuation-translated to a
+    space before tokenizing, and is never treated as a marker).
+
+    #617 perf fold (Codex PR #626): rather than materializing a fresh
+    remainder (list slice + string slice) and re-scanning it for EVERY
+    anchor occurrence — O(n) work per occurrence, O(n²) total on a
+    crafted heading with O(n) occurrences — every marker position
+    (conjunction word/symbol token, or raw comma) is precomputed ONCE
+    into a prefix-count array (:func:`_heading_compound_marker_prefix_counts`),
+    then each occurrence is checked with two O(1) array lookups: a
+    marker exists in the remainder iff one sits strictly before the
+    matched span's raw start, or at/after its raw end — exactly the
+    same "outside the matched anchor span" test the old remainder slice
+    computed, just without ever materializing it.
+
+    Args:
+        heading_text: The raw heading line's text (``#`` markers and
+            leading/trailing whitespace already stripped).
+        anchors_normalized: The page's title/JSON-LD-name anchors, each
+            already run through :func:`_normalize_for_containment`.
+
+    Returns:
+        ``True`` if some anchor matches within the heading AND the
+        remainder around that match carries no conjunction word/symbol
+        and no comma.
+    """
     normalized_heading = _normalize_for_containment(heading_text)
     if not normalized_heading:
         return False
-    return any(_contains_whole_phrase(anchor, normalized_heading) for anchor in anchors_normalized)
+    heading_word_spans = _raw_word_spans(heading_text)
+    heading_tokens = [word for word, _, _ in heading_word_spans]
+    bad_before = _heading_compound_marker_prefix_counts(heading_text, heading_word_spans)
+    length = len(heading_text)
+    for anchor in anchors_normalized:
+        anchor_tokens = tuple(anchor.split())
+        if not anchor_tokens:
+            continue
+        for start, end in _phrase_token_spans(anchor_tokens, heading_tokens):
+            raw_start = heading_word_spans[start][1]
+            raw_end = heading_word_spans[end][2]
+            if bad_before[raw_start] > 0 or bad_before[length] > bad_before[raw_end]:
+                continue
+            return True
+    return False
 
 
 def _main_product_region(body_text: str, json_ld_values: str, json_ld_name: str) -> str:
@@ -3582,6 +3986,34 @@ def _quote_supports_is_blend(
 # fields.
 
 
+def _kmp_failure_function(pattern: tuple[str, ...]) -> list[int]:
+    """The Knuth-Morris-Pratt failure (partial-match) table for
+    ``pattern`` (#617 perf fold, Codex PR #626 round 3) — ``failure[i]``
+    is the length of the longest proper prefix of ``pattern[: i + 1]``
+    that is also a suffix of it. Standard KMP preprocessing, generalized
+    from characters to opaque tokens (plain ``==`` comparison, no
+    slicing) so :func:`_phrase_token_spans` can match in one linear pass
+    instead of re-comparing a fresh width-sized slice at every start
+    position.
+
+    Args:
+        pattern: The needle token sequence (non-empty).
+
+    Returns:
+        The failure table, same length as ``pattern``.
+    """
+    length = len(pattern)
+    failure = [0] * length
+    k = 0
+    for i in range(1, length):
+        while k > 0 and pattern[i] != pattern[k]:
+            k = failure[k - 1]
+        if pattern[i] == pattern[k]:
+            k += 1
+        failure[i] = k
+    return failure
+
+
 def _phrase_token_spans(
     phrase_tokens: tuple[str, ...], corpus_tokens: list[str]
 ) -> list[tuple[int, int]]:
@@ -3591,6 +4023,19 @@ def _phrase_token_spans(
     Needed here (unlike D1's free-text containment, which only needs a
     bool) because :func:`_display_token_has_process_cue` must inspect the
     token immediately either side of a match, not just whether one exists.
+
+    Token-sequence KMP (#617 perf fold, Codex PR #626 round 3) —
+    :func:`_kmp_failure_function` once over ``phrase_tokens``, then a
+    SINGLE pass over ``corpus_tokens``: O(len(phrase_tokens) +
+    len(corpus_tokens)) worst case, never re-materializing or
+    re-comparing a width-sized slice per candidate start position. The
+    naive per-position slice-and-compare this replaced was
+    O(len(corpus_tokens) * len(phrase_tokens)) — synchronous, adversarial
+    input on both sides (a long anchor sharing most tokens with a long
+    heading) could stall the event loop under ``_start_lock``. Overlapping
+    matches are still all reported, identical to the naive scan (a
+    successful match resumes from the failure table's fallback, not from
+    scratch).
 
     Args:
         phrase_tokens: The already-normalized, already-split needle, e.g.
@@ -3604,11 +4049,18 @@ def _phrase_token_spans(
     width = len(phrase_tokens)
     if width == 0:
         return []
-    return [
-        (start, start + width - 1)
-        for start in range(len(corpus_tokens) - width + 1)
-        if tuple(corpus_tokens[start : start + width]) == phrase_tokens
-    ]
+    failure = _kmp_failure_function(phrase_tokens)
+    spans: list[tuple[int, int]] = []
+    k = 0
+    for i, token in enumerate(corpus_tokens):
+        while k > 0 and token != phrase_tokens[k]:
+            k = failure[k - 1]
+        if token == phrase_tokens[k]:
+            k += 1
+        if k == width:
+            spans.append((i - width + 1, i))
+            k = failure[k - 1]
+    return spans
 
 
 def _display_token_has_process_cue(
@@ -3838,17 +4290,25 @@ def _draft_from_identity(
     verbatim, it is lower-stakes (the roast advisor never reads it), and
     it keeps the original presence-only tagging. ALL FOUR typed fields
     (``altitude_m``, ``processing``, ``bean_species``, ``is_blend``) now
-    demote unconditionally — #590 slice E2 concludes lexical certification
-    of typed fields EXHAUSTED. Each has a fully built, unit-tested
-    citation-gate helper whose runtime consumption is gated off by its own
-    dormant/parked constant, cross-referenced from ``field_sources`` below
-    — see each constant's own docstring for its specific bypass evidence.
-    Altitude alone stays dormant-pending-redesign (#617's shape-grammar,
-    numbers-with-units); the other three are PARKED PERMANENTLY on
-    demonstrated semantic bypasses — no lexical denylist hardening,
-    revisit only with a non-lexical mechanism. The LIVE verification
-    surface is exactly D1's free-text containment below plus the
-    ``description`` exemption above.
+    demote unconditionally — lexical certification is EXHAUSTED for all
+    four, each gated off by its own parked constant, see each constant's
+    docstring: ``processing``/``bean_species``/``is_blend`` concluded
+    #590 slice E2; ``altitude_m`` concluded #617's terminal probe — its
+    fail-CLOSED whitelist (:func:`_altitude_whitelist_match`) built,
+    stayed unit-tested, and ran ENABLED for two review rounds, but a
+    THIRD (terminal) round still found plausible certify-leaks in the
+    just-tightened mechanisms, demonstrating the same enumerative-
+    denylist problem the whole redesign existed to avoid. No lexical
+    denylist hardening will be attempted on any of the four; revisit
+    only with a non-lexical mechanism (e.g. an entailment judge). THE
+    LIVE VERIFICATION SURFACE, final for this architecture, is D1's
+    free-text containment below plus the ``description`` exemption
+    above. Every typed field's evidence quote IS captured on
+    ``identity`` (#590 D2a) — but ``BeanProfileDraft`` itself carries no
+    evidence fields, so it is not yet returned by the API; surfacing it
+    to the operator for human judgement, instead of automated
+    certification, is the deliberate contract-crossing follow-up slice
+    (#627), alongside eval capture (#612).
     Every roast-target field is always
     ``"origin_estimated"``. The optional free-text fields (``country``, ``farm``,
     ``bean_varietal``, ``description``) are normalized via
@@ -3864,8 +4324,8 @@ def _draft_from_identity(
     before any fetch). The vendor page itself is still fetched with the
     REAL, un-redacted URL — only what is returned/persisted is redacted.
     NONE of ``identity``'s four ``*_evidence`` quotes affect provenance at
-    runtime as of #590 slice E2 — every typed-field gate is dormant or
-    parked, see above.
+    runtime — every typed-field gate is now permanently parked, see
+    above.
 
     Args:
         identity: The provider's page-only extraction, including its four
@@ -3998,10 +4458,14 @@ def _draft_from_identity(
             field_sources[field_name] = "on_page" if gate_verdict else "origin_estimated"
             continue
         if field_name == "altitude_m":
-            # DORMANT (_ALTITUDE_CITATION_GATE_ENABLED) — ``and`` short-
-            # circuits before the check ever runs, until D2d flips it.
+            # PARKED PERMANENTLY (_ALTITUDE_CITATION_GATE_ENABLED, see its
+            # docstring — the #617 terminal probe) — ``and`` short-circuits
+            # before the helper ever runs, so this demotes unconditionally,
+            # same as processing/bean_species/is_blend. main_region (not
+            # merged_corpus/the whole page) is still the intended
+            # authentication scope should this ever revisit.
             gate_verdict = _ALTITUDE_CITATION_GATE_ENABLED and _quote_supports_altitude(
-                identity.altitude_m, identity.altitude_m_evidence, merged_corpus
+                identity.altitude_m, identity.altitude_m_evidence, main_region
             )
             field_sources[field_name] = "on_page" if gate_verdict else "origin_estimated"
             continue

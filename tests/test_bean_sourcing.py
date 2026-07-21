@@ -2438,16 +2438,17 @@ def test_draft_from_identity_abstained_processing_has_no_spurious_provenance() -
 # only — Codex round-1 triage: sound processing/bean_species verification
 # needs locality + conflicting-method logic deferred to slice E) ---
 #
-# The gate ships DORMANT (_ALTITUDE_CITATION_GATE_ENABLED = False). #615/D2c
-# folded five hardening fixes — cue adjacency, suffix-only glued-m,
-# non-metre unit rejection, the segmenter's thousands-period exception, and
-# range-endpoint rejection — but round-6 (Codex) review found 6 MORE shape
-# bypasses the guard-stack design fails open on; enablement now moves to a
-# fail-CLOSED whitelist redesign (D2d, #615). Tests below that assert a
-# "_demotes" outcome via _draft_from_identity are still valid proof of
-# today's SAFE runtime behaviour (altitude_m always demotes), but no longer
-# exercise the specific mechanism their docstring names — that mechanism is
-# proven by a sibling test calling the gate function(s) directly.
+# RETIRED (#617 D2d-a): the guard-stack matcher FAILED OPEN across two
+# enable attempts (#615/#616 found 6 more shape bypasses on top of 5 prior
+# hardening folds) — its machinery is deleted;
+# :func:`bean_sourcing._quote_supports_altitude` is now a stub always
+# returning ``False``. The gate stays DORMANT
+# (``_ALTITUDE_CITATION_GATE_ENABLED = False``), so tests below asserting a
+# "_demotes" outcome via ``_draft_from_identity`` remain valid proof of
+# today's SAFE runtime behaviour — they just no longer exercise the
+# specific (now-deleted) mechanism their docstring names. The sibling
+# direct-call tests that proved each mechanism are deleted; #617 D2d-b's
+# whitelist grammar re-proves the same adversarial shapes structurally.
 
 
 def test_quote_supports_altitude_price_cited_as_evidence_is_rejected() -> None:
@@ -2489,23 +2490,6 @@ def test_quote_supports_altitude_decimal_comma_price_demotes() -> None:
     assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
-def test_quote_supports_altitude_glued_metre_unit_flips_on_page() -> None:
-    """#590 D2b fix 2 (Codex round, SXVDR): the exact compact form
-    ``_EXTRACTION_INSTRUCTIONS`` itself exemplifies ("1,850m") could never
-    verify before this fix — bare "m" isn't a recognized elevation cue on
-    its own, so a unit GLUED directly onto the value-matching digits is
-    now accepted as unambiguous (distance 0). #590 D2c fold 2 narrows the
-    shortcut to a SUFFIX-only match (:func:`bean_sourcing._is_glued_metre_suffix`)
-    — see ``test_quote_supports_altitude_prefix_glued_m_does_not_verify``
-    for the prefix form ("M1800") this narrowing excludes."""
-    assert (
-        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
-            1850, "grown at 1,850m", "This lot is grown at 1,850m above the valley floor."
-        )
-        is True
-    )
-
-
 def test_quote_supports_altitude_prefix_glued_m_does_not_verify() -> None:
     """#590 D2c fold 2 (SX60f): the glued-"m" shortcut is SUFFIX-only — a
     PREFIX form like "M1800" (a model number) has the same
@@ -2542,18 +2526,6 @@ def test_quote_supports_altitude_hyphen_glued_identifier_prefix_does_not_verify(
     assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
-def test_quote_supports_altitude_space_separated_glued_m_is_unaffected() -> None:
-    """The isolation guard's safe-direction mirror: a glued-m value NOT
-    preceded by an identifier ("at 1,800m", plain whitespace before the
-    digits) is unaffected by the fold 2 guard."""
-    assert (
-        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
-            1800, "at 1,800m", "This lot sits at 1,800m above the valley floor."
-        )
-        is True
-    )
-
-
 def test_quote_supports_altitude_space_separated_bare_m_still_demotes() -> None:
     """The safe-direction mirror of fix 2: "1850 m" (space-separated, not
     glued) must NOT verify off the bare "m" alone — only a unit glued
@@ -2582,70 +2554,6 @@ def test_quote_supports_altitude_glued_m_on_different_number_has_no_effect() -> 
         corpus="This shop uses priced at 18m tall shelving for storage.",
     )
     assert draft.field_sources["altitude_m"] == "origin_estimated"
-
-
-@pytest.mark.parametrize(
-    "evidence_quote",
-    [
-        "grown at 1,800 masl",
-        "1,800 masl",
-        "1800masl",
-        "elevation of 1800 metres",
-        "1800 metres elevation",
-        "at 1800 above sea level",
-        "1800 above sea level",
-        "Elevation: 1,800",
-    ],
-)
-def test_quote_supports_altitude_genuinely_verified_flips_on_page(evidence_quote: str) -> None:
-    """A quote that both (a) is an authentic single-segment page span and
-    (b) genuinely supports the value — a matching digit run with an
-    elevation cue ADJACENT to it (:func:`bean_sourcing._cue_binds_to_value`,
-    strict adjacency post-security-review), in any of the accepted forms
-    (comma-grouped digits, a colon-adjacent cue, a different cue word
-    before or after the value, or the complete "above sea level" phrase)
-    — the ENABLED gate returns ``True``."""
-    corpus = f"{_IDENTITY_PAGE_TEXT} This lot is {evidence_quote}."
-    assert (
-        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
-            1800, evidence_quote, corpus
-        )
-        is True
-    )
-
-
-def test_quote_supports_altitude_non_adjacent_cue_first_form_now_demotes() -> None:
-    """#590 D2c fold 1 (tightened, security review): the strict-adjacency
-    rewrite DELIBERATELY over-demotes a unit-less cue-first form like
-    "altitude of 1800" (no unit adjacent to the value) — this used to
-    verify via the now-deleted stopword-bridge. The safe direction is
-    accepted here: the common compact form the extraction prompt itself
-    uses ("1,850m") still verifies via the suffix-glued-m shortcut, see
-    ``test_quote_supports_altitude_glued_metre_unit_flips_on_page``."""
-    evidence_quote = "altitude of 1800"
-    corpus = f"{_IDENTITY_PAGE_TEXT} This lot is {evidence_quote}."
-    assert (
-        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
-            1800, evidence_quote, corpus
-        )
-        is False
-    )
-
-
-def test_quote_supports_altitude_thousands_period_glued_metre_flips_on_page() -> None:
-    """#590 D2c fold 4 (SX60a): a European-style thousands-period number
-    glued to a bare "m" unit ("1.850m") must verify — the segmenter
-    (:func:`bean_sourcing._split_corpus_segments`) must not treat that
-    period as a sentence boundary, or the authentic-span check (fold 3,
-    #590 D2b) could never see the quote as a single segment. Calls the
-    gate function directly (dormant at the :func:`_draft_from_identity`
-    level pending D2d, see ``test_quote_supports_altitude_ships_dormant``)."""
-    assert (
-        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
-            1850, "grown at 1.850m", "This farm is grown at 1.850m above the valley floor."
-        )
-        is True
-    )
 
 
 def test_quote_supports_altitude_review_count_laundering_demotes() -> None:
@@ -2752,23 +2660,6 @@ def test_quote_supports_altitude_whole_word_cue_closes_substring_launder(
     assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
-def test_quote_supports_altitude_fabricated_quote_demotes() -> None:
-    """A quote that genuinely WOULD support the value if it were real page
-    text, but is never actually on the page (a fabricated citation), must
-    still demote — the authentic-single-segment-span check is the first
-    gate. Calls the gate function directly (dormant at the
-    :func:`_draft_from_identity` level, see
-    ``test_quote_supports_altitude_ships_dormant``)."""
-    assert (
-        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
-            1800,
-            "grown at 1,800 masl",
-            _IDENTITY_PAGE_TEXT,  # never mentions 1800/masl at all
-        )
-        is False
-    )
-
-
 def test_quote_supports_altitude_cross_sentence_splice_demotes() -> None:
     """#590 D2b fix 3 (SH8b8) HEADLINE repro: whole-corpus normalized
     containment turns a sentence-ending period into a space, so
@@ -2786,19 +2677,6 @@ def test_quote_supports_altitude_cross_sentence_splice_demotes() -> None:
         corpus="This farm sits at 1800. Masl is the unit used here.",
     )
     assert draft.field_sources["altitude_m"] == "origin_estimated"
-
-
-def test_quote_supports_altitude_real_single_sentence_quote_verifies() -> None:
-    """The positive mirror of the cross-sentence-splice case: a genuine
-    sentence among many others still verifies — a quote that genuinely
-    sits within ONE sentence, surrounded by other sentences on both sides."""
-    corpus = "Random intro text. This farm sits at 1800 masl elevation. More text follows after."
-    assert (
-        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
-            1800, "1800 masl elevation", corpus
-        )
-        is True
-    )
 
 
 # --- #590 D2c fold 1: cue-value BINDING (STRICT ADJACENCY, security review) ---
@@ -2823,43 +2701,6 @@ def test_quote_supports_altitude_unbound_cue_across_a_real_noun_phrase_demotes()
     assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
-@pytest.mark.parametrize(
-    "evidence_quote",
-    [
-        "altitude of about 1,800 reviews",
-        "elevation at 1,800 dollars",
-        "altitude is 1800 SKU",
-    ],
-)
-def test_quote_supports_altitude_stopword_bridge_reviewer_repros_now_demote(
-    evidence_quote: str,
-) -> None:
-    """security-reviewer repros on ``c8c9167`` — the deleted stopword-bridge
-    used to certify a number near a cue word without the number itself
-    reading as a measurement. Strict adjacency
-    (:func:`bean_sourcing._cue_binds_to_value`) closes all three: none of
-    these numbers sits immediately next to its cue word."""
-    corpus = f"{_IDENTITY_PAGE_TEXT} This lot is {evidence_quote}."
-    assert (
-        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
-            1800, evidence_quote, corpus
-        )
-        is False
-    )
-
-
-def test_cue_binds_to_value_is_strict_adjacency_only() -> None:
-    """Direct unit coverage: the bridge is GONE — only distance <= 1 binds,
-    regardless of what intervenes (:func:`bean_sourcing._cue_binds_to_value`,
-    #590 D2c fold 1)."""
-    binds = bean_sourcing._cue_binds_to_value  # pyright: ignore[reportPrivateUsage]
-    assert binds(0, 1) is True
-    assert binds(1, 0) is True
-    assert binds(0, 0) is True
-    assert binds(0, 2) is False
-    assert binds(3, 0) is False
-
-
 # --- #590 D2c fold 3: non-metre unit rejection ---
 
 
@@ -2877,20 +2718,6 @@ def test_quote_supports_altitude_feet_unit_demotes_despite_adjacent_cue() -> Non
         corpus="Elevation: 1,800 ft above the valley floor.",
     )
     assert draft.field_sources["altitude_m"] == "origin_estimated"
-
-
-def test_quote_supports_altitude_glued_feet_unit_demotes() -> None:
-    """The glued-unit variant of fold 3: "1800ft" must reject just as the
-    space-separated form does. Calls the gate function directly (dormant
-    at the :func:`_draft_from_identity` level pending D2d) — this is the
-    only exerciser of :func:`bean_sourcing._digit_token_has_non_metre_unit`'s
-    trailing-alpha-run branch now the gate ships off."""
-    assert (
-        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
-            1800, "Elevation 1800ft here", "Elevation 1800ft here at the visitor centre."
-        )
-        is False
-    )
 
 
 # --- #590 D2c fold 5: range-endpoint rejection ---
@@ -2919,19 +2746,6 @@ def test_quote_supports_altitude_range_endpoint_demotes(corpus: str) -> None:
         identity, url="https://vendor.example/products/kenya", corpus=corpus
     )
     assert draft.field_sources["altitude_m"] == "origin_estimated"
-
-
-def test_quote_supports_altitude_range_endpoint_short_circuits_before_cue_check() -> None:
-    """Direct-call coverage of :func:`bean_sourcing._quote_supports_altitude`'s
-    OWN range-endpoint branch — now the gate ships off, the
-    ``_draft_from_identity``-routed range tests above no longer reach this
-    function at all (the flag short-circuits first)."""
-    assert (
-        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
-            1800, "1,800 masl", "This farm sits at 1,600-1,800 masl on the slope."
-        )
-        is False
-    )
 
 
 # --- Additional negative-probe regressions (security-reviewer "already
@@ -2972,20 +2786,6 @@ def test_quote_supports_altitude_additional_negative_probes_still_demote(
     assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
-def test_quote_supports_altitude_scalar_reading_is_not_mistaken_for_a_range() -> None:
-    """The positive control for fold 5: a genuine SCALAR altitude
-    statement (no preceding digit, no to/and-digit pattern) must still
-    verify — the range check must not over-fire on an ordinary sentence.
-    Calls the gate function directly (dormant at the
-    :func:`_draft_from_identity` level pending D2d)."""
-    assert (
-        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
-            1800, "Altitude: 1800 masl", "Altitude: 1800 masl above sea level on this farm."
-        )
-        is True
-    )
-
-
 def test_quote_supports_altitude_forward_range_with_glued_units_demotes() -> None:
     """#590 D2c fold 4 (security-reviewer BLOCKER): the backward-only
     original range check never looked FORWARD, so "grown at 1,800m to
@@ -3002,22 +2802,6 @@ def test_quote_supports_altitude_forward_range_with_glued_units_demotes() -> Non
         corpus="This farm is grown at 1,800m to 2,000m depending on the plot.",
     )
     assert draft.field_sources["altitude_m"] == "origin_estimated"
-
-
-def test_quote_supports_altitude_unrelated_following_word_is_unaffected() -> None:
-    """The safe-direction mirror of fold 4: "grown at 1,800 masl in the
-    highlands" is a genuine scalar reading — the following word ("in") is
-    neither a value token nor to/and, so the forward check must not
-    over-fire. Calls the gate function directly (dormant at the
-    :func:`_draft_from_identity` level pending D2d)."""
-    assert (
-        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
-            1800,
-            "grown at 1,800 masl",
-            "This farm is grown at 1,800 masl in the highlands.",
-        )
-        is True
-    )
 
 
 # --- #590 D2c fold 5 MEDIUM: bound qualifiers ---
@@ -3051,72 +2835,6 @@ def test_quote_supports_altitude_max_qualifier_bound_demotes() -> None:
         corpus="This farm sits at 1,800 masl max on the ridge.",
     )
     assert draft.field_sources["altitude_m"] == "origin_estimated"
-
-
-def test_value_is_range_endpoint_true_for_forward_glued_unit_range() -> None:
-    """Direct unit coverage: the forward "to"-then-value-token branch."""
-    is_range_endpoint = bean_sourcing._value_is_range_endpoint  # pyright: ignore[reportPrivateUsage]
-    assert is_range_endpoint(1800, "grown at 1,800m to 2,000m") is True
-
-
-def test_value_is_range_endpoint_true_for_up_to_bound() -> None:
-    """Direct unit coverage: the "to" preceded by "up" branch."""
-    is_range_endpoint = bean_sourcing._value_is_range_endpoint  # pyright: ignore[reportPrivateUsage]
-    assert is_range_endpoint(1800, "grows up to 1800 masl here") is True
-
-
-def test_value_is_range_endpoint_true_for_max_qualifier() -> None:
-    """Direct unit coverage: the bound-qualifier-within-2-tokens branch."""
-    is_range_endpoint = bean_sourcing._value_is_range_endpoint  # pyright: ignore[reportPrivateUsage]
-    assert is_range_endpoint(1800, "sits at 1800 masl max here") is True
-    assert is_range_endpoint(1800, "sits at 1800 max here") is True
-
-
-def test_looks_like_a_value_token_matches_plain_and_unit_glued_forms() -> None:
-    looks_like_value = bean_sourcing._looks_like_a_value_token  # pyright: ignore[reportPrivateUsage]
-    assert looks_like_value("1600") is True
-    assert looks_like_value("2000m") is True
-    assert looks_like_value("masl") is False
-    assert looks_like_value("") is False
-
-
-def test_value_is_range_endpoint_true_for_dash_separated_range() -> None:
-    """Direct unit coverage: the preceding-digit-token branch."""
-    is_range_endpoint = bean_sourcing._value_is_range_endpoint  # pyright: ignore[reportPrivateUsage]
-    assert is_range_endpoint(1800, "grown at 1,600-1,800 masl") is True
-
-
-def test_value_is_range_endpoint_true_for_and_separated_range() -> None:
-    """Direct unit coverage: the "and"-preceded-by-digit branch."""
-    is_range_endpoint = bean_sourcing._value_is_range_endpoint  # pyright: ignore[reportPrivateUsage]
-    assert is_range_endpoint(1800, "grown between 1600 and 1800 masl") is True
-
-
-def test_value_is_range_endpoint_false_when_value_is_the_first_token() -> None:
-    """The ``i == 0`` guard: a value token with nothing preceding it in
-    the segment is never a range endpoint."""
-    is_range_endpoint = bean_sourcing._value_is_range_endpoint  # pyright: ignore[reportPrivateUsage]
-    assert is_range_endpoint(1800, "1800 masl on this farm") is False
-
-
-def test_value_is_range_endpoint_false_for_a_scalar_reading() -> None:
-    is_range_endpoint = bean_sourcing._value_is_range_endpoint  # pyright: ignore[reportPrivateUsage]
-    assert is_range_endpoint(1800, "grown at 1800 masl on this farm") is False
-
-
-def test_value_is_range_endpoint_true_for_immediate_forward_value_token() -> None:
-    """Direct unit coverage: the immediate forward value-token branch (no
-    "to"/"and" bridge) — two numbers glued back to back."""
-    is_range_endpoint = bean_sourcing._value_is_range_endpoint  # pyright: ignore[reportPrivateUsage]
-    assert is_range_endpoint(1600, "at 1600 1800 masl") is True
-
-
-def test_value_is_range_endpoint_false_when_to_is_not_preceded_by_up_or_a_value() -> None:
-    """A "to" before the value that is neither a value token nor "up"
-    (e.g. an unrelated verb) must not be mistaken for a bound — exercises
-    the inner-block fall-through directly."""
-    is_range_endpoint = bean_sourcing._value_is_range_endpoint  # pyright: ignore[reportPrivateUsage]
-    assert is_range_endpoint(1800, "sits then to 1800 masl here") is False
 
 
 def test_draft_from_identity_processing_and_species_demote_without_an_anchor() -> None:
@@ -3167,48 +2885,974 @@ def test_draft_from_identity_is_blend_demotes_with_no_anchor_even_with_a_genuine
     assert draft.field_sources["is_blend"] == "origin_estimated"
 
 
-def test_quote_supports_altitude_ships_dormant() -> None:
-    """#590 D2c: the citation gate ships DORMANT
-    (:data:`bean_sourcing._ALTITUDE_CITATION_GATE_ENABLED` is ``False``,
-    pending D2d's whitelist redesign) — even a PERFECT citation (genuine,
-    bound, authentic, not a range endpoint) must still demote at runtime,
-    because :func:`_draft_from_identity` gates the flip on the flag. The
-    underlying gate function itself (tested directly elsewhere in this
-    file) would return ``True`` for this exact quote."""
+def test_draft_from_identity_altitude_ships_dormant() -> None:
+    """#617 terminal probe: the citation gate ships DORMANT PERMANENTLY
+    (:data:`bean_sourcing._ALTITUDE_CITATION_GATE_ENABLED` is ``False``)
+    — even a PERFECT citation (genuine, region-authenticated, no
+    conjunction/comma-compound heading, no clause-bridging quote gap, a
+    real context-cued unit) must still demote at runtime, because
+    :func:`_draft_from_identity` gates the flip on the flag. The
+    underlying gate function itself (the whitelist grammar stays built
+    and unit-tested, just permanently unconsumed) would return ``True``
+    for this exact quote — the two-round enable arc closed five, then
+    three, real leaks in this exact mechanism before the terminal probe
+    found two more, so it never got to run this correctly in
+    production."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1800, altitude_m_evidence="grown at 1,800 masl")
+    )
+    corpus = _framed(
+        "Kenya Kiambu AA (Washed)",
+        "Kenya Kiambu AA (Washed) is a washed coffee from Kenya, grown at 1,800 masl on the "
+        "Gakuyuini Factory farm. Variety: SL28, SL34. Tasting notes: blackcurrant, tomato, "
+        "bright acidity.\n",
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya", corpus=corpus
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+    main_region = bean_sourcing._main_product_region(corpus, "", "")  # pyright: ignore[reportPrivateUsage]
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "grown at 1,800 masl", main_region
+        )
+        is True
+    )
+
+
+# --- #617 terminal probe: the two plausible certify-leaks that PARKED
+# altitude certification permanently (see
+# :data:`bean_sourcing._ALTITUDE_CITATION_GATE_ENABLED`'s docstring). The
+# whitelist grammar stays built and unit-tested (all the other fold tests
+# in this file still pass), but these two repros are the MOTIVATING
+# EVIDENCE for the park: each asserts the CURRENT actual (leaking)
+# outcome, not the desired one — do NOT "fix" these assertions without
+# also revisiting the park decision itself. ---
+
+
+@pytest.mark.parametrize("separator", ["; ", "/ ", "| "])
+def test_heading_matches_anchor_separator_sweep_incompleteness_is_a_leak(
+    separator: str,
+) -> None:
+    """Terminal-probe repro (leak 1): the comma/conjunction sweep (#617
+    fold 4, fold 4-FIX-1) covered only the ONE separator character
+    actually repro'd at each round, not the general class — ";"/"/"/"|"
+    still anchor a compound heading exactly like the comma and "&"/"and"
+    did before their own fixes. This is the CURRENT LEAKING behavior
+    (``True``), asserted as the park's motivating evidence — it is NOT
+    the desired outcome."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor(f"Kenya AA{separator}Sumatra", ["kenya aa"]) is True
+
+
+def test_quote_supports_altitude_slash_heading_cross_bean_misattribution_is_a_leak() -> None:
+    """Terminal-probe repro (leak 1, end-to-end): a page anchored on
+    "Kenya AA" has a "## Kenya AA / Sumatra Mandailing" section stating a
+    SIBLING lot's altitude ("1,800 metres") — the slash-joined heading
+    still anchors (leak 1), so the sibling's reading sits INSIDE the main
+    region and cross-bean-certifies. Asserted as the park's motivating
+    evidence — it is NOT the desired outcome."""
+    body = _framed(
+        "Kenya AA",
+        "## Kenya AA / Sumatra Mandailing\n"
+        "Our Sumatra Mandailing lot is grown at 1,800 metres in the highlands.\n",
+    )
+    region = bean_sourcing._main_product_region(body, "", "")  # pyright: ignore[reportPrivateUsage]
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "is grown at 1,800 metres", region
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_paren_bridged_quote_gap_is_a_leak() -> None:
+    """Terminal-probe repro (leak 2): the clause-break character set
+    (#617 fold 4-FIX-2) was a hand-picked subset of the module's own
+    boundary-punctuation set — it never included the paren/bracket/pipe
+    family, so a 2-char gap through ")" still bridges an unrelated
+    clause: "This farm has (with a lovely tasting room) 1800masl of
+    shelving space nearby" certifies off a quote naming only the
+    parenthetical, which never mentions the number at all. Asserted as
+    the park's motivating evidence — it is NOT the desired outcome."""
+    corpus = "This farm has (with a lovely tasting room) 1800masl of shelving space nearby."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "with a lovely tasting room", corpus
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_pipe_bridged_quote_gap_is_a_leak() -> None:
+    """Terminal-probe repro (leak 2, pipe variant): "Farm Notes| 1800masl
+    of shelving space in the warehouse" certifies off a quote naming only
+    "Farm Notes", which never mentions the number either — the same
+    clause-break gap, through "|" instead of ")". Asserted as the park's
+    motivating evidence — it is NOT the desired outcome."""
+    corpus = "Farm Notes| 1800masl of shelving space in the warehouse."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "Farm Notes", corpus
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_context_word_referent_mismatch_is_a_leak() -> None:
+    """Terminal-probe repro (leak 3, the context-word medium): "This
+    locally grown coffee sits beside 1,800 metres of shelving" certifies
+    — "grown" is genuinely within the context-word window, but it
+    describes the COFFEE, not the shelving measurement; a proximity
+    check has no way to verify the word's actual REFERENT, only its
+    distance. Asserted as the park's motivating evidence — it is NOT the
+    desired outcome."""
+    corpus = "This locally grown coffee sits beside 1,800 metres of shelving"
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, corpus, corpus
+        )
+        is True
+    )
+
+
+def test_draft_from_identity_altitude_no_anchor_page_demotes_despite_a_perfect_quote() -> None:
+    """The fail-CLOSED law at the :func:`_draft_from_identity` level: a
+    page with NEITHER a frontmatter title nor a matched JSON-LD name has
+    an EMPTY main region (:func:`bean_sourcing._main_product_region`'s
+    documented fail-closed collapse) — even a perfect, genuine,
+    grammar-matching citation demotes, because there is nowhere authentic
+    for it to land. The underlying gate function (tested directly
+    elsewhere) returns ``True`` for this exact quote against a region
+    that actually contained it."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(altitude_m=1800, altitude_m_evidence="grown at 1,800 masl")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
         identity,
         url="https://vendor.example/products/kenya",
-        corpus=f"{_IDENTITY_PAGE_TEXT} This lot is grown at 1,800 masl.",
+        corpus="This lot is grown at 1,800 masl, no frontmatter or heading anchor anywhere.",
     )
     assert draft.field_sources["altitude_m"] == "origin_estimated"
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
-            1800, "grown at 1,800 masl", f"{_IDENTITY_PAGE_TEXT} This lot is grown at 1,800 masl."
+            1800,
+            "grown at 1,800 masl",
+            "This lot is grown at 1,800 masl, no frontmatter or heading anchor anywhere.",
         )
         is True
     )
 
 
-# --- #616 Codex round-1: known guard-stack bypasses, preserved as D2d's
-# adversarial spec. The gate ships DORMANT, so none of these reach runtime
-# (_draft_from_identity always demotes altitude_m regardless) — each
-# documents a shape the CURRENT _quote_supports_altitude wrongly certifies
-# by calling the gate function directly. D2d's fail-CLOSED whitelist
-# redesign must flip every one of these to False; do NOT patch them here. ---
+def test_draft_from_identity_altitude_wrong_entity_sibling_product_demotes() -> None:
+    """The wrong-entity class the E-gated fields close, now closed for
+    altitude too (#617 D2d-b): a single-origin page's own anchored region
+    never mentions an altitude at all; a SIBLING product's "1,900 masl"
+    sits under an unmatched "## You May Also Like" heading, outside the
+    main region entirely. Citing that line demotes even though it is a
+    genuine, grammar-matching page span — it simply belongs to the wrong
+    product."""
+    corpus = _framed(
+        "Ethiopia Yirgacheffe Single Origin",
+        "This lot is a single origin coffee from Yirgacheffe.\n"
+        "\n"
+        "## You May Also Like\n"
+        "Our Kenya AA grows at 1,900 masl on the Gakuyuini Factory farm.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1900, altitude_m_evidence="Our Kenya AA grows at 1,900 masl")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/yirgacheffe", corpus=corpus
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+
+
+# --- #617 D2d-b: the positive matrix (direct-call, region text == the
+# raw text under test, bypassing _main_product_region) ---
+
+
+@pytest.mark.parametrize(
+    "evidence_quote",
+    [
+        "grown at 1,800 masl",
+        "1,800 masl",
+        "1800masl",
+        "elevation of 1800 metres",
+        "1800 metres elevation",
+        "at 1800 above sea level",
+        "1800 above sea level",
+    ],
+)
+def test_quote_supports_altitude_genuinely_verified_flips_on_page(evidence_quote: str) -> None:
+    """A quote that both (a) is an authentic single-segment page span and
+    (b) genuinely matches the #617 D2d-b whitelist grammar (a ``NUMBER
+    UNIT`` shape — comma-grouped digits, a glued unit, a unit before or
+    after the value, or the complete "above sea level" phrase) — the
+    ENABLED gate returns ``True``."""
+    corpus = f"{_IDENTITY_PAGE_TEXT} This lot is {evidence_quote}."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, evidence_quote, corpus
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_cue_first_unitless_form_now_demotes() -> None:
+    """#617 D2d-b's accepted OVER-DEMOTE: "Elevation: 1,800" has no
+    recognized unit adjacent to the digits (a bare colon is not a unit),
+    so the whitelist grammar does not certify it — the whole cue-adjacency
+    surface the retired guard-stack matcher used is gone entirely. #617's
+    stopping rule explicitly accepts this direction of change (over-
+    demotes never count as a certify-bypass)."""
+    evidence_quote = "Elevation: 1,800"
+    corpus = f"{_IDENTITY_PAGE_TEXT} This lot is {evidence_quote}."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, evidence_quote, corpus
+        )
+        is False
+    )
+
+
+def test_quote_supports_altitude_thousands_period_glued_metre_verifies() -> None:
+    """A European-style thousands-period number glued to a bare "m" unit
+    ("1.850m") must verify — the segmenter
+    (:func:`bean_sourcing._split_corpus_segments`) must not treat that
+    period as a sentence boundary, or the authentic-span check could
+    never see the quote as a single segment."""
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1850, "grown at 1.850m", "This farm is grown at 1.850m above the valley floor."
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_shape_stands_alone_irrelevant_surrounding_copy() -> None:
+    """The grammar needs no elevation cue at all — the shape itself is
+    sufficient evidence, regardless of what the rest of the page says.
+    (NOT phrased as "Beans FROM 1,750 masl" — #617 fold 3 makes "from" a
+    PRE-bound qualifier, see
+    ``test_quote_supports_altitude_from_qualifier_bound_demotes``.)"""
+    corpus = "Tasting notes: blackcurrant and stone fruit. Farm data: 1,750 masl. Roasted fresh."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1750, "Farm data: 1,750 masl", corpus
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_real_single_sentence_quote_verifies() -> None:
+    """A genuine sentence among many others still verifies — a quote that
+    genuinely sits within ONE sentence, surrounded by other sentences on
+    both sides (a page with many segments, not just the target one)."""
+    corpus = "Random intro text. This farm sits at 1800 masl elevation. More text follows after."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "1800 masl elevation", corpus
+        )
+        is True
+    )
+
+
+# --- #617 D2d-b: additional grammar-branch coverage (direct-call, region
+# text == the raw text under test, bypassing _main_product_region so the
+# shape/context-guard machinery is what's actually exercised rather than
+# short-circuiting on an empty region) ---
+
+
+def test_quote_supports_altitude_plain_multidigit_glued_unit_verifies() -> None:
+    """A plain multi-digit NUMBER with no thousands separator at all
+    (exercising :func:`bean_sourcing._altitude_number_at`'s digit-run loop
+    beyond the first character) glued to a unit still certifies."""
+    text = "This farm is grown at 1850m above the valley floor."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1850, text, text
+        )
+        is True
+    )
+
+
+def test_altitude_whitelist_match_glued_unit_boundary_break_falls_through_to_space_check() -> None:
+    """A glued unit match that fails ITS OWN trailing-boundary check must
+    fall through to the space-separated form, not return early — "1800m2"
+    (a digit glued right after "m") never certifies either way, since
+    there is no space-separated unit here either."""
+    text = "This building has a 1800m2 apartment for sale nearby."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, text, text
+        )
+        is False
+    )
+
+
+def test_altitude_whitelist_match_glued_unit_hyphen_suffix_falls_through() -> None:
+    """The hyphen-glued-suffix mirror of the "1800m2" case: "1800masl-x" —
+    the glued "masl" match fails its trailing-boundary check (a hyphen
+    right after), and no space-separated unit follows either."""
+    text = "This lot is coded 1800masl-x in our internal system."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, text, text
+        )
+        is False
+    )
+
+
+def test_altitude_whitelist_match_space_unit_boundary_break_falls_through_to_phrase_check() -> None:
+    """A space-separated unit match that fails its trailing-boundary check
+    must fall through to the "above sea level" phrase check, not return
+    early — "1800 masl2" (a digit glued right after "masl") never
+    certifies, and the phrase check correctly also fails ("masl2" is not
+    "above")."""
+    text = "This sign reads 1800 masl2 at the trailhead."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, text, text
+        )
+        is False
+    )
+
+
+def test_altitude_whitelist_match_above_sea_level_missing_space_demotes() -> None:
+    """The "above sea level" phrase match requires an ACTUAL single space
+    between each word — "above-sea level" (a hyphen instead of a space
+    after "above") does not match the phrase, and there is no other unit
+    adjacent either."""
+    text = "This farm sits at 1800 above-sea level on the ridge."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, text, text
+        )
+        is False
+    )
+
+
+def test_altitude_whitelist_match_above_sea_levels_word_mismatch_demotes() -> None:
+    """The phrase match's word-equality check: "above sea levels" reads a
+    FULL alphabetic run ("levels", not "level") for the third word, which
+    does not equal "level" at all — a plain mismatch, not a boundary
+    break."""
+    text = "This farm sits at 1800 above sea levels on the ridge."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, text, text
+        )
+        is False
+    )
+
+
+def test_altitude_whitelist_match_above_sea_level_glued_digit_suffix_demotes() -> None:
+    """The phrase match's OWN trailing-boundary check
+    (:func:`bean_sourcing._match_above_sea_level`): "above sea level2" —
+    the alpha run for the third word reads exactly "level" (stopping at
+    the digit), satisfying the word-equality check, but the digit
+    immediately glued after it breaks the trailing word boundary, so the
+    phrase still does not match."""
+    text = "This farm sits at 1800 above sea level2 on the ridge."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, text, text
+        )
+        is False
+    )
+
+
+def test_altitude_whitelist_match_non_metre_unit_adjacent_to_a_clean_shape_demotes() -> None:
+    """#617 D2d-b context guard: a non-metre unit sitting in the word
+    IMMEDIATELY before an otherwise clean, structurally-complete
+    ``NUMBER UNIT`` shape must still reject it — a mixed-unit page stating
+    a feet reading directly beside the metres one must not let the metres
+    reading certify uncontested."""
+    text = "This farm reads 5,905 ft 1,800 masl at the gate."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "1,800 masl", text
+        )
+        is False
+    )
+
+
+def test_altitude_whitelist_match_range_joiner_word_with_no_far_digit_is_unaffected() -> None:
+    """The safe-direction mirror of the unit-mediated-range guard: a range
+    joiner word ("to") sitting near the shape but NOT followed by another
+    digit run within the window must not false-fire — "grown at 1,800
+    masl to great acclaim" is an ordinary sentence, not a range."""
+    text = "This farm is grown at 1,800 masl to great acclaim."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "1,800 masl", text
+        )
+        is True
+    )
+
+
+def test_altitude_whitelist_match_skips_a_rejected_occurrence_for_a_later_clean_one() -> None:
+    """#617 D2d-b step 3's stated behavior: an earlier occurrence failing
+    the context guard does not stop
+    :func:`bean_sourcing._altitude_whitelist_match` from certifying a
+    LATER, genuinely clean occurrence of the same value in the same
+    segment — "up to 1,800 masl" (bound, rejected) followed by "sits at
+    1,800 masl exactly" (clean) within one sentence."""
+    text = "This farm ranges up to 1,800 masl and a neighbouring plot sits at 1,800 masl exactly"
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "sits at 1,800 masl exactly", text
+        )
+        is True
+    )
+
+
+def test_altitude_whitelist_match_all_occurrences_bounded_demotes() -> None:
+    """The negative control for the multi-occurrence loop: when EVERY
+    occurrence in the segment is context-guard-rejected, the whole match
+    demotes — it does not just stop at the first rejection and skip
+    forward past a clean one that doesn't exist."""
+    text = "This region grows coffee up to 1,800 masl and never above 1,800 masl either."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "up to 1,800 masl", text
+        )
+        is False
+    )
+
+
+# --- #617 fold 1 (BLOCKER, adversarial review post-D2d-b): the shape scan
+# must be anchored to the QUOTE's own raw span, not just anywhere in the
+# authentic segment — else a model can cite ANY authentic clause of a
+# sentence while the number it names sits elsewhere in that same segment. ---
+
+
+def test_quote_supports_altitude_unrelated_clause_in_same_segment_demotes() -> None:
+    """Reviewer repro: the quote cites a genuinely authentic clause of the
+    sentence ("which also produces excellent honey-processed lots") that
+    never mentions 1,900 at all — the claimed altitude sits in a
+    DIFFERENT clause of the SAME segment. Without a quote-anchored shape
+    scan this used to certify (any authentic segment text, wherever the
+    shape happened to be); #617 fold 1 requires the matched shape to
+    overlap the quote's own span, so this now demotes."""
+    corpus = (
+        "This coffee, which also produces excellent honey-processed lots, "
+        "grows at 1,900 masl in a nearby valley."
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(
+            altitude_m=1900,
+            altitude_m_evidence="which also produces excellent honey-processed lots",
+        )
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=_framed("Kenya Example", corpus),
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1900, "which also produces excellent honey-processed lots", corpus
+        )
+        is False
+    )
+
+
+def test_quote_supports_altitude_quote_actually_containing_the_number_verifies() -> None:
+    """The positive control for fold 1: the SAME sentence, but the model's
+    quote genuinely contains "1,900 masl" this time — the matched shape
+    sits inside the quote's own span, so it certifies."""
+    corpus = (
+        "This coffee, which also produces excellent honey-processed lots, "
+        "grows at 1,900 masl in a nearby valley."
+    )
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1900, "grows at 1,900 masl in a nearby valley", corpus
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_shape_just_outside_the_quote_span_margin_demotes() -> None:
+    """The margin (:data:`bean_sourcing._ALTITUDE_QUOTE_SPAN_MARGIN_CHARS`)
+    is a SMALL punctuation-trim allowance, not a licence to reach a
+    distant clause — a shape well beyond the margin outside the quote's
+    own span still demotes even though it is in the SAME authentic
+    segment."""
+    corpus = (
+        "This coffee, grown with meticulous care across several small family "
+        "plots nestled in the highlands, reaches 1,950 masl at its peak."
+    )
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1950,
+            "grown with meticulous care across several small family plots",
+            corpus,
+        )
+        is False
+    )
+
+
+def test_locate_quote_span_returns_none_for_a_blank_after_normalization_quote() -> None:
+    """Direct unit coverage: a quote that normalizes to zero words (pure
+    punctuation) has no span to locate."""
+    locate = bean_sourcing._locate_quote_span  # pyright: ignore[reportPrivateUsage]
+    assert locate("...", "This farm sits at 1,800 masl.") is None
+
+
+def test_locate_quote_span_returns_none_when_word_sequence_is_absent() -> None:
+    """Direct unit coverage: a quote whose word sequence never appears in
+    the segment (even though both are non-blank) cannot be located."""
+    locate = bean_sourcing._locate_quote_span  # pyright: ignore[reportPrivateUsage]
+    assert locate("completely unrelated words", "This farm sits at 1,800 masl.") is None
+
+
+# --- #617 fold 2 (BLOCKER, adversarial review post-D2d-b): a GENERIC
+# metre unit ("m"/"metre(s)"/"meter(s)") is an ordinary length unit with
+# countless non-altitude readings, so it additionally needs an
+# altitude-context word nearby; self-sufficient units (masl/asl/msnm, or
+# "above sea level") still need none. ---
+
+
+@pytest.mark.parametrize(
+    "corpus",
+    [
+        "This building is 1,800 metres of shelving in total.",
+        "The gauge shows a 1800 meter reading today.",
+        "The warehouse stocks 1800 meters of copper for the project.",
+        "This lot fetched £1,800m revenue at auction last year.",
+    ],
+)
+def test_quote_supports_altitude_generic_unit_without_context_word_demotes(corpus: str) -> None:
+    """Reviewer repros: a generic metre unit with NO altitude-context word
+    within the window must demote, even though the shape itself is
+    structurally complete."""
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, corpus, corpus
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "corpus"),
+    [
+        (1850, "This farm is grown at 1,850 metres in the highlands."),
+        (1850, "The elevation of 1.850m is typical for this region."),
+    ],
+)
+def test_quote_supports_altitude_generic_unit_with_context_word_verifies(
+    value: int, corpus: str
+) -> None:
+    """Reviewer repros: a generic metre unit WITH an altitude-context word
+    ("grown"/"elevation") within the window certifies."""
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            value, corpus, corpus
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_bare_generic_unit_is_a_documented_over_demote() -> None:
+    """#617 fold 2's accepted OVER-DEMOTE: a bare generic-unit reading with
+    NO context word anywhere nearby ("1850m" entirely standing alone, no
+    "grown"/"elevation"/etc.) now demotes — the safe direction; a
+    self-sufficient unit (masl/asl/msnm) needs no such cue, see
+    ``test_quote_supports_altitude_shape_stands_alone_irrelevant_surrounding_copy``."""
+    corpus = "Product code: 1850m. Ships in 3-5 business days."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1850, "Product code: 1850m", corpus
+        )
+        is False
+    )
+
+
+# --- #617 fold 3 (MEDIUM, adversarial review post-D2d-b): context-guard
+# set extensions — comma-glued digit runs, the "or" joiner, the "from"
+# pre-qualifier, and the "higher"/"lower" post-qualifiers. ---
+
+
+def test_quote_supports_altitude_comma_glued_digit_run_range_demotes() -> None:
+    """Reviewer repro: "1,600, 1,800 masl" — the comma glued directly onto
+    the first number is BOTH the far digit run and its own joiner, a
+    shape the word/char joiner scan alone would miss (neither "1,600,"
+    nor a bare comma is a recognized joiner WORD)."""
+    corpus = "This farm sits at 1,600, 1,800 masl on the slope."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "1,800 masl", corpus
+        )
+        is False
+    )
+
+
+def test_quote_supports_altitude_or_joiner_range_demotes() -> None:
+    """Reviewer repro: "1,600 or 1,800 masl" is the same disjunctive-range
+    shape as "to"/"and", now closed for "or" too."""
+    corpus = "This farm sits at 1,600 or 1,800 masl on the slope."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "1,800 masl", corpus
+        )
+        is False
+    )
+
+
+def test_quote_supports_altitude_from_qualifier_bound_demotes() -> None:
+    """Reviewer repro: "Grown from 1,200 masl" states a floor, not a
+    scalar reading — "from" now sits in the PRE-bound qualifier set."""
+    corpus = "Grown from 1,200 masl in select highland plots."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1200, corpus, corpus
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("qualifier", ["higher", "lower"])
+def test_quote_supports_altitude_higher_lower_post_qualifier_bound_demotes(
+    qualifier: str,
+) -> None:
+    """Reviewer repro: "1,800 masl and higher/lower" states an open-ended
+    bound — "and" ALONE does not fire here (nothing after it starts with
+    a digit), so "higher"/"lower" must independently be recognized as a
+    post-qualifier."""
+    corpus = f"This region grows coffee at 1,800 masl and {qualifier} in some plots."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, corpus, corpus
+        )
+        is False
+    )
+
+
+# --- #617 fold 4 (MEDIUM, E1-inherited, now live): a conjunction heading
+# ("## Kenya AA & Friends") must NOT anchor for a bare product name —
+# doing so admits a sibling product's data into the wrong region. ---
+
+
+def test_heading_matches_anchor_conjunction_symbol_no_longer_anchors() -> None:
+    """Direct unit coverage: "## Kenya AA & Friends" no longer anchors for
+    "Kenya AA" — the remainder "& Friends" names a compound section."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor("Kenya AA & Friends", ["kenya aa"]) is False
+
+
+@pytest.mark.parametrize("conjunction", ["and", "with", "plus"])
+def test_heading_matches_anchor_conjunction_word_no_longer_anchors(conjunction: str) -> None:
+    """Direct unit coverage: the standalone conjunction WORDS "and"/
+    "with"/"plus" in the remainder are treated the same as "&"/"+"."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor(f"Kenya AA {conjunction} Friends", ["kenya aa"]) is False
+
+
+def test_heading_matches_anchor_still_anchors_with_no_conjunction_in_remainder() -> None:
+    """The E1b regression this fold must NOT break: "## Kenya Kiambu —
+    Single Origin" still anchors for "Kenya Kiambu" — its remainder
+    ("single origin", the em dash already punctuation-translated to a
+    space before tokenizing) carries no conjunction at all."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor("Kenya Kiambu — Single Origin", ["kenya kiambu"]) is True
+
+
+def test_heading_matches_anchor_skips_a_blank_anchor_in_the_list() -> None:
+    """Direct unit coverage: an empty-string anchor in ``anchors_normalized``
+    (never produced by :func:`bean_sourcing._main_product_region`'s own
+    filtered construction, but defended against here) is skipped rather
+    than raising or matching everything."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor("Kenya AA & Friends", ["", "kenya aa"]) is False
+
+
+def test_draft_from_identity_altitude_conjunction_heading_sibling_demotes() -> None:
+    """End-to-end repro (#617 fold 4): a page anchored on "Kenya AA" has a
+    "## Kenya AA & Friends" section describing a SIBLING lot's altitude
+    ("1,900 masl") — the conjunction heading no longer anchors at all, so
+    that section falls OUTSIDE the main region and the citation demotes."""
+    corpus = _framed(
+        "Kenya AA",
+        "## Kenya AA & Friends\n"
+        "Our sister lot, the Ethiopia Yirgacheffe, grows at 1,900 masl "
+        "and is also available.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1900, altitude_m_evidence="grows at 1,900 masl")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya-aa", corpus=corpus
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+
+
+# --- #617 fold 4-FIX-1 (BLOCKER, second review round): a COMMA-compound
+# heading ("## Kenya AA, Sumatra Mandailing") must not anchor either —
+# the comma is erased by normalization before the word/symbol conjunction
+# check ever runs, so it is checked separately on the RAW heading text. ---
+
+
+def test_heading_matches_anchor_comma_compound_no_longer_anchors() -> None:
+    """Direct unit coverage: "## Kenya AA, Sumatra Mandailing" no longer
+    anchors for "Kenya AA" — the comma in the raw remainder marks a
+    compound heading, same disposition as "&"/"and"/"with"/"plus"."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor("Kenya AA, Sumatra Mandailing", ["kenya aa"]) is False
+
+
+def test_heading_matches_anchor_still_anchors_with_no_comma_in_remainder() -> None:
+    """The E1b regression this fix must NOT break: "## Kenya Kiambu —
+    Single Origin" still anchors — its remainder has no comma (the em
+    dash is a different character, already punctuation-translated away
+    before the word-level conjunction check, and never reaches the raw
+    comma check at all since "," is not "—")."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor("Kenya Kiambu — Single Origin", ["kenya kiambu"]) is True
+
+
+def test_heading_matches_anchor_is_linear_not_quadratic_on_a_crafted_heading() -> None:
+    """Perf regression (Codex PR #626): the OLD implementation
+    materialized a fresh remainder (list slice + string slice) and
+    re-scanned it for EVERY anchor occurrence — O(n) work per
+    occurrence, O(n²) total on a heading engineered to produce O(n)
+    occurrences, a synchronous event-loop stall held behind
+    ``draft_bean_from_url``'s start-lock. A ~19,900-char heading of
+    repeated "a," (each "a" its own occurrence of the 1-character
+    anchor "a") must complete in comfortably sub-second time — the
+    bound is loose (well under the O(n²) case's expected multi-second
+    blowup) to absorb CI jitter, not to pin an exact budget."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    heading = "a," * 9_950  # ~19,900 chars
+    start = time.monotonic()
+    result = matches_anchor(heading, ["a"])
+    elapsed = time.monotonic() - start
+    assert result is False  # every "a" is comma-adjacent — a compound heading throughout
+    assert elapsed < 1.0
+
+
+def test_heading_matches_anchor_kmp_worst_case_anchor_is_linear_not_quadratic() -> None:
+    """Perf regression (Codex PR #626 round 3): the OLD
+    :func:`bean_sourcing._phrase_token_spans` materialized and compared a
+    fresh anchor-width tuple slice at EVERY heading token position — an
+    anchor sharing almost all of its tokens with the heading, but never
+    actually matching in full, is the classic quadratic-naive-matching
+    worst case: a 501-token anchor ("a " * 500 + "b") against a
+    9,000-token heading of nothing but "a" would make a naive scan do
+    ~500 comparisons at ALMOST EVERY position (each failing only on the
+    501st token, since the heading never contains "b" at all) — up to
+    ~4.5M token comparisons. Token-sequence KMP resolves the whole scan
+    in O(anchor_width + heading_length) — comfortably sub-second."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    anchor = "a " * 500 + "b"
+    heading = "a " * 9_000
+    start = time.monotonic()
+    result = matches_anchor(heading, [anchor])
+    elapsed = time.monotonic() - start
+    assert result is False  # the heading never contains the anchor's trailing "b"
+    assert elapsed < 1.0
+
+
+# --- #617 D2d, Codex PR #626 round 2 (BLOCKER): casefold() can EXPAND a
+# character into MORE codepoints than it started with (German "ß" -> "ss",
+# Turkish "İ" -> "i" + a combining dot), so a raw span computed from a
+# pre-casefolded copy silently desyncs from the real text's own length —
+# an ordinary non-English heading could raise IndexError out of the
+# fixed-size prefix array, aborting the whole draft. Fixed by computing
+# every span from the punctuation-translated (never casefolded) raw
+# text; casefold is applied per-token, strictly after its span is fixed. ---
+
+
+def test_heading_matches_anchor_german_sharp_s_expansion_no_exception() -> None:
+    """ "Große Kaffee" ("ß" casefolds to "ss", expanding the string) must
+    not raise — and, with the anchor normalized the SAME way the real
+    caller would (:func:`bean_sourcing._normalize_for_containment`), it
+    correctly anchors."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    anchor = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
+        "Große Kaffee"
+    )
+    assert matches_anchor("Große Kaffee", [anchor]) is True
+
+
+def test_heading_matches_anchor_german_sharp_s_expansion_non_match_no_exception() -> None:
+    """The same expanding heading against an UNRELATED anchor must not
+    raise either, and correctly does not anchor."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor("Große Kaffee", ["kenya aa"]) is False
+
+
+def test_heading_matches_anchor_turkish_dotted_capital_expansion_no_exception() -> None:
+    """ "İ Kenya" (Turkish dotted capital I, U+0130, casefolds to "i" plus a
+    COMBINING DOT ABOVE — two codepoints from one) must not raise."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor("İ Kenya", ["kenya"]) is True
+
+
+def test_heading_matches_anchor_expanding_fold_inside_a_long_comma_heading_no_indexerror() -> None:
+    """A length-expanding fold ("ß") sitting INSIDE a long, comma-heavy
+    heading — exercising the marker prefix array right at its own
+    boundary, where a desynced span would most easily read or write past
+    ``len(heading_text)`` — must not raise ``IndexError``."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    heading = "Kenya AA, " * 200 + "Große Kaffee, " * 5 + "Sumatra Mandailing"
+    assert matches_anchor(heading, ["kenya aa"]) is False  # comma-compound throughout
+
+
+def test_draft_from_identity_heading_with_german_sharp_s_no_error() -> None:
+    """End-to-end: a page whose product section heading contains "ß" must
+    draft cleanly — :func:`_main_product_region` (and the
+    :func:`_heading_matches_anchor` it calls) must not raise while
+    computing the region, whatever the anchor outcome."""
+    corpus = _framed(
+        "Große Kaffee",
+        "## Große Kaffee\nA rich, full-bodied lot from the highlands.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args()
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/grosse-kaffee", corpus=corpus
+    )
+    assert draft.name
+
+
+def test_draft_from_identity_altitude_comma_compound_heading_sibling_demotes() -> None:
+    """End-to-end repro (#617 fold 4-FIX-1): a page anchored on "Kenya AA"
+    has a "## Kenya AA, Sumatra Mandailing" section naming a SIBLING lot's
+    altitude ("1,200 masl") — the comma-compound heading no longer
+    anchors, so that section falls OUTSIDE the main region and the
+    citation demotes."""
+    corpus = _framed(
+        "Kenya AA",
+        "## Kenya AA, Sumatra Mandailing\n"
+        "Our Sumatra Mandailing lot grows at 1,200 masl and is also available.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1200, altitude_m_evidence="grows at 1,200 masl")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya-aa", corpus=corpus
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+
+
+# --- #617 fold 4-FIX-2 (BLOCKER, second review round): the quote-span
+# margin is shrunk to 2 chars AND the gap it allows must be clause-clean
+# (no comma/semicolon/colon/dash) — the margin absorbs trimmed
+# punctuation, never bridges to an unrelated clause. ---
+
+
+def test_quote_supports_altitude_short_comma_gap_to_an_unrelated_clause_demotes() -> None:
+    """Reviewer repro: "This farm has a lovely tasting room, 1800masl of
+    area" — the quote names only "a lovely tasting room", a mere 2
+    characters (", ") from the shape. The OLD 10-char margin let this
+    certify; the NEW margin is itself only 2 chars, but the comma inside
+    that gap now rejects it regardless of length."""
+    corpus = "This farm has a lovely tasting room, 1800masl of area."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "a lovely tasting room", corpus
+        )
+        is False
+    )
+
+
+def test_quote_supports_altitude_shape_flush_at_end_of_quote_verifies() -> None:
+    """A quote ending flush at the shape ("Grown at 1,800 masl" cited in
+    full, the shape sitting entirely within the quote's own span) still
+    verifies — a genuine overlap, no gap involved at all."""
+    corpus = "Grown at 1,800 masl in the highlands."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "Grown at 1,800 masl", corpus
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_quote_with_trailing_period_still_verifies() -> None:
+    """A quote ending at "...masl." with a trailing period still verifies
+    — the period tokenizes away, so the quote's own located span ends
+    flush with the shape (a genuine overlap), the trailing punctuation
+    itself never entering the gap calculation at all."""
+    corpus = "Grown at 1,800 masl. Roasted fresh weekly."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "Grown at 1,800 masl.", corpus
+        )
+        is True
+    )
+
+
+# --- #617 fold 4-FIX-3 (MEDIUM, second review round): drop "sea" and
+# "growing" from the generic-unit context-word set — both admitted
+# non-altitude business copy. ---
+
+
+def test_quote_supports_altitude_growing_business_copy_demotes() -> None:
+    """Reviewer repro: "growing business with 1,800 metres of shelving" —
+    the present-participle "growing" used to satisfy the context-word
+    requirement for ordinary business copy with no altitude meaning at
+    all."""
+    corpus = "Our growing business with 1,800 metres of shelving needs more space."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, corpus, corpus
+        )
+        is False
+    )
+
+
+def test_quote_supports_altitude_distance_from_the_sea_demotes() -> None:
+    """Reviewer repro: "1,800 metres from the sea" is a distance-from-the-
+    coast reading, not an altitude — "sea" alone used to satisfy the
+    context-word requirement; the accepted "above sea level" phrase is a
+    SEPARATE, already self-sufficient code path and never needs this
+    set."""
+    corpus = "This warehouse sits 1,800 metres from the sea on the coast road."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, corpus, corpus
+        )
+        is False
+    )
+
+
+def test_quote_supports_altitude_grown_at_metres_still_verifies_after_context_tightening() -> None:
+    """The positive control for fix 3: "grown at 1,850 metres" still
+    verifies — "grown" (the past participle used in genuine provenance
+    statements) stays in the context-word set."""
+    corpus = "This lot is grown at 1,850 metres in the highlands."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1850, corpus, corpus
+        )
+        is True
+    )
+
+
+# --- #616 Codex round-1: known guard-stack bypasses. The guard-stack is
+# RETIRED (#617 D2d-a) and REPLACED (#617 D2d-b) — the fail-closed
+# whitelist grammar closes every one of these STRUCTURALLY (positive
+# recognition of a shape, never enumeration of a bad one). ---
 
 
 def test_quote_supports_altitude_delimiter_blind_adjacency_is_a_known_bypass() -> None:
-    """#616 Codex repro: "Altitude | 1,800 reviews" — the cue-adjacency
-    check is blind to a field-delimiter ("|") sitting between a cue and an
-    unrelated number; today this WRONGLY certifies. D2d must close this."""
+    """#616 Codex repro: "Altitude | 1,800 reviews" — the retired
+    guard-stack's cue-adjacency check was blind to a field-delimiter ("|")
+    sitting between a cue and an unrelated number and WRONGLY certified
+    it. Closed STRUCTURALLY by #617 D2d-b: "reviews" is not an accepted
+    unit, so no ``NUMBER UNIT`` shape ever matches "1800" here."""
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
             1800, "Altitude | 1,800 reviews", "This lot is Altitude | 1,800 reviews."
         )
-        is True
+        is False
     )
 
 
@@ -3219,72 +3863,87 @@ def test_quote_supports_altitude_delimiter_blind_adjacency_is_a_known_bypass() -
 def test_quote_supports_altitude_above_below_at_least_bounds_are_a_known_bypass(
     evidence_quote: str,
 ) -> None:
-    """#616 Codex repro: bound phrasing ("above"/"at least") the fold 5
-    qualifier set doesn't cover; today this WRONGLY certifies a bound as a
-    scalar. D2d must close this."""
+    """#616 Codex repro: bound phrasing ("above"/"at least") the retired
+    guard-stack's fold-5 qualifier set didn't cover, so it WRONGLY
+    certified a bound as a scalar. Closed STRUCTURALLY by #617 D2d-b's
+    PRE-qualifier context guard
+    (:data:`bean_sourcing._ALTITUDE_PRE_BOUND_QUALIFIER_WORDS`), which
+    covers both "above" and "least" (for "at least")."""
     corpus = f"This lot is {evidence_quote}."
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
             1800, evidence_quote, corpus
         )
-        is True
+        is False
     )
 
 
 def test_quote_supports_altitude_un_isolated_plain_digit_is_a_known_bypass() -> None:
-    """#616 Codex repro: "product SKU-1800 masl" — the fold 2 isolation
-    guard (:func:`bean_sourcing._is_isolated_value_token`) only runs on
-    the GLUED-m shortcut path; a plain digit token hyphen-glued to an
-    identifier, immediately adjacent to a genuine "masl" cue, is never
-    isolation-checked at all. Today this WRONGLY certifies. D2d must
-    close this."""
+    """#616 Codex repro: "product SKU-1800 masl" — the retired
+    guard-stack's isolation guard only ran on the glued-m shortcut path, so
+    a plain digit token hyphen-glued to an identifier, immediately
+    adjacent to a genuine "masl" cue, was never isolation-checked and
+    WRONGLY certified. Closed STRUCTURALLY by #617 D2d-b: the leading
+    word-boundary check applies to EVERY NUMBER match unconditionally
+    (:func:`bean_sourcing._altitude_number_at`) — the digits are preceded
+    by a hyphen, so no NUMBER match can even start there."""
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
             1800, "product SKU-1800 masl", "This lot is product SKU-1800 masl."
         )
-        is True
+        is False
     )
 
 
 def test_quote_supports_altitude_quote_scoped_unit_check_is_a_known_bypass() -> None:
     """#616 Codex repro: segment "Elevation: 1,800 ft" cropped to quote
-    "Elevation: 1,800" — the non-metre-unit check (fold 3) runs on the
-    QUOTE, not the authenticated segment, so cropping the unit out of the
-    quote defeats it even though the full segment states feet. Today
-    this WRONGLY certifies. D2d must close this."""
+    "Elevation: 1,800" — the retired guard-stack's non-metre-unit check ran
+    on the QUOTE, not the authenticated segment, so cropping the unit out
+    of the quote defeated it even though the full segment states feet, and
+    it WRONGLY certified. Closed STRUCTURALLY by #617 D2d-b: the grammar
+    scans the RAW AUTHENTIC SEGMENT (never the cropped quote) for a
+    shape, and "ft" is not an accepted unit, so no shape matches "1800"
+    here at all."""
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
             1800, "Elevation: 1,800", "Elevation: 1,800 ft"
         )
-        is True
+        is False
     )
 
 
 def test_quote_supports_altitude_unit_mediated_range_is_a_known_bypass() -> None:
-    """#616 Codex repro: "1,600 masl to 1,800 masl" — each endpoint has
-    its OWN unit token between it and "to", so the range check's
-    adjacent-to-"to" pattern (fold 4/5) never fires. Today this WRONGLY
-    certifies the upper bound as a scalar. D2d must close this."""
+    """#616 Codex repro: "1,600 masl to 1,800 masl" — each endpoint has its
+    OWN unit token between it and "to", so the retired guard-stack's
+    adjacent-to-"to" range check never fired and it WRONGLY certified the
+    upper bound as a scalar. Closed STRUCTURALLY by #617 D2d-b: the
+    context guard scans OUTWARD past the unit word for a range joiner
+    followed by a far digit run
+    (:func:`bean_sourcing._altitude_context_guard_rejects`), which is
+    exactly this unit-mediated shape."""
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
             1800, "1,600 masl to 1,800 masl", "This lot is 1,600 masl to 1,800 masl."
         )
-        is True
+        is False
     )
 
 
 def test_quote_supports_altitude_decimal_split_segment_is_a_known_bypass() -> None:
     """#616 Codex repro: segment "Elevation: 1,800.5 ft" with quote
-    "Elevation: 1,800" — the decimal point (only 1 digit follows, not a
-    valid thousands separator) splits the segment into "Elevation: 1,800"
-    and "5 ft", so the unit ends up in a DIFFERENT segment than the one
-    the quote authenticates against. Today this WRONGLY certifies. D2d
-    must close this."""
+    "Elevation: 1,800" — the retired guard-stack's segmenter treated the
+    non-thousands decimal point as a sentence boundary, splitting the unit
+    into a DIFFERENT segment than the one the quote authenticated against,
+    and it WRONGLY certified. Closed STRUCTURALLY by #617 D2d-b: the
+    grammar requires a UNIT immediately after the parsed NUMBER (glued or
+    one space away); here the NUMBER "1800" is followed by "." with no
+    unit at all, so no shape matches — the decimal-split segmentation
+    quirk no longer matters."""
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
             1800, "Elevation: 1,800", "Elevation: 1,800.5 ft"
         )
-        is True
+        is False
     )
 
 
@@ -3328,31 +3987,18 @@ def test_quote_supports_altitude_returns_false_for_none_value() -> None:
     )
 
 
-def test_numeric_tokens_elides_thousands_separator_commas() -> None:
-    numeric_tokens = bean_sourcing._numeric_tokens  # pyright: ignore[reportPrivateUsage]
-    assert numeric_tokens("grown at 1,800 masl") == {"1800"}
-
-
-def test_numeric_tokens_ignores_a_leading_orphan_comma() -> None:
-    """A comma with no digits accumulated yet (nothing to elide into) must
-    not raise or corrupt the scan — the comma is simply dropped."""
-    numeric_tokens = bean_sourcing._numeric_tokens  # pyright: ignore[reportPrivateUsage]
-    assert numeric_tokens(",800 masl") == {"800"}
-
-
-def test_numeric_tokens_flushes_a_trailing_digit_run_at_string_end() -> None:
-    """A digit run with no trailing non-digit character (the string simply
-    ends) must still be captured via the post-loop flush."""
-    numeric_tokens = bean_sourcing._numeric_tokens  # pyright: ignore[reportPrivateUsage]
-    assert numeric_tokens("elevation 1850") == {"1850"}
-
-
-def test_numeric_tokens_does_not_elide_a_decimal_comma_with_two_digits() -> None:
-    """#590 D2b fix 1: a genuine 2-digit decimal (cents) must NOT collapse
-    into a hallucinated thousands-grouped number."""
-    numeric_tokens = bean_sourcing._numeric_tokens  # pyright: ignore[reportPrivateUsage]
-    assert numeric_tokens("18,00") == {"18", "00"}
-    assert numeric_tokens("1,234,567 units") == {"1234567"}
+def test_quote_supports_altitude_fabricated_quote_demotes() -> None:
+    """A quote that genuinely WOULD support the value if it were real page
+    text, but is never actually on the page (a fabricated citation), must
+    still demote — the authentic-single-segment-span check is the first
+    gate, exercised here with a region that never mentions 1800/masl at
+    all."""
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "grown at 1,800 masl", _IDENTITY_PAGE_TEXT
+        )
+        is False
+    )
 
 
 def test_elides_as_thousands_separator_requires_exactly_three_digits() -> None:
@@ -3374,113 +4020,6 @@ def test_elides_as_thousands_separator_requires_a_clean_digit_run_start() -> Non
     assert elides(" 1.800", 2) is True  # whitespace before the run
     assert elides("1.800", 1) is True  # start of text before the run
     assert elides("v121.800", 4) is False  # a multi-digit run, still glued
-
-
-def test_alpha_runs_splits_on_digits_and_casefolds() -> None:
-    alpha_runs = bean_sourcing._alpha_runs  # pyright: ignore[reportPrivateUsage]
-    assert alpha_runs("MASL") == ["masl"]
-    assert alpha_runs("1800masl") == ["masl"]
-    assert alpha_runs("800masl") == ["masl"]
-    assert alpha_runs("1800") == []
-    assert alpha_runs("parameter") == ["parameter"]
-    # letters followed by digits (mid-token flush, not just the post-loop one)
-    assert alpha_runs("masl1800") == ["masl"]
-    assert alpha_runs("masl1800m") == ["masl", "m"]
-
-
-def test_token_carries_altitude_cue_matches_a_whole_word_case_insensitively() -> None:
-    """#590 D2b (claude-review): a SUBSTRING check let ``"meter"`` match
-    inside ``"parameter"``/``"diameter"``/``"kilometer"`` — reopening the
-    laundering class even after fix 1 dropped standalone above/sea/level.
-    A token only carries a cue when one of its whole alphabetic runs
-    (:func:`_alpha_runs`) EQUALS an :data:`_ALTITUDE_CUES` member."""
-    token_carries_cue = bean_sourcing._token_carries_altitude_cue  # pyright: ignore[reportPrivateUsage]
-    assert token_carries_cue("MASL") is True
-    assert token_carries_cue("1800masl") is True
-    assert token_carries_cue("800masl") is True
-    assert token_carries_cue("meters") is True
-    assert token_carries_cue("shipping") is False
-    assert token_carries_cue("level") is False  # #590 D2b fix 1: no longer a cue
-    assert token_carries_cue("parameter") is False  # the substring bug this fix closes
-    assert token_carries_cue("diameter") is False
-    assert token_carries_cue("kilometer") is False
-    assert token_carries_cue("kilometres") is False  # != "metres"
-    assert token_carries_cue("1800parameter") is False  # glued form of the same bug
-
-
-def test_proximity_tokens_splits_on_punctuation_preserving_grouped_numbers() -> None:
-    """#590 D2b fix 2 (SH8b9): colon/semicolon/hyphen are hard boundaries,
-    but a comma/period directly between two digits is preserved."""
-    proximity_tokens = bean_sourcing._proximity_tokens  # pyright: ignore[reportPrivateUsage]
-    assert proximity_tokens("Reviews:1,800;shipping;shop-elevation-map") == [
-        "Reviews",
-        "1800",
-        "shipping",
-        "shop",
-        "elevation",
-        "map",
-    ]
-    assert proximity_tokens("1800masl") == ["1800masl"]
-
-
-def test_proximity_tokens_boundary_at_string_end_and_orphan_separators() -> None:
-    """A trailing comma right after a digit (nothing following it) is a
-    boundary, not an elision — covers the ``i + 1 < length`` guard — and a
-    leading/orphan punctuation mark with no accumulated token is dropped
-    without producing a spurious empty token."""
-    proximity_tokens = bean_sourcing._proximity_tokens  # pyright: ignore[reportPrivateUsage]
-    assert proximity_tokens("1800,") == ["1800"]
-    assert proximity_tokens(",,1800") == ["1800"]
-    assert proximity_tokens("abc,123") == ["abc", "123"]
-
-
-def test_proximity_tokens_with_starts_records_each_tokens_start_index() -> None:
-    """#590 D2c fold 2 support: :func:`bean_sourcing._proximity_tokens` is
-    a thin wrapper over this — the start indices must line up with where
-    each token actually begins in the raw text, including after an
-    elided thousands separator (the digit run's FIRST character, not the
-    separator)."""
-    with_starts = bean_sourcing._proximity_tokens_with_starts  # pyright: ignore[reportPrivateUsage]
-    assert with_starts("SKU-1800m") == [("SKU", 0), ("1800m", 4)]
-    assert with_starts("at 1,800m") == [("at", 0), ("1800m", 3)]
-
-
-def test_is_isolated_value_token_rejects_a_glued_identifier_prefix() -> None:
-    """#590 D2c fold 2 (security-reviewer BLOCKER): a hyphen, underscore,
-    or other alphanumeric character glued directly before a value token
-    is NOT a safe boundary; start-of-text, whitespace, and opening
-    punctuation all are."""
-    is_isolated = bean_sourcing._is_isolated_value_token  # pyright: ignore[reportPrivateUsage]
-    assert is_isolated("SKU-1800m", 4) is False  # hyphen-glued
-    assert is_isolated("SKU_1800m", 4) is False  # underscore-glued
-    assert is_isolated("v1800m", 1) is False  # alnum-glued
-    assert is_isolated("1800m", 0) is True  # start of text
-    assert is_isolated("at 1800m", 3) is True  # whitespace before
-    assert is_isolated("(1800m)", 1) is True  # opening punctuation before
-
-
-def test_above_sea_level_cue_indices_finds_the_contiguous_phrase() -> None:
-    """#590 D2c fold 1: returns BOTH edge anchors ("above" and "level"),
-    not the phrase's middle — so a value token on EITHER side of the
-    phrase can bind from its nearest edge (:func:`bean_sourcing._cue_binds_to_value`)."""
-    indices = bean_sourcing._above_sea_level_cue_indices  # pyright: ignore[reportPrivateUsage]
-    assert indices(["1800", "above", "sea", "level"]) == [1, 3]
-    assert indices(["1800", "above", "the", "level"]) == []
-    assert indices(["above", "sea"]) == []
-
-
-def test_altitude_evidence_supports_value_no_matching_digit_token_returns_false() -> None:
-    """A quote that never mentions the value's digits at all (even with
-    cues present) must not verify — exercises the ``digit_indices``
-    empty-list branch directly."""
-    supports_value = bean_sourcing._altitude_evidence_supports_value  # pyright: ignore[reportPrivateUsage]
-    assert supports_value(1800, "This is a wonderful high altitude lot") is False
-
-
-def test_altitude_evidence_supports_value_no_cue_token_returns_false() -> None:
-    """A matching digit token with NO cue token anywhere in the quote."""
-    supports_value = bean_sourcing._altitude_evidence_supports_value  # pyright: ignore[reportPrivateUsage]
-    assert supports_value(1800, "priced at 1800 dollars") is False
 
 
 def test_split_corpus_segments_drops_boundaries_and_skips_consecutive_ones() -> None:
@@ -4943,14 +5482,20 @@ def test_quote_supports_processing_non_coffee_cue_collision_bypass_certifies_wro
     assert result is True  # documented cue-collision bypass — NOT the desired outcome
 
 
-def test_quote_supports_processing_sibling_product_locality_bypass_certifies_wrongly() -> None:
-    """MEDIUM finding: an anchored sibling-product heading ("## Kenya AA
-    & Friends" matching the page's own "Kenya AA" anchor) admits a
-    DIFFERENT product's processing sentence ("our sister lot, the
-    Ethiopia Yirgacheffe, which uses a honey process") into the main
-    region — the heading-match whitelist has no way to know the sentence
-    describes another SKU entirely, so the wrong-entity citation
-    certifies ``honey`` for the Kenya AA page."""
+def test_quote_supports_processing_sibling_product_locality_bypass_now_closed() -> None:
+    """MEDIUM finding, CLOSED by #617 fold 4: an anchored sibling-product
+    heading ("## Kenya AA & Friends" matching the page's own "Kenya AA"
+    anchor) used to admit a DIFFERENT product's processing sentence ("our
+    sister lot, the Ethiopia Yirgacheffe, which uses a honey process")
+    into the main region — the heading-match whitelist had no way to know
+    the sentence described another SKU entirely, so the wrong-entity
+    citation certified ``honey`` for the Kenya AA page. Fixed at the
+    SHARED root (:func:`bean_sourcing._heading_matches_anchor`'s
+    conjunction-remainder check, #617 fold 4, driven by the altitude
+    whitelist's own sibling-product finding) — a heading whose remainder
+    names a conjunction no longer anchors at all, for ANY citation gate
+    built on :func:`bean_sourcing._main_product_region`, not just
+    altitude's."""
     body = _framed(
         "Kenya AA",
         "## Kenya AA & Friends\n"
@@ -4961,7 +5506,7 @@ def test_quote_supports_processing_sibling_product_locality_bypass_certifies_wro
     result = bean_sourcing._quote_supports_processing(  # pyright: ignore[reportPrivateUsage]
         "honey", "which uses a honey process", region
     )
-    assert result is True  # documented wrong-entity bypass — NOT the desired outcome
+    assert result is False
 
 
 def test_quote_supports_bean_species_percent_prefix_verifies_without_a_cue() -> None:
@@ -5087,6 +5632,41 @@ def test_phrase_token_spans_empty_phrase_returns_no_spans() -> None:
         (), ["natural", "process"]
     )
     assert spans == []
+
+
+def test_phrase_token_spans_overlapping_matches_all_reported() -> None:
+    """#617 perf fold (token-sequence KMP, Codex PR #626 round 3): every
+    OVERLAPPING occurrence is still reported, identical to the naive
+    per-position scan this replaced — "a a a" against pattern "a a"
+    matches at both (0, 1) and (1, 2)."""
+    spans = bean_sourcing._phrase_token_spans(  # pyright: ignore[reportPrivateUsage]
+        ("a", "a"), ["a", "a", "a"]
+    )
+    assert spans == [(0, 1), (1, 2)]
+
+
+def test_phrase_token_spans_exercises_the_kmp_failure_fallback() -> None:
+    """Direct unit coverage of the KMP mismatch-after-partial-match
+    branch: pattern ("a", "a", "b") against text ("a", "a", "a", "b") —
+    at the third token the partial match "a a" fails to extend with "a"
+    (pattern wants "b" next), so the failure table falls back to a
+    shorter partial match ("a") rather than restarting from scratch, and
+    still finds the match ending at the final "b"."""
+    spans = bean_sourcing._phrase_token_spans(  # pyright: ignore[reportPrivateUsage]
+        ("a", "a", "b"), ["a", "a", "a", "b"]
+    )
+    assert spans == [(1, 3)]
+
+
+def test_kmp_failure_function_matches_the_textbook_example() -> None:
+    """Direct unit coverage of :func:`bean_sourcing._kmp_failure_function`
+    against the standard textbook pattern "a b a b a a" — a mix of
+    partial-prefix reuse (index 4) and a fallback-then-extend case
+    (index 5)."""
+    failure = bean_sourcing._kmp_failure_function(  # pyright: ignore[reportPrivateUsage]
+        ("a", "b", "a", "b", "a", "a")
+    )
+    assert failure == [0, 0, 1, 2, 3, 1]
 
 
 def test_segment_has_conflicting_enum_value_no_conflict_returns_false() -> None:
