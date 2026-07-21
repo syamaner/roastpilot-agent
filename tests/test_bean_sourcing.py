@@ -3635,6 +3635,28 @@ def test_heading_matches_anchor_is_linear_not_quadratic_on_a_crafted_heading() -
     assert elapsed < 1.0
 
 
+def test_heading_matches_anchor_kmp_worst_case_anchor_is_linear_not_quadratic() -> None:
+    """Perf regression (Codex PR #626 round 3): the OLD
+    :func:`bean_sourcing._phrase_token_spans` materialized and compared a
+    fresh anchor-width tuple slice at EVERY heading token position — an
+    anchor sharing almost all of its tokens with the heading, but never
+    actually matching in full, is the classic quadratic-naive-matching
+    worst case: a 501-token anchor ("a " * 500 + "b") against a
+    9,000-token heading of nothing but "a" would make a naive scan do
+    ~500 comparisons at ALMOST EVERY position (each failing only on the
+    501st token, since the heading never contains "b" at all) — up to
+    ~4.5M token comparisons. Token-sequence KMP resolves the whole scan
+    in O(anchor_width + heading_length) — comfortably sub-second."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    anchor = "a " * 500 + "b"
+    heading = "a " * 9_000
+    start = time.monotonic()
+    result = matches_anchor(heading, [anchor])
+    elapsed = time.monotonic() - start
+    assert result is False  # the heading never contains the anchor's trailing "b"
+    assert elapsed < 1.0
+
+
 # --- #617 D2d, Codex PR #626 round 2 (BLOCKER): casefold() can EXPAND a
 # character into MORE codepoints than it started with (German "ß" -> "ss",
 # Turkish "İ" -> "i" + a combining dot), so a raw span computed from a
@@ -5610,6 +5632,41 @@ def test_phrase_token_spans_empty_phrase_returns_no_spans() -> None:
         (), ["natural", "process"]
     )
     assert spans == []
+
+
+def test_phrase_token_spans_overlapping_matches_all_reported() -> None:
+    """#617 perf fold (token-sequence KMP, Codex PR #626 round 3): every
+    OVERLAPPING occurrence is still reported, identical to the naive
+    per-position scan this replaced — "a a a" against pattern "a a"
+    matches at both (0, 1) and (1, 2)."""
+    spans = bean_sourcing._phrase_token_spans(  # pyright: ignore[reportPrivateUsage]
+        ("a", "a"), ["a", "a", "a"]
+    )
+    assert spans == [(0, 1), (1, 2)]
+
+
+def test_phrase_token_spans_exercises_the_kmp_failure_fallback() -> None:
+    """Direct unit coverage of the KMP mismatch-after-partial-match
+    branch: pattern ("a", "a", "b") against text ("a", "a", "a", "b") —
+    at the third token the partial match "a a" fails to extend with "a"
+    (pattern wants "b" next), so the failure table falls back to a
+    shorter partial match ("a") rather than restarting from scratch, and
+    still finds the match ending at the final "b"."""
+    spans = bean_sourcing._phrase_token_spans(  # pyright: ignore[reportPrivateUsage]
+        ("a", "a", "b"), ["a", "a", "a", "b"]
+    )
+    assert spans == [(1, 3)]
+
+
+def test_kmp_failure_function_matches_the_textbook_example() -> None:
+    """Direct unit coverage of :func:`bean_sourcing._kmp_failure_function`
+    against the standard textbook pattern "a b a b a a" — a mix of
+    partial-prefix reuse (index 4) and a fallback-then-extend case
+    (index 5)."""
+    failure = bean_sourcing._kmp_failure_function(  # pyright: ignore[reportPrivateUsage]
+        ("a", "b", "a", "b", "a", "a")
+    )
+    assert failure == [0, 0, 1, 2, 3, 1]
 
 
 def test_segment_has_conflicting_enum_value_no_conflict_returns_false() -> None:

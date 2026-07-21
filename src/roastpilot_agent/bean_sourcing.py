@@ -2032,8 +2032,10 @@ class _ExtractedBeanIdentity(BaseModel):
     enable review rounds) — see :func:`_draft_from_identity`'s docstring
     for each field's own gate and evidence. The live verification surface
     is D1's free-text containment plus the ``description`` exemption;
-    every typed field's evidence quote is surfaced to the operator for
-    human judgement instead.
+    every typed field's evidence quote is captured on this extraction
+    schema for operator surfacing (a follow-up UI/API slice, #627) and
+    eval capture (#612) instead — ``BeanProfileDraft`` itself carries no
+    evidence fields today, so the API does not yet return them.
     """
 
     name: str | None = None
@@ -2562,9 +2564,12 @@ _BEAN_SPECIES_DISPLAY_SPELLINGS: dict[str, str] = {
 #: the retired guard-stack — with the terminal probe's own repros now
 #: captured as executable-spec tests documenting the two leaks (see the
 #: "#617 terminal probe" test section). ``altitude_m_evidence`` is
-#: captured (#590 D2a) and surfaced to the operator for human judgement,
-#: same disposition as the other three fields; ``altitude_m`` itself
-#: always demotes to ``"origin_estimated"``. A future revisit starts
+#: captured (#590 D2a) on this extraction schema for operator surfacing
+#: (a follow-up UI/API slice, #627) and eval capture (#612) — same
+#: disposition as the other three fields; ``BeanProfileDraft`` itself
+#: carries no evidence fields today, so the operator does not yet see
+#: any of them. ``altitude_m`` itself always demotes to
+#: ``"origin_estimated"``. A future revisit starts
 #: from EITHER the probe's own class-sweep design (use
 #: :data:`_CONTAINMENT_PUNCTUATION_TRANSLATION`'s full punctuation set,
 #: not a hand-picked subset, as the phrase/clause-boundary definition)
@@ -3981,6 +3986,34 @@ def _quote_supports_is_blend(
 # fields.
 
 
+def _kmp_failure_function(pattern: tuple[str, ...]) -> list[int]:
+    """The Knuth-Morris-Pratt failure (partial-match) table for
+    ``pattern`` (#617 perf fold, Codex PR #626 round 3) — ``failure[i]``
+    is the length of the longest proper prefix of ``pattern[: i + 1]``
+    that is also a suffix of it. Standard KMP preprocessing, generalized
+    from characters to opaque tokens (plain ``==`` comparison, no
+    slicing) so :func:`_phrase_token_spans` can match in one linear pass
+    instead of re-comparing a fresh width-sized slice at every start
+    position.
+
+    Args:
+        pattern: The needle token sequence (non-empty).
+
+    Returns:
+        The failure table, same length as ``pattern``.
+    """
+    length = len(pattern)
+    failure = [0] * length
+    k = 0
+    for i in range(1, length):
+        while k > 0 and pattern[i] != pattern[k]:
+            k = failure[k - 1]
+        if pattern[i] == pattern[k]:
+            k += 1
+        failure[i] = k
+    return failure
+
+
 def _phrase_token_spans(
     phrase_tokens: tuple[str, ...], corpus_tokens: list[str]
 ) -> list[tuple[int, int]]:
@@ -3990,6 +4023,19 @@ def _phrase_token_spans(
     Needed here (unlike D1's free-text containment, which only needs a
     bool) because :func:`_display_token_has_process_cue` must inspect the
     token immediately either side of a match, not just whether one exists.
+
+    Token-sequence KMP (#617 perf fold, Codex PR #626 round 3) —
+    :func:`_kmp_failure_function` once over ``phrase_tokens``, then a
+    SINGLE pass over ``corpus_tokens``: O(len(phrase_tokens) +
+    len(corpus_tokens)) worst case, never re-materializing or
+    re-comparing a width-sized slice per candidate start position. The
+    naive per-position slice-and-compare this replaced was
+    O(len(corpus_tokens) * len(phrase_tokens)) — synchronous, adversarial
+    input on both sides (a long anchor sharing most tokens with a long
+    heading) could stall the event loop under ``_start_lock``. Overlapping
+    matches are still all reported, identical to the naive scan (a
+    successful match resumes from the failure table's fallback, not from
+    scratch).
 
     Args:
         phrase_tokens: The already-normalized, already-split needle, e.g.
@@ -4003,11 +4049,18 @@ def _phrase_token_spans(
     width = len(phrase_tokens)
     if width == 0:
         return []
-    return [
-        (start, start + width - 1)
-        for start in range(len(corpus_tokens) - width + 1)
-        if tuple(corpus_tokens[start : start + width]) == phrase_tokens
-    ]
+    failure = _kmp_failure_function(phrase_tokens)
+    spans: list[tuple[int, int]] = []
+    k = 0
+    for i, token in enumerate(corpus_tokens):
+        while k > 0 and token != phrase_tokens[k]:
+            k = failure[k - 1]
+        if token == phrase_tokens[k]:
+            k += 1
+        if k == width:
+            spans.append((i - width + 1, i))
+            k = failure[k - 1]
+    return spans
 
 
 def _display_token_has_process_cue(
@@ -4250,9 +4303,12 @@ def _draft_from_identity(
     only with a non-lexical mechanism (e.g. an entailment judge). THE
     LIVE VERIFICATION SURFACE, final for this architecture, is D1's
     free-text containment below plus the ``description`` exemption
-    above — every typed field's evidence quote is captured and surfaced
-    to the operator for human judgement instead of automated
-    certification.
+    above. Every typed field's evidence quote IS captured on
+    ``identity`` (#590 D2a) — but ``BeanProfileDraft`` itself carries no
+    evidence fields, so it is not yet returned by the API; surfacing it
+    to the operator for human judgement, instead of automated
+    certification, is the deliberate contract-crossing follow-up slice
+    (#627), alongside eval capture (#612).
     Every roast-target field is always
     ``"origin_estimated"``. The optional free-text fields (``country``, ``farm``,
     ``bean_varietal``, ``description``) are normalized via
