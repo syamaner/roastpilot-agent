@@ -6997,7 +6997,18 @@ async def test_fetch_page_text_bounds_a_hanging_markdown_extraction_with_a_timeo
     below for that pool's own admission-control/isolation/recovery
     coverage. This test stays a pure integration check: the
     ``_fetch_page_text`` caller must still fall back promptly regardless
-    of which pool the hang happens on."""
+    of which pool the hang happens on.
+
+    Drains the dedicated pool's admission counter back to zero (via
+    :func:`_await_condition`) before returning: this test's own hung
+    worker keeps running for up to a real ~1s AFTER the assertions below
+    (the timeout only bounds the await, not the thread) — draining here,
+    the same way the ``test_extract_page_markdown_bounded_*`` tests
+    below drain their own occupying tasks, prevents that lingering
+    worker's EVENTUAL release from firing during whichever test runs
+    next and mutating ITS view of the shared counter."""
+
+    _reset_parse_pool_state()
 
     def _hangs(html: str) -> str | None:
         # A REAL (synchronous) sleep — this runs on the dedicated
@@ -7026,6 +7037,12 @@ async def test_fetch_page_text_bounds_a_hanging_markdown_extraction_with_a_timeo
     # use — the draft proceeds, it does not fail.
     assert text == bean_sourcing._extract_page_text(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
     assert "Kenya Kiambu AA" in text
+    # Drain: let the still-running hung worker actually finish and release
+    # its slot before this test returns (see the docstring above).
+    await _await_condition(
+        lambda: bean_sourcing._inflight_parse_count == 0,  # pyright: ignore[reportPrivateUsage]
+        timeout=2.0,
+    )
 
 
 # --- #607: dedicated, bounded executor + admission control for the
@@ -7303,28 +7320,86 @@ def test_release_parse_slot_clamps_at_zero() -> None:
     """Defensive floor: :func:`_release_parse_slot` never drives the
     counter negative, even if called with the counter already at zero
     (#607 — should not happen in practice, since every increment has
-    exactly one matching completion callback, but the floor is cheap
-    insurance)."""
+    exactly one matching completion callback or submission-failure
+    decrement, but the floor is cheap insurance)."""
     _reset_parse_pool_state()
+    dummy_future: concurrent.futures.Future[str | None] = concurrent.futures.Future()
+    dummy_future.set_result(None)
     try:
-        bean_sourcing._release_parse_slot()  # pyright: ignore[reportPrivateUsage]
+        bean_sourcing._release_parse_slot(dummy_future)  # pyright: ignore[reportPrivateUsage]
         assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
     finally:
         _reset_parse_pool_state()
 
 
-def test_schedule_parse_slot_release_swallows_runtime_error_on_closed_loop() -> None:
-    """A worker completing after its submitting event loop has already
-    closed (a per-test event loop torn down mid-hang, in this suite; a
-    process shutting down, in production) must not raise out of the
-    worker thread — :func:`_schedule_parse_slot_release` swallows the
-    resulting ``RuntimeError`` as a safe no-op (#607)."""
-    loop = asyncio.new_event_loop()
-    loop.close()
+def test_release_parse_slot_runs_correctly_from_a_foreign_thread_with_no_event_loop() -> None:
+    """#607 fold 1: the worker-thread completion callback is
+    LOOP-INDEPENDENT by construction — running it directly from a plain
+    background thread with NO asyncio event loop involved at all
+    (simulating a worker completing after its submitting loop is long
+    gone: a per-test loop already torn down, a successive ``asyncio.run()``
+    embedding, or process shutdown) still releases the slot correctly.
+    The prior ``call_soon_threadsafe``-based release could instead
+    silently swallow a ``RuntimeError`` from a closed loop, permanently
+    skipping this exact decrement."""
+    _reset_parse_pool_state()
+    bean_sourcing._inflight_parse_count = 1  # pyright: ignore[reportPrivateUsage]
     dummy_future: concurrent.futures.Future[str | None] = concurrent.futures.Future()
     dummy_future.set_result(None)
-    # Must not raise.
-    bean_sourcing._schedule_parse_slot_release(loop, dummy_future)  # pyright: ignore[reportPrivateUsage]
+    errors: list[BaseException] = []
+
+    def _run_release_with_no_event_loop() -> None:
+        # A plain background thread — deliberately never creates or sets
+        # an asyncio event loop of its own, so a call that depended on
+        # ``asyncio.get_event_loop()`` or similar would fail here.
+        try:
+            bean_sourcing._release_parse_slot(dummy_future)  # pyright: ignore[reportPrivateUsage]
+        except BaseException as exc:  # pragma: no cover - regression guard only
+            errors.append(exc)
+
+    thread = threading.Thread(target=_run_release_with_no_event_loop)
+    thread.start()
+    thread.join(timeout=5.0)
+    assert not errors
+    assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+class _SubmitRaisingExecutor:
+    """A test double whose ``submit`` raises immediately — simulating a
+    thread-limit ``OSError`` (or any other submission-time failure) on a
+    resource-constrained host (#607 fold 1)."""
+
+    def submit(
+        self, func: Callable[[str], str | None], html: str
+    ) -> concurrent.futures.Future[str | None]:
+        raise OSError("can't start new thread (simulated, #607 fold 1 test)")
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_submission_failure_falls_back_and_frees_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2 + claude low fold: a submission failure must (a) fall back
+    to linear-strip rather than raise past this function's fail-soft
+    contract, and (b) release the slot it had just reserved — capacity
+    for the VERY NEXT call must stay intact, not silently shrink by one
+    forever (#607 fold 1)."""
+    _reset_parse_pool_state()
+    monkeypatch.setattr(bean_sourcing, "_get_parse_executor", lambda: _SubmitRaisingExecutor())
+    result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        "<html></html>", timeout_seconds=5.0
+    )
+    assert result is None
+    assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+
+    # Capacity intact: restore the REAL executor and confirm a normal
+    # parse still succeeds right afterwards — the failed submission above
+    # must not have permanently eaten a slot.
+    monkeypatch.undo()
+    result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        _SAMPLE_HTML, timeout_seconds=5.0
+    )
+    assert result == bean_sourcing._extract_page_markdown(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio

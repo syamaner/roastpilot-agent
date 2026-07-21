@@ -187,23 +187,27 @@ executor ``api.py``'s own ``asyncio.to_thread`` calls (config
 load/persistence, device enumeration) use, so an orphaned hung worker can
 only ever exhaust that dedicated pool, never the default one those
 unrelated calls depend on. It also refuses to queue behind a saturated
-pool: an in-flight-worker counter (:data:`_inflight_parse_count`, mutated
-only on the event-loop thread) tells a new call to skip the markdown
-attempt immediately — falling back to the linear-strip pass at once —
-when both dedicated workers are already busy, rather than waiting out its
-own timeout for nothing.
+pool: an in-flight-worker counter (:data:`_inflight_parse_count`, guarded
+by the plain :data:`_parse_slot_lock` — LOOP-INDEPENDENT by construction,
+#607 fold 1, after an event-loop-affined first version could permanently
+leak a slot when its release hopped onto an already-closed loop) tells a
+new call to skip the markdown attempt immediately — falling back to the
+linear-strip pass at once — when both dedicated workers are already busy,
+rather than waiting out its own timeout for nothing. A submission failure
+(e.g. a thread-limit ``OSError`` on a resource-constrained host) releases
+the reserved slot and falls back the same way, never escaping this
+function's fail-soft contract.
 """
 
 from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import contextlib
-import functools
 import ipaddress
 import logging
 import re
 import socket
+import threading
 import zlib
 from dataclasses import dataclass
 from html import unescape
@@ -802,6 +806,22 @@ def _sanitize_trafilatura_frontmatter(markdown: str) -> str:
 # fix below is two-layered: a pool a leak can only ever exhaust on its
 # own, plus admission control that reacts to actual worker occupancy
 # rather than just queuing behind a full pool.
+#
+# #607 fold 1 (Codex + claude, PR #629): the FIRST version of this
+# admission counter was mutated only on the event-loop thread — the
+# release hopped from the worker thread onto the loop via
+# ``call_soon_threadsafe`` — and swallowed the ``RuntimeError`` that
+# raises when that loop is already closed. That swallow was itself the
+# bug: it skipped the ONLY decrement for that slot, permanently. Two
+# occurrences (both dedicated workers releasing into an already-closed
+# loop — reachable via successive ``asyncio.run()`` embeddings, not just
+# the test suite's per-test loops) wedges the pool forever, reporting
+# "saturated" even with zero real workers running. This version is
+# LOOP-INDEPENDENT by construction: the counter is a plain module-level
+# ``int`` guarded by :data:`_parse_slot_lock`, mutated directly from
+# whichever thread touches it (the event-loop thread for admission, the
+# worker thread itself for release) — no ``call_soon_threadsafe``, no
+# loop reference carried anywhere, nothing that can go stale.
 
 #: Worker count for the dedicated parse pool. Two, matching the existing
 #: concurrency-1 draft semaphore (``api._draft_bean_from_url_semaphore``)
@@ -812,18 +832,29 @@ _MAX_CONCURRENT_PARSES: Final[int] = 2
 
 _parse_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
-#: In-flight-worker admission counter. Mutated ONLY on the event-loop
-#: thread — incremented directly in :func:`_extract_page_markdown_bounded`
-#: (which always runs on the loop), decremented via
-#: ``loop.call_soon_threadsafe`` from a worker-thread completion callback
-#: (:func:`_release_parse_slot`) — so this plain module-level ``int`` is
-#: never touched from two threads at once; no lock needed. Tracks workers
-#: ACTUALLY OCCUPIED, not calls merely awaited: a timed-out *await* does
-#: NOT decrement this counter, because the underlying worker thread keeps
-#: running regardless of the await having given up on it — only the
-#: worker's own eventual completion does. For a genuinely infinite-loop
-#: parse that means the slot correctly stays occupied forever, exactly
-#: like the real worker thread it represents.
+#: Guards every read-modify-write of :data:`_inflight_parse_count` — the
+#: only role this lock plays. It is held ONLY for the plain-int mutation
+#: itself, NEVER around ``submit()`` or the parse call: the admission
+#: check-and-increment in :func:`_extract_page_markdown_bounded` happens
+#: inside a single ``with _parse_slot_lock:`` block (so that decision is
+#: exact, not a peek-then-lock approximation — no window exists where two
+#: admissions could push the count over the cap), and the worker-thread
+#: release in :func:`_release_parse_slot` takes the SAME lock for its own
+#: brief decrement. The only interleaving the lock allows is between
+#: those two paths (an admission on the loop thread racing a release on a
+#: worker thread) — exactly what it exists to serialize. Because the lock
+#: is never held across the actual parse, a hung worker can never block
+#: another call's admission decision.
+_parse_slot_lock = threading.Lock()
+
+#: In-flight-worker admission counter, guarded by :data:`_parse_slot_lock`.
+#: Tracks workers ACTUALLY OCCUPIED, not calls merely awaited: a timed-out
+#: *await* does NOT decrement this counter, because the underlying worker
+#: thread keeps running regardless of the await having given up on it —
+#: only the worker's own eventual completion does (via
+#: :func:`_release_parse_slot`, its ``concurrent.futures`` done-callback).
+#: For a genuinely infinite-loop parse that means the slot correctly stays
+#: occupied forever, exactly like the real worker thread it represents.
 _inflight_parse_count: int = 0
 
 
@@ -851,49 +882,32 @@ def _get_parse_executor() -> concurrent.futures.ThreadPoolExecutor:
     return _parse_executor
 
 
-def _release_parse_slot() -> None:
-    """Decrement :data:`_inflight_parse_count` by one.
+def _release_parse_slot(_future: concurrent.futures.Future[str | None]) -> None:
+    """Decrement :data:`_inflight_parse_count` by one, under
+    :data:`_parse_slot_lock`.
 
-    Always invoked via ``loop.call_soon_threadsafe`` from a worker
-    thread's completion callback (see :func:`_schedule_parse_slot_release`)
-    — like the increment, this only ever runs on the event-loop thread.
-    Clamped at zero as a defensive floor (each increment has exactly one
-    matching completion callback, so this should never actually go
+    Registered as the dedicated pool's worker-thread completion callback
+    (``concurrent.futures`` invokes a future's done-callbacks synchronously
+    from whichever thread completed it — the worker thread itself, or the
+    calling thread if the future was already done when the callback was
+    attached) — so this runs DIRECTLY on that thread, with no event-loop
+    hop and no dependency on any particular loop still existing (#607 fold
+    1): a worker completing after its SUBMITTING event loop has already
+    closed (a per-test event loop torn down mid-hang; successive
+    ``asyncio.run()`` embeddings; process shutdown) still releases
+    correctly here, since nothing about this path reads or needs that
+    loop. Clamped at zero as a defensive floor (each increment has exactly
+    one matching completion callback — or one matching decrement in the
+    submission-failure path below — so this should never actually go
     negative).
-    """
-    global _inflight_parse_count
-    _inflight_parse_count = max(0, _inflight_parse_count - 1)
-
-
-def _schedule_parse_slot_release(
-    loop: asyncio.AbstractEventLoop, _future: concurrent.futures.Future[str | None]
-) -> None:
-    """The dedicated pool's worker-thread completion callback.
-
-    Runs on the WORKER thread (``concurrent.futures`` invokes a future's
-    done-callbacks synchronously from whichever thread completed it), so
-    it hops onto the event-loop thread via ``call_soon_threadsafe`` rather
-    than mutating :data:`_inflight_parse_count` directly — see that
-    counter's own docstring for why it must only ever be touched from the
-    loop thread.
-
-    Guards ``RuntimeError`` from ``call_soon_threadsafe``: the loop that
-    submitted this parse may already be closed by the time a genuinely
-    long-hung worker finally completes (its per-test event loop already
-    torn down, in the test suite; the process shutting down, in
-    production) — with no loop left to schedule onto, this is a safe
-    no-op rather than an unhandled exception escaping a worker thread
-    (``concurrent.futures`` would otherwise only log it, but never raise
-    it into anything that could act on it).
 
     Args:
-        loop: The event loop :func:`_extract_page_markdown_bounded` ran
-            on when it submitted this parse.
         _future: The completed future (unused; required by the
             ``add_done_callback`` signature).
     """
-    with contextlib.suppress(RuntimeError):
-        loop.call_soon_threadsafe(_release_parse_slot)
+    global _inflight_parse_count
+    with _parse_slot_lock:
+        _inflight_parse_count = max(0, _inflight_parse_count - 1)
 
 
 async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -> str | None:
@@ -904,9 +918,9 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
     ``asyncio.to_thread(...)`` pairing (#590 slice C) with two layers:
 
     1. **Isolation.** The parse runs via
-       ``loop.run_in_executor(_get_parse_executor(), ...)`` — a
-       separately-owned pool, not ``asyncio.to_thread``'s default one —
-       so an orphaned hung worker can only ever exhaust THIS pool's
+       ``_get_parse_executor().submit(...)`` — a separately-owned pool,
+       not ``asyncio.to_thread``'s default one — so an orphaned hung
+       worker can only ever exhaust THIS pool's
        :data:`_MAX_CONCURRENT_PARSES` slots, never the shared default
        executor unrelated code depends on.
     2. **Admission control tied to actual worker availability**, not mere
@@ -918,8 +932,19 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
        queuing behind the saturated pool and waiting out its own
        ``timeout_seconds`` for nothing.
 
-    Either branch returns exactly like the pre-#607 call site: ``None``
-    tells the caller to fall back to the linear-strip pass
+    **Submission failure (#607 fold 1)** — e.g. ``OSError: can't start new
+    thread`` on a resource-constrained host (the Raspberry Pi target) —
+    is caught around ``submit()``/``add_done_callback()`` together: on
+    ANY exception there, the just-reserved slot is released immediately
+    (nothing will ever call the completion callback, since no future was
+    ever created/registered) and the call falls back to linear-strip, the
+    same as every other extraction failure mode. Without this, a
+    submission failure would both raise past this function's documented
+    fail-soft contract AND permanently leak the slot it had already
+    reserved.
+
+    Either remaining branch returns exactly like the pre-#607 call site:
+    ``None`` tells the caller to fall back to the linear-strip pass
     (:func:`_extract_page_text`) — this module's never-worse-than-before,
     never-an-unhandled-exception fail-soft contract is unchanged.
 
@@ -932,23 +957,42 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
 
     Returns:
         The extracted markdown, or ``None`` on a timeout, a saturated
-        pool, or whatever :func:`_extract_page_markdown` itself already
-        returns ``None``/raises for.
+        pool, a submission failure, or whatever
+        :func:`_extract_page_markdown` itself already returns
+        ``None``/raises for.
     """
     global _inflight_parse_count
-    if _inflight_parse_count >= _MAX_CONCURRENT_PARSES:
+    with _parse_slot_lock:
+        if _inflight_parse_count >= _MAX_CONCURRENT_PARSES:
+            _log.warning(
+                "bean_sourcing: dedicated parse pool saturated (%d/%d workers busy "
+                "— likely orphaned by prior timed-out parses, #607); skipping "
+                "markdown extraction, falling back to linear-strip",
+                _inflight_parse_count,
+                _MAX_CONCURRENT_PARSES,
+            )
+            return None
+        _inflight_parse_count += 1
+
+    try:
+        concurrent_future = _get_parse_executor().submit(_extract_page_markdown, html)
+        concurrent_future.add_done_callback(_release_parse_slot)
+    except Exception:
+        # Submission itself failed — no future was ever created/registered,
+        # so no completion callback will EVER fire to release the slot
+        # reserved above. Release it here instead, and fall back to
+        # linear-strip: the request must stay inside this function's
+        # documented fail-soft envelope regardless of WHERE a failure
+        # happens (checklist class 4/6).
+        with _parse_slot_lock:
+            _inflight_parse_count = max(0, _inflight_parse_count - 1)
         _log.warning(
-            "bean_sourcing: dedicated parse pool saturated (%d/%d workers busy — "
-            "likely orphaned by prior timed-out parses, #607); skipping markdown "
-            "extraction, falling back to linear-strip",
-            _inflight_parse_count,
-            _MAX_CONCURRENT_PARSES,
+            "bean_sourcing: dedicated parse pool submission failed; falling back to linear-strip",
+            exc_info=True,
         )
         return None
-    _inflight_parse_count += 1
+
     loop = asyncio.get_running_loop()
-    concurrent_future = _get_parse_executor().submit(_extract_page_markdown, html)
-    concurrent_future.add_done_callback(functools.partial(_schedule_parse_slot_release, loop))
     try:
         async with asyncio.timeout(timeout_seconds):
             return await asyncio.wrap_future(concurrent_future, loop=loop)
