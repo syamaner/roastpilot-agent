@@ -18,13 +18,16 @@ transitive import graph checked in a fresh subprocess).
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import gzip
 import ipaddress
 import logging
 import socket
 import subprocess
 import sys
+import threading
 import time
+import unittest.mock
 import zlib
 from collections.abc import AsyncGenerator, Callable
 from typing import Literal
@@ -6986,15 +6989,24 @@ async def test_fetch_page_text_bounds_a_hanging_markdown_extraction_with_a_timeo
     slow-to-parse page timing out here must not regress that page from
     "draft succeeds via linear-strip" to a 422 that didn't exist before
     this slice. The lock-hold bound still holds (the wait is capped, only
-    the OUTCOME changed from fail to fall back)."""
+    the OUTCOME changed from fail to fall back).
+
+    #607: the hung worker now runs on the DEDICATED
+    ``bean-sourcing-parse`` pool, not the process's shared default
+    executor — see the ``test_extract_page_markdown_bounded_*`` tests
+    below for that pool's own admission-control/isolation/recovery
+    coverage. This test stays a pure integration check: the
+    ``_fetch_page_text`` caller must still fall back promptly regardless
+    of which pool the hang happens on."""
 
     def _hangs(html: str) -> str | None:
-        # A REAL (synchronous) sleep — this runs on the asyncio.to_thread
-        # worker thread, mirroring a genuinely pathological/slow parse;
-        # asyncio.timeout can only stop the AWAIT, not this thread, so it
-        # keeps running in the background after the test's own timeout
-        # fires (tracked separately as #607) — kept short so that residual
-        # cost stays negligible.
+        # A REAL (synchronous) sleep — this runs on the dedicated
+        # bean-sourcing-parse pool (#607), mirroring a genuinely
+        # pathological/slow parse; asyncio.timeout can only stop the
+        # AWAIT, not this thread, so it keeps running in the background
+        # after the test's own timeout fires — kept short so that
+        # residual cost stays negligible, and contained to the dedicated
+        # pool alone rather than the shared default executor.
         time.sleep(1.0)
         return "should never be observed"  # pragma: no cover
 
@@ -7014,6 +7026,305 @@ async def test_fetch_page_text_bounds_a_hanging_markdown_extraction_with_a_timeo
     # use — the draft proceeds, it does not fail.
     assert text == bean_sourcing._extract_page_text(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
     assert "Kenya Kiambu AA" in text
+
+
+# --- #607: dedicated, bounded executor + admission control for the
+# untrusted trafilatura markdown parse ---
+#
+# Every test below drives a REAL (synchronous, cross-thread) hang via
+# ``threading.Event`` — never a fake/mocked future — so the admission
+# counter and the dedicated pool's actual worker occupancy are exercised
+# for real, not simulated. Every blocking fake bounds its own wait
+# (``event.wait(timeout=...)``) as a safety ceiling: even if a test's own
+# ``finally``/cleanup failed to signal release, the underlying thread
+# still returns on its own well within the test suite's timeout, so a
+# broken test cannot leave a genuinely un-joinable non-daemon thread
+# blocking process exit.
+
+
+def _reset_parse_pool_state() -> None:
+    """Reset the module-level admission counter to zero.
+
+    Defensive: guards each test below against a prior failure elsewhere
+    in the suite having left :data:`bean_sourcing._inflight_parse_count`
+    non-zero. The dedicated executor singleton itself is intentionally
+    NOT torn down/recreated — matching production, where it lives for
+    the whole process — only the counter is reset.
+    """
+    bean_sourcing._inflight_parse_count = 0  # pyright: ignore[reportPrivateUsage]
+
+
+async def _await_condition(predicate: Callable[[], bool], *, timeout: float = 2.0) -> None:
+    """Poll ``predicate`` on a short ``asyncio.sleep`` cadence until it is
+    ``True`` or ``timeout`` elapses, without ever blocking the event loop
+    (a plain busy-``while`` would starve the worker threads' own
+    ``call_soon_threadsafe`` callbacks of a chance to run)."""
+    started = time.monotonic()
+    while not predicate():
+        if time.monotonic() - started > timeout:
+            raise AssertionError(f"condition not met within {timeout}s")
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_skips_immediately_when_pool_saturated() -> None:
+    """The cap works: with both dedicated-pool workers genuinely still
+    busy (simulating orphaned hung parses from prior timeouts), the NEXT
+    call must not queue behind them and wait out its own timeout — it
+    should skip the markdown attempt and return ``None`` almost
+    immediately (#607)."""
+    _reset_parse_pool_state()
+    release = threading.Event()
+    entered = threading.Event()
+    entered_count = 0
+    count_lock = threading.Lock()
+
+    def _hangs_until_released(html: str) -> str | None:
+        nonlocal entered_count
+        with count_lock:
+            entered_count += 1
+            if entered_count >= bean_sourcing._MAX_CONCURRENT_PARSES:  # pyright: ignore[reportPrivateUsage]
+                entered.set()
+        release.wait(timeout=5.0)  # safety ceiling — always released below
+        return None
+
+    with unittest.mock.patch.object(bean_sourcing, "_extract_page_markdown", _hangs_until_released):
+        occupying = [
+            asyncio.create_task(
+                bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+                    "<html></html>", timeout_seconds=10.0
+                )
+            )
+            for _ in range(bean_sourcing._MAX_CONCURRENT_PARSES)  # pyright: ignore[reportPrivateUsage]
+        ]
+        try:
+            # Wait until BOTH workers have genuinely started (are
+            # occupying a real dedicated-pool thread), not merely
+            # "submitted" — otherwise the assertion below could race
+            # ahead of the pool actually filling up.
+            await _await_condition(entered.is_set)
+            assert (
+                bean_sourcing._inflight_parse_count  # pyright: ignore[reportPrivateUsage]
+                == bean_sourcing._MAX_CONCURRENT_PARSES  # pyright: ignore[reportPrivateUsage]
+            )
+
+            started_at = time.monotonic()
+            result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+                "<html></html>", timeout_seconds=10.0
+            )
+            elapsed = time.monotonic() - started_at
+            assert result is None
+            assert elapsed < 1.0, f"admission control did not skip immediately: {elapsed:.2f}s"
+            # The skip path never touches the counter — still exactly the
+            # cap, not cap+1.
+            assert (
+                bean_sourcing._inflight_parse_count  # pyright: ignore[reportPrivateUsage]
+                == bean_sourcing._MAX_CONCURRENT_PARSES  # pyright: ignore[reportPrivateUsage]
+            )
+        finally:
+            release.set()
+            await asyncio.gather(*occupying)
+
+
+@pytest.mark.asyncio
+async def test_unrelated_to_thread_work_unaffected_by_saturated_parse_pool() -> None:
+    """Orphan containment: unrelated ``asyncio.to_thread`` work (the
+    process's SHARED default executor — what ``api.py``'s config
+    load/persistence and device-enumeration calls use) must still
+    complete promptly while the DEDICATED parse pool is fully saturated
+    (#607) — proving a leak is contained to the dedicated pool alone."""
+    _reset_parse_pool_state()
+    release = threading.Event()
+    entered = threading.Event()
+    entered_count = 0
+    count_lock = threading.Lock()
+
+    def _hangs_until_released(html: str) -> str | None:
+        nonlocal entered_count
+        with count_lock:
+            entered_count += 1
+            if entered_count >= bean_sourcing._MAX_CONCURRENT_PARSES:  # pyright: ignore[reportPrivateUsage]
+                entered.set()
+        release.wait(timeout=5.0)
+        return None
+
+    with unittest.mock.patch.object(bean_sourcing, "_extract_page_markdown", _hangs_until_released):
+        occupying = [
+            asyncio.create_task(
+                bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+                    "<html></html>", timeout_seconds=10.0
+                )
+            )
+            for _ in range(bean_sourcing._MAX_CONCURRENT_PARSES)  # pyright: ignore[reportPrivateUsage]
+        ]
+        try:
+            await _await_condition(entered.is_set)
+            assert (
+                bean_sourcing._inflight_parse_count  # pyright: ignore[reportPrivateUsage]
+                == bean_sourcing._MAX_CONCURRENT_PARSES  # pyright: ignore[reportPrivateUsage]
+            )
+
+            started_at = time.monotonic()
+            result = await asyncio.to_thread(lambda: 21 + 21)
+            elapsed = time.monotonic() - started_at
+            assert result == 42
+            assert elapsed < 1.0, (
+                f"unrelated default-executor work was delayed by the saturated "
+                f"dedicated pool: {elapsed:.2f}s"
+            )
+        finally:
+            release.set()
+            await asyncio.gather(*occupying)
+
+
+@pytest.mark.asyncio
+async def test_parse_pool_recovers_once_hung_workers_complete() -> None:
+    """Recovery: once the previously-hung workers actually complete and
+    release their slots, markdown extraction works again (#607) — the
+    admission counter is not a permanent trip, only a reflection of
+    current worker occupancy."""
+    _reset_parse_pool_state()
+    release = threading.Event()
+    entered = threading.Event()
+    entered_count = 0
+    count_lock = threading.Lock()
+
+    def _hangs_until_released(html: str) -> str | None:
+        nonlocal entered_count
+        with count_lock:
+            entered_count += 1
+            if entered_count >= bean_sourcing._MAX_CONCURRENT_PARSES:  # pyright: ignore[reportPrivateUsage]
+                entered.set()
+        release.wait(timeout=5.0)
+        return None
+
+    with unittest.mock.patch.object(bean_sourcing, "_extract_page_markdown", _hangs_until_released):
+        occupying = [
+            asyncio.create_task(
+                bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+                    "<html></html>", timeout_seconds=10.0
+                )
+            )
+            for _ in range(bean_sourcing._MAX_CONCURRENT_PARSES)  # pyright: ignore[reportPrivateUsage]
+        ]
+        await _await_condition(entered.is_set)
+        release.set()
+        await asyncio.gather(*occupying)
+
+    # The completion callbacks hop back onto the loop via
+    # call_soon_threadsafe — give them a turn to actually run.
+    await _await_condition(
+        lambda: bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+    )
+
+    def _recovered(html: str) -> str | None:
+        return "recovered markdown"
+
+    with unittest.mock.patch.object(bean_sourcing, "_extract_page_markdown", _recovered):
+        result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+            "<html></html>", timeout_seconds=5.0
+        )
+    assert result == "recovered markdown"
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_normal_path_returns_markdown() -> None:
+    """Regression: the ordinary (non-hung, non-saturated) draft path is
+    unchanged — a normal, fast parse still returns its markdown through
+    the new dedicated-pool dispatch (#607)."""
+    _reset_parse_pool_state()
+    result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        _SAMPLE_HTML, timeout_seconds=5.0
+    )
+    assert result == bean_sourcing._extract_page_markdown(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_saturation_log_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The saturated-pool skip path logs a warning naming the occupied/
+    capacity counts (#607) — observability for an operator diagnosing a
+    stuck draft."""
+    _reset_parse_pool_state()
+    bean_sourcing._inflight_parse_count = (  # pyright: ignore[reportPrivateUsage]
+        bean_sourcing._MAX_CONCURRENT_PARSES  # pyright: ignore[reportPrivateUsage]
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="roastpilot_agent.bean_sourcing"):
+            result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+                "<html></html>", timeout_seconds=5.0
+            )
+        assert result is None
+        assert any("saturated" in record.message for record in caplog.records)
+    finally:
+        _reset_parse_pool_state()
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_timeout_falls_back_and_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A genuine (bounded, not pool-saturation) timeout still falls back
+    to ``None`` and logs at debug — the pre-#607 timeout behavior,
+    unchanged by the dedicated-pool dispatch."""
+    _reset_parse_pool_state()
+    release = threading.Event()
+
+    def _hangs(html: str) -> str | None:
+        release.wait(timeout=5.0)
+        return None
+
+    with unittest.mock.patch.object(bean_sourcing, "_extract_page_markdown", _hangs):
+        try:
+            with caplog.at_level(logging.DEBUG, logger="roastpilot_agent.bean_sourcing"):
+                result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+                    "<html></html>", timeout_seconds=0.1
+                )
+            assert result is None
+            assert any("deadline" in record.message for record in caplog.records)
+        finally:
+            release.set()
+            await _await_condition(
+                lambda: bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+            )
+
+
+def test_get_parse_executor_returns_the_same_singleton_across_calls() -> None:
+    """:func:`_get_parse_executor`'s lazy singleton is created once and
+    reused — a fresh executor per call would defeat the whole point of a
+    bounded pool (#607)."""
+    first = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+    second = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+    assert first is second
+
+
+def test_release_parse_slot_clamps_at_zero() -> None:
+    """Defensive floor: :func:`_release_parse_slot` never drives the
+    counter negative, even if called with the counter already at zero
+    (#607 — should not happen in practice, since every increment has
+    exactly one matching completion callback, but the floor is cheap
+    insurance)."""
+    _reset_parse_pool_state()
+    try:
+        bean_sourcing._release_parse_slot()  # pyright: ignore[reportPrivateUsage]
+        assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+    finally:
+        _reset_parse_pool_state()
+
+
+def test_schedule_parse_slot_release_swallows_runtime_error_on_closed_loop() -> None:
+    """A worker completing after its submitting event loop has already
+    closed (a per-test event loop torn down mid-hang, in this suite; a
+    process shutting down, in production) must not raise out of the
+    worker thread — :func:`_schedule_parse_slot_release` swallows the
+    resulting ``RuntimeError`` as a safe no-op (#607)."""
+    loop = asyncio.new_event_loop()
+    loop.close()
+    dummy_future: concurrent.futures.Future[str | None] = concurrent.futures.Future()
+    dummy_future.set_result(None)
+    # Must not raise.
+    bean_sourcing._schedule_parse_slot_release(loop, dummy_future)  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
