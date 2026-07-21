@@ -141,6 +141,39 @@ name: Review gate
 # The gate still only ever flips to `success` on an actual `success`
 # conclusion from the sha's newest run (or on already being `success`, check
 # 1) — never on a cancellation, and never from a non-newest run's completion.
+#
+# ROUND 3 (Codex on #628, 21 Jul): round 2's check-1 no-op'd on ANY existing
+# `success`, regardless of what put it there. That's wrong for a genuine
+# stale flip: draft-time claude-review completes `success` and flips the
+# gate; the operator marks the PR ready, which both (a) fires a fresh
+# `ready_for_review` claude-review run and (b) re-stamps the gate `pending`
+# via stamp-on-pr — but if the fresh run gets cancelled and its
+# `flip-on-review` invocation reads the gate BEFORE the ready-toggle's
+# `pending` re-stamp lands, it sees the draft's stale `success`, wrongly
+# no-ops, and the cancelled ready-run never heals. Deadlock reappears via a
+# path check 1 was supposed to prevent.
+#
+# THE FIX correlates the success with its ORIGIN instead of trusting any
+# `success` blindly: `stamp-on-pr`'s two EXEMPTION stamps (Dependabot;
+# workflow-editing PR — the only writers of a `success` state that must
+# never be second-guessed, because `Claude Code Review` legitimately cannot
+# run for them at all) prefix their status `description` with the
+# machine-readable marker `[exempt] `. The ordinary `pending` stamp and
+# `flip-on-review`'s own success-flip description both deliberately do NOT
+# carry it. Check 1 narrows to: no-op ONLY when the latest status is
+# `success` AND its description starts with `[exempt] `. A non-exempt
+# `success` (a real flip — possibly the stale one above) no longer no-ops;
+# the handler proceeds through the normal ownership checks, where
+# newest-run-wins (round 2) makes every remaining ordering safe on its own:
+# a genuinely CURRENT success belongs to the newest run, so a stale OLDER
+# run's cancelled completion still defers to it via the newest-run check
+# above (unchanged); only the sha's actual NEWEST run, if IT is the one
+# that's cancelled, reaches this far and self-heals — and that heal is
+# idempotent-harmless even if the existing non-exempt `success` was in fact
+# still current (the re-run's own eventual `success` just re-lands the same
+# state; see `flip-on-review`'s script for where the marker is checked and
+# `stamp-on-pr`'s script for where it's written — the exact string `[exempt]
+# ` is load-bearing and must stay identical in both places).
 
 on:
   # Stamp the gate on every PR head as soon as it appears / updates.
@@ -203,11 +236,21 @@ jobs:
               f.filename.startsWith('.github/workflows/'),
             );
 
+            // #605 round 3, LOAD-BEARING: `[exempt] ` marks a status this
+            // job posted BECAUSE claude-review structurally cannot run for
+            // this PR (Dependabot / workflow-editing), never because a
+            // review actually completed. flip-on-review's check 1 reads this
+            // exact prefix to tell a genuine, permanent exemption apart from
+            // a possibly-stale prior flip `success` — keep it identical in
+            // both places, and never add it to the ordinary `pending` stamp
+            // below (the `else` branch) or to flip-on-review's own
+            // success-flip description.
+            const EXEMPT_MARKER = '[exempt] ';
             const exempt = isDependabot || editsWorkflow;
             const reason = isDependabot
-              ? 'Dependabot PR — Claude Code Review does not run (no secret); auto-pass.'
+              ? `${EXEMPT_MARKER}Dependabot PR — Claude Code Review does not run (no secret); auto-pass.`
               : editsWorkflow
-                ? 'PR edits .github/workflows/** — Claude Code Review cannot run (workflow-validation guard); auto-pass.'
+                ? `${EXEMPT_MARKER}PR edits .github/workflows/** — Claude Code Review cannot run (workflow-validation guard); auto-pass.`
                 : 'Awaiting Claude Code Review to post its findings.';
 
             await github.rest.repos.createCommitStatus({
@@ -300,21 +343,30 @@ jobs:
               return;
             }
 
-            // #605 fold 2: never clobber a gate that already reads
-            // `success`. A stamped exemption (Dependabot / workflow-editing
-            // PR, from stamp-on-pr) or a prior successful flip already owns
-            // this sha — a later completion of any kind (including this
-            // PR's own claude-review, which fails-by-design on
-            // workflow-editing PRs like this one) must be a no-op. `skipped`
-            // (Dependabot's structural, permanent conclusion — its
-            // claude-review job always skips via
-            // `if: actor != dependabot[bot]`, never a race artifact) is
-            // covered here too, not by retrying a job that can never run.
+            // #605 fold 2 / round 3, LOAD-BEARING: never clobber a gate that
+            // already reads a genuinely EXEMPT `success` — but do NOT
+            // blindly trust every `success` (round 3's fix). stamp-on-pr
+            // prefixes its two exemption stamps (Dependabot / workflow-
+            // editing PR — the only classes where claude-review structurally
+            // cannot run) with the exact marker `[exempt] ` in the status
+            // description; that's the only `success` this check no-ops on.
+            // A NON-exempt `success` is a real flip (possibly a STALE one —
+            // e.g. a draft-time success sitting in front of a ready-toggle's
+            // `pending` re-stamp that hasn't landed yet) and must NOT
+            // suppress a self-heal: it falls through to the normal ownership
+            // checks below, where newest-run-wins (round 2) makes every
+            // remaining ordering safe on its own.
+            const EXEMPT_MARKER = '[exempt] ';
             const combined = await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sha });
             const currentGate = combined.data.statuses.find((s) => s.context === 'review-gate');
-            if (currentGate && currentGate.state === 'success') {
+            if (
+              currentGate &&
+              currentGate.state === 'success' &&
+              typeof currentGate.description === 'string' &&
+              currentGate.description.startsWith(EXEMPT_MARKER)
+            ) {
               core.info(
-                `review-gate: ${run.conclusion} run ${run.id} on ${sha} — gate already reads success (exemption stamp or a prior flip); no-op.`,
+                `review-gate: ${run.conclusion} run ${run.id} on ${sha} — gate already reads success via a stamped EXEMPTION ("${currentGate.description}"); no-op.`,
               );
               return;
             }
