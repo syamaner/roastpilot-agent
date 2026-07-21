@@ -5,6 +5,7 @@ import {
   fieldEvidenceFor,
   fieldSourceFor,
   PROVENANCE_TRACKED_FIELDS,
+  withFieldEdited,
   type BeanProfileDraft,
   type ProvenanceTrackedField,
 } from "./beanProfileDraft";
@@ -99,5 +100,55 @@ describe("fieldEvidenceFor (#627)", () => {
     expect([...PROVENANCE_TRACKED_FIELDS].sort()).toEqual(
       ["altitude_m", "bean_species", "is_blend", "processing"].sort(),
     );
+  });
+});
+
+describe("withFieldEdited (#627 Codex round-2: clear-on-edit)", () => {
+  it("applies the new value AND clears that field's provenance + evidence", () => {
+    const draft = draftWith(
+      { altitude_m: "origin_estimated", processing: "on_page" },
+      { altitude_m: "Grown at 1900-2100 masl", processing: "Washed" },
+    );
+    const next = withFieldEdited(draft, "altitude_m", "1234");
+    expect(next.altitude_m).toBe("1234");
+    expect(next.field_sources).not.toHaveProperty("altitude_m");
+    expect(next.field_evidence).not.toHaveProperty("altitude_m");
+    // The sibling field's provenance/evidence is untouched.
+    expect(next.field_sources?.processing).toBe("on_page");
+    expect(next.field_evidence?.processing).toBe("Washed");
+  });
+
+  it("clears a free-text field's field_sources entry likewise (not just the four typed fields)", () => {
+    const draft = draftWith({ bean_varietal: "origin_estimated" }, {});
+    const next = withFieldEdited(draft, "bean_varietal", "Heirloom");
+    expect(next.bean_varietal).toBe("Heirloom");
+    expect(next.field_sources).not.toHaveProperty("bean_varietal");
+  });
+
+  it("clears is_blend's provenance/evidence via the boolean setter path", () => {
+    const draft = draftWith(
+      { is_blend: "origin_estimated" },
+      { is_blend: "This is a single-origin lot" },
+    );
+    const next = withFieldEdited(draft, "is_blend", true);
+    expect(next.is_blend).toBe(true);
+    expect(next.field_sources).not.toHaveProperty("is_blend");
+    expect(next.field_evidence).not.toHaveProperty("is_blend");
+  });
+
+  it("produces the SAME field_sources/field_evidence reference when the edited field carries none (no spurious churn)", () => {
+    const draft = draftWith({ processing: "on_page" }, { processing: "Washed" });
+    // Editing altitude_m, which has no provenance/evidence entry here.
+    const next = withFieldEdited(draft, "altitude_m", "1500");
+    expect(next.altitude_m).toBe("1500");
+    expect(next.field_sources).toBe(draft.field_sources);
+    expect(next.field_evidence).toBe(draft.field_evidence);
+  });
+
+  it("is a no-op on field_sources/field_evidence when the draft carries neither map at all", () => {
+    const next = withFieldEdited(DEFAULT_BEAN_PROFILE_DRAFT, "name", "House blend");
+    expect(next.name).toBe("House blend");
+    expect(next.field_sources).toBeUndefined();
+    expect(next.field_evidence).toBeUndefined();
   });
 });

@@ -125,6 +125,39 @@ export function fieldEvidenceFor(
   return draft.field_evidence?.[field];
 }
 
+/**
+ * Applies an operator edit to `field` on the draft, immutably — AND drops
+ * that field's `field_sources`/`field_evidence` entries, if any (#627
+ * Codex round-2): provenance describes the value the server EXTRACTED from
+ * the vendor page; once the operator edits the field, carrying the old
+ * badge/quote forward would falsely attribute the operator's new value to
+ * the vendor page. Applies to every keyed field, not just the four typed
+ * ones — a `field_sources`-tracked free-text field (e.g. `bean_varietal`)
+ * is subject to the same false-attribution risk.
+ *
+ * Only rebuilds a map when it actually carries an entry for this field, so
+ * editing an untracked field (the common case — no draft-from-URL flow is
+ * wired up yet) leaves `field_sources`/`field_evidence` at the SAME
+ * reference as before: no spurious object churn for anything memoised on
+ * them.
+ */
+export function withFieldEdited<K extends keyof BeanProfileDraft>(
+  draft: BeanProfileDraft,
+  field: K,
+  value: BeanProfileDraft[K],
+): BeanProfileDraft {
+  const next: BeanProfileDraft = { ...draft, [field]: value };
+  if (draft.field_sources !== undefined && field in draft.field_sources) {
+    const { [field as string]: _removed, ...rest } = draft.field_sources;
+    next.field_sources = rest;
+  }
+  if (draft.field_evidence !== undefined && field in draft.field_evidence) {
+    const { [field as string]: _removed, ...rest } = draft.field_evidence;
+    next.field_evidence = rest;
+  }
+  return next;
+}
+
 /** Field-level validation errors, keyed by draft field. */
 export type BeanProfileErrors = Partial<Record<keyof BeanProfileDraft, string>>;
 
