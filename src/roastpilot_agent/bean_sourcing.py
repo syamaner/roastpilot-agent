@@ -2022,14 +2022,16 @@ class _ExtractedBeanIdentity(BaseModel):
 
     The four ``*_evidence`` fields (#590 slice D2a) are a PARALLEL, optional
     verbatim quote alongside each TYPED field (``altitude_m``,
-    ``processing``, ``bean_species``, ``is_blend``). All four stay
-    CAPTURED-BUT-UNCONSUMED at runtime — ``altitude_m_evidence`` feeds a
-    DORMANT gate, :data:`_ALTITUDE_CITATION_GATE_ENABLED`, pending D2d;
+    ``processing``, ``bean_species``, ``is_blend``). Two of the four now
+    feed a LIVE, ENABLED gate at runtime (#590 slice E2, the story's final
+    field family): ``processing_evidence``/``bean_species_evidence`` feed
+    :func:`_quote_supports_processing`/:func:`_quote_supports_bean_species`
+    (:data:`_ENUM_CITATION_GATE_ENABLED`). The other two stay
+    CAPTURED-BUT-UNCONSUMED — ``altitude_m_evidence`` feeds a DORMANT
+    gate, :data:`_ALTITUDE_CITATION_GATE_ENABLED`, pending D2d;
     ``is_blend_evidence`` feeds a DORMANT gate too,
     :data:`_IS_BLEND_LOCALITY_GATE_ENABLED` — certification PARKED
-    PERMANENTLY (a semantic certify-bypass class, not a page-shape one);
-    and ``processing_evidence``/``bean_species_evidence`` wait for slice
-    E2.
+    PERMANENTLY (a semantic certify-bypass class, not a page-shape one).
     """
 
     name: str | None = None
@@ -2039,13 +2041,15 @@ class _ExtractedBeanIdentity(BaseModel):
     bean_varietal: str | None = None
     processing: ProcessingMethod | None = None
     processing_evidence: str | None = Field(default=None, max_length=500)
-    """A verbatim span supporting ``processing`` (#590 D2a). Captured but
-    UNCONSUMED — deferred to slice E. Bounded to
-    :data:`_MAX_JSON_LD_FIELD_CHARS`-sized (500 chars), D2a's LOW."""
+    """A verbatim span supporting ``processing`` (#590 D2a). Feeds the
+    ENABLED :func:`_quote_supports_processing` gate (#590 slice E2).
+    Bounded to :data:`_MAX_JSON_LD_FIELD_CHARS`-sized (500 chars), D2a's
+    LOW."""
     bean_species: BeanSpecies | None = None
     bean_species_evidence: str | None = Field(default=None, max_length=500)
     """A verbatim span of page text supporting ``bean_species`` (#590
-    D2a). Captured but UNCONSUMED — see ``processing_evidence``."""
+    D2a). Feeds the ENABLED :func:`_quote_supports_bean_species` gate
+    (#590 slice E2) — see ``processing_evidence``."""
     altitude_m: int | None = Field(default=None, ge=0, le=4000)
     """A single STATED altitude — never a computed midpoint of a page-given
     RANGE (#587 P2, round 6: the extraction used to average a range down to
@@ -2451,12 +2455,59 @@ _IDENTITY_FIELDS: tuple[str, ...] = (
     "description",
 )
 
-#: TYPED enum fields DEFERRED to slice E2 (#590 D2b — sound verification
-#: needs LOCALITY + conflicting-method handling flat matching can't
-#: provide safely). ``is_blend`` no longer belongs here: E1b flips it via
-#: the main-region locality + polarity gate
-#: (:func:`_quote_supports_is_blend`); these two remain demoted until E2.
-_ENUM_FIELDS_DEFERRED_TO_E: frozenset[str] = frozenset({"processing", "bean_species"})
+#: Ships ENABLED AT BIRTH (#590 slice E2, final field family in the story
+#: — see the "Field certification ledger" comment on #590) — whitelist-
+#: native from the start, same posture as E1b, unlike the altitude gate's
+#: guard-stack retrofit. PRE-DECLARED STOPPING RULE (repo precedent:
+#: #614/#615/#616 for altitude, #618/#619 for ``is_blend``): a
+#: review-round certify-bypass of the whitelist flips this constant to
+#: ``False`` and spawns a hardening slice — UNLESS the bypass is
+#: SEMANTIC (negation, disambiguation-defeating composition — the class
+#: that got ``is_blend`` PARKED PERMANENTLY, see
+#: :data:`_IS_BLEND_LOCALITY_GATE_ENABLED`), in which case the field is
+#: parked instead of patched (an enumerative negation denylist is exactly
+#: the arms race the polarity law forbids). Over-demotes never count
+#: against this stopping rule — only a false ``"on_page"`` does.
+_ENUM_CITATION_GATE_ENABLED: Final = True
+
+#: Process words a ``processing`` enum display token must sit IMMEDIATELY
+#: ADJACENT to, ±1 token in normalized token space (#590 slice E2) — a
+#: display spelling sharing its word with ordinary prose ("natural
+#: sweetness", "notes of honey") never counts as a process claim on its
+#: own; the token must actually be attached to a process word ("natural
+#: process", "Process: Natural" — the colon normalizes to a space,
+#: collapsing to the adjacent case). Applied UNIFORMLY to every method,
+#: never special-cased per value (uniformity over cleverness — see
+#: :func:`_quote_supports_processing`).
+_PROCESS_CONTEXT_WORDS: frozenset[str] = frozenset({"process", "processed", "processing", "method"})
+
+#: Every non-``"other"`` :data:`~roastpilot_agent.models.ProcessingMethod`
+#: value's DISPLAY spelling (#590 slice E2) — ``"other"`` is excluded
+#: entirely: it never verifies as a claimed value (AC E-6, permanent — it
+#: has no vendor display spelling to cite) and it names no lexical
+#: process, so it never participates as a conflicting value either.
+#: ``wet_hulled`` -> ``"wet hulled"`` is the one Literal whose underscore
+#: form differs from vendor prose; every other value's own spelling
+#: already IS its display form.
+_PROCESSING_DISPLAY_SPELLINGS: dict[str, str] = {
+    "washed": "washed",
+    "natural": "natural",
+    "honey": "honey",
+    "anaerobic": "anaerobic",
+    "wet_hulled": "wet hulled",
+}
+
+#: Every :data:`~roastpilot_agent.models.BeanSpecies` value's display
+#: spelling (#590 slice E2) — an identity mapping (no value needs
+#: re-spelling), kept as its own dict purely so the shared conflict scan
+#: (:func:`_segment_has_conflicting_enum_value`) iterates the same shape
+#: for both enum fields.
+_BEAN_SPECIES_DISPLAY_SPELLINGS: dict[str, str] = {
+    "arabica": "arabica",
+    "robusta": "robusta",
+    "liberica": "liberica",
+    "excelsa": "excelsa",
+}
 
 #: Ships DORMANT (#590 D2c, #615) — the five hardening folds (cue
 #: adjacency, suffix-only glued-m, non-metre unit rejection, the
@@ -3059,7 +3110,10 @@ def _value_is_range_endpoint(value: int, segment: str) -> bool:
 
 def _quote_supports_altitude(value: int | None, quote: str | None, corpus: str) -> bool:
     """Whether ``quote`` genuinely supports ``value`` for ``altitude_m``
-    (#590 D2b/D2c — see :data:`_ENUM_FIELDS_DEFERRED_TO_E`). Three
+    (#590 D2b/D2c — ships DORMANT, see
+    :data:`_ALTITUDE_CITATION_GATE_ENABLED`; ``processing``/``bean_species``
+    verify via the separate, ENABLED :func:`_quote_supports_processing`/
+    :func:`_quote_supports_bean_species` gates, #590 slice E2). Three
     conditions: (1) an AUTHENTIC single-segment page span
     (:func:`_find_authentic_segment`), (2) the value is not a RANGE
     endpoint on that segment (:func:`_value_is_range_endpoint`, fold 5),
@@ -3503,6 +3557,236 @@ def _quote_supports_is_blend(
         return False
 
 
+# --- #590 slice E2: fail-closed enum (processing/bean_species) citation
+# gate — the final field family in the story (see #590's "Field
+# certification ledger" comment). Reuses E1's _main_product_region and
+# _find_authentic_segment unchanged; adds display-spelling
+# value-derivation, a process-word adjacency cue (processing only), and a
+# segment-scoped symmetric conflicting-value exclusion shared by both
+# fields.
+
+
+def _phrase_token_spans(
+    phrase_tokens: tuple[str, ...], corpus_tokens: list[str]
+) -> list[tuple[int, int]]:
+    """Every contiguous index span (inclusive, ``(start, end)``) in
+    ``corpus_tokens`` where ``phrase_tokens`` matches whole-word (#590
+    slice E2) — the token-POSITION analogue of :func:`_contains_whole_phrase`.
+    Needed here (unlike D1's free-text containment, which only needs a
+    bool) because :func:`_display_token_has_process_cue` must inspect the
+    token immediately either side of a match, not just whether one exists.
+
+    Args:
+        phrase_tokens: The already-normalized, already-split needle, e.g.
+            ``("wet", "hulled")``.
+        corpus_tokens: The already-normalized, already-split haystack.
+
+    Returns:
+        Every matching span; empty when ``phrase_tokens`` is empty or has
+        no match.
+    """
+    width = len(phrase_tokens)
+    if width == 0:
+        return []
+    return [
+        (start, start + width - 1)
+        for start in range(len(corpus_tokens) - width + 1)
+        if tuple(corpus_tokens[start : start + width]) == phrase_tokens
+    ]
+
+
+def _display_token_has_process_cue(
+    display_tokens: tuple[str, ...], quote_tokens: list[str]
+) -> bool:
+    """Whether some occurrence of ``display_tokens`` in ``quote_tokens``
+    sits IMMEDIATELY ADJACENT — one token before or after, in normalized
+    token space — to a :data:`_PROCESS_CONTEXT_WORDS` member (#590 slice
+    E2). "natural process", "Process: Natural" (the colon normalizes to a
+    space, collapsing to the adjacent case), "honey processed", and
+    "washed method" all verify this way; "natural sweetness" and "notes
+    of honey" never do, since neither token touching the display spelling
+    is a process word.
+
+    Args:
+        display_tokens: The enum's display spelling, normalized and
+            split, e.g. ``("wet", "hulled")``.
+        quote_tokens: The evidence quote, normalized and split.
+
+    Returns:
+        ``True`` if any match is adjacent to a process word on either
+        side.
+    """
+    for start, end in _phrase_token_spans(display_tokens, quote_tokens):
+        before = quote_tokens[start - 1] if start > 0 else ""
+        after = quote_tokens[end + 1] if end + 1 < len(quote_tokens) else ""
+        if before in _PROCESS_CONTEXT_WORDS or after in _PROCESS_CONTEXT_WORDS:
+            return True
+    return False
+
+
+def _segment_has_conflicting_enum_value(
+    value: str, segment_tokens: list[str], display_spellings: dict[str, str]
+) -> bool:
+    """Whether ``segment_tokens`` — the FULL authentic segment, not just
+    the quote — whole-word-contains some OTHER value's display spelling
+    (#590 slice E2). The SYMMETRIC conflicting-value exclusion: "the
+    washed process preserves natural sweetness" certifies neither
+    ``washed`` nor ``natural``, and "80% Arabica, 20% Robusta" certifies
+    neither species — a single-valued field cannot honestly certify a
+    claim its own segment contradicts (AC E-7).
+
+    Args:
+        value: The claimed enum value — excluded from the conflict scan.
+        segment_tokens: The authentic segment's normalized, split tokens
+            (:func:`_find_authentic_segment`'s return, normalized).
+        display_spellings: :data:`_PROCESSING_DISPLAY_SPELLINGS` or
+            :data:`_BEAN_SPECIES_DISPLAY_SPELLINGS` — also the conflict
+            scan's universe.
+
+    Returns:
+        ``True`` if any other value's display spelling appears whole-word
+        in the segment.
+    """
+    return any(
+        _phrase_token_spans(tuple(other_display.split()), segment_tokens)
+        for other_value, other_display in display_spellings.items()
+        if other_value != value
+    )
+
+
+def _quote_supports_enum_value(
+    value: str | None,
+    quote: str | None,
+    main_region_text: str,
+    display_spellings: dict[str, str],
+    *,
+    require_process_cue: bool,
+) -> bool:
+    """Shared core for :func:`_quote_supports_processing` and
+    :func:`_quote_supports_bean_species` (#590 slice E2) — see either
+    wrapper's docstring for the field-specific rules. Holds the common
+    shape: authenticity+locality (one check, :func:`_find_authentic_segment`
+    reused unchanged from D2b/E1b), value-derivation against the QUOTE, an
+    optional process-word cue (processing only), and the segment-scoped
+    symmetric conflict exclusion (both fields). Fails SOFT on any defect —
+    never raises out of a draft.
+
+    Args:
+        value: The claimed enum value, or ``None`` (never verifies).
+        quote: The model's verbatim evidence quote, or ``None``.
+        main_region_text: :func:`_main_product_region`'s output for this
+            page — E-gated quotes authenticate against this, never the
+            whole page corpus.
+        display_spellings: The full display-spelling map for this enum —
+            also the conflict-scan universe.
+        require_process_cue: ``True`` for ``processing``; ``False`` for
+            ``bean_species`` (see :func:`_quote_supports_bean_species`'s
+            docstring for why the asymmetry is safe).
+
+    Returns:
+        ``True`` only when every applicable condition holds; ``False``
+        otherwise.
+    """
+    if value is None or not quote:
+        return False
+    display = display_spellings.get(value)
+    if display is None:  # pragma: no cover - defensive: unreachable via either public wrapper
+        # (_quote_supports_processing already rejects "other" before calling
+        # in; every remaining ProcessingMethod/BeanSpecies Literal member is
+        # a key in its display-spelling map).
+        return False
+    try:
+        raw_quote = quote.strip()
+        if not raw_quote:
+            return False
+        segment = _find_authentic_segment(raw_quote, main_region_text)
+        if segment is None:
+            return False  # not a genuine single-segment main-region quote
+        quote_tokens = _normalize_for_containment(raw_quote).split()
+        display_tokens = tuple(display.split())
+        if not _phrase_token_spans(display_tokens, quote_tokens):
+            return False  # value-derivation: display spelling not IN the quote
+        if require_process_cue and not _display_token_has_process_cue(display_tokens, quote_tokens):
+            return False
+        segment_tokens = _normalize_for_containment(segment).split()
+        return not _segment_has_conflicting_enum_value(value, segment_tokens, display_spellings)
+    except Exception:  # pragma: no cover - defensive: citation gate must fail soft, never raise
+        return False
+
+
+def _quote_supports_processing(value: str | None, quote: str | None, main_region_text: str) -> bool:
+    """Whether ``quote`` genuinely supports ``value`` for ``processing``
+    (#590 slice E2 — the last field family in the story; see #590's
+    "Field certification ledger" comment). ``"other"`` NEVER verifies (AC
+    E-6, permanent — it has no vendor display spelling to cite).
+    Otherwise verifies iff ALL of:
+
+    1. ``quote`` authenticates as a single, whole-phrase segment within
+       ``main_region_text`` (:func:`_find_authentic_segment`, reused
+       unchanged from D2b/E1b — authenticity and locality collapse into
+       this one check).
+    2. ``value``'s enum display spelling
+       (:data:`_PROCESSING_DISPLAY_SPELLINGS`) appears whole-word in the
+       normalized quote.
+    3. that display token sits IMMEDIATELY ADJACENT to a process word
+       (:func:`_display_token_has_process_cue`,
+       :data:`_PROCESS_CONTEXT_WORDS`) — applied UNIFORMLY to every
+       method, never special-cased per value.
+    4. no OTHER method's display spelling appears whole-word anywhere in
+       the SAME authentic segment
+       (:func:`_segment_has_conflicting_enum_value`, segment-scoped and
+       symmetric).
+
+    Args:
+        value: The extracted ``processing`` value, or ``None``.
+        quote: The model's verbatim ``processing_evidence`` span, or
+            ``None``.
+        main_region_text: :func:`_main_product_region`'s output for this
+            page.
+
+    Returns:
+        ``True`` only when all conditions hold; ``False`` otherwise —
+        including, unconditionally, for ``value == "other"``.
+    """
+    if value == "other":
+        return False
+    return _quote_supports_enum_value(
+        value, quote, main_region_text, _PROCESSING_DISPLAY_SPELLINGS, require_process_cue=True
+    )
+
+
+def _quote_supports_bean_species(
+    value: str | None, quote: str | None, main_region_text: str
+) -> bool:
+    """Whether ``quote`` genuinely supports ``value`` for ``bean_species``
+    (#590 slice E2). Identical to :func:`_quote_supports_processing` minus
+    the process-word cue (its condition 3): arabica/robusta/liberica/
+    excelsa are self-disambiguating tokens with no generic-adjective
+    collision to guard against — unlike "natural"/"honey", which double
+    as ordinary English words, a bare species name is not independently a
+    common noun/adjective in vendor prose, so recognition strength here
+    scales with TOKEN AMBIGUITY: requiring an attached cue word for an
+    already-unambiguous token would only over-demote for no safety gain.
+    The conflict exclusion still applies unchanged (AC E-7): a
+    single-valued field cannot certify a mixed-species claim, e.g. "80%
+    Arabica, 20% Robusta" certifies neither.
+
+    Args:
+        value: The extracted ``bean_species`` value, or ``None``.
+        quote: The model's verbatim ``bean_species_evidence`` span, or
+            ``None``.
+        main_region_text: :func:`_main_product_region`'s output for this
+            page.
+
+    Returns:
+        ``True`` only when authenticity+locality, value-derivation, and
+        the conflict exclusion all hold; ``False`` otherwise.
+    """
+    return _quote_supports_enum_value(
+        value, quote, main_region_text, _BEAN_SPECIES_DISPLAY_SPELLINGS, require_process_cue=False
+    )
+
+
 def _draft_from_identity(
     identity: _ExtractedBeanIdentity,
     *,
@@ -3530,10 +3814,16 @@ def _draft_from_identity(
     it keeps the original presence-only tagging. ``altitude_m`` never runs
     through the containment matcher — its citation gate ships DORMANT
     (:data:`_ALTITUDE_CITATION_GATE_ENABLED`), so it demotes
-    unconditionally today like ``processing``/``bean_species``
-    (:data:`_ENUM_FIELDS_DEFERRED_TO_E`, deferred to slice E2). ``is_blend``
-    also demotes unconditionally: its main-region locality + polarity
-    gate (:func:`_quote_supports_is_blend`) ships DORMANT
+    unconditionally today. ``processing``/``bean_species`` instead verify
+    via the ENABLED :func:`_quote_supports_processing`/
+    :func:`_quote_supports_bean_species` gates (:data:`_ENUM_CITATION_GATE_ENABLED`,
+    #590 slice E2 — the story's final field family): quote authenticity +
+    main-region locality (:func:`_find_authentic_segment`, reused from
+    D2b/E1b), enum display-spelling value-derivation, a process-word
+    adjacency cue (processing only), and a segment-scoped symmetric
+    conflicting-value exclusion. ``is_blend`` demotes unconditionally:
+    its main-region locality + polarity gate
+    (:func:`_quote_supports_is_blend`) ships DORMANT
     (:data:`_IS_BLEND_LOCALITY_GATE_ENABLED`) — an independent
     security-reviewer pass found a semantic certify-bypass class
     (negation/composition/collection-membership chrome) the lexical
@@ -3552,9 +3842,11 @@ def _draft_from_identity(
     at all (:func:`draft_bean_profile_from_url` rejects those outright,
     before any fetch). The vendor page itself is still fetched with the
     REAL, un-redacted URL — only what is returned/persisted is redacted.
-    None of ``identity``'s four ``*_evidence`` quotes (#590 D2a) affect
-    provenance at runtime — all four gates (``is_blend_evidence``
-    included, see above) stay dormant/deferred.
+    Two of ``identity``'s four ``*_evidence`` quotes now affect provenance
+    at runtime (#590 slice E2): ``processing_evidence``/
+    ``bean_species_evidence`` feed the ENABLED enum gates above. The other
+    two (``altitude_m_evidence``/``is_blend_evidence``) stay dormant/
+    parked, see above.
 
     Args:
         identity: The provider's page-only extraction, including its four
@@ -3650,7 +3942,8 @@ def _draft_from_identity(
     # The main product region (#590 slice E1b) — computed ONCE, over the
     # BODY-only ``corpus`` plus ``json_ld_values``/``json_ld_name`` unioned
     # in separately (see _main_product_region); reused by the is_blend
-    # gate below and, in a future slice, by processing/bean_species (E2).
+    # gate below and, per #590 slice E2, by the processing/bean_species
+    # gates in the loop below.
     main_region = _main_product_region(corpus, json_ld_values, json_ld_name)
     title, _rest = _frontmatter_title_and_body(corpus)
     anchor_names_blend = _contains_whole_phrase(
@@ -3668,9 +3961,24 @@ def _draft_from_identity(
             # see the function docstring for why.
             field_sources[field_name] = "on_page"
             continue
-        if field_name in _ENUM_FIELDS_DEFERRED_TO_E:
-            # Demoted unconditionally — see _ENUM_FIELDS_DEFERRED_TO_E.
-            field_sources[field_name] = "origin_estimated"
+        if field_name == "processing":
+            # ENABLED (#590 slice E2, _ENUM_CITATION_GATE_ENABLED) —
+            # quote authenticity+locality, display-spelling
+            # value-derivation, a process-word cue, and the segment-scoped
+            # conflicting-method exclusion.
+            gate_verdict = _ENUM_CITATION_GATE_ENABLED and _quote_supports_processing(
+                identity.processing, identity.processing_evidence, main_region
+            )
+            field_sources[field_name] = "on_page" if gate_verdict else "origin_estimated"
+            continue
+        if field_name == "bean_species":
+            # ENABLED (#590 slice E2) — same as processing, minus the
+            # process-word cue (arabica/robusta/liberica/excelsa are
+            # self-disambiguating tokens).
+            gate_verdict = _ENUM_CITATION_GATE_ENABLED and _quote_supports_bean_species(
+                identity.bean_species, identity.bean_species_evidence, main_region
+            )
+            field_sources[field_name] = "on_page" if gate_verdict else "origin_estimated"
             continue
         if field_name == "altitude_m":
             # DORMANT (_ALTITUDE_CITATION_GATE_ENABLED) — ``and`` short-
