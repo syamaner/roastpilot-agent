@@ -91,6 +91,20 @@ describe("BeanProfileFields draft-review provenance + evidence (#627b)", () => {
     expect(container.innerHTML).not.toContain("<script>alert(1)</script>");
   });
 
+  it("bidi-isolates the quote text against a bidi-override character (security)", () => {
+    // U+202E (RIGHT-TO-LEFT OVERRIDE) could otherwise visually invert this
+    // quoted-authority framing ("page says: ...") without changing the
+    // underlying (still-escaped) text.
+    const hostile = "‮normal-looking text that renders reversed";
+    renderFields({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      field_evidence: { processing: hostile },
+    });
+    const quoteText = screen.getByTestId(`${PREFIX}-processing-evidence-text`);
+    expect(quoteText).toHaveAttribute("dir", "ltr");
+    expect(quoteText).toHaveTextContent(hostile);
+  });
+
   it("renders the quote for each of the four typed fields under its own field", () => {
     renderFields({
       ...DEFAULT_BEAN_PROFILE_DRAFT,

@@ -71,7 +71,11 @@ function ProvenanceBadge({ source }: { source: FieldSourceValue }): React.JSX.El
  * with an expand toggle for the rare long quote (server-bounded to 500
  * chars) — mirrors the `DecisionTraceTable` rationale clamp pattern; the
  * full quote is always present in the DOM/accessibility tree, clamp is
- * visual only.
+ * visual only. The quote span is bidi-isolated (`dir="ltr"` +
+ * `unicode-bidi: isolate`) so a U+202E (or other bidi-override) character in
+ * the vendor text cannot visually invert this quoted-authority framing, and
+ * carries `break-words` so a long unbroken token never paints outside the
+ * flex box once expanded (security review, #627).
  */
 function EvidenceQuote({ quote, testId }: { quote: string; testId: string }): React.JSX.Element {
   const [expanded, setExpanded] = useState(false);
@@ -83,7 +87,14 @@ function EvidenceQuote({ quote, testId }: { quote: string; testId: string }): Re
     >
       <span className="min-w-0">
         <span className="font-semibold not-italic">Page says: </span>
-        <span className={cn("italic", !expanded && "line-clamp-2")}>
+        <span
+          dir="ltr"
+          data-testid={`${testId}-text`}
+          className={cn(
+            "italic break-words [unicode-bidi:isolate]",
+            !expanded && "line-clamp-2",
+          )}
+        >
           &ldquo;{quote}&rdquo;
         </span>
       </span>
