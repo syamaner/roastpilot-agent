@@ -194,9 +194,13 @@ leak a slot when its release hopped onto an already-closed loop) tells a
 new call to skip the markdown attempt immediately — falling back to the
 linear-strip pass at once — when both dedicated workers are already busy,
 rather than waiting out its own timeout for nothing. A submission failure
-(e.g. a thread-limit ``OSError`` on a resource-constrained host) releases
-the reserved slot and falls back the same way, never escaping this
-function's fail-soft contract.
+(e.g. a thread-limit ``OSError`` on a resource-constrained host) discards
+and replaces the (possibly poisoned) executor
+(:func:`_replace_poisoned_parse_executor` — #607 fold 2: ``submit()``
+enqueues its work item before the call that can raise, so a release-only
+handler leaves a hidden queued parse behind for a later thread start to
+run anyway), releases the reserved slot, and falls back the same way —
+never escaping this function's fail-soft contract.
 """
 
 from __future__ import annotations
@@ -822,6 +826,26 @@ def _sanitize_trafilatura_frontmatter(markdown: str) -> str:
 # whichever thread touches it (the event-loop thread for admission, the
 # worker thread itself for release) — no ``call_soon_threadsafe``, no
 # loop reference carried anywhere, nothing that can go stale.
+#
+# #607 fold 2 (Codex round 2, PR #629): fold 1's submission-failure path
+# freed the reserved SLOT but left the underlying executor untouched —
+# and ``ThreadPoolExecutor.submit()`` (CPython, verified directly against
+# the stdlib source) puts the work item on its internal, UNBOUNDED
+# ``_work_queue`` BEFORE calling ``_adjust_thread_count()`` (the call that
+# can raise, e.g. ``OSError: can't start new thread`` on a
+# resource-constrained host — the Raspberry Pi target). ``submit()``
+# gives the caller no handle to that work item on raise — there is no
+# future to inspect or cancel directly — so fold 1's handler could free
+# the SLOT but had no way to reach the now-hidden queued item itself: a
+# LATER successful thread start on that SAME executor would eventually
+# pop and execute it anyway, holding a full HTML payload the admission
+# accounting no longer knew about. Repeated failures accumulate more such
+# unaccounted, queued parses. The fix is DISCARD-AND-REPLACE, not
+# queue-surgery: :func:`_replace_poisoned_parse_executor` shuts the
+# poisoned executor down with ``cancel_futures=True`` (3.9+ — the
+# supported way to drain a queue and CANCEL every pending work item's
+# future, so nothing hidden ever runs) and resets the module singleton to
+# ``None`` so the next call lazily builds a fresh, clean executor.
 
 #: Worker count for the dedicated parse pool. Two, matching the existing
 #: concurrency-1 draft semaphore (``api._draft_bean_from_url_semaphore``)
@@ -831,6 +855,14 @@ def _sanitize_trafilatura_frontmatter(markdown: str) -> str:
 _MAX_CONCURRENT_PARSES: Final[int] = 2
 
 _parse_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+#: Guards every read/create/replace of the :data:`_parse_executor`
+#: singleton (#607 fold 2) — distinct from :data:`_parse_slot_lock`, which
+#: guards the in-flight COUNT, not the executor object itself. Held only
+#: for the brief singleton read-or-create in :func:`_get_parse_executor`
+#: and the shutdown-and-reset in :func:`_replace_poisoned_parse_executor`
+#: — never across ``submit()`` or the parse itself.
+_parse_executor_lock = threading.Lock()
 
 #: Guards every read-modify-write of :data:`_inflight_parse_count` — the
 #: only role this lock plays. It is held ONLY for the plain-int mutation
@@ -860,11 +892,18 @@ _inflight_parse_count: int = 0
 
 def _get_parse_executor() -> concurrent.futures.ThreadPoolExecutor:
     """Return the module-owned, lazily-created dedicated parse executor
-    (#607), creating it on first use.
+    (#607), creating it on first use — or recreating it after
+    :func:`_replace_poisoned_parse_executor` has reset the singleton to
+    ``None`` (#607 fold 2).
 
-    Safe without a lock: every caller runs on the single asyncio
-    event-loop thread, and nothing between the ``is None`` check and the
-    assignment ``await``s — so no second creation can interleave.
+    Guarded by :data:`_parse_executor_lock`: fold 1 reasoned this was safe
+    lock-free because every caller ran on the single event-loop thread
+    with no ``await`` between the check and the assignment — still true,
+    but fold 2 added a SECOND writer of the same singleton
+    (:func:`_replace_poisoned_parse_executor`, called from the same
+    event-loop thread's exception handler), so the read-or-create here
+    and that reset now share one lock rather than relying on ordering
+    alone.
 
     Returns:
         The process-wide dedicated executor for trafilatura markdown
@@ -874,12 +913,54 @@ def _get_parse_executor() -> concurrent.futures.ThreadPoolExecutor:
         enumeration) share.
     """
     global _parse_executor
-    if _parse_executor is None:
-        _parse_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=_MAX_CONCURRENT_PARSES,
-            thread_name_prefix="bean-sourcing-parse",
-        )
-    return _parse_executor
+    with _parse_executor_lock:
+        if _parse_executor is None:
+            _parse_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_MAX_CONCURRENT_PARSES,
+                thread_name_prefix="bean-sourcing-parse",
+            )
+        return _parse_executor
+
+
+def _replace_poisoned_parse_executor(poisoned: concurrent.futures.ThreadPoolExecutor) -> None:
+    """Discard ``poisoned`` and reset the module singleton so the NEXT
+    call to :func:`_get_parse_executor` lazily builds a fresh one (#607
+    fold 2).
+
+    Called from :func:`_extract_page_markdown_bounded`'s submission-failure
+    handler, BEFORE that handler releases the reserved slot (order
+    matters: replacing the singleton first closes the window where a
+    racing admission could still grab the poisoned executor between a
+    slot release and this replacement).
+
+    **Why replacement, not queue-surgery.** A failed ``submit()`` gives
+    the caller no reference to the work item it already enqueued (CPython
+    puts it on ``_work_queue`` before the call that can raise — see the
+    module-level comment above :data:`_MAX_CONCURRENT_PARSES`), so there
+    is nothing to individually cancel or remove even if this module
+    reached into the executor's private queue. ``shutdown(cancel_futures=True)``
+    (3.9+) is the SUPPORTED mechanism for draining an executor's queue and
+    CANCELLING every pending work item's future in one call — the whole
+    poisoned instance (queue included) is discarded rather than
+    surgically repaired.
+
+    ``wait=False``: returns immediately rather than blocking on any
+    thread that happens to already be running — a hung worker from a
+    PRIOR successful submission on this same executor keeps running
+    regardless (this module never claimed it could kill a running
+    thread), and its own already-registered completion callback still
+    fires and releases its slot normally when it eventually finishes;
+    capacity accounting stays sound because that accounting lives in the
+    process-wide counter, not in the executor object being discarded here.
+
+    Args:
+        poisoned: The executor instance whose ``submit()`` just raised.
+    """
+    global _parse_executor
+    with _parse_executor_lock:
+        poisoned.shutdown(wait=False, cancel_futures=True)
+        if _parse_executor is poisoned:
+            _parse_executor = None
 
 
 def _release_parse_slot(_future: concurrent.futures.Future[str | None]) -> None:
@@ -932,16 +1013,24 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
        queuing behind the saturated pool and waiting out its own
        ``timeout_seconds`` for nothing.
 
-    **Submission failure (#607 fold 1)** — e.g. ``OSError: can't start new
-    thread`` on a resource-constrained host (the Raspberry Pi target) —
-    is caught around ``submit()``/``add_done_callback()`` together: on
-    ANY exception there, the just-reserved slot is released immediately
-    (nothing will ever call the completion callback, since no future was
-    ever created/registered) and the call falls back to linear-strip, the
-    same as every other extraction failure mode. Without this, a
-    submission failure would both raise past this function's documented
-    fail-soft contract AND permanently leak the slot it had already
-    reserved.
+    **Submission failure (#607 fold 1, hardened fold 2)** — e.g.
+    ``OSError: can't start new thread`` on a resource-constrained host
+    (the Raspberry Pi target) — is caught around
+    ``submit()``/``add_done_callback()`` together. On ANY exception
+    there, in order: (1) the executor is treated as POISONED and
+    discarded/replaced (:func:`_replace_poisoned_parse_executor` — fold 2
+    found that ``submit()`` enqueues its work item BEFORE the call that
+    can raise, so a released slot alone left a hidden, unaccounted-for
+    queued parse behind on the SAME executor for a later successful
+    thread start to run anyway); (2) the just-reserved slot is released
+    (nothing will ever call the completion callback for THIS attempt,
+    since no future was ever created/registered); (3) the call falls back
+    to linear-strip, the same as every other extraction failure mode.
+    Without step 1, a submission failure would leave a hidden queued
+    payload behind even though the slot accounting reported it free;
+    without steps 2–3, it would both raise past this function's
+    documented fail-soft contract and permanently leak the slot it had
+    already reserved.
 
     Either remaining branch returns exactly like the pre-#607 call site:
     ``None`` tells the caller to fall back to the linear-strip pass
@@ -974,20 +1063,27 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
             return None
         _inflight_parse_count += 1
 
+    executor = _get_parse_executor()
     try:
-        concurrent_future = _get_parse_executor().submit(_extract_page_markdown, html)
+        concurrent_future = executor.submit(_extract_page_markdown, html)
         concurrent_future.add_done_callback(_release_parse_slot)
     except Exception:
-        # Submission itself failed — no future was ever created/registered,
-        # so no completion callback will EVER fire to release the slot
-        # reserved above. Release it here instead, and fall back to
-        # linear-strip: the request must stay inside this function's
-        # documented fail-soft envelope regardless of WHERE a failure
-        # happens (checklist class 4/6).
+        # Submission itself failed. CPython's ThreadPoolExecutor.submit()
+        # enqueues the work item BEFORE the call that can raise (#607 fold
+        # 2 — see the module-level comment above _MAX_CONCURRENT_PARSES),
+        # so this executor may now hold a HIDDEN queued parse this
+        # function has no future/handle to individually cancel. Replace
+        # the executor FIRST (cancels every pending work item via
+        # shutdown(cancel_futures=True) and resets the singleton so the
+        # NEXT call builds a fresh one) — order matters: doing this
+        # before releasing the slot below closes the window where a
+        # racing admission could grab the poisoned executor in between.
+        _replace_poisoned_parse_executor(executor)
         with _parse_slot_lock:
             _inflight_parse_count = max(0, _inflight_parse_count - 1)
         _log.warning(
-            "bean_sourcing: dedicated parse pool submission failed; falling back to linear-strip",
+            "bean_sourcing: dedicated parse pool submission failed; replacing the "
+            "poisoned executor and falling back to linear-strip",
             exc_info=True,
         )
         return None

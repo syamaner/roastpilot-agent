@@ -7367,12 +7367,17 @@ def test_release_parse_slot_runs_correctly_from_a_foreign_thread_with_no_event_l
 class _SubmitRaisingExecutor:
     """A test double whose ``submit`` raises immediately — simulating a
     thread-limit ``OSError`` (or any other submission-time failure) on a
-    resource-constrained host (#607 fold 1)."""
+    resource-constrained host (#607 fold 1). ``shutdown`` is a no-op: this
+    fake never creates real threads/a real queue for
+    :func:`_replace_poisoned_parse_executor` to drain."""
 
     def submit(
         self, func: Callable[[str], str | None], html: str
     ) -> concurrent.futures.Future[str | None]:
         raise OSError("can't start new thread (simulated, #607 fold 1 test)")
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        pass
 
 
 @pytest.mark.asyncio
@@ -7383,7 +7388,10 @@ async def test_extract_page_markdown_bounded_submission_failure_falls_back_and_f
     to linear-strip rather than raise past this function's fail-soft
     contract, and (b) release the slot it had just reserved — capacity
     for the VERY NEXT call must stay intact, not silently shrink by one
-    forever (#607 fold 1)."""
+    forever (#607 fold 1). See
+    ``test_extract_page_markdown_bounded_replaces_poisoned_executor_and_cancels_hidden_queue``
+    below for fold 2's executor-replacement/hidden-queue coverage, which
+    needs a REAL ``ThreadPoolExecutor`` rather than this simple fake."""
     _reset_parse_pool_state()
     monkeypatch.setattr(bean_sourcing, "_get_parse_executor", lambda: _SubmitRaisingExecutor())
     result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
@@ -7400,6 +7408,83 @@ async def test_extract_page_markdown_bounded_submission_failure_falls_back_and_f
         _SAMPLE_HTML, timeout_seconds=5.0
     )
     assert result == bean_sourcing._extract_page_markdown(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_replaces_poisoned_executor_and_cancels_hidden_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#607 fold 2 (Codex round 2): ``ThreadPoolExecutor.submit()`` puts
+    its work item on the internal queue BEFORE calling
+    ``_adjust_thread_count()`` — the call that can raise — so a
+    submission failure leaves a HIDDEN, queued work item behind on a
+    release-only handler's executor. Patches ``_adjust_thread_count`` on
+    a REAL ``ThreadPoolExecutor`` (mirroring the actual CPython failure
+    shape, verified directly against the installed ``submit()``
+    implementation — not a simplified fake) so the sentinel parse
+    callable genuinely lands on the queue before the raise. Asserts the
+    sentinel NEVER executes (not even after a settle window that would
+    have given a live worker thread every chance to pop and run it), the
+    singleton executor was REPLACED (new object identity), and the very
+    next call parses normally on the fresh executor with full capacity."""
+    _reset_parse_pool_state()
+    # Force a fresh, otherwise-untouched singleton so this test owns the
+    # executor end-to-end and isn't sharing prior submissions with
+    # whichever executor an earlier test happened to create.
+    monkeypatch.setattr(bean_sourcing, "_parse_executor", None)
+    original_executor = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+
+    executed = threading.Event()
+
+    def _sentinel_parse(html: str) -> str | None:
+        # Must NEVER run — if the hidden queued item survives
+        # cancel_futures=True, it would eventually be picked up here.
+        executed.set()
+        return "should never be observed"  # pragma: no cover
+
+    def _raising_adjust_thread_count() -> None:
+        # Reproduces the exact CPython failure shape: submit() has
+        # ALREADY called self._work_queue.put(w) by the time this raises
+        # (verified directly against ThreadPoolExecutor.submit's source),
+        # so the sentinel's work item is genuinely enqueued first.
+        raise OSError("can't start new thread (simulated, #607 fold 2 test)")
+
+    real_extract_page_markdown = bean_sourcing._extract_page_markdown  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(original_executor, "_adjust_thread_count", _raising_adjust_thread_count)
+    monkeypatch.setattr(bean_sourcing, "_extract_page_markdown", _sentinel_parse)
+
+    result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        "<html></html>", timeout_seconds=5.0
+    )
+    assert result is None
+    assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+
+    # The singleton was REPLACED, not merely reused: a fresh executor
+    # object, distinct from the poisoned one.
+    replaced_executor = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+    assert replaced_executor is not original_executor
+
+    # Settle window: give the poisoned executor's queue every reasonable
+    # chance to have run the hidden sentinel item if cancel_futures had
+    # failed to actually cancel it, then assert it never did.
+    await asyncio.sleep(0.2)
+    assert not executed.is_set(), (
+        "the hidden queued parse executed despite cancel_futures=True — "
+        "the poisoned executor was not properly drained"
+    )
+
+    # Recovery: the NEXT call, on the SAME fresh (replaced) executor,
+    # parses normally with full capacity. Restore ONLY the real
+    # _extract_page_markdown here (rather than a blanket monkeypatch.undo()
+    # — that would also revert bean_sourcing._parse_executor back to its
+    # PRE-test value, discarding the very replacement this assertion means
+    # to exercise).
+    monkeypatch.setattr(bean_sourcing, "_extract_page_markdown", real_extract_page_markdown)
+    result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        _SAMPLE_HTML, timeout_seconds=5.0
+    )
+    assert result == real_extract_page_markdown(_SAMPLE_HTML)
+    assert bean_sourcing._get_parse_executor() is replaced_executor  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
