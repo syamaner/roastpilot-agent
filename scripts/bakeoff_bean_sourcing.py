@@ -243,17 +243,21 @@ BAKEOFF_EXTRACTION_TIMEOUT_S: float = 45.0
 #: docs/advisor-bakeoff-2026-06-08.md -- gemini-3.1-flash-lite (same flash family,
 #: "enable light thinking" per the research note) and gpt-5-nano (same -nano/-mini
 #: reasoning-model family) follow suit; grok-4.3 is ambiguous -> mandatory (safe
-#: default). That same doc reports Anthropic models "don't reason by default"
-#: (reasoning-off is a no-op) -- so claude-haiku-4.5 is "none", not "optional".
-#: gpt-4o/gpt-4.1-mini are the classic non-reasoning generation ("none"). gpt-5.6-luna
-#: follows gpt-5.5's (no "-mini"/"-nano" suffix) confirmed "optional" pattern.
+#: default). gpt-4o/gpt-4.1-mini are the classic non-reasoning generation ("none").
+#: gpt-5.6-luna follows gpt-5.5's (no "-mini"/"-nano" suffix) confirmed "optional"
+#: pattern. claude-haiku-4.5 is "optional" (#601 fold round 5 FOLD 1 correction --
+#: NOT "none"): the doc only shows off-as-no-op for Anthropic models, never that
+#: light is unsupported (Haiku 4.5 supports extended thinking), and off-as-no-op is
+#: itself a genuine, distinct no-reasoning arm for a model that doesn't reason by
+#: default -- both off (no-op == true no-reasoning) and light (extended-thinking,
+#: low) are real, comparable arms here.
 MODEL_ROSTER: tuple[RosterModel, ...] = (
     RosterModel("openai/gpt-5-nano", 0.05, 0.40, "cheapest; beat this on price", "mandatory"),
     RosterModel("x-ai/grok-4.3", 0.20, 0.50, "grok-4-fast dead (404); 4.3 live", "mandatory"),
     RosterModel("google/gemini-3.1-flash-lite", 0.25, 1.00, "beats gpt-5-mini 6/8", "mandatory"),
     RosterModel("openai/gpt-5-mini", 0.25, 2.00, "ParseBench small-model reference", "mandatory"),
     RosterModel("openai/gpt-4.1-mini", 0.40, 1.60, "battle-tested strict-SO workhorse", "none"),
-    RosterModel("anthropic/claude-haiku-4.5", 1.00, 5.00, "best at deciding not to emit", "none"),
+    RosterModel("anthropic/claude-haiku-4.5", 1.00, 5.00, "best at deciding not to emit"),
     RosterModel("openai/gpt-5.6-luna", 1.00, 6.00, "strong text/table extraction (ParseBench)"),
     RosterModel("openai/gpt-4o", 2.50, 10.00, "ceiling only, no extraction edge", "none"),
 )
@@ -2835,14 +2839,17 @@ def make_sourcing_config(model_slug: str) -> BeanSourcingConfig:
 
 
 def _run_wholly_failed(run: ModelRun) -> bool:
-    """Whether every page errored with >=1 NON-schema (infra-class) failure.
+    """Whether every page errored AND NONE of the failures is a schema failure.
 
-    All-schema-failure (every page a validation-retry-exhausted malformed shape) is
-    the strongest possible non-adherence signal, not an outage -- must be scored, not
-    dropped (#601 fold round 2, F1)."""
+    ANY schema failure present (even mixed with infra failures, e.g. 8 schema + 1
+    timeout) means the run is a real outcome -- checkpoint/score it, schema_failures
+    and other_errors both recorded (#601 fold round 5, FOLD 2: the prior ``any``
+    non-schema condition wrongly dropped a mostly-schema-failure run over one
+    infra hiccup). Only an ALL-non-schema (all-timeout/-provider-error/etc.) run is
+    a genuine outage -- never checkpointed, always retried on resume."""
     if not run.pages or not all(page.error is not None for page in run.pages):
         return False
-    return any(not _is_schema_failure(page.error) for page in run.pages)
+    return not any(_is_schema_failure(page.error) for page in run.pages)
 
 
 def _has_any_success(run: ModelRun) -> bool:

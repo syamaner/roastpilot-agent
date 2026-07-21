@@ -1215,6 +1215,14 @@ def test_expand_arms_both_pairs_off_and_light_never_default() -> None:
     assert len({a.label for a in both}) == 4
 
 
+def test_model_roster_haiku_is_optional_not_none() -> None:
+    """claude-haiku-4.5 is "optional" (#601 fold round 5, FOLD 1): off-as-no-op is
+    still a genuine no-reasoning arm, and Haiku 4.5 supports extended thinking, so
+    it is NOT reasoning-incapable ("none")."""
+    haiku = next(m for m in bo.MODEL_ROSTER if m.slug == "anthropic/claude-haiku-4.5")
+    assert haiku.reasoning == "optional"
+
+
 def test_expand_arms_both_gates_arms_by_three_way_capability(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2479,6 +2487,35 @@ def test_run_wholly_failed_detects_all_errored_pages() -> None:
     assert bo._run_wholly_failed(mixed) is False  # pyright: ignore[reportPrivateUsage]
     empty = bo.ModelRun(model_slug="m", pages=[])
     assert bo._run_wholly_failed(empty) is False  # pyright: ignore[reportPrivateUsage]
+
+
+def test_run_wholly_failed_retains_a_mostly_schema_failure_run() -> None:
+    """A run with 8 schema failures + 1 infra (timeout) failure is a REAL outcome
+    (any schema failure present -> not wholly-failed), not dropped over one infra
+    hiccup; an ALL-infra run is still wholly-failed (#601 fold round 5, FOLD 2)."""
+    schema_error = "BeanExtractionUnavailableError: ... returned a malformed shape: x"
+    timeout_error = "BeanExtractionUnavailableError: ... exceeded the 45s deadline"
+    mostly_schema = bo.ModelRun(
+        model_slug="m",
+        pages=[
+            bo.PageResult(slug=f"s{i}", outcomes={}, error=schema_error, on_page_fields=0)
+            for i in range(8)
+        ]
+        + [bo.PageResult(slug="t0", outcomes={}, error=timeout_error, on_page_fields=0)],
+    )
+    assert bo._run_wholly_failed(mostly_schema) is False  # pyright: ignore[reportPrivateUsage]
+    m = bo.model_metrics(mostly_schema)
+    assert m.schema_failures == 8
+    assert m.other_errors == 1
+
+    all_infra = bo.ModelRun(
+        model_slug="m",
+        pages=[
+            bo.PageResult(slug=f"t{i}", outcomes={}, error=timeout_error, on_page_fields=0)
+            for i in range(9)
+        ],
+    )
+    assert bo._run_wholly_failed(all_infra) is True  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
