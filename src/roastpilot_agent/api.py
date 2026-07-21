@@ -40,6 +40,7 @@ from roastpilot_agent.advisor import (
 )
 from roastpilot_agent.bean_sourcing import (
     BeanExtractionError,
+    BeanExtractionUnavailableError,
     BeanFetchError,
     draft_bean_profile_from_url,
 )
@@ -3001,8 +3002,12 @@ async def draft_bean_from_url(
     the roast advisor, and returns a conservative-target draft — it never
     persists anything (saving is the existing ``POST /api/bean-profiles``
     action, driven by the operator explicitly submitting the reviewed draft).
-    A 422 on a bad/unreachable URL or a failed extraction; the detail message
-    names which. A 409 while a roast is active (#587 P1) — see
+    A 422 on a bad/unreachable URL or a client-actionable extraction failure
+    (the page yielded too little identity to draft from); the detail message
+    names which. A 503 when extraction failed for a DEPENDENCY reason — a
+    provider/transport timeout, error, or malformed output — rather than the
+    page itself (#613: origin-mapped, not a uniform 422 for every
+    ``BeanExtractionError``). A 409 while a roast is active (#587 P1) — see
     :meth:`RoastService.draft_bean_from_url`.
 
     Concurrency-bounded (#587 fix 5; fixed at 1, #587 P2 round 6): at most
@@ -3034,6 +3039,15 @@ async def draft_bean_from_url(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BeanFetchError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except BeanExtractionUnavailableError as exc:
+        # Dependency-origin failure (provider timeout/error/malformed
+        # output) — the vendor page may have been fine; a 503, not a 422
+        # accusing the caller of bad input (#613). Caught BEFORE the base
+        # ``BeanExtractionError`` below since it is a subclass.
+        raise HTTPException(
+            status_code=503,
+            detail=f"bean extraction temporarily unavailable (provider error) — try again: {exc}",
+        ) from exc
     except BeanExtractionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     finally:
