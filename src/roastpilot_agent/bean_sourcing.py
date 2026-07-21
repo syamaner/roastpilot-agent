@@ -1712,6 +1712,15 @@ class _JsonLdProductFacts:
 #: formatted, so the worst case stays tiny regardless.
 _MAX_JSON_LD_FIELD_CHARS = 500
 
+#: Per-field cap for :class:`_ExtractedBeanIdentity`'s ``description``
+#: field (#609) — wider than :data:`_MAX_JSON_LD_FIELD_CHARS` because
+#: ``description`` is intentionally short PROSE (the extraction prompt asks
+#: for 1-3 sentences), not a short name/label; the other free-text fields
+#: on that model (``name``, ``country``, ``bean_origin``, ``farm``,
+#: ``bean_varietal``) reuse :data:`_MAX_JSON_LD_FIELD_CHARS` itself for
+#: parity with the deterministic JSON-LD path.
+_MAX_DESCRIPTION_FIELD_CHARS = 2000
+
 
 def _clean_json_ld_text(value: object) -> str | None:
     """Coerce an arbitrary JSON-LD field value to a stripped, length-capped,
@@ -2364,11 +2373,29 @@ class _ExtractedBeanIdentity(BaseModel):
     evidence fields today, so the API does not yet return them.
     """
 
-    name: str | None = None
-    country: str | None = None
-    bean_origin: str | None = None
-    farm: str | None = None
-    bean_varietal: str | None = None
+    name: str | None = Field(default=None, max_length=_MAX_JSON_LD_FIELD_CHARS)
+    """The product title/bean name, as extracted from the page. Bounded to
+    :data:`_MAX_JSON_LD_FIELD_CHARS` (500 chars) for parity with the
+    deterministic JSON-LD path (#609) — the model-returned free-text fields
+    previously carried no length bound at all, unlike the four
+    ``*_evidence`` fields below (#590 D2a) and the JSON-LD extraction path
+    (:func:`_clean_json_ld_text`). An over-limit value fails this field's
+    validation; pydantic-ai retries the call, and exhausting those retries
+    surfaces as :class:`~pydantic_ai.exceptions.UnexpectedModelBehavior`,
+    mapped by :func:`_extract_bean_identity` to
+    :class:`BeanExtractionUnavailableError` (#613 — DEPENDENCY-origin, HTTP
+    503)."""
+    country: str | None = Field(default=None, max_length=_MAX_JSON_LD_FIELD_CHARS)
+    """The producing country. Bounded as :attr:`name` above (#609)."""
+    bean_origin: str | None = Field(default=None, max_length=_MAX_JSON_LD_FIELD_CHARS)
+    """The (possibly more specific) origin region. Bounded as :attr:`name`
+    above (#609)."""
+    farm: str | None = Field(default=None, max_length=_MAX_JSON_LD_FIELD_CHARS)
+    """The farm/co-op/washing station, if named. Bounded as :attr:`name`
+    above (#609)."""
+    bean_varietal: str | None = Field(default=None, max_length=_MAX_JSON_LD_FIELD_CHARS)
+    """The cultivar(s) named on the page. Bounded as :attr:`name` above
+    (#609)."""
     processing: ProcessingMethod | None = None
     processing_evidence: str | None = Field(default=None, max_length=500)
     """A verbatim span supporting ``processing`` (#590 D2a). Feeds
@@ -2402,7 +2429,14 @@ class _ExtractedBeanIdentity(BaseModel):
     plausible certify-leaks; see that constant's docstring. Bounded to
     :data:`_MAX_JSON_LD_FIELD_CHARS`-sized (500 chars), D2a's
     LOW."""
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=_MAX_DESCRIPTION_FIELD_CHARS)
+    """A short prose summary of tasting notes/process/lot detail. Bounded to
+    :data:`_MAX_DESCRIPTION_FIELD_CHARS` (2000 chars, #609) — a wider cap
+    than the other free-text fields above since this one is intentionally
+    multi-sentence prose rather than a short name/label; the extraction
+    prompt already asks for 1-3 sentences, so 2000 chars is generous
+    headroom, not a tight fit, while still bounding the field (matching the
+    JSON-LD path's own per-field discipline, :func:`_clean_json_ld_text`)."""
     is_blend: bool | None = None
     """Tri-state, not a plain ``bool`` with a False default (#587 P2): the
     page can state EITHER "this is a blend" (``True``) OR "this is a single
