@@ -519,6 +519,29 @@ def _validate_gold_value_type(slug: str, spec: FieldSpec, value: Any) -> None:
         raise AssertionError(f"unhandled FieldSpec.kind {spec.kind!r} for {spec.name!r}")
 
 
+def _validate_accept_any_of(slug: str, spec: FieldSpec, value: Any) -> None:
+    """Validate an optional gold-ABSENT ``accept_any_of`` tolerance list.
+
+    Runs at corpus-LOAD time, same as :func:`_validate_gold_value_type`, so
+    a malformed list (e.g. a non-string entry) fails fast BEFORE any paid
+    call, not partway through :func:`_tolerates_absent_value` (#602 fold 3).
+
+    Args:
+        slug: The fixture stem (for the error message).
+        spec: The field spec (for the error message).
+        value: The candidate ``accept_any_of`` payload.
+
+    Raises:
+        ValueError: If ``value`` is not a list of non-empty strings.
+    """
+    label = f"{slug}.gold.json: field {spec.name!r} 'accept_any_of'"
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a non-empty list of non-empty strings, got {value!r}")
+    items = cast("list[Any]", value)
+    if not items or not all(isinstance(v, str) and v.strip() for v in items):
+        raise ValueError(f"{label} must be a non-empty list of non-empty strings, got {value!r}")
+
+
 def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> None:
     """Validate every scored field has exactly one of ``{"value": ...}`` / ``{"absent": true}``.
 
@@ -528,7 +551,9 @@ def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> N
     and only then crashing in :func:`render_report`'s unconditional per-field
     indexing (#600 finding) -- extended in round 2 to also validate the
     ``value`` payload's TYPE (see :func:`_validate_gold_value_type`), not
-    just that the ``"value"`` key exists.
+    just that the ``"value"`` key exists, and in #602 (fold 3) to also
+    validate an optional ``accept_any_of`` tolerance list on an ABSENT field
+    (see :func:`_validate_accept_any_of`).
 
     Args:
         slug: The fixture stem (for the error message).
@@ -536,8 +561,9 @@ def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> N
 
     Raises:
         ValueError: If a required field is missing, has neither/both of
-            ``"value"``/``"absent": true``, or a present ``"value"`` has the
-            wrong type/shape for its field kind.
+            ``"value"``/``"absent": true``, a present ``"value"`` has the
+            wrong type/shape for its field kind, or a present
+            ``accept_any_of`` is not a non-empty list of non-empty strings.
     """
     for spec in FIELD_SPECS:
         field = gold_fields.get(spec.name)
@@ -555,6 +581,8 @@ def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> N
             )
         if has_value:
             _validate_gold_value_type(slug, spec, field["value"])
+        elif "accept_any_of" in field:
+            _validate_accept_any_of(slug, spec, field["accept_any_of"])
 
 
 def load_corpus(fixtures_dir: Path) -> list[CorpusPage]:
@@ -994,22 +1022,44 @@ _COMPARATORS: dict[str, Callable[[Any, Any], Outcome]] = {
 }
 
 
+def _tolerates_absent_value(tolerated: Sequence[str], model_value: str) -> bool:
+    """Whether ``model_value`` matches ANY tolerated phrase on BOTH recall
+    AND precision -- the SAME bidirectional gate :func:`_compare_text` uses
+    (#600) so a padded answer cannot earn credit for an unsupported extra
+    token. Recall alone would let "a blend of multiple origins, primarily
+    Ethiopia" match "blend of multiple origins" (every phrase word present)
+    while smuggling in an invented country (#602 fold 2); precision catches
+    the padding and fails the match.
+
+    Args:
+        tolerated: The gold-JSON ``accept_any_of`` phrase list.
+        model_value: The model's extracted (non-empty) text value.
+
+    Returns:
+        Whether any phrase matches on both axes.
+    """
+    for phrase in tolerated:
+        recall = word_bag_recall([phrase], model_value)
+        precision_ = word_bag_precision([phrase], model_value)
+        if recall >= _WORDBAG_COR_RECALL and precision_ >= _WORDBAG_COR_PRECISION:
+            return True
+    return False
+
+
 def _classify_absent_field(gold_field: dict[str, Any], model_value: object | None) -> Outcome:
     """Score a gold-ABSENT field, honouring an optional ``accept_any_of`` tolerance.
 
     A field is gold-ABSENT either because the vendor page gives nothing to
-    say (the ordinary abstention-correctness case), or because it is
-    absent-because-UNKNOWABLE -- e.g. a blend's ``origin`` has no single
-    country, so a model that faithfully answers "a blend of multiple
-    origins" has not hallucinated a specific (wrong) country and must not be
-    scored the same as one that invents "Ethiopia" (#602 gold-label
-    nuance). ``accept_any_of`` (an optional gold-JSON list of tolerated
-    phrases) lets a labeller mark those cases: a model value that word-bag-
-    matches ANY tolerated phrase scores ``ABS_COR`` -- the SAME credit as a
-    plain abstention, neither rewarded as if it named a real value nor
-    penalised as ``SPU``. Anything else (a genuinely invented specific
-    value) still scores ``SPU`` exactly as before. An absent/empty
-    ``accept_any_of`` is a no-op (identical to the pre-#602 behaviour).
+    say, or because it is absent-because-UNKNOWABLE -- e.g. a blend's
+    ``origin`` has no single country, so a model answering "a blend of
+    multiple origins" has not hallucinated a wrong country (#602 gold-label
+    nuance). ``accept_any_of`` (an optional gold-JSON phrase list) lets a
+    labeller mark those cases: a value matching ANY tolerated phrase on
+    BOTH recall AND precision (:func:`_tolerates_absent_value`) scores
+    ``ABS_COR`` -- same credit as a plain abstention, neither reward nor
+    penalty. Anything else, including a tolerated phrase padded with an
+    invented value, still scores ``SPU``. Absent/empty ``accept_any_of`` is
+    a no-op (pre-#602 behaviour).
 
     Args:
         gold_field: The field's gold state (``{"absent": true, ...}``).
@@ -1024,9 +1074,8 @@ def _classify_absent_field(gold_field: dict[str, Any], model_value: object | Non
         return Outcome.ABS_COR
     if isinstance(model_value, str):
         tolerated = cast("list[str]", gold_field.get("accept_any_of", []))
-        for phrase in tolerated:
-            if word_bag_recall([phrase], model_value) >= _WORDBAG_COR_RECALL:
-                return Outcome.ABS_COR
+        if _tolerates_absent_value(tolerated, model_value):
+            return Outcome.ABS_COR
     return Outcome.SPU
 
 
@@ -2266,6 +2315,28 @@ def compute_fingerprint(pages: Sequence[CorpusPage]) -> str:
     return digest.hexdigest()[:16]
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Replace ``path``'s content atomically via a same-directory temp file.
+
+    A plain ``path.write_text(content)`` truncates THEN writes -- a crash in
+    between leaves a partial/zero-byte file, destroying the very
+    already-complete records a repair write means to preserve (#602 fold 4).
+    Write to a sibling temp file, ``fsync`` it, then ``os.replace`` over
+    ``path``: atomic on POSIX/Windows, so the destination is always either
+    the full OLD content or the full NEW content, never a partial write.
+
+    Args:
+        path: The destination file.
+        content: The full text to write.
+    """
+    tmp_path = path.with_name(f"{path.name}.repair-{os.getpid()}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, path)
+
+
 def _load_checkpoint_lines(path: Path) -> list[dict[str, Any]]:
     """Parse the checkpoint sidecar, recovering from a truncated final line.
 
@@ -2277,13 +2348,13 @@ def _load_checkpoint_lines(path: Path) -> list[dict[str, Any]]:
     still raises -- that is real corruption, not an interrupted in-flight
     append, and should not be silently swallowed.
 
-    The truncated tail is also REWRITTEN OUT of the sidecar (#602 finding):
-    leaving the bad bytes on disk would let the next :meth:`Checkpoint.append`
-    concatenate a new record directly onto them (no trailing newline) or
-    strand them as a now-interior malformed line that a later resume raises
-    on -- either way losing newly paid-for checkpoints written after this
-    recovery. Rewriting to just the recovered, complete lines makes the next
-    append start clean.
+    The truncated tail is also REWRITTEN OUT of the sidecar, ATOMICALLY (see
+    :func:`_atomic_write_text`, #602 fold 4): leaving the bad bytes on disk
+    would let the next :meth:`Checkpoint.append` concatenate onto them or
+    strand them as an interior malformed line a later resume raises on --
+    either way losing newly paid-for checkpoints. A non-atomic rewrite would
+    itself risk destroying the recovered records on a second crash
+    mid-repair, so the write goes through a temp-file + ``os.replace``.
 
     Args:
         path: The sidecar JSONL path.
@@ -2312,7 +2383,7 @@ def _load_checkpoint_lines(path: Path) -> list[dict[str, Any]]:
             raise
     if truncated_at is not None:
         clean_lines = lines[:truncated_at]
-        path.write_text("".join(f"{ln}\n" for ln in clean_lines))
+        _atomic_write_text(path, "".join(f"{ln}\n" for ln in clean_lines))
     return records
 
 
@@ -2479,61 +2550,63 @@ def _has_any_success(run: ModelRun) -> bool:
 
 
 def _classify_wholly_failed_runs(
-    runs: list[ModelRun], candidates: list[ModelRun], checkpoint: Checkpoint
+    runs: list[ModelRun],
+    candidates: list[ModelRun],
+    checkpoint: Checkpoint,
+    executed_slugs: Sequence[str],
 ) -> list[str]:
     """Classify each wholly-failed candidate as MODEL-SPECIFIC or INFRA-WIDE.
 
-    Detection rule (#602 design point, decided honestly rather than guessed):
-    every page erroring is not necessarily a transient, session-wide outage --
-    a candidate that cannot produce the required structured schema,
-    consistently exceeds the extraction deadline, or names an unsupported
-    model slug also errors on every page, and that is a genuine (poor)
-    quality result for THAT model, not evidence the whole invocation is
-    broken. So: if ANY OTHER model already scored this invocation (resumed
-    from checkpoint or freshly run, either counts) succeeded on at least one
-    page, the corpus/pipeline is PROVABLY extractable this session -- a
-    candidate's total failure is then MODEL-SPECIFIC and is scored +
-    checkpointed like any other result. If NO model has succeeded on ANY
-    page this invocation, the harness cannot yet tell a real per-model
-    failure apart from a session-wide outage (bad key, provider down) --
-    INFRA-WIDE, excluded and NOT checkpointed so a retry actually retries it
-    (#600 finding). The caller batches every wholly-failed candidate and
-    classifies once every requested model this invocation has had its turn
-    (:func:`run_bakeoff` calls this once at the end, and again at an early
-    budget-stop return), so an EARLIER candidate benefits from a LATER
-    peer's success just as much as the reverse -- order-independent WITHIN
-    one invocation. The one real limit: a budget-stopped invocation only
-    classifies against peers that got a turn before the stop
-    (``unevaluated_slugs`` never ran at all, so they cannot count either
-    way).
+    Detection rule (#602 design point): a candidate whose every page errored
+    may be a genuine (poor) reliability result for THAT model (bad schema,
+    persistent timeout, unsupported slug), not evidence the whole invocation
+    is broken. If ANY OTHER model FRESHLY EXECUTED this invocation (a real
+    call was made, NOT resumed from a prior checkpoint) succeeded on at
+    least one page, the corpus/pipeline is provably extractable right now --
+    MODEL-SPECIFIC, scored + checkpointed. A resumed run's PAST success
+    proves nothing about THIS invocation's key/provider health, so it does
+    NOT count (#602 fold 1 -- round 1 wrongly counted it too, letting a
+    stale checkpoint mask a real session-wide outage). With no fresh success
+    at all, a candidate is INFRA-WIDE: excluded, uncheckpointed, so a retry
+    actually retries it (#600). The caller batches every candidate and
+    classifies once every requested model has had its turn (once at the
+    end, again at an early budget-stop return), so an earlier candidate
+    benefits from a later fresh peer's success too -- order-independent
+    within one invocation's freshly-executed models (a budget-stopped
+    invocation only sees peers that ran before the stop).
 
     Args:
-        runs: Already-scored (non-wholly-failed) runs this invocation;
-            mutated in place with any MODEL-SPECIFIC candidate appended.
+        runs: Already-scored (non-wholly-failed) runs this invocation
+            (resumed + freshly run); mutated in place with any
+            MODEL-SPECIFIC candidate appended.
         candidates: Wholly-failed runs pending classification.
         checkpoint: The sidecar to persist MODEL-SPECIFIC failures into.
+        executed_slugs: Model slugs a REAL call was made for THIS
+            invocation -- the only ones whose success counts as evidence.
 
     Returns:
         The slugs classified INFRA-WIDE (excluded from ``runs``).
     """
-    has_any_success = any(_has_any_success(r) for r in runs)
+    executed_set = set(executed_slugs)
+    has_fresh_success = any(r.model_slug in executed_set and _has_any_success(r) for r in runs)
     failed_slugs: list[str] = []
     for run in candidates:
-        if has_any_success:
+        if has_fresh_success:
             checkpoint.append(run_to_json(run))
             runs.append(run)
             print(
                 f"[run] {run.model_slug}: ALL {len(run.pages)} page(s) errored -- "
-                "MODEL-SPECIFIC failure (a peer succeeded on this corpus this invocation), "
-                "SCORED + checkpointed as a real (poor) result",
+                "MODEL-SPECIFIC failure (a FRESHLY-EXECUTED peer succeeded on this corpus "
+                "this invocation), SCORED + checkpointed as a real (poor) result",
                 flush=True,
             )
         else:
             failed_slugs.append(run.model_slug)
             print(
                 f"[run] {run.model_slug}: ALL {len(run.pages)} page(s) errored -- INFRA-WIDE "
-                "candidate (no model has succeeded on any page this invocation), EXCLUDED "
-                "from the leaderboard/statistics, NOT checkpointed (a re-run will retry it)",
+                "candidate (no FRESHLY-EXECUTED model has succeeded on any page this "
+                "invocation -- a resumed checkpoint does not count), EXCLUDED from the "
+                "leaderboard/statistics, NOT checkpointed (a re-run will retry it)",
                 flush=True,
             )
     return failed_slugs
@@ -2637,7 +2710,9 @@ async def run_bakeoff(
                 f"--max-spend ${max_spend:.2f} (spent est. ${spent:.4f})",
                 flush=True,
             )
-            failed_slugs = _classify_wholly_failed_runs(runs, candidates, checkpoint)
+            failed_slugs = _classify_wholly_failed_runs(
+                runs, candidates, checkpoint, executed_slugs
+            )
             return BakeoffResult(
                 runs=runs,
                 stopped_early=True,
@@ -2665,7 +2740,7 @@ async def run_bakeoff(
             flush=True,
         )
         runs.append(run)
-    failed_slugs = _classify_wholly_failed_runs(runs, candidates, checkpoint)
+    failed_slugs = _classify_wholly_failed_runs(runs, candidates, checkpoint, executed_slugs)
     return BakeoffResult(
         runs=runs,
         stopped_early=False,

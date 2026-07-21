@@ -131,6 +131,26 @@ def test_load_corpus_rejects_ambiguous_gold_shape(tmp_path: Path) -> None:
         bo.load_corpus(tmp_path)
 
 
+def test_load_corpus_rejects_malformed_accept_any_of(tmp_path: Path) -> None:
+    """A malformed ``accept_any_of`` tolerance list (a non-string entry) must
+    fail at LOAD time -- before any paid call -- naming the fixture, not
+    crash mid-scoring inside ``_tolerates_absent_value`` after money has
+    already been spent (#602 fold 3)."""
+    (tmp_path / "bad.html").write_text("<html>hi</html>")
+    all_absent = {f.name: {"absent": True} for f in bo.FIELD_SPECS if f.name != "name"}
+    (tmp_path / "bad.gold.json").write_text(
+        json.dumps(
+            {
+                "provenance": {"url": "https://example.com/bad", "vendor": "x"},
+                "name": {"value": "X"},
+                "fields": {**all_absent, "origin": {"absent": True, "accept_any_of": ["ok", 5]}},
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="bad.gold.json.*accept_any_of"):
+        bo.load_corpus(tmp_path)
+
+
 def test_load_corpus_rejects_a_gold_json_with_no_top_level_name(tmp_path: Path) -> None:
     """A custom gold record missing the top-level ``name`` key entirely (the
     ``if name_field is not None`` branch's False path) must fail the same
@@ -224,6 +244,30 @@ def test_validate_gold_value_type_altitude_accepts_scalar_and_range() -> None:
     bo._validate_gold_value_type(  # pyright: ignore[reportPrivateUsage]
         "slug", _altitude_spec, {"min_m": 1000, "max_m": 2000}
     )
+
+
+# --- accept_any_of validation (#602 fold 3) -----------------------------------
+
+
+def test_validate_accept_any_of_accepts_a_nonempty_string_list() -> None:
+    bo._validate_accept_any_of(  # pyright: ignore[reportPrivateUsage]
+        "slug", _text_spec, ["blend of multiple origins", "multiple origins"]
+    )
+
+
+def test_validate_accept_any_of_rejects_a_non_list() -> None:
+    with pytest.raises(ValueError, match="accept_any_of"):
+        bo._validate_accept_any_of("slug", _text_spec, "blend of multiple origins")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validate_accept_any_of_rejects_an_empty_list() -> None:
+    with pytest.raises(ValueError, match="accept_any_of"):
+        bo._validate_accept_any_of("slug", _text_spec, [])  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validate_accept_any_of_rejects_a_non_string_element() -> None:
+    with pytest.raises(ValueError, match="accept_any_of"):
+        bo._validate_accept_any_of("slug", _text_spec, ["ok", 5])  # pyright: ignore[reportPrivateUsage]
 
 
 def test_load_corpus_rejects_null_value_before_paid_calls(tmp_path: Path) -> None:
@@ -362,6 +406,27 @@ def test_classify_absent_field_still_penalises_a_real_invented_value() -> None:
     an actual (wrong) single country on the same field still scores SPU."""
     gold = {"absent": True, "accept_any_of": ["blend of multiple origins"]}
     assert bo._classify_absent_field(gold, "Ethiopia") is bo.Outcome.SPU  # pyright: ignore[reportPrivateUsage]
+
+
+def test_classify_absent_field_rejects_a_tolerated_phrase_padded_with_a_country() -> None:
+    """Recall alone would let 'a blend of multiple origins, primarily
+    Ethiopia' match the tolerated phrase on recall (every phrase word is
+    present) while smuggling in an invented country -- the precision gate
+    must catch the padding and still score SPU (#602 fold 2)."""
+    gold = {"absent": True, "accept_any_of": ["blend of multiple origins"]}
+    padded = "a blend of multiple origins, primarily Ethiopia"
+    assert bo._classify_absent_field(gold, padded) is bo.Outcome.SPU  # pyright: ignore[reportPrivateUsage]
+
+
+def test_classify_absent_field_clean_tolerated_phrase_still_scores_abs_cor() -> None:
+    """A clean (unpadded) tolerated phrase must still pass the joint
+    recall+precision gate -- the precision requirement must not become so
+    strict it defeats the tolerance itself (#602 fold 2)."""
+    gold = {"absent": True, "accept_any_of": ["blend of multiple origins"]}
+    assert (
+        bo._classify_absent_field(gold, "a blend of multiple origins")  # pyright: ignore[reportPrivateUsage]
+        is bo.Outcome.ABS_COR
+    )
 
 
 def test_classify_absent_field_without_accept_any_of_is_unchanged() -> None:
@@ -1267,6 +1332,46 @@ def test_checkpoint_recovers_earlier_records_after_truncated_final_line(
     assert not resumed_again.has("m3")
 
 
+def test_atomic_write_text_replaces_content_and_leaves_no_temp_file(tmp_path: Path) -> None:
+    """``_atomic_write_text`` fully replaces the destination's content via a
+    same-directory temp file + ``os.replace`` -- never a bare truncate-then-
+    write in place (#602 fold 4)."""
+    path = tmp_path / "cells.jsonl"
+    path.write_text("old content\n")
+    bo._atomic_write_text(path, "new content\n")  # pyright: ignore[reportPrivateUsage]
+    assert path.read_text() == "new content\n"
+    assert list(tmp_path.glob("*.tmp")) == []  # the temp file is renamed away, not left behind
+
+
+def test_checkpoint_tail_repair_goes_through_atomic_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The truncated-tail repair goes through ``_atomic_write_text`` (#602
+    fold 4), not a direct ``path.write_text`` -- a non-atomic truncate-then-
+    write would risk destroying the just-recovered records on a SECOND crash
+    mid-repair, exactly the failure class this repair exists to prevent."""
+    path = tmp_path / "cells.jsonl"
+    checkpoint = bo.Checkpoint(path, resume=False)
+    checkpoint.append(bo.run_to_json(_run("m1", {"p": {"origin": bo.Outcome.COR}})))
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"model_slug": "m2", "pages": [truncated')  # no trailing newline
+
+    calls: list[tuple[Path, str]] = []
+    original = bo._atomic_write_text  # pyright: ignore[reportPrivateUsage]
+
+    def spy(target: Path, content: str) -> None:
+        calls.append((target, content))
+        original(target, content)
+
+    monkeypatch.setattr(bo, "_atomic_write_text", spy)
+    reopened = bo.Checkpoint(path, resume=True)
+    assert reopened.has("m1")
+    assert len(calls) == 1
+    repaired_path, repaired_content = calls[0]
+    assert repaired_path == path
+    assert repaired_content == path.read_text()  # exactly what's on disk now
+
+
 def test_checkpoint_raises_on_malformed_interior_line(tmp_path: Path) -> None:
     """A malformed line that is NOT the final one is real corruption, not an
     interrupted append, and must still raise."""
@@ -1507,20 +1612,21 @@ async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
 
 
 @pytest.mark.asyncio
-async def test_run_bakeoff_model_specific_failure_is_scored_when_a_peer_succeeded(
+async def test_run_bakeoff_resumed_success_does_not_excuse_a_fresh_failure(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
-    """Every page erroring is NOT automatically excluded: if a PEER already
-    succeeded on this corpus this invocation, the corpus/pipeline is provably
-    extractable, so this model's total failure is its OWN reliability issue
-    (a bad schema, a persistent timeout, an unsupported slug) -- MODEL-
-    SPECIFIC, scored and checkpointed like any other result, not silently
-    dropped (#602 design point)."""
+    """A RESUMED peer's PAST success must NOT count as evidence this
+    invocation's key/provider/network is healthy right now -- otherwise a
+    stale checkpoint would turn a genuine session-wide outage into
+    permanently-checkpointed MODEL-SPECIFIC scores for every freshly-
+    attempted model (#602 fold 1: round 1 of this fix wrongly counted a
+    resumed success too). With ONLY a resumed peer and every FRESH model
+    failing, the fresh failure stays INFRA-WIDE -- excluded, not scored,
+    not checkpointed."""
     out = tmp_path / "o.json"
     fingerprint = bo.compute_fingerprint(corpus)
-    # Seed a checkpoint with a peer that already succeeded on this corpus --
-    # resuming it (no new call) is how the injected FunctionModel below can
-    # apply ONLY to the newly-executed "bad" slug.
+    # Seed a checkpoint with a peer that succeeded in a PRIOR invocation --
+    # resuming it (no new call) means it is NOT freshly executed this run.
     seed = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
     seed.append(bo.run_to_json(_full_run("good", bo.Outcome.COR)))
 
@@ -1535,11 +1641,59 @@ async def test_run_bakeoff_model_specific_failure_is_scored_when_a_peer_succeede
         ),
         model=_model_text_only(),  # only applies to "bad" -- "good" resumes
     )
-    assert {r.model_slug for r in result.runs} == {"good", "bad"}
-    assert result.failed_slugs == []
+    assert {r.model_slug for r in result.runs} == {"good"}  # "bad" NOT scored
+    assert result.failed_slugs == ["bad"]
     assert result.executed_slugs == ["bad"]
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
-    assert checkpoint.has("bad")  # a model-specific failure IS checkpointed
+    assert not checkpoint.has("bad")  # INFRA-WIDE is never checkpointed
+
+
+def _failed_run(slug: str, n_pages: int = 2) -> bo.ModelRun:
+    return bo.ModelRun(
+        model_slug=slug,
+        pages=[
+            bo.PageResult(slug=f"p{i}", outcomes={}, error="boom", on_page_fields=0)
+            for i in range(n_pages)
+        ],
+    )
+
+
+def test_classify_wholly_failed_runs_model_specific_when_a_fresh_peer_succeeded(
+    tmp_path: Path,
+) -> None:
+    """A FRESHLY-EXECUTED peer's success (a real call was made THIS
+    invocation, not merely resumed) DOES count as evidence the
+    corpus/pipeline is healthy right now -- MODEL-SPECIFIC: scored and
+    checkpointed like any other result (#602 design point, fold 1)."""
+    checkpoint = bo.Checkpoint(tmp_path / "cells.jsonl", resume=False)
+    runs = [_full_run("good", bo.Outcome.COR)]
+    candidates = [_failed_run("bad")]
+    failed_slugs = bo._classify_wholly_failed_runs(  # pyright: ignore[reportPrivateUsage]
+        runs, candidates, checkpoint, ["good", "bad"]
+    )
+    assert failed_slugs == []
+    assert {r.model_slug for r in runs} == {"good", "bad"}
+    assert checkpoint.has("bad")
+
+
+def test_classify_wholly_failed_runs_infra_wide_when_only_a_resumed_peer_succeeded(
+    tmp_path: Path,
+) -> None:
+    """A RESUMED (not freshly-executed) peer's success must NOT count --
+    with no fresh success at all, the candidate stays INFRA-WIDE (#602
+    fold 1)."""
+    checkpoint = bo.Checkpoint(tmp_path / "cells.jsonl", resume=False)
+    runs = [_full_run("good", bo.Outcome.COR)]  # resumed -- NOT in executed_slugs
+    candidates = [_failed_run("bad")]
+    failed_slugs = bo._classify_wholly_failed_runs(  # pyright: ignore[reportPrivateUsage]
+        runs,
+        candidates,
+        checkpoint,
+        ["bad"],  # only "bad" was freshly executed
+    )
+    assert failed_slugs == ["bad"]
+    assert {r.model_slug for r in runs} == {"good"}  # "bad" NOT appended
+    assert not checkpoint.has("bad")
 
 
 def test_run_wholly_failed_detects_all_errored_pages() -> None:
