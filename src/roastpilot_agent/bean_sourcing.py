@@ -2024,7 +2024,12 @@ class _ExtractedBeanIdentity(BaseModel):
     verbatim quote alongside each TYPED field (``altitude_m``,
     ``processing``, ``bean_species``, ``is_blend``). All four stay
     CAPTURED-BUT-UNCONSUMED at runtime — ``altitude_m_evidence`` feeds a
-    DORMANT gate, :data:`_ALTITUDE_CITATION_GATE_ENABLED`, pending D2d.
+    DORMANT gate, :data:`_ALTITUDE_CITATION_GATE_ENABLED`, pending D2d;
+    ``is_blend_evidence`` feeds a DORMANT gate too,
+    :data:`_IS_BLEND_LOCALITY_GATE_ENABLED` — certification PARKED
+    PERMANENTLY (a semantic certify-bypass class, not a page-shape one);
+    and ``processing_evidence``/``bean_species_evidence`` wait for slice
+    E2.
     """
 
     name: str | None = None
@@ -2065,9 +2070,12 @@ class _ExtractedBeanIdentity(BaseModel):
     claim. See :data:`_EXTRACTION_INSTRUCTIONS` and
     :func:`_draft_from_identity`'s provenance handling."""
     is_blend_evidence: str | None = Field(default=None, max_length=500)
-    """A verbatim span supporting ``is_blend`` (#590 D2a). Still UNCONSUMED
-    — polarity verification is deferred to slice E. Bounded for
-    consistency with the other three fields even though not yet read."""
+    """A verbatim span supporting ``is_blend`` (#590 D2a). Feeds
+    :func:`_quote_supports_is_blend`, DORMANT pending
+    :data:`_IS_BLEND_LOCALITY_GATE_ENABLED` — certification PARKED
+    PERMANENTLY (see that constant's docstring). Bounded to
+    :data:`_MAX_JSON_LD_FIELD_CHARS`-sized (500 chars), matching the other
+    three ``*_evidence`` fields."""
 
 
 _EXTRACTION_INSTRUCTIONS = """
@@ -2443,9 +2451,11 @@ _IDENTITY_FIELDS: tuple[str, ...] = (
     "description",
 )
 
-#: TYPED enum fields DEFERRED to slice E (#590 D2b — sound verification
+#: TYPED enum fields DEFERRED to slice E2 (#590 D2b — sound verification
 #: needs LOCALITY + conflicting-method handling flat matching can't
-#: provide safely). These two, like ``is_blend``, demote until E lands.
+#: provide safely). ``is_blend`` no longer belongs here: E1b flips it via
+#: the main-region locality + polarity gate
+#: (:func:`_quote_supports_is_blend`); these two remain demoted until E2.
 _ENUM_FIELDS_DEFERRED_TO_E: frozenset[str] = frozenset({"processing", "bean_species"})
 
 #: Ships DORMANT (#590 D2c, #615) — the five hardening folds (cue
@@ -2966,12 +2976,16 @@ def _find_authentic_segment(quote: str, corpus: str) -> str | None:
     (:func:`_split_corpus_segments`). Returning the segment (not just a
     bool) lets :func:`_value_is_range_endpoint` (fold 5) run against the
     FULL segment, not the model-cropped quote, which can hide a preceding
-    range digit. Only for the altitude quote — D1's free-text fields keep
-    the whole-corpus check.
+    range digit. Used for the altitude quote (#590 D2b) and, reused
+    unchanged, for the ``is_blend`` main-region quote (#590 slice E1b,
+    :func:`_quote_supports_is_blend`) — D1's free-text fields keep the
+    whole-corpus check.
 
     Args:
         quote: The raw evidence quote (not pre-normalized).
-        corpus: The raw page corpus (not pre-normalized).
+        corpus: The raw corpus to search — the whole page corpus for
+            altitude, or :func:`_main_product_region`'s output for
+            ``is_blend`` (not pre-normalized either way).
 
     Returns:
         The first matching raw segment, or ``None`` if no segment
@@ -3349,6 +3363,146 @@ def _main_product_region(body_text: str, json_ld_values: str, json_ld_name: str)
     return "\n".join(regions)
 
 
+#: Ships DORMANT (#590 slice E1b — an independent adversarial
+#: security-reviewer pass BLOCKed live enablement). The lexical polarity
+#: whitelist below (:func:`_quote_supports_is_blend`) has a SEMANTIC
+#: certify-bypass class no amount of shape-level hardening can close:
+#: negation ("this coffee is never a blend"), composition statements
+#: ("this blend combines two single origin lots"), and
+#: collection-membership chrome ("part of our single origin collection"
+#: sitting beside the real "## Blend Composition" section) all certify
+#: the WRONG polarity from ORDINARY, non-adversarial vendor copy — no
+#: adversarial page structure needed at all. See the three executable-spec
+#: probe tests below (mirroring the reviewer's exact findings). Per the
+#: polarity law (positive recognition, never a denylist), an enumerative
+#: negation/composition-phrase denylist will NOT be attempted — that is
+#: an arms race against natural language, not against page shape, and the
+#: whitelist pattern that closed every prior fold does not apply to a
+#: semantic bypass class. ``is_blend`` certification is PARKED
+#: PERMANENTLY unless a non-lexical mechanism (e.g. an entailment judge,
+#: research §3.5) is adopted — revisit only then, never by growing this
+#: whitelist.
+_IS_BLEND_LOCALITY_GATE_ENABLED: Final = False
+
+#: Positive phrases proving ``is_blend=False`` (single origin, #590 slice
+#: E1b) — whole-phrase match required somewhere in the evidence quote.
+_SINGLE_ORIGIN_PHRASES: frozenset[str] = frozenset(
+    {"single origin", "single estate", "single farm"}
+)
+
+#: Compound phrases proving ``is_blend=True`` WITHOUT requiring a
+#: blend-named anchor (Tier 2, #590 slice E1b) — bare "blend" alone, with
+#: neither this tier nor the anchor-named Tier 1 satisfied, never
+#: verifies (the tasting-metaphor decoy: "a blend of chocolate and
+#: cherry notes" describes flavour, not composition).
+_BLEND_COMPOUND_PHRASES: frozenset[str] = frozenset(
+    {
+        "house blend",
+        "espresso blend",
+        "coffee blend",
+        "signature blend",
+        "seasonal blend",
+        "blend of coffees",
+        "blend of beans",
+        "blend of origins",
+    }
+)
+
+
+def _has_true_blend_polarity(normalized_text: str, *, anchor_names_blend: bool) -> bool:
+    """Whether ``normalized_text`` (already run through
+    :func:`_normalize_for_containment`) carries a positive
+    ``is_blend=True`` signal (#590 slice E1b) — Tier 1 (the product's own
+    anchor names it a blend AND a bare "blend" appears) or Tier 2 (a
+    fixed compound phrase, no anchor needed). See
+    :data:`_BLEND_COMPOUND_PHRASES` for why bare "blend" alone never
+    verifies."""
+    if anchor_names_blend and _contains_whole_phrase("blend", normalized_text):
+        return True
+    return any(
+        _contains_whole_phrase(phrase, normalized_text) for phrase in _BLEND_COMPOUND_PHRASES
+    )
+
+
+def _has_false_blend_polarity(normalized_text: str) -> bool:
+    """Whether ``normalized_text`` (already :func:`_normalize_for_containment`d)
+    carries a positive ``is_blend=False`` (single-origin) signal (#590
+    slice E1b). See :data:`_SINGLE_ORIGIN_PHRASES`."""
+    return any(_contains_whole_phrase(phrase, normalized_text) for phrase in _SINGLE_ORIGIN_PHRASES)
+
+
+def _quote_supports_is_blend(
+    claimed: bool,
+    quote: str | None,
+    main_region_text: str,
+    *,
+    anchor_names_blend: bool,
+) -> bool:
+    """Whether ``quote`` genuinely supports ``claimed`` for ``is_blend``
+    (#590 slice E1b). Shipped whitelist-native (enabled at birth), unlike
+    the altitude gate's guard-stack retrofit (#615/#616) — but the
+    PRE-DECLARED STOPPING RULE (repo precedent: #614/#615/#616) FIRED on
+    an independent adversarial security-reviewer pass: a SEMANTIC
+    certify-bypass class (negation/composition/collection-membership
+    chrome — see :data:`_IS_BLEND_LOCALITY_GATE_ENABLED`'s docstring and
+    the three probe tests) needs no page-shape hardening this whitelist
+    pattern can close, so the gate now ships DORMANT and this function's
+    return value is never consumed by ``field_sources`` at runtime. Fails
+    SOFT on any defect — never raises out of a draft.
+
+    Verifies iff ALL of:
+
+    1. ``quote`` is non-blank and authenticates as a single-segment,
+       whole-phrase span WITHIN ``main_region_text``
+       (:func:`_find_authentic_segment`, reused from the #590 D2b
+       altitude gate) — authenticity and locality collapse into this ONE
+       check; an empty region yields no segment, so a claim demotes
+       rather than falling back to the whole corpus.
+    2. The quote itself carries a positive, claimed-polarity phrase —
+       :func:`_has_false_blend_polarity` for ``claimed=False``,
+       :func:`_has_true_blend_polarity` for ``claimed=True``.
+    3. The OPPOSITE polarity appears NOWHERE in ``main_region_text``
+       — scoped to the main region, not the whole page corpus, so
+       cross-sell chrome can neither supply verifying evidence NOR veto a
+       genuine main-region claim.
+
+    Args:
+        claimed: The extracted ``is_blend`` value.
+        quote: The model's verbatim ``is_blend_evidence`` span, or
+            ``None``.
+        main_region_text: :func:`_main_product_region`'s output for this
+            page.
+        anchor_names_blend: Whether the page's own title/JSON-LD anchor
+            names the product a "blend" (Tier 1 of
+            :func:`_has_true_blend_polarity`).
+
+    Returns:
+        ``True`` only when all three conditions hold; ``False``
+        otherwise.
+    """
+    if not quote:
+        return False
+    try:
+        raw_quote = quote.strip()
+        if not raw_quote or _find_authentic_segment(raw_quote, main_region_text) is None:
+            return False
+        quote_normalized = _normalize_for_containment(raw_quote)
+        region_normalized = _normalize_for_containment(main_region_text)
+        if claimed:
+            if not _has_true_blend_polarity(
+                quote_normalized, anchor_names_blend=anchor_names_blend
+            ):
+                return False
+            return not _has_false_blend_polarity(region_normalized)
+        if not _has_false_blend_polarity(quote_normalized):
+            return False
+        return not _has_true_blend_polarity(
+            region_normalized, anchor_names_blend=anchor_names_blend
+        )
+    except Exception:  # pragma: no cover - defensive: gate must fail soft, never raise
+        return False
+
+
 def _draft_from_identity(
     identity: _ExtractedBeanIdentity,
     *,
@@ -3376,10 +3530,16 @@ def _draft_from_identity(
     it keeps the original presence-only tagging. ``altitude_m`` never runs
     through the containment matcher — its citation gate ships DORMANT
     (:data:`_ALTITUDE_CITATION_GATE_ENABLED`), so it demotes
-    unconditionally today like ``processing``/``bean_species``/
-    ``is_blend`` (:data:`_ENUM_FIELDS_DEFERRED_TO_E`). Every roast-target
-    field is always ``"origin_estimated"``. The optional free-text fields
-    (``country``, ``farm``,
+    unconditionally today like ``processing``/``bean_species``
+    (:data:`_ENUM_FIELDS_DEFERRED_TO_E`, deferred to slice E2). ``is_blend``
+    also demotes unconditionally: its main-region locality + polarity
+    gate (:func:`_quote_supports_is_blend`) ships DORMANT
+    (:data:`_IS_BLEND_LOCALITY_GATE_ENABLED`) — an independent
+    security-reviewer pass found a semantic certify-bypass class
+    (negation/composition/collection-membership chrome) the lexical
+    whitelist cannot close, so certification is PARKED PERMANENTLY (see
+    that constant's docstring). Every roast-target field is always
+    ``"origin_estimated"``. The optional free-text fields (``country``, ``farm``,
     ``bean_varietal``, ``description``) are normalized via
     :func:`_normalize_optional_text` BEFORE both the provenance loop and
     the draft construction (#587 P2) — see that function's docstring for
@@ -3393,10 +3553,8 @@ def _draft_from_identity(
     before any fetch). The vendor page itself is still fetched with the
     REAL, un-redacted URL — only what is returned/persisted is redacted.
     None of ``identity``'s four ``*_evidence`` quotes (#590 D2a) affect
-    provenance while the gate is dormant. ``json_ld_values`` (#590 slice
-    E1) feeds :func:`_main_product_region`, computed here but not yet
-    consumed by any field's provenance (capture-only machinery; E1b wires
-    ``is_blend`` through it).
+    provenance at runtime — all four gates (``is_blend_evidence``
+    included, see above) stay dormant/deferred.
 
     Args:
         identity: The provider's page-only extraction, including its four
@@ -3489,11 +3647,16 @@ def _draft_from_identity(
     # containment check below reuses this same corpus form.
     merged_corpus = corpus if not json_ld_values else f"{corpus}\n{json_ld_values}"
     corpus_normalized = _normalize_for_containment(merged_corpus)
-    # Computed here so a future slice's is_blend gate arrives as pure
-    # logic with no new plumbing (#590 slice E1b consumes this against
-    # identity.is_blend_evidence via _quote_supports_is_blend) — not yet
-    # consumed by any field's provenance.
-    _main_product_region(corpus, json_ld_values, json_ld_name)
+    # The main product region (#590 slice E1b) — computed ONCE, over the
+    # BODY-only ``corpus`` plus ``json_ld_values``/``json_ld_name`` unioned
+    # in separately (see _main_product_region); reused by the is_blend
+    # gate below and, in a future slice, by processing/bean_species (E2).
+    main_region = _main_product_region(corpus, json_ld_values, json_ld_name)
+    title, _rest = _frontmatter_title_and_body(corpus)
+    anchor_names_blend = _contains_whole_phrase(
+        "blend",
+        _normalize_for_containment(f"{title or ''} {json_ld_name}"),
+    )
 
     field_sources: dict[str, BeanFieldSource] = {}
     for field_name in _IDENTITY_FIELDS:
@@ -3533,13 +3696,24 @@ def _draft_from_identity(
         # said nothing" value is None, not ""/False — the generic
         # "not in (None, '')" test above would work for None but a bare
         # ``False`` used to be indistinguishable from "unstated" before
-        # #587 P2 made this field tri-state. An explicit True or False is
-        # DEFERRED to slice E (locality) — always demotes, never routed
-        # through any matcher.
+        # #587 P2 made this field tri-state. The main-region locality +
+        # polarity gate (#590 slice E1b, _quote_supports_is_blend) ships
+        # DORMANT (_IS_BLEND_LOCALITY_GATE_ENABLED) — an independent
+        # security-reviewer pass found a semantic certify-bypass class
+        # (negation/composition/collection chrome) the lexical whitelist
+        # cannot close; see that constant's docstring. ``and`` short-
+        # circuits before the helper ever runs, so an explicit True or
+        # False demotes unconditionally, same as before this slice.
         # No field_sources entry at all when the page said nothing
         # (identity.is_blend is None) — "absent from field_sources" stays
         # meaningful as "unset".
-        field_sources["is_blend"] = "origin_estimated"
+        gate_verdict = _IS_BLEND_LOCALITY_GATE_ENABLED and _quote_supports_is_blend(
+            identity.is_blend,
+            identity.is_blend_evidence,
+            main_region,
+            anchor_names_blend=anchor_names_blend,
+        )
+        field_sources["is_blend"] = "on_page" if gate_verdict else "origin_estimated"
     for field_name in _TARGET_FIELDS:
         field_sources[field_name] = "origin_estimated"
 
