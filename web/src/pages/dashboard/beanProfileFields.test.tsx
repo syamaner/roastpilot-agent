@@ -91,18 +91,56 @@ describe("BeanProfileFields draft-review provenance + evidence (#627b)", () => {
     expect(container.innerHTML).not.toContain("<script>alert(1)</script>");
   });
 
-  it("bidi-isolates the quote text against a bidi-override character (security)", () => {
-    // U+202E (RIGHT-TO-LEFT OVERRIDE) could otherwise visually invert this
-    // quoted-authority framing ("page says: ...") without changing the
-    // underlying (still-escaped) text.
-    const hostile = "‮normal-looking text that renders reversed";
+  // Built from explicit codepoints rather than literal characters in the test
+  // source — same reasoning as production: a raw bidi control embedded in a
+  // source file is its own Trojan-Source-style footgun.
+  const RLO = String.fromCodePoint(0x202e); // RIGHT-TO-LEFT OVERRIDE
+  const PDF = String.fromCodePoint(0x202c); // POP DIRECTIONAL FORMATTING
+  const LRI = String.fromCodePoint(0x2066); // LEFT-TO-RIGHT ISOLATE
+  const PDI = String.fromCodePoint(0x2069); // POP DIRECTIONAL ISOLATE
+
+  it("keeps the ltr/isolate attributes as defence-in-depth even though the control itself is stripped", () => {
     renderFields({
       ...DEFAULT_BEAN_PROFILE_DRAFT,
-      field_evidence: { processing: hostile },
+      field_evidence: { processing: `${RLO}normal-looking text that renders reversed` },
     });
     const quoteText = screen.getByTestId(`${PREFIX}-processing-evidence-text`);
     expect(quoteText).toHaveAttribute("dir", "ltr");
-    expect(quoteText).toHaveTextContent(hostile);
+  });
+
+  it("strips a bidi-override control from the rendered quote, leaving the rest of the text intact (retro finding on #634)", () => {
+    // Not just isolation: `dir`/unicode-bidi only shield the SURROUNDING
+    // layout — a control INSIDE the quote still reorders the quote's own
+    // rendered characters, so it must be stripped, not merely isolated.
+    renderFields({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      field_evidence: { processing: `${RLO}normal-looking text that renders reversed${PDF}` },
+    });
+    const quoteText = screen.getByTestId(`${PREFIX}-processing-evidence-text`);
+    expect(quoteText.textContent).not.toContain(RLO);
+    expect(quoteText.textContent).not.toContain(PDF);
+    expect(quoteText).toHaveTextContent("normal-looking text that renders reversed");
+  });
+
+  it("strips a bidi-isolate pair from the rendered quote", () => {
+    renderFields({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      field_evidence: { altitude_m: `${LRI}1900${PDI} masl` },
+    });
+    const quoteText = screen.getByTestId(`${PREFIX}-altitude_m-evidence-text`);
+    expect(quoteText.textContent).not.toContain(LRI);
+    expect(quoteText.textContent).not.toContain(PDI);
+    expect(quoteText).toHaveTextContent("1900 masl");
+  });
+
+  it("passes legitimate RTL text (Arabic letters, no bidi controls) through unmodified", () => {
+    const arabic = "هذه القهوة مغسولة ومجففة في الشمس";
+    renderFields({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      field_evidence: { bean_species: arabic },
+    });
+    const quoteText = screen.getByTestId(`${PREFIX}-bean_species-evidence-text`);
+    expect(quoteText).toHaveTextContent(arabic);
   });
 
   it("renders the quote for each of the four typed fields under its own field", () => {

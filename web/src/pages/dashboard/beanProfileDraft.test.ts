@@ -5,6 +5,7 @@ import {
   fieldEvidenceFor,
   fieldSourceFor,
   PROVENANCE_TRACKED_FIELDS,
+  stripBidiControls,
   withFieldEdited,
   type BeanProfileDraft,
   type ProvenanceTrackedField,
@@ -150,5 +151,55 @@ describe("withFieldEdited (#627 Codex round-2: clear-on-edit)", () => {
     expect(next.name).toBe("House blend");
     expect(next.field_sources).toBeUndefined();
     expect(next.field_evidence).toBeUndefined();
+  });
+});
+
+describe("stripBidiControls (#627 retro finding on #634)", () => {
+  // Built from explicit codepoints, never literal characters in the test
+  // source — embedding a real bidi control in a source file is its own
+  // Trojan-Source-style footgun, in a test file as much as in production.
+  const ALM = String.fromCodePoint(0x061c); // ARABIC LETTER MARK
+  const LRM = String.fromCodePoint(0x200e); // LEFT-TO-RIGHT MARK
+  const RLM = String.fromCodePoint(0x200f); // RIGHT-TO-LEFT MARK
+  const LRE = String.fromCodePoint(0x202a); // LEFT-TO-RIGHT EMBEDDING
+  const RLO = String.fromCodePoint(0x202e); // RIGHT-TO-LEFT OVERRIDE
+  const PDF = String.fromCodePoint(0x202c); // POP DIRECTIONAL FORMATTING
+  const LRI = String.fromCodePoint(0x2066); // LEFT-TO-RIGHT ISOLATE
+  const FSI = String.fromCodePoint(0x2068); // FIRST STRONG ISOLATE
+  const PDI = String.fromCodePoint(0x2069); // POP DIRECTIONAL ISOLATE
+
+  it("strips a bidi-override control, leaving the surrounding text intact", () => {
+    expect(stripBidiControls(`${RLO}reversed-looking${PDF} text`)).toBe("reversed-looking text");
+  });
+
+  it("strips an isolate pair", () => {
+    expect(stripBidiControls(`${LRI}1900${PDI} masl`)).toBe("1900 masl");
+    expect(stripBidiControls(`${FSI}auto-detected${PDI}`)).toBe("auto-detected");
+  });
+
+  it("strips embeddings + marks + the Arabic letter mark", () => {
+    expect(stripBidiControls(`${LRE}embedded${PDF}`)).toBe("embedded");
+    expect(stripBidiControls(`left${LRM}right${RLM}`)).toBe("leftright");
+    expect(stripBidiControls(`${ALM}note`)).toBe("note");
+  });
+
+  it("strips every control at once, wherever it sits in the string", () => {
+    const hostile = `${RLO}${LRI}${ALM}mixed${PDI}${PDF}${LRM}`;
+    expect(stripBidiControls(hostile)).toBe("mixed");
+  });
+
+  it("passes plain ASCII text through unmodified", () => {
+    const plain = "Washed and sun-dried on raised beds.";
+    expect(stripBidiControls(plain)).toBe(plain);
+  });
+
+  it("passes legitimate RTL text (Arabic letters, no bidi controls) through unmodified", () => {
+    const arabic = "هذه القهوة مغسولة ومجففة في الشمس";
+    expect(stripBidiControls(arabic)).toBe(arabic);
+  });
+
+  it("is a no-op on an already-clean string with punctuation/diacritics", () => {
+    const text = "Grown at 1,900–2,100 m — hand-picked & sun-dried.";
+    expect(stripBidiControls(text)).toBe(text);
   });
 });
