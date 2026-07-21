@@ -1947,23 +1947,38 @@ async def _fetch_and_extract(
 
 @dataclass(frozen=True)
 class _FetchedPage:
-    """A fetched vendor page's two text forms (#590 D1 fold 1).
+    """A fetched vendor page's text forms (#590 D1 fold 1; parts split
+    #590 slice E1).
 
-    ``prompt_text`` is what the LLM sees for extraction — the JSON-LD
-    context header/labels (:func:`_format_json_ld_context`) prepended
-    ahead of the extracted body when a block matched, the body alone
-    otherwise (this is :func:`_fetch_page_text`'s ORIGINAL, pre-fold
-    ``str`` contract, unchanged). ``verification_corpus`` is
-    VENDOR-DATA-ONLY (the extracted page body plus the raw JSON-LD fact
-    VALUES, :func:`_json_ld_fact_values` — never our own generated
-    header/labels) — the corpus :func:`_draft_from_identity` verifies
-    ``on_page`` claims against. Using ``prompt_text`` there would let a
-    model-returned value match OUR scaffolding text instead of real
-    vendor content, defeating the whole provenance guarantee.
+    ``prompt_text`` is what the LLM sees for extraction (unchanged).
+    ``extracted_text`` (page BODY only) and ``json_ld_values`` (raw
+    JSON-LD fact VALUES, :func:`_json_ld_fact_values` — never our own
+    generated header/labels) are carried SEPARATELY so a future locality
+    gate can compute over the body alone (a merged blob would misread the
+    JSON-LD tail as page prose). ``json_ld_name`` is the matched block's
+    own ``name`` fact ALONE (Codex round-1, SaV9L) — deliberately not
+    recovered from ``json_ld_values``, whose first line is a brand/SKU
+    whenever the block omits ``name``. ``verification_corpus`` stays a
+    DERIVED, byte-identical property — the vendor-data-only containment
+    corpus :func:`_draft_from_identity` verifies ``on_page`` claims
+    against.
     """
 
     prompt_text: str
-    verification_corpus: str
+    extracted_text: str
+    json_ld_values: str
+    json_ld_name: str = ""
+
+    @property
+    def verification_corpus(self) -> str:
+        """``extracted_text`` plus ``json_ld_values`` when non-blank —
+        the same formula this dataclass stored directly before the
+        parts split."""
+        return (
+            self.extracted_text
+            if not self.json_ld_values
+            else f"{self.extracted_text}\n{self.json_ld_values}"
+        )
 
 
 async def _fetch_page_text(
@@ -1975,17 +1990,22 @@ async def _fetch_page_text(
     """Fetch ``url`` and return both of :class:`_FetchedPage`'s text
     forms (#590 D1 fold 1 — this function's return type changed from a
     bare ``str`` to :class:`_FetchedPage`, so ``.prompt_text`` is the
-    pre-fold return value; ``.verification_corpus`` is new). See
-    :func:`_fetch_and_extract` for the fetch/extraction behavior and
-    failure modes."""
+    pre-fold return value; ``.extracted_text``/``.json_ld_values`` are
+    the #590 slice E1 split of what was one stored ``verification_corpus``
+    field). See :func:`_fetch_and_extract` for the fetch/extraction
+    behavior and failure modes."""
     extracted_text, facts = await _fetch_and_extract(url, config=config, http_client=http_client)
     json_ld_context = _format_json_ld_context(facts) if facts is not None else None
     prompt_text = (
         extracted_text if json_ld_context is None else f"{json_ld_context}\n\n{extracted_text}"
     )
     fact_values = _json_ld_fact_values(facts)
-    verification_corpus = extracted_text if not fact_values else f"{extracted_text}\n{fact_values}"
-    return _FetchedPage(prompt_text=prompt_text, verification_corpus=verification_corpus)
+    return _FetchedPage(
+        prompt_text=prompt_text,
+        extracted_text=extracted_text,
+        json_ld_values=fact_values,
+        json_ld_name=(facts.name if facts is not None else None) or "",
+    )
 
 
 class _ExtractedBeanIdentity(BaseModel):
@@ -3089,8 +3109,253 @@ def _normalize_optional_text(value: str | None) -> str | None:
     return stripped or None
 
 
+# --- #590 slice E1: fail-closed main-product-region locality (machinery
+# only — capture-only posture, like D2a; no field's provenance consumes
+# this yet). The polarity law is the design axiom for the consumer slice
+# (E1b): a field earns "on_page" only on STRICT POSITIVE recognition
+# against the main product region; anything unrecognised over-demotes,
+# and no whole-corpus fallback is ever used (fail-CLOSED). See #590's
+# "Slice E kickoff PR-plan" issue comment for the full ratified design.
+
+#: Cross-sell / related-product chrome markers (#590 slice E1) — matched
+#: as a normalized whole-phrase within one line. DEFENSE-IN-DEPTH ONLY:
+#: the fail-closed anchor law below is what makes locality sound; a
+#: sentinel merely truncates a region a little earlier when cross-sell
+#: chrome happens to sit inside it — never grow this into a denylist
+#: arms race.
+_CROSS_SELL_SENTINELS: frozenset[str] = frozenset(
+    {
+        "you may also like",
+        "related products",
+        "customers also bought",
+        "you might also like",
+        "shop our",
+        "more from",
+        "pairs well with",
+        "recently viewed",
+        "frequently bought together",
+    }
+)
+
+
+def _frontmatter_title_and_body(body_text: str) -> tuple[str | None, str]:
+    """Split ``body_text``'s optional trafilatura frontmatter block into
+    its title (anchor A1, #590 slice E1) and the body text that follows.
+
+    Mirrors :func:`_sanitize_trafilatura_frontmatter`'s exact emitted
+    shape — a leading ``---\\n`` line, a single ``title:`` line (the only
+    key sanitisation ever leaves standing), then a closing ``\\n---\\n``
+    — so a well-formed, TITLED block is the only shape production code
+    ever emits; the linear-strip fallback path never emits this shape at
+    all, so title presence here also proves the trafilatura-markdown path
+    ran.
+
+    Args:
+        body_text: The page's extracted body text, as handed to
+            :func:`_main_product_region`.
+
+    Returns:
+        ``(title, rest)``: ``title`` is the frontmatter's stripped
+        ``title:`` value, or ``None`` when ``body_text`` carries no
+        (well-formed, titled) frontmatter block; ``rest`` is everything
+        after the closing delimiter, or ``body_text`` itself unchanged
+        when there is no such block.
+    """
+    if not body_text.startswith("---\n"):
+        return None, body_text
+    closing = body_text.find("\n---\n", 4)
+    if closing == -1:
+        return None, body_text
+    rest = body_text[closing + len("\n---\n") :]
+    for line in body_text[4:closing].splitlines():
+        if line.startswith("title:"):
+            title = line[len("title:") :].strip()
+            return (title or None), rest
+    # Never emitted by _sanitize_trafilatura_frontmatter (an untitled
+    # block is dropped there, not left in place) — reachable only via a
+    # hand-built test input exercising this pure function directly.
+    return None, rest
+
+
+def _heading_text(line: str) -> str | None:
+    """The heading text if ``line`` is a Markdown ATX heading — optional
+    indent, 1-6 ``#`` characters, then a space (#590 slice E1) — else
+    ``None``. Pure ``str`` operations only, no regex.
+
+    Args:
+        line: One line of body text.
+
+    Returns:
+        The trimmed heading text (possibly ``""`` for a bare ``"#"``
+        line), or ``None`` if ``line`` is not a heading.
+    """
+    stripped = line.strip()
+    hashes = 0
+    while hashes < len(stripped) and hashes < 6 and stripped[hashes] == "#":
+        hashes += 1
+    if hashes == 0 or (hashes < len(stripped) and stripped[hashes] != " "):
+        return None
+    return stripped[hashes:].strip()
+
+
+def _line_is_sentinel(line: str) -> bool:
+    """Whether ``line`` normalizes to a cross-sell chrome marker (#590
+    slice E1 — see :data:`_CROSS_SELL_SENTINELS`)."""
+    normalized = _normalize_for_containment(line)
+    return bool(normalized) and any(
+        _contains_whole_phrase(sentinel, normalized) for sentinel in _CROSS_SELL_SENTINELS
+    )
+
+
+def _heading_matches_anchor(heading_text: str, anchors_normalized: list[str]) -> bool:
+    """Whether ``heading_text`` (raw) whole-phrase-CONTAINS any of
+    ``anchors_normalized`` (#590 slice E1) — ONE-DIRECTIONAL ONLY (Codex
+    round-2, Sa4cf): a short anchor inside a longer heading counts (e.g.
+    heading "Kenya Kiambu — Single Origin" for anchor "Kenya Kiambu"),
+    but the reverse — a longer anchor merely CONTAINING the heading —
+    does NOT, because that direction lets a generic heading reverse-match
+    a suffix-laden anchor (JSON-LD name "Kenya Coffee" would otherwise
+    let an unrelated "## Coffee" related-products heading open a region;
+    a fail-open crack in the whitelist). Documented over-demote (AC
+    E-2, same pattern as the altitude whitelist): a heading that
+    ABBREVIATES a suffix-laden anchor (e.g. "## Kenya Kiambu AA" vs
+    anchor "Kenya Kiambu AA 250g Whole Bean") no longer matches — the
+    safe direction only; widening is evidence-gated, not assumed."""
+    normalized_heading = _normalize_for_containment(heading_text)
+    if not normalized_heading:
+        return False
+    return any(_contains_whole_phrase(anchor, normalized_heading) for anchor in anchors_normalized)
+
+
+def _main_product_region(body_text: str, json_ld_values: str, json_ld_name: str) -> str:
+    """The fail-closed main-product-region text within ``body_text``
+    (#590 slice E1) — the text a future citation gate (E1b's
+    ``is_blend``; #617/D2d's altitude) authenticates evidence quotes
+    against, INSTEAD of the whole page corpus, so a cross-sell/
+    related-products block can never supply verifiable evidence.
+    Not yet consumed by any field's provenance (capture-only, like D2a).
+
+    Positive anchors only, never a denylist: A1 is the frontmatter
+    ``title:`` value (:func:`_frontmatter_title_and_body`); A2 is
+    ``json_ld_name`` itself — the identity-matched JSON-LD Product
+    block's ACTUAL ``name`` fact, never recovered from the flattened
+    ``json_ld_values`` string (Codex round-1, SaV9L): when a matched
+    block omits ``name`` but states ``brand``/``sku``, that flattened
+    string's first line is a brand/SKU, not a product name — treating it
+    as an anchor would let a generic brand heading ("## Acme") open a
+    body region with no genuine anchor present, a fail-open crack in the
+    whitelist. A2 exists ONLY when ``json_ld_name`` is itself non-blank.
+    The region is the UNION of:
+
+    - A1's title TEXT itself, prepended when present (Codex round-1,
+      SaV9T) — trusted by construction (it IS the anchor), so a page
+      whose only blend/polarity statement is the title line (e.g.
+      ``title: Morning House Blend``) still lets a quote of the title
+      authenticate;
+    - the LEAD region (the post-frontmatter body up to the first heading
+      or :func:`_line_is_sentinel` line) — included ONLY when A1 exists
+      (a linear-strip page, with no frontmatter at all, never gets a
+      lead region);
+    - every ANCHORED-HEADING region — a heading whose text matches an
+      anchor (:func:`_heading_matches_anchor`) AND is NOT ITSELF a
+      sentinel line (Codex round-1, SaV9O: sentinel status is checked
+      BEFORE the anchor match, so a heading that is both — e.g. "## More
+      from Acme" when "Acme" is the anchor — never opens a region; a
+      sentinel heading only ever closes/truncates, like every other
+      sentinel line). The MATCHED HEADING'S OWN TEXT (sans the ``#``
+      marks) is itself the first line of that region (Codex round-2,
+      Sa4cg — the heading IS the positive recognition, same rationale as
+      the A1 title prepend: a polarity statement written only in the
+      heading, e.g. "## Kenya Kiambu — Single Origin", must still be
+      able to authenticate even when the body below is only tasting
+      notes). The region then extends up to the next heading of ANY
+      level or a sentinel line; and
+    - ``json_ld_values`` itself, appended unconditionally when non-blank
+      (already identity-matched to the URL upstream, so it is
+      main-region by construction, never scanned for headings/sentinels).
+
+    With NEITHER A1 nor A2, the lead region is excluded and no heading can
+    ever match, so the region collapses to ``json_ld_values`` alone —
+    ``""`` when that too is blank (fail-closed: no whole-corpus fallback,
+    ever).
+
+    Args:
+        body_text: The page's extracted body text (:attr:`_FetchedPage.extracted_text`).
+        json_ld_values: The identity-matched JSON-LD fact values
+            (:func:`_json_ld_fact_values`'s output), or ``""``.
+        json_ld_name: The identity-matched JSON-LD Product block's own
+            ``name`` fact (cleaned, or ``""`` when absent) — see A2
+            above; deliberately a SEPARATE argument from
+            ``json_ld_values``, never derived from it.
+
+    Returns:
+        The main-region text, or ``""`` when no anchor is available and
+        ``json_ld_values`` is blank too.
+    """
+    title, rest = _frontmatter_title_and_body(body_text)
+    anchors_normalized = [
+        normalized
+        for normalized in (
+            _normalize_for_containment(title or ""),
+            _normalize_for_containment(json_ld_name),
+        )
+        if normalized
+    ]
+
+    lines = rest.splitlines()
+    total = len(lines)
+    regions: list[str] = []
+
+    if title:
+        regions.append(title)
+        lead: list[str] = []
+        for line in lines:
+            if _heading_text(line) is not None or _line_is_sentinel(line):
+                break
+            lead.append(line)
+        if lead:
+            regions.append("\n".join(lead))
+
+    index = 0
+    while index < total:
+        line = lines[index]
+        heading = _heading_text(line)
+        if (
+            heading is not None
+            and not _line_is_sentinel(line)
+            and _heading_matches_anchor(heading, anchors_normalized)
+        ):
+            index += 1
+            # The matched heading's own text seeds the region (#590 Codex
+            # round-2, Sa4cg) — always non-blank here (an empty/whitespace
+            # heading normalizes to "" in _heading_matches_anchor and so
+            # never reaches this branch), so this list is never empty and
+            # the join below always has content to append.
+            region_lines: list[str] = [heading]
+            while (
+                index < total
+                and _heading_text(lines[index]) is None
+                and not _line_is_sentinel(lines[index])
+            ):
+                region_lines.append(lines[index])
+                index += 1
+            regions.append("\n".join(region_lines))
+        else:
+            index += 1
+
+    if json_ld_values:
+        regions.append(json_ld_values)
+
+    return "\n".join(regions)
+
+
 def _draft_from_identity(
-    identity: _ExtractedBeanIdentity, *, url: str, corpus: str
+    identity: _ExtractedBeanIdentity,
+    *,
+    url: str,
+    corpus: str,
+    json_ld_values: str = "",
+    json_ld_name: str = "",
 ) -> BeanProfileDraft:
     """Assemble the :class:`BeanProfileDraft` from an extracted identity.
 
@@ -3128,17 +3393,33 @@ def _draft_from_identity(
     before any fetch). The vendor page itself is still fetched with the
     REAL, un-redacted URL — only what is returned/persisted is redacted.
     None of ``identity``'s four ``*_evidence`` quotes (#590 D2a) affect
-    provenance while the gate is dormant.
+    provenance while the gate is dormant. ``json_ld_values`` (#590 slice
+    E1) feeds :func:`_main_product_region`, computed here but not yet
+    consumed by any field's provenance (capture-only machinery; E1b wires
+    ``is_blend`` through it).
 
     Args:
         identity: The provider's page-only extraction, including its four
             ``*_evidence`` quote fields (see above).
         url: The source URL (carried onto ``source_url`` in redacted form).
-        corpus: The SAME page text the model saw when producing ``identity``
-            (:func:`draft_bean_profile_from_url` threads its already-fetched
-            ``page_text`` straight through — never re-fetched or expanded
-            here) — the containment-verification corpus for ``"on_page"``
-            tagging.
+        corpus: The SAME page BODY text the model saw when producing
+            ``identity`` (:func:`draft_bean_profile_from_url` threads its
+            already-fetched ``page.extracted_text`` straight through —
+            never re-fetched or expanded here). ``corpus`` plus
+            ``json_ld_values`` (below) forms the FULL verification corpus
+            for ``"on_page"`` containment tagging — identical to this
+            function's pre-#590-slice-E1 single merged ``corpus``
+            argument whenever ``json_ld_values`` is left at its default
+            (every existing caller's behavior is unchanged).
+        json_ld_values: The page's identity-matched JSON-LD fact values
+            (:func:`_json_ld_fact_values`'s output, or ``""``) — appended
+            to ``corpus`` to form the merged containment corpus, and
+            threaded separately into :func:`_main_product_region`.
+        json_ld_name: The identity-matched JSON-LD Product block's own
+            ``name`` fact (or ``""``) — :func:`_main_product_region`'s
+            A2 anchor, deliberately separate from ``json_ld_values``
+            (whose first line is a brand/SKU whenever the block omits
+            ``name``).
 
     Returns:
         The drafted profile, ready for the operator to review, edit, and
@@ -3200,9 +3481,19 @@ def _draft_from_identity(
         "description": description,
     }
 
-    # Normalized ONCE, not per field (#590 D1) — every containment check
-    # below reuses this same corpus form.
-    corpus_normalized = _normalize_for_containment(corpus)
+    # The merged containment corpus (#590 D1; split from ``json_ld_values``
+    # #590 slice E1) — identical formula to the pre-slice-E1 stored
+    # ``_FetchedPage.verification_corpus`` field, so every existing caller
+    # passing only ``corpus`` (``json_ld_values=""``) sees byte-identical
+    # behavior. Normalized ONCE, not per field — every whole-corpus
+    # containment check below reuses this same corpus form.
+    merged_corpus = corpus if not json_ld_values else f"{corpus}\n{json_ld_values}"
+    corpus_normalized = _normalize_for_containment(merged_corpus)
+    # Computed here so a future slice's is_blend gate arrives as pure
+    # logic with no new plumbing (#590 slice E1b consumes this against
+    # identity.is_blend_evidence via _quote_supports_is_blend) — not yet
+    # consumed by any field's provenance.
+    _main_product_region(corpus, json_ld_values, json_ld_name)
 
     field_sources: dict[str, BeanFieldSource] = {}
     for field_name in _IDENTITY_FIELDS:
@@ -3222,7 +3513,7 @@ def _draft_from_identity(
             # DORMANT (_ALTITUDE_CITATION_GATE_ENABLED) — ``and`` short-
             # circuits before the check ever runs, until D2d flips it.
             gate_verdict = _ALTITUDE_CITATION_GATE_ENABLED and _quote_supports_altitude(
-                identity.altitude_m, identity.altitude_m_evidence, corpus
+                identity.altitude_m, identity.altitude_m_evidence, merged_corpus
             )
             field_sources[field_name] = "on_page" if gate_verdict else "origin_estimated"
             continue
@@ -3402,10 +3693,20 @@ async def draft_bean_profile_from_url(
     identity = await _extract_bean_identity(
         page.prompt_text, advisor_config=advisor_config, sourcing_config=config, model=model
     )
-    # page.verification_corpus, NOT page.prompt_text (#590 D1 fold 1) — the
-    # prompt text carries OUR OWN generated JSON-LD header/labels, which
-    # must never enter the containment gate (see _FetchedPage's docstring).
-    draft = _draft_from_identity(identity, url=url, corpus=page.verification_corpus)
+    # page.extracted_text/page.json_ld_values, NOT page.prompt_text (#590
+    # D1 fold 1; split #590 slice E1) — the prompt text carries OUR OWN
+    # generated JSON-LD header/labels, which must never enter the
+    # containment gate (see _FetchedPage's docstring). Passed separately
+    # (rather than the merged page.verification_corpus) so
+    # _draft_from_identity can compute _main_product_region over the body
+    # alone.
+    draft = _draft_from_identity(
+        identity,
+        url=url,
+        corpus=page.extracted_text,
+        json_ld_values=page.json_ld_values,
+        json_ld_name=page.json_ld_name,
+    )
     _log.info(
         "draft_bean_profile_from_url: drafted %r (%d fields sourced)",
         draft.name,
