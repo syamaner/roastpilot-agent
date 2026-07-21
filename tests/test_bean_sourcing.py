@@ -3635,6 +3635,70 @@ def test_heading_matches_anchor_is_linear_not_quadratic_on_a_crafted_heading() -
     assert elapsed < 1.0
 
 
+# --- #617 D2d, Codex PR #626 round 2 (BLOCKER): casefold() can EXPAND a
+# character into MORE codepoints than it started with (German "ß" -> "ss",
+# Turkish "İ" -> "i" + a combining dot), so a raw span computed from a
+# pre-casefolded copy silently desyncs from the real text's own length —
+# an ordinary non-English heading could raise IndexError out of the
+# fixed-size prefix array, aborting the whole draft. Fixed by computing
+# every span from the punctuation-translated (never casefolded) raw
+# text; casefold is applied per-token, strictly after its span is fixed. ---
+
+
+def test_heading_matches_anchor_german_sharp_s_expansion_no_exception() -> None:
+    """ "Große Kaffee" ("ß" casefolds to "ss", expanding the string) must
+    not raise — and, with the anchor normalized the SAME way the real
+    caller would (:func:`bean_sourcing._normalize_for_containment`), it
+    correctly anchors."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    anchor = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
+        "Große Kaffee"
+    )
+    assert matches_anchor("Große Kaffee", [anchor]) is True
+
+
+def test_heading_matches_anchor_german_sharp_s_expansion_non_match_no_exception() -> None:
+    """The same expanding heading against an UNRELATED anchor must not
+    raise either, and correctly does not anchor."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor("Große Kaffee", ["kenya aa"]) is False
+
+
+def test_heading_matches_anchor_turkish_dotted_capital_expansion_no_exception() -> None:
+    """ "İ Kenya" (Turkish dotted capital I, U+0130, casefolds to "i" plus a
+    COMBINING DOT ABOVE — two codepoints from one) must not raise."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor("İ Kenya", ["kenya"]) is True
+
+
+def test_heading_matches_anchor_expanding_fold_inside_a_long_comma_heading_no_indexerror() -> None:
+    """A length-expanding fold ("ß") sitting INSIDE a long, comma-heavy
+    heading — exercising the marker prefix array right at its own
+    boundary, where a desynced span would most easily read or write past
+    ``len(heading_text)`` — must not raise ``IndexError``."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    heading = "Kenya AA, " * 200 + "Große Kaffee, " * 5 + "Sumatra Mandailing"
+    assert matches_anchor(heading, ["kenya aa"]) is False  # comma-compound throughout
+
+
+def test_draft_from_identity_heading_with_german_sharp_s_no_error() -> None:
+    """End-to-end: a page whose product section heading contains "ß" must
+    draft cleanly — :func:`_main_product_region` (and the
+    :func:`_heading_matches_anchor` it calls) must not raise while
+    computing the region, whatever the anchor outcome."""
+    corpus = _framed(
+        "Große Kaffee",
+        "## Große Kaffee\nA rich, full-bodied lot from the highlands.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args()
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/grosse-kaffee", corpus=corpus
+    )
+    assert draft.name
+
+
 def test_draft_from_identity_altitude_comma_compound_heading_sibling_demotes() -> None:
     """End-to-end repro (#617 fold 4-FIX-1): a page anchored on "Kenya AA"
     has a "## Kenya AA, Sumatra Mandailing" section naming a SIBLING lot's

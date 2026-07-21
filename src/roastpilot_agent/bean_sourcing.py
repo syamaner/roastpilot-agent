@@ -3247,31 +3247,48 @@ def _altitude_context_guard_rejects(segment: str, start: int, end: int) -> bool:
 
 
 def _raw_word_spans(text: str) -> list[tuple[str, int, int]]:
-    """Whitespace-delimited words of ``text`` after casefold + the SAME
+    """Whitespace-delimited words of ``text``, each returned casefolded
+    for comparison but with a span computed ONLY from the SAME
     punctuation translation :func:`_normalize_for_containment` uses (#617
-    fold 1) — the translation maps each punctuation character to a
-    space, 1-for-1, so the result stays the SAME LENGTH as ``text`` and
-    every word's raw ``[start, end)`` span is genuinely in ``text``'s own
-    coordinates.
+    fold 1; casefold-desync fix, Codex PR #626 round 2) — the
+    translation maps each punctuation character to a space, 1-for-1, so
+    it alone keeps the result the SAME LENGTH as ``text`` and every
+    word's raw ``[start, end)`` span genuinely in ``text``'s own
+    coordinates. ``casefold()`` is DELIBERATELY NOT applied before
+    computing spans: unlike the punctuation translation, casefold can
+    EXPAND some characters into more codepoints than they started with
+    (German "ß" -> "ss", Turkish "İ" -> "i" + a combining dot above), so
+    a span computed from a pre-casefolded copy can silently drift past
+    ``text``'s own length — an ordinary "Große Kaffee" or "İ Kenya"
+    heading used to raise ``IndexError`` out of
+    :func:`_heading_compound_marker_prefix_counts`'s fixed-size array
+    (a genuine desync, not just a crash — the same drift would have
+    silently corrupted :func:`_locate_quote_span`'s spans too, without
+    raising anything, had that path not been index-array-based). Each
+    token is casefolded INDIVIDUALLY here, strictly AFTER its span is
+    already fixed from the raw text — casefolding only ever changes the
+    token's own comparison string, never the bookkeeping around it.
 
     Args:
-        text: The raw text to tokenize (a quote or a segment).
+        text: The raw text to tokenize (a quote, a segment, or a
+            heading).
 
     Returns:
-        ``(word, start, end)`` triples, in order.
+        ``(word, start, end)`` triples, in order — ``word`` is
+        casefolded; ``start``/``end`` are raw offsets into ``text``.
     """
-    pretransform = text.casefold().translate(_CONTAINMENT_PUNCTUATION_TRANSLATION)
+    pretransform = text.translate(_CONTAINMENT_PUNCTUATION_TRANSLATION)
     spans: list[tuple[str, int, int]] = []
     start: int | None = None
     for i, char in enumerate(pretransform):
         if char.isspace():
             if start is not None:
-                spans.append((pretransform[start:i], start, i))
+                spans.append((text[start:i].casefold(), start, i))
                 start = None
         elif start is None:
             start = i
     if start is not None:
-        spans.append((pretransform[start:], start, len(pretransform)))
+        spans.append((text[start:].casefold(), start, len(text)))
     return spans
 
 
