@@ -2536,7 +2536,18 @@ _BEAN_SPECIES_DISPLAY_SPELLINGS: dict[str, str] = {
 #: recognition of a strict ``NUMBER UNIT`` grammar; everything else
 #: demotes by construction. STOPPING RULE (#617): a review-round
 #: certify-bypass of THIS whitelist parks certification permanently, flag
-#: back to ``False`` — over-demotes never count against that rule.
+#: back to ``False`` — over-demotes never count against that rule. Two
+#: post-enable review rounds have already folded five, then three more,
+#: parameter-level leaks (conjunction/comma-compound headings, the
+#: quote-span margin, the generic-unit context-word set — see each
+#: mechanism's own docstring for the specific repro each fold closed).
+#: TERMINAL CONDITION (second round, pre-declared): this is the LAST
+#: parameter-tuning round for these three mechanisms — a follow-up
+#: scoped probe runs after this fold lands; if ANY certify-leak remains
+#: in the quote-anchoring, generic-unit-context, or heading-anchor
+#: mechanisms, this flag flips back to ``False`` and altitude
+#: certification parks PERMANENTLY under the stopping rule above — no
+#: further tuning rounds on these mechanisms after that.
 _ALTITUDE_CITATION_GATE_ENABLED: Final = True
 
 #: SELF-SUFFICIENT trailing units (#617 fold 2, post-review) — these are
@@ -2578,9 +2589,17 @@ _ABOVE_SEA_LEVEL_WORDS: tuple[str, str, str] = ("above", "sea", "level")
 #: review) — mirrors :data:`_PROCESS_CONTEXT_WORDS`'s "cue must sit near
 #: the claim" pattern. "grown at 1,850m" / "elevation of 1.850m" verify;
 #: "1,800 metres of shelving" / "1800 meter reading" (no cue nearby)
-#: demote.
+#: demote. Tightened (#617 fold 4-FIX-3, second review round): "sea"
+#: REMOVED — "1,800 metres from the sea" (a distance-from-the-coast
+#: reading, not an altitude) certified on "sea" alone; the ACCEPTED
+#: "above sea level" phrase (:data:`_ABOVE_SEA_LEVEL_WORDS`) is already
+#: separately self-sufficient and never needs this set at all. "growing"
+#: REMOVED (present-participle business copy — "growing business with
+#: 1,800 metres of shelving" — certified on it); "grown" (the past
+#: participle used in genuine provenance statements, "grown at 1,850m")
+#: stays.
 _ALTITUDE_CONTEXT_WORDS: frozenset[str] = frozenset(
-    {"altitude", "altitudes", "elevation", "elevations", "grown", "growing", "asl", "masl", "sea"}
+    {"altitude", "altitudes", "elevation", "elevations", "grown", "asl", "masl"}
 )
 
 #: Non-metre length units that REJECT an altitude reading when adjacent to
@@ -2656,11 +2675,26 @@ _ALTITUDE_CONTEXT_WINDOW_WORDS: Final[int] = 4
 #: A small allowance (raw characters) between the matched shape and the
 #: model's evidence quote's own raw span (#617 fold 1,
 #: :func:`_shape_overlaps_quote_span`) — enough to absorb a trimmed
-#: leading/trailing punctuation mark, NOT enough to reach a different
-#: clause of a long sentence ("...which also produces excellent
-#: honey-processed lots, grows at 1,900 masl..." must still demote when
-#: the quote names only the unrelated clause).
-_ALTITUDE_QUOTE_SPAN_MARGIN_CHARS: Final[int] = 10
+#: leading/trailing punctuation mark (a closing quote mark, a full stop),
+#: NOT enough to reach a different clause of a long sentence ("...which
+#: also produces excellent honey-processed lots, grows at 1,900
+#: masl..." must still demote when the quote names only the unrelated
+#: clause). Shrunk 10 -> 2 chars (#617 fold 4-FIX-2, second review
+#: round): 10 chars let "This farm has a lovely tasting room, 1800masl
+#: of area" certify off a quote naming only "a lovely tasting room" — a
+#: ", " gap is only 2 characters, well inside the old margin. The gap is
+#: now ALSO required to contain no clause-breaking character
+#: (:data:`_ALTITUDE_CLAUSE_BREAK_CHARS`) regardless of its length — the
+#: margin exists to absorb trimmed punctuation, never to bridge a clause
+#: boundary.
+_ALTITUDE_QUOTE_SPAN_MARGIN_CHARS: Final[int] = 2
+
+#: Characters that end one clause and begin another (#617 fold 4-FIX-2)
+#: — if the small gap :data:`_ALTITUDE_QUOTE_SPAN_MARGIN_CHARS` allows
+#: between the quote's own span and the matched shape contains ANY of
+#: these, the two are in different clauses and must not be treated as
+#: overlapping, however short the gap.
+_ALTITUDE_CLAUSE_BREAK_CHARS: frozenset[str] = frozenset({",", ";", ":", "-", "–", "—"})
 
 #: Roast-target fields a vendor page never states — always
 #: ``"origin_estimated"`` in the drafted :attr:`BeanProfileDraft.field_sources`.
@@ -3252,15 +3286,23 @@ def _locate_quote_span(quote: str, segment: str) -> tuple[int, int] | None:
 
 
 def _shape_overlaps_quote_span(
-    shape_start: int, shape_end: int, quote_start: int, quote_end: int
+    segment: str, shape_start: int, shape_end: int, quote_start: int, quote_end: int
 ) -> bool:
     """Whether the matched shape ``[shape_start, shape_end)`` intersects
-    the quote's own raw span, padded by
-    :data:`_ALTITUDE_QUOTE_SPAN_MARGIN_CHARS` on each side (#617 fold 1)
-    — a small allowance for punctuation trimmed while quoting, NOT a
-    licence to cite an unrelated clause of the same long sentence.
+    the quote's own raw span, or sits within a small, CLAUSE-CLEAN gap of
+    it (#617 fold 1, tightened fold 4-FIX-2, second review round) — a
+    genuine overlap (the shape sits inside the quote, or vice versa)
+    always counts; a NON-overlapping gap counts ONLY when it is no
+    longer than :data:`_ALTITUDE_QUOTE_SPAN_MARGIN_CHARS` raw characters
+    AND contains no clause-breaking character
+    (:data:`_ALTITUDE_CLAUSE_BREAK_CHARS`) — the margin absorbs a trimmed
+    punctuation mark (a closing quote, a full stop), never a clause
+    boundary like ", " ("...tasting room, 1800masl of area" must not
+    certify off a quote naming only "a lovely tasting room").
 
     Args:
+        segment: The raw authentic segment both spans live in — needed
+            to inspect the actual gap characters, not just their count.
         shape_start: The matched shape's start index.
         shape_end: The matched shape's end index (one past its last
             character).
@@ -3269,10 +3311,18 @@ def _shape_overlaps_quote_span(
         quote_end: The quote's own raw end index.
 
     Returns:
-        ``True`` if the two spans overlap within the margin.
+        ``True`` if the two spans genuinely overlap, or are close with a
+        clause-clean gap between them.
     """
-    margin = _ALTITUDE_QUOTE_SPAN_MARGIN_CHARS
-    return shape_start < quote_end + margin and shape_end > quote_start - margin
+    if shape_start < quote_end and shape_end > quote_start:
+        return True
+    if shape_end <= quote_start:
+        gap = segment[shape_end:quote_start]
+    else:
+        gap = segment[quote_end:shape_start]
+    if len(gap) > _ALTITUDE_QUOTE_SPAN_MARGIN_CHARS:
+        return False
+    return not any(char in _ALTITUDE_CLAUSE_BREAK_CHARS for char in gap)
 
 
 def _altitude_whitelist_match(value: int, quote: str, main_region_text: str) -> bool:
@@ -3331,7 +3381,7 @@ def _altitude_whitelist_match(value: int, quote: str, main_region_text: str) -> 
         quote_start, quote_end = quote_span
         target_digits = str(value)
         for start, end, requires_context in _iter_altitude_shapes(segment, target_digits):
-            if not _shape_overlaps_quote_span(start, end, quote_start, quote_end):
+            if not _shape_overlaps_quote_span(segment, start, end, quote_start, quote_end):
                 continue
             if requires_context and not _altitude_shape_has_context_word(segment, start, end):
                 continue
@@ -3550,6 +3600,16 @@ def _heading_matches_anchor(heading_text: str, anchors_normalized: list[str]) ->
     space by :func:`_normalize_for_containment` before tokenizing, so it
     never reaches this check at all.
 
+    #617 fold 4-FIX-1 (second review round): a comma in the RAW remainder
+    is ALSO treated as compound — "## Kenya AA, Sumatra Mandailing" must
+    not anchor for "Kenya AA" either, but a comma normalizes to a space
+    by :func:`_normalize_for_containment` before the word-based
+    conjunction check ever runs, erasing the signal. Checked on the RAW
+    heading text (:func:`_raw_word_spans`, never the normalized/tokenized
+    form) so the comma survives long enough to be seen — the em dash in
+    "Kenya Kiambu — Single Origin" is a DIFFERENT character and is
+    unaffected by this check.
+
     Args:
         heading_text: The raw heading line's text (``#`` markers and
             leading/trailing whitespace already stripped).
@@ -3558,20 +3618,28 @@ def _heading_matches_anchor(heading_text: str, anchors_normalized: list[str]) ->
 
     Returns:
         ``True`` if some anchor matches within the heading AND the
-        remainder around that match carries no conjunction.
+        remainder around that match carries no conjunction AND no comma
+        (checked on the raw text).
     """
     normalized_heading = _normalize_for_containment(heading_text)
     if not normalized_heading:
         return False
-    heading_tokens = normalized_heading.split()
+    heading_word_spans = _raw_word_spans(heading_text)
+    heading_tokens = [word for word, _, _ in heading_word_spans]
     for anchor in anchors_normalized:
         anchor_tokens = tuple(anchor.split())
         if not anchor_tokens:
             continue
         for start, end in _phrase_token_spans(anchor_tokens, heading_tokens):
-            remainder = heading_tokens[:start] + heading_tokens[end + 1 :]
-            if not _heading_remainder_has_conjunction(remainder):
-                return True
+            remainder_tokens = heading_tokens[:start] + heading_tokens[end + 1 :]
+            if _heading_remainder_has_conjunction(remainder_tokens):
+                continue
+            raw_start = heading_word_spans[start][1]
+            raw_end = heading_word_spans[end][2]
+            raw_remainder = heading_text[:raw_start] + heading_text[raw_end:]
+            if "," in raw_remainder:
+                continue
+            return True
     return False
 
 

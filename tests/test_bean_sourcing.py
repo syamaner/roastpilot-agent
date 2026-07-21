@@ -3485,6 +3485,145 @@ def test_draft_from_identity_altitude_conjunction_heading_sibling_demotes() -> N
     assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
+# --- #617 fold 4-FIX-1 (BLOCKER, second review round): a COMMA-compound
+# heading ("## Kenya AA, Sumatra Mandailing") must not anchor either —
+# the comma is erased by normalization before the word/symbol conjunction
+# check ever runs, so it is checked separately on the RAW heading text. ---
+
+
+def test_heading_matches_anchor_comma_compound_no_longer_anchors() -> None:
+    """Direct unit coverage: "## Kenya AA, Sumatra Mandailing" no longer
+    anchors for "Kenya AA" — the comma in the raw remainder marks a
+    compound heading, same disposition as "&"/"and"/"with"/"plus"."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor("Kenya AA, Sumatra Mandailing", ["kenya aa"]) is False
+
+
+def test_heading_matches_anchor_still_anchors_with_no_comma_in_remainder() -> None:
+    """The E1b regression this fix must NOT break: "## Kenya Kiambu —
+    Single Origin" still anchors — its remainder has no comma (the em
+    dash is a different character, already punctuation-translated away
+    before the word-level conjunction check, and never reaches the raw
+    comma check at all since "," is not "—")."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor("Kenya Kiambu — Single Origin", ["kenya kiambu"]) is True
+
+
+def test_draft_from_identity_altitude_comma_compound_heading_sibling_demotes() -> None:
+    """End-to-end repro (#617 fold 4-FIX-1): a page anchored on "Kenya AA"
+    has a "## Kenya AA, Sumatra Mandailing" section naming a SIBLING lot's
+    altitude ("1,200 masl") — the comma-compound heading no longer
+    anchors, so that section falls OUTSIDE the main region and the
+    citation demotes."""
+    corpus = _framed(
+        "Kenya AA",
+        "## Kenya AA, Sumatra Mandailing\n"
+        "Our Sumatra Mandailing lot grows at 1,200 masl and is also available.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1200, altitude_m_evidence="grows at 1,200 masl")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya-aa", corpus=corpus
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+
+
+# --- #617 fold 4-FIX-2 (BLOCKER, second review round): the quote-span
+# margin is shrunk to 2 chars AND the gap it allows must be clause-clean
+# (no comma/semicolon/colon/dash) — the margin absorbs trimmed
+# punctuation, never bridges to an unrelated clause. ---
+
+
+def test_quote_supports_altitude_short_comma_gap_to_an_unrelated_clause_demotes() -> None:
+    """Reviewer repro: "This farm has a lovely tasting room, 1800masl of
+    area" — the quote names only "a lovely tasting room", a mere 2
+    characters (", ") from the shape. The OLD 10-char margin let this
+    certify; the NEW margin is itself only 2 chars, but the comma inside
+    that gap now rejects it regardless of length."""
+    corpus = "This farm has a lovely tasting room, 1800masl of area."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "a lovely tasting room", corpus
+        )
+        is False
+    )
+
+
+def test_quote_supports_altitude_shape_flush_at_end_of_quote_verifies() -> None:
+    """A quote ending flush at the shape ("Grown at 1,800 masl" cited in
+    full, the shape sitting entirely within the quote's own span) still
+    verifies — a genuine overlap, no gap involved at all."""
+    corpus = "Grown at 1,800 masl in the highlands."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "Grown at 1,800 masl", corpus
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_quote_with_trailing_period_still_verifies() -> None:
+    """A quote ending at "...masl." with a trailing period still verifies
+    — the period tokenizes away, so the quote's own located span ends
+    flush with the shape (a genuine overlap), the trailing punctuation
+    itself never entering the gap calculation at all."""
+    corpus = "Grown at 1,800 masl. Roasted fresh weekly."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "Grown at 1,800 masl.", corpus
+        )
+        is True
+    )
+
+
+# --- #617 fold 4-FIX-3 (MEDIUM, second review round): drop "sea" and
+# "growing" from the generic-unit context-word set — both admitted
+# non-altitude business copy. ---
+
+
+def test_quote_supports_altitude_growing_business_copy_demotes() -> None:
+    """Reviewer repro: "growing business with 1,800 metres of shelving" —
+    the present-participle "growing" used to satisfy the context-word
+    requirement for ordinary business copy with no altitude meaning at
+    all."""
+    corpus = "Our growing business with 1,800 metres of shelving needs more space."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, corpus, corpus
+        )
+        is False
+    )
+
+
+def test_quote_supports_altitude_distance_from_the_sea_demotes() -> None:
+    """Reviewer repro: "1,800 metres from the sea" is a distance-from-the-
+    coast reading, not an altitude — "sea" alone used to satisfy the
+    context-word requirement; the accepted "above sea level" phrase is a
+    SEPARATE, already self-sufficient code path and never needs this
+    set."""
+    corpus = "This warehouse sits 1,800 metres from the sea on the coast road."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, corpus, corpus
+        )
+        is False
+    )
+
+
+def test_quote_supports_altitude_grown_at_metres_still_verifies_after_context_tightening() -> None:
+    """The positive control for fix 3: "grown at 1,850 metres" still
+    verifies — "grown" (the past participle used in genuine provenance
+    statements) stays in the context-word set."""
+    corpus = "This lot is grown at 1,850 metres in the highlands."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1850, corpus, corpus
+        )
+        is True
+    )
+
+
 # --- #616 Codex round-1: known guard-stack bypasses. The guard-stack is
 # RETIRED (#617 D2d-a) and REPLACED (#617 D2d-b) — the fail-closed
 # whitelist grammar closes every one of these STRUCTURALLY (positive
