@@ -2022,16 +2022,17 @@ class _ExtractedBeanIdentity(BaseModel):
 
     The four ``*_evidence`` fields (#590 slice D2a) are a PARALLEL, optional
     verbatim quote alongside each TYPED field (``altitude_m``,
-    ``processing``, ``bean_species``, ``is_blend``). Two of the four now
-    feed a LIVE, ENABLED gate at runtime (#590 slice E2, the story's final
-    field family): ``processing_evidence``/``bean_species_evidence`` feed
-    :func:`_quote_supports_processing`/:func:`_quote_supports_bean_species`
-    (:data:`_ENUM_CITATION_GATE_ENABLED`). The other two stay
+    ``processing``, ``bean_species``, ``is_blend``). Only ONE of the four
+    feeds a LIVE, ENABLED gate at runtime (#590 slice E2):
+    ``processing_evidence`` feeds :func:`_quote_supports_processing`
+    (:data:`_PROCESSING_CITATION_GATE_ENABLED`). The other three stay
     CAPTURED-BUT-UNCONSUMED — ``altitude_m_evidence`` feeds a DORMANT
-    gate, :data:`_ALTITUDE_CITATION_GATE_ENABLED`, pending D2d;
-    ``is_blend_evidence`` feeds a DORMANT gate too,
-    :data:`_IS_BLEND_LOCALITY_GATE_ENABLED` — certification PARKED
-    PERMANENTLY (a semantic certify-bypass class, not a page-shape one).
+    gate pending D2d (:data:`_ALTITUDE_CITATION_GATE_ENABLED`);
+    ``is_blend_evidence`` feeds one PARKED PERMANENTLY
+    (:data:`_IS_BLEND_LOCALITY_GATE_ENABLED`, a semantic certify-bypass
+    class); ``bean_species_evidence`` feeds
+    :func:`_quote_supports_bean_species`, PARKED PRE-REVIEW on the SAME
+    semantic-bypass class (:data:`_BEAN_SPECIES_CITATION_GATE_ENABLED`).
     """
 
     name: str | None = None
@@ -2048,8 +2049,10 @@ class _ExtractedBeanIdentity(BaseModel):
     bean_species: BeanSpecies | None = None
     bean_species_evidence: str | None = Field(default=None, max_length=500)
     """A verbatim span of page text supporting ``bean_species`` (#590
-    D2a). Feeds the ENABLED :func:`_quote_supports_bean_species` gate
-    (#590 slice E2) — see ``processing_evidence``."""
+    D2a). Feeds :func:`_quote_supports_bean_species` (#590 slice E2), but
+    that gate ships DORMANT (:data:`_BEAN_SPECIES_CITATION_GATE_ENABLED`)
+    — captured but UNCONSUMED at runtime, parked on a demonstrated
+    negation bypass; see that constant's docstring."""
     altitude_m: int | None = Field(default=None, ge=0, le=4000)
     """A single STATED altitude — never a computed midpoint of a page-given
     RANGE (#587 P2, round 6: the extraction used to average a range down to
@@ -2455,20 +2458,33 @@ _IDENTITY_FIELDS: tuple[str, ...] = (
     "description",
 )
 
-#: Ships ENABLED AT BIRTH (#590 slice E2, final field family in the story
-#: — see the "Field certification ledger" comment on #590) — whitelist-
-#: native from the start, same posture as E1b, unlike the altitude gate's
-#: guard-stack retrofit. PRE-DECLARED STOPPING RULE (repo precedent:
-#: #614/#615/#616 for altitude, #618/#619 for ``is_blend``): a
-#: review-round certify-bypass of the whitelist flips this constant to
-#: ``False`` and spawns a hardening slice — UNLESS the bypass is
-#: SEMANTIC (negation, disambiguation-defeating composition — the class
-#: that got ``is_blend`` PARKED PERMANENTLY, see
-#: :data:`_IS_BLEND_LOCALITY_GATE_ENABLED`), in which case the field is
-#: parked instead of patched (an enumerative negation denylist is exactly
-#: the arms race the polarity law forbids). Over-demotes never count
-#: against this stopping rule — only a false ``"on_page"`` does.
-_ENUM_CITATION_GATE_ENABLED: Final = True
+#: Ships ENABLED AT BIRTH (#590 slice E2) — whitelist-native, unlike the
+#: altitude retrofit. PRE-DECLARED STOPPING RULE (repo precedent:
+#: #614-#616, #618/#619): a review-round certify-bypass flips this
+#: ``False`` and spawns a hardening slice, UNLESS SEMANTIC (negation —
+#: the class that parked ``is_blend`` permanently, see
+#: :data:`_IS_BLEND_LOCALITY_GATE_ENABLED`, and pre-emptively parked
+#: ``bean_species`` below), in which case the field parks instead — no
+#: denylist arms race. ``processing``'s cue+conflict structure has no
+#: DEMONSTRATED bypass ("unlike washed coffees" fails the cue; a mixed
+#: sentence dies on the conflict exclusion), so it earns a live review
+#: shot; ``bean_species`` did not (see next).
+_PROCESSING_CITATION_GATE_ENABLED: Final = True
+
+#: Ships DORMANT — split off ``processing``'s gate PRE-REVIEW (lead
+#: triage, #590 slice E2) on DEMONSTRATED evidence, not a review round:
+#: this slice's own negation probe
+#: (``test_quote_supports_bean_species_negation_probe_documents_actual_behavior``)
+#: shows "This coffee is not a robusta varietal." certifying
+#: ``robusta=True`` from ordinary vendor copy. No cue can save it —
+#: ``bean_species`` has none (self-disambiguating tokens, see
+#: :func:`_quote_supports_bean_species`), and "varietal" sits adjacent to
+#: "robusta" anyway. Same class that parked ``is_blend`` permanently — no
+#: denylist hardening will be attempted; revisit only with a non-lexical
+#: mechanism. The helper stays fully built and unit-tested, only its
+#: consumption here is gated off (dormancy pattern ×3: altitude, is_blend,
+#: bean_species).
+_BEAN_SPECIES_CITATION_GATE_ENABLED: Final = False
 
 #: Process words a ``processing`` enum display token must sit IMMEDIATELY
 #: ADJACENT to, ±1 token in normalized token space (#590 slice E2) — a
@@ -3716,10 +3732,9 @@ def _quote_supports_enum_value(
 
 def _quote_supports_processing(value: str | None, quote: str | None, main_region_text: str) -> bool:
     """Whether ``quote`` genuinely supports ``value`` for ``processing``
-    (#590 slice E2 — the last field family in the story; see #590's
-    "Field certification ledger" comment). ``"other"`` NEVER verifies (AC
-    E-6, permanent — it has no vendor display spelling to cite).
-    Otherwise verifies iff ALL of:
+    (#590 slice E2). ``"other"`` NEVER verifies (AC E-6, permanent — it
+    has no vendor display spelling to cite). Otherwise verifies iff ALL
+    of:
 
     1. ``quote`` authenticates as a single, whole-phrase segment within
        ``main_region_text`` (:func:`_find_authentic_segment`, reused
@@ -3771,6 +3786,12 @@ def _quote_supports_bean_species(
     single-valued field cannot certify a mixed-species claim, e.g. "80%
     Arabica, 20% Robusta" certifies neither.
 
+    This helper ships fully built and unit-tested, but its result is NOT
+    consumed at runtime — :data:`_BEAN_SPECIES_CITATION_GATE_ENABLED` is
+    ``False`` (parked pre-review on demonstrated evidence, see that
+    constant's docstring): call this function directly to exercise it; it
+    is never reached through :func:`_draft_from_identity` while dormant.
+
     Args:
         value: The extracted ``bean_species`` value, or ``None``.
         quote: The model's verbatim ``bean_species_evidence`` span, or
@@ -3814,15 +3835,19 @@ def _draft_from_identity(
     it keeps the original presence-only tagging. ``altitude_m`` never runs
     through the containment matcher — its citation gate ships DORMANT
     (:data:`_ALTITUDE_CITATION_GATE_ENABLED`), so it demotes
-    unconditionally today. ``processing``/``bean_species`` instead verify
-    via the ENABLED :func:`_quote_supports_processing`/
-    :func:`_quote_supports_bean_species` gates (:data:`_ENUM_CITATION_GATE_ENABLED`,
-    #590 slice E2 — the story's final field family): quote authenticity +
-    main-region locality (:func:`_find_authentic_segment`, reused from
-    D2b/E1b), enum display-spelling value-derivation, a process-word
-    adjacency cue (processing only), and a segment-scoped symmetric
-    conflicting-value exclusion. ``is_blend`` demotes unconditionally:
-    its main-region locality + polarity gate
+    unconditionally today. ``processing`` instead verifies via the ENABLED
+    :func:`_quote_supports_processing` gate
+    (:data:`_PROCESSING_CITATION_GATE_ENABLED`, #590 slice E2): quote
+    authenticity + main-region locality (:func:`_find_authentic_segment`,
+    reused from D2b/E1b), enum display-spelling value-derivation, a
+    process-word adjacency cue, and a segment-scoped symmetric
+    conflicting-method exclusion. ``bean_species`` has the SAME machinery
+    built (:func:`_quote_supports_bean_species`, minus the process-word
+    cue) but demotes unconditionally too: its gate ships DORMANT
+    (:data:`_BEAN_SPECIES_CITATION_GATE_ENABLED`) — parked PRE-REVIEW on a
+    demonstrated negation bypass (see that constant's docstring), the same
+    semantic-bypass class as below, not a page-shape one. ``is_blend``
+    demotes unconditionally too: its main-region locality + polarity gate
     (:func:`_quote_supports_is_blend`) ships DORMANT
     (:data:`_IS_BLEND_LOCALITY_GATE_ENABLED`) — an independent
     security-reviewer pass found a semantic certify-bypass class
@@ -3842,11 +3867,11 @@ def _draft_from_identity(
     at all (:func:`draft_bean_profile_from_url` rejects those outright,
     before any fetch). The vendor page itself is still fetched with the
     REAL, un-redacted URL — only what is returned/persisted is redacted.
-    Two of ``identity``'s four ``*_evidence`` quotes now affect provenance
-    at runtime (#590 slice E2): ``processing_evidence``/
-    ``bean_species_evidence`` feed the ENABLED enum gates above. The other
-    two (``altitude_m_evidence``/``is_blend_evidence``) stay dormant/
-    parked, see above.
+    Only ONE of ``identity``'s four ``*_evidence`` quotes affects
+    provenance at runtime (#590 slice E2): ``processing_evidence`` feeds
+    the ENABLED gate above. The other three (``bean_species_evidence``,
+    ``altitude_m_evidence``, ``is_blend_evidence``) stay dormant/parked,
+    see above.
 
     Args:
         identity: The provider's page-only extraction, including its four
@@ -3962,20 +3987,22 @@ def _draft_from_identity(
             field_sources[field_name] = "on_page"
             continue
         if field_name == "processing":
-            # ENABLED (#590 slice E2, _ENUM_CITATION_GATE_ENABLED) —
+            # ENABLED (#590 slice E2, _PROCESSING_CITATION_GATE_ENABLED) —
             # quote authenticity+locality, display-spelling
             # value-derivation, a process-word cue, and the segment-scoped
             # conflicting-method exclusion.
-            gate_verdict = _ENUM_CITATION_GATE_ENABLED and _quote_supports_processing(
+            gate_verdict = _PROCESSING_CITATION_GATE_ENABLED and _quote_supports_processing(
                 identity.processing, identity.processing_evidence, main_region
             )
             field_sources[field_name] = "on_page" if gate_verdict else "origin_estimated"
             continue
         if field_name == "bean_species":
-            # ENABLED (#590 slice E2) — same as processing, minus the
-            # process-word cue (arabica/robusta/liberica/excelsa are
-            # self-disambiguating tokens).
-            gate_verdict = _ENUM_CITATION_GATE_ENABLED and _quote_supports_bean_species(
+            # DORMANT (#590 slice E2, _BEAN_SPECIES_CITATION_GATE_ENABLED)
+            # — parked pre-review on a DEMONSTRATED negation bypass (see
+            # that constant's docstring); ``and`` short-circuits before
+            # the helper ever runs, so this demotes unconditionally, same
+            # as altitude_m/is_blend.
+            gate_verdict = _BEAN_SPECIES_CITATION_GATE_ENABLED and _quote_supports_bean_species(
                 identity.bean_species, identity.bean_species_evidence, main_region
             )
             field_sources[field_name] = "on_page" if gate_verdict else "origin_estimated"

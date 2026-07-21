@@ -4958,8 +4958,18 @@ def test_quote_supports_bean_species_negation_probe_documents_actual_behavior() 
     conflict with it. **This is the ACTUAL, CURRENT behavior — it
     CERTIFIES the wrong claim** (a known gap in the lexical whitelist,
     structurally the same class that got ``is_blend`` parked in E1b).
-    Documented here for the adversarial review pass this story's kickoff
-    plan calls for; not asserted as correct, only as current."""
+
+    THIS is the demonstrated evidence that got
+    :data:`bean_sourcing._BEAN_SPECIES_CITATION_GATE_ENABLED` parked
+    PRE-REVIEW (lead triage, #590 slice E2) rather than shipped enabled
+    pending a review round: ordinary vendor copy ("arabica" marketing
+    routinely disses "robusta"), not an adversarial construction, and no
+    context cue could have saved it — "varietal" sits immediately
+    adjacent to "robusta" in this very sentence, so importing
+    ``processing``'s cue mechanism would not close it either. The helper
+    itself stays exercised directly here (never through
+    :func:`bean_sourcing._draft_from_identity` while the gate is
+    dormant); not asserted as correct, only as current."""
     sentence = "This coffee is not a robusta varietal."
     result = bean_sourcing._quote_supports_bean_species(  # pyright: ignore[reportPrivateUsage]
         "robusta", sentence, sentence
@@ -5049,7 +5059,15 @@ def test_draft_from_identity_processing_verifies_under_matched_heading() -> None
     assert draft.field_sources["processing"] == "on_page"
 
 
-def test_draft_from_identity_bean_species_verifies_under_matched_heading() -> None:
+def test_draft_from_identity_bean_species_under_matched_heading_stays_dormant() -> None:
+    """DORMANT-gate form (#590 slice E2 — ``bean_species`` split off and
+    parked before this slice opened, see
+    :data:`bean_sourcing._BEAN_SPECIES_CITATION_GATE_ENABLED`), mirroring
+    E1b's ``is_blend`` dormancy proof: the SAME page, with a genuine,
+    authentic, well-formed citation, demotes at RUNTIME regardless — the
+    helper itself still recognizes the citation (see the direct-call
+    assertion below), proving the machinery works and only its
+    consumption is gated off."""
     body = _framed(
         "Ethiopia Yirgacheffe",
         "## Ethiopia Yirgacheffe\n100% arabica, hand-picked at peak ripeness.\n",
@@ -5060,7 +5078,14 @@ def test_draft_from_identity_bean_species_verifies_under_matched_heading() -> No
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
         identity, url="https://vendor.example/products/yirgacheffe", corpus=body
     )
-    assert draft.field_sources["bean_species"] == "on_page"
+    assert draft.field_sources["bean_species"] == "origin_estimated"
+    main_region = bean_sourcing._main_product_region(body, "", "")  # pyright: ignore[reportPrivateUsage]
+    assert (
+        bean_sourcing._quote_supports_bean_species(  # pyright: ignore[reportPrivateUsage]
+            "arabica", "100% arabica", main_region
+        )
+        is True
+    )
 
 
 def test_draft_from_identity_processing_cross_sell_decoy_demotes() -> None:
@@ -5084,10 +5109,24 @@ def test_draft_from_identity_processing_cross_sell_decoy_demotes() -> None:
     assert draft.field_sources["processing"] == "origin_estimated"
 
 
-def test_draft_from_identity_enum_gate_ships_enabled() -> None:
-    """#590 slice E2 ships ENABLED at birth (unlike the altitude
-    retrofit) — direct proof on the enable constant itself."""
-    assert bean_sourcing._ENUM_CITATION_GATE_ENABLED is True  # pyright: ignore[reportPrivateUsage]
+def test_draft_from_identity_processing_gate_ships_enabled() -> None:
+    """#590 slice E2: ``processing`` ships ENABLED at birth (unlike the
+    altitude retrofit) — its cue+conflict structure has no demonstrated
+    bypass, so it earns its adversarial review shot live."""
+    assert (
+        bean_sourcing._PROCESSING_CITATION_GATE_ENABLED is True  # pyright: ignore[reportPrivateUsage]
+    )
+
+
+def test_draft_from_identity_bean_species_gate_ships_dormant() -> None:
+    """#590 slice E2: ``bean_species`` was split off and parked BEFORE
+    this slice opened — a demonstrated negation bypass (see the negation
+    probe test above), the same semantic class that parked ``is_blend``
+    in E1b, with no context cue available to close it."""
+    assert (
+        bean_sourcing._BEAN_SPECIES_CITATION_GATE_ENABLED  # pyright: ignore[reportPrivateUsage]
+        is False
+    )
 
 
 def test_draft_from_identity_marks_every_roast_target_origin_estimated() -> None:
