@@ -56,18 +56,12 @@ model can only ever land ``MIS`` (a correct abstention) or ``INC`` (a leaked
 scalar, always tagged ``on_page``) -- never ``COR`` -- uniformly deflating
 recall/macro-F1 on the two RANGE-altitude corpus pages
 (``cbc-costa-rica-laminita-tarrazu``, ``counterculture-concepcion-huista``)
-regardless of model quality. **This does NOT guarantee an unchanged relative
-ranking** (#602 correction -- the prior wording overclaimed this): ``MIS``
-(weight 0, a compliant abstention) and ``INC`` (weight -0.5, a leaked
-scalar) are different penalties, so a pass where one model abstains while
-another leaks a scalar on these cells CAN shift both ``CombinedScore`` and
-macro-F1 ordering. In the committed 19 Jul run every model happened to
-abstain on both RANGE-altitude cells, so THAT run's deflation was uniform
-and did not itself reorder anything -- but that uniformity is a property of
-that run, not a guarantee of every run. See the report's committed
-:data:`CAVEAT_TEXT` and the results doc's Honest caveats section, which both
-disclose this correctly. Aligning the harness's RANGE contract with a real
-midpoint/``origin_estimated`` extractor feature is deferred to #590.
+regardless of model quality. **This does NOT guarantee an unchanged relative ranking** (#602
+correction -- prior wording overclaimed this): ``MIS`` (weight 0) and ``INC`` (weight -0.5) are
+different penalties, so one model abstaining while another leaks a scalar here CAN shift
+``CombinedScore``/macro-F1 ordering. The committed 19 Jul run saw uniform abstention on both
+cells -- a property of THAT run, not a guarantee; see :data:`CAVEAT_TEXT` and the results doc.
+Aligning the RANGE contract with a real midpoint/``origin_estimated`` feature is deferred to #590.
 
 **Evidence-quote capture (#612).** Every ``pages[*].extracted`` record already
 carries the drafted :attr:`~roastpilot_agent.models.BeanProfileDraft.field_sources`
@@ -118,6 +112,7 @@ import argparse
 import asyncio
 import dataclasses
 import hashlib
+import importlib.metadata
 import inspect
 import itertools
 import json
@@ -162,17 +157,30 @@ from roastpilot_agent.models import BeanProfileDraft  # noqa: E402
 #: provider/model construction (``advisor.build_model``), config defaults
 #: (``AdvisorConfig``/``BeanSourcingConfig``), and schema/validation
 #: (``BeanProfileDraft``). INCLUSION RULE (#602): hash every first-party
-#: module on that call path whose source can change a result; third-party
-#: and stdlib dependencies (pydantic_ai, httpx, lxml, trafilatura, extruct)
-#: are deliberately EXCLUDED -- they are version-pinned via
-#: pyproject.toml/the lockfile, not source-hashed here, and a dependency
-#: bump is a separate kind of drift (see the ``mcp-contract-checker``
-#: dependency-bump review), not this fingerprint's job.
+#: module on that call path whose source can change a result. Third-party
+#: dependencies are hashed SEPARATELY, by installed VERSION (see
+#: :data:`_FINGERPRINTED_DEPENDENCIES`), not source -- their code is not
+#: committed to this repo.
 _FINGERPRINTED_MODULES: tuple[ModuleType, ...] = (
     _bean_sourcing_module,
     _advisor_module,
     _config_module,
     _models_module,
+)
+
+#: Third-party distribution names whose INSTALLED VERSION can change
+#: extraction behaviour with no first-party source change (#602 fold round
+#: 4): no lockfile, and pyproject's ranges (e.g. ``httpx>=0.28,<1``) admit a
+#: compatible upgrade between invocations. Same INCLUSION RULE as
+#: :data:`_FINGERPRINTED_MODULES`, applied to ``bean_sourcing.py``'s own
+#: third-party imports instead of first-party source.
+_FINGERPRINTED_DEPENDENCIES: tuple[str, ...] = (
+    "httpx",
+    "pydantic",
+    "pydantic-ai-slim",
+    "extruct",
+    "trafilatura",
+    "lxml",
 )
 
 # --- Constants ---------------------------------------------------------------
@@ -562,8 +570,9 @@ def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> N
     Raises:
         ValueError: If a required field is missing, has neither/both of
             ``"value"``/``"absent": true``, a present ``"value"`` has the
-            wrong type/shape for its field kind, or a present
-            ``accept_any_of`` is not a non-empty list of non-empty strings.
+            wrong type/shape, ``"value"`` and ``accept_any_of`` are BOTH
+            present (the latter is absent-only, #602 fold round 4), or a
+            present ``accept_any_of`` is not a non-empty string list.
     """
     for spec in FIELD_SPECS:
         field = gold_fields.get(spec.name)
@@ -580,6 +589,12 @@ def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> N
                 "{'value': ...} or {'absent': true}, got " + repr(field)
             )
         if has_value:
+            if "accept_any_of" in field:
+                raise ValueError(
+                    f"{slug}.gold.json: field {spec.name!r} has BOTH 'value' and "
+                    "'accept_any_of' -- 'accept_any_of' is an ABSENT-only tolerance list, "
+                    "not valid alongside a 'value' (#602 fold round 4)"
+                )
             _validate_gold_value_type(slug, spec, field["value"])
         elif "accept_any_of" in field:
             _validate_accept_any_of(slug, spec, field["accept_any_of"])
@@ -1025,13 +1040,11 @@ _COMPARATORS: dict[str, Callable[[Any, Any], Outcome]] = {
 def _tolerates_absent_value(tolerated: Sequence[str], model_value: str) -> bool:
     """Whether ``model_value`` matches ANY tolerated phrase on recall AND
     EXACT precision -- unlike :func:`_compare_text`'s fuzzy 0.75 gate (fit
-    for comparing two free-text descriptions), ``accept_any_of`` is a
-    WHITELIST of acceptable non-answers, so ANY unsupported token must
-    reject the match: the fuzzy threshold would admit "blend of multiple
-    origins Ethiopia" (3/4 tokens = precision exactly 0.75) and score an
-    invented country ABS_COR (#602 fold 2 round 2). Precision must be
-    ``1.0`` -- every content token of ``model_value`` in the phrase's own
-    token bag, zero padding tolerated.
+    for free-text comparison), ``accept_any_of`` is a WHITELIST, so ANY
+    unsupported token must reject the match: a fuzzy threshold admitted
+    "blend of multiple origins Ethiopia" (precision exactly 0.75) as if it
+    were a correct non-answer (#602 fold round 2). Precision must be
+    ``1.0`` -- zero padding tolerated.
 
     Args:
         tolerated: The gold-JSON ``accept_any_of`` phrase list.
@@ -1051,17 +1064,13 @@ def _tolerates_absent_value(tolerated: Sequence[str], model_value: str) -> bool:
 def _classify_absent_field(gold_field: dict[str, Any], model_value: object | None) -> Outcome:
     """Score a gold-ABSENT field, honouring an optional ``accept_any_of`` tolerance.
 
-    A field is gold-ABSENT either because the vendor page gives nothing to
-    say, or because it is absent-because-UNKNOWABLE -- e.g. a blend's
-    ``origin`` has no single country, so a model answering "a blend of
-    multiple origins" has not hallucinated a wrong country (#602 gold-label
-    nuance). ``accept_any_of`` (an optional gold-JSON phrase list) lets a
-    labeller mark those cases: a value matching ANY tolerated phrase on
-    BOTH recall AND precision (:func:`_tolerates_absent_value`) scores
-    ``ABS_COR`` -- same credit as a plain abstention, neither reward nor
-    penalty. Anything else, including a tolerated phrase padded with an
-    invented value, still scores ``SPU``. Absent/empty ``accept_any_of`` is
-    a no-op (pre-#602 behaviour).
+    A field is gold-ABSENT either because the page says nothing, or because it is
+    absent-because-UNKNOWABLE -- e.g. a blend's ``origin`` has no single country, so a model
+    answering "a blend of multiple origins" has not hallucinated a wrong one (#602 gold-label
+    nuance). ``accept_any_of`` (an optional gold-JSON phrase list) marks those cases: a value
+    matching ANY tolerated phrase on BOTH recall AND precision (:func:`_tolerates_absent_value`)
+    scores ``ABS_COR`` -- same as a plain abstention. Anything else, including a padded
+    tolerated phrase, still scores ``SPU``. Absent/empty ``accept_any_of`` is a no-op.
 
     Args:
         gold_field: The field's gold state (``{"absent": true, ...}``).
@@ -1559,17 +1568,12 @@ class BootstrapCI:
     """A paired-bootstrap point estimate + percentile interval.
 
     Attributes:
-        estimate: The observed A-minus-B gap on the full sample, or ``None``
-            when the underlying metric is undefined for A or B (an empty
-            denominator -- e.g. neither model has a gold-present cell to
-            compute precision/recall/abstention over). ``None`` must render
-            as ``n/a``, never be silently coerced to ``0.0``: a fabricated
-            zero gap reads as "no difference" when the comparison is
-            actually not computable at all (#602 finding).
-        low: The lower percentile bound (default 2.5%), or ``None`` when
-            ``estimate`` is ``None`` or no resample had both sides defined.
-        high: The upper percentile bound (default 97.5%); ``None`` under the
-            same conditions as ``low``.
+        estimate: The observed A-minus-B gap, or ``None`` when the metric is
+            undefined for A or B (an empty denominator) -- rendered
+            ``n/a``, never coerced to a fabricated ``0.0`` (#602 finding).
+        low: The lower percentile bound (2.5%), or ``None`` under the same
+            condition as ``estimate``.
+        high: The upper percentile bound (97.5%); ``None`` likewise.
         resamples: How many bootstrap resamples had both sides defined.
     """
 
@@ -1796,14 +1800,16 @@ class WilsonInterval:
     Attributes:
         successes: COR count (PAR excluded).
         trials: Present-field decisions (COR+PAR+INC+MIS).
-        proportion: ``successes / trials``.
-        low: Lower Wilson bound.
-        high: Upper Wilson bound.
+        proportion: ``successes / trials``, or ``None`` when ``trials`` is 0
+            (undefined -- rendered ``n/a``, never a fabricated ``0.000``,
+            #602 fold round 4).
+        low: Lower Wilson bound (degenerate ``0.0`` when ``trials`` is 0).
+        high: Upper Wilson bound (degenerate ``1.0`` when ``trials`` is 0).
     """
 
     successes: int
     trials: int
-    proportion: float
+    proportion: float | None
     low: float
     high: float
 
@@ -1821,11 +1827,11 @@ def wilson_interval(successes: int, trials: int, *, z: float = 1.959963984540054
         z: The standard-normal quantile (default 95%).
 
     Returns:
-        The :class:`WilsonInterval` (a degenerate ``0..1`` interval when
-        ``trials == 0``).
+        The :class:`WilsonInterval` (``proportion=None`` and a degenerate
+        ``[0, 1]`` bound when ``trials == 0``).
     """
     if trials == 0:
-        return WilsonInterval(0, 0, 0.0, 0.0, 1.0)
+        return WilsonInterval(0, 0, None, 0.0, 1.0)
     phat = successes / trials
     denom = 1.0 + z * z / trials
     centre = (phat + z * z / (2 * trials)) / denom
@@ -2003,15 +2009,11 @@ def render_report(
             separate banner; never counted in the leaderboard/stats below
             since they are already excluded from ``runs`` (#600 round-2
             finding).
-        executed_slugs: Models a REAL call was made for THIS invocation (see
-            :attr:`BakeoffResult.executed_slugs`) -- distinguishes spend
-            already INCURRED (a real call was made, though the figure itself
-            remains this harness's cost ESTIMATE, never verified OpenRouter
-            billing -- #602 finding) from a pre-run planning estimate where no
-            call has been attempted yet (#600 round-2 finding). Empty (the
-            default) renders the cost section as a pure pre-run estimate,
-            matching a direct :func:`render_report` call outside
-            :func:`run_bakeoff`.
+        executed_slugs: Models a REAL call was made for THIS invocation --
+            distinguishes spend already INCURRED (still this harness's cost
+            ESTIMATE, never verified OpenRouter billing -- #602) from a
+            pre-run planning estimate (#600 round-2). Empty (the default)
+            renders the cost section as a pure pre-run estimate.
 
     Returns:
         The markdown report text.
@@ -2066,10 +2068,8 @@ def render_report(
     lines.append("")
 
     lines.append(
-        "## Wilson intervals (indicative only, section 5.2 -- a strictly-binary "
-        "COR-vs-not decomposition per model; ignores within-page clustering, so it "
-        "OVERSTATES certainty exactly like McNemar; the page-clustered bootstrap above "
-        "is the primary test)"
+        "## Wilson intervals (indicative only, section 5.2 -- ignores within-page "
+        "clustering, so it OVERSTATES certainty like McNemar; the bootstrap above is primary)"
     )
     lines.append("")
     lines.append("| Model | COR / trials | proportion | 95% Wilson CI |")
@@ -2250,30 +2250,19 @@ def sidecar_path(out: Path) -> Path:
 def _pipeline_fingerprint() -> str:
     """A fingerprint of the EVALUATED PIPELINE (not the corpus).
 
-    Hashes every module in :data:`_FINGERPRINTED_MODULES` (the
-    extraction/preprocessing pipeline plus every first-party module its call
-    path imports that can change a drafted result -- see that constant's
-    inclusion rule) together with this harness's OWN source (its scoring
-    logic -- ``FIELD_SPECS``, comparators, thresholds) and the extraction
-    timeout. Any code change to any of them invalidates a stale checkpoint
-    automatically, with nothing to remember to bump.
-
-    This closes the gap the fixture-only fingerprint left open (#600
-    round-2 finding): #590 (preprocessing) changes ``bean_sourcing.py``
-    WITHOUT touching any committed HTML/gold fixture, so a corpus-only
-    fingerprint would silently resume the pre-#590 checkpoint as if it were
-    the post-#590 result -- and widened (#602) after a review finding that
-    round-2 hashed only ``bean_sourcing.py`` + the harness, missing that the
-    evaluated pipeline also calls ``advisor.build_model`` and constructs
-    ``BeanProfileDraft``/config objects through ``config.py``/``models.py``.
+    Hashes every module in :data:`_FINGERPRINTED_MODULES` (first-party source that can change
+    a drafted result) plus this harness's OWN source, the extraction timeout, and every
+    :data:`_FINGERPRINTED_DEPENDENCIES` entry's INSTALLED VERSION (#602 fold round 4 -- no
+    lockfile, so a compatible third-party upgrade between invocations would otherwise change
+    behaviour under an unchanged fingerprint and mix old/new records). Any change invalidates a
+    stale checkpoint automatically (closes the #600 round-2 gap: #590-style preprocessing
+    changes without touching any fixture).
 
     Returns:
-        A short, stable hex digest of every fingerprinted module's + the
-        harness's source bytes, plus the extraction timeout. ``""``
-        (fingerprinting disabled) if ANY of those source files cannot be
-        located (e.g. a frozen/zipped install) -- degrading to the
-        pre-existing corpus-only guard rather than crashing a real run over
-        an unreachable introspection failure.
+        A short, stable hex digest of every fingerprinted module's + the harness's source
+        bytes, the extraction timeout, and every dependency's installed version (``""`` for an
+        unresolvable one). ``""`` overall (fingerprinting disabled) if ANY source file cannot
+        be located -- degrading to the pre-existing corpus-only guard rather than crashing.
     """
     try:
         harness_source = inspect.getsourcefile(sys.modules[__name__])
@@ -2285,6 +2274,12 @@ def _pipeline_fingerprint() -> str:
             digest.update(Path(cast("str", src)).read_bytes())
         digest.update(Path(harness_source).read_bytes())
         digest.update(str(BAKEOFF_EXTRACTION_TIMEOUT_S).encode())
+        for name in _FINGERPRINTED_DEPENDENCIES:
+            try:
+                installed_version = importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:
+                installed_version = ""
+            digest.update(f"{name}=={installed_version}".encode())
         return digest.hexdigest()[:16]
     except OSError:  # pragma: no cover - only when source is unavailable
         return ""
@@ -2320,12 +2315,10 @@ def compute_fingerprint(pages: Sequence[CorpusPage]) -> str:
 def _atomic_write_text(path: Path, content: str) -> None:
     """Replace ``path``'s content atomically via a same-directory temp file.
 
-    A plain ``path.write_text(content)`` truncates THEN writes -- a crash in
-    between leaves a partial/zero-byte file, destroying the very
-    already-complete records a repair write means to preserve (#602 fold 4).
-    Write to a sibling temp file, ``fsync`` it, then ``os.replace`` over
-    ``path``: atomic on POSIX/Windows, so the destination is always either
-    the full OLD content or the full NEW content, never a partial write.
+    A plain ``path.write_text(content)`` truncates THEN writes -- a crash in between leaves a
+    partial/zero-byte file, destroying already-complete records a repair means to preserve
+    (#602 fold 4). Write a sibling temp file, ``fsync`` it, then ``os.replace`` over ``path``:
+    atomic, so the destination is always either the full OLD or full NEW content.
 
     Args:
         path: The destination file.
@@ -2342,21 +2335,14 @@ def _atomic_write_text(path: Path, content: str) -> None:
 def _load_checkpoint_lines(path: Path) -> list[dict[str, Any]]:
     """Parse the checkpoint sidecar, recovering from a truncated final line.
 
-    A kill mid-``write`` can leave the LAST appended line an incomplete JSON
-    object (the multi-kilobyte per-model record does not fit in one atomic
-    filesystem write). Without this, the very next invocation raises on that
-    truncated tail and loses every EARLIER, complete, already-paid-for model
-    record too (#600 finding). A malformed line anywhere else in the file
-    still raises -- that is real corruption, not an interrupted in-flight
-    append, and should not be silently swallowed.
-
-    The truncated tail is also REWRITTEN OUT of the sidecar, ATOMICALLY (see
-    :func:`_atomic_write_text`, #602 fold 4): leaving the bad bytes on disk
-    would let the next :meth:`Checkpoint.append` concatenate onto them or
-    strand them as an interior malformed line a later resume raises on --
-    either way losing newly paid-for checkpoints. A non-atomic rewrite would
-    itself risk destroying the recovered records on a second crash
-    mid-repair, so the write goes through a temp-file + ``os.replace``.
+    A kill mid-``write`` can leave the LAST line an incomplete, newline-LESS JSON object (one
+    ``write()`` call cut off before the trailing ``\\n``) -- unrepaired, the next invocation
+    raises and loses every earlier, already-paid-for record too (#600). A malformed line
+    elsewhere, OR a malformed FINAL line that DOES end with a newline (#602 fold round 4: that
+    write completed, so it's genuine corruption, not an interrupted append), still raises for
+    manual recovery -- only a newline-less tail is auto-repaired, ATOMICALLY (see
+    :func:`_atomic_write_text`): a non-atomic rewrite would itself risk destroying recovered
+    records on a second crash mid-repair.
 
     Args:
         path: The sidecar JSONL path.
@@ -2365,16 +2351,18 @@ def _load_checkpoint_lines(path: Path) -> list[dict[str, Any]]:
         Every successfully-parsed record, in file order.
 
     Raises:
-        json.JSONDecodeError: If a non-final line is malformed.
+        json.JSONDecodeError: If a non-final line is malformed, or the final line is malformed
+            but newline-terminated.
     """
-    lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+    raw_text = path.read_text()
+    lines = [ln for ln in raw_text.splitlines() if ln.strip()]
     records: list[dict[str, Any]] = []
     truncated_at: int | None = None
     for i, line in enumerate(lines):
         try:
             records.append(cast("dict[str, Any]", json.loads(line)))
         except json.JSONDecodeError:
-            if i == len(lines) - 1:
+            if i == len(lines) - 1 and not raw_text.endswith("\n"):
                 truncated_at = i
                 print(
                     f"[resume] ignoring a truncated final line in {path.name} "
@@ -2382,7 +2370,7 @@ def _load_checkpoint_lines(path: Path) -> list[dict[str, Any]]:
                     flush=True,
                 )
                 break
-            raise
+            raise  # non-final OR newline-terminated final line: real corruption, not repaired
     if truncated_at is not None:
         clean_lines = lines[:truncated_at]
         _atomic_write_text(path, "".join(f"{ln}\n" for ln in clean_lines))
@@ -2554,12 +2542,9 @@ def _has_any_success(run: ModelRun) -> bool:
 def _checkpoint_model_specific(run: ModelRun, runs: list[ModelRun], checkpoint: Checkpoint) -> None:
     """Score + checkpoint a wholly-failed run as MODEL-SPECIFIC, EAGERLY.
 
-    A paid attempt is checkpointed at the EARLIEST moment its
-    classification is provable (#602 fold, round 3) -- the instant a fresh
-    peer succeeds this invocation -- not deferred to loop-end/budget-stop:
-    an interruption while a LATER roster model is still running must not
-    lose an EARLIER already-provable failure and force resume to re-pay
-    for it.
+    Checkpointed the instant classification is provable (see
+    :func:`run_bakeoff`), not deferred -- an interruption later must not
+    lose an already-provable failure and force a resume to re-pay for it.
 
     Args:
         run: The wholly-failed candidate.
@@ -2569,9 +2554,8 @@ def _checkpoint_model_specific(run: ModelRun, runs: list[ModelRun], checkpoint: 
     checkpoint.append(run_to_json(run))
     runs.append(run)
     print(
-        f"[run] {run.model_slug}: ALL {len(run.pages)} page(s) errored -- MODEL-SPECIFIC "
-        "failure (a FRESHLY-EXECUTED peer succeeded this invocation), SCORED + checkpointed "
-        "as a real (poor) result",
+        f"[run] {run.model_slug}: ALL {len(run.pages)} page(s) errored -- MODEL-SPECIFIC, "
+        "checkpointed as a real (poor) result",
         flush=True,
     )
 
@@ -2579,10 +2563,9 @@ def _checkpoint_model_specific(run: ModelRun, runs: list[ModelRun], checkpoint: 
 def _exclude_infra_wide(pending: list[ModelRun]) -> list[str]:
     """Every STILL-pending wholly-failed candidate: INFRA-WIDE, excluded.
 
-    Reached only when NO fresh success ever occurred this invocation (see
-    :func:`run_bakeoff`) -- the harness cannot tell a real per-model failure
-    apart from a session-wide outage (bad key, provider down), so each stays
-    excluded and NOT checkpointed, so a retry actually retries it (#600).
+    Reached only when no fresh success ever occurred this invocation --
+    indistinguishable from a session-wide outage, so excluded and NOT
+    checkpointed, so a retry actually retries it (#600).
 
     Args:
         pending: Wholly-failed runs never reclassified MODEL-SPECIFIC.
@@ -2594,9 +2577,8 @@ def _exclude_infra_wide(pending: list[ModelRun]) -> list[str]:
     for run in pending:
         failed_slugs.append(run.model_slug)
         print(
-            f"[run] {run.model_slug}: ALL {len(run.pages)} page(s) errored -- INFRA-WIDE "
-            "candidate (no FRESHLY-EXECUTED model ever succeeded this invocation), EXCLUDED "
-            "from the leaderboard/statistics, NOT checkpointed (a re-run will retry it)",
+            f"[run] {run.model_slug}: ALL {len(run.pages)} page(s) errored -- INFRA-WIDE, "
+            "excluded, not checkpointed (a re-run will retry it)",
             flush=True,
         )
     return failed_slugs
@@ -2614,19 +2596,14 @@ class BakeoffResult:
             comparison (#600 finding).
         unevaluated_slugs: The requested model slugs never run at all because
             of the budget stop (empty when ``stopped_early`` is ``False``).
-        failed_slugs: Model slugs whose run was a total outage every page
-            errored, AND classified INFRA-WIDE (#602): no FRESHLY-EXECUTED
-            model ever succeeded this invocation, so the harness cannot
-            tell this apart from a session-wide provider/key fault (see
-            :func:`_exclude_infra_wide`). EXCLUDED from ``runs`` and
-            therefore from every metric, the leaderboard, and pairwise
-            statistics -- a transient failure must not masquerade as a
-            scored 0.000 row (#600 round-2 finding). Not checkpointed
-            either, so a re-run retries these models. A wholly-failed run
-            classified MODEL-SPECIFIC instead (a fresh peer succeeded) is
-            scored and checkpointed EAGERLY, at the moment its
-            classification became provable (see :func:`run_bakeoff`), NOT
-            listed here.
+        failed_slugs: Model slugs classified INFRA-WIDE (see
+            :func:`_exclude_infra_wide`): every page errored and no
+            FRESHLY-EXECUTED model ever succeeded this invocation. EXCLUDED
+            from ``runs`` and every metric/leaderboard/pairwise statistic --
+            never a scored 0.000 row (#600 round-2) -- and NOT checkpointed,
+            so a re-run retries them. A wholly-failed run classified
+            MODEL-SPECIFIC instead (a fresh peer succeeded) is scored and
+            checkpointed EAGERLY (see :func:`run_bakeoff`), NOT listed here.
         executed_slugs: Model slugs a REAL (paid) call was made for THIS
             invocation -- includes ``failed_slugs`` (a paid attempt was still
             made) but excludes anything resumed from an existing checkpoint.
@@ -2655,22 +2632,18 @@ async def run_bakeoff(
 ) -> BakeoffResult:
     """Run + checkpoint every model over the corpus, under a spend guard.
 
-    Read-only: never touches any store/DB, never saves a profile. Stops
-    gracefully BEFORE a model whose estimated cost would breach ``max_spend``
-    (see :attr:`BakeoffResult.stopped_early`). A run where EVERY page errored
-    is classified EAGERLY, the instant it becomes provable (#602 fold, round
-    3 -- a money guarantee: a paid attempt is checkpointed at the earliest
-    moment its classification is provable, so an interruption while a LATER
-    roster model is still running cannot lose an already-provable EARLIER
-    failure and force resume to re-pay for it): MODEL-SPECIFIC the moment a
-    fresh peer has already succeeded (scored + checkpointed right there), or
-    held ``pending`` until the FIRST fresh success arrives, which flushes
-    every pending candidate immediately. Only candidates STILL pending when
-    every requested model has had its turn (or the budget guard stops the
-    run) are INFRA-WIDE -- excluded and NOT checkpointed, so a retry
-    actually retries them (#600; see :func:`_exclude_infra_wide`). Either
-    way a wholly-failed run IS still counted against the spend guard (a
-    paid attempt was made).
+    Read-only: never touches any store/DB, never saves a profile. Stops gracefully BEFORE a
+    model whose estimated cost would breach ``max_spend`` (see :attr:`BakeoffResult.stopped_early`).
+    A run where EVERY page errored is classified EAGERLY: a paid attempt is checkpointed at the
+    earliest moment its classification is provable, so an interruption while a LATER roster
+    model is still running cannot lose an already-provable EARLIER failure and force resume to
+    re-pay for it (#602 fold rounds 3-4). MODEL-SPECIFIC the moment a fresh peer has already
+    succeeded (checkpointed right there), or held ``pending`` until the FIRST fresh success
+    arrives -- which flushes every pending candidate BEFORE that success's own checkpoint/report
+    (fold round 4: an interruption during the success's own reporting must not lose the flush).
+    Only candidates STILL pending at the end (or an early budget stop) are INFRA-WIDE -- excluded
+    and NOT checkpointed, so a retry actually retries them (#600; see :func:`_exclude_infra_wide`).
+    Either way a wholly-failed run IS still counted against the spend guard.
 
     Args:
         pages: The corpus.
@@ -2728,6 +2701,14 @@ async def run_bakeoff(
             else:
                 pending.append(run)
             continue
+        if not has_fresh_success and _has_any_success(run):
+            has_fresh_success = True
+            # Flush BEFORE this success's own checkpoint/report (#602 fold
+            # round 4, FOLD 1): an interruption during THIS success's own
+            # reporting must never lose an already-provable pending failure.
+            for candidate in pending:
+                _checkpoint_model_specific(candidate, runs, checkpoint)
+            pending = []
         checkpoint.append(run_to_json(run))
         m = model_metrics(run)
         print(
@@ -2736,11 +2717,6 @@ async def run_bakeoff(
             flush=True,
         )
         runs.append(run)
-        if not has_fresh_success and _has_any_success(run):
-            has_fresh_success = True
-            for candidate in pending:  # flush every pending failure NOW (#602)
-                _checkpoint_model_specific(candidate, runs, checkpoint)
-            pending = []
     return BakeoffResult(
         runs=runs,
         stopped_early=False,
@@ -2775,12 +2751,10 @@ def _run_from_checkpoint(record: dict[str, Any]) -> ModelRun:
 def _finite_nonnegative_spend(raw: str) -> float:
     """``argparse`` ``type=`` for ``--max-spend``: a finite, non-negative USD figure.
 
-    Plain ``type=float`` happily parses ``"inf"``/``"nan"``, and every
-    ``spent + upcoming > max_spend`` guard comparison in :func:`run_bakeoff`
-    is FALSE against either (``x > nan`` is always ``False``; nothing beats
-    infinity), so the entire requested roster would run with no meaningful
-    budget at all -- silently bypassing the explicit paid-run guard (#602
-    finding). A negative limit is equally meaningless as a budget.
+    Plain ``type=float`` parses ``"inf"``/``"nan"``, and every
+    ``spent + upcoming > max_spend`` guard in :func:`run_bakeoff` is FALSE
+    against either -- silently bypassing the spend guard (#602). A negative
+    limit is equally meaningless.
 
     Args:
         raw: The raw CLI argument string.

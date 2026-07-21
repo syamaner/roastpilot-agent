@@ -14,6 +14,7 @@ new scoring logic.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import sys
 from pathlib import Path
@@ -148,6 +149,28 @@ def test_load_corpus_rejects_malformed_accept_any_of(tmp_path: Path) -> None:
         )
     )
     with pytest.raises(ValueError, match="bad.gold.json.*accept_any_of"):
+        bo.load_corpus(tmp_path)
+
+
+def test_load_corpus_rejects_accept_any_of_on_a_gold_present_field(tmp_path: Path) -> None:
+    """``accept_any_of`` is an ABSENT-only construct -- a field carrying
+    BOTH a ``value`` and ``accept_any_of`` must fail at LOAD time, naming
+    the field and the reason (#602 fold round 4, FOLD 3)."""
+    (tmp_path / "bad.html").write_text("<html>hi</html>")
+    all_absent = {f.name: {"absent": True} for f in bo.FIELD_SPECS if f.name != "name"}
+    (tmp_path / "bad.gold.json").write_text(
+        json.dumps(
+            {
+                "provenance": {"url": "https://example.com/bad", "vendor": "x"},
+                "name": {"value": "X"},
+                "fields": {
+                    **all_absent,
+                    "origin": {"value": "Ecuador", "accept_any_of": ["a blend"]},
+                },
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="origin.*accept_any_of"):
         bo.load_corpus(tmp_path)
 
 
@@ -813,7 +836,17 @@ def test_wilson_interval_known() -> None:
     assert interval.proportion == pytest.approx(0.8)
     assert interval.low == pytest.approx(0.4902, abs=1e-3)
     assert interval.high == pytest.approx(0.9432, abs=1e-3)
-    assert bo.wilson_interval(0, 0).high == 1.0
+
+
+def test_wilson_interval_zero_trials_is_undefined_proportion() -> None:
+    """Zero trials must leave ``proportion`` undefined (``None``, rendered
+    ``n/a``), never a fabricated ``0.0`` -- consistent with every other
+    undefined metric in this harness; the degenerate ``[0, 1]`` bounds are
+    kept (#602 fold round 4, FOLD 5)."""
+    degenerate = bo.wilson_interval(0, 0)
+    assert degenerate.proportion is None
+    assert degenerate.low == 0.0
+    assert degenerate.high == 1.0
 
 
 def test_mcnemar_exact_known() -> None:
@@ -1036,6 +1069,15 @@ def test_render_report_emits_wilson_intervals(corpus: list[bo.CorpusPage]) -> No
     assert "## Wilson intervals" in report
     assert "`model-a`" in report
     assert "95% Wilson CI" in report
+
+
+def test_render_report_wilson_zero_trials_renders_na(corpus: list[bo.CorpusPage]) -> None:
+    """A model with zero present-field decisions (every field ABS_COR) has
+    an undefined Wilson proportion -- rendered 'n/a', never a fabricated
+    '0.000' (#602 fold round 4, FOLD 5)."""
+    runs = [_full_run("model-a", bo.Outcome.ABS_COR)]
+    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    assert "| `model-a` | 0/0 | n/a | [0.000, 1.000] |" in report
 
 
 def test_render_report_marks_budget_stopped_runs_partial(
@@ -1398,6 +1440,26 @@ def test_checkpoint_raises_on_malformed_interior_line(tmp_path: Path) -> None:
         bo.Checkpoint(path, resume=True)
 
 
+def test_checkpoint_raises_on_a_newline_terminated_malformed_final_line(
+    tmp_path: Path,
+) -> None:
+    """A malformed FINAL line that DOES end with a newline cannot be an
+    interrupted in-flight append -- that write completed, so the broken
+    JSON is real corruption (a manual edit / a bug), not a mid-write kill.
+    It must raise for manual recovery, NOT be silently auto-repaired away
+    (#602 fold round 4, FOLD 4)."""
+    path = tmp_path / "cells.jsonl"
+    checkpoint = bo.Checkpoint(path, resume=False)
+    checkpoint.append(bo.run_to_json(_run("m1", {"p": {"origin": bo.Outcome.COR}})))
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"model_slug": "m2", "pages": [corrupted}\n')  # WITH a trailing newline
+    with pytest.raises(json.JSONDecodeError):
+        bo.Checkpoint(path, resume=True)
+    # Not auto-repaired: the corrupted bytes must still be on disk, untouched,
+    # for manual recovery.
+    assert "corrupted" in path.read_text()
+
+
 def test_checkpoint_ignores_stale_fingerprinted_records(tmp_path: Path) -> None:
     path = tmp_path / "cells.jsonl"
     written = bo.Checkpoint(path, resume=False, fingerprint="fp-a")
@@ -1508,6 +1570,55 @@ def test_pipeline_fingerprint_changes_when_a_widened_module_changes(
     changed = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
     assert changed != baseline
     assert changed  # still resolvable, not degraded to ""
+
+
+def test_fingerprinted_dependencies_cover_bean_sourcing_third_party_imports() -> None:
+    """No lockfile + broad pyproject ranges mean a compatible upgrade of any
+    of these changes extraction behaviour without touching first-party
+    source (#602 fold round 4, FOLD 2)."""
+    assert set(bo._FINGERPRINTED_DEPENDENCIES) == {  # pyright: ignore[reportPrivateUsage]
+        "httpx",
+        "pydantic",
+        "pydantic-ai-slim",
+        "extruct",
+        "trafilatura",
+        "lxml",
+    }
+
+
+def test_pipeline_fingerprint_changes_when_a_dependency_version_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compatible third-party upgrade (no lockfile, broad pyproject
+    ranges) must invalidate a stale checkpoint too, not just a first-party
+    source change (#602 fold round 4, FOLD 2)."""
+    baseline = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
+    original_version = importlib.metadata.version
+
+    def _patched(name: str) -> str:
+        if name == "httpx":
+            return "999.999.999"
+        return original_version(name)
+
+    monkeypatch.setattr(bo.importlib.metadata, "version", _patched)
+    changed = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
+    assert changed != baseline
+    assert changed
+
+
+def test_pipeline_fingerprint_degrades_gracefully_on_missing_dependency_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresolvable dependency version must not crash a real run -- same
+    degrade-gracefully posture as a missing source file (#602 fold round
+    4, FOLD 2)."""
+
+    def _raise(name: str) -> str:
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(bo.importlib.metadata, "version", _raise)
+    fingerprint = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
+    assert fingerprint  # still resolvable (source hashes still succeed)
 
 
 def test_compute_fingerprint_changes_with_pipeline_fingerprint(
@@ -1751,6 +1862,46 @@ async def test_run_bakeoff_eagerly_checkpoints_a_provable_model_specific_failure
         model=_model_text_only(),
     )
     assert "b" not in resumed.executed_slugs  # resumed, NOT re-run (no re-pay)
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_flushes_pending_before_the_triggering_success_reports(
+    corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pending flush must complete BEFORE the triggering success's OWN
+    checkpoint/report step -- if THAT step raises (simulating an
+    interruption in exactly that window, before "a" itself is ever
+    recorded), every already-provable pending failure must already be
+    durable on disk (#602 fold round 4, FOLD 1)."""
+    out = tmp_path / "o.json"
+    fingerprint = bo.compute_fingerprint(corpus)
+    original_model_metrics = bo.model_metrics
+
+    def _raise_for_a(run: bo.ModelRun) -> bo.ModelMetrics:
+        if run.model_slug == "a":
+            raise RuntimeError("simulated interruption during success reporting")
+        return original_model_metrics(run)
+
+    monkeypatch.setattr(bo, "model_metrics", _raise_for_a)
+    roster = [bo.RosterModel("b", 0.1, 0.1, "x"), bo.RosterModel("a", 0.1, 0.1, "x")]
+    estimates = bo.estimate_cost(corpus, roster)
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        await bo.run_bakeoff(
+            corpus,
+            ["b", "a"],  # "b" fails first (pending), "a" succeeds second (triggers the flush)
+            out=out,
+            resume=True,
+            max_spend=1000.0,
+            cost_estimates=estimates,
+            model=_model_switch_after(2 * len(corpus), fail_first=True),
+        )
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    # "b" is durable even though "a" itself never got recorded at all (its
+    # OWN serialisation raised) -- proving the flush fully completed BEFORE
+    # any of "a"'s own checkpoint/report code ran.
+    assert checkpoint.has("b")
+    assert not checkpoint.has("a")
 
 
 @pytest.mark.asyncio
