@@ -152,6 +152,26 @@ def test_load_corpus_rejects_malformed_accept_any_of(tmp_path: Path) -> None:
         bo.load_corpus(tmp_path)
 
 
+def test_load_corpus_rejects_a_zero_token_accept_any_of_entry(tmp_path: Path) -> None:
+    """A stopword-only ``accept_any_of`` entry ("the") strips to zero tokens
+    at scoring time, so it can never match -- must fail at LOAD time, not
+    silently pass a paid experiment that then never fires (#602 fold round
+    8)."""
+    (tmp_path / "bad.html").write_text("<html>hi</html>")
+    all_absent = {f.name: {"absent": True} for f in bo.FIELD_SPECS if f.name != "name"}
+    (tmp_path / "bad.gold.json").write_text(
+        json.dumps(
+            {
+                "provenance": {"url": "https://example.com/bad", "vendor": "x"},
+                "name": {"value": "X"},
+                "fields": {**all_absent, "origin": {"absent": True, "accept_any_of": ["the"]}},
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="bad.gold.json.*accept_any_of"):
+        bo.load_corpus(tmp_path)
+
+
 def test_load_corpus_rejects_accept_any_of_on_a_gold_present_field(tmp_path: Path) -> None:
     """``accept_any_of`` is an ABSENT-only construct -- a field carrying
     BOTH a ``value`` and ``accept_any_of`` must fail at LOAD time, naming
@@ -361,6 +381,23 @@ def test_validate_accept_any_of_rejects_an_empty_list() -> None:
 def test_validate_accept_any_of_rejects_a_non_string_element() -> None:
     with pytest.raises(ValueError, match="accept_any_of"):
         bo._validate_accept_any_of("slug", _text_spec, ["ok", 5])  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("zero_token_entry", ["the", "---"])
+def test_validate_accept_any_of_rejects_a_zero_token_entry(zero_token_entry: str) -> None:
+    """A stopword-only or punctuation-only entry strips to zero tokens under
+    ``words()`` normalisation, so it has zero recall against every
+    response and can never match at scoring time -- an advertised
+    tolerance that silently never fires, only discoverable after a paid
+    run (#602 fold round 8)."""
+    with pytest.raises(ValueError, match="accept_any_of"):
+        bo._validate_accept_any_of("slug", _text_spec, [zero_token_entry])  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validate_accept_any_of_accepts_an_entry_with_one_substantive_token() -> None:
+    """An entry need not be multi-word -- one substantive (non-stopword)
+    token is enough to be matchable (#602 fold round 8)."""
+    bo._validate_accept_any_of("slug", _text_spec, ["blend"])  # pyright: ignore[reportPrivateUsage]
 
 
 def test_load_corpus_rejects_null_value_before_paid_calls(tmp_path: Path) -> None:

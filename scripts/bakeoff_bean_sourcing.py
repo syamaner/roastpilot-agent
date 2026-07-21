@@ -515,9 +515,11 @@ def _validate_gold_value_type(slug: str, spec: FieldSpec, value: Any) -> None:
 def _validate_accept_any_of(slug: str, spec: FieldSpec, value: Any) -> None:
     """Validate an optional gold-ABSENT ``accept_any_of`` tolerance list.
 
-    Runs at corpus-LOAD time, same as :func:`_validate_gold_value_type`, so
-    a malformed list (e.g. a non-string entry) fails fast BEFORE any paid
-    call, not partway through :func:`_tolerates_absent_value` (#602 fold 3).
+    Runs at corpus-LOAD time, same as :func:`_validate_gold_value_type`, so a malformed list
+    (e.g. a non-string entry) fails fast BEFORE any paid call (#602 fold 3). Every entry must
+    also yield >=1 token under the SAME :func:`words` normalisation scoring uses (#602 fold
+    round 8): a stopword/punctuation-only entry (``"the"``, ``"---"``) strips to zero tokens,
+    so it can never match -- an advertised tolerance silently dead until a paid run reveals it.
 
     Args:
         slug: The fixture stem (for the error message).
@@ -525,7 +527,8 @@ def _validate_accept_any_of(slug: str, spec: FieldSpec, value: Any) -> None:
         value: The candidate ``accept_any_of`` payload.
 
     Raises:
-        ValueError: If ``value`` is not a list of non-empty strings.
+        ValueError: If ``value`` isn't a list of non-empty strings, or any entry has no
+            matchable token after :func:`words` normalisation.
     """
     label = f"{slug}.gold.json: field {spec.name!r} 'accept_any_of'"
     if not isinstance(value, list):
@@ -533,6 +536,9 @@ def _validate_accept_any_of(slug: str, spec: FieldSpec, value: Any) -> None:
     items = cast("list[Any]", value)
     if not items or not all(isinstance(v, str) and v.strip() for v in items):
         raise ValueError(f"{label} must be a non-empty list of non-empty strings, got {value!r}")
+    for item in cast("list[str]", items):
+        if not words(item):
+            raise ValueError(f"{label} entry {item!r} has no matchable token (never matches)")
 
 
 def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> None:
@@ -866,8 +872,7 @@ FIELD_SPECS: tuple[FieldSpec, ...] = (
 )
 
 #: FieldSpec kinds whose ``extract`` returns ``str | None`` -- the ONLY kinds
-#: ``_classify_absent_field``'s ``isinstance(str)`` gate lets reach the tolerance check
-#: (#602 fold round 6: POSITIVE derivation -- round 5's exclusion list let ``is_blend`` in).
+#: ``_classify_absent_field``'s ``isinstance(str)`` gate lets reach the tolerance check.
 _STRING_PRODUCING_FIELD_KINDS: frozenset[str] = frozenset({"text", "enum", "variety"})
 
 #: Field names eligible for ``accept_any_of``; rejected elsewhere at load time.
@@ -2255,17 +2260,13 @@ def sidecar_path(out: Path) -> Path:
 def _environment_fingerprint() -> str:
     """A stable fingerprint of the WHOLE environment: interpreter, platform, distributions.
 
-    Categorical replacement for a hand-picked dependency list (#602 fold round 6): a
-    TRANSITIVE dependency moving (e.g. jusText/courlan under ``trafilatura``) invalidates
-    resume too, with no enumeration arms race. The distribution set alone missed the RUNTIME
-    itself (#602 fold round 7: same packages under Python 3.12 vs 3.11 would otherwise
-    fingerprint identically) -- also hashes ``sys.implementation.name``, the full
-    ``platform.python_version()`` (micro included), and ``platform.platform()`` (OS/arch).
-    Deliberately conservative: ANY environment change invalidates resume, never silently wrong.
+    Categorical (#602 round 6): a TRANSITIVE dependency moving invalidates resume too, no
+    enumeration arms race. Also hashes ``sys.implementation.name``, ``platform.python_version()``,
+    and ``platform.platform()`` (#602 round 7 -- the distribution set alone missed the runtime).
+    Deliberately conservative: ANY change invalidates resume, never silently wrong.
 
     Returns:
-        A stable string built from the interpreter/platform identity plus every installed
-        distribution's sorted ``(name, version)``.
+        A stable string: interpreter/platform identity + every distribution's ``(name, version)``.
     """
     pairs = sorted((dist.name, dist.version) for dist in importlib.metadata.distributions())
     identity = f"{sys.implementation.name}|{platform.python_version()}|{platform.platform()}"
