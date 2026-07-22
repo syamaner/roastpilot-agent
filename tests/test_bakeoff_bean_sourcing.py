@@ -52,6 +52,22 @@ def _model_returning(args: dict[str, Any]) -> FunctionModel:
     return FunctionModel(respond)
 
 
+def _model_returning_with_usage(
+    args: dict[str, Any], *, input_tokens: int, output_tokens: int
+) -> FunctionModel:
+    """Like :func:`_model_returning`, but with an EXACT, explicit usage count
+    (#601 fold round 13) -- deterministic control over the priced cost,
+    unlike the default heuristic estimate."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[ToolCallPart(info.output_tools[0].name, args)],
+            usage=RequestUsage(input_tokens=input_tokens, output_tokens=output_tokens),
+        )
+
+    return FunctionModel(respond)
+
+
 def _model_text_only() -> FunctionModel:
     """A double that only ever returns prose — never the output tool, so the
     structured extraction exhausts retries and the page fails to draft.
@@ -1483,6 +1499,35 @@ async def test_run_model_over_corpus_model_construction_failure_never_gets_the_r
     assert entry.priced_usd == 0.0
 
 
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_halts_between_pages_when_meter_trips(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """The runtime :class:`bo.SpendMeter` halts the page loop BETWEEN pages once
+    cumulative usage-priced spend reaches ``max_spend`` -- never mid-page -- returning
+    a run SHORTER than the corpus (#601 fold round 1, slice B). An absurd per-token
+    price guarantees a trip after the first page regardless of the exact
+    (heuristic-estimated) token count. The already-written ledger entries persist
+    even though the run itself is incomplete -- a PENDING then a FINAL entry per
+    attempted page (#601 fold round 4, FOLD 1)."""
+    model = _model_returning({"name": "X", "country": "Ecuador"})
+    price = bo.RosterModel("m1", 1_000_000, 1_000_000, "x")  # $1/token -- any nonzero trips it
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    meter = bo.SpendMeter(max_spend=0.01)
+    run = await bo.run_model_over_corpus(
+        corpus,
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=model,
+        roster_price=price,
+        ledger=ledger,
+        meter=meter,
+    )
+    assert 0 < len(run.pages) < len(corpus)  # halted early, not empty, not the whole corpus
+    assert meter.tripped
+    assert len(ledger.entries) == 2 * len(run.pages)  # pending + final per attempted page
+
+
 def test_run_json_roundtrips_elapsed_s() -> None:
     page = bo.PageResult(
         slug="p", outcomes={"origin": bo.Outcome.COR}, error=None, on_page_fields=1, elapsed_s=4.2
@@ -2325,6 +2370,134 @@ def test_charge_ledger_two_genuinely_separate_calls_for_one_page_both_count(
     assert ledger.total_usd() == pytest.approx(0.05)  # BOTH real calls counted
 
 
+def test_charge_ledger_total_usd_for_arm_supersedes_pending_not_summed(
+    tmp_path: Path,
+) -> None:
+    """#601 fold round 12 (final review): ``total_usd_for_arm()`` must share
+    ``total_usd()``'s :meth:`bo.ChargeLedger._effective_entries` supersession
+    rule -- a raw sum over ``self._entries`` double-charged every normally
+    completed page's pending reserve on top of its final charge in the
+    per-arm figure (the report column and the ``actual_costs`` JSON
+    artifact both read this)."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    ledger = bo.ChargeLedger(path)
+    ledger.append(_pending_entry(priced_usd=0.07, call_id="call-1"))  # the reserve
+    ledger.append(  # the real, smaller, post-call charge, same call_id
+        bo.LedgerEntry(
+            arm="m1",
+            slug="a",
+            request_tokens=100,
+            response_tokens=50,
+            priced_usd=0.02,
+            timed_out=False,
+            reserve_applied=False,
+            is_pending=False,
+            call_id="call-1",
+        )
+    )
+    assert ledger.total_usd_for_arm("m1") == pytest.approx(0.02)  # NOT 0.09
+
+
+def test_charge_ledger_total_usd_for_arm_counts_kill_window_pending_at_the_reserve(
+    tmp_path: Path,
+) -> None:
+    """A page killed mid-call (pending only, no final ever follows) still
+    counts at its reserve in the per-arm figure -- the same fail-safe
+    :meth:`bo.ChargeLedger._effective_entries` already guarantees for
+    ``total_usd()``."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    ledger = bo.ChargeLedger(path)
+    ledger.append(_pending_entry(priced_usd=0.07, call_id="call-killed"))
+    assert ledger.total_usd_for_arm("m1") == pytest.approx(0.07)
+
+
+def test_ledger_actual_costs_matches_total_usd_for_arm_semantics(tmp_path: Path) -> None:
+    """The report/JSON-artifact ``actual_costs`` figure
+    (:func:`bo._ledger_actual_costs`) must share ``total_usd_for_arm()``'s
+    supersession semantics on the SAME ledger -- a stale, un-superseded sum
+    here would silently overstate a normally-completed arm's reported cost
+    even though the meter itself (:class:`bo.SpendMeter`, seeded from
+    ``total_usd()``) stayed correct: an easy-to-miss reporting-only
+    regression, not a spend-guard one."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    ledger = bo.ChargeLedger(path)
+    ledger.append(_pending_entry(priced_usd=0.07, call_id="call-1"))
+    ledger.append(
+        bo.LedgerEntry(
+            arm="m1",
+            slug="a",
+            request_tokens=100,
+            response_tokens=50,
+            priced_usd=0.02,
+            timed_out=False,
+            reserve_applied=False,
+            is_pending=False,
+            call_id="call-1",
+        )
+    )
+    actual = bo._ledger_actual_costs(ledger)  # pyright: ignore[reportPrivateUsage]
+    assert actual["m1"] == pytest.approx(ledger.total_usd_for_arm("m1"))
+    assert actual["m1"] == pytest.approx(0.02)  # NOT 0.09
+
+
+def test_charge_ledger_reserved_usd_for_arm_sums_only_reserved_entries(
+    tmp_path: Path,
+) -> None:
+    """#601 fold round 13: ``reserved_usd_for_arm()`` sums ONLY entries with
+    ``reserve_applied`` -- a pure-captured page (no reserve) never
+    contributes, a reserved one contributes its FULL priced amount."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    ledger = bo.ChargeLedger(path)
+    ledger.append(  # pure captured, no reserve
+        bo.LedgerEntry(
+            arm="m1",
+            slug="a",
+            request_tokens=100,
+            response_tokens=50,
+            priced_usd=0.02,
+            timed_out=False,
+            reserve_applied=False,
+            call_id="call-1",
+        )
+    )
+    ledger.append(  # a genuine reserved (timeout) page
+        bo.LedgerEntry(
+            arm="m1",
+            slug="b",
+            request_tokens=0,
+            response_tokens=0,
+            priced_usd=0.05,
+            timed_out=True,
+            reserve_applied=True,
+            call_id="call-2",
+        )
+    )
+    assert ledger.total_usd_for_arm("m1") == pytest.approx(0.07)
+    assert ledger.reserved_usd_for_arm("m1") == pytest.approx(0.05)  # NOT 0.07
+    reserved = bo._ledger_reserved_costs(ledger)  # pyright: ignore[reportPrivateUsage]
+    assert reserved["m1"] == pytest.approx(0.05)
+
+
+def test_charge_ledger_reserved_usd_for_arm_zero_when_pure_captured(
+    tmp_path: Path,
+) -> None:
+    """An arm with no reserved entries reports ``0.0``, never absent."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    ledger = bo.ChargeLedger(path)
+    ledger.append(
+        bo.LedgerEntry(
+            arm="m1",
+            slug="a",
+            request_tokens=100,
+            response_tokens=50,
+            priced_usd=0.02,
+            timed_out=False,
+            reserve_applied=False,
+        )
+    )
+    assert ledger.reserved_usd_for_arm("m1") == pytest.approx(0.0)
+
+
 def test_load_dotenv_key(tmp_path: Path) -> None:
     (tmp_path / ".env").write_text('OPENROUTER_API_KEY="sk-or-secret"\nOTHER=1\n')
     assert bo.load_dotenv_key(tmp_path) == "sk-or-secret"
@@ -2459,6 +2632,19 @@ def test_parse_args_accepts_a_finite_nonnegative_max_spend() -> None:
     assert args.max_spend == pytest.approx(3.5)
     zero_args = bo._parse_args(["--max-spend", "0"])  # pyright: ignore[reportPrivateUsage]
     assert zero_args.max_spend == 0.0
+
+
+def test_parse_args_rejects_duplicate_models() -> None:
+    """A duplicate ``--models`` slug is rejected AT PARSE TIME (#601 fold round 1,
+    cheapest categorical fix) -- it would otherwise run + charge the ledger twice
+    under one report row."""
+    with pytest.raises(SystemExit):
+        bo._parse_args(["--models", "m1", "m2", "m1"])  # pyright: ignore[reportPrivateUsage]
+
+
+def test_parse_args_accepts_distinct_models() -> None:
+    args = bo._parse_args(["--models", "m1", "m2"])  # pyright: ignore[reportPrivateUsage]
+    assert args.models == ["m1", "m2"]
 
 
 # --- Report + serialization + checkpoint/budget (all network-free) ----------
@@ -2621,6 +2807,112 @@ def test_render_report_no_executed_slugs_is_pure_estimate(corpus: list[bo.Corpus
     assert "NOT yet spent" in report
     assert "ESTIMATED SPEND INCURRED" not in report
     assert "ACTUALLY SPENT" not in report
+
+
+def test_render_report_shows_actual_vs_estimated_spend(corpus: list[bo.CorpusPage]) -> None:
+    """The cost table's "usage-priced USD (list price)" column (#601 fold round 1,
+    slice B) coexists with the unchanged estimate column/label -- "n/a" for an arm
+    with no captured usage data, the real figure otherwise."""
+    slug_a, slug_b = bo.MODEL_ROSTER[0].slug, bo.MODEL_ROSTER[1].slug
+    runs = [_full_run(slug_a, bo.Outcome.COR), _full_run(slug_b, bo.Outcome.INC)]
+    report = bo.render_report(
+        runs,
+        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:2]),
+        executed_slugs=[slug_a],
+        actual_costs={slug_a: 0.0042},
+    )
+    assert "usage-priced USD (list price)" in report
+    assert "$0.0042" in report
+    cost_section = report.split("## Cost", 1)[1]
+    assert f"| `{slug_b}` |" in cost_section
+    remainder = cost_section.split(f"| `{slug_b}` |", 1)[1]
+    assert "n/a" in remainder  # slug_b has no captured actual cost
+
+
+def test_render_report_discloses_reserved_component_of_actuals(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """#601 fold round 13, F3: an arm whose actual includes a reserve
+    component (a timeout/provider-error page) must disclose it -- the
+    headline "usage-priced" column stops implying pure captured usage."""
+    slug_a = bo.MODEL_ROSTER[0].slug
+    runs = [_full_run(slug_a, bo.Outcome.COR)]
+    report = bo.render_report(
+        runs,
+        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
+        executed_slugs=[slug_a],
+        actual_costs={slug_a: 0.0042},
+        reserved_costs={slug_a: 0.0010},
+    )
+    assert "of which reserved" in report
+    assert "$0.0010" in report
+
+
+def test_render_report_pure_captured_shows_zero_reserved(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """An arm with no reserved pages shows an explicit ``$0.0000``, never
+    "n/a" (which is reserved for an arm with no actual cost at all)."""
+    slug_a = bo.MODEL_ROSTER[0].slug
+    runs = [_full_run(slug_a, bo.Outcome.COR)]
+    report = bo.render_report(
+        runs,
+        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
+        executed_slugs=[slug_a],
+        actual_costs={slug_a: 0.0042},
+        reserved_costs={slug_a: 0.0},
+    )
+    cost_section = report.split("## Cost", 1)[1]
+    assert f"| `{slug_a}` |" in cost_section
+    row = cost_section.split(f"| `{slug_a}` |", 1)[1].splitlines()[0]
+    assert "$0.0000" in row
+
+
+def test_render_report_renders_ledger_only_prior_lineage_arm(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """#601 fold round 13, F4: an arm present in the current-lineage ledger
+    but absent from THIS invocation's ``cost_estimates`` (a prior
+    ``--models`` subset) still gets its own report row, marked
+    prior-lineage, and still counts in the actual total -- no more
+    tripped-breaker-with-$0-actuals."""
+    slug_a = bo.MODEL_ROSTER[0].slug
+    runs = [_full_run(slug_a, bo.Outcome.COR)]
+    report = bo.render_report(
+        runs,
+        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
+        executed_slugs=[slug_a],
+        actual_costs={slug_a: 0.0042, "prior-model": 0.0500},
+        reserved_costs={slug_a: 0.0, "prior-model": 0.0},
+    )
+    assert "| `prior-model` |" in report
+    assert "prior-lineage-arm" in report
+    cost_section = report.split("## Cost", 1)[1]
+    total_row = next(line for line in cost_section.splitlines() if "arm total" in line)
+    assert "$0.0542" in total_row  # 0.0042 + 0.0500, the prior arm counted
+
+
+def test_render_report_prorates_mid_arm_incurred_estimate(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """#601 fold round 13, F5: a mid-arm breaker trip must prorate that arm's
+    ESTIMATED SPEND INCURRED contribution (attempted/total pages), not count
+    the full-corpus estimate for pages never attempted."""
+    slug_a = bo.MODEL_ROSTER[0].slug
+    runs = [_full_run(slug_a, bo.Outcome.COR)]
+    cost_estimates = [
+        bo.ModelCostEstimate(slug=slug_a, input_tokens=900, output_tokens=90, usd=0.09),
+    ]
+    report = bo.render_report(
+        runs,
+        cost_estimates,
+        executed_slugs=[slug_a],
+        prorated_arm=slug_a,
+        prorated_attempted_pages=1,
+        prorated_total_pages=9,
+    )
+    assert "PRORATED" in report
+    assert "$0.0100" in report  # 0.09 * 1/9 == 0.01, not the full $0.0900
 
 
 def test_render_report_reasoning_arm_comparison_groups_by_model(
@@ -3043,6 +3335,12 @@ def test_checkpoint_ignores_stale_fingerprinted_records(tmp_path: Path) -> None:
 async def test_run_bakeoff_budget_stop_makes_no_calls(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
+    """A tiny but NONZERO --max-spend (#601 fold round 13: the meter is
+    checked FIRST, so a bare ``0.0`` would trip via the meter -- charged
+    ``0.0 >= max_spend 0.0`` -- before ever reaching the estimate guard this
+    test targets) exercises the PURE pre-run estimate guard: a fresh ledger's
+    meter (``charged=0.0``) is not yet tripped, but the arm's own real
+    estimate alone exceeds the budget."""
     roster = [bo.RosterModel("m1", 1.0, 1.0, "x")]
     estimates = bo.estimate_cost(corpus, roster)
     result = await bo.run_bakeoff(
@@ -3050,7 +3348,7 @@ async def test_run_bakeoff_budget_stop_makes_no_calls(
         bo.expand_arms(["m1"], "default"),
         out=tmp_path / "o.json",
         resume=False,
-        max_spend=0.0,  # first model's estimate > 0 -> stop before any (paid) call
+        max_spend=0.001,  # first model's estimate (~$0.025) > this -> stop, meter not tripped
         cost_estimates=estimates,
         roster=roster,
     )
@@ -3059,6 +3357,7 @@ async def test_run_bakeoff_budget_stop_makes_no_calls(
     assert result.unevaluated_slugs == ["m1"]
     assert result.executed_slugs == []
     assert result.failed_slugs == []
+    assert result.breaker_tripped is False  # the ESTIMATE guard, not the meter
 
 
 @pytest.mark.asyncio
@@ -3299,6 +3598,312 @@ async def test_main_refuses_a_pre_ledger_checkpoint(
     )
     assert code == 2
     assert not out.exists()
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_meter_reconstructs_from_ledger_no_double_charge(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """The :class:`bo.SpendMeter` is seeded from the persistent :class:`bo.ChargeLedger`
+    (#601 fold round 1, slice B) BEFORE the main loop -- NEVER from scored/checkpointed
+    runs -- so a resumed invocation never resets it or double-charges completed work.
+    "m1" is checkpointed (so it resumes without a new call) and its LEDGER already
+    carries a HUGE charge (synthetic entries, no heuristic guessing); "m2" then never
+    starts because the reconstructed meter is already at --max-spend."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x"), bo.RosterModel("m2", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1", "m2"], "default")
+    fingerprint = bo.compute_fingerprint(corpus)
+
+    # "m1" is scored + checkpointed (a trivial run) -- its DOLLAR figure comes from
+    # the LEDGER, not from PageResult (which carries no token fields, #601 slice A).
+    seed_pages = [
+        bo.PageResult(slug=p.slug, outcomes={}, error=None, on_page_fields=0) for p in corpus
+    ]
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
+    checkpoint.append(bo.run_to_json(bo.ModelRun(model_slug="m1", pages=seed_pages)))
+
+    ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
+    for page in corpus:
+        ledger.append(
+            bo.LedgerEntry(
+                arm="m1",
+                slug=page.slug,
+                request_tokens=1_000_000,
+                response_tokens=1_000_000,
+                priced_usd=0.2,  # (0.1+0.1) $/mtok * 1M tokens each -- huge, well over budget
+                timed_out=False,
+                reserve_applied=False,
+            )
+        )
+
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, roster)
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=0.5,  # m1's ledgered spend alone (0.2 * len(corpus)) is huge
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert {r.model_slug for r in result.runs} == {"m1"}  # resumed, no new call
+    assert result.breaker_tripped is True
+    assert result.stopped_early is True
+    assert result.unevaluated_slugs == ["m2"]
+    assert result.executed_slugs == []  # m1 resumed, m2 never attempted -- no NEW spend
+    assert result.actual_costs["m1"] == pytest.approx(0.2 * len(corpus))
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_meter_checked_before_estimate_guard_on_resume(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 13: the runtime METER must be checked BEFORE the
+    pre-run ESTIMATE guard in the arm loop. On a resumed invocation whose
+    ledger already carries real spend past a tiny remaining --max-spend, the
+    next arm's OWN naive char-based estimate also exceeds that tiny budget
+    -- BOTH guards fire on the same iteration. The estimate guard, checked
+    first before this fold, won the race and returned breaker_tripped=False
+    (exit 0) even though real money was already over budget."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x"), bo.RosterModel("m2", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1", "m2"], "default")
+    fingerprint = bo.compute_fingerprint(corpus)
+
+    seed_pages = [
+        bo.PageResult(slug=p.slug, outcomes={}, error=None, on_page_fields=0) for p in corpus
+    ]
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
+    checkpoint.append(bo.run_to_json(bo.ModelRun(model_slug="m1", pages=seed_pages)))
+
+    ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
+    for page in corpus:
+        ledger.append(
+            bo.LedgerEntry(
+                arm="m1",
+                slug=page.slug,
+                request_tokens=1_000_000,
+                response_tokens=1_000_000,
+                priced_usd=0.2,
+                timed_out=False,
+                reserve_applied=False,
+            )
+        )
+
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, roster)
+    # Tiny remaining budget: m2's own real corpus-based estimate (well over a
+    # cent) ALSO exceeds it, so the estimate guard would independently fire
+    # too -- the meter (real spend) must still win the race.
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=0.0001,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert result.breaker_tripped is True
+    assert result.stopped_early is True
+    assert result.executed_slugs == []
+
+
+@pytest.mark.asyncio
+async def test_meter_rounding_parity_live_vs_resumed_at_the_boundary(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 13: the meter must charge the SAME rounded amount the
+    ledger persists (``round(priced, 5)``) -- charging the raw, unrounded
+    float let a LIVE run's meter disagree with a RESUMED run's meter (seeded
+    from :meth:`bo.ChargeLedger.total_usd`, which sums the PERSISTED rounded
+    entries) at exactly the boundary --max-spend sits on."""
+    price = bo.RosterModel("m1", 35.0, 1.0, "x")
+    raw = 3 / 1_000_000 * 35.0  # 0.000105
+    rounded = round(raw, 5)  # 0.00011 -- rounds UP past raw
+    assert rounded > raw  # sanity: the case this test needs to expose
+
+    ledger_path = bo.ledger_path(tmp_path / "o.json")
+    live_ledger = bo.ChargeLedger(ledger_path)
+    live_meter = bo.SpendMeter(max_spend=rounded)
+    await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=_model_returning_with_usage(
+            {"name": "X", "country": "Ecuador"}, input_tokens=3, output_tokens=0
+        ),
+        roster_price=price,
+        ledger=live_ledger,
+        meter=live_meter,
+    )
+    assert live_meter.charged == pytest.approx(rounded)
+    assert live_meter.tripped is True  # exactly at the boundary
+
+    resumed_ledger = bo.ChargeLedger(ledger_path)  # reloads the same persisted entries
+    resumed_meter = bo.SpendMeter(max_spend=rounded, charged=resumed_ledger.total_usd())
+    assert resumed_meter.charged == pytest.approx(live_meter.charged)
+    assert resumed_meter.tripped == live_meter.tripped  # must AGREE, not coincidentally match
+
+
+def test_spend_meter_charge_rounds_cumulative_after_every_add() -> None:
+    """#601 fold round 14: ``charged`` is rounded to 5dp after EVERY charge,
+    not left as a raw float sum -- three additions of $0.00007 in raw binary
+    float sum to $0.00020999999999999998 (epsilon UNDER $0.00021), which
+    would disagree with a ledger-reconstructed meter (whose ``total_usd()``
+    rounds once, at the end, reaching exactly $0.00021) at that exact
+    boundary."""
+    live = bo.SpendMeter(max_spend=0.00021)
+    for _ in range(3):
+        live.charge(0.00007)
+    assert live.charged == 0.00021  # not 0.00020999999999999998
+    assert live.tripped is True
+
+    # A meter reconstructed from a ledger that summed the SAME 3 rounded
+    # entries once, at the end (mirroring ChargeLedger.total_usd()), agrees.
+    resumed_charged = round(sum([0.00007, 0.00007, 0.00007]), 5)
+    resumed = bo.SpendMeter(max_spend=0.00021, charged=resumed_charged)
+    assert resumed.charged == live.charged
+    assert resumed.tripped == live.tripped
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_estimate_guard_forecasts_off_carried_meter_spend(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 14, F4: the pre-arm ESTIMATE guard's forecast base is
+    the METER's real cumulative charge (includes RESUMED-ledger spend), not
+    a per-invocation-zero accumulator. Resuming with $0.09 already charged, a
+    $0.10 limit, and the next arm's own ~$0.09 estimate must refuse BEFORE
+    any call (0.09 + 0.09 = 0.18 > 0.10) -- even though the estimate ALONE
+    (0.09 <= 0.10) would have let the OLD per-invocation-zero accumulator
+    through."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x"), bo.RosterModel("m2", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1", "m2"], "default")
+    fingerprint = bo.compute_fingerprint(corpus)
+
+    seed_pages = [
+        bo.PageResult(slug=p.slug, outcomes={}, error=None, on_page_fields=0) for p in corpus
+    ]
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
+    checkpoint.append(bo.run_to_json(bo.ModelRun(model_slug="m1", pages=seed_pages)))
+
+    # Every checkpointed page needs >=1 ledger entry (page-level coverage,
+    # #601 fold round 5, D FOLD 3) -- charge it all on the first page so the
+    # total stays exactly $0.09 while every OTHER page is still covered.
+    ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
+    for i, page in enumerate(corpus):
+        ledger.append(
+            bo.LedgerEntry(
+                arm="m1",
+                slug=page.slug,
+                request_tokens=900_000 if i == 0 else 0,
+                response_tokens=0,
+                priced_usd=0.09 if i == 0 else 0.0,
+                timed_out=False,
+                reserve_applied=False,
+            )
+        )
+
+    cost_estimates = [
+        bo.ModelCostEstimate(slug="m1", input_tokens=0, output_tokens=0, usd=0.0),
+        bo.ModelCostEstimate(slug="m2", input_tokens=900_000, output_tokens=0, usd=0.09),
+    ]
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=0.10,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert result.stopped_early is True
+    assert result.executed_slugs == []  # refused BEFORE any call
+    assert result.unevaluated_slugs == ["m2"]
+    assert result.breaker_tripped is False  # the ESTIMATE guard, not the real-spend breaker
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_mid_arm_breaker_trip_is_not_checkpointed(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """A NEW (non-checkpointed) arm whose usage-priced spend trips the meter MID-RUN
+    (#601 fold round 1, slice B) is reported via ``breaker_tripped`` and NEVER
+    checkpointed -- a re-run always retries the whole arm from page one.
+    ``cost_estimates`` stays a tiny hand-built figure decoupled from the absurd
+    ACTUAL roster price so the pre-existing chars/4 ESTIMATE guard does not fire
+    first."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 1_000_000, 1_000_000, "x")]  # absurd actual price
+    cost_estimates = [bo.ModelCostEstimate(slug="m1", input_tokens=1, output_tokens=1, usd=0.0001)]
+    result = await bo.run_bakeoff(
+        corpus,
+        bo.expand_arms(["m1"], "default"),
+        out=out,
+        resume=True,
+        max_spend=0.01,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert result.breaker_tripped is True
+    assert result.stopped_early is True
+    assert result.runs == []  # the incomplete run is never appended
+    assert result.unevaluated_slugs == ["m1"]
+    assert result.executed_slugs == ["m1"]  # a real call WAS attempted
+    checkpoint = bo.Checkpoint(
+        bo.sidecar_path(out), resume=True, fingerprint=bo.compute_fingerprint(corpus)
+    )
+    assert not checkpoint.has("m1")  # never checkpointed -- a re-run retries from page one
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_ledger_persists_a_mid_arm_trip_across_invocations(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """The repeated-resume overspend regression (#601 fold round 1, the round-1 P1):
+    a mid-arm trip's charges are NEVER checkpointed as a scored run, so reconstructing
+    the meter from scored runs would find NOTHING for an incomplete arm and let a
+    re-run spend the WHOLE budget again on the SAME arm. The persistent ledger closes
+    that gap: a SECOND invocation against the same ``--out`` refuses "m1" immediately,
+    before any new call."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 1_000_000, 1_000_000, "x")]  # absurd -- 1 page trips it
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = [bo.ModelCostEstimate(slug="m1", input_tokens=1, output_tokens=1, usd=0.0001)]
+    model = _model_returning({"name": "X", "country": "Ecuador"})
+
+    first = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=0.01,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=model,
+    )
+    assert first.breaker_tripped is True
+    assert first.runs == []  # the incomplete arm was never checkpointed
+
+    second = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=0.01,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=model,
+    )
+    assert second.breaker_tripped is True
+    assert second.executed_slugs == []  # refused BEFORE any new call -- ledger carried it
+    assert second.runs == []
 
 
 @pytest.mark.asyncio
@@ -3991,3 +4596,70 @@ async def test_main_full_run_writes_artifact_and_partial_report(
     assert "EXCLUDED -- failed this invocation" in report_text
     assert "some/failed-slug" in report_text
     assert "ESTIMATED SPEND INCURRED" in report_text
+
+
+@pytest.mark.asyncio
+async def test_main_returns_distinct_exit_code_when_breaker_tripped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A :class:`bo.BakeoffResult` with ``breaker_tripped=True`` (#601 fold round 1,
+    slice B) must surface as exit code 3 -- distinct from the plain 0 success exit
+    and the 2 used by the pre-run REFUSED guards, per the parser epilog."""
+    canned = bo.BakeoffResult(
+        runs=[_full_run(bo.MODEL_ROSTER[0].slug, bo.Outcome.COR)],
+        stopped_early=True,
+        unevaluated_slugs=[bo.MODEL_ROSTER[1].slug],
+        failed_slugs=[],
+        executed_slugs=[bo.MODEL_ROSTER[0].slug],
+        breaker_tripped=True,
+    )
+
+    async def _fake_run_bakeoff(*args: object, **kwargs: object) -> bo.BakeoffResult:
+        return canned
+
+    monkeypatch.setattr(bo, "run_bakeoff", _fake_run_bakeoff)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-not-real")
+    out = tmp_path / "out.json"
+    code = await bo.main(
+        [
+            "--models",
+            bo.MODEL_ROSTER[0].slug,
+            bo.MODEL_ROSTER[1].slug,
+            "--max-spend",
+            "5",
+            "--out",
+            str(out),
+        ]
+    )
+    assert code == 3
+    artifact = json.loads(out.read_text())
+    assert artifact["breaker_tripped"] is True
+
+
+@pytest.mark.asyncio
+async def test_main_refuses_a_zero_max_spend_before_any_real_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--max-spend 0`` admits no spend at all -- REFUSED at exit 2, distinct from
+    exit 3 (the breaker halting a NON-zero, real run) (#601 fold round 1, slice B).
+    Never calls :func:`bo.run_bakeoff` at all -- a monkeypatched trap fails the test
+    if it does."""
+
+    async def _trap_run_bakeoff(*args: object, **kwargs: object) -> bo.BakeoffResult:
+        raise AssertionError("run_bakeoff must not be called for a zero --max-spend")
+
+    monkeypatch.setattr(bo, "run_bakeoff", _trap_run_bakeoff)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-not-real")
+    out = tmp_path / "out.json"
+    code = await bo.main(
+        [
+            "--models",
+            bo.MODEL_ROSTER[0].slug,
+            "--max-spend",
+            "0",
+            "--out",
+            str(out),
+        ]
+    )
+    assert code == 2
+    assert not out.exists()  # refused before any artifact is written
