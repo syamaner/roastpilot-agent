@@ -233,15 +233,25 @@ class RosterModel:
 #: (the extraction-owning config, #590 slice A) and make_advisor_config.
 BAKEOFF_EXTRACTION_TIMEOUT_S: float = 45.0
 
-#: Mirrors ``BeanSourcingConfig.fetch_timeout_seconds``'s default (#601 fold
-#: round 3) -- the smaller PARSE-bound knob :func:`_reserve_prompt_text` uses.
-_DEFAULT_FETCH_TIMEOUT_S: float = 10.0
-
 #: The PLANNING estimate's heuristic (:func:`estimate_cost` only -- the
 #: RESERVE's overhead is a separate DERIVED figure, see
 #: :data:`_RESERVE_INSTRUCTION_OVERHEAD_BYTES`).
 _INSTRUCTION_OVERHEAD_CHARS = 1600
 _OUTPUT_TOKENS_PER_PAGE = 220  #: A small flat ``BeanProfileDraft`` record.
+
+#: The bake-off's own enforced provider-side output cap (#601 fold round 4,
+#: FOLD 4) -- passed as ``max_output_tokens`` on every real (paid) extraction
+#: call, so the timeout-reserve floor's output component bounds what the
+#: provider can actually BILL, not a generic physical decode-rate guess. The
+#: observed structured output is ~220 tokens (:data:`_OUTPUT_TOKENS_PER_PAGE`)
+#: and a "light" reasoning arm adds at most low thousands (see
+#: ``LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER`` below), but a DEFAULT arm on a
+#: reasoning-mandatory endpoint at provider-default effort can genuinely bill
+#: several thousand completion tokens; 16384 clears that with margin while
+#: staying under every roster model's own output-token ceiling -- chosen high
+#: enough that enforcement never truncates legitimate work into a fake schema
+#: failure (which would corrupt the adherence metric). Uniform across every arm.
+BAKEOFF_MAX_OUTPUT_TOKENS: int = 16384
 
 #: Reasoning classification evidence (#601 FA/F7/F8, "mandatory" ONLY for a
 #: CONFIRMED off-rejecting endpoint): gpt-5-mini is HTTP-400-on-disable per
@@ -1280,6 +1290,7 @@ async def draft_for_page(
     sourcing_config: BeanSourcingConfig | None = None,
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
     diagnostics: BeanSourcingDiagnostics | None = None,
+    max_output_tokens: int = BAKEOFF_MAX_OUTPUT_TOKENS,
 ) -> tuple[BeanProfileDraft | None, str | None]:
     """Run the real extractor over one captured page (replay-only, fail-soft).
 
@@ -1295,6 +1306,10 @@ async def draft_for_page(
         reasoning_effort: Threaded through to ``draft_bean_profile_from_url`` (#601);
             ``None`` omits the setting.
         diagnostics: Optional accumulator, forwarded through (#601 F2).
+        max_output_tokens: The ENFORCED provider-side output cap (#601 fold
+            round 4, FOLD 4), passed straight through to
+            ``draft_bean_profile_from_url`` -- :data:`BAKEOFF_MAX_OUTPUT_TOKENS`
+            by default, uniform across every arm.
 
     Returns:
         ``(draft, None)`` on success, or ``(None, error_str)`` on any typed
@@ -1310,6 +1325,7 @@ async def draft_for_page(
             model=model,
             reasoning_effort=reasoning_effort,
             diagnostics=diagnostics,
+            max_output_tokens=max_output_tokens,
         )
         return draft, None
     except BeanSourcingError as exc:
@@ -1379,6 +1395,7 @@ async def run_model_over_corpus(
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
     roster_price: RosterModel | None = None,
     ledger: ChargeLedger | None = None,
+    max_output_tokens: int = BAKEOFF_MAX_OUTPUT_TOKENS,
 ) -> ModelRun:
     """Draft + score every page for one model.
 
@@ -1395,26 +1412,20 @@ async def run_model_over_corpus(
         roster_price: This arm's model price (#601 fold round 1, slice A); ``None``
             disables ledger writes entirely (existing/test callers unaffected).
         ledger: The invocation's :class:`ChargeLedger`; when given alongside
-            ``roster_price``, ONE entry is written per page THE INSTANT its call
-            completes, from the page's OWN captured diagnostics -- the ledger is the
-            token/spend store of record, :class:`PageResult` carries none of this.
-            The reserve is computed BEFORE the call (#601 fold round 3).
+            ``roster_price``, a PENDING entry (charged at the reserve) is written
+            BEFORE each page's call, then a FINAL entry -- from the page's OWN
+            captured diagnostics -- supersedes it the instant the call completes
+            (#601 fold round 4, FOLD 1: a kill between the two leaves the pending
+            entry as the worst-case charge, never silently dropped). The ledger is
+            the token/spend store of record, :class:`PageResult` carries none of this.
+        max_output_tokens: The ENFORCED provider-side output cap (#601 fold round
+            4, FOLD 4), threaded to :func:`draft_for_page` AND sized into the
+            reserve (:func:`_page_cost_reserve`) -- the same value on both sides
+            is what makes the reserve's worst case true, not a guess.
 
     Returns:
         The :class:`ModelRun`.
     """
-    # EFFECTIVE timeouts (#601 fold round 3): output bounded by extraction,
-    # the reserve's parse bounded by the smaller fetch knob.
-    effective_extraction_timeout_s = (
-        sourcing_config.extraction_timeout_seconds
-        if sourcing_config is not None
-        else BAKEOFF_EXTRACTION_TIMEOUT_S
-    )
-    effective_fetch_timeout_s = (
-        sourcing_config.fetch_timeout_seconds
-        if sourcing_config is not None
-        else _DEFAULT_FETCH_TIMEOUT_S
-    )
     results: list[PageResult] = []
     for page in pages:
         started = time.monotonic()
@@ -1423,15 +1434,27 @@ async def run_model_over_corpus(
         # failure handler must never re-parse, or a kill mid-timeout loses a
         # billed charge.
         reserve = (
-            await _page_cost_reserve(
-                page,
-                roster_price,
-                extraction_timeout_s=effective_extraction_timeout_s,
-                parse_timeout_s=effective_fetch_timeout_s,
-            )
+            _page_cost_reserve(page, roster_price, max_output_tokens=max_output_tokens)
             if roster_price is not None and ledger is not None
             else 0.0
         )
+        if roster_price is not None and ledger is not None:
+            # PENDING, charged at the reserve (#601 fold round 4, FOLD 1) --
+            # written BEFORE the call so a kill mid-call still leaves this
+            # page's worst-case charge on the books; the FINAL entry below
+            # supersedes it once the call actually completes.
+            ledger.append(
+                LedgerEntry(
+                    arm=model_slug,
+                    slug=page.slug,
+                    request_tokens=0,
+                    response_tokens=0,
+                    priced_usd=round(reserve, 5),
+                    timed_out=False,
+                    reserve_applied=True,
+                    is_pending=True,
+                )
+            )
         draft, error = await draft_for_page(
             page,
             advisor_config=advisor_config,
@@ -1439,6 +1462,7 @@ async def run_model_over_corpus(
             sourcing_config=sourcing_config,
             reasoning_effort=reasoning_effort,
             diagnostics=diagnostics,
+            max_output_tokens=max_output_tokens,
         )
         elapsed_s = time.monotonic() - started
         on_page = (
@@ -1466,6 +1490,9 @@ async def run_model_over_corpus(
                 reserve,
                 timed_out=timed_out,
             )
+            # FINAL supersedes the PENDING entry above (#601 fold round 4, FOLD 1)
+            # the instant the call completes -- the ledger's ``is_pending=True``
+            # write is the only trace left if a kill lands between the two.
             ledger.append(
                 LedgerEntry(
                     arm=model_slug,
@@ -1475,6 +1502,7 @@ async def run_model_over_corpus(
                     priced_usd=round(priced, 5),
                     timed_out=timed_out,
                     reserve_applied=timed_out,  # #601 fold round 4: SUM, always applied
+                    is_pending=False,
                 )
             )
     return ModelRun(model_slug=model_slug, pages=results)
@@ -2214,17 +2242,6 @@ def estimate_cost_for_arms(
     return estimates
 
 
-#: A conservative generation-rate bound (tokens/second) for the timeout-reserve
-#: floor's OUTPUT component (#601 fold round 1) -- a PHYSICAL ceiling, not a
-#: per-arm reasoning-effort heuristic like :data:`LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER`:
-#: this floor exists ONLY to catch a timed-out call's possibly-unreported usage, so
-#: it must hold for ANY model (including a reasoning-capable one whose "default"
-#: arm bills far more than a flat per-page estimate), uniformly across every arm.
-#: 200 tok/s comfortably exceeds real single-request decode throughput observed
-#: across current-generation hosted providers -- chosen high enough that real
-#: generation over the effective timeout can never exceed the bound it sets.
-_TIMEOUT_RESERVE_TOKENS_PER_SECOND = 200
-
 #: Worst-case input-token bound for the RESERVE (#601 fold round 3): 1 token per
 #: BYTE, never a code point (an emoji/CJK char spans several UTF-8 bytes, and
 #: byte-level BPE emits at most one token per byte). A SAFETY FLOOR, not the
@@ -2242,56 +2259,60 @@ _RESERVE_INSTRUCTION_OVERHEAD_BYTES = (
 )
 
 
-async def _reserve_prompt_text(page: CorpusPage, *, parse_timeout_s: float) -> str:
-    """The prompt text for the RESERVE floor (#601 fold round 2/3) -- reuses the
-    runtime's OWN bounded, off-loop trafilatura call (``_extract_page_markdown_bounded``,
-    the same dedicated parse pool the real extraction already uses), bounded by
-    ``parse_timeout_s`` (the FETCH-timeout knob, FOLD 1, matching the runtime's own
-    caller), never the unbounded sync variant :func:`_extract_prompt_text` uses.
-
-    Falls back to the linear-strip pass on a timeout/saturated pool/no result --
-    CONSERVATIVE for reserve purposes (never shorter than trafilatura's
-    boilerplate-removed markdown), still with the JSON-LD context prepend.
+def _reserve_prompt_text(page: CorpusPage) -> str:
+    """The prompt text for the RESERVE floor (#601 fold round 4, FOLD 4) --
+    ALWAYS the linear-strip pass + JSON-LD context, never trafilatura's
+    boilerplate-removed markdown: trafilatura can produce SHORTER text than
+    the raw linear strip, UNDERSTATING the reserve, so the reserve wants the
+    LONGER candidate outright rather than a bounded, off-loop parse attempt
+    (dropped -- no parse-pool budget needed for a reserve floor).
     """
     from roastpilot_agent.bean_sourcing import (  # noqa: PLC0415
-        _extract_page_markdown_bounded,  # pyright: ignore[reportPrivateUsage]
         _extract_page_text,  # pyright: ignore[reportPrivateUsage]
         _format_json_ld_context,  # pyright: ignore[reportPrivateUsage]
         _match_json_ld_product_facts,  # pyright: ignore[reportPrivateUsage]
     )
 
-    markdown = await _extract_page_markdown_bounded(page.html, timeout_seconds=parse_timeout_s)
-    extracted_text = markdown if markdown is not None else _extract_page_text(page.html)
+    extracted_text = _extract_page_text(page.html)
     facts = _match_json_ld_product_facts(page.html, page.url)
     json_ld_context = _format_json_ld_context(facts) if facts is not None else None
     return extracted_text if json_ld_context is None else f"{json_ld_context}\n\n{extracted_text}"
 
 
-async def _page_cost_reserve(
-    page: CorpusPage, price: RosterModel, *, extraction_timeout_s: float, parse_timeout_s: float
+def _page_cost_reserve(
+    page: CorpusPage, price: RosterModel, *, max_output_tokens: int = BAKEOFF_MAX_OUTPUT_TOKENS
 ) -> float:
     """THIS page's PHYSICALLY-BOUNDED, WORST-CASE timeout-reserve floor (#601
-    fold rounds 1-3). Input tokens use the worst-case byte bound over the
-    DERIVED overhead, via the bounded parse (:func:`_reserve_prompt_text`).
-    Output tokens are bounded by :data:`_TIMEOUT_RESERVE_TOKENS_PER_SECOND`
-    over the EFFECTIVE ``extraction_timeout_s``, never the module default.
+    fold rounds 1-4). Input tokens use the worst-case byte bound over the
+    DERIVED overhead (:func:`_reserve_prompt_text`). Output tokens are bounded
+    by the ENFORCED provider cap over its retry budget (#601 fold round 4,
+    FOLD 4 -- the P2 fold on #645): ``max_output_tokens`` bounds each
+    provider REQUEST, and :data:`~roastpilot_agent.bean_sourcing.EXTRACTION_MAX_RETRIES`
+    bounds how many times a validation failure re-requests, so the run-wide
+    worst case is ``max_output_tokens * (1 + EXTRACTION_MAX_RETRIES)`` --
+    matching what the provider can actually bill across a retrying run, not
+    a generic tokens/second decode-rate guess.
 
     Args:
         page: The corpus page (its extracted prompt text drives the input estimate).
         price: The arm's model pricing.
-        extraction_timeout_s: The effective extraction timeout -- sizes the
-            output component.
-        parse_timeout_s: The effective FETCH timeout the parse is bounded by
-            (FOLD 1) -- distinct, deliberately smaller.
+        max_output_tokens: The ENFORCED per-request output cap actually passed
+            to the real call (:data:`BAKEOFF_MAX_OUTPUT_TOKENS` by default) --
+            the reserve's promise only holds if this matches what the paid
+            call itself enforces.
 
     Returns:
         The page's physically-bounded, worst-case estimated USD cost.
     """
-    prompt_text = await _reserve_prompt_text(page, parse_timeout_s=parse_timeout_s)
+    from roastpilot_agent.bean_sourcing import (  # noqa: PLC0415
+        EXTRACTION_MAX_RETRIES,
+    )
+
+    prompt_text = _reserve_prompt_text(page)
     input_tokens = (
         len(prompt_text.encode("utf-8")) + _RESERVE_INSTRUCTION_OVERHEAD_BYTES
     ) // _RESERVE_BYTES_PER_TOKEN
-    output_tokens = round(extraction_timeout_s * _TIMEOUT_RESERVE_TOKENS_PER_SECOND)
+    output_tokens = max_output_tokens * (1 + EXTRACTION_MAX_RETRIES)
     return (
         input_tokens / 1_000_000 * price.price_in_per_mtok
         + output_tokens / 1_000_000 * price.price_out_per_mtok
@@ -2944,6 +2965,11 @@ class LedgerEntry:
             fold round 4 -- always true when ``timed_out``, summed not maxed).
         fingerprint: The writing invocation's experiment fingerprint (#601 fold
             round 3, FOLD 4), stamped by :meth:`ChargeLedger.append`.
+        is_pending: ``True`` for the PENDING entry written before a page's call
+            (charged at the reserve), ``False`` for the FINAL entry that
+            supersedes it once the call completes (#601 fold round 4, FOLD 1) --
+            see :meth:`ChargeLedger.total_usd`. Defaults ``False`` so every
+            pre-FOLD-1 entry loads as final, its prior meaning.
     """
 
     arm: str
@@ -2954,6 +2980,7 @@ class LedgerEntry:
     timed_out: bool
     reserve_applied: bool
     fingerprint: str = ""
+    is_pending: bool = False
 
 
 #: Sentinel for a pre-fold-4 ledger entry with no persisted fingerprint (#601
@@ -3007,6 +3034,7 @@ class ChargeLedger:
                         timed_out=bool(record["timed_out"]),
                         reserve_applied=bool(record["reserve_applied"]),
                         fingerprint=str(record.get("fingerprint", _LEGACY_LEDGER_FINGERPRINT)),
+                        is_pending=bool(record.get("is_pending", False)),
                     )
                 )
 
@@ -3016,11 +3044,33 @@ class ChargeLedger:
         trail (see :meth:`total_usd` for the fingerprint-scoped view)."""
         return list(self._entries)
 
+    def _effective_entries(self) -> list[LedgerEntry]:
+        """One EFFECTIVE entry per ``(arm, slug)`` key, scoped to THIS
+        fingerprint (#601 fold round 4, FOLD 1). A FINAL entry
+        (``is_pending=False``) always supersedes a PENDING one for the same
+        key -- the call completed, so the pending worst-case guess retires.
+        A key with ONLY a pending entry (killed between the pending write and
+        the final one) still counts, at its reserve valuation -- the
+        two-phase design's whole point. Among same-phase entries for one key
+        (e.g. a resumed attempt's fresh pending/final alongside an orphaned
+        prior one), the LATEST wins.
+        """
+        by_key: dict[tuple[str, str], LedgerEntry] = {}
+        for entry in self._entries:
+            if entry.fingerprint != self.fingerprint:
+                continue
+            key = (entry.arm, entry.slug)
+            existing = by_key.get(key)
+            if existing is None or not entry.is_pending or existing.is_pending:
+                by_key[key] = entry
+        return list(by_key.values())
+
     def total_usd(self) -> float:
         """Cumulative charged spend, scoped to THIS fingerprint (#601 fold
-        round 3, FOLD 4) -- a legacy or other-lineage entry never counts."""
-        matching = (e.priced_usd for e in self._entries if e.fingerprint == self.fingerprint)
-        return round(sum(matching), 5)
+        round 4, FOLD 1: a final entry supersedes its pending counterpart --
+        see :meth:`_effective_entries`) -- a legacy or other-lineage entry
+        never counts."""
+        return round(sum(e.priced_usd for e in self._effective_entries()), 5)
 
     def append(self, entry: LedgerEntry) -> None:
         """Persist one page's real charge immediately (append-only, never
