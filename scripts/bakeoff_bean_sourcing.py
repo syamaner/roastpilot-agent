@@ -2645,6 +2645,7 @@ def render_report(
     prorated_total_pages: int | None = None,
     prorated_attempted_estimate: float | None = None,
     deferred_retry_slugs: Sequence[str] = (),
+    retry_prorations: Mapping[str, RetryProration] | None = None,
 ) -> str:
     """Render the markdown scorecard for one or more model runs.
 
@@ -2675,6 +2676,9 @@ def render_report(
             (display only).
         prorated_attempted_estimate: The USD amount actually counted for
             ``prorated_arm`` in the incurred-spend line.
+        retry_prorations: Optional ``{Arm.label: RetryProration}`` (#652
+            round-6) -- per-arm proration for a residual retry, distinct from
+            ``prorated_arm`` (the mid-arm-trip mechanism's single scalar).
         stopped_early: Whether the spend guard stopped before evaluating every
             requested model (see :attr:`BakeoffResult.stopped_early`). A
             PARTIAL banner is rendered prominently at the top so this result
@@ -2682,14 +2686,13 @@ def render_report(
             finding).
         unevaluated_slugs: The requested models with NO run at all, when
             ``stopped_early`` is ``True``.
-        deferred_retry_slugs: Models WITH a run present whose residual retry
-            was deferred by the budget (#652 round-5) -- distinct from
-            ``unevaluated_slugs``, rendered separately so the leaderboard's
-            completeness claim stays true for a deferred arm's real data.
-        failed_slugs: Every wholly-failed run this invocation, with its DISPLAY-ONLY
-            heuristic label (:class:`FailedRun`) -- rendered as a separate banner; NEVER
-            checkpointed, never counted in the leaderboard/stats below (#600 round-2;
-            never-checkpoint simplification #602 fold round 5).
+        deferred_retry_slugs: Models whose residual retry was deferred by the
+            budget -- distinct from ``unevaluated_slugs``; most have a scored
+            row, a still wholly-failed one has none (see ``failed_slugs``).
+        failed_slugs: Every wholly-failed run, DISPLAY-ONLY heuristic label
+            (:class:`FailedRun`) -- a separate banner, never counted in the
+            leaderboard/stats below. The underlying run IS checkpointed
+            (#652 round-6), so a re-run retries only its still-retryable pages.
         executed_slugs: Models a REAL call was made for THIS invocation --
             distinguishes spend already INCURRED (still this harness's cost
             ESTIMATE, never verified OpenRouter billing -- #602) from a
@@ -2717,30 +2720,32 @@ def render_report(
         lines.append(
             "> **PARTIAL RUN -- budget-stopped.** The `--max-spend` guard stopped: "
             f"{'; '.join(status_parts)}. The leaderboard below covers only what is "
-            "scored; a DEFERRED arm's row is real data, just possibly stale until a "
-            "later resume retries it -- NOT a completed roster comparison -- re-run "
-            "with a higher `--max-spend` (or `--no-resume` off, to resume) before "
-            "treating any ranking here as final."
+            "scored; a deferred arm's row (if scored -- see the EXCLUDED banner for "
+            "one that is not) is real data, just possibly stale until a later resume "
+            "retries it -- NOT a completed roster comparison -- re-run with a higher "
+            "`--max-spend` (or `--no-resume` off, to resume) before treating any "
+            "ranking here as final."
         )
         lines.append("")
     if failed_slugs:
+        # #659: a `resumed` entry was LOADED, no call made this invocation.
         failed_desc = ", ".join(
             f"`{f.model_slug}` ({f.heuristic_label}, schema {f.schema_failures}/"
-            f"other {f.other_errors})"
+            f"other {f.other_errors}{', prior invocation' if f.resumed else ''})"
             for f in failed_slugs
         )
         lines.append(
-            f"> **EXCLUDED -- failed this invocation.** Every page errored for "
-            f"{len(failed_slugs)} model(s): {failed_desc}. The heuristic label is DISPLAY-ONLY "
-            "best-effort context (no invocation-local signal can truly tell a transient "
-            "outage apart from a model-specific fault) -- NEVER checkpointed regardless of "
-            "it, so a re-run ALWAYS retries them; excluded from every statistic below."
+            f"> **EXCLUDED.** Every page errored for "
+            f"{len(failed_slugs)} model(s): {failed_desc}. Heuristic label is DISPLAY-ONLY, "
+            "never authoritative -- excluded from every statistic below. The full run IS "
+            f"checkpointed (an attempt-counter flag), retried up to {_MAX_RESIDUAL_RETRIES} "
+            "times per page; still erroring after that finalises, never re-billed further."
         )
         lines.append("")
     retryable_by_slug = {
         run.model_slug: (
             sum(1 for p in run.pages if p.retryable),
-            max(p.retry_count for p in run.pages if p.retryable) + 1,
+            sorted({p.retry_count + 1 for p in run.pages if p.retryable}),
         )
         for run in runs
         if any(p.retryable for p in run.pages)
@@ -2749,9 +2754,17 @@ def render_report(
         # #652 round-5, finding 2: NEUTRAL wording -- never asserts "transient"
         # (a permanent failure looks identical until it exhausts its retries,
         # #652 FOLD 3); "eligible for residual retry" states only what IS true.
+        # #652 round-6, finding 6: a RANGE across the retryable pages' own
+        # attempt numbers, not max()+1 -- a model whose pages sit at different
+        # retry counts (some fresh, some already once-retried) never gets
+        # rounded up to the highest page's attempt number for every page.
+        def _attempt_range(attempts: list[int]) -> str:
+            lo, hi = attempts[0], attempts[-1]
+            return f"attempt {lo}" if lo == hi else f"attempts {lo}-{hi}"
+
         detail = ", ".join(
-            f"`{slug}` ({n} page(s), attempt {attempt} of {_MAX_RESIDUAL_RETRIES})"
-            for slug, (n, attempt) in retryable_by_slug.items()
+            f"`{slug}` ({n} page(s), {_attempt_range(attempts)} of {_MAX_RESIDUAL_RETRIES})"
+            for slug, (n, attempts) in retryable_by_slug.items()
         )
         total_pages = sum(n for n, _ in retryable_by_slug.values())
         lines.append(
@@ -2904,23 +2917,34 @@ def render_report(
     resumed_set = scored_slugs - executed_set
     if executed_slugs:
         incurred_estimate = 0.0
-        prorated_note = ""
+        prorated_notes: list[str] = []
         for s in executed_slugs:
             est_usd = cost_by_slug.get(s, 0.0)
-            if s == prorated_arm and prorated_attempted_estimate is not None:
+            retry_prorated = retry_prorations.get(s) if retry_prorations else None
+            if retry_prorated is not None:
+                # #652 round-6, finding 4: PER-ARM proration -- every retried
+                # arm this invocation is checked here, not just one scalar slot.
+                incurred_estimate += retry_prorated.attempted_estimate
+                prorated_notes.append(
+                    f" `{s}`'s estimate is PRORATED to its attempted pages' own "
+                    f"cost-weighted estimate ({retry_prorated.attempted_pages}/"
+                    f"{retry_prorated.total_pages} pages attempted, a residual retry -- #652)."
+                )
+            elif s == prorated_arm and prorated_attempted_estimate is not None:
                 incurred_estimate += prorated_attempted_estimate
                 pages_note = (
                     f" ({prorated_attempted_pages}/{prorated_total_pages} pages attempted)"
                     if prorated_attempted_pages is not None and prorated_total_pages
                     else ""
                 )
-                prorated_note = (
+                prorated_notes.append(
                     f" `{s}`'s estimate is PRORATED to its attempted pages' own "
                     f"cost-weighted estimate{pages_note} (the breaker tripped mid-arm, "
                     "#601 fold round 14)."
                 )
             else:
                 incurred_estimate += est_usd
+        prorated_note = "".join(prorated_notes)
         lines.append("## Cost (estimated spend incurred this invocation)")
         lines.append("")
         lines.append(
@@ -4452,6 +4476,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
         prorated_total_pages=result.prorated_total_pages,
         prorated_attempted_estimate=result.prorated_attempted_estimate,
         deferred_retry_slugs=result.deferred_retry_slugs,
+        retry_prorations=result.retry_prorations,
     )
     print("\n" + report, flush=True)
 
