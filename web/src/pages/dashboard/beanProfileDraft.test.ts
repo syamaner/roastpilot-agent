@@ -2,14 +2,18 @@ import { describe, expect, it } from "vitest";
 
 import {
   DEFAULT_BEAN_PROFILE_DRAFT,
+  draftFromBeanProfileDraft,
   fieldEvidenceFor,
   fieldSourceFor,
   PROVENANCE_TRACKED_FIELDS,
+  redactUrlQueryStrings,
   stripBidiControls,
+  validateBeanProfile,
   withFieldEdited,
   type BeanProfileDraft,
   type ProvenanceTrackedField,
 } from "./beanProfileDraft";
+import { FIXTURE_DRAFT_RESPONSE } from "./beanProfileFixture";
 
 /** A draft with the given `field_sources`/`field_evidence` maps layered on
  *  the default (the shape the draft-review UI reads from, #627). */
@@ -201,5 +205,135 @@ describe("stripBidiControls (#627 retro finding on #634)", () => {
   it("is a no-op on an already-clean string with punctuation/diacritics", () => {
     const text = "Grown at 1,900–2,100 m — hand-picked & sun-dried.";
     expect(stripBidiControls(text)).toBe(text);
+  });
+});
+
+describe("draftFromBeanProfileDraft — is_blend tri-state (#637, #654 fold 2)", () => {
+  it("flags is_blend_unresolved when the vendor page never addressed blending (wire is_blend: null)", () => {
+    const { draft } = draftFromBeanProfileDraft({ ...FIXTURE_DRAFT_RESPONSE, is_blend: null });
+    expect(draft.is_blend).toBe(false);
+    expect(draft.is_blend_unresolved).toBe(true);
+  });
+
+  it("leaves is_blend_unresolved absent when the page confirmed single-origin (false)", () => {
+    const { draft } = draftFromBeanProfileDraft({ ...FIXTURE_DRAFT_RESPONSE, is_blend: false });
+    expect(draft.is_blend).toBe(false);
+    expect(draft.is_blend_unresolved).toBeUndefined();
+  });
+
+  it("leaves is_blend_unresolved absent when the page confirmed a blend (true)", () => {
+    const { draft } = draftFromBeanProfileDraft({ ...FIXTURE_DRAFT_RESPONSE, is_blend: true });
+    expect(draft.is_blend).toBe(true);
+    expect(draft.is_blend_unresolved).toBeUndefined();
+  });
+});
+
+describe("withFieldEdited — resolves is_blend_unresolved on the operator's choice (#654 fold 2)", () => {
+  it("clears is_blend_unresolved the moment the operator picks a value via the boolean setter path", () => {
+    const draft: BeanProfileDraft = { ...DEFAULT_BEAN_PROFILE_DRAFT, is_blend_unresolved: true };
+    const next = withFieldEdited(draft, "is_blend", true);
+    expect(next.is_blend).toBe(true);
+    expect(next.is_blend_unresolved).toBeUndefined();
+  });
+
+  it("editing an unrelated field leaves an already-absent is_blend_unresolved absent", () => {
+    const next = withFieldEdited(DEFAULT_BEAN_PROFILE_DRAFT, "name", "House blend");
+    expect(next.is_blend_unresolved).toBeUndefined();
+  });
+});
+
+describe("validateBeanProfile — blocks save on an unresolved is_blend (#637, #654 fold 2)", () => {
+  const VALID_BASE: BeanProfileDraft = {
+    ...DEFAULT_BEAN_PROFILE_DRAFT,
+    name: "Test bean",
+    bean_origin: "Ethiopia",
+  };
+
+  it("blocks save with a clear message while is_blend_unresolved is true", () => {
+    const result = validateBeanProfile({ ...VALID_BASE, is_blend_unresolved: true });
+    expect("errors" in result).toBe(true);
+    if ("errors" in result) {
+      expect(result.errors.is_blend).toMatch(/didn't say|choose/i);
+    }
+  });
+
+  it("does not block save once the operator has explicitly chosen (unresolved flag absent)", () => {
+    const result = validateBeanProfile({ ...VALID_BASE, is_blend: true });
+    expect("input" in result).toBe(true);
+    if ("input" in result) {
+      expect(result.input.is_blend).toBe(true);
+    }
+  });
+
+  it("does not block a plain manual-entry draft (is_blend_unresolved never set)", () => {
+    const result = validateBeanProfile(VALID_BASE);
+    expect("input" in result).toBe(true);
+  });
+});
+
+describe("redactUrlQueryStrings (#654 round 2 fold 4)", () => {
+  it("strips the query string from an http(s) URL-shaped substring", () => {
+    const text = "drafted bean profile failed validation for 'https://x.test/p?token=abc': bad";
+    expect(redactUrlQueryStrings(text)).toBe(
+      "drafted bean profile failed validation for 'https://x.test/p': bad",
+    );
+    expect(redactUrlQueryStrings(text)).not.toContain("token=abc");
+  });
+
+  it("leaves a URL with no query string untouched", () => {
+    const text = "failed for https://x.test/p — page too thin";
+    expect(redactUrlQueryStrings(text)).toBe(text);
+  });
+
+  it("leaves ordinary text containing a bare '?' untouched (no URL prefix, no match)", () => {
+    const text = "Is this a valid bean profile? Please check.";
+    expect(redactUrlQueryStrings(text)).toBe(text);
+  });
+
+  it("redacts multiple URLs independently", () => {
+    const text = "https://a.test/x?a=1 and https://b.test/y?b=2";
+    expect(redactUrlQueryStrings(text)).toBe("https://a.test/x and https://b.test/y");
+  });
+
+  it("passes text with no URL at all through unmodified", () => {
+    const text = "bean extraction temporarily unavailable (provider error)";
+    expect(redactUrlQueryStrings(text)).toBe(text);
+  });
+});
+
+describe("draftFromBeanProfileDraft — strips bidi controls from drafted free text (#654 round 2 fold 6)", () => {
+  const RLO = String.fromCodePoint(0x202e); // RIGHT-TO-LEFT OVERRIDE
+
+  it("strips a bidi override from the drafted name", () => {
+    const { draft } = draftFromBeanProfileDraft({
+      ...FIXTURE_DRAFT_RESPONSE,
+      name: `${RLO}Hostile Name`,
+    });
+    expect(draft.name).not.toContain(RLO);
+    expect(draft.name).toBe("Hostile Name");
+  });
+
+  it("strips bidi controls from every drafted free-text identity field", () => {
+    const { draft } = draftFromBeanProfileDraft({
+      ...FIXTURE_DRAFT_RESPONSE,
+      bean_origin: `${RLO}Origin`,
+      bean_varietal: `${RLO}Varietal`,
+      country: `${RLO}Country`,
+      farm: `${RLO}Farm`,
+      description: `${RLO}Description`,
+      source_url: `https://roaster.example.com/${RLO}bean`,
+    });
+    expect(draft.bean_origin).toBe("Origin");
+    expect(draft.bean_varietal).toBe("Varietal");
+    expect(draft.country).toBe("Country");
+    expect(draft.farm).toBe("Farm");
+    expect(draft.description).toBe("Description");
+    expect(draft.source_url).toBe("https://roaster.example.com/bean");
+  });
+
+  it("leaves clean drafted text unmodified", () => {
+    const { draft } = draftFromBeanProfileDraft(FIXTURE_DRAFT_RESPONSE);
+    expect(draft.name).toBe(FIXTURE_DRAFT_RESPONSE.name);
+    expect(draft.bean_origin).toBe(FIXTURE_DRAFT_RESPONSE.bean_origin);
   });
 });
