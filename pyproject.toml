@@ -80,6 +80,13 @@ dependencies = [
   # requests at runtime — accepted for the extraction quality this buys
   # (docs/research/bean-sourcing/README.md §2).
   "extruct>=0.18,<0.19",
+  # #601 fold round 9, E FOLD 2: previously transitive via
+  # pydantic-ai-slim[openai] (>=2.29.0); now imported directly
+  # (bean_sourcing._extract_bean_identity closes the bespoke,
+  # retry-disabled AsyncOpenAI client it builds; advisor.build_model
+  # constructs it) so it is a direct dep, same precedent as
+  # pyserial/sounddevice/anyio above.
+  "openai>=2.29.0,<3",
   # #590 slice C: boilerplate-stripped markdown preprocessing ahead of the
   # bean-sourcing LLM call (bean_sourcing._extract_page_markdown) — ~65%
   # fewer tokens and nav/footer/related-products stripped so a page's

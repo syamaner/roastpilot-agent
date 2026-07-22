@@ -1799,7 +1799,21 @@ def reasoning_extra_body(
     return {"reasoning": {"effort": reasoning_effort}}
 
 
-def build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+#: The native OpenAI API endpoint (#601 fold round 9, E FOLD 1) -- PINNED
+#: explicitly on the bespoke, retry-disabled ``AsyncOpenAI`` client for
+#: ``provider="openai"``. Constructing that client with no ``base_url=`` at
+#: all would let it fall back to the SDK's own default resolution, which
+#: reads an ambient ``OPENAI_BASE_URL`` env var first (the #587-class
+#: credential-redirection hole: the api_key would be sent to whatever host
+#: that variable names). The NORMAL (non-bespoke) construction path has the
+#: same SDK-default behaviour, but is unaffected by this pin either way --
+#: this constant only bounds the NEW bespoke-client code path.
+_OPENAI_NATIVE_BASE_URL = "https://api.openai.com/v1"
+
+
+def build_model(
+    config: AdvisorConfig, *, model_slug: str | None = None, disable_transport_retries: bool = False
+) -> Model:
     """Build the PydanticAI ``Model`` for ``config.provider`` (D18).
 
     One factory, one advisor — only model construction varies per provider.
@@ -1819,6 +1833,15 @@ def build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Mode
             phase-resolved slug here so one provider config can serve several
             models. The provider is always ``config.provider`` — per-phase
             selection varies the model, not the provider.
+        disable_transport_retries: When ``True``, the OpenAI-family providers
+            (``openai`` / ``ollama`` / ``openai_compatible``) build their
+            underlying ``AsyncOpenAI`` client with ``max_retries=0`` instead
+            of the SDK default (#601 — an experiment needing EXACT, SDK-
+            invisible request accounting; the bean-sourcing bake-off's
+            reserve budgeting is the first caller). ``False`` (the default)
+            preserves today's behaviour exactly — the roast advisor never
+            sets this. No effect on ``anthropic``/``google`` (their own
+            SDKs, untouched).
 
     Returns:
         The constructed PydanticAI ``Model`` for the given slug and provider.
@@ -1831,6 +1854,13 @@ def build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Mode
             from pydantic_ai.models.openai import OpenAIChatModel
             from pydantic_ai.providers.openai import OpenAIProvider
 
+            if disable_transport_retries:
+                from openai import AsyncOpenAI
+
+                openai_client = AsyncOpenAI(
+                    base_url=_OPENAI_NATIVE_BASE_URL, api_key=api_key, max_retries=0
+                )
+                return OpenAIChatModel(slug, provider=OpenAIProvider(openai_client=openai_client))
             return OpenAIChatModel(slug, provider=OpenAIProvider(api_key=api_key))
         if provider == "anthropic":
             from pydantic_ai.models.anthropic import AnthropicModel
@@ -1849,11 +1879,17 @@ def build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Mode
             # The OpenAI client requires a non-empty key even for a keyless
             # local Ollama endpoint; fall back to a placeholder so a LAN
             # Ollama with no auth still constructs.
+            resolved_key = api_key or "not-required"
+            if disable_transport_retries:
+                from openai import AsyncOpenAI
+
+                openai_client = AsyncOpenAI(
+                    base_url=config.provider_base_url, api_key=resolved_key, max_retries=0
+                )
+                return OpenAIChatModel(slug, provider=OpenAIProvider(openai_client=openai_client))
             return OpenAIChatModel(
                 slug,
-                provider=OpenAIProvider(
-                    base_url=config.provider_base_url, api_key=api_key or "not-required"
-                ),
+                provider=OpenAIProvider(base_url=config.provider_base_url, api_key=resolved_key),
             )
     except ImportError as exc:  # pragma: no cover — needs the extra uninstalled
         # Only the native providers have their own extra; openai / ollama /

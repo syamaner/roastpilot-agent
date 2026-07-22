@@ -213,6 +213,7 @@ import httpx
 import lxml.etree  # type: ignore[import-untyped]
 import lxml.html  # type: ignore[import-untyped]
 import trafilatura
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai import Agent, ModelAPIError, ModelSettings, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelRequest, RetryPromptPart
@@ -2696,6 +2697,7 @@ def _bean_sourcing_agent(
     model: Model | None = None,
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
     max_output_tokens: int | None = None,
+    disable_transport_retries: bool = False,
 ) -> Agent[None, _ExtractedBeanIdentity]:
     """Build the bean-identity extraction agent.
 
@@ -2737,6 +2739,9 @@ def _bean_sourcing_agent(
             times, so the run-wide worst case is
             ``(1 + EXTRACTION_MAX_RETRIES) * max_output_tokens``, not the
             bare cap (#601 P2 fold).
+        disable_transport_retries: Passed straight through to
+            :func:`~roastpilot_agent.advisor.build_model` (#601). ``False``
+            (the default) preserves today's behaviour exactly.
 
     Returns:
         The extraction agent, temperature 0 for deterministic, literal
@@ -2746,7 +2751,11 @@ def _bean_sourcing_agent(
         resolved_model = model
     else:
         model_slug = _resolve_extraction_model_slug(advisor_config, sourcing_config)
-        resolved_model = build_model(advisor_config, model_slug=model_slug)
+        resolved_model = build_model(
+            advisor_config,
+            model_slug=model_slug,
+            disable_transport_retries=disable_transport_retries,
+        )
     settings = ModelSettings(temperature=0.0)
     extra_body = reasoning_extra_body(reasoning_effort)
     if extra_body is not None:
@@ -2800,6 +2809,7 @@ async def _extract_bean_identity(
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
     diagnostics: BeanSourcingDiagnostics | None = None,
     max_output_tokens: int | None = None,
+    disable_transport_retries: bool = False,
 ) -> _ExtractedBeanIdentity:
     """Run the structured bean-identity extraction call over ``page_text``.
 
@@ -2830,6 +2840,13 @@ async def _extract_bean_identity(
             slug resolution is PROVIDER-AWARE — see
             :func:`_resolve_extraction_model_slug`.
         model: An injected PydanticAI ``Model`` (the extraction test seam).
+        disable_transport_retries: Passed straight through to
+            :func:`_bean_sourcing_agent` (#601). ``False`` (the default)
+            preserves today's behaviour exactly. When ``True`` and ``model``
+            is NOT injected, the bespoke, retry-disabled ``AsyncOpenAI``
+            client :func:`build_model` constructs is closed once this run
+            completes (success or raise) -- a fresh client per call would
+            otherwise leak its connection pool across a multi-model corpus.
 
     Returns:
         The provider's honest, page-only bean identity.
@@ -2856,6 +2873,14 @@ async def _extract_bean_identity(
     # undercounted every failing, still-billed call. ``None`` when no diagnostics is
     # passed, so a caller that omits it pays no extra bookkeeping.
     run_usage = RunUsage() if diagnostics is not None else None
+    # #601 fold round 9 (E FOLD 3): tracks the bespoke, retry-disabled client
+    # ONLY when WE constructed one (model not injected, disable_transport_retries
+    # requested) -- never an injected test double, never an SDK-managed default
+    # client (those are never ours to close). ``bespoke_model_name`` is captured
+    # alongside it (never re-read from ``agent`` later -- ``agent`` is only
+    # conditionally bound) purely for the round-10 teardown-failure log line.
+    bespoke_client: AsyncOpenAI | None = None
+    bespoke_model_name: str | None = None
     try:
         # Agent construction (which calls ``build_model`` when ``model`` is
         # omitted) lives INSIDE the try: it can raise ``AdvisorDependencyError``
@@ -2868,7 +2893,14 @@ async def _extract_bean_identity(
             model=model,
             reasoning_effort=reasoning_effort,
             max_output_tokens=max_output_tokens,
+            disable_transport_retries=disable_transport_retries,
         )
+        if model is None and disable_transport_retries:
+            from pydantic_ai.models.openai import OpenAIChatModel  # noqa: PLC0415
+
+            if isinstance(agent.model, OpenAIChatModel):
+                bespoke_client = agent.model.client
+                bespoke_model_name = agent.model.model_name
         async with asyncio.timeout(extraction_timeout_seconds):
             result = (
                 await agent.run(page_text, usage=run_usage)
@@ -2901,6 +2933,24 @@ async def _extract_bean_identity(
             assert diagnostics is not None  # narrows: run_usage is only ever set alongside it
             diagnostics.request_tokens += run_usage.input_tokens
             diagnostics.response_tokens += run_usage.output_tokens
+        if bespoke_client is not None:
+            # #601 fold round 10 (E FOLD): teardown must never OUTRANK the
+            # primary outcome -- an unconditional close() that itself raises
+            # (e.g. transport-pool teardown) would replace a successful
+            # result or the typed BeanExtractionUnavailableError above with
+            # an untyped error draft_for_page does not catch, aborting the
+            # whole resumable bake-off instead of recording one page failure.
+            try:
+                await bespoke_client.close()
+            except Exception:
+                _log.warning(
+                    "bean_sourcing: bespoke transport-retry-disabled client "
+                    "teardown failed for provider=%r model_slug=%r -- swallowed, "
+                    "never masking the extraction's own outcome",
+                    advisor_config.provider,
+                    bespoke_model_name,
+                    exc_info=True,
+                )
     if diagnostics is not None:
         diagnostics.schema_retries += sum(
             isinstance(part, RetryPromptPart)
@@ -5088,6 +5138,7 @@ async def draft_bean_profile_from_url(
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
     diagnostics: BeanSourcingDiagnostics | None = None,
     max_output_tokens: int | None = None,
+    disable_transport_retries: bool = False,
 ) -> BeanProfileDraft:
     """Draft a bean profile from a vendor product URL (#573 phase 1).
 
@@ -5129,6 +5180,13 @@ async def draft_bean_profile_from_url(
             ``None`` (the default) omits the setting -- unchanged before #601.
             A per-request bound; see :func:`_bean_sourcing_agent` for the
             retry-inclusive run-wide worst case.
+        disable_transport_retries: When ``True``, the underlying provider
+            client is built with SDK transport retries disabled (#601 --
+            passed straight through to :func:`_extract_bean_identity`), so an
+            experiment can account for EXACT requests: a transient transport
+            failure then surfaces as a page error (retried on resume)
+            instead of a silent, SDK-invisible re-send. ``False`` (the
+            default) preserves today's behaviour exactly.
 
     Returns:
         The drafted :class:`~roastpilot_agent.models.BeanProfileDraft`.
@@ -5206,6 +5264,7 @@ async def draft_bean_profile_from_url(
         reasoning_effort=reasoning_effort,
         diagnostics=diagnostics,
         max_output_tokens=max_output_tokens,
+        disable_transport_retries=disable_transport_retries,
     )
     # page.extracted_text/page.json_ld_values, NOT page.prompt_text (#590
     # D1 fold 1; split #590 slice E1) — the prompt text carries OUR OWN

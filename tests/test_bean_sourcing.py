@@ -35,11 +35,13 @@ from typing import Literal
 import extruct  # type: ignore[import-untyped]
 import httpx
 import pytest
+from openai import AsyncOpenAI
 from pydantic import ValidationError
-from pydantic_ai import ModelHTTPError
+from pydantic_ai import Agent, ModelAPIError, ModelHTTPError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models import Model
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.openai import OpenAIChatModel
 
 from roastpilot_agent import bean_sourcing
 from roastpilot_agent.advisor import AdvisorDependencyError
@@ -2055,6 +2057,222 @@ def test_bean_sourcing_agent_pins_extraction_max_retries() -> None:
     )
 
 
+def test_bean_sourcing_agent_threads_disable_transport_retries() -> None:
+    """#601: ``disable_transport_retries=True`` reaches the REAL, un-injected
+    ``build_model`` call -- the underlying provider client is built with
+    ``max_retries=0`` (offline-safe: no network call happens at construction
+    time)."""
+    agent = bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
+        _ADVISOR_CONFIG, disable_transport_retries=True
+    )
+    assert isinstance(agent.model, OpenAIChatModel)
+    assert agent.model.client.max_retries == 0
+
+
+def test_bean_sourcing_agent_omits_disable_transport_retries_by_default() -> None:
+    """``disable_transport_retries=False`` (the default) preserves today's
+    behaviour exactly -- the SDK's own transport-retry default, never
+    zeroed."""
+    agent = bean_sourcing._bean_sourcing_agent(_ADVISOR_CONFIG)  # pyright: ignore[reportPrivateUsage]
+    assert isinstance(agent.model, OpenAIChatModel)
+    assert agent.model.client.max_retries != 0
+
+
+class _FakeAgentResult:
+    """A minimal stand-in for pydantic-ai's run result -- only the two
+    attributes ``_extract_bean_identity`` actually reads."""
+
+    def __init__(self, output: bean_sourcing._ExtractedBeanIdentity) -> None:  # pyright: ignore[reportPrivateUsage]
+        self.output = output
+
+    def all_messages(self) -> list[object]:
+        return []
+
+
+_IdentityAgent = Agent[None, bean_sourcing._ExtractedBeanIdentity]  # pyright: ignore[reportPrivateUsage]
+
+
+def _agent_with_faked_run(
+    outcome: bean_sourcing._ExtractedBeanIdentity | Exception,  # pyright: ignore[reportPrivateUsage]
+) -> Callable[..., _IdentityAgent]:
+    """A ``_bean_sourcing_agent`` monkeypatch replacement (#601 fold round 9,
+    E FOLD 3): builds the REAL agent (so ``build_model`` really runs and
+    ``.model`` is a genuine, offline-safe ``OpenAIChatModel``), then swaps in
+    a fake ``.run`` that succeeds or raises WITHOUT a real network call --
+    isolating the close()-lifecycle test from the extraction call's own
+    result-shape concerns (already covered elsewhere)."""
+    real_bean_sourcing_agent = bean_sourcing._bean_sourcing_agent  # pyright: ignore[reportPrivateUsage]
+
+    def _build(*args: object, **kwargs: object) -> _IdentityAgent:
+        agent = real_bean_sourcing_agent(*args, **kwargs)  # type: ignore[arg-type]
+
+        async def _fake_run(prompt: str, *, usage: object = None) -> _FakeAgentResult:
+            if isinstance(outcome, Exception):
+                raise outcome
+            return _FakeAgentResult(outcome)
+
+        agent.run = _fake_run  # type: ignore[method-assign]
+        return agent
+
+    return _build
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_closes_the_bespoke_client_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#601 fold round 9, E FOLD 3 (P2): the bespoke, retry-disabled client
+    ``build_model`` constructs is closed once a SUCCESSFUL extraction run
+    completes -- a fresh client per call would otherwise leak its connection
+    pool across a multi-model corpus."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args()
+    )
+    monkeypatch.setattr(bean_sourcing, "_bean_sourcing_agent", _agent_with_faked_run(identity))
+    close_calls: list[AsyncOpenAI] = []
+    real_close = AsyncOpenAI.close
+
+    async def _tracking_close(self: AsyncOpenAI) -> None:
+        close_calls.append(self)
+        await real_close(self)
+
+    monkeypatch.setattr(AsyncOpenAI, "close", _tracking_close)
+
+    await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "some page text", advisor_config=_ADVISOR_CONFIG, disable_transport_retries=True
+    )
+    assert len(close_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_closes_the_bespoke_client_on_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#601 fold round 9, E FOLD 3 (P2): the bespoke client is closed even
+    when the extraction call raises -- the ``finally`` covers both paths."""
+    monkeypatch.setattr(
+        bean_sourcing,
+        "_bean_sourcing_agent",
+        _agent_with_faked_run(ModelAPIError("m1", "boom")),
+    )
+    close_calls: list[AsyncOpenAI] = []
+    real_close = AsyncOpenAI.close
+
+    async def _tracking_close(self: AsyncOpenAI) -> None:
+        close_calls.append(self)
+        await real_close(self)
+
+    monkeypatch.setattr(AsyncOpenAI, "close", _tracking_close)
+
+    with pytest.raises(bean_sourcing.BeanExtractionUnavailableError):
+        await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+            "some page text", advisor_config=_ADVISOR_CONFIG, disable_transport_retries=True
+        )
+    assert len(close_calls) == 1
+
+
+async def _raising_close(self: AsyncOpenAI) -> None:
+    raise RuntimeError("bespoke client teardown blew up")
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_close_failure_never_masks_a_successful_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#601 fold round 10 (E FOLD, P2): teardown must never OUTRANK the
+    primary outcome -- a close() that itself raises (a real, if rare,
+    transport-pool teardown failure) must not replace a SUCCESSFUL
+    extraction result; the failure is logged and swallowed."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args()
+    )
+    monkeypatch.setattr(bean_sourcing, "_bean_sourcing_agent", _agent_with_faked_run(identity))
+    monkeypatch.setattr(AsyncOpenAI, "close", _raising_close)
+
+    result = await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "some page text", advisor_config=_ADVISOR_CONFIG, disable_transport_retries=True
+    )
+    assert result.name == _identity_args()["name"]  # the real result, not a teardown error
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_close_failure_never_masks_the_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#601 fold round 10 (E FOLD, P2): a close() that itself raises must
+    not replace the ORIGINAL typed ``BeanExtractionUnavailableError`` with
+    an untyped teardown error -- ``draft_for_page`` only catches the typed
+    ``BeanSourcingError`` family, so an untyped escape would abort the
+    whole resumable bake-off instead of recording one page failure."""
+    monkeypatch.setattr(
+        bean_sourcing,
+        "_bean_sourcing_agent",
+        _agent_with_faked_run(ModelAPIError("m1", "boom")),
+    )
+    monkeypatch.setattr(AsyncOpenAI, "close", _raising_close)
+
+    with pytest.raises(bean_sourcing.BeanExtractionUnavailableError, match="boom"):
+        await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+            "some page text", advisor_config=_ADVISOR_CONFIG, disable_transport_retries=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_injected_model_builds_no_bespoke_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#601 fold round 9, E FOLD 3: an INJECTED ``model`` (the test seam)
+    never triggers ``build_model`` at all, so there is no bespoke client to
+    close -- the close() spy must see zero calls."""
+    close_calls: list[AsyncOpenAI] = []
+    real_close = AsyncOpenAI.close
+
+    async def _tracking_close(self: AsyncOpenAI) -> None:
+        close_calls.append(self)
+        await real_close(self)
+
+    monkeypatch.setattr(AsyncOpenAI, "close", _tracking_close)
+
+    await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "some page text",
+        advisor_config=_ADVISOR_CONFIG,
+        model=_function_model_returning(_identity_args()),
+        disable_transport_retries=True,
+    )
+    assert close_calls == []
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_non_openai_family_provider_builds_no_bespoke_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#601 fold round 9, E FOLD 3: ``disable_transport_retries`` has no
+    effect on anthropic/google (:func:`build_model`'s own docstring) -- a
+    non-openai-family ``agent.model`` is never an ``OpenAIChatModel``, so no
+    bespoke client is tracked or closed."""
+    monkeypatch.setenv("ADVISOR_TEST_KEY", "dummy-key")
+    anthropic_config = AdvisorConfig(
+        provider="anthropic", api_key_env="ADVISOR_TEST_KEY", model_slug="claude-3-haiku"
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args()
+    )
+    monkeypatch.setattr(bean_sourcing, "_bean_sourcing_agent", _agent_with_faked_run(identity))
+    close_calls: list[AsyncOpenAI] = []
+    real_close = AsyncOpenAI.close
+
+    async def _tracking_close(self: AsyncOpenAI) -> None:
+        close_calls.append(self)
+        await real_close(self)
+
+    monkeypatch.setattr(AsyncOpenAI, "close", _tracking_close)
+
+    await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "some page text", advisor_config=anthropic_config, disable_transport_retries=True
+    )
+    assert close_calls == []
+
+
 # --- _resolve_extraction_model_slug (#590 P1 + P2 fix: provider-aware default) ---
 #
 # Codex caught a P1 on the PR that introduced BeanSourcingConfig.model_slug:
@@ -2222,7 +2440,12 @@ def test_bean_sourcing_agent_uses_resolved_model_slug_openai_compatible(
     consulted."""
     captured: dict[str, object] = {}
 
-    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
         captured["model_slug"] = model_slug
         return _function_model_returning(_identity_args())
 
@@ -2246,7 +2469,12 @@ def test_bean_sourcing_agent_native_provider_uses_advisor_model_slug(
     OpenRouter-only default."""
     captured: dict[str, object] = {}
 
-    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
         captured["model_slug"] = model_slug
         return _function_model_returning(_identity_args())
 
@@ -2528,7 +2756,12 @@ async def test_extract_bean_identity_maps_build_model_dependency_error(
     #613: this is DEPENDENCY-origin, so it is the ``BeanExtractionUnavailableError``
     subclass, not the base class."""
 
-    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
         raise AdvisorDependencyError(
             "advisor provider 'anthropic' needs an optional dependency: "
             "pip install 'roastpilot-agent[anthropic]'"
@@ -8473,7 +8706,12 @@ async def test_draft_bean_profile_from_url_threads_model_slug_from_sourcing_conf
     default too) reaches ``build_model`` when no ``model`` is injected."""
     captured: dict[str, object] = {}
 
-    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
         captured["model_slug"] = model_slug
         return _function_model_returning(_identity_args())
 
@@ -8499,7 +8737,12 @@ async def test_draft_bean_profile_from_url_native_provider_uses_advisor_model_sl
     native provider's own API."""
     captured: dict[str, object] = {}
 
-    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
         captured["model_slug"] = model_slug
         return _function_model_returning(_identity_args())
 
@@ -8524,7 +8767,12 @@ async def test_draft_bean_profile_from_url_openai_compatible_non_openrouter_uses
     "openai/gpt-5-mini" default."""
     captured: dict[str, object] = {}
 
-    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
         captured["model_slug"] = model_slug
         return _function_model_returning(_identity_args())
 
@@ -8610,7 +8858,12 @@ async def test_draft_bean_profile_from_url_maps_build_model_dependency_error(
     ``model`` is deliberately omitted so the ``build_model`` path is hit.
     #613: this is DEPENDENCY-origin, so the subclass, ``BeanExtractionUnavailableError``."""
 
-    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
         raise AdvisorDependencyError(
             "advisor provider 'anthropic' needs an optional dependency: "
             "pip install 'roastpilot-agent[anthropic]'"
