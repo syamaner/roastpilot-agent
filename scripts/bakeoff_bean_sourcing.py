@@ -1482,17 +1482,10 @@ async def run_model_over_corpus(
             # IMMEDIATELY once the call returns (#601 fold round 5, D FOLD 2)
             # -- before scoring, so a later raise there keeps the ACTUAL charge.
             timed_out = diagnostics.timed_out_runs > 0
-            # #601 fold round 10: transport retries off (Refs slice E) means an
-            # accepted-but-lost request surfaces as an INFRA (non-schema) error
-            # with ZERO usage -- the same unreported-attempt risk as a timeout.
-            zero_usage_infra_failure = (
-                error is not None
-                and not _is_schema_failure(error)
-                and not timed_out
-                and diagnostics.request_tokens == 0
-                and diagnostics.response_tokens == 0
-            )
-            apply_reserve = timed_out or zero_usage_infra_failure
+            # #601 fold round 11 (D fold 4): reserve by IN-FLIGHT failure
+            # CLASS, not captured usage -- a retry that reports usage then
+            # hits a provider error still risks a lost, billed request.
+            apply_reserve = timed_out or _is_provider_error_failure(error)
             priced = _actual_page_cost(
                 diagnostics.request_tokens,
                 diagnostics.response_tokens,
@@ -1664,6 +1657,16 @@ _SCHEMA_FAILURE_MARKER = "returned a malformed shape"
 def _is_schema_failure(error: str | None) -> bool:
     """Whether a page's error string is a schema/structured-output failure."""
     return error is not None and _SCHEMA_FAILURE_MARKER in error
+
+
+# Matches _extract_bean_identity's provider-error branch text -- an
+# ACCEPTED, possibly-lost request (#601 fold round 11, D fold 4).
+_PROVIDER_ERROR_MARKER = "provider error"
+
+
+def _is_provider_error_failure(error: str | None) -> bool:
+    """Whether a page's error string is a provider/transport failure."""
+    return error is not None and _PROVIDER_ERROR_MARKER in error
 
 
 @dataclass(frozen=True)
@@ -2445,12 +2448,11 @@ def _actual_page_cost(
     reserve is a DIFFERENT, additional call (the unreported one), so it is
     ADDED, never maxed (#601 fold round 4, FOLD 3).
 
-    ``apply_reserve`` covers TWO cases (#601 fold round 10, D amendment): a
-    wall-clock TIMEOUT (always unreported, regardless of prior captured
-    usage), or an INFRA-class error (never schema/malformed-shape) with ZERO
-    captured usage overall -- with transport retries disabled (Refs slice
-    E), an accepted-but-lost request surfaces as exactly this. An infra
-    failure that DID capture some usage is trusted as complete, no reserve.
+    ``apply_reserve`` is set by failure CLASS, not captured usage (#601 fold
+    round 11, D fold 4): a wall-clock TIMEOUT or a PROVIDER-ERROR
+    (:func:`_is_provider_error_failure`) -- both in-flight, possibly-lost
+    requests -- get it regardless of prior captured usage; schema exhaustion
+    and model-construction failures never do (nothing left unreported).
 
     ``per_page_reserve`` must be a SINGLE-ATTEMPT reserve (:func:`_single_attempt_reserve`),
     never the full multi-attempt :func:`_page_cost_reserve` the PENDING entry
@@ -3068,8 +3070,9 @@ class LedgerEntry:
             timeout-reserve floor (see :func:`_actual_page_cost`).
         timed_out: Whether the outer extraction timeout cancelled this call.
         reserve_applied: Whether the reserve was ADDED to ``priced_usd`` (#601
-            fold round 4/10 -- true for ``timed_out`` OR a zero-usage infra
-            failure, summed not maxed; see :func:`_actual_page_cost`).
+            fold round 4/11 -- true for ``timed_out`` OR a provider-error
+            failure (:func:`_is_provider_error_failure`), regardless of
+            captured usage, summed not maxed; see :func:`_actual_page_cost`).
         fingerprint: The writing invocation's experiment fingerprint (#601 fold
             round 3, FOLD 4), stamped by :meth:`ChargeLedger.append`.
         is_pending: ``True`` for the PENDING entry (charged at the reserve),

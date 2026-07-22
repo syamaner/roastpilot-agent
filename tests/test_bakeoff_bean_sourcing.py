@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import bakeoff_bean_sourcing as bo  # noqa: E402
 
+from roastpilot_agent.advisor import AdvisorDependencyError  # noqa: E402
 from roastpilot_agent.config import AdvisorConfig  # noqa: E402
 from roastpilot_agent.models import BeanFieldSource, BeanProfileDraft  # noqa: E402
 
@@ -932,6 +933,30 @@ def test_is_schema_failure_matches_only_the_malformed_shape_message() -> None:
     assert not bo._is_schema_failure(None)  # pyright: ignore[reportPrivateUsage]
 
 
+def test_is_provider_error_failure_matches_only_the_provider_error_message() -> None:
+    """#601 fold round 11, D fold 4: the reserve-by-class predicate must match
+    the runtime's provider-error branch text and nothing else -- distinct from
+    a timeout, a schema failure, a model-construction failure, or a fetch
+    failure."""
+    assert bo._is_provider_error_failure(  # pyright: ignore[reportPrivateUsage]
+        "BeanExtractionUnavailableError: bean identity extraction provider error: boom"
+    )
+    assert not bo._is_provider_error_failure(  # pyright: ignore[reportPrivateUsage]
+        "BeanExtractionUnavailableError: bean identity extraction exceeded the 45s deadline"
+    )
+    assert not bo._is_provider_error_failure(  # pyright: ignore[reportPrivateUsage]
+        "BeanExtractionUnavailableError: bean identity extraction returned a malformed "
+        "shape: some pydantic-ai detail"
+    )
+    assert not bo._is_provider_error_failure(  # pyright: ignore[reportPrivateUsage]
+        "BeanExtractionUnavailableError: bean identity extraction could not build its model: boom"
+    )
+    assert not bo._is_provider_error_failure(  # pyright: ignore[reportPrivateUsage]
+        "BeanFetchError: vendor page fetch failed: boom"
+    )
+    assert not bo._is_provider_error_failure(None)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_model_metrics_separates_schema_failures_from_other_errors() -> None:
     fields = {spec.name: bo.Outcome.ERR for spec in bo.FIELD_SPECS}
     pages = [
@@ -1350,14 +1375,16 @@ async def test_run_model_over_corpus_zero_usage_provider_error_charges_single_at
 
 
 @pytest.mark.asyncio
-async def test_run_model_over_corpus_provider_error_with_captured_usage_is_trusted_as_complete(
+async def test_run_model_over_corpus_provider_error_with_captured_usage_still_gets_the_reserve(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
-    """#601 fold round 10, D amendment: a provider-error page that DID
-    capture some usage (an earlier retry succeeded before the final attempt
-    failed) is trusted as complete -- charged at exactly the captured
-    tokens, no reserve added on top (unlike a timeout's cancelled-mid-flight
-    ambiguity, which always adds the reserve regardless of prior usage)."""
+    """#601 fold round 11, D fold 4: a provider-error page that DID capture
+    some usage (an earlier retry reported real usage before the final
+    attempt raised) is NOT trusted as complete -- the retry that raised is
+    itself an in-flight, possibly-billed request whose response may be
+    lost. The reserve is charged ON TOP of the captured usage, same as the
+    zero-usage provider-error case, because the failure CLASS (provider
+    error), not the captured usage, decides the reserve."""
     price = bo.RosterModel("m1", 1.0, 1.0, "x")
     ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
     run = await bo.run_model_over_corpus(
@@ -1372,12 +1399,14 @@ async def test_run_model_over_corpus_provider_error_with_captured_usage_is_trust
     _, entry = ledger.entries
     assert entry.request_tokens > 0
     assert entry.response_tokens > 0
-    assert entry.reserve_applied is False  # captured usage is trusted, no reserve added
+    assert entry.reserve_applied is True  # in-flight failure class -- reserve on top of captured
+    single_reserve = bo._single_attempt_reserve(corpus[0], price)  # pyright: ignore[reportPrivateUsage]
     assert entry.priced_usd == pytest.approx(
         round(
             bo._raw_priced_cost(  # pyright: ignore[reportPrivateUsage]
                 entry.request_tokens, entry.response_tokens, price
-            ),
+            )
+            + single_reserve,
             5,
         )
     )
@@ -1412,6 +1441,46 @@ async def test_run_model_over_corpus_schema_failure_never_gets_the_reserve(
             5,
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_model_construction_failure_never_gets_the_reserve(
+    corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#601 fold round 11, D fold 4: a model-CONSTRUCTION failure (a
+    misconfigured or under-installed provider) never sends a request, so
+    there is nothing billable to lose -- no reserve, even though nothing was
+    captured. Distinct from a provider error (an ACCEPTED, possibly-lost
+    request), which always gets the reserve regardless of captured usage."""
+
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Any:
+        raise AdvisorDependencyError(
+            "advisor provider 'anthropic' needs an optional dependency: "
+            "pip install 'roastpilot-agent[anthropic]'"
+        )
+
+    monkeypatch.setattr(bo._bean_sourcing_module, "build_model", fake_build_model)  # pyright: ignore[reportPrivateUsage]
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    run = await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        roster_price=price,
+        ledger=ledger,
+    )
+    assert run.pages[0].error is not None
+    assert "could not build its model" in run.pages[0].error
+    _, entry = ledger.entries
+    assert entry.request_tokens == 0
+    assert entry.response_tokens == 0
+    assert entry.reserve_applied is False
+    assert entry.priced_usd == 0.0
 
 
 def test_run_json_roundtrips_elapsed_s() -> None:
