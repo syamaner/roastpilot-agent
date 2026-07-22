@@ -2679,12 +2679,23 @@ def _resolve_extraction_model_slug(
     return advisor_config.model_slug
 
 
+#: The bean-identity extraction agent's retry budget (#601), PINNED explicitly
+#: rather than left to pydantic-ai's own default (currently 1, for both tool
+#: and output-validation retries -- this agent has no tools, so only the
+#: output-validation budget is exercised) -- code-visible and stable even if
+#: that default ever changes, so a caller's ``max_output_tokens`` (see
+#: :func:`_bean_sourcing_agent`) has a real constant for its documented
+#: run-wide worst case, not a guess.
+EXTRACTION_MAX_RETRIES: int = 1
+
+
 def _bean_sourcing_agent(
     advisor_config: AdvisorConfig,
     *,
     sourcing_config: BeanSourcingConfig | None = None,
     model: Model | None = None,
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
+    max_output_tokens: int | None = None,
 ) -> Agent[None, _ExtractedBeanIdentity]:
     """Build the bean-identity extraction agent.
 
@@ -2717,6 +2728,15 @@ def _bean_sourcing_agent(
             it unset is the behaviour-preserving no-op; an explicit level
             sets the OpenRouter ``reasoning`` request body the same way the
             roast advisor does.
+        max_output_tokens: An optional provider-enforced output cap (#601 --
+            ``ModelSettings["max_tokens"]``, verified the correct pydantic-ai
+            key on the installed version). ``None`` (the default) omits the
+            setting entirely -- behaviour-preserving, unchanged before #601.
+            This bounds each provider REQUEST only; validation retries mean
+            a run can re-request up to :data:`EXTRACTION_MAX_RETRIES` more
+            times, so the run-wide worst case is
+            ``(1 + EXTRACTION_MAX_RETRIES) * max_output_tokens``, not the
+            bare cap (#601 P2 fold).
 
     Returns:
         The extraction agent, temperature 0 for deterministic, literal
@@ -2731,11 +2751,14 @@ def _bean_sourcing_agent(
     extra_body = reasoning_extra_body(reasoning_effort)
     if extra_body is not None:
         settings["extra_body"] = extra_body
+    if max_output_tokens is not None:
+        settings["max_tokens"] = max_output_tokens
     return Agent(
         resolved_model,
         output_type=_ExtractedBeanIdentity,
         instructions=_EXTRACTION_INSTRUCTIONS,
         model_settings=settings,
+        retries=EXTRACTION_MAX_RETRIES,
     )
 
 
@@ -2776,6 +2799,7 @@ async def _extract_bean_identity(
     model: Model | None = None,
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
     diagnostics: BeanSourcingDiagnostics | None = None,
+    max_output_tokens: int | None = None,
 ) -> _ExtractedBeanIdentity:
     """Run the structured bean-identity extraction call over ``page_text``.
 
@@ -2788,6 +2812,11 @@ async def _extract_bean_identity(
         reasoning_effort: An optional provider reasoning-effort override,
             passed straight through to :func:`_bean_sourcing_agent` (#601).
         diagnostics: Optional accumulator (#601 F2), incremented on success.
+        max_output_tokens: An optional provider-enforced output cap (#601),
+            passed straight through to :func:`_bean_sourcing_agent`. ``None``
+            (the default) omits the setting -- unchanged before #601. A
+            per-request bound; see :func:`_bean_sourcing_agent` for the
+            retry-inclusive run-wide worst case.
         sourcing_config: The extraction model/timeout config
             (:attr:`~roastpilot_agent.config.BeanSourcingConfig.model_slug`,
             :attr:`~roastpilot_agent.config.BeanSourcingConfig.extraction_timeout_seconds`
@@ -2838,6 +2867,7 @@ async def _extract_bean_identity(
             sourcing_config=sourcing_config,
             model=model,
             reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
         )
         async with asyncio.timeout(extraction_timeout_seconds):
             result = (
@@ -5057,6 +5087,7 @@ async def draft_bean_profile_from_url(
     model: Model | None = None,
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
     diagnostics: BeanSourcingDiagnostics | None = None,
+    max_output_tokens: int | None = None,
 ) -> BeanProfileDraft:
     """Draft a bean profile from a vendor product URL (#573 phase 1).
 
@@ -5093,6 +5124,11 @@ async def draft_bean_profile_from_url(
             the setting — behaviour-preserving, since extraction has never
             set reasoning before #601.
         diagnostics: Optional accumulator (#601 F2).
+        max_output_tokens: An optional provider-enforced output cap (#601),
+            passed straight through to :func:`_extract_bean_identity`.
+            ``None`` (the default) omits the setting -- unchanged before #601.
+            A per-request bound; see :func:`_bean_sourcing_agent` for the
+            retry-inclusive run-wide worst case.
 
     Returns:
         The drafted :class:`~roastpilot_agent.models.BeanProfileDraft`.
@@ -5169,6 +5205,7 @@ async def draft_bean_profile_from_url(
         model=model,
         reasoning_effort=reasoning_effort,
         diagnostics=diagnostics,
+        max_output_tokens=max_output_tokens,
     )
     # page.extracted_text/page.json_ld_values, NOT page.prompt_text (#590
     # D1 fold 1; split #590 slice E1) — the prompt text carries OUR OWN
