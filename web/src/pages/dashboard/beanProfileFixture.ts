@@ -8,7 +8,7 @@
  * the device ships with. All temperatures Celsius.
  */
 
-import type { BeanProfile } from "@/lib/types";
+import type { BeanProfile, BeanProfileDraftResponse } from "@/lib/types";
 
 /** The built-in Ethiopia Yirgacheffe Koke seed (mirrors seed.ETHIOPIA_KOKE_SEED). */
 export const FIXTURE_KOKE: BeanProfile = {
@@ -62,3 +62,31 @@ export const FIXTURE_COLOMBIA: BeanProfile = {
 
 /** The saved library the dropdown renders from. */
 export const FIXTURE_BEAN_PROFILES: BeanProfile[] = [FIXTURE_KOKE, FIXTURE_COLOMBIA];
+
+/** A `POST /api/beans/draft-from-url` response (#573 phase 1, #627), for
+ *  draft-from-URL tests (#637): one on-page typed field with a captured
+ *  evidence quote, one origin-estimated typed field with none — exercises
+ *  both provenance states through the real seeding path. */
+export const FIXTURE_DRAFT_RESPONSE: BeanProfileDraftResponse = {
+  name: "Guji Uraga Natural",
+  bean_origin: "Ethiopia",
+  bean_varietal: "Heirloom",
+  country: "Ethiopia",
+  farm: "Uraga",
+  bean_species: "arabica",
+  is_blend: false,
+  description: "Natural process; blueberry, jasmine.",
+  processing: "natural",
+  altitude_m: 2000,
+  source_url: "https://roaster.example.com/guji-uraga",
+  charge_guidance_min_c: 170,
+  charge_guidance_max_c: 200,
+  initial_heat_percent: 70,
+  initial_fan_percent: 40,
+  target_drop_temp_c: 195,
+  target_development_percent: 15,
+  default_bean_weight_grams: 250,
+  field_sources: { processing: "on_page", altitude_m: "origin_estimated" },
+  field_evidence: { processing: "Naturally processed on raised beds." },
+  scouting_note: "Scouting run — this is the FIRST roast on this bean.",
+};

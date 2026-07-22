@@ -10,6 +10,7 @@ import type {
   AppConfigSnapshot,
   BeanProfile,
   BeanProfileDeleteResult,
+  BeanProfileDraftResponse,
   BeanProfileInput,
   BeanProfileList,
   ChargeWeightRequest,
@@ -195,6 +196,19 @@ export const api = {
   deleteBeanProfile: (id: string) =>
     request<BeanProfileDeleteResult>(`/api/bean-profiles/${id}`, {
       method: "DELETE",
+    }),
+
+  /** `POST /api/beans/draft-from-url` — draft a bean profile from a vendor
+   *  product page (#573 phase 1, #637). Never persists anything; saving stays
+   *  the operator's explicit `createBeanProfile` action. 422: bad/unreachable
+   *  URL, or the page yielded too little identity to draft from. 503: the
+   *  extraction provider/transport failed — the page itself may be fine,
+   *  retry. 409: a roast is active. 429: too many concurrent draft requests
+   *  in flight, try again shortly. */
+  draftBeanFromUrl: (url: string) =>
+    request<BeanProfileDraftResponse>("/api/beans/draft-from-url", {
+      method: "POST",
+      body: JSON.stringify({ url }),
     }),
 
   // --- Config (#419, D78) ---
