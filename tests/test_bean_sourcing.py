@@ -40,6 +40,7 @@ from pydantic_ai import ModelHTTPError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models import Model
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.openai import OpenAIChatModel
 
 from roastpilot_agent import bean_sourcing
 from roastpilot_agent.advisor import AdvisorDependencyError
@@ -2055,6 +2056,27 @@ def test_bean_sourcing_agent_pins_extraction_max_retries() -> None:
     )
 
 
+def test_bean_sourcing_agent_threads_disable_transport_retries() -> None:
+    """#601: ``disable_transport_retries=True`` reaches the REAL, un-injected
+    ``build_model`` call -- the underlying provider client is built with
+    ``max_retries=0`` (offline-safe: no network call happens at construction
+    time)."""
+    agent = bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
+        _ADVISOR_CONFIG, disable_transport_retries=True
+    )
+    assert isinstance(agent.model, OpenAIChatModel)
+    assert agent.model.client.max_retries == 0
+
+
+def test_bean_sourcing_agent_omits_disable_transport_retries_by_default() -> None:
+    """``disable_transport_retries=False`` (the default) preserves today's
+    behaviour exactly -- the SDK's own transport-retry default, never
+    zeroed."""
+    agent = bean_sourcing._bean_sourcing_agent(_ADVISOR_CONFIG)  # pyright: ignore[reportPrivateUsage]
+    assert isinstance(agent.model, OpenAIChatModel)
+    assert agent.model.client.max_retries != 0
+
+
 # --- _resolve_extraction_model_slug (#590 P1 + P2 fix: provider-aware default) ---
 #
 # Codex caught a P1 on the PR that introduced BeanSourcingConfig.model_slug:
@@ -2222,7 +2244,12 @@ def test_bean_sourcing_agent_uses_resolved_model_slug_openai_compatible(
     consulted."""
     captured: dict[str, object] = {}
 
-    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
         captured["model_slug"] = model_slug
         return _function_model_returning(_identity_args())
 
@@ -2246,7 +2273,12 @@ def test_bean_sourcing_agent_native_provider_uses_advisor_model_slug(
     OpenRouter-only default."""
     captured: dict[str, object] = {}
 
-    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
         captured["model_slug"] = model_slug
         return _function_model_returning(_identity_args())
 
@@ -2528,7 +2560,12 @@ async def test_extract_bean_identity_maps_build_model_dependency_error(
     #613: this is DEPENDENCY-origin, so it is the ``BeanExtractionUnavailableError``
     subclass, not the base class."""
 
-    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
         raise AdvisorDependencyError(
             "advisor provider 'anthropic' needs an optional dependency: "
             "pip install 'roastpilot-agent[anthropic]'"
@@ -8473,7 +8510,12 @@ async def test_draft_bean_profile_from_url_threads_model_slug_from_sourcing_conf
     default too) reaches ``build_model`` when no ``model`` is injected."""
     captured: dict[str, object] = {}
 
-    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
         captured["model_slug"] = model_slug
         return _function_model_returning(_identity_args())
 
@@ -8499,7 +8541,12 @@ async def test_draft_bean_profile_from_url_native_provider_uses_advisor_model_sl
     native provider's own API."""
     captured: dict[str, object] = {}
 
-    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
         captured["model_slug"] = model_slug
         return _function_model_returning(_identity_args())
 
@@ -8524,7 +8571,12 @@ async def test_draft_bean_profile_from_url_openai_compatible_non_openrouter_uses
     "openai/gpt-5-mini" default."""
     captured: dict[str, object] = {}
 
-    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
         captured["model_slug"] = model_slug
         return _function_model_returning(_identity_args())
 
@@ -8610,7 +8662,12 @@ async def test_draft_bean_profile_from_url_maps_build_model_dependency_error(
     ``model`` is deliberately omitted so the ``build_model`` path is hit.
     #613: this is DEPENDENCY-origin, so the subclass, ``BeanExtractionUnavailableError``."""
 
-    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
         raise AdvisorDependencyError(
             "advisor provider 'anthropic' needs an optional dependency: "
             "pip install 'roastpilot-agent[anthropic]'"

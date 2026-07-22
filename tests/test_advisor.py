@@ -591,6 +591,45 @@ def test_build_model_ollama_needs_no_key() -> None:
     assert isinstance(build_model(config), OpenAIChatModel)
 
 
+@pytest.mark.parametrize("provider", ["openai", "openai_compatible", "ollama"])
+def test_build_model_disable_transport_retries_zeroes_the_client(
+    provider: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#601: ``disable_transport_retries=True`` builds the underlying
+    ``AsyncOpenAI`` client with ``max_retries=0`` -- removing an SDK-level
+    transport retry so an experiment's request accounting is exact."""
+    monkeypatch.setenv("ADVISOR_TEST_KEY", "dummy-key")
+    config = AdvisorConfig(
+        provider=provider,  # type: ignore[arg-type]
+        api_key_env="ADVISOR_TEST_KEY",
+        model_slug="some-model",
+    )
+    model = build_model(config, disable_transport_retries=True)
+    assert isinstance(model, OpenAIChatModel)
+    assert model.client.max_retries == 0
+
+
+@pytest.mark.parametrize("provider", ["openai", "openai_compatible", "ollama"])
+def test_build_model_disable_transport_retries_false_is_the_sdk_default(
+    provider: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default (``False``, and omitting the argument entirely) preserves
+    today's behaviour exactly -- the SDK's own transport-retry default,
+    never touched."""
+    monkeypatch.setenv("ADVISOR_TEST_KEY", "dummy-key")
+    config = AdvisorConfig(
+        provider=provider,  # type: ignore[arg-type]
+        api_key_env="ADVISOR_TEST_KEY",
+        model_slug="some-model",
+    )
+    default_omitted = build_model(config)
+    default_explicit = build_model(config, disable_transport_retries=False)
+    assert isinstance(default_omitted, OpenAIChatModel)
+    assert isinstance(default_explicit, OpenAIChatModel)
+    assert default_omitted.client.max_retries == default_explicit.client.max_retries
+    assert default_omitted.client.max_retries != 0  # the SDK default, not zeroed
+
+
 # PydanticAIAdvisor behind the recorded-response double.
 
 

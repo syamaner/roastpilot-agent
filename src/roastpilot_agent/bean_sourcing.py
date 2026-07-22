@@ -2696,6 +2696,7 @@ def _bean_sourcing_agent(
     model: Model | None = None,
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
     max_output_tokens: int | None = None,
+    disable_transport_retries: bool = False,
 ) -> Agent[None, _ExtractedBeanIdentity]:
     """Build the bean-identity extraction agent.
 
@@ -2737,6 +2738,9 @@ def _bean_sourcing_agent(
             times, so the run-wide worst case is
             ``(1 + EXTRACTION_MAX_RETRIES) * max_output_tokens``, not the
             bare cap (#601 P2 fold).
+        disable_transport_retries: Passed straight through to
+            :func:`~roastpilot_agent.advisor.build_model` (#601). ``False``
+            (the default) preserves today's behaviour exactly.
 
     Returns:
         The extraction agent, temperature 0 for deterministic, literal
@@ -2746,7 +2750,11 @@ def _bean_sourcing_agent(
         resolved_model = model
     else:
         model_slug = _resolve_extraction_model_slug(advisor_config, sourcing_config)
-        resolved_model = build_model(advisor_config, model_slug=model_slug)
+        resolved_model = build_model(
+            advisor_config,
+            model_slug=model_slug,
+            disable_transport_retries=disable_transport_retries,
+        )
     settings = ModelSettings(temperature=0.0)
     extra_body = reasoning_extra_body(reasoning_effort)
     if extra_body is not None:
@@ -2800,6 +2808,7 @@ async def _extract_bean_identity(
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
     diagnostics: BeanSourcingDiagnostics | None = None,
     max_output_tokens: int | None = None,
+    disable_transport_retries: bool = False,
 ) -> _ExtractedBeanIdentity:
     """Run the structured bean-identity extraction call over ``page_text``.
 
@@ -2830,6 +2839,9 @@ async def _extract_bean_identity(
             slug resolution is PROVIDER-AWARE — see
             :func:`_resolve_extraction_model_slug`.
         model: An injected PydanticAI ``Model`` (the extraction test seam).
+        disable_transport_retries: Passed straight through to
+            :func:`_bean_sourcing_agent` (#601). ``False`` (the default)
+            preserves today's behaviour exactly.
 
     Returns:
         The provider's honest, page-only bean identity.
@@ -2868,6 +2880,7 @@ async def _extract_bean_identity(
             model=model,
             reasoning_effort=reasoning_effort,
             max_output_tokens=max_output_tokens,
+            disable_transport_retries=disable_transport_retries,
         )
         async with asyncio.timeout(extraction_timeout_seconds):
             result = (
@@ -5088,6 +5101,7 @@ async def draft_bean_profile_from_url(
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
     diagnostics: BeanSourcingDiagnostics | None = None,
     max_output_tokens: int | None = None,
+    disable_transport_retries: bool = False,
 ) -> BeanProfileDraft:
     """Draft a bean profile from a vendor product URL (#573 phase 1).
 
@@ -5129,6 +5143,13 @@ async def draft_bean_profile_from_url(
             ``None`` (the default) omits the setting -- unchanged before #601.
             A per-request bound; see :func:`_bean_sourcing_agent` for the
             retry-inclusive run-wide worst case.
+        disable_transport_retries: When ``True``, the underlying provider
+            client is built with SDK transport retries disabled (#601 --
+            passed straight through to :func:`_extract_bean_identity`), so an
+            experiment can account for EXACT requests: a transient transport
+            failure then surfaces as a page error (retried on resume)
+            instead of a silent, SDK-invisible re-send. ``False`` (the
+            default) preserves today's behaviour exactly.
 
     Returns:
         The drafted :class:`~roastpilot_agent.models.BeanProfileDraft`.
@@ -5206,6 +5227,7 @@ async def draft_bean_profile_from_url(
         reasoning_effort=reasoning_effort,
         diagnostics=diagnostics,
         max_output_tokens=max_output_tokens,
+        disable_transport_retries=disable_transport_retries,
     )
     # page.extracted_text/page.json_ld_values, NOT page.prompt_text (#590
     # D1 fold 1; split #590 slice E1) — the prompt text carries OUR OWN
