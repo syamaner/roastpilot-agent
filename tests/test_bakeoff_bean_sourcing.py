@@ -1492,7 +1492,8 @@ async def test_run_model_over_corpus_halts_between_pages_when_meter_trips(
     a run SHORTER than the corpus (#601 fold round 1, slice B). An absurd per-token
     price guarantees a trip after the first page regardless of the exact
     (heuristic-estimated) token count. The already-written ledger entries persist
-    even though the run itself is incomplete."""
+    even though the run itself is incomplete -- a PENDING then a FINAL entry per
+    attempted page (#601 fold round 4, FOLD 1)."""
     model = _model_returning({"name": "X", "country": "Ecuador"})
     price = bo.RosterModel("m1", 1_000_000, 1_000_000, "x")  # $1/token -- any nonzero trips it
     ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
@@ -1508,7 +1509,7 @@ async def test_run_model_over_corpus_halts_between_pages_when_meter_trips(
     )
     assert 0 < len(run.pages) < len(corpus)  # halted early, not empty, not the whole corpus
     assert meter.tripped
-    assert len(ledger.entries) == len(run.pages)  # every attempted page was ledgered
+    assert len(ledger.entries) == 2 * len(run.pages)  # pending + final per attempted page
 
 
 def test_run_json_roundtrips_elapsed_s() -> None:
