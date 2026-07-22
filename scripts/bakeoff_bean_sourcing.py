@@ -1466,6 +1466,7 @@ async def run_model_over_corpus(
                     reserve_applied=True,
                     is_pending=True,
                     call_id=call_id,
+                    reserved_usd=round(reserve, 5),  # the WHOLE pending charge IS the reserve
                 )
             )
         # STARTED here, AFTER the reserve compute + pending write (#601 fold
@@ -1500,6 +1501,10 @@ async def run_model_over_corpus(
                 apply_reserve=apply_reserve,
             )
             rounded_priced = round(priced, 5)
+            # #601 fold round 14: the RESERVE COMPONENT alone -- the single
+            # attempt's worst case ADDED on top of captured usage, never the
+            # whole (possibly usage-inclusive) priced_usd.
+            reserved_component = round(single_attempt_reserve, 5) if apply_reserve else 0.0
             ledger.append(
                 LedgerEntry(
                     arm=model_slug,
@@ -1511,6 +1516,7 @@ async def run_model_over_corpus(
                     reserve_applied=apply_reserve,
                     is_pending=False,
                     call_id=call_id,
+                    reserved_usd=reserved_component,
                 )
             )
             if meter is not None:
@@ -2195,6 +2201,32 @@ def _extract_prompt_text(page: CorpusPage) -> str:
     return extracted_text if json_ld_context is None else f"{json_ld_context}\n\n{extracted_text}"
 
 
+def _page_input_tokens_estimate(page: CorpusPage) -> int:
+    """One page's estimated input tokens (chars/4 heuristic) -- factored out
+    of :func:`estimate_cost` (#601 fold round 14) for per-page proration."""
+    return (len(_extract_prompt_text(page)) + _INSTRUCTION_OVERHEAD_CHARS) // 4
+
+
+def _page_cost_estimate(
+    page: CorpusPage, price: RosterModel, *, reasoning: ReasoningArm = "default"
+) -> float:
+    """One page's estimated USD cost at ``price`` (#601 fold round 14) --
+    :func:`estimate_cost`'s SAME heuristic, applied to a single page.
+
+    ``reasoning="light"`` multiplies the output-token component by
+    :data:`LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER` (#650 round 1) -- matching
+    :func:`estimate_cost_for_arms`'s pricing, since a light arm's real output
+    tokens (reasoning + the structured record) cost more than the base estimate.
+    """
+    output_tokens = _OUTPUT_TOKENS_PER_PAGE * (
+        LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER if reasoning == "light" else 1.0
+    )
+    return (
+        _page_input_tokens_estimate(page) / 1_000_000 * price.price_in_per_mtok
+        + output_tokens / 1_000_000 * price.price_out_per_mtok
+    )
+
+
 def estimate_cost(
     pages: Sequence[CorpusPage], roster: Sequence[RosterModel]
 ) -> list[ModelCostEstimate]:
@@ -2212,9 +2244,7 @@ def estimate_cost(
     Returns:
         One :class:`ModelCostEstimate` per roster model.
     """
-    input_tokens = sum(
-        (len(_extract_prompt_text(page)) + _INSTRUCTION_OVERHEAD_CHARS) // 4 for page in pages
-    )
+    input_tokens = sum(_page_input_tokens_estimate(page) for page in pages)
     output_tokens = _OUTPUT_TOKENS_PER_PAGE * len(pages)
     estimates: list[ModelCostEstimate] = []
     for entry in roster:
@@ -2558,6 +2588,7 @@ def render_report(
     prorated_arm: str | None = None,
     prorated_attempted_pages: int | None = None,
     prorated_total_pages: int | None = None,
+    prorated_attempted_estimate: float | None = None,
 ) -> str:
     """Render the markdown scorecard for one or more model runs.
 
@@ -2579,10 +2610,15 @@ def render_report(
             fold round 13) -- discloses how much of ``actual_costs`` is NOT
             pure captured usage; ``"n/a"`` alongside a ``"n/a"`` actual.
         prorated_arm: The arm a mid-arm breaker trip halted, if any -- its
-            estimate is prorated by attempted/total pages in the incurred-
-            spend line, labelled PRORATED (#601 fold round 13).
-        prorated_attempted_pages: ``prorated_arm``'s attempted page count.
-        prorated_total_pages: ``prorated_arm``'s full corpus page count.
+            incurred-spend contribution is ``prorated_attempted_estimate``
+            (COST-weighted, #601 fold round 14), labelled PRORATED, never
+            the full-corpus estimate for pages never attempted.
+        prorated_attempted_pages: ``prorated_arm``'s attempted page count
+            (display only).
+        prorated_total_pages: ``prorated_arm``'s full corpus page count
+            (display only).
+        prorated_attempted_estimate: The USD amount actually counted for
+            ``prorated_arm`` in the incurred-spend line.
         stopped_early: Whether the spend guard stopped before evaluating every
             requested model (see :attr:`BakeoffResult.stopped_early`). A
             PARTIAL banner is rendered prominently at the top so this result
@@ -2774,12 +2810,17 @@ def render_report(
         prorated_note = ""
         for s in executed_slugs:
             est_usd = cost_by_slug.get(s, 0.0)
-            if s == prorated_arm and prorated_attempted_pages is not None and prorated_total_pages:
-                incurred_estimate += est_usd * prorated_attempted_pages / prorated_total_pages
+            if s == prorated_arm and prorated_attempted_estimate is not None:
+                incurred_estimate += prorated_attempted_estimate
+                pages_note = (
+                    f" ({prorated_attempted_pages}/{prorated_total_pages} pages attempted)"
+                    if prorated_attempted_pages is not None and prorated_total_pages
+                    else ""
+                )
                 prorated_note = (
-                    f" `{s}`'s estimate is PRORATED to {prorated_attempted_pages}/"
-                    f"{prorated_total_pages} pages (the breaker tripped mid-arm, #601 "
-                    "fold round 13)."
+                    f" `{s}`'s estimate is PRORATED to its attempted pages' own "
+                    f"cost-weighted estimate{pages_note} (the breaker tripped mid-arm, "
+                    "#601 fold round 14)."
                 )
             else:
                 incurred_estimate += est_usd
@@ -3168,6 +3209,9 @@ class LedgerEntry:
             final share ONE ``call_id``; a resumed re-attempt gets a NEW one
             (see :meth:`ChargeLedger._effective_entries`). Defaults ``""``;
             loaded as a fresh random id per pre-FOLD-A entry (never shared).
+        reserved_usd: The RESERVE COMPONENT of ``priced_usd`` (#601 fold round
+            14), persisted at entry creation, never derived by subtraction --
+            ``0.0`` when ``reserve_applied`` is ``False``.
     """
 
     arm: str
@@ -3180,6 +3224,7 @@ class LedgerEntry:
     fingerprint: str = ""
     is_pending: bool = False
     call_id: str = ""
+    reserved_usd: float = 0.0
 
 
 #: Sentinel for a pre-fold-4 ledger entry with no persisted fingerprint (#601
@@ -3227,6 +3272,19 @@ class ChargeLedger:
                 # one per entry (#601 fold round 6, FOLD A) so two such
                 # legacy entries never wrongly collide under one key.
                 call_id = str(record["call_id"]) if record.get("call_id") else uuid.uuid4().hex
+                # #650 round-1: a pre-#601-fold-round-14 record has NO
+                # reserved_usd key at all -- for a reserve_applied entry, the
+                # captured-vs-reserve split is UNRECOVERABLE, so fall back to
+                # the WHOLE priced_usd (conservative in the DISCLOSURE
+                # direction: overstate reserved rather than claim observed
+                # captured usage). A non-reserved legacy entry is 0.0, same
+                # as a current-format one.
+                if "reserved_usd" in record:
+                    reserved_usd = float(record["reserved_usd"])
+                elif bool(record["reserve_applied"]):
+                    reserved_usd = float(record["priced_usd"])
+                else:
+                    reserved_usd = 0.0
                 self._entries.append(
                     LedgerEntry(
                         arm=str(record["arm"]),
@@ -3239,6 +3297,7 @@ class ChargeLedger:
                         fingerprint=str(record.get("fingerprint", _LEGACY_LEDGER_FINGERPRINT)),
                         is_pending=bool(record.get("is_pending", False)),
                         call_id=call_id,
+                        reserved_usd=reserved_usd,
                     )
                 )
 
@@ -3284,14 +3343,11 @@ class ChargeLedger:
         return round(sum(matching), 5)
 
     def reserved_usd_for_arm(self, arm: str) -> float:
-        """One arm's ``priced_usd`` sum over entries with ``reserve_applied``
-        (#601 fold round 13) -- the portion of :meth:`total_usd_for_arm` NOT
-        pure captured usage (a timeout or provider-error page's charge
-        includes an added safety reserve on top of, or instead of, what was
-        actually captured)."""
-        matching = (
-            e.priced_usd for e in self._effective_entries() if e.arm == arm and e.reserve_applied
-        )
+        """One arm's ``reserved_usd`` sum, scoped via :meth:`_effective_entries`
+        (#601 fold round 14: the RESERVE COMPONENT ONLY, persisted at entry
+        creation -- summing whole ``priced_usd`` here overstated a reserved
+        entry that ALSO captured real usage)."""
+        matching = (e.reserved_usd for e in self._effective_entries() if e.arm == arm)
         return round(sum(matching), 5)
 
     def append(self, entry: LedgerEntry) -> None:
@@ -3532,6 +3588,10 @@ class BakeoffResult:
             full, in the report's incurred-spend line.
         prorated_attempted_pages: ``prorated_arm``'s attempted page count.
         prorated_total_pages: ``prorated_arm``'s full corpus page count.
+        prorated_attempted_estimate: The COST-WEIGHTED USD estimate for just
+            ``prorated_arm``'s attempted pages (#601 fold round 14, sum of
+            :func:`_page_cost_estimate`) -- a flat page-count fraction
+            under/overstates this whenever page cost varies.
     """
 
     runs: list[ModelRun]
@@ -3545,6 +3605,7 @@ class BakeoffResult:
     prorated_arm: str | None = None
     prorated_attempted_pages: int | None = None
     prorated_total_pages: int | None = None
+    prorated_attempted_estimate: float | None = None
 
 
 async def run_bakeoff(
@@ -3706,6 +3767,14 @@ async def run_bakeoff(
                 f"${max_spend:.2f}; {len(arms) - index} arm(s) skipped",
                 flush=True,
             )
+            # #601 fold round 14: COST-WEIGHTED, not a flat page-count
+            # fraction (`run.pages` is a known PREFIX of `pages`). #650
+            # round 1: reasoning-aware -- a light arm's real output tokens
+            # cost more, matching estimate_cost_for_arms's own pricing.
+            attempted_estimate = sum(
+                _page_cost_estimate(p, price_by_slug[arm.model_slug], reasoning=arm.reasoning)
+                for p in pages[: len(run.pages)]
+            )
             return BakeoffResult(
                 runs=runs,
                 stopped_early=True,
@@ -3718,6 +3787,7 @@ async def run_bakeoff(
                 prorated_arm=slug,
                 prorated_attempted_pages=len(run.pages),
                 prorated_total_pages=len(pages),
+                prorated_attempted_estimate=round(attempted_estimate, 5),
             )
         if _run_wholly_failed(run):
             label = "MODEL-SPECIFIC" if has_fresh_success else "INFRA-WIDE"
@@ -3982,6 +4052,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
         prorated_arm=result.prorated_arm,
         prorated_attempted_pages=result.prorated_attempted_pages,
         prorated_total_pages=result.prorated_total_pages,
+        prorated_attempted_estimate=result.prorated_attempted_estimate,
     )
     print("\n" + report, flush=True)
 
@@ -4001,6 +4072,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 "prorated_arm": result.prorated_arm,
                 "prorated_attempted_pages": result.prorated_attempted_pages,
                 "prorated_total_pages": result.prorated_total_pages,
+                "prorated_attempted_estimate": result.prorated_attempted_estimate,
             },
             indent=2,
         )
