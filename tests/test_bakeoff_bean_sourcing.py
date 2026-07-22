@@ -19,6 +19,7 @@ import dataclasses
 import importlib.metadata
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -26,11 +27,13 @@ import pytest
 from pydantic_ai import ModelAPIError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.usage import RequestUsage
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import bakeoff_bean_sourcing as bo  # noqa: E402
 
+from roastpilot_agent.advisor import AdvisorDependencyError  # noqa: E402
 from roastpilot_agent.config import AdvisorConfig  # noqa: E402
 from roastpilot_agent.models import BeanFieldSource, BeanProfileDraft  # noqa: E402
 
@@ -66,6 +69,26 @@ def _model_provider_error() -> FunctionModel:
     failure (#601 F1), unlike :func:`_model_text_only`'s schema failure."""
 
     def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise ModelAPIError("test-model", "simulated provider outage")
+
+    return FunctionModel(respond)
+
+
+def _model_retry_then_provider_error() -> FunctionModel:
+    """A double whose FIRST attempt is malformed (a real, billed response
+    with explicit usage -- a validation retry pydantic-ai recovers from),
+    then raises a genuine provider error on the retry itself (#601 fold
+    round 10, D amendment): captured usage IS present before an INFRA
+    failure, unlike :func:`_model_provider_error`'s zero-usage case."""
+    calls = {"n": 0}
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ModelResponse(
+                parts=[TextPart("no structured output")],
+                usage=RequestUsage(input_tokens=50, output_tokens=10),
+            )
         raise ModelAPIError("test-model", "simulated provider outage")
 
     return FunctionModel(respond)
@@ -910,6 +933,30 @@ def test_is_schema_failure_matches_only_the_malformed_shape_message() -> None:
     assert not bo._is_schema_failure(None)  # pyright: ignore[reportPrivateUsage]
 
 
+def test_is_provider_error_failure_matches_only_the_provider_error_message() -> None:
+    """#601 fold round 11, D fold 4: the reserve-by-class predicate must match
+    the runtime's provider-error branch text and nothing else -- distinct from
+    a timeout, a schema failure, a model-construction failure, or a fetch
+    failure."""
+    assert bo._is_provider_error_failure(  # pyright: ignore[reportPrivateUsage]
+        "BeanExtractionUnavailableError: bean identity extraction provider error: boom"
+    )
+    assert not bo._is_provider_error_failure(  # pyright: ignore[reportPrivateUsage]
+        "BeanExtractionUnavailableError: bean identity extraction exceeded the 45s deadline"
+    )
+    assert not bo._is_provider_error_failure(  # pyright: ignore[reportPrivateUsage]
+        "BeanExtractionUnavailableError: bean identity extraction returned a malformed "
+        "shape: some pydantic-ai detail"
+    )
+    assert not bo._is_provider_error_failure(  # pyright: ignore[reportPrivateUsage]
+        "BeanExtractionUnavailableError: bean identity extraction could not build its model: boom"
+    )
+    assert not bo._is_provider_error_failure(  # pyright: ignore[reportPrivateUsage]
+        "BeanFetchError: vendor page fetch failed: boom"
+    )
+    assert not bo._is_provider_error_failure(None)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_model_metrics_separates_schema_failures_from_other_errors() -> None:
     fields = {spec.name: bo.Outcome.ERR for spec in bo.FIELD_SPECS}
     pages = [
@@ -1011,11 +1058,11 @@ async def test_run_model_over_corpus_counts_recovered_violations_on_a_failed_pag
 async def test_run_model_over_corpus_ledgers_every_page(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
-    """When given ``roster_price`` + a :class:`bo.ChargeLedger`, ONE entry is
-    written per page from the page's OWN captured diagnostics (#601 fold round 1,
-    slice A) -- :class:`bo.PageResult` carries none of this, the ledger is the
-    token/spend store of record. No breaker exists this slice, so the FULL corpus
-    always completes."""
+    """When given ``roster_price`` + a :class:`bo.ChargeLedger``, a PENDING then a
+    FINAL entry are written per page from the page's OWN captured diagnostics
+    (#601 fold round 1/4, slice A + FOLD 1) -- :class:`bo.PageResult` carries
+    none of this, the ledger is the token/spend store of record. No breaker
+    exists this slice, so the FULL corpus always completes."""
     model = _model_returning({"name": "X", "country": "Ecuador"})
     price = bo.RosterModel("m1", 2.0, 4.0, "x")
     ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
@@ -1028,32 +1075,107 @@ async def test_run_model_over_corpus_ledgers_every_page(
         ledger=ledger,
     )
     assert len(run.pages) == len(corpus)
+    assert len(ledger.entries) == 2 * len(corpus)  # pending + final per page
     assert {e.slug for e in ledger.entries} == {p.slug for p in corpus}
     assert all(e.arm == "m1" for e in ledger.entries)
     assert ledger.total_usd() > 0.0
 
 
 @pytest.mark.asyncio
-async def test_reserve_prompt_text_bounds_the_parse_with_the_fetch_knob(
+async def test_run_model_over_corpus_assigns_a_fresh_call_id_each_invocation(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 6, FOLD A (P1): re-running the SAME page (simulating a
+    resumed arm re-attempting from scratch after a later page's wholesale
+    failure) writes entries under a NEW ``call_id`` each time -- both real
+    calls' charges count, never collapsed by a bare ``(arm, slug)`` key."""
+    model = _model_returning({"name": "X", "country": "Ecuador"})
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    for _ in range(2):
+        await bo.run_model_over_corpus(
+            [corpus[0]],
+            model_slug="m1",
+            advisor_config=_ADVISOR_CONFIG,
+            model=model,
+            roster_price=price,
+            ledger=ledger,
+        )
+    assert len(ledger.entries) == 4  # 2 pending + 2 final, across two DISTINCT calls
+    assert len({e.call_id for e in ledger.entries}) == 2  # two genuinely separate attempt-cycles
+    finals = [e for e in ledger.entries if not e.is_pending]
+    assert len(finals) == 2
+    assert ledger.total_usd() == pytest.approx(sum(e.priced_usd for e in finals))
+
+
+@pytest.mark.asyncio
+async def test_draft_for_page_threads_the_enforced_cap_to_the_paid_call(
     corpus: list[bo.CorpusPage], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#601 fold round 3, FOLD 1: the reserve's trafilatura parse is bounded by
-    ``fetch_timeout_seconds`` -- the SAME, deliberately smaller knob the runtime's
-    real caller uses -- never the (larger) extraction timeout."""
-    captured: list[float] = []
-    real_bounded = bo._bean_sourcing_module._extract_page_markdown_bounded  # pyright: ignore[reportPrivateUsage]
+    """#601 fold round 4, FOLD 4: ``max_output_tokens`` reaches the real,
+    paid ``draft_bean_profile_from_url`` call -- the reserve's worst-case
+    promise only holds if the SAME value the reserve assumes is what the
+    provider call itself enforces."""
+    captured: list[object] = []
 
-    async def _tracking_bounded(html: str, *, timeout_seconds: float) -> str | None:
-        captured.append(timeout_seconds)
-        return await real_bounded(html, timeout_seconds=timeout_seconds)
+    async def _fake_draft(
+        url: str,
+        *,
+        advisor_config: AdvisorConfig,
+        sourcing_config: bo.BeanSourcingConfig | None = None,
+        http_client: object = None,
+        model: object = None,
+        reasoning_effort: object = None,
+        diagnostics: object = None,
+        max_output_tokens: object = None,
+        disable_transport_retries: object = None,
+    ) -> BeanProfileDraft:
+        captured.append(max_output_tokens)
+        raise bo.BeanSourcingError("stub -- no real extraction needed for this guard")
 
-    monkeypatch.setattr(
-        bo._bean_sourcing_module,  # pyright: ignore[reportPrivateUsage]
-        "_extract_page_markdown_bounded",
-        _tracking_bounded,
-    )
-    await bo._reserve_prompt_text(corpus[0], parse_timeout_s=7.5)  # pyright: ignore[reportPrivateUsage]
-    assert captured == [7.5]  # the FETCH knob, not BAKEOFF_EXTRACTION_TIMEOUT_S (45)
+    monkeypatch.setattr(bo, "draft_bean_profile_from_url", _fake_draft)
+    await bo.draft_for_page(corpus[0], advisor_config=_ADVISOR_CONFIG)
+    assert captured == [bo.BAKEOFF_MAX_OUTPUT_TOKENS]  # the default, uniform across arms
+
+    captured.clear()
+    await bo.draft_for_page(corpus[0], advisor_config=_ADVISOR_CONFIG, max_output_tokens=99)
+    assert captured == [99]  # an explicit override still threads through
+
+
+def test_reserve_prompt_text_is_the_longer_candidate_never_trafilatura(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """#601 fold round 4, FOLD 4: the reserve ALWAYS uses the linear-strip pass
+    (never the bounded, off-loop trafilatura call removed by this fold) -- it
+    must be at least as long as EITHER prompt candidate a real caller could
+    see: the harness's own trafilatura-first estimate text
+    (:func:`bo._extract_prompt_text`) and the bare linear-strip text alone,
+    since trafilatura's boilerplate-removed markdown can be SHORTER and would
+    understate the reserve."""
+    page = corpus[0]
+    reserve_text = bo._reserve_prompt_text(page)  # pyright: ignore[reportPrivateUsage]
+    estimate_text = bo._extract_prompt_text(page)  # pyright: ignore[reportPrivateUsage]
+    linear_only = bo._bean_sourcing_module._extract_page_text(page.html)  # pyright: ignore[reportPrivateUsage]
+    assert len(reserve_text.encode("utf-8")) >= len(estimate_text.encode("utf-8"))
+    assert len(reserve_text.encode("utf-8")) >= len(linear_only.encode("utf-8"))
+
+
+def test_reserve_input_tokens_per_attempt_applies_structural_inflation(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """#601 fold round 6, FOLD C: the reserve's per-attempt input-token bound
+    is inflated by :data:`bo._RESERVE_STRUCTURAL_INFLATION` over EITHER
+    prompt candidate's PLAIN byte length -- markdown structural punctuation
+    (table pipes/dashes, list markers, frontmatter delimiters) the
+    linear-strip pass never emits could otherwise exceed the reserve's
+    "longer candidate" claim even though it adds no content."""
+    page = corpus[0]
+    per_attempt_tokens = bo._reserve_input_tokens_per_attempt(page)  # pyright: ignore[reportPrivateUsage]
+    reserve_text = bo._reserve_prompt_text(page)  # pyright: ignore[reportPrivateUsage]
+    estimate_text = bo._extract_prompt_text(page)  # pyright: ignore[reportPrivateUsage]
+    inflation = bo._RESERVE_STRUCTURAL_INFLATION  # pyright: ignore[reportPrivateUsage]
+    assert per_attempt_tokens >= inflation * len(reserve_text.encode("utf-8"))
+    assert per_attempt_tokens >= inflation * len(estimate_text.encode("utf-8"))
 
 
 def _function_model_hanging() -> FunctionModel:
@@ -1072,12 +1194,13 @@ def _function_model_hanging() -> FunctionModel:
 async def test_run_model_over_corpus_ledgers_a_real_timed_out_page_with_reserve_floor(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
-    """End-to-end wiring proof (#601 fold round 1, FOLD 4): a REAL timed-out
+    """End-to-end wiring proof (#601 fold round 1/4, FOLD 4): a REAL timed-out
     extraction call (a hanging model + a short extraction timeout, not a
     synthetic ``PageResult``/``LedgerEntry`` construction) must flow through to a
-    ``LedgerEntry`` with ``timed_out=True``, ``reserve_applied=True``, and the
-    reserve-priced USD -- catching any wrong-field wiring the synthetic-
-    construction unit tests above cannot."""
+    FINAL ``LedgerEntry`` with ``timed_out=True``, ``reserve_applied=True``, and
+    the reserve-priced USD -- catching any wrong-field wiring the synthetic-
+    construction unit tests above cannot. A PENDING entry precedes it
+    (#601 fold round 4, FOLD 1) -- both land on disk."""
     price = bo.RosterModel("m1", 1.0, 1.0, "x")
     ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
     run = await bo.run_model_over_corpus(
@@ -1090,39 +1213,40 @@ async def test_run_model_over_corpus_ledgers_a_real_timed_out_page_with_reserve_
         ledger=ledger,
     )
     assert run.pages[0].error is not None  # the extraction call DID fail
-    assert len(ledger.entries) == 1
-    entry = ledger.entries[0]
+    assert len(ledger.entries) == 2  # pending, then final (#601 fold round 4, FOLD 1)
+    pending, entry = ledger.entries
+    assert pending.is_pending is True
+    assert entry.is_pending is False
     assert entry.timed_out is True
     assert entry.reserve_applied is True
     assert entry.priced_usd > 0.0  # the reserve floor, never the (unreported) $0
-    # FOLD 1 (#601 fold round 2): the reserve derives from the EFFECTIVE 0.05s
-    # timeout this call ran under, not the 45s module default.
-    default_reserve = await bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
-        corpus[0],
-        price,
-        extraction_timeout_s=bo.BAKEOFF_EXTRACTION_TIMEOUT_S,
-        parse_timeout_s=bo._DEFAULT_FETCH_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
-    )
-    assert entry.priced_usd < default_reserve
+    assert entry.call_id == pending.call_id  # one attempt-cycle (#601 fold round 6, FOLD A)
+    # A timed-out FINAL entry sums a SINGLE-attempt reserve onto any captured
+    # usage (#601 fold round 6, FOLD D) -- smaller than the pending entry's
+    # own FULL, multi-attempt reserve valuation for the same page (at most
+    # ONE in-flight request can ever be unreported at final-timeout time).
+    assert entry.priced_usd <= pending.priced_usd
 
 
 @pytest.mark.asyncio
 async def test_run_model_over_corpus_ledgers_a_timeout_with_zero_post_call_parsing(
     corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#601 fold round 3, FOLD 2: the reserve is computed/cached BEFORE the
-    billable call, so a REAL timeout's failure handler appends the ledger entry
-    with ZERO post-call parsing -- a kill between the call and ledger.append must
-    never lose a billed charge. Proven by failing the parse if it EVER runs after
-    the provider call starts."""
+    """#601 fold round 3/4, FOLD 2 + FOLD 1: the reserve is computed/cached
+    BEFORE the billable call, and the PENDING ledger entry is written before
+    it too, so a REAL timeout's failure handler appends the FINAL entry with
+    ZERO post-call parsing -- a kill between the call and the final append
+    must never lose a billed charge (the pending entry already covers it).
+    Proven by failing the parse if it EVER runs after the provider call
+    starts."""
     call_order: list[str] = []
     real_reserve_prompt_text = bo._reserve_prompt_text  # pyright: ignore[reportPrivateUsage]
 
-    async def _tracking_reserve_prompt_text(page: bo.CorpusPage, *, parse_timeout_s: float) -> str:
+    def _tracking_reserve_prompt_text(page: bo.CorpusPage) -> str:
         if "provider_call_started" in call_order:
             raise AssertionError("reserve parse ran AFTER the provider call started")
         call_order.append("parse")
-        return await real_reserve_prompt_text(page, parse_timeout_s=parse_timeout_s)
+        return real_reserve_prompt_text(page)
 
     monkeypatch.setattr(bo, "_reserve_prompt_text", _tracking_reserve_prompt_text)
 
@@ -1142,9 +1266,221 @@ async def test_run_model_over_corpus_ledgers_a_timeout_with_zero_post_call_parsi
         roster_price=price,
         ledger=ledger,
     )
-    assert call_order == ["parse", "provider_call_started"]
-    assert len(ledger.entries) == 1
-    assert ledger.entries[0].timed_out is True
+    # TWO parses before the provider call (#601 fold round 6, FOLD D): the
+    # full multi-attempt reserve (pending) and the single-attempt reserve
+    # (for the final entry's own, smaller timeout addition) are computed
+    # separately, both still strictly BEFORE the call starts.
+    assert call_order == ["parse", "parse", "provider_call_started"]
+    assert len(ledger.entries) == 2  # pending, then final
+    pending, entry = ledger.entries
+    assert pending.is_pending is True
+    assert entry.is_pending is False
+    assert entry.timed_out is True
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_elapsed_s_excludes_reserve_work(
+    corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#601 fold round 5, D FOLD 1 (P1): ``elapsed_s`` feeds
+    ``latency_median_p95()``'s cost+latency tie-break -- the reserve
+    computation + pending-entry write must never land inside the timed
+    region. A deliberately slow reserve stub must not move ``elapsed_s``."""
+
+    def _slow_reserve(page: bo.CorpusPage, price: bo.RosterModel, **_: object) -> float:
+        time.sleep(0.5)
+        return 0.01
+
+    monkeypatch.setattr(bo, "_page_cost_reserve", _slow_reserve)
+    model = _model_returning({"name": "X", "country": "Ecuador"})
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    run = await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=model,
+        roster_price=price,
+        ledger=ledger,
+    )
+    assert run.pages[0].elapsed_s is not None
+    assert run.pages[0].elapsed_s < 0.3  # well under the reserve stub's 0.5s sleep
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_final_entry_survives_a_scoring_raise(
+    corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#601 fold round 5, D FOLD 2 (P2): the FINAL ledger entry is appended
+    IMMEDIATELY once the paid call returns, before scoring/``PageResult``
+    construction -- so a raise there (a real, if rare, failure mode) still
+    leaves the ACTUAL charge on the books, not just the pending reserve."""
+
+    def _raising_score_page(
+        page: bo.CorpusPage, draft: BeanProfileDraft | None, error: str | None
+    ) -> dict[str, bo.Outcome]:
+        raise RuntimeError("scoring blew up")
+
+    monkeypatch.setattr(bo, "score_page", _raising_score_page)
+    model = _model_returning({"name": "X", "country": "Ecuador"})
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    with pytest.raises(RuntimeError, match="scoring blew up"):
+        await bo.run_model_over_corpus(
+            [corpus[0]],
+            model_slug="m1",
+            advisor_config=_ADVISOR_CONFIG,
+            model=model,
+            roster_price=price,
+            ledger=ledger,
+        )
+    assert len(ledger.entries) == 2  # pending, then the FINAL entry -- despite the raise
+    pending, entry = ledger.entries
+    assert pending.is_pending is True
+    assert entry.is_pending is False
+    assert entry.request_tokens > 0  # the ACTUAL charge, not just the pending reserve
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_zero_usage_provider_error_charges_single_attempt_reserve(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 10, D amendment: with transport retries disabled, an
+    accepted-but-lost request now surfaces as a genuine PROVIDER error (never
+    a timeout) with ZERO captured usage -- the same unreported-attempt risk a
+    timeout already covers. The final entry must be charged at the
+    single-attempt reserve, not left at $0."""
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    run = await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=_model_provider_error(),
+        roster_price=price,
+        ledger=ledger,
+    )
+    assert run.pages[0].error is not None
+    pending, entry = ledger.entries
+    assert entry.request_tokens == 0
+    assert entry.response_tokens == 0
+    assert entry.reserve_applied is True
+    assert entry.timed_out is False  # a genuine provider error, never a wall-clock timeout
+    single_reserve = bo._single_attempt_reserve(corpus[0], price)  # pyright: ignore[reportPrivateUsage]
+    assert entry.priced_usd == pytest.approx(round(single_reserve, 5))
+    # The final entry's SINGLE-attempt reserve is smaller than the pending
+    # entry's FULL multi-attempt one -- different valuations by design (#601
+    # fold round 6, FOLD D), never expected to match.
+    assert entry.priced_usd < pending.priced_usd
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_provider_error_with_captured_usage_still_gets_the_reserve(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 11, D fold 4: a provider-error page that DID capture
+    some usage (an earlier retry reported real usage before the final
+    attempt raised) is NOT trusted as complete -- the retry that raised is
+    itself an in-flight, possibly-billed request whose response may be
+    lost. The reserve is charged ON TOP of the captured usage, same as the
+    zero-usage provider-error case, because the failure CLASS (provider
+    error), not the captured usage, decides the reserve."""
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    run = await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=_model_retry_then_provider_error(),
+        roster_price=price,
+        ledger=ledger,
+    )
+    assert run.pages[0].error is not None
+    _, entry = ledger.entries
+    assert entry.request_tokens > 0
+    assert entry.response_tokens > 0
+    assert entry.reserve_applied is True  # in-flight failure class -- reserve on top of captured
+    single_reserve = bo._single_attempt_reserve(corpus[0], price)  # pyright: ignore[reportPrivateUsage]
+    assert entry.priced_usd == pytest.approx(
+        round(
+            bo._raw_priced_cost(  # pyright: ignore[reportPrivateUsage]
+                entry.request_tokens, entry.response_tokens, price
+            )
+            + single_reserve,
+            5,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_schema_failure_never_gets_the_reserve(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 10, D amendment: a SCHEMA (malformed-shape) failure is
+    never treated as an unreported-usage risk -- it is a real, complete
+    exchange the model simply answered wrong, not a lost request. No reserve
+    on top, even with zero captured usage."""
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    run = await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=_model_text_only(),
+        roster_price=price,
+        ledger=ledger,
+    )
+    assert run.pages[0].error is not None
+    _, entry = ledger.entries
+    assert entry.reserve_applied is False
+    assert entry.priced_usd == pytest.approx(
+        round(
+            bo._raw_priced_cost(  # pyright: ignore[reportPrivateUsage]
+                entry.request_tokens, entry.response_tokens, price
+            ),
+            5,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_model_construction_failure_never_gets_the_reserve(
+    corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#601 fold round 11, D fold 4: a model-CONSTRUCTION failure (a
+    misconfigured or under-installed provider) never sends a request, so
+    there is nothing billable to lose -- no reserve, even though nothing was
+    captured. Distinct from a provider error (an ACCEPTED, possibly-lost
+    request), which always gets the reserve regardless of captured usage."""
+
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Any:
+        raise AdvisorDependencyError(
+            "advisor provider 'anthropic' needs an optional dependency: "
+            "pip install 'roastpilot-agent[anthropic]'"
+        )
+
+    monkeypatch.setattr(bo._bean_sourcing_module, "build_model", fake_build_model)  # pyright: ignore[reportPrivateUsage]
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    run = await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        roster_price=price,
+        ledger=ledger,
+    )
+    assert run.pages[0].error is not None
+    assert "could not build its model" in run.pages[0].error
+    _, entry = ledger.entries
+    assert entry.request_tokens == 0
+    assert entry.response_tokens == 0
+    assert entry.reserve_applied is False
+    assert entry.priced_usd == 0.0
 
 
 def test_run_json_roundtrips_elapsed_s() -> None:
@@ -1487,78 +1823,186 @@ def test_raw_priced_cost_prices_captured_tokens() -> None:
 
 
 def test_actual_page_cost_applies_timeout_reserve_floor() -> None:
-    """A timed-out page's usage can be unreported, so it is charged at
-    ``max(priced, per_page_reserve)`` -- never the (possibly zero) priced amount
-    alone; a non-timed-out page is NEVER floored, even below the reserve."""
+    """A page whose reserve applies can have unreported usage, so it is charged
+    at ``max(priced, per_page_reserve)`` -- never the (possibly zero) priced
+    amount alone; a page the reserve does NOT apply to is NEVER floored, even
+    below the reserve."""
     price = bo.RosterModel("m1", 1.0, 1.0, "x")
     floored = bo._actual_page_cost(  # pyright: ignore[reportPrivateUsage]
-        0, 0, price, per_page_reserve=0.01, timed_out=True
+        0, 0, price, per_page_reserve=0.01, apply_reserve=True
     )
     assert floored == pytest.approx(0.01)
 
     not_floored = bo._actual_page_cost(  # pyright: ignore[reportPrivateUsage]
-        1, 1, price, per_page_reserve=0.01, timed_out=False
+        1, 1, price, per_page_reserve=0.01, apply_reserve=False
     )
-    assert not_floored < 0.01  # NOT floored -- the reserve only applies to timed-out pages
+    assert not_floored < 0.01  # NOT floored -- the reserve only applies when apply_reserve is set
 
 
-@pytest.mark.asyncio
-async def test_page_cost_reserve_scales_with_page_length() -> None:
-    """The timeout-reserve floor is sized to THIS page's own prompt length (#601 fold
-    round 1, slice A) -- a long page's reserve must exceed a short page's, not a
-    corpus-wide average that under-charges a long page's timeout."""
+def test_page_cost_reserve_scales_with_page_length() -> None:
+    """The timeout-reserve floor is sized to THIS page's own content (#601
+    fold round 1, slice A) -- updated for #601 fold round 7, FOLD 2's
+    markdown-cap floor: an ordinary (ASCII-length, under the truncation
+    ceiling) page sits AT that floor regardless of its own length (see the
+    dedicated floor test below), so exceeding it now takes DENSE multi-byte
+    content whose 2x-inflated bytes clear the floor -- not just more
+    characters, not a corpus-wide average that under-charges a real timeout.
+    """
     price = bo.RosterModel("m1", 1.0, 1.0, "x")
     short_page = bo.CorpusPage(
         slug="short", url="https://example.com/short", html="<p>Hi.</p>", gold_fields={}, vendor="x"
     )
-    long_page = bo.CorpusPage(
-        slug="long",
-        url="https://example.com/long",
-        html="<p>" + ("Ethiopian washed heirloom single origin. " * 500) + "</p>",
+    dense_page = bo.CorpusPage(
+        slug="dense",
+        url="https://example.com/dense",
+        html="<p>" + ("咖啡豆的品質與烘焙程度密切相關。" * 2000) + "</p>",
         gold_fields={},
         vendor="x",
     )
-    short_reserve = await bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
-        short_page,
-        price,
-        extraction_timeout_s=bo.BAKEOFF_EXTRACTION_TIMEOUT_S,
-        parse_timeout_s=bo._DEFAULT_FETCH_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
-    )
-    long_reserve = await bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
-        long_page,
-        price,
-        extraction_timeout_s=bo.BAKEOFF_EXTRACTION_TIMEOUT_S,
-        parse_timeout_s=bo._DEFAULT_FETCH_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
-    )
-    assert long_reserve > short_reserve
+    short_reserve = bo._page_cost_reserve(short_page, price)  # pyright: ignore[reportPrivateUsage]
+    dense_reserve = bo._page_cost_reserve(dense_page, price)  # pyright: ignore[reportPrivateUsage]
+    assert dense_reserve > short_reserve
 
 
-@pytest.mark.asyncio
-async def test_page_cost_reserve_output_component_is_physically_bounded() -> None:
-    """The reserve's OUTPUT-token component is a PHYSICAL generation-rate bound
-    (#601 fold round 1, FOLD 3) -- uniform across every arm, not a per-arm
-    reasoning-effort heuristic -- so it is identical for two pages with the SAME
-    input length regardless of which arm/model would have run them, and scales
-    with the EFFECTIVE timeout (#601 fold round 2, FOLD 1), not a fixed module
-    constant."""
+def test_reserve_input_tokens_per_attempt_floors_at_the_markdown_cap() -> None:
+    """#601 fold round 7, FOLD 2: a synthetic SHORT-text page's per-attempt
+    input-token bound is still >= the runtime's markdown-cap-derived floor --
+    a table-heavy page's real markdown COULD sit near that cap even when the
+    linear-strip text (this page's entire prompt) is tiny, so the floor must
+    hold regardless of actual page length."""
     page = bo.CorpusPage(
         slug="p", url="https://example.com/p", html="<p>Hi.</p>", gold_fields={}, vendor="x"
     )
-    # A second RosterModel priced ONLY on output tokens isolates the output
-    # component: if it were arm-dependent, this would need per-arm wiring that
-    # no longer exists (_output_tokens_per_page_for_arm was removed).
-    output_only_price = bo.RosterModel("m1", 0.0, 1.0, "x")
-    timeout_s = 12.5  # deliberately NOT bo.BAKEOFF_EXTRACTION_TIMEOUT_S
-    reserve = await bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
-        page,
-        output_only_price,
-        extraction_timeout_s=timeout_s,
-        parse_timeout_s=bo._DEFAULT_FETCH_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
+    per_attempt_tokens = bo._reserve_input_tokens_per_attempt(page)  # pyright: ignore[reportPrivateUsage]
+    markdown_cap_chars = bo._bean_sourcing_module._MAX_EXTRACTED_CHARS  # pyright: ignore[reportPrivateUsage]
+    max_bytes_per_char = bo._RESERVE_MAX_BYTES_PER_CHAR  # pyright: ignore[reportPrivateUsage]
+    assert per_attempt_tokens >= markdown_cap_chars * max_bytes_per_char
+
+
+def test_page_cost_reserve_output_component_is_the_enforced_cap_times_retries() -> None:
+    """The reserve's OUTPUT-token component equals the ENFORCED provider cap
+    times ``1 + EXTRACTION_MAX_RETRIES`` (#601 fold round 4/8, FOLD 4; the
+    transport-retry factor is GONE as of round 8 -- the bake-off's paid
+    calls disable SDK transport retries entirely, Refs slice E), priced in
+    full. Uniform across every arm/model (isolated here via an output-only
+    price)."""
+    page = bo.CorpusPage(
+        slug="p", url="https://example.com/p", html="<p>Hi.</p>", gold_fields={}, vendor="x"
     )
-    expected_output_tokens = round(
-        timeout_s * bo._TIMEOUT_RESERVE_TOKENS_PER_SECOND  # pyright: ignore[reportPrivateUsage]
+    output_only_price = bo.RosterModel("m1", 0.0, 1.0, "x")  # isolates the output component
+    cap = 4096
+    reserve = bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
+        page, output_only_price, max_output_tokens=cap
     )
+    max_retries = bo._bean_sourcing_module.EXTRACTION_MAX_RETRIES  # pyright: ignore[reportPrivateUsage]
+    expected_output_tokens = cap * (1 + max_retries)
     assert reserve == pytest.approx(expected_output_tokens / 1_000_000 * 1.0)
+
+
+def test_page_cost_reserve_input_component_accounts_for_retries() -> None:
+    """#601 fold round 6/8, FOLD B (revised round 8): the reserve's INPUT
+    component accounts for EVERY validation attempt re-sending the prompt,
+    plus each RETRY additionally re-sending the PRIOR RESPONSE (up to the
+    output cap) AND its own serialized validation-error copy of it
+    (``RetryPromptPart`` quotes the offending output back -- a SECOND
+    cap-sized term) plus a small fixed wrapper -- not a flat single-prompt
+    bound (isolated here via an input-only price)."""
+    page = bo.CorpusPage(
+        slug="p", url="https://example.com/p", html="<p>Hi.</p>", gold_fields={}, vendor="x"
+    )
+    input_only_price = bo.RosterModel("m1", 1.0, 0.0, "x")  # isolates the input component
+    cap = 4096
+    reserve = bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
+        page, input_only_price, max_output_tokens=cap
+    )
+    per_attempt = bo._reserve_input_tokens_per_attempt(page)  # pyright: ignore[reportPrivateUsage]
+    max_retries = bo._bean_sourcing_module.EXTRACTION_MAX_RETRIES  # pyright: ignore[reportPrivateUsage]
+    wrapper_overhead = bo._RESERVE_RETRY_WRAPPER_TOKENS  # pyright: ignore[reportPrivateUsage]
+    expected_input_tokens = (1 + max_retries) * per_attempt + max_retries * (
+        2 * cap + wrapper_overhead
+    )
+    assert reserve == pytest.approx(expected_input_tokens / 1_000_000 * 1.0)
+
+
+def test_page_cost_reserve_and_single_attempt_reserve_pinned_literal_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#601 qa pass, round 8: an INDEPENDENT, hand-computed literal check --
+    the other formula tests recombine the SAME constants production uses, so
+    a shared authoring misunderstanding could pass unnoticed. Pins every
+    input to a small fixed value and asserts an exact USD figure computed by
+    hand.
+
+    Fixed inputs: per-attempt input tokens = 50 (monkeypatched, bypassing the
+    byte/markdown-cap sub-formula -- already covered by its own dedicated
+    tests), output cap = 100, EXTRACTION_MAX_RETRIES = 1,
+    _RESERVE_RETRY_WRAPPER_TOKENS = 10, price = $1/mtok in, $2/mtok out.
+
+    _page_cost_reserve (2 total requests -- 1 initial + 1 retry):
+        input  = (1+1)*50 + 1*(2*100 + 10) = 100 + 210 = 310
+        output = 100 * (1+1) = 200
+        usd    = 310/1e6*1 + 200/1e6*2 = 0.00031 + 0.0004 = 0.00071
+
+    _single_attempt_reserve (the worst SINGLE attempt, a retry):
+        input  = 50 + 2*100 + 10 = 260
+        output = 100
+        usd    = 260/1e6*1 + 100/1e6*2 = 0.00026 + 0.0002 = 0.00046
+    """
+
+    def _fixed_per_attempt_input(page: bo.CorpusPage) -> int:
+        return 50
+
+    monkeypatch.setattr(bo, "_reserve_input_tokens_per_attempt", _fixed_per_attempt_input)
+    monkeypatch.setattr(
+        bo._bean_sourcing_module,  # pyright: ignore[reportPrivateUsage]
+        "EXTRACTION_MAX_RETRIES",
+        1,
+    )
+    monkeypatch.setattr(bo, "_RESERVE_RETRY_WRAPPER_TOKENS", 10)  # pyright: ignore[reportPrivateUsage]
+    page = bo.CorpusPage(
+        slug="p", url="https://example.com/p", html="<p>Hi.</p>", gold_fields={}, vendor="x"
+    )
+    price = bo.RosterModel("m1", 1.0, 2.0, "x")
+
+    full_reserve = bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
+        page, price, max_output_tokens=100
+    )
+    assert full_reserve == pytest.approx(0.00071)
+
+    single_reserve = bo._single_attempt_reserve(  # pyright: ignore[reportPrivateUsage]
+        page, price, max_output_tokens=100
+    )
+    assert single_reserve == pytest.approx(0.00046)
+
+
+def test_actual_page_cost_final_timeout_uses_single_attempt_reserve_not_multi() -> None:
+    """#601 fold round 6, FOLD D (P2): a FINAL timed-out entry's reserve
+    addition is ONE attempt's worst case (:func:`bo._single_attempt_reserve`),
+    never the full multi-attempt worst case (:func:`bo._page_cost_reserve`)
+    the PENDING entry uses -- every COMPLETED retry's usage is already in
+    ``request_tokens``/``response_tokens``, so at most ONE in-flight request
+    can ever be unreported. Holds for a PLAIN timeout (zero captured usage)
+    and a retry-completes-then-timeout page (real usage already captured)."""
+    page = bo.CorpusPage(
+        slug="p", url="https://example.com/p", html="<p>Hi.</p>", gold_fields={}, vendor="x"
+    )
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    full_reserve = bo._page_cost_reserve(page, price)  # pyright: ignore[reportPrivateUsage]
+    single_reserve = bo._single_attempt_reserve(page, price)  # pyright: ignore[reportPrivateUsage]
+    assert single_reserve < full_reserve  # strictly smaller (EXTRACTION_MAX_RETRIES >= 1)
+
+    plain = bo._actual_page_cost(  # pyright: ignore[reportPrivateUsage]
+        0, 0, price, single_reserve, apply_reserve=True
+    )
+    assert plain == pytest.approx(single_reserve)
+
+    retry_then_timeout = bo._actual_page_cost(  # pyright: ignore[reportPrivateUsage]
+        500, 100, price, single_reserve, apply_reserve=True
+    )
+    assert retry_then_timeout == pytest.approx(
+        bo._raw_priced_cost(500, 100, price) + single_reserve  # pyright: ignore[reportPrivateUsage]
+    )
+    assert retry_then_timeout > plain  # the completed retry's captured usage adds on top
 
 
 def test_reserve_instruction_overhead_is_derived_not_guessed() -> None:
@@ -1571,14 +2015,13 @@ def test_reserve_instruction_overhead_is_derived_not_guessed() -> None:
     assert overhead >= instructions_bytes
 
 
-@pytest.mark.asyncio
-async def test_page_cost_reserve_bounds_by_bytes_not_code_points(
+def test_page_cost_reserve_bounds_by_bytes_not_code_points(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """#601 fold round 3, FOLD 3: an emoji-dense prompt's reserve must reflect
     its UTF-8 BYTE length, not its (smaller) code-point count -- byte-level BPE
     can emit up to one token per byte, so code points alone would under-price a
-    token-dense page. Bypasses real trafilatura extraction (monkeypatches
+    token-dense page. Bypasses real linear-strip extraction (monkeypatches
     :func:`bo._reserve_prompt_text`) for a deterministic, same-code-point-count
     comparison."""
     emoji_text = "\U0001f600" * 200  # each code point is 4 UTF-8 bytes
@@ -1586,7 +2029,7 @@ async def test_page_cost_reserve_bounds_by_bytes_not_code_points(
     assert len(emoji_text) == len(plain_text)
     assert len(emoji_text.encode("utf-8")) > len(plain_text.encode("utf-8"))
 
-    async def _fake_reserve_prompt_text(page: bo.CorpusPage, *, parse_timeout_s: float) -> str:
+    def _fake_reserve_prompt_text(page: bo.CorpusPage) -> str:
         return emoji_text if page.slug == "emoji" else plain_text
 
     monkeypatch.setattr(bo, "_reserve_prompt_text", _fake_reserve_prompt_text)
@@ -1597,12 +2040,8 @@ async def test_page_cost_reserve_bounds_by_bytes_not_code_points(
     plain_page = bo.CorpusPage(
         slug="plain", url="https://x/p", html="x", gold_fields={}, vendor="x"
     )
-    kwargs: dict[str, float] = {
-        "extraction_timeout_s": bo.BAKEOFF_EXTRACTION_TIMEOUT_S,
-        "parse_timeout_s": bo._DEFAULT_FETCH_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
-    }
-    emoji_reserve = await bo._page_cost_reserve(emoji_page, price, **kwargs)  # pyright: ignore[reportPrivateUsage]
-    plain_reserve = await bo._page_cost_reserve(plain_page, price, **kwargs)  # pyright: ignore[reportPrivateUsage]
+    emoji_reserve = bo._page_cost_reserve(emoji_page, price)  # pyright: ignore[reportPrivateUsage]
+    plain_reserve = bo._page_cost_reserve(plain_page, price)  # pyright: ignore[reportPrivateUsage]
     assert emoji_reserve > plain_reserve  # same code-point count, more BYTES
 
 
@@ -1614,6 +2053,8 @@ def test_charge_ledger_total_usd_sums_priced_entries_and_reloads(tmp_path: Path)
     spend, once a follow-on slice adds a spend guard that reads it)."""
     path = bo.ledger_path(tmp_path / "o.json")
     ledger = bo.ChargeLedger(path)
+    # Distinct call_ids (#601 fold round 6, FOLD A) -- two genuinely separate
+    # calls (different arms) must never collide under one supersession key.
     ledger.append(
         bo.LedgerEntry(
             arm="m1",
@@ -1623,6 +2064,7 @@ def test_charge_ledger_total_usd_sums_priced_entries_and_reloads(tmp_path: Path)
             priced_usd=4.0,
             timed_out=False,
             reserve_applied=False,
+            call_id="call-m1",
         )
     )
     ledger.append(
@@ -1634,6 +2076,7 @@ def test_charge_ledger_total_usd_sums_priced_entries_and_reloads(tmp_path: Path)
             priced_usd=0.0001,
             timed_out=False,
             reserve_applied=False,
+            call_id="call-m2",
         )
     )
     assert ledger.total_usd() == pytest.approx(4.0001)
@@ -1732,6 +2175,154 @@ def test_charge_ledger_excludes_a_legacy_entry_with_no_fingerprint(tmp_path: Pat
     ledger = bo.ChargeLedger(path, fingerprint="")  # even the disabled-guard default
     assert len(ledger.entries) == 1
     assert ledger.total_usd() == pytest.approx(0.0)  # never silently trusted
+
+
+def _pending_entry(*, priced_usd: float = 0.05, call_id: str = "") -> bo.LedgerEntry:
+    return bo.LedgerEntry(
+        arm="m1",
+        slug="a",
+        request_tokens=0,
+        response_tokens=0,
+        priced_usd=priced_usd,
+        timed_out=False,
+        reserve_applied=True,
+        is_pending=True,
+        call_id=call_id,
+    )
+
+
+def test_charge_ledger_kill_between_pending_and_final_counts_the_reserve(
+    tmp_path: Path,
+) -> None:
+    """#601 fold round 4, FOLD 1: a PENDING-only entry (a kill landed before the
+    FINAL write) still counts, at its reserve valuation -- the two-phase
+    design's whole point: a mid-call kill must never silently drop a page's
+    worst-case charge from the books."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    ledger = bo.ChargeLedger(path)
+    ledger.append(_pending_entry(priced_usd=0.07))
+    assert ledger.total_usd() == pytest.approx(0.07)
+
+    reloaded = bo.ChargeLedger(path)  # a fresh process, reloading from disk
+    assert reloaded.total_usd() == pytest.approx(0.07)
+
+
+def test_charge_ledger_final_supersedes_pending_not_summed(tmp_path: Path) -> None:
+    """#601 fold round 4, FOLD 1: the FINAL entry for a ``(arm, slug)`` key
+    REPLACES its PENDING one in the meter -- the call completed, so the
+    reserve's worst-case guess retires. Summing them would double-charge
+    every normal (non-killed) page."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    ledger = bo.ChargeLedger(path)
+    ledger.append(_pending_entry(priced_usd=0.07))  # the reserve, pre-call
+    ledger.append(  # the real, smaller, post-call charge
+        bo.LedgerEntry(
+            arm="m1",
+            slug="a",
+            request_tokens=100,
+            response_tokens=50,
+            priced_usd=0.02,
+            timed_out=False,
+            reserve_applied=False,
+            is_pending=False,
+        )
+    )
+    assert ledger.total_usd() == pytest.approx(0.02)  # NOT 0.09
+    assert len(ledger.entries) == 2  # both stay on disk -- the audit trail
+
+
+def test_charge_ledger_a_pending_entry_never_eclipses_an_existing_final(
+    tmp_path: Path,
+) -> None:
+    """#601 fold round 4, FOLD 1: a FINAL entry, once recorded, is never
+    superseded by a LATER pending write for the same ``(arm, slug)`` key --
+    the defensive direction of :meth:`bo.ChargeLedger._effective_entries`'s
+    supersede rule (final always wins, regardless of write order)."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    ledger = bo.ChargeLedger(path)
+    ledger.append(
+        bo.LedgerEntry(
+            arm="m1",
+            slug="a",
+            request_tokens=100,
+            response_tokens=50,
+            priced_usd=0.02,
+            timed_out=False,
+            reserve_applied=False,
+            is_pending=False,
+        )
+    )
+    ledger.append(_pending_entry(priced_usd=0.07))  # arrives AFTER the final
+    assert ledger.total_usd() == pytest.approx(0.02)  # the final still wins
+
+
+def test_charge_ledger_resume_after_pending_counts_only_the_new_final(
+    tmp_path: Path,
+) -> None:
+    """#601 fold round 4, FOLD 1 + fold round 6, FOLD A: resuming after a kill
+    re-attempts the page, writing a FRESH pending + final pair -- a NEW
+    call_id, since it is a genuinely separate call -- alongside the orphaned
+    pending from the killed attempt (same ``(arm, slug)``, DIFFERENT
+    ``call_id``, same lineage). The meter must count only the winning final
+    for the resumed call_id, never double-count the orphaned one's own
+    pending (which, being a DIFFERENT call, still counts on its own -- see
+    :func:`test_charge_ledger_two_genuinely_separate_calls_for_one_page_both_count`
+    for the case where the orphan's call itself later completes)."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    killed_run = bo.ChargeLedger(path, fingerprint="fp-1")
+    killed_run.append(
+        _pending_entry(priced_usd=0.07, call_id="call-killed")
+    )  # orphaned: no final follows
+
+    resumed = bo.ChargeLedger(path, fingerprint="fp-1")
+    assert resumed.total_usd() == pytest.approx(0.07)  # still just the orphan, pre-resume
+    resumed.append(
+        _pending_entry(priced_usd=0.06, call_id="call-resumed")
+    )  # the resumed attempt's OWN call
+    resumed.append(
+        bo.LedgerEntry(
+            arm="m1",
+            slug="a",
+            request_tokens=80,
+            response_tokens=40,
+            priced_usd=0.015,
+            timed_out=False,
+            reserve_applied=False,
+            is_pending=False,
+            call_id="call-resumed",
+        )
+    )
+    # The orphan's own pending (0.07, never finalized) still counts on its
+    # own call_id; the resumed call's final (0.015) supersedes ITS pending.
+    assert resumed.total_usd() == pytest.approx(0.085)
+    assert len(resumed.entries) == 3  # orphaned pending + resumed pending + final
+
+
+def test_charge_ledger_two_genuinely_separate_calls_for_one_page_both_count(
+    tmp_path: Path,
+) -> None:
+    """#601 fold round 6, FOLD A (P1): a page CALLED TWICE across a resume --
+    e.g. it succeeded before the arm's run later failed wholesale and re-ran
+    from page 0 -- is TWO real, separate charges. Keying supersession by bare
+    ``(arm, slug)`` would collapse them into one, under-counting actual
+    cumulative spend; keying by ``call_id`` keeps both."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    ledger = bo.ChargeLedger(path)
+    first_call = bo.LedgerEntry(
+        arm="m1",
+        slug="a",
+        request_tokens=100,
+        response_tokens=50,
+        priced_usd=0.02,
+        timed_out=False,
+        reserve_applied=False,
+        is_pending=False,
+        call_id="call-1",
+    )
+    second_call = dataclasses.replace(first_call, priced_usd=0.03, call_id="call-2")
+    ledger.append(first_call)
+    ledger.append(second_call)
+    assert ledger.total_usd() == pytest.approx(0.05)  # BOTH real calls counted
 
 
 def test_load_dotenv_key(tmp_path: Path) -> None:
@@ -2478,10 +3069,13 @@ async def test_run_bakeoff_resumes_without_calls(
     fingerprint = bo.compute_fingerprint(corpus)
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
     checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
-    # A matching ledger entry -- #601 fold round 2, FOLD 4: a checkpoint with no
-    # ledger at all refuses (see test_run_bakeoff_refuses_a_pre_ledger_checkpoint).
+    # Full page coverage -- #601 fold round 2, FOLD 4 + fold round 5, D FOLD 3:
+    # a checkpoint with no ledger at all refuses (see
+    # test_run_bakeoff_refuses_a_pre_ledger_checkpoint); a checkpoint whose
+    # ledger is missing any of ITS OWN pages refuses too.
     seed_ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
-    seed_ledger.append(dataclasses.replace(_seeded_ledger_entry(), arm="m1"))
+    for entry in _page_covering_entries("m1", ["page-a", "page-b"]):
+        seed_ledger.append(entry)
     result = await bo.run_bakeoff(
         corpus,
         bo.expand_arms(["m1"], "default"),
@@ -2577,21 +3171,83 @@ async def test_run_bakeoff_refuses_a_foreign_fingerprint_ledger(
     await _refuses_naming(corpus, out, ["m1"], "m1")
 
 
+def _page_covering_entries(arm: str, slugs: list[str]) -> list[bo.LedgerEntry]:
+    """One synthetic FINAL ledger entry per ``slugs`` member, for seeding
+    page-level coverage fixtures (#601 fold round 5, D FOLD 3). Each gets its
+    OWN ``call_id`` (#601 qa pass, round 8) -- the shared default ``""``
+    would collide two entries under one key in
+    :meth:`bo.ChargeLedger._effective_entries` if a future call site ever
+    asserted ``total_usd()`` against these fixtures too."""
+    return [
+        dataclasses.replace(_seeded_ledger_entry(), arm=arm, slug=slug, call_id=slug)
+        for slug in slugs
+    ]
+
+
 @pytest.mark.asyncio
 async def test_run_bakeoff_refuses_naming_only_the_uncovered_arm(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
-    """Per-arm coverage: "m1" is covered, "m2" is not -- the refusal must name
-    ONLY "m2", not the already-covered "m1"."""
+    """Per-arm coverage: "m1" has a ledger entry for EVERY one of its
+    checkpointed pages, "m2" has none -- the refusal must name ONLY "m2", not
+    the already-fully-covered "m1"."""
     out = tmp_path / "o.json"
     fingerprint = bo.compute_fingerprint(corpus)
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
     checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
     checkpoint.append(bo.run_to_json(_full_run("m2", bo.Outcome.COR)))
     ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
-    ledger.append(dataclasses.replace(_seeded_ledger_entry(), arm="m1"))  # "m2" left uncovered
+    for entry in _page_covering_entries("m1", ["page-a", "page-b"]):  # "m2" left uncovered
+        ledger.append(entry)
 
     await _refuses_naming(corpus, out, ["m1", "m2"], "m2")
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_refuses_an_arm_with_partial_page_coverage(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 5, D FOLD 3: a checkpointed TWO-page arm with a ledger
+    entry for only ONE of its pages must still refuse -- per-ARM existence
+    (the round 4 check) would have wrongly passed this; page-level coverage
+    catches the tail-truncated-ledger case it cannot."""
+    out = tmp_path / "o.json"
+    fingerprint = bo.compute_fingerprint(corpus)
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
+    checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
+    ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
+    for entry in _page_covering_entries("m1", ["page-a"]):  # "page-b" never landed
+        ledger.append(entry)
+
+    await _refuses_naming(corpus, out, ["m1"], "m1")
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_full_page_coverage_is_unaffected(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 5, D FOLD 3: a checkpointed arm with a ledger entry for
+    EVERY one of its pages resumes normally -- the guard never fires against a
+    genuinely complete arm."""
+    out = tmp_path / "o.json"
+    fingerprint = bo.compute_fingerprint(corpus)
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
+    checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
+    ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
+    for entry in _page_covering_entries("m1", ["page-a", "page-b"]):
+        ledger.append(entry)
+
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    result = await bo.run_bakeoff(
+        corpus,
+        bo.expand_arms(["m1"], "default"),
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost(corpus, roster),
+        roster=roster,
+    )
+    assert len(result.runs) == 1  # resumed from checkpoint, not refused
 
 
 @pytest.mark.asyncio
@@ -2667,6 +3323,8 @@ async def test_run_bakeoff_threads_the_correct_reasoning_effort_per_arm(
         model: object = None,
         reasoning_effort: object = None,
         diagnostics: object = None,
+        max_output_tokens: object = None,
+        disable_transport_retries: object = None,
     ) -> BeanProfileDraft:
         captured.append(reasoning_effort)
         raise bo.BeanSourcingError("stub -- no real extraction needed for this guard")
@@ -2728,9 +3386,10 @@ async def test_run_bakeoff_resume_distinguishes_arms(
     seed = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
     # only the "off" arm resumed
     seed.append(bo.run_to_json(_full_run("m1+reasoning-off", bo.Outcome.COR)))
-    # A matching ledger entry -- #601 fold round 2, FOLD 4.
+    # Full page coverage -- #601 fold round 2, FOLD 4 + fold round 5, D FOLD 3.
     seed_ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
-    seed_ledger.append(dataclasses.replace(_seeded_ledger_entry(), arm="m1+reasoning-off"))
+    for entry in _page_covering_entries("m1+reasoning-off", ["page-a", "page-b"]):
+        seed_ledger.append(entry)
 
     arms = bo.expand_arms(["m1"], "both")
     result = await bo.run_bakeoff(
@@ -3103,9 +3762,10 @@ async def test_run_bakeoff_resumed_success_does_not_flip_the_heuristic_label(
     # resuming it (no new call) means it is NOT freshly executed this run.
     seed = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
     seed.append(bo.run_to_json(_full_run("good", bo.Outcome.COR)))
-    # A matching ledger entry -- #601 fold round 2, FOLD 4.
+    # Full page coverage -- #601 fold round 2, FOLD 4 + fold round 5, D FOLD 3.
     seed_ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
-    seed_ledger.append(dataclasses.replace(_seeded_ledger_entry(), arm="good"))
+    for entry in _page_covering_entries("good", ["page-a", "page-b"]):
+        seed_ledger.append(entry)
 
     result = await bo.run_bakeoff(
         corpus,
