@@ -2016,6 +2016,31 @@ def test_bean_sourcing_agent_omits_extra_body_by_default() -> None:
     assert "extra_body" not in settings
 
 
+def test_bean_sourcing_agent_sets_max_tokens_when_given() -> None:
+    """An explicit ``max_output_tokens`` maps to pydantic-ai's ``ModelSettings``
+    ``max_tokens`` key (#601), the provider-enforced output cap."""
+    agent = bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
+        _ADVISOR_CONFIG,
+        model=_function_model_returning(_identity_args()),
+        max_output_tokens=16384,
+    )
+    settings = agent.model_settings
+    assert isinstance(settings, dict)
+    assert "max_tokens" in settings
+    assert settings["max_tokens"] == 16384
+
+
+def test_bean_sourcing_agent_omits_max_tokens_by_default() -> None:
+    """``max_output_tokens=None`` (the default) omits ``max_tokens`` entirely --
+    behaviour-preserving, unchanged before #601."""
+    agent = bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
+        _ADVISOR_CONFIG, model=_function_model_returning(_identity_args())
+    )
+    settings = agent.model_settings
+    assert isinstance(settings, dict)
+    assert "max_tokens" not in settings
+
+
 # --- _resolve_extraction_model_slug (#590 P1 + P2 fix: provider-aware default) ---
 #
 # Codex caught a P1 on the PR that introduced BeanSourcingConfig.model_slug:

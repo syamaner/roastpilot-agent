@@ -2685,6 +2685,7 @@ def _bean_sourcing_agent(
     sourcing_config: BeanSourcingConfig | None = None,
     model: Model | None = None,
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
+    max_output_tokens: int | None = None,
 ) -> Agent[None, _ExtractedBeanIdentity]:
     """Build the bean-identity extraction agent.
 
@@ -2717,6 +2718,10 @@ def _bean_sourcing_agent(
             it unset is the behaviour-preserving no-op; an explicit level
             sets the OpenRouter ``reasoning`` request body the same way the
             roast advisor does.
+        max_output_tokens: An optional provider-enforced output cap (#601 --
+            ``ModelSettings["max_tokens"]``, verified the correct pydantic-ai
+            key on the installed version). ``None`` (the default) omits the
+            setting entirely -- behaviour-preserving, unchanged before #601.
 
     Returns:
         The extraction agent, temperature 0 for deterministic, literal
@@ -2731,6 +2736,8 @@ def _bean_sourcing_agent(
     extra_body = reasoning_extra_body(reasoning_effort)
     if extra_body is not None:
         settings["extra_body"] = extra_body
+    if max_output_tokens is not None:
+        settings["max_tokens"] = max_output_tokens
     return Agent(
         resolved_model,
         output_type=_ExtractedBeanIdentity,
@@ -2776,6 +2783,7 @@ async def _extract_bean_identity(
     model: Model | None = None,
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
     diagnostics: BeanSourcingDiagnostics | None = None,
+    max_output_tokens: int | None = None,
 ) -> _ExtractedBeanIdentity:
     """Run the structured bean-identity extraction call over ``page_text``.
 
@@ -2788,6 +2796,9 @@ async def _extract_bean_identity(
         reasoning_effort: An optional provider reasoning-effort override,
             passed straight through to :func:`_bean_sourcing_agent` (#601).
         diagnostics: Optional accumulator (#601 F2), incremented on success.
+        max_output_tokens: An optional provider-enforced output cap (#601),
+            passed straight through to :func:`_bean_sourcing_agent`. ``None``
+            (the default) omits the setting -- unchanged before #601.
         sourcing_config: The extraction model/timeout config
             (:attr:`~roastpilot_agent.config.BeanSourcingConfig.model_slug`,
             :attr:`~roastpilot_agent.config.BeanSourcingConfig.extraction_timeout_seconds`
@@ -2838,6 +2849,7 @@ async def _extract_bean_identity(
             sourcing_config=sourcing_config,
             model=model,
             reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
         )
         async with asyncio.timeout(extraction_timeout_seconds):
             result = (
@@ -5057,6 +5069,7 @@ async def draft_bean_profile_from_url(
     model: Model | None = None,
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
     diagnostics: BeanSourcingDiagnostics | None = None,
+    max_output_tokens: int | None = None,
 ) -> BeanProfileDraft:
     """Draft a bean profile from a vendor product URL (#573 phase 1).
 
@@ -5093,6 +5106,9 @@ async def draft_bean_profile_from_url(
             the setting — behaviour-preserving, since extraction has never
             set reasoning before #601.
         diagnostics: Optional accumulator (#601 F2).
+        max_output_tokens: An optional provider-enforced output cap (#601),
+            passed straight through to :func:`_extract_bean_identity`.
+            ``None`` (the default) omits the setting -- unchanged before #601.
 
     Returns:
         The drafted :class:`~roastpilot_agent.models.BeanProfileDraft`.
@@ -5169,6 +5185,7 @@ async def draft_bean_profile_from_url(
         model=model,
         reasoning_effort=reasoning_effort,
         diagnostics=diagnostics,
+        max_output_tokens=max_output_tokens,
     )
     # page.extracted_text/page.json_ld_values, NOT page.prompt_text (#590
     # D1 fold 1; split #590 slice E1) — the prompt text carries OUR OWN
