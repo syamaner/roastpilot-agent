@@ -1357,6 +1357,13 @@ class PageResult:
             from (#601 F2), independent of the page's final outcome -- a later
             ``_draft_from_identity`` rejection does NOT zero this (F7: extraction
             adherence is not draft policy). ``0`` if extraction never retried.
+        retryable: Whether this page's ``error`` is an INFRA-class (timeout or
+            provider-error) failure worth re-attempting on resume (#649) --
+            never ``True`` for a schema failure (a real outcome) or a
+            model-construction failure (a persistent config issue, not
+            transient). ``False`` on success and on a checkpoint record
+            written before this field existed (no retry, matching prior
+            behavior exactly).
     """
 
     slug: str
@@ -1366,6 +1373,7 @@ class PageResult:
     extracted: dict[str, Any] | None = None
     elapsed_s: float | None = None
     recovered_violations: int = 0
+    retryable: bool = False
 
 
 @dataclass(frozen=True)
@@ -1484,6 +1492,12 @@ async def run_model_over_corpus(
             max_output_tokens=max_output_tokens,
         )
         elapsed_s = time.monotonic() - started
+        # #649: INFRA-class (timeout or provider-error) -- computed UNCONDITIONALLY
+        # (never gated on ledger/roster_price) so a page's retryability is set even
+        # for a ledger-free/scoring-only call. Schema failures are a real outcome,
+        # never retryable; same "in-flight failure class" test the ledger's own
+        # reserve decision already uses (#601 fold round 11, D fold 4).
+        retryable = diagnostics.timed_out_runs > 0 or _is_provider_error_failure(error)
         if roster_price is not None and ledger is not None:
             # FINAL supersedes PENDING (#601 fold round 4, FOLD 1), appended
             # IMMEDIATELY once the call returns (#601 fold round 5, D FOLD 2)
@@ -1492,7 +1506,7 @@ async def run_model_over_corpus(
             # #601 fold round 11 (D fold 4): reserve by IN-FLIGHT failure
             # CLASS, not captured usage -- a retry that reports usage then
             # hits a provider error still risks a lost, billed request.
-            apply_reserve = timed_out or _is_provider_error_failure(error)
+            apply_reserve = retryable
             priced = _actual_page_cost(
                 diagnostics.request_tokens,
                 diagnostics.response_tokens,
@@ -1539,6 +1553,7 @@ async def run_model_over_corpus(
                 # UNCONDITIONAL (#601 F7 -- round 3's zero-on-failed-page contract was
                 # wrong): extraction adherence, independent of a later draft rejection.
                 recovered_violations=diagnostics.schema_retries,
+                retryable=retryable,
             )
         )
         if meter is not None and meter.tripped:
@@ -2664,6 +2679,21 @@ def render_report(
             "it, so a re-run ALWAYS retries them; excluded from every statistic below."
         )
         lines.append("")
+    retryable_by_slug = {
+        run.model_slug: sum(1 for p in run.pages if p.retryable)
+        for run in runs
+        if any(p.retryable for p in run.pages)
+    }
+    if retryable_by_slug:
+        detail = ", ".join(f"`{slug}` ({n})" for slug, n in retryable_by_slug.items())
+        lines.append(
+            f"> **RESUME TO RETRY -- {sum(retryable_by_slug.values())} page(s) still "
+            f"retryable** across {len(retryable_by_slug)} model(s): {detail} (#649). Each is a "
+            "transient timeout/provider-error, never a schema failure -- scored as an error "
+            "below UNTIL a `--resume` re-run retries it; this arm's metrics reflect that "
+            "residual gap in the meantime."
+        )
+        lines.append("")
     lines.append(f"- models scored: {len(runs)}")
     lines.append(f"- corpus pages: {len(runs[0].pages) if runs else 0}")
     lines.append("")
@@ -2953,6 +2983,7 @@ def run_to_json(run: ModelRun) -> dict[str, Any]:
                 "extracted": page.extracted,
                 "elapsed_s": page.elapsed_s,
                 "recovered_violations": page.recovered_violations,
+                "retryable": page.retryable,
             }
             for page in run.pages
         ],
@@ -3523,6 +3554,26 @@ def _has_any_success(run: ModelRun) -> bool:
     return any(page.error is None for page in run.pages)
 
 
+def _retryable_slugs(run: ModelRun) -> set[str]:
+    """Slugs of ``run``'s pages still marked :attr:`PageResult.retryable` (#649)."""
+    return {p.slug for p in run.pages if p.retryable}
+
+
+def _merge_retry_results(existing: ModelRun, fresh: ModelRun) -> ModelRun:
+    """Merge a residual retry's fresh page results into a checkpointed run (#649).
+
+    A fresh entry REPLACES its matching (retryable) slug; corpus order is
+    preserved from ``existing``. A retryable slug the retry never reached
+    (the meter tripped mid-retry) keeps its PRIOR entry -- still retryable,
+    picked up again on a later resume. Never touches an already-successful
+    or schema-failed page: ``existing`` cannot become wholly-failed by this
+    merge (a wholly-failed run is never checkpointed in the first place).
+    """
+    fresh_by_slug = {p.slug: p for p in fresh.pages}
+    merged = [fresh_by_slug.get(p.slug, p) for p in existing.pages]
+    return ModelRun(model_slug=existing.model_slug, pages=merged)
+
+
 @dataclass(frozen=True)
 class FailedRun:
     """A wholly-failed run this invocation -- NEVER checkpointed (#602 fold round 5).
@@ -3634,6 +3685,17 @@ async def run_bakeoff(
     :class:`FailedRun` and always retried on resume, but its ledger charges still stand.
     Every checkpoint/report/ledger identity is :attr:`Arm.label`.
 
+    PAGE-LEVEL RESIDUAL RETRY (#649): a checkpointed arm with any
+    :attr:`PageResult.retryable` page (a transient timeout/provider-error, never
+    a schema failure) is NOT skipped wholesale on resume -- only its retryable
+    pages re-run, merged into the record (:func:`_merge_retry_results`); metrics
+    are recomputed from the merged page set on every read. Money: no ledger/meter
+    change -- each retried page is a genuine new call, charged again, honestly
+    (the existing per-call charge model already handles this correctly). The
+    retry itself still defers to an already-tripped meter (real money), but
+    skips the pre-run ESTIMATE guard (that guard's whole-arm basis does not
+    scale to a handful of retried pages).
+
     Args:
         pages: The corpus.
         arms: The (model, reasoning) study arms to run (real, paid calls) -- see
@@ -3697,8 +3759,37 @@ async def run_bakeoff(
     for index, arm in enumerate(arms):
         slug = arm.label
         if checkpoint.has(slug):
-            runs.append(_run_from_checkpoint(checkpoint.get(slug)))
-            print(f"[resume] {slug}: on disk (ledger ${meter.charged:.4f} total)", flush=True)
+            existing_run = _run_from_checkpoint(checkpoint.get(slug))
+            retry_slugs = _retryable_slugs(existing_run)
+            # #649: a residual retry is REAL money too -- an already-tripped
+            # meter defers it to a later resume, same as a fresh arm would be.
+            if not retry_slugs or meter.tripped:
+                runs.append(existing_run)
+                print(f"[resume] {slug}: on disk (ledger ${meter.charged:.4f} total)", flush=True)
+                continue
+            retry_pages = [p for p in pages if p.slug in retry_slugs]
+            fresh_run = await run_model_over_corpus(
+                retry_pages,
+                model_slug=slug,
+                advisor_config=make_advisor_config(arm.model_slug),
+                model=model,
+                sourcing_config=make_sourcing_config(arm.model_slug),
+                reasoning_effort=_REASONING_EFFORT_BY_ARM[arm.reasoning],
+                roster_price=price_by_slug[arm.model_slug],
+                ledger=ledger,
+                meter=meter,
+            )
+            executed_slugs.append(slug)  # a real (retry) call was attempted
+            has_fresh_success = has_fresh_success or _has_any_success(fresh_run)
+            merged_run = _merge_retry_results(existing_run, fresh_run)
+            checkpoint.append(run_to_json(merged_run))  # supersedes the old record
+            still_retryable = len(_retryable_slugs(merged_run))
+            outcome = f"{still_retryable} still retryable" if still_retryable else "all resolved"
+            print(
+                f"[resume] {slug}: retried {len(retry_pages)} retryable page(s) -- {outcome}",
+                flush=True,
+            )
+            runs.append(merged_run)
             continue
         # #601 fold round 13: the REAL meter is checked BEFORE the pre-run
         # ESTIMATE guard -- a resumed, already-over-budget ledger (or a
@@ -3848,6 +3939,9 @@ def _run_from_checkpoint(record: dict[str, Any]) -> ModelRun:
                 extracted=cast("dict[str, Any] | None", page.get("extracted")),
                 elapsed_s=None if elapsed_raw is None else float(cast("float", elapsed_raw)),
                 recovered_violations=int(cast("int", page.get("recovered_violations", 0))),
+                # #649: absent on a pre-#649 record -- defaults False (never
+                # retryable), matching prior behavior exactly (whole-arm resume).
+                retryable=bool(page.get("retryable", False)),
             )
         )
     return ModelRun(model_slug=str(record["model_slug"]), pages=pages)
