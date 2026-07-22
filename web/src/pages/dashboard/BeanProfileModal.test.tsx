@@ -1067,6 +1067,40 @@ describe("BeanProfileModal draft-from-URL — the single-flight guard survives u
     );
   });
 
+  it("edit mode never adopts a module-level in-flight draft (#654 P2): Save is enabled, no drafting state, even though the add-mode modal that started it is still abandoned", async () => {
+    // Edit mode renders no draft panel at all — its Save button never
+    // depended on `draftInFlight` — so blindly inheriting `drafting` there
+    // would disable Save with no visible cause and no way for the operator
+    // to clear it (edit mode has no draft button to wait out the settle).
+    const abandoned = deferred<BeanProfileDraftResponse>();
+    vi.spyOn(api, "draftBeanFromUrl").mockReturnValue(abandoned.promise);
+    const addModal = render(
+      <BeanProfileModal mode="add" onSave={vi.fn()} onSaved={vi.fn()} onClose={vi.fn()} />,
+    );
+    fireEvent.change(screen.getByTestId("bean-profile-draft-url"), {
+      target: { value: "https://roaster.example.com/abandoned" },
+    });
+    fireEvent.click(screen.getByTestId("bean-profile-draft-button"));
+    addModal.unmount();
+
+    render(
+      <BeanProfileModal
+        mode="edit"
+        profile={FIXTURE_KOKE}
+        onSave={vi.fn()}
+        onSaved={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    expect(screen.getByTestId("bean-profile-save")).toBeEnabled();
+    expect(screen.queryByTestId("bean-profile-draft-panel")).toBeNull();
+
+    await act(async () => {
+      abandoned.resolve(FIXTURE_DRAFT_RESPONSE);
+    });
+    expect(screen.getByTestId("bean-profile-save")).toBeEnabled();
+  });
+
   it("produces no setState-on-an-unmounted-component warning when the abandoned request settles after unmount", async () => {
     const pending = deferred<BeanProfileDraftResponse>();
     vi.spyOn(api, "draftBeanFromUrl").mockReturnValue(pending.promise);

@@ -137,14 +137,17 @@ export function BeanProfileModal({
   // (#654 final thread): a remounted modal (e.g. reopened via Cancel while a
   // request was still running) must show itself as busy until that
   // abandoned request's `settle` resolves, not start fresh as idle while
-  // secretly blocked from firing by `draftInFlight` below.
+  // secretly blocked from firing by `draftInFlight` below. Gated to `add`
+  // mode only (one more #654 P2): edit mode renders no draft panel at all —
+  // its Save never depended on `draftInFlight` — so inheriting `drafting`
+  // there would disable Save with no visible cause and no way to clear it.
   useEffect(() => {
-    if (draftInFlight === null) return;
+    if (mode !== "add" || draftInFlight === null) return;
     setDrafting(true);
     void draftInFlight.settle.then(() => {
       if (mountedRef.current) setDrafting(false);
     });
-  }, []);
+  }, [mode]);
 
   // Editing a field orphans any provenance/evidence it carried (#627): those
   // describe the value the SERVER extracted, not whatever the operator just
