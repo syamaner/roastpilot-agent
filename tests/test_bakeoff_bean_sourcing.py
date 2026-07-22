@@ -1033,6 +1033,29 @@ async def test_run_model_over_corpus_ledgers_every_page(
     assert ledger.total_usd() > 0.0
 
 
+@pytest.mark.asyncio
+async def test_reserve_prompt_text_bounds_the_parse_with_the_fetch_knob(
+    corpus: list[bo.CorpusPage], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#601 fold round 3, FOLD 1: the reserve's trafilatura parse is bounded by
+    ``fetch_timeout_seconds`` -- the SAME, deliberately smaller knob the runtime's
+    real caller uses -- never the (larger) extraction timeout."""
+    captured: list[float] = []
+    real_bounded = bo._bean_sourcing_module._extract_page_markdown_bounded  # pyright: ignore[reportPrivateUsage]
+
+    async def _tracking_bounded(html: str, *, timeout_seconds: float) -> str | None:
+        captured.append(timeout_seconds)
+        return await real_bounded(html, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr(
+        bo._bean_sourcing_module,  # pyright: ignore[reportPrivateUsage]
+        "_extract_page_markdown_bounded",
+        _tracking_bounded,
+    )
+    await bo._reserve_prompt_text(corpus[0], parse_timeout_s=7.5)  # pyright: ignore[reportPrivateUsage]
+    assert captured == [7.5]  # the FETCH knob, not BAKEOFF_EXTRACTION_TIMEOUT_S (45)
+
+
 def _function_model_hanging() -> FunctionModel:
     """A double that never returns -- used to force a REAL outer-timeout
     cancellation (mirrors ``tests/test_bean_sourcing.py``'s helper of the same
@@ -1075,9 +1098,53 @@ async def test_run_model_over_corpus_ledgers_a_real_timed_out_page_with_reserve_
     # FOLD 1 (#601 fold round 2): the reserve derives from the EFFECTIVE 0.05s
     # timeout this call ran under, not the 45s module default.
     default_reserve = await bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
-        corpus[0], price, bo.BAKEOFF_EXTRACTION_TIMEOUT_S
+        corpus[0],
+        price,
+        extraction_timeout_s=bo.BAKEOFF_EXTRACTION_TIMEOUT_S,
+        parse_timeout_s=bo._DEFAULT_FETCH_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
     )
     assert entry.priced_usd < default_reserve
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_ledgers_a_timeout_with_zero_post_call_parsing(
+    corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#601 fold round 3, FOLD 2: the reserve is computed/cached BEFORE the
+    billable call, so a REAL timeout's failure handler appends the ledger entry
+    with ZERO post-call parsing -- a kill between the call and ledger.append must
+    never lose a billed charge. Proven by failing the parse if it EVER runs after
+    the provider call starts."""
+    call_order: list[str] = []
+    real_reserve_prompt_text = bo._reserve_prompt_text  # pyright: ignore[reportPrivateUsage]
+
+    async def _tracking_reserve_prompt_text(page: bo.CorpusPage, *, parse_timeout_s: float) -> str:
+        if "provider_call_started" in call_order:
+            raise AssertionError("reserve parse ran AFTER the provider call started")
+        call_order.append("parse")
+        return await real_reserve_prompt_text(page, parse_timeout_s=parse_timeout_s)
+
+    monkeypatch.setattr(bo, "_reserve_prompt_text", _tracking_reserve_prompt_text)
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        call_order.append("provider_call_started")
+        await asyncio.sleep(10)
+        return ModelResponse(parts=[TextPart("too late")])  # pragma: no cover
+
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=FunctionModel(respond),
+        sourcing_config=bo.BeanSourcingConfig(extraction_timeout_seconds=0.05),
+        roster_price=price,
+        ledger=ledger,
+    )
+    assert call_order == ["parse", "provider_call_started"]
+    assert len(ledger.entries) == 1
+    assert ledger.entries[0].timed_out is True
 
 
 def test_run_json_roundtrips_elapsed_s() -> None:
@@ -1452,10 +1519,16 @@ async def test_page_cost_reserve_scales_with_page_length() -> None:
         vendor="x",
     )
     short_reserve = await bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
-        short_page, price, bo.BAKEOFF_EXTRACTION_TIMEOUT_S
+        short_page,
+        price,
+        extraction_timeout_s=bo.BAKEOFF_EXTRACTION_TIMEOUT_S,
+        parse_timeout_s=bo._DEFAULT_FETCH_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
     )
     long_reserve = await bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
-        long_page, price, bo.BAKEOFF_EXTRACTION_TIMEOUT_S
+        long_page,
+        price,
+        extraction_timeout_s=bo.BAKEOFF_EXTRACTION_TIMEOUT_S,
+        parse_timeout_s=bo._DEFAULT_FETCH_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
     )
     assert long_reserve > short_reserve
 
@@ -1477,12 +1550,60 @@ async def test_page_cost_reserve_output_component_is_physically_bounded() -> Non
     output_only_price = bo.RosterModel("m1", 0.0, 1.0, "x")
     timeout_s = 12.5  # deliberately NOT bo.BAKEOFF_EXTRACTION_TIMEOUT_S
     reserve = await bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
-        page, output_only_price, timeout_s
+        page,
+        output_only_price,
+        extraction_timeout_s=timeout_s,
+        parse_timeout_s=bo._DEFAULT_FETCH_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
     )
     expected_output_tokens = round(
         timeout_s * bo._TIMEOUT_RESERVE_TOKENS_PER_SECOND  # pyright: ignore[reportPrivateUsage]
     )
     assert reserve == pytest.approx(expected_output_tokens / 1_000_000 * 1.0)
+
+
+def test_reserve_instruction_overhead_is_derived_not_guessed() -> None:
+    """#601 fold round 3, FOLD 3: the reserve's overhead is DERIVED from the
+    ACTUAL runtime extraction instructions (+ schema + margin), so it must be AT
+    LEAST the instructions' own byte length -- never a smaller, hand-picked
+    guess like the (separate) planning heuristic's 1600 chars."""
+    overhead = bo._RESERVE_INSTRUCTION_OVERHEAD_BYTES  # pyright: ignore[reportPrivateUsage]
+    instructions_bytes = len(bo._EXTRACTION_INSTRUCTIONS.encode("utf-8"))  # pyright: ignore[reportPrivateUsage]
+    assert overhead >= instructions_bytes
+
+
+@pytest.mark.asyncio
+async def test_page_cost_reserve_bounds_by_bytes_not_code_points(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#601 fold round 3, FOLD 3: an emoji-dense prompt's reserve must reflect
+    its UTF-8 BYTE length, not its (smaller) code-point count -- byte-level BPE
+    can emit up to one token per byte, so code points alone would under-price a
+    token-dense page. Bypasses real trafilatura extraction (monkeypatches
+    :func:`bo._reserve_prompt_text`) for a deterministic, same-code-point-count
+    comparison."""
+    emoji_text = "\U0001f600" * 200  # each code point is 4 UTF-8 bytes
+    plain_text = "a" * 200  # SAME code-point count, 1 byte each
+    assert len(emoji_text) == len(plain_text)
+    assert len(emoji_text.encode("utf-8")) > len(plain_text.encode("utf-8"))
+
+    async def _fake_reserve_prompt_text(page: bo.CorpusPage, *, parse_timeout_s: float) -> str:
+        return emoji_text if page.slug == "emoji" else plain_text
+
+    monkeypatch.setattr(bo, "_reserve_prompt_text", _fake_reserve_prompt_text)
+    price = bo.RosterModel("m1", 1.0, 0.0, "x")  # isolate the INPUT component
+    emoji_page = bo.CorpusPage(
+        slug="emoji", url="https://x/e", html="x", gold_fields={}, vendor="x"
+    )
+    plain_page = bo.CorpusPage(
+        slug="plain", url="https://x/p", html="x", gold_fields={}, vendor="x"
+    )
+    kwargs: dict[str, float] = {
+        "extraction_timeout_s": bo.BAKEOFF_EXTRACTION_TIMEOUT_S,
+        "parse_timeout_s": bo._DEFAULT_FETCH_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
+    }
+    emoji_reserve = await bo._page_cost_reserve(emoji_page, price, **kwargs)  # pyright: ignore[reportPrivateUsage]
+    plain_reserve = await bo._page_cost_reserve(plain_page, price, **kwargs)  # pyright: ignore[reportPrivateUsage]
+    assert emoji_reserve > plain_reserve  # same code-point count, more BYTES
 
 
 def test_charge_ledger_total_usd_sums_priced_entries_and_reloads(tmp_path: Path) -> None:
@@ -1532,9 +1653,10 @@ def test_charge_ledger_skips_a_blank_line_on_load(tmp_path: Path) -> None:
         "priced_usd": 0.01,
         "timed_out": False,
         "reserve_applied": False,
+        "fingerprint": "fp-a",
     }
     path.write_text(json.dumps(entry) + "\n\n")  # a trailing blank line
-    ledger = bo.ChargeLedger(path)
+    ledger = bo.ChargeLedger(path, fingerprint="fp-a")
     assert len(ledger.entries) == 1
     assert ledger.total_usd() == pytest.approx(0.01)
 
@@ -1575,6 +1697,41 @@ def test_charge_ledger_resume_preserves_prior_charges(tmp_path: Path) -> None:
     resumed = bo.ChargeLedger(path, resume=True)
     assert resumed.total_usd() == pytest.approx(0.05)
     assert len(resumed.entries) == 1
+
+
+def test_charge_ledger_scopes_total_usd_to_the_current_fingerprint(tmp_path: Path) -> None:
+    """#601 fold round 3, FOLD 4: a fingerprint change (corpus/pipeline/
+    environment) starts a fresh budget -- ``total_usd()`` counts ONLY the
+    CURRENT lineage's entries, but the file (``entries``) retains every
+    lineage EVER written -- an append-only money-history audit trail, never
+    wiped on a fingerprint change (only ``resume=False`` wipes it)."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    old_lineage = bo.ChargeLedger(path, fingerprint="fp-old")
+    old_lineage.append(_seeded_ledger_entry())  # $0.05 under "fp-old"
+
+    new_lineage = bo.ChargeLedger(path, fingerprint="fp-new")
+    assert new_lineage.total_usd() == pytest.approx(0.0)  # a fresh budget
+    new_lineage.append(_seeded_ledger_entry())  # $0.05 under "fp-new"
+    assert new_lineage.total_usd() == pytest.approx(0.05)  # only ITS lineage
+
+    reloaded = bo.ChargeLedger(path, fingerprint="fp-new")
+    assert len(reloaded.entries) == 2  # BOTH lineages still on disk
+    assert reloaded.total_usd() == pytest.approx(0.05)  # still scoped to fp-new
+
+
+def test_charge_ledger_excludes_a_legacy_entry_with_no_fingerprint(tmp_path: Path) -> None:
+    """#601 fold round 3, FOLD 4: a pre-fold ledger entry with NO persisted
+    ``fingerprint`` key is treated as non-matching -- excluded from the meter
+    regardless of the CURRENT fingerprint (fail-closed, never silently
+    trusted) -- but stays visible in ``entries`` (the audit trail)."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    legacy_record = dataclasses.asdict(_seeded_ledger_entry())
+    del legacy_record["fingerprint"]  # a genuinely pre-fold-4 on-disk record
+    path.write_text(json.dumps(legacy_record) + "\n")
+
+    ledger = bo.ChargeLedger(path, fingerprint="")  # even the disabled-guard default
+    assert len(ledger.entries) == 1
+    assert ledger.total_usd() == pytest.approx(0.0)  # never silently trusted
 
 
 def test_load_dotenv_key(tmp_path: Path) -> None:
