@@ -1006,6 +1006,32 @@ async def test_run_model_over_corpus_counts_recovered_violations_on_a_failed_pag
     assert page.recovered_violations == 1  # the retry still counts
 
 
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_ledgers_every_page(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """When given ``roster_price`` + a :class:`bo.ChargeLedger`, ONE entry is
+    written per page from the page's OWN captured diagnostics (#601 fold round 1,
+    slice A) -- :class:`bo.PageResult` carries none of this, the ledger is the
+    token/spend store of record. No breaker exists this slice, so the FULL corpus
+    always completes."""
+    model = _model_returning({"name": "X", "country": "Ecuador"})
+    price = bo.RosterModel("m1", 2.0, 4.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    run = await bo.run_model_over_corpus(
+        corpus,
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=model,
+        roster_price=price,
+        ledger=ledger,
+    )
+    assert len(run.pages) == len(corpus)
+    assert {e.slug for e in ledger.entries} == {p.slug for p in corpus}
+    assert all(e.arm == "m1" for e in ledger.entries)
+    assert ledger.total_usd() > 0.0
+
+
 def test_run_json_roundtrips_elapsed_s() -> None:
     page = bo.PageResult(
         slug="p", outcomes={"origin": bo.Outcome.COR}, error=None, on_page_fields=1, elapsed_s=4.2
@@ -1335,6 +1361,114 @@ def test_estimate_cost_for_arms_light_multiplies_output_tokens(
     )
     assert light_est.input_tokens == off_est.input_tokens
     assert light_est.usd > off_est.usd
+
+
+def test_raw_priced_cost_prices_captured_tokens() -> None:
+    """Priced cost multiplies captured tokens by roster list price (#601 fold
+    round 1, slice A) -- synthetic diagnostics, no live provider call needed."""
+    price = bo.RosterModel("m1", 2.0, 4.0, "x")  # $2/mtok in, $4/mtok out
+    # $2*1 + $4*0.5 = $4.
+    assert bo._raw_priced_cost(1_000_000, 500_000, price) == pytest.approx(4.0)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_actual_page_cost_applies_timeout_reserve_floor() -> None:
+    """A timed-out page's usage can be unreported, so it is charged at
+    ``max(priced, per_page_reserve)`` -- never the (possibly zero) priced amount
+    alone; a non-timed-out page is NEVER floored, even below the reserve."""
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    floored = bo._actual_page_cost(  # pyright: ignore[reportPrivateUsage]
+        0, 0, price, per_page_reserve=0.01, timed_out=True
+    )
+    assert floored == pytest.approx(0.01)
+
+    not_floored = bo._actual_page_cost(  # pyright: ignore[reportPrivateUsage]
+        1, 1, price, per_page_reserve=0.01, timed_out=False
+    )
+    assert not_floored < 0.01  # NOT floored -- the reserve only applies to timed-out pages
+
+
+def test_page_cost_reserve_scales_with_page_length() -> None:
+    """The timeout-reserve floor is sized to THIS page's own prompt length (#601 fold
+    round 1, slice A) -- a long page's reserve must exceed a short page's, not a
+    corpus-wide average that under-charges a long page's timeout."""
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    short_page = bo.CorpusPage(
+        slug="short", url="https://example.com/short", html="<p>Hi.</p>", gold_fields={}, vendor="x"
+    )
+    long_page = bo.CorpusPage(
+        slug="long",
+        url="https://example.com/long",
+        html="<p>" + ("Ethiopian washed heirloom single origin. " * 500) + "</p>",
+        gold_fields={},
+        vendor="x",
+    )
+    output_tokens = bo._OUTPUT_TOKENS_PER_PAGE  # pyright: ignore[reportPrivateUsage]
+    short_reserve = bo._page_cost_reserve(short_page, price, output_tokens)  # pyright: ignore[reportPrivateUsage]
+    long_reserve = bo._page_cost_reserve(long_page, price, output_tokens)  # pyright: ignore[reportPrivateUsage]
+    assert long_reserve > short_reserve
+
+
+def test_output_tokens_per_page_for_arm_multiplies_for_light() -> None:
+    off_arm = bo.Arm(model_slug="m1", reasoning="off", label="m1+reasoning-off")
+    light_arm = bo.Arm(model_slug="m1", reasoning="light", label="m1+reasoning-light")
+    off_tokens = bo._output_tokens_per_page_for_arm(off_arm)  # pyright: ignore[reportPrivateUsage]
+    light_tokens = bo._output_tokens_per_page_for_arm(light_arm)  # pyright: ignore[reportPrivateUsage]
+    assert off_tokens == bo._OUTPUT_TOKENS_PER_PAGE  # pyright: ignore[reportPrivateUsage]
+    assert light_tokens > off_tokens
+
+
+def test_charge_ledger_total_usd_sums_priced_entries_and_reloads(tmp_path: Path) -> None:
+    """The persistent :class:`bo.ChargeLedger` (#601 fold round 1, slice A) rolls up
+    every entry's already-priced ``priced_usd`` -- synthetic entries, no live
+    provider call needed -- and a fresh instance over the SAME path reloads every
+    entry from disk (this is exactly how a resumed invocation will reconstruct
+    spend, once a follow-on slice adds a spend guard that reads it)."""
+    path = bo.ledger_path(tmp_path / "o.json")
+    ledger = bo.ChargeLedger(path)
+    ledger.append(
+        bo.LedgerEntry(
+            arm="m1",
+            slug="a",
+            request_tokens=1_000_000,
+            response_tokens=500_000,
+            priced_usd=4.0,
+            timed_out=False,
+            reserve_applied=False,
+        )
+    )
+    ledger.append(
+        bo.LedgerEntry(
+            arm="m2",
+            slug="a",
+            request_tokens=1,
+            response_tokens=1,
+            priced_usd=0.0001,
+            timed_out=False,
+            reserve_applied=False,
+        )
+    )
+    assert ledger.total_usd() == pytest.approx(4.0001)
+    reloaded = bo.ChargeLedger(path)
+    assert reloaded.total_usd() == pytest.approx(4.0001)
+
+
+def test_charge_ledger_skips_a_blank_line_on_load(tmp_path: Path) -> None:
+    """A stray blank line in the ledger JSONL (a manual edit, or a partial write) is
+    skipped on load, mirroring :class:`bo.Checkpoint`'s tolerance."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    entry = {
+        "arm": "m1",
+        "slug": "a",
+        "request_tokens": 1,
+        "response_tokens": 1,
+        "priced_usd": 0.01,
+        "timed_out": False,
+        "reserve_applied": False,
+    }
+    path.write_text(json.dumps(entry) + "\n\n")  # a trailing blank line
+    ledger = bo.ChargeLedger(path)
+    assert len(ledger.entries) == 1
+    assert ledger.total_usd() == pytest.approx(0.01)
 
 
 def test_load_dotenv_key(tmp_path: Path) -> None:
@@ -2064,6 +2198,7 @@ async def test_run_bakeoff_budget_stop_makes_no_calls(
         resume=False,
         max_spend=0.0,  # first model's estimate > 0 -> stop before any (paid) call
         cost_estimates=estimates,
+        roster=roster,
     )
     assert result.runs == []
     assert result.stopped_early is True
@@ -2087,6 +2222,7 @@ async def test_run_bakeoff_resumes_without_calls(
         resume=True,
         max_spend=1000.0,
         cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 0.1, 0.1, "x")]),
+        roster=[bo.RosterModel("m1", 0.1, 0.1, "x")],
     )
     assert [r.model_slug for r in result.runs] == ["m1"]
     assert result.stopped_early is False
@@ -2131,6 +2267,7 @@ async def test_run_bakeoff_threads_the_correct_reasoning_effort_per_arm(
         resume=True,
         max_spend=1000.0,
         cost_estimates=bo.estimate_cost_for_arms(corpus, arms, roster),
+        roster=roster,
     )
     assert len(captured) == 2 * len(corpus)  # "off" arm's pages, then "light" arm's
     assert set(captured[: len(corpus)]) == {"off"}
@@ -2154,6 +2291,7 @@ async def test_run_bakeoff_both_arms_checkpoint_under_distinct_labels(
         resume=True,
         max_spend=1000.0,
         cost_estimates=bo.estimate_cost_for_arms(corpus, arms, roster),
+        roster=roster,
         model=_model_returning({"name": "X", "country": "Ecuador"}),
     )
     assert {r.model_slug for r in result.runs} == {"m1+reasoning-off", "m1+reasoning-light"}
@@ -2185,6 +2323,7 @@ async def test_run_bakeoff_resume_distinguishes_arms(
         resume=True,
         max_spend=1000.0,
         cost_estimates=bo.estimate_cost_for_arms(corpus, arms, roster),
+        roster=roster,
         model=_model_returning({"name": "X", "country": "Ecuador"}),
     )
     assert {r.model_slug for r in result.runs} == {"m1+reasoning-off", "m1+reasoning-light"}
@@ -2343,6 +2482,7 @@ async def test_run_bakeoff_pipeline_change_invalidates_resume(
         resume=True,
         max_spend=1000.0,
         cost_estimates=bo.estimate_cost(corpus, roster),
+        roster=roster,
         model=model,
     )
     assert first.executed_slugs == ["m1"]
@@ -2357,6 +2497,7 @@ async def test_run_bakeoff_pipeline_change_invalidates_resume(
         resume=True,
         max_spend=1000.0,
         cost_estimates=bo.estimate_cost(corpus, roster),
+        roster=roster,
         model=model,
     )
     assert second.executed_slugs == ["m1"]
@@ -2381,6 +2522,7 @@ async def test_run_bakeoff_stale_fingerprint_is_not_resumed(
         resume=True,
         max_spend=0.0,
         cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 1.0, 1.0, "x")]),
+        roster=[bo.RosterModel("m1", 1.0, 1.0, "x")],
     )
     assert result.runs == []
     assert result.stopped_early is True
@@ -2406,6 +2548,7 @@ async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
         resume=True,
         max_spend=1000.0,
         cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 0.1, 0.1, "x")]),
+        roster=[bo.RosterModel("m1", 0.1, 0.1, "x")],
         model=_model_provider_error(),
     )
     assert result.runs == []
@@ -2435,6 +2578,7 @@ async def test_run_bakeoff_all_schema_failure_run_is_checkpointed_and_scored(
         resume=True,
         max_spend=1000.0,
         cost_estimates=bo.estimate_cost(corpus, roster),
+        roster=roster,
         model=_model_text_only(),
     )
     assert result.failed_slugs == []
@@ -2463,6 +2607,7 @@ async def test_run_bakeoff_all_schema_failure_arm_appears_in_reasoning_compariso
         resume=True,
         max_spend=1000.0,
         cost_estimates=bo.estimate_cost_for_arms(corpus, arms, roster),
+        roster=roster,
         model=_model_text_only(),  # both arms all-schema-failure
     )
     assert {r.model_slug for r in result.runs} == {"m1+reasoning-off", "m1+reasoning-light"}
@@ -2495,6 +2640,7 @@ async def test_run_bakeoff_mixed_failure_run_is_dropped_with_counts_preserved(
         resume=True,
         max_spend=1000.0,
         cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 0.1, 0.1, "x")]),
+        roster=[bo.RosterModel("m1", 0.1, 0.1, "x")],
         model=FunctionModel(respond),
     )
     assert result.runs == []
@@ -2518,6 +2664,7 @@ async def test_run_bakeoff_mixed_failure_run_is_dropped_with_counts_preserved(
         resume=True,
         max_spend=1000.0,
         cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 0.1, 0.1, "x")]),
+        roster=[bo.RosterModel("m1", 0.1, 0.1, "x")],
         model=FunctionModel(respond),
     )
     assert resumed.executed_slugs == ["m1"]
@@ -2549,6 +2696,7 @@ async def test_run_bakeoff_resumed_success_does_not_flip_the_heuristic_label(
         cost_estimates=bo.estimate_cost(
             corpus, [bo.RosterModel("good", 0.1, 0.1, "x"), bo.RosterModel("bad", 0.1, 0.1, "x")]
         ),
+        roster=[bo.RosterModel("good", 0.1, 0.1, "x"), bo.RosterModel("bad", 0.1, 0.1, "x")],
         model=_model_provider_error(),  # only applies to "bad" -- "good" resumes
     )
     assert {r.model_slug for r in result.runs} == {"good"}  # "bad" NOT scored
@@ -2605,6 +2753,7 @@ async def test_run_bakeoff_never_checkpoints_a_wholly_failed_run_even_with_a_fre
         resume=True,
         max_spend=1000.0,
         cost_estimates=estimates,
+        roster=roster,
         model=_model_switch_after(len(corpus), fail_first=False),  # "a" succeeds, "b" fails
     )
     assert {r.model_slug for r in result.runs} == {"a"}  # the success IS scored, unaffected
@@ -2623,6 +2772,7 @@ async def test_run_bakeoff_never_checkpoints_a_wholly_failed_run_even_with_a_fre
         resume=True,
         max_spend=1000.0,
         cost_estimates=estimates,
+        roster=roster,
         model=_model_text_only(),
     )
     assert resumed.executed_slugs == ["b"]  # "a" resumed (no new call), "b" retried
@@ -2695,6 +2845,7 @@ async def test_run_bakeoff_checkpoints_a_successful_run(
         resume=True,
         max_spend=1000.0,
         cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 0.1, 0.1, "x")]),
+        roster=[bo.RosterModel("m1", 0.1, 0.1, "x")],
         model=model,
     )
     assert result.stopped_early is False

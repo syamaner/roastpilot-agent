@@ -231,6 +231,12 @@ class RosterModel:
 #: (the extraction-owning config, #590 slice A) and make_advisor_config.
 BAKEOFF_EXTRACTION_TIMEOUT_S: float = 45.0
 
+#: The extraction instructions + schema, roughly (shared by :func:`estimate_cost` and
+#: the per-page :func:`_page_cost_reserve`, #601 fold round 1 slice A). Defined this
+#: early since :func:`run_model_over_corpus` uses the pair as default values.
+_INSTRUCTION_OVERHEAD_CHARS = 1600
+_OUTPUT_TOKENS_PER_PAGE = 220  #: A small flat ``BeanProfileDraft`` record.
+
 #: Reasoning classification evidence (#601 FA/F7/F8, "mandatory" ONLY for a
 #: CONFIRMED off-rejecting endpoint): gpt-5-mini is HTTP-400-on-disable per
 #: docs/advisor-bakeoff-2026-06-08.md:279-291 -> "mandatory". gpt-5-nano's only
@@ -1365,18 +1371,30 @@ async def run_model_over_corpus(
     model: Model | None = None,
     sourcing_config: BeanSourcingConfig | None = None,
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
+    roster_price: RosterModel | None = None,
+    ledger: ChargeLedger | None = None,
+    output_tokens_per_page: int = _OUTPUT_TOKENS_PER_PAGE,
 ) -> ModelRun:
     """Draft + score every page for one model.
 
     Args:
         pages: The corpus.
         model_slug: The run's report label (an :attr:`Arm.label`, not necessarily the
-            bare provider slug -- see :func:`expand_arms`).
+            bare provider slug -- see :func:`expand_arms`); also the ledger's ``arm``
+            key (#601 fold round 1, slice A).
         advisor_config: The provider/key/model config.
         model: An injected ``Model`` (self-test); ``None`` = a real paid call.
         sourcing_config: Fetch/extraction-limit config (#590 slice A).
         reasoning_effort: Threaded to :func:`draft_for_page` per page (#601); ``None``
             omits the setting.
+        roster_price: This arm's model price (#601 fold round 1, slice A); ``None``
+            disables ledger writes entirely (existing/test callers unaffected).
+        ledger: The invocation's :class:`ChargeLedger`; when given alongside
+            ``roster_price``, ONE entry is written per page THE INSTANT its call
+            completes, from the page's OWN captured diagnostics -- the ledger is the
+            token/spend store of record, :class:`PageResult` carries none of this.
+        output_tokens_per_page: This arm's conservative per-page output-token
+            estimate, sizing :func:`_page_cost_reserve`'s timeout-reserve floor.
 
     Returns:
         The :class:`ModelRun`.
@@ -1410,6 +1428,30 @@ async def run_model_over_corpus(
                 recovered_violations=diagnostics.schema_retries,
             )
         )
+        if roster_price is not None and ledger is not None:
+            timed_out = diagnostics.timed_out_runs > 0
+            reserve = _page_cost_reserve(page, roster_price, output_tokens_per_page)
+            priced = _actual_page_cost(
+                diagnostics.request_tokens,
+                diagnostics.response_tokens,
+                roster_price,
+                reserve,
+                timed_out=timed_out,
+            )
+            raw = _raw_priced_cost(
+                diagnostics.request_tokens, diagnostics.response_tokens, roster_price
+            )
+            ledger.append(
+                LedgerEntry(
+                    arm=model_slug,
+                    slug=page.slug,
+                    request_tokens=diagnostics.request_tokens,
+                    response_tokens=diagnostics.response_tokens,
+                    priced_usd=round(priced, 5),
+                    timed_out=timed_out,
+                    reserve_applied=timed_out and reserve > raw,
+                )
+            )
     return ModelRun(model_slug=model_slug, pages=results)
 
 
@@ -2061,12 +2103,10 @@ def estimate_cost(
     Returns:
         One :class:`ModelCostEstimate` per roster model.
     """
-    instruction_overhead_chars = 1600  # the extraction instructions + schema, roughly
-    output_tokens_per_page = 220  # a small flat BeanProfileDraft record
     input_tokens = sum(
-        (len(_extract_prompt_text(page)) + instruction_overhead_chars) // 4 for page in pages
+        (len(_extract_prompt_text(page)) + _INSTRUCTION_OVERHEAD_CHARS) // 4 for page in pages
     )
-    output_tokens = output_tokens_per_page * len(pages)
+    output_tokens = _OUTPUT_TOKENS_PER_PAGE * len(pages)
     estimates: list[ModelCostEstimate] = []
     for entry in roster:
         usd = (
@@ -2133,6 +2173,69 @@ def estimate_cost_for_arms(
             )
         )
     return estimates
+
+
+def _output_tokens_per_page_for_arm(arm: Arm) -> int:
+    """This arm's conservative per-page output-token estimate (#601 fold round 1,
+    slice A), for :func:`_page_cost_reserve`'s timeout-reserve floor -- mirrors
+    :func:`estimate_cost_for_arms`'s "light" multiplier so the runtime reserve and
+    the pre-run estimate agree."""
+    if arm.reasoning == "light":
+        return round(_OUTPUT_TOKENS_PER_PAGE * LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER)
+    return _OUTPUT_TOKENS_PER_PAGE
+
+
+def _page_cost_reserve(page: CorpusPage, price: RosterModel, output_tokens_per_page: int) -> float:
+    """THIS page's conservative chars/4 estimated cost (#601 fold round 1, slice A) --
+    sized to the PAGE's own prompt length, not a corpus-wide average, so a long
+    page's timeout-reserve floor exceeds a short page's.
+
+    Args:
+        page: The corpus page (its extracted prompt text drives the input estimate).
+        price: The arm's model pricing.
+        output_tokens_per_page: The arm's conservative per-page output-token
+            estimate (a "light" reasoning arm multiplies this before calling in).
+
+    Returns:
+        The page's chars/4-heuristic estimated USD cost.
+    """
+    input_tokens = (len(_extract_prompt_text(page)) + _INSTRUCTION_OVERHEAD_CHARS) // 4
+    return (
+        input_tokens / 1_000_000 * price.price_in_per_mtok
+        + output_tokens_per_page / 1_000_000 * price.price_out_per_mtok
+    )
+
+
+def _raw_priced_cost(request_tokens: int, response_tokens: int, price: RosterModel) -> float:
+    """Priced cost from captured tokens, with NO timeout-reserve floor (#601 fold
+    round 1, slice A) -- what :func:`_actual_page_cost`'s floor compares against,
+    and what ``LedgerEntry.reserve_applied`` reports on. Takes raw token counts, not
+    a :class:`PageResult` -- the ledger is the token/spend store of record."""
+    return (
+        request_tokens / 1_000_000 * price.price_in_per_mtok
+        + response_tokens / 1_000_000 * price.price_out_per_mtok
+    )
+
+
+def _actual_page_cost(
+    request_tokens: int,
+    response_tokens: int,
+    price: RosterModel,
+    per_page_reserve: float,
+    *,
+    timed_out: bool,
+) -> float:
+    """A page's usage-priced (list-price) cost from its captured tokens (#601 fold
+    round 1, slice A).
+
+    A TIMED-OUT page's usage can be partly or wholly UNREPORTED -- the provider may
+    have accepted+billed a request our outer timeout cancelled before any response,
+    so its priced (possibly zero) tokens must never be treated as the true cost.
+    Charged at ``max(priced, per_page_reserve)`` instead -- THIS page's own
+    :func:`_page_cost_reserve`, never zero.
+    """
+    priced = _raw_priced_cost(request_tokens, response_tokens, price)
+    return max(priced, per_page_reserve) if timed_out else priced
 
 
 def resolve_roster_for_slugs(model_slugs: Sequence[str]) -> list[RosterModel]:
@@ -2445,11 +2548,12 @@ def render_report(
     lines.append(
         "Token counts use a chars/4 heuristic over the extractor's ACTUAL post-strip "
         "prompt text; prompt caching on the stable schema/instructions makes the real "
-        "cost lower. This harness has NO live token-usage/billing readback, so EVERY USD "
-        "figure above -- including a model marked 'spend incurred (est.)' -- is still this "
-        "harness's pre-call ESTIMATE, never a verified OpenRouter billing amount: actual "
-        "output/reasoning tokens, retries, and prompt caching can all make the real charge "
-        "differ. A self-consistency vote (sample 3-5x) or a two-pass entailment judge would "
+        "cost lower. EVERY USD figure above -- including a model marked 'spend incurred "
+        "(est.)' -- is still this harness's pre-call ESTIMATE, never a verified OpenRouter "
+        "billing amount: actual output/reasoning tokens, retries, and prompt caching can "
+        "all make the real charge differ. (This harness DOES now capture real per-page "
+        "usage internally, #601 fold round 1 -- not yet surfaced in this table.) A "
+        "self-consistency vote (sample 3-5x) or a two-pass entailment judge would "
         "multiply these figures accordingly."
     )
     lines.append("")
@@ -2722,6 +2826,89 @@ class Checkpoint:
         self._records[str(record["model_slug"])] = record
 
 
+def ledger_path(out: Path) -> Path:
+    """The append-only per-PAGE-CALL :class:`ChargeLedger` sidecar next to ``--out``
+    (#601 fold round 1, slice A) -- independent of the per-model :class:`Checkpoint`.
+    """
+    return out.with_name(out.name + ".ledger.jsonl")
+
+
+@dataclass(frozen=True)
+class LedgerEntry:
+    """One page call's real charge, independent of its later scored outcome.
+
+    Attributes:
+        arm: The study arm's report label (:attr:`Arm.label`).
+        slug: The page slug.
+        request_tokens: Captured input/prompt tokens.
+        response_tokens: Captured output/completion tokens.
+        priced_usd: The page's usage-priced (list-price) cost, past the
+            timeout-reserve floor (see :func:`_actual_page_cost`).
+        timed_out: Whether the outer extraction timeout cancelled this call.
+        reserve_applied: Whether the reserve floor (not raw priced tokens)
+            determined ``priced_usd``.
+    """
+
+    arm: str
+    slug: str
+    request_tokens: int
+    response_tokens: int
+    priced_usd: float
+    timed_out: bool
+    reserve_applied: bool
+
+
+class ChargeLedger:
+    """Append-only, whole-invocation-LINEAGE record of every priced page call
+    (#601 fold round 1, slice A) -- independent of :class:`Checkpoint`. A page's
+    charge is recorded the INSTANT its call completes, before any
+    scoring/checkpoint decision, so a mid-arm trip, whole failure, or dropped
+    mixed-failure arm all leave real spend on the books. THIS SLICE writes every
+    entry but nothing yet enforces against it -- no spend guard reads it back
+    (a follow-on slice adds one). No fingerprint filtering.
+    """
+
+    def __init__(self, path: Path) -> None:
+        """Load every existing entry (if any) from ``path``, reusing
+        :func:`_load_checkpoint_lines`'s truncation-safe JSONL parser.
+
+        Args:
+            path: The ledger JSONL path (see :func:`ledger_path`).
+        """
+        self.path = path
+        self._entries: list[LedgerEntry] = []
+        if path.exists():
+            for record in _load_checkpoint_lines(path):
+                self._entries.append(
+                    LedgerEntry(
+                        arm=str(record["arm"]),
+                        slug=str(record["slug"]),
+                        request_tokens=int(record["request_tokens"]),
+                        response_tokens=int(record["response_tokens"]),
+                        priced_usd=float(record["priced_usd"]),
+                        timed_out=bool(record["timed_out"]),
+                        reserve_applied=bool(record["reserve_applied"]),
+                    )
+                )
+
+    @property
+    def entries(self) -> list[LedgerEntry]:
+        """Every entry loaded or appended so far, in file order."""
+        return list(self._entries)
+
+    def total_usd(self) -> float:
+        """Cumulative charged spend across EVERY entry ever written."""
+        return round(sum(e.priced_usd for e in self._entries), 5)
+
+    def append(self, entry: LedgerEntry) -> None:
+        """Persist one page's real charge immediately (append-only, never rewritten)."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(dataclasses.asdict(entry)) + "\n")
+            handle.flush()
+        self._entries.append(entry)
+
+
 # --- .env key loading (the 401-shadowing ops gotcha) -------------------------
 
 
@@ -2892,6 +3079,7 @@ async def run_bakeoff(
     resume: bool,
     max_spend: float,
     cost_estimates: Sequence[ModelCostEstimate],
+    roster: Sequence[RosterModel],
     model: Model | None = None,
 ) -> BakeoffResult:
     """Run + checkpoint every arm over the corpus, under a spend guard.
@@ -2903,16 +3091,24 @@ async def run_bakeoff(
     retried on resume, but still counted against the spend guard. Every checkpoint/report
     identity is :attr:`Arm.label` (#601), so a model's several arms are tracked distinctly.
 
+    A persistent :class:`ChargeLedger` (#601 fold round 1, slice A) is ALSO opened and
+    threaded through, so every dollar is now durably recorded page-by-page -- but
+    nothing here reads it back yet, no spend guard enforces against it (a follow-on
+    slice adds one).
+
     Args:
         pages: The corpus.
         arms: The (model, reasoning) study arms to run (real, paid calls) -- see
             :func:`expand_arms`.
-        out: The JSON artifact path (anchors the checkpoint sidecar).
+        out: The JSON artifact path (anchors the checkpoint sidecar + the ledger, see
+            :func:`ledger_path`).
         resume: Skip arms already checkpointed.
         max_spend: USD budget; an arm is skipped once the running estimate
             would exceed it.
         cost_estimates: Per-arm cost estimates (the spend guard's basis), keyed by
             :attr:`Arm.label`.
+        roster: Priced roster the arms' model slugs resolve against (for the ledger's
+            usage pricing, #601 fold round 1, slice A).
         model: An injected ``Model`` (the self-test seam); ``None`` = a real
             paid call, threaded through to :func:`run_model_over_corpus`.
 
@@ -2920,8 +3116,10 @@ async def run_bakeoff(
         The :class:`BakeoffResult`.
     """
     cost_by_slug = {est.slug: est.usd for est in cost_estimates}
+    price_by_slug = {r.slug: r for r in roster}
     fingerprint = compute_fingerprint(pages)
     checkpoint = Checkpoint(sidecar_path(out), resume=resume, fingerprint=fingerprint)
+    ledger = ChargeLedger(ledger_path(out))
     runs: list[ModelRun] = []
     failed_runs: list[FailedRun] = []
     executed_slugs: list[str] = []
@@ -2954,6 +3152,9 @@ async def run_bakeoff(
             model=model,
             sourcing_config=make_sourcing_config(arm.model_slug),
             reasoning_effort=_REASONING_EFFORT_BY_ARM[arm.reasoning],
+            roster_price=price_by_slug[arm.model_slug],
+            ledger=ledger,
+            output_tokens_per_page=_output_tokens_per_page_for_arm(arm),
         )
         spent += upcoming
         executed_slugs.append(slug)  # a real call was attempted, win or lose
@@ -3160,6 +3361,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
         resume=not bool(args.no_resume),
         max_spend=float(cast("float", args.max_spend)),
         cost_estimates=cost_estimates,
+        roster=roster_for_cost,
     )
     report = render_report(
         result.runs,
