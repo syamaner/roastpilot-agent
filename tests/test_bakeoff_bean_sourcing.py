@@ -4052,6 +4052,65 @@ async def test_run_bakeoff_deferred_retry_still_loads_later_completed_checkpoint
 
 
 @pytest.mark.asyncio
+async def test_run_bakeoff_deferred_and_fresh_arms_both_unevaluated_around_a_completed_one(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-4: the sandwich scenario -- [deferred checkpointed arm,
+    fresh (never-checkpointed) arm, completed checkpointed arm], meter
+    already tripped. The completed arm still loads (loading is never
+    spend); BOTH the deferred retry arm AND the fresh arm land in
+    unevaluated_slugs (neither got a real call this invocation); exit 3."""
+    out = tmp_path / "o.json"
+    roster = [
+        bo.RosterModel("m1", 0.1, 0.1, "x"),
+        bo.RosterModel("m2", 0.1, 0.1, "x"),
+        bo.RosterModel("m3", 0.1, 0.1, "x"),
+    ]
+    # Setup covers ONLY m1 and m3 -- m2 is left genuinely FRESH (never
+    # checkpointed at all). ONE transient failure (the first call overall,
+    # m1's first page); every other call (the rest of m1, all of m3) succeeds.
+    setup_arms = bo.expand_arms(["m1", "m3"], "default")
+    setup_estimates = bo.estimate_cost_for_arms(corpus, setup_arms, roster)
+    await bo.run_bakeoff(
+        corpus,
+        setup_arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=setup_estimates,
+        roster=roster,
+        model=_model_fails_nth_call(1),
+    )
+    fingerprint = bo.compute_fingerprint(corpus)
+    total_charged = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint).total_usd()
+
+    def _never_called(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise AssertionError("no call should be made -- the meter is already tripped")
+
+    test_arms = bo.expand_arms(["m1", "m2", "m3"], "default")  # m1, m2, m3 IN ORDER
+    test_estimates = bo.estimate_cost_for_arms(corpus, test_arms, roster)
+    result = await bo.run_bakeoff(
+        corpus,
+        test_arms,
+        out=out,
+        resume=True,
+        max_spend=total_charged,  # already tripped from the very start
+        cost_estimates=test_estimates,
+        roster=roster,
+        model=FunctionModel(_never_called),
+    )
+    assert result.breaker_tripped is True
+    assert result.stopped_early is True
+    assert result.executed_slugs == []
+    assert {r.model_slug for r in result.runs} == {"m1", "m3"}  # m2 has no data at all
+    assert set(result.unevaluated_slugs) == {"m1", "m2"}  # BOTH deferred/fresh
+    m1_run = next(r for r in result.runs if r.model_slug == "m1")
+    assert bo._retryable_slugs(m1_run)  # pyright: ignore[reportPrivateUsage]  # still retryable
+    m3_run = next(r for r in result.runs if r.model_slug == "m3")
+    assert not bo._retryable_slugs(m3_run)  # pyright: ignore[reportPrivateUsage]  # complete
+
+
+@pytest.mark.asyncio
 async def test_run_bakeoff_persistent_failure_finalizes_after_max_residual_retries(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:

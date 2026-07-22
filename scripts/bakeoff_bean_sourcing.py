@@ -3736,20 +3736,24 @@ async def run_bakeoff(
     retry itself still defers to an already-tripped meter (real money), but
     skips the pre-run ESTIMATE guard (that guard's whole-arm basis does not
     scale to a handful of retried pages). A meter trip DURING or BEFORE a
-    residual retry (#652) DEFERS that arm's retry and keeps iterating in
-    LOAD-ONLY mode -- a later already-complete checkpoint still loads for
-    free, since loading is never spend; the honest breaker verdict
+    residual retry, OR before a fresh (never-checkpointed) arm even starts
+    (#652), DEFERS that arm and keeps iterating in LOAD-ONLY mode -- a later
+    already-complete checkpoint still loads for free, since loading is never
+    spend, regardless of what deferred before it; the honest breaker verdict
     (``breaker_tripped``, ``unevaluated_slugs``) is decided ONCE, when the
     loop finishes, from whatever genuinely needed spend but got none. The
     breaker fires only when work was ACTUALLY halted (retryable pages remain
     after a retry) -- a trip landing exactly on an arm's LAST retryable page
-    is a normal completion, never a false exit 3. Retry eligibility is also
-    BOUNDED (:data:`_MAX_RESIDUAL_RETRIES`, #652 FOLD 3): a page still
-    infra-failing after that many residual retries finalises as its error,
-    since transience is proven by success, never guessed from error text
-    (auth/invalid-model/context-length failures share the SAME provider-error
-    marker as a genuine transient outage) -- this bounds spend on any
-    permanent failure to a fixed number of extra paid attempts.
+    is a normal completion, never a false exit 3. A MID-ARM trip (a run cut
+    short mid-flight, genuinely incomplete) is the one case that still
+    returns immediately -- an incomplete corpus pass cannot meaningfully
+    "continue" the way a complete-but-retryable checkpoint can. Retry
+    eligibility is also BOUNDED (:data:`_MAX_RESIDUAL_RETRIES`, #652 FOLD 3):
+    a page still infra-failing after that many residual retries finalises as
+    its error, since transience is proven by success, never guessed from
+    error text (auth/invalid-model/context-length failures share the SAME
+    provider-error marker as a genuine transient outage) -- this bounds spend
+    on any permanent failure to a fixed number of extra paid attempts.
 
     Args:
         pages: The corpus.
@@ -3891,25 +3895,19 @@ async def run_bakeoff(
         # ESTIMATE guard -- a resumed, already-over-budget ledger (or a
         # final-page trip on the arm just completed) must always report
         # breaker_tripped=True/exit 3, never a false exit 0 from the
-        # estimate guard firing first on the same iteration.
+        # estimate guard firing first on the same iteration. #652 FOLD 4:
+        # unified with the retry paths' OWN deferral -- this FRESH (never
+        # checkpointed) arm joins deferred_slugs and the loop CONTINUES in
+        # load-only mode, so a LATER already-complete checkpointed arm still
+        # loads for free even after this one (never an immediate return).
         if meter.tripped:
+            deferred_slugs.append(slug)
             print(
-                f"[breaker] halting before {slug}: cumulative usage-priced spend "
-                f"${meter.charged:.4f} reached --max-spend ${max_spend:.2f}; "
-                f"{len(arms) - index} arm(s) skipped: "
-                f"{', '.join(a.label for a in arms[index:])}",
+                f"[breaker] deferring {slug}: cumulative usage-priced spend "
+                f"${meter.charged:.4f} reached --max-spend ${max_spend:.2f}",
                 flush=True,
             )
-            return BakeoffResult(
-                runs=runs,
-                stopped_early=True,
-                unevaluated_slugs=[a.label for a in arms[index:]],
-                failed_slugs=failed_runs,
-                executed_slugs=executed_slugs,
-                breaker_tripped=True,
-                actual_costs=_ledger_actual_costs(ledger),
-                reserved_costs=_ledger_reserved_costs(ledger),
-            )
+            continue
         upcoming = cost_by_slug.get(slug, 0.0)
         # #601 fold round 14: forecast off the METER's real cumulative
         # charge (includes RESUMED-ledger spend), not a per-invocation-zero
