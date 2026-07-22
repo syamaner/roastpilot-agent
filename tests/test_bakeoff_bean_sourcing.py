@@ -1233,6 +1233,18 @@ def test_model_roster_grok_is_unknown_not_mandatory() -> None:
     assert grok.reasoning == "unknown"
 
 
+def test_model_roster_nano_and_flash_lite_are_unknown_not_mandatory() -> None:
+    """gpt-5-nano's only citation is a default-effort TIMEOUT, not a disable
+    attempt, and gemini-3.1-flash-lite's confirmed HTTP-400 evidence belongs to a
+    DIFFERENT endpoint (gemini-3.5-flash) -- neither is CONFIRMED off-rejecting, so
+    both are "unknown" (#601 fold round 8), leaving gpt-5-mini the roster's only
+    "mandatory" entry."""
+    by_slug = {m.slug: m for m in bo.MODEL_ROSTER}
+    assert by_slug["openai/gpt-5-nano"].reasoning == "unknown"
+    assert by_slug["google/gemini-3.1-flash-lite"].reasoning == "unknown"
+    assert by_slug["openai/gpt-5-mini"].reasoning == "mandatory"
+
+
 def test_expand_arms_both_gates_arms_by_four_way_capability(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

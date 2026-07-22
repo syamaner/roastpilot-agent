@@ -87,9 +87,8 @@ reasoning barely helps extraction quality but sharply improves schema adherence 
 the cheapest models. Three DISTINCT arms (:data:`ReasoningArm`) -- "default"
 (provider default, possibly-high effort) is NOT "off" (true no-reasoning), so
 ``"both"`` expands to "off"+"light" only. Each arm is checkpointed/reported under
-its own :attr:`Arm.label`; :func:`render_report` adds a per-model off-vs-light
-section when both arms were scored. Arms are skipped, with a printed note, per a
-roster entry's :data:`RosterReasoningCapability` (FA/F7).
+its own :attr:`Arm.label`. Arms are skipped, with a printed note, per a roster
+entry's :data:`RosterReasoningCapability` (FA/F7/F8).
 
 **Ops gotcha -- a stale ``OPENROUTER_API_KEY`` shadows ``.env`` -> 401.** The
 advisor reads ``OPENROUTER_API_KEY`` from ``os.environ`` (via
@@ -232,17 +231,18 @@ class RosterModel:
 #: (the extraction-owning config, #590 slice A) and make_advisor_config.
 BAKEOFF_EXTRACTION_TIMEOUT_S: float = 45.0
 
-#: Reasoning classification evidence (#601 FA/F7): gpt-5-nano/gpt-5-mini/gemini-
-#: 3.1-flash-lite are "mandatory" (19 Jul bake-off timeout; gpt-5-mini/gemini-3.5-
-#: flash HTTP-400-on-disable in docs/advisor-bakeoff-2026-06-08.md). gpt-4o/
-#: gpt-4.1-mini are classic non-reasoning ("none"). gpt-5.6-luna/claude-haiku-4.5
-#: are "optional" (off-as-no-op is a genuine arm, both support real light/thinking,
-#: round 5 F1). grok-4.3 has NO verified evidence either way -> "unknown" (F3):
-#: "mandatory" is reserved for a CONFIRMED off-rejecting endpoint.
+#: Reasoning classification evidence (#601 FA/F7/F8, "mandatory" ONLY for a
+#: CONFIRMED off-rejecting endpoint): gpt-5-mini is HTTP-400-on-disable per
+#: docs/advisor-bakeoff-2026-06-08.md:279-291 -> "mandatory". gpt-5-nano's only
+#: citation is a default-effort TIMEOUT (19 Jul bake-off, not a disable attempt),
+#: and gemini-3.1-flash-lite's HTTP-400 evidence is for gemini-3.5-flash, a
+#: DIFFERENT endpoint -> both "unknown", like grok-4.3 (no evidence either way).
+#: gpt-4o/gpt-4.1-mini are classic non-reasoning ("none"). gpt-5.6-luna/claude-
+#: haiku-4.5 are "optional" (off-as-no-op is genuine, both support light/thinking).
 MODEL_ROSTER: tuple[RosterModel, ...] = (
-    RosterModel("openai/gpt-5-nano", 0.05, 0.40, "cheapest; beat this on price", "mandatory"),
+    RosterModel("openai/gpt-5-nano", 0.05, 0.40, "cheapest; beat this on price", "unknown"),
     RosterModel("x-ai/grok-4.3", 0.20, 0.50, "grok-4-fast dead (404); 4.3 live", "unknown"),
-    RosterModel("google/gemini-3.1-flash-lite", 0.25, 1.00, "beats gpt-5-mini 6/8", "mandatory"),
+    RosterModel("google/gemini-3.1-flash-lite", 0.25, 1.00, "beats gpt-5-mini 6/8", "unknown"),
     RosterModel("openai/gpt-5-mini", 0.25, 2.00, "ParseBench small-model reference", "mandatory"),
     RosterModel("openai/gpt-4.1-mini", 0.40, 1.60, "battle-tested strict-SO workhorse", "none"),
     RosterModel("anthropic/claude-haiku-4.5", 1.00, 5.00, "best at deciding not to emit"),
