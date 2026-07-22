@@ -6,9 +6,20 @@
  * agents (they always carry an active run), so this mirrors the `/__chart-harness`
  * + `/__detail-harness` route-harness convention.
  *
- * Two baselines:
- *   - start-roast            → the idle form with the saved-profile dropdown
- *   - start-roast-add-modal  → the add-profile modal open
+ * Three baselines:
+ *   - start-roast                       → the idle form with the saved-profile dropdown
+ *   - start-roast-add-modal             → the add-profile modal open (full page)
+ *   - start-roast-add-modal-draft-panel → JUST the draft-from-URL panel (#637), scoped
+ *     to its container locator rather than the full page. The full-page shot's 1%
+ *     `maxDiffPixelRatio` tolerance (tuned to absorb un-masked-canvas AA noise
+ *     elsewhere in the suite) is loose enough that this panel's dark-on-dark, modest
+ *     footprint can appear or vanish within budget without failing the full-page
+ *     comparison — confirmed empirically: adding the panel moved only ~1% of the
+ *     full-page pixels by pixelmatch's perceptual metric, right at the threshold. A
+ *     locator-scoped shot of a small region has no such headroom: if the panel
+ *     disappears, `toHaveScreenshot` on its locator fails outright (element not
+ *     found / zero-size) before any pixel math runs, so this closes that gap
+ *     without loosening or fighting the full-page tolerance.
  *
  * The data-assert layer (per D24) is the dropdown options + the fields filling from
  * a selected profile + the modal opening — asserted alongside the pixels so a
@@ -63,6 +74,24 @@ test("start-roast-add-modal — the add-profile modal open (full-page snapshot)"
   await page.evaluate(() => document.fonts.ready);
 
   await expect(page).toHaveScreenshot("start-roast-add-modal.png", { fullPage: true });
+});
+
+test("start-roast-add-modal — the draft-from-URL panel, scoped snapshot (#637)", async ({
+  page,
+}) => {
+  // A locator-scoped shot of just the draft-from-URL panel (#637): the full-page
+  // shot above budgets a 1% maxDiffPixelRatio (tuned for the un-masked canvas
+  // elsewhere in the suite), which is loose enough that this panel's addition can
+  // sit within tolerance and never fail the full-page comparison. Scoping to the
+  // panel's own locator removes that headroom — if the panel is missing entirely,
+  // `toHaveScreenshot` fails on the locator itself, not a diluted page-wide ratio.
+  await page.getByTestId("bean-profile-add-button").click();
+  const panel = page.getByTestId("bean-profile-draft-panel");
+  await expect(panel).toBeVisible();
+  await expect(page.getByTestId("bean-profile-draft-url")).toBeVisible();
+  await page.evaluate(() => document.fonts.ready);
+
+  await expect(panel).toHaveScreenshot("start-roast-add-modal-draft-panel.png");
 });
 
 test("the edit pencil opens the edit modal for the selected profile (data-assert)", async ({
