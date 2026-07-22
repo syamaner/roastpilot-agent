@@ -27,6 +27,7 @@ import pytest
 from pydantic_ai import ModelAPIError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.usage import RequestUsage
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -67,6 +68,26 @@ def _model_provider_error() -> FunctionModel:
     failure (#601 F1), unlike :func:`_model_text_only`'s schema failure."""
 
     def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise ModelAPIError("test-model", "simulated provider outage")
+
+    return FunctionModel(respond)
+
+
+def _model_retry_then_provider_error() -> FunctionModel:
+    """A double whose FIRST attempt is malformed (a real, billed response
+    with explicit usage -- a validation retry pydantic-ai recovers from),
+    then raises a genuine provider error on the retry itself (#601 fold
+    round 10, D amendment): captured usage IS present before an INFRA
+    failure, unlike :func:`_model_provider_error`'s zero-usage case."""
+    calls = {"n": 0}
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ModelResponse(
+                parts=[TextPart("no structured output")],
+                usage=RequestUsage(input_tokens=50, output_tokens=10),
+            )
         raise ModelAPIError("test-model", "simulated provider outage")
 
     return FunctionModel(respond)
@@ -1295,6 +1316,104 @@ async def test_run_model_over_corpus_final_entry_survives_a_scoring_raise(
     assert entry.request_tokens > 0  # the ACTUAL charge, not just the pending reserve
 
 
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_zero_usage_provider_error_charges_single_attempt_reserve(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 10, D amendment: with transport retries disabled, an
+    accepted-but-lost request now surfaces as a genuine PROVIDER error (never
+    a timeout) with ZERO captured usage -- the same unreported-attempt risk a
+    timeout already covers. The final entry must be charged at the
+    single-attempt reserve, not left at $0."""
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    run = await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=_model_provider_error(),
+        roster_price=price,
+        ledger=ledger,
+    )
+    assert run.pages[0].error is not None
+    pending, entry = ledger.entries
+    assert entry.request_tokens == 0
+    assert entry.response_tokens == 0
+    assert entry.reserve_applied is True
+    assert entry.timed_out is False  # a genuine provider error, never a wall-clock timeout
+    single_reserve = bo._single_attempt_reserve(corpus[0], price)  # pyright: ignore[reportPrivateUsage]
+    assert entry.priced_usd == pytest.approx(round(single_reserve, 5))
+    # The final entry's SINGLE-attempt reserve is smaller than the pending
+    # entry's FULL multi-attempt one -- different valuations by design (#601
+    # fold round 6, FOLD D), never expected to match.
+    assert entry.priced_usd < pending.priced_usd
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_provider_error_with_captured_usage_is_trusted_as_complete(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 10, D amendment: a provider-error page that DID
+    capture some usage (an earlier retry succeeded before the final attempt
+    failed) is trusted as complete -- charged at exactly the captured
+    tokens, no reserve added on top (unlike a timeout's cancelled-mid-flight
+    ambiguity, which always adds the reserve regardless of prior usage)."""
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    run = await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=_model_retry_then_provider_error(),
+        roster_price=price,
+        ledger=ledger,
+    )
+    assert run.pages[0].error is not None
+    _, entry = ledger.entries
+    assert entry.request_tokens > 0
+    assert entry.response_tokens > 0
+    assert entry.reserve_applied is False  # captured usage is trusted, no reserve added
+    assert entry.priced_usd == pytest.approx(
+        round(
+            bo._raw_priced_cost(  # pyright: ignore[reportPrivateUsage]
+                entry.request_tokens, entry.response_tokens, price
+            ),
+            5,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_schema_failure_never_gets_the_reserve(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 10, D amendment: a SCHEMA (malformed-shape) failure is
+    never treated as an unreported-usage risk -- it is a real, complete
+    exchange the model simply answered wrong, not a lost request. No reserve
+    on top, even with zero captured usage."""
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    run = await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=_model_text_only(),
+        roster_price=price,
+        ledger=ledger,
+    )
+    assert run.pages[0].error is not None
+    _, entry = ledger.entries
+    assert entry.reserve_applied is False
+    assert entry.priced_usd == pytest.approx(
+        round(
+            bo._raw_priced_cost(  # pyright: ignore[reportPrivateUsage]
+                entry.request_tokens, entry.response_tokens, price
+            ),
+            5,
+        )
+    )
+
+
 def test_run_json_roundtrips_elapsed_s() -> None:
     page = bo.PageResult(
         slug="p", outcomes={"origin": bo.Outcome.COR}, error=None, on_page_fields=1, elapsed_s=4.2
@@ -1635,19 +1754,20 @@ def test_raw_priced_cost_prices_captured_tokens() -> None:
 
 
 def test_actual_page_cost_applies_timeout_reserve_floor() -> None:
-    """A timed-out page's usage can be unreported, so it is charged at
-    ``max(priced, per_page_reserve)`` -- never the (possibly zero) priced amount
-    alone; a non-timed-out page is NEVER floored, even below the reserve."""
+    """A page whose reserve applies can have unreported usage, so it is charged
+    at ``max(priced, per_page_reserve)`` -- never the (possibly zero) priced
+    amount alone; a page the reserve does NOT apply to is NEVER floored, even
+    below the reserve."""
     price = bo.RosterModel("m1", 1.0, 1.0, "x")
     floored = bo._actual_page_cost(  # pyright: ignore[reportPrivateUsage]
-        0, 0, price, per_page_reserve=0.01, timed_out=True
+        0, 0, price, per_page_reserve=0.01, apply_reserve=True
     )
     assert floored == pytest.approx(0.01)
 
     not_floored = bo._actual_page_cost(  # pyright: ignore[reportPrivateUsage]
-        1, 1, price, per_page_reserve=0.01, timed_out=False
+        1, 1, price, per_page_reserve=0.01, apply_reserve=False
     )
-    assert not_floored < 0.01  # NOT floored -- the reserve only applies to timed-out pages
+    assert not_floored < 0.01  # NOT floored -- the reserve only applies when apply_reserve is set
 
 
 def test_page_cost_reserve_scales_with_page_length() -> None:
@@ -1803,12 +1923,12 @@ def test_actual_page_cost_final_timeout_uses_single_attempt_reserve_not_multi() 
     assert single_reserve < full_reserve  # strictly smaller (EXTRACTION_MAX_RETRIES >= 1)
 
     plain = bo._actual_page_cost(  # pyright: ignore[reportPrivateUsage]
-        0, 0, price, single_reserve, timed_out=True
+        0, 0, price, single_reserve, apply_reserve=True
     )
     assert plain == pytest.approx(single_reserve)
 
     retry_then_timeout = bo._actual_page_cost(  # pyright: ignore[reportPrivateUsage]
-        500, 100, price, single_reserve, timed_out=True
+        500, 100, price, single_reserve, apply_reserve=True
     )
     assert retry_then_timeout == pytest.approx(
         bo._raw_priced_cost(500, 100, price) + single_reserve  # pyright: ignore[reportPrivateUsage]
