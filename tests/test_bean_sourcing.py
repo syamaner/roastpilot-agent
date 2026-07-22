@@ -2409,6 +2409,45 @@ async def test_extract_bean_identity_timeout_uses_sourcing_config_not_advisor_co
 
 
 @pytest.mark.asyncio
+async def test_extract_bean_identity_flags_timed_out_runs() -> None:
+    """A run cancelled by the outer timeout must flag ``timed_out_runs`` -- its
+    token usage can be partly or wholly unreported (the provider may have
+    accepted+billed a request our ``asyncio.timeout`` cancelled before any
+    ``ModelResponse``), so spend enforcement must not treat it as free (#601)."""
+    diagnostics = bean_sourcing.BeanSourcingDiagnostics()
+    sourcing_config = BeanSourcingConfig(extraction_timeout_seconds=0.05)
+    with pytest.raises(BeanExtractionUnavailableError, match="deadline"):
+        await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+            "page text",
+            advisor_config=_ADVISOR_CONFIG,
+            sourcing_config=sourcing_config,
+            model=_function_model_hanging(),
+            diagnostics=diagnostics,
+        )
+    assert diagnostics.timed_out_runs == 1
+
+    # non-timeout failure paths must NOT flag it.
+    other_failure = bean_sourcing.BeanSourcingDiagnostics()
+    with pytest.raises(BeanExtractionUnavailableError, match="malformed"):
+        await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+            "page text",
+            advisor_config=_ADVISOR_CONFIG,
+            model=_function_model_text("here is some prose, not the tool call"),
+            diagnostics=other_failure,
+        )
+    assert other_failure.timed_out_runs == 0
+
+    # omitted accumulator is unaffected -- no crash, nothing to assert on.
+    with pytest.raises(BeanExtractionUnavailableError, match="deadline"):
+        await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+            "page text",
+            advisor_config=_ADVISOR_CONFIG,
+            sourcing_config=sourcing_config,
+            model=_function_model_hanging(),
+        )
+
+
+@pytest.mark.asyncio
 async def test_extract_bean_identity_default_timeout_ignores_short_advisor_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

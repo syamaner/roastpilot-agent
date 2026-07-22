@@ -2754,11 +2754,18 @@ class BeanSourcingDiagnostics:
             not just a successful one.
         response_tokens: Output/completion tokens, same accumulation semantics.
             Tokens only -- pricing is harness policy, not a runtime concern.
+        timed_out_runs: Runs cancelled by the outer timeout whose token usage is
+            partly or wholly unreported (the provider can accept+bill a request
+            our ``asyncio.timeout`` cancels before any ``ModelResponse``, so
+            ``request_tokens``/``response_tokens`` can legitimately be zero for
+            it) -- spend enforcement must charge these at a conservative
+            reserve, never zero.
     """
 
     schema_retries: int = 0
     request_tokens: int = 0
     response_tokens: int = 0
+    timed_out_runs: int = 0
 
 
 async def _extract_bean_identity(
@@ -2839,6 +2846,8 @@ async def _extract_bean_identity(
                 else await agent.run(page_text)
             )
     except TimeoutError as exc:
+        if diagnostics is not None:
+            diagnostics.timed_out_runs += 1
         raise BeanExtractionUnavailableError(
             f"bean identity extraction exceeded the {extraction_timeout_seconds:g}s deadline"
         ) from exc
