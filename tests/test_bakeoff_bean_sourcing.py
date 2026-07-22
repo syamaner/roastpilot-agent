@@ -1082,6 +1082,7 @@ async def test_draft_for_page_threads_the_enforced_cap_to_the_paid_call(
         reasoning_effort: object = None,
         diagnostics: object = None,
         max_output_tokens: object = None,
+        disable_transport_retries: object = None,
     ) -> BeanProfileDraft:
         captured.append(max_output_tokens)
         raise bo.BeanSourcingError("stub -- no real extraction needed for this guard")
@@ -1691,11 +1692,11 @@ def test_reserve_input_tokens_per_attempt_floors_at_the_markdown_cap() -> None:
 
 def test_page_cost_reserve_output_component_is_the_enforced_cap_times_retries() -> None:
     """The reserve's OUTPUT-token component equals the ENFORCED provider cap
-    times ``(1 + EXTRACTION_MAX_RETRIES) * (1 + _PROVIDER_TRANSPORT_RETRIES)``
-    (#601 fold round 4/7, FOLD 4 + FOLD 3), priced in full -- matching what
-    the provider can actually bill across a retrying, transport-retrying run,
-    not a generic physical decode-rate guess. Uniform across every arm/model
-    (isolated here via an output-only price)."""
+    times ``1 + EXTRACTION_MAX_RETRIES`` (#601 fold round 4/8, FOLD 4; the
+    transport-retry factor is GONE as of round 8 -- the bake-off's paid
+    calls disable SDK transport retries entirely, Refs slice E), priced in
+    full. Uniform across every arm/model (isolated here via an output-only
+    price)."""
     page = bo.CorpusPage(
         slug="p", url="https://example.com/p", html="<p>Hi.</p>", gold_fields={}, vendor="x"
     )
@@ -1705,19 +1706,18 @@ def test_page_cost_reserve_output_component_is_the_enforced_cap_times_retries() 
         page, output_only_price, max_output_tokens=cap
     )
     max_retries = bo._bean_sourcing_module.EXTRACTION_MAX_RETRIES  # pyright: ignore[reportPrivateUsage]
-    transport_retries = bo._PROVIDER_TRANSPORT_RETRIES  # pyright: ignore[reportPrivateUsage]
-    expected_output_tokens = cap * (1 + max_retries) * (1 + transport_retries)
+    expected_output_tokens = cap * (1 + max_retries)
     assert reserve == pytest.approx(expected_output_tokens / 1_000_000 * 1.0)
 
 
 def test_page_cost_reserve_input_component_accounts_for_retries() -> None:
-    """#601 fold round 6/7, FOLD B + FOLD 3: the reserve's INPUT component
-    accounts for EVERY validation attempt re-sending the prompt, plus each
-    RETRY additionally re-sending the prior response (up to the output cap)
-    and a small retry-prompt-wrapper overhead, all scaled by
-    ``1 + _PROVIDER_TRANSPORT_RETRIES`` (any validation attempt can ALSO
-    transport-retry) -- not a flat single-prompt bound (isolated here via an
-    input-only price)."""
+    """#601 fold round 6/8, FOLD B (revised round 8): the reserve's INPUT
+    component accounts for EVERY validation attempt re-sending the prompt,
+    plus each RETRY additionally re-sending the PRIOR RESPONSE (up to the
+    output cap) AND its own serialized validation-error copy of it
+    (``RetryPromptPart`` quotes the offending output back -- a SECOND
+    cap-sized term) plus a small fixed wrapper -- not a flat single-prompt
+    bound (isolated here via an input-only price)."""
     page = bo.CorpusPage(
         slug="p", url="https://example.com/p", html="<p>Hi.</p>", gold_fields={}, vendor="x"
     )
@@ -1728,11 +1728,62 @@ def test_page_cost_reserve_input_component_accounts_for_retries() -> None:
     )
     per_attempt = bo._reserve_input_tokens_per_attempt(page)  # pyright: ignore[reportPrivateUsage]
     max_retries = bo._bean_sourcing_module.EXTRACTION_MAX_RETRIES  # pyright: ignore[reportPrivateUsage]
-    retry_overhead = bo._RESERVE_RETRY_OVERHEAD_TOKENS  # pyright: ignore[reportPrivateUsage]
-    transport_retries = bo._PROVIDER_TRANSPORT_RETRIES  # pyright: ignore[reportPrivateUsage]
-    validation_tokens = (1 + max_retries) * per_attempt + max_retries * (cap + retry_overhead)
-    expected_input_tokens = validation_tokens * (1 + transport_retries)
+    wrapper_overhead = bo._RESERVE_RETRY_WRAPPER_TOKENS  # pyright: ignore[reportPrivateUsage]
+    expected_input_tokens = (1 + max_retries) * per_attempt + max_retries * (
+        2 * cap + wrapper_overhead
+    )
     assert reserve == pytest.approx(expected_input_tokens / 1_000_000 * 1.0)
+
+
+def test_page_cost_reserve_and_single_attempt_reserve_pinned_literal_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#601 qa pass, round 8: an INDEPENDENT, hand-computed literal check --
+    the other formula tests recombine the SAME constants production uses, so
+    a shared authoring misunderstanding could pass unnoticed. Pins every
+    input to a small fixed value and asserts an exact USD figure computed by
+    hand.
+
+    Fixed inputs: per-attempt input tokens = 50 (monkeypatched, bypassing the
+    byte/markdown-cap sub-formula -- already covered by its own dedicated
+    tests), output cap = 100, EXTRACTION_MAX_RETRIES = 1,
+    _RESERVE_RETRY_WRAPPER_TOKENS = 10, price = $1/mtok in, $2/mtok out.
+
+    _page_cost_reserve (2 total requests -- 1 initial + 1 retry):
+        input  = (1+1)*50 + 1*(2*100 + 10) = 100 + 210 = 310
+        output = 100 * (1+1) = 200
+        usd    = 310/1e6*1 + 200/1e6*2 = 0.00031 + 0.0004 = 0.00071
+
+    _single_attempt_reserve (the worst SINGLE attempt, a retry):
+        input  = 50 + 2*100 + 10 = 260
+        output = 100
+        usd    = 260/1e6*1 + 100/1e6*2 = 0.00026 + 0.0002 = 0.00046
+    """
+
+    def _fixed_per_attempt_input(page: bo.CorpusPage) -> int:
+        return 50
+
+    monkeypatch.setattr(bo, "_reserve_input_tokens_per_attempt", _fixed_per_attempt_input)
+    monkeypatch.setattr(
+        bo._bean_sourcing_module,  # pyright: ignore[reportPrivateUsage]
+        "EXTRACTION_MAX_RETRIES",
+        1,
+    )
+    monkeypatch.setattr(bo, "_RESERVE_RETRY_WRAPPER_TOKENS", 10)  # pyright: ignore[reportPrivateUsage]
+    page = bo.CorpusPage(
+        slug="p", url="https://example.com/p", html="<p>Hi.</p>", gold_fields={}, vendor="x"
+    )
+    price = bo.RosterModel("m1", 1.0, 2.0, "x")
+
+    full_reserve = bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
+        page, price, max_output_tokens=100
+    )
+    assert full_reserve == pytest.approx(0.00071)
+
+    single_reserve = bo._single_attempt_reserve(  # pyright: ignore[reportPrivateUsage]
+        page, price, max_output_tokens=100
+    )
+    assert single_reserve == pytest.approx(0.00046)
 
 
 def test_actual_page_cost_final_timeout_uses_single_attempt_reserve_not_multi() -> None:
@@ -2933,8 +2984,15 @@ async def test_run_bakeoff_refuses_a_foreign_fingerprint_ledger(
 
 def _page_covering_entries(arm: str, slugs: list[str]) -> list[bo.LedgerEntry]:
     """One synthetic FINAL ledger entry per ``slugs`` member, for seeding
-    page-level coverage fixtures (#601 fold round 5, D FOLD 3)."""
-    return [dataclasses.replace(_seeded_ledger_entry(), arm=arm, slug=slug) for slug in slugs]
+    page-level coverage fixtures (#601 fold round 5, D FOLD 3). Each gets its
+    OWN ``call_id`` (#601 qa pass, round 8) -- the shared default ``""``
+    would collide two entries under one key in
+    :meth:`bo.ChargeLedger._effective_entries` if a future call site ever
+    asserted ``total_usd()`` against these fixtures too."""
+    return [
+        dataclasses.replace(_seeded_ledger_entry(), arm=arm, slug=slug, call_id=slug)
+        for slug in slugs
+    ]
 
 
 @pytest.mark.asyncio
@@ -3077,6 +3135,7 @@ async def test_run_bakeoff_threads_the_correct_reasoning_effort_per_arm(
         reasoning_effort: object = None,
         diagnostics: object = None,
         max_output_tokens: object = None,
+        disable_transport_retries: object = None,
     ) -> BeanProfileDraft:
         captured.append(reasoning_effort)
         raise bo.BeanSourcingError("stub -- no real extraction needed for this guard")

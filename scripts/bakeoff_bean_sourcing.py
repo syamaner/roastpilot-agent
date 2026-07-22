@@ -143,10 +143,6 @@ from typing import Any, Literal, cast
 
 import httpx
 
-# #601 fold round 7, FOLD 3: the SDK's own transport-retry default, never
-# forked -- public API, verified against the installed 2.46.0 build.
-from openai import DEFAULT_MAX_RETRIES as _PROVIDER_TRANSPORT_RETRIES
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))  # editable-install fallback
 
 from pydantic_ai.models import Model  # noqa: E402
@@ -1331,6 +1327,10 @@ async def draft_for_page(
             reasoning_effort=reasoning_effort,
             diagnostics=diagnostics,
             max_output_tokens=max_output_tokens,
+            # #601 fold round 8: every bake-off call disables SDK transport
+            # retries (Refs slice E) -- the reserve no longer needs its own
+            # transport-retry factor, since none can happen.
+            disable_transport_retries=True,
         )
         return draft, None
     except BeanSourcingError as exc:
@@ -2291,25 +2291,19 @@ _RESERVE_INSTRUCTION_OVERHEAD_BYTES = (
 #: trafilatura (:func:`_reserve_prompt_text` still never touches it).
 _RESERVE_STRUCTURAL_INFLATION = 2
 
-#: A small, documented retry-prompt-wrapper overhead (#601 fold round 6, FOLD
-#: B) -- pydantic-ai's ``RetryPromptPart`` wraps a validation failure in a
-#: short, fixed "please fix this" instruction the model sees on every RETRY
-#: attempt (never the initial one). A flat token estimate, not modeled per
-#: schema -- the wrapper text is short and provider-independent.
-_RESERVE_RETRY_OVERHEAD_TOKENS = 200
+#: A small, fixed retry-prompt-WRAPPER overhead only (#601 fold round 8, FOLD
+#: 3 revision of fold 6 FOLD B) -- pydantic-ai's ``RetryPromptPart`` wraps a
+#: validation failure in a short, fixed "please fix this" instruction; the
+#: (much larger) serialized validation error, which quotes the offending
+#: output back, is priced separately as a SECOND ``max_output_tokens``-sized
+#: term (see :func:`_page_cost_reserve`) -- not folded into this constant.
+_RESERVE_RETRY_WRAPPER_TOKENS = 200
 
 #: Worst-case UTF-8 bytes/char (#601 fold round 7, FOLD 2) -- a code point can
 #: span up to 4 UTF-8 bytes; converts the runtime's CHARACTER-based
 #: extraction cap (below) into a worst-case BYTE floor (matches
 #: :data:`_RESERVE_BYTES_PER_TOKEN`'s own philosophy).
 _RESERVE_MAX_BYTES_PER_CHAR = 4
-
-#: The OpenAI SDK's transport-retry default (#601 fold round 7, FOLD 3,
-#: imported as ``_PROVIDER_TRANSPORT_RETRIES`` near the module top) -- an
-#: automatic HTTP-layer retry (a 5xx/timeout, independent of
-#: :data:`~roastpilot_agent.bean_sourcing.EXTRACTION_MAX_RETRIES`'s
-#: validation retries) can re-send an already-billed request. Reserve-side
-#: ONLY -- never touches ``advisor.build_model()``, shared with roast advice.
 
 
 def _reserve_prompt_text(page: CorpusPage) -> str:
@@ -2362,18 +2356,23 @@ def _page_cost_reserve(
     page: CorpusPage, price: RosterModel, *, max_output_tokens: int = BAKEOFF_MAX_OUTPUT_TOKENS
 ) -> float:
     """THIS page's PHYSICALLY-BOUNDED, WORST-CASE, MULTI-ATTEMPT timeout-reserve
-    floor (#601 fold rounds 1-7) -- for the PENDING entry, before anything is
+    floor (#601 fold rounds 1-8) -- for the PENDING entry, before anything is
     known about how many attempts will occur.
 
-    Total worst-case REQUEST count (FOLD 3):
-    ``(1 + EXTRACTION_MAX_RETRIES) * (1 + _PROVIDER_TRANSPORT_RETRIES)`` --
-    each validation attempt can ALSO transport-retry (an SDK-level
-    5xx/timeout re-send of identical, still-billable bytes). Output =
-    ``max_output_tokens * total_requests``. Input (FOLD B) = every
-    VALIDATION attempt re-sending the prompt, plus each RETRY re-sending the
-    prior response and :data:`_RESERVE_RETRY_OVERHEAD_TOKENS`, the whole
-    total then scaled by the SAME transport factor (see
-    :func:`_single_attempt_reserve` for the final-entry's smaller bound).
+    Total worst-case REQUEST count is ``1 + EXTRACTION_MAX_RETRIES`` (#601
+    fold round 8: the bake-off's own paid calls now run with
+    ``disable_transport_retries=True`` (Refs slice E), removing the SDK's
+    transport-retry layer entirely from what this reserve needs to bound --
+    no separate transport factor). Output = ``max_output_tokens *
+    total_requests``.
+
+    Input (#601 fold round 6/8, FOLD B revised) = every VALIDATION attempt
+    re-sending the prompt, plus each RETRY additionally re-sending the PRIOR
+    RESPONSE (up to the output cap) AND its own SERIALIZED validation-error
+    copy (``RetryPromptPart`` quotes the offending output back to the model,
+    #601 fold round 8) -- a second ``max_output_tokens``-sized term -- plus
+    the small, fixed :data:`_RESERVE_RETRY_WRAPPER_TOKENS` instruction text
+    (see :func:`_single_attempt_reserve` for the final-entry's smaller bound).
 
     Args:
         page: The corpus page (its extracted prompt text drives the input estimate).
@@ -2388,15 +2387,11 @@ def _page_cost_reserve(
         EXTRACTION_MAX_RETRIES,
     )
 
-    transport_factor = 1 + _PROVIDER_TRANSPORT_RETRIES
     per_attempt_input = _reserve_input_tokens_per_attempt(page)
-    validation_input_tokens = (
-        1 + EXTRACTION_MAX_RETRIES
-    ) * per_attempt_input + EXTRACTION_MAX_RETRIES * (
-        max_output_tokens + _RESERVE_RETRY_OVERHEAD_TOKENS
+    input_tokens = (1 + EXTRACTION_MAX_RETRIES) * per_attempt_input + EXTRACTION_MAX_RETRIES * (
+        2 * max_output_tokens + _RESERVE_RETRY_WRAPPER_TOKENS
     )
-    input_tokens = validation_input_tokens * transport_factor
-    output_tokens = max_output_tokens * (1 + EXTRACTION_MAX_RETRIES) * transport_factor
+    output_tokens = max_output_tokens * (1 + EXTRACTION_MAX_RETRIES)
     return (
         input_tokens / 1_000_000 * price.price_in_per_mtok
         + output_tokens / 1_000_000 * price.price_out_per_mtok
@@ -2406,12 +2401,12 @@ def _page_cost_reserve(
 def _single_attempt_reserve(
     page: CorpusPage, price: RosterModel, *, max_output_tokens: int = BAKEOFF_MAX_OUTPUT_TOKENS
 ) -> float:
-    """ONE attempt's worst-case reserve (#601 fold round 6/7, FOLD D + FOLD 1
-    + FOLD 3) -- for the FINAL entry's timeout addition, at most ONE
+    """ONE attempt's worst-case reserve (#601 fold round 6/8, FOLD D + FOLD 1
+    revised) -- for the FINAL entry's timeout addition, at most ONE
     in-flight attempt ever unreported (a completed retry's usage is already
-    captured). That attempt is the WORST single one (FOLD 1) -- a
-    RETRY-shaped input, same as one RETRY term in :func:`_page_cost_reserve`
-    -- scaled by ``1 + _PROVIDER_TRANSPORT_RETRIES`` (FOLD 3). The full
+    captured; no transport-retry factor -- see :func:`_page_cost_reserve`).
+    That attempt is the WORST single one (FOLD 1) -- a RETRY-shaped input,
+    same shape as one RETRY term in :func:`_page_cost_reserve`. The full
     multi-attempt worst case stays reserved for the PENDING entry.
 
     Args:
@@ -2422,15 +2417,14 @@ def _single_attempt_reserve(
     Returns:
         ONE attempt's physically-bounded, worst-case estimated USD cost.
     """
-    transport_factor = 1 + _PROVIDER_TRANSPORT_RETRIES
-    worst_attempt_input = (
-        _reserve_input_tokens_per_attempt(page) + max_output_tokens + _RESERVE_RETRY_OVERHEAD_TOKENS
+    input_tokens = (
+        _reserve_input_tokens_per_attempt(page)
+        + 2 * max_output_tokens
+        + _RESERVE_RETRY_WRAPPER_TOKENS
     )
-    input_tokens = worst_attempt_input * transport_factor
-    output_tokens = max_output_tokens * transport_factor
     return (
         input_tokens / 1_000_000 * price.price_in_per_mtok
-        + output_tokens / 1_000_000 * price.price_out_per_mtok
+        + max_output_tokens / 1_000_000 * price.price_out_per_mtok
     )
 
 
