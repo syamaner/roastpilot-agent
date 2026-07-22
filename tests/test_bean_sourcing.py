@@ -2041,6 +2041,20 @@ def test_bean_sourcing_agent_omits_max_tokens_by_default() -> None:
     assert "max_tokens" not in settings
 
 
+def test_bean_sourcing_agent_pins_extraction_max_retries() -> None:
+    """The agent's resolved output-validation retry budget equals
+    ``EXTRACTION_MAX_RETRIES`` (#601 P2 fold) -- pinned explicitly rather than
+    left to pydantic-ai's own default, so a caller computing the run-wide
+    worst case for ``max_output_tokens`` has a real, code-visible constant."""
+    agent = bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
+        _ADVISOR_CONFIG, model=_function_model_returning(_identity_args())
+    )
+    assert (
+        agent._max_output_retries  # pyright: ignore[reportPrivateUsage]
+        == bean_sourcing.EXTRACTION_MAX_RETRIES
+    )
+
+
 # --- _resolve_extraction_model_slug (#590 P1 + P2 fix: provider-aware default) ---
 #
 # Codex caught a P1 on the PR that introduced BeanSourcingConfig.model_slug:

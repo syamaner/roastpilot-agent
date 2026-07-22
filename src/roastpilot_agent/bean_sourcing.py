@@ -2679,6 +2679,16 @@ def _resolve_extraction_model_slug(
     return advisor_config.model_slug
 
 
+#: The bean-identity extraction agent's retry budget (#601), PINNED explicitly
+#: rather than left to pydantic-ai's own default (currently 1, for both tool
+#: and output-validation retries -- this agent has no tools, so only the
+#: output-validation budget is exercised) -- code-visible and stable even if
+#: that default ever changes, so a caller's ``max_output_tokens`` (see
+#: :func:`_bean_sourcing_agent`) has a real constant for its documented
+#: run-wide worst case, not a guess.
+EXTRACTION_MAX_RETRIES: int = 1
+
+
 def _bean_sourcing_agent(
     advisor_config: AdvisorConfig,
     *,
@@ -2722,6 +2732,11 @@ def _bean_sourcing_agent(
             ``ModelSettings["max_tokens"]``, verified the correct pydantic-ai
             key on the installed version). ``None`` (the default) omits the
             setting entirely -- behaviour-preserving, unchanged before #601.
+            This bounds each provider REQUEST only; validation retries mean
+            a run can re-request up to :data:`EXTRACTION_MAX_RETRIES` more
+            times, so the run-wide worst case is
+            ``(1 + EXTRACTION_MAX_RETRIES) * max_output_tokens``, not the
+            bare cap (#601 P2 fold).
 
     Returns:
         The extraction agent, temperature 0 for deterministic, literal
@@ -2743,6 +2758,7 @@ def _bean_sourcing_agent(
         output_type=_ExtractedBeanIdentity,
         instructions=_EXTRACTION_INSTRUCTIONS,
         model_settings=settings,
+        retries=EXTRACTION_MAX_RETRIES,
     )
 
 
@@ -2798,7 +2814,9 @@ async def _extract_bean_identity(
         diagnostics: Optional accumulator (#601 F2), incremented on success.
         max_output_tokens: An optional provider-enforced output cap (#601),
             passed straight through to :func:`_bean_sourcing_agent`. ``None``
-            (the default) omits the setting -- unchanged before #601.
+            (the default) omits the setting -- unchanged before #601. A
+            per-request bound; see :func:`_bean_sourcing_agent` for the
+            retry-inclusive run-wide worst case.
         sourcing_config: The extraction model/timeout config
             (:attr:`~roastpilot_agent.config.BeanSourcingConfig.model_slug`,
             :attr:`~roastpilot_agent.config.BeanSourcingConfig.extraction_timeout_seconds`
@@ -5109,6 +5127,8 @@ async def draft_bean_profile_from_url(
         max_output_tokens: An optional provider-enforced output cap (#601),
             passed straight through to :func:`_extract_bean_identity`.
             ``None`` (the default) omits the setting -- unchanged before #601.
+            A per-request bound; see :func:`_bean_sourcing_agent` for the
+            retry-inclusive run-wide worst case.
 
     Returns:
         The drafted :class:`~roastpilot_agent.models.BeanProfileDraft`.
