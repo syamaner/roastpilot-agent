@@ -222,9 +222,13 @@ export function stripBidiControls(text: string): string {
  * punctuation from the surrounding sentence is never swept into the match
  * and stripped along with the query string. No unbounded backtracking
  * (`[^...]+`/`[^...]*` are both simple negated-character-class runs) — no
- * ReDoS surface on operator-uncontrolled server text.
+ * ReDoS surface on operator-uncontrolled server text. Case-insensitive
+ * (`i` flag): the scheme the backend echoes back is whatever the operator
+ * typed verbatim (never normalized), so `HTTPS://…`/`Https://…` must be
+ * caught the same as `https://…` — a case-sensitive match would let an
+ * uppercase-scheme URL's query string escape redaction entirely.
  */
-const URL_WITH_QUERY = /https?:\/\/[^\s?'"<>)]+\?[^\s'"<>)]*/g;
+const URL_WITH_QUERY = /https?:\/\/[^\s?'"<>)]+\?[^\s'"<>)]*/gi;
 
 export function redactUrlQueryStrings(text: string): string {
   return text.replace(URL_WITH_QUERY, (match) => match.slice(0, match.indexOf("?")));

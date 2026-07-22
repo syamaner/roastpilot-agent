@@ -299,6 +299,14 @@ describe("redactUrlQueryStrings (#654 round 2 fold 4)", () => {
     const text = "bean extraction temporarily unavailable (provider error)";
     expect(redactUrlQueryStrings(text)).toBe(text);
   });
+
+  it("redacts a mixed/upper-case scheme (the backend echoes the operator's URL verbatim, never normalized)", () => {
+    const text = "drafted bean profile failed validation for 'HTTPS://x.test/p?token=secret': bad";
+    expect(redactUrlQueryStrings(text)).toBe(
+      "drafted bean profile failed validation for 'HTTPS://x.test/p': bad",
+    );
+    expect(redactUrlQueryStrings(text)).not.toContain("token=secret");
+  });
 });
 
 describe("draftFromBeanProfileDraft — strips bidi controls from drafted free text (#654 round 2 fold 6)", () => {
