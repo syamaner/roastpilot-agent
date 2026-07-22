@@ -2171,6 +2171,52 @@ async def test_extract_bean_identity_closes_the_bespoke_client_on_raise(
     assert len(close_calls) == 1
 
 
+async def _raising_close(self: AsyncOpenAI) -> None:
+    raise RuntimeError("bespoke client teardown blew up")
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_close_failure_never_masks_a_successful_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#601 fold round 10 (E FOLD, P2): teardown must never OUTRANK the
+    primary outcome -- a close() that itself raises (a real, if rare,
+    transport-pool teardown failure) must not replace a SUCCESSFUL
+    extraction result; the failure is logged and swallowed."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args()
+    )
+    monkeypatch.setattr(bean_sourcing, "_bean_sourcing_agent", _agent_with_faked_run(identity))
+    monkeypatch.setattr(AsyncOpenAI, "close", _raising_close)
+
+    result = await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "some page text", advisor_config=_ADVISOR_CONFIG, disable_transport_retries=True
+    )
+    assert result.name == _identity_args()["name"]  # the real result, not a teardown error
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_close_failure_never_masks_the_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#601 fold round 10 (E FOLD, P2): a close() that itself raises must
+    not replace the ORIGINAL typed ``BeanExtractionUnavailableError`` with
+    an untyped teardown error -- ``draft_for_page`` only catches the typed
+    ``BeanSourcingError`` family, so an untyped escape would abort the
+    whole resumable bake-off instead of recording one page failure."""
+    monkeypatch.setattr(
+        bean_sourcing,
+        "_bean_sourcing_agent",
+        _agent_with_faked_run(ModelAPIError("m1", "boom")),
+    )
+    monkeypatch.setattr(AsyncOpenAI, "close", _raising_close)
+
+    with pytest.raises(bean_sourcing.BeanExtractionUnavailableError, match="boom"):
+        await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+            "some page text", advisor_config=_ADVISOR_CONFIG, disable_transport_retries=True
+        )
+
+
 @pytest.mark.asyncio
 async def test_extract_bean_identity_injected_model_builds_no_bespoke_client(
     monkeypatch: pytest.MonkeyPatch,

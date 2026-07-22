@@ -2876,8 +2876,11 @@ async def _extract_bean_identity(
     # #601 fold round 9 (E FOLD 3): tracks the bespoke, retry-disabled client
     # ONLY when WE constructed one (model not injected, disable_transport_retries
     # requested) -- never an injected test double, never an SDK-managed default
-    # client (those are never ours to close).
+    # client (those are never ours to close). ``bespoke_model_name`` is captured
+    # alongside it (never re-read from ``agent`` later -- ``agent`` is only
+    # conditionally bound) purely for the round-10 teardown-failure log line.
     bespoke_client: AsyncOpenAI | None = None
+    bespoke_model_name: str | None = None
     try:
         # Agent construction (which calls ``build_model`` when ``model`` is
         # omitted) lives INSIDE the try: it can raise ``AdvisorDependencyError``
@@ -2897,6 +2900,7 @@ async def _extract_bean_identity(
 
             if isinstance(agent.model, OpenAIChatModel):
                 bespoke_client = agent.model.client
+                bespoke_model_name = agent.model.model_name
         async with asyncio.timeout(extraction_timeout_seconds):
             result = (
                 await agent.run(page_text, usage=run_usage)
@@ -2930,7 +2934,23 @@ async def _extract_bean_identity(
             diagnostics.request_tokens += run_usage.input_tokens
             diagnostics.response_tokens += run_usage.output_tokens
         if bespoke_client is not None:
-            await bespoke_client.close()
+            # #601 fold round 10 (E FOLD): teardown must never OUTRANK the
+            # primary outcome -- an unconditional close() that itself raises
+            # (e.g. transport-pool teardown) would replace a successful
+            # result or the typed BeanExtractionUnavailableError above with
+            # an untyped error draft_for_page does not catch, aborting the
+            # whole resumable bake-off instead of recording one page failure.
+            try:
+                await bespoke_client.close()
+            except Exception:
+                _log.warning(
+                    "bean_sourcing: bespoke transport-retry-disabled client "
+                    "teardown failed for provider=%r model_slug=%r -- swallowed, "
+                    "never masking the extraction's own outcome",
+                    advisor_config.provider,
+                    bespoke_model_name,
+                    exc_info=True,
+                )
     if diagnostics is not None:
         diagnostics.schema_retries += sum(
             isinstance(part, RetryPromptPart)
