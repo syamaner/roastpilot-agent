@@ -1650,31 +1650,52 @@ def test_actual_page_cost_applies_timeout_reserve_floor() -> None:
 
 
 def test_page_cost_reserve_scales_with_page_length() -> None:
-    """The timeout-reserve floor is sized to THIS page's own prompt length (#601 fold
-    round 1, slice A) -- a long page's reserve must exceed a short page's, not a
-    corpus-wide average that under-charges a long page's timeout."""
+    """The timeout-reserve floor is sized to THIS page's own content (#601
+    fold round 1, slice A) -- updated for #601 fold round 7, FOLD 2's
+    markdown-cap floor: an ordinary (ASCII-length, under the truncation
+    ceiling) page sits AT that floor regardless of its own length (see the
+    dedicated floor test below), so exceeding it now takes DENSE multi-byte
+    content whose 2x-inflated bytes clear the floor -- not just more
+    characters, not a corpus-wide average that under-charges a real timeout.
+    """
     price = bo.RosterModel("m1", 1.0, 1.0, "x")
     short_page = bo.CorpusPage(
         slug="short", url="https://example.com/short", html="<p>Hi.</p>", gold_fields={}, vendor="x"
     )
-    long_page = bo.CorpusPage(
-        slug="long",
-        url="https://example.com/long",
-        html="<p>" + ("Ethiopian washed heirloom single origin. " * 500) + "</p>",
+    dense_page = bo.CorpusPage(
+        slug="dense",
+        url="https://example.com/dense",
+        html="<p>" + ("咖啡豆的品質與烘焙程度密切相關。" * 2000) + "</p>",
         gold_fields={},
         vendor="x",
     )
     short_reserve = bo._page_cost_reserve(short_page, price)  # pyright: ignore[reportPrivateUsage]
-    long_reserve = bo._page_cost_reserve(long_page, price)  # pyright: ignore[reportPrivateUsage]
-    assert long_reserve > short_reserve
+    dense_reserve = bo._page_cost_reserve(dense_page, price)  # pyright: ignore[reportPrivateUsage]
+    assert dense_reserve > short_reserve
+
+
+def test_reserve_input_tokens_per_attempt_floors_at_the_markdown_cap() -> None:
+    """#601 fold round 7, FOLD 2: a synthetic SHORT-text page's per-attempt
+    input-token bound is still >= the runtime's markdown-cap-derived floor --
+    a table-heavy page's real markdown COULD sit near that cap even when the
+    linear-strip text (this page's entire prompt) is tiny, so the floor must
+    hold regardless of actual page length."""
+    page = bo.CorpusPage(
+        slug="p", url="https://example.com/p", html="<p>Hi.</p>", gold_fields={}, vendor="x"
+    )
+    per_attempt_tokens = bo._reserve_input_tokens_per_attempt(page)  # pyright: ignore[reportPrivateUsage]
+    markdown_cap_chars = bo._bean_sourcing_module._MAX_EXTRACTED_CHARS  # pyright: ignore[reportPrivateUsage]
+    max_bytes_per_char = bo._RESERVE_MAX_BYTES_PER_CHAR  # pyright: ignore[reportPrivateUsage]
+    assert per_attempt_tokens >= markdown_cap_chars * max_bytes_per_char
 
 
 def test_page_cost_reserve_output_component_is_the_enforced_cap_times_retries() -> None:
     """The reserve's OUTPUT-token component equals the ENFORCED provider cap
-    times ``1 + EXTRACTION_MAX_RETRIES`` (#601 fold round 4, FOLD 4 -- the P2
-    fold on #645), priced in full -- matching what the provider can actually
-    bill across a retrying run, not a generic physical decode-rate guess.
-    Uniform across every arm/model (isolated here via an output-only price)."""
+    times ``(1 + EXTRACTION_MAX_RETRIES) * (1 + _PROVIDER_TRANSPORT_RETRIES)``
+    (#601 fold round 4/7, FOLD 4 + FOLD 3), priced in full -- matching what
+    the provider can actually bill across a retrying, transport-retrying run,
+    not a generic physical decode-rate guess. Uniform across every arm/model
+    (isolated here via an output-only price)."""
     page = bo.CorpusPage(
         slug="p", url="https://example.com/p", html="<p>Hi.</p>", gold_fields={}, vendor="x"
     )
@@ -1684,16 +1705,19 @@ def test_page_cost_reserve_output_component_is_the_enforced_cap_times_retries() 
         page, output_only_price, max_output_tokens=cap
     )
     max_retries = bo._bean_sourcing_module.EXTRACTION_MAX_RETRIES  # pyright: ignore[reportPrivateUsage]
-    expected_output_tokens = cap * (1 + max_retries)
+    transport_retries = bo._PROVIDER_TRANSPORT_RETRIES  # pyright: ignore[reportPrivateUsage]
+    expected_output_tokens = cap * (1 + max_retries) * (1 + transport_retries)
     assert reserve == pytest.approx(expected_output_tokens / 1_000_000 * 1.0)
 
 
 def test_page_cost_reserve_input_component_accounts_for_retries() -> None:
-    """#601 fold round 6, FOLD B: the reserve's INPUT component accounts for
-    EVERY attempt re-sending the prompt, plus each RETRY additionally
-    re-sending the prior response (up to the output cap) and a small
-    retry-prompt-wrapper overhead -- not a flat single-prompt bound (isolated
-    here via an input-only price)."""
+    """#601 fold round 6/7, FOLD B + FOLD 3: the reserve's INPUT component
+    accounts for EVERY validation attempt re-sending the prompt, plus each
+    RETRY additionally re-sending the prior response (up to the output cap)
+    and a small retry-prompt-wrapper overhead, all scaled by
+    ``1 + _PROVIDER_TRANSPORT_RETRIES`` (any validation attempt can ALSO
+    transport-retry) -- not a flat single-prompt bound (isolated here via an
+    input-only price)."""
     page = bo.CorpusPage(
         slug="p", url="https://example.com/p", html="<p>Hi.</p>", gold_fields={}, vendor="x"
     )
@@ -1705,7 +1729,9 @@ def test_page_cost_reserve_input_component_accounts_for_retries() -> None:
     per_attempt = bo._reserve_input_tokens_per_attempt(page)  # pyright: ignore[reportPrivateUsage]
     max_retries = bo._bean_sourcing_module.EXTRACTION_MAX_RETRIES  # pyright: ignore[reportPrivateUsage]
     retry_overhead = bo._RESERVE_RETRY_OVERHEAD_TOKENS  # pyright: ignore[reportPrivateUsage]
-    expected_input_tokens = (1 + max_retries) * per_attempt + max_retries * (cap + retry_overhead)
+    transport_retries = bo._PROVIDER_TRANSPORT_RETRIES  # pyright: ignore[reportPrivateUsage]
+    validation_tokens = (1 + max_retries) * per_attempt + max_retries * (cap + retry_overhead)
+    expected_input_tokens = validation_tokens * (1 + transport_retries)
     assert reserve == pytest.approx(expected_input_tokens / 1_000_000 * 1.0)
 
 
