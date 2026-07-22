@@ -495,9 +495,12 @@ export function BeanProfileFields({
         <BlendToggle
           checked={draft.is_blend}
           onChange={(e) => onBlendChange(e.target.checked)}
+          onResolve={onBlendChange}
           testIdPrefix={testIdPrefix}
           provenance={fieldSourceFor(draft, "is_blend")}
           evidenceQuote={fieldEvidenceFor(draft, "is_blend")}
+          unresolved={draft.is_blend_unresolved === true}
+          error={errors.is_blend}
         />
         <DescriptionField
           value={draft.description}
@@ -620,9 +623,41 @@ export function BeanProfileFields({
   );
 }
 
+/**
+ * The tri-state "needs an operator choice" cue for `is_blend` (#637): a
+ * draft-from-URL response whose blend flag the vendor page never addressed
+ * leaves the checkbox at a safe-default `false` — this badge is what tells
+ * the operator that default is UNCHOSEN, not "single-origin confirmed",
+ * distinct from the `ProvenanceBadge` above (which only ever renders for a
+ * value the server actually resolved one way or the other). Same short
+ * visible text + full `sr-only` sentence pattern as `ProvenanceBadge`.
+ */
+function UnresolvedBlendBadge({ id }: { id: string }): React.JSX.Element {
+  return (
+    <span
+      id={id}
+      data-testid={id}
+      title="Not stated by the vendor page — choose before saving"
+      className="inline-flex items-center rounded-md border border-roast-caution/40 bg-roast-caution/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-roast-caution"
+    >
+      <span aria-hidden="true">Choose</span>
+      <span className="sr-only">
+        Not stated by the vendor page — choose single-origin or blend before saving.
+      </span>
+    </span>
+  );
+}
+
 interface BlendToggleProps {
   checked: boolean;
   onChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  /** Resolves an unresolved tri-state with an explicit boolean choice (#654
+   *  round 2 fold 2) — wired to the "Single origin" / "Blend" buttons shown
+   *  while `unresolved` is true. Takes a plain boolean rather than a
+   *  synthesized checkbox event: there is no native `<input>` change event to
+   *  fabricate for a button click, and the parent's `onBlendChange` already
+   *  accepts one directly. */
+  onResolve: (value: boolean) => void;
   testIdPrefix: string;
   /** Draft-review provenance (#627) — omit for a field the server never
    *  tracks. */
@@ -630,23 +665,39 @@ interface BlendToggleProps {
   /** Draft-review captured vendor quote (#627) — omit when none was
    *  captured. */
   evidenceQuote?: string;
+  /** Whether a draft-from-URL response left this UNRESOLVED (#637): the
+   *  vendor page never addressed blending, so `checked` is a safe default,
+   *  not a confirmed choice. While true, the plain checkbox is replaced by an
+   *  explicit two-choice control (#654 round 2 fold 2) — a checkbox's first
+   *  interaction can only ever SET it, so confirming the default (single
+   *  origin) is otherwise undiscoverable. Cleared (the plain checkbox
+   *  returns) the moment the operator picks either choice. */
+  unresolved?: boolean;
+  /** Validation error (#637) — set only while `unresolved` and the operator
+   *  has attempted to save without choosing; replaces the hint text. */
+  error?: string;
 }
 
 /** Single-origin vs blend toggle (#164). */
 function BlendToggle({
   checked,
   onChange,
+  onResolve,
   testIdPrefix,
   provenance,
   evidenceQuote,
+  unresolved,
+  error,
 }: BlendToggleProps): React.JSX.Element {
   const provenanceId =
     provenance !== undefined ? `${testIdPrefix}-is_blend-provenance` : undefined;
+  const unresolvedId = unresolved === true ? `${testIdPrefix}-is_blend-unresolved` : undefined;
   const evidenceId = evidenceQuote !== undefined ? `${testIdPrefix}-is_blend-evidence` : undefined;
-  const describedBy = joinDescribedBy(provenanceId, evidenceId);
+  const errorId = error !== undefined ? `${testIdPrefix}-is_blend-error` : undefined;
+  const describedBy = joinDescribedBy(provenanceId, unresolvedId, evidenceId, errorId);
   return (
     <div className="flex flex-col gap-1 sm:col-span-2">
-      {provenance === undefined || provenanceId === undefined ? (
+      {provenanceId === undefined && unresolvedId === undefined ? (
         <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
           Blend
         </span>
@@ -655,27 +706,71 @@ function BlendToggle({
           <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             Blend
           </span>
-          <ProvenanceBadge id={provenanceId} source={provenance} />
+          {provenanceId !== undefined && provenance !== undefined && (
+            <ProvenanceBadge id={provenanceId} source={provenance} />
+          )}
+          {unresolvedId !== undefined && <UnresolvedBlendBadge id={unresolvedId} />}
         </div>
       )}
-      <label htmlFor={`${testIdPrefix}-is_blend`} className="flex items-center gap-2 text-sm">
-        <input
-          id={`${testIdPrefix}-is_blend`}
-          name="is_blend"
-          type="checkbox"
-          checked={checked}
-          onChange={onChange}
-          aria-describedby={describedBy}
-          data-testid={`${testIdPrefix}-is_blend`}
-          className="h-4 w-4 rounded border-input bg-background accent-roast-coffee"
-        />
-        <span>This is a blend (not single-origin)</span>
-      </label>
-      <span className="text-xs text-muted-foreground">
-        {checked
-          ? "Put the secondary beans / components in the description below."
-          : "Single origin — leave off, or turn on for a blend."}
-      </span>
+      {unresolved === true ? (
+        <div
+          role="group"
+          aria-label="Choose single-origin or blend"
+          className="flex items-center gap-2"
+        >
+          <button
+            type="button"
+            onClick={() => onResolve(false)}
+            aria-describedby={describedBy}
+            data-testid={`${testIdPrefix}-is_blend-choose-single-origin`}
+            className="rounded-md border border-input px-3 py-1.5 text-sm transition-colors hover:bg-muted/40"
+          >
+            Single origin
+          </button>
+          <button
+            type="button"
+            onClick={() => onResolve(true)}
+            aria-describedby={describedBy}
+            data-testid={`${testIdPrefix}-is_blend-choose-blend`}
+            className="rounded-md border border-input px-3 py-1.5 text-sm transition-colors hover:bg-muted/40"
+          >
+            Blend
+          </button>
+        </div>
+      ) : (
+        <label htmlFor={`${testIdPrefix}-is_blend`} className="flex items-center gap-2 text-sm">
+          <input
+            id={`${testIdPrefix}-is_blend`}
+            name="is_blend"
+            type="checkbox"
+            checked={checked}
+            onChange={onChange}
+            aria-describedby={describedBy}
+            data-testid={`${testIdPrefix}-is_blend`}
+            className="h-4 w-4 rounded border-input bg-background accent-roast-coffee"
+          />
+          <span>This is a blend (not single-origin)</span>
+        </label>
+      )}
+      {error !== undefined ? (
+        <span
+          id={errorId}
+          data-testid={`${testIdPrefix}-is_blend-error`}
+          className="text-xs text-roast-fault"
+        >
+          {error}
+        </span>
+      ) : (
+        <span
+          className={cn("text-xs", unresolved === true ? "text-roast-caution" : "text-muted-foreground")}
+        >
+          {unresolved === true
+            ? "The vendor page didn't say — choose single-origin or blend before saving."
+            : checked
+              ? "Put the secondary beans / components in the description below."
+              : "Single origin — leave off, or turn on for a blend."}
+        </span>
+      )}
       {evidenceQuote !== undefined && evidenceId !== undefined && (
         <EvidenceQuote id={evidenceId} quote={evidenceQuote} testId={evidenceId} fieldLabel="Blend" />
       )}

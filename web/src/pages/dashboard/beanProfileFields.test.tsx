@@ -376,3 +376,83 @@ describe("BeanProfileFields draft-review sr-only warning + contextual toggle nam
     expect(toggle.getAttribute("aria-label")).toEqual(expect.stringContaining("Blend"));
   });
 });
+
+describe("BeanProfileFields is_blend tri-state (#637, #654 fold 2)", () => {
+  it("renders no unresolved cue for the common case (is_blend_unresolved absent)", () => {
+    renderFields(DEFAULT_BEAN_PROFILE_DRAFT);
+    expect(screen.queryByTestId(`${PREFIX}-is_blend-unresolved`)).toBeNull();
+  });
+
+  it("shows an unresolved cue + caution hint when is_blend_unresolved is true", () => {
+    renderFields({ ...DEFAULT_BEAN_PROFILE_DRAFT, is_blend_unresolved: true });
+    const badge = screen.getByTestId(`${PREFIX}-is_blend-unresolved`);
+    expect(badge).toHaveTextContent(/choose/i);
+    expect(screen.getByText(/didn't say/i)).toBeInTheDocument();
+  });
+
+  it("replaces the plain checkbox with an explicit Single origin / Blend choice while unresolved (#654 round 2 fold 2)", () => {
+    renderFields({ ...DEFAULT_BEAN_PROFILE_DRAFT, is_blend_unresolved: true });
+    // No plain checkbox — a checkbox's first interaction can only ever SET it,
+    // so confirming the safe default (single origin) would be undiscoverable.
+    expect(screen.queryByTestId(`${PREFIX}-is_blend`)).toBeNull();
+    expect(screen.getByTestId(`${PREFIX}-is_blend-choose-single-origin`)).toBeInTheDocument();
+    expect(screen.getByTestId(`${PREFIX}-is_blend-choose-blend`)).toBeInTheDocument();
+  });
+
+  it("choosing 'Single origin' resolves is_blend to false and the plain checkbox returns", () => {
+    const onBlendChange = vi.fn();
+    render(
+      <BeanProfileFields
+        draft={{ ...DEFAULT_BEAN_PROFILE_DRAFT, is_blend_unresolved: true }}
+        errors={{}}
+        onChange={vi.fn()}
+        onBlendChange={onBlendChange}
+        testIdPrefix={PREFIX}
+        showDefaultWeight
+      />,
+    );
+    fireEvent.click(screen.getByTestId(`${PREFIX}-is_blend-choose-single-origin`));
+    expect(onBlendChange).toHaveBeenCalledWith(false);
+  });
+
+  it("choosing 'Blend' resolves is_blend to true", () => {
+    const onBlendChange = vi.fn();
+    render(
+      <BeanProfileFields
+        draft={{ ...DEFAULT_BEAN_PROFILE_DRAFT, is_blend_unresolved: true }}
+        errors={{}}
+        onChange={vi.fn()}
+        onBlendChange={onBlendChange}
+        testIdPrefix={PREFIX}
+        showDefaultWeight
+      />,
+    );
+    fireEvent.click(screen.getByTestId(`${PREFIX}-is_blend-choose-blend`));
+    expect(onBlendChange).toHaveBeenCalledWith(true);
+  });
+
+  it("renders the plain checkbox (not the two-choice control) once resolved", () => {
+    renderFields({ ...DEFAULT_BEAN_PROFILE_DRAFT, is_blend: true });
+    expect(screen.getByTestId(`${PREFIX}-is_blend`)).toBeChecked();
+    expect(screen.queryByTestId(`${PREFIX}-is_blend-choose-single-origin`)).toBeNull();
+    expect(screen.queryByTestId(`${PREFIX}-is_blend-choose-blend`)).toBeNull();
+  });
+
+  it("renders the validation error (post-submit-attempt) in place of the hint, not alongside it", () => {
+    render(
+      <BeanProfileFields
+        draft={{ ...DEFAULT_BEAN_PROFILE_DRAFT, is_blend_unresolved: true }}
+        errors={{ is_blend: "The vendor page didn't say — choose before saving." }}
+        onChange={vi.fn()}
+        onBlendChange={vi.fn()}
+        testIdPrefix={PREFIX}
+        showDefaultWeight
+      />,
+    );
+    expect(screen.getByTestId(`${PREFIX}-is_blend-error`)).toHaveTextContent(/didn't say/i);
+    // The unresolved BADGE (next to the label) is independent of the error slot
+    // and still renders — only the hint/error TEXT slot below the checkbox
+    // switches from the caution hint to the fault-coloured error.
+    expect(screen.getByTestId(`${PREFIX}-is_blend-unresolved`)).toBeInTheDocument();
+  });
+});
