@@ -1396,6 +1396,14 @@ async def run_model_over_corpus(
     Returns:
         The :class:`ModelRun`.
     """
+    # The EFFECTIVE timeout this call actually runs under (#601 fold round 2,
+    # FOLD 1) -- a caller-overridden sourcing_config must size the reserve's
+    # physical bound, never the module default alone.
+    effective_timeout_s = (
+        sourcing_config.extraction_timeout_seconds
+        if sourcing_config is not None
+        else BAKEOFF_EXTRACTION_TIMEOUT_S
+    )
     results: list[PageResult] = []
     for page in pages:
         started = time.monotonic()
@@ -1431,7 +1439,11 @@ async def run_model_over_corpus(
             # _actual_page_cost) -- computing it unconditionally would run a real
             # trafilatura parse (#601 fold round 1, FOLD 2) on every page for no
             # reason.
-            reserve = _page_cost_reserve(page, roster_price) if timed_out else 0.0
+            reserve = (
+                await _page_cost_reserve(page, roster_price, effective_timeout_s)
+                if timed_out
+                else 0.0
+            )
             priced = _actual_page_cost(
                 diagnostics.request_tokens,
                 diagnostics.response_tokens,
@@ -2198,28 +2210,74 @@ def estimate_cost_for_arms(
 #: arm bills far more than a flat per-page estimate), uniformly across every arm.
 #: 200 tok/s comfortably exceeds real single-request decode throughput observed
 #: across current-generation hosted providers -- chosen high enough that real
-#: generation over the WHOLE extraction timeout can never exceed the bound it sets.
+#: generation over the effective timeout can never exceed the bound it sets.
 _TIMEOUT_RESERVE_TOKENS_PER_SECOND = 200
 
+#: Worst-case input-token bound for the RESERVE (#601 fold round 2, FOLD 3): 1
+#: token per character, NOT the chars/4 PLANNING heuristic :func:`estimate_cost`
+#: uses. A token-dense prompt (CJK, emoji, identifier-heavy text) can bill several
+#: times a chars/4 guess, and this is a SAFETY FLOOR, not a forecast. BPE-family
+#: tokenizers virtually never split a single byte across more than one output
+#: token, so tokens <= chars is a documented, defensible worst case.
+_RESERVE_CHARS_PER_TOKEN = 1
 
-def _page_cost_reserve(page: CorpusPage, price: RosterModel) -> float:
-    """THIS page's PHYSICALLY-BOUNDED timeout-reserve floor (#601 fold round 1) --
-    input tokens sized to the PAGE's own prompt length (never a corpus-wide
-    average), output tokens bounded by :data:`_TIMEOUT_RESERVE_TOKENS_PER_SECOND`
-    over the extraction timeout -- a real generation-rate ceiling, not a per-arm
-    reasoning-effort heuristic, since this floor exists ONLY to catch a timed-out
-    call's possibly-unreported usage (the non-timeout cost paths keep their
-    existing labelled est./usage-priced heuristics unchanged).
+
+async def _reserve_prompt_text(page: CorpusPage, *, timeout_s: float) -> str:
+    """The prompt text for the RESERVE floor (#601 fold round 2, FOLD 2) --
+    reuses the runtime's OWN bounded, off-loop-dispatched trafilatura call
+    (``_extract_page_markdown_bounded``, the SAME dedicated parse pool the real
+    extraction call already uses this invocation) instead of the unbounded sync
+    variant :func:`_extract_prompt_text` uses for the pre-run estimate: a
+    stalling page must never hang the bake-off AFTER a billed call and BEFORE
+    its ledger entry persists.
+
+    On a timeout/saturated pool/no result, falls back to the linear-strip pass,
+    same as the runtime's own fail-soft contract -- CONSERVATIVE for reserve
+    purposes (the un-stripped linear text is at least as long as trafilatura's
+    boilerplate-removed markdown would have been, never an under-price), still
+    with the JSON-LD context prepend.
+    """
+    from roastpilot_agent.bean_sourcing import (  # noqa: PLC0415
+        _extract_page_markdown_bounded,  # pyright: ignore[reportPrivateUsage]
+        _extract_page_text,  # pyright: ignore[reportPrivateUsage]
+        _format_json_ld_context,  # pyright: ignore[reportPrivateUsage]
+        _match_json_ld_product_facts,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    markdown = await _extract_page_markdown_bounded(page.html, timeout_seconds=timeout_s)
+    extracted_text = markdown if markdown is not None else _extract_page_text(page.html)
+    facts = _match_json_ld_product_facts(page.html, page.url)
+    json_ld_context = _format_json_ld_context(facts) if facts is not None else None
+    return extracted_text if json_ld_context is None else f"{json_ld_context}\n\n{extracted_text}"
+
+
+async def _page_cost_reserve(page: CorpusPage, price: RosterModel, timeout_s: float) -> float:
+    """THIS page's PHYSICALLY-BOUNDED, WORST-CASE timeout-reserve floor (#601
+    fold rounds 1-2).
+
+    Input tokens use the worst-case 1-char-per-token bound
+    (:data:`_RESERVE_CHARS_PER_TOKEN`, FOLD 3), sized to the PAGE's own prompt
+    length via the bounded, off-loop trafilatura call (FOLD 2, see
+    :func:`_reserve_prompt_text`) -- never a corpus-wide average, never the
+    chars/4 planning heuristic. Output tokens are bounded by
+    :data:`_TIMEOUT_RESERVE_TOKENS_PER_SECOND` over ``timeout_s`` -- the
+    EFFECTIVE timeout THIS call actually ran under (FOLD 1), never the module
+    default alone: a caller-overridden ``sourcing_config`` timeout must size the
+    bound it protects against, or a shorter-than-default config would be priced
+    against a reserve sized for a longer one. The non-timeout cost paths keep
+    their existing labelled est./usage-priced heuristics unchanged.
 
     Args:
         page: The corpus page (its extracted prompt text drives the input estimate).
         price: The arm's model pricing.
+        timeout_s: The effective extraction timeout THIS call ran under.
 
     Returns:
-        The page's physically-bounded estimated USD cost.
+        The page's physically-bounded, worst-case estimated USD cost.
     """
-    input_tokens = (len(_extract_prompt_text(page)) + _INSTRUCTION_OVERHEAD_CHARS) // 4
-    output_tokens = round(BAKEOFF_EXTRACTION_TIMEOUT_S * _TIMEOUT_RESERVE_TOKENS_PER_SECOND)
+    prompt_text = await _reserve_prompt_text(page, timeout_s=timeout_s)
+    input_tokens = (len(prompt_text) + _INSTRUCTION_OVERHEAD_CHARS) // _RESERVE_CHARS_PER_TOKEN
+    output_tokens = round(timeout_s * _TIMEOUT_RESERVE_TOKENS_PER_SECOND)
     return (
         input_tokens / 1_000_000 * price.price_in_per_mtok
         + output_tokens / 1_000_000 * price.price_out_per_mtok
@@ -2832,6 +2890,11 @@ class Checkpoint:
         """Whether ``model_slug`` is already complete on disk."""
         return model_slug in self._records
 
+    def has_any(self) -> bool:
+        """Whether ANY (non-stale) record is on disk -- #601 fold round 2, FOLD 4:
+        :func:`run_bakeoff`'s pre-ledger-checkpoint guard."""
+        return bool(self._records)
+
     def get(self, model_slug: str) -> dict[str, Any]:
         """The stored record for an already-complete model."""
         return self._records[model_slug]
@@ -3148,12 +3211,31 @@ async def run_bakeoff(
 
     Returns:
         The :class:`BakeoffResult`.
+
+    Raises:
+        ValueError: If ``out``'s checkpoint has non-stale records but its ledger
+            sidecar is absent (#601 fold round 2, FOLD 4) -- a checkpoint written
+            BEFORE the ledger existed has no durable spend record, so resuming it
+            would silently skip already-paid arms with an empty budget meter.
+            Never fabricates a migration; the message names both fixes
+            (``--no-resume``, or a different ``--out``).
     """
     cost_by_slug = {est.slug: est.usd for est in cost_estimates}
     price_by_slug = {r.slug: r for r in roster}
     fingerprint = compute_fingerprint(pages)
     checkpoint = Checkpoint(sidecar_path(out), resume=resume, fingerprint=fingerprint)
-    ledger = ChargeLedger(ledger_path(out), resume=resume)
+    ledger_sidecar_path = ledger_path(out)
+    if checkpoint.has_any() and not ledger_sidecar_path.exists():
+        # #601 fold round 2, FOLD 4: a checkpoint written BEFORE the ledger existed
+        # has no durable spend record at all -- resuming it would silently
+        # initialise an empty ledger and skip every already-paid arm forever,
+        # outside the store of record. Fail closed; never fabricate a migration.
+        raise ValueError(
+            f"{sidecar_path(out)} predates the charge ledger (#601) -- its spend "
+            "cannot be accounted for. Rerun with --no-resume (fresh books, fresh "
+            "budget) or point --out elsewhere."
+        )
+    ledger = ChargeLedger(ledger_sidecar_path, resume=resume)
     runs: list[ModelRun] = []
     failed_runs: list[FailedRun] = []
     executed_slugs: list[str] = []
@@ -3387,15 +3469,20 @@ async def main(argv: Sequence[str] | None = None) -> int:
         print(f"REFUSED: no {OPENROUTER_KEY_ENV} in .env or environment.", file=sys.stderr)
         return 2
 
-    result = await run_bakeoff(
-        pages,
-        arms,
-        out=cast("Path", args.out),
-        resume=not bool(args.no_resume),
-        max_spend=float(cast("float", args.max_spend)),
-        cost_estimates=cost_estimates,
-        roster=roster_for_cost,
-    )
+    try:
+        result = await run_bakeoff(
+            pages,
+            arms,
+            out=cast("Path", args.out),
+            resume=not bool(args.no_resume),
+            max_spend=float(cast("float", args.max_spend)),
+            cost_estimates=cost_estimates,
+            roster=roster_for_cost,
+        )
+    except ValueError as exc:
+        # #601 fold round 2, FOLD 4: a pre-ledger checkpoint.
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 2
     report = render_report(
         result.runs,
         cost_estimates,

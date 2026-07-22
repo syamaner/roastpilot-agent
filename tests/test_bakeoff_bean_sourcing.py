@@ -1072,6 +1072,12 @@ async def test_run_model_over_corpus_ledgers_a_real_timed_out_page_with_reserve_
     assert entry.timed_out is True
     assert entry.reserve_applied is True
     assert entry.priced_usd > 0.0  # the reserve floor, never the (unreported) $0
+    # FOLD 1 (#601 fold round 2): the reserve derives from the EFFECTIVE 0.05s
+    # timeout this call ran under, not the 45s module default.
+    default_reserve = await bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
+        corpus[0], price, bo.BAKEOFF_EXTRACTION_TIMEOUT_S
+    )
+    assert entry.priced_usd < default_reserve
 
 
 def test_run_json_roundtrips_elapsed_s() -> None:
@@ -1429,7 +1435,8 @@ def test_actual_page_cost_applies_timeout_reserve_floor() -> None:
     assert not_floored < 0.01  # NOT floored -- the reserve only applies to timed-out pages
 
 
-def test_page_cost_reserve_scales_with_page_length() -> None:
+@pytest.mark.asyncio
+async def test_page_cost_reserve_scales_with_page_length() -> None:
     """The timeout-reserve floor is sized to THIS page's own prompt length (#601 fold
     round 1, slice A) -- a long page's reserve must exceed a short page's, not a
     corpus-wide average that under-charges a long page's timeout."""
@@ -1444,16 +1451,23 @@ def test_page_cost_reserve_scales_with_page_length() -> None:
         gold_fields={},
         vendor="x",
     )
-    short_reserve = bo._page_cost_reserve(short_page, price)  # pyright: ignore[reportPrivateUsage]
-    long_reserve = bo._page_cost_reserve(long_page, price)  # pyright: ignore[reportPrivateUsage]
+    short_reserve = await bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
+        short_page, price, bo.BAKEOFF_EXTRACTION_TIMEOUT_S
+    )
+    long_reserve = await bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
+        long_page, price, bo.BAKEOFF_EXTRACTION_TIMEOUT_S
+    )
     assert long_reserve > short_reserve
 
 
-def test_page_cost_reserve_output_component_is_physically_bounded() -> None:
+@pytest.mark.asyncio
+async def test_page_cost_reserve_output_component_is_physically_bounded() -> None:
     """The reserve's OUTPUT-token component is a PHYSICAL generation-rate bound
     (#601 fold round 1, FOLD 3) -- uniform across every arm, not a per-arm
     reasoning-effort heuristic -- so it is identical for two pages with the SAME
-    input length regardless of which arm/model would have run them."""
+    input length regardless of which arm/model would have run them, and scales
+    with the EFFECTIVE timeout (#601 fold round 2, FOLD 1), not a fixed module
+    constant."""
     page = bo.CorpusPage(
         slug="p", url="https://example.com/p", html="<p>Hi.</p>", gold_fields={}, vendor="x"
     )
@@ -1461,9 +1475,12 @@ def test_page_cost_reserve_output_component_is_physically_bounded() -> None:
     # component: if it were arm-dependent, this would need per-arm wiring that
     # no longer exists (_output_tokens_per_page_for_arm was removed).
     output_only_price = bo.RosterModel("m1", 0.0, 1.0, "x")
-    reserve = bo._page_cost_reserve(page, output_only_price)  # pyright: ignore[reportPrivateUsage]
+    timeout_s = 12.5  # deliberately NOT bo.BAKEOFF_EXTRACTION_TIMEOUT_S
+    reserve = await bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
+        page, output_only_price, timeout_s
+    )
     expected_output_tokens = round(
-        bo.BAKEOFF_EXTRACTION_TIMEOUT_S * bo._TIMEOUT_RESERVE_TOKENS_PER_SECOND  # pyright: ignore[reportPrivateUsage]
+        timeout_s * bo._TIMEOUT_RESERVE_TOKENS_PER_SECOND  # pyright: ignore[reportPrivateUsage]
     )
     assert reserve == pytest.approx(expected_output_tokens / 1_000_000 * 1.0)
 
@@ -2304,6 +2321,10 @@ async def test_run_bakeoff_resumes_without_calls(
     fingerprint = bo.compute_fingerprint(corpus)
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
     checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
+    # A matching ledger entry -- #601 fold round 2, FOLD 4: a checkpoint with no
+    # ledger at all refuses (see test_run_bakeoff_refuses_a_pre_ledger_checkpoint).
+    seed_ledger = bo.ChargeLedger(bo.ledger_path(out))
+    seed_ledger.append(dataclasses.replace(_seeded_ledger_entry(), arm="m1"))
     result = await bo.run_bakeoff(
         corpus,
         bo.expand_arms(["m1"], "default"),
@@ -2318,6 +2339,84 @@ async def test_run_bakeoff_resumes_without_calls(
     assert result.unevaluated_slugs == []
     assert result.executed_slugs == []  # resumed, not newly called
     assert result.failed_slugs == []
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_refuses_a_pre_ledger_checkpoint(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """A checkpoint with non-stale records but NO ledger sidecar (#601 fold round
+    2, FOLD 4) predates the charge ledger's existence -- its spend cannot be
+    accounted for, so resuming it must refuse rather than silently initialise an
+    empty budget meter and skip already-paid arms forever. Names both fixes in
+    the message."""
+    out = tmp_path / "o.json"
+    fingerprint = bo.compute_fingerprint(corpus)
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
+    checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
+    assert not bo.ledger_path(out).exists()  # no ledger seeded -- the pre-ledger scenario
+
+    with pytest.raises(ValueError, match=r"--no-resume.*--out elsewhere"):
+        await bo.run_bakeoff(
+            corpus,
+            bo.expand_arms(["m1"], "default"),
+            out=out,
+            resume=True,
+            max_spend=1000.0,
+            cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 0.1, 0.1, "x")]),
+            roster=[bo.RosterModel("m1", 0.1, 0.1, "x")],
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_fresh_run_with_neither_file_is_unaffected(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """A brand-new ``--out`` (neither checkpoint nor ledger exists) is the
+    ordinary case -- #601 fold round 2, FOLD 4's guard must never fire for it."""
+    out = tmp_path / "o.json"
+    result = await bo.run_bakeoff(
+        corpus,
+        bo.expand_arms(["m1"], "default"),
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 0.1, 0.1, "x")]),
+        roster=[bo.RosterModel("m1", 0.1, 0.1, "x")],
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert result.runs[0].model_slug == "m1"
+
+
+@pytest.mark.asyncio
+async def test_main_refuses_a_pre_ledger_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``main()`` surfaces the pre-ledger-checkpoint refusal (#601 fold round 2,
+    FOLD 4) as exit code 2, matching every other pre-spend REFUSED guard."""
+
+    async def _refusing_run_bakeoff(*args: object, **kwargs: object) -> bo.BakeoffResult:
+        raise ValueError(
+            "o.json.cells.jsonl predates the charge ledger (#601) -- its spend cannot "
+            "be accounted for. Rerun with --no-resume (fresh books, fresh budget) or "
+            "point --out elsewhere."
+        )
+
+    monkeypatch.setattr(bo, "run_bakeoff", _refusing_run_bakeoff)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-not-real")
+    out = tmp_path / "out.json"
+    code = await bo.main(
+        [
+            "--models",
+            bo.MODEL_ROSTER[0].slug,
+            "--max-spend",
+            "5",
+            "--out",
+            str(out),
+        ]
+    )
+    assert code == 2
+    assert not out.exists()
 
 
 @pytest.mark.asyncio
@@ -2403,6 +2502,9 @@ async def test_run_bakeoff_resume_distinguishes_arms(
     seed = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
     # only the "off" arm resumed
     seed.append(bo.run_to_json(_full_run("m1+reasoning-off", bo.Outcome.COR)))
+    # A matching ledger entry -- #601 fold round 2, FOLD 4.
+    seed_ledger = bo.ChargeLedger(bo.ledger_path(out))
+    seed_ledger.append(dataclasses.replace(_seeded_ledger_entry(), arm="m1+reasoning-off"))
 
     arms = bo.expand_arms(["m1"], "both")
     result = await bo.run_bakeoff(
@@ -2775,6 +2877,9 @@ async def test_run_bakeoff_resumed_success_does_not_flip_the_heuristic_label(
     # resuming it (no new call) means it is NOT freshly executed this run.
     seed = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
     seed.append(bo.run_to_json(_full_run("good", bo.Outcome.COR)))
+    # A matching ledger entry -- #601 fold round 2, FOLD 4.
+    seed_ledger = bo.ChargeLedger(bo.ledger_path(out))
+    seed_ledger.append(dataclasses.replace(_seeded_ledger_entry(), arm="good"))
 
     result = await bo.run_bakeoff(
         corpus,
