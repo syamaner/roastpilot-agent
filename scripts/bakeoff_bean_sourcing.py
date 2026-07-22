@@ -1428,7 +1428,6 @@ async def run_model_over_corpus(
     """
     results: list[PageResult] = []
     for page in pages:
-        started = time.monotonic()
         diagnostics = BeanSourcingDiagnostics()  # #601 F2: per-page retry count
         # Computed BEFORE the billable call (#601 fold round 3, FOLD 2): the
         # failure handler must never re-parse, or a kill mid-timeout loses a
@@ -1455,6 +1454,11 @@ async def run_model_over_corpus(
                     is_pending=True,
                 )
             )
+        # STARTED here, AFTER the reserve compute + pending write (#601 fold
+        # round 5, D FOLD 1): elapsed_s feeds latency_median_p95()'s
+        # cost+latency tie-break -- reserve/ledger overhead in that window
+        # would corrupt the metric with non-provider latency.
+        started = time.monotonic()
         draft, error = await draft_for_page(
             page,
             advisor_config=advisor_config,
@@ -1465,6 +1469,31 @@ async def run_model_over_corpus(
             max_output_tokens=max_output_tokens,
         )
         elapsed_s = time.monotonic() - started
+        if roster_price is not None and ledger is not None:
+            # FINAL supersedes the PENDING entry above (#601 fold round 4, FOLD 1),
+            # appended IMMEDIATELY once the call returns (#601 fold round 5, D FOLD 2)
+            # -- before scoring/serialization, so a later raise there still leaves
+            # the ACTUAL charge on the books, not just the pending reserve.
+            timed_out = diagnostics.timed_out_runs > 0
+            priced = _actual_page_cost(
+                diagnostics.request_tokens,
+                diagnostics.response_tokens,
+                roster_price,
+                reserve,
+                timed_out=timed_out,
+            )
+            ledger.append(
+                LedgerEntry(
+                    arm=model_slug,
+                    slug=page.slug,
+                    request_tokens=diagnostics.request_tokens,
+                    response_tokens=diagnostics.response_tokens,
+                    priced_usd=round(priced, 5),
+                    timed_out=timed_out,
+                    reserve_applied=timed_out,  # #601 fold round 4: SUM, always applied
+                    is_pending=False,
+                )
+            )
         on_page = (
             0 if draft is None else sum(1 for v in draft.field_sources.values() if v == "on_page")
         )
@@ -1481,30 +1510,6 @@ async def run_model_over_corpus(
                 recovered_violations=diagnostics.schema_retries,
             )
         )
-        if roster_price is not None and ledger is not None:
-            timed_out = diagnostics.timed_out_runs > 0
-            priced = _actual_page_cost(
-                diagnostics.request_tokens,
-                diagnostics.response_tokens,
-                roster_price,
-                reserve,
-                timed_out=timed_out,
-            )
-            # FINAL supersedes the PENDING entry above (#601 fold round 4, FOLD 1)
-            # the instant the call completes -- the ledger's ``is_pending=True``
-            # write is the only trace left if a kill lands between the two.
-            ledger.append(
-                LedgerEntry(
-                    arm=model_slug,
-                    slug=page.slug,
-                    request_tokens=diagnostics.request_tokens,
-                    response_tokens=diagnostics.response_tokens,
-                    priced_usd=round(priced, 5),
-                    timed_out=timed_out,
-                    reserve_applied=timed_out,  # #601 fold round 4: SUM, always applied
-                    is_pending=False,
-                )
-            )
     return ModelRun(model_slug=model_slug, pages=results)
 
 
@@ -3291,9 +3296,11 @@ async def run_bakeoff(
 
     Raises:
         ValueError: If a non-stale checkpointed arm (about to be skipped/resumed)
-            has NO current-fingerprint ledger entry (#601 fold round 4, FOLD 2 --
-            COVERAGE, not mere ledger EXISTENCE: an empty/legacy/foreign-fingerprint
-            ledger is just as unaccounted) -- names the uncovered arm(s). Never
+            is missing a current-fingerprint ledger entry for ONE OR MORE of its
+            OWN checkpointed pages (#601 fold round 5, D FOLD 3 -- PAGE-LEVEL
+            coverage, not mere per-arm EXISTENCE: a tail-truncated ledger can
+            carry a real entry for the arm yet still be missing most of its
+            pages' charges) -- names the uncovered arm(s) + missing count. Never
             fabricates a migration; the message names both fixes (``--no-resume``,
             or a different ``--out``).
     """
@@ -3302,17 +3309,31 @@ async def run_bakeoff(
     fingerprint = compute_fingerprint(pages)
     checkpoint = Checkpoint(sidecar_path(out), resume=resume, fingerprint=fingerprint)
     ledger = ChargeLedger(ledger_path(out), resume=resume, fingerprint=fingerprint)
-    # #601 fold round 4, FOLD 2: EXISTENCE isn't COVERAGE -- an empty, legacy, or
-    # foreign-fingerprint ledger must not silently pass while a checkpointed arm
-    # (about to be skipped/resumed) has no accounted spend. Fail closed, per-arm.
-    covered = {e.arm for e in ledger.entries if e.fingerprint == fingerprint}
-    uncovered = sorted(a.label for a in arms if checkpoint.has(a.label) and a.label not in covered)
+    # #601 fold round 5, D FOLD 3: PAGE-LEVEL coverage -- an arm's checkpoint
+    # record names its OWN complete page set; a tail-truncated ledger (a kill
+    # mid-write) can still have ONE entry for the arm while most of its pages'
+    # charges never landed. Fail closed, per missing page.
+    covered_pages: dict[str, set[str]] = {}
+    for e in ledger.entries:
+        if e.fingerprint == fingerprint:
+            covered_pages.setdefault(e.arm, set()).add(e.slug)
+    uncovered: list[str] = []
+    for a in arms:
+        if not checkpoint.has(a.label):
+            continue
+        expected = {
+            str(p["slug"]) for p in cast("list[dict[str, Any]]", checkpoint.get(a.label)["pages"])
+        }
+        missing = expected - covered_pages.get(a.label, set())
+        if missing:
+            uncovered.append(f"{a.label} (missing {len(missing)}/{len(expected)} page(s))")
+    uncovered.sort()
     if uncovered:
         raise ValueError(
-            f"{sidecar_path(out)}: checkpointed arm(s) {uncovered} have NO ledger "
-            "record for this fingerprint -- their spend cannot be accounted for. "
-            "Rerun with --no-resume (fresh books, fresh budget) or point --out "
-            "elsewhere."
+            f"{sidecar_path(out)}: checkpointed arm(s) {uncovered} have incomplete "
+            "ledger coverage for this fingerprint -- their spend cannot be fully "
+            "accounted for. Rerun with --no-resume (fresh books, fresh budget) or "
+            "point --out elsewhere."
         )
     runs: list[ModelRun] = []
     failed_runs: list[FailedRun] = []

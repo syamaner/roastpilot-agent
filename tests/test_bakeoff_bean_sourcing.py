@@ -19,6 +19,7 @@ import dataclasses
 import importlib.metadata
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -1177,6 +1178,69 @@ async def test_run_model_over_corpus_ledgers_a_timeout_with_zero_post_call_parsi
     assert pending.is_pending is True
     assert entry.is_pending is False
     assert entry.timed_out is True
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_elapsed_s_excludes_reserve_work(
+    corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#601 fold round 5, D FOLD 1 (P1): ``elapsed_s`` feeds
+    ``latency_median_p95()``'s cost+latency tie-break -- the reserve
+    computation + pending-entry write must never land inside the timed
+    region. A deliberately slow reserve stub must not move ``elapsed_s``."""
+
+    def _slow_reserve(page: bo.CorpusPage, price: bo.RosterModel, **_: object) -> float:
+        time.sleep(0.5)
+        return 0.01
+
+    monkeypatch.setattr(bo, "_page_cost_reserve", _slow_reserve)
+    model = _model_returning({"name": "X", "country": "Ecuador"})
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    run = await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=model,
+        roster_price=price,
+        ledger=ledger,
+    )
+    assert run.pages[0].elapsed_s is not None
+    assert run.pages[0].elapsed_s < 0.3  # well under the reserve stub's 0.5s sleep
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_final_entry_survives_a_scoring_raise(
+    corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#601 fold round 5, D FOLD 2 (P2): the FINAL ledger entry is appended
+    IMMEDIATELY once the paid call returns, before scoring/``PageResult``
+    construction -- so a raise there (a real, if rare, failure mode) still
+    leaves the ACTUAL charge on the books, not just the pending reserve."""
+
+    def _raising_score_page(
+        page: bo.CorpusPage, draft: BeanProfileDraft | None, error: str | None
+    ) -> dict[str, bo.Outcome]:
+        raise RuntimeError("scoring blew up")
+
+    monkeypatch.setattr(bo, "score_page", _raising_score_page)
+    model = _model_returning({"name": "X", "country": "Ecuador"})
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    with pytest.raises(RuntimeError, match="scoring blew up"):
+        await bo.run_model_over_corpus(
+            [corpus[0]],
+            model_slug="m1",
+            advisor_config=_ADVISOR_CONFIG,
+            model=model,
+            roster_price=price,
+            ledger=ledger,
+        )
+    assert len(ledger.entries) == 2  # pending, then the FINAL entry -- despite the raise
+    pending, entry = ledger.entries
+    assert pending.is_pending is True
+    assert entry.is_pending is False
+    assert entry.request_tokens > 0  # the ACTUAL charge, not just the pending reserve
 
 
 def test_run_json_roundtrips_elapsed_s() -> None:
@@ -2593,10 +2657,13 @@ async def test_run_bakeoff_resumes_without_calls(
     fingerprint = bo.compute_fingerprint(corpus)
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
     checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
-    # A matching ledger entry -- #601 fold round 2, FOLD 4: a checkpoint with no
-    # ledger at all refuses (see test_run_bakeoff_refuses_a_pre_ledger_checkpoint).
+    # Full page coverage -- #601 fold round 2, FOLD 4 + fold round 5, D FOLD 3:
+    # a checkpoint with no ledger at all refuses (see
+    # test_run_bakeoff_refuses_a_pre_ledger_checkpoint); a checkpoint whose
+    # ledger is missing any of ITS OWN pages refuses too.
     seed_ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
-    seed_ledger.append(dataclasses.replace(_seeded_ledger_entry(), arm="m1"))
+    for entry in _page_covering_entries("m1", ["page-a", "page-b"]):
+        seed_ledger.append(entry)
     result = await bo.run_bakeoff(
         corpus,
         bo.expand_arms(["m1"], "default"),
@@ -2692,21 +2759,76 @@ async def test_run_bakeoff_refuses_a_foreign_fingerprint_ledger(
     await _refuses_naming(corpus, out, ["m1"], "m1")
 
 
+def _page_covering_entries(arm: str, slugs: list[str]) -> list[bo.LedgerEntry]:
+    """One synthetic FINAL ledger entry per ``slugs`` member, for seeding
+    page-level coverage fixtures (#601 fold round 5, D FOLD 3)."""
+    return [dataclasses.replace(_seeded_ledger_entry(), arm=arm, slug=slug) for slug in slugs]
+
+
 @pytest.mark.asyncio
 async def test_run_bakeoff_refuses_naming_only_the_uncovered_arm(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
-    """Per-arm coverage: "m1" is covered, "m2" is not -- the refusal must name
-    ONLY "m2", not the already-covered "m1"."""
+    """Per-arm coverage: "m1" has a ledger entry for EVERY one of its
+    checkpointed pages, "m2" has none -- the refusal must name ONLY "m2", not
+    the already-fully-covered "m1"."""
     out = tmp_path / "o.json"
     fingerprint = bo.compute_fingerprint(corpus)
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
     checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
     checkpoint.append(bo.run_to_json(_full_run("m2", bo.Outcome.COR)))
     ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
-    ledger.append(dataclasses.replace(_seeded_ledger_entry(), arm="m1"))  # "m2" left uncovered
+    for entry in _page_covering_entries("m1", ["page-a", "page-b"]):  # "m2" left uncovered
+        ledger.append(entry)
 
     await _refuses_naming(corpus, out, ["m1", "m2"], "m2")
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_refuses_an_arm_with_partial_page_coverage(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 5, D FOLD 3: a checkpointed TWO-page arm with a ledger
+    entry for only ONE of its pages must still refuse -- per-ARM existence
+    (the round 4 check) would have wrongly passed this; page-level coverage
+    catches the tail-truncated-ledger case it cannot."""
+    out = tmp_path / "o.json"
+    fingerprint = bo.compute_fingerprint(corpus)
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
+    checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
+    ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
+    for entry in _page_covering_entries("m1", ["page-a"]):  # "page-b" never landed
+        ledger.append(entry)
+
+    await _refuses_naming(corpus, out, ["m1"], "m1")
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_full_page_coverage_is_unaffected(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 5, D FOLD 3: a checkpointed arm with a ledger entry for
+    EVERY one of its pages resumes normally -- the guard never fires against a
+    genuinely complete arm."""
+    out = tmp_path / "o.json"
+    fingerprint = bo.compute_fingerprint(corpus)
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
+    checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
+    ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
+    for entry in _page_covering_entries("m1", ["page-a", "page-b"]):
+        ledger.append(entry)
+
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    result = await bo.run_bakeoff(
+        corpus,
+        bo.expand_arms(["m1"], "default"),
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost(corpus, roster),
+        roster=roster,
+    )
+    assert len(result.runs) == 1  # resumed from checkpoint, not refused
 
 
 @pytest.mark.asyncio
@@ -2844,9 +2966,10 @@ async def test_run_bakeoff_resume_distinguishes_arms(
     seed = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
     # only the "off" arm resumed
     seed.append(bo.run_to_json(_full_run("m1+reasoning-off", bo.Outcome.COR)))
-    # A matching ledger entry -- #601 fold round 2, FOLD 4.
+    # Full page coverage -- #601 fold round 2, FOLD 4 + fold round 5, D FOLD 3.
     seed_ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
-    seed_ledger.append(dataclasses.replace(_seeded_ledger_entry(), arm="m1+reasoning-off"))
+    for entry in _page_covering_entries("m1+reasoning-off", ["page-a", "page-b"]):
+        seed_ledger.append(entry)
 
     arms = bo.expand_arms(["m1"], "both")
     result = await bo.run_bakeoff(
@@ -3219,9 +3342,10 @@ async def test_run_bakeoff_resumed_success_does_not_flip_the_heuristic_label(
     # resuming it (no new call) means it is NOT freshly executed this run.
     seed = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
     seed.append(bo.run_to_json(_full_run("good", bo.Outcome.COR)))
-    # A matching ledger entry -- #601 fold round 2, FOLD 4.
+    # Full page coverage -- #601 fold round 2, FOLD 4 + fold round 5, D FOLD 3.
     seed_ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
-    seed_ledger.append(dataclasses.replace(_seeded_ledger_entry(), arm="good"))
+    for entry in _page_covering_entries("good", ["page-a", "page-b"]):
+        seed_ledger.append(entry)
 
     result = await bo.run_bakeoff(
         corpus,
