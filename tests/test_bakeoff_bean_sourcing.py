@@ -107,6 +107,23 @@ def _model_fails_nth_call(n: int) -> FunctionModel:
     return FunctionModel(respond)
 
 
+def _model_fails_calls(ns: set[int]) -> FunctionModel:
+    """Like :func:`_model_fails_nth_call`, but for MULTIPLE call numbers
+    (1-indexed) -- more than one transient failure inside an otherwise-clean
+    run (#652)."""
+    calls = {"n": 0}
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls["n"] += 1
+        if calls["n"] in ns:
+            raise ModelAPIError("test-model", "simulated provider outage")
+        return ModelResponse(
+            parts=[ToolCallPart(info.output_tools[0].name, {"name": "X", "country": "Ecuador"})]
+        )
+
+    return FunctionModel(respond)
+
+
 def _model_retry_then_provider_error() -> FunctionModel:
     """A double whose FIRST attempt is malformed (a real, billed response
     with explicit usage -- a validation retry pydantic-ai recovers from),
@@ -3787,6 +3804,68 @@ async def test_run_bakeoff_resume_idempotent_once_nothing_retryable_remains(
     )
     assert third.executed_slugs == []
     assert all(not p.retryable for p in third.runs[0].pages)
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_breaker_trip_mid_retry_reports_honestly(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652: a meter trip DURING a residual retry must report breaker_tripped
+    (exit 3), never a false stopped_early=False/exit 0 from falling through to
+    the next arm (or simply running out of arms) -- the SAME trip semantics a
+    fresh arm's mid-arm trip already gets. The untouched (never-reached)
+    retryable page stays retryable for the next resume -- the merge already
+    guarantees this; pinned here too."""
+    out = tmp_path / "o.json"
+    cheap_roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, cheap_roster)
+
+    # Two transient failures (pages 1 and 2, corpus order) inside an
+    # otherwise-clean run, at a CHEAP real price -- sets up a checkpoint with
+    # two retryable pages without tripping anything.
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=cheap_roster,
+        model=_model_fails_calls({1, 2}),
+    )
+    fingerprint = bo.compute_fingerprint(corpus)
+    charged_after_setup = bo.ChargeLedger(
+        bo.ledger_path(out), fingerprint=fingerprint
+    ).total_usd_for_arm("m1")
+
+    # Resume: an ABSURD real price so retrying the FIRST retryable page alone
+    # trips the meter -- the retry's own internal loop must then break BEFORE
+    # ever reaching the second retryable page.
+    absurd_roster = [bo.RosterModel("m1", 1_000_000, 1_000_000, "x")]
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=charged_after_setup + 0.01,  # tiny headroom -- one absurd charge blows past it
+        cost_estimates=cost_estimates,
+        roster=absurd_roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert result.breaker_tripped is True
+    assert result.stopped_early is True
+    assert result.executed_slugs == ["m1"]  # the retry WAS attempted this invocation
+    merged_run = result.runs[0]
+    still_retryable = bo._retryable_slugs(merged_run)  # pyright: ignore[reportPrivateUsage]
+    assert len(still_retryable) == 1  # the second retryable page was never reached
+
+    # The untouched page is still retryable on disk too -- a later resume
+    # would pick it up (the merge/checkpoint-supersede guarantee).
+    reloaded = bo._run_from_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint).get("m1")
+    )
+    assert bo._retryable_slugs(reloaded) == still_retryable  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio

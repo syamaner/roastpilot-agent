@@ -3694,7 +3694,11 @@ async def run_bakeoff(
     (the existing per-call charge model already handles this correctly). The
     retry itself still defers to an already-tripped meter (real money), but
     skips the pre-run ESTIMATE guard (that guard's whole-arm basis does not
-    scale to a handful of retried pages).
+    scale to a handful of retried pages). A meter trip DURING the retry (#652)
+    reports honestly -- SAME early-return trip semantics as a fresh arm's
+    mid-arm trip, never an unconditional ``continue`` that could let a later
+    already-checkpointed arm (or simply running out of arms) mask the exit
+    code; the untouched retryable pages stay retryable for the next resume.
 
     Args:
         pages: The corpus.
@@ -3783,13 +3787,41 @@ async def run_bakeoff(
             has_fresh_success = has_fresh_success or _has_any_success(fresh_run)
             merged_run = _merge_retry_results(existing_run, fresh_run)
             checkpoint.append(run_to_json(merged_run))  # supersedes the old record
+            runs.append(merged_run)
             still_retryable = len(_retryable_slugs(merged_run))
+            # #652: the SAME trip semantics as a fresh arm's mid-arm trip --
+            # an unconditional `continue` here would let a later
+            # already-checkpointed arm (or simply running out of arms)
+            # silently swallow a REAL trip, returning breaker_tripped=False/
+            # exit 0 despite real money having just hit the cap.
+            if meter.tripped:
+                print(
+                    f"[breaker] halted mid-retry for {slug}: cumulative usage-priced spend "
+                    f"${meter.charged:.4f} reached --max-spend ${max_spend:.2f}; "
+                    f"{still_retryable} page(s) remain retryable; "
+                    f"{len(arms) - index - 1} arm(s) skipped",
+                    flush=True,
+                )
+                return BakeoffResult(
+                    runs=runs,
+                    stopped_early=True,
+                    unevaluated_slugs=[a.label for a in arms[index + 1 :]],
+                    failed_slugs=failed_runs,
+                    executed_slugs=executed_slugs,
+                    breaker_tripped=True,
+                    actual_costs=_ledger_actual_costs(ledger),
+                    reserved_costs=_ledger_reserved_costs(ledger),
+                    # No prorated_* fields for a retry trip -- the "n/a" case
+                    # per the documented approximation (the incurred-spend
+                    # line already over-estimates a residual retry's cost by
+                    # using the whole-arm estimate, a pre-existing style of
+                    # conservatism, not a new gap).
+                )
             outcome = f"{still_retryable} still retryable" if still_retryable else "all resolved"
             print(
                 f"[resume] {slug}: retried {len(retry_pages)} retryable page(s) -- {outcome}",
                 flush=True,
             )
-            runs.append(merged_run)
             continue
         # #601 fold round 13: the REAL meter is checked BEFORE the pre-run
         # ESTIMATE guard -- a resumed, already-over-budget ledger (or a
