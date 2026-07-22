@@ -2534,6 +2534,48 @@ def test_charge_ledger_reserved_usd_for_arm_zero_when_pure_captured(
     assert ledger.reserved_usd_for_arm("m1") == pytest.approx(0.0)
 
 
+def test_charge_ledger_legacy_reserve_applied_entry_discloses_full_amount(
+    tmp_path: Path,
+) -> None:
+    """#650 round-1: a pre-#601-fold-round-14 legacy record (NO
+    ``reserved_usd`` key at all, ``reserve_applied=True``) has an
+    UNRECOVERABLE captured-vs-reserve split -- the loader falls back to the
+    WHOLE ``priced_usd``, conservative in the DISCLOSURE direction (overstate
+    reserved rather than silently claim observed captured usage)."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    legacy_reserved = dataclasses.asdict(
+        bo.LedgerEntry(
+            arm="m1",
+            slug="a",
+            request_tokens=0,
+            response_tokens=0,
+            priced_usd=0.05,
+            timed_out=True,
+            reserve_applied=True,
+        )
+    )
+    del legacy_reserved["reserved_usd"]  # genuinely pre-#650 on-disk shape
+    path.write_text(json.dumps(legacy_reserved) + "\n")
+
+    ledger = bo.ChargeLedger(path)
+    assert len(ledger.entries) == 1
+    assert ledger.entries[0].reserved_usd == pytest.approx(0.05)
+    assert ledger.reserved_usd_for_arm("m1") == pytest.approx(0.05)
+
+
+def test_charge_ledger_legacy_non_reserved_entry_discloses_zero(tmp_path: Path) -> None:
+    """A legacy record (no ``reserved_usd`` key) with ``reserve_applied=False``
+    still defaults to ``0.0`` -- the fallback only widens for a RESERVED
+    legacy entry, never invents a reserve where none was applied."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    legacy_plain = dataclasses.asdict(_seeded_ledger_entry())
+    del legacy_plain["reserved_usd"]
+    path.write_text(json.dumps(legacy_plain) + "\n")
+
+    ledger = bo.ChargeLedger(path)
+    assert ledger.entries[0].reserved_usd == pytest.approx(0.0)
+
+
 def test_load_dotenv_key(tmp_path: Path) -> None:
     (tmp_path / ".env").write_text('OPENROUTER_API_KEY="sk-or-secret"\nOTHER=1\n')
     assert bo.load_dotenv_key(tmp_path) == "sk-or-secret"
@@ -3935,6 +3977,91 @@ async def test_run_bakeoff_prorates_by_cost_not_flat_page_fraction(
     flat_fraction_share = cost_estimates[0].usd / len(pages)
     assert result.prorated_attempted_estimate is not None
     assert result.prorated_attempted_estimate > flat_fraction_share
+
+
+def test_page_cost_estimate_light_reasoning_multiplies_output_component(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """#650 round-1: ``_page_cost_estimate`` must match
+    ``estimate_cost_for_arms``'s :data:`bo.LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER`
+    on the output-token component -- mid-arm proration on a light arm
+    previously understated every attempted page by using the base
+    (non-multiplied) output estimate."""
+    page = corpus[0]
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    default_est = bo._page_cost_estimate(page, price)  # pyright: ignore[reportPrivateUsage]
+    light_est = bo._page_cost_estimate(page, price, reasoning="light")  # pyright: ignore[reportPrivateUsage]
+    input_component = (
+        bo._page_input_tokens_estimate(page)  # pyright: ignore[reportPrivateUsage]
+        / 1_000_000
+        * price.price_in_per_mtok
+    )
+    default_output_component = default_est - input_component
+    light_output_component = light_est - input_component
+    assert light_output_component == pytest.approx(
+        default_output_component * bo.LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_prorates_light_arm_output_component_at_the_multiplier(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#650 round-1: an identical mid-arm trip on a "light" arm must prorate
+    at :data:`bo.LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER` on the output
+    component -- matching a "default" arm's trip except for that scaling,
+    never silently reusing the base (unscaled) per-page estimate."""
+    out_default = tmp_path / "default.json"
+    out_light = tmp_path / "light.json"
+    estimate_roster = [bo.RosterModel("m1", 0.05, 0.5, "x")]  # nonzero output price
+    real_roster = [bo.RosterModel("m1", 1_000_000, 1_000_000, "x")]  # trips after page 1
+
+    default_arms = bo.expand_arms(["m1"], "default")
+    default_estimates = bo.estimate_cost_for_arms(corpus, default_arms, estimate_roster)
+    default_result = await bo.run_bakeoff(
+        corpus,
+        default_arms,
+        out=out_default,
+        resume=True,
+        max_spend=0.01,
+        cost_estimates=default_estimates,
+        roster=real_roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+
+    light_arms = bo.expand_arms(["m1"], "light")
+    light_estimates = bo.estimate_cost_for_arms(corpus, light_arms, estimate_roster)
+    light_result = await bo.run_bakeoff(
+        corpus,
+        light_arms,
+        out=out_light,
+        resume=True,
+        max_spend=0.01,
+        cost_estimates=light_estimates,
+        roster=real_roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+
+    assert default_result.breaker_tripped is True
+    assert light_result.breaker_tripped is True
+    assert default_result.prorated_attempted_pages == 1
+    assert light_result.prorated_attempted_pages == 1
+    # The mid-arm proration prices at the REAL roster (`roster=`, what
+    # price_by_slug resolves to inside run_bakeoff) -- estimate_roster is
+    # ONLY the pre-run estimate guard's decoupled basis, never this.
+    price = real_roster[0]
+    input_component = (
+        bo._page_input_tokens_estimate(corpus[0])  # pyright: ignore[reportPrivateUsage]
+        / 1_000_000
+        * price.price_in_per_mtok
+    )
+    assert default_result.prorated_attempted_estimate is not None
+    assert light_result.prorated_attempted_estimate is not None
+    default_output = default_result.prorated_attempted_estimate - input_component
+    light_output = light_result.prorated_attempted_estimate - input_component
+    assert light_output == pytest.approx(
+        default_output * bo.LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER
+    )
 
 
 @pytest.mark.asyncio

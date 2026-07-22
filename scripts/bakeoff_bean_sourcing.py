@@ -2207,12 +2207,23 @@ def _page_input_tokens_estimate(page: CorpusPage) -> int:
     return (len(_extract_prompt_text(page)) + _INSTRUCTION_OVERHEAD_CHARS) // 4
 
 
-def _page_cost_estimate(page: CorpusPage, price: RosterModel) -> float:
+def _page_cost_estimate(
+    page: CorpusPage, price: RosterModel, *, reasoning: ReasoningArm = "default"
+) -> float:
     """One page's estimated USD cost at ``price`` (#601 fold round 14) --
-    :func:`estimate_cost`'s SAME heuristic, applied to a single page."""
+    :func:`estimate_cost`'s SAME heuristic, applied to a single page.
+
+    ``reasoning="light"`` multiplies the output-token component by
+    :data:`LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER` (#650 round 1) -- matching
+    :func:`estimate_cost_for_arms`'s pricing, since a light arm's real output
+    tokens (reasoning + the structured record) cost more than the base estimate.
+    """
+    output_tokens = _OUTPUT_TOKENS_PER_PAGE * (
+        LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER if reasoning == "light" else 1.0
+    )
     return (
         _page_input_tokens_estimate(page) / 1_000_000 * price.price_in_per_mtok
-        + _OUTPUT_TOKENS_PER_PAGE / 1_000_000 * price.price_out_per_mtok
+        + output_tokens / 1_000_000 * price.price_out_per_mtok
     )
 
 
@@ -3261,6 +3272,19 @@ class ChargeLedger:
                 # one per entry (#601 fold round 6, FOLD A) so two such
                 # legacy entries never wrongly collide under one key.
                 call_id = str(record["call_id"]) if record.get("call_id") else uuid.uuid4().hex
+                # #650 round-1: a pre-#601-fold-round-14 record has NO
+                # reserved_usd key at all -- for a reserve_applied entry, the
+                # captured-vs-reserve split is UNRECOVERABLE, so fall back to
+                # the WHOLE priced_usd (conservative in the DISCLOSURE
+                # direction: overstate reserved rather than claim observed
+                # captured usage). A non-reserved legacy entry is 0.0, same
+                # as a current-format one.
+                if "reserved_usd" in record:
+                    reserved_usd = float(record["reserved_usd"])
+                elif bool(record["reserve_applied"]):
+                    reserved_usd = float(record["priced_usd"])
+                else:
+                    reserved_usd = 0.0
                 self._entries.append(
                     LedgerEntry(
                         arm=str(record["arm"]),
@@ -3273,7 +3297,7 @@ class ChargeLedger:
                         fingerprint=str(record.get("fingerprint", _LEGACY_LEDGER_FINGERPRINT)),
                         is_pending=bool(record.get("is_pending", False)),
                         call_id=call_id,
-                        reserved_usd=float(record.get("reserved_usd", 0.0)),
+                        reserved_usd=reserved_usd,
                     )
                 )
 
@@ -3744,9 +3768,11 @@ async def run_bakeoff(
                 flush=True,
             )
             # #601 fold round 14: COST-WEIGHTED, not a flat page-count
-            # fraction (`run.pages` is a known PREFIX of `pages`).
+            # fraction (`run.pages` is a known PREFIX of `pages`). #650
+            # round 1: reasoning-aware -- a light arm's real output tokens
+            # cost more, matching estimate_cost_for_arms's own pricing.
             attempted_estimate = sum(
-                _page_cost_estimate(p, price_by_slug[arm.model_slug])
+                _page_cost_estimate(p, price_by_slug[arm.model_slug], reasoning=arm.reasoning)
                 for p in pages[: len(run.pages)]
             )
             return BakeoffResult(
