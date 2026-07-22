@@ -2480,7 +2480,7 @@ async def test_run_bakeoff_resumes_without_calls(
     checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
     # A matching ledger entry -- #601 fold round 2, FOLD 4: a checkpoint with no
     # ledger at all refuses (see test_run_bakeoff_refuses_a_pre_ledger_checkpoint).
-    seed_ledger = bo.ChargeLedger(bo.ledger_path(out))
+    seed_ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
     seed_ledger.append(dataclasses.replace(_seeded_ledger_entry(), arm="m1"))
     result = await bo.run_bakeoff(
         corpus,
@@ -2523,6 +2523,75 @@ async def test_run_bakeoff_refuses_a_pre_ledger_checkpoint(
             cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 0.1, 0.1, "x")]),
             roster=[bo.RosterModel("m1", 0.1, 0.1, "x")],
         )
+
+
+async def _refuses_naming(
+    corpus: list[bo.CorpusPage], out: Path, arm_labels: list[str], expect_named: str
+) -> None:
+    """Shared assertion for the coverage-based refusal's per-arm scenarios (#601
+    fold round 4, FOLD 2): ``run_bakeoff`` must refuse, naming ``expect_named``."""
+    roster = [bo.RosterModel(a, 0.1, 0.1, "x") for a in arm_labels]
+    with pytest.raises(ValueError, match=rf"{expect_named}.*--no-resume.*--out elsewhere"):
+        await bo.run_bakeoff(
+            corpus,
+            bo.expand_arms(arm_labels, "default"),
+            out=out,
+            resume=True,
+            max_spend=1000.0,
+            cost_estimates=bo.estimate_cost(corpus, roster),
+            roster=roster,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_refuses_a_legacy_only_ledger(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 4, FOLD 2: EXISTENCE isn't COVERAGE -- a ledger with an
+    entry for "m1" but NO fingerprint (a genuinely pre-fold-4 record) does not
+    cover the checkpointed arm; must refuse the same as no ledger at all."""
+    out = tmp_path / "o.json"
+    fingerprint = bo.compute_fingerprint(corpus)
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
+    checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
+    legacy_record = dataclasses.asdict(dataclasses.replace(_seeded_ledger_entry(), arm="m1"))
+    del legacy_record["fingerprint"]
+    bo.ledger_path(out).write_text(json.dumps(legacy_record) + "\n")
+
+    await _refuses_naming(corpus, out, ["m1"], "m1")
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_refuses_a_foreign_fingerprint_ledger(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """A ledger entry for "m1" under a DIFFERENT (foreign) fingerprint does not
+    cover THIS invocation's checkpointed "m1" -- must refuse."""
+    out = tmp_path / "o.json"
+    fingerprint = bo.compute_fingerprint(corpus)
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
+    checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
+    foreign = bo.ChargeLedger(bo.ledger_path(out), fingerprint="fp-foreign")
+    foreign.append(dataclasses.replace(_seeded_ledger_entry(), arm="m1"))
+
+    await _refuses_naming(corpus, out, ["m1"], "m1")
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_refuses_naming_only_the_uncovered_arm(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """Per-arm coverage: "m1" is covered, "m2" is not -- the refusal must name
+    ONLY "m2", not the already-covered "m1"."""
+    out = tmp_path / "o.json"
+    fingerprint = bo.compute_fingerprint(corpus)
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
+    checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
+    checkpoint.append(bo.run_to_json(_full_run("m2", bo.Outcome.COR)))
+    ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
+    ledger.append(dataclasses.replace(_seeded_ledger_entry(), arm="m1"))  # "m2" left uncovered
+
+    await _refuses_naming(corpus, out, ["m1", "m2"], "m2")
 
 
 @pytest.mark.asyncio
@@ -2660,7 +2729,7 @@ async def test_run_bakeoff_resume_distinguishes_arms(
     # only the "off" arm resumed
     seed.append(bo.run_to_json(_full_run("m1+reasoning-off", bo.Outcome.COR)))
     # A matching ledger entry -- #601 fold round 2, FOLD 4.
-    seed_ledger = bo.ChargeLedger(bo.ledger_path(out))
+    seed_ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
     seed_ledger.append(dataclasses.replace(_seeded_ledger_entry(), arm="m1+reasoning-off"))
 
     arms = bo.expand_arms(["m1"], "both")
@@ -3035,7 +3104,7 @@ async def test_run_bakeoff_resumed_success_does_not_flip_the_heuristic_label(
     seed = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
     seed.append(bo.run_to_json(_full_run("good", bo.Outcome.COR)))
     # A matching ledger entry -- #601 fold round 2, FOLD 4.
-    seed_ledger = bo.ChargeLedger(bo.ledger_path(out))
+    seed_ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
     seed_ledger.append(dataclasses.replace(_seeded_ledger_entry(), arm="good"))
 
     result = await bo.run_bakeoff(

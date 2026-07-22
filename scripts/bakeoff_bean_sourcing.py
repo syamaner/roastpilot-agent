@@ -1466,9 +1466,6 @@ async def run_model_over_corpus(
                 reserve,
                 timed_out=timed_out,
             )
-            raw = _raw_priced_cost(
-                diagnostics.request_tokens, diagnostics.response_tokens, roster_price
-            )
             ledger.append(
                 LedgerEntry(
                     arm=model_slug,
@@ -1477,7 +1474,7 @@ async def run_model_over_corpus(
                     response_tokens=diagnostics.response_tokens,
                     priced_usd=round(priced, 5),
                     timed_out=timed_out,
-                    reserve_applied=timed_out and reserve > raw,
+                    reserve_applied=timed_out,  # #601 fold round 4: SUM, always applied
                 )
             )
     return ModelRun(model_slug=model_slug, pages=results)
@@ -2324,13 +2321,16 @@ def _actual_page_cost(
     round 1, slice A).
 
     A TIMED-OUT page's usage can be partly or wholly UNREPORTED -- the provider may
-    have accepted+billed a request our outer timeout cancelled before any response,
-    so its priced (possibly zero) tokens must never be treated as the true cost.
-    Charged at ``max(priced, per_page_reserve)`` instead -- THIS page's own
-    :func:`_page_cost_reserve`, never zero.
+    have accepted+billed a request our outer timeout cancelled before any response.
+    ``request_tokens``/``response_tokens`` already SUM every completed, billed
+    retry attempt (``RunUsage`` accumulates across retries) -- the reserve is a
+    DIFFERENT, additional call (the final, unreported, timed-out one), so it is
+    ADDED, never maxed (#601 fold round 4, FOLD 3: a retry-then-timeout page's
+    completed attempts and its unreported one are separate charges, not
+    alternative estimates of the same one).
     """
     priced = _raw_priced_cost(request_tokens, response_tokens, price)
-    return max(priced, per_page_reserve) if timed_out else priced
+    return priced + per_page_reserve if timed_out else priced
 
 
 def resolve_roster_for_slugs(model_slugs: Sequence[str]) -> list[RosterModel]:
@@ -2907,11 +2907,6 @@ class Checkpoint:
         """Whether ``model_slug`` is already complete on disk."""
         return model_slug in self._records
 
-    def has_any(self) -> bool:
-        """Whether ANY (non-stale) record is on disk -- #601 fold round 2, FOLD 4:
-        :func:`run_bakeoff`'s pre-ledger-checkpoint guard."""
-        return bool(self._records)
-
     def get(self, model_slug: str) -> dict[str, Any]:
         """The stored record for an already-complete model."""
         return self._records[model_slug]
@@ -2945,8 +2940,8 @@ class LedgerEntry:
         priced_usd: The page's usage-priced (list-price) cost, past the
             timeout-reserve floor (see :func:`_actual_page_cost`).
         timed_out: Whether the outer extraction timeout cancelled this call.
-        reserve_applied: Whether the reserve floor (not raw priced tokens)
-            determined ``priced_usd``.
+        reserve_applied: Whether the reserve was ADDED to ``priced_usd`` (#601
+            fold round 4 -- always true when ``timed_out``, summed not maxed).
         fingerprint: The writing invocation's experiment fingerprint (#601 fold
             round 3, FOLD 4), stamped by :meth:`ChargeLedger.append`.
     """
@@ -3245,29 +3240,30 @@ async def run_bakeoff(
         The :class:`BakeoffResult`.
 
     Raises:
-        ValueError: If ``out``'s checkpoint has non-stale records but its ledger
-            sidecar is absent (#601 fold round 2, FOLD 4) -- a checkpoint written
-            BEFORE the ledger existed has no durable spend record, so resuming it
-            would silently skip already-paid arms with an empty budget meter.
-            Never fabricates a migration; the message names both fixes
-            (``--no-resume``, or a different ``--out``).
+        ValueError: If a non-stale checkpointed arm (about to be skipped/resumed)
+            has NO current-fingerprint ledger entry (#601 fold round 4, FOLD 2 --
+            COVERAGE, not mere ledger EXISTENCE: an empty/legacy/foreign-fingerprint
+            ledger is just as unaccounted) -- names the uncovered arm(s). Never
+            fabricates a migration; the message names both fixes (``--no-resume``,
+            or a different ``--out``).
     """
     cost_by_slug = {est.slug: est.usd for est in cost_estimates}
     price_by_slug = {r.slug: r for r in roster}
     fingerprint = compute_fingerprint(pages)
     checkpoint = Checkpoint(sidecar_path(out), resume=resume, fingerprint=fingerprint)
-    ledger_sidecar_path = ledger_path(out)
-    if checkpoint.has_any() and not ledger_sidecar_path.exists():
-        # #601 fold round 2, FOLD 4: a checkpoint written BEFORE the ledger existed
-        # has no durable spend record at all -- resuming it would silently
-        # initialise an empty ledger and skip every already-paid arm forever,
-        # outside the store of record. Fail closed; never fabricate a migration.
+    ledger = ChargeLedger(ledger_path(out), resume=resume, fingerprint=fingerprint)
+    # #601 fold round 4, FOLD 2: EXISTENCE isn't COVERAGE -- an empty, legacy, or
+    # foreign-fingerprint ledger must not silently pass while a checkpointed arm
+    # (about to be skipped/resumed) has no accounted spend. Fail closed, per-arm.
+    covered = {e.arm for e in ledger.entries if e.fingerprint == fingerprint}
+    uncovered = sorted(a.label for a in arms if checkpoint.has(a.label) and a.label not in covered)
+    if uncovered:
         raise ValueError(
-            f"{sidecar_path(out)} predates the charge ledger (#601) -- its spend "
-            "cannot be accounted for. Rerun with --no-resume (fresh books, fresh "
-            "budget) or point --out elsewhere."
+            f"{sidecar_path(out)}: checkpointed arm(s) {uncovered} have NO ledger "
+            "record for this fingerprint -- their spend cannot be accounted for. "
+            "Rerun with --no-resume (fresh books, fresh budget) or point --out "
+            "elsewhere."
         )
-    ledger = ChargeLedger(ledger_sidecar_path, resume=resume, fingerprint=fingerprint)
     runs: list[ModelRun] = []
     failed_runs: list[FailedRun] = []
     executed_slugs: list[str] = []
