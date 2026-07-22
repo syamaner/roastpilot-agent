@@ -14,6 +14,7 @@ new scoring logic.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import importlib.metadata
 import json
@@ -1032,6 +1033,47 @@ async def test_run_model_over_corpus_ledgers_every_page(
     assert ledger.total_usd() > 0.0
 
 
+def _function_model_hanging() -> FunctionModel:
+    """A double that never returns -- used to force a REAL outer-timeout
+    cancellation (mirrors ``tests/test_bean_sourcing.py``'s helper of the same
+    name) rather than a synthetic ``timed_out=True`` construction."""
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        await asyncio.sleep(10)
+        return ModelResponse(parts=[TextPart("too late")])  # pragma: no cover
+
+    return FunctionModel(respond)
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_ledgers_a_real_timed_out_page_with_reserve_floor(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """End-to-end wiring proof (#601 fold round 1, FOLD 4): a REAL timed-out
+    extraction call (a hanging model + a short extraction timeout, not a
+    synthetic ``PageResult``/``LedgerEntry`` construction) must flow through to a
+    ``LedgerEntry`` with ``timed_out=True``, ``reserve_applied=True``, and the
+    reserve-priced USD -- catching any wrong-field wiring the synthetic-
+    construction unit tests above cannot."""
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    run = await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=_function_model_hanging(),
+        sourcing_config=bo.BeanSourcingConfig(extraction_timeout_seconds=0.05),
+        roster_price=price,
+        ledger=ledger,
+    )
+    assert run.pages[0].error is not None  # the extraction call DID fail
+    assert len(ledger.entries) == 1
+    entry = ledger.entries[0]
+    assert entry.timed_out is True
+    assert entry.reserve_applied is True
+    assert entry.priced_usd > 0.0  # the reserve floor, never the (unreported) $0
+
+
 def test_run_json_roundtrips_elapsed_s() -> None:
     page = bo.PageResult(
         slug="p", outcomes={"origin": bo.Outcome.COR}, error=None, on_page_fields=1, elapsed_s=4.2
@@ -1402,19 +1444,28 @@ def test_page_cost_reserve_scales_with_page_length() -> None:
         gold_fields={},
         vendor="x",
     )
-    output_tokens = bo._OUTPUT_TOKENS_PER_PAGE  # pyright: ignore[reportPrivateUsage]
-    short_reserve = bo._page_cost_reserve(short_page, price, output_tokens)  # pyright: ignore[reportPrivateUsage]
-    long_reserve = bo._page_cost_reserve(long_page, price, output_tokens)  # pyright: ignore[reportPrivateUsage]
+    short_reserve = bo._page_cost_reserve(short_page, price)  # pyright: ignore[reportPrivateUsage]
+    long_reserve = bo._page_cost_reserve(long_page, price)  # pyright: ignore[reportPrivateUsage]
     assert long_reserve > short_reserve
 
 
-def test_output_tokens_per_page_for_arm_multiplies_for_light() -> None:
-    off_arm = bo.Arm(model_slug="m1", reasoning="off", label="m1+reasoning-off")
-    light_arm = bo.Arm(model_slug="m1", reasoning="light", label="m1+reasoning-light")
-    off_tokens = bo._output_tokens_per_page_for_arm(off_arm)  # pyright: ignore[reportPrivateUsage]
-    light_tokens = bo._output_tokens_per_page_for_arm(light_arm)  # pyright: ignore[reportPrivateUsage]
-    assert off_tokens == bo._OUTPUT_TOKENS_PER_PAGE  # pyright: ignore[reportPrivateUsage]
-    assert light_tokens > off_tokens
+def test_page_cost_reserve_output_component_is_physically_bounded() -> None:
+    """The reserve's OUTPUT-token component is a PHYSICAL generation-rate bound
+    (#601 fold round 1, FOLD 3) -- uniform across every arm, not a per-arm
+    reasoning-effort heuristic -- so it is identical for two pages with the SAME
+    input length regardless of which arm/model would have run them."""
+    page = bo.CorpusPage(
+        slug="p", url="https://example.com/p", html="<p>Hi.</p>", gold_fields={}, vendor="x"
+    )
+    # A second RosterModel priced ONLY on output tokens isolates the output
+    # component: if it were arm-dependent, this would need per-arm wiring that
+    # no longer exists (_output_tokens_per_page_for_arm was removed).
+    output_only_price = bo.RosterModel("m1", 0.0, 1.0, "x")
+    reserve = bo._page_cost_reserve(page, output_only_price)  # pyright: ignore[reportPrivateUsage]
+    expected_output_tokens = round(
+        bo.BAKEOFF_EXTRACTION_TIMEOUT_S * bo._TIMEOUT_RESERVE_TOKENS_PER_SECOND  # pyright: ignore[reportPrivateUsage]
+    )
+    assert reserve == pytest.approx(expected_output_tokens / 1_000_000 * 1.0)
 
 
 def test_charge_ledger_total_usd_sums_priced_entries_and_reloads(tmp_path: Path) -> None:
@@ -1469,6 +1520,44 @@ def test_charge_ledger_skips_a_blank_line_on_load(tmp_path: Path) -> None:
     ledger = bo.ChargeLedger(path)
     assert len(ledger.entries) == 1
     assert ledger.total_usd() == pytest.approx(0.01)
+
+
+def _seeded_ledger_entry() -> bo.LedgerEntry:
+    return bo.LedgerEntry(
+        arm="m1",
+        slug="a",
+        request_tokens=1,
+        response_tokens=1,
+        priced_usd=0.05,
+        timed_out=False,
+        reserve_applied=False,
+    )
+
+
+def test_charge_ledger_no_resume_wipes_a_prior_experiment(tmp_path: Path) -> None:
+    """``resume=False`` unlinks a pre-existing ledger, mirroring
+    :class:`bo.Checkpoint` (#601 fold round 1, FOLD 1) -- a fresh experiment means
+    a fresh budget; a completed PRIOR experiment's charges must never silently eat
+    a later, unrelated one's --max-spend."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    seeded = bo.ChargeLedger(path)
+    seeded.append(_seeded_ledger_entry())
+    assert seeded.total_usd() == pytest.approx(0.05)
+
+    fresh = bo.ChargeLedger(path, resume=False)
+    assert fresh.total_usd() == pytest.approx(0.0)
+    assert fresh.entries == []
+    assert not path.exists()  # unlinked, not just ignored in memory
+
+
+def test_charge_ledger_resume_preserves_prior_charges(tmp_path: Path) -> None:
+    path = tmp_path / "o.json.ledger.jsonl"
+    seeded = bo.ChargeLedger(path)
+    seeded.append(_seeded_ledger_entry())
+
+    resumed = bo.ChargeLedger(path, resume=True)
+    assert resumed.total_usd() == pytest.approx(0.05)
+    assert len(resumed.entries) == 1
 
 
 def test_load_dotenv_key(tmp_path: Path) -> None:

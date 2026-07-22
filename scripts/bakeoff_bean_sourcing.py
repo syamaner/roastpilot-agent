@@ -1373,7 +1373,6 @@ async def run_model_over_corpus(
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
     roster_price: RosterModel | None = None,
     ledger: ChargeLedger | None = None,
-    output_tokens_per_page: int = _OUTPUT_TOKENS_PER_PAGE,
 ) -> ModelRun:
     """Draft + score every page for one model.
 
@@ -1393,8 +1392,6 @@ async def run_model_over_corpus(
             ``roster_price``, ONE entry is written per page THE INSTANT its call
             completes, from the page's OWN captured diagnostics -- the ledger is the
             token/spend store of record, :class:`PageResult` carries none of this.
-        output_tokens_per_page: This arm's conservative per-page output-token
-            estimate, sizing :func:`_page_cost_reserve`'s timeout-reserve floor.
 
     Returns:
         The :class:`ModelRun`.
@@ -1430,7 +1427,11 @@ async def run_model_over_corpus(
         )
         if roster_price is not None and ledger is not None:
             timed_out = diagnostics.timed_out_runs > 0
-            reserve = _page_cost_reserve(page, roster_price, output_tokens_per_page)
+            # Lazy: the reserve floor only ever MATTERS for a timed-out page (see
+            # _actual_page_cost) -- computing it unconditionally would run a real
+            # trafilatura parse (#601 fold round 1, FOLD 2) on every page for no
+            # reason.
+            reserve = _page_cost_reserve(page, roster_price) if timed_out else 0.0
             priced = _actual_page_cost(
                 diagnostics.request_tokens,
                 diagnostics.response_tokens,
@@ -2077,13 +2078,27 @@ class ModelCostEstimate:
 
 
 def _extract_prompt_text(page: CorpusPage) -> str:
-    """The exact text the extractor would feed the model for ``page`` (post
-    strip + 20k-char cap) -- imported lazily so the cost path is self-contained."""
+    """The exact text the extractor would feed the model for ``page`` (post strip
+    + 20k-char cap) -- imported lazily so the cost path is self-contained.
+
+    Mirrors ``_fetch_page_text``'s REAL prompt assembly (#601 fold round 1): the
+    trafilatura-first Markdown, falling back to the linear-strip pass, with the
+    JSON-LD context prepend -- a JSON-LD-heavy page's context used to be invisible
+    to every cost figure (the pre-run estimate AND the timeout-reserve floor)
+    before this fix. Offline-callable, no network fetch: both underlying steps
+    take ``html`` directly, and this harness already has ``page.html``.
+    """
     from roastpilot_agent.bean_sourcing import (  # noqa: PLC0415
+        _extract_page_markdown,  # pyright: ignore[reportPrivateUsage]
         _extract_page_text,  # pyright: ignore[reportPrivateUsage]
+        _format_json_ld_context,  # pyright: ignore[reportPrivateUsage]
+        _match_json_ld_product_facts,  # pyright: ignore[reportPrivateUsage]
     )
 
-    return _extract_page_text(page.html)
+    extracted_text = _extract_page_markdown(page.html) or _extract_page_text(page.html)
+    facts = _match_json_ld_product_facts(page.html, page.url)
+    json_ld_context = _format_json_ld_context(facts) if facts is not None else None
+    return extracted_text if json_ld_context is None else f"{json_ld_context}\n\n{extracted_text}"
 
 
 def estimate_cost(
@@ -2175,34 +2190,39 @@ def estimate_cost_for_arms(
     return estimates
 
 
-def _output_tokens_per_page_for_arm(arm: Arm) -> int:
-    """This arm's conservative per-page output-token estimate (#601 fold round 1,
-    slice A), for :func:`_page_cost_reserve`'s timeout-reserve floor -- mirrors
-    :func:`estimate_cost_for_arms`'s "light" multiplier so the runtime reserve and
-    the pre-run estimate agree."""
-    if arm.reasoning == "light":
-        return round(_OUTPUT_TOKENS_PER_PAGE * LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER)
-    return _OUTPUT_TOKENS_PER_PAGE
+#: A conservative generation-rate bound (tokens/second) for the timeout-reserve
+#: floor's OUTPUT component (#601 fold round 1) -- a PHYSICAL ceiling, not a
+#: per-arm reasoning-effort heuristic like :data:`LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER`:
+#: this floor exists ONLY to catch a timed-out call's possibly-unreported usage, so
+#: it must hold for ANY model (including a reasoning-capable one whose "default"
+#: arm bills far more than a flat per-page estimate), uniformly across every arm.
+#: 200 tok/s comfortably exceeds real single-request decode throughput observed
+#: across current-generation hosted providers -- chosen high enough that real
+#: generation over the WHOLE extraction timeout can never exceed the bound it sets.
+_TIMEOUT_RESERVE_TOKENS_PER_SECOND = 200
 
 
-def _page_cost_reserve(page: CorpusPage, price: RosterModel, output_tokens_per_page: int) -> float:
-    """THIS page's conservative chars/4 estimated cost (#601 fold round 1, slice A) --
-    sized to the PAGE's own prompt length, not a corpus-wide average, so a long
-    page's timeout-reserve floor exceeds a short page's.
+def _page_cost_reserve(page: CorpusPage, price: RosterModel) -> float:
+    """THIS page's PHYSICALLY-BOUNDED timeout-reserve floor (#601 fold round 1) --
+    input tokens sized to the PAGE's own prompt length (never a corpus-wide
+    average), output tokens bounded by :data:`_TIMEOUT_RESERVE_TOKENS_PER_SECOND`
+    over the extraction timeout -- a real generation-rate ceiling, not a per-arm
+    reasoning-effort heuristic, since this floor exists ONLY to catch a timed-out
+    call's possibly-unreported usage (the non-timeout cost paths keep their
+    existing labelled est./usage-priced heuristics unchanged).
 
     Args:
         page: The corpus page (its extracted prompt text drives the input estimate).
         price: The arm's model pricing.
-        output_tokens_per_page: The arm's conservative per-page output-token
-            estimate (a "light" reasoning arm multiplies this before calling in).
 
     Returns:
-        The page's chars/4-heuristic estimated USD cost.
+        The page's physically-bounded estimated USD cost.
     """
     input_tokens = (len(_extract_prompt_text(page)) + _INSTRUCTION_OVERHEAD_CHARS) // 4
+    output_tokens = round(BAKEOFF_EXTRACTION_TIMEOUT_S * _TIMEOUT_RESERVE_TOKENS_PER_SECOND)
     return (
         input_tokens / 1_000_000 * price.price_in_per_mtok
-        + output_tokens_per_page / 1_000_000 * price.price_out_per_mtok
+        + output_tokens / 1_000_000 * price.price_out_per_mtok
     )
 
 
@@ -2859,25 +2879,39 @@ class LedgerEntry:
 
 
 class ChargeLedger:
-    """Append-only, whole-invocation-LINEAGE record of every priced page call
+    """Append-only, per-INVOCATION-LINEAGE record of every priced page call
     (#601 fold round 1, slice A) -- independent of :class:`Checkpoint`. A page's
     charge is recorded the INSTANT its call completes, before any
     scoring/checkpoint decision, so a mid-arm trip, whole failure, or dropped
     mixed-failure arm all leave real spend on the books. THIS SLICE writes every
     entry but nothing yet enforces against it -- no spend guard reads it back
     (a follow-on slice adds one). No fingerprint filtering.
+
+    "Invocation-lineage" means cumulative across every RESUME of the SAME
+    experiment (``resume=True``, the default) -- NOT across unrelated
+    experiments: a fresh run (``resume=False``, mirroring :class:`Checkpoint`'s
+    own semantics, #601 fold round 1) means a fresh budget, or a completed prior
+    experiment against the same default ``--out`` path would silently eat a
+    later, unrelated one's ``--max-spend`` the moment a spend guard reads
+    :meth:`total_usd`.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, resume: bool = True) -> None:
         """Load every existing entry (if any) from ``path``, reusing
-        :func:`_load_checkpoint_lines`'s truncation-safe JSONL parser.
+        :func:`_load_checkpoint_lines`'s truncation-safe JSONL parser --
+        or wipe a stale ledger when starting fresh (``resume=False``,
+        mirroring :class:`Checkpoint`).
 
         Args:
             path: The ledger JSONL path (see :func:`ledger_path`).
+            resume: Load existing entries when ``True`` (the default);
+                delete the file first when ``False``.
         """
         self.path = path
         self._entries: list[LedgerEntry] = []
-        if path.exists():
+        if not resume and path.exists():
+            path.unlink()
+        if resume and path.exists():
             for record in _load_checkpoint_lines(path):
                 self._entries.append(
                     LedgerEntry(
@@ -3119,7 +3153,7 @@ async def run_bakeoff(
     price_by_slug = {r.slug: r for r in roster}
     fingerprint = compute_fingerprint(pages)
     checkpoint = Checkpoint(sidecar_path(out), resume=resume, fingerprint=fingerprint)
-    ledger = ChargeLedger(ledger_path(out))
+    ledger = ChargeLedger(ledger_path(out), resume=resume)
     runs: list[ModelRun] = []
     failed_runs: list[FailedRun] = []
     executed_slugs: list[str] = []
@@ -3154,7 +3188,6 @@ async def run_bakeoff(
             reasoning_effort=_REASONING_EFFORT_BY_ARM[arm.reasoning],
             roster_price=price_by_slug[arm.model_slug],
             ledger=ledger,
-            output_tokens_per_page=_output_tokens_per_page_for_arm(arm),
         )
         spent += upcoming
         executed_slugs.append(slug)  # a real call was attempted, win or lose
