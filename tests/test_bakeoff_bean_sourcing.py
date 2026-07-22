@@ -3868,6 +3868,91 @@ async def test_run_bakeoff_breaker_trip_mid_retry_reports_honestly(
     assert bo._retryable_slugs(reloaded) == still_retryable  # pyright: ignore[reportPrivateUsage]
 
 
+async def _setup_one_retryable_page(
+    corpus: list[bo.CorpusPage], out: Path
+) -> tuple[list[bo.Arm], list[bo.ModelCostEstimate], float]:
+    """Shared #652 round-2 fixture: a checkpoint with ONE retryable page (page
+    1, corpus order), at a cheap real price, plus the arm/estimate/charged
+    values callers need to construct the resumed invocation."""
+    cheap_roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, cheap_roster)
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=cheap_roster,
+        model=_model_fails_nth_call(1),
+    )
+    fingerprint = bo.compute_fingerprint(corpus)
+    charged = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint).total_usd_for_arm("m1")
+    return arms, cost_estimates, charged
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_deferred_retry_reports_breaker_when_already_tripped(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-2: an arm with retryable pages, resumed against an ALREADY
+    tripped meter (a resumed, over-budget ledger), must report the breaker
+    state IMMEDIATELY -- never silently defer the retry and fall through to a
+    false breaker_tripped=False/exit 0 if the rest of the run is
+    already-checkpointed too. No retry attempt is made at all (never called)."""
+    out = tmp_path / "o.json"
+    arms, cost_estimates, charged = await _setup_one_retryable_page(corpus, out)
+
+    def _never_called(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise AssertionError("no retry attempt should be made -- the meter is already tripped")
+
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=charged,  # exactly at the edge -- charged >= max_spend is tripped
+        cost_estimates=cost_estimates,
+        roster=[bo.RosterModel("m1", 0.1, 0.1, "x")],
+        model=FunctionModel(_never_called),
+    )
+    assert result.breaker_tripped is True
+    assert result.stopped_early is True
+    assert result.executed_slugs == []  # deferred -- no call made
+    fingerprint = bo.compute_fingerprint(corpus)
+    reloaded = bo._run_from_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint).get("m1")
+    )
+    assert bo._retryable_slugs(reloaded)  # pyright: ignore[reportPrivateUsage]  # still retryable
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_deferred_retry_runs_once_budget_is_raised(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-2 companion: the happy path stays reachable -- raising
+    --max-spend past the already-charged amount lets the SAME deferred retry
+    actually run and resolve."""
+    out = tmp_path / "o.json"
+    arms, cost_estimates, charged = await _setup_one_retryable_page(corpus, out)
+
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=charged + 10.0,  # ample headroom this time
+        cost_estimates=cost_estimates,
+        roster=[bo.RosterModel("m1", 0.1, 0.1, "x")],
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert result.breaker_tripped is False
+    assert result.stopped_early is False
+    assert result.executed_slugs == ["m1"]  # the retry DID run
+    assert all(not p.retryable for p in result.runs[0].pages)
+
+
 @pytest.mark.asyncio
 async def test_run_bakeoff_refuses_a_pre_ledger_checkpoint(
     corpus: list[bo.CorpusPage], tmp_path: Path

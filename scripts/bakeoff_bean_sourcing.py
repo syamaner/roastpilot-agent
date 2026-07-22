@@ -3694,11 +3694,14 @@ async def run_bakeoff(
     (the existing per-call charge model already handles this correctly). The
     retry itself still defers to an already-tripped meter (real money), but
     skips the pre-run ESTIMATE guard (that guard's whole-arm basis does not
-    scale to a handful of retried pages). A meter trip DURING the retry (#652)
-    reports honestly -- SAME early-return trip semantics as a fresh arm's
-    mid-arm trip, never an unconditional ``continue`` that could let a later
-    already-checkpointed arm (or simply running out of arms) mask the exit
-    code; the untouched retryable pages stay retryable for the next resume.
+    scale to a handful of retried pages). A meter trip DURING the retry (#652
+    round 1) reports honestly -- SAME early-return trip semantics as a fresh
+    arm's mid-arm trip, never an unconditional ``continue`` that could let a
+    later already-checkpointed arm (or simply running out of arms) mask the
+    exit code; the untouched retryable pages stay retryable for the next
+    resume. A meter ALREADY tripped BEFORE a retry even starts (#652 round 2
+    -- the deferred-retry mirror) reports the SAME way, immediately, rather
+    than silently deferring and risking the identical mask.
 
     Args:
         pages: The corpus.
@@ -3765,12 +3768,35 @@ async def run_bakeoff(
         if checkpoint.has(slug):
             existing_run = _run_from_checkpoint(checkpoint.get(slug))
             retry_slugs = _retryable_slugs(existing_run)
-            # #649: a residual retry is REAL money too -- an already-tripped
-            # meter defers it to a later resume, same as a fresh arm would be.
-            if not retry_slugs or meter.tripped:
+            if not retry_slugs:
                 runs.append(existing_run)
                 print(f"[resume] {slug}: on disk (ledger ${meter.charged:.4f} total)", flush=True)
                 continue
+            # #649/#652: retryable pages exist, but the meter is ALREADY
+            # tripped (e.g. a resumed, already-over-budget ledger) -- this
+            # must report the breaker state immediately, mirroring the
+            # meter-before-estimate-guard check for fresh arms, never
+            # silently defer + fall through to a false breaker_tripped=False
+            # if every remaining arm happens to be checkpointed too.
+            if meter.tripped:
+                runs.append(existing_run)
+                print(
+                    f"[breaker] deferring retry for {slug}: cumulative usage-priced spend "
+                    f"${meter.charged:.4f} reached --max-spend ${max_spend:.2f}; "
+                    f"{len(retry_slugs)} page(s) remain retryable; "
+                    f"{len(arms) - index - 1} arm(s) skipped",
+                    flush=True,
+                )
+                return BakeoffResult(
+                    runs=runs,
+                    stopped_early=True,
+                    unevaluated_slugs=[a.label for a in arms[index + 1 :]],
+                    failed_slugs=failed_runs,
+                    executed_slugs=executed_slugs,
+                    breaker_tripped=True,
+                    actual_costs=_ledger_actual_costs(ledger),
+                    reserved_costs=_ledger_reserved_costs(ledger),
+                )
             retry_pages = [p for p in pages if p.slug in retry_slugs]
             fresh_run = await run_model_over_corpus(
                 retry_pages,
