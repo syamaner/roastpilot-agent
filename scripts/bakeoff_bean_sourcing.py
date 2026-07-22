@@ -81,6 +81,15 @@ eventual paid run. **This module is read-only and never runs a paid model on
 import or under the self-test**; a real bake-off spends OpenRouter credits and
 is gated on explicit operator approval (see the run command below and #588).
 
+**Reasoning-effort arms (#601).** ``--reasoning {default,off,light,both}`` (default
+``default``, behaviour/spend-preserving) adds a second study dimension: light
+reasoning barely helps extraction quality but sharply improves schema adherence on
+the cheapest models. Three DISTINCT arms (:data:`ReasoningArm`) -- "default"
+(provider default, possibly-high effort) is NOT "off" (true no-reasoning), so
+``"both"`` expands to "off"+"light" only. Each arm is checkpointed/reported under
+its own :attr:`Arm.label`. Arms are skipped, with a printed note, per a roster
+entry's :data:`RosterReasoningCapability` (FA/F7/F8).
+
 **Ops gotcha -- a stale ``OPENROUTER_API_KEY`` shadows ``.env`` -> 401.** The
 advisor reads ``OPENROUTER_API_KEY`` from ``os.environ`` (via
 :func:`roastpilot_agent.advisor.build_model`). A key exported in the shell (even
@@ -123,13 +132,13 @@ import re
 import sys
 import time
 import unicodedata
-from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from math import comb, isfinite, sqrt
 from pathlib import Path
 from types import ModuleType
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx
 
@@ -142,6 +151,7 @@ import roastpilot_agent.bean_sourcing as _bean_sourcing_module  # noqa: E402
 import roastpilot_agent.config as _config_module  # noqa: E402
 import roastpilot_agent.models as _models_module  # noqa: E402
 from roastpilot_agent.bean_sourcing import (  # noqa: E402
+    BeanSourcingDiagnostics,
     BeanSourcingError,
     draft_bean_profile_from_url,
 )
@@ -185,6 +195,13 @@ DEFAULT_FIXTURES_DIR = _REPO_ROOT / "tests" / "fixtures" / "bean-sourcing"
 OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
 
 
+#: A model's reasoning-capability class (#601 FA/F7): "none" skips off+light
+#: ("default" only); "optional" gets both; "mandatory" REJECTS disabling reasoning
+#: (HTTP 400, docs/advisor-bakeoff-2026-06-08.md:279-291) so only "light" runs;
+#: "unknown" (unverified) skips BOTH like "none" -- "mandatory" needs CONFIRMED evidence.
+RosterReasoningCapability = Literal["none", "optional", "mandatory", "unknown"]
+
+
 @dataclass(frozen=True)
 class RosterModel:
     """One candidate model + its list price (research note section 4).
@@ -194,12 +211,15 @@ class RosterModel:
         price_in_per_mtok: List input price, USD per 1M tokens.
         price_out_per_mtok: List output price, USD per 1M tokens.
         note: The shortlist rationale (report only).
+        reasoning: The model's :data:`RosterReasoningCapability`, gating
+            :func:`expand_arms`'s off/light arms.
     """
 
     slug: str
     price_in_per_mtok: float
     price_out_per_mtok: float
     note: str
+    reasoning: RosterReasoningCapability = "optional"
 
 
 #: The section-4 cost/quality-frontier shortlist for the (later, gated) paid
@@ -211,16 +231,101 @@ class RosterModel:
 #: (the extraction-owning config, #590 slice A) and make_advisor_config.
 BAKEOFF_EXTRACTION_TIMEOUT_S: float = 45.0
 
+#: Reasoning classification evidence (#601 FA/F7/F8, "mandatory" ONLY for a
+#: CONFIRMED off-rejecting endpoint): gpt-5-mini is HTTP-400-on-disable per
+#: docs/advisor-bakeoff-2026-06-08.md:279-291 -> "mandatory". gpt-5-nano's only
+#: citation is a default-effort TIMEOUT (19 Jul bake-off, not a disable attempt),
+#: and gemini-3.1-flash-lite's HTTP-400 evidence is for gemini-3.5-flash, a
+#: DIFFERENT endpoint -> both "unknown", like grok-4.3 (no evidence either way).
+#: gpt-4o/gpt-4.1-mini are classic non-reasoning ("none"). gpt-5.6-luna/claude-
+#: haiku-4.5 are "optional" (off-as-no-op is genuine, both support light/thinking).
 MODEL_ROSTER: tuple[RosterModel, ...] = (
-    RosterModel("openai/gpt-5-nano", 0.05, 0.40, "cheapest frontier; the one to beat on price"),
-    RosterModel("x-ai/grok-4.3", 0.20, 0.50, "grok-4-fast deprecated (404); 4.3 is the live slug"),
-    RosterModel("google/gemini-3.1-flash-lite", 0.25, 1.00, "beats gpt-5-mini on 6/8 benches"),
-    RosterModel("openai/gpt-5-mini", 0.25, 2.00, "ParseBench small-model reference; safe default"),
-    RosterModel("openai/gpt-4.1-mini", 0.40, 1.60, "battle-tested strict-SO workhorse"),
+    RosterModel("openai/gpt-5-nano", 0.05, 0.40, "cheapest; beat this on price", "unknown"),
+    RosterModel("x-ai/grok-4.3", 0.20, 0.50, "grok-4-fast dead (404); 4.3 live", "unknown"),
+    RosterModel("google/gemini-3.1-flash-lite", 0.25, 1.00, "beats gpt-5-mini 6/8", "unknown"),
+    RosterModel("openai/gpt-5-mini", 0.25, 2.00, "ParseBench small-model reference", "mandatory"),
+    RosterModel("openai/gpt-4.1-mini", 0.40, 1.60, "battle-tested strict-SO workhorse", "none"),
     RosterModel("anthropic/claude-haiku-4.5", 1.00, 5.00, "best at deciding not to emit"),
     RosterModel("openai/gpt-5.6-luna", 1.00, 6.00, "strong text/table extraction (ParseBench)"),
-    RosterModel("openai/gpt-4o", 2.50, 10.00, "ceiling only -- no extraction edge at 50x price"),
+    RosterModel("openai/gpt-4o", 2.50, 10.00, "ceiling only, no extraction edge", "none"),
 )
+
+
+#: A study arm's ``reasoning_effort`` request (#601 F1). "default" omits the field
+#: (provider default, possibly high -- NOT no-reasoning, never compared vs "light");
+#: "off" is the true explicit no-reasoning request; "light" is the LOW effort tier.
+ReasoningArm = Literal["default", "off", "light"]
+
+_REASONING_EFFORT_BY_ARM: dict[ReasoningArm, Literal["off", "low"] | None] = {
+    "default": None,
+    "off": "off",
+    "light": "low",
+}
+
+#: Suffixes marking an "off"/"light" arm's LABEL, distinct from the bare model slug
+#: a "default" arm uses -- unchanged while ``--reasoning`` stays at its default.
+_OFF_ARM_LABEL_SUFFIX = "+reasoning-off"
+_LIGHT_ARM_LABEL_SUFFIX = "+reasoning-light"
+
+
+@dataclass(frozen=True)
+class Arm:
+    """One (model, reasoning-effort) bake-off study arm (#601).
+
+    Attributes:
+        model_slug: The OpenRouter model slug -- drives provider construction and cost.
+        reasoning: The study arm (see :data:`ReasoningArm`).
+        label: The report/checkpoint identity: bare ``model_slug`` for "default",
+            else ``model_slug`` + :data:`_OFF_ARM_LABEL_SUFFIX`/:data:`_LIGHT_ARM_LABEL_SUFFIX`.
+    """
+
+    model_slug: str
+    reasoning: ReasoningArm
+    label: str
+
+
+def expand_arms(
+    model_slugs: Sequence[str],
+    reasoning: Literal["default", "off", "light", "both"],
+    *,
+    capability: Mapping[str, RosterReasoningCapability] | None = None,
+) -> list[Arm]:
+    """Expand requested model slugs into study arms per ``--reasoning`` (#601).
+
+    Args:
+        model_slugs: The requested model slugs, in request order.
+        reasoning: ``"default"``/``"off"``/``"light"`` yields one arm per model;
+            ``"both"`` yields "off"+"light" (never "default"), grouped per model.
+        capability: Optional ``{model_slug: RosterReasoningCapability}`` map --
+            ``"none"``/``"unknown"`` skip off+light (printed note); ``"mandatory"``
+            skips off only; ``"optional"`` (or absent) gets both. "default" always runs.
+
+    Returns:
+        The expanded arm list.
+    """
+    cap = capability or {}
+    arms: list[Arm] = []
+    for slug in model_slugs:
+        model_cap = cap.get(slug, "optional")
+        if reasoning == "default":
+            arms.append(Arm(model_slug=slug, reasoning="default", label=slug))
+        if reasoning in ("off", "both"):
+            if model_cap in ("none", "mandatory", "unknown"):
+                reason = "unverified" if model_cap == "unknown" else f"reasoning is {model_cap!r}"
+                print(f"[reasoning] skipping off arm for {slug!r}: {reason}")
+            else:
+                arms.append(
+                    Arm(model_slug=slug, reasoning="off", label=slug + _OFF_ARM_LABEL_SUFFIX)
+                )
+        if reasoning in ("light", "both"):
+            if model_cap in ("none", "unknown"):
+                reason = "unverified" if model_cap == "unknown" else "not reasoning-capable"
+                print(f"[reasoning] skipping light arm for {slug!r}: {reason}")
+            else:
+                arms.append(
+                    Arm(model_slug=slug, reasoning="light", label=slug + _LIGHT_ARM_LABEL_SUFFIX)
+                )
+    return arms
 
 
 class Outcome(Enum):
@@ -1161,6 +1266,8 @@ async def draft_for_page(
     advisor_config: AdvisorConfig,
     model: Model | None = None,
     sourcing_config: BeanSourcingConfig | None = None,
+    reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
+    diagnostics: BeanSourcingDiagnostics | None = None,
 ) -> tuple[BeanProfileDraft | None, str | None]:
     """Run the real extractor over one captured page (replay-only, fail-soft).
 
@@ -1173,6 +1280,9 @@ async def draft_for_page(
         sourcing_config: Fetch/extraction-limit config (#590 slice A: also
             selects the extraction model/timeout, not just the fetch); a
             default is built when omitted.
+        reasoning_effort: Threaded through to ``draft_bean_profile_from_url`` (#601);
+            ``None`` omits the setting.
+        diagnostics: Optional accumulator, forwarded through (#601 F2).
 
     Returns:
         ``(draft, None)`` on success, or ``(None, error_str)`` on any typed
@@ -1186,6 +1296,8 @@ async def draft_for_page(
             sourcing_config=sourcing_config,
             http_client=client,
             model=model,
+            reasoning_effort=reasoning_effort,
+            diagnostics=diagnostics,
         )
         return draft, None
     except BeanSourcingError as exc:
@@ -1217,6 +1329,10 @@ class PageResult:
             selection plan specifies for a statistical tie (#600 round-2
             finding): the 45s timeout alone can only identify a censored
             failure, not distinguish a 2s model from a 40s one.
+        recovered_violations: Validation-retry events the EXTRACTION step recovered
+            from (#601 F2), independent of the page's final outcome -- a later
+            ``_draft_from_identity`` rejection does NOT zero this (F7: extraction
+            adherence is not draft policy). ``0`` if extraction never retried.
     """
 
     slug: str
@@ -1225,6 +1341,7 @@ class PageResult:
     on_page_fields: int
     extracted: dict[str, Any] | None = None
     elapsed_s: float | None = None
+    recovered_violations: int = 0
 
 
 @dataclass(frozen=True)
@@ -1247,15 +1364,19 @@ async def run_model_over_corpus(
     advisor_config: AdvisorConfig,
     model: Model | None = None,
     sourcing_config: BeanSourcingConfig | None = None,
+    reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
 ) -> ModelRun:
     """Draft + score every page for one model.
 
     Args:
         pages: The corpus.
-        model_slug: The model's report label.
+        model_slug: The run's report label (an :attr:`Arm.label`, not necessarily the
+            bare provider slug -- see :func:`expand_arms`).
         advisor_config: The provider/key/model config.
         model: An injected ``Model`` (self-test); ``None`` = a real paid call.
         sourcing_config: Fetch/extraction-limit config (#590 slice A).
+        reasoning_effort: Threaded to :func:`draft_for_page` per page (#601); ``None``
+            omits the setting.
 
     Returns:
         The :class:`ModelRun`.
@@ -1263,8 +1384,14 @@ async def run_model_over_corpus(
     results: list[PageResult] = []
     for page in pages:
         started = time.monotonic()
+        diagnostics = BeanSourcingDiagnostics()  # #601 F2: per-page retry count
         draft, error = await draft_for_page(
-            page, advisor_config=advisor_config, model=model, sourcing_config=sourcing_config
+            page,
+            advisor_config=advisor_config,
+            model=model,
+            sourcing_config=sourcing_config,
+            reasoning_effort=reasoning_effort,
+            diagnostics=diagnostics,
         )
         elapsed_s = time.monotonic() - started
         on_page = (
@@ -1278,6 +1405,9 @@ async def run_model_over_corpus(
                 on_page_fields=on_page,
                 extracted=None if draft is None else draft.model_dump(mode="json"),
                 elapsed_s=elapsed_s,
+                # UNCONDITIONAL (#601 F7 -- round 3's zero-on-failed-page contract was
+                # wrong): extraction adherence, independent of a later draft rejection.
+                recovered_violations=diagnostics.schema_retries,
             )
         )
     return ModelRun(model_slug=model_slug, pages=results)
@@ -1405,9 +1535,30 @@ def latency_median_p95(run: ModelRun) -> tuple[float, float] | None:
     return _percentile(values, 0.5), _percentile(values, 0.95)
 
 
+#: The message fragment for a validation-retry-exhausted (malformed structured
+#: output) extraction -- the ONLY ``page.error`` cause that is a genuine
+#: schema-adherence failure; every other cause (timeout, provider/fetch error, model
+#: construction failure) must not be counted as one (#601 F1/F2).
+_SCHEMA_FAILURE_MARKER = "returned a malformed shape"
+
+
+def _is_schema_failure(error: str | None) -> bool:
+    """Whether a page's error string is a schema/structured-output failure."""
+    return error is not None and _SCHEMA_FAILURE_MARKER in error
+
+
 @dataclass(frozen=True)
 class ModelMetrics:
-    """A model's headline metrics over the corpus."""
+    """A model's headline metrics over the corpus.
+
+    Attributes:
+        page_errors: ``schema_failures + other_errors`` (kept for pre-#601 callers).
+        schema_failures: Pages failing on a malformed structured-output shape --
+            the schema-adherence proxy (see :func:`_is_schema_failure`).
+        other_errors: Every OTHER page error -- NOT a schema-adherence signal.
+        recovered_violations: Extraction-level retry events, summed over pages,
+            independent of final page outcome (#601 F2/F7).
+    """
 
     model_slug: str
     counts: Counts
@@ -1418,6 +1569,9 @@ class ModelMetrics:
     macro_f1: float | None
     combined_score: float | None
     page_errors: int
+    schema_failures: int
+    other_errors: int
+    recovered_violations: int
     median_latency_s: float | None
     p95_latency_s: float | None
 
@@ -1428,6 +1582,10 @@ def model_metrics(run: ModelRun) -> ModelMetrics:
     prec = precision(counts)
     rec = recall(counts)
     latency = latency_median_p95(run)
+    schema_failures = sum(1 for page in run.pages if _is_schema_failure(page.error))
+    other_errors = sum(
+        1 for page in run.pages if page.error is not None and not _is_schema_failure(page.error)
+    )
     return ModelMetrics(
         model_slug=run.model_slug,
         counts=counts,
@@ -1437,7 +1595,10 @@ def model_metrics(run: ModelRun) -> ModelMetrics:
         micro_f1=f1(prec, rec),
         macro_f1=macro_f1(run),
         combined_score=combined_score(all_outcomes(run)),
-        page_errors=sum(1 for page in run.pages if page.error is not None),
+        page_errors=schema_failures + other_errors,
+        schema_failures=schema_failures,
+        other_errors=other_errors,
+        recovered_violations=sum(page.recovered_violations for page in run.pages),
         median_latency_s=latency[0] if latency else None,
         p95_latency_s=latency[1] if latency else None,
     )
@@ -1923,6 +2084,57 @@ def estimate_cost(
     return estimates
 
 
+#: Conservative ESTIMATE-only multiplier on a "light" arm's output tokens: reasoning
+#: tokens bill as completion tokens, and this harness has no live usage readback --
+#: chosen high so the spend guard never under-budgets a light call.
+LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER: float = 4.0
+
+
+def estimate_cost_for_arms(
+    pages: Sequence[CorpusPage], arms: Sequence[Arm], roster: Sequence[RosterModel]
+) -> list[ModelCostEstimate]:
+    """Per-ARM cost estimate (#601), built on top of :func:`estimate_cost`.
+
+    "default" is IDENTICAL to :func:`estimate_cost`'s per-model figure (bare-slug
+    label, so the CLI default reproduces its numbers exactly). "off" is priced the
+    SAME as "default" (explicit no-reasoning costs no more than omitted), just
+    relabelled distinct. "light" multiplies output tokens by
+    :data:`LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER`. Every arm is labelled under
+    :attr:`Arm.label` so a model's several arms are distinct report rows.
+
+    Args:
+        pages: The corpus.
+        arms: The expanded arm list (see :func:`expand_arms`).
+        roster: The priced roster the arms' model slugs resolve against.
+
+    Returns:
+        One :class:`ModelCostEstimate` per arm, keyed by :attr:`Arm.label`.
+    """
+    per_model = {est.slug: est for est in estimate_cost(pages, roster)}
+    price_by_slug = {entry.slug: entry for entry in roster}
+    estimates: list[ModelCostEstimate] = []
+    for arm in arms:
+        base = per_model[arm.model_slug]
+        if arm.reasoning in ("default", "off"):
+            estimates.append(dataclasses.replace(base, slug=arm.label))
+            continue
+        output_tokens = round(base.output_tokens * LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER)
+        price = price_by_slug[arm.model_slug]
+        usd = (
+            base.input_tokens / 1_000_000 * price.price_in_per_mtok
+            + output_tokens / 1_000_000 * price.price_out_per_mtok
+        )
+        estimates.append(
+            ModelCostEstimate(
+                slug=arm.label,
+                input_tokens=base.input_tokens,
+                output_tokens=output_tokens,
+                usd=round(usd, 5),
+            )
+        )
+    return estimates
+
+
 def resolve_roster_for_slugs(model_slugs: Sequence[str]) -> list[RosterModel]:
     """Every requested slug's :class:`RosterModel`, in request order.
 
@@ -2038,7 +2250,9 @@ def render_report(
         lines.append("")
     if failed_slugs:
         failed_desc = ", ".join(
-            f"`{f.model_slug}` ({f.heuristic_label}, heuristic)" for f in failed_slugs
+            f"`{f.model_slug}` ({f.heuristic_label}, schema {f.schema_failures}/"
+            f"other {f.other_errors})"
+            for f in failed_slugs
         )
         lines.append(
             f"> **EXCLUDED -- failed this invocation.** Every page errored for "
@@ -2053,14 +2267,14 @@ def render_report(
     lines.append("")
     lines.append(
         "## Per-model headline (macro F1 is the model-choice headline; latency is the "
-        "cost/latency tie-break signal for a statistical tie)"
+        "cost/latency tie-break; schema F/R = schema failures/recovered, #601 F6)"
     )
     lines.append("")
     lines.append(
         "| Model | COR | PAR | INC | MIS | ABS-COR | SPU | ERR | Recall | Faithful | Abstain | "
-        "micro F1 | macro F1 | Combined | latency p50/p95 (s) |"
+        "micro F1 | macro F1 | Combined | latency p50/p95 (s) | schema F/R |"
     )
-    lines.append("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
+    lines.append("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
     for run in runs:
         m = model_metrics(run)
         c = m.counts
@@ -2073,7 +2287,7 @@ def render_report(
             f"| `{m.model_slug}` | {c.cor} | {c.par} | {c.inc} | {c.mis} | {c.abs_cor} | "
             f"{c.spu} | {c.err} | {_fmt(m.recall)} | {_fmt(m.precision)} | "
             f"{_fmt(m.abstention)} | {_fmt(m.micro_f1)} | {_fmt(m.macro_f1)} | "
-            f"{_fmt(m.combined_score)} | {latency} |"
+            f"{_fmt(m.combined_score)} | {latency} | {m.schema_failures}/{m.recovered_violations} |"
         )
     lines.append("")
 
@@ -2147,6 +2361,44 @@ def render_report(
             )
         lines.append("")
 
+    light_runs = {
+        r.model_slug[: -len(_LIGHT_ARM_LABEL_SUFFIX)]: r
+        for r in runs
+        if r.model_slug.endswith(_LIGHT_ARM_LABEL_SUFFIX)
+    }
+    off_runs = {
+        r.model_slug[: -len(_OFF_ARM_LABEL_SUFFIX)]: r
+        for r in runs
+        if r.model_slug.endswith(_OFF_ARM_LABEL_SUFFIX)
+    }
+    paired_models = sorted(set(light_runs) & set(off_runs))
+    if paired_models:
+        lines.append(
+            "## Reasoning-arm comparison (off vs light, #601) -- per-model deltas where "
+            "BOTH arms were scored (never vs 'default'). 'schema F/recovered R' is the "
+            "adherence proxy; 'other errors' is NOT."
+        )
+        lines.append("")
+        lines.append(
+            "| Model | macro F1 (off -> light) | Combined (off -> light) | "
+            "Recall (off -> light) | Faithful (off -> light) | schema F/recovered R "
+            "(off -> light) | other errors (off -> light) |"
+        )
+        lines.append("|---|---|---|---|---|---|---|")
+        for model_slug in paired_models:
+            off_m = model_metrics(off_runs[model_slug])
+            light_m = model_metrics(light_runs[model_slug])
+            lines.append(
+                f"| `{model_slug}` | {_fmt(off_m.macro_f1)} -> {_fmt(light_m.macro_f1)} | "
+                f"{_fmt(off_m.combined_score)} -> {_fmt(light_m.combined_score)} | "
+                f"{_fmt(off_m.recall)} -> {_fmt(light_m.recall)} | "
+                f"{_fmt(off_m.precision)} -> {_fmt(light_m.precision)} | "
+                f"{off_m.schema_failures}/{off_m.recovered_violations} -> "
+                f"{light_m.schema_failures}/{light_m.recovered_violations} | "
+                f"{off_m.other_errors} -> {light_m.other_errors} |"
+            )
+        lines.append("")
+
     cost_by_slug = {est.slug: est.usd for est in cost_estimates}
     executed_set = set(executed_slugs)
     scored_slugs = {r.model_slug for r in runs}
@@ -2186,7 +2438,8 @@ def render_report(
             f"{status} |"
         )
     lines.append(
-        f"| **roster total (1 pass each, every requested model)** | | | **${total:.4f}** | |"
+        f"| **arm total (1 pass each, every requested model/reasoning arm)** | | | "
+        f"**${total:.4f}** | |"
     )
     lines.append("")
     lines.append(
@@ -2229,6 +2482,9 @@ def run_to_json(run: ModelRun) -> dict[str, Any]:
             "macro_f1": m.macro_f1,
             "combined_score": m.combined_score,
             "page_errors": m.page_errors,
+            "schema_failures": m.schema_failures,
+            "other_errors": m.other_errors,
+            "recovered_violations": m.recovered_violations,
             "median_latency_s": m.median_latency_s,
             "p95_latency_s": m.p95_latency_s,
         },
@@ -2243,6 +2499,7 @@ def run_to_json(run: ModelRun) -> dict[str, Any]:
                 },
                 "extracted": page.extracted,
                 "elapsed_s": page.elapsed_s,
+                "recovered_violations": page.recovered_violations,
             }
             for page in run.pages
         ],
@@ -2555,8 +2812,14 @@ def make_sourcing_config(model_slug: str) -> BeanSourcingConfig:
 
 
 def _run_wholly_failed(run: ModelRun) -> bool:
-    """Whether EVERY page of ``run`` errored (a total-outage, not a model finding)."""
-    return bool(run.pages) and all(page.error is not None for page in run.pages)
+    """Whether every page errored AND NOT ALL failures are schema failures.
+
+    ALL-SCHEMA is a real outcome, scored, never dropped (strongest signal); any MIX
+    with an infra failure is a genuine outage -- see :class:`FailedRun` for how the
+    mix stays visible instead of silently discarded (#601 F7)."""
+    if not run.pages or not all(page.error is not None for page in run.pages):
+        return False
+    return not all(_is_schema_failure(page.error) for page in run.pages)
 
 
 def _has_any_success(run: ModelRun) -> bool:
@@ -2577,10 +2840,15 @@ class FailedRun:
         heuristic_label: ``"MODEL-SPECIFIC"`` if a FRESHLY-EXECUTED peer had already succeeded
             this invocation, else ``"INFRA-WIDE"``. DISPLAY-ONLY best-effort context -- NOT
             authoritative, NEVER affects checkpointing or scoring.
+        schema_failures: Malformed-structured-output pages in this DROPPED run --
+            a mixed run's adherence signal stays visible here (#601 F7).
+        other_errors: Every OTHER page error in this dropped run.
     """
 
     model_slug: str
     heuristic_label: str
+    schema_failures: int = 0
+    other_errors: int = 0
 
 
 @dataclass(frozen=True)
@@ -2618,7 +2886,7 @@ class BakeoffResult:
 
 async def run_bakeoff(
     pages: Sequence[CorpusPage],
-    model_slugs: Sequence[str],
+    arms: Sequence[Arm],
     *,
     out: Path,
     resume: bool,
@@ -2626,25 +2894,25 @@ async def run_bakeoff(
     cost_estimates: Sequence[ModelCostEstimate],
     model: Model | None = None,
 ) -> BakeoffResult:
-    """Run + checkpoint every model over the corpus, under a spend guard.
+    """Run + checkpoint every arm over the corpus, under a spend guard.
 
-    Read-only: never touches any store/DB, never saves a profile. Stops gracefully BEFORE a
-    model whose estimated cost would breach ``max_spend`` (see :attr:`BakeoffResult.stopped_early`).
-    A run where EVERY page errored is NEVER checkpointed (#602 fold round 5 -- see
-    :class:`FailedRun`'s docstring for the trade this simplification resolves): it is reported
-    as a :class:`FailedRun` with a DISPLAY-ONLY ``heuristic_label`` (``"MODEL-SPECIFIC"`` if a
-    FRESHLY-EXECUTED peer had already succeeded this invocation, else ``"INFRA-WIDE"``) and a
-    re-run ALWAYS retries it. Either way a wholly-failed run IS still counted against the spend
-    guard (a paid attempt was made).
+    Read-only: never touches any store/DB, never saves a profile. Stops gracefully BEFORE an
+    arm whose estimated cost would breach ``max_spend`` (see :attr:`BakeoffResult.stopped_early`).
+    A WHOLLY-FAILED run (see :func:`_run_wholly_failed`) is NEVER checkpointed -- reported as a
+    :class:`FailedRun` (DISPLAY-ONLY heuristic label + its schema/other-error counts) and always
+    retried on resume, but still counted against the spend guard. Every checkpoint/report
+    identity is :attr:`Arm.label` (#601), so a model's several arms are tracked distinctly.
 
     Args:
         pages: The corpus.
-        model_slugs: The models to run (real, paid calls).
+        arms: The (model, reasoning) study arms to run (real, paid calls) -- see
+            :func:`expand_arms`.
         out: The JSON artifact path (anchors the checkpoint sidecar).
-        resume: Skip models already checkpointed.
-        max_spend: USD budget; a model is skipped once the running estimate
+        resume: Skip arms already checkpointed.
+        max_spend: USD budget; an arm is skipped once the running estimate
             would exceed it.
-        cost_estimates: Per-model cost estimates (the spend guard's basis).
+        cost_estimates: Per-arm cost estimates (the spend guard's basis), keyed by
+            :attr:`Arm.label`.
         model: An injected ``Model`` (the self-test seam); ``None`` = a real
             paid call, threaded through to :func:`run_model_over_corpus`.
 
@@ -2659,7 +2927,8 @@ async def run_bakeoff(
     executed_slugs: list[str] = []
     has_fresh_success = False
     spent = 0.0
-    for index, slug in enumerate(model_slugs):
+    for index, arm in enumerate(arms):
+        slug = arm.label
         if checkpoint.has(slug):
             runs.append(_run_from_checkpoint(checkpoint.get(slug)))
             print(f"[resume] {slug}: on disk", flush=True)
@@ -2674,27 +2943,38 @@ async def run_bakeoff(
             return BakeoffResult(
                 runs=runs,
                 stopped_early=True,
-                unevaluated_slugs=list(model_slugs[index:]),
+                unevaluated_slugs=[a.label for a in arms[index:]],
                 failed_slugs=failed_runs,
                 executed_slugs=executed_slugs,
             )
         run = await run_model_over_corpus(
             pages,
             model_slug=slug,
-            advisor_config=make_advisor_config(slug),
+            advisor_config=make_advisor_config(arm.model_slug),
             model=model,
-            sourcing_config=make_sourcing_config(slug),
+            sourcing_config=make_sourcing_config(arm.model_slug),
+            reasoning_effort=_REASONING_EFFORT_BY_ARM[arm.reasoning],
         )
         spent += upcoming
         executed_slugs.append(slug)  # a real call was attempted, win or lose
         if _run_wholly_failed(run):
             label = "MODEL-SPECIFIC" if has_fresh_success else "INFRA-WIDE"
+            schema_n = sum(1 for p in run.pages if _is_schema_failure(p.error))
+            other_n = len(run.pages) - schema_n
             print(
                 f"[run] {slug}: ALL {len(run.pages)} page(s) errored -- {label} (heuristic, "
-                "display-only) -- NEVER checkpointed, a re-run always retries it",
+                f"display-only), schema {schema_n}/other {other_n} -- NEVER checkpointed, a "
+                "re-run always retries it",
                 flush=True,
             )
-            failed_runs.append(FailedRun(model_slug=slug, heuristic_label=label))
+            failed_runs.append(
+                FailedRun(
+                    model_slug=slug,
+                    heuristic_label=label,
+                    schema_failures=schema_n,
+                    other_errors=other_n,
+                )
+            )
             continue
         has_fresh_success = has_fresh_success or _has_any_success(run)
         checkpoint.append(run_to_json(run))
@@ -2731,6 +3011,7 @@ def _run_from_checkpoint(record: dict[str, Any]) -> ModelRun:
                 on_page_fields=int(page["on_page_fields"]),
                 extracted=cast("dict[str, Any] | None", page.get("extracted")),
                 elapsed_s=None if elapsed_raw is None else float(cast("float", elapsed_raw)),
+                recovered_violations=int(cast("int", page.get("recovered_violations", 0))),
             )
         )
     return ModelRun(model_slug=str(record["model_slug"]), pages=pages)
@@ -2794,6 +3075,16 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         action="store_true",
         help="print the cost estimate for the roster + corpus and exit (zero spend, no key)",
     )
+    parser.add_argument(
+        "--reasoning",
+        choices=("default", "off", "light", "both"),
+        default="default",
+        help="reasoning-effort study arm(s) per model (#601): 'default' (no override, "
+        "the CLI default -- NOTE this is the provider's OWN default effort, NOT the "
+        "same as no reasoning), 'off' (explicit no-reasoning), 'light' (provider "
+        "low effort), or 'both' (the 'off' AND 'light' arms -- the research's actual "
+        "no-reasoning-vs-light-reasoning question, section 4)",
+    )
     return parser.parse_args(argv)
 
 
@@ -2815,12 +3106,34 @@ async def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
-    cost_estimates = estimate_cost(pages, roster_for_cost)
+    reasoning_arg = cast("Literal['default', 'off', 'light', 'both']", args.reasoning)
+    capability: dict[str, RosterReasoningCapability] = {
+        m.slug: m.reasoning for m in roster_for_cost
+    }
+    arms = expand_arms(model_slugs, reasoning_arg, capability=capability)
+    if not arms:
+        # Categorical, mode-agnostic (#601 F4): ANY --reasoning value can skip every
+        # requested model -- fires before any cost estimate or spend.
+        print(
+            f"REFUSED: --reasoning {reasoning_arg} -- every requested model "
+            f"({', '.join(model_slugs)}) was skipped as reasoning-incapable for this "
+            "mode; nothing to run (#601).",
+            file=sys.stderr,
+        )
+        return 2
+    if reasoning_arg == "both" and not any(c == "optional" for c in capability.values()):
+        print(
+            "REFUSED: --reasoning both -- no requested model has BOTH off and light arms "
+            "(#601 FA); nothing comparable to run.",
+            file=sys.stderr,
+        )
+        return 2
+    cost_estimates = estimate_cost_for_arms(pages, arms, roster_for_cost)
 
     if args.estimate_only:
         for est in cost_estimates:
             print(f"{est.slug}: ~${est.usd:.4f} ({est.input_tokens} in / {est.output_tokens} out)")
-        print(f"roster total (1 pass each): ~${sum(e.usd for e in cost_estimates):.4f}")
+        print(f"arm total (1 pass each): ~${sum(e.usd for e in cost_estimates):.4f}")
         return 0
 
     if args.max_spend is None:
@@ -2842,7 +3155,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
 
     result = await run_bakeoff(
         pages,
-        model_slugs,
+        arms,
         out=cast("Path", args.out),
         resume=not bool(args.no_resume),
         max_spend=float(cast("float", args.max_spend)),
