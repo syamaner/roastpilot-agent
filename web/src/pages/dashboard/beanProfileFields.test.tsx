@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -454,5 +456,67 @@ describe("BeanProfileFields is_blend tri-state (#637, #654 fold 2)", () => {
     // and still renders — only the hint/error TEXT slot below the checkbox
     // switches from the caution hint to the fault-coloured error.
     expect(screen.getByTestId(`${PREFIX}-is_blend-unresolved`)).toBeInTheDocument();
+  });
+});
+
+describe("BeanProfileFields is_blend resolution — a11y (#658 round 1)", () => {
+  /** A minimal STATEFUL parent mimicking a real consumer: owns draft + errors
+   *  and updates them on `onBlendChange`, so the unresolved→resolved
+   *  TRANSITION genuinely happens across renders — a fixed prop snapshot
+   *  (the pattern the rest of this file uses) can't exercise either fold,
+   *  since both are about what happens WHEN the field resolves, not a
+   *  single static state. Deliberately does NOT clear `errors.is_blend`
+   *  itself on resolve (unlike `BeanProfileModal`'s `onBlendChange`) — fold
+   *  1 is exactly the claim that the structural gate hides the error even
+   *  when the parent doesn't. */
+  function StatefulWrapper({
+    initialErrors = {},
+  }: {
+    initialErrors?: Record<string, string>;
+  }): React.JSX.Element {
+    const [draft, setDraft] = useState<BeanProfileDraft>({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      is_blend_unresolved: true,
+    });
+    const [errors] = useState(initialErrors);
+    return (
+      <BeanProfileFields
+        draft={draft}
+        errors={errors}
+        onChange={vi.fn()}
+        onBlendChange={(checked) =>
+          setDraft((d) => ({ ...d, is_blend: checked, is_blend_unresolved: undefined }))
+        }
+        testIdPrefix={PREFIX}
+        showDefaultWeight
+      />
+    );
+  }
+
+  it("hides the is_blend error the moment the field resolves, even when the parent never clears it (fold 1)", () => {
+    render(
+      <StatefulWrapper
+        initialErrors={{ is_blend: "The vendor page didn't say — choose before saving." }}
+      />,
+    );
+    expect(screen.getByTestId(`${PREFIX}-is_blend-error`)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId(`${PREFIX}-is_blend-choose-single-origin`));
+
+    // Gone from the DOM entirely (not merely re-styled) — the wrapper above
+    // never touched `errors`, so this is the structural gate at work, not a
+    // parent clearing it.
+    expect(screen.queryByTestId(`${PREFIX}-is_blend-error`)).toBeNull();
+    const checkbox = screen.getByTestId(`${PREFIX}-is_blend`);
+    expect(checkbox.getAttribute("aria-describedby") ?? "").not.toContain("is_blend-error");
+  });
+
+  it("moves focus to the restored checkbox once resolved (fold 2)", () => {
+    render(<StatefulWrapper />);
+    screen.getByTestId(`${PREFIX}-is_blend-choose-single-origin`).focus();
+
+    fireEvent.click(screen.getByTestId(`${PREFIX}-is_blend-choose-single-origin`));
+
+    expect(document.activeElement).toBe(screen.getByTestId(`${PREFIX}-is_blend`));
   });
 });

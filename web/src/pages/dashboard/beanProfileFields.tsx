@@ -12,7 +12,7 @@
  * temperatures are Celsius.
  */
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { cn } from "@/lib/cn";
 import {
@@ -673,8 +673,15 @@ interface BlendToggleProps {
    *  origin) is otherwise undiscoverable. Cleared (the plain checkbox
    *  returns) the moment the operator picks either choice. */
   unresolved?: boolean;
-  /** Validation error (#637) — set only while `unresolved` and the operator
-   *  has attempted to save without choosing; replaces the hint text. */
+  /** Validation error (#637) — the operator attempted to save without
+   *  choosing. Rendered only while `unresolved` is ALSO true (#658 round 1
+   *  fold 1): the error's only legitimate lifetime is the unresolved state
+   *  itself, so this is gated structurally here rather than trusting every
+   *  consumer to clear it the moment the field resolves — #654's modal-side
+   *  clearing (on the explicit choice) stays as belt-and-braces, but a
+   *  consumer that doesn't clear it (e.g. `StartRoastForm`, which has no
+   *  draft-from-URL wiring to clear it on resolve) still never shows a
+   *  stale error once the field is no longer unresolved. */
   error?: string;
 }
 
@@ -689,11 +696,27 @@ function BlendToggle({
   unresolved,
   error,
 }: BlendToggleProps): React.JSX.Element {
+  // Focus continuity on resolution (#658 round 1 fold 2): choosing either
+  // button unmounts it (the plain checkbox replaces the button group), which
+  // would otherwise drop keyboard/screen-reader focus with nowhere to land.
+  // Tracks the PREVIOUS `unresolved` value in a ref (not state — this must
+  // not itself trigger a render) so the effect can detect the true→false/
+  // undefined transition and move focus to the now-restored checkbox.
+  const checkboxRef = useRef<HTMLInputElement>(null);
+  const wasUnresolvedRef = useRef(unresolved === true);
+  useEffect(() => {
+    if (wasUnresolvedRef.current && unresolved !== true) {
+      checkboxRef.current?.focus();
+    }
+    wasUnresolvedRef.current = unresolved === true;
+  }, [unresolved]);
+
+  const showError = unresolved === true && error !== undefined;
   const provenanceId =
     provenance !== undefined ? `${testIdPrefix}-is_blend-provenance` : undefined;
   const unresolvedId = unresolved === true ? `${testIdPrefix}-is_blend-unresolved` : undefined;
   const evidenceId = evidenceQuote !== undefined ? `${testIdPrefix}-is_blend-evidence` : undefined;
-  const errorId = error !== undefined ? `${testIdPrefix}-is_blend-error` : undefined;
+  const errorId = showError ? `${testIdPrefix}-is_blend-error` : undefined;
   const describedBy = joinDescribedBy(provenanceId, unresolvedId, evidenceId, errorId);
   return (
     <div className="flex flex-col gap-1 sm:col-span-2">
@@ -740,6 +763,7 @@ function BlendToggle({
       ) : (
         <label htmlFor={`${testIdPrefix}-is_blend`} className="flex items-center gap-2 text-sm">
           <input
+            ref={checkboxRef}
             id={`${testIdPrefix}-is_blend`}
             name="is_blend"
             type="checkbox"
@@ -752,7 +776,7 @@ function BlendToggle({
           <span>This is a blend (not single-origin)</span>
         </label>
       )}
-      {error !== undefined ? (
+      {showError ? (
         <span
           id={errorId}
           data-testid={`${testIdPrefix}-is_blend-error`}
