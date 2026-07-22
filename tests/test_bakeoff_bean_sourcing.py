@@ -2354,6 +2354,76 @@ def test_charge_ledger_two_genuinely_separate_calls_for_one_page_both_count(
     assert ledger.total_usd() == pytest.approx(0.05)  # BOTH real calls counted
 
 
+def test_charge_ledger_total_usd_for_arm_supersedes_pending_not_summed(
+    tmp_path: Path,
+) -> None:
+    """#601 fold round 12 (final review): ``total_usd_for_arm()`` must share
+    ``total_usd()``'s :meth:`bo.ChargeLedger._effective_entries` supersession
+    rule -- a raw sum over ``self._entries`` double-charged every normally
+    completed page's pending reserve on top of its final charge in the
+    per-arm figure (the report column and the ``actual_costs`` JSON
+    artifact both read this)."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    ledger = bo.ChargeLedger(path)
+    ledger.append(_pending_entry(priced_usd=0.07, call_id="call-1"))  # the reserve
+    ledger.append(  # the real, smaller, post-call charge, same call_id
+        bo.LedgerEntry(
+            arm="m1",
+            slug="a",
+            request_tokens=100,
+            response_tokens=50,
+            priced_usd=0.02,
+            timed_out=False,
+            reserve_applied=False,
+            is_pending=False,
+            call_id="call-1",
+        )
+    )
+    assert ledger.total_usd_for_arm("m1") == pytest.approx(0.02)  # NOT 0.09
+
+
+def test_charge_ledger_total_usd_for_arm_counts_kill_window_pending_at_the_reserve(
+    tmp_path: Path,
+) -> None:
+    """A page killed mid-call (pending only, no final ever follows) still
+    counts at its reserve in the per-arm figure -- the same fail-safe
+    :meth:`bo.ChargeLedger._effective_entries` already guarantees for
+    ``total_usd()``."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    ledger = bo.ChargeLedger(path)
+    ledger.append(_pending_entry(priced_usd=0.07, call_id="call-killed"))
+    assert ledger.total_usd_for_arm("m1") == pytest.approx(0.07)
+
+
+def test_ledger_actual_costs_matches_total_usd_for_arm_semantics(tmp_path: Path) -> None:
+    """The report/JSON-artifact ``actual_costs`` figure
+    (:func:`bo._ledger_actual_costs`) must share ``total_usd_for_arm()``'s
+    supersession semantics on the SAME ledger -- a stale, un-superseded sum
+    here would silently overstate a normally-completed arm's reported cost
+    even though the meter itself (:class:`bo.SpendMeter`, seeded from
+    ``total_usd()``) stayed correct: an easy-to-miss reporting-only
+    regression, not a spend-guard one."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    ledger = bo.ChargeLedger(path)
+    ledger.append(_pending_entry(priced_usd=0.07, call_id="call-1"))
+    ledger.append(
+        bo.LedgerEntry(
+            arm="m1",
+            slug="a",
+            request_tokens=100,
+            response_tokens=50,
+            priced_usd=0.02,
+            timed_out=False,
+            reserve_applied=False,
+            is_pending=False,
+            call_id="call-1",
+        )
+    )
+    actual = bo._ledger_actual_costs(ledger)  # pyright: ignore[reportPrivateUsage]
+    assert actual["m1"] == pytest.approx(ledger.total_usd_for_arm("m1"))
+    assert actual["m1"] == pytest.approx(0.02)  # NOT 0.09
+
+
 def test_load_dotenv_key(tmp_path: Path) -> None:
     (tmp_path / ".env").write_text('OPENROUTER_API_KEY="sk-or-secret"\nOTHER=1\n')
     assert bo.load_dotenv_key(tmp_path) == "sk-or-secret"

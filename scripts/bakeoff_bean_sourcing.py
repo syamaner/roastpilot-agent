@@ -3217,15 +3217,14 @@ class ChargeLedger:
         return round(sum(e.priced_usd for e in self._effective_entries()), 5)
 
     def total_usd_for_arm(self, arm: str) -> float:
-        """Cumulative charged spend for one arm, scoped to THIS fingerprint
-        (#601 fold round 3, FOLD 4), across every attempt (retries included --
+        """Cumulative charged spend for one arm, scoped to THIS fingerprint,
+        via :meth:`_effective_entries` -- the SAME supersession rule
+        :meth:`total_usd` uses (#601 fold round 12: a raw, un-superseded sum
+        here double-counted every normally-completed page's pending reserve
+        on top of its final charge). Across every attempt (retries included --
         a re-run of a previously mid-arm-tripped arm double-counts its
         already-charged pages, by design, since real money was spent twice)."""
-        matching = (
-            e.priced_usd
-            for e in self._entries
-            if e.arm == arm and e.fingerprint == self.fingerprint
-        )
+        matching = (e.priced_usd for e in self._effective_entries() if e.arm == arm)
         return round(sum(matching), 5)
 
     def append(self, entry: LedgerEntry) -> None:
@@ -3268,9 +3267,19 @@ class SpendMeter:
 
     @property
     def tripped(self) -> bool:
+        """Whether cumulative ``charged`` has reached ``max_spend``.
+
+        Returns:
+            ``True`` once the meter should halt the run BETWEEN pages.
+        """
         return self.charged >= self.max_spend
 
     def charge(self, usd: float) -> None:
+        """Add one page's real, priced cost to the cumulative total.
+
+        Args:
+            usd: The page's usage-priced (list-price) cost to add.
+        """
         self.charged += usd
 
 
