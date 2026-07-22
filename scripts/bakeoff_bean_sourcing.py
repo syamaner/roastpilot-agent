@@ -198,13 +198,10 @@ DEFAULT_FIXTURES_DIR = _REPO_ROOT / "tests" / "fixtures" / "bean-sourcing"
 OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
 
 
-#: A model's reasoning-capability class (#601 fold round 3, FA): "none" never reasons
-#: (an "off" request is at best a no-op, so it and "light" are both skipped -- only
-#: "default" runs); "optional" honours BOTH an explicit off and a light request; a
-#: "mandatory"-reasoning endpoint REJECTS disabling reasoning (HTTP 400 "reasoning is
-#: mandatory for this endpoint", docs/advisor-bakeoff-2026-06-08.md:279-291) -- so its
-#: "off" arm is skipped (only "light" runs); ambiguous (no evidence either way) defaults
-#: to "mandatory", the SAFE choice (it only withholds an arm, never risks a paid 400).
+#: A model's reasoning-capability class (#601 FA): "none" skips off+light (only
+#: "default" runs); "optional" gets both; "mandatory" REJECTS disabling reasoning
+#: (HTTP 400, docs/advisor-bakeoff-2026-06-08.md:279-291) so only "light" runs;
+#: ambiguous defaults to "mandatory" (safe -- withholds an arm, never risks a 400).
 RosterReasoningCapability = Literal["none", "optional", "mandatory"]
 
 
@@ -237,20 +234,13 @@ class RosterModel:
 #: (the extraction-owning config, #590 slice A) and make_advisor_config.
 BAKEOFF_EXTRACTION_TIMEOUT_S: float = 45.0
 
-#: Reasoning classification evidence (#601 FA): gpt-5-nano/gpt-5-mini timed out as
-#: "reasoning models" in the 19 Jul bean-sourcing bake-off, and gpt-5-mini/
-#: gemini-3.5-flash are confirmed HTTP-400-on-disable ("mandatory") in
-#: docs/advisor-bakeoff-2026-06-08.md -- gemini-3.1-flash-lite (same flash family,
-#: "enable light thinking" per the research note) and gpt-5-nano (same -nano/-mini
-#: reasoning-model family) follow suit; grok-4.3 is ambiguous -> mandatory (safe
-#: default). gpt-4o/gpt-4.1-mini are the classic non-reasoning generation ("none").
-#: gpt-5.6-luna follows gpt-5.5's (no "-mini"/"-nano" suffix) confirmed "optional"
-#: pattern. claude-haiku-4.5 is "optional" (#601 fold round 5 FOLD 1 correction --
-#: NOT "none"): the doc only shows off-as-no-op for Anthropic models, never that
-#: light is unsupported (Haiku 4.5 supports extended thinking), and off-as-no-op is
-#: itself a genuine, distinct no-reasoning arm for a model that doesn't reason by
-#: default -- both off (no-op == true no-reasoning) and light (extended-thinking,
-#: low) are real, comparable arms here.
+#: Reasoning classification evidence (#601 FA): gpt-5-nano/gpt-5-mini are "reasoning
+#: models" per the 19 Jul bean-sourcing bake-off's timeout, and gpt-5-mini/
+#: gemini-3.5-flash are HTTP-400-on-disable in docs/advisor-bakeoff-2026-06-08.md ->
+#: "mandatory"; gemini-3.1-flash-lite/gpt-5-nano follow suit, grok-4.3 ambiguous ->
+#: mandatory (safe). gpt-4o/gpt-4.1-mini are classic non-reasoning ("none").
+#: gpt-5.6-luna/claude-haiku-4.5 are "optional": off-as-no-op is still a genuine
+#: no-reasoning arm and both support real light/extended-thinking (round 5 FOLD 1).
 MODEL_ROSTER: tuple[RosterModel, ...] = (
     RosterModel("openai/gpt-5-nano", 0.05, 0.40, "cheapest; beat this on price", "mandatory"),
     RosterModel("x-ai/grok-4.3", 0.20, 0.50, "grok-4-fast dead (404); 4.3 live", "mandatory"),
@@ -2293,14 +2283,14 @@ def render_report(
     lines.append("")
     lines.append(
         "## Per-model headline (macro F1 is the model-choice headline; latency is the "
-        "cost/latency tie-break signal for a statistical tie)"
+        "cost/latency tie-break; schema F/R = schema failures/recovered, #601 F6)"
     )
     lines.append("")
     lines.append(
         "| Model | COR | PAR | INC | MIS | ABS-COR | SPU | ERR | Recall | Faithful | Abstain | "
-        "micro F1 | macro F1 | Combined | latency p50/p95 (s) |"
+        "micro F1 | macro F1 | Combined | latency p50/p95 (s) | schema F/R |"
     )
-    lines.append("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
+    lines.append("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
     for run in runs:
         m = model_metrics(run)
         c = m.counts
@@ -2313,7 +2303,7 @@ def render_report(
             f"| `{m.model_slug}` | {c.cor} | {c.par} | {c.inc} | {c.mis} | {c.abs_cor} | "
             f"{c.spu} | {c.err} | {_fmt(m.recall)} | {_fmt(m.precision)} | "
             f"{_fmt(m.abstention)} | {_fmt(m.micro_f1)} | {_fmt(m.macro_f1)} | "
-            f"{_fmt(m.combined_score)} | {latency} |"
+            f"{_fmt(m.combined_score)} | {latency} | {m.schema_failures}/{m.recovered_violations} |"
         )
     lines.append("")
 

@@ -1457,6 +1457,27 @@ def test_render_report_has_headline_pairwise_cost_and_caveat(
     assert "EXCLUDED -- failed this invocation" not in report
 
 
+def test_render_report_headline_table_shows_schema_counts_for_unpaired_arm(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """schema_failures/recovered_violations must render in the per-model HEADLINE
+    table (always present, every arm) -- not just the off-vs-light paired section --
+    so a lone ``--reasoning off``/``light`` run (or an unpaired arm left by a budget
+    stop) still surfaces the primary adherence signal (#601 fold round 6)."""
+    fields = {spec.name: bo.Outcome.ERR for spec in bo.FIELD_SPECS}
+    page = bo.PageResult(
+        slug="p",
+        outcomes=dict(fields),
+        error="BeanExtractionUnavailableError: ... returned a malformed shape: x",
+        on_page_fields=0,
+    )
+    run = bo.ModelRun(model_slug="model-a+reasoning-off", pages=[page])
+    report = bo.render_report([run], bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    assert "schema F/R" in report  # the new headline column
+    assert "| 1/0 |" in report  # schema_failures=1, recovered_violations=0
+    assert "Reasoning-arm comparison" not in report  # no light sibling -- unpaired
+
+
 def test_render_report_pairwise_reports_every_promised_axis(
     corpus: list[bo.CorpusPage],
 ) -> None:
