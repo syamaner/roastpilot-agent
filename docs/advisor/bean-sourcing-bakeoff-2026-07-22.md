@@ -22,16 +22,20 @@ zero schema failures on any arm).
   0 schema failures on every arm, so the original motivation (35→3 violations on
   a cheap Gemini, pre-#590) is moot on the hardened pipeline; #590's
   preprocessing appears to have solved adherence outright. Quality effects are
-  model-dependent and modest: `luna` off→light improves (macro F1 0.686→0.753,
-  errors 2→1 — light thinking fixes a blend page); `haiku` off→light is
+  model-dependent and modest: `luna` off→light shows a higher POINT ESTIMATE
+  (macro F1 0.686→0.753, errors 2→1 — light thinking fixes a blend page), but
+  the page-clustered bootstrap CI on the CombinedScore gap includes zero
+  (-0.034 [-0.155, 0.033]) so by this report's own decision rule it is not an
+  established improvement; `haiku` off→light is
   byte-identical (0.764→0.764, zero delta on every axis — light thinking does
   nothing for it here); and `gpt-5-mini` at LIGHT effort (0.735) scores BELOW
   its provider-default mandatory reasoning (0.770) while being ~2× cheaper and
   3.5× faster (p50 7.9 s vs 28.0 s).
 - **Cost/latency reality check:** on the DEFAULT-arm run, actual usage-priced
   costs ran 1.2–12× the chars/4 estimates (worst: `gpt-5-nano` at 12×,
-  provider-default reasoning tokens); the reasoning arms ran 0.59–1.10× (the
-  light arms' 4× output budgets over-predict) — the estimate-vs-actual gap the
+  provider-default reasoning tokens); the reasoning arms ran 0.59–1.72×
+  (haiku-off the high end at 1.72×; the light arms' 4× output budgets
+  over-predict, luna-light the low end at 0.59×) — the estimate-vs-actual gap the
   #601 harness now measures in both directions.
 - **Selection implication (pin unchanged until operator review):** `grok-4.3`
   and `gpt-5.6-luna` lead the honest-abstention ranking at low latency;
