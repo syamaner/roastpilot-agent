@@ -1499,13 +1499,14 @@ async def run_model_over_corpus(
                 single_attempt_reserve,
                 apply_reserve=apply_reserve,
             )
+            rounded_priced = round(priced, 5)
             ledger.append(
                 LedgerEntry(
                     arm=model_slug,
                     slug=page.slug,
                     request_tokens=diagnostics.request_tokens,
                     response_tokens=diagnostics.response_tokens,
-                    priced_usd=round(priced, 5),
+                    priced_usd=rounded_priced,
                     timed_out=timed_out,
                     reserve_applied=apply_reserve,
                     is_pending=False,
@@ -1513,7 +1514,11 @@ async def run_model_over_corpus(
                 )
             )
             if meter is not None:
-                meter.charge(priced)
+                # #601 fold round 13: charge the SAME rounded amount just
+                # persisted -- charging the raw float let a live meter
+                # disagree with one reconstructed from the ledger (which
+                # sums rounded entries) at the exact --max-spend boundary.
+                meter.charge(rounded_priced)
         on_page = (
             0 if draft is None else sum(1 for v in draft.field_sources.values() if v == "on_page")
         )
@@ -2549,6 +2554,10 @@ def render_report(
     failed_slugs: Sequence[FailedRun] = (),
     executed_slugs: Sequence[str] = (),
     actual_costs: Mapping[str, float] | None = None,
+    reserved_costs: Mapping[str, float] | None = None,
+    prorated_arm: str | None = None,
+    prorated_attempted_pages: int | None = None,
+    prorated_total_pages: int | None = None,
 ) -> str:
     """Render the markdown scorecard for one or more model runs.
 
@@ -2562,7 +2571,18 @@ def render_report(
             captured tokens at roster LIST price, never a verified billing readback
             ("charged" is reserved for :attr:`SpendMeter.charged`'s internal
             accounting, not this label); ``"n/a"`` for an arm with no captured usage
-            data.
+            data. An arm present here but absent from ``cost_estimates`` (a prior
+            ``--models`` subset, same ledger lineage) still gets its own row,
+            marked prior-lineage, and still counts in the actual total (#601
+            fold round 13) -- never a tripped-breaker report with a $0 total.
+        reserved_costs: Optional ``{Arm.label: reserve-inclusive USD}`` (#601
+            fold round 13) -- discloses how much of ``actual_costs`` is NOT
+            pure captured usage; ``"n/a"`` alongside a ``"n/a"`` actual.
+        prorated_arm: The arm a mid-arm breaker trip halted, if any -- its
+            estimate is prorated by attempted/total pages in the incurred-
+            spend line, labelled PRORATED (#601 fold round 13).
+        prorated_attempted_pages: ``prorated_arm``'s attempted page count.
+        prorated_total_pages: ``prorated_arm``'s full corpus page count.
         stopped_early: Whether the spend guard stopped before evaluating every
             requested model (see :attr:`BakeoffResult.stopped_early`). A
             PARTIAL banner is rendered prominently at the top so this result
@@ -2750,7 +2770,19 @@ def render_report(
     scored_slugs = {r.model_slug for r in runs}
     resumed_set = scored_slugs - executed_set
     if executed_slugs:
-        incurred_estimate = sum(cost_by_slug.get(s, 0.0) for s in executed_slugs)
+        incurred_estimate = 0.0
+        prorated_note = ""
+        for s in executed_slugs:
+            est_usd = cost_by_slug.get(s, 0.0)
+            if s == prorated_arm and prorated_attempted_pages is not None and prorated_total_pages:
+                incurred_estimate += est_usd * prorated_attempted_pages / prorated_total_pages
+                prorated_note = (
+                    f" `{s}`'s estimate is PRORATED to {prorated_attempted_pages}/"
+                    f"{prorated_total_pages} pages (the breaker tripped mid-arm, #601 "
+                    "fold round 13)."
+                )
+            else:
+                incurred_estimate += est_usd
         lines.append("## Cost (estimated spend incurred this invocation)")
         lines.append("")
         lines.append(
@@ -2758,7 +2790,7 @@ def render_report(
             f"{len(executed_slugs)} newly-called model(s): "
             f"{', '.join(f'`{s}`' for s in executed_slugs)}. A real (paid) call WAS made for "
             "each -- but see the note below: this is still this harness's cost ESTIMATE, "
-            "never a verified OpenRouter billing amount."
+            "never a verified OpenRouter billing amount." + prorated_note
         )
     else:
         lines.append("## Cost (pre-run estimate -- NOT yet spent)")
@@ -2770,11 +2802,12 @@ def render_report(
     lines.append("")
     lines.append(
         "| Model | in tok | out tok | est. USD (full corpus, 1 pass) | usage-priced "
-        "USD (list price) | status |"
+        "USD (list price) | of which reserved | status |"
     )
-    lines.append("|---|--:|--:|--:|--:|---|")
+    lines.append("|---|--:|--:|--:|--:|--:|---|")
     total = 0.0
     actual_total = 0.0
+    reserved_total = 0.0
     for est in cost_estimates:
         total += est.usd
         if est.slug in executed_set:
@@ -2785,15 +2818,35 @@ def render_report(
             status = "not run"
         actual = None if actual_costs is None else actual_costs.get(est.slug)
         actual_cell = "n/a" if actual is None else f"${actual:.4f}"
+        reserved = (
+            None if actual is None or reserved_costs is None else reserved_costs.get(est.slug, 0.0)
+        )
+        reserved_cell = "n/a" if reserved is None else f"${reserved:.4f}"
         if actual is not None:
             actual_total += actual
+            reserved_total += reserved or 0.0
         lines.append(
             f"| `{est.slug}` | {est.input_tokens} | {est.output_tokens} | ${est.usd:.4f} | "
-            f"{actual_cell} | {status} |"
+            f"{actual_cell} | {reserved_cell} | {status} |"
         )
+    # Arms with real spend this LEDGER lineage but outside this invocation's
+    # requested roster (#601 fold round 13, F4) -- a prior --models subset --
+    # still get a row + count in the total, never a $0 total while tripped.
+    if actual_costs is not None:
+        cost_slugs = {est.slug for est in cost_estimates}
+        for slug in sorted(set(actual_costs) - cost_slugs):
+            actual = actual_costs[slug]
+            actual_total += actual
+            reserved = None if reserved_costs is None else reserved_costs.get(slug, 0.0)
+            reserved_total += reserved or 0.0
+            reserved_cell = "n/a" if reserved is None else f"${reserved:.4f}"
+            lines.append(
+                f"| `{slug}` | n/a | n/a | n/a | ${actual:.4f} | {reserved_cell} | "
+                "prior-lineage-arm (not in this invocation's --models) |"
+            )
     lines.append(
         f"| **arm total (1 pass each, every requested model/reasoning arm)** | | | "
-        f"**${total:.4f}** | **${actual_total:.4f}** | |"
+        f"**${total:.4f}** | **${actual_total:.4f}** | **${reserved_total:.4f}** | |"
     )
     lines.append("")
     lines.append(
@@ -2806,7 +2859,10 @@ def render_report(
         "caching, provider-side rounding, and any account discount can all make the real "
         "invoiced charge differ from the list-price figure shown. A self-consistency vote "
         "(sample 3-5x) or a two-pass entailment judge would multiply either figure "
-        "accordingly."
+        "accordingly. 'of which reserved' discloses the portion of the usage-priced figure "
+        "that is NOT pure captured usage -- a timeout or provider-error page's added safety "
+        "reserve (#601 fold round 13); ``$0.0000`` means the arm's actual is pure captured "
+        "usage."
     )
     lines.append("")
     lines.append("## Caveat")
@@ -3227,6 +3283,17 @@ class ChargeLedger:
         matching = (e.priced_usd for e in self._effective_entries() if e.arm == arm)
         return round(sum(matching), 5)
 
+    def reserved_usd_for_arm(self, arm: str) -> float:
+        """One arm's ``priced_usd`` sum over entries with ``reserve_applied``
+        (#601 fold round 13) -- the portion of :meth:`total_usd_for_arm` NOT
+        pure captured usage (a timeout or provider-error page's charge
+        includes an added safety reserve on top of, or instead of, what was
+        actually captured)."""
+        matching = (
+            e.priced_usd for e in self._effective_entries() if e.arm == arm and e.reserve_applied
+        )
+        return round(sum(matching), 5)
+
     def append(self, entry: LedgerEntry) -> None:
         """Persist one page's real charge immediately (append-only, never
         rewritten), stamped with THIS invocation's fingerprint."""
@@ -3245,6 +3312,14 @@ def _ledger_actual_costs(ledger: ChargeLedger) -> dict[str, float]:
     (#601 fold round 3, FOLD 4) -- an other-lineage arm never appears."""
     arms = {e.arm for e in ledger.entries if e.fingerprint == ledger.fingerprint}
     return {arm: ledger.total_usd_for_arm(arm) for arm in arms}
+
+
+def _ledger_reserved_costs(ledger: ChargeLedger) -> dict[str, float]:
+    """Every attempted arm's reserve-inclusive portion of its usage-priced
+    spend (#601 fold round 13) -- ``0.0`` for an arm with no reserved
+    entries, never absent, so a report row can always disclose it."""
+    arms = {e.arm for e in ledger.entries if e.fingerprint == ledger.fingerprint}
+    return {arm: ledger.reserved_usd_for_arm(arm) for arm in arms}
 
 
 @dataclass
@@ -3444,6 +3519,15 @@ class BakeoffResult:
             :class:`ChargeLedger`, for EVERY arm a real call was attempted this
             invocation-lineage -- including a breaker-tripped or wholly-failed arm
             -- never silently ``$0``/absent while the meter is at max.
+        reserved_costs: ``{Arm.label: reserve-inclusive USD}`` (#601 fold round
+            13) -- the portion of ``actual_costs`` NOT pure captured usage
+            (a timeout/provider-error page's charge). ``0.0`` for a fully
+            captured arm.
+        prorated_arm: The arm a MID-ARM breaker trip halted, if any (#601
+            fold round 13) -- its cost estimate is prorated, not counted in
+            full, in the report's incurred-spend line.
+        prorated_attempted_pages: ``prorated_arm``'s attempted page count.
+        prorated_total_pages: ``prorated_arm``'s full corpus page count.
     """
 
     runs: list[ModelRun]
@@ -3453,6 +3537,10 @@ class BakeoffResult:
     executed_slugs: list[str]
     breaker_tripped: bool = False
     actual_costs: dict[str, float] = field(default_factory=lambda: cast("dict[str, float]", {}))
+    reserved_costs: dict[str, float] = field(default_factory=lambda: cast("dict[str, float]", {}))
+    prorated_arm: str | None = None
+    prorated_attempted_pages: int | None = None
+    prorated_total_pages: int | None = None
 
 
 async def run_bakeoff(
@@ -3548,21 +3636,11 @@ async def run_bakeoff(
             runs.append(_run_from_checkpoint(checkpoint.get(slug)))
             print(f"[resume] {slug}: on disk (ledger ${meter.charged:.4f} total)", flush=True)
             continue
-        upcoming = cost_by_slug.get(slug, 0.0)
-        if spent + upcoming > max_spend:
-            print(
-                f"[budget] stopping before {slug}: est. ${upcoming:.4f} would exceed "
-                f"--max-spend ${max_spend:.2f} (spent est. ${spent:.4f})",
-                flush=True,
-            )
-            return BakeoffResult(
-                runs=runs,
-                stopped_early=True,
-                unevaluated_slugs=[a.label for a in arms[index:]],
-                failed_slugs=failed_runs,
-                executed_slugs=executed_slugs,
-                actual_costs=_ledger_actual_costs(ledger),
-            )
+        # #601 fold round 13: the REAL meter is checked BEFORE the pre-run
+        # ESTIMATE guard -- a resumed, already-over-budget ledger (or a
+        # final-page trip on the arm just completed) must always report
+        # breaker_tripped=True/exit 3, never a false exit 0 from the
+        # estimate guard firing first on the same iteration.
         if meter.tripped:
             print(
                 f"[breaker] halting before {slug}: cumulative usage-priced spend "
@@ -3579,6 +3657,23 @@ async def run_bakeoff(
                 executed_slugs=executed_slugs,
                 breaker_tripped=True,
                 actual_costs=_ledger_actual_costs(ledger),
+                reserved_costs=_ledger_reserved_costs(ledger),
+            )
+        upcoming = cost_by_slug.get(slug, 0.0)
+        if spent + upcoming > max_spend:
+            print(
+                f"[budget] stopping before {slug}: est. ${upcoming:.4f} would exceed "
+                f"--max-spend ${max_spend:.2f} (spent est. ${spent:.4f})",
+                flush=True,
+            )
+            return BakeoffResult(
+                runs=runs,
+                stopped_early=True,
+                unevaluated_slugs=[a.label for a in arms[index:]],
+                failed_slugs=failed_runs,
+                executed_slugs=executed_slugs,
+                actual_costs=_ledger_actual_costs(ledger),
+                reserved_costs=_ledger_reserved_costs(ledger),
             )
         run = await run_model_over_corpus(
             pages,
@@ -3612,6 +3707,10 @@ async def run_bakeoff(
                 executed_slugs=executed_slugs,
                 breaker_tripped=True,
                 actual_costs=_ledger_actual_costs(ledger),
+                reserved_costs=_ledger_reserved_costs(ledger),
+                prorated_arm=slug,
+                prorated_attempted_pages=len(run.pages),
+                prorated_total_pages=len(pages),
             )
         if _run_wholly_failed(run):
             label = "MODEL-SPECIFIC" if has_fresh_success else "INFRA-WIDE"
@@ -3650,6 +3749,7 @@ async def run_bakeoff(
         failed_slugs=failed_runs,
         executed_slugs=executed_slugs,
         actual_costs=_ledger_actual_costs(ledger),
+        reserved_costs=_ledger_reserved_costs(ledger),
     )
 
 
@@ -3871,6 +3971,10 @@ async def main(argv: Sequence[str] | None = None) -> int:
         failed_slugs=result.failed_slugs,
         executed_slugs=result.executed_slugs,
         actual_costs=result.actual_costs,
+        reserved_costs=result.reserved_costs,
+        prorated_arm=result.prorated_arm,
+        prorated_attempted_pages=result.prorated_attempted_pages,
+        prorated_total_pages=result.prorated_total_pages,
     )
     print("\n" + report, flush=True)
 
@@ -3886,6 +3990,10 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 "executed_slugs": result.executed_slugs,
                 "breaker_tripped": result.breaker_tripped,
                 "actual_costs": result.actual_costs,
+                "reserved_costs": result.reserved_costs,
+                "prorated_arm": result.prorated_arm,
+                "prorated_attempted_pages": result.prorated_attempted_pages,
+                "prorated_total_pages": result.prorated_total_pages,
             },
             indent=2,
         )
