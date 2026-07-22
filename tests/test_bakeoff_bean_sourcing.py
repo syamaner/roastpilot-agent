@@ -1388,6 +1388,9 @@ async def test_run_model_over_corpus_zero_usage_provider_error_charges_single_at
     # entry's FULL multi-attempt one -- different valuations by design (#601
     # fold round 6, FOLD D), never expected to match.
     assert entry.priced_usd < pending.priced_usd
+    # #601 fold round 14: zero captured usage -- the WHOLE priced_usd IS the
+    # reserve component.
+    assert entry.reserved_usd == pytest.approx(entry.priced_usd)
 
 
 @pytest.mark.asyncio
@@ -1426,6 +1429,10 @@ async def test_run_model_over_corpus_provider_error_with_captured_usage_still_ge
             5,
         )
     )
+    # #601 fold round 14: reserved_usd discloses ONLY the added reserve
+    # component -- not the whole (usage-inclusive) priced_usd.
+    assert entry.reserved_usd == pytest.approx(round(single_reserve, 5))
+    assert entry.reserved_usd < entry.priced_usd
 
 
 @pytest.mark.asyncio
@@ -1457,6 +1464,7 @@ async def test_run_model_over_corpus_schema_failure_never_gets_the_reserve(
             5,
         )
     )
+    assert entry.reserved_usd == 0.0  # #601 fold round 14: no reserve, nothing to disclose
 
 
 @pytest.mark.asyncio
@@ -2440,12 +2448,14 @@ def test_ledger_actual_costs_matches_total_usd_for_arm_semantics(tmp_path: Path)
     assert actual["m1"] == pytest.approx(0.02)  # NOT 0.09
 
 
-def test_charge_ledger_reserved_usd_for_arm_sums_only_reserved_entries(
+def test_charge_ledger_reserved_usd_for_arm_sums_the_persisted_field(
     tmp_path: Path,
 ) -> None:
-    """#601 fold round 13: ``reserved_usd_for_arm()`` sums ONLY entries with
-    ``reserve_applied`` -- a pure-captured page (no reserve) never
-    contributes, a reserved one contributes its FULL priced amount."""
+    """#601 fold round 14: ``reserved_usd_for_arm()`` sums the PERSISTED
+    ``reserved_usd`` field, not a derived ``reserve_applied``-filtered whole
+    ``priced_usd`` -- a pure-captured page (``reserved_usd=0.0``) never
+    contributes; a zero-usage reserved (timeout) page's WHOLE charge is its
+    reserve, so it contributes its full amount."""
     path = tmp_path / "o.json.ledger.jsonl"
     ledger = bo.ChargeLedger(path)
     ledger.append(  # pure captured, no reserve
@@ -2460,7 +2470,7 @@ def test_charge_ledger_reserved_usd_for_arm_sums_only_reserved_entries(
             call_id="call-1",
         )
     )
-    ledger.append(  # a genuine reserved (timeout) page
+    ledger.append(  # a genuine reserved (timeout) page, zero captured usage
         bo.LedgerEntry(
             arm="m1",
             slug="b",
@@ -2469,6 +2479,7 @@ def test_charge_ledger_reserved_usd_for_arm_sums_only_reserved_entries(
             priced_usd=0.05,
             timed_out=True,
             reserve_applied=True,
+            reserved_usd=0.05,
             call_id="call-2",
         )
     )
@@ -2476,6 +2487,31 @@ def test_charge_ledger_reserved_usd_for_arm_sums_only_reserved_entries(
     assert ledger.reserved_usd_for_arm("m1") == pytest.approx(0.05)  # NOT 0.07
     reserved = bo._ledger_reserved_costs(ledger)  # pyright: ignore[reportPrivateUsage]
     assert reserved["m1"] == pytest.approx(0.05)
+
+
+def test_charge_ledger_reserved_usd_for_arm_excludes_captured_usage(
+    tmp_path: Path,
+) -> None:
+    """#601 fold round 14: a reserved entry that ALSO captured real usage (a
+    retry succeeded before the final attempt hit a provider error)
+    discloses only the ADDED reserve component -- never the whole,
+    usage-inclusive ``priced_usd``."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    ledger = bo.ChargeLedger(path)
+    ledger.append(
+        bo.LedgerEntry(
+            arm="m1",
+            slug="a",
+            request_tokens=50,
+            response_tokens=10,
+            priced_usd=0.05,  # captured (0.02) + reserve (0.03) -- mixed case
+            timed_out=False,
+            reserve_applied=True,
+            reserved_usd=0.03,
+        )
+    )
+    assert ledger.total_usd_for_arm("m1") == pytest.approx(0.05)
+    assert ledger.reserved_usd_for_arm("m1") == pytest.approx(0.03)  # NOT 0.05
 
 
 def test_charge_ledger_reserved_usd_for_arm_zero_when_pure_captured(
@@ -2895,9 +2931,10 @@ def test_render_report_renders_ledger_only_prior_lineage_arm(
 def test_render_report_prorates_mid_arm_incurred_estimate(
     corpus: list[bo.CorpusPage],
 ) -> None:
-    """#601 fold round 13, F5: a mid-arm breaker trip must prorate that arm's
-    ESTIMATED SPEND INCURRED contribution (attempted/total pages), not count
-    the full-corpus estimate for pages never attempted."""
+    """#601 fold round 14, F3: a mid-arm breaker trip must prorate that arm's
+    ESTIMATED SPEND INCURRED contribution by ``prorated_attempted_estimate``
+    (COST-weighted), not count the full-corpus estimate for pages never
+    attempted."""
     slug_a = bo.MODEL_ROSTER[0].slug
     runs = [_full_run(slug_a, bo.Outcome.COR)]
     cost_estimates = [
@@ -2910,9 +2947,10 @@ def test_render_report_prorates_mid_arm_incurred_estimate(
         prorated_arm=slug_a,
         prorated_attempted_pages=1,
         prorated_total_pages=9,
+        prorated_attempted_estimate=0.01,
     )
     assert "PRORATED" in report
-    assert "$0.0100" in report  # 0.09 * 1/9 == 0.01, not the full $0.0900
+    assert "$0.0100" in report  # the cost-weighted figure, not the full $0.0900
 
 
 def test_render_report_reasoning_arm_comparison_groups_by_model(
@@ -3860,6 +3898,43 @@ async def test_run_bakeoff_mid_arm_breaker_trip_is_not_checkpointed(
         bo.sidecar_path(out), resume=True, fingerprint=bo.compute_fingerprint(corpus)
     )
     assert not checkpoint.has("m1")  # never checkpointed -- a re-run retries from page one
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_prorates_by_cost_not_flat_page_fraction(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 14, F3: proration is COST-weighted, not a flat
+    attempted/total page-count fraction -- attempting the corpus's most
+    EXPENSIVE (longest) page FIRST must show MORE than its 1/N page-count
+    share of the arm's total estimate."""
+    out = tmp_path / "o.json"
+    pages = sorted(
+        corpus,
+        key=lambda p: len(bo._extract_prompt_text(p)),  # pyright: ignore[reportPrivateUsage]
+        reverse=True,
+    )
+    # A modest, REAL size-based estimate (decoupled from the absurd actual
+    # price below, so the pre-run ESTIMATE guard doesn't fire first).
+    estimate_roster = [bo.RosterModel("m1", 0.05, 0.05, "x")]
+    cost_estimates = bo.estimate_cost(pages, estimate_roster)
+    roster = [bo.RosterModel("m1", 1_000_000, 1_000_000, "x")]  # absurd actual price, trips fast
+    result = await bo.run_bakeoff(
+        pages,
+        bo.expand_arms(["m1"], "default"),
+        out=out,
+        resume=True,
+        max_spend=0.01,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert result.breaker_tripped is True
+    assert result.prorated_attempted_pages == 1
+    assert result.prorated_total_pages == len(pages)
+    flat_fraction_share = cost_estimates[0].usd / len(pages)
+    assert result.prorated_attempted_estimate is not None
+    assert result.prorated_attempted_estimate > flat_fraction_share
 
 
 @pytest.mark.asyncio
