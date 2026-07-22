@@ -208,30 +208,63 @@ export function stripBidiControls(text: string): string {
 }
 
 /**
- * Strips the query string from any http(s) URL-shaped substring in `text`
- * (#654 round 2 fold 4): some backend 422 detail messages embed the
- * requested URL verbatim (e.g. `drafted bean profile failed validation for
- * 'https://x.test/p?token=...'`), and a signed/token-bearing query string on
- * that URL must never render on screen. Conservative by construction: the
- * match REQUIRES an `http(s)://` prefix before it ever considers a `?`, so a
- * `?` in ordinary message text (not part of a URL) is never touched — only
- * everything from the first `?` onward within an ALREADY-matched URL span is
- * dropped. The URL/query body excludes quotes, angle brackets, and closing
- * parens in addition to whitespace — the common "URL embedded in prose"
- * delimiters (e.g. the single quotes wrapping the URL above) — so trailing
- * punctuation from the surrounding sentence is never swept into the match
- * and stripped along with the query string. No unbounded backtracking
- * (`[^...]+`/`[^...]*` are both simple negated-character-class runs) — no
- * ReDoS surface on operator-uncontrolled server text. Case-insensitive
- * (`i` flag): the scheme the backend echoes back is whatever the operator
- * typed verbatim (never normalized), so `HTTPS://…`/`Https://…` must be
- * caught the same as `https://…` — a case-sensitive match would let an
- * uppercase-scheme URL's query string escape redaction entirely.
+ * A URL wrapped in matching quotes (`'…'` or `"…"`) — the shape the backend's
+ * error details actually use when echoing a requested URL back (Python's
+ * `repr()` always quotes a string, single-quoted by default; it falls back to
+ * double quotes only when the string itself contains a literal `'`). `\1`
+ * backreferences whichever quote character opened the span, so a URL
+ * containing the OTHER quote character can't prematurely close the match. The
+ * closing quote is an UNAMBIGUOUS boundary, so — unlike the conservative
+ * fallback below — the query value here may safely contain parentheses or any
+ * other punctuation without risking capture of surrounding prose: there is no
+ * boundary ambiguity to guard against once a quote pair is found.
+ */
+const QUOTED_URL = /(['"])(https?:\/\/[^'"]*)\1/gi;
+
+/**
+ * A BARE (unquoted) http(s) URL-shaped substring — the fallback for a message
+ * that doesn't quote the URL. Conservative by construction: the match
+ * REQUIRES an `http(s)://` prefix before it ever considers a `?`, so a `?` in
+ * ordinary message text (not part of a URL) is never touched. The URL/query
+ * body excludes quotes, angle brackets, and closing parens in addition to
+ * whitespace — the common "URL embedded in prose" delimiters — so trailing
+ * punctuation from the surrounding sentence is never swept into the match.
+ * The trade-off this exclusion accepts: a paren inside an UNQUOTED URL's own
+ * query value (e.g. `?next=(x)`) is itself indistinguishable from prose
+ * parens with no quote to mark the true boundary, so redaction can truncate
+ * early there — narrowed to a non-issue in practice by the quoted pass above
+ * running FIRST and covering the actual backend format. No unbounded
+ * backtracking (`[^...]+`/`[^...]*` are both simple negated-character-class
+ * runs) — no ReDoS surface on operator-uncontrolled server text.
  */
 const URL_WITH_QUERY = /https?:\/\/[^\s?'"<>)]+\?[^\s'"<>)]*/gi;
 
+/** Case-insensitive (both patterns carry the `i` flag): the scheme the
+ *  backend echoes back is whatever the operator typed verbatim (never
+ *  normalized), so `HTTPS://…`/`Https://…` must be caught the same as
+ *  `https://…` — a case-sensitive match would let an uppercase-scheme URL's
+ *  query string escape redaction entirely. */
+function redactQueryFrom(url: string): string {
+  const questionMarkIndex = url.indexOf("?");
+  return questionMarkIndex === -1 ? url : url.slice(0, questionMarkIndex);
+}
+
+/**
+ * Strips the query string from any http(s) URL-shaped substring in `text`
+ * (#654 round 2 fold 4, round 3): some backend 422 detail messages embed the
+ * requested URL verbatim (e.g. `drafted bean profile failed validation for
+ * 'https://x.test/p?token=...'`), and a signed/token-bearing query string on
+ * that URL must never render on screen. Tries the quoted-URL pattern FIRST
+ * (matching the backend's actual quoting), falling back to the conservative
+ * unquoted pattern for anything the quoted pass didn't already handle.
+ */
 export function redactUrlQueryStrings(text: string): string {
-  return text.replace(URL_WITH_QUERY, (match) => match.slice(0, match.indexOf("?")));
+  return text
+    .replace(
+      QUOTED_URL,
+      (_match, quote: string, url: string) => `${quote}${redactQueryFrom(url)}${quote}`,
+    )
+    .replace(URL_WITH_QUERY, redactQueryFrom);
 }
 
 /** Field-level validation errors, keyed by draft field. */

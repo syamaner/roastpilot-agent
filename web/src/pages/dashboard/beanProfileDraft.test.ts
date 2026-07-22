@@ -307,6 +307,37 @@ describe("redactUrlQueryStrings (#654 round 2 fold 4)", () => {
     );
     expect(redactUrlQueryStrings(text)).not.toContain("token=secret");
   });
+
+  it("fully redacts a quoted URL whose query value contains parentheses (#654 round 3)", () => {
+    // Parens are valid URL characters — the round-1 fix's prose-punctuation
+    // exclusion (dropping trailing parens) traded one bug for another when
+    // the paren is part of the QUERY VALUE itself, not surrounding prose.
+    // Quoting is the unambiguous boundary the backend actually provides.
+    const text =
+      "drafted bean profile failed validation for 'https://x.test/a?next=(x)&token=secret': bad";
+    expect(redactUrlQueryStrings(text)).toBe(
+      "drafted bean profile failed validation for 'https://x.test/a': bad",
+    );
+    expect(redactUrlQueryStrings(text)).not.toContain("token=secret");
+  });
+
+  it("still redacts the round-1 prose case (no parens) via the same quoted pass", () => {
+    const text = "drafted bean profile failed validation for 'https://x.test/p?token=abc': bad";
+    expect(redactUrlQueryStrings(text)).toBe(
+      "drafted bean profile failed validation for 'https://x.test/p': bad",
+    );
+  });
+
+  it("still redacts an unquoted bare URL via the conservative fallback pattern", () => {
+    const text = "failed for https://x.test/p?token=xyz — page too thin";
+    expect(redactUrlQueryStrings(text)).toBe("failed for https://x.test/p — page too thin");
+    expect(redactUrlQueryStrings(text)).not.toContain("token=xyz");
+  });
+
+  it("also handles a double-quoted URL (Python repr falls back to double quotes when the string contains a literal single quote)", () => {
+    const text = 'failed for "https://x.test/a?next=(x)&token=secret": bad';
+    expect(redactUrlQueryStrings(text)).toBe('failed for "https://x.test/a": bad');
+  });
 });
 
 describe("draftFromBeanProfileDraft — strips bidi controls from drafted free text (#654 round 2 fold 6)", () => {
