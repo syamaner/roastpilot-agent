@@ -2269,6 +2269,22 @@ async def test_extract_bean_identity_maps_malformed_output() -> None:
 
 
 @pytest.mark.asyncio
+async def test_extract_bean_identity_captures_token_usage_when_it_raises() -> None:
+    """A run that exhausts retries and raises still consumed billable requests --
+    the pre-created ``RunUsage`` handed to ``agent.run(usage=...)`` accumulates in
+    place even on the raised path, folded into diagnostics via ``finally``, so the
+    future spend circuit breaker does not undercount a failing (still billed) cell."""
+    model = _function_model_text("here is some prose, not the tool call")
+    diagnostics = bean_sourcing.BeanSourcingDiagnostics()
+    with pytest.raises(BeanExtractionUnavailableError, match="malformed"):
+        await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+            "page text", advisor_config=_ADVISOR_CONFIG, model=model, diagnostics=diagnostics
+        )
+    assert diagnostics.request_tokens > 0
+    assert diagnostics.response_tokens > 0
+
+
+@pytest.mark.asyncio
 async def test_extract_bean_identity_counts_a_recovered_validation_retry() -> None:
     """A first-attempt schema violation that succeeds on retry reports zero page
     errors (PydanticAI's own retry recovery) -- ``diagnostics.schema_retries`` must

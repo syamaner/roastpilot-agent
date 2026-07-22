@@ -217,6 +217,7 @@ from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai import Agent, ModelAPIError, ModelSettings, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelRequest, RetryPromptPart
 from pydantic_ai.models import Model
+from pydantic_ai.usage import RunUsage
 
 from roastpilot_agent.advisor import (
     AdvisorDependencyError,
@@ -2745,13 +2746,14 @@ class BeanSourcingDiagnostics:
     Attributes:
         schema_retries: ``RetryPromptPart`` occurrences a success recovered from
             (F2 -- otherwise invisible).
-        request_tokens: Input/prompt tokens for the extraction call, from
-            ``AgentRunResult.usage.input_tokens`` -- PydanticAI already SUMS this
-            across every request in the run (retries included), so this is the
-            run TOTAL, not just the final request.
-        response_tokens: Output/completion tokens, same run-total semantics
-            (``AgentRunResult.usage.output_tokens``). Tokens only -- pricing is
-            harness policy, not a runtime concern.
+        request_tokens: Input/prompt tokens for the extraction call. A pre-created
+            ``RunUsage`` is handed to ``agent.run(usage=...)``, which PydanticAI
+            accumulates in place across every request in the run (retries
+            included) and folds in via ``finally`` -- so this counts a raised
+            (retries-exhausted/provider-error/timeout) run's billed tokens too,
+            not just a successful one.
+        response_tokens: Output/completion tokens, same accumulation semantics.
+            Tokens only -- pricing is harness policy, not a runtime concern.
     """
 
     schema_retries: int = 0
@@ -2811,6 +2813,13 @@ async def _extract_bean_identity(
         if sourcing_config is not None
         else _DEFAULT_EXTRACTION_TIMEOUT_SECONDS
     )
+    # Pre-created and handed to ``agent.run(usage=...)`` so it accumulates IN PLACE
+    # even when the run raises (retries exhausted, provider error, timeout) --
+    # ``result.usage`` is unreachable on that path since ``result`` is never
+    # assigned, so reading usage only after a successful return (as before) silently
+    # undercounted every failing, still-billed call. ``None`` when no diagnostics is
+    # passed, so a caller that omits it pays no extra bookkeeping.
+    run_usage = RunUsage() if diagnostics is not None else None
     try:
         # Agent construction (which calls ``build_model`` when ``model`` is
         # omitted) lives INSIDE the try: it can raise ``AdvisorDependencyError``
@@ -2824,7 +2833,11 @@ async def _extract_bean_identity(
             reasoning_effort=reasoning_effort,
         )
         async with asyncio.timeout(extraction_timeout_seconds):
-            result = await agent.run(page_text)
+            result = (
+                await agent.run(page_text, usage=run_usage)
+                if run_usage is not None
+                else await agent.run(page_text)
+            )
     except TimeoutError as exc:
         raise BeanExtractionUnavailableError(
             f"bean identity extraction exceeded the {extraction_timeout_seconds:g}s deadline"
@@ -2844,6 +2857,11 @@ async def _extract_bean_identity(
         raise BeanExtractionUnavailableError(
             f"bean identity extraction could not build its model: {exc}"
         ) from exc
+    finally:
+        if run_usage is not None:
+            assert diagnostics is not None  # narrows: run_usage is only ever set alongside it
+            diagnostics.request_tokens += run_usage.input_tokens
+            diagnostics.response_tokens += run_usage.output_tokens
     if diagnostics is not None:
         diagnostics.schema_retries += sum(
             isinstance(part, RetryPromptPart)
@@ -2851,8 +2869,6 @@ async def _extract_bean_identity(
             if isinstance(msg, ModelRequest)
             for part in msg.parts
         )
-        diagnostics.request_tokens += result.usage.input_tokens
-        diagnostics.response_tokens += result.usage.output_tokens
     return result.output
 
 
