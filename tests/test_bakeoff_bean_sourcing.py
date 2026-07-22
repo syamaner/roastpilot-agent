@@ -1528,6 +1528,27 @@ async def test_run_model_over_corpus_provider_error_page_is_retryable(
 
 
 @pytest.mark.asyncio
+async def test_run_model_over_corpus_timeout_page_is_retryable(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """#652 round-5 qa fold: a genuine (REAL, not synthetic) wall-clock TIMEOUT
+    is the OTHER ``is_infra_failure`` branch (``diagnostics.timed_out_runs > 0``)
+    -- only the provider-error branch had a positive ``retryable`` assertion
+    before this fold. A hanging model + a short extraction timeout forces the
+    real outer-timeout path (mirrors :func:`_function_model_hanging`'s other
+    uses), never a synthetic ``timed_out=True`` construction."""
+    run = await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=_function_model_hanging(),
+        sourcing_config=bo.BeanSourcingConfig(extraction_timeout_seconds=0.05),
+    )
+    assert run.pages[0].error is not None
+    assert run.pages[0].retryable is True
+
+
+@pytest.mark.asyncio
 async def test_run_model_over_corpus_success_page_is_never_retryable(
     corpus: list[bo.CorpusPage],
 ) -> None:
@@ -1575,6 +1596,9 @@ async def test_run_model_over_corpus_model_construction_failure_never_gets_the_r
     )
     assert run.pages[0].error is not None
     assert "could not build its model" in run.pages[0].error
+    # #652 round-5 qa fold: a model-construction failure never sent a request,
+    # so it is not an INFRA-class failure -- never retryable (#649).
+    assert run.pages[0].retryable is False
     _, entry = ledger.entries
     assert entry.request_tokens == 0
     assert entry.response_tokens == 0
@@ -3773,10 +3797,10 @@ async def test_run_bakeoff_ledger_charges_accumulate_across_a_residual_retry(
         model=_model_fails_nth_call(1),
     )
     fingerprint = bo.compute_fingerprint(corpus)
-    charge_after_failure = bo.ChargeLedger(
-        bo.ledger_path(out), fingerprint=fingerprint
-    ).total_usd_for_arm("m1")
+    ledger_after_failure = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
+    charge_after_failure = ledger_after_failure.total_usd_for_arm("m1")
     assert charge_after_failure > 0.0  # the failed attempt's reserve is already charged
+    entries_before_retry = len(ledger_after_failure.entries)
 
     await bo.run_bakeoff(
         corpus,
@@ -3788,10 +3812,17 @@ async def test_run_bakeoff_ledger_charges_accumulate_across_a_residual_retry(
         roster=roster,
         model=_model_returning({"name": "X", "country": "Ecuador"}),
     )
-    charge_after_retry = bo.ChargeLedger(
-        bo.ledger_path(out), fingerprint=fingerprint
-    ).total_usd_for_arm("m1")
+    ledger_after_retry = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
+    charge_after_retry = ledger_after_retry.total_usd_for_arm("m1")
     assert charge_after_retry > charge_after_failure  # the retry ADDS a new charge
+    # #652 round-5 qa fold: an any-nonzero-increase check alone would also pass
+    # a double-counted or wrong-page write -- pin the raw entry count grows by
+    # EXACTLY one call's write-ahead pair (pending + final, #601 fold round 4,
+    # FOLD 1), and that the two new entries belong to the ONE page that was
+    # actually retryable (corpus[0], the only page failed by call #1 above).
+    new_entries = ledger_after_retry.entries[entries_before_retry:]
+    assert len(new_entries) == 2
+    assert {e.slug for e in new_entries} == {corpus[0].slug}
 
 
 @pytest.mark.asyncio
