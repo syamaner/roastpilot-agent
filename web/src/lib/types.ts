@@ -300,6 +300,31 @@ export interface BeanProfileDeleteResult {
   result: "archived";
 }
 
+// --- Draft-from-URL (#573 phase 1, #627, #637): models.BeanProfileDraft. ---
+
+/** Per-field provenance for a `BeanProfileDraftResponse` (models.BeanFieldSource):
+ *  `"on_page"` when the value was read off the vendor page, `"origin_estimated"`
+ *  when it was imputed (a conservative first-roast target, or a value the page
+ *  never stated). A constrained literal, not an enum — bean metadata, not a
+ *  safety verdict. */
+export type BeanFieldSource = "on_page" | "origin_estimated";
+
+/** `POST /api/beans/draft-from-url` response (models.BeanProfileDraft) — a
+ *  drafted, NOT-YET-SAVED profile the operator reviews/edits/saves via the
+ *  existing `createBeanProfile` action. Never persisted server-side. Carries
+ *  every `BeanProfileFields` field plus honest per-field provenance
+ *  (`field_sources`), the model-cited vendor-page quotes backing the four
+ *  typed fields (`field_evidence`), and the conservative "scouting run"
+ *  framing (`scouting_note`). `is_blend` overrides the shared base's plain
+ *  `boolean` with a tri-state: `null` means the page never addressed
+ *  blending at all (distinct from the page confirming single-origin). */
+export interface BeanProfileDraftResponse extends Omit<BeanProfileFields, "is_blend"> {
+  is_blend: boolean | null;
+  field_sources: Record<string, BeanFieldSource>;
+  field_evidence: Record<string, string>;
+  scouting_note: string;
+}
+
 export interface LogManifest {
   log_dir: string;
   jsonl_path: string;

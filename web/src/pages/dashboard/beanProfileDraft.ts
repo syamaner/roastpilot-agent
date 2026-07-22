@@ -16,6 +16,7 @@
  */
 
 import type {
+  BeanProfileDraftResponse,
   BeanProfileInput,
   BeanSpecies,
   ProcessingMethod,
@@ -46,6 +47,18 @@ export interface BeanProfileDraft {
   target_drop_temp_c: string;
   target_development_percent: string;
   default_bean_weight_grams: string;
+  /**
+   * Marks `is_blend` as an UNRESOLVED tri-state from a draft-from-URL response
+   * (#637): the vendor page never addressed blending at all (the wire value was
+   * `null`), so `is_blend` above is a safe-default `false`, not an operator- or
+   * vendor-confirmed "single origin". `true` while unresolved; absent (never
+   * `false`) once resolved — the same "absent means unset" convention as
+   * `field_sources`/`field_evidence`. `validateBeanProfile` blocks save while this
+   * is `true`; `withFieldEdited` clears it the moment the operator picks blend or
+   * single-origin explicitly, on the same edit that would otherwise silently
+   * persist the un-chosen default.
+   */
+  is_blend_unresolved?: boolean;
   /**
    * Model-cited verbatim vendor-page quotes for the four typed fields
    * (`altitude_m`, `processing`, `bean_species`, `is_blend`), keyed the
@@ -140,6 +153,11 @@ export function fieldEvidenceFor(
  * wired up yet) leaves `field_sources`/`field_evidence` at the SAME
  * reference as before: no spurious object churn for anything memoised on
  * them.
+ *
+ * Editing `is_blend` specifically also clears `is_blend_unresolved` (#637):
+ * an explicit true/false choice from the operator IS the resolution, on the
+ * same edit that would otherwise leave the un-chosen safe-default in place —
+ * there is no separate "confirm" step for this field.
  */
 export function withFieldEdited<K extends keyof BeanProfileDraft>(
   draft: BeanProfileDraft,
@@ -154,6 +172,9 @@ export function withFieldEdited<K extends keyof BeanProfileDraft>(
   if (draft.field_evidence !== undefined && field in draft.field_evidence) {
     const { [field as string]: _removed, ...rest } = draft.field_evidence;
     next.field_evidence = rest;
+  }
+  if (field === "is_blend") {
+    next.is_blend_unresolved = undefined;
   }
   return next;
 }
@@ -184,6 +205,77 @@ const BIDI_CONTROL_CHARS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
  */
 export function stripBidiControls(text: string): string {
   return text.replace(BIDI_CONTROL_CHARS, "");
+}
+
+/**
+ * A URL wrapped in matching quotes (`'…'` or `"…"`) — the shape the backend's
+ * error details actually use when echoing a requested URL back (Python's
+ * `repr()` always quotes a string, single-quoted by default; it falls back to
+ * double quotes only when the string itself contains a literal `'`). The body
+ * is a NEGATED BACKREFERENCE (`(?:(?!\1).)*`), not a `[^'"]*` character
+ * class: a naive class excludes BOTH quote characters, so a double-quoted
+ * span whose URL happens to contain a literal `'` (`repr()`'s own
+ * opposite-delimiter case) would stop at that embedded `'` instead of the
+ * real closing `"`, letting everything after it — including the query
+ * string — escape redaction. The negated backreference stops ONLY at the
+ * SAME character that opened the span (checked via a lookahead before each
+ * character is consumed), so the other quote character, parens, or anything
+ * else inside is inert; this closes the whole CLASS of "wrong delimiter"
+ * bypasses categorically, not just the one instance already found. No
+ * unbounded backtracking: the lookahead is a single-character comparison
+ * repeated linearly with the outer `*`, not nested/overlapping quantifiers.
+ *
+ * This function is defence-in-depth on DISPLAY, not the source of truth —
+ * if review ever surfaces a further bypass class here, the categorical fix
+ * is redacting the URL at the BACKEND, before it ever reaches an error
+ * detail (its own runtime slice), not another regex refinement client-side.
+ */
+const QUOTED_URL = /(['"])(https?:\/\/(?:(?!\1).)*)\1/gi;
+
+/**
+ * A BARE (unquoted) http(s) URL-shaped substring — the fallback for a message
+ * that doesn't quote the URL. Conservative by construction: the match
+ * REQUIRES an `http(s)://` prefix before it ever considers a `?`, so a `?` in
+ * ordinary message text (not part of a URL) is never touched. The URL/query
+ * body excludes quotes, angle brackets, and closing parens in addition to
+ * whitespace — the common "URL embedded in prose" delimiters — so trailing
+ * punctuation from the surrounding sentence is never swept into the match.
+ * The trade-off this exclusion accepts: a paren inside an UNQUOTED URL's own
+ * query value (e.g. `?next=(x)`) is itself indistinguishable from prose
+ * parens with no quote to mark the true boundary, so redaction can truncate
+ * early there — narrowed to a non-issue in practice by the quoted pass above
+ * running FIRST and covering the actual backend format. No unbounded
+ * backtracking (`[^...]+`/`[^...]*` are both simple negated-character-class
+ * runs) — no ReDoS surface on operator-uncontrolled server text.
+ */
+const URL_WITH_QUERY = /https?:\/\/[^\s?'"<>)]+\?[^\s'"<>)]*/gi;
+
+/** Case-insensitive (both patterns carry the `i` flag): the scheme the
+ *  backend echoes back is whatever the operator typed verbatim (never
+ *  normalized), so `HTTPS://…`/`Https://…` must be caught the same as
+ *  `https://…` — a case-sensitive match would let an uppercase-scheme URL's
+ *  query string escape redaction entirely. */
+function redactQueryFrom(url: string): string {
+  const questionMarkIndex = url.indexOf("?");
+  return questionMarkIndex === -1 ? url : url.slice(0, questionMarkIndex);
+}
+
+/**
+ * Strips the query string from any http(s) URL-shaped substring in `text`
+ * (#654 round 2 fold 4, round 3): some backend 422 detail messages embed the
+ * requested URL verbatim (e.g. `drafted bean profile failed validation for
+ * 'https://x.test/p?token=...'`), and a signed/token-bearing query string on
+ * that URL must never render on screen. Tries the quoted-URL pattern FIRST
+ * (matching the backend's actual quoting), falling back to the conservative
+ * unquoted pattern for anything the quoted pass didn't already handle.
+ */
+export function redactUrlQueryStrings(text: string): string {
+  return text
+    .replace(
+      QUOTED_URL,
+      (_match, quote: string, url: string) => `${quote}${redactQueryFrom(url)}${quote}`,
+    )
+    .replace(URL_WITH_QUERY, redactQueryFrom);
 }
 
 /** Field-level validation errors, keyed by draft field. */
@@ -271,6 +363,67 @@ export function draftFromBeanProfile(profile: BeanProfileInput): BeanProfileDraf
 }
 
 /**
+ * Build a modal draft + scouting note from a `POST /api/beans/draft-from-url`
+ * response (#573 phase 1, #627, #637): seeds the string-keyed form draft AND
+ * carries the server's `field_sources`/`field_evidence` straight through, so
+ * the existing provenance-badge/evidence-quote UI (#627) lights up with no
+ * further wiring. `is_blend` is tri-state on the wire (`null` means the
+ * vendor page never addressed blending at all), but this string-keyed
+ * draft's checkbox is a plain boolean — `null` maps to `false` as the
+ * DISPLAYED default, flagged `is_blend_unresolved: true` (#637) so the form
+ * visibly marks it as an open choice rather than a confirmed single-origin,
+ * and `validateBeanProfile` blocks save until the operator picks one. The
+ * server never emits an `is_blend` entry in `field_sources` when the value
+ * is `null` either, so the provenance badge simply doesn't render for a
+ * field the page never addressed — the unresolved flag is what covers the
+ * gap that badge leaves.
+ *
+ * Every drafted FREE-TEXT identity field (name, bean_origin, bean_varietal,
+ * country, farm, description, source_url) is passed through
+ * `stripBidiControls` (#654 round 2 fold 6): this is UNTRUSTED vendor-page
+ * text, same as the evidence quotes — a bidi override embedded in, say, the
+ * drafted `name` could make the seeded form (and, if saved unedited, the
+ * saved profile and everywhere it's displayed) visually claim something
+ * different from its actual character content. `bean_species`/`processing`
+ * are excluded: they are constrained server-side `Literal`s, never arbitrary
+ * vendor text.
+ */
+function strippedOrEmpty(value: string | null | undefined): string {
+  return value == null ? "" : stripBidiControls(value);
+}
+
+export function draftFromBeanProfileDraft(
+  response: BeanProfileDraftResponse,
+): { draft: BeanProfileDraft; scoutingNote: string } {
+  return {
+    draft: {
+      name: stripBidiControls(response.name),
+      bean_origin: stripBidiControls(response.bean_origin),
+      bean_varietal: strippedOrEmpty(response.bean_varietal),
+      country: strippedOrEmpty(response.country),
+      farm: strippedOrEmpty(response.farm),
+      bean_species: response.bean_species ?? "",
+      is_blend: response.is_blend ?? false,
+      is_blend_unresolved: response.is_blend === null ? true : undefined,
+      description: strippedOrEmpty(response.description),
+      processing: response.processing ?? "",
+      altitude_m: response.altitude_m == null ? "" : String(response.altitude_m),
+      source_url: strippedOrEmpty(response.source_url),
+      charge_guidance_min_c: String(response.charge_guidance_min_c),
+      charge_guidance_max_c: String(response.charge_guidance_max_c),
+      initial_heat_percent: String(response.initial_heat_percent),
+      initial_fan_percent: String(response.initial_fan_percent),
+      target_drop_temp_c: String(response.target_drop_temp_c),
+      target_development_percent: String(response.target_development_percent),
+      default_bean_weight_grams: String(response.default_bean_weight_grams),
+      field_sources: response.field_sources,
+      field_evidence: response.field_evidence,
+    },
+    scoutingNote: response.scouting_note,
+  };
+}
+
+/**
  * Whether a string parses as an absolute http(s) URL with a host (#315). Mirrors
  * the server's `source_url` validator: a non-http(s) scheme (e.g. `javascript:`,
  * `ftp:`), a missing host, embedded userinfo (`user:pass@host` — a credential
@@ -326,6 +479,16 @@ export function validateBeanProfile(
       errors.source_url = "Must be a http(s):// URL.";
     }
   }
+  // #637: a draft-from-URL response whose blend flag the vendor page never
+  // addressed leaves `is_blend` at a SAFE-DEFAULT `false`, flagged
+  // `is_blend_unresolved` — block save until the operator explicitly picks
+  // single-origin or blend, so an untouched checkbox is never mistaken for a
+  // confirmed "single origin".
+  if (draft.is_blend_unresolved === true) {
+    errors.is_blend =
+      "The vendor page didn't say — choose single-origin or blend before saving.";
+  }
+
   const processing =
     draft.processing === "" ? null : (draft.processing as ProcessingMethod);
 
