@@ -132,6 +132,7 @@ import re
 import sys
 import time
 import unicodedata
+import uuid
 from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -1429,19 +1430,35 @@ async def run_model_over_corpus(
     results: list[PageResult] = []
     for page in pages:
         diagnostics = BeanSourcingDiagnostics()  # #601 F2: per-page retry count
+        # A fresh id per ATTEMPT-CYCLE (#601 fold round 6, FOLD A) -- shared by
+        # this page's pending + final entry below, so supersession never
+        # collapses two GENUINELY separate calls for the same page (a resumed
+        # arm re-attempts every page from scratch) into one.
+        call_id = uuid.uuid4().hex
         # Computed BEFORE the billable call (#601 fold round 3, FOLD 2): the
         # failure handler must never re-parse, or a kill mid-timeout loses a
-        # billed charge.
+        # billed charge. `reserve` = full MULTI-attempt worst case (pending
+        # entry, attempt count unknown yet); `single_attempt_reserve` = ONE
+        # attempt's worst case (#601 fold round 6, FOLD D -- the final
+        # entry's OWN timeout addition, at most one request ever unreported).
         reserve = (
             _page_cost_reserve(page, roster_price, max_output_tokens=max_output_tokens)
             if roster_price is not None and ledger is not None
             else 0.0
         )
+        single_attempt_reserve = (
+            _single_attempt_reserve(page, roster_price, max_output_tokens=max_output_tokens)
+            if roster_price is not None and ledger is not None
+            else 0.0
+        )
         if roster_price is not None and ledger is not None:
             # PENDING, charged at the reserve (#601 fold round 4, FOLD 1) --
-            # written BEFORE the call so a kill mid-call still leaves this
-            # page's worst-case charge on the books; the FINAL entry below
-            # supersedes it once the call actually completes.
+            # written BEFORE the call so a kill mid-call leaves this page's
+            # worst-case charge on the books; FINAL below supersedes it once
+            # the call completes. A kill DURING draft_for_page's own local
+            # preprocessing (no provider bytes sent yet) leaves this pending
+            # entry as the only record -- an ACCEPTED trade (#601 fold round
+            # 6 review, dismissed): fails SAFE, cents-magnitude, ms-wide window.
             ledger.append(
                 LedgerEntry(
                     arm=model_slug,
@@ -1452,6 +1469,7 @@ async def run_model_over_corpus(
                     timed_out=False,
                     reserve_applied=True,
                     is_pending=True,
+                    call_id=call_id,
                 )
             )
         # STARTED here, AFTER the reserve compute + pending write (#601 fold
@@ -1479,7 +1497,7 @@ async def run_model_over_corpus(
                 diagnostics.request_tokens,
                 diagnostics.response_tokens,
                 roster_price,
-                reserve,
+                single_attempt_reserve,
                 timed_out=timed_out,
             )
             ledger.append(
@@ -1492,6 +1510,7 @@ async def run_model_over_corpus(
                     timed_out=timed_out,
                     reserve_applied=timed_out,  # #601 fold round 4: SUM, always applied
                     is_pending=False,
+                    call_id=call_id,
                 )
             )
         on_page = (
@@ -2263,6 +2282,23 @@ _RESERVE_INSTRUCTION_OVERHEAD_BYTES = (
     + 500
 )
 
+#: A generous structural-inflation factor on the reserve's PAGE-TEXT bytes
+#: (#601 fold round 6, FOLD C) -- markdown syntax (table pipes/dashes, list
+#: markers, frontmatter delimiters) is punctuation the plain linear-strip pass
+#: does not emit, so a real prompt COULD exceed the linear-strip byte count
+#: even though it adds no CONTENT -- breaking the "linear-strip is always the
+#: longer candidate" claim FOLD 4 relied on. 2x generously covers realistic
+#: table/list-heavy structural inflation without reintroducing trafilatura
+#: (:func:`_reserve_prompt_text` still never touches it).
+_RESERVE_STRUCTURAL_INFLATION = 2
+
+#: A small, documented retry-prompt-wrapper overhead (#601 fold round 6, FOLD
+#: B) -- pydantic-ai's ``RetryPromptPart`` wraps a validation failure in a
+#: short, fixed "please fix this" instruction the model sees on every RETRY
+#: attempt (never the initial one). A flat token estimate, not modeled per
+#: schema -- the wrapper text is short and provider-independent.
+_RESERVE_RETRY_OVERHEAD_TOKENS = 200
+
 
 def _reserve_prompt_text(page: CorpusPage) -> str:
     """The prompt text for the RESERVE floor (#601 fold round 4, FOLD 4) --
@@ -2284,19 +2320,44 @@ def _reserve_prompt_text(page: CorpusPage) -> str:
     return extracted_text if json_ld_context is None else f"{json_ld_context}\n\n{extracted_text}"
 
 
+def _reserve_input_tokens_per_attempt(page: CorpusPage) -> int:
+    """ONE attempt's worst-case input-token bound (#601 fold round 6, FOLD C):
+    the reserve TEXT's UTF-8 bytes, inflated by :data:`_RESERVE_STRUCTURAL_INFLATION`
+    (markdown structural punctuation the linear-strip pass never emits), plus
+    the DERIVED instruction+schema overhead (exact, no structural variability
+    -- never inflated)."""
+    prompt_text = _reserve_prompt_text(page)
+    input_bytes = (
+        len(prompt_text.encode("utf-8")) * _RESERVE_STRUCTURAL_INFLATION
+        + _RESERVE_INSTRUCTION_OVERHEAD_BYTES
+    )
+    return input_bytes // _RESERVE_BYTES_PER_TOKEN
+
+
 def _page_cost_reserve(
     page: CorpusPage, price: RosterModel, *, max_output_tokens: int = BAKEOFF_MAX_OUTPUT_TOKENS
 ) -> float:
-    """THIS page's PHYSICALLY-BOUNDED, WORST-CASE timeout-reserve floor (#601
-    fold rounds 1-4). Input tokens use the worst-case byte bound over the
-    DERIVED overhead (:func:`_reserve_prompt_text`). Output tokens are bounded
-    by the ENFORCED provider cap over its retry budget (#601 fold round 4,
-    FOLD 4 -- the P2 fold on #645): ``max_output_tokens`` bounds each
-    provider REQUEST, and :data:`~roastpilot_agent.bean_sourcing.EXTRACTION_MAX_RETRIES`
-    bounds how many times a validation failure re-requests, so the run-wide
-    worst case is ``max_output_tokens * (1 + EXTRACTION_MAX_RETRIES)`` --
-    matching what the provider can actually bill across a retrying run, not
-    a generic tokens/second decode-rate guess.
+    """THIS page's PHYSICALLY-BOUNDED, WORST-CASE, MULTI-ATTEMPT timeout-reserve
+    floor (#601 fold rounds 1-6) -- for the PENDING entry, written before
+    anything is known about how many attempts will actually occur.
+
+    Output tokens are bounded by the ENFORCED provider cap over its retry
+    budget (#601 fold round 4, FOLD 4 -- the P2 fold on #645):
+    ``max_output_tokens`` bounds each provider REQUEST, and
+    :data:`~roastpilot_agent.bean_sourcing.EXTRACTION_MAX_RETRIES` bounds how
+    many times a validation failure re-requests, so the total is
+    ``max_output_tokens * (1 + EXTRACTION_MAX_RETRIES)``.
+
+    Input tokens (#601 fold round 6, FOLD B) account for every attempt
+    RE-SENDING the prompt, plus each RETRY additionally re-sending the prior
+    response (up to the output cap) and a small retry-prompt wrapper
+    (:data:`_RESERVE_RETRY_OVERHEAD_TOKENS`) pydantic-ai injects on a
+    validation-failure retry: ``(1 + EXTRACTION_MAX_RETRIES) *
+    prompt_tokens_per_attempt + EXTRACTION_MAX_RETRIES * (max_output_tokens +
+    _RESERVE_RETRY_OVERHEAD_TOKENS)`` -- matching what the provider can
+    actually bill across a RETRYING run, not a single-attempt guess (see
+    :func:`_single_attempt_reserve` for the final-timeout-entry's own,
+    smaller bound).
 
     Args:
         page: The corpus page (its extracted prompt text drives the input estimate).
@@ -2307,20 +2368,46 @@ def _page_cost_reserve(
             call itself enforces.
 
     Returns:
-        The page's physically-bounded, worst-case estimated USD cost.
+        The page's physically-bounded, worst-case, multi-attempt estimated USD cost.
     """
     from roastpilot_agent.bean_sourcing import (  # noqa: PLC0415
         EXTRACTION_MAX_RETRIES,
     )
 
-    prompt_text = _reserve_prompt_text(page)
-    input_tokens = (
-        len(prompt_text.encode("utf-8")) + _RESERVE_INSTRUCTION_OVERHEAD_BYTES
-    ) // _RESERVE_BYTES_PER_TOKEN
+    per_attempt_input = _reserve_input_tokens_per_attempt(page)
+    input_tokens = (1 + EXTRACTION_MAX_RETRIES) * per_attempt_input + EXTRACTION_MAX_RETRIES * (
+        max_output_tokens + _RESERVE_RETRY_OVERHEAD_TOKENS
+    )
     output_tokens = max_output_tokens * (1 + EXTRACTION_MAX_RETRIES)
     return (
         input_tokens / 1_000_000 * price.price_in_per_mtok
         + output_tokens / 1_000_000 * price.price_out_per_mtok
+    )
+
+
+def _single_attempt_reserve(
+    page: CorpusPage, price: RosterModel, *, max_output_tokens: int = BAKEOFF_MAX_OUTPUT_TOKENS
+) -> float:
+    """ONE attempt's worst-case reserve (#601 fold round 6, FOLD D) -- for the
+    FINAL entry's timeout addition, where at most ONE in-flight request can
+    ever be unreported (a completed retry's usage is already captured in
+    ``request_tokens``/``response_tokens``; only the LAST, cancelled attempt
+    is unknown). The full multi-attempt worst case
+    (:func:`_page_cost_reserve`) stays reserved for the PENDING entry, where
+    nothing about the eventual attempt count is known yet.
+
+    Args:
+        page: The corpus page.
+        price: The arm's model pricing.
+        max_output_tokens: The ENFORCED per-request output cap.
+
+    Returns:
+        ONE attempt's physically-bounded, worst-case estimated USD cost.
+    """
+    input_tokens = _reserve_input_tokens_per_attempt(page)
+    return (
+        input_tokens / 1_000_000 * price.price_in_per_mtok
+        + max_output_tokens / 1_000_000 * price.price_out_per_mtok
     )
 
 
@@ -2354,6 +2441,14 @@ def _actual_page_cost(
     ADDED, never maxed (#601 fold round 4, FOLD 3: a retry-then-timeout page's
     completed attempts and its unreported one are separate charges, not
     alternative estimates of the same one).
+
+    ``per_page_reserve`` must be a SINGLE-ATTEMPT reserve here (#601 fold round
+    6, FOLD D -- :func:`_single_attempt_reserve`), never the full multi-attempt
+    :func:`_page_cost_reserve` the PENDING entry uses: every COMPLETED retry's
+    usage is already counted in ``request_tokens``/``response_tokens``, so at
+    most ONE in-flight request (the final, cancelled one) can ever be
+    unreported at this point -- the multi-attempt worst case belongs only
+    where nothing about the eventual attempt count is known yet.
     """
     priced = _raw_priced_cost(request_tokens, response_tokens, price)
     return priced + per_page_reserve if timed_out else priced
@@ -2975,6 +3070,13 @@ class LedgerEntry:
             supersedes it once the call completes (#601 fold round 4, FOLD 1) --
             see :meth:`ChargeLedger.total_usd`. Defaults ``False`` so every
             pre-FOLD-1 entry loads as final, its prior meaning.
+        call_id: A per-ATTEMPT-CYCLE identity (fresh ``uuid4().hex`` per page
+            processed, #601 fold round 6, FOLD A) -- a pending entry and its
+            final share ONE ``call_id``; a resumed re-attempt gets a NEW one.
+            :meth:`ChargeLedger.total_usd` supersedes by ``call_id``, never
+            bare ``(arm, slug)``, so two GENUINELY separate real calls for one
+            page both count. Defaults ``""``; loaded as a fresh random id per
+            pre-FOLD-A entry (never a shared ``""``, which would collide them).
     """
 
     arm: str
@@ -2986,6 +3088,7 @@ class LedgerEntry:
     reserve_applied: bool
     fingerprint: str = ""
     is_pending: bool = False
+    call_id: str = ""
 
 
 #: Sentinel for a pre-fold-4 ledger entry with no persisted fingerprint (#601
@@ -3029,6 +3132,10 @@ class ChargeLedger:
             path.unlink()
         if resume and path.exists():
             for record in _load_checkpoint_lines(path):
+                # A pre-FOLD-A record has no call_id -- assign a FRESH random
+                # one per entry (#601 fold round 6, FOLD A) so two such
+                # legacy entries never wrongly collide under one key.
+                call_id = str(record["call_id"]) if record.get("call_id") else uuid.uuid4().hex
                 self._entries.append(
                     LedgerEntry(
                         arm=str(record["arm"]),
@@ -3040,6 +3147,7 @@ class ChargeLedger:
                         reserve_applied=bool(record["reserve_applied"]),
                         fingerprint=str(record.get("fingerprint", _LEGACY_LEDGER_FINGERPRINT)),
                         is_pending=bool(record.get("is_pending", False)),
+                        call_id=call_id,
                     )
                 )
 
@@ -3050,25 +3158,27 @@ class ChargeLedger:
         return list(self._entries)
 
     def _effective_entries(self) -> list[LedgerEntry]:
-        """One EFFECTIVE entry per ``(arm, slug)`` key, scoped to THIS
-        fingerprint (#601 fold round 4, FOLD 1). A FINAL entry
-        (``is_pending=False``) always supersedes a PENDING one for the same
-        key -- the call completed, so the pending worst-case guess retires.
-        A key with ONLY a pending entry (killed between the pending write and
-        the final one) still counts, at its reserve valuation -- the
-        two-phase design's whole point. Among same-phase entries for one key
-        (e.g. a resumed attempt's fresh pending/final alongside an orphaned
-        prior one), the LATEST wins.
+        """One EFFECTIVE entry per ``call_id``, scoped to THIS fingerprint
+        (#601 fold round 6, FOLD A -- keyed on ``call_id``, never bare
+        ``(arm, slug)``: a page can legitimately be CALLED more than once
+        across a resume, e.g. it succeeded before the arm's run later failed
+        wholesale and re-ran from page 0 -- each such call is a real,
+        separate charge, and collapsing them by page would under-count
+        actual cumulative spend). A FINAL entry (``is_pending=False``)
+        always supersedes ITS OWN pending -- the call completed, so that
+        call's worst-case guess retires. A ``call_id`` with ONLY a pending
+        entry (killed between the pending write and the final one) still
+        counts, at its reserve valuation -- the two-phase design's whole
+        point.
         """
-        by_key: dict[tuple[str, str], LedgerEntry] = {}
+        by_call: dict[str, LedgerEntry] = {}
         for entry in self._entries:
             if entry.fingerprint != self.fingerprint:
                 continue
-            key = (entry.arm, entry.slug)
-            existing = by_key.get(key)
+            existing = by_call.get(entry.call_id)
             if existing is None or not entry.is_pending or existing.is_pending:
-                by_key[key] = entry
-        return list(by_key.values())
+                by_call[entry.call_id] = entry
+        return list(by_call.values())
 
     def total_usd(self) -> float:
         """Cumulative charged spend, scoped to THIS fingerprint (#601 fold
@@ -3312,7 +3422,10 @@ async def run_bakeoff(
     # #601 fold round 5, D FOLD 3: PAGE-LEVEL coverage -- an arm's checkpoint
     # record names its OWN complete page set; a tail-truncated ledger (a kill
     # mid-write) can still have ONE entry for the arm while most of its pages'
-    # charges never landed. Fail closed, per missing page.
+    # charges never landed. Fail closed, per missing page. The bar is >=1
+    # entry for the page, ANY call (#601 fold round 6, FOLD A) -- pending or
+    # final, from any attempt-cycle; per-CALL identity (call_id) only matters
+    # for total_usd()'s supersession, not this existence-style coverage check.
     covered_pages: dict[str, set[str]] = {}
     for e in ledger.entries:
         if e.fingerprint == fingerprint:

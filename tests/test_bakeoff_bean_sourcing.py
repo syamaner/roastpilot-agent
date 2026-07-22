@@ -1036,6 +1036,33 @@ async def test_run_model_over_corpus_ledgers_every_page(
 
 
 @pytest.mark.asyncio
+async def test_run_model_over_corpus_assigns_a_fresh_call_id_each_invocation(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 6, FOLD A (P1): re-running the SAME page (simulating a
+    resumed arm re-attempting from scratch after a later page's wholesale
+    failure) writes entries under a NEW ``call_id`` each time -- both real
+    calls' charges count, never collapsed by a bare ``(arm, slug)`` key."""
+    model = _model_returning({"name": "X", "country": "Ecuador"})
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    for _ in range(2):
+        await bo.run_model_over_corpus(
+            [corpus[0]],
+            model_slug="m1",
+            advisor_config=_ADVISOR_CONFIG,
+            model=model,
+            roster_price=price,
+            ledger=ledger,
+        )
+    assert len(ledger.entries) == 4  # 2 pending + 2 final, across two DISTINCT calls
+    assert len({e.call_id for e in ledger.entries}) == 2  # two genuinely separate attempt-cycles
+    finals = [e for e in ledger.entries if not e.is_pending]
+    assert len(finals) == 2
+    assert ledger.total_usd() == pytest.approx(sum(e.priced_usd for e in finals))
+
+
+@pytest.mark.asyncio
 async def test_draft_for_page_threads_the_enforced_cap_to_the_paid_call(
     corpus: list[bo.CorpusPage], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1086,6 +1113,24 @@ def test_reserve_prompt_text_is_the_longer_candidate_never_trafilatura(
     assert len(reserve_text.encode("utf-8")) >= len(linear_only.encode("utf-8"))
 
 
+def test_reserve_input_tokens_per_attempt_applies_structural_inflation(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """#601 fold round 6, FOLD C: the reserve's per-attempt input-token bound
+    is inflated by :data:`bo._RESERVE_STRUCTURAL_INFLATION` over EITHER
+    prompt candidate's PLAIN byte length -- markdown structural punctuation
+    (table pipes/dashes, list markers, frontmatter delimiters) the
+    linear-strip pass never emits could otherwise exceed the reserve's
+    "longer candidate" claim even though it adds no content."""
+    page = corpus[0]
+    per_attempt_tokens = bo._reserve_input_tokens_per_attempt(page)  # pyright: ignore[reportPrivateUsage]
+    reserve_text = bo._reserve_prompt_text(page)  # pyright: ignore[reportPrivateUsage]
+    estimate_text = bo._extract_prompt_text(page)  # pyright: ignore[reportPrivateUsage]
+    inflation = bo._RESERVE_STRUCTURAL_INFLATION  # pyright: ignore[reportPrivateUsage]
+    assert per_attempt_tokens >= inflation * len(reserve_text.encode("utf-8"))
+    assert per_attempt_tokens >= inflation * len(estimate_text.encode("utf-8"))
+
+
 def _function_model_hanging() -> FunctionModel:
     """A double that never returns -- used to force a REAL outer-timeout
     cancellation (mirrors ``tests/test_bean_sourcing.py``'s helper of the same
@@ -1128,10 +1173,12 @@ async def test_run_model_over_corpus_ledgers_a_real_timed_out_page_with_reserve_
     assert entry.timed_out is True
     assert entry.reserve_applied is True
     assert entry.priced_usd > 0.0  # the reserve floor, never the (unreported) $0
-    # A timed-out FINAL entry sums the reserve onto any captured usage (#601
-    # fold round 4, FOLD 3), so it is never LESS than the pending entry's own
-    # bare reserve valuation for the same page.
-    assert entry.priced_usd >= pending.priced_usd
+    assert entry.call_id == pending.call_id  # one attempt-cycle (#601 fold round 6, FOLD A)
+    # A timed-out FINAL entry sums a SINGLE-attempt reserve onto any captured
+    # usage (#601 fold round 6, FOLD D) -- smaller than the pending entry's
+    # own FULL, multi-attempt reserve valuation for the same page (at most
+    # ONE in-flight request can ever be unreported at final-timeout time).
+    assert entry.priced_usd <= pending.priced_usd
 
 
 @pytest.mark.asyncio
@@ -1172,7 +1219,11 @@ async def test_run_model_over_corpus_ledgers_a_timeout_with_zero_post_call_parsi
         roster_price=price,
         ledger=ledger,
     )
-    assert call_order == ["parse", "provider_call_started"]
+    # TWO parses before the provider call (#601 fold round 6, FOLD D): the
+    # full multi-attempt reserve (pending) and the single-attempt reserve
+    # (for the final entry's own, smaller timeout addition) are computed
+    # separately, both still strictly BEFORE the call starts.
+    assert call_order == ["parse", "parse", "provider_call_started"]
     assert len(ledger.entries) == 2  # pending, then final
     pending, entry = ledger.entries
     assert pending.is_pending is True
@@ -1637,6 +1688,57 @@ def test_page_cost_reserve_output_component_is_the_enforced_cap_times_retries() 
     assert reserve == pytest.approx(expected_output_tokens / 1_000_000 * 1.0)
 
 
+def test_page_cost_reserve_input_component_accounts_for_retries() -> None:
+    """#601 fold round 6, FOLD B: the reserve's INPUT component accounts for
+    EVERY attempt re-sending the prompt, plus each RETRY additionally
+    re-sending the prior response (up to the output cap) and a small
+    retry-prompt-wrapper overhead -- not a flat single-prompt bound (isolated
+    here via an input-only price)."""
+    page = bo.CorpusPage(
+        slug="p", url="https://example.com/p", html="<p>Hi.</p>", gold_fields={}, vendor="x"
+    )
+    input_only_price = bo.RosterModel("m1", 1.0, 0.0, "x")  # isolates the input component
+    cap = 4096
+    reserve = bo._page_cost_reserve(  # pyright: ignore[reportPrivateUsage]
+        page, input_only_price, max_output_tokens=cap
+    )
+    per_attempt = bo._reserve_input_tokens_per_attempt(page)  # pyright: ignore[reportPrivateUsage]
+    max_retries = bo._bean_sourcing_module.EXTRACTION_MAX_RETRIES  # pyright: ignore[reportPrivateUsage]
+    retry_overhead = bo._RESERVE_RETRY_OVERHEAD_TOKENS  # pyright: ignore[reportPrivateUsage]
+    expected_input_tokens = (1 + max_retries) * per_attempt + max_retries * (cap + retry_overhead)
+    assert reserve == pytest.approx(expected_input_tokens / 1_000_000 * 1.0)
+
+
+def test_actual_page_cost_final_timeout_uses_single_attempt_reserve_not_multi() -> None:
+    """#601 fold round 6, FOLD D (P2): a FINAL timed-out entry's reserve
+    addition is ONE attempt's worst case (:func:`bo._single_attempt_reserve`),
+    never the full multi-attempt worst case (:func:`bo._page_cost_reserve`)
+    the PENDING entry uses -- every COMPLETED retry's usage is already in
+    ``request_tokens``/``response_tokens``, so at most ONE in-flight request
+    can ever be unreported. Holds for a PLAIN timeout (zero captured usage)
+    and a retry-completes-then-timeout page (real usage already captured)."""
+    page = bo.CorpusPage(
+        slug="p", url="https://example.com/p", html="<p>Hi.</p>", gold_fields={}, vendor="x"
+    )
+    price = bo.RosterModel("m1", 1.0, 1.0, "x")
+    full_reserve = bo._page_cost_reserve(page, price)  # pyright: ignore[reportPrivateUsage]
+    single_reserve = bo._single_attempt_reserve(page, price)  # pyright: ignore[reportPrivateUsage]
+    assert single_reserve < full_reserve  # strictly smaller (EXTRACTION_MAX_RETRIES >= 1)
+
+    plain = bo._actual_page_cost(  # pyright: ignore[reportPrivateUsage]
+        0, 0, price, single_reserve, timed_out=True
+    )
+    assert plain == pytest.approx(single_reserve)
+
+    retry_then_timeout = bo._actual_page_cost(  # pyright: ignore[reportPrivateUsage]
+        500, 100, price, single_reserve, timed_out=True
+    )
+    assert retry_then_timeout == pytest.approx(
+        bo._raw_priced_cost(500, 100, price) + single_reserve  # pyright: ignore[reportPrivateUsage]
+    )
+    assert retry_then_timeout > plain  # the completed retry's captured usage adds on top
+
+
 def test_reserve_instruction_overhead_is_derived_not_guessed() -> None:
     """#601 fold round 3, FOLD 3: the reserve's overhead is DERIVED from the
     ACTUAL runtime extraction instructions (+ schema + margin), so it must be AT
@@ -1685,6 +1787,8 @@ def test_charge_ledger_total_usd_sums_priced_entries_and_reloads(tmp_path: Path)
     spend, once a follow-on slice adds a spend guard that reads it)."""
     path = bo.ledger_path(tmp_path / "o.json")
     ledger = bo.ChargeLedger(path)
+    # Distinct call_ids (#601 fold round 6, FOLD A) -- two genuinely separate
+    # calls (different arms) must never collide under one supersession key.
     ledger.append(
         bo.LedgerEntry(
             arm="m1",
@@ -1694,6 +1798,7 @@ def test_charge_ledger_total_usd_sums_priced_entries_and_reloads(tmp_path: Path)
             priced_usd=4.0,
             timed_out=False,
             reserve_applied=False,
+            call_id="call-m1",
         )
     )
     ledger.append(
@@ -1705,6 +1810,7 @@ def test_charge_ledger_total_usd_sums_priced_entries_and_reloads(tmp_path: Path)
             priced_usd=0.0001,
             timed_out=False,
             reserve_applied=False,
+            call_id="call-m2",
         )
     )
     assert ledger.total_usd() == pytest.approx(4.0001)
@@ -1805,7 +1911,7 @@ def test_charge_ledger_excludes_a_legacy_entry_with_no_fingerprint(tmp_path: Pat
     assert ledger.total_usd() == pytest.approx(0.0)  # never silently trusted
 
 
-def _pending_entry(*, priced_usd: float = 0.05) -> bo.LedgerEntry:
+def _pending_entry(*, priced_usd: float = 0.05, call_id: str = "") -> bo.LedgerEntry:
     return bo.LedgerEntry(
         arm="m1",
         slug="a",
@@ -1815,6 +1921,7 @@ def _pending_entry(*, priced_usd: float = 0.05) -> bo.LedgerEntry:
         timed_out=False,
         reserve_applied=True,
         is_pending=True,
+        call_id=call_id,
     )
 
 
@@ -1886,17 +1993,26 @@ def test_charge_ledger_a_pending_entry_never_eclipses_an_existing_final(
 def test_charge_ledger_resume_after_pending_counts_only_the_new_final(
     tmp_path: Path,
 ) -> None:
-    """#601 fold round 4, FOLD 1: resuming after a kill re-attempts the page,
-    writing a FRESH pending + final pair alongside the orphaned pending from
-    the killed attempt (same ``(arm, slug)`` key, same lineage) -- the meter
-    must count only the winning final, never double-count the orphan."""
+    """#601 fold round 4, FOLD 1 + fold round 6, FOLD A: resuming after a kill
+    re-attempts the page, writing a FRESH pending + final pair -- a NEW
+    call_id, since it is a genuinely separate call -- alongside the orphaned
+    pending from the killed attempt (same ``(arm, slug)``, DIFFERENT
+    ``call_id``, same lineage). The meter must count only the winning final
+    for the resumed call_id, never double-count the orphaned one's own
+    pending (which, being a DIFFERENT call, still counts on its own -- see
+    :func:`test_charge_ledger_two_genuinely_separate_calls_for_one_page_both_count`
+    for the case where the orphan's call itself later completes)."""
     path = tmp_path / "o.json.ledger.jsonl"
     killed_run = bo.ChargeLedger(path, fingerprint="fp-1")
-    killed_run.append(_pending_entry(priced_usd=0.07))  # orphaned: no final follows
+    killed_run.append(
+        _pending_entry(priced_usd=0.07, call_id="call-killed")
+    )  # orphaned: no final follows
 
     resumed = bo.ChargeLedger(path, fingerprint="fp-1")
     assert resumed.total_usd() == pytest.approx(0.07)  # still just the orphan, pre-resume
-    resumed.append(_pending_entry(priced_usd=0.06))  # the resumed attempt's own pending
+    resumed.append(
+        _pending_entry(priced_usd=0.06, call_id="call-resumed")
+    )  # the resumed attempt's OWN call
     resumed.append(
         bo.LedgerEntry(
             arm="m1",
@@ -1907,10 +2023,40 @@ def test_charge_ledger_resume_after_pending_counts_only_the_new_final(
             timed_out=False,
             reserve_applied=False,
             is_pending=False,
+            call_id="call-resumed",
         )
     )
-    assert resumed.total_usd() == pytest.approx(0.015)  # neither pending counts anymore
+    # The orphan's own pending (0.07, never finalized) still counts on its
+    # own call_id; the resumed call's final (0.015) supersedes ITS pending.
+    assert resumed.total_usd() == pytest.approx(0.085)
     assert len(resumed.entries) == 3  # orphaned pending + resumed pending + final
+
+
+def test_charge_ledger_two_genuinely_separate_calls_for_one_page_both_count(
+    tmp_path: Path,
+) -> None:
+    """#601 fold round 6, FOLD A (P1): a page CALLED TWICE across a resume --
+    e.g. it succeeded before the arm's run later failed wholesale and re-ran
+    from page 0 -- is TWO real, separate charges. Keying supersession by bare
+    ``(arm, slug)`` would collapse them into one, under-counting actual
+    cumulative spend; keying by ``call_id`` keeps both."""
+    path = tmp_path / "o.json.ledger.jsonl"
+    ledger = bo.ChargeLedger(path)
+    first_call = bo.LedgerEntry(
+        arm="m1",
+        slug="a",
+        request_tokens=100,
+        response_tokens=50,
+        priced_usd=0.02,
+        timed_out=False,
+        reserve_applied=False,
+        is_pending=False,
+        call_id="call-1",
+    )
+    second_call = dataclasses.replace(first_call, priced_usd=0.03, call_id="call-2")
+    ledger.append(first_call)
+    ledger.append(second_call)
+    assert ledger.total_usd() == pytest.approx(0.05)  # BOTH real calls counted
 
 
 def test_load_dotenv_key(tmp_path: Path) -> None:
