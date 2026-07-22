@@ -204,11 +204,21 @@ export const api = {
    *  URL, or the page yielded too little identity to draft from. 503: the
    *  extraction provider/transport failed — the page itself may be fine,
    *  retry. 409: a roast is active. 429: too many concurrent draft requests
-   *  in flight, try again shortly. */
-  draftBeanFromUrl: (url: string) =>
+   *  in flight, try again shortly. An optional `signal` lets a caller abort
+   *  the fetch — currently UNUSED by any caller (#654 verdict round): the
+   *  modal's own invalidation deliberately does NOT abort, since the backend
+   *  has no disconnect check on this route and `AbortController.abort()`
+   *  settles the fetch's promise immediately on the client regardless — a
+   *  caller that aborted and then released its own in-flight guard on that
+   *  abort-triggered settle would risk firing a fresh request into the
+   *  backend's still-occupied one-at-a-time admission slot. Left threaded
+   *  through as an available capability for a future caller with a genuine
+   *  cancel need, not a signal this route's current caller relies on. */
+  draftBeanFromUrl: (url: string, signal?: AbortSignal) =>
     request<BeanProfileDraftResponse>("/api/beans/draft-from-url", {
       method: "POST",
       body: JSON.stringify({ url }),
+      signal,
     }),
 
   // --- Config (#419, D78) ---

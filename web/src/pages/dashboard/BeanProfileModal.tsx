@@ -8,25 +8,48 @@
  * selects the saved profile. Editing a saved profile affects FUTURE roasts only —
  * the backend guarantees a past roast keeps its frozen snapshot (#303).
  *
+ * Add mode also offers "Draft from a vendor page" (#573 phase 1, #637): a URL
+ * calls `POST /api/beans/draft-from-url`, and the returned draft — including its
+ * `field_sources`/`field_evidence` — seeds the form below, which activates the
+ * existing provenance-badge/evidence-quote UI (#627) with no further wiring.
+ * Drafting never saves anything; the operator still reviews/edits and submits
+ * normally. Edit mode omits the affordance (re-drafting over an already-saved
+ * profile is out of this slice's scope).
+ *
  * INVARIANTS: the SPA renders + mutates only via the typed REST client (never MCP);
  * all temperatures are Celsius; the client-side validation is defense-in-depth + UX,
  * the server's pydantic bounds are the authority (a 422 surfaces inline).
  */
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 
-import { ApiError } from "@/lib/api";
+import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import type { BeanProfile, BeanProfileInput } from "@/lib/types";
 import {
   DEFAULT_BEAN_PROFILE_DRAFT,
   draftFromBeanProfile,
+  draftFromBeanProfileDraft,
+  redactUrlQueryStrings,
   validateBeanProfile,
   withFieldEdited,
   type BeanProfileDraft,
   type BeanProfileErrors,
 } from "./beanProfileDraft";
 import { BeanProfileFields } from "./beanProfileFields";
+
+/** The draft fields the server's `scouting_note` text actually summarizes
+ *  (#654 final round): "...targets are a conservative, de-risked starting
+ *  point (X % development, drop Y °C) based on the Z processing method...".
+ *  Editing any ONE of these three retires the note — it would otherwise
+ *  keep citing figures the operator has since changed, and there is no
+ *  cheap way to recompute the prose client-side. Editing an unrelated field
+ *  (e.g. `farm`) leaves the note in place. */
+const SCOUTING_NOTE_SUMMARIZED_FIELDS = new Set<keyof BeanProfileDraft>([
+  "processing",
+  "target_development_percent",
+  "target_drop_temp_c",
+]);
 
 export interface BeanProfileModalProps {
   /** Modal mode — "add" starts blank; "edit" pre-fills from `profile`. */
@@ -62,20 +85,95 @@ export function BeanProfileModal({
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
+  // Draft-from-URL (#573 phase 1, #637): a scouting entry that fetches a vendor
+  // page and seeds the form below from the drafted profile — nothing is saved
+  // until the operator reviews it and submits normally. `draftErrorKind`
+  // distinguishes the two origin-mapped failure modes (#613) the endpoint can
+  // return, so the copy tells the operator whether the URL/page is the problem
+  // or the extraction provider is: a 422 is fix-the-input, a 503 is
+  // try-again-shortly, and anything else (409/429/network) is a generic
+  // fail-and-retry. `drafting` doubles as the retry affordance — the same
+  // button re-fires the request with whatever URL is still in the field.
+  const [draftUrl, setDraftUrl] = useState("");
+  const [drafting, setDrafting] = useState(false);
+  const [draftErrorKind, setDraftErrorKind] = useState<"invalid" | "unavailable" | "other" | null>(
+    null,
+  );
+  const [draftErrorDetail, setDraftErrorDetail] = useState<string | null>(null);
+  const [scoutingNote, setScoutingNote] = useState<string | null>(null);
+  // Race guard (#637, #654 round 2): the latest fired request "wins" — a token
+  // bumped whenever the in-flight draft is invalidated (a newer request, or an
+  // operator edit made while it was pending), captured at fire time, and
+  // re-checked before EITHER branch of `handleDraftFromUrl` applies its result.
+  // A response that no longer matches the current token is dropped outright.
+  const draftRequestIdRef = useRef(0);
+  // Synchronous single-flight guard (#654 round 2 fold 1): `drafting` (React
+  // state) is not enough on its own — two dispatches in the SAME event batch
+  // both read the same stale `drafting === false`, so both would fire a real
+  // request and the backend's own 429 on the second could race the first's
+  // genuine success. A ref is read/written synchronously, so the SECOND
+  // invocation — even same-batch — sees `true` and bails before calling the
+  // API. Cleared UNCONDITIONALLY only when a request's own promise settles,
+  // in `handleDraftFromUrl`'s `finally` (#654 landing round) — an operator
+  // edit invalidates the DATA (bumps the token) but does NOT clear this guard
+  // itself; see `invalidateInFlightDraft` for why.
+  const draftingRef = useRef(false);
+
   // Editing a field orphans any provenance/evidence it carried (#627): those
   // describe the value the SERVER extracted, not whatever the operator just
   // typed — `withFieldEdited` drops the stale entry so it is never re-attributed
-  // to the new value.
-  const onChange = (field: keyof BeanProfileDraft, value: string) =>
+  // to the new value. It ALSO invalidates an in-flight draft's DATA (#654
+  // round 2 fold 3): bumping the token here makes the eventual response's own
+  // staleness check drop it.
+  //
+  // Invalidation is TOKEN-BUMP ONLY (#654 verdict round) — it deliberately
+  // does NOT abort the fetch or touch the single-flight guard
+  // (`drafting`/`draftingRef`). An earlier version aborted the request, but
+  // `AbortController.abort()` settles the fetch's promise IMMEDIATELY on the
+  // client, while the backend has no disconnect check — so that abort was
+  // defeating its own purpose: the guard would release (via
+  // `handleDraftFromUrl`'s `finally`, which runs on that immediate abort-
+  // rejection) long before the backend's one-at-a-time admission slot was
+  // actually free, letting a fresh attempt fire straight into a self-
+  // inflicted 429 anyway. Without an abort, the guard genuinely holds until
+  // the ORIGINAL response arrives — the only signal the client has for
+  // "the backend is done with this one" — which is what makes the hold
+  // correct. A true server-side cancel would need a disconnect check on the
+  // backend; out of scope, and unnecessary for correctness once the guard
+  // holds to the real response.
+  const invalidateInFlightDraft = () => {
+    if (!drafting) return;
+    draftRequestIdRef.current += 1;
+  };
+  const onChange = (field: keyof BeanProfileDraft, value: string) => {
+    invalidateInFlightDraft();
     setDraft((d) => withFieldEdited(d, field, value));
-  const onBlendChange = (checked: boolean) =>
+    if (SCOUTING_NOTE_SUMMARIZED_FIELDS.has(field)) setScoutingNote(null);
+  };
+  const onBlendChange = (checked: boolean) => {
+    invalidateInFlightDraft();
     setDraft((d) => withFieldEdited(d, "is_blend", checked));
+    // Clearing the field's own validation error on the explicit choice itself
+    // (#654 final round), not only at the next save attempt: the operator
+    // just resolved exactly what the error was blocking on, so leaving the
+    // stale error visible until they hit Save would be a confusing lag.
+    setErrors((e) => {
+      if (e.is_blend === undefined) return e;
+      const { is_blend: _removed, ...rest } = e;
+      return rest;
+    });
+  };
 
   const title = mode === "add" ? "Add Bean Profile" : "Edit Bean Profile";
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (submitting) return;
+    // Guarded here (not just via the disabled Save button, #637): pressing Enter
+    // with focus in any OTHER form field submits natively regardless of the
+    // button's disabled attribute, so a draft in flight must block at the
+    // handler too — the simplest-correct pairing with the request-token guard
+    // in `handleDraftFromUrl` (latest-token-wins + Save blocked meanwhile).
+    if (submitting || drafting) return;
     setSubmitError(null);
 
     const result = validateBeanProfile(draft);
@@ -117,6 +215,60 @@ export function BeanProfileModal({
     }
   };
 
+  const handleDraftFromUrl = async () => {
+    const url = draftUrl.trim();
+    // Synchronous check-and-set (#654 round 2 fold 1) — see `draftingRef` above.
+    // Also refused while a save is in flight (#654 landing round): the modal
+    // may unmount on a successful save, and no vendor/LLM call should ever
+    // start mid-save regardless.
+    if (draftingRef.current || submitting || url === "") return;
+    draftingRef.current = true;
+    const requestId = ++draftRequestIdRef.current;
+    setDrafting(true);
+    setDraftErrorKind(null);
+    setDraftErrorDetail(null);
+    try {
+      const response = await api.draftBeanFromUrl(url);
+      // Superseded (#637, #654 round 2): a newer request already applied, or an
+      // operator edit invalidated this one while it was in flight — drop this
+      // stale response's DATA rather than clobbering whatever is now current.
+      if (draftRequestIdRef.current !== requestId) return;
+      const { draft: seeded, scoutingNote: note } = draftFromBeanProfileDraft(response);
+      setDraft(seeded);
+      setErrors({});
+      // A stale error from a PREVIOUS failed save must not caption a freshly
+      // seeded draft (#654 landing round, cheap fix).
+      setSubmitError(null);
+      // The note is paired with the draft it describes (#637): only replaced by
+      // a NEW successful response, never cleared pre-emptively on the next
+      // attempt — a failed retry must not erase the still-active prior draft's
+      // explanation.
+      setScoutingNote(note);
+    } catch (err) {
+      if (draftRequestIdRef.current !== requestId) return;
+      if (err instanceof ApiError && err.status === 422) {
+        setDraftErrorKind("invalid");
+        setDraftErrorDetail(err.detail);
+      } else if (err instanceof ApiError && err.status === 503) {
+        setDraftErrorKind("unavailable");
+        setDraftErrorDetail(err.detail);
+      } else if (err instanceof ApiError) {
+        setDraftErrorKind("other");
+        setDraftErrorDetail(err.detail || `Request failed (${err.status}).`);
+      } else {
+        setDraftErrorKind("other");
+        setDraftErrorDetail(err instanceof Error ? err.message : "Request failed.");
+      }
+    } finally {
+      // Cleared UNCONDITIONALLY on settle, not gated on the token (#654
+      // landing round): even a superseded request releases the guard once
+      // it's done — the earliest point a new attempt is safe. Only the DATA
+      // application above stays gated on the token still matching.
+      setDrafting(false);
+      draftingRef.current = false;
+    }
+  };
+
   return (
     <div
       data-testid="bean-profile-modal"
@@ -153,6 +305,104 @@ export function BeanProfileModal({
           <p className="rounded-md border border-border bg-muted/30 px-4 py-2 text-xs text-muted-foreground">
             Edits affect future roasts only. Past roasts keep their saved settings.
           </p>
+        )}
+
+        {mode === "add" && (
+          <div
+            data-testid="bean-profile-draft-panel"
+            className="flex flex-col gap-2 rounded-md border border-border bg-muted/20 p-4"
+          >
+            <label
+              htmlFor="bean-profile-draft-url"
+              className="text-xs font-semibold uppercase tracking-wide text-muted-foreground"
+            >
+              Draft from a vendor page (optional)
+            </label>
+            {/* Stacks below `sm` (input full-width, button underneath) — consistent
+                with the rest of the form's single-column collapse (#654 final
+                round). The scoped Playwright baseline is captured at the desktop
+                1600px viewport, well above `sm`, so this never touches its pixels. */}
+            <div className="flex flex-col gap-2 sm:flex-row">
+              <input
+                id="bean-profile-draft-url"
+                type="url"
+                data-testid="bean-profile-draft-url"
+                value={draftUrl}
+                onChange={(e) => {
+                  // #654 final round: editing the URL mid-flight invalidates the
+                  // in-flight request the SAME way a profile-field edit does —
+                  // without this, a fresh Enter on the NEW url could still get
+                  // clobbered by a stale response seeded from the OLD url.
+                  invalidateInFlightDraft();
+                  setDraftUrl(e.target.value);
+                }}
+                onKeyDown={(e) => {
+                  // #637: Enter in a text input implicitly submits its enclosing
+                  // <form> — without this, pressing Enter here would SAVE the
+                  // profile (whatever is currently filled) instead of drafting
+                  // from the URL just typed. Prevent the native submission and
+                  // route Enter to the draft action instead, respecting the same
+                  // disabled/empty guard as the button.
+                  if (e.key !== "Enter") return;
+                  e.preventDefault();
+                  void handleDraftFromUrl();
+                }}
+                placeholder="https://roaster.example.com/the-bean"
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus:ring-1 focus:ring-ring sm:flex-1"
+              />
+              <button
+                type="button"
+                onClick={() => void handleDraftFromUrl()}
+                disabled={drafting || submitting || draftUrl.trim() === ""}
+                aria-disabled={drafting || submitting || draftUrl.trim() === ""}
+                data-testid="bean-profile-draft-button"
+                className={cn(
+                  "w-full shrink-0 rounded-md border border-roast-coffee/60 bg-roast-coffee/20 px-4 py-2 text-sm font-semibold uppercase tracking-wide text-roast-coffee transition-colors sm:w-auto",
+                  drafting || submitting || draftUrl.trim() === ""
+                    ? "cursor-not-allowed opacity-60"
+                    : "hover:bg-roast-coffee/30",
+                )}
+              >
+                {drafting ? "Drafting…" : "Draft from page"}
+              </button>
+            </div>
+            <span className="text-xs text-muted-foreground">
+              Fetches the page and drafts a conservative first-roast profile below for
+              you to review — nothing is saved until you submit.
+            </span>
+            {draftErrorKind !== null &&
+              (() => {
+                // #654 round 2 fold 4: some backend 422 detail messages embed the
+                // requested URL verbatim (e.g. "...validation for '<url>': ...") —
+                // a signed/token-bearing query string on that URL must never
+                // render on screen. Redacted at the render boundary, not when the
+                // state is set, matching the same defense-in-depth-at-display
+                // convention `stripBidiControls` uses for evidence quotes.
+                const safeDetail =
+                  draftErrorDetail !== null ? redactUrlQueryStrings(draftErrorDetail) : null;
+                return (
+                  <p
+                    data-testid="bean-profile-draft-error"
+                    role="alert"
+                    className="text-xs text-roast-fault"
+                  >
+                    {draftErrorKind === "invalid" &&
+                      `Couldn't draft from that page — check the URL, or the page may be too thin to draft from. ${safeDetail ?? ""}`}
+                    {draftErrorKind === "unavailable" &&
+                      "Drafting is temporarily unavailable (provider error) — try again in a moment."}
+                    {draftErrorKind === "other" && (safeDetail ?? "Request failed.")}
+                  </p>
+                );
+              })()}
+            {scoutingNote !== null && (
+              <p
+                data-testid="bean-profile-scouting-note"
+                className="text-xs text-roast-caution"
+              >
+                {scoutingNote}
+              </p>
+            )}
+          </div>
         )}
 
         <BeanProfileFields
@@ -193,12 +443,12 @@ export function BeanProfileModal({
           )}
           <button
             type="submit"
-            disabled={submitting}
-            aria-disabled={submitting}
+            disabled={submitting || drafting}
+            aria-disabled={submitting || drafting}
             data-testid="bean-profile-save"
             className={cn(
               "inline-flex items-center justify-center rounded-md border border-roast-coffee/60 bg-roast-coffee/20 px-6 py-2 text-sm font-semibold uppercase tracking-wide text-roast-coffee transition-colors",
-              submitting ? "cursor-not-allowed opacity-60" : "hover:bg-roast-coffee/30",
+              submitting || drafting ? "cursor-not-allowed opacity-60" : "hover:bg-roast-coffee/30",
             )}
           >
             {submitting ? "Saving…" : "Save Profile"}
