@@ -134,7 +134,7 @@ import time
 import unicodedata
 import uuid
 from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from math import comb, isfinite, sqrt
 from pathlib import Path
@@ -1392,6 +1392,7 @@ async def run_model_over_corpus(
     roster_price: RosterModel | None = None,
     ledger: ChargeLedger | None = None,
     max_output_tokens: int = BAKEOFF_MAX_OUTPUT_TOKENS,
+    meter: SpendMeter | None = None,
 ) -> ModelRun:
     """Draft + score every page for one model.
 
@@ -1416,9 +1417,14 @@ async def run_model_over_corpus(
             round 4, FOLD 4), threaded to :func:`draft_for_page` AND sized
             into the reserve -- the SAME value on both sides is what makes
             the reserve's worst case true.
+        meter: The invocation-wide :class:`SpendMeter` (#601 fold round 1, slice B);
+            charged after EVERY page when given alongside ``roster_price``. Once
+            tripped, the loop stops BETWEEN pages (never mid-page), returning a run
+            SHORTER than ``pages`` -- the caller (:func:`run_bakeoff`) must treat
+            that as an incomplete arm.
 
     Returns:
-        The :class:`ModelRun`.
+        The :class:`ModelRun` (possibly SHORTER than ``pages`` if the meter tripped).
     """
     results: list[PageResult] = []
     for page in pages:
@@ -1506,6 +1512,8 @@ async def run_model_over_corpus(
                     call_id=call_id,
                 )
             )
+            if meter is not None:
+                meter.charge(priced)
         on_page = (
             0 if draft is None else sum(1 for v in draft.field_sources.values() if v == "on_page")
         )
@@ -1522,6 +1530,8 @@ async def run_model_over_corpus(
                 recovered_violations=diagnostics.schema_retries,
             )
         )
+        if meter is not None and meter.tripped:
+            break  # halt BETWEEN pages (#601 fold round 1, slice B) -- never mid-page
     return ModelRun(model_slug=model_slug, pages=results)
 
 
@@ -2538,12 +2548,21 @@ def render_report(
     unevaluated_slugs: Sequence[str] = (),
     failed_slugs: Sequence[FailedRun] = (),
     executed_slugs: Sequence[str] = (),
+    actual_costs: Mapping[str, float] | None = None,
 ) -> str:
     """Render the markdown scorecard for one or more model runs.
 
     Args:
         runs: The scored model runs.
         cost_estimates: The per-model paid-run cost estimate (for the operator).
+        actual_costs: Optional ``{Arm.label: usage-priced USD}`` (#601 fold round 1,
+            slice B -- from the persistent :class:`ChargeLedger`, covering EVERY arm
+            a real call was attempted for, including a breaker-tripped or
+            wholly-failed one) -- adds a "usage-priced USD (list price)" column: real
+            captured tokens at roster LIST price, never a verified billing readback
+            ("charged" is reserved for :attr:`SpendMeter.charged`'s internal
+            accounting, not this label); ``"n/a"`` for an arm with no captured usage
+            data.
         stopped_early: Whether the spend guard stopped before evaluating every
             requested model (see :attr:`BakeoffResult.stopped_early`). A
             PARTIAL banner is rendered prominently at the top so this result
@@ -2749,9 +2768,13 @@ def render_report(
             "existing checkpoint (no new paid calls) or this is a pre-run estimate."
         )
     lines.append("")
-    lines.append("| Model | in tok | out tok | est. USD (full corpus, 1 pass) | status |")
-    lines.append("|---|--:|--:|--:|---|")
+    lines.append(
+        "| Model | in tok | out tok | est. USD (full corpus, 1 pass) | usage-priced "
+        "USD (list price) | status |"
+    )
+    lines.append("|---|--:|--:|--:|--:|---|")
     total = 0.0
+    actual_total = 0.0
     for est in cost_estimates:
         total += est.usd
         if est.slug in executed_set:
@@ -2760,25 +2783,30 @@ def render_report(
             status = "resumed (no new spend)"
         else:
             status = "not run"
+        actual = None if actual_costs is None else actual_costs.get(est.slug)
+        actual_cell = "n/a" if actual is None else f"${actual:.4f}"
+        if actual is not None:
+            actual_total += actual
         lines.append(
             f"| `{est.slug}` | {est.input_tokens} | {est.output_tokens} | ${est.usd:.4f} | "
-            f"{status} |"
+            f"{actual_cell} | {status} |"
         )
     lines.append(
         f"| **arm total (1 pass each, every requested model/reasoning arm)** | | | "
-        f"**${total:.4f}** | |"
+        f"**${total:.4f}** | **${actual_total:.4f}** | |"
     )
     lines.append("")
     lines.append(
-        "Token counts use a chars/4 heuristic over the extractor's ACTUAL post-strip "
-        "prompt text; prompt caching on the stable schema/instructions makes the real "
-        "cost lower. EVERY USD figure above -- including a model marked 'spend incurred "
-        "(est.)' -- is still this harness's pre-call ESTIMATE, never a verified OpenRouter "
-        "billing amount: actual output/reasoning tokens, retries, and prompt caching can "
-        "all make the real charge differ. (This harness DOES now capture real per-page "
-        "usage internally, #601 fold round 1 -- not yet surfaced in this table.) A "
-        "self-consistency vote (sample 3-5x) or a two-pass entailment judge would "
-        "multiply these figures accordingly."
+        "The 'est.' column uses a chars/4 heuristic over the extractor's ACTUAL post-strip "
+        "prompt text (a pre-call approval figure, not a bill); prompt caching on the stable "
+        "schema/instructions makes the real cost lower still. The 'usage-priced' column "
+        "prices this harness's OWN captured request/response token counts against the "
+        "roster's LIST price -- real usage, not a chars/4 guess -- but this harness has NO "
+        "live BILLING readback, so it is still NOT a verified OpenRouter invoice: prompt "
+        "caching, provider-side rounding, and any account discount can all make the real "
+        "invoiced charge differ from the list-price figure shown. A self-consistency vote "
+        "(sample 3-5x) or a two-pass entailment judge would multiply either figure "
+        "accordingly."
     )
     lines.append("")
     lines.append("## Caveat")
@@ -3188,6 +3216,18 @@ class ChargeLedger:
         never counts."""
         return round(sum(e.priced_usd for e in self._effective_entries()), 5)
 
+    def total_usd_for_arm(self, arm: str) -> float:
+        """Cumulative charged spend for one arm, scoped to THIS fingerprint
+        (#601 fold round 3, FOLD 4), across every attempt (retries included --
+        a re-run of a previously mid-arm-tripped arm double-counts its
+        already-charged pages, by design, since real money was spent twice)."""
+        matching = (
+            e.priced_usd
+            for e in self._entries
+            if e.arm == arm and e.fingerprint == self.fingerprint
+        )
+        return round(sum(matching), 5)
+
     def append(self, entry: LedgerEntry) -> None:
         """Persist one page's real charge immediately (append-only, never
         rewritten), stamped with THIS invocation's fingerprint."""
@@ -3197,6 +3237,41 @@ class ChargeLedger:
             handle.write(json.dumps(dataclasses.asdict(entry)) + "\n")
             handle.flush()
         self._entries.append(entry)
+
+
+def _ledger_actual_costs(ledger: ChargeLedger) -> dict[str, float]:
+    """Every attempted arm's cumulative usage-priced spend (#601 fold round 1,
+    slice B) -- covers a breaker-tripped or wholly-failed arm too, never silently
+    absent while the meter is at max. Scoped to THIS fingerprint's lineage
+    (#601 fold round 3, FOLD 4) -- an other-lineage arm never appears."""
+    arms = {e.arm for e in ledger.entries if e.fingerprint == ledger.fingerprint}
+    return {arm: ledger.total_usd_for_arm(arm) for arm in arms}
+
+
+@dataclass
+class SpendMeter:
+    """Cumulative usage-priced spend across the WHOLE invocation-lineage (#601 fold
+    round 1, slice B).
+
+    Shared by every arm/page so ``--max-spend`` enforces cumulative REALITY (priced
+    captured tokens), not the pre-run chars/4 estimate. Seeded at the top of
+    :func:`run_bakeoff` from :meth:`ChargeLedger.total_usd` -- NEVER from scored runs
+    -- so a mid-arm trip, a wholly-failed run, or a dropped mixed-failure arm's
+    charges all persist across resume. ``charged`` is the internal meter figure,
+    distinct from the report's "usage-priced (list price)" label for the same
+    number. ``tripped`` fires once ``charged`` reaches ``max_spend``; every caller
+    must stop BETWEEN pages, never mid-page, once tripped.
+    """
+
+    max_spend: float
+    charged: float = 0.0
+
+    @property
+    def tripped(self) -> bool:
+        return self.charged >= self.max_spend
+
+    def charge(self, usd: float) -> None:
+        self.charged += usd
 
 
 # --- .env key loading (the 401-shadowing ops gotcha) -------------------------
@@ -3352,6 +3427,14 @@ class BakeoffResult:
             existing checkpoint. Distinguishes spend already INCURRED (still
             this harness's cost ESTIMATE, never verified billing -- #602) from
             a pre-run planning estimate (#600 round-2).
+        breaker_tripped: Whether the usage-priced circuit breaker (#601 fold round
+            1, slice B), not the pre-run estimate guard, caused ``stopped_early`` --
+            distinct exit code in :func:`main` (real money already spent, not just
+            a budget forecast).
+        actual_costs: ``{Arm.label: usage-priced USD}`` from the persistent
+            :class:`ChargeLedger`, for EVERY arm a real call was attempted this
+            invocation-lineage -- including a breaker-tripped or wholly-failed arm
+            -- never silently ``$0``/absent while the meter is at max.
     """
 
     runs: list[ModelRun]
@@ -3359,6 +3442,8 @@ class BakeoffResult:
     unevaluated_slugs: list[str]
     failed_slugs: list[FailedRun]
     executed_slugs: list[str]
+    breaker_tripped: bool = False
+    actual_costs: dict[str, float] = field(default_factory=lambda: cast("dict[str, float]", {}))
 
 
 async def run_bakeoff(
@@ -3372,19 +3457,20 @@ async def run_bakeoff(
     roster: Sequence[RosterModel],
     model: Model | None = None,
 ) -> BakeoffResult:
-    """Run + checkpoint every arm over the corpus, under a spend guard.
+    """Run + checkpoint every arm over the corpus, under BOTH spend guards.
 
-    Read-only: never touches any store/DB, never saves a profile. Stops gracefully BEFORE an
-    arm whose estimated cost would breach ``max_spend`` (see :attr:`BakeoffResult.stopped_early`).
-    A WHOLLY-FAILED run (see :func:`_run_wholly_failed`) is NEVER checkpointed -- reported as a
-    :class:`FailedRun` (DISPLAY-ONLY heuristic label + its schema/other-error counts) and always
-    retried on resume, but still counted against the spend guard. Every checkpoint/report
-    identity is :attr:`Arm.label` (#601), so a model's several arms are tracked distinctly.
-
-    A persistent :class:`ChargeLedger` (#601 fold round 1, slice A) is ALSO opened and
-    threaded through, so every dollar is now durably recorded page-by-page -- but
-    nothing here reads it back yet, no spend guard enforces against it (a follow-on
-    slice adds one).
+    Read-only: never touches any store/DB, never saves a profile. TWO independent guards
+    (#601 fold round 1, slice B adds the second): (1) the pre-run ESTIMATE guard stops
+    BEFORE an arm whose chars/4 estimate would breach ``max_spend``, unchanged since
+    #588, checked FIRST; (2) the runtime :class:`SpendMeter` tracks usage-priced tokens
+    as pages complete and halts BETWEEN pages (never mid-page) once cumulative REALITY
+    reaches ``max_spend`` -- see :attr:`BakeoffResult.breaker_tripped`. The meter is
+    SEEDED from the persistent :class:`ChargeLedger` (:meth:`ChargeLedger.total_usd`)
+    -- never from scored/checkpointed runs -- so a mid-arm trip, a wholly-failed run, or
+    a dropped mixed-failure arm's charges all persist across resume. A WHOLLY-FAILED run
+    (see :func:`_run_wholly_failed`) is NEVER checkpointed -- reported as a
+    :class:`FailedRun` and always retried on resume, but its ledger charges still stand.
+    Every checkpoint/report/ledger identity is :attr:`Arm.label`.
 
     Args:
         pages: The corpus.
@@ -3393,12 +3479,10 @@ async def run_bakeoff(
         out: The JSON artifact path (anchors the checkpoint sidecar + the ledger, see
             :func:`ledger_path`).
         resume: Skip arms already checkpointed.
-        max_spend: USD budget; an arm is skipped once the running estimate
-            would exceed it.
-        cost_estimates: Per-arm cost estimates (the spend guard's basis), keyed by
+        max_spend: USD budget, enforced by both guards.
+        cost_estimates: Per-arm cost estimates (the ESTIMATE guard's basis), keyed by
             :attr:`Arm.label`.
-        roster: Priced roster the arms' model slugs resolve against (for the ledger's
-            usage pricing, #601 fold round 1, slice A).
+        roster: Priced roster the arms' model slugs resolve against (usage pricing).
         model: An injected ``Model`` (the self-test seam); ``None`` = a real
             paid call, threaded through to :func:`run_model_over_corpus`.
 
@@ -3443,6 +3527,7 @@ async def run_bakeoff(
             "accounted for. Rerun with --no-resume (fresh books, fresh budget) or "
             "point --out elsewhere."
         )
+    meter = SpendMeter(max_spend=max_spend, charged=ledger.total_usd())
     runs: list[ModelRun] = []
     failed_runs: list[FailedRun] = []
     executed_slugs: list[str] = []
@@ -3452,7 +3537,7 @@ async def run_bakeoff(
         slug = arm.label
         if checkpoint.has(slug):
             runs.append(_run_from_checkpoint(checkpoint.get(slug)))
-            print(f"[resume] {slug}: on disk", flush=True)
+            print(f"[resume] {slug}: on disk (ledger ${meter.charged:.4f} total)", flush=True)
             continue
         upcoming = cost_by_slug.get(slug, 0.0)
         if spent + upcoming > max_spend:
@@ -3467,6 +3552,24 @@ async def run_bakeoff(
                 unevaluated_slugs=[a.label for a in arms[index:]],
                 failed_slugs=failed_runs,
                 executed_slugs=executed_slugs,
+                actual_costs=_ledger_actual_costs(ledger),
+            )
+        if meter.tripped:
+            print(
+                f"[breaker] halting before {slug}: cumulative usage-priced spend "
+                f"${meter.charged:.4f} reached --max-spend ${max_spend:.2f}; "
+                f"{len(arms) - index} arm(s) skipped: "
+                f"{', '.join(a.label for a in arms[index:])}",
+                flush=True,
+            )
+            return BakeoffResult(
+                runs=runs,
+                stopped_early=True,
+                unevaluated_slugs=[a.label for a in arms[index:]],
+                failed_slugs=failed_runs,
+                executed_slugs=executed_slugs,
+                breaker_tripped=True,
+                actual_costs=_ledger_actual_costs(ledger),
             )
         run = await run_model_over_corpus(
             pages,
@@ -3477,9 +3580,30 @@ async def run_bakeoff(
             reasoning_effort=_REASONING_EFFORT_BY_ARM[arm.reasoning],
             roster_price=price_by_slug[arm.model_slug],
             ledger=ledger,
+            meter=meter,
         )
         spent += upcoming
         executed_slugs.append(slug)  # a real call was attempted, win or lose
+        if len(run.pages) < len(pages):
+            # The meter tripped MID-ARM -- an incomplete run is NEVER checkpointed (it
+            # would wrongly look "done" on resume); the whole arm is retried, and every
+            # page it already charged is already durable in the LEDGER (written
+            # page-by-page inside run_model_over_corpus, before this point).
+            print(
+                f"[breaker] halted {slug} after {len(run.pages)}/{len(pages)} page(s): "
+                f"cumulative usage-priced spend ${meter.charged:.4f} reached --max-spend "
+                f"${max_spend:.2f}; {len(arms) - index} arm(s) skipped",
+                flush=True,
+            )
+            return BakeoffResult(
+                runs=runs,
+                stopped_early=True,
+                unevaluated_slugs=[a.label for a in arms[index:]],
+                failed_slugs=failed_runs,
+                executed_slugs=executed_slugs,
+                breaker_tripped=True,
+                actual_costs=_ledger_actual_costs(ledger),
+            )
         if _run_wholly_failed(run):
             label = "MODEL-SPECIFIC" if has_fresh_success else "INFRA-WIDE"
             schema_n = sum(1 for p in run.pages if _is_schema_failure(p.error))
@@ -3487,7 +3611,7 @@ async def run_bakeoff(
             print(
                 f"[run] {slug}: ALL {len(run.pages)} page(s) errored -- {label} (heuristic, "
                 f"display-only), schema {schema_n}/other {other_n} -- NEVER checkpointed, a "
-                "re-run always retries it",
+                "re-run always retries it (its ledger charges already stand)",
                 flush=True,
             )
             failed_runs.append(
@@ -3502,9 +3626,11 @@ async def run_bakeoff(
         has_fresh_success = has_fresh_success or _has_any_success(run)
         checkpoint.append(run_to_json(run))
         m = model_metrics(run)
+        actual = ledger.total_usd_for_arm(slug)
         print(
             f"[run] {slug}: combined={_fmt(m.combined_score)} macroF1={_fmt(m.macro_f1)} "
-            f"errors={m.page_errors} (est. ${upcoming:.4f}, ${spent:.4f} total)",
+            f"errors={m.page_errors} (est. ${upcoming:.4f}, usage-priced ${actual:.4f}, meter "
+            f"${meter.charged:.4f} total)",
             flush=True,
         )
         runs.append(run)
@@ -3514,6 +3640,7 @@ async def run_bakeoff(
         unevaluated_slugs=[],
         failed_slugs=failed_runs,
         executed_slugs=executed_slugs,
+        actual_costs=_ledger_actual_costs(ledger),
     )
 
 
@@ -3571,7 +3698,14 @@ def _finite_nonnegative_spend(raw: str) -> float:
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Exit codes: 0 success (or a graceful pre-run estimate stop); 2 refused "
+        "before any spend (bad args/roster/reasoning/duplicate --models, OR a "
+        "--max-spend that admits no spend at all -- see --max-spend's help); 3 the "
+        "usage-priced circuit breaker halted mid-run (#601 fold round 1) -- real "
+        "money was already charged THIS OR A PRIOR invocation against the same "
+        "--out, distinct from the 2-exit refusal above.",
     )
     parser.add_argument(
         "--fixtures-dir", type=Path, default=DEFAULT_FIXTURES_DIR, help="corpus directory"
@@ -3580,15 +3714,19 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--models",
         nargs="+",
         default=None,
-        help="model slug(s) to run (default: the full section-4 roster)",
+        help="model slug(s) to run (default: the full section-4 roster); no duplicates",
     )
     parser.add_argument(
         "--max-spend",
         type=_finite_nonnegative_spend,
         default=None,
-        help="REQUIRED USD budget for a real run; the run stops before a model whose "
-        "estimated cost would breach it. No default -- an unbounded paid run is refused. "
-        "Must be finite and non-negative (inf/nan/negative are rejected).",
+        help="REQUIRED USD budget for a real run: the pre-run ESTIMATE guard stops "
+        "before a model whose estimated cost would breach it, AND the runtime "
+        "usage-priced circuit breaker (#601 fold round 1) halts between pages once "
+        "priced captured tokens reach it (see the epilog's exit code 3). No default "
+        "-- an unbounded paid run is refused. Must be finite and non-negative; a "
+        "budget of exactly $0.00 admits no spend at all and is refused (exit 2) "
+        "before any arm is attempted, distinct from the breaker halting a real run.",
     )
     parser.add_argument("--out", type=Path, default=Path("/tmp/bakeoff-bean-sourcing.json"))
     parser.add_argument("--report-md", type=Path, default=None)
@@ -3608,7 +3746,20 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "low effort), or 'both' (the 'off' AND 'light' arms -- the research's actual "
         "no-reasoning-vs-light-reasoning question, section 4)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.models is not None:
+        counts: dict[str, int] = {}
+        for slug in cast("list[str]", args.models):
+            counts[slug] = counts.get(slug, 0) + 1
+        dupes = sorted(slug for slug, n in counts.items() if n > 1)
+        if dupes:
+            # Cheapest categorical fix (#601 fold round 1): a duplicate arm would
+            # otherwise run + charge the ledger twice under one report row.
+            parser.error(
+                f"--models contains duplicate slug(s): {dupes} -- each model must be "
+                "requested once (use --reasoning both for off+light on the same model)"
+            )
+    return args
 
 
 async def main(argv: Sequence[str] | None = None) -> int:
@@ -3618,7 +3769,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
         argv: Optional argument vector.
 
     Returns:
-        Process exit code (``0`` on success or a graceful budget stop).
+        Process exit code -- see the parser epilog (0/2/3).
     """
     args = _parse_args(argv)
     pages = load_corpus(cast("Path", args.fixtures_dir))
@@ -3668,6 +3819,19 @@ async def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
+    max_spend = float(cast("float", args.max_spend))
+    if max_spend <= 0.0:
+        # A structurally zero/exhausted budget admits no spend at all -- refuse before
+        # touching the ledger/meter (#601 fold round 1, slice B), distinct from exit 3
+        # (a NON-zero budget the usage-priced breaker halted mid-run, this or a prior
+        # invocation).
+        print(
+            f"REFUSED: --max-spend ${max_spend:.2f} admits no spend -- no real call can "
+            "ever be attempted. Use --estimate-only for a zero-spend cost estimate.",
+            file=sys.stderr,
+        )
+        return 2
+
     dotenv_key = load_dotenv_key(_REPO_ROOT)
     if dotenv_key:
         os.environ[OPENROUTER_KEY_ENV] = dotenv_key
@@ -3682,7 +3846,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
             arms,
             out=cast("Path", args.out),
             resume=not bool(args.no_resume),
-            max_spend=float(cast("float", args.max_spend)),
+            max_spend=max_spend,
             cost_estimates=cost_estimates,
             roster=roster_for_cost,
         )
@@ -3697,6 +3861,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
         unevaluated_slugs=result.unevaluated_slugs,
         failed_slugs=result.failed_slugs,
         executed_slugs=result.executed_slugs,
+        actual_costs=result.actual_costs,
     )
     print("\n" + report, flush=True)
 
@@ -3710,6 +3875,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 "unevaluated_slugs": result.unevaluated_slugs,
                 "failed_slugs": [dataclasses.asdict(f) for f in result.failed_slugs],
                 "executed_slugs": result.executed_slugs,
+                "breaker_tripped": result.breaker_tripped,
+                "actual_costs": result.actual_costs,
             },
             indent=2,
         )
@@ -3720,7 +3887,9 @@ async def main(argv: Sequence[str] | None = None) -> int:
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(report)
         print(f"wrote markdown report -> {report_path}", flush=True)
-    return 0
+    # Distinct from a 0-exit estimate stop (#601 fold round 1): real money was
+    # charged before the usage-priced breaker halted -- see the parser epilog.
+    return 3 if result.breaker_tripped else 0
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entrypoint guard
