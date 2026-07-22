@@ -2096,6 +2096,48 @@ async def test_run_bakeoff_resumes_without_calls(
 
 
 @pytest.mark.asyncio
+async def test_run_bakeoff_threads_the_correct_reasoning_effort_per_arm(
+    corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Integration guard against an off<->light swap (#601 qa pass, round 8
+    addendum): ``Arm.reasoning`` -> ``_REASONING_EFFORT_BY_ARM`` -> the actual
+    ``draft_bean_profile_from_url`` call must reach the provider with the
+    CORRECT, DISTINCT ``reasoning_effort`` per arm -- "off" arm gets ``"off"``,
+    "light" arm gets ``"low"``. ``_REASONING_EFFORT_BY_ARM`` is unit-tested and the
+    extra_body plumbing is covered in test_bean_sourcing.py, but neither exercises
+    this harness-level hand-off end-to-end."""
+    captured: list[object] = []
+
+    async def _fake_draft(
+        url: str,
+        *,
+        advisor_config: AdvisorConfig,
+        sourcing_config: bo.BeanSourcingConfig | None = None,
+        http_client: object = None,
+        model: object = None,
+        reasoning_effort: object = None,
+        diagnostics: object = None,
+    ) -> BeanProfileDraft:
+        captured.append(reasoning_effort)
+        raise bo.BeanSourcingError("stub -- no real extraction needed for this guard")
+
+    monkeypatch.setattr(bo, "draft_bean_profile_from_url", _fake_draft)
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1"], "both")
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=tmp_path / "o.json",
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost_for_arms(corpus, arms, roster),
+    )
+    assert len(captured) == 2 * len(corpus)  # "off" arm's pages, then "light" arm's
+    assert set(captured[: len(corpus)]) == {"off"}
+    assert set(captured[len(corpus) :]) == {"low"}
+
+
+@pytest.mark.asyncio
 async def test_run_bakeoff_both_arms_checkpoint_under_distinct_labels(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
