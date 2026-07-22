@@ -82,16 +82,14 @@ import or under the self-test**; a real bake-off spends OpenRouter credits and
 is gated on explicit operator approval (see the run command below and #588).
 
 **Reasoning-effort arms (#601).** ``--reasoning {default,off,light,both}`` (default
-``default``, behaviour/spend-preserving) adds a second study dimension per the
-model-selection research (section 4): light reasoning barely helps extraction quality
-but sharply improves schema adherence on the cheapest models (35->3 violations). Three
-DISTINCT arms (:data:`ReasoningArm`) -- "default" (provider's own, possibly-high
-effort) is NOT "off" (true no-reasoning), so ``"both"`` expands to "off"+"light" only,
-never "default". Each arm is checkpointed/reported under its own :attr:`Arm.label`
-(:func:`expand_arms`); :func:`render_report` adds a per-model off-vs-light section
-(schema failures/recovered vs other errors, F1/F2) when both arms were scored. "off"/
-"light" are skipped, with a printed note, per a roster entry's
-:data:`RosterReasoningCapability` (FA).
+``default``, behaviour/spend-preserving) adds a second study dimension: light
+reasoning barely helps extraction quality but sharply improves schema adherence on
+the cheapest models. Three DISTINCT arms (:data:`ReasoningArm`) -- "default"
+(provider default, possibly-high effort) is NOT "off" (true no-reasoning), so
+``"both"`` expands to "off"+"light" only. Each arm is checkpointed/reported under
+its own :attr:`Arm.label`; :func:`render_report` adds a per-model off-vs-light
+section when both arms were scored. Arms are skipped, with a printed note, per a
+roster entry's :data:`RosterReasoningCapability` (FA/F7).
 
 **Ops gotcha -- a stale ``OPENROUTER_API_KEY`` shadows ``.env`` -> 401.** The
 advisor reads ``OPENROUTER_API_KEY`` from ``os.environ`` (via
@@ -198,11 +196,11 @@ DEFAULT_FIXTURES_DIR = _REPO_ROOT / "tests" / "fixtures" / "bean-sourcing"
 OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
 
 
-#: A model's reasoning-capability class (#601 FA): "none" skips off+light (only
-#: "default" runs); "optional" gets both; "mandatory" REJECTS disabling reasoning
+#: A model's reasoning-capability class (#601 FA/F7): "none" skips off+light
+#: ("default" only); "optional" gets both; "mandatory" REJECTS disabling reasoning
 #: (HTTP 400, docs/advisor-bakeoff-2026-06-08.md:279-291) so only "light" runs;
-#: ambiguous defaults to "mandatory" (safe -- withholds an arm, never risks a 400).
-RosterReasoningCapability = Literal["none", "optional", "mandatory"]
+#: "unknown" (unverified) skips BOTH like "none" -- "mandatory" needs CONFIRMED evidence.
+RosterReasoningCapability = Literal["none", "optional", "mandatory", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -234,16 +232,16 @@ class RosterModel:
 #: (the extraction-owning config, #590 slice A) and make_advisor_config.
 BAKEOFF_EXTRACTION_TIMEOUT_S: float = 45.0
 
-#: Reasoning classification evidence (#601 FA): gpt-5-nano/gpt-5-mini are "reasoning
-#: models" per the 19 Jul bean-sourcing bake-off's timeout, and gpt-5-mini/
-#: gemini-3.5-flash are HTTP-400-on-disable in docs/advisor-bakeoff-2026-06-08.md ->
-#: "mandatory"; gemini-3.1-flash-lite/gpt-5-nano follow suit, grok-4.3 ambiguous ->
-#: mandatory (safe). gpt-4o/gpt-4.1-mini are classic non-reasoning ("none").
-#: gpt-5.6-luna/claude-haiku-4.5 are "optional": off-as-no-op is still a genuine
-#: no-reasoning arm and both support real light/extended-thinking (round 5 FOLD 1).
+#: Reasoning classification evidence (#601 FA/F7): gpt-5-nano/gpt-5-mini/gemini-
+#: 3.1-flash-lite are "mandatory" (19 Jul bake-off timeout; gpt-5-mini/gemini-3.5-
+#: flash HTTP-400-on-disable in docs/advisor-bakeoff-2026-06-08.md). gpt-4o/
+#: gpt-4.1-mini are classic non-reasoning ("none"). gpt-5.6-luna/claude-haiku-4.5
+#: are "optional" (off-as-no-op is a genuine arm, both support real light/thinking,
+#: round 5 F1). grok-4.3 has NO verified evidence either way -> "unknown" (F3):
+#: "mandatory" is reserved for a CONFIRMED off-rejecting endpoint.
 MODEL_ROSTER: tuple[RosterModel, ...] = (
     RosterModel("openai/gpt-5-nano", 0.05, 0.40, "cheapest; beat this on price", "mandatory"),
-    RosterModel("x-ai/grok-4.3", 0.20, 0.50, "grok-4-fast dead (404); 4.3 live", "mandatory"),
+    RosterModel("x-ai/grok-4.3", 0.20, 0.50, "grok-4-fast dead (404); 4.3 live", "unknown"),
     RosterModel("google/gemini-3.1-flash-lite", 0.25, 1.00, "beats gpt-5-mini 6/8", "mandatory"),
     RosterModel("openai/gpt-5-mini", 0.25, 2.00, "ParseBench small-model reference", "mandatory"),
     RosterModel("openai/gpt-4.1-mini", 0.40, 1.60, "battle-tested strict-SO workhorse", "none"),
@@ -254,9 +252,8 @@ MODEL_ROSTER: tuple[RosterModel, ...] = (
 
 
 #: A study arm's ``reasoning_effort`` request (#601 F1). "default" omits the field
-#: (provider's own default effort, possibly high -- NOT the same as no-reasoning, so
-#: never compared against "light"); "off" is the true explicit no-reasoning request;
-#: "light" is the LOW effort tier. "default" is the CLI's behaviour-preserving default.
+#: (provider default, possibly high -- NOT no-reasoning, never compared vs "light");
+#: "off" is the true explicit no-reasoning request; "light" is the LOW effort tier.
 ReasoningArm = Literal["default", "off", "light"]
 
 _REASONING_EFFORT_BY_ARM: dict[ReasoningArm, Literal["off", "low"] | None] = {
@@ -265,10 +262,8 @@ _REASONING_EFFORT_BY_ARM: dict[ReasoningArm, Literal["off", "low"] | None] = {
     "light": "low",
 }
 
-#: Suffixes marking an "off"/"light" arm's report/checkpoint LABEL (:attr:`Arm.label`),
-#: distinct from the bare model slug a "default" arm uses -- so every existing
-#: label/checkpoint key is UNCHANGED while ``--reasoning`` stays at its ``"default"``
-#: CLI default.
+#: Suffixes marking an "off"/"light" arm's LABEL, distinct from the bare model slug
+#: a "default" arm uses -- unchanged while ``--reasoning`` stays at its default.
 _OFF_ARM_LABEL_SUFFIX = "+reasoning-off"
 _LIGHT_ARM_LABEL_SUFFIX = "+reasoning-light"
 
@@ -280,9 +275,8 @@ class Arm:
     Attributes:
         model_slug: The OpenRouter model slug -- drives provider construction and cost.
         reasoning: The study arm (see :data:`ReasoningArm`).
-        label: The report/checkpoint identity: the bare ``model_slug`` for a ``"default"``
-            arm (unchanged from every pre-#601 run), else ``model_slug`` +
-            :data:`_OFF_ARM_LABEL_SUFFIX` or :data:`_LIGHT_ARM_LABEL_SUFFIX`.
+        label: The report/checkpoint identity: bare ``model_slug`` for "default",
+            else ``model_slug`` + :data:`_OFF_ARM_LABEL_SUFFIX`/:data:`_LIGHT_ARM_LABEL_SUFFIX`.
     """
 
     model_slug: str
@@ -301,15 +295,10 @@ def expand_arms(
     Args:
         model_slugs: The requested model slugs, in request order.
         reasoning: ``"default"``/``"off"``/``"light"`` yields one arm per model;
-            ``"both"`` yields the "off" AND "light" arms (fold round 1 -- the research
-            question is no-reasoning vs light-reasoning, so ``"both"`` pairs the TRUE
-            "off" arm with "light", never the provider-default arm), grouped per model
-            (off then light) so a per-model comparison reads naturally in run/report
-            order.
-        capability: Optional ``{model_slug: RosterReasoningCapability}`` map (#601 FA)
-            -- ``"none"`` skips BOTH off and light (printed note); ``"mandatory"``
-            skips off only (printed note, light still runs); ``"optional"`` (or a slug
-            absent from the map) gets both, unchanged. "default" is always emitted.
+            ``"both"`` yields "off"+"light" (never "default"), grouped per model.
+        capability: Optional ``{model_slug: RosterReasoningCapability}`` map --
+            ``"none"``/``"unknown"`` skip off+light (printed note); ``"mandatory"``
+            skips off only; ``"optional"`` (or absent) gets both. "default" always runs.
 
     Returns:
         The expanded arm list.
@@ -321,15 +310,17 @@ def expand_arms(
         if reasoning == "default":
             arms.append(Arm(model_slug=slug, reasoning="default", label=slug))
         if reasoning in ("off", "both"):
-            if model_cap in ("none", "mandatory"):
-                print(f"[reasoning] skipping off arm for {slug!r}: reasoning is {model_cap!r}")
+            if model_cap in ("none", "mandatory", "unknown"):
+                reason = "unverified" if model_cap == "unknown" else f"reasoning is {model_cap!r}"
+                print(f"[reasoning] skipping off arm for {slug!r}: {reason}")
             else:
                 arms.append(
                     Arm(model_slug=slug, reasoning="off", label=slug + _OFF_ARM_LABEL_SUFFIX)
                 )
         if reasoning in ("light", "both"):
-            if model_cap == "none":
-                print(f"[reasoning] skipping light arm for {slug!r}: not reasoning-capable")
+            if model_cap in ("none", "unknown"):
+                reason = "unverified" if model_cap == "unknown" else "not reasoning-capable"
+                print(f"[reasoning] skipping light arm for {slug!r}: {reason}")
             else:
                 arms.append(
                     Arm(model_slug=slug, reasoning="light", label=slug + _LIGHT_ARM_LABEL_SUFFIX)
@@ -1289,9 +1280,8 @@ async def draft_for_page(
         sourcing_config: Fetch/extraction-limit config (#590 slice A: also
             selects the extraction model/timeout, not just the fetch); a
             default is built when omitted.
-        reasoning_effort: Threaded straight through to
-            :func:`~roastpilot_agent.bean_sourcing.draft_bean_profile_from_url`
-            (#601's reasoning-arm dimension); ``None`` omits the setting.
+        reasoning_effort: Threaded through to ``draft_bean_profile_from_url`` (#601);
+            ``None`` omits the setting.
         diagnostics: Optional accumulator, forwarded through (#601 F2).
 
     Returns:
@@ -1339,8 +1329,10 @@ class PageResult:
             selection plan specifies for a statistical tie (#600 round-2
             finding): the 45s timeout alone can only identify a censored
             failure, not distinguish a 2s model from a 40s one.
-        recovered_violations: Validation-retry events a SUCCESS recovered from
-            (#601 F2); ``0`` on a failed page or an old checkpoint record.
+        recovered_violations: Validation-retry events the EXTRACTION step recovered
+            from (#601 F2), independent of the page's final outcome -- a later
+            ``_draft_from_identity`` rejection does NOT zero this (F7: extraction
+            adherence is not draft policy). ``0`` if extraction never retried.
     """
 
     slug: str
@@ -1383,8 +1375,8 @@ async def run_model_over_corpus(
         advisor_config: The provider/key/model config.
         model: An injected ``Model`` (self-test); ``None`` = a real paid call.
         sourcing_config: Fetch/extraction-limit config (#590 slice A).
-        reasoning_effort: Threaded straight through to :func:`draft_for_page` for every
-            page (#601's reasoning-arm dimension); ``None`` omits the setting.
+        reasoning_effort: Threaded to :func:`draft_for_page` per page (#601); ``None``
+            omits the setting.
 
     Returns:
         The :class:`ModelRun`.
@@ -1392,7 +1384,7 @@ async def run_model_over_corpus(
     results: list[PageResult] = []
     for page in pages:
         started = time.monotonic()
-        diagnostics = BeanSourcingDiagnostics()  # #601 F2: per-page retry-recovery count
+        diagnostics = BeanSourcingDiagnostics()  # #601 F2: per-page retry count
         draft, error = await draft_for_page(
             page,
             advisor_config=advisor_config,
@@ -1413,11 +1405,9 @@ async def run_model_over_corpus(
                 on_page_fields=on_page,
                 extracted=None if draft is None else draft.model_dump(mode="json"),
                 elapsed_s=elapsed_s,
-                # 0 on any failed page (#601 FB) -- a retry-recovered identity extraction
-                # followed by a LATER _draft_from_identity rejection still leaves
-                # diagnostics.schema_retries > 0; PageResult's own contract is "0 on a
-                # failed page", so zero it here rather than leaking a positive count.
-                recovered_violations=0 if draft is None else diagnostics.schema_retries,
+                # UNCONDITIONAL (#601 F7 -- round 3's zero-on-failed-page contract was
+                # wrong): extraction adherence, independent of a later draft rejection.
+                recovered_violations=diagnostics.schema_retries,
             )
         )
     return ModelRun(model_slug=model_slug, pages=results)
@@ -1566,10 +1556,8 @@ class ModelMetrics:
         schema_failures: Pages failing on a malformed structured-output shape --
             the schema-adherence proxy (see :func:`_is_schema_failure`).
         other_errors: Every OTHER page error -- NOT a schema-adherence signal.
-        recovered_violations: Validation-retry events a SUCCESS recovered from,
-            summed over pages -- otherwise-invisible schema-adherence signal
-            PydanticAI's retry hides (#601 F2, see
-            :class:`~roastpilot_agent.bean_sourcing.BeanSourcingDiagnostics`).
+        recovered_violations: Extraction-level retry events, summed over pages,
+            independent of final page outcome (#601 F2/F7).
     """
 
     model_slug: str
@@ -2096,11 +2084,9 @@ def estimate_cost(
     return estimates
 
 
-#: Conservative, documented ESTIMATE-only multiplier on a "light" arm's output tokens:
-#: reasoning tokens bill as completion tokens (see
-#: ``roastpilot_agent.advisor.OutputTokens``'s docstring), and this harness has no live
-#: token-usage readback (:func:`estimate_cost`'s own caveat) -- chosen conservatively
-#: high so the spend guard never under-budgets a light call.
+#: Conservative ESTIMATE-only multiplier on a "light" arm's output tokens: reasoning
+#: tokens bill as completion tokens, and this harness has no live usage readback --
+#: chosen high so the spend guard never under-budgets a light call.
 LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER: float = 4.0
 
 
@@ -2109,16 +2095,12 @@ def estimate_cost_for_arms(
 ) -> list[ModelCostEstimate]:
     """Per-ARM cost estimate (#601), built on top of :func:`estimate_cost`.
 
-    A ``"default"`` arm's estimate is IDENTICAL to :func:`estimate_cost`'s per-model
-    figure (and shares its label, since a "default" arm's :attr:`Arm.label` is the bare
-    model slug) -- so the ``--reasoning default`` CLI default reproduces
-    :func:`estimate_cost`'s numbers exactly. An ``"off"`` arm is priced the SAME as
-    "default" (explicit no-reasoning costs no more than the omitted setting -- both emit
-    the same, small, non-reasoning output), just relabelled/distinct so its leaderboard
-    row is separate from "default"/"light". A ``"light"`` arm multiplies output tokens by
-    :data:`LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER` and recomputes USD. Every arm is
-    labelled under :attr:`Arm.label` (the model slug + suffix) so the leaderboard/cost
-    report rows for a model's several arms are distinct entries.
+    "default" is IDENTICAL to :func:`estimate_cost`'s per-model figure (bare-slug
+    label, so the CLI default reproduces its numbers exactly). "off" is priced the
+    SAME as "default" (explicit no-reasoning costs no more than omitted), just
+    relabelled distinct. "light" multiplies output tokens by
+    :data:`LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER`. Every arm is labelled under
+    :attr:`Arm.label` so a model's several arms are distinct report rows.
 
     Args:
         pages: The corpus.
@@ -2268,7 +2250,9 @@ def render_report(
         lines.append("")
     if failed_slugs:
         failed_desc = ", ".join(
-            f"`{f.model_slug}` ({f.heuristic_label}, heuristic)" for f in failed_slugs
+            f"`{f.model_slug}` ({f.heuristic_label}, schema {f.schema_failures}/"
+            f"other {f.other_errors})"
+            for f in failed_slugs
         )
         lines.append(
             f"> **EXCLUDED -- failed this invocation.** Every page errored for "
@@ -2391,9 +2375,8 @@ def render_report(
     if paired_models:
         lines.append(
             "## Reasoning-arm comparison (off vs light, #601) -- per-model deltas where "
-            "BOTH the TRUE no-reasoning arm and light were scored (never vs 'default', "
-            "F1). 'schema failures' (malformed structured output, format F/recovered R) "
-            "is the schema-adherence proxy; 'other errors' is NOT (F1 P2/F2)."
+            "BOTH arms were scored (never vs 'default'). 'schema F/recovered R' is the "
+            "adherence proxy; 'other errors' is NOT."
         )
         lines.append("")
         lines.append(
@@ -2829,17 +2812,14 @@ def make_sourcing_config(model_slug: str) -> BeanSourcingConfig:
 
 
 def _run_wholly_failed(run: ModelRun) -> bool:
-    """Whether every page errored AND NONE of the failures is a schema failure.
+    """Whether every page errored AND NOT ALL failures are schema failures.
 
-    ANY schema failure present (even mixed with infra failures, e.g. 8 schema + 1
-    timeout) means the run is a real outcome -- checkpoint/score it, schema_failures
-    and other_errors both recorded (#601 fold round 5, FOLD 2: the prior ``any``
-    non-schema condition wrongly dropped a mostly-schema-failure run over one
-    infra hiccup). Only an ALL-non-schema (all-timeout/-provider-error/etc.) run is
-    a genuine outage -- never checkpointed, always retried on resume."""
+    ALL-SCHEMA is a real outcome, scored, never dropped (strongest signal); any MIX
+    with an infra failure is a genuine outage -- see :class:`FailedRun` for how the
+    mix stays visible instead of silently discarded (#601 F7)."""
     if not run.pages or not all(page.error is not None for page in run.pages):
         return False
-    return not any(_is_schema_failure(page.error) for page in run.pages)
+    return not all(_is_schema_failure(page.error) for page in run.pages)
 
 
 def _has_any_success(run: ModelRun) -> bool:
@@ -2860,10 +2840,15 @@ class FailedRun:
         heuristic_label: ``"MODEL-SPECIFIC"`` if a FRESHLY-EXECUTED peer had already succeeded
             this invocation, else ``"INFRA-WIDE"``. DISPLAY-ONLY best-effort context -- NOT
             authoritative, NEVER affects checkpointing or scoring.
+        schema_failures: Malformed-structured-output pages in this DROPPED run --
+            a mixed run's adherence signal stays visible here (#601 F7).
+        other_errors: Every OTHER page error in this dropped run.
     """
 
     model_slug: str
     heuristic_label: str
+    schema_failures: int = 0
+    other_errors: int = 0
 
 
 @dataclass(frozen=True)
@@ -2913,13 +2898,10 @@ async def run_bakeoff(
 
     Read-only: never touches any store/DB, never saves a profile. Stops gracefully BEFORE an
     arm whose estimated cost would breach ``max_spend`` (see :attr:`BakeoffResult.stopped_early`).
-    A run where EVERY page errored is NEVER checkpointed (#602 fold round 5 -- see
-    :class:`FailedRun`'s docstring for the trade this simplification resolves): it is reported
-    as a :class:`FailedRun` with a DISPLAY-ONLY ``heuristic_label`` (``"MODEL-SPECIFIC"`` if a
-    FRESHLY-EXECUTED peer had already succeeded this invocation, else ``"INFRA-WIDE"``) and a
-    re-run ALWAYS retries it. Either way a wholly-failed run IS still counted against the spend
-    guard (a paid attempt was made). Every checkpoint/report identity is :attr:`Arm.label`
-    (#601), so the two arms of one model are tracked, resumed, and reported as distinct entries.
+    A WHOLLY-FAILED run (see :func:`_run_wholly_failed`) is NEVER checkpointed -- reported as a
+    :class:`FailedRun` (DISPLAY-ONLY heuristic label + its schema/other-error counts) and always
+    retried on resume, but still counted against the spend guard. Every checkpoint/report
+    identity is :attr:`Arm.label` (#601), so a model's several arms are tracked distinctly.
 
     Args:
         pages: The corpus.
@@ -2977,12 +2959,22 @@ async def run_bakeoff(
         executed_slugs.append(slug)  # a real call was attempted, win or lose
         if _run_wholly_failed(run):
             label = "MODEL-SPECIFIC" if has_fresh_success else "INFRA-WIDE"
+            schema_n = sum(1 for p in run.pages if _is_schema_failure(p.error))
+            other_n = len(run.pages) - schema_n
             print(
                 f"[run] {slug}: ALL {len(run.pages)} page(s) errored -- {label} (heuristic, "
-                "display-only) -- NEVER checkpointed, a re-run always retries it",
+                f"display-only), schema {schema_n}/other {other_n} -- NEVER checkpointed, a "
+                "re-run always retries it",
                 flush=True,
             )
-            failed_runs.append(FailedRun(model_slug=slug, heuristic_label=label))
+            failed_runs.append(
+                FailedRun(
+                    model_slug=slug,
+                    heuristic_label=label,
+                    schema_failures=schema_n,
+                    other_errors=other_n,
+                )
+            )
             continue
         has_fresh_success = has_fresh_success or _has_any_success(run)
         checkpoint.append(run_to_json(run))
@@ -3087,14 +3079,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--reasoning",
         choices=("default", "off", "light", "both"),
         default="default",
-        help="reasoning-effort study arm(s) per model (#601): 'default' (no override -- "
-        "the CLI default, preserves pre-#601 behaviour/spend; NOTE this leaves a "
-        "reasoning-capable model at its OWN provider default effort, which is NOT the "
+        help="reasoning-effort study arm(s) per model (#601): 'default' (no override, "
+        "the CLI default -- NOTE this is the provider's OWN default effort, NOT the "
         "same as no reasoning), 'off' (explicit no-reasoning), 'light' (provider "
-        "low-effort reasoning), or 'both' (the 'off' AND 'light' arms -- the "
-        "model-selection research's actual question, section 4: no-reasoning vs "
-        "light-reasoning; light sharply improves schema adherence on the cheapest "
-        "models, with little extraction-quality change)",
+        "low effort), or 'both' (the 'off' AND 'light' arms -- the research's actual "
+        "no-reasoning-vs-light-reasoning question, section 4)",
     )
     return parser.parse_args(argv)
 
@@ -3123,10 +3112,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
     }
     arms = expand_arms(model_slugs, reasoning_arg, capability=capability)
     if not arms:
-        # Categorical (#601 fold round 4): ANY --reasoning value can skip every
-        # requested model (e.g. "off" against an all-none/mandatory roster) -- not
-        # just "light" -- so this guard is mode-agnostic, not a "light"-only special
-        # case, and fires before any cost estimate or spend.
+        # Categorical, mode-agnostic (#601 F4): ANY --reasoning value can skip every
+        # requested model -- fires before any cost estimate or spend.
         print(
             f"REFUSED: --reasoning {reasoning_arg} -- every requested model "
             f"({', '.join(model_slugs)}) was skipped as reasoning-incapable for this "

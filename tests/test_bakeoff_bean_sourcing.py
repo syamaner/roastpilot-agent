@@ -982,12 +982,14 @@ async def test_run_model_over_corpus_captures_elapsed_time(corpus: list[bo.Corpu
 
 
 @pytest.mark.asyncio
-async def test_run_model_over_corpus_zeroes_recovered_violations_on_a_failed_page(
+async def test_run_model_over_corpus_counts_recovered_violations_on_a_failed_page(
     corpus: list[bo.CorpusPage],
 ) -> None:
     """A retry-RECOVERED extraction whose identity is later REJECTED downstream (no
-    usable name/origin) must still report ``recovered_violations == 0`` on that page
-    -- ``PageResult``'s own "0 on a failed page" contract (#601 fold round 3, FB)."""
+    usable name/origin) must still report the REAL retry count -- round 3's "0 on a
+    failed page" was the WRONG contract, not the count: extraction-schema adherence
+    is independent of a later, separate draft-policy rejection (#601 fold round 7,
+    FOLD 2)."""
     calls = {"n": 0}
 
     def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -1001,7 +1003,7 @@ async def test_run_model_over_corpus_zeroes_recovered_violations_on_a_failed_pag
     )
     page = run.pages[0]
     assert page.error is not None  # no usable name/origin -> the page DID fail
-    assert page.recovered_violations == 0
+    assert page.recovered_violations == 1  # the retry still counts
 
 
 def test_run_json_roundtrips_elapsed_s() -> None:
@@ -1223,16 +1225,30 @@ def test_model_roster_haiku_is_optional_not_none() -> None:
     assert haiku.reasoning == "optional"
 
 
-def test_expand_arms_both_gates_arms_by_three_way_capability(
+def test_model_roster_grok_is_unknown_not_mandatory() -> None:
+    """grok-4.3 has no VERIFIED reasoning evidence either way -- "unknown", not
+    "mandatory" (#601 fold round 7, FOLD 3): "mandatory" is reserved for a CONFIRMED
+    off-rejecting endpoint, never an unverified guess that could burn a paid arm."""
+    grok = next(m for m in bo.MODEL_ROSTER if m.slug == "x-ai/grok-4.3")
+    assert grok.reasoning == "unknown"
+
+
+def test_expand_arms_both_gates_arms_by_four_way_capability(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """ "both" on a mixed roster must gate BOTH off and light per capability (#601
-    fold round 3, FA): "none" gets neither (both skipped), "mandatory" gets light
-    only (off skipped -- disabling would 400), "optional" gets both, unchanged."""
+    """ "both" on a mixed roster must gate BOTH off and light per capability (#601 FA,
+    extended F3): "none"/"unknown" get neither (both skipped -- "unknown" is an
+    UNVERIFIED endpoint, so it must not risk a paid arm on a guess); "mandatory" gets
+    light only (off skipped -- disabling would 400); "optional" gets both, unchanged."""
     both = bo.expand_arms(
-        ["nope", "must", "opt"],
+        ["nope", "must", "opt", "unverified"],
         "both",
-        capability={"nope": "none", "must": "mandatory", "opt": "optional"},
+        capability={
+            "nope": "none",
+            "must": "mandatory",
+            "opt": "optional",
+            "unverified": "unknown",
+        },
     )
     assert [(a.model_slug, a.reasoning) for a in both] == [
         ("must", "light"),
@@ -1243,6 +1259,17 @@ def test_expand_arms_both_gates_arms_by_three_way_capability(
     assert "skipping off arm for 'nope': reasoning is 'none'" in out
     assert "skipping light arm for 'nope'" in out
     assert "skipping off arm for 'must': reasoning is 'mandatory'" in out
+    assert "skipping off arm for 'unverified': unverified" in out
+    assert "skipping light arm for 'unverified': unverified" in out
+
+
+def test_expand_arms_unknown_capability_emits_only_default_arm() -> None:
+    """An "unknown" (unverified) model requesting "default" still gets its one arm --
+    only off/light are gated, "default" is always emitted (#601 fold round 7, FOLD 3)."""
+    arms = bo.expand_arms(["unverified"], "default", capability={"unverified": "unknown"})
+    assert [(a.model_slug, a.reasoning, a.label) for a in arms] == [
+        ("unverified", "default", "unverified")
+    ]
 
 
 def test_reasoning_effort_by_arm_maps_default_off_and_light_correctly() -> None:
@@ -1548,7 +1575,7 @@ def test_render_report_marks_failed_models_excluded(corpus: list[bo.CorpusPage])
         failed_slugs=[bo.FailedRun(model_slug="model-failed", heuristic_label="MODEL-SPECIFIC")],
     )
     assert "EXCLUDED -- failed this invocation" in report
-    assert "`model-failed` (MODEL-SPECIFIC, heuristic)" in report
+    assert "`model-failed` (MODEL-SPECIFIC, schema 0/other 0)" in report
     assert "- models scored: 1" in report  # the failed model is NOT counted
 
 
@@ -2328,7 +2355,9 @@ async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
         model=_model_provider_error(),
     )
     assert result.runs == []
-    assert result.failed_slugs == [bo.FailedRun(model_slug="m1", heuristic_label="INFRA-WIDE")]
+    assert result.failed_slugs == [
+        bo.FailedRun(model_slug="m1", heuristic_label="INFRA-WIDE", other_errors=len(corpus))
+    ]
     assert result.executed_slugs == ["m1"]  # a paid attempt WAS made
     fingerprint = bo.compute_fingerprint(corpus)
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
@@ -2389,6 +2418,58 @@ async def test_run_bakeoff_all_schema_failure_arm_appears_in_reasoning_compariso
 
 
 @pytest.mark.asyncio
+async def test_run_bakeoff_mixed_failure_run_is_dropped_with_counts_preserved(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """A MIXED all-error run (1 schema failure + 8 infra failures) is dropped (never
+    checkpointed, always retried on resume) -- but its FailedRun annotation preserves
+    the schema/other-error split, so the adherence signal stays visible even though
+    the run itself isn't scored (#601 fold round 7, FOLD 1)."""
+    out = tmp_path / "o.json"
+    calls = {"n": 0}
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls["n"] += 1
+        if calls["n"] <= 2:  # first page: schema failure (1 attempt + 1 retry)
+            return ModelResponse(parts=[TextPart("no structured output")])
+        raise ModelAPIError("test-model", "simulated provider outage")  # every other page
+
+    result = await bo.run_bakeoff(
+        corpus,
+        bo.expand_arms(["m1"], "default"),
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 0.1, 0.1, "x")]),
+        model=FunctionModel(respond),
+    )
+    assert result.runs == []
+    assert result.failed_slugs == [
+        bo.FailedRun(
+            model_slug="m1",
+            heuristic_label="INFRA-WIDE",
+            schema_failures=1,
+            other_errors=len(corpus) - 1,
+        )
+    ]
+    fingerprint = bo.compute_fingerprint(corpus)
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert not checkpoint.has("m1")
+
+    calls["n"] = 0  # a resume must ALWAYS retry a dropped run
+    resumed = await bo.run_bakeoff(
+        corpus,
+        bo.expand_arms(["m1"], "default"),
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 0.1, 0.1, "x")]),
+        model=FunctionModel(respond),
+    )
+    assert resumed.executed_slugs == ["m1"]
+
+
+@pytest.mark.asyncio
 async def test_run_bakeoff_resumed_success_does_not_flip_the_heuristic_label(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
@@ -2417,7 +2498,9 @@ async def test_run_bakeoff_resumed_success_does_not_flip_the_heuristic_label(
         model=_model_provider_error(),  # only applies to "bad" -- "good" resumes
     )
     assert {r.model_slug for r in result.runs} == {"good"}  # "bad" NOT scored
-    assert result.failed_slugs == [bo.FailedRun(model_slug="bad", heuristic_label="INFRA-WIDE")]
+    assert result.failed_slugs == [
+        bo.FailedRun(model_slug="bad", heuristic_label="INFRA-WIDE", other_errors=len(corpus))
+    ]
     assert result.executed_slugs == ["bad"]
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
     assert not checkpoint.has("bad")  # NEVER checkpointed, regardless of the heuristic label
@@ -2471,7 +2554,9 @@ async def test_run_bakeoff_never_checkpoints_a_wholly_failed_run_even_with_a_fre
         model=_model_switch_after(len(corpus), fail_first=False),  # "a" succeeds, "b" fails
     )
     assert {r.model_slug for r in result.runs} == {"a"}  # the success IS scored, unaffected
-    assert result.failed_slugs == [bo.FailedRun(model_slug="b", heuristic_label="MODEL-SPECIFIC")]
+    assert result.failed_slugs == [
+        bo.FailedRun(model_slug="b", heuristic_label="MODEL-SPECIFIC", other_errors=len(corpus))
+    ]
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
     assert checkpoint.has("a")
     assert not checkpoint.has("b")  # NEVER checkpointed, regardless of the heuristic label
@@ -2510,32 +2595,35 @@ def test_run_wholly_failed_detects_all_errored_pages() -> None:
     assert bo._run_wholly_failed(empty) is False  # pyright: ignore[reportPrivateUsage]
 
 
-def test_run_wholly_failed_retains_a_mostly_schema_failure_run() -> None:
-    """A run with 8 schema failures + 1 infra (timeout) failure is a REAL outcome
-    (any schema failure present -> not wholly-failed), not dropped over one infra
-    hiccup; an ALL-infra run is still wholly-failed (#601 fold round 5, FOLD 2)."""
+def test_run_wholly_failed_drops_any_mix_but_retains_all_schema() -> None:
+    """Synthesis of round 5 + round 7 (#601): a MIXED all-error run (even 1 schema +
+    8 infra) is dropped -- its F1 would measure the outage, not model quality -- but
+    an ALL-SCHEMA run (every failure malformed structured output) is still retained
+    as a real outcome, the strongest non-adherence signal. An ALL-infra run is also
+    dropped."""
     schema_error = "BeanExtractionUnavailableError: ... returned a malformed shape: x"
     timeout_error = "BeanExtractionUnavailableError: ... exceeded the 45s deadline"
-    mostly_schema = bo.ModelRun(
-        model_slug="m",
-        pages=[
-            bo.PageResult(slug=f"s{i}", outcomes={}, error=schema_error, on_page_fields=0)
-            for i in range(8)
-        ]
-        + [bo.PageResult(slug="t0", outcomes={}, error=timeout_error, on_page_fields=0)],
-    )
-    assert bo._run_wholly_failed(mostly_schema) is False  # pyright: ignore[reportPrivateUsage]
-    m = bo.model_metrics(mostly_schema)
-    assert m.schema_failures == 8
-    assert m.other_errors == 1
 
-    all_infra = bo.ModelRun(
-        model_slug="m",
-        pages=[
+    def _run(n_schema: int, n_timeout: int) -> bo.ModelRun:
+        pages = [
+            bo.PageResult(slug=f"s{i}", outcomes={}, error=schema_error, on_page_fields=0)
+            for i in range(n_schema)
+        ] + [
             bo.PageResult(slug=f"t{i}", outcomes={}, error=timeout_error, on_page_fields=0)
-            for i in range(9)
-        ],
-    )
+            for i in range(n_timeout)
+        ]
+        return bo.ModelRun(model_slug="m", pages=pages)
+
+    mixed = _run(1, 8)
+    assert bo._run_wholly_failed(mixed) is True  # pyright: ignore[reportPrivateUsage]
+
+    all_schema = _run(9, 0)
+    assert bo._run_wholly_failed(all_schema) is False  # pyright: ignore[reportPrivateUsage]
+    m = bo.model_metrics(all_schema)
+    assert m.schema_failures == 9
+    assert m.other_errors == 0
+
+    all_infra = _run(0, 9)
     assert bo._run_wholly_failed(all_infra) is True  # pyright: ignore[reportPrivateUsage]
 
 
@@ -2605,7 +2693,12 @@ async def test_main_full_run_writes_artifact_and_partial_report(
     assert artifact["stopped_early"] is True
     assert artifact["unevaluated_slugs"] == [bo.MODEL_ROSTER[1].slug]
     assert artifact["failed_slugs"] == [
-        {"model_slug": "some/failed-slug", "heuristic_label": "INFRA-WIDE"}
+        {
+            "model_slug": "some/failed-slug",
+            "heuristic_label": "INFRA-WIDE",
+            "schema_failures": 0,
+            "other_errors": 0,
+        }
     ]
     assert artifact["executed_slugs"] == [bo.MODEL_ROSTER[0].slug, "some/failed-slug"]
     report_text = report_md.read_text()
