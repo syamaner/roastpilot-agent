@@ -630,6 +630,26 @@ def test_build_model_disable_transport_retries_false_is_the_sdk_default(
     assert default_omitted.client.max_retries != 0  # the SDK default, not zeroed
 
 
+def test_build_model_disable_transport_retries_pins_the_native_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#601 fold round 9, E FOLD 1 (P1): an ambient ``OPENAI_BASE_URL`` must
+    NOT redirect the bespoke, retry-disabled client's requests (and its
+    api_key) to an arbitrary proxy -- the #587-class credential-redirection
+    hole. The native ``openai`` provider's bespoke client is pinned to the
+    real endpoint regardless of the env var."""
+    monkeypatch.setenv("ADVISOR_TEST_KEY", "dummy-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://evil-proxy.example/v1")
+    config = AdvisorConfig(
+        provider="openai",
+        api_key_env="ADVISOR_TEST_KEY",
+        model_slug="some-model",
+    )
+    model = build_model(config, disable_transport_retries=True)
+    assert isinstance(model, OpenAIChatModel)
+    assert str(model.client.base_url) == "https://api.openai.com/v1/"
+
+
 # PydanticAIAdvisor behind the recorded-response double.
 
 

@@ -1799,6 +1799,18 @@ def reasoning_extra_body(
     return {"reasoning": {"effort": reasoning_effort}}
 
 
+#: The native OpenAI API endpoint (#601 fold round 9, E FOLD 1) -- PINNED
+#: explicitly on the bespoke, retry-disabled ``AsyncOpenAI`` client for
+#: ``provider="openai"``. Constructing that client with no ``base_url=`` at
+#: all would let it fall back to the SDK's own default resolution, which
+#: reads an ambient ``OPENAI_BASE_URL`` env var first (the #587-class
+#: credential-redirection hole: the api_key would be sent to whatever host
+#: that variable names). The NORMAL (non-bespoke) construction path has the
+#: same SDK-default behaviour, but is unaffected by this pin either way --
+#: this constant only bounds the NEW bespoke-client code path.
+_OPENAI_NATIVE_BASE_URL = "https://api.openai.com/v1"
+
+
 def build_model(
     config: AdvisorConfig, *, model_slug: str | None = None, disable_transport_retries: bool = False
 ) -> Model:
@@ -1845,7 +1857,9 @@ def build_model(
             if disable_transport_retries:
                 from openai import AsyncOpenAI
 
-                openai_client = AsyncOpenAI(api_key=api_key, max_retries=0)
+                openai_client = AsyncOpenAI(
+                    base_url=_OPENAI_NATIVE_BASE_URL, api_key=api_key, max_retries=0
+                )
                 return OpenAIChatModel(slug, provider=OpenAIProvider(openai_client=openai_client))
             return OpenAIChatModel(slug, provider=OpenAIProvider(api_key=api_key))
         if provider == "anthropic":

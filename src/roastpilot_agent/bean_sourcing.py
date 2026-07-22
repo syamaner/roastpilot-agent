@@ -213,6 +213,7 @@ import httpx
 import lxml.etree  # type: ignore[import-untyped]
 import lxml.html  # type: ignore[import-untyped]
 import trafilatura
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai import Agent, ModelAPIError, ModelSettings, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelRequest, RetryPromptPart
@@ -2841,7 +2842,11 @@ async def _extract_bean_identity(
         model: An injected PydanticAI ``Model`` (the extraction test seam).
         disable_transport_retries: Passed straight through to
             :func:`_bean_sourcing_agent` (#601). ``False`` (the default)
-            preserves today's behaviour exactly.
+            preserves today's behaviour exactly. When ``True`` and ``model``
+            is NOT injected, the bespoke, retry-disabled ``AsyncOpenAI``
+            client :func:`build_model` constructs is closed once this run
+            completes (success or raise) -- a fresh client per call would
+            otherwise leak its connection pool across a multi-model corpus.
 
     Returns:
         The provider's honest, page-only bean identity.
@@ -2868,6 +2873,11 @@ async def _extract_bean_identity(
     # undercounted every failing, still-billed call. ``None`` when no diagnostics is
     # passed, so a caller that omits it pays no extra bookkeeping.
     run_usage = RunUsage() if diagnostics is not None else None
+    # #601 fold round 9 (E FOLD 3): tracks the bespoke, retry-disabled client
+    # ONLY when WE constructed one (model not injected, disable_transport_retries
+    # requested) -- never an injected test double, never an SDK-managed default
+    # client (those are never ours to close).
+    bespoke_client: AsyncOpenAI | None = None
     try:
         # Agent construction (which calls ``build_model`` when ``model`` is
         # omitted) lives INSIDE the try: it can raise ``AdvisorDependencyError``
@@ -2882,6 +2892,11 @@ async def _extract_bean_identity(
             max_output_tokens=max_output_tokens,
             disable_transport_retries=disable_transport_retries,
         )
+        if model is None and disable_transport_retries:
+            from pydantic_ai.models.openai import OpenAIChatModel  # noqa: PLC0415
+
+            if isinstance(agent.model, OpenAIChatModel):
+                bespoke_client = agent.model.client
         async with asyncio.timeout(extraction_timeout_seconds):
             result = (
                 await agent.run(page_text, usage=run_usage)
@@ -2914,6 +2929,8 @@ async def _extract_bean_identity(
             assert diagnostics is not None  # narrows: run_usage is only ever set alongside it
             diagnostics.request_tokens += run_usage.input_tokens
             diagnostics.response_tokens += run_usage.output_tokens
+        if bespoke_client is not None:
+            await bespoke_client.close()
     if diagnostics is not None:
         diagnostics.schema_retries += sum(
             isinstance(part, RetryPromptPart)
