@@ -3954,6 +3954,271 @@ async def test_run_bakeoff_deferred_retry_runs_once_budget_is_raised(
 
 
 @pytest.mark.asyncio
+async def test_run_bakeoff_trip_on_last_retryable_page_is_normal_completion(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-3, FOLD 1: a trip landing EXACTLY on an arm's LAST
+    retryable page (nothing left anywhere) is a normal completion, never a
+    false exit 3 -- the breaker only fires when work is ACTUALLY halted."""
+    out = tmp_path / "o.json"
+    cheap_roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, cheap_roster)
+
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=cheap_roster,
+        model=_model_fails_nth_call(1),
+    )
+    fingerprint = bo.compute_fingerprint(corpus)
+    charged_after_setup = bo.ChargeLedger(
+        bo.ledger_path(out), fingerprint=fingerprint
+    ).total_usd_for_arm("m1")
+
+    # An ABSURD real price so retrying the ONE retryable page trips the meter
+    # -- but there is only ONE retryable page, so the retry still fully
+    # completes (never "cut short"); nothing is left for this arm afterward.
+    absurd_roster = [bo.RosterModel("m1", 1_000_000, 1_000_000, "x")]
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=charged_after_setup + 0.01,
+        cost_estimates=cost_estimates,
+        roster=absurd_roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert result.breaker_tripped is False
+    assert result.stopped_early is False
+    assert result.executed_slugs == ["m1"]  # the retry DID run
+    assert all(not p.retryable for p in result.runs[0].pages)
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_deferred_retry_still_loads_later_completed_checkpoints(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-3, FOLD 2: a deferred retry (meter already tripped) must
+    NOT prevent a LATER, already-complete checkpoint from loading into
+    runs/the artifact/the leaderboard -- loading is free, only the retry
+    needs spend."""
+    out = tmp_path / "o.json"
+    cheap_roster = [bo.RosterModel("m1", 0.1, 0.1, "x"), bo.RosterModel("m2", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1", "m2"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, cheap_roster)
+
+    # ONE transient failure -- the FIRST call overall (m1's first page); every
+    # other call (the rest of m1, and ALL of m2, which runs second) succeeds.
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=cheap_roster,
+        model=_model_fails_nth_call(1),
+    )
+    fingerprint = bo.compute_fingerprint(corpus)
+    total_charged = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint).total_usd()
+
+    def _never_called(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise AssertionError("no retry attempt should be made -- the meter is already tripped")
+
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=total_charged,  # already tripped from the very start
+        cost_estimates=cost_estimates,
+        roster=cheap_roster,
+        model=FunctionModel(_never_called),
+    )
+    assert result.breaker_tripped is True
+    assert result.stopped_early is True
+    assert result.executed_slugs == []
+    assert {r.model_slug for r in result.runs} == {"m1", "m2"}  # BOTH present
+    m1_run = next(r for r in result.runs if r.model_slug == "m1")
+    assert bo._retryable_slugs(m1_run)  # pyright: ignore[reportPrivateUsage]  # still retryable
+    m2_run = next(r for r in result.runs if r.model_slug == "m2")
+    assert not bo._retryable_slugs(m2_run)  # pyright: ignore[reportPrivateUsage]  # complete
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_persistent_failure_finalizes_after_max_residual_retries(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-3, FOLD 3: a page still infra-failing after
+    _MAX_RESIDUAL_RETRIES residual retries finalises as its error -- bounded
+    spend on a permanent (or merely stubborn) failure, never an eternal
+    per-resume re-burn."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, roster)
+    fingerprint = bo.compute_fingerprint(corpus)
+
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_fails_nth_call(1),
+    )
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    run_after_setup = bo._run_from_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        checkpoint.get("m1")
+    )
+    failing_slug = next(p.slug for p in run_after_setup.pages if p.retryable)
+    assert next(p.retry_count for p in run_after_setup.pages if p.slug == failing_slug) == 0
+
+    # Resume 1 (1st residual retry) -- fails again.
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_provider_error(),
+    )
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    run_after_retry1 = bo._run_from_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        checkpoint.get("m1")
+    )
+    failing_page1 = next(p for p in run_after_retry1.pages if p.slug == failing_slug)
+    assert failing_page1.retry_count == 1
+    assert failing_page1.retryable is True  # 1 < 2 -- still one more chance
+
+    # Resume 2 (2nd residual retry) -- fails again, hits the cap, finalises.
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_provider_error(),
+    )
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    run_after_retry2 = bo._run_from_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        checkpoint.get("m1")
+    )
+    failing_page2 = next(p for p in run_after_retry2.pages if p.slug == failing_slug)
+    assert failing_page2.retry_count == 2
+    assert failing_page2.retryable is False  # finalised -- the cap is reached
+    assert failing_page2.error is not None  # still an error, just no longer retryable
+
+    # Resume 3 -- nothing retryable remains anywhere, so NO call is made.
+    def _never_called(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise AssertionError("no call should be made -- the page finalised last resume")
+
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=FunctionModel(_never_called),
+    )
+    assert result.executed_slugs == []
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_retry_count_persists_through_a_mid_way_success(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-3, FOLD 3 companion: a page that SUCCEEDS mid-way through
+    its residual retries keeps its accumulated retry_count -- there is
+    nothing to "reset", a success is final regardless of how many retries
+    preceded it."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, roster)
+    fingerprint = bo.compute_fingerprint(corpus)
+
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_fails_nth_call(1),
+    )
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    run_after_setup = bo._run_from_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        checkpoint.get("m1")
+    )
+    failing_slug = next(p.slug for p in run_after_setup.pages if p.retryable)
+
+    # Resume 1 -- succeeds this time.
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    resolved_run = bo._run_from_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        checkpoint.get("m1")
+    )
+    resolved_page = next(p for p in resolved_run.pages if p.slug == failing_slug)
+    assert resolved_page.error is None
+    assert resolved_page.retryable is False
+    assert resolved_page.retry_count == 1  # persisted, not reset -- final regardless
+
+
+def test_run_json_roundtrips_retry_count() -> None:
+    page = bo.PageResult(
+        slug="p", outcomes={}, error="boom", on_page_fields=0, retryable=True, retry_count=1
+    )
+    run = bo.ModelRun(model_slug="m", pages=[page])
+    rebuilt = bo._run_from_checkpoint(bo.run_to_json(run))  # pyright: ignore[reportPrivateUsage]
+    assert rebuilt.pages[0].retry_count == 1
+
+
+def test_run_from_checkpoint_legacy_record_defaults_zero_retry_count() -> None:
+    """#652 FOLD 3: a pre-#652 checkpoint record has no ``retry_count`` key at
+    all -- defaults to ``0`` (never yet retried)."""
+    record: dict[str, Any] = {
+        "model_slug": "m",
+        "pages": [
+            {
+                "slug": "p",
+                "error": "boom",
+                "on_page_fields": 0,
+                "outcomes": {},
+                "retryable": True,
+                # no "retry_count" key at all -- a genuinely pre-#652 record.
+            }
+        ],
+    }
+    rebuilt = bo._run_from_checkpoint(record)  # pyright: ignore[reportPrivateUsage]
+    assert rebuilt.pages[0].retry_count == 0
+
+
+@pytest.mark.asyncio
 async def test_run_bakeoff_refuses_a_pre_ledger_checkpoint(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
