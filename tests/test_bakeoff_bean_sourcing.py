@@ -90,6 +90,40 @@ def _model_provider_error() -> FunctionModel:
     return FunctionModel(respond)
 
 
+def _model_fails_nth_call(n: int) -> FunctionModel:
+    """A double that raises a genuine (INFRA-class) provider error on exactly
+    the ``n``th call (1-indexed page-processing order), succeeding on every
+    other call -- one transient failure inside an otherwise-clean run (#649)."""
+    calls = {"n": 0}
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls["n"] += 1
+        if calls["n"] == n:
+            raise ModelAPIError("test-model", "simulated provider outage")
+        return ModelResponse(
+            parts=[ToolCallPart(info.output_tools[0].name, {"name": "X", "country": "Ecuador"})]
+        )
+
+    return FunctionModel(respond)
+
+
+def _model_fails_calls(ns: set[int]) -> FunctionModel:
+    """Like :func:`_model_fails_nth_call`, but for MULTIPLE call numbers
+    (1-indexed) -- more than one transient failure inside an otherwise-clean
+    run (#652)."""
+    calls = {"n": 0}
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls["n"] += 1
+        if calls["n"] in ns:
+            raise ModelAPIError("test-model", "simulated provider outage")
+        return ModelResponse(
+            parts=[ToolCallPart(info.output_tools[0].name, {"name": "X", "country": "Ecuador"})]
+        )
+
+    return FunctionModel(respond)
+
+
 def _model_retry_then_provider_error() -> FunctionModel:
     """A double whose FIRST attempt is malformed (a real, billed response
     with explicit usage -- a validation retry pydantic-ai recovers from),
@@ -1468,6 +1502,68 @@ async def test_run_model_over_corpus_schema_failure_never_gets_the_reserve(
 
 
 @pytest.mark.asyncio
+async def test_run_model_over_corpus_schema_failure_page_is_never_retryable(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """#649: a SCHEMA (malformed-shape) failure is a real outcome, never
+    retryable -- distinct from a timeout/provider-error page."""
+    run = await bo.run_model_over_corpus(
+        [corpus[0]], model_slug="m1", advisor_config=_ADVISOR_CONFIG, model=_model_text_only()
+    )
+    assert run.pages[0].error is not None
+    assert run.pages[0].retryable is False
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_provider_error_page_is_retryable(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """#649: a genuine (INFRA-class) provider error IS retryable -- an
+    accepted, possibly-lost request worth re-attempting."""
+    run = await bo.run_model_over_corpus(
+        [corpus[0]], model_slug="m1", advisor_config=_ADVISOR_CONFIG, model=_model_provider_error()
+    )
+    assert run.pages[0].error is not None
+    assert run.pages[0].retryable is True
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_timeout_page_is_retryable(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """#652 round-5 qa fold: a genuine (REAL, not synthetic) wall-clock TIMEOUT
+    is the OTHER ``is_infra_failure`` branch (``diagnostics.timed_out_runs > 0``)
+    -- only the provider-error branch had a positive ``retryable`` assertion
+    before this fold. A hanging model + a short extraction timeout forces the
+    real outer-timeout path (mirrors :func:`_function_model_hanging`'s other
+    uses), never a synthetic ``timed_out=True`` construction."""
+    run = await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=_function_model_hanging(),
+        sourcing_config=bo.BeanSourcingConfig(extraction_timeout_seconds=0.05),
+    )
+    assert run.pages[0].error is not None
+    assert run.pages[0].retryable is True
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_success_page_is_never_retryable(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """A successful page is never retryable (nothing to retry)."""
+    run = await bo.run_model_over_corpus(
+        [corpus[0]],
+        model_slug="m1",
+        advisor_config=_ADVISOR_CONFIG,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert run.pages[0].error is None
+    assert run.pages[0].retryable is False
+
+
+@pytest.mark.asyncio
 async def test_run_model_over_corpus_model_construction_failure_never_gets_the_reserve(
     corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1500,6 +1596,9 @@ async def test_run_model_over_corpus_model_construction_failure_never_gets_the_r
     )
     assert run.pages[0].error is not None
     assert "could not build its model" in run.pages[0].error
+    # #652 round-5 qa fold: a model-construction failure never sent a request,
+    # so it is not an INFRA-class failure -- never retryable (#649).
+    assert run.pages[0].retryable is False
     _, entry = ledger.entries
     assert entry.request_tokens == 0
     assert entry.response_tokens == 0
@@ -1561,6 +1660,33 @@ def test_run_json_roundtrips_missing_elapsed_s_as_none() -> None:
     }
     rebuilt = bo._run_from_checkpoint(record)  # pyright: ignore[reportPrivateUsage]
     assert rebuilt.pages[0].elapsed_s is None
+
+
+def test_run_json_roundtrips_retryable() -> None:
+    page = bo.PageResult(slug="p", outcomes={}, error="boom", on_page_fields=0, retryable=True)
+    run = bo.ModelRun(model_slug="m", pages=[page])
+    rebuilt = bo._run_from_checkpoint(bo.run_to_json(run))  # pyright: ignore[reportPrivateUsage]
+    assert rebuilt.pages[0].retryable is True
+
+
+def test_run_from_checkpoint_legacy_record_defaults_no_retryable_pages() -> None:
+    """#649: a pre-#649 checkpoint record has no ``retryable`` key at all --
+    every page defaults to ``retryable=False`` (never retried on resume),
+    preserving EXACT prior behavior (whole-arm skip) for old records."""
+    record: dict[str, Any] = {
+        "model_slug": "m",
+        "pages": [
+            {
+                "slug": "p",
+                "error": "boom",
+                "on_page_fields": 0,
+                "outcomes": {},
+                # no "retryable" key at all -- a genuinely pre-#649 record.
+            }
+        ],
+    }
+    rebuilt = bo._run_from_checkpoint(record)  # pyright: ignore[reportPrivateUsage]
+    assert rebuilt.pages[0].retryable is False
 
 
 # --- Statistics (section 5.2) ------------------------------------------------
@@ -2827,6 +2953,41 @@ def test_render_report_marks_budget_stopped_runs_partial(
     assert "model-c" in report
 
 
+def test_render_report_partial_run_distinguishes_deferred_from_never_run(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """#652 round-5, finding 3: the PARTIAL RUN banner renders "never run"
+    and "retry deferred, budget" as DISTINCT lists -- a deferred arm has a
+    real, scored row (unlike a never-run one), so the two claims must not be
+    conflated."""
+    runs = [_full_run("model-a", bo.Outcome.COR)]
+    report = bo.render_report(
+        runs,
+        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
+        stopped_early=True,
+        unevaluated_slugs=["model-b"],
+        deferred_retry_slugs=["model-c"],
+    )
+    assert "never run (1): `model-b`" in report
+    assert "retry deferred, budget (1): `model-c`" in report
+
+
+def test_render_report_partial_run_deferred_only_no_never_run_line(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """Companion: when EVERY stopped arm has a real (deferred) row, the
+    "never run" clause never renders at all."""
+    runs = [_full_run("model-a", bo.Outcome.COR)]
+    report = bo.render_report(
+        runs,
+        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
+        stopped_early=True,
+        deferred_retry_slugs=["model-c"],
+    )
+    assert "never run" not in report
+    assert "retry deferred, budget (1): `model-c`" in report
+
+
 def test_render_report_marks_failed_models_excluded(corpus: list[bo.CorpusPage]) -> None:
     """A wholly-failed model must appear ONLY in the exclusion banner, never
     in the leaderboard/per-page/pairwise sections below it (#600 round-2
@@ -2841,6 +3002,35 @@ def test_render_report_marks_failed_models_excluded(corpus: list[bo.CorpusPage])
     assert "EXCLUDED -- failed this invocation" in report
     assert "`model-failed` (MODEL-SPECIFIC, schema 0/other 0)" in report
     assert "- models scored: 1" in report  # the failed model is NOT counted
+
+
+def test_render_report_labels_still_retryable_pages(corpus: list[bo.CorpusPage]) -> None:
+    """#649: a run with any still-retryable page is labelled in the report, so
+    a partial/degraded result is never silently presented as final. #652
+    round-5, finding 2: NEUTRAL wording -- never asserts "transient" (a
+    permanent failure looks identical until it exhausts its retries)."""
+    fields = {spec.name: bo.Outcome.COR for spec in bo.FIELD_SPECS}
+    run = bo.ModelRun(
+        model_slug="model-a",
+        pages=[
+            bo.PageResult(
+                slug="p1", outcomes=dict(fields), error="boom", on_page_fields=0, retryable=True
+            ),
+            bo.PageResult(slug="p2", outcomes=dict(fields), error=None, on_page_fields=1),
+        ],
+    )
+    report = bo.render_report([run], bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    assert "eligible for residual retry" in report
+    assert "transient" not in report
+    assert "`model-a` (1 page(s), attempt 1 of 2)" in report
+
+
+def test_render_report_no_retryable_banner_when_nothing_retryable(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    runs = [_full_run("model-a", bo.Outcome.COR)]
+    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    assert "eligible for residual retry" not in report
 
 
 def test_render_report_pairwise_covers_all_pairs_not_just_first(
@@ -3411,6 +3601,56 @@ def test_checkpoint_ignores_stale_fingerprinted_records(tmp_path: Path) -> None:
     assert no_guard.has("m1")
 
 
+def test_checkpoint_supersedes_earlier_record_for_the_same_arm(tmp_path: Path) -> None:
+    """#649: appending a SECOND record for the same ``model_slug`` supersedes
+    the first (latest wins) -- the sidecar is append-only, never rewritten in
+    place, mirroring :meth:`bo.ChargeLedger._effective_entries`'s supersession
+    pattern. This is what makes the residual-retry merge coherent."""
+    path = tmp_path / "cells.jsonl"
+    checkpoint = bo.Checkpoint(path, resume=False)
+    checkpoint.append(bo.run_to_json(_run("m1", {"p": {"origin": bo.Outcome.INC}})))
+    checkpoint.append(bo.run_to_json(_run("m1", {"p": {"origin": bo.Outcome.COR}})))
+    assert checkpoint.get("m1")["pages"][0]["outcomes"]["origin"] == "COR"  # the LATEST record
+
+    reopened = bo.Checkpoint(path, resume=True)
+    assert (
+        reopened.get("m1")["pages"][0]["outcomes"]["origin"] == "COR"
+    )  # latest wins on reload too
+
+
+def test_retryable_slugs_only_includes_flagged_pages() -> None:
+    run = bo.ModelRun(
+        model_slug="m1",
+        pages=[
+            bo.PageResult(slug="a", outcomes={}, error=None, on_page_fields=1),
+            bo.PageResult(slug="b", outcomes={}, error="boom", on_page_fields=0, retryable=True),
+        ],
+    )
+    assert bo._retryable_slugs(run) == {"b"}  # pyright: ignore[reportPrivateUsage]
+
+
+def test_merge_retry_results_replaces_only_matching_slugs_preserving_order() -> None:
+    """#649: a fresh entry replaces its matching slug; a slug the retry never
+    reached (the meter tripped mid-retry) keeps its prior entry, still
+    retryable, ready for a later resume -- corpus order preserved throughout."""
+    existing = bo.ModelRun(
+        model_slug="m1",
+        pages=[
+            bo.PageResult(slug="a", outcomes={}, error=None, on_page_fields=1),
+            bo.PageResult(slug="b", outcomes={}, error="boom", on_page_fields=0, retryable=True),
+            bo.PageResult(slug="c", outcomes={}, error="boom", on_page_fields=0, retryable=True),
+        ],
+    )
+    fresh = bo.ModelRun(
+        model_slug="m1",
+        pages=[bo.PageResult(slug="b", outcomes={}, error=None, on_page_fields=1)],
+    )
+    merged = bo._merge_retry_results(existing, fresh)  # pyright: ignore[reportPrivateUsage]
+    assert [p.slug for p in merged.pages] == ["a", "b", "c"]  # corpus order preserved
+    assert merged.pages[1].error is None  # "b" resolved by the retry
+    assert merged.pages[2].retryable is True  # "c" untouched -- never reached by this retry
+
+
 @pytest.mark.asyncio
 async def test_run_bakeoff_budget_stop_makes_no_calls(
     corpus: list[bo.CorpusPage], tmp_path: Path
@@ -3469,6 +3709,760 @@ async def test_run_bakeoff_resumes_without_calls(
     assert result.unevaluated_slugs == []
     assert result.executed_slugs == []  # resumed, not newly called
     assert result.failed_slugs == []
+
+
+# --- #649: page-level residual retry -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_resume_retries_only_the_transient_page_and_merges(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#649: a transient infra failure on ONE page of an otherwise-successful
+    arm is checkpointed with that page marked retryable; ``--resume`` retries
+    ONLY that page and merges the fresh result into the record -- metrics
+    recomputed, the arm no longer labelled retryable once resolved."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 1.0, 1.0, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, roster)
+
+    failing_call = 2  # the 2nd page processed fails, the rest succeed
+    first = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_fails_nth_call(failing_call),
+    )
+    assert first.executed_slugs == ["m1"]
+    first_run = first.runs[0]
+    failed_page = corpus[failing_call - 1]
+    first_entry = next(p for p in first_run.pages if p.slug == failed_page.slug)
+    assert first_entry.error is not None
+    assert first_entry.retryable is True
+    first_metrics = bo.model_metrics(first_run)
+    assert first_metrics.page_errors == 1
+
+    resumed = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert resumed.executed_slugs == ["m1"]  # a real (retry) call was made
+    resumed_run = resumed.runs[0]
+    assert all(p.error is None for p in resumed_run.pages)
+    assert all(not p.retryable for p in resumed_run.pages)
+    resumed_metrics = bo.model_metrics(resumed_run)
+    assert resumed_metrics.page_errors == 0  # metrics recomputed from the merged set
+
+    # The supersede-aware Checkpoint sidecar reflects the merged record too.
+    reloaded_checkpoint = bo.Checkpoint(
+        bo.sidecar_path(out), resume=True, fingerprint=bo.compute_fingerprint(corpus)
+    )
+    reloaded_run = bo._run_from_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        reloaded_checkpoint.get("m1")
+    )
+    assert all(p.error is None for p in reloaded_run.pages)
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_ledger_charges_accumulate_across_a_residual_retry(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#649: money is untouched by the retry design -- the retried page is a
+    genuinely NEW call, charged again, on top of the failed attempt's own
+    charge (never a free retry, never a double-count either)."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 1.0, 1.0, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, roster)
+
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_fails_nth_call(1),
+    )
+    fingerprint = bo.compute_fingerprint(corpus)
+    ledger_after_failure = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
+    charge_after_failure = ledger_after_failure.total_usd_for_arm("m1")
+    assert charge_after_failure > 0.0  # the failed attempt's reserve is already charged
+    entries_before_retry = len(ledger_after_failure.entries)
+
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    ledger_after_retry = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
+    charge_after_retry = ledger_after_retry.total_usd_for_arm("m1")
+    assert charge_after_retry > charge_after_failure  # the retry ADDS a new charge
+    # #652 round-5 qa fold: an any-nonzero-increase check alone would also pass
+    # a double-counted or wrong-page write -- pin the raw entry count grows by
+    # EXACTLY one call's write-ahead pair (pending + final, #601 fold round 4,
+    # FOLD 1), and that the two new entries belong to the ONE page that was
+    # actually retryable (corpus[0], the only page failed by call #1 above).
+    new_entries = ledger_after_retry.entries[entries_before_retry:]
+    assert len(new_entries) == 2
+    assert {e.slug for e in new_entries} == {corpus[0].slug}
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_resume_idempotent_once_nothing_retryable_remains(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#649: once a residual retry resolves every retryable page, a THIRD
+    resume makes NO new call at all -- the arm is skipped wholesale, same as
+    any other fully-resolved checkpointed arm."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 1.0, 1.0, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, roster)
+
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_fails_nth_call(1),
+    )
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+
+    def _never_called(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise AssertionError("model must not be called -- nothing retryable remains")
+
+    third = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=FunctionModel(_never_called),
+    )
+    assert third.executed_slugs == []
+    assert all(not p.retryable for p in third.runs[0].pages)
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_breaker_trip_mid_retry_reports_honestly(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652: a meter trip DURING a residual retry must report breaker_tripped
+    (exit 3), never a false stopped_early=False/exit 0 from falling through to
+    the next arm (or simply running out of arms) -- the SAME trip semantics a
+    fresh arm's mid-arm trip already gets. The untouched (never-reached)
+    retryable page stays retryable for the next resume -- the merge already
+    guarantees this; pinned here too."""
+    out = tmp_path / "o.json"
+    cheap_roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, cheap_roster)
+
+    # Two transient failures (pages 1 and 2, corpus order) inside an
+    # otherwise-clean run, at a CHEAP real price -- sets up a checkpoint with
+    # two retryable pages without tripping anything.
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=cheap_roster,
+        model=_model_fails_calls({1, 2}),
+    )
+    fingerprint = bo.compute_fingerprint(corpus)
+    charged_after_setup = bo.ChargeLedger(
+        bo.ledger_path(out), fingerprint=fingerprint
+    ).total_usd_for_arm("m1")
+
+    # Resume: an ABSURD real price so retrying the FIRST retryable page alone
+    # trips the meter -- the retry's own internal loop must then break BEFORE
+    # ever reaching the second retryable page.
+    absurd_roster = [bo.RosterModel("m1", 1_000_000, 1_000_000, "x")]
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=charged_after_setup + 0.01,  # tiny headroom -- one absurd charge blows past it
+        cost_estimates=cost_estimates,
+        roster=absurd_roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert result.breaker_tripped is True
+    assert result.stopped_early is True
+    assert result.executed_slugs == ["m1"]  # the retry WAS attempted this invocation
+    merged_run = result.runs[0]
+    still_retryable = bo._retryable_slugs(merged_run)  # pyright: ignore[reportPrivateUsage]
+    assert len(still_retryable) == 1  # the second retryable page was never reached
+
+    # The untouched page is still retryable on disk too -- a later resume
+    # would pick it up (the merge/checkpoint-supersede guarantee).
+    reloaded = bo._run_from_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint).get("m1")
+    )
+    assert bo._retryable_slugs(reloaded) == still_retryable  # pyright: ignore[reportPrivateUsage]
+
+
+async def _setup_one_retryable_page(
+    corpus: list[bo.CorpusPage], out: Path
+) -> tuple[list[bo.Arm], list[bo.ModelCostEstimate], float]:
+    """Shared #652 round-2 fixture: a checkpoint with ONE retryable page (page
+    1, corpus order), at a cheap real price, plus the arm/estimate/charged
+    values callers need to construct the resumed invocation."""
+    cheap_roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, cheap_roster)
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=cheap_roster,
+        model=_model_fails_nth_call(1),
+    )
+    fingerprint = bo.compute_fingerprint(corpus)
+    charged = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint).total_usd_for_arm("m1")
+    return arms, cost_estimates, charged
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_deferred_retry_reports_breaker_when_already_tripped(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-2: an arm with retryable pages, resumed against an ALREADY
+    tripped meter (a resumed, over-budget ledger), must report the breaker
+    state IMMEDIATELY -- never silently defer the retry and fall through to a
+    false breaker_tripped=False/exit 0 if the rest of the run is
+    already-checkpointed too. No retry attempt is made at all (never called)."""
+    out = tmp_path / "o.json"
+    arms, cost_estimates, charged = await _setup_one_retryable_page(corpus, out)
+
+    def _never_called(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise AssertionError("no retry attempt should be made -- the meter is already tripped")
+
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=charged,  # exactly at the edge -- charged >= max_spend is tripped
+        cost_estimates=cost_estimates,
+        roster=[bo.RosterModel("m1", 0.1, 0.1, "x")],
+        model=FunctionModel(_never_called),
+    )
+    assert result.breaker_tripped is True
+    assert result.stopped_early is True
+    assert result.executed_slugs == []  # deferred -- no call made
+    fingerprint = bo.compute_fingerprint(corpus)
+    reloaded = bo._run_from_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint).get("m1")
+    )
+    assert bo._retryable_slugs(reloaded)  # pyright: ignore[reportPrivateUsage]  # still retryable
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_deferred_retry_runs_once_budget_is_raised(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-2 companion: the happy path stays reachable -- raising
+    --max-spend past the already-charged amount lets the SAME deferred retry
+    actually run and resolve."""
+    out = tmp_path / "o.json"
+    arms, cost_estimates, charged = await _setup_one_retryable_page(corpus, out)
+
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=charged + 10.0,  # ample headroom this time
+        cost_estimates=cost_estimates,
+        roster=[bo.RosterModel("m1", 0.1, 0.1, "x")],
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert result.breaker_tripped is False
+    assert result.stopped_early is False
+    assert result.executed_slugs == ["m1"]  # the retry DID run
+    assert all(not p.retryable for p in result.runs[0].pages)
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_trip_on_last_retryable_page_is_normal_completion(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-3, FOLD 1: a trip landing EXACTLY on an arm's LAST
+    retryable page (nothing left anywhere) is a normal completion, never a
+    false exit 3 -- the breaker only fires when work is ACTUALLY halted."""
+    out = tmp_path / "o.json"
+    cheap_roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, cheap_roster)
+
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=cheap_roster,
+        model=_model_fails_nth_call(1),
+    )
+    fingerprint = bo.compute_fingerprint(corpus)
+    charged_after_setup = bo.ChargeLedger(
+        bo.ledger_path(out), fingerprint=fingerprint
+    ).total_usd_for_arm("m1")
+
+    # An ABSURD real price so retrying the ONE retryable page trips the meter
+    # -- but there is only ONE retryable page, so the retry still fully
+    # completes (never "cut short"); nothing is left for this arm afterward.
+    absurd_roster = [bo.RosterModel("m1", 1_000_000, 1_000_000, "x")]
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=charged_after_setup + 0.01,
+        cost_estimates=cost_estimates,
+        roster=absurd_roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert result.breaker_tripped is False
+    assert result.stopped_early is False
+    assert result.executed_slugs == ["m1"]  # the retry DID run
+    assert all(not p.retryable for p in result.runs[0].pages)
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_deferred_retry_still_loads_later_completed_checkpoints(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-3, FOLD 2: a deferred retry (meter already tripped) must
+    NOT prevent a LATER, already-complete checkpoint from loading into
+    runs/the artifact/the leaderboard -- loading is free, only the retry
+    needs spend."""
+    out = tmp_path / "o.json"
+    cheap_roster = [bo.RosterModel("m1", 0.1, 0.1, "x"), bo.RosterModel("m2", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1", "m2"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, cheap_roster)
+
+    # ONE transient failure -- the FIRST call overall (m1's first page); every
+    # other call (the rest of m1, and ALL of m2, which runs second) succeeds.
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=cheap_roster,
+        model=_model_fails_nth_call(1),
+    )
+    fingerprint = bo.compute_fingerprint(corpus)
+    total_charged = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint).total_usd()
+
+    def _never_called(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise AssertionError("no retry attempt should be made -- the meter is already tripped")
+
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=total_charged,  # already tripped from the very start
+        cost_estimates=cost_estimates,
+        roster=cheap_roster,
+        model=FunctionModel(_never_called),
+    )
+    assert result.breaker_tripped is True
+    assert result.stopped_early is True
+    assert result.executed_slugs == []
+    assert {r.model_slug for r in result.runs} == {"m1", "m2"}  # BOTH present
+    m1_run = next(r for r in result.runs if r.model_slug == "m1")
+    assert bo._retryable_slugs(m1_run)  # pyright: ignore[reportPrivateUsage]  # still retryable
+    m2_run = next(r for r in result.runs if r.model_slug == "m2")
+    assert not bo._retryable_slugs(m2_run)  # pyright: ignore[reportPrivateUsage]  # complete
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_deferred_and_fresh_arms_both_unevaluated_around_a_completed_one(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-4/5: the sandwich scenario -- [deferred checkpointed arm,
+    fresh (never-checkpointed) arm, completed checkpointed arm], meter
+    already tripped. The completed arm still loads (loading is never
+    spend); the deferred arm (m1, a SCORED run present) lands in
+    deferred_retry_slugs, and the fresh arm (m2, NO run at all) lands in
+    unevaluated_slugs -- distinct lists (#652 round-5, finding 3), since the
+    leaderboard's completeness claim must stay true for m1's real data; exit
+    3 either way."""
+    out = tmp_path / "o.json"
+    roster = [
+        bo.RosterModel("m1", 0.1, 0.1, "x"),
+        bo.RosterModel("m2", 0.1, 0.1, "x"),
+        bo.RosterModel("m3", 0.1, 0.1, "x"),
+    ]
+    # Setup covers ONLY m1 and m3 -- m2 is left genuinely FRESH (never
+    # checkpointed at all). ONE transient failure (the first call overall,
+    # m1's first page); every other call (the rest of m1, all of m3) succeeds.
+    setup_arms = bo.expand_arms(["m1", "m3"], "default")
+    setup_estimates = bo.estimate_cost_for_arms(corpus, setup_arms, roster)
+    await bo.run_bakeoff(
+        corpus,
+        setup_arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=setup_estimates,
+        roster=roster,
+        model=_model_fails_nth_call(1),
+    )
+    fingerprint = bo.compute_fingerprint(corpus)
+    total_charged = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint).total_usd()
+
+    def _never_called(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise AssertionError("no call should be made -- the meter is already tripped")
+
+    test_arms = bo.expand_arms(["m1", "m2", "m3"], "default")  # m1, m2, m3 IN ORDER
+    test_estimates = bo.estimate_cost_for_arms(corpus, test_arms, roster)
+    result = await bo.run_bakeoff(
+        corpus,
+        test_arms,
+        out=out,
+        resume=True,
+        max_spend=total_charged,  # already tripped from the very start
+        cost_estimates=test_estimates,
+        roster=roster,
+        model=FunctionModel(_never_called),
+    )
+    assert result.breaker_tripped is True
+    assert result.stopped_early is True
+    assert result.executed_slugs == []
+    assert {r.model_slug for r in result.runs} == {"m1", "m3"}  # m2 has no data at all
+    assert result.deferred_retry_slugs == ["m1"]  # a run present, retry deferred
+    assert result.unevaluated_slugs == ["m2"]  # NO run at all -- genuinely never run
+    m1_run = next(r for r in result.runs if r.model_slug == "m1")
+    assert bo._retryable_slugs(m1_run)  # pyright: ignore[reportPrivateUsage]  # still retryable
+    m3_run = next(r for r in result.runs if r.model_slug == "m3")
+    assert not bo._retryable_slugs(m3_run)  # pyright: ignore[reportPrivateUsage]  # complete
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_fresh_arm_final_page_trip_with_retryable_page_defers(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-5, finding 1: a FRESH arm's run completes FULL LENGTH (the
+    trip lands on the corpus's LAST page, so it bypasses the mid-arm-trip
+    branch entirely) but that page is ITSELF retryable (an infra-class
+    failure, unresolved) -- the arm still gets checkpointed/scored normally,
+    but its retry cannot happen this invocation (budget gone). Must join the
+    deferred set at the final derivation: exit 3, the run present in runs,
+    the page retryable."""
+    out = tmp_path / "o.json"
+    two_pages = [corpus[0], corpus[1]]
+    price = bo.RosterModel("m1", 1000.0, 1000.0, "x")
+    # page 1 succeeds at an EXACT, known charge; page 2 (the LAST page) fails
+    # with a genuine (INFRA-class) provider error -- computed so the meter
+    # trips EXACTLY after page 2's reserve, never earlier.
+    page1_charge = 10 / 1_000_000 * 1000.0 + 5 / 1_000_000 * 1000.0
+    page2_reserve = bo._single_attempt_reserve(  # pyright: ignore[reportPrivateUsage]
+        two_pages[1], price, max_output_tokens=bo.BAKEOFF_MAX_OUTPUT_TOKENS
+    )
+    max_spend = round(page1_charge + page2_reserve, 5)
+    calls = {"n": 0}
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(info.output_tools[0].name, {"name": "X", "country": "Ecuador"})
+                ],
+                usage=RequestUsage(input_tokens=10, output_tokens=5),
+            )
+        raise ModelAPIError("test-model", "simulated provider outage")
+
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = [bo.ModelCostEstimate(slug="m1", input_tokens=1, output_tokens=1, usd=0.0001)]
+    result = await bo.run_bakeoff(
+        two_pages,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=max_spend,
+        cost_estimates=cost_estimates,
+        roster=[price],
+        model=FunctionModel(respond),
+    )
+    assert result.breaker_tripped is True
+    assert result.stopped_early is True
+    assert {r.model_slug for r in result.runs} == {"m1"}  # checkpointed/scored, not dropped
+    m1_run = result.runs[0]
+    assert len(m1_run.pages) == 2  # the FULL corpus, never mid-arm cut short
+    assert bo._retryable_slugs(m1_run)  # pyright: ignore[reportPrivateUsage]  # still retryable
+    assert result.deferred_retry_slugs == ["m1"]
+    assert result.unevaluated_slugs == []  # a run IS present -- never "unevaluated"
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_prorates_residual_retry_incurred_estimate(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-5, finding 4: the residual retry path prorates the
+    incurred-spend line to just the retried page's OWN cost-weighted
+    estimate (the #650 machinery), not the whole (9-page) corpus estimate --
+    closes the previously-documented approximation."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 0.05, 0.05, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, roster)
+
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_fails_nth_call(1),
+    )
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert result.prorated_arm == "m1"
+    assert result.prorated_attempted_pages == 1
+    assert result.prorated_total_pages == len(corpus)
+    expected_page_estimate = round(
+        bo._page_cost_estimate(corpus[0], roster[0], reasoning="default"),  # pyright: ignore[reportPrivateUsage]
+        5,
+    )
+    assert result.prorated_attempted_estimate == pytest.approx(expected_page_estimate)
+    full_arm_estimate = next(e.usd for e in cost_estimates if e.slug == "m1")
+    assert result.prorated_attempted_estimate is not None
+    assert (
+        result.prorated_attempted_estimate < full_arm_estimate / 3
+    )  # a small share, not the whole
+    report = bo.render_report(
+        result.runs,
+        cost_estimates,
+        executed_slugs=result.executed_slugs,
+        prorated_arm=result.prorated_arm,
+        prorated_attempted_pages=result.prorated_attempted_pages,
+        prorated_total_pages=result.prorated_total_pages,
+        prorated_attempted_estimate=result.prorated_attempted_estimate,
+    )
+    assert f"${result.prorated_attempted_estimate:.4f}" in report
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_persistent_failure_finalizes_after_max_residual_retries(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-3, FOLD 3: a page still infra-failing after
+    _MAX_RESIDUAL_RETRIES residual retries finalises as its error -- bounded
+    spend on a permanent (or merely stubborn) failure, never an eternal
+    per-resume re-burn."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, roster)
+    fingerprint = bo.compute_fingerprint(corpus)
+
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_fails_nth_call(1),
+    )
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    run_after_setup = bo._run_from_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        checkpoint.get("m1")
+    )
+    failing_slug = next(p.slug for p in run_after_setup.pages if p.retryable)
+    assert next(p.retry_count for p in run_after_setup.pages if p.slug == failing_slug) == 0
+
+    # Resume 1 (1st residual retry) -- fails again.
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_provider_error(),
+    )
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    run_after_retry1 = bo._run_from_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        checkpoint.get("m1")
+    )
+    failing_page1 = next(p for p in run_after_retry1.pages if p.slug == failing_slug)
+    assert failing_page1.retry_count == 1
+    assert failing_page1.retryable is True  # 1 < 2 -- still one more chance
+
+    # Resume 2 (2nd residual retry) -- fails again, hits the cap, finalises.
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_provider_error(),
+    )
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    run_after_retry2 = bo._run_from_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        checkpoint.get("m1")
+    )
+    failing_page2 = next(p for p in run_after_retry2.pages if p.slug == failing_slug)
+    assert failing_page2.retry_count == 2
+    assert failing_page2.retryable is False  # finalised -- the cap is reached
+    assert failing_page2.error is not None  # still an error, just no longer retryable
+
+    # Resume 3 -- nothing retryable remains anywhere, so NO call is made.
+    def _never_called(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise AssertionError("no call should be made -- the page finalised last resume")
+
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=FunctionModel(_never_called),
+    )
+    assert result.executed_slugs == []
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_retry_count_persists_through_a_mid_way_success(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-3, FOLD 3 companion: a page that SUCCEEDS mid-way through
+    its residual retries keeps its accumulated retry_count -- there is
+    nothing to "reset", a success is final regardless of how many retries
+    preceded it."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, roster)
+    fingerprint = bo.compute_fingerprint(corpus)
+
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_fails_nth_call(1),
+    )
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    run_after_setup = bo._run_from_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        checkpoint.get("m1")
+    )
+    failing_slug = next(p.slug for p in run_after_setup.pages if p.retryable)
+
+    # Resume 1 -- succeeds this time.
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    resolved_run = bo._run_from_checkpoint(  # pyright: ignore[reportPrivateUsage]
+        checkpoint.get("m1")
+    )
+    resolved_page = next(p for p in resolved_run.pages if p.slug == failing_slug)
+    assert resolved_page.error is None
+    assert resolved_page.retryable is False
+    assert resolved_page.retry_count == 1  # persisted, not reset -- final regardless
+
+
+def test_run_json_roundtrips_retry_count() -> None:
+    page = bo.PageResult(
+        slug="p", outcomes={}, error="boom", on_page_fields=0, retryable=True, retry_count=1
+    )
+    run = bo.ModelRun(model_slug="m", pages=[page])
+    rebuilt = bo._run_from_checkpoint(bo.run_to_json(run))  # pyright: ignore[reportPrivateUsage]
+    assert rebuilt.pages[0].retry_count == 1
+
+
+def test_run_from_checkpoint_legacy_record_defaults_zero_retry_count() -> None:
+    """#652 FOLD 3: a pre-#652 checkpoint record has no ``retry_count`` key at
+    all -- defaults to ``0`` (never yet retried)."""
+    record: dict[str, Any] = {
+        "model_slug": "m",
+        "pages": [
+            {
+                "slug": "p",
+                "error": "boom",
+                "on_page_fields": 0,
+                "outcomes": {},
+                "retryable": True,
+                # no "retry_count" key at all -- a genuinely pre-#652 record.
+            }
+        ],
+    }
+    rebuilt = bo._run_from_checkpoint(record)  # pyright: ignore[reportPrivateUsage]
+    assert rebuilt.pages[0].retry_count == 0
 
 
 @pytest.mark.asyncio
@@ -4417,11 +5411,14 @@ async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
 ) -> None:
     """Every page erroring on a genuine INFRA-class failure, with NO peer having
     succeeded this invocation, is labelled INFRA-WIDE (heuristic, display-only, #602
-    fold round 5): must not be cached as 'done' -- a re-run should retry, not resume
-    the outage forever (#600 finding) -- AND must not appear in ``runs`` as a scored
-    0.000 row polluting the leaderboard/statistics (#600 round-2 finding): it is
-    reported separately via ``failed_slugs`` instead. Uses a genuine provider error
-    (NOT a schema failure -- #601 F1 gives that case different treatment, see
+    fold round 5): must not be cached as SCORED/'done' -- a re-run should retry, not
+    resume the outage forever (#600 finding) -- AND must not appear in ``runs`` as a
+    scored 0.000 row polluting the leaderboard/statistics (#600 round-2 finding): it
+    is reported separately via ``failed_slugs`` instead. An ATTEMPT-COUNTER record IS
+    now persisted (#652 round-5, finding 5 -- bounds an unbounded per-resume re-bill on
+    a permanent failure), but it is flagged ``wholly_failed``, never a scored run.
+    Uses a genuine provider error (NOT a schema failure -- #601 F1 gives that case
+    different treatment, see
     :func:`test_run_bakeoff_all_schema_failure_run_is_checkpointed_and_scored`)."""
     out = tmp_path / "o.json"
     result = await bo.run_bakeoff(
@@ -4441,7 +5438,7 @@ async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
     assert result.executed_slugs == ["m1"]  # a paid attempt WAS made
     fingerprint = bo.compute_fingerprint(corpus)
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
-    assert not checkpoint.has("m1")
+    assert checkpoint.get("m1")["wholly_failed"] is True  # an attempt-counter, never scored
 
 
 @pytest.mark.asyncio
@@ -4503,9 +5500,10 @@ async def test_run_bakeoff_all_schema_failure_arm_appears_in_reasoning_compariso
 async def test_run_bakeoff_mixed_failure_run_is_dropped_with_counts_preserved(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
-    """A MIXED all-error run (1 schema failure + 8 infra failures) is dropped (never
-    checkpointed, always retried on resume) -- but its FailedRun annotation preserves
-    the schema/other-error split, so the adherence signal stays visible even though
+    """A MIXED all-error run (1 schema failure + 8 infra failures) is dropped (never a
+    SCORED run, always retried on resume -- an ATTEMPT-COUNTER record persists
+    instead, #652 round-5) -- but its FailedRun annotation preserves the
+    schema/other-error split, so the adherence signal stays visible even though
     the run itself isn't scored (#601 fold round 7, FOLD 1)."""
     out = tmp_path / "o.json"
     calls = {"n": 0}
@@ -4537,9 +5535,9 @@ async def test_run_bakeoff_mixed_failure_run_is_dropped_with_counts_preserved(
     ]
     fingerprint = bo.compute_fingerprint(corpus)
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
-    assert not checkpoint.has("m1")
+    assert checkpoint.get("m1")["wholly_failed"] is True  # an attempt-counter, never scored
 
-    calls["n"] = 0  # a resume must ALWAYS retry a dropped run
+    calls["n"] = 0  # a resume must ALWAYS retry a dropped run's WHOLE corpus
     resumed = await bo.run_bakeoff(
         corpus,
         bo.expand_arms(["m1"], "default"),
@@ -4560,9 +5558,9 @@ async def test_run_bakeoff_resumed_success_does_not_flip_the_heuristic_label(
     """A RESUMED peer's PAST success does not count as ``has_fresh_success``
     for the DISPLAY-ONLY heuristic label (#602 fold round 1, preserved
     through the round-5 simplification): with only a resumed peer and every
-    FRESH model failing, the fresh failure is labelled INFRA-WIDE -- never
-    checkpointed either way (the label no longer affects persistence at
-    all, #602 fold round 5)."""
+    FRESH model failing, the fresh failure is labelled INFRA-WIDE -- never a
+    SCORED run either way (the label no longer affects persistence at all,
+    #602 fold round 5; an ATTEMPT-COUNTER now persists instead, #652 round-5)."""
     out = tmp_path / "o.json"
     fingerprint = bo.compute_fingerprint(corpus)
     # Seed a checkpoint with a peer that succeeded in a PRIOR invocation --
@@ -4592,7 +5590,7 @@ async def test_run_bakeoff_resumed_success_does_not_flip_the_heuristic_label(
     ]
     assert result.executed_slugs == ["bad"]
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
-    assert not checkpoint.has("bad")  # NEVER checkpointed, regardless of the heuristic label
+    assert checkpoint.get("bad")["wholly_failed"] is True  # an attempt-counter, never scored
 
 
 def _model_switch_after(n: int, *, fail_first: bool) -> FunctionModel:
@@ -4627,8 +5625,9 @@ async def test_run_bakeoff_never_checkpoints_a_wholly_failed_run_even_with_a_fre
     model-specific fault, so that eager persistence could permanently
     corrupt the leaderboard on exactly this ambiguous case. Failed attempts
     are cheap to retry; a mis-scored failure is expensive to fix -- so a
-    wholly-failed run is NEVER checkpointed, even when "a" succeeds first
-    and "b" then wholly fails (the heuristic label is display-only)."""
+    wholly-failed run is NEVER a SCORED checkpoint, even when "a" succeeds
+    first and "b" then wholly fails (the heuristic label is display-only) --
+    "b" persists only as an ATTEMPT-COUNTER (#652 round-5), never scored."""
     out = tmp_path / "o.json"
     fingerprint = bo.compute_fingerprint(corpus)
     roster = [bo.RosterModel("a", 0.1, 0.1, "x"), bo.RosterModel("b", 0.1, 0.1, "x")]
@@ -4649,7 +5648,7 @@ async def test_run_bakeoff_never_checkpoints_a_wholly_failed_run_even_with_a_fre
     ]
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
     assert checkpoint.has("a")
-    assert not checkpoint.has("b")  # NEVER checkpointed, regardless of the heuristic label
+    assert checkpoint.get("b")["wholly_failed"] is True  # an attempt-counter, never scored
 
     # A resume must ALWAYS retry "b" -- a paid attempt is made again.
     resumed = await bo.run_bakeoff(
@@ -4663,6 +5662,137 @@ async def test_run_bakeoff_never_checkpoints_a_wholly_failed_run_even_with_a_fre
         model=_model_text_only(),
     )
     assert resumed.executed_slugs == ["b"]  # "a" resumed (no new call), "b" retried
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_wholly_failed_arm_bounded_retries_then_finalises(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-5, finding 5: a wholly-failed arm re-bills the WHOLE corpus
+    at most 1 (fresh) + _MAX_RESIDUAL_RETRIES (residual) times total across
+    resumes -- an ATTEMPT-COUNTER record persists between attempts (never a
+    scored run, never in the leaderboard/``runs``) so retry_count keeps
+    incrementing instead of resetting to 0 forever (the money hole a bad API
+    key would otherwise create). Once every page hits the cap, the arm
+    FINALISES as a real scored record; a further resume makes NO call."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, roster)
+    fingerprint = bo.compute_fingerprint(corpus)
+
+    # Attempt 1 (fresh) -- ALL pages fail, genuinely INFRA-class.
+    first = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_provider_error(),
+    )
+    assert first.executed_slugs == ["m1"]
+    assert first.runs == []  # never in the leaderboard
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert checkpoint.get("m1")["wholly_failed"] is True
+
+    # Attempt 2 (1st residual retry) -- fails again, still bounded.
+    second = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_provider_error(),
+    )
+    assert second.executed_slugs == ["m1"]
+    assert second.runs == []  # STILL never in the leaderboard
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert checkpoint.get("m1")["wholly_failed"] is True
+
+    # Attempt 3 (2nd residual retry) -- fails again; every page now hits the
+    # cap -- FINALISES as a real scored record.
+    third = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_provider_error(),
+    )
+    assert third.executed_slugs == ["m1"]
+    assert {r.model_slug for r in third.runs} == {"m1"}  # NOW it IS scored
+    assert third.failed_slugs == []  # no longer routed through FailedRun
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert not checkpoint.get("m1").get("wholly_failed", False)  # a real scored record now
+    assert all(not p.retryable for p in third.runs[0].pages)
+
+    # A further resume makes NO call at all -- finalised.
+    def _never_called(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise AssertionError("no call should be made -- the arm finalised last resume")
+
+    fourth = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=FunctionModel(_never_called),
+    )
+    assert fourth.executed_slugs == []
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_wholly_failed_arm_mid_way_success_becomes_scored(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#652 round-5, finding 5 companion: a wholly-failed arm's residual
+    retry that gets even ONE page to succeed is no longer wholly-failed -- it
+    converts straight to a normal scored record, never routed back through
+    the ATTEMPT-COUNTER special-casing."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1"], "default")
+    cost_estimates = bo.estimate_cost_for_arms(corpus, arms, roster)
+    fingerprint = bo.compute_fingerprint(corpus)
+
+    await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_provider_error(),  # every page fails
+    )
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert checkpoint.get("m1")["wholly_failed"] is True
+
+    # Resume: the FIRST page now succeeds, every other call still fails.
+    resumed = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=10.0,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_fails_calls(set(range(2, len(corpus) + 1))),
+    )
+    assert {r.model_slug for r in resumed.runs} == {"m1"}  # scored -- no longer wholly-failed
+    assert resumed.failed_slugs == []
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert not checkpoint.get("m1").get("wholly_failed", False)
+    m1_run = resumed.runs[0]
+    assert sum(1 for p in m1_run.pages if p.error is None) == 1  # exactly the one success
 
 
 def test_run_wholly_failed_detects_all_errored_pages() -> None:
