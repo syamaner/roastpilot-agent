@@ -1016,6 +1016,81 @@ describe("BeanProfileModal draft-from-URL — in-flight race guard (#654 fold 4,
   });
 });
 
+describe("BeanProfileModal draft-from-URL — the single-flight guard survives unmount (#654 final thread)", () => {
+  it("a request abandoned by Cancel (unmount) still blocks a remounted modal's draft attempt, until it settles a fresh draft fires", async () => {
+    // Cancel unmounts the modal while the request is still running server-
+    // side (no disconnect check on this route, #654 verdict round) — a
+    // per-instance guard would reset to idle on the fresh instance below and
+    // fire straight into the backend's still-occupied one-at-a-time slot.
+    const abandoned = deferred<BeanProfileDraftResponse>();
+    const spy = vi.spyOn(api, "draftBeanFromUrl").mockReturnValue(abandoned.promise);
+    const first = render(
+      <BeanProfileModal mode="add" onSave={vi.fn()} onSaved={vi.fn()} onClose={vi.fn()} />,
+    );
+    fireEvent.change(screen.getByTestId("bean-profile-draft-url"), {
+      target: { value: "https://roaster.example.com/abandoned" },
+    });
+    fireEvent.click(screen.getByTestId("bean-profile-draft-button"));
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    first.unmount();
+    render(<BeanProfileModal mode="add" onSave={vi.fn()} onSaved={vi.fn()} onClose={vi.fn()} />);
+
+    // The remounted instance adopts the module-level in-flight status.
+    expect(screen.getByTestId("bean-profile-draft-button")).toBeDisabled();
+    fireEvent.change(screen.getByTestId("bean-profile-draft-url"), {
+      target: { value: "https://roaster.example.com/new" },
+    });
+    // Enter routes straight to `handleDraftFromUrl`'s own guard, regardless
+    // of the button's disabled attribute — a second real request is refused.
+    fireEvent.keyDown(screen.getByTestId("bean-profile-draft-url"), { key: "Enter" });
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    // The abandoned request finally settles — the (unmounted) first instance
+    // never touches state to apply it, and the guard releases.
+    const fresh = deferred<BeanProfileDraftResponse>();
+    spy.mockReturnValueOnce(fresh.promise);
+    await act(async () => {
+      abandoned.resolve({ ...FIXTURE_DRAFT_RESPONSE, name: "Abandoned draft" });
+    });
+    await waitFor(() => expect(screen.getByTestId("bean-profile-draft-button")).toBeEnabled());
+
+    // Now a fresh draft attempt in the remounted instance fires for real.
+    fireEvent.keyDown(screen.getByTestId("bean-profile-draft-url"), { key: "Enter" });
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(spy).toHaveBeenLastCalledWith("https://roaster.example.com/new");
+    await act(async () => {
+      fresh.resolve({ ...FIXTURE_DRAFT_RESPONSE, name: "Fresh after remount" });
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("bean-profile-name")).toHaveValue("Fresh after remount"),
+    );
+  });
+
+  it("produces no setState-on-an-unmounted-component warning when the abandoned request settles after unmount", async () => {
+    const pending = deferred<BeanProfileDraftResponse>();
+    vi.spyOn(api, "draftBeanFromUrl").mockReturnValue(pending.promise);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const view = render(
+      <BeanProfileModal mode="add" onSave={vi.fn()} onSaved={vi.fn()} onClose={vi.fn()} />,
+    );
+    fireEvent.change(screen.getByTestId("bean-profile-draft-url"), {
+      target: { value: "https://roaster.example.com/x" },
+    });
+    fireEvent.click(screen.getByTestId("bean-profile-draft-button"));
+    view.unmount();
+
+    await act(async () => {
+      pending.resolve(FIXTURE_DRAFT_RESPONSE);
+    });
+
+    const unmountWarning = consoleError.mock.calls.some((args) =>
+      args.some((arg) => typeof arg === "string" && arg.includes("unmounted component")),
+    );
+    expect(unmountWarning).toBe(false);
+  });
+});
+
 describe("BeanProfileModal draft-from-URL — redacts URL query strings in the error detail (#654 round 2 fold 4)", () => {
   it("a 422 detail embedding a signed URL renders without its query string", async () => {
     vi.spyOn(api, "draftBeanFromUrl").mockRejectedValue(

@@ -21,7 +21,7 @@
  * the server's pydantic bounds are the authority (a 422 surfaces inline).
  */
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/cn";
@@ -37,6 +37,21 @@ import {
   type BeanProfileErrors,
 } from "./beanProfileDraft";
 import { BeanProfileFields } from "./beanProfileFields";
+
+/**
+ * Module-scope single-flight tracking for draft-from-URL (#654 final
+ * thread) — plain module state, NOT per-component-instance. Cancelling (or
+ * any other unmount) destroys a per-instance ref along with the component,
+ * but the backend has no disconnect check on this route (#654 verdict
+ * round): an abandoned request may still be running server-side, still
+ * holding its one-at-a-time admission slot, when the modal is reopened. A
+ * freshly-mounted instance's own state starts clean and would otherwise
+ * fire straight into that slot. `settle` resolves once the CURRENT
+ * request's fetch actually settles, regardless of which instance (or
+ * whether any instance) is still mounted to see it — a remounted instance
+ * subscribes to it to adopt the busy state it can't otherwise see.
+ */
+let draftInFlight: { settle: Promise<void> } | null = null;
 
 /** The draft fields the server's `scouting_note` text actually summarizes
  *  (#654 final round): "...targets are a conservative, de-risked starting
@@ -107,17 +122,29 @@ export function BeanProfileModal({
   // re-checked before EITHER branch of `handleDraftFromUrl` applies its result.
   // A response that no longer matches the current token is dropped outright.
   const draftRequestIdRef = useRef(0);
-  // Synchronous single-flight guard (#654 round 2 fold 1): `drafting` (React
-  // state) is not enough on its own — two dispatches in the SAME event batch
-  // both read the same stale `drafting === false`, so both would fire a real
-  // request and the backend's own 429 on the second could race the first's
-  // genuine success. A ref is read/written synchronously, so the SECOND
-  // invocation — even same-batch — sees `true` and bails before calling the
-  // API. Cleared UNCONDITIONALLY only when a request's own promise settles,
-  // in `handleDraftFromUrl`'s `finally` (#654 landing round) — an operator
-  // edit invalidates the DATA (bumps the token) but does NOT clear this guard
-  // itself; see `invalidateInFlightDraft` for why.
-  const draftingRef = useRef(false);
+  // Whether THIS instance is still mounted (#654 final thread): every
+  // setState past an `await` in `handleDraftFromUrl` is gated on this too, so
+  // an instance that unmounted mid-request (Cancel) never touches state that
+  // no longer exists once its own abandoned response finally arrives.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  // On mount, adopt whatever module-level in-flight status already exists
+  // (#654 final thread): a remounted modal (e.g. reopened via Cancel while a
+  // request was still running) must show itself as busy until that
+  // abandoned request's `settle` resolves, not start fresh as idle while
+  // secretly blocked from firing by `draftInFlight` below.
+  useEffect(() => {
+    if (draftInFlight === null) return;
+    setDrafting(true);
+    void draftInFlight.settle.then(() => {
+      if (mountedRef.current) setDrafting(false);
+    });
+  }, []);
 
   // Editing a field orphans any provenance/evidence it carried (#627): those
   // describe the value the SERVER extracted, not whatever the operator just
@@ -127,8 +154,8 @@ export function BeanProfileModal({
   // staleness check drop it.
   //
   // Invalidation is TOKEN-BUMP ONLY (#654 verdict round) — it deliberately
-  // does NOT abort the fetch or touch the single-flight guard
-  // (`drafting`/`draftingRef`). An earlier version aborted the request, but
+  // does NOT abort the fetch or touch the single-flight guard (`draftInFlight`
+  // module state). An earlier version aborted the request, but
   // `AbortController.abort()` settles the fetch's promise IMMEDIATELY on the
   // client, while the backend has no disconnect check — so that abort was
   // defeating its own purpose: the guard would release (via
@@ -217,22 +244,27 @@ export function BeanProfileModal({
 
   const handleDraftFromUrl = async () => {
     const url = draftUrl.trim();
-    // Synchronous check-and-set (#654 round 2 fold 1) — see `draftingRef` above.
-    // Also refused while a save is in flight (#654 landing round): the modal
-    // may unmount on a successful save, and no vendor/LLM call should ever
-    // start mid-save regardless.
-    if (draftingRef.current || submitting || url === "") return;
-    draftingRef.current = true;
+    // Synchronous check-and-set against the MODULE-scope guard (#654 final
+    // thread) — see `draftInFlight` above. Also refused while a save is in
+    // flight (#654 landing round): the modal may unmount on a successful
+    // save, and no vendor/LLM call should ever start mid-save regardless.
+    if (draftInFlight !== null || submitting || url === "") return;
     const requestId = ++draftRequestIdRef.current;
+    let resolveSettle!: () => void;
+    draftInFlight = {
+      settle: new Promise<void>((resolve) => {
+        resolveSettle = resolve;
+      }),
+    };
     setDrafting(true);
     setDraftErrorKind(null);
     setDraftErrorDetail(null);
     try {
       const response = await api.draftBeanFromUrl(url);
-      // Superseded (#637, #654 round 2): a newer request already applied, or an
-      // operator edit invalidated this one while it was in flight — drop this
-      // stale response's DATA rather than clobbering whatever is now current.
-      if (draftRequestIdRef.current !== requestId) return;
+      // Superseded (#637, #654 round 2), or this instance unmounted while the
+      // request was in flight (#654 final thread) — either way, never apply a
+      // stale response's DATA, and never setState on an unmounted instance.
+      if (draftRequestIdRef.current !== requestId || !mountedRef.current) return;
       const { draft: seeded, scoutingNote: note } = draftFromBeanProfileDraft(response);
       setDraft(seeded);
       setErrors({});
@@ -245,7 +277,7 @@ export function BeanProfileModal({
       // explanation.
       setScoutingNote(note);
     } catch (err) {
-      if (draftRequestIdRef.current !== requestId) return;
+      if (draftRequestIdRef.current !== requestId || !mountedRef.current) return;
       if (err instanceof ApiError && err.status === 422) {
         setDraftErrorKind("invalid");
         setDraftErrorDetail(err.detail);
@@ -260,12 +292,19 @@ export function BeanProfileModal({
         setDraftErrorDetail(err instanceof Error ? err.message : "Request failed.");
       }
     } finally {
-      // Cleared UNCONDITIONALLY on settle, not gated on the token (#654
-      // landing round): even a superseded request releases the guard once
-      // it's done — the earliest point a new attempt is safe. Only the DATA
-      // application above stays gated on the token still matching.
-      setDrafting(false);
-      draftingRef.current = false;
+      // The MODULE guard clears UNCONDITIONALLY on settle (#654 final
+      // thread), regardless of token match or mount state — a remounted (or
+      // still-mounted-but-superseded) instance can only safely fire once the
+      // real backend admission slot is free, which this settle is the sole
+      // signal for. `drafting` (React state) stays UNCONDITIONAL on token
+      // match too (#654 landing round) — even a superseded request must
+      // release Save once it settles; only mount state gates it, since a
+      // setState on an unmounted instance is the one thing to avoid here.
+      draftInFlight = null;
+      resolveSettle();
+      if (mountedRef.current) {
+        setDrafting(false);
+      }
     }
   };
 
