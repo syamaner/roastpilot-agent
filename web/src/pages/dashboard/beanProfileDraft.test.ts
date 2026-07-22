@@ -338,6 +338,25 @@ describe("redactUrlQueryStrings (#654 round 2 fold 4)", () => {
     const text = 'failed for "https://x.test/a?next=(x)&token=secret": bad';
     expect(redactUrlQueryStrings(text)).toBe('failed for "https://x.test/a": bad');
   });
+
+  it("redacts a double-quoted URL whose own content embeds a literal single quote (#654 round 4)", () => {
+    // repr()'s own reason for choosing double quotes: the string contains a
+    // '. A naive [^'"]* body would stop at that embedded ' instead of the
+    // real closing ", letting the query string after it escape redaction.
+    const text = `drafted bean profile failed validation for "https://x.test/a'b?token=secret": bad`;
+    expect(redactUrlQueryStrings(text)).toBe(
+      `drafted bean profile failed validation for "https://x.test/a'b": bad`,
+    );
+    expect(redactUrlQueryStrings(text)).not.toContain("token=secret");
+  });
+
+  it("redacts a single-quoted URL whose own content embeds a literal double quote (the reverse case)", () => {
+    const text = `drafted bean profile failed validation for 'https://x.test/a"b?token=secret': bad`;
+    expect(redactUrlQueryStrings(text)).toBe(
+      `drafted bean profile failed validation for 'https://x.test/a"b': bad`,
+    );
+    expect(redactUrlQueryStrings(text)).not.toContain("token=secret");
+  });
 });
 
 describe("draftFromBeanProfileDraft — strips bidi controls from drafted free text (#654 round 2 fold 6)", () => {

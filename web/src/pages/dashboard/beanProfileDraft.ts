@@ -211,15 +211,26 @@ export function stripBidiControls(text: string): string {
  * A URL wrapped in matching quotes (`'…'` or `"…"`) — the shape the backend's
  * error details actually use when echoing a requested URL back (Python's
  * `repr()` always quotes a string, single-quoted by default; it falls back to
- * double quotes only when the string itself contains a literal `'`). `\1`
- * backreferences whichever quote character opened the span, so a URL
- * containing the OTHER quote character can't prematurely close the match. The
- * closing quote is an UNAMBIGUOUS boundary, so — unlike the conservative
- * fallback below — the query value here may safely contain parentheses or any
- * other punctuation without risking capture of surrounding prose: there is no
- * boundary ambiguity to guard against once a quote pair is found.
+ * double quotes only when the string itself contains a literal `'`). The body
+ * is a NEGATED BACKREFERENCE (`(?:(?!\1).)*`), not a `[^'"]*` character
+ * class: a naive class excludes BOTH quote characters, so a double-quoted
+ * span whose URL happens to contain a literal `'` (`repr()`'s own
+ * opposite-delimiter case) would stop at that embedded `'` instead of the
+ * real closing `"`, letting everything after it — including the query
+ * string — escape redaction. The negated backreference stops ONLY at the
+ * SAME character that opened the span (checked via a lookahead before each
+ * character is consumed), so the other quote character, parens, or anything
+ * else inside is inert; this closes the whole CLASS of "wrong delimiter"
+ * bypasses categorically, not just the one instance already found. No
+ * unbounded backtracking: the lookahead is a single-character comparison
+ * repeated linearly with the outer `*`, not nested/overlapping quantifiers.
+ *
+ * This function is defence-in-depth on DISPLAY, not the source of truth —
+ * if review ever surfaces a further bypass class here, the categorical fix
+ * is redacting the URL at the BACKEND, before it ever reaches an error
+ * detail (its own runtime slice), not another regex refinement client-side.
  */
-const QUOTED_URL = /(['"])(https?:\/\/[^'"]*)\1/gi;
+const QUOTED_URL = /(['"])(https?:\/\/(?:(?!\1).)*)\1/gi;
 
 /**
  * A BARE (unquoted) http(s) URL-shaped substring — the fallback for a message
