@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -374,5 +376,147 @@ describe("BeanProfileFields draft-review sr-only warning + contextual toggle nam
     });
     const toggle = screen.getByTestId(`${PREFIX}-is_blend-evidence-toggle`);
     expect(toggle.getAttribute("aria-label")).toEqual(expect.stringContaining("Blend"));
+  });
+});
+
+describe("BeanProfileFields is_blend tri-state (#637, #654 fold 2)", () => {
+  it("renders no unresolved cue for the common case (is_blend_unresolved absent)", () => {
+    renderFields(DEFAULT_BEAN_PROFILE_DRAFT);
+    expect(screen.queryByTestId(`${PREFIX}-is_blend-unresolved`)).toBeNull();
+  });
+
+  it("shows an unresolved cue + caution hint when is_blend_unresolved is true", () => {
+    renderFields({ ...DEFAULT_BEAN_PROFILE_DRAFT, is_blend_unresolved: true });
+    const badge = screen.getByTestId(`${PREFIX}-is_blend-unresolved`);
+    expect(badge).toHaveTextContent(/choose/i);
+    expect(screen.getByText(/didn't say/i)).toBeInTheDocument();
+  });
+
+  it("replaces the plain checkbox with an explicit Single origin / Blend choice while unresolved (#654 round 2 fold 2)", () => {
+    renderFields({ ...DEFAULT_BEAN_PROFILE_DRAFT, is_blend_unresolved: true });
+    // No plain checkbox — a checkbox's first interaction can only ever SET it,
+    // so confirming the safe default (single origin) would be undiscoverable.
+    expect(screen.queryByTestId(`${PREFIX}-is_blend`)).toBeNull();
+    expect(screen.getByTestId(`${PREFIX}-is_blend-choose-single-origin`)).toBeInTheDocument();
+    expect(screen.getByTestId(`${PREFIX}-is_blend-choose-blend`)).toBeInTheDocument();
+  });
+
+  it("choosing 'Single origin' resolves is_blend to false and the plain checkbox returns", () => {
+    const onBlendChange = vi.fn();
+    render(
+      <BeanProfileFields
+        draft={{ ...DEFAULT_BEAN_PROFILE_DRAFT, is_blend_unresolved: true }}
+        errors={{}}
+        onChange={vi.fn()}
+        onBlendChange={onBlendChange}
+        testIdPrefix={PREFIX}
+        showDefaultWeight
+      />,
+    );
+    fireEvent.click(screen.getByTestId(`${PREFIX}-is_blend-choose-single-origin`));
+    expect(onBlendChange).toHaveBeenCalledWith(false);
+  });
+
+  it("choosing 'Blend' resolves is_blend to true", () => {
+    const onBlendChange = vi.fn();
+    render(
+      <BeanProfileFields
+        draft={{ ...DEFAULT_BEAN_PROFILE_DRAFT, is_blend_unresolved: true }}
+        errors={{}}
+        onChange={vi.fn()}
+        onBlendChange={onBlendChange}
+        testIdPrefix={PREFIX}
+        showDefaultWeight
+      />,
+    );
+    fireEvent.click(screen.getByTestId(`${PREFIX}-is_blend-choose-blend`));
+    expect(onBlendChange).toHaveBeenCalledWith(true);
+  });
+
+  it("renders the plain checkbox (not the two-choice control) once resolved", () => {
+    renderFields({ ...DEFAULT_BEAN_PROFILE_DRAFT, is_blend: true });
+    expect(screen.getByTestId(`${PREFIX}-is_blend`)).toBeChecked();
+    expect(screen.queryByTestId(`${PREFIX}-is_blend-choose-single-origin`)).toBeNull();
+    expect(screen.queryByTestId(`${PREFIX}-is_blend-choose-blend`)).toBeNull();
+  });
+
+  it("renders the validation error (post-submit-attempt) in place of the hint, not alongside it", () => {
+    render(
+      <BeanProfileFields
+        draft={{ ...DEFAULT_BEAN_PROFILE_DRAFT, is_blend_unresolved: true }}
+        errors={{ is_blend: "The vendor page didn't say — choose before saving." }}
+        onChange={vi.fn()}
+        onBlendChange={vi.fn()}
+        testIdPrefix={PREFIX}
+        showDefaultWeight
+      />,
+    );
+    expect(screen.getByTestId(`${PREFIX}-is_blend-error`)).toHaveTextContent(/didn't say/i);
+    // The unresolved BADGE (next to the label) is independent of the error slot
+    // and still renders — only the hint/error TEXT slot below the checkbox
+    // switches from the caution hint to the fault-coloured error.
+    expect(screen.getByTestId(`${PREFIX}-is_blend-unresolved`)).toBeInTheDocument();
+  });
+});
+
+describe("BeanProfileFields is_blend resolution — a11y (#658 round 1)", () => {
+  /** A minimal STATEFUL parent mimicking a real consumer: owns draft + errors
+   *  and updates them on `onBlendChange`, so the unresolved→resolved
+   *  TRANSITION genuinely happens across renders — a fixed prop snapshot
+   *  (the pattern the rest of this file uses) can't exercise either fold,
+   *  since both are about what happens WHEN the field resolves, not a
+   *  single static state. Deliberately does NOT clear `errors.is_blend`
+   *  itself on resolve (unlike `BeanProfileModal`'s `onBlendChange`) — fold
+   *  1 is exactly the claim that the structural gate hides the error even
+   *  when the parent doesn't. */
+  function StatefulWrapper({
+    initialErrors = {},
+  }: {
+    initialErrors?: Record<string, string>;
+  }): React.JSX.Element {
+    const [draft, setDraft] = useState<BeanProfileDraft>({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      is_blend_unresolved: true,
+    });
+    const [errors] = useState(initialErrors);
+    return (
+      <BeanProfileFields
+        draft={draft}
+        errors={errors}
+        onChange={vi.fn()}
+        onBlendChange={(checked) =>
+          setDraft((d) => ({ ...d, is_blend: checked, is_blend_unresolved: undefined }))
+        }
+        testIdPrefix={PREFIX}
+        showDefaultWeight
+      />
+    );
+  }
+
+  it("hides the is_blend error the moment the field resolves, even when the parent never clears it (fold 1)", () => {
+    render(
+      <StatefulWrapper
+        initialErrors={{ is_blend: "The vendor page didn't say — choose before saving." }}
+      />,
+    );
+    expect(screen.getByTestId(`${PREFIX}-is_blend-error`)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId(`${PREFIX}-is_blend-choose-single-origin`));
+
+    // Gone from the DOM entirely (not merely re-styled) — the wrapper above
+    // never touched `errors`, so this is the structural gate at work, not a
+    // parent clearing it.
+    expect(screen.queryByTestId(`${PREFIX}-is_blend-error`)).toBeNull();
+    const checkbox = screen.getByTestId(`${PREFIX}-is_blend`);
+    expect(checkbox.getAttribute("aria-describedby") ?? "").not.toContain("is_blend-error");
+  });
+
+  it("moves focus to the restored checkbox once resolved (fold 2)", () => {
+    render(<StatefulWrapper />);
+    screen.getByTestId(`${PREFIX}-is_blend-choose-single-origin`).focus();
+
+    fireEvent.click(screen.getByTestId(`${PREFIX}-is_blend-choose-single-origin`));
+
+    expect(document.activeElement).toBe(screen.getByTestId(`${PREFIX}-is_blend`));
   });
 });
