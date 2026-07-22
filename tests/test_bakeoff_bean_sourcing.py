@@ -3748,6 +3748,86 @@ async def test_meter_rounding_parity_live_vs_resumed_at_the_boundary(
     assert resumed_meter.tripped == live_meter.tripped  # must AGREE, not coincidentally match
 
 
+def test_spend_meter_charge_rounds_cumulative_after_every_add() -> None:
+    """#601 fold round 14: ``charged`` is rounded to 5dp after EVERY charge,
+    not left as a raw float sum -- three additions of $0.00007 in raw binary
+    float sum to $0.00020999999999999998 (epsilon UNDER $0.00021), which
+    would disagree with a ledger-reconstructed meter (whose ``total_usd()``
+    rounds once, at the end, reaching exactly $0.00021) at that exact
+    boundary."""
+    live = bo.SpendMeter(max_spend=0.00021)
+    for _ in range(3):
+        live.charge(0.00007)
+    assert live.charged == 0.00021  # not 0.00020999999999999998
+    assert live.tripped is True
+
+    # A meter reconstructed from a ledger that summed the SAME 3 rounded
+    # entries once, at the end (mirroring ChargeLedger.total_usd()), agrees.
+    resumed_charged = round(sum([0.00007, 0.00007, 0.00007]), 5)
+    resumed = bo.SpendMeter(max_spend=0.00021, charged=resumed_charged)
+    assert resumed.charged == live.charged
+    assert resumed.tripped == live.tripped
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_estimate_guard_forecasts_off_carried_meter_spend(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#601 fold round 14, F4: the pre-arm ESTIMATE guard's forecast base is
+    the METER's real cumulative charge (includes RESUMED-ledger spend), not
+    a per-invocation-zero accumulator. Resuming with $0.09 already charged, a
+    $0.10 limit, and the next arm's own ~$0.09 estimate must refuse BEFORE
+    any call (0.09 + 0.09 = 0.18 > 0.10) -- even though the estimate ALONE
+    (0.09 <= 0.10) would have let the OLD per-invocation-zero accumulator
+    through."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x"), bo.RosterModel("m2", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1", "m2"], "default")
+    fingerprint = bo.compute_fingerprint(corpus)
+
+    seed_pages = [
+        bo.PageResult(slug=p.slug, outcomes={}, error=None, on_page_fields=0) for p in corpus
+    ]
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
+    checkpoint.append(bo.run_to_json(bo.ModelRun(model_slug="m1", pages=seed_pages)))
+
+    # Every checkpointed page needs >=1 ledger entry (page-level coverage,
+    # #601 fold round 5, D FOLD 3) -- charge it all on the first page so the
+    # total stays exactly $0.09 while every OTHER page is still covered.
+    ledger = bo.ChargeLedger(bo.ledger_path(out), fingerprint=fingerprint)
+    for i, page in enumerate(corpus):
+        ledger.append(
+            bo.LedgerEntry(
+                arm="m1",
+                slug=page.slug,
+                request_tokens=900_000 if i == 0 else 0,
+                response_tokens=0,
+                priced_usd=0.09 if i == 0 else 0.0,
+                timed_out=False,
+                reserve_applied=False,
+            )
+        )
+
+    cost_estimates = [
+        bo.ModelCostEstimate(slug="m1", input_tokens=0, output_tokens=0, usd=0.0),
+        bo.ModelCostEstimate(slug="m2", input_tokens=900_000, output_tokens=0, usd=0.09),
+    ]
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=0.10,
+        cost_estimates=cost_estimates,
+        roster=roster,
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert result.stopped_early is True
+    assert result.executed_slugs == []  # refused BEFORE any call
+    assert result.unevaluated_slugs == ["m2"]
+    assert result.breaker_tripped is False  # the ESTIMATE guard, not the real-spend breaker
+
+
 @pytest.mark.asyncio
 async def test_run_bakeoff_mid_arm_breaker_trip_is_not_checkpointed(
     corpus: list[bo.CorpusPage], tmp_path: Path

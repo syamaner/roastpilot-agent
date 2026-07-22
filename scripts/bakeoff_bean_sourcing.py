@@ -3352,10 +3352,14 @@ class SpendMeter:
     def charge(self, usd: float) -> None:
         """Add one page's real, priced cost to the cumulative total.
 
+        Rounds after every charge (#601 fold round 14) -- unrounded binary
+        float accumulation can drift epsilon-under a limit the (once-rounded)
+        ledger-reconstructed sum would reach, disagreeing at the boundary.
+
         Args:
             usd: The page's usage-priced (list-price) cost to add.
         """
-        self.charged += usd
+        self.charged = round(self.charged + usd, 5)
 
 
 # --- .env key loading (the 401-shadowing ops gotcha) -------------------------
@@ -3629,7 +3633,6 @@ async def run_bakeoff(
     failed_runs: list[FailedRun] = []
     executed_slugs: list[str] = []
     has_fresh_success = False
-    spent = 0.0
     for index, arm in enumerate(arms):
         slug = arm.label
         if checkpoint.has(slug):
@@ -3660,10 +3663,15 @@ async def run_bakeoff(
                 reserved_costs=_ledger_reserved_costs(ledger),
             )
         upcoming = cost_by_slug.get(slug, 0.0)
-        if spent + upcoming > max_spend:
+        # #601 fold round 14: forecast off the METER's real cumulative
+        # charge (includes RESUMED-ledger spend), not a per-invocation-zero
+        # estimate accumulator -- a resumed run's prior real spend + this
+        # arm's own estimate can blow the budget even if the OLD
+        # per-invocation accumulator alone never would.
+        if meter.charged + upcoming > max_spend:
             print(
                 f"[budget] stopping before {slug}: est. ${upcoming:.4f} would exceed "
-                f"--max-spend ${max_spend:.2f} (spent est. ${spent:.4f})",
+                f"--max-spend ${max_spend:.2f} (already ${meter.charged:.4f} charged)",
                 flush=True,
             )
             return BakeoffResult(
@@ -3686,7 +3694,6 @@ async def run_bakeoff(
             ledger=ledger,
             meter=meter,
         )
-        spent += upcoming
         executed_slugs.append(slug)  # a real call was attempted, win or lose
         if len(run.pages) < len(pages):
             # The meter tripped MID-ARM -- an incomplete run is NEVER checkpointed (it
@@ -3780,9 +3787,9 @@ def _finite_nonnegative_spend(raw: str) -> float:
     """``argparse`` ``type=`` for ``--max-spend``: a finite, non-negative USD figure.
 
     Plain ``type=float`` parses ``"inf"``/``"nan"``, and every
-    ``spent + upcoming > max_spend`` guard in :func:`run_bakeoff` is FALSE
-    against either -- silently bypassing the spend guard (#602). A negative
-    limit is equally meaningless.
+    ``meter.charged + upcoming > max_spend`` guard in :func:`run_bakeoff` is
+    FALSE against either -- silently bypassing the spend guard (#602). A
+    negative limit is equally meaningless.
 
     Args:
         raw: The raw CLI argument string.
