@@ -3024,6 +3024,39 @@ def test_render_report_labels_still_retryable_pages(corpus: list[bo.CorpusPage])
     assert "`model-a` (1 page(s), attempt 1 of 2)" in report
 
 
+def test_render_report_attempt_range_across_different_retry_counts(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """#652 round-6, finding 6: retryable pages sitting at DIFFERENT retry
+    counts render a RANGE across their own attempt numbers, not max()+1
+    rounding every page up to the highest one's -- pin the exact string so
+    a min/max swap (or a regression back to max()+1) fails."""
+    fields = {spec.name: bo.Outcome.COR for spec in bo.FIELD_SPECS}
+    run = bo.ModelRun(
+        model_slug="model-a",
+        pages=[
+            bo.PageResult(
+                slug="p1",
+                outcomes=dict(fields),
+                error="boom",
+                on_page_fields=0,
+                retryable=True,
+                retry_count=0,
+            ),
+            bo.PageResult(
+                slug="p2",
+                outcomes=dict(fields),
+                error="boom",
+                on_page_fields=0,
+                retryable=True,
+                retry_count=1,
+            ),
+        ],
+    )
+    report = bo.render_report([run], bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    assert "`model-a` (2 page(s), attempts 1-2 of 2)" in report
+
+
 def test_render_report_no_retryable_banner_when_nothing_retryable(
     corpus: list[bo.CorpusPage],
 ) -> None:
@@ -3080,6 +3113,32 @@ def test_render_report_labels_actual_spend_vs_resumed(corpus: list[bo.CorpusPage
     assert "$0.0100" in report  # only model-a's cost counted as incurred
     assert "spend incurred (est.)" in report
     assert "resumed (no new spend)" in report
+
+
+def test_render_report_sums_multiple_arms_retry_prorations(corpus: list[bo.CorpusPage]) -> None:
+    """#652 round-6, finding 4: multiple retried arms in ONE invocation each
+    keep their own proration -- the incurred-spend line SUMS every arm's own
+    attempted-page estimate (never the full-arm estimates), and each arm's
+    own prorated note renders, instead of the last one silently overwriting
+    the rest (the last-writer-wins bug the per-arm dict replaced)."""
+    runs = [_full_run("model-a", bo.Outcome.COR), _full_run("model-b", bo.Outcome.COR)]
+    cost_estimates = [
+        bo.ModelCostEstimate(slug="model-a", input_tokens=100, output_tokens=50, usd=1.0),
+        bo.ModelCostEstimate(slug="model-b", input_tokens=100, output_tokens=50, usd=2.0),
+    ]
+    retry_prorations = {
+        "model-a": bo.RetryProration(attempted_pages=1, total_pages=9, attempted_estimate=0.01),
+        "model-b": bo.RetryProration(attempted_pages=2, total_pages=9, attempted_estimate=0.02),
+    }
+    report = bo.render_report(
+        runs,
+        cost_estimates,
+        executed_slugs=["model-a", "model-b"],
+        retry_prorations=retry_prorations,
+    )
+    assert "$0.0300" in report  # 0.01 + 0.02 summed, never the full $1.0000 + $2.0000
+    assert "`model-a`'s estimate is PRORATED" in report
+    assert "`model-b`'s estimate is PRORATED" in report
 
 
 def test_render_report_no_executed_slugs_is_pure_estimate(corpus: list[bo.CorpusPage]) -> None:
