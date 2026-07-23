@@ -2991,15 +2991,14 @@ def test_render_report_partial_run_deferred_only_no_never_run_line(
 def test_render_report_marks_failed_models_excluded(corpus: list[bo.CorpusPage]) -> None:
     """A wholly-failed model must appear ONLY in the exclusion banner, never
     in the leaderboard/per-page/pairwise sections below it (#600 round-2
-    finding) -- and the banner shows its DISPLAY-ONLY heuristic label,
-    never checkpointed regardless of it (#602 fold round 5)."""
+    finding) -- and the banner shows its DISPLAY-ONLY heuristic label."""
     runs = [_full_run("model-a", bo.Outcome.COR)]
     report = bo.render_report(
         runs,
         bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
         failed_slugs=[bo.FailedRun(model_slug="model-failed", heuristic_label="MODEL-SPECIFIC")],
     )
-    assert "EXCLUDED -- failed this invocation" in report
+    assert "**EXCLUDED.**" in report
     assert "`model-failed` (MODEL-SPECIFIC, schema 0/other 0)" in report
     assert "- models scored: 1" in report  # the failed model is NOT counted
 
@@ -3025,12 +3024,59 @@ def test_render_report_labels_still_retryable_pages(corpus: list[bo.CorpusPage])
     assert "`model-a` (1 page(s), attempt 1 of 2)" in report
 
 
+def test_render_report_attempt_range_across_different_retry_counts(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """#652 round-6, finding 6: retryable pages sitting at DIFFERENT retry
+    counts render a RANGE across their own attempt numbers, not max()+1
+    rounding every page up to the highest one's -- pin the exact string so
+    a min/max swap (or a regression back to max()+1) fails."""
+    fields = {spec.name: bo.Outcome.COR for spec in bo.FIELD_SPECS}
+    run = bo.ModelRun(
+        model_slug="model-a",
+        pages=[
+            bo.PageResult(
+                slug="p1",
+                outcomes=dict(fields),
+                error="boom",
+                on_page_fields=0,
+                retryable=True,
+                retry_count=0,
+            ),
+            bo.PageResult(
+                slug="p2",
+                outcomes=dict(fields),
+                error="boom",
+                on_page_fields=0,
+                retryable=True,
+                retry_count=1,
+            ),
+        ],
+    )
+    report = bo.render_report([run], bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    assert "`model-a` (2 page(s), attempts 1-2 of 2)" in report
+
+
 def test_render_report_no_retryable_banner_when_nothing_retryable(
     corpus: list[bo.CorpusPage],
 ) -> None:
     runs = [_full_run("model-a", bo.Outcome.COR)]
     report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
     assert "eligible for residual retry" not in report
+
+
+def test_render_report_resumed_exclusion_renders_prior_invocation_wording() -> None:
+    """#659 P3: a ``resumed`` :class:`bo.FailedRun` (loaded, no call made this
+    invocation) renders distinct wording from a fresh (this-invocation) one --
+    the report must never claim a loaded-only entry failed THIS invocation."""
+    fresh = bo.FailedRun(model_slug="fresh", heuristic_label="INFRA-WIDE", other_errors=1)
+    stale = bo.FailedRun(
+        model_slug="stale", heuristic_label="INFRA-WIDE", other_errors=1, resumed=True
+    )
+    report = bo.render_report([], [], failed_slugs=[fresh, stale])
+    assert "prior invocation" in report
+    fresh_clause = report[report.index("`fresh`") : report.index("`fresh`") + 60]
+    assert "prior invocation" not in fresh_clause  # the fresh entry is unmarked
 
 
 def test_render_report_pairwise_covers_all_pairs_not_just_first(
@@ -3067,6 +3113,32 @@ def test_render_report_labels_actual_spend_vs_resumed(corpus: list[bo.CorpusPage
     assert "$0.0100" in report  # only model-a's cost counted as incurred
     assert "spend incurred (est.)" in report
     assert "resumed (no new spend)" in report
+
+
+def test_render_report_sums_multiple_arms_retry_prorations(corpus: list[bo.CorpusPage]) -> None:
+    """#652 round-6, finding 4: multiple retried arms in ONE invocation each
+    keep their own proration -- the incurred-spend line SUMS every arm's own
+    attempted-page estimate (never the full-arm estimates), and each arm's
+    own prorated note renders, instead of the last one silently overwriting
+    the rest (the last-writer-wins bug the per-arm dict replaced)."""
+    runs = [_full_run("model-a", bo.Outcome.COR), _full_run("model-b", bo.Outcome.COR)]
+    cost_estimates = [
+        bo.ModelCostEstimate(slug="model-a", input_tokens=100, output_tokens=50, usd=1.0),
+        bo.ModelCostEstimate(slug="model-b", input_tokens=100, output_tokens=50, usd=2.0),
+    ]
+    retry_prorations = {
+        "model-a": bo.RetryProration(attempted_pages=1, total_pages=9, attempted_estimate=0.01),
+        "model-b": bo.RetryProration(attempted_pages=2, total_pages=9, attempted_estimate=0.02),
+    }
+    report = bo.render_report(
+        runs,
+        cost_estimates,
+        executed_slugs=["model-a", "model-b"],
+        retry_prorations=retry_prorations,
+    )
+    assert "$0.0300" in report  # 0.01 + 0.02 summed, never the full $1.0000 + $2.0000
+    assert "`model-a`'s estimate is PRORATED" in report
+    assert "`model-b`'s estimate is PRORATED" in report
 
 
 def test_render_report_no_executed_slugs_is_pure_estimate(corpus: list[bo.CorpusPage]) -> None:
@@ -4285,6 +4357,13 @@ async def test_run_bakeoff_prorates_residual_retry_incurred_estimate(
     assert proration.attempted_estimate == pytest.approx(expected_page_estimate)
     full_arm_estimate = next(e.usd for e in cost_estimates if e.slug == "m1")
     assert proration.attempted_estimate < full_arm_estimate / 3  # a small share, not the whole
+    report = bo.render_report(
+        result.runs,
+        cost_estimates,
+        executed_slugs=result.executed_slugs,
+        retry_prorations=result.retry_prorations,
+    )
+    assert f"${proration.attempted_estimate:.4f}" in report
 
 
 @pytest.mark.asyncio
@@ -6161,9 +6240,12 @@ async def test_run_bakeoff_wholly_failed_retry_deferred_when_meter_already_tripp
     assert result.runs == []  # nothing to load -- it was never scored
     assert result.deferred_retry_slugs == ["m1"]
     assert result.breaker_tripped is True
-    # #659 P2: the arm is EXCLUDED-visible (a FailedRun entry), not vanished.
+    # #659 P2: the arm is EXCLUDED-visible, not vanished from the report.
     assert [f.model_slug for f in result.failed_slugs] == ["m1"]
     assert result.failed_slugs[0].resumed is True
+    report = bo.render_report(result.runs, cost_estimates, failed_slugs=result.failed_slugs)
+    assert "`m1`" in report
+    assert "prior invocation" in report
 
 
 def test_run_wholly_failed_detects_all_errored_pages() -> None:
@@ -6297,7 +6379,7 @@ async def test_main_full_run_writes_artifact_and_partial_report(
     assert artifact["executed_slugs"] == [bo.MODEL_ROSTER[0].slug, "some/failed-slug"]
     report_text = report_md.read_text()
     assert "PARTIAL RUN" in report_text
-    assert "EXCLUDED -- failed this invocation" in report_text
+    assert "**EXCLUDED.**" in report_text
     assert "some/failed-slug" in report_text
     assert "ESTIMATED SPEND INCURRED" in report_text
 
