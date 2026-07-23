@@ -2739,7 +2739,8 @@ def render_report(
             f"{len(failed_slugs)} model(s): {failed_desc}. Heuristic label is DISPLAY-ONLY, "
             "never authoritative -- excluded from every statistic below. The full run IS "
             f"checkpointed (an attempt-counter flag), retried up to {_MAX_RESIDUAL_RETRIES} "
-            "times per page; still erroring after that finalises, never re-billed further."
+            "times per page; still erroring after that finalises, not re-billed on resumes "
+            "of this checkpoint lineage (a --no-resume or fresh --out rerun pays again)."
         )
         lines.append("")
     retryable_by_slug = {
