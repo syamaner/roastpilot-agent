@@ -743,13 +743,13 @@ async def _teardown_live(
        fail-closed; a no-op when no live run is active);
     2. ``service.shutdown`` — cancel the tick loop;
     3. ``mcp.stop`` — end the MCP child (after heat-off has landed);
-    4. ``record_child_stop_unconfirmed`` — if ``mcp.stop`` had to force-kill the
-       child (``mcp.stop_unconfirmed``), persist a trace marker (#177) while the
-       store is still open;
+    4. ``record_child_stop_unconfirmed`` — if ``mcp.stop`` could not confirm
+       clean teardown (``mcp.stop_unconfirmed``), persist a trace marker (#177)
+       while the store is still open;
     5. ``store.close`` — close the decision-trace store.
 
     Step 4 sits between ``mcp.stop`` and ``store.close`` deliberately: the
-    force-kill verdict is only known after step 3, and the marker must be
+    clean-teardown verdict is only known after step 3, and the marker must be
     written before the store closes in step 5.
 
     (A hard kill / SIGKILL / power loss is uncatchable and skips this entirely —
@@ -787,7 +787,7 @@ async def _cleanup_step(name: str, action: Callable[[], Awaitable[object]]) -> N
     try:
         await action()
     except Exception:  # noqa: BLE001 — best-effort cleanup, logged not raised
-        _log.warning("live-serve teardown step %r failed", name, exc_info=True)
+        _log.warning("serve teardown step %r failed", name, exc_info=True)
 
 
 async def _serve_replay(args: argparse.Namespace) -> int:
@@ -830,33 +830,51 @@ async def _serve_replay(args: argparse.Namespace) -> int:
             speed=args.speed,
             spa_dir=_resolve_spa_dir(args),
         )
-        # Report the *clamped* speed the harness actually runs at (1×–60×), not
-        # the raw request — `--speed 100` runs 60×, so the banner must say 60×.
-        effective_speed = clamp_speed(args.speed)
-        mode = (
-            "stepped (paused at tick 0)" if args.step else f"free-running at {effective_speed:g}x"
-        )
-        print(
-            f"replaying {export_dir.name} ({source.frame_count} frames, {mode}); "
-            f"run {source.run_id} on http://{args.host}:{args.port}"
-        )
-        if not args.step:
-            # Free-running replay finishes driving the recorded frames then keeps
-            # serving the terminal state — intentional for the screen-recording
-            # rig, but non-obvious (the process "hangs" rather than exits). Say so.
-            print("  (serves the final frame after the roast ends; Ctrl-C to stop)")
-        config = uvicorn.Config(
-            app,
-            host=args.host,
-            port=args.port,
-            log_level=log_level,
-            access_log=access_log,
-        )
-        server = uvicorn.Server(config)
-        runner = asyncio.create_task(server.serve())
-        if not args.step:
-            await source.run()  # drive the recorded roast at the chosen speed
-        await runner
+        runner: asyncio.Task[None] | None = None
+        completed = False
+        try:
+            # Report the *clamped* speed the harness actually runs at (1×–60×), not
+            # the raw request — `--speed 100` runs 60×, so the banner must say 60×.
+            effective_speed = clamp_speed(args.speed)
+            mode = (
+                "stepped (paused at tick 0)"
+                if args.step
+                else f"free-running at {effective_speed:g}x"
+            )
+            print(
+                f"replaying {export_dir.name} ({source.frame_count} frames, {mode}); "
+                f"run {source.run_id} on http://{args.host}:{args.port}"
+            )
+            if not args.step:
+                # Free-running replay finishes driving the recorded frames then keeps
+                # serving the terminal state — intentional for the screen-recording
+                # rig, but non-obvious (the process "hangs" rather than exits). Say so.
+                print("  (serves the final frame after the roast ends; Ctrl-C to stop)")
+            config = uvicorn.Config(
+                app,
+                host=args.host,
+                port=args.port,
+                log_level=log_level,
+                access_log=access_log,
+            )
+            server = uvicorn.Server(config)
+            runner = asyncio.create_task(server.serve())
+            if not args.step:
+                await source.run()  # drive the recorded roast at the chosen speed
+            await runner
+            completed = True
+        finally:
+            # Uvicorn's lifespan normally closes these resources. Retain CLI
+            # ownership as a backstop if serve returns before lifespan startup.
+            try:
+                if runner is not None and not runner.done():
+                    runner.cancel()
+                    await asyncio.gather(runner, return_exceptions=True)
+            finally:
+                if completed:
+                    await source.aclose()
+                else:
+                    await _cleanup_step("replay source close", source.aclose)
     return 0
 
 

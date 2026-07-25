@@ -763,8 +763,9 @@ class RoastRunner:
           was the real stop.
         - ``command="mcp_stop"`` — :meth:`RoastService.record_child_stop_unconfirmed`
           when ``MCPServerProcess.stop_unconfirmed`` is True after teardown: the
-          child stop overran its bound and was force-killed, so the clean-stop
-          handshake never confirmed.
+          owner exited unexpectedly or teardown did not confirm cleanly.
+          Force-termination is best-effort, so the marker records uncertainty,
+          not a claim that a kill signal succeeded.
 
         Written **directly to the store** (not via the emitter buffer): the
         heat-off coroutine that owns the buffer may have just been cancelled by
@@ -1457,12 +1458,10 @@ class RoastService:
         the agent owns the full lifecycle and knows the state is idle.
 
         Fail-closed: if stop or re-start raises, the exception propagates out
-        of :meth:`start_roast`, surfacing as a 500 to the operator.  The
-        baseline is invalidated (``None``) before the stop/start sequence so
-        that a failed respawn does NOT leave a stale match: on the next
-        ``start_roast`` the reverted config is compared against ``None`` →
-        drift is re-detected → respawn is re-attempted automatically.  Only a
-        successful start records the new baseline.
+        of :meth:`start_roast`. The baseline is invalidated before the sequence
+        so a failed restart is retried on the next request. An unconfirmed stop
+        instead requires hardware verification and an agent restart (#668).
+        Only a successful start records the new baseline.
 
         Args:
             new_device_config: The new device config to render into the MCP yaml
@@ -1474,25 +1473,22 @@ class RoastService:
             "mcp_device config changed since last spawn — respawning MCP child"
             " with new device config"
         )
-        # Invalidate the baseline BEFORE touching the child so any failure
-        # (stop or start) leaves _spawned_mcp_device=None.  On the next
-        # start_roast the None baseline forces a re-detect and re-attempt,
-        # avoiding the "reverted config matches stale baseline → child
-        # silently dead" trap.
+        # Invalidate before touching the child so a confirmed-stop restart
+        # failure is retried rather than hidden by a stale baseline.
         self._spawned_mcp_device = None
         # stop() bypasses record_child_stop_unconfirmed intentionally: there
         # is no active run to key a marker to, and start() resets the flag.
         await self._mcp.stop()
-        # If stop() timed out and force-killed the child, the old process may
-        # still be holding the serial port or audio device.  Starting a new
-        # child into that state risks a resource conflict or a hidden live
-        # process.  Abort the respawn; the None baseline ensures the next
-        # start_roast re-attempts cleanly once the operator has confirmed the
-        # hardware is clear.
+        # If stop() could not confirm clean teardown, the old process may still
+        # be holding the serial port or audio device. Starting a new child into
+        # that state risks a resource conflict or a hidden live process. Abort
+        # the respawn. After the operator verifies the hardware is inactive, a
+        # controlled agent restart clears process-local teardown uncertainty.
         if self._mcp.stop_unconfirmed:
             raise MCPConnectionError(
-                "old MCP child stop was unconfirmed (force-killed); "
-                "aborting respawn — retry start_roast once hardware is clear"
+                "old MCP child teardown was unconfirmed; "
+                "aborting respawn - verify the roaster and old MCP child resources are inactive, "
+                "restart the agent, then retry"
             )
         self._mcp.set_device_config(new_device_config)
         await self._mcp.start()
@@ -1615,9 +1611,8 @@ class RoastService:
                 #      is only reachable if the caller skips that step — which
                 #      production never does.  A None baseline with a live _mcp
                 #      is treated conservatively as "respawn needed".
-                #   2. After a failed respawn: _respawn_mcp_for_device_config
-                #      invalidates the baseline so a stuck child is re-attempted
-                #      next start rather than silently skipped.
+                #   2. After a failed respawn: the None baseline re-detects drift.
+                #      Unconfirmed teardown remains restart-only (#668).
                 # Between-roasts guarantee: the active_run() check above (under
                 # _start_lock) confirms no roast is active before this block.
                 if self._mcp is not None and (
@@ -1964,13 +1959,13 @@ class RoastService:
         """Persist a marker if the MCP child stop went unconfirmed (#177).
 
         Called by the live-serve teardown **after** ``mcp.stop`` (so the
-        force-kill verdict is known) and **before** ``store.close`` (so the
+        clean-teardown verdict is known) and **before** ``store.close`` (so the
         store is still open to write to). When
-        ``MCPServerProcess.stop_unconfirmed`` is True the child overran its
-        stop bound and was force-killed, so the clean-stop handshake never
-        confirmed — this records that in the decision trace for post-roast
-        diagnosis. A no-op when the stop confirmed cleanly or there is no live
-        runner to key the marker to (API-only / never started).
+        ``MCPServerProcess.stop_unconfirmed`` is True, the owner exited
+        unexpectedly or teardown did not confirm cleanly. This records that
+        uncertainty in the decision trace for post-roast diagnosis. A no-op
+        when teardown confirmed cleanly or there is no live runner to key the
+        marker to (API-only / never started).
 
         Observability only — never an auto-resume trigger (a restart still
         enters ``operator_recovery_required``). Fail-closed: delegates to the
@@ -1978,7 +1973,7 @@ class RoastService:
 
         Args:
             stop_unconfirmed: ``MCPServerProcess.stop_unconfirmed`` after
-                ``mcp.stop`` — whether the child stop had to force-terminate.
+                ``mcp.stop`` — whether clean child teardown was unconfirmed.
         """
         if not stop_unconfirmed:
             return
@@ -1986,7 +1981,7 @@ class RoastService:
         if runner is None:
             return
         _log.error(
-            "MCP child stop went UNCONFIRMED (force-killed) — recording a trace marker; "
+            "MCP child teardown went UNCONFIRMED — recording a trace marker; "
             "a restart will enter operator_recovery_required"
         )
         await runner.record_shutdown_unconfirmed(
