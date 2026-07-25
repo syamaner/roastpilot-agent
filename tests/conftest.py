@@ -339,3 +339,18 @@ def event_sink() -> EventSink:
 def tmp_store(tmp_path: Path) -> RoastStore:
     """A RoastStore backed by a temporary SQLite path (initialization: E6)."""
     return RoastStore(db_path=tmp_path / "roastpilot-test.sqlite3")
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Shut down bounded parse workers before pytest enters interpreter exit."""
+    del session, exitstatus
+    from roastpilot_agent import bean_sourcing
+
+    with bean_sourcing._parse_executor_lock:  # pyright: ignore[reportPrivateUsage]
+        executor = bean_sourcing._parse_executor  # pyright: ignore[reportPrivateUsage]
+        bean_sourcing._parse_executor = None  # pyright: ignore[reportPrivateUsage]
+    if executor is not None:
+        # Test parse fakes cap their own waits at five seconds. This explicit
+        # join is test cleanup, not a production claim that Python can kill a
+        # genuinely stuck parser thread.
+        executor.shutdown(wait=True, cancel_futures=True)

@@ -1425,6 +1425,11 @@ class MCPServerProcess:
         Resets :attr:`stop_unconfirmed` to ``False`` first: the flag describes
         the most recent teardown, so a reused process (start → stop → start)
         must not carry a prior run's unconfirmed verdict into the new run.
+        A prior owner retained after a bounded teardown attempt must finish
+        before another child can start; otherwise the old owner's finalizer
+        could clear the replacement session. If an owner instead finishes
+        uncleanly without an earlier fail-closed stop, start marks teardown
+        unconfirmed and refuses the replacement.
 
         Re-arms the force-terminate hook for each spawn: on the first start the
         auto-registered hook captures the spawned pid via
@@ -1436,6 +1441,28 @@ class MCPServerProcess:
         """
         if self._session is not None:
             return
+        previous_owner = self._owner_task
+        if previous_owner is not None:
+            if not previous_owner.done():
+                raise MCPConnectionError(
+                    "previous MCP owner is still tearing down; refusing to start a second child"
+                )
+            previous_owner_error = (
+                asyncio.CancelledError()
+                if previous_owner.cancelled()
+                else previous_owner.exception()
+            )
+            with contextlib.suppress(BaseException):
+                previous_owner.result()
+            self._owner_task = None
+            self._stop_requested = None
+            if previous_owner_error is not None and not self._stop_unconfirmed:
+                self._fail_closed_teardown(
+                    "previous MCP owner exited uncleanly before a replacement start"
+                )
+                raise MCPConnectionError(
+                    "previous MCP owner exited uncleanly; refusing to start a second child"
+                )
         self._stop_unconfirmed = False
         # Re-arm: clear the auto-registered hook before each spawn so
         # _register_force_terminate captures the new pid, not the previous one.
@@ -1582,55 +1609,81 @@ class MCPServerProcess:
         owner = self._owner_task
         if owner is None:
             return
+        stop_deadline = asyncio.get_running_loop().time() + self._config.stop_timeout_seconds
         stop_requested = self._stop_requested
         try:
             # Ask the owner to exit its context stack (in its own task) and wait
-            # for it, bounded.  asyncio.wait_for is safe here — it re-parents the
-            # *await of the owner task*, not the aclose(); aclose() itself always
-            # runs inside the owner task where the scope was entered.
+            # for it, bounded. ``asyncio.wait`` observes completion without
+            # propagating the owner's stored CancelledError into this task, so an
+            # owner cancelled during an earlier bounded reap cannot masquerade as
+            # cancellation of this stop() caller.
             if stop_requested is not None:
                 stop_requested.set()
-            await asyncio.wait_for(asyncio.shield(owner), timeout=self._config.stop_timeout_seconds)
-        except TimeoutError:
-            # The owner overran the bound (a wedged native child / open pipe).
-            self._fail_closed_teardown(
-                "MCP child did not confirm clean stop within "
-                f"{self._config.stop_timeout_seconds:.1f}s"
-            )
-            # Cancel the wedged owner so its task does not leak; force-terminate
-            # has already killed the child, so the aclose it was blocked on will
-            # now unwind (or the cancel unblocks it).  Bounded reap of the
-            # now-cancelled task; a hook that somehow failed to kill the child
-            # must still never block exit, so any outcome is swallowed.
-            owner.cancel()
-            with contextlib.suppress(TimeoutError, asyncio.CancelledError, Exception):
-                await asyncio.wait_for(owner, timeout=self._config.stop_timeout_seconds)
+            done, _pending = await asyncio.wait({owner}, timeout=self._config.stop_timeout_seconds)
+            if owner in done:
+                # A retained owner may finish after an earlier fail-closed kill.
+                # Drain that outcome without invoking the same PID hook again:
+                # the original PID may have been recycled by this later retry.
+                if self._owner_task is owner and owner.cancelled():
+                    if not self._stop_unconfirmed:
+                        self._fail_closed_teardown("MCP owner was cancelled during teardown")
+                elif self._owner_task is owner:
+                    owner_error = owner.exception()
+                    if owner_error is not None and not self._stop_unconfirmed:
+                        self._fail_closed_teardown(
+                            f"MCP child stop raised during teardown: {owner_error}"
+                        )
+            else:
+                # The owner overran the bound (a wedged native child / open pipe).
+                if self._owner_task is owner and not self._stop_unconfirmed:
+                    self._fail_closed_teardown(
+                        "MCP child did not confirm clean stop within "
+                        f"{self._config.stop_timeout_seconds:.1f}s"
+                    )
+                    # Cancel once: a retry must not inject a second cancellation
+                    # into an owner that is already unwinding the first one.
+                    owner.cancel()
+                # Force-terminate has killed the child, so the aclose it was
+                # blocked on should unwind. Bounded reap within the original
+                # deadline; a failed kill must still never block exit.
+                remaining = max(0.0, stop_deadline - asyncio.get_running_loop().time())
+                done, _pending = await asyncio.wait({owner}, timeout=remaining)
+                if owner in done:
+                    with contextlib.suppress(BaseException):
+                        owner.result()
         except asyncio.CancelledError:
             # stop()'s OWN task was cancelled mid-wait (Codex #492-3). A
             # cancellation is a BaseException, so it would bypass the handlers
             # below and the finally would wipe our state with the child possibly
             # still alive and NO fail-closed marking — a stop we could not confirm
-            # silently recorded as clean. Mark unconfirmed + force-kill first, then
-            # RE-RAISE: a cancellation must always propagate, never be swallowed.
-            self._fail_closed_teardown("MCP child stop was cancelled mid-teardown")
+            # silently recorded as clean. Mark unconfirmed + force-kill first,
+            # then cancel and bounded-reap the owner. If it resists cancellation,
+            # the finally block retains it so start() cannot create a competing
+            # owner. RE-RAISE afterwards: cancellation must always propagate,
+            # never be swallowed.
+            if self._owner_task is owner and not self._stop_unconfirmed:
+                self._fail_closed_teardown("MCP child stop was cancelled mid-teardown")
+                owner.cancel()
+            remaining = max(0.0, stop_deadline - asyncio.get_running_loop().time())
+            with contextlib.suppress(BaseException):
+                done, _pending = await asyncio.wait({owner}, timeout=remaining)
+                if owner in done:
+                    owner.result()
             raise
-        except Exception as exc:
-            # The owner's aclose RAISED (a broken-pipe teardown after a child
-            # segfault, roast 2 — a NORMAL event on this rig, not an unreachable
-            # one). We could not confirm a clean stop, so fail closed exactly like
-            # the timeout path: force-kill the (pre-respawn, non-recycled) pid and
-            # mark the stop unconfirmed. The owner task has already completed
-            # (its exception is what we caught here), so there is nothing to reap.
-            self._fail_closed_teardown(f"MCP child stop raised during teardown: {exc}")
         finally:
-            self._owner_task = None
-            self._stop_requested = None
-            self._session = None
-            # Clean up the rendered yaml temp dir (D78-4, #420); best-effort —
-            # a leftover temp dir is harmless, never blocks shutdown.
-            if self._rendered_yaml_dir is not None:
-                shutil.rmtree(self._rendered_yaml_dir, ignore_errors=True)
-                self._rendered_yaml_dir = None
+            # A replacement can start after this owner finishes but before this
+            # stop task resumes. Only the stop that still owns the current
+            # generation may clear its session or rendered config.
+            if self._owner_task is owner:
+                if owner.done():
+                    self._owner_task = None
+                    self._stop_requested = None
+                self._session = None
+                # Clean up the rendered yaml temp dir (D78-4, #420); best-effort —
+                # a leftover temp dir is harmless, never blocks shutdown.
+                if self._rendered_yaml_dir is not None:
+                    shutil.rmtree(self._rendered_yaml_dir, ignore_errors=True)
+                    self._rendered_yaml_dir = None
 
     def _fail_closed_teardown(self, reason: str) -> None:
         """Mark an unconfirmed stop and force-kill the child group (#484 MEDIUM).
