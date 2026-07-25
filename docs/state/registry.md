@@ -104,16 +104,19 @@
 
 ## Active Context
 
-**25 Jul 2026 — #665 MCP/pytest shutdown hardening in progress (D104).** Three CI runs reached
+**25 Jul 2026 — #665 MCP/pytest shutdown hardening completed (D104).** Three CI runs reached
 the complete pytest summary and then failed to exit, exposing lifecycle ownership bugs rather than
 test failures. The fix keeps a cancellation-resistant MCP owner referenced until it finishes,
 refuses to spawn a replacement owner meanwhile, requires ``stop`` to finalize a completed retained
 owner without reusing its now-stale PID kill hook, and explicitly joins the test-bounded
-bean-sourcing parse executor at pytest session end. A fresh-process regression covers real
-mock-driver MCP start/stop plus parse-pool use and verifies both the probe and captured MCP child
-exit. This is cross-cutting process/CI hardening, not a new E11 story row; issue #665 and plan
-decision D104 carry its acceptance and ownership contract. Remote clean-exit verification remains
-pending.
+bean-sourcing parse executor at pytest session end. Linux thread tracing also exposed three replay
+CLI stores whose cleanup had relied only on Uvicorn entering lifespan; the CLI now retains
+idempotent source-cleanup ownership across early server return and failure. A fresh-process
+regression covers real mock-driver MCP start/stop plus parse-pool use and verifies both the probe
+and captured MCP child exit. Final evidence: an unprivileged Linux full suite returned with only
+``MainThread`` live, and GitHub CI completed its contract-drift, coverage-upload, and CLI-smoke
+steps after pytest. This is cross-cutting process/CI hardening, not a new E11 story row; issue #665
+and plan decisions D104/D105 carry its acceptance and ownership contract.
 
 **18 Jul 2026 (later — D102 plant-model experiment + the discard-roast feature).** After #567
 parked, the operator's diagnosis that the system lacks RoR PROJECTION (only the pre-FC FC-ETA
