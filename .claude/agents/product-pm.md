@@ -43,9 +43,11 @@ silently when it isn't checked out.)*
 4. **Write the next brief — including the PR PLAN.** Produce the next
    engineer/agent-team handoff prompt (self-contained: setup, stories, invariants,
    guardrails, deliverables) and save it under `career/.../prompts/`. For each story the
-   brief MUST include its **PR plan** (AGENTS.md PR-Hygiene): the ordered list of thin
-   PRs — scope / rough size / reviewers (safety/security/qa) / deps — each under the
-   400-line logic cap, decided *before* code is written. A story that only says "build X"
+   brief MUST include its **PR plan** (AGENTS.md PR-Hygiene): the ordered list of
+   coherent PRs — scope / rough size / reviewers (safety/security/qa) / deps — targeting
+   about 400 changed logic lines, decided *before* code is written. For a materially
+   larger slice, record why splitting would reduce reviewability and require applicable
+   domain review plus independent pre-open triage. A story that only says "build X"
    without its PR decomposition is an incomplete brief. This is what removes the
    cross-session copy-paste — the lead invokes you and gets the brief in-session.
 5. **Escalate genuine product/architecture forks to the human** — never invent
