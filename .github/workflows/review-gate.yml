@@ -15,8 +15,8 @@ name: Review gate
 # activates"). This workflow publishes a commit STATUS context named
 # `review-gate` on the PR head SHA:
 #
-#   - PR opened / synchronized  -> review-gate = PENDING   (once the operator
-#     marks it a required check, auto-merge then WAITS for it — the race closes).
+#   - PR opened / synchronized -> review-gate = PENDING (the already-required
+#     branch-protection context then waits — the race closes).
 #   - `Claude Code Review` completes with conclusion=SUCCESS -> review-gate =
 #     SUCCESS (the review has now posted; its inline threads + required_
 #     conversation_resolution become the real findings gate from here. review-gate
@@ -28,26 +28,39 @@ name: Review gate
 #     the stamp-time PENDING stays in place. FAIL-CLOSED: a crashed review on a
 #     normal PR never posted, so auto-merge must stay blocked until the operator
 #     re-runs the review (which on success then flips it).
-#   - Dependabot PR, OR a PR that edits any .github/workflows/** file ->
-#     review-gate = SUCCESS immediately at STAMP time. These are exactly the PR
-#     classes where `Claude Code Review` legitimately cannot run (Dependabot gets
-#     no secret; the App's workflow-validation guard 401s on workflow edits),
-#     which is why claude-review is un-required. The UNBLOCK for these classes
-#     comes from this stamp-time auto-pass, NOT from the conclusion-gated flip —
-#     so the success-only flip above does not re-introduce a deadlock. The gate
-#     MUST inherit that property — including for THIS PR, which edits a workflow
-#     file.
+#   - Dependabot PR, a PR that edits any .github/workflows/** file, OR an
+#     operator suspension (`CLAUDE_REVIEW_SUSPENDED=true`) -> review-gate =
+#     SUCCESS immediately at STAMP time. These are exactly the cases where
+#     `Claude Code Review` cannot currently run (Dependabot gets no secret; the
+#     App's workflow-validation guard 401s on workflow edits; an operator
+#     suspension records a known service outage). The UNBLOCK comes from this
+#     stamp-time auto-pass, NOT from the conclusion-gated flip — so the
+#     success-only flip above does not re-introduce a deadlock. The gate MUST
+#     inherit that property — including for THIS PR, which edits a workflow
+#     file. Removing or setting the variable to any value other than exact
+#     `true` restores the ordinary fail-closed wait on the next PR event.
 #
-# ACTIVATION SEQUENCING. `workflow_run` only fires for the version of this
-# workflow that lives on the DEFAULT branch. So the `workflow_run` half does
-# nothing until this file is merged to main. The operator must therefore merge
-# this PR FIRST, then mark `review-gate` a required check — not the reverse, or
-# normal PRs would hang on a PENDING that never resolves. (This PR's own
-# workflow-edit auto-pass path keeps it mergeable before activation.)
+# SUSPENSION LIFECYCLE. Repository-variable changes do not emit a pull_request
+# event and therefore cannot rewrite an already-stamped head. Set/remove the
+# variable FIRST, then send the default-branch `reconcile-review-gate`
+# repository-dispatch event with a numeric `client_payload.pr_number` for each
+# open ready PR. The per-PR concurrency group cancels an older stamp for that PR
+# before reconciliation reads the current variable and re-stamps its current
+# head. Complete that reconciliation for every open merge candidate before
+# allowing merges. Draft PRs are already non-mergeable and re-stamp naturally
+# when later marked ready. Suspension uses a distinct `[suspended] ` status
+# marker; the workflow-run path preserves it only while the variable remains
+# exact `true`.
 #
-# Branch protection (marking review-gate required) is the operator's governance
-# call (main has enforce_admins on) and is NOT changed here — this PR ships only
-# the mechanism.
+# ACTIVATION SEQUENCING. `review-gate` is already required and branch protection
+# remains unchanged. This workflow-editing PR is mergeable through the existing
+# workflow-edit exemption. Once merged to the default branch, set the variable
+# and run the reconciliation above before relying on the suspension path.
+#
+# Branch protection has enforce_admins on and pins `review-gate` to the GitHub
+# Actions App (app id 15368). It is NOT changed here — this PR ships only the
+# reversible suspension/reconciliation mechanism. Do not unpin the source App:
+# the status context and description are public strings and are not identities.
 #
 # #605 — THE DRAFT->READY DEADLOCK (found 19 Jul on #604, repeated on every
 # ready-toggle that week: #608/#610/#611/#614/#616/#618-#620/#622/#624/#626).
@@ -179,16 +192,30 @@ on:
   # Stamp the gate on every PR head as soon as it appears / updates.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  # Reconcile one current PR head from this default-branch workflow definition.
+  # Unlike workflow_dispatch, repository_dispatch cannot execute a writer's
+  # modified workflow from an arbitrary branch.
+  repository_dispatch:
+    types: [reconcile-review-gate]
   # Flip the gate to success once the review workflow has finished. `workflow_run`
   # carries the originating run's head_sha so the status lands on the PR head.
   workflow_run:
     workflows: ["Claude Code Review"]
     types: [completed]
 
-# statuses: write posts AND reads the commit status (`getCombinedStatusForRef`
-# — the #605 fold-2 exemption no-op check — is covered by `statuses: write`,
-# no separate `read` permission exists for statuses). pull-requests: read
-# looks up the PR's current head SHA (self-heal staleness check, #605).
+# A reconciliation dispatch for one PR cancels any older in-flight stamp for
+# that same PR before reading the current repository variable. `toJSON`
+# preserves the payload type: numeric 17 shares the PR event's group, while an
+# invalid string "17" cannot cancel that valid stamp before script validation.
+concurrency:
+  group: review-gate-status-${{ toJSON(github.event.pull_request.number || github.event.client_payload.pr_number || github.run_id) }}
+  cancel-in-progress: true
+
+# statuses: write posts AND reads commit statuses
+# (`listCommitStatusesForRef` — the #605 fold-2 exemption no-op check — is
+# covered by `statuses: write`; no separate `read` permission exists for
+# statuses). pull-requests: read looks up the PR's current head SHA (self-heal
+# staleness check, #605).
 # actions: write is `flip-on-review`'s #605 self-heal only — listing +
 # re-running a cancelled `Claude Code Review` run via the Actions API when
 # nothing else will retry it (read access to list runs is included in
@@ -202,17 +229,40 @@ permissions:
   actions: write
 
 jobs:
-  # ---- PR opened / synchronized: stamp PENDING, or auto-pass the exempt classes.
+  # ---- PR event / dispatch: stamp PENDING, or auto-pass an exempt class.
   stamp-on-pr:
     name: Stamp review-gate on PR head
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'repository_dispatch' }}
     runs-on: ubuntu-latest
+    env:
+      CLAUDE_REVIEW_SUSPENDED: ${{ vars.CLAUDE_REVIEW_SUSPENDED }}
     steps:
       - name: Decide pending vs immediate success, then post the status
         uses: actions/github-script@v7
         with:
           script: |
-            const pr = context.payload.pull_request;
+            const dispatchedNumber =
+              context.payload.client_payload?.pr_number;
+            if (
+              context.eventName === 'repository_dispatch' &&
+              (!Number.isInteger(dispatchedNumber) || dispatchedNumber <= 0)
+            ) {
+              core.setFailed(
+                'client_payload.pr_number must be a positive JSON integer',
+              );
+              return;
+            }
+            const pr = context.eventName === 'pull_request'
+              ? context.payload.pull_request
+              : (await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: dispatchedNumber,
+                })).data;
+            if (pr.state !== 'open') {
+              core.setFailed(`PR #${pr.number} is not open`);
+              return;
+            }
             const sha = pr.head.sha;
 
             // Dependabot PRs run with a read-only token (no secrets), so
@@ -220,6 +270,8 @@ jobs:
             // that will not run. Match the same actor the review workflow excludes.
             const isDependabot = pr.user.login === 'dependabot[bot]'
               || context.actor === 'dependabot[bot]';
+            const reviewSuspended =
+              process.env.CLAUDE_REVIEW_SUSPENDED === 'true';
 
             // A PR that edits any .github/workflows/** file trips the Claude App's
             // workflow-validation guard (a 401), so the review cannot post. Detect
@@ -236,22 +288,21 @@ jobs:
               f.filename.startsWith('.github/workflows/'),
             );
 
-            // #605 round 3, LOAD-BEARING: `[exempt] ` marks a status this
-            // job posted BECAUSE claude-review structurally cannot run for
-            // this PR (Dependabot / workflow-editing), never because a
-            // review actually completed. flip-on-review's check 1 reads this
-            // exact prefix to tell a genuine, permanent exemption apart from
-            // a possibly-stale prior flip `success` — keep it identical in
-            // both places, and never add it to the ordinary `pending` stamp
-            // below (the `else` branch) or to flip-on-review's own
-            // success-flip description.
+            // #605 round 3, LOAD-BEARING: structural exemptions and temporal
+            // suspension use different markers. flip-on-review preserves the
+            // former permanently and the latter only while the variable is
+            // still exact `true`. Never add either marker to ordinary pending
+            // or review-completed success statuses.
             const EXEMPT_MARKER = '[exempt] ';
-            const exempt = isDependabot || editsWorkflow;
+            const SUSPENSION_MARKER = '[suspended] ';
+            const exempt = isDependabot || editsWorkflow || reviewSuspended;
             const reason = isDependabot
               ? `${EXEMPT_MARKER}Dependabot PR — Claude Code Review does not run (no secret); auto-pass.`
               : editsWorkflow
                 ? `${EXEMPT_MARKER}PR edits .github/workflows/** — Claude Code Review cannot run (workflow-validation guard); auto-pass.`
-                : 'Awaiting Claude Code Review to post its findings.';
+                : reviewSuspended
+                  ? `${SUSPENSION_MARKER}Claude Code Review is operator-suspended; Codex and independent triage remain required.`
+                  : 'Awaiting Claude Code Review to post its findings.';
 
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
@@ -269,6 +320,8 @@ jobs:
     name: Flip review-gate to success after review
     if: ${{ github.event_name == 'workflow_run' }}
     runs-on: ubuntu-latest
+    env:
+      CLAUDE_REVIEW_SUSPENDED: ${{ vars.CLAUDE_REVIEW_SUSPENDED }}
     steps:
       - name: Mark review-gate success on the reviewed head SHA
         uses: actions/github-script@v7
@@ -343,30 +396,56 @@ jobs:
               return;
             }
 
-            // #605 fold 2 / round 3, LOAD-BEARING: never clobber a gate that
-            // already reads a genuinely EXEMPT `success` — but do NOT
-            // blindly trust every `success` (round 3's fix). stamp-on-pr
-            // prefixes its two exemption stamps (Dependabot / workflow-
-            // editing PR — the only classes where claude-review structurally
-            // cannot run) with the exact marker `[exempt] ` in the status
-            // description; that's the only `success` this check no-ops on.
-            // A NON-exempt `success` is a real flip (possibly a STALE one —
-            // e.g. a draft-time success sitting in front of a ready-toggle's
-            // `pending` re-stamp that hasn't landed yet) and must NOT
-            // suppress a self-heal: it falls through to the normal ownership
-            // checks below, where newest-run-wins (round 2) makes every
-            // remaining ordering safe on its own.
+            // #605 fold 2 / round 3, LOAD-BEARING: preserve only an
+            // Actions-authored structural exemption, or an Actions-authored
+            // suspension while the repository variable is still exact `true`.
+            // A stale suspension success is actively returned to PENDING.
+            // Every other success falls through to newest-run-wins below.
             const EXEMPT_MARKER = '[exempt] ';
-            const combined = await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sha });
-            const currentGate = combined.data.statuses.find((s) => s.context === 'review-gate');
+            const SUSPENSION_MARKER = '[suspended] ';
+            const statuses = await github.paginate(
+              github.rest.repos.listCommitStatusesForRef,
+              { owner, repo, ref: sha, per_page: 100 },
+            );
+            const currentGate = statuses
+              .filter((status) => status.context === 'review-gate')
+              .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))[0];
+            const actionsAuthored =
+              currentGate?.creator?.login === 'github-actions[bot]';
+            const structuralExemption =
+              currentGate?.description?.startsWith(EXEMPT_MARKER) === true;
+            const suspensionExemption =
+              currentGate?.description?.startsWith(SUSPENSION_MARKER) === true;
+            const suspensionActive =
+              process.env.CLAUDE_REVIEW_SUSPENDED === 'true';
             if (
-              currentGate &&
-              currentGate.state === 'success' &&
-              typeof currentGate.description === 'string' &&
-              currentGate.description.startsWith(EXEMPT_MARKER)
+              currentGate?.state === 'success' &&
+              actionsAuthored &&
+              (structuralExemption ||
+                (suspensionExemption && suspensionActive))
             ) {
               core.info(
                 `review-gate: ${run.conclusion} run ${run.id} on ${sha} — gate already reads success via a stamped EXEMPTION ("${currentGate.description}"); no-op.`,
+              );
+              return;
+            }
+            if (
+              currentGate?.state === 'success' &&
+              actionsAuthored &&
+              suspensionExemption &&
+              !suspensionActive
+            ) {
+              await github.rest.repos.createCommitStatus({
+                owner,
+                repo,
+                sha,
+                context: 'review-gate',
+                state: 'pending',
+                description:
+                  'Suspension ended; awaiting Claude Code Review to post its findings.',
+              });
+              core.info(
+                `review-gate=pending on ${sha}: stale suspension exemption revoked.`,
               );
               return;
             }
