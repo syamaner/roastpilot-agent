@@ -50,7 +50,11 @@ name: Review gate
 # allowing merges. Draft PRs are already non-mergeable and re-stamp naturally
 # when later marked ready. Suspension uses a distinct `[suspended] ` status
 # marker; the workflow-run path preserves it only while the variable remains
-# exact `true`.
+# exact `true`. When reconciliation revokes a suspension on a non-exempt PR, it
+# also re-runs the newest completed `Claude Code Review` run already bound to
+# that exact PR and head. This preserves the original trusted pull_request
+# context; an active exact-head run is left alone, and a missing or failed
+# re-run stays PENDING with an actionable workflow failure.
 #
 # ACTIVATION SEQUENCING. `review-gate` is already required and branch protection
 # remains unchanged. This workflow-editing PR is mergeable through the existing
@@ -104,10 +108,11 @@ name: Review gate
 # GitHub might ever add. A single ownership rule subsumes all three:
 #
 #   **NEWEST-RUN-WINS.** A `flip-on-review` invocation acts on the gate ONLY
-#   if its own run is the newest `Claude Code Review` run for this exact head
-#   SHA (compare `run_number`, GitHub's monotonically increasing per-workflow
-#   counter; tiebreak on `created_at` for the vanishingly unlikely case of a
-#   tie). Every other invocation — regardless of ITS OWN conclusion, even
+#   if its own run and attempt are the newest `Claude Code Review` execution
+#   for this exact head SHA (compare `run_number`, GitHub's monotonically
+#   increasing per-workflow counter; tiebreak on `created_at`, then require the
+#   current API record's `run_attempt` to equal the event's attempt). Every
+#   other invocation — regardless of ITS OWN conclusion, even
 #   `success` — defers unconditionally: the newest run's own completion event
 #   is the one authorized to decide, whenever it lands. This is provably
 #   race-order-independent (it doesn't matter which of several completion
@@ -203,13 +208,15 @@ on:
     workflows: ["Claude Code Review"]
     types: [completed]
 
-# A reconciliation dispatch for one PR cancels any older in-flight stamp for
-# that same PR before reading the current repository variable. `toJSON`
-# preserves the payload type: numeric 17 shares the PR event's group, while an
-# invalid string "17" cannot cancel that valid stamp before script validation.
+# One PR owns one status-transition lane across stamp, reconciliation, and
+# review-completion events. `toJSON` is intentional: unlike interpolation it
+# preserves the payload type, so an invalid dispatch string "17" cannot share
+# the valid numeric PR's lane. Never cancel an in-flight transition: serial
+# ordering is the commit-status marker's compare-and-swap boundary.
 concurrency:
-  group: review-gate-status-${{ toJSON(github.event.pull_request.number || github.event.client_payload.pr_number || github.run_id) }}
-  cancel-in-progress: true
+  group: review-gate-status-${{ toJSON(github.event.pull_request.number || github.event.client_payload.pr_number || github.event.workflow_run.pull_requests[0].number || github.run_id) }}
+  cancel-in-progress: false
+  queue: max
 
 # statuses: write posts AND reads commit statuses
 # (`listCommitStatusesForRef` — the #605 fold-2 exemption no-op check — is
@@ -272,6 +279,30 @@ jobs:
               || context.actor === 'dependabot[bot]';
             const reviewSuspended =
               process.env.CLAUDE_REVIEW_SUSPENDED === 'true';
+            const EXEMPT_MARKER = '[exempt] ';
+            const SUSPENSION_MARKER = '[suspended] ';
+            const REVOCATION_MARKER = '[revocation] ';
+            const REVOCATION_IN_PROGRESS =
+              `${REVOCATION_MARKER}Reconciliation in progress; Claude review required after suspension.`;
+            const revocationRequested =
+              context.eventName === 'repository_dispatch' &&
+              !isDependabot &&
+              !reviewSuspended;
+
+            // Revoke a prior suspension success before any fallible file/run
+            // enumeration. This generic authenticated marker deliberately
+            // matches no run: flip-on-review denies every completion until
+            // reconciliation replaces it with an exact run/attempt marker.
+            if (revocationRequested) {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha,
+                context: 'review-gate',
+                state: 'pending',
+                description: REVOCATION_IN_PROGRESS.slice(0, 140),
+              });
+            }
 
             // A PR that edits any .github/workflows/** file trips the Claude App's
             // workflow-validation guard (a 401), so the review cannot post. Detect
@@ -293,16 +324,73 @@ jobs:
             // former permanently and the latter only while the variable is
             // still exact `true`. Never add either marker to ordinary pending
             // or review-completed success statuses.
-            const EXEMPT_MARKER = '[exempt] ';
-            const SUSPENSION_MARKER = '[suspended] ';
             const exempt = isDependabot || editsWorkflow || reviewSuspended;
-            const reason = isDependabot
+            let reason = isDependabot
               ? `${EXEMPT_MARKER}Dependabot PR — Claude Code Review does not run (no secret); auto-pass.`
               : editsWorkflow
                 ? `${EXEMPT_MARKER}PR edits .github/workflows/** — Claude Code Review cannot run (workflow-validation guard); auto-pass.`
                 : reviewSuspended
                   ? `${SUSPENSION_MARKER}Claude Code Review is operator-suspended; Codex and independent triage remain required.`
-                  : 'Awaiting Claude Code Review to post its findings.';
+                  : revocationRequested
+                    ? REVOCATION_IN_PROGRESS
+                    : 'Awaiting Claude Code Review to post its findings.';
+
+            // A repository-variable change emits no pull_request event. Before
+            // revocation writes PENDING, select only an existing review run
+            // whose original pull_request context is bound to this exact PR and
+            // SHA. The status marker records the attempt allowed to flip the
+            // gate: an active run's current attempt, or a completed run's next
+            // attempt. Writing it BEFORE requesting a re-run closes both stale
+            // event windows (before and after GitHub registers the new attempt).
+            let reconciliationRun;
+            let expectedAttempt;
+            const operatorInstruction =
+              `toggle PR #${pr.number} draft/ready if needed, then send the suspension reconciliation dispatch again`;
+            if (context.eventName === 'repository_dispatch' && !exempt) {
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRuns,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id: 'claude-code-review.yml',
+                  event: 'pull_request',
+                  head_sha: sha,
+                  per_page: 100,
+                },
+              );
+              const matchingRuns = runs.filter(
+                (run) =>
+                  run.head_sha === sha &&
+                  run.event === 'pull_request' &&
+                  Number.isInteger(run.pull_requests?.[0]?.number) &&
+                  run.pull_requests[0].number > 0 &&
+                  run.pull_requests[0].number === pr.number,
+              );
+              reconciliationRun = matchingRuns.sort((a, b) => {
+                if (a.run_number !== b.run_number) {
+                  return b.run_number - a.run_number;
+                }
+                return new Date(b.created_at) - new Date(a.created_at);
+              })[0];
+              const attempt = reconciliationRun?.run_attempt;
+              if (
+                reconciliationRun &&
+                Number.isInteger(attempt) &&
+                attempt > 0
+              ) {
+                expectedAttempt = reconciliationRun.status === 'completed'
+                  ? attempt + 1
+                  : attempt;
+                if (!Number.isSafeInteger(expectedAttempt)) {
+                  expectedAttempt = undefined;
+                }
+              }
+              if (reconciliationRun && expectedAttempt) {
+                reason =
+                  `${REVOCATION_MARKER}Claude review run ${reconciliationRun.id} ` +
+                  `attempt ${expectedAttempt} required after suspension.`;
+              }
+            }
 
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
@@ -314,6 +402,35 @@ jobs:
             });
 
             core.info(`review-gate=${exempt ? 'success' : 'pending'} on ${sha}: ${reason}`);
+
+            if (context.eventName === 'repository_dispatch' && !exempt) {
+              if (!reconciliationRun || !expectedAttempt) {
+                core.setFailed(
+                  `Suspension ended with no valid Claude Code Review run/attempt bound to PR #${pr.number} at ${sha}; review-gate remains pending. Operator must ${operatorInstruction}.`,
+                );
+                return;
+              }
+              if (reconciliationRun.status !== 'completed') {
+                core.info(
+                  `review-gate remains pending on ${sha}: exact PR/head review run ${reconciliationRun.id} attempt ${expectedAttempt} is ${reconciliationRun.status}; no duplicate re-run requested.`,
+                );
+                return;
+              }
+              try {
+                await github.rest.actions.reRunWorkflow({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: reconciliationRun.id,
+                });
+                core.info(
+                  `review-gate remains pending on ${sha}: re-ran completed exact PR/head review run ${reconciliationRun.id}; attempt ${expectedAttempt} is required after suspension.`,
+                );
+              } catch (err) {
+                core.setFailed(
+                  `Could not re-run Claude Code Review ${reconciliationRun.id} for PR #${pr.number} at ${sha}: ${err}. review-gate remains pending; operator must ${operatorInstruction}.`,
+                );
+              }
+            }
 
   # ---- Claude Code Review finished: flip the gate to success on the PR head.
   flip-on-review:
@@ -352,6 +469,16 @@ jobs:
             const repo = context.repo.repo;
             const run = context.payload.workflow_run;
             const sha = run.head_sha;
+            const directlyBoundPrNumber = run.pull_requests?.[0]?.number;
+            if (
+              !Number.isInteger(directlyBoundPrNumber) ||
+              directlyBoundPrNumber <= 0
+            ) {
+              core.info(
+                `review-gate: review run ${run.id} on ${sha} has no directly bound PR number; refusing every status mutation because this event cannot share the PR concurrency lane.`,
+              );
+              return;
+            }
 
             // #605 round 2 — NEWEST-RUN-WINS ownership. This invocation may
             // act on the gate ONLY if its own run is the newest `Claude Code
@@ -376,23 +503,19 @@ jobs:
               if (a.run_number !== b.run_number) return a.run_number > b.run_number ? a : b;
               return new Date(a.created_at) >= new Date(b.created_at) ? a : b;
             });
-            if (newest.id !== run.id) {
+            const runAttemptValid =
+              Number.isInteger(run.run_attempt) && run.run_attempt > 0;
+            const newestAttemptValid =
+              Number.isInteger(newest.run_attempt) && newest.run_attempt > 0;
+            if (
+              !runAttemptValid ||
+              !newestAttemptValid ||
+              newest.id !== run.id ||
+              newest.run_attempt !== run.run_attempt
+            ) {
               core.info(
-                `review-gate: run ${run.id} (run_number ${run.run_number}) on ${sha} is not the newest Claude Code Review run for this sha (newest is run ${newest.id}, run_number ${newest.run_number}) — deferring; its own completion event owns the gate.`,
+                `review-gate: run ${run.id} attempt ${run.run_attempt} (run_number ${run.run_number}) on ${sha} is not the newest Claude Code Review execution for this sha (newest is run ${newest.id} attempt ${newest.run_attempt}, run_number ${newest.run_number}) — deferring; its own completion event owns the gate.`,
               );
-              return;
-            }
-
-            if (run.conclusion === 'success') {
-              await github.rest.repos.createCommitStatus({
-                owner,
-                repo,
-                sha,
-                context: 'review-gate',
-                state: 'success',
-                description: 'Claude Code Review completed; findings gated by conversation resolution.'.slice(0, 140),
-              });
-              core.info(`review-gate=success on ${sha} (review run ${run.id}, conclusion=success, newest run for this sha).`);
               return;
             }
 
@@ -403,6 +526,7 @@ jobs:
             // Every other success falls through to newest-run-wins below.
             const EXEMPT_MARKER = '[exempt] ';
             const SUSPENSION_MARKER = '[suspended] ';
+            const REVOCATION_MARKER = '[revocation] ';
             const statuses = await github.paginate(
               github.rest.repos.listCommitStatusesForRef,
               { owner, repo, ref: sha, per_page: 100 },
@@ -416,8 +540,27 @@ jobs:
               currentGate?.description?.startsWith(EXEMPT_MARKER) === true;
             const suspensionExemption =
               currentGate?.description?.startsWith(SUSPENSION_MARKER) === true;
+            const revocationPending =
+              currentGate?.state === 'pending' &&
+              actionsAuthored &&
+              currentGate?.description?.startsWith(REVOCATION_MARKER) === true;
             const suspensionActive =
               process.env.CLAUDE_REVIEW_SUSPENDED === 'true';
+            if (revocationPending) {
+              const expected = currentGate.description.match(
+                /^\[revocation\] Claude review run ([0-9]+) attempt ([0-9]+) required after suspension\.$/,
+              );
+              if (
+                !expected ||
+                expected[1] !== String(run.id) ||
+                expected[2] !== String(run.run_attempt)
+              ) {
+                core.info(
+                  `review-gate: run ${run.id} attempt ${run.run_attempt} on ${sha} does not match the authenticated revocation requirement \"${currentGate.description}\" — deferring and staying pending.`,
+                );
+                return;
+              }
+            }
             if (
               currentGate?.state === 'success' &&
               actionsAuthored &&
@@ -449,6 +592,18 @@ jobs:
               );
               return;
             }
+            if (run.conclusion === 'success') {
+              await github.rest.repos.createCommitStatus({
+                owner,
+                repo,
+                sha,
+                context: 'review-gate',
+                state: 'success',
+                description: 'Claude Code Review completed; findings gated by conversation resolution.'.slice(0, 140),
+              });
+              core.info(`review-gate=success on ${sha} (review run ${run.id}, attempt ${run.run_attempt}, conclusion=success, newest execution for this sha).`);
+              return;
+            }
 
             // #605 fold 1: self-heal ONLY on a genuinely `cancelled`
             // conclusion. Everything else — `failure`, `timed_out`,
@@ -462,38 +617,11 @@ jobs:
               core.info(
                 `review-gate NOT flipping on ${sha}: review run ${run.id} conclusion=${run.conclusion} (newest run for this sha), staying pending (fail-closed).`,
               );
-              return;
-            }
-
-            // Find the PR this run reviewed (same-repo PRs populate
-            // `pull_requests` directly; fall back to the commit-associated-PRs
-            // API for the rare case it doesn't — #605 fold 5: an OPEN PR
-            // whose head sha still matches this run's sha in THIS repo, not
-            // just the first commit-associated PR returned, which can be a
-            // closed/merged or unrelated PR that happens to share history).
-            let prNumber = run.pull_requests && run.pull_requests[0]
-              ? run.pull_requests[0].number
-              : undefined;
-            if (!prNumber) {
-              const assoc = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-                owner,
-                repo,
-                commit_sha: sha,
-              });
-              const match = assoc.data.find(
-                (p) =>
-                  p.state === 'open' &&
-                  p.head &&
-                  p.head.sha === sha &&
-                  p.head.repo &&
-                  p.head.repo.full_name === `${owner}/${repo}`,
-              );
-              prNumber = match && match.number;
-            }
-            if (!prNumber) {
-              core.info(
-                `review-gate: cancelled run ${run.id} on ${sha} has no associated OPEN PR with a matching head sha; nothing to self-heal, staying pending.`,
-              );
+              if (revocationPending) {
+                core.notice(
+                  `review-gate: suspension revocation is bound to a non-successful review attempt; send the suspension reconciliation dispatch again before any manual retry.`,
+                );
+              }
               return;
             }
 
@@ -504,10 +632,14 @@ jobs:
             // a newer commit, a fresh claude-review run for THAT sha already
             // owns its own, separate newest-run decision — nothing to retry
             // for this stale one.
-            const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            const pr = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: directlyBoundPrNumber,
+            });
             if (pr.data.head.sha !== sha) {
               core.info(
-                `review-gate: cancelled run ${run.id} targeted stale sha ${sha}; PR #${prNumber} head is now ${pr.data.head.sha} — already superseded, staying pending on the new sha until its own review completes.`,
+                `review-gate: cancelled run ${run.id} targeted stale sha ${sha}; PR #${directlyBoundPrNumber} head is now ${pr.data.head.sha} — already superseded, staying pending on the new sha until its own review completes.`,
               );
               return;
             }
@@ -521,7 +653,7 @@ jobs:
             // completion.
             if (run.run_attempt && run.run_attempt >= 2) {
               core.notice(
-                `review-gate: cancelled run ${run.id} on ${sha} is already retry attempt ${run.run_attempt}; #605 self-heal retries automatically only once. Staying pending — needs operator attention (manual \`gh pr ready --undo && gh pr ready\` still works).`,
+                `review-gate: cancelled run ${run.id} on ${sha} is already retry attempt ${run.run_attempt}; #605 self-heal retries automatically only once. Staying pending — needs operator attention${revocationPending ? ' and a fresh suspension reconciliation dispatch before any manual retry' : ' (manual `gh pr ready --undo && gh pr ready` still works)'}.`,
               );
               return;
             }
@@ -531,26 +663,42 @@ jobs:
             // Self-heal: re-run this exact workflow run (the API re-runs it
             // against the same commit/ref it originally targeted). This is
             // exactly what the manual `gh pr ready --undo && gh pr ready`
-            // workaround forced — one more clean attempt. Deliberately do
-            // NOT re-write the commit status here (#605 round 2 TOCTOU
-            // fold): the gate is already `pending` (the fold-2 check above
-            // just confirmed it isn't `success`), so a redundant `pending`
-            // write adds no information, only a race window against
-            // `stamp-on-pr`'s exemption stamp landing at the same time. The
-            // re-run's own completion re-enters this exact script and is,
-            // again, the newest run for this sha — it alone decides next.
+            // workaround forced — one more clean attempt. Normally the gate is
+            // already pending, so avoid a redundant write.
+            // Revocation is different: its authenticated marker binds the exact
+            // allowed attempt, so advance that marker before requesting attempt
+            // 2. The ordering prevents either attempt from flipping through a
+            // stale marker if the rerun API races or fails.
+            if (revocationPending) {
+              const retryAttempt = run.run_attempt + 1;
+              if (!Number.isSafeInteger(retryAttempt)) {
+                core.warning(
+                  `review-gate: cannot represent the retry attempt after ${run.run_attempt}; staying pending. Send the suspension reconciliation dispatch again.`,
+                );
+                return;
+              }
+              await github.rest.repos.createCommitStatus({
+                owner,
+                repo,
+                sha,
+                context: 'review-gate',
+                state: 'pending',
+                description:
+                  `${REVOCATION_MARKER}Claude review run ${run.id} attempt ${retryAttempt} required after suspension.`.slice(0, 140),
+              });
+            }
             try {
               await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
               core.info(
-                `review-gate: #605 self-heal — re-ran cancelled run ${run.id} on ${sha} (newest run, attempt 1); staying pending (no redundant status write) until it completes.`,
+                `review-gate: #605 self-heal — re-ran cancelled run ${run.id} on ${sha} (newest run, attempt 1); staying pending${revocationPending ? ' with the exact retry-attempt marker' : ' (no redundant status write)'} until it completes.`,
               );
             } catch (err) {
               // Fail-closed, not fail-loud: leave the stamp-time `pending`
               // exactly where it was (never flip on a re-run request we
               // couldn't even confirm was accepted) and surface the API
-              // error in the log for the operator, who still has the manual
-              // `gh pr ready --undo && gh pr ready` workaround available.
+              // error in the log with the recovery path appropriate to the
+              // current marker.
               core.warning(
-                `review-gate: #605 self-heal re-run of ${run.id} on ${sha} failed: ${err}. Staying pending — manual re-trigger still works.`,
+                `review-gate: #605 self-heal re-run of ${run.id} on ${sha} failed: ${err}. Staying pending — ${revocationPending ? 'send the suspension reconciliation dispatch again before retrying' : 'manual re-trigger still works'}.`,
               );
             }
