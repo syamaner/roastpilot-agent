@@ -59,26 +59,27 @@ If a gate fails, fix it and re-run before continuing.
 
 ## 2. Size + data/logic split
 
-- **The 400-line logic cap is a HARD STOP — the number is exact, not "~400".** Measure
+- **Target about 400 changed logic lines as a reviewability guide.** Measure
   **logic** lines from the branch's MERGE BASE (so an advancing `origin/main` doesn't
-  inflate the count): `git diff --stat $(git merge-base origin/main HEAD)` (equivalently
-  `git diff --stat origin/main...HEAD`), minus data/fixtures/generated/doc files **and
-  minus test files** (operator ruling, 21 Jul — #621: the cap bounds reviewable LOGIC;
-  test bulk is largely spec-corpus data in test form). If that
-  exceeds **400**, STOP — do not open.
+  inflate the estimate): `git diff --stat $(git merge-base origin/main HEAD)`
+  (equivalently `git diff --stat origin/main...HEAD`), minus separated
+  data/fixtures/generated/doc files **and minus test files** (operator ruling,
+  21 Jul — #621: test bulk is often spec-corpus data in test form).
 - **Large test diffs get a qa pass instead of a count.** If the test-file diff exceeds
   **600** lines (exact threshold), run the `qa` reviewer on the branch pre-open and fold
   its findings — test quality (vacuous assertions, wrong expectations) is policed by the
-  qa lens, not by rationing test lines. The story should already have a **PR plan from
-  kickoff** (AGENTS.md PR-Hygiene: the ordered list of thin PRs decided *before* writing
-  code); over the cap means the plan was too coarse or you merged two planned slices —
-  split it back to the planned boundary and open the current slice only. Reactively
-  discovering the size here is the failure this catches; plan the slices up front, don't
-  split a monolith at review time.
+  qa lens, not by rationing test lines.
+- The story should already have a **PR plan from kickoff** (AGENTS.md PR-Hygiene:
+  coherent review units decided *before* writing code). Split unrelated or independently
+  shippable responsibilities at that planned boundary. Do not create awkward interfaces,
+  temporary dead code, or extra PRs solely to hit the size target. If the logic diff
+  materially exceeds the target, record why the larger unit is more reviewable than the
+  available splits, run the applicable domain reviewers, and obtain independent
+  pre-open triage. A large unexplained diff must be replanned.
 - **Executable `.md` counts as logic, not exempt docs.** The doc exemption is for
   prose (README, design notes, plan files). Agent/skill/workflow definitions under
   `.claude/` (`agents/*.md`, `skills/**/*.md`, `workflows/*.mjs`) are executable behaviour
-  — they count toward the 400-line logic cap and get review like code.
+  — they count toward the logic-size estimate and get review like code.
 - **Separate data from logic.** Fixtures, snapshots, generated files, research
   output, bake-off results belong in their OWN PR or commit — never bundled with
   logic. They inflate size and don't need code review the way logic does. If the

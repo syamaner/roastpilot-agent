@@ -42,13 +42,15 @@ definition.
   e.g. the 7 Jun 2026 live-roast JSONL/summary excerpts the MCP mirrors
   validate against.
 - **One PR per SLICE, not per story.** A story is decomposed at kickoff into its PR plan
-  (see PR-Hygiene) — an ordered set of thin PRs, each under the 400-line logic cap; each
-  slice is one PR on its own branch `feature/{issue-number}-{slug}-{slice}` (or plain
-  `feature/{issue-number}-{slug}` when a story is genuinely a single slice), and every PR references the story
-  issue (`Refs #N`, or `Closes #N` only on the slice that finishes it). A story whose
-  plan called for multiple slices but ships as one big PR is an unplanned monolith —
-  split it to the plan; a story whose kickoff plan is genuinely one slice under the cap
-  stays one PR (don't manufacture slices to hit a count).
+  (see PR-Hygiene) — an ordered set of coherent review units, normally targeting about
+  400 changed logic lines each; each slice is one PR on its own branch
+  `feature/{issue-number}-{slug}-{slice}` (or plain
+  `feature/{issue-number}-{slug}` when a story is genuinely a single slice), and every PR
+  references the story issue (`Refs #N`, or `Closes #N` only on the slice that finishes
+  it). A story whose plan called for multiple responsibilities but ships as one big PR is
+  an unplanned monolith — split it to the plan; a cohesive single-slice story stays one
+  PR even when its justified size differs from the target (don't manufacture slices to
+  hit a count).
 - The PR that completes a story updates the epic file's status table in the
   same PR — file state and GitHub state never drift.
 - Before starting a task: read `docs/state/registry.md`, open the active
@@ -160,8 +162,9 @@ Before starting a story:
 3. Read the GitHub story issue and any comments.
 4. Confirm acceptance criteria and current risks.
 5. **Write the PR plan** (see PR-Hygiene: "PR-plan the story at KICKOFF") — the ordered
-   list of thin PRs (scope / rough size / reviewers / deps), each under the 400-line logic
-   cap, *before* writing code. Record it in the story brief / issue.
+   list of coherent PRs (scope / rough size / reviewers / deps), normally targeting about
+   400 changed logic lines each, *before* writing code. Record it in the story brief /
+   issue, including the reviewability rationale for any materially larger slice.
 6. Work on a branch for the **first planned slice** — `feature/{issue-number}-{slug}-{slice}`
    for a multi-slice plan, or plain `feature/{issue-number}-{slug}` when the plan is one slice.
 
@@ -227,36 +230,37 @@ fixture regens). Cut the preventable half; the `pr-preflight` skill runs this
 checklist before you open.
 
 - **Separate data from logic.** Fixtures, snapshots, generated files, research
-  output, bake-off results go in their OWN PR (or at least their own commit),
-  never bundled with logic — they were the size outliers and don't need code
-  review the way logic does.
+  output, and bake-off results get their own PR when independently reviewable;
+  otherwise they get at least a dedicated commit, never a logic commit. Their
+  exclusion from the logic-size estimate applies only when separated this way.
 - **PR-plan the story at KICKOFF — a planning step, not an execution-time reaction.**
-  Before writing code, decompose the story into an **ordered list of thin PRs**, each
+  Before writing code, decompose the story into an **ordered list of coherent PRs**, each
   with its scope, rough size, dependencies, and which reviewers it triggers
-  (safety / security / qa). You should know "this story is 8 PRs, and PR3 does exactly
-  X" *before* PR1 opens. This lives in the story brief (a lead / `product-pm` activity).
-  Reactively splitting a 900-line diff at review time is the failure mode this prevents
-  (#587's ~800-line module and #600's ~2,000-line harness were unplanned monoliths — the
-  logic in each should have been ~3 and ~6 planned slices under the cap below; the
-  shift-left folds then *masked* the size problem instead of fixing it).
-- **Keep logic PRs small — the 400-line cap is a HARD STOP.** Measure **logic** lines
-  from the branch's MERGE BASE (not the advancing `origin/main` tip):
+  (safety / security / qa). You should know the planned review units and why each is
+  coherent *before* PR1 opens. This lives in the story brief (a lead / `product-pm`
+  activity). Reactively discovering unrelated responsibilities in a large diff is the
+  failure mode this prevents (#587's ~800-line module and #600's ~2,000-line harness
+  combined concerns that should have been identified at kickoff); line count is the
+  prompt to inspect the design, not the design itself.
+- **Keep logic PRs reviewably small — target about 400 changed logic lines.** This is a
+  planning and reviewability guide, not an automatic pass/fail threshold. Measure
+  **logic** lines from the branch's MERGE BASE (not the advancing `origin/main` tip):
   `git diff --stat $(git merge-base origin/main HEAD)` (equivalently
-  `git diff --stat origin/main...HEAD`), minus data/fixtures/generated/doc files (those
-  are exempt and go in their own PR per the rule above). **Test files are also exempt
-  from the 400 count** (operator ruling, 21 Jul — #621): the cap bounds the reviewable
-  LOGIC change, and much test bulk is spec-corpus material (parametrised repro tables —
-  data in test form). The quality valve replacing the count: **any PR whose test-file
-  diff exceeds **600** lines (exact threshold) triggers a mandatory `qa` reviewer pass
-  pre-open** — test
-  quality is policed by the qa lens, not by rationing test lines. If the logic diff
-  exceeds **400**, the PR plan was too coarse — split to the planned slice boundary
-  before opening. Enough slices that every one is under the cap: the ~2,000-line #600
-  harness was ~5–6 reviewable logic slices (scoring / stats / runner / report), not 4.
-  The number is exact (400), the slicing is what flexes. **Pure-deletion accounting (operator ruling, 21 Jul — #623):** deletions of an
-  atomically-retired unit are EXEMPT from the summed count (insertions still
-  capped at 400) — a retired unit larger than the cap cannot be split without
-  dead-code scaffolding that worsens review. **Pure-deletion PRs
+  `git diff --stat origin/main...HEAD`), minus separated
+  data/fixtures/generated/doc files under the rule above. Test files are also excluded
+  from this estimate (operator ruling, 21 Jul — #621), because much test bulk is
+  spec-corpus material. **Any PR whose test-file diff exceeds 600 lines (exact
+  threshold) still triggers a mandatory `qa` reviewer pass pre-open** — test quality is
+  policed by the qa lens, not by rationing test lines. Slice logic by coherent
+  responsibility, security boundary, dependency order, and reviewer load; do not create
+  awkward interfaces, temporary dead code, or extra PRs merely to hit the target. When
+  a logic diff materially exceeds the target, record in the story's PR plan and PR body
+  why the larger unit is more reviewable than the available splits, then run the
+  applicable domain reviewers and independent pre-open triage. A large unexplained diff
+  must be replanned; a justified cohesive diff may proceed. **Pure-deletion accounting
+  (operator ruling, 21 Jul — #623):** deletions of an atomically-retired unit are
+  excluded from the estimate — a retired unit cannot always be split without dead-code
+  scaffolding that worsens review. **Pure-deletion PRs
   deadlock on the app-pinned `codecov/patch`** (zero coverable lines → codecov
   posts no status; a hand-posted status is rejected at merge — #624/#625): fold
   an atomic retirement WITH the logic that replaces it rather than opening a

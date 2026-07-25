@@ -90,8 +90,9 @@
 
 - Before starting implementation, read this registry, then the active epic
   file, then the GitHub issue for the story.
-- One PR per SLICE (a story is PR-planned at kickoff into thin slices, each ≤400
-  logic lines — see AGENTS.md PR-Hygiene); branch
+- One PR per SLICE (a story is PR-planned at kickoff into coherent review
+  units, normally targeting about 400 changed logic lines — see AGENTS.md
+  PR-Hygiene); branch
   `feature/{issue-number}-{slug}-{slice}`; the PR that completes a story updates
   the epic file's status table in the same PR.
 - Plans live in `~/git/roastpilot-plan` and are the source of truth; record
