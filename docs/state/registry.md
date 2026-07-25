@@ -116,7 +116,12 @@ regression covers real mock-driver MCP start/stop plus parse-pool use and verifi
 and captured MCP child exit. Final evidence: an unprivileged Linux full suite returned with only
 ``MainThread`` live, and GitHub CI completed its contract-drift, coverage-upload, and CLI-smoke
 steps after pytest. This is cross-cutting process/CI hardening, not a new E11 story row; issue #665
-and plan decisions D104/D105 carry its acceptance and ownership contract.
+and plan decisions D104/D105 carry its acceptance and ownership contract. Residual boundaries are
+explicit: P1 #667 owns a live-mode event-loop policy for a pathological MCP owner that suppresses
+cancellation indefinitely, and P1 #668 owns an audited in-process operator acknowledgement after
+unconfirmed teardown. Until #668 ships, the supported recovery is to verify the roaster and old MCP
+child resources are inactive, restart the agent, and retry; restart recovery still never auto-resumes
+heat or fan.
 
 **18 Jul 2026 (later — D102 plant-model experiment + the discard-roast feature).** After #567
 parked, the operator's diagnosis that the system lacks RoR PROJECTION (only the pre-FC FC-ETA

@@ -172,8 +172,9 @@ def test_replay_closes_source_when_server_fails(
 
 def test_replay_source_failure_cancels_server_and_closes_source(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A replay failure drains the server before closing owned resources."""
+    """A replay failure stays primary when both server cancellation and close fail."""
     import uvicorn
 
     from roastpilot_agent.replay import ReplaySource
@@ -185,6 +186,7 @@ def test_replay_source_failure_cancels_server_and_closes_source(
     async def recording_aclose(source: ReplaySource) -> None:
         closed.append(source)
         await real_aclose(source)
+        raise RuntimeError("close failed")
 
     async def fail_run(_source: ReplaySource) -> None:
         await asyncio.sleep(0)
@@ -210,6 +212,39 @@ def test_replay_source_failure_cancels_server_and_closes_source(
         cli.main()
     assert server_cancelled == [True]
     assert len(closed) == 1
+    assert "close failed" in caplog.text
+
+
+def test_replay_close_failure_propagates_without_a_primary_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller's handled exception does not hide a standalone close failure."""
+    import uvicorn
+
+    from roastpilot_agent.replay import ReplaySource
+
+    real_aclose = ReplaySource.aclose
+
+    async def fail_aclose(source: ReplaySource) -> None:
+        await real_aclose(source)
+        raise RuntimeError("close failed")
+
+    async def no_op_serve(_server: uvicorn.Server) -> None:
+        return None
+
+    monkeypatch.setattr(ReplaySource, "aclose", fail_aclose)
+    monkeypatch.setattr(uvicorn.Server, "serve", no_op_serve)
+    fixture = Path(__file__).parent / "fixtures" / "replay" / "session-2"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "--replay", str(fixture), "--step", "--port", "0"],
+    )
+
+    try:
+        raise ValueError("caller's handled error")
+    except ValueError:
+        with pytest.raises(RuntimeError, match="close failed"):
+            cli.main()
 
 
 @pytest.mark.usefixtures("no_serve")

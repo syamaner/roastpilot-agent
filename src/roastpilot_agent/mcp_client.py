@@ -1556,7 +1556,7 @@ class MCPServerProcess:
         ANY type — already delivered via ``ready``) is drained without
         re-raising. Bounded by
         ``stop_timeout_seconds`` so a wedged native child during a startup abort
-        can never block exit; on overrun the force-kill hook (if armed) reaps the
+        bounds this reap call; on overrun the force-kill hook (if armed) reaps the
         child group, mirroring :meth:`stop`. Owner identity is cleared only
         after confirmed task completion; a cancellation-resistant owner remains
         retained so :meth:`start` refuses a replacement until :meth:`stop`
@@ -1583,7 +1583,7 @@ class MCPServerProcess:
         # Did NOT complete in time — genuinely stuck (blocked in __aenter__ after
         # a cancelled start, or a wedged native child). NOW cancel to unblock it,
         # fail closed (force-kill + unconfirmed), and bounded-reap; a startup
-        # teardown must never block exit, so any reap outcome is swallowed.
+        # teardown call must stay bounded, so any reap outcome is swallowed.
         if self._owner_task is owner and not self._stop_unconfirmed:
             self._fail_closed_teardown("MCP child did not unwind after start failure")
             owner.cancel()
@@ -1610,8 +1610,8 @@ class MCPServerProcess:
         native child (blocked PortAudio read) or a task group still awaiting an
         open pipe. A hung shutdown drives the operator to ``kill -9`` — the one
         uncatchable path that leaves the roaster commanded-hot — so this method
-        NEVER blocks past the bound and NEVER re-raises: the agent must always be
-        able to exit.
+        NEVER blocks this stop call past the bound and never re-raises; #667 owns
+        top-level exit when a retained task suppresses cancellation indefinitely.
 
         On a clean stop within the bound, ``stop_unconfirmed`` is left ``False``
         (it was reset by the preceding :meth:`start`, and the clean path never
@@ -1625,8 +1625,8 @@ class MCPServerProcess:
         roast 2) mean we could NOT confirm the child stopped cleanly, so both
         force-kill the child process group and set ``stop_unconfirmed = True``.
         That keeps the #431 respawn guard and restart→recovery honest: a stop we
-        could not confirm must never masquerade as clean. The method still NEVER
-        blocks past the bound and NEVER re-raises: the agent must always exit.
+        could not confirm must never masquerade as clean. The stop call still
+        stays bounded and never re-raises; #667 owns the top-level exit policy.
         """
         owner = self._owner_task
         if owner is None:
@@ -1660,7 +1660,7 @@ class MCPServerProcess:
                     owner.cancel()
                 # Force-terminate has killed the child, so the aclose it was
                 # blocked on should unwind. Bounded reap within the original
-                # deadline; a failed kill must still never block exit.
+                # deadline; even a failed kill cannot unbound this stop call.
                 remaining = max(0.0, stop_deadline - asyncio.get_running_loop().time())
                 done, _pending = await asyncio.wait({owner}, timeout=remaining)
                 if owner in done:
@@ -1676,7 +1676,7 @@ class MCPServerProcess:
             # the finally block retains it so start() cannot create a competing
             # owner. RE-RAISE afterwards: cancellation must always propagate,
             # never be swallowed.
-            if self._owner_task is owner and not self._stop_unconfirmed:
+            if self._owner_task is owner and not owner.done() and not self._stop_unconfirmed:
                 self._fail_closed_teardown("MCP child stop was cancelled mid-teardown")
                 owner.cancel()
             remaining = max(0.0, stop_deadline - asyncio.get_running_loop().time())
@@ -1709,7 +1709,7 @@ class MCPServerProcess:
         drives restart→``operator_recovery_required``) and best-effort
         force-kill the current process group. Never raises: a buggy
         force-terminate hook is logged and swallowed, because this runs on a
-        shutdown path that must always let the agent exit.
+        shutdown path where cleanup failures must not mask the primary error.
 
         Args:
             reason: Human-readable cause, logged at ERROR for post-roast diagnosis.

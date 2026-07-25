@@ -787,7 +787,7 @@ async def _cleanup_step(name: str, action: Callable[[], Awaitable[object]]) -> N
     try:
         await action()
     except Exception:  # noqa: BLE001 — best-effort cleanup, logged not raised
-        _log.warning("live-serve teardown step %r failed", name, exc_info=True)
+        _log.warning("serve teardown step %r failed", name, exc_info=True)
 
 
 async def _serve_replay(args: argparse.Namespace) -> int:
@@ -831,6 +831,7 @@ async def _serve_replay(args: argparse.Namespace) -> int:
             spa_dir=_resolve_spa_dir(args),
         )
         runner: asyncio.Task[None] | None = None
+        completed = False
         try:
             # Report the *clamped* speed the harness actually runs at (1×–60×), not
             # the raw request — `--speed 100` runs 60×, so the banner must say 60×.
@@ -861,6 +862,7 @@ async def _serve_replay(args: argparse.Namespace) -> int:
             if not args.step:
                 await source.run()  # drive the recorded roast at the chosen speed
             await runner
+            completed = True
         finally:
             # Uvicorn's lifespan normally closes these resources. Retain CLI
             # ownership as a backstop if serve returns before lifespan startup.
@@ -869,7 +871,10 @@ async def _serve_replay(args: argparse.Namespace) -> int:
                     runner.cancel()
                     await asyncio.gather(runner, return_exceptions=True)
             finally:
-                await source.aclose()
+                if completed:
+                    await source.aclose()
+                else:
+                    await _cleanup_step("replay source close", source.aclose)
     return 0
 
 

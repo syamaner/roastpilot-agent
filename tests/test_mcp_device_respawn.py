@@ -614,7 +614,8 @@ async def test_unconfirmed_stop_aborts_respawn(
 
     persist_config_edit(AppConfigEdit(mcp_device=MCPDeviceConfigEdit(serial_port="/dev/ttyUSB1")))
 
-    with pytest.raises(MCPConnErr, match="teardown was unconfirmed"):
+    restart_message = "verify the roaster and old MCP child resources are inactive.*restart.*retry"
+    with pytest.raises(MCPConnErr, match=restart_message):
         await svc.start_roast(RoastProfile(**_profile()))
 
     # Only stop() was called — set_device_config and start must NOT have run.
@@ -622,6 +623,10 @@ async def test_unconfirmed_stop_aborts_respawn(
 
     # Baseline must be None — not the stale old value.
     assert svc._spawned_mcp_device is None  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(MCPConnErr, match=restart_message):
+        await svc.start_roast(RoastProfile(**_profile()))
+    assert fake_mcp.calls == ["stop", "stop"]
 
 
 # ---------------------------------------------------------------------------
