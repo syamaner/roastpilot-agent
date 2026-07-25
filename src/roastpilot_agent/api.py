@@ -763,8 +763,9 @@ class RoastRunner:
           was the real stop.
         - ``command="mcp_stop"`` — :meth:`RoastService.record_child_stop_unconfirmed`
           when ``MCPServerProcess.stop_unconfirmed`` is True after teardown: the
-          child stop overran its bound and was force-killed, so the clean-stop
-          handshake never confirmed.
+          owner exited unexpectedly or teardown did not confirm cleanly.
+          Force-termination is best-effort, so the marker records uncertainty,
+          not a claim that a kill signal succeeded.
 
         Written **directly to the store** (not via the emitter buffer): the
         heat-off coroutine that owns the buffer may have just been cancelled by
@@ -1483,15 +1484,14 @@ class RoastService:
         # stop() bypasses record_child_stop_unconfirmed intentionally: there
         # is no active run to key a marker to, and start() resets the flag.
         await self._mcp.stop()
-        # If stop() timed out and force-killed the child, the old process may
-        # still be holding the serial port or audio device.  Starting a new
-        # child into that state risks a resource conflict or a hidden live
-        # process.  Abort the respawn; the None baseline ensures the next
-        # start_roast re-attempts cleanly once the operator has confirmed the
-        # hardware is clear.
+        # If stop() could not confirm clean teardown, the old process may still
+        # be holding the serial port or audio device. Starting a new child into
+        # that state risks a resource conflict or a hidden live process. Abort
+        # the respawn; the None baseline ensures the next start_roast re-attempts
+        # cleanly once the operator has confirmed the hardware is clear.
         if self._mcp.stop_unconfirmed:
             raise MCPConnectionError(
-                "old MCP child stop was unconfirmed (force-killed); "
+                "old MCP child teardown was unconfirmed; "
                 "aborting respawn — retry start_roast once hardware is clear"
             )
         self._mcp.set_device_config(new_device_config)
@@ -1964,13 +1964,13 @@ class RoastService:
         """Persist a marker if the MCP child stop went unconfirmed (#177).
 
         Called by the live-serve teardown **after** ``mcp.stop`` (so the
-        force-kill verdict is known) and **before** ``store.close`` (so the
+        clean-teardown verdict is known) and **before** ``store.close`` (so the
         store is still open to write to). When
-        ``MCPServerProcess.stop_unconfirmed`` is True the child overran its
-        stop bound and was force-killed, so the clean-stop handshake never
-        confirmed — this records that in the decision trace for post-roast
-        diagnosis. A no-op when the stop confirmed cleanly or there is no live
-        runner to key the marker to (API-only / never started).
+        ``MCPServerProcess.stop_unconfirmed`` is True, the owner exited
+        unexpectedly or teardown did not confirm cleanly. This records that
+        uncertainty in the decision trace for post-roast diagnosis. A no-op
+        when teardown confirmed cleanly or there is no live runner to key the
+        marker to (API-only / never started).
 
         Observability only — never an auto-resume trigger (a restart still
         enters ``operator_recovery_required``). Fail-closed: delegates to the
@@ -1978,7 +1978,7 @@ class RoastService:
 
         Args:
             stop_unconfirmed: ``MCPServerProcess.stop_unconfirmed`` after
-                ``mcp.stop`` — whether the child stop had to force-terminate.
+                ``mcp.stop`` — whether clean child teardown was unconfirmed.
         """
         if not stop_unconfirmed:
             return
@@ -1986,7 +1986,7 @@ class RoastService:
         if runner is None:
             return
         _log.error(
-            "MCP child stop went UNCONFIRMED (force-killed) — recording a trace marker; "
+            "MCP child teardown went UNCONFIRMED — recording a trace marker; "
             "a restart will enter operator_recovery_required"
         )
         await runner.record_shutdown_unconfirmed(

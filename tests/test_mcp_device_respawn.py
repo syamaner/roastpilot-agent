@@ -614,7 +614,7 @@ async def test_unconfirmed_stop_aborts_respawn(
 
     persist_config_edit(AppConfigEdit(mcp_device=MCPDeviceConfigEdit(serial_port="/dev/ttyUSB1")))
 
-    with pytest.raises(MCPConnErr, match="stop was unconfirmed"):
+    with pytest.raises(MCPConnErr, match="teardown was unconfirmed"):
         await svc.start_roast(RoastProfile(**_profile()))
 
     # Only stop() was called — set_device_config and start must NOT have run.

@@ -391,10 +391,10 @@ async def test_record_shutdown_unconfirmed_swallows_store_error(
 
 
 @pytest.mark.asyncio
-async def test_record_child_stop_unconfirmed_persists_marker_when_force_killed(
+async def test_record_child_stop_unconfirmed_persists_marker_when_teardown_uncertain(
     store: RoastStore,
 ) -> None:
-    """When the MCP child stop went unconfirmed (force-killed), the teardown
+    """When MCP child teardown went unconfirmed, the teardown
     step persists an ``mcp_stop`` unconfirmed marker a recovery read can see (#177)."""
     clock = FakeClock()
     mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])

@@ -117,6 +117,16 @@ def test_replay_step_mode_builds_and_serves(
 ) -> None:
     """``--replay <dir> --step`` builds the app, prints the run banner, and
     returns 0 — paused (no frames advanced) since stepping is HTTP-driven."""
+    from roastpilot_agent.replay import ReplaySource
+
+    closed: list[ReplaySource] = []
+    real_aclose = ReplaySource.aclose
+
+    async def recording_aclose(source: ReplaySource) -> None:
+        closed.append(source)
+        await real_aclose(source)
+
+    monkeypatch.setattr(ReplaySource, "aclose", recording_aclose)
     fixture = Path(__file__).parent / "fixtures" / "replay" / "session-2"
     monkeypatch.setattr(
         "sys.argv",
@@ -126,6 +136,80 @@ def test_replay_step_mode_builds_and_serves(
     out = capsys.readouterr().out
     assert "replaying session-2" in out
     assert "stepped (paused at tick 0)" in out
+    assert len(closed) == 1
+
+
+def test_replay_closes_source_when_server_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A serve failure closes replay resources without relying on lifespan."""
+    import uvicorn
+
+    from roastpilot_agent.replay import ReplaySource
+
+    closed: list[ReplaySource] = []
+    real_aclose = ReplaySource.aclose
+
+    async def recording_aclose(source: ReplaySource) -> None:
+        closed.append(source)
+        await real_aclose(source)
+
+    async def fail_serve(_server: uvicorn.Server) -> None:
+        raise RuntimeError("serve failed")
+
+    monkeypatch.setattr(ReplaySource, "aclose", recording_aclose)
+    monkeypatch.setattr(uvicorn.Server, "serve", fail_serve)
+    fixture = Path(__file__).parent / "fixtures" / "replay" / "session-2"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "--replay", str(fixture), "--step", "--port", "0"],
+    )
+
+    with pytest.raises(RuntimeError, match="serve failed"):
+        cli.main()
+    assert len(closed) == 1
+
+
+def test_replay_source_failure_cancels_server_and_closes_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replay failure drains the server before closing owned resources."""
+    import uvicorn
+
+    from roastpilot_agent.replay import ReplaySource
+
+    closed: list[ReplaySource] = []
+    server_cancelled: list[bool] = []
+    real_aclose = ReplaySource.aclose
+
+    async def recording_aclose(source: ReplaySource) -> None:
+        closed.append(source)
+        await real_aclose(source)
+
+    async def fail_run(_source: ReplaySource) -> None:
+        await asyncio.sleep(0)
+        raise RuntimeError("source failed")
+
+    async def pending_serve(_server: uvicorn.Server) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            server_cancelled.append(True)
+            raise RuntimeError("server cancellation failed") from None
+
+    monkeypatch.setattr(ReplaySource, "aclose", recording_aclose)
+    monkeypatch.setattr(ReplaySource, "run", fail_run)
+    monkeypatch.setattr(uvicorn.Server, "serve", pending_serve)
+    fixture = Path(__file__).parent / "fixtures" / "replay" / "session-2"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "--replay", str(fixture), "--speed", "60", "--port", "0"],
+    )
+
+    with pytest.raises(RuntimeError, match="source failed"):
+        cli.main()
+    assert server_cancelled == [True]
+    assert len(closed) == 1
 
 
 @pytest.mark.usefixtures("no_serve")

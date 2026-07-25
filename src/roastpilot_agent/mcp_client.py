@@ -886,9 +886,9 @@ SessionFactory = Callable[
 ]
 
 #: A best-effort, synchronous force-terminate of the spawned child process
-#: tree, invoked only when graceful ``stop`` overruns ``stop_timeout_seconds``.
+#: tree, invoked whenever the current lifecycle cannot confirm clean teardown.
 #: Returns ``True`` if a termination signal was actually delivered (a child was
-#: known and alive), ``False`` otherwise. Injectable so the timeout path is
+#: known and alive), ``False`` otherwise. Injectable so fail-closed paths are
 #: unit-testable without a real process.
 ForceTerminate = Callable[[], bool]
 
@@ -902,9 +902,9 @@ def force_terminate_process_group(pid: int) -> bool:
     the group atomically reaps the child and anything it forked (the audio
     worker), which is exactly what a wedged-child shutdown needs.
 
-    This is the uncatchable last resort: it runs only after graceful
-    ``aclose`` has already overrun ``stop_timeout_seconds``, so SIGKILL (not a
-    catchable SIGTERM the wedged child may never service) is deliberate.
+    This is the uncatchable last resort after the owner exits unexpectedly or
+    graceful teardown cannot be confirmed. SIGKILL (not a catchable SIGTERM the
+    uncertain or wedged child may never service) is deliberate.
 
     POSIX-only: ``os.killpg``/``os.getpgid`` do not exist on Windows. This
     repo targets darwin/linux; on any other platform the helper is a no-op.
@@ -1108,12 +1108,12 @@ class MCPServerProcess:
             session: A pre-attached ``ToolSession`` (test seam); skips spawn.
             session_factory: Override the real ``stdio_client`` spawn (test
                 seam). When omitted, the default factory both spawns the child
-                and registers a process-group force-terminate hook used if
-                graceful :meth:`stop` overruns ``stop_timeout_seconds``.
+                and registers a process-group force-terminate hook used when
+                the current lifecycle cannot confirm clean teardown.
             force_terminate: An injectable force-terminate hook (test seam).
-                When provided, it is used directly on a stop timeout instead
-                of the spawned-pid hook — letting the timeout path be unit
-                tested without a real process.
+                When provided, it is used directly on fail-closed teardown
+                instead of the spawned-pid hook, letting uncertain-lifecycle
+                paths be unit tested without a real process.
         """
         self._config = config or MCPConfig()
         self._device_config: MCPDeviceConfig | None = device_config
@@ -1135,9 +1135,9 @@ class MCPServerProcess:
         #: Set by :meth:`stop` to ask the owner task to exit its context stack.
         #: Created per spawn so a fresh start never inherits a set event.
         self._stop_requested: asyncio.Event | None = None
-        #: Set on the timeout path of :meth:`stop` when the child did not
-        #: confirm a clean shutdown and had to be force-terminated. #177 will
-        #: persist it so a restart enters ``operator_recovery_required``.
+        #: Set when an owner exits unexpectedly or teardown cannot confirm a
+        #: clean shutdown. Force-termination is best-effort; #177 persists the
+        #: flag so a restart enters ``operator_recovery_required``.
         self._stop_unconfirmed = False
         #: Best-effort force-terminate of the spawned child group, populated by
         #: the default factory once the pid is known (or injected for tests).
@@ -1159,10 +1159,10 @@ class MCPServerProcess:
         """The real spawn factory: spawn the child and capture its pid.
 
         Wires :func:`_spawn_stdio_session`'s ``on_spawn`` to
-        :meth:`_register_force_terminate` so a wedged-child timeout in
-        :meth:`stop` can force-kill the process group. An explicitly injected
-        ``force_terminate`` (test seam) is left untouched — only an unset hook
-        is populated by the spawn.
+        :meth:`_register_force_terminate` so any unconfirmed current lifecycle
+        can force-kill the process group. An explicitly injected
+        ``force_terminate`` (test seam) is left untouched; only an unset hook is
+        populated by the spawn.
 
         Args:
             params: The stdio spawn parameters.
@@ -1173,7 +1173,7 @@ class MCPServerProcess:
         return _spawn_stdio_session(params, on_spawn=self._register_force_terminate)
 
     def _register_force_terminate(self, pid: int) -> None:
-        """Record a process-group force-terminate hook for the spawned ``pid``.
+        """Record the current child's fail-closed process-group kill hook.
 
         Skips registration if a force-terminate hook was injected at
         construction (test seam): the injected hook must win.
@@ -1321,17 +1321,17 @@ class MCPServerProcess:
 
     @property
     def stop_unconfirmed(self) -> bool:
-        """Whether the *most recent* :meth:`stop` had to force-terminate the child.
+        """Whether the most recent child lifecycle lacked confirmed clean teardown.
 
-        ``True`` means the last graceful teardown overran ``stop_timeout_seconds``
-        and the child process group was force-killed, so a clean shutdown was
-        never confirmed. It is reset to ``False`` at the top of :meth:`start`,
-        so across a ``start → stop → start`` cycle a fresh run never inherits a
-        previous run's unconfirmed flag — the flag describes the last completed
-        teardown, not the lifetime. A clean stop leaves it ``False``. #177
-        persists this to the decision trace so an unconfirmed stop is visible
-        post-roast (observability for diagnosis / recovery — never an
-        auto-resume trigger).
+        ``True`` means an owner exited unexpectedly or graceful teardown could
+        not be confirmed within ``stop_timeout_seconds``. Force-termination is
+        attempted when a current child hook is available, but the flag does not
+        claim that attempt succeeded. It is reset to ``False`` immediately
+        before :meth:`start` spawns a new owner, so a fresh run never inherits a
+        previous run's unconfirmed verdict. A confirmed clean stop leaves it
+        ``False``. #177 persists this to the decision trace so an unconfirmed
+        lifecycle is visible post-roast (observability for diagnosis / recovery
+        — never an auto-resume trigger).
         """
         return self._stop_unconfirmed
 
@@ -1353,13 +1353,18 @@ class MCPServerProcess:
         A startup failure resolves ``ready`` with the exception and returns
         WITHOUT parking (the context has already unwound in-task), so
         :meth:`start` re-raises it and leaves the process not-running.
+        Any BaseException from the owned context body fails closed before
+        context unwind begins, while this generation's PID hook is current.
+        The outer guard also handles context-enter/exit failures without
+        repeating that action. A later :meth:`start` never signals a completed
+        owner's PID.
 
         Args:
             ready: Future the caller (``start``) awaits; resolved with the live
                 session on success or the startup exception on failure.
         """
+        stop_requested = self._stop_requested
         try:
-            stop_requested = self._stop_requested
             if stop_requested is None:  # pragma: no cover - start() always sets it
                 # Defensive: start() sets _stop_requested before launching us, so
                 # this is unreachable — but never leave ``ready`` dangling, or
@@ -1367,29 +1372,46 @@ class MCPServerProcess:
                 raise MCPConnectionError("MCP owner task started without a stop signal")
             async with AsyncExitStack() as stack:
                 try:
-                    session = await stack.enter_async_context(
-                        self._session_factory(self.build_server_parameters())
-                    )
-                    await asyncio.wait_for(
-                        session.initialize(), timeout=self._config.startup_timeout_seconds
-                    )
-                    self._session = session
-                    # Health check through the public surface before we report ready.
-                    await self.call_tool("get_server_info", {})
-                except Exception as exc:  # startup failure: unwind + report to start()
-                    self._session = None
-                    # First (and only) resolution on this path — ready is still
-                    # pending here (nothing else resolves it), so set directly; a
-                    # hypothetical double-set would raise InvalidStateError, which
-                    # the outer BaseException guard + the finally backstop catch.
-                    ready.set_exception(exc)
-                    return  # exits the `async with` here, in THIS task
-                # Startup succeeded: hand the session to start() and park until stop.
-                ready.set_result(session)
-                await stop_requested.wait()
-                # Falls out of the `async with` → stack.aclose() runs IN THIS TASK,
-                # so the stdio_client cancel scope exits where it was entered.
+                    try:
+                        session = await stack.enter_async_context(
+                            self._session_factory(self.build_server_parameters())
+                        )
+                        await asyncio.wait_for(
+                            session.initialize(), timeout=self._config.startup_timeout_seconds
+                        )
+                        self._session = session
+                        # Health check through the public surface before we report ready.
+                        await self.call_tool("get_server_info", {})
+                    except Exception as exc:  # startup failure: unwind + report to start()
+                        self._session = None
+                        # First (and only) resolution on this path — ready is still
+                        # pending here (nothing else resolves it), so set directly; a
+                        # hypothetical double-set would raise InvalidStateError, which
+                        # the outer BaseException guard + the finally backstop catch.
+                        ready.set_exception(exc)
+                        return  # exits the `async with` here, in THIS task
+                    # Startup succeeded: hand the session to start() and park until stop.
+                    ready.set_result(session)
+                    await stop_requested.wait()
+                    # Falls out of the `async with` → stack.aclose() runs IN THIS TASK,
+                    # so the stdio_client cancel scope exits where it was entered.
+                except BaseException as exc:
+                    # Act before AsyncExitStack unwinds. A slow __aexit__ may outlive
+                    # the child and make this generation's PID unsafe to signal.
+                    if self._owner_task is asyncio.current_task() and not self._stop_unconfirmed:
+                        self._fail_closed_teardown(f"MCP owner task exited uncleanly: {exc!r}")
+                    raise
         except BaseException as exc:  # noqa: BLE001 — ready must never dangle
+            # Fail closed while this owner still identifies the current child
+            # generation. Delaying this until a later start() would reuse a PID
+            # hook after the child may have exited and its PID been recycled.
+            if self._owner_task is asyncio.current_task() and not self._stop_unconfirmed:
+                reason = (
+                    f"MCP child stop raised during teardown: {exc}"
+                    if stop_requested is not None and stop_requested.is_set()
+                    else f"MCP owner task exited uncleanly: {exc!r}"
+                )
+                self._fail_closed_teardown(reason)
             # Any exit path that reaches here (a raise before/after the inner
             # try, a cancellation, an aclose error) MUST resolve ``ready`` or
             # ``start``'s ``await ready`` hangs forever. The inner success/failure
@@ -1422,14 +1444,16 @@ class MCPServerProcess:
         awaits its ``ready`` signal.  This is what lets a respawn driven from a
         request-handler task tear the child down without a cross-task scope exit.
 
-        Resets :attr:`stop_unconfirmed` to ``False`` first: the flag describes
-        the most recent teardown, so a reused process (start → stop → start)
-        must not carry a prior run's unconfirmed verdict into the new run.
-        A prior owner retained after a bounded teardown attempt must finish
-        before another child can start; otherwise the old owner's finalizer
-        could clear the replacement session. If an owner instead finishes
-        uncleanly without an earlier fail-closed stop, start marks teardown
-        unconfirmed and refuses the replacement.
+        Resets :attr:`stop_unconfirmed` to ``False`` only immediately before
+        spawning a new owner: a reused process (start → stop → start) must not
+        carry a prior run's unconfirmed verdict into the new run, while a
+        refused start must preserve it.
+        A prior owner retained after a bounded teardown attempt must be
+        finalized by :meth:`stop` before another child can start, even if the
+        owner task has since finished. Otherwise an old stop body/finalizer
+        could act on the replacement generation. Unexpected owner failure
+        fails closed inside the owner task while its PID hook is still current;
+        start never signals a completed generation's potentially stale PID.
 
         Re-arms the force-terminate hook for each spawn: on the first start the
         auto-registered hook captures the spawned pid via
@@ -1439,7 +1463,8 @@ class MCPServerProcess:
         pid.  An injected hook (test seam, ``_force_terminate_injected=True``)
         is never cleared — it must win and be reused across respawns.
         """
-        if self._session is not None:
+        stop_requested = self._stop_requested
+        if self._session is not None and (stop_requested is None or not stop_requested.is_set()):
             return
         previous_owner = self._owner_task
         if previous_owner is not None:
@@ -1447,22 +1472,9 @@ class MCPServerProcess:
                 raise MCPConnectionError(
                     "previous MCP owner is still tearing down; refusing to start a second child"
                 )
-            previous_owner_error = (
-                asyncio.CancelledError()
-                if previous_owner.cancelled()
-                else previous_owner.exception()
+            raise MCPConnectionError(
+                "previous MCP owner is awaiting stop finalization; refusing to start a second child"
             )
-            with contextlib.suppress(BaseException):
-                previous_owner.result()
-            self._owner_task = None
-            self._stop_requested = None
-            if previous_owner_error is not None and not self._stop_unconfirmed:
-                self._fail_closed_teardown(
-                    "previous MCP owner exited uncleanly before a replacement start"
-                )
-                raise MCPConnectionError(
-                    "previous MCP owner exited uncleanly; refusing to start a second child"
-                )
         self._stop_unconfirmed = False
         # Re-arm: clear the auto-registered hook before each spawn so
         # _register_force_terminate captures the new pid, not the previous one.
@@ -1540,16 +1552,17 @@ class MCPServerProcess:
         **await the owner's natural completion FIRST, bounded**, and only
         ``cancel()`` if that bound overruns — which is the genuinely-stuck case
         (blocked in the factory ``__aenter__`` after a ``start()`` cancelled
-        mid-spawn, where a bare await would hang forever). ``gather(...,
-        return_exceptions=True)`` collects the owner's outcome (of ANY type —
-        already delivered via ``ready``) without re-raising. Bounded by
+        mid-spawn, where a bare await would hang forever). The task result (of
+        ANY type — already delivered via ``ready``) is drained without
+        re-raising. Bounded by
         ``stop_timeout_seconds`` so a wedged native child during a startup abort
         can never block exit; on overrun the force-kill hook (if armed) reaps the
-        child group, mirroring :meth:`stop`.
+        child group, mirroring :meth:`stop`. Owner identity is cleared only
+        after confirmed task completion; a cancellation-resistant owner remains
+        retained so :meth:`start` refuses a replacement until :meth:`stop`
+        finalizes it.
         """
         owner = self._owner_task
-        self._owner_task = None
-        self._stop_requested = None
         if owner is None:  # pragma: no cover - defensive: start() always set it
             return
         # Natural completion first: an already-tearing-down owner must be let
@@ -1563,15 +1576,24 @@ class MCPServerProcess:
             # never re-raised out of this best-effort reap.
             with contextlib.suppress(BaseException):
                 owner.result()
+            if self._owner_task is owner:
+                self._owner_task = None
+                self._stop_requested = None
             return
         # Did NOT complete in time — genuinely stuck (blocked in __aenter__ after
         # a cancelled start, or a wedged native child). NOW cancel to unblock it,
         # fail closed (force-kill + unconfirmed), and bounded-reap; a startup
         # teardown must never block exit, so any reap outcome is swallowed.
-        self._fail_closed_teardown("MCP child did not unwind after start failure")
-        owner.cancel()
-        with contextlib.suppress(TimeoutError, BaseException):
-            await asyncio.wait_for(owner, timeout=self._config.stop_timeout_seconds)
+        if self._owner_task is owner and not self._stop_unconfirmed:
+            self._fail_closed_teardown("MCP child did not unwind after start failure")
+            owner.cancel()
+        done, _pending = await asyncio.wait({owner}, timeout=self._config.stop_timeout_seconds)
+        if owner in done:
+            with contextlib.suppress(BaseException):
+                owner.result()
+            if self._owner_task is owner:
+                self._owner_task = None
+                self._stop_requested = None
 
     async def stop(self) -> None:
         """Shut the child down, bounded by ``stop_timeout_seconds`` (#212).
@@ -1621,18 +1643,11 @@ class MCPServerProcess:
                 stop_requested.set()
             done, _pending = await asyncio.wait({owner}, timeout=self._config.stop_timeout_seconds)
             if owner in done:
-                # A retained owner may finish after an earlier fail-closed kill.
-                # Drain that outcome without invoking the same PID hook again:
-                # the original PID may have been recycled by this later retry.
-                if self._owner_task is owner and owner.cancelled():
-                    if not self._stop_unconfirmed:
-                        self._fail_closed_teardown("MCP owner was cancelled during teardown")
-                elif self._owner_task is owner:
-                    owner_error = owner.exception()
-                    if owner_error is not None and not self._stop_unconfirmed:
-                        self._fail_closed_teardown(
-                            f"MCP child stop raised during teardown: {owner_error}"
-                        )
+                # _run_session fail-closes every cancelled/raising outcome before
+                # task completion. A retained completed owner is therefore drain
+                # only: its PID hook may already be stale and must not be signalled.
+                with contextlib.suppress(BaseException):
+                    owner.result()
             else:
                 # The owner overran the bound (a wedged native child / open pipe).
                 if self._owner_task is owner and not self._stop_unconfirmed:
@@ -1688,13 +1703,13 @@ class MCPServerProcess:
     def _fail_closed_teardown(self, reason: str) -> None:
         """Mark an unconfirmed stop and force-kill the child group (#484 MEDIUM).
 
-        Shared by both uncertain-teardown paths in :meth:`stop` — a timeout and a
-        raising ``aclose``. Either way the child's state is unknown, so we fail
+        Used by the owner task's immediate unexpected-exit path and by bounded
+        startup/shutdown cleanup. Whenever the child's state is unknown, fail
         closed: set ``stop_unconfirmed`` (which gates the #431 respawn guard and
-        drives restart→``operator_recovery_required``) and best-effort force-kill
-        the process group. Never raises: a buggy force-terminate hook is logged
-        and swallowed, because this runs on the fail-closed shutdown path that
-        must always let the agent exit.
+        drives restart→``operator_recovery_required``) and best-effort
+        force-kill the current process group. Never raises: a buggy
+        force-terminate hook is logged and swallowed, because this runs on a
+        shutdown path that must always let the agent exit.
 
         Args:
             reason: Human-readable cause, logged at ERROR for post-roast diagnosis.

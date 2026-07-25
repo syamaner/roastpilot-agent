@@ -743,7 +743,10 @@ async def test_start_initializes_health_checks_and_stops_cleanly() -> None:
     probe = FactoryProbe(session)
     process = MCPServerProcess(session_factory=probe)
     await process.start()
+    owner = process._owner_task  # pyright: ignore[reportPrivateUsage]
+    await process.start()
     assert process.running
+    assert process._owner_task is owner  # pyright: ignore[reportPrivateUsage]
     assert session.initialized
     assert session.calls == [("get_server_info", {})]  # health check
     params = probe.params
@@ -879,6 +882,59 @@ async def test_start_cancelled_mid_flight_reaps_the_owner() -> None:
     assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
     assert process._stop_requested is None  # pyright: ignore[reportPrivateUsage]
     assert not process.running
+
+
+@pytest.mark.asyncio
+async def test_start_cancellation_retains_owner_that_delays_cancel() -> None:
+    """A cancellation-resistant startup owner blocks replacement until stop."""
+    release = asyncio.Event()
+    force_terminate_calls: list[int] = []
+
+    def force_terminate() -> bool:
+        force_terminate_calls.append(1)
+        return True
+
+    class CancellationResistantEnter:
+        async def __aenter__(self) -> FakeInitializableSession:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+                raise
+            raise AssertionError("unreachable")  # pragma: no cover
+
+        async def __aexit__(self, *exc_info: object) -> None:
+            return None
+
+    process = MCPServerProcess(
+        MCPConfig(stop_timeout_seconds=0.05),
+        session_factory=lambda _params: CancellationResistantEnter(),
+        force_terminate=force_terminate,
+    )
+    start_task = asyncio.create_task(process.start())
+    await asyncio.sleep(0.01)
+    owner = process._owner_task  # pyright: ignore[reportPrivateUsage]
+    assert owner is not None
+    start_task.cancel()
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(start_task, timeout=0.5)
+        assert not owner.done()
+        assert process._owner_task is owner  # pyright: ignore[reportPrivateUsage]
+        assert process.stop_unconfirmed is True
+        assert force_terminate_calls == [1]
+        with pytest.raises(MCPConnectionError, match="still tearing down"):
+            await process.start()
+    finally:
+        release.set()
+        done, _pending = await asyncio.wait({owner}, timeout=0.5)
+        assert owner in done
+        assert owner.cancelled()
+
+    await process.stop()
+    assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
+    assert force_terminate_calls == [1]
 
 
 class _SlowExitOnHealthFailFactory:
@@ -1167,19 +1223,34 @@ async def test_stop_cancelled_mid_wait_fails_closed_and_reraises() -> None:
     owner = process._owner_task  # pyright: ignore[reportPrivateUsage]
     assert owner is not None
 
-    stop_task = asyncio.create_task(process.stop())
-    # Let stop() reach its shielded `await` (the owner is wedged in __aexit__).
-    await asyncio.sleep(0.05)
-    stop_task.cancel()
-    # The cancellation must PROPAGATE to the caller — never be swallowed.
-    with pytest.raises(asyncio.CancelledError):
-        await stop_task
+    stop_task: asyncio.Task[None] | None = None
+    try:
+        stop_task = asyncio.create_task(process.stop())
+        # Let stop() reach its shielded `await` (the owner is wedged in __aexit__).
+        await asyncio.sleep(0.05)
+        with pytest.raises(MCPConnectionError, match="still tearing down"):
+            await process.start()
+        stop_task.cancel()
+        # The cancellation must PROPAGATE to the caller — never be swallowed.
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
 
-    # ...but first it failed closed: force-terminate fired, unconfirmed marked.
-    assert calls == [1], "cancelled stop() did not force-terminate the child"
-    assert process.stop_unconfirmed is True
-    assert not process.running
-    assert owner.done(), "cancelled stop() leaked its MCP owner task"
+        # ...but first it failed closed: force-terminate fired, unconfirmed marked.
+        assert calls == [1], "cancelled stop() did not force-terminate the child"
+        assert process.stop_unconfirmed is True
+        assert not process.running
+        assert owner.done(), "cancelled stop() leaked its MCP owner task"
+    finally:
+        if stop_task is not None and not stop_task.done():
+            stop_task.cancel()
+        if stop_task is not None:
+            with suppress(BaseException):
+                await asyncio.wait_for(stop_task, timeout=0.5)
+        if not owner.done():
+            owner.cancel()
+            with suppress(BaseException):
+                await asyncio.wait_for(owner, timeout=0.5)
+        await process.stop()
 
 
 @pytest.mark.asyncio
@@ -1266,8 +1337,8 @@ async def test_stop_cancellation_reap_stays_bounded_when_owner_delays_cancel() -
 
 
 @pytest.mark.asyncio
-async def test_start_drains_a_completed_retained_owner_before_respawn() -> None:
-    """A completed retained owner is drained before a replacement starts."""
+async def test_start_refuses_completed_owner_until_stop_finalizes_it() -> None:
+    """Only stop may drain a completed retained owner before respawn."""
     process = MCPServerProcess(
         session_factory=FactoryProbe(FakeInitializableSession(info_result()))
     )
@@ -1282,6 +1353,12 @@ async def test_start_drains_a_completed_retained_owner_before_respawn() -> None:
     process._owner_task = previous_owner  # pyright: ignore[reportPrivateUsage]
     process._stop_requested = asyncio.Event()  # pyright: ignore[reportPrivateUsage]
     process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(MCPConnectionError, match="awaiting stop finalization"):
+        await process.start()
+    assert process._owner_task is previous_owner  # pyright: ignore[reportPrivateUsage]
+    await process.stop()
+    assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
 
     await process.start()
     replacement_owner = process._owner_task  # pyright: ignore[reportPrivateUsage]
@@ -1312,45 +1389,68 @@ async def test_stop_fails_closed_for_a_newly_cancelled_owner() -> None:
     assert owner in done
     assert owner.cancelled()
 
-    await process.stop()
     assert process.stop_unconfirmed is True
+    assert calls == [1]
+    with pytest.raises(MCPConnectionError, match="awaiting stop finalization"):
+        await process.start()
+    assert process._owner_task is owner  # pyright: ignore[reportPrivateUsage]
+
+    await process.stop()
     assert calls == [1]
     assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
-async def test_start_refuses_a_newly_cancelled_completed_owner() -> None:
-    """Direct restart fails closed when the prior owner was not already handled."""
-    calls: list[int] = []
+async def test_owner_cancellation_fails_closed_before_context_exit() -> None:
+    """Owner cancellation signals its PID hook before a slow context exit."""
+    exit_started = asyncio.Event()
+    release_exit = asyncio.Event()
+    force_terminate_calls: list[int] = []
 
     def force_terminate() -> bool:
-        calls.append(1)
+        force_terminate_calls.append(1)
         return True
 
+    class SlowCancellationExit:
+        async def __aenter__(self) -> FakeInitializableSession:
+            return FakeInitializableSession(info_result())
+
+        async def __aexit__(self, *exc_info: object) -> None:
+            exit_started.set()
+            await release_exit.wait()
+
     process = MCPServerProcess(
-        session_factory=FactoryProbe(FakeInitializableSession(info_result())),
+        session_factory=lambda _params: SlowCancellationExit(),
         force_terminate=force_terminate,
     )
     await process.start()
     owner = process._owner_task  # pyright: ignore[reportPrivateUsage]
     assert owner is not None
-    owner.cancel()
-    done, _pending = await asyncio.wait({owner}, timeout=0.5)
-    assert owner in done
-    assert owner.cancelled()
 
-    with pytest.raises(MCPConnectionError, match="exited uncleanly"):
-        await process.start()
-    assert process.stop_unconfirmed is True
-    assert calls == [1]
-    assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
+    try:
+        owner.cancel()
+        await asyncio.wait_for(exit_started.wait(), timeout=0.5)
+        assert force_terminate_calls == [1]
+        assert process.stop_unconfirmed is True
+        assert not owner.done()
+    finally:
+        release_exit.set()
+        done, _pending = await asyncio.wait({owner}, timeout=0.5)
+        if owner in done:
+            with suppress(BaseException):
+                owner.result()
+        await process.stop()
+
+    assert owner.done()
+    assert owner.cancelled()
+    assert force_terminate_calls == [1]
 
 
 @pytest.mark.asyncio
 async def test_old_stop_finalizer_cannot_clobber_a_concurrent_replacement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A completed old generation cannot clear a replacement session."""
+    """A completed owner blocks start, and an old finalizer cannot clear its replacement."""
     real_wait = asyncio.wait
     old_wait_returned = asyncio.Event()
     allow_old_stop_to_finish = asyncio.Event()
@@ -1383,13 +1483,21 @@ async def test_old_stop_finalizer_cannot_clobber_a_concurrent_replacement(
         await asyncio.wait_for(old_wait_returned.wait(), timeout=0.5)
         assert old_owner.done()
 
+        with pytest.raises(MCPConnectionError, match="awaiting stop finalization"):
+            await process.start()
+        assert process._owner_task is old_owner  # pyright: ignore[reportPrivateUsage]
+
+        # A second stop finalizes the completed owner while the first stop is
+        # paused after observing the same generation.
+        await process.stop()
+        assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
+
         await process.start()
         replacement_owner = process._owner_task  # pyright: ignore[reportPrivateUsage]
         assert replacement_owner is not None
         assert replacement_owner is not old_owner
         assert process.running
 
-        monkeypatch.setattr(asyncio, "wait", real_wait)
         allow_old_stop_to_finish.set()
         await asyncio.wait_for(old_stop, timeout=0.5)
         old_stop = None
@@ -1451,14 +1559,6 @@ async def test_old_stop_body_cannot_fail_close_a_concurrent_replacement(
     await process.start()
     old_owner = process._owner_task  # pyright: ignore[reportPrivateUsage]
     assert old_owner is not None
-    first_stop = asyncio.create_task(process.stop())
-    await asyncio.sleep(0.01)
-    first_stop.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await first_stop
-    assert process.stop_unconfirmed is True
-    assert force_terminate_calls == [1]
-
     real_wait = asyncio.wait
     retry_wait_returned = asyncio.Event()
     allow_retry_stop_to_finish = asyncio.Event()
@@ -1477,13 +1577,34 @@ async def test_old_stop_body_cannot_fail_close_a_concurrent_replacement(
             await allow_retry_stop_to_finish.wait()
         return result
 
-    monkeypatch.setattr(asyncio, "wait", pausing_wait)
-    retry_stop: asyncio.Task[None] | None = asyncio.create_task(process.stop())
+    first_stop: asyncio.Task[None] | None = None
+    retry_stop: asyncio.Task[None] | None = None
     replacement_owner: asyncio.Task[None] | None = None
     try:
+        first_stop = asyncio.create_task(process.stop())
+        await asyncio.sleep(0.01)
+        first_stop.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_stop
+        assert process.stop_unconfirmed is True
+        assert force_terminate_calls == [1]
+
+        monkeypatch.setattr(asyncio, "wait", pausing_wait)
+        retry_stop = asyncio.create_task(process.stop())
         release_old_owner.set()
         await asyncio.wait_for(retry_wait_returned.wait(), timeout=0.5)
         assert old_owner.cancelled()
+
+        with pytest.raises(MCPConnectionError, match="awaiting stop finalization"):
+            await process.start()
+        assert process._owner_task is old_owner  # pyright: ignore[reportPrivateUsage]
+        assert process.stop_unconfirmed is True
+
+        # A second stop finalizes the retained owner while this retry is paused
+        # after observing the same generation.
+        await process.stop()
+        assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
+        assert force_terminate_calls == [1]
 
         await process.start()
         replacement_owner = process._owner_task  # pyright: ignore[reportPrivateUsage]
@@ -1491,8 +1612,8 @@ async def test_old_stop_body_cannot_fail_close_a_concurrent_replacement(
         assert replacement_owner is not old_owner
         assert process.running
         assert process.stop_unconfirmed is False
+        assert force_terminate_calls == [1]
 
-        monkeypatch.setattr(asyncio, "wait", real_wait)
         allow_retry_stop_to_finish.set()
         await asyncio.wait_for(retry_stop, timeout=0.5)
         retry_stop = None
@@ -1504,9 +1625,12 @@ async def test_old_stop_body_cannot_fail_close_a_concurrent_replacement(
         monkeypatch.setattr(asyncio, "wait", real_wait)
         release_old_owner.set()
         allow_retry_stop_to_finish.set()
-        if retry_stop is not None:
-            with suppress(BaseException):
-                await asyncio.wait_for(retry_stop, timeout=0.5)
+        for task in (first_stop, retry_stop):
+            if task is not None and not task.done():
+                task.cancel()
+            if task is not None:
+                with suppress(BaseException):
+                    await asyncio.wait_for(task, timeout=0.5)
         if process._owner_task is not None:  # pyright: ignore[reportPrivateUsage]
             await process.stop()
 
