@@ -3619,6 +3619,21 @@ async def test_start_run_falls_back_to_per_process_roast_num_when_none() -> None
 
 
 @pytest.mark.asyncio
+async def test_start_run_clears_prior_roast_telemetry() -> None:
+    """A new run cannot expose or stamp the prior run's last reading (#592)."""
+    harness = make_harness(readings=[reading(bean=187.5)])
+    await harness.controller.start_run(PROFILE)
+    await harness.controller.tick()
+    assert harness.controller.snapshot().telemetry is not None
+
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    harness.controller.transition_to(RoastPhase.IDLE)
+    await harness.controller.start_run(PROFILE)
+
+    assert harness.controller.snapshot().telemetry is None
+
+
+@pytest.mark.asyncio
 async def test_start_run_per_process_counter_syncs_to_store_derived_number() -> None:
     """#385 auggie: when a store-derived number is used, the per-process counter
     is advanced to at least that value so a subsequent fallback (None) cannot produce
@@ -3859,6 +3874,24 @@ async def test_operator_first_crack_override_stamped_and_gated() -> None:
     await harness.controller.operator_mark_first_crack()
     assert harness.controller.phase is RoastPhase.DEVELOPMENT
     assert "mark_first_crack" in harness.executor.commands
+    first_crack = [p for k, p in harness.events.events if k is RoastEventKind.FIRST_CRACK]
+    assert first_crack == [{"source": "operator"}]  # no reading consumed: never invent
+
+    # Once a server telemetry tick has been consumed, the supported operator
+    # override persists that exact last validated bean reading for the fixed
+    # FC landmark (#592 / Codex P2).
+    harness_with_telemetry = make_harness(readings=[reading(bean=187.5)])
+    harness_with_telemetry.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness_with_telemetry.controller.transition_to(step)
+    await harness_with_telemetry.controller.tick()
+    harness_with_telemetry.events.events.clear()
+    await harness_with_telemetry.controller.operator_mark_first_crack()
+    first_crack_with_temp = [
+        p for k, p in harness_with_telemetry.events.events if k is RoastEventKind.FIRST_CRACK
+    ]
+    assert first_crack_with_temp == [{"source": "operator", "bean_temp_c": 187.5}]
+
     # And gated by the matrix outside roasting:
     harness2 = make_harness(readings=[reading()])
     harness2.controller.load_profile(PROFILE)

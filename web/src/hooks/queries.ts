@@ -169,6 +169,10 @@ export function useTimeline(runId: string | null) {
   return useQuery({
     queryKey: roastKeys.timeline(runId ?? ""),
     queryFn: runId === null ? skipToken : () => api.timeline(runId),
+    // The live dashboard uses the persisted timeline to recover one-shot
+    // server events after remount. A still-"fresh" FC-free cache entry must
+    // therefore never suppress the remount fetch (#592 / Codex P2).
+    refetchOnMount: "always",
   });
 }
 

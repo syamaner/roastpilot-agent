@@ -4098,6 +4098,7 @@ async def test_mark_first_crack_via_queue_enters_development(store: RoastStore) 
     for _ in range(3):
         await _tick(service, clock)  # → roasting_pre_first_crack
     mcp.frames = [_reading(190.0, 200.0, t0_detected=True)]  # no auto-FC
+    await _tick(service, clock)  # prime the controller's last validated reading
     result = await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.MARK_FIRST_CRACK)
     )
@@ -4105,6 +4106,16 @@ async def test_mark_first_crack_via_queue_enters_development(store: RoastStore) 
     await _tick(service, clock)
     assert (await store.read_run(run_id)).agent_phase is RoastPhase.DEVELOPMENT  # type: ignore[union-attr]
     assert "mark_first_crack" in mcp.commands()
+    first_crack = [
+        event
+        for event in (await service.timeline(run_id)).events
+        if event.kind is RoastEventKind.FIRST_CRACK
+    ]
+    assert len(first_crack) == 1
+    assert first_crack[0].payload == {
+        "source": "operator",
+        "bean_temp_c": 190.0,
+    }
 
 
 @pytest.mark.asyncio

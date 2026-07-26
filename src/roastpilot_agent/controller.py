@@ -3678,6 +3678,7 @@ class RoastController:
         self._run_started_monotonic = self._clock()
         self._current_heat = 0
         self._current_fan = 0
+        self._last_telemetry = None  # never carry a prior run's reading into this run
         self._last_command_monotonic = None  # new run: rate-limit baseline resets
         # New run: advisory baselines reset too, so the first consult in the
         # new roast fires on its own merits, not on a previous run's timer.
@@ -3959,7 +3960,13 @@ class RoastController:
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "mark_first_crack"})
             return
-        self._events.emit(RoastEventKind.FIRST_CRACK, {"source": RoastEventSource.OPERATOR.value})
+        event_payload: dict[str, object] = {"source": RoastEventSource.OPERATOR.value}
+        # #592 / Codex P2: operator FC is a supported server-authored path too.
+        # Preserve the last validated bean reading when one exists; never invent
+        # a landmark before the controller has consumed telemetry for this run.
+        if self._last_telemetry is not None:
+            event_payload["bean_temp_c"] = self._last_telemetry.bean_temp_c
+        self._events.emit(RoastEventKind.FIRST_CRACK, event_payload)
         self.transition_to(RoastPhase.DEVELOPMENT)
 
     async def operator_drop_beans(self) -> None:
