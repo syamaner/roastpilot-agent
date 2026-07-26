@@ -4693,14 +4693,20 @@ async def test_draft_bean_from_url_rejects_empty_url_body(client: AsyncClient) -
 
 
 @pytest.mark.asyncio
-async def test_roast_service_draft_bean_from_url_reuses_configured_advisor_and_sourcing_config(
+async def test_roast_service_draft_bean_from_url_uses_activated_config_without_reload(
     service: RoastService, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#573: confirms the BYOK wiring — the service passes ITS configured
-    ``AdvisorConfig``/``BeanSourcingConfig`` straight through, so drafting
-    reuses the same provider/key the operator already set for the roast
-    advisor, via a SEPARATE call (not the roast advisor object itself)."""
+    """#596/D107: drafting cannot activate newly saved config early.
+
+    The service passes its currently activated ``AdvisorConfig`` and
+    ``BeanSourcingConfig`` through to the separate BYOK extraction call.
+    It does not reload saved config; that boundary remains ``start_roast``
+    so an active roast's configuration stays frozen.
+    """
     captured: dict[str, object] = {}
+
+    def fail_if_reloaded() -> tuple[AppConfig, set[str]]:
+        raise AssertionError("drafting must not reload saved configuration")
 
     async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
         captured["url"] = url
@@ -4708,6 +4714,7 @@ async def test_roast_service_draft_bean_from_url_reuses_configured_advisor_and_s
         captured["sourcing_config"] = sourcing_config
         return _draft_from(url)
 
+    monkeypatch.setattr("roastpilot_agent.api.load_app_config", fail_if_reloaded)
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
     draft = await service.draft_bean_from_url("https://vendor.example/products/kenya")
     assert isinstance(draft, BeanProfileDraft)

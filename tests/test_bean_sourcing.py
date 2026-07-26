@@ -1869,6 +1869,77 @@ def test_decompress_within_cap_decodes_gzip() -> None:
     assert decode(compressed, "x-gzip", max_bytes=1000, url="https://x/y") == payload
 
 
+def test_decompress_within_cap_decodes_concatenated_gzip_members() -> None:
+    """#596: every gzip member is decoded under one aggregate output cap."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    first = b"<html>Kenya Kiambu "
+    second = b"AA washed process</html>"
+    compressed = gzip.compress(first) + gzip.compress(second)
+    assert decode(compressed, "gzip", max_bytes=1000, url="https://x/y") == first + second
+
+
+def test_decompress_within_cap_decodes_zero_padded_gzip_members() -> None:
+    """Zero padding between members does not hide later decoded content."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    compressed = gzip.compress(b"first") + b"\x00\x00" + gzip.compress(b"second")
+    assert decode(compressed, "gzip", max_bytes=1000, url="https://x/y") == b"firstsecond"
+
+
+def test_decompress_within_cap_accepts_trailing_gzip_zero_padding() -> None:
+    """CPython-compatible trailing zero padding is not a new gzip member."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    compressed = gzip.compress(b"complete") + b"\x00\x00"
+    assert decode(compressed, "gzip", max_bytes=1000, url="https://x/y") == b"complete"
+
+
+def test_decompress_within_cap_caps_concatenated_gzip_members_in_aggregate() -> None:
+    """Each member fits alone, but their combined decoded body exceeds the cap."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    compressed = gzip.compress(b"abcd") + gzip.compress(b"efgh")
+    with pytest.raises(BeanFetchError, match="fetch cap"):
+        decode(compressed, "gzip", max_bytes=7, url="https://x/y")
+
+
+def test_decompress_within_cap_allows_concatenated_gzip_at_exact_aggregate_cap() -> None:
+    """The aggregate ceiling is inclusive even when a later member reaches it."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    compressed = gzip.compress(b"abcd") + gzip.compress(b"efgh")
+    assert decode(compressed, "gzip", max_bytes=8, url="https://x/y") == b"abcdefgh"
+
+
+def test_decompress_within_cap_bounds_empty_concatenated_gzip_members() -> None:
+    """Padding does not let empty members evade the independent work cap."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    member_limit = bean_sourcing._MAX_GZIP_MEMBERS  # pyright: ignore[reportPrivateUsage]
+    compressed = b"\x00".join(gzip.compress(b"") for _ in range(member_limit + 1))
+    with pytest.raises(BeanFetchError, match="concatenated gzip limit"):
+        decode(compressed, "gzip", max_bytes=1000, url="https://x/y")
+
+
+def test_decompress_within_cap_rejects_truncated_later_gzip_member() -> None:
+    """A complete first member must not hide a truncated second member."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    second = gzip.compress(b"second member")
+    compressed = gzip.compress(b"first member") + second[:-5]
+    with pytest.raises(BeanFetchError, match="truncated/incomplete"):
+        decode(compressed, "gzip", max_bytes=1000, url="https://x/y")
+
+
+def test_decompress_within_cap_rejects_corrupt_later_gzip_member() -> None:
+    """Nonzero garbage after padding fails without exposing URL secrets."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    compressed = gzip.compress(b"first member") + b"\x00\x00not a gzip member"
+    secret_url = "https://user:pass@example.com/y?token=secret#private"
+
+    with pytest.raises(BeanFetchError, match="failed to decompress") as exc_info:
+        decode(compressed, "gzip", max_bytes=1000, url=secret_url)
+
+    detail = str(exc_info.value)
+    assert "user:pass" not in detail
+    assert "token=secret" not in detail
+    assert "private" not in detail
+
+
 def test_decompress_within_cap_decodes_deflate_with_zlib_header() -> None:
     decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
     payload = b"<html>Kenya Kiambu AA</html>"
@@ -1885,6 +1956,29 @@ def test_decompress_within_cap_decodes_raw_deflate_without_zlib_header() -> None
     compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
     compressed = compressor.compress(payload) + compressor.flush()
     assert decode(compressed, "deflate", max_bytes=1000, url="https://x/y") == payload
+
+
+def test_decompress_within_cap_rejects_deflate_decompression_bomb() -> None:
+    """The deflate path retains the same bounded-output rejection as gzip."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    compressed = zlib.compress(b"a" * 1_000_000)
+    with pytest.raises(BeanFetchError, match="fetch cap"):
+        decode(compressed, "deflate", max_bytes=1000, url="https://x/y")
+
+
+def test_decompress_within_cap_rejects_truncated_deflate_body() -> None:
+    """A cut-off deflate stream fails closed without exposing URL secrets."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    compressed = zlib.compress(b"complete vendor page")
+    secret_url = "https://user:pass@example.com/y?token=secret#private"
+
+    with pytest.raises(BeanFetchError, match="truncated/incomplete") as exc_info:
+        decode(compressed[:-2], "deflate", max_bytes=1000, url=secret_url)
+
+    detail = str(exc_info.value)
+    assert "user:pass" not in detail
+    assert "token=secret" not in detail
+    assert "private" not in detail
 
 
 def test_decompress_within_cap_rejects_unsupported_encoding() -> None:
@@ -2025,6 +2119,29 @@ async def test_fetch_page_text_decodes_a_small_legitimate_gzip_body() -> None:
     """A well-behaved small gzip response decodes correctly end-to-end
     (not just the decompression-bomb rejection path)."""
     compressed = gzip.compress(_SAMPLE_HTML.encode())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=_bytes_stream(compressed), headers={"Content-Encoding": "gzip"}
+        )
+
+    async with _mock_client(httpx.MockTransport(handler)) as client:
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/kenya",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+        ).prompt_text
+    assert "Kenya Kiambu AA" in text
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_decodes_all_concatenated_gzip_members() -> None:
+    """#596: the fetch pipeline extracts text spanning gzip members."""
+    payload = _SAMPLE_HTML.encode()
+    split_at = payload.index(b"Kiambu")
+    compressed = gzip.compress(payload[:split_at]) + gzip.compress(payload[split_at:])
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
