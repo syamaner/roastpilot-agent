@@ -367,6 +367,43 @@ def _redact_url_credentials(url: str) -> str:
     return urlunsplit(parsed._replace(netloc=redacted_netloc, query=redacted_query, fragment=""))
 
 
+def redact_url_for_error(url: str) -> str:
+    """Return a URL safe to interpolate into a client-visible error detail.
+
+    The query string and fragment are removed wholesale, and any userinfo is
+    removed from the authority. This deliberately uses a small structural
+    scan rather than :func:`urllib.parse.urlsplit`: malformed input such as an
+    unclosed IPv6 literal is exactly where an error-detail sanitizer is
+    needed, and ``urlsplit`` raises before it can redact that input. The scan
+    never raises and runs before ``repr``/f-string interpolation, so quotes
+    inside a secret query cannot confuse a downstream display-layer parser.
+
+    Args:
+        url: The possibly malformed, untrusted URL.
+
+    Returns:
+        A display-only URL with userinfo, query, and fragment removed.
+    """
+    tail_positions = [position for marker in ("?", "#") if (position := url.find(marker)) >= 0]
+    without_tail = url[: min(tail_positions)] if tail_positions else url
+
+    scheme_end = without_tail.find("://")
+    if scheme_end >= 0:
+        authority_start = scheme_end + 3
+    elif without_tail.startswith("//"):
+        authority_start = 2
+    else:
+        authority_start = 0
+    path_start = without_tail.find("/", authority_start)
+    authority_end = path_start if path_start >= 0 else len(without_tail)
+    authority = without_tail[authority_start:authority_end]
+    if "@" not in authority:
+        return without_tail
+
+    safe_authority = authority.rsplit("@", 1)[-1]
+    return without_tail[:authority_start] + safe_authority + without_tail[authority_end:]
+
+
 _INLINE_WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
 _BLANK_LINES_RE = re.compile(r"\n{3,}")
 
@@ -1226,9 +1263,11 @@ async def _assert_public_destination(
         # check (#587 P2).
         parsed = urlsplit(url)
     except ValueError as exc:
-        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r} ({exc})") from exc
+        raise BeanFetchError(
+            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} ({exc})"
+        ) from exc
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r}")
+        raise BeanFetchError(f"not a well-formed http(s) URL: {redact_url_for_error(url)!r}")
 
     host = parsed.hostname
     try:
@@ -1238,7 +1277,7 @@ async def _assert_public_destination(
         # fail-soft error every other malformed-URL case gets here.
         explicit_port = parsed.port
     except ValueError as exc:
-        raise BeanFetchError(f"malformed port in {url!r}: {exc}") from exc
+        raise BeanFetchError(f"malformed port in {redact_url_for_error(url)!r}: {exc}") from exc
     port = explicit_port or (443 if parsed.scheme == "https" else 80)
 
     try:
@@ -1258,23 +1297,27 @@ async def _assert_public_destination(
             # UTF-16 surrogate, for instance. Left uncaught this escapes as
             # an unhandled 500 instead of the typed fail-soft error every
             # other malformed-host case here gets (#587 P2, round 6).
-            raise BeanFetchError(f"could not resolve host {host!r} for {url!r}: {exc}") from exc
+            raise BeanFetchError(
+                f"could not resolve host {host!r} for {redact_url_for_error(url)!r}: {exc}"
+            ) from exc
         addresses = [ipaddress.ip_address(info[4][0]) for info in resolved]
         if not addresses:
             raise BeanFetchError(
-                f"host {host!r} resolved to no usable address for {url!r}"
+                f"host {host!r} resolved to no usable address for {redact_url_for_error(url)!r}"
             ) from None
 
     for address in addresses:
         if _is_non_public_address(address):
             raise BeanFetchError(
-                f"fetch destination {url!r} resolves to a non-public address "
+                f"fetch destination {redact_url_for_error(url)!r} "
+                "resolves to a non-public address "
                 f"({address}) — blocked by the SSRF guard (#587)"
             )
         embedded_v4 = _extract_embedded_ipv4(address)
         if embedded_v4 is not None and _is_non_public_address(embedded_v4):
             raise BeanFetchError(
-                f"fetch destination {url!r} resolves to {address}, which embeds "
+                f"fetch destination {redact_url_for_error(url)!r} resolves to "
+                f"{address}, which embeds "
                 f"a non-public IPv4 address ({embedded_v4}) — blocked by the "
                 "SSRF guard (#587)"
             )
@@ -1308,7 +1351,9 @@ def _append_within_cap(body: bytearray, chunk: bytes, *, max_bytes: int, url: st
         BeanFetchError: Appending ``chunk`` would exceed ``max_bytes``.
     """
     if len(body) + len(chunk) > max_bytes:
-        raise BeanFetchError(f"vendor page exceeded the {max_bytes}-byte fetch cap: {url!r}")
+        raise BeanFetchError(
+            f"vendor page exceeded the {max_bytes}-byte fetch cap: {redact_url_for_error(url)!r}"
+        )
     body.extend(chunk)
 
 
@@ -1381,7 +1426,8 @@ def _decompress_within_cap(
     if normalized not in ("gzip", "x-gzip", "deflate"):
         raise BeanFetchError(
             f"vendor page used an unsupported Content-Encoding "
-            f"{content_encoding!r} for {url!r} (only gzip/deflate are "
+            f"{content_encoding!r} for {redact_url_for_error(url)!r} "
+            "(only gzip/deflate are "
             "requested and decoded)"
         )
     try:
@@ -1403,12 +1449,13 @@ def _decompress_within_cap(
             # process — the decoded output would have exceeded the cap.
             raise BeanFetchError(
                 f"vendor page exceeded the {max_bytes}-byte fetch cap "
-                f"(after decompression) for {url!r}"
+                f"(after decompression) for {redact_url_for_error(url)!r}"
             )
         decoded += decompressor.flush()
     except zlib.error as exc:
         raise BeanFetchError(
-            f"vendor page failed to decompress ({content_encoding!r}) for {url!r}: {exc}"
+            f"vendor page failed to decompress ({content_encoding!r}) for "
+            f"{redact_url_for_error(url)!r}: {exc}"
         ) from exc
     if not decompressor.eof:
         # A truncated stream (connection cut mid-body, or a misbehaving
@@ -1418,11 +1465,13 @@ def _decompress_within_cap(
         # would silently draft from an incomplete page instead of failing
         # the fetch outright.
         raise BeanFetchError(
-            f"vendor page sent a truncated/incomplete {content_encoding!r} body for {url!r}"
+            f"vendor page sent a truncated/incomplete {content_encoding!r} "
+            f"body for {redact_url_for_error(url)!r}"
         )
     if len(decoded) > max_bytes:
         raise BeanFetchError(
-            f"vendor page exceeded the {max_bytes}-byte fetch cap (after decompression) for {url!r}"
+            f"vendor page exceeded the {max_bytes}-byte fetch cap "
+            f"(after decompression) for {redact_url_for_error(url)!r}"
         )
     return decoded
 
@@ -1538,7 +1587,10 @@ async def _fetch_one_hop(
         # (#587 P2).
         original_url = httpx.URL(current_url)
     except httpx.InvalidURL as exc:
-        raise BeanFetchError(f"not a well-formed http(s) URL: {current_url!r} ({exc})") from exc
+        raise BeanFetchError(
+            f"not a well-formed http(s) URL: "
+            f"{redact_url_for_error(current_url)!r} (invalid URL syntax)"
+        ) from exc
     pinned_headers = {**headers, "Host": original_url.netloc.decode("ascii")}
     per_address_timeout = timeout
     if len(candidate_addresses) > 1 and timeout.connect is not None:
@@ -1564,7 +1616,7 @@ async def _fetch_one_hop(
                     if not location:
                         raise BeanFetchError(
                             f"vendor page redirected (HTTP {response.status_code}) with no "
-                            f"Location header for {current_url!r}"
+                            f"Location header for {redact_url_for_error(current_url)!r}"
                         )
                     try:
                         # A malformed Location (e.g. an unclosed IPv6
@@ -1575,12 +1627,14 @@ async def _fetch_one_hop(
                     except ValueError as exc:
                         raise BeanFetchError(
                             f"vendor page redirected to a malformed Location "
-                            f"{location!r} for {current_url!r}: {exc}"
+                            f"{redact_url_for_error(location)!r} for "
+                            f"{redact_url_for_error(current_url)!r}: {exc}"
                         ) from exc
                     return next_url, True
                 if response.status_code >= 400:
                     raise BeanFetchError(
-                        f"vendor page fetch failed: HTTP {response.status_code} for {current_url!r}"
+                        f"vendor page fetch failed: HTTP {response.status_code} for "
+                        f"{redact_url_for_error(current_url)!r}"
                     )
                 # aiter_raw(), never aiter_bytes() (#587 P1 round 2):
                 # aiter_bytes() runs httpx's OWN internal decompression per
@@ -1607,7 +1661,9 @@ async def _fetch_one_hop(
             last_connect_error = exc
             continue
     raise BeanFetchError(
-        f"could not connect to any resolved address for {current_url!r}: {last_connect_error}"
+        f"could not connect to any resolved address for "
+        f"{redact_url_for_error(current_url)!r}: "
+        f"{type(last_connect_error).__name__}"
     ) from last_connect_error
 
 
@@ -1683,7 +1739,9 @@ async def _fetch_with_ssrf_guard(
             current_url = result
             continue
         return result, current_url
-    raise BeanFetchError(f"too many redirects (> {_MAX_REDIRECTS}) fetching {url!r}")
+    raise BeanFetchError(
+        f"too many redirects (> {_MAX_REDIRECTS}) fetching {redact_url_for_error(url)!r}"
+    )
 
 
 # --- #590 slice B: deterministic JSON-LD product extraction, ahead of the LLM ---
@@ -2136,9 +2194,11 @@ async def _fetch_and_extract(
         # every other malformed-URL case here gets (#587 P2).
         parsed = urlsplit(url)
     except ValueError as exc:
-        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r} ({exc})") from exc
+        raise BeanFetchError(
+            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} ({exc})"
+        ) from exc
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r}")
+        raise BeanFetchError(f"not a well-formed http(s) URL: {redact_url_for_error(url)!r}")
 
     headers = {"User-Agent": config.user_agent, "Accept-Encoding": _ACCEPT_ENCODING}
     timeout = httpx.Timeout(config.fetch_timeout_seconds)
@@ -2183,7 +2243,8 @@ async def _fetch_and_extract(
                 async with client.stream("GET", url, headers=headers, timeout=timeout) as response:
                     if response.status_code >= 400:
                         raise BeanFetchError(
-                            f"vendor page fetch failed: HTTP {response.status_code} for {url!r}"
+                            f"vendor page fetch failed: HTTP {response.status_code} for "
+                            f"{redact_url_for_error(url)!r}"
                         )
                     # aiter_raw() + our own bounded decompress — see the
                     # owns-client path's identical comment in
@@ -2204,7 +2265,7 @@ async def _fetch_and_extract(
     except TimeoutError as exc:
         raise BeanFetchError(
             f"vendor page fetch exceeded the {config.fetch_timeout_seconds:g}s end-to-end "
-            f"deadline for {url!r}"
+            f"deadline for {redact_url_for_error(url)!r}"
         ) from exc
     except BeanFetchError:
         raise
@@ -2217,9 +2278,13 @@ async def _fetch_and_extract(
         # injected-client path's client.stream(url) internally parsing
         # ``url``; the owns-client path's own httpx.URL() call (in
         # _fetch_one_hop) is already guarded at the source.
-        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r} ({exc})") from exc
+        raise BeanFetchError(
+            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} (invalid URL syntax)"
+        ) from exc
     except httpx.HTTPError as exc:
-        raise BeanFetchError(f"vendor page fetch failed for {url!r}: {exc}") from exc
+        raise BeanFetchError(
+            f"vendor page fetch failed for {redact_url_for_error(url)!r}: {type(exc).__name__}"
+        ) from exc
     finally:
         if owns_client:
             await client.aclose()
@@ -4913,7 +4978,8 @@ def _draft_from_identity(
     description = _normalize_optional_text(identity.description)
     if not name or not bean_origin:
         raise BeanExtractionError(
-            f"could not determine a bean name and origin from the page ({url!r}) "
+            "could not determine a bean name and origin from the page "
+            f"({redact_url_for_error(url)!r}) "
             "— add the profile manually instead"
         )
 
@@ -5124,7 +5190,9 @@ def _draft_from_identity(
         # URL can still fail here (#587) — fail soft, not an unhandled
         # pydantic.ValidationError.
         raise BeanExtractionError(
-            f"drafted bean profile failed validation for {url!r}: {exc}"
+            f"drafted bean profile failed validation for "
+            f"{redact_url_for_error(url)!r}: "
+            f"{exc.error_count()} validation error(s)"
         ) from exc
 
 
@@ -5216,7 +5284,9 @@ async def draft_bean_profile_from_url(
     try:
         parsed_url = urlsplit(url)
     except ValueError as exc:
-        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r} ({exc})") from exc
+        raise BeanFetchError(
+            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} ({exc})"
+        ) from exc
     if parsed_url.username is not None or parsed_url.password is not None:
         _log.warning(
             "draft_bean_profile_from_url: rejected a URL with embedded credentials: %r",

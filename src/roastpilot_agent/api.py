@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, cast
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
@@ -43,6 +44,7 @@ from roastpilot_agent.bean_sourcing import (
     BeanExtractionUnavailableError,
     BeanFetchError,
     draft_bean_profile_from_url,
+    redact_url_for_error,
 )
 from roastpilot_agent.config import AppConfig, MCPDeviceConfig
 from roastpilot_agent.config_store import (
@@ -3020,6 +3022,14 @@ async def draft_bean_from_url(
     single-operator LAN app — that is a deliberate, existing, app-wide
     decision, not something this fix changes or is meant to compensate for.
     """
+    try:
+        urlsplit(body.url)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(f"not a well-formed http(s) URL: {redact_url_for_error(body.url)!r} ({exc})"),
+        ) from exc
+
     try:
         async with asyncio.timeout(_DRAFT_BEAN_FROM_URL_ACQUIRE_TIMEOUT_SECONDS):
             await _draft_bean_from_url_semaphore.acquire()

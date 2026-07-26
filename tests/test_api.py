@@ -4462,6 +4462,35 @@ async def test_draft_bean_from_url_fetch_error_is_422(
     assert "fetch failed" in response.json()["detail"]
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param(
+            "https://user:password@[bad?access_token=SECRET-QUERY-656#fragment-secret",
+            id="unclosed-ipv6-userinfo-query-fragment",
+        ),
+        pytest.param(
+            "ftp://vendor.example/products/kenya?x='\"&access_token=SECRET-QUERY-656",
+            id="query-with-both-quotes",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_parse_failure_detail_strips_sensitive_url_parts(
+    client: AsyncClient, url: str
+) -> None:
+    """#656: malformed URL details are sanitized before repr/interpolation."""
+    response = await client.post("/api/beans/draft-from-url", json={"url": url})
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "SECRET-QUERY-656" not in detail
+    assert "access_token" not in detail
+    assert "user:password@" not in detail
+    assert "fragment-secret" not in detail
+    assert "?" not in detail
+
+
 @pytest.mark.asyncio
 async def test_draft_bean_from_url_extraction_error_is_422(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
