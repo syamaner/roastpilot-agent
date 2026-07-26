@@ -33,6 +33,7 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from roastpilot_agent import __version__
 from roastpilot_agent.advisor import (
@@ -2954,9 +2955,14 @@ async def delete_bean_profile(profile_id: str, service: ServiceDep) -> dict[str,
     return {"id": profile_id, "result": "archived"}
 
 
+_DRAFT_BEAN_FROM_URL_PATH = "/api/beans/draft-from-url"
 _DRAFT_BEAN_FROM_URL_MAX_URL_CHARS = 4096
+_DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES = 64 * 1024
 _DRAFT_BEAN_FROM_URL_TOO_LONG_DETAIL = (
     f"URL exceeds {_DRAFT_BEAN_FROM_URL_MAX_URL_CHARS}-character limit"
+)
+_DRAFT_BEAN_FROM_URL_BODY_TOO_LARGE_DETAIL = (
+    f"request body exceeds {_DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES}-byte limit"
 )
 
 
@@ -2997,10 +3003,64 @@ _DRAFT_BEAN_FROM_URL_ACQUIRE_TIMEOUT_SECONDS = 0.1
 _draft_bean_from_url_semaphore = asyncio.Semaphore(_DRAFT_BEAN_FROM_URL_CONCURRENCY)
 
 
+class _RouteBodyLimitMiddleware:
+    """Bound one route's body before FastAPI buffers or JSON-decodes it."""
+
+    def __init__(self, app: ASGIApp, *, path: str, max_body_bytes: int) -> None:
+        self._app = app
+        self._path = path
+        self._max_body_bytes = max_body_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["path"] != self._path:
+            await self._app(scope, receive, send)
+            return
+
+        content_length = next(
+            (value for name, value in scope["headers"] if name.lower() == b"content-length"),
+            None,
+        )
+        try:
+            declared_body_bytes = int(content_length) if content_length is not None else None
+        except ValueError:  # pragma: no cover - Uvicorn rejects malformed Content-Length.
+            declared_body_bytes = None
+        if declared_body_bytes is not None and declared_body_bytes > self._max_body_bytes:
+            await self._reject(scope, receive, send)
+            return
+
+        received_body_bytes = 0
+        body_too_large = False
+
+        async def bounded_receive() -> Message:
+            nonlocal body_too_large, received_body_bytes
+            message = await receive()
+            if message["type"] == "http.request":  # pragma: no branch - disconnect passes through.
+                received_body_bytes += len(message.get("body", b""))
+                if received_body_bytes > self._max_body_bytes:
+                    body_too_large = True
+                    return {"type": "http.request", "body": b"", "more_body": False}
+            return message
+
+        async def bounded_send(message: Message) -> None:
+            if not body_too_large:
+                await send(message)
+
+        await self._app(scope, bounded_receive, bounded_send)
+        if body_too_large:
+            await self._reject(scope, receive, send)
+
+    async def _reject(self, scope: Scope, receive: Receive, send: Send) -> None:
+        response = JSONResponse(
+            status_code=413,
+            content={"detail": _DRAFT_BEAN_FROM_URL_BODY_TOO_LARGE_DETAIL},
+        )
+        await response(scope, receive, send)
+
+
 async def _request_validation_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """Keep oversized bean-source URL validation responses constant and secret-free."""
     validation_error = cast(RequestValidationError, exc)
-    if request.url.path == "/api/beans/draft-from-url" and any(
+    if request.url.path == _DRAFT_BEAN_FROM_URL_PATH and any(
         error["type"] == "string_too_long" and tuple(error["loc"]) == ("body", "url")
         for error in validation_error.errors()
     ):
@@ -3472,6 +3532,11 @@ def create_app(
         version=__version__,
         lifespan=lifespan or _lifespan,
     )
+    app.add_middleware(
+        _RouteBodyLimitMiddleware,
+        path=_DRAFT_BEAN_FROM_URL_PATH,
+        max_body_bytes=_DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES,
+    )
     app.state.service = service
     app.add_exception_handler(RequestValidationError, _request_validation_error_handler)
     app.get(HEALTH_PATH)(health)
@@ -3498,7 +3563,7 @@ def create_app(
     app.post("/api/bean-profiles", status_code=201)(create_bean_profile)
     app.put("/api/bean-profiles/{profile_id}")(update_bean_profile)
     app.delete("/api/bean-profiles/{profile_id}")(delete_bean_profile)
-    app.post("/api/beans/draft-from-url")(draft_bean_from_url)
+    app.post(_DRAFT_BEAN_FROM_URL_PATH)(draft_bean_from_url)
     app.get(EVENTS_PATH)(stream_events)
     if spa_dir is not None and (spa_dir / "index.html").is_file():
         # Imported lazily so the API-only/scaffold path carries no static-mount

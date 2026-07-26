@@ -28,6 +28,7 @@ from httpx import ASGITransport, AsyncClient
 from roastpilot_agent import __version__
 from roastpilot_agent.advisor import AdvisorContext, FakeAdvisor, RoastDecision
 from roastpilot_agent.api import (
+    _DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     EventBroadcaster,
     QueuedOperatorAction,
     RoastRunConflictError,
@@ -4520,6 +4521,51 @@ async def test_draft_bean_from_url_parse_failure_detail_strips_sensitive_url_par
 
 
 @pytest.mark.asyncio
+async def test_draft_bean_from_url_bounds_body_before_framework_parsing(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Declared, chunked, and understated oversized bodies fail before the endpoint."""
+    provider = mock.AsyncMock(side_effect=AssertionError("must not reach provider"))
+    redact = mock.Mock(side_effect=AssertionError("must not redact oversized body"))
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", provider)
+    monkeypatch.setattr("roastpilot_agent.api.redact_url_for_error", redact)
+    too_large = b'{"url":"' + (b"x" * _DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES) + b'"}'
+    headers = {"content-type": "application/json"}
+    expected = {"detail": "request body exceeds 65536-byte limit"}
+
+    response = await client.post("/api/beans/draft-from-url", content=too_large, headers=headers)
+    assert response.status_code == 413
+    assert response.json() == expected
+
+    async def streamed_body() -> AsyncIterator[bytes]:
+        yield too_large[:_DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES]
+        yield too_large[_DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES:]
+
+    response = await client.post(
+        "/api/beans/draft-from-url", content=streamed_body(), headers=headers
+    )
+    assert response.status_code == 413
+    assert response.json() == expected
+    response = await client.post(
+        "/api/beans/draft-from-url",
+        content=streamed_body(),
+        headers={**headers, "content-length": "1"},
+    )
+    assert response.status_code == 413
+    assert response.json() == expected
+    provider.assert_not_awaited()
+    redact.assert_not_called()
+
+    exact = (b" " * (_DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES - 2)) + b"{}"
+    assert (
+        await client.post("/api/beans/draft-from-url", content=exact, headers=headers)
+    ).status_code == 422
+    assert (
+        await client.post("/api/bean-profiles", content=too_large, headers=headers)
+    ).status_code != 413
+
+
+@pytest.mark.asyncio
 async def test_draft_bean_from_url_bounds_url_before_redaction_or_admission(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4541,8 +4587,12 @@ async def test_draft_bean_from_url_bounds_url_before_redaction_or_admission(
     provider.assert_not_awaited()
 
     prefix = "https://vendor.example/"
-    boundary = prefix + ("x" * (4096 - len(prefix)))
-    response = await client.post("/api/beans/draft-from-url", json={"url": boundary})
+    boundary = prefix + ("😀" * (4096 - len(prefix)))
+    encoded = json.dumps({"url": boundary}).encode()
+    assert len(encoded) < _DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES
+    response = await client.post(
+        "/api/beans/draft-from-url", content=encoded, headers={"content-type": "application/json"}
+    )
     assert response.status_code == 422
     assert response.json()["detail"] == "boundary URL reached provider"
     admission.acquire.assert_awaited_once()
