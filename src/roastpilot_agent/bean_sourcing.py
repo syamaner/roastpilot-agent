@@ -1593,7 +1593,10 @@ def _decompress_within_cap(
                         f"vendor page exceeded the {max_bytes}-byte fetch cap "
                         f"(after decompression) for {redact_url_for_error(url)!r}"
                     )
-                member_input = decompressor.unused_data
+                # CPython's gzip reader accepts zero padding after a complete
+                # member. Ignore only that padding; any remaining nonzero
+                # bytes must still parse as another gzip member or fail closed.
+                member_input = decompressor.unused_data.lstrip(b"\x00")
                 if not member_input:
                     break
             decoded = b"".join(decoded_parts)

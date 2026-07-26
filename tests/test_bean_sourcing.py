@@ -1878,6 +1878,20 @@ def test_decompress_within_cap_decodes_concatenated_gzip_members() -> None:
     assert decode(compressed, "gzip", max_bytes=1000, url="https://x/y") == first + second
 
 
+def test_decompress_within_cap_decodes_zero_padded_gzip_members() -> None:
+    """Zero padding between members does not hide later decoded content."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    compressed = gzip.compress(b"first") + b"\x00\x00" + gzip.compress(b"second")
+    assert decode(compressed, "gzip", max_bytes=1000, url="https://x/y") == b"firstsecond"
+
+
+def test_decompress_within_cap_accepts_trailing_gzip_zero_padding() -> None:
+    """CPython-compatible trailing zero padding is not a new gzip member."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    compressed = gzip.compress(b"complete") + b"\x00\x00"
+    assert decode(compressed, "gzip", max_bytes=1000, url="https://x/y") == b"complete"
+
+
 def test_decompress_within_cap_caps_concatenated_gzip_members_in_aggregate() -> None:
     """Each member fits alone, but their combined decoded body exceeds the cap."""
     decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
@@ -1894,10 +1908,10 @@ def test_decompress_within_cap_allows_concatenated_gzip_at_exact_aggregate_cap()
 
 
 def test_decompress_within_cap_bounds_empty_concatenated_gzip_members() -> None:
-    """Empty members cannot evade the decoded cap to create unbounded work."""
+    """Padding does not let empty members evade the independent work cap."""
     decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
     member_limit = bean_sourcing._MAX_GZIP_MEMBERS  # pyright: ignore[reportPrivateUsage]
-    compressed = gzip.compress(b"") * (member_limit + 1)
+    compressed = b"\x00".join(gzip.compress(b"") for _ in range(member_limit + 1))
     with pytest.raises(BeanFetchError, match="concatenated gzip limit"):
         decode(compressed, "gzip", max_bytes=1000, url="https://x/y")
 
@@ -1912,11 +1926,18 @@ def test_decompress_within_cap_rejects_truncated_later_gzip_member() -> None:
 
 
 def test_decompress_within_cap_rejects_corrupt_later_gzip_member() -> None:
-    """Trailing non-member bytes fail the whole fetch instead of being ignored."""
+    """Nonzero garbage after padding fails without exposing URL secrets."""
     decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
-    compressed = gzip.compress(b"first member") + b"not a gzip member"
-    with pytest.raises(BeanFetchError, match="failed to decompress"):
-        decode(compressed, "gzip", max_bytes=1000, url="https://x/y")
+    compressed = gzip.compress(b"first member") + b"\x00\x00not a gzip member"
+    secret_url = "https://user:pass@example.com/y?token=secret#private"
+
+    with pytest.raises(BeanFetchError, match="failed to decompress") as exc_info:
+        decode(compressed, "gzip", max_bytes=1000, url=secret_url)
+
+    detail = str(exc_info.value)
+    assert "user:pass" not in detail
+    assert "token=secret" not in detail
+    assert "private" not in detail
 
 
 def test_decompress_within_cap_decodes_deflate_with_zlib_header() -> None:
