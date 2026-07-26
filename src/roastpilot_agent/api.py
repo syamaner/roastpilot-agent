@@ -29,7 +29,9 @@ from typing import Annotated, Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from roastpilot_agent import __version__
@@ -2952,10 +2954,16 @@ async def delete_bean_profile(profile_id: str, service: ServiceDep) -> dict[str,
     return {"id": profile_id, "result": "archived"}
 
 
+_DRAFT_BEAN_FROM_URL_MAX_URL_CHARS = 4096
+_DRAFT_BEAN_FROM_URL_TOO_LONG_DETAIL = (
+    f"URL exceeds {_DRAFT_BEAN_FROM_URL_MAX_URL_CHARS}-character limit"
+)
+
+
 class DraftBeanFromUrlRequest(BaseModel):
     """``POST /api/beans/draft-from-url`` request body (#573 phase 1)."""
 
-    url: str = Field(min_length=1)
+    url: str = Field(min_length=1, max_length=_DRAFT_BEAN_FROM_URL_MAX_URL_CHARS)
     """The vendor's green-coffee product page URL."""
 
 
@@ -2987,6 +2995,20 @@ _DRAFT_BEAN_FROM_URL_CONCURRENCY = 1
 _DRAFT_BEAN_FROM_URL_ACQUIRE_TIMEOUT_SECONDS = 0.1
 
 _draft_bean_from_url_semaphore = asyncio.Semaphore(_DRAFT_BEAN_FROM_URL_CONCURRENCY)
+
+
+async def _request_validation_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Keep oversized bean-source URL validation responses constant and secret-free."""
+    validation_error = cast(RequestValidationError, exc)
+    if request.url.path == "/api/beans/draft-from-url" and any(
+        error["type"] == "string_too_long" and tuple(error["loc"]) == ("body", "url")
+        for error in validation_error.errors()
+    ):
+        return JSONResponse(
+            status_code=422,
+            content={"detail": _DRAFT_BEAN_FROM_URL_TOO_LONG_DETAIL},
+        )
+    return await request_validation_exception_handler(request, validation_error)
 
 
 async def draft_bean_from_url(
@@ -3451,6 +3473,7 @@ def create_app(
         lifespan=lifespan or _lifespan,
     )
     app.state.service = service
+    app.add_exception_handler(RequestValidationError, _request_validation_error_handler)
     app.get(HEALTH_PATH)(health)
     app.get(CONFIG_PATH)(get_config)
     app.put(CONFIG_PATH)(put_config)

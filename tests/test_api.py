@@ -4465,55 +4465,28 @@ async def test_draft_bean_from_url_fetch_error_is_422(
 @pytest.mark.parametrize(
     "url",
     [
-        pytest.param(
-            "https://user:password@[bad?access_token=SECRET-QUERY-656#fragment-secret",
-            id="unclosed-ipv6-userinfo-query-fragment",
-        ),
-        pytest.param(
-            "ftp://vendor.example/products/kenya?x='\"&access_token=SECRET-QUERY-656",
-            id="query-with-both-quotes",
-        ),
+        "https://user:password@[bad?access_token=SECRET-QUERY-656#fragment-secret",
+        "ftp://vendor.example/products/kenya?x='\"&access_token=SECRET-QUERY-656",
         pytest.param(
             "https:\n//user:SECRET-QUERY-656／password@vendor.example/path"
             "?access_token=SECRET-QUERY-656#fragment-secret",
             id="parser-ignored-control-and-nfkc-invalid-userinfo",
         ),
-        pytest.param(
-            "https://user:SECRET-QUERY-656＠vendor.example/path"
-            "?access_token=SECRET-QUERY-656#fragment-secret",
-            id="nfkc-equivalent-userinfo-delimiter",
-        ),
-        pytest.param(
-            "https://vendor.example？access_token=SECRET-QUERY-656/path",
-            id="nfkc-equivalent-query-delimiter",
-        ),
-        pytest.param(
-            "https://vendor.example＃access_token=SECRET-QUERY-656/path",
-            id="nfkc-equivalent-fragment-delimiter",
-        ),
-        pytest.param(
-            "https://SECRET-QUERY-656？x@vendor.example/path"
-            "?access_token=SECRET-QUERY-656#fragment-secret",
-            id="nfkc-equivalent-query-before-userinfo",
-        ),
-        pytest.param(
-            "https://SECRET-QUERY-656＃x@vendor.example/path"
-            "?access_token=SECRET-QUERY-656#fragment-secret",
-            id="nfkc-equivalent-fragment-before-userinfo",
-        ),
+        "https://user:SECRET-QUERY-656＠vendor.example/path"
+        "?access_token=SECRET-QUERY-656#fragment-secret",
+        "https://vendor.example？access_token=SECRET-QUERY-656/path",
+        "https://vendor.example＃access_token=SECRET-QUERY-656/path",
+        "https://SECRET-QUERY-656？x@vendor.example/path"
+        "?access_token=SECRET-QUERY-656#fragment-secret",
+        "https://SECRET-QUERY-656＃x@vendor.example/path"
+        "?access_token=SECRET-QUERY-656#fragment-secret",
         pytest.param(
             "https://SECRET-QUERY-656？x＠vendor.example/path"
             "?access_token=SECRET-QUERY-656#fragment-secret",
             id="nfkc-equivalent-query-and-userinfo-delimiters",
         ),
-        pytest.param(
-            "https:/user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
-            id="one-slash-scheme-separator",
-        ),
-        pytest.param(
-            "https:user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
-            id="zero-slash-scheme-separator",
-        ),
+        "https:/user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
+        "https:user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
         *(
             f"{slashes}user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656"
             for slashes in ("///", "////")
@@ -4544,6 +4517,36 @@ async def test_draft_bean_from_url_parse_failure_detail_strips_sensitive_url_par
     assert "user:password@" not in detail
     assert "fragment-secret" not in detail
     assert "?" not in detail
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_bounds_url_before_redaction_or_admission(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An oversized malformed URL is rejected in constant work with no secret echo."""
+    admission = mock.Mock()
+    admission.acquire = mock.AsyncMock()
+    redact = mock.Mock(side_effect=AssertionError("must not redact oversized URL"))
+    provider = mock.AsyncMock(side_effect=BeanFetchError("boundary URL reached provider"))
+    monkeypatch.setattr("roastpilot_agent.api._draft_bean_from_url_semaphore", admission)
+    monkeypatch.setattr("roastpilot_agent.api.redact_url_for_error", redact)
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", provider)
+
+    oversized = "https://user:SECRET-QUERY-656@[" + ("x" * 4096)
+    response = await client.post("/api/beans/draft-from-url", json={"url": oversized})
+    assert response.status_code == 422
+    assert response.json() == {"detail": "URL exceeds 4096-character limit"}
+    redact.assert_not_called()
+    admission.acquire.assert_not_awaited()
+    provider.assert_not_awaited()
+
+    prefix = "https://vendor.example/"
+    boundary = prefix + ("x" * (4096 - len(prefix)))
+    response = await client.post("/api/beans/draft-from-url", json={"url": boundary})
+    assert response.status_code == 422
+    assert response.json()["detail"] == "boundary URL reached provider"
+    admission.acquire.assert_awaited_once()
+    provider.assert_awaited_once()
 
 
 @pytest.mark.asyncio
