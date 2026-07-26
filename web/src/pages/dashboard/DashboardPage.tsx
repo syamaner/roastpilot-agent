@@ -24,7 +24,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { AppFrame, ConnectionIndicator, LiveCurve } from "@/components/shared";
-import { roastKeys, useHealth, useRoast } from "@/hooks/queries";
+import { roastKeys, useHealth, useRoast, useTimeline } from "@/hooks/queries";
 import { useFrameDrain, useRoastStream } from "@/hooks/useRoastStream";
 import { api } from "@/lib/api";
 import { runConfirmRetry } from "@/lib/confirmRetry";
@@ -39,6 +39,7 @@ import { resolveMicStatus } from "./micStatus";
 import { OperatorActionBar, type OperatorActionResultView } from "./OperatorActionBar";
 import { RecoveryModal } from "./RecoveryModal";
 import { RoastHeader } from "./RoastHeader";
+import { firstCrackFromTimeline } from "./events";
 import { snapshotFault, useDashboardEvents } from "./useDashboardEvents";
 
 export function DashboardPage(): React.JSX.Element {
@@ -101,6 +102,12 @@ export function DashboardPage(): React.JSX.Element {
   // The run snapshot (profile name + initial enabled actions before the first
   // phase_changed). Read-only REST snapshot, hydrated by TanStack Query.
   const detail = useRoast(runId);
+  // #592 reload fallback: SSE does not replay the one-shot first_crack event.
+  // The timeline carries that SAME persisted server event (payload + source), so
+  // a reload keeps the FC landmark without inferring it from phase/curve data.
+  const timeline = useTimeline(runId);
+  const persistedFirstCrack = firstCrackFromTimeline(timeline.data);
+  const firstCrack = view.firstCrack ?? persistedFirstCrack;
 
   // Operator action POST result (the action bar surfaces its typed reason).
   const [lastResult, setLastResult] = useState<OperatorActionResultView | null>(null);
@@ -291,6 +298,16 @@ export function DashboardPage(): React.JSX.Element {
     () => ({ points: smoothCurveForDisplay(view.points), markers: view.markers }),
     [view.points, view.markers],
   );
+  // #592: SSE is authoritative while frames are flowing. On a reload/reconnect
+  // before the next tick, the existing /telemetry backfill still carries the
+  // server's latest bean + RoR values; read that final server point directly
+  // rather than flashing empty or borrowing the chart cursor's historical value.
+  const latestSnapshotPoint =
+    view.points.length > 0 ? view.points[view.points.length - 1] : null;
+  const latestBeanTempC =
+    telemetry?.bean_temp_c ?? latestSnapshotPoint?.bean ?? null;
+  const latestBeanRorCPerMin =
+    telemetry?.bean_ror_c_per_min ?? latestSnapshotPoint?.ror ?? null;
 
   return (
     <AppFrame headerRight={<ConnectionIndicator status={status} />}>
@@ -356,9 +373,12 @@ export function DashboardPage(): React.JSX.Element {
           elapsedSeconds={telemetry?.elapsed_seconds ?? null}
           developmentSeconds={developmentSeconds}
           developmentPercent={developmentPercent}
-          beanRorCPerMin={telemetry?.bean_ror_c_per_min ?? null}
+          beanRorCPerMin={latestBeanRorCPerMin}
+          // #592: latest server telemetry — deliberately independent of the
+          // chart cursor/legend's historical point.
+          beanTempC={latestBeanTempC}
           profileName={detail.data?.profile.name ?? null}
-          firstCrack={view.firstCrack}
+          firstCrack={firstCrack}
           mcpChild={health.data?.mcp_child}
           // Capture-alive mic health (#197/#200): live frame is authoritative once
           // present (its null = idle passes through, not the stale snapshot); the

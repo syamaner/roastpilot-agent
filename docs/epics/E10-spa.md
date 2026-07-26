@@ -350,6 +350,7 @@ all merged to `main`. None re-open a story; they harden the shipped surface.
 | #253 | Structural column-header assertion on the detail trace-table | #258 |
 | #184 | Advisor stats on `RoastSummary` — drop the history `/timeline` N+1 | #245 |
 | #257 | Dependabot: bump `form-data` | #257 |
+| #592 | Prominent live `BEAN` °C header readout + persisted FC landmark | this PR |
 
 **Governance / CI (cross-epic, recorded here for board completeness):** PR review
 roster = Claude Code Review (+ human reviewers); the Augment Code trial ended

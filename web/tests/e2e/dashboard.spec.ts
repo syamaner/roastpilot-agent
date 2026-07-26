@@ -75,6 +75,11 @@ test("dashboard-live — preheating with the charge band, full-page snapshot (ca
   // The live RoR readout is surfaced as an operator-facing metric (#165) and is
   // shown from the start incl. preheat (real probe data — not hidden pre-charge).
   await expect(page.getByTestId("ror-readout")).toContainText("°C/min");
+  // #592: BEAN is the latest server telemetry value — visible before FC and not
+  // coupled to the chart cursor legend. The fixed FC landmark stays explicitly
+  // empty until the server emits first_crack.
+  await expect(page.getByTestId("bean-temp-readout")).toHaveText(/^\d+\.\d °C$/);
+  await expect(page.getByTestId("bean-fc-reference")).toHaveText("▲ FC —");
   // Pre-charge, ROAST TIME reads 00:00 and the distinct Preheat read-out carries the
   // serve-referenced lead-in (#308). The big clock is charge-referenced (0:00 =
   // charge); preheat duration is shown separately, never as roast time.
@@ -294,6 +299,15 @@ test("dashboard-developed — full ramping curve at first crack (canvas un-maske
   // must fail HERE, not only in the regenerated baseline.
   await expect(page.getByTestId("dtr-readout")).toHaveText(/^\d+\.\d+ %$/);
 
+  // #592: developed state carries both distinct server sources: the LATEST
+  // telemetry bean value and the fixed first_crack event landmark. Numeric
+  // assertions make a missing/placeholder value fail before pixel comparison.
+  const beanTemperatureReadout = page.getByTestId("bean-temperature-readout");
+  await expect(page.getByTestId("bean-temp-readout")).toHaveText(/^\d+\.\d °C$/);
+  await expect(page.getByTestId("bean-fc-reference")).toHaveText(
+    /^▲ FC \d+\.\d °C$/,
+  );
+
   // ROAST TIME is CHARGE-referenced (#308): in this post-charge state the server
   // emits a non-null `charge_elapsed_seconds`, so the big clock reads since-charge,
   // NOT since-serve. This is the ONLY e2e guard on the DashboardPage wiring — a
@@ -326,7 +340,31 @@ test("dashboard-developed — full ramping curve at first crack (canvas un-maske
   await expect(page.getByTestId("control-fan")).toHaveAttribute("data-mode", "interactive");
 
   await settle(page);
+  // Genuinely new UI block: keep an element-scoped visual contract in addition
+  // to the existing whole-page developed baseline (#653 convention). Canonical
+  // pixels are generated only by the pinned CI baseline workflow.
+  await expect(beanTemperatureReadout).toHaveScreenshot(
+    "bean-temperature-developed.png",
+  );
   await expect(page).toHaveScreenshot("dashboard-developed.png", { fullPage: true });
+
+  // Reload after the one-shot first_crack SSE event has already passed. The
+  // server telemetry + persisted event snapshots must restore both values;
+  // neither may flash/stick at the empty placeholder while paused between ticks.
+  await page.reload();
+  await expect(page.getByTestId("connection-indicator")).toHaveAttribute(
+    "data-status",
+    "live",
+    { timeout: 15_000 },
+  );
+  await expect(page.getByTestId("phase-badge")).toHaveAttribute(
+    "data-phase",
+    "development",
+  );
+  await expect(page.getByTestId("bean-temp-readout")).toHaveText(/^\d+\.\d °C$/);
+  await expect(page.getByTestId("bean-fc-reference")).toHaveText(
+    /^▲ FC \d+\.\d °C$/,
+  );
 });
 
 test("dashboard-charge-window — preheating + bean in the charge band shows the persistent banner (#211)", async ({
