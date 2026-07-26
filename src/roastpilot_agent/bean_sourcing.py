@@ -1474,6 +1474,13 @@ def _append_within_cap(body: bytearray, chunk: bytes, *, max_bytes: int, url: st
 #: either, because we never asked for them.
 _ACCEPT_ENCODING = "gzip, deflate"
 
+#: Concatenated gzip is legitimate, but an attacker can fill the raw-byte
+#: allowance with thousands of empty members that consume almost no decoded
+#: budget while forcing a fresh zlib state allocation for each one. Real HTTP
+#: page responses need at most a handful; this independent work cap keeps the
+#: member loop bounded even when decoded output stays empty.
+_MAX_GZIP_MEMBERS = 64
+
 
 def _decompress_within_cap(
     raw_body: bytes, content_encoding: str, *, max_bytes: int, url: str
@@ -1487,12 +1494,12 @@ def _decompress_within_cap(
     ``response.aiter_raw()``, never ``aiter_bytes()`` — see the callers).
     That raw cap alone is not enough: a highly-compressed body can still
     decompress to something enormous. ``zlib.decompressobj.decompress``'s
-    ``max_length`` parameter bounds the OUTPUT of a single call — the
-    stdlib-documented technique for safely decompressing untrusted data —
-    so this never allocates more than ``max_bytes + 1`` decoded bytes
-    REGARDLESS of the compression ratio, in one bounded call (no
-    hand-rolled incremental multi-call draining loop needed, since the raw
-    input is already fully buffered and capped by the time this runs).
+    ``max_length`` parameter bounds the OUTPUT of each call — the
+    stdlib-documented technique for safely decompressing untrusted data.
+    Gzip permits concatenated members, so each member is decoded with a
+    fresh decompressor while one aggregate ``max_bytes`` ceiling is carried
+    across the whole body. The raw input is already fully buffered and
+    independently capped by the time this runs.
 
     Only ``gzip``/``deflate``/absent/``identity`` are decoded — anything
     else (``br``, ``zstd``, an unknown/typo'd value) is REJECTED rather
@@ -1546,23 +1553,56 @@ def _decompress_within_cap(
                 # httpx's own DeflateDecoder compatibility shim.
                 decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
                 decoded = decompressor.decompress(raw_body, max_bytes + 1)
+            if decompressor.unconsumed_tail:
+                # decompress() stopped at max_length with more input left to
+                # process — the decoded output would have exceeded the cap.
+                raise BeanFetchError(
+                    f"vendor page exceeded the {max_bytes}-byte fetch cap "
+                    f"(after decompression) for {redact_url_for_error(url)!r}"
+                )
+            decoded += decompressor.flush()
         else:
-            decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
-            decoded = decompressor.decompress(raw_body, max_bytes + 1)
-        if decompressor.unconsumed_tail:
-            # decompress() stopped at max_length with more input left to
-            # process — the decoded output would have exceeded the cap.
-            raise BeanFetchError(
-                f"vendor page exceeded the {max_bytes}-byte fetch cap "
-                f"(after decompression) for {redact_url_for_error(url)!r}"
-            )
-        decoded += decompressor.flush()
+            decoded_parts: list[bytes] = []
+            decoded_size = 0
+            member_count = 0
+            member_input = raw_body
+            while True:
+                member_count += 1
+                if member_count > _MAX_GZIP_MEMBERS:
+                    raise BeanFetchError(
+                        f"vendor page exceeded the {_MAX_GZIP_MEMBERS}-member "
+                        f"concatenated gzip limit for {redact_url_for_error(url)!r}"
+                    )
+                decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+                member_decoded = decompressor.decompress(member_input, max_bytes - decoded_size + 1)
+                if decompressor.unconsumed_tail:
+                    raise BeanFetchError(
+                        f"vendor page exceeded the {max_bytes}-byte fetch cap "
+                        f"(after decompression) for {redact_url_for_error(url)!r}"
+                    )
+                member_decoded += decompressor.flush()
+                if not decompressor.eof:
+                    raise BeanFetchError(
+                        f"vendor page sent a truncated/incomplete "
+                        f"{content_encoding!r} body for {redact_url_for_error(url)!r}"
+                    )
+                decoded_parts.append(member_decoded)
+                decoded_size += len(member_decoded)
+                if decoded_size > max_bytes:
+                    raise BeanFetchError(
+                        f"vendor page exceeded the {max_bytes}-byte fetch cap "
+                        f"(after decompression) for {redact_url_for_error(url)!r}"
+                    )
+                member_input = decompressor.unused_data
+                if not member_input:
+                    break
+            decoded = b"".join(decoded_parts)
     except zlib.error as exc:
         raise BeanFetchError(
             f"vendor page failed to decompress ({content_encoding!r}) for "
             f"{redact_url_for_error(url)!r}: {exc}"
         ) from exc
-    if not decompressor.eof:
+    if normalized == "deflate" and not decompressor.eof:
         # A truncated stream (connection cut mid-body, or a misbehaving
         # server) can decompress+flush to PARTIAL output with no exception
         # at all — verified directly against zlib's actual behavior, not
