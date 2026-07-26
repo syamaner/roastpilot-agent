@@ -371,6 +371,34 @@ def _redact_url_credentials(url: str) -> str:
 _URL_PARSER_IGNORED_LEADING_CHARS = "".join(chr(codepoint) for codepoint in range(0x21))
 
 
+def _redact_invalid_port(authority: str) -> str:
+    """Remove an invalid port whose text may itself contain a secret."""
+    if authority.startswith("["):
+        bracket_end = authority.find("]")
+        if bracket_end < 0:
+            return "[redacted-authority]"
+        suffix = authority[bracket_end + 1 :]
+        if not suffix:
+            return authority
+        if not suffix.startswith(":"):
+            return "[redacted-authority]"
+        port = suffix[1:]
+        if port == "" or (
+            len(port) <= 5 and port.isascii() and port.isdigit() and int(port) <= 65535
+        ):
+            return authority
+        return authority[: bracket_end + 1]
+
+    host, separator, port = authority.rpartition(":")
+    if not separator:
+        return authority
+    if ":" in host:
+        return "[redacted-authority]"
+    if port == "" or (len(port) <= 5 and port.isascii() and port.isdigit() and int(port) <= 65535):
+        return authority
+    return host
+
+
 def redact_url_for_error(url: str) -> str:
     """Return a URL safe to interpolate into a client-visible error detail.
 
@@ -382,11 +410,11 @@ def redact_url_for_error(url: str) -> str:
     carriage returns, and newlines are removed first, and leading WHATWG C0
     controls/spaces are stripped, because ``urlsplit`` also ignores them;
     otherwise they could hide authority syntax from this scan while still
-    being treated as such by the parser. NFKC-equivalent ``@`` delimiters are
-    handled fail-closed by suppressing the whole authority when its safe host
-    boundary cannot be mapped back to the original text. The scan never raises
-    and runs before ``repr``/f-string interpolation, so quotes inside a secret
-    query cannot confuse a downstream display-layer parser.
+    being treated as such by the parser. NFKC-equivalent reserved delimiters
+    are handled fail-closed, and invalid port text is removed because either
+    can itself contain a secret. The scan never raises and runs before
+    ``repr``/f-string interpolation, so quotes inside a secret query cannot
+    confuse a downstream display-layer parser.
 
     Args:
         url: The possibly malformed, untrusted URL.
@@ -397,7 +425,9 @@ def redact_url_for_error(url: str) -> str:
     normalized = url.translate({ord("\t"): None, ord("\r"): None, ord("\n"): None})
     normalized = normalized.lstrip(_URL_PARSER_IGNORED_LEADING_CHARS)
     tail_positions = [
-        position for marker in ("?", "#") if (position := normalized.find(marker)) >= 0
+        position
+        for position, character in enumerate(normalized)
+        if any(marker in unicodedata.normalize("NFKC", character) for marker in ("?", "#"))
     ]
     without_tail = normalized[: min(tail_positions)] if tail_positions else normalized
 
@@ -412,12 +442,18 @@ def redact_url_for_error(url: str) -> str:
     authority_end = path_start if path_start >= 0 else len(without_tail)
     authority = without_tail[authority_start:authority_end]
     normalized_authority = unicodedata.normalize("NFKC", authority)
-    if "@" not in normalized_authority:
-        return without_tail
-
-    safe_authority = authority.rsplit("@", 1)[-1]
-    if "@" in unicodedata.normalize("NFKC", safe_authority):
+    introduces_reserved_delimiter = any(
+        normalized_authority.count(marker) > authority.count(marker) for marker in "/?#@:"
+    )
+    if introduces_reserved_delimiter:
         safe_authority = "[redacted-authority]"
+    elif "@" in normalized_authority:
+        safe_authority = authority.rsplit("@", 1)[-1]
+    else:
+        safe_authority = authority
+    safe_authority = _redact_invalid_port(safe_authority)
+    if safe_authority == authority:
+        return without_tail
     return without_tail[:authority_start] + safe_authority + without_tail[authority_end:]
 
 
@@ -1294,7 +1330,9 @@ async def _assert_public_destination(
         # fail-soft error every other malformed-URL case gets here.
         explicit_port = parsed.port
     except ValueError as exc:
-        raise BeanFetchError(f"malformed port in {redact_url_for_error(url)!r}: {exc}") from exc
+        raise BeanFetchError(
+            f"malformed port in {redact_url_for_error(url)!r} (invalid port syntax)"
+        ) from exc
     port = explicit_port or (443 if parsed.scheme == "https" else 80)
 
     try:

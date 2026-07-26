@@ -4484,6 +4484,14 @@ async def test_draft_bean_from_url_fetch_error_is_422(
             id="nfkc-equivalent-userinfo-delimiter",
         ),
         pytest.param(
+            "https://vendor.example？access_token=SECRET-QUERY-656/path",
+            id="nfkc-equivalent-query-delimiter",
+        ),
+        pytest.param(
+            "https://vendor.example＃access_token=SECRET-QUERY-656/path",
+            id="nfkc-equivalent-fragment-delimiter",
+        ),
+        pytest.param(
             " //user:SECRET-QUERY-656＠vendor.example/path"
             "?access_token=SECRET-QUERY-656#fragment-secret",
             id="leading-parser-ignored-space-and-nfkc-userinfo",
@@ -4504,6 +4512,23 @@ async def test_draft_bean_from_url_parse_failure_detail_strips_sensitive_url_par
     assert "user:password@" not in detail
     assert "fragment-secret" not in detail
     assert "?" not in detail
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_malformed_port_detail_strips_sensitive_text(
+    client: AsyncClient,
+) -> None:
+    """#656: lazy port parse failures do not echo port or URL secrets."""
+    url = "https://vendor.example:access_token=SECRET-QUERY-656/path?query_secret=SECRET-QUERY-656"
+    response = await client.post("/api/beans/draft-from-url", json={"url": url})
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "malformed port" in detail
+    assert "SECRET-QUERY-656" not in detail
+    assert "access_token" not in detail
+    assert "query_secret" not in detail
+    assert "Port could not be cast" not in detail
 
 
 @pytest.mark.asyncio

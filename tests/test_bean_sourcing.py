@@ -477,6 +477,14 @@ async def test_draft_bean_profile_from_url_rejects_url_with_unclosed_ipv6_bracke
             id="nfkc-equivalent-userinfo-delimiter",
         ),
         pytest.param(
+            f"https://vendor.example？access_token={_ERROR_URL_SECRET}/path",
+            id="nfkc-equivalent-query-delimiter",
+        ),
+        pytest.param(
+            f"https://vendor.example＃access_token={_ERROR_URL_SECRET}/path",
+            id="nfkc-equivalent-fragment-delimiter",
+        ),
+        pytest.param(
             f" \x00//user:{_ERROR_URL_SECRET}＠vendor.example/path"
             f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
             id="leading-parser-ignored-c0-and-space",
@@ -1630,6 +1638,24 @@ async def test_assert_public_destination_rejects_non_numeric_port() -> None:
         await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
             "https://vendor.example:bad/x"
         )
+
+
+@pytest.mark.asyncio
+async def test_malformed_port_error_does_not_echo_sensitive_port_text() -> None:
+    """A nonnumeric port and its lazy parser error are both client-visible."""
+    url = (
+        f"https://vendor.example:access_token={_ERROR_URL_SECRET}/path"
+        f"?query_secret={_ERROR_URL_SECRET}#fragment-secret"
+    )
+    with pytest.raises(BeanFetchError, match="malformed port") as error:
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            url
+        )
+
+    _assert_error_url_is_safe(error.value)
+    detail = str(error.value)
+    assert "Port could not be cast" not in detail
+    assert "query_secret" not in detail
 
 
 @pytest.mark.asyncio
@@ -9220,7 +9246,7 @@ def test_redact_url_credentials_returns_url_unchanged_on_malformed_url() -> None
         ),
         pytest.param(
             "https://user:password@[bad?access_token=SECRET-QUERY-656#fragment-secret",
-            "https://[bad",
+            "https://[redacted-authority]",
             id="unclosed-ipv6",
         ),
         pytest.param(
@@ -9234,6 +9260,51 @@ def test_redact_url_credentials_returns_url_unchanged_on_malformed_url() -> None
             "?access_token=SECRET-QUERY-656#fragment-secret",
             "https://[redacted-authority]/path",
             id="nfkc-equivalent-userinfo-delimiter",
+        ),
+        pytest.param(
+            "https://vendor.example？access_token=SECRET-QUERY-656/path",
+            "https://vendor.example",
+            id="nfkc-equivalent-query-delimiter",
+        ),
+        pytest.param(
+            "https://vendor.example＃access_token=SECRET-QUERY-656/path",
+            "https://vendor.example",
+            id="nfkc-equivalent-fragment-delimiter",
+        ),
+        pytest.param(
+            "https://vendor.example:access_token=SECRET-QUERY-656/path",
+            "https://vendor.example/path",
+            id="sensitive-invalid-port",
+        ),
+        pytest.param(
+            "https://[2001:db8::1]/path",
+            "https://[2001:db8::1]/path",
+            id="bracketed-ipv6-without-port",
+        ),
+        pytest.param(
+            "https://[2001:db8::1]:443/path",
+            "https://[2001:db8::1]:443/path",
+            id="bracketed-ipv6-valid-port",
+        ),
+        pytest.param(
+            "https://[2001:db8::1]:access_token=SECRET-QUERY-656/path",
+            "https://[2001:db8::1]/path",
+            id="bracketed-ipv6-sensitive-invalid-port",
+        ),
+        pytest.param(
+            "https://[2001:db8::1]access_token=SECRET-QUERY-656/path",
+            "https://[redacted-authority]/path",
+            id="bracketed-ipv6-invalid-suffix",
+        ),
+        pytest.param(
+            "https://2001:db8::1/path",
+            "https://[redacted-authority]/path",
+            id="unbracketed-ipv6",
+        ),
+        pytest.param(
+            "https://vendor.example:443/path",
+            "https://vendor.example:443/path",
+            id="valid-port",
         ),
         pytest.param(
             " \x00//user:password＠vendor.example/path"
