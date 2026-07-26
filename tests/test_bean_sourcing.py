@@ -463,14 +463,29 @@ async def test_draft_bean_profile_from_url_rejects_url_with_unclosed_ipv6_bracke
     _assert_error_url_is_safe(error.value)
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param(
+            f"https:\n//user:{_ERROR_URL_SECRET}／password@vendor.example/path"
+            f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+            id="control-inside-scheme-separator",
+        ),
+        pytest.param(
+            f"https://user:{_ERROR_URL_SECRET}＠vendor.example/path"
+            f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+            id="nfkc-equivalent-userinfo-delimiter",
+        ),
+        pytest.param(
+            f" \x00//user:{_ERROR_URL_SECRET}＠vendor.example/path"
+            f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+            id="leading-parser-ignored-c0-and-space",
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_urlsplit_error_layers_do_not_echo_nfkc_invalid_userinfo() -> None:
+async def test_urlsplit_error_layers_do_not_echo_nfkc_invalid_userinfo(url: str) -> None:
     """Parser exception text and ignored controls cannot bypass redaction."""
-    url = (
-        f"https:\n//user:{_ERROR_URL_SECRET}／password@vendor.example/path"
-        f"?access_token={_ERROR_URL_SECRET}#fragment-secret"
-    )
-
     with pytest.raises(BeanFetchError, match="invalid URL syntax") as fetch_error:
         await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
             url, config=BeanSourcingConfig()
@@ -1438,9 +1453,7 @@ async def test_fetch_page_text_rejects_redirect_to_non_http_scheme(
 async def test_fetch_page_text_rejects_redirect_to_malformed_location(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#587 P2: a malformed redirect ``Location`` (an unclosed IPv6 bracket,
-    ``http://[::1``) makes ``urljoin()`` raise ``ValueError`` — left
-    unguarded this escapes as an unhandled 500 instead of failing soft.
+    """A malformed redirect ``Location`` can echo credentials from urljoin.
 
     Uses HTTP 300 (Multiple Choices), not 302: ``httpx`` itself EAGERLY
     parses the ``Location`` header for the standard redirect codes
@@ -1455,9 +1468,20 @@ async def test_fetch_page_text_rejects_redirect_to_malformed_location(
     ``False`` for it) but still inside this module's own broader
     ``300 <= status_code < 400`` redirect-hop range, so httpx hands us the
     raw header untouched and OUR OWN ``urljoin()`` call — the one this test
-    targets — is what has to catch the malformed value."""
+    targets — is what has to catch the malformed value. ``httpx`` restricts
+    response-header strings to ASCII in this mock seam, so ``urljoin`` is
+    patched to raise the exact credential-bearing NFKC error shape the stdlib
+    produces; the mapped client detail must use a constant syntax reason."""
 
-    malformed_location = f"http://[::1?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    malformed_location = (
+        f"https://vendor.example/path?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    )
+
+    def fail_with_credential_bearing_parser_error(base: str, location: str) -> str:
+        raise ValueError(
+            f"netloc 'user:{_ERROR_URL_SECRET}／password@vendor.example' "
+            "contains invalid characters under NFKC normalization"
+        )
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(300, headers={"Location": malformed_location})
@@ -1469,6 +1493,7 @@ async def test_fetch_page_text_rejects_redirect_to_malformed_location(
         return real_async_client(transport=transport)
 
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(bean_sourcing, "urljoin", fail_with_credential_bearing_parser_error)
     monkeypatch.setattr(
         bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
     )
@@ -9203,6 +9228,18 @@ def test_redact_url_credentials_returns_url_unchanged_on_malformed_url() -> None
             "?access_token=SECRET-QUERY-656#fragment-secret",
             "https://vendor.example/path",
             id="parser-ignored-control-inside-scheme-separator",
+        ),
+        pytest.param(
+            "https://user:password＠vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https://[redacted-authority]/path",
+            id="nfkc-equivalent-userinfo-delimiter",
+        ),
+        pytest.param(
+            " \x00//user:password＠vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "//[redacted-authority]/path",
+            id="leading-parser-ignored-c0-and-space",
         ),
         pytest.param(
             "//user:password@vendor.example/path?access_token=SECRET-QUERY-656",

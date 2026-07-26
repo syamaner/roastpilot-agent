@@ -202,6 +202,7 @@ import logging
 import re
 import socket
 import threading
+import unicodedata
 import zlib
 from dataclasses import dataclass
 from html import unescape
@@ -367,6 +368,9 @@ def _redact_url_credentials(url: str) -> str:
     return urlunsplit(parsed._replace(netloc=redacted_netloc, query=redacted_query, fragment=""))
 
 
+_URL_PARSER_IGNORED_LEADING_CHARS = "".join(chr(codepoint) for codepoint in range(0x21))
+
+
 def redact_url_for_error(url: str) -> str:
     """Return a URL safe to interpolate into a client-visible error detail.
 
@@ -375,12 +379,14 @@ def redact_url_for_error(url: str) -> str:
     scan rather than :func:`urllib.parse.urlsplit`: malformed input such as an
     unclosed IPv6 literal is exactly where an error-detail sanitizer is
     needed, and ``urlsplit`` raises before it can redact that input. Tabs,
-    carriage returns, and newlines are removed first because ``urlsplit`` also
-    ignores them; otherwise one inserted inside ``://`` could hide the
-    authority from this scan while still being treated as authority syntax by
-    the parser. The scan never raises and runs before ``repr``/f-string
-    interpolation, so quotes inside a secret query cannot confuse a downstream
-    display-layer parser.
+    carriage returns, and newlines are removed first, and leading WHATWG C0
+    controls/spaces are stripped, because ``urlsplit`` also ignores them;
+    otherwise they could hide authority syntax from this scan while still
+    being treated as such by the parser. NFKC-equivalent ``@`` delimiters are
+    handled fail-closed by suppressing the whole authority when its safe host
+    boundary cannot be mapped back to the original text. The scan never raises
+    and runs before ``repr``/f-string interpolation, so quotes inside a secret
+    query cannot confuse a downstream display-layer parser.
 
     Args:
         url: The possibly malformed, untrusted URL.
@@ -389,6 +395,7 @@ def redact_url_for_error(url: str) -> str:
         A display-only URL with userinfo, query, and fragment removed.
     """
     normalized = url.translate({ord("\t"): None, ord("\r"): None, ord("\n"): None})
+    normalized = normalized.lstrip(_URL_PARSER_IGNORED_LEADING_CHARS)
     tail_positions = [
         position for marker in ("?", "#") if (position := normalized.find(marker)) >= 0
     ]
@@ -404,10 +411,13 @@ def redact_url_for_error(url: str) -> str:
     path_start = without_tail.find("/", authority_start)
     authority_end = path_start if path_start >= 0 else len(without_tail)
     authority = without_tail[authority_start:authority_end]
-    if "@" not in authority:
+    normalized_authority = unicodedata.normalize("NFKC", authority)
+    if "@" not in normalized_authority:
         return without_tail
 
     safe_authority = authority.rsplit("@", 1)[-1]
+    if "@" in unicodedata.normalize("NFKC", safe_authority):
+        safe_authority = "[redacted-authority]"
     return without_tail[:authority_start] + safe_authority + without_tail[authority_end:]
 
 
@@ -1635,7 +1645,8 @@ async def _fetch_one_hop(
                         raise BeanFetchError(
                             f"vendor page redirected to a malformed Location "
                             f"{redact_url_for_error(location)!r} for "
-                            f"{redact_url_for_error(current_url)!r}: {exc}"
+                            f"{redact_url_for_error(current_url)!r} "
+                            "(invalid redirect URL syntax)"
                         ) from exc
                     return next_url, True
                 if response.status_code >= 400:

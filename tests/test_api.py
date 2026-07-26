@@ -4478,6 +4478,16 @@ async def test_draft_bean_from_url_fetch_error_is_422(
             "?access_token=SECRET-QUERY-656#fragment-secret",
             id="parser-ignored-control-and-nfkc-invalid-userinfo",
         ),
+        pytest.param(
+            "https://user:SECRET-QUERY-656＠vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            id="nfkc-equivalent-userinfo-delimiter",
+        ),
+        pytest.param(
+            " //user:SECRET-QUERY-656＠vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            id="leading-parser-ignored-space-and-nfkc-userinfo",
+        ),
     ],
 )
 @pytest.mark.asyncio
