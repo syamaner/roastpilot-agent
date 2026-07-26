@@ -201,15 +201,30 @@ clean.
 - Re-run the checks after any fix; only merge once CI is green *and* every
   comment is resolved or consciously dismissed.
 - **`main` is branch-protected (13 Jun, enforces this policy at the platform).**
-  Required: the CI checks + `codecov/patch`, `required_conversation_resolution`
-  (every review thread resolved), and `enforce_admins` (no bypass for owner or
-  agents); force-push/deletion off; repo auto-merge on. **`claude-review` is
+  Required: the CI checks + `codecov/patch`,
+  `required_conversation_resolution` (every review thread resolved), and
+  `enforce_admins` (no bypass for owner or agents); force-push/deletion off; repo
+  auto-merge on. See the temporary Claude exception below. **`claude-review` is
   intentionally NOT a required check** — it fails by design on PRs that edit a
   workflow file (the App's workflow-validation guard) and on Dependabot PRs (no
   secrets), and it passes-on-findings; so the findings gate is its **inline
   comments** (`--comment`) + conversation-resolution, not the check itself. Don't
   re-add it as required (it would deadlock workflow PRs). Green CI alone never
   means mergeable.
+- **Temporary Claude outage state (25 Jul 2026, operator-authorized).**
+  `review-gate` is temporarily NOT required after the SHA-scoped suspension
+  experiment #662 was closed unmerged: commit statuses cannot prove PR-specific
+  review coverage or atomically invalidate a draft review on `ready_for_review`.
+  The live required status set is `Checks`, `Web (lint + typecheck + unit)`,
+  `Web (Playwright snapshots)`, and `codecov/patch`, all app-pinned; strict mode,
+  `required_conversation_resolution`, and `enforce_admins` remain enabled.
+  Codecov ingestion recovered on 26 Jul and #646 restored its patch gate.
+  Until #663 delivers a genuinely PR-scoped gate, Claude is optional and must
+  not be waited on; the exact-head Codex trigger/wait/triage protocol (including
+  its bounded silent/stalled fallback) and independent lead/`pr-triage`
+  adjudication remain mandatory before merge.
+  Restore automated review enforcement only through #663, never by re-requiring
+  the known-unsafe SHA-scoped `review-gate`.
 - **Independent triage when work is delivered by an agent team (D23).** PR
   review feedback (the review roster below — **Claude Code Review** and any human
   reviewer — plus codecov and a `/review-branch` roster pass) is
@@ -320,6 +335,8 @@ checklist before you open.
 (`.github/workflows/claude-code-review.yml`, running `/code-review --comment`), the
 **Codex** connector, and any human reviewer follow this rubric. **CodeRabbit stays
 disabled (15 Jun) and the Augment Code trial ENDED (28 Jun).**
+During the temporary 25-Jul outage above, Claude drops from this roster; the applicable
+shift-left domain reviewer plus independent triage are the required replacement lenses.
 
 **Codex (`chatgpt-codex-connector[bot]`) was RE-ENABLED 30 Jun** after its 15-Jun
 disable, because on real PRs it catches bugs the other lenses miss (on the Config UI
