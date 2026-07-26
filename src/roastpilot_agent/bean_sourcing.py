@@ -399,6 +399,19 @@ def _redact_invalid_port(authority: str) -> str:
     return host
 
 
+def _url_authority_bounds(url: str) -> tuple[int, int]:
+    """Return the best-effort authority bounds for a possibly malformed URL."""
+    scheme_end = url.find("://")
+    if scheme_end >= 0:
+        authority_start = scheme_end + 3
+    elif url.startswith("//"):
+        authority_start = 2
+    else:
+        authority_start = 0
+    path_start = url.find("/", authority_start)
+    return authority_start, path_start if path_start >= 0 else len(url)
+
+
 def redact_url_for_error(url: str) -> str:
     """Return a URL safe to interpolate into a client-visible error detail.
 
@@ -424,6 +437,16 @@ def redact_url_for_error(url: str) -> str:
     """
     normalized = url.translate({ord("\t"): None, ord("\r"): None, ord("\n"): None})
     normalized = normalized.lstrip(_URL_PARSER_IGNORED_LEADING_CHARS)
+    authority_start, authority_end = _url_authority_bounds(normalized)
+    authority = normalized[authority_start:authority_end]
+    if any(
+        character not in "?#"
+        and any(marker in unicodedata.normalize("NFKC", character) for marker in ("?", "#"))
+        for character in authority
+    ):
+        normalized = (
+            normalized[:authority_start] + "[redacted-authority]" + normalized[authority_end:]
+        )
     tail_positions = [
         position
         for position, character in enumerate(normalized)
@@ -431,15 +454,7 @@ def redact_url_for_error(url: str) -> str:
     ]
     without_tail = normalized[: min(tail_positions)] if tail_positions else normalized
 
-    scheme_end = without_tail.find("://")
-    if scheme_end >= 0:
-        authority_start = scheme_end + 3
-    elif without_tail.startswith("//"):
-        authority_start = 2
-    else:
-        authority_start = 0
-    path_start = without_tail.find("/", authority_start)
-    authority_end = path_start if path_start >= 0 else len(without_tail)
+    authority_start, authority_end = _url_authority_bounds(without_tail)
     authority = without_tail[authority_start:authority_end]
     normalized_authority = unicodedata.normalize("NFKC", authority)
     introduces_reserved_delimiter = any(

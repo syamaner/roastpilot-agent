@@ -485,6 +485,21 @@ async def test_draft_bean_profile_from_url_rejects_url_with_unclosed_ipv6_bracke
             id="nfkc-equivalent-fragment-delimiter",
         ),
         pytest.param(
+            f"https://{_ERROR_URL_SECRET}？x@vendor.example/path"
+            f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+            id="nfkc-equivalent-query-before-userinfo",
+        ),
+        pytest.param(
+            f"https://{_ERROR_URL_SECRET}＃x@vendor.example/path"
+            f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+            id="nfkc-equivalent-fragment-before-userinfo",
+        ),
+        pytest.param(
+            f"https://{_ERROR_URL_SECRET}？x＠vendor.example/path"
+            f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+            id="nfkc-equivalent-query-and-userinfo-delimiters",
+        ),
+        pytest.param(
             f" \x00//user:{_ERROR_URL_SECRET}＠vendor.example/path"
             f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
             id="leading-parser-ignored-c0-and-space",
@@ -9263,13 +9278,31 @@ def test_redact_url_credentials_returns_url_unchanged_on_malformed_url() -> None
         ),
         pytest.param(
             "https://vendor.example？access_token=SECRET-QUERY-656/path",
-            "https://vendor.example",
+            "https://[redacted-authority]/path",
             id="nfkc-equivalent-query-delimiter",
         ),
         pytest.param(
             "https://vendor.example＃access_token=SECRET-QUERY-656/path",
-            "https://vendor.example",
+            "https://[redacted-authority]/path",
             id="nfkc-equivalent-fragment-delimiter",
+        ),
+        pytest.param(
+            "https://SECRET-QUERY-656？x@vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https://[redacted-authority]/path",
+            id="nfkc-equivalent-query-before-userinfo",
+        ),
+        pytest.param(
+            "https://SECRET-QUERY-656＃x@vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https://[redacted-authority]/path",
+            id="nfkc-equivalent-fragment-before-userinfo",
+        ),
+        pytest.param(
+            "https://SECRET-QUERY-656？x＠vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https://[redacted-authority]/path",
+            id="nfkc-equivalent-query-and-userinfo-delimiters",
         ),
         pytest.param(
             "https://vendor.example:access_token=SECRET-QUERY-656/path",
