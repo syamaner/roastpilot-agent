@@ -369,6 +369,7 @@ def _redact_url_credentials(url: str) -> str:
 
 
 _URL_PARSER_IGNORED_LEADING_CHARS = "".join(chr(codepoint) for codepoint in range(0x21))
+_URL_SCHEME_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*")
 _URL_SCHEME_PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
 
@@ -413,6 +414,20 @@ def _url_authority_bounds(url: str) -> tuple[int, int]:
     return authority_start, path_start if path_start >= 0 else len(url)
 
 
+def _nfkc_compatibility_scheme(url: str) -> str | None:
+    """Return an apparent scheme ending in an NFKC-equivalent colon."""
+    for position, character in enumerate(url):
+        normalized_character = unicodedata.normalize("NFKC", character)
+        if character != ":" and ":" in normalized_character:
+            normalized_scheme = unicodedata.normalize("NFKC", url[:position])
+            if _URL_SCHEME_NAME_RE.fullmatch(normalized_scheme) is not None:
+                return normalized_scheme
+            return None
+        if any(marker in normalized_character for marker in "/?#:"):
+            return None
+    return None
+
+
 def redact_url_for_error(url: str) -> str:
     """Return a URL safe to interpolate into a client-visible error detail.
 
@@ -439,6 +454,10 @@ def redact_url_for_error(url: str) -> str:
     normalized = url.translate({ord("\t"): None, ord("\r"): None, ord("\n"): None})
     normalized = normalized.lstrip(_URL_PARSER_IGNORED_LEADING_CHARS)
     scheme_prefix = _URL_SCHEME_PREFIX_RE.match(normalized)
+    if scheme_prefix is None:
+        compatibility_scheme = _nfkc_compatibility_scheme(normalized)
+        if compatibility_scheme is not None:
+            return compatibility_scheme + ":[redacted-url]"
     if scheme_prefix is not None:
         suffix = normalized[scheme_prefix.end() :]
         if not suffix.startswith("//") or suffix.startswith("///"):

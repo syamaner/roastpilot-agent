@@ -549,6 +549,11 @@ async def test_urlsplit_error_layers_do_not_echo_nfkc_invalid_userinfo(url: str)
             f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
             id="three-slashes",
         ),
+        *(
+            f"https{colon}//user:{_ERROR_URL_SECRET}{userinfo}vendor.example/path"
+            f"?access_token={_ERROR_URL_SECRET}#fragment-secret"
+            for colon, userinfo in (("：", "@"), ("﹕", "＠"))
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -556,6 +561,8 @@ async def test_malformed_scheme_separator_error_layers_do_not_echo_userinfo(
     url: str,
 ) -> None:
     """Ambiguous slash runs cannot turn userinfo-like text into a safe path."""
+    assert bean_sourcing.redact_url_for_error(url) == "https:[redacted-url]"
+
     with pytest.raises(BeanFetchError, match="well-formed") as fetch_error:
         await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
             url, config=BeanSourcingConfig()
@@ -9420,6 +9427,11 @@ def test_redact_url_credentials_returns_url_unchanged_on_malformed_url() -> None
             "/products/kenya?access_token=SECRET-QUERY-656#fragment-secret",
             "/products/kenya",
             id="relative-path",
+        ),
+        pytest.param(
+            "1invalid：value?access_token=SECRET-QUERY-656",
+            "[redacted-authority]",
+            id="invalid-scheme-with-compatibility-colon",
         ),
         pytest.param("", "", id="empty"),
     ],
