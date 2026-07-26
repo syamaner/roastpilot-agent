@@ -464,6 +464,35 @@ async def test_draft_bean_profile_from_url_rejects_url_with_unclosed_ipv6_bracke
 
 
 @pytest.mark.asyncio
+async def test_urlsplit_error_layers_do_not_echo_nfkc_invalid_userinfo() -> None:
+    """Parser exception text and ignored controls cannot bypass redaction."""
+    url = (
+        f"https:\n//user:{_ERROR_URL_SECRET}／password@vendor.example/path"
+        f"?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    )
+
+    with pytest.raises(BeanFetchError, match="invalid URL syntax") as fetch_error:
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            url, config=BeanSourcingConfig()
+        )
+    _assert_error_url_is_safe(fetch_error.value)
+
+    with pytest.raises(BeanFetchError, match="invalid URL syntax") as destination_error:
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            url
+        )
+    _assert_error_url_is_safe(destination_error.value)
+
+    with pytest.raises(BeanFetchError, match="invalid URL syntax") as public_error:
+        await draft_bean_profile_from_url(
+            url,
+            advisor_config=_ADVISOR_CONFIG,
+            model=_function_model_returning(_identity_args()),
+        )
+    _assert_error_url_is_safe(public_error.value)
+
+
+@pytest.mark.asyncio
 async def test_fetch_page_text_success_extracts_text() -> None:
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
         text = (
@@ -9168,6 +9197,12 @@ def test_redact_url_credentials_returns_url_unchanged_on_malformed_url() -> None
             "https://user:password@[bad?access_token=SECRET-QUERY-656#fragment-secret",
             "https://[bad",
             id="unclosed-ipv6",
+        ),
+        pytest.param(
+            "https:\n//user:password@vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https://vendor.example/path",
+            id="parser-ignored-control-inside-scheme-separator",
         ),
         pytest.param(
             "//user:password@vendor.example/path?access_token=SECRET-QUERY-656",

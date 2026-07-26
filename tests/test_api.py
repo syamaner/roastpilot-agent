@@ -4473,6 +4473,11 @@ async def test_draft_bean_from_url_fetch_error_is_422(
             "ftp://vendor.example/products/kenya?x='\"&access_token=SECRET-QUERY-656",
             id="query-with-both-quotes",
         ),
+        pytest.param(
+            "https:\n//user:SECRET-QUERY-656／password@vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            id="parser-ignored-control-and-nfkc-invalid-userinfo",
+        ),
     ],
 )
 @pytest.mark.asyncio

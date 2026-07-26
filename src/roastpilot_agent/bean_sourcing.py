@@ -374,9 +374,13 @@ def redact_url_for_error(url: str) -> str:
     removed from the authority. This deliberately uses a small structural
     scan rather than :func:`urllib.parse.urlsplit`: malformed input such as an
     unclosed IPv6 literal is exactly where an error-detail sanitizer is
-    needed, and ``urlsplit`` raises before it can redact that input. The scan
-    never raises and runs before ``repr``/f-string interpolation, so quotes
-    inside a secret query cannot confuse a downstream display-layer parser.
+    needed, and ``urlsplit`` raises before it can redact that input. Tabs,
+    carriage returns, and newlines are removed first because ``urlsplit`` also
+    ignores them; otherwise one inserted inside ``://`` could hide the
+    authority from this scan while still being treated as authority syntax by
+    the parser. The scan never raises and runs before ``repr``/f-string
+    interpolation, so quotes inside a secret query cannot confuse a downstream
+    display-layer parser.
 
     Args:
         url: The possibly malformed, untrusted URL.
@@ -384,8 +388,11 @@ def redact_url_for_error(url: str) -> str:
     Returns:
         A display-only URL with userinfo, query, and fragment removed.
     """
-    tail_positions = [position for marker in ("?", "#") if (position := url.find(marker)) >= 0]
-    without_tail = url[: min(tail_positions)] if tail_positions else url
+    normalized = url.translate({ord("\t"): None, ord("\r"): None, ord("\n"): None})
+    tail_positions = [
+        position for marker in ("?", "#") if (position := normalized.find(marker)) >= 0
+    ]
+    without_tail = normalized[: min(tail_positions)] if tail_positions else normalized
 
     scheme_end = without_tail.find("://")
     if scheme_end >= 0:
@@ -1264,7 +1271,7 @@ async def _assert_public_destination(
         parsed = urlsplit(url)
     except ValueError as exc:
         raise BeanFetchError(
-            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} ({exc})"
+            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} (invalid URL syntax)"
         ) from exc
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise BeanFetchError(f"not a well-formed http(s) URL: {redact_url_for_error(url)!r}")
@@ -2195,7 +2202,7 @@ async def _fetch_and_extract(
         parsed = urlsplit(url)
     except ValueError as exc:
         raise BeanFetchError(
-            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} ({exc})"
+            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} (invalid URL syntax)"
         ) from exc
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise BeanFetchError(f"not a well-formed http(s) URL: {redact_url_for_error(url)!r}")
@@ -5285,7 +5292,7 @@ async def draft_bean_profile_from_url(
         parsed_url = urlsplit(url)
     except ValueError as exc:
         raise BeanFetchError(
-            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} ({exc})"
+            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} (invalid URL syntax)"
         ) from exc
     if parsed_url.username is not None or parsed_url.password is not None:
         _log.warning(

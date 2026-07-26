@@ -3027,7 +3027,10 @@ async def draft_bean_from_url(
     except ValueError as exc:
         raise HTTPException(
             status_code=422,
-            detail=(f"not a well-formed http(s) URL: {redact_url_for_error(body.url)!r} ({exc})"),
+            detail=(
+                f"not a well-formed http(s) URL: {redact_url_for_error(body.url)!r} "
+                "(invalid URL syntax)"
+            ),
         ) from exc
 
     try:
