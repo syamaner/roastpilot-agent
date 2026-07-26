@@ -106,13 +106,14 @@ and fails closed if one sends them anyway. The whole fetch (all hops + body
 streaming) is additionally bounded by an end-to-end deadline independent of
 ``httpx``'s own per-request timeout, and the LLM extraction call is bounded
 by its own deadline — both mapped to this module's typed errors, never left
-to hang indefinitely. Drafting is also mutually exclusive with starting a
-roast (:meth:`~roastpilot_agent.api.RoastService.draft_bean_from_url` holds
-the same lock :meth:`~roastpilot_agent.api.RoastService.start_roast` does,
-across its own active-run check AND the whole fetch+extraction) — a
-bean-extraction LLM call sharing a resource-constrained provider (e.g.
-local Ollama) with an active roast's advisor calls can starve them into the
-controller's sustained-outage safety fallback.
+to hang indefinitely. Draft admission shares
+:meth:`~roastpilot_agent.api.RoastService.start_roast`'s lock only for its
+persisted active-run check: a new draft is rejected once a roast is active,
+but the lock is released before fetch+extraction so a slow or abandoned
+draft never delays an operator's roast start (#657). A draft admitted while
+idle may therefore overlap a later roast. The route's concurrency limit and
+these deadlines bound that overlap; they do not eliminate provider
+contention with the active roast's advisor.
 
 **Deterministic JSON-LD extraction, ahead of the LLM (#590 slice B):**
 before the LLM sees the page, :func:`_match_json_ld_product_facts` looks for a
@@ -151,19 +152,17 @@ never expands DTD entities; ``no_network`` defaults ``True`` and is never
 overridden) — see :func:`_extract_page_markdown`. Dispatched off the event
 loop via :func:`_extract_page_markdown_bounded` in :func:`_fetch_page_text`
 (checklist class 6), BOUNDED by that same call's
-``config.fetch_timeout_seconds`` deadline (#590 slice C P1 fix — this call
-runs under :meth:`~roastpilot_agent.api.RoastService.draft_bean_from_url`'s
-``_start_lock``, shared with ``start_roast``, so an unbounded call here
-would hang every roast start, not just this draft). On that timeout the
-draft FALLS BACK to the linear-strip pass rather than failing (#590 slice C
-P2 fix — a slow-to-parse page must not regress from "draft succeeds via
-linear-strip", true before this slice, to a 422 that didn't exist before
-it); the timeout only bounds the WAIT, never the outcome. Measured up to
-~2.5s of
+``config.fetch_timeout_seconds`` deadline (#590 slice C P1 fix). A draft
+admitted while idle may overlap a later roast (#657), so unbounded
+synchronous parsing here could stall that roast's controller event loop.
+On timeout the draft FALLS BACK to the linear-strip pass rather than failing
+(#590 slice C P2 fix — a slow-to-parse page must not regress from "draft
+succeeds via linear-strip", true before this slice, to a 422 that didn't
+exist before it); the timeout only bounds the WAIT, never the outcome.
+Measured up to ~2.5s of
 CPU-bound tree-walking on a page at the ``max_response_bytes`` cap, which
 would otherwise block the whole process's event loop (health checks, SSE
-heartbeats to other connected clients — not just an active roast, which
-this feature already excludes by a separate mutex) for that entire window.
+heartbeats, and any later-started roast) for that entire window.
 The date-extraction pass — measured as the majority of that CPU cost, and
 never used by this feature — is disabled
 (``date_extraction_params={"extensive_search": False}``, #590 slice C P2
@@ -1123,7 +1122,7 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
         timeout_seconds: The bound on this call's OWN wait (reuses
             ``config.fetch_timeout_seconds`` — see
             :func:`_fetch_and_extract`'s comment on the resulting
-            lock-hold bound, unchanged by this fix).
+            draft-request latency bound).
 
     Returns:
         The extracted markdown, or ``None`` on a timeout, a saturated
@@ -2402,19 +2401,14 @@ async def _fetch_and_extract(
     #
     # BOUNDED by its own ``config.fetch_timeout_seconds`` deadline (#590
     # slice C P1 fix): this call sits AFTER the fetch's own
-    # ``asyncio.timeout`` block above already closed, and it runs under
-    # ``RoastService.draft_bean_from_url``'s ``_start_lock`` — the SAME
-    # lock ``start_roast`` needs — so an unbounded call here would let a
-    # pathological page hang ALL roast starts, defeating the very
-    # advisor-starvation guard that lock exists for. Reusing
+    # ``asyncio.timeout`` block above already closed. Reusing
     # ``fetch_timeout_seconds`` (rather than adding a third timeout knob)
-    # avoids a new config field, but it does NOT keep the lock-hold bound
-    # unchanged: this is a SECOND, SEQUENTIAL ``asyncio.timeout`` block on
-    # the same ``fetch_timeout_seconds`` value, after the fetch's own
-    # already closed — so the fetch term counts TWICE in the worst case,
-    # not once. ``RoastService.draft_bean_from_url``'s docstring (api.py)
-    # states the corrected bound: at most
-    # ``2 * fetch_timeout_seconds + extraction_timeout_seconds``.
+    # avoids a new config field, but this is still a SECOND, SEQUENTIAL
+    # timeout on the same value — so the fetch term counts TWICE in the
+    # draft request's worst-case wait, before the separate extraction
+    # timeout. The bound protects request resources and limits how long an
+    # idle-admitted draft can overlap a later roast; it is not a
+    # roast-start lock-hold bound (#657).
     #
     # DISPATCHED via :func:`_extract_page_markdown_bounded` (#607), not
     # bare ``asyncio.timeout(...)`` + ``asyncio.to_thread(...)`` as
@@ -2437,7 +2431,7 @@ async def _fetch_and_extract(
     # used the fast, synchronous linear-strip path; a slow-to-parse (or
     # pool-saturated) page must not regress that page from "draft
     # succeeds via linear-strip" to a 422 that didn't exist before it. The
-    # ``2 * fetch_timeout + extraction_timeout`` lock-hold bound above
+    # ``2 * fetch_timeout + extraction_timeout`` draft-wait bound above
     # still holds either way: the markdown-extraction stage still counts
     # once (it ran for up to ``fetch_timeout_seconds`` before giving up,
     # or returned near-instantly on a saturated pool), the linear-strip
@@ -4312,8 +4306,8 @@ def _heading_compound_marker_prefix_counts(
     makes :func:`_heading_matches_anchor` linear: a crafted heading like
     ``"a,a,a,..."`` with a 1-character anchor produces O(n) occurrences,
     and the old per-occurrence slice-and-scan did O(n) work for each —
-    O(n²) total, an event-loop stall synchronously held behind
-    ``draft_bean_from_url``'s start-lock. Every occurrence now costs O(1)
+    O(n²) total, an event-loop stall in the shared server process that could
+    overlap a later-started roast (#657). Every occurrence now costs O(1)
     array lookups instead (:func:`_heading_matches_anchor`).
 
     Args:
@@ -4728,10 +4722,10 @@ def _phrase_token_spans(
     naive per-position slice-and-compare this replaced was
     O(len(corpus_tokens) * len(phrase_tokens)) — synchronous, adversarial
     input on both sides (a long anchor sharing most tokens with a long
-    heading) could stall the event loop under ``_start_lock``. Overlapping
-    matches are still all reported, identical to the naive scan (a
-    successful match resumes from the failure table's fallback, not from
-    scratch).
+    heading) could stall the shared event loop, including a roast started
+    after the draft was admitted (#657). Overlapping matches are still all
+    reported, identical to the naive scan (a successful match resumes from
+    the failure table's fallback, not from scratch).
 
     Args:
         phrase_tokens: The already-normalized, already-split needle, e.g.
