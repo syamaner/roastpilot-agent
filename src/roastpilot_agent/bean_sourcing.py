@@ -369,6 +369,7 @@ def _redact_url_credentials(url: str) -> str:
 
 
 _URL_PARSER_IGNORED_LEADING_CHARS = "".join(chr(codepoint) for codepoint in range(0x21))
+_URL_SCHEME_PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
 
 def _redact_invalid_port(authority: str) -> str:
@@ -437,6 +438,11 @@ def redact_url_for_error(url: str) -> str:
     """
     normalized = url.translate({ord("\t"): None, ord("\r"): None, ord("\n"): None})
     normalized = normalized.lstrip(_URL_PARSER_IGNORED_LEADING_CHARS)
+    scheme_prefix = _URL_SCHEME_PREFIX_RE.match(normalized)
+    if scheme_prefix is not None:
+        suffix = normalized[scheme_prefix.end() :]
+        if not suffix.startswith("//") or suffix.startswith("///"):
+            return normalized[: scheme_prefix.end()] + "[redacted-url]"
     authority_start, authority_end = _url_authority_bounds(normalized)
     authority = normalized[authority_start:authority_end]
     if any(
@@ -447,12 +453,15 @@ def redact_url_for_error(url: str) -> str:
         normalized = (
             normalized[:authority_start] + "[redacted-authority]" + normalized[authority_end:]
         )
-    tail_positions = [
-        position
-        for position, character in enumerate(normalized)
-        if any(marker in unicodedata.normalize("NFKC", character) for marker in ("?", "#"))
-    ]
-    without_tail = normalized[: min(tail_positions)] if tail_positions else normalized
+    tail_position = next(
+        (
+            position
+            for position, character in enumerate(normalized)
+            if any(marker in unicodedata.normalize("NFKC", character) for marker in ("?", "#"))
+        ),
+        None,
+    )
+    without_tail = normalized[:tail_position] if tail_position is not None else normalized
 
     authority_start, authority_end = _url_authority_bounds(without_tail)
     authority = without_tail[authority_start:authority_end]

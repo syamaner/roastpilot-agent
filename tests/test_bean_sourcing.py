@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import unittest.mock
 import zlib
 from collections.abc import AsyncGenerator, Callable
@@ -524,6 +525,53 @@ async def test_urlsplit_error_layers_do_not_echo_nfkc_invalid_userinfo(url: str)
     with pytest.raises(BeanFetchError, match="invalid URL syntax") as public_error:
         await draft_bean_profile_from_url(
             url,
+            advisor_config=_ADVISOR_CONFIG,
+            model=_function_model_returning(_identity_args()),
+        )
+    _assert_error_url_is_safe(public_error.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param(
+            f"https:user:{_ERROR_URL_SECRET}@vendor.example/path"
+            f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+            id="zero-slashes",
+        ),
+        pytest.param(
+            f"https:/user:{_ERROR_URL_SECRET}@vendor.example/path"
+            f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+            id="one-slash",
+        ),
+        pytest.param(
+            f"https:///user:{_ERROR_URL_SECRET}@vendor.example/path"
+            f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+            id="three-slashes",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_malformed_scheme_separator_error_layers_do_not_echo_userinfo(
+    url: str,
+) -> None:
+    """Ambiguous slash runs cannot turn userinfo-like text into a safe path."""
+    with pytest.raises(BeanFetchError, match="well-formed") as fetch_error:
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            url, config=BeanSourcingConfig()
+        )
+    _assert_error_url_is_safe(fetch_error.value)
+
+    with pytest.raises(BeanFetchError, match="well-formed") as destination_error:
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            url
+        )
+    _assert_error_url_is_safe(destination_error.value)
+
+    public_url = url.rsplit("#", 1)[0]
+    with pytest.raises(BeanFetchError, match="well-formed") as public_error:
+        await draft_bean_profile_from_url(
+            public_url,
             advisor_config=_ADVISOR_CONFIG,
             model=_function_model_returning(_identity_args()),
         )
@@ -9305,6 +9353,24 @@ def test_redact_url_credentials_returns_url_unchanged_on_malformed_url() -> None
             id="nfkc-equivalent-query-and-userinfo-delimiters",
         ),
         pytest.param(
+            "https:/user:SECRET-QUERY-656@vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https:[redacted-url]",
+            id="one-slash-scheme-separator",
+        ),
+        pytest.param(
+            "https:user:SECRET-QUERY-656@vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https:[redacted-url]",
+            id="zero-slash-scheme-separator",
+        ),
+        pytest.param(
+            "https:///user:SECRET-QUERY-656@vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https:[redacted-url]",
+            id="three-slash-scheme-separator",
+        ),
+        pytest.param(
             "https://vendor.example:access_token=SECRET-QUERY-656/path",
             "https://vendor.example/path",
             id="sensitive-invalid-port",
@@ -9363,6 +9429,25 @@ def test_redact_url_for_error_structurally_strips_sensitive_components(
 ) -> None:
     """#656: redaction succeeds before repr, even when URL parsing cannot."""
     assert bean_sourcing.redact_url_for_error(url) == expected
+
+
+def test_redact_url_for_error_stops_scanning_after_first_tail_delimiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An early query marker must not allocate or scan over a huge suffix."""
+    real_normalize = unicodedata.normalize
+    normalize_calls = 0
+
+    def counting_normalize(form: Literal["NFC", "NFD", "NFKC", "NFKD"], text: str, /) -> str:
+        nonlocal normalize_calls
+        normalize_calls += 1
+        return real_normalize(form, text)
+
+    monkeypatch.setattr(unicodedata, "normalize", counting_normalize)
+    url = "https://vendor.example?" + ("#" * 100_000)
+
+    assert bean_sourcing.redact_url_for_error(url) == "https://vendor.example"
+    assert normalize_calls < 128
 
 
 def test_url_bearing_error_constructors_never_interpolate_raw_url_variables() -> None:

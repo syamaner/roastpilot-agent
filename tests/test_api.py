@@ -4507,6 +4507,18 @@ async def test_draft_bean_from_url_fetch_error_is_422(
             id="nfkc-equivalent-query-and-userinfo-delimiters",
         ),
         pytest.param(
+            "https:/user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
+            id="one-slash-scheme-separator",
+        ),
+        pytest.param(
+            "https:user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
+            id="zero-slash-scheme-separator",
+        ),
+        pytest.param(
+            "https:///user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
+            id="three-slash-scheme-separator",
+        ),
+        pytest.param(
             " //user:SECRET-QUERY-656＠vendor.example/path"
             "?access_token=SECRET-QUERY-656#fragment-secret",
             id="leading-parser-ignored-space-and-nfkc-userinfo",
