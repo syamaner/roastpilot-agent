@@ -52,10 +52,13 @@ If the diff matches none of these, say so and stop — don't invent scope.
 5. **Normalization consistency** — every extracted value normalized *before* provenance
    tagging / required-field checks / model construction; tri-state (nullable) where "absent"
    must differ from "explicitly empty/false".
-6. **Cross-feature contention** — a new provider-calling path must not run during an active
-   roast / starve the advisor; the guard must be **race-free** (check + work under the same
-   lock the roast-start path uses). **This one is safety-adjacent — name it in your summary
-   and escalate to `safety-reviewer`.**
+6. **Cross-feature contention** — a new provider-calling path must not begin during an
+   active roast or delay an operator's roast start. Make admission **race-free** by checking
+   active-run state under the roast-start lock, then release it before remote work (#657).
+   Register admitted work under that lock so start can mark/cancel it and perform a bounded
+   cancellation drain before persisting the run. Bound/isolate provider and CPU contention
+   too; local cancellation is only best-effort at a remote provider boundary. **This one is
+   safety-adjacent — name it in your summary and escalate to `safety-reviewer`.**
 7. **LLM prompt-injection & tool boundary** — when attacker-controlled fetched/decoded content
    flows into an LLM prompt, it's untrusted *instructions*: the LLM path has no write tools /
    privileged actions, its output is treated as untrusted (normalized + provenance-verified +

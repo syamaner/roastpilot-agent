@@ -129,12 +129,16 @@ Each item: the check, the failure it prevents, and the fix pattern. Cite `file:l
 
 ## 6. Cross-feature contention (safety-adjacent — escalate to `safety-reviewer` too)
 
-- [ ] **A new provider-calling path must not be able to run during an active roast** (or
-      must not contend with advisor availability). The roast loop's advice calls time out
-      and a few consecutive failures trip the safety fallback — a background extraction on
-      the same backend can starve it. Guard on the active-run signal (→ 409), and make the
-      guard **race-free**: check + do the work under the same lock the roast-start path uses,
-      or a concurrent start can interleave after the check.
+- [ ] **A new provider-calling path must not delay roast start or begin once a roast is
+      active.** The roast loop's advice calls time out and a few consecutive failures trip
+      the safety fallback — a background extraction on the same backend can starve it.
+      Make admission **race-free** by checking the active-run signal (→ 409) under the
+      roast-start lock, but release that lock before remote work: an abandoned request must
+      never queue an operator's start (#657). Register admitted work under the same lock so
+      roast start can mark and cancel it, then perform a bounded cancellation drain before
+      persisting the run. Also bound and isolate contention (concurrency rejection,
+      end-to-end deadlines, off-loop CPU work). Local cancellation is only best-effort at a
+      remote provider boundary; claim guaranteed non-overlap only with provider isolation.
 - [ ] **CPU-heavy synchronous parsing counts as contention too, not just provider calls.**
       The same process runs the roast controller, so a synchronous HTML/markup/decompression
       parse (see the ReDoS + compression-bomb items in §3) blocks the event loop and can stall

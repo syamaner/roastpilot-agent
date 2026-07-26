@@ -12,6 +12,7 @@ directly into the broadcaster.
 """
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta, timezone
@@ -25,6 +26,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 from httpx import ASGITransport, AsyncClient
 
+import roastpilot_agent.api as api_module
 from roastpilot_agent import __version__
 from roastpilot_agent.advisor import AdvisorContext, FakeAdvisor, RoastDecision
 from roastpilot_agent.api import (
@@ -4729,29 +4731,46 @@ async def test_roast_service_draft_bean_from_url_raises_when_a_roast_is_active(
 
 
 @pytest.mark.asyncio
-async def test_draft_bean_from_url_and_start_roast_are_mutually_exclusive(
-    service: RoastService, monkeypatch: pytest.MonkeyPatch
+async def test_slow_draft_bean_from_url_does_not_block_start_roast(
+    service: RoastService, store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#587 P1 (round 5): ``draft_bean_from_url`` shares ``start_roast``'s
-    ``_start_lock``, held across the WHOLE fetch+extraction — not just the
-    active-run check — so a roast-start issued while a draft is in flight
-    cannot interleave and start underneath it. Without this, an
-    unsynchronized ``active_run()`` snapshot could pass, yield during the
-    (multi-second) fetch/LLM call, and let a concurrent roast start in that
-    window — reopening the exact advisor-starvation race the #587 P1 guard
-    exists to close."""
+    """#657: roast start preempts and drains a stalled provider first."""
     draft_entered = asyncio.Event()
-    release_draft = asyncio.Event()
-    events: list[str] = []
+    cancellation_received = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
 
     async def slow_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
-        events.append("draft_entered")
         draft_entered.set()
-        await release_draft.wait()
-        events.append("draft_exited")
-        return _draft_from(url)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_received.set()
+            await release_cleanup.wait()
+            cleanup_finished.set()
+            raise
+
+    original_create_run = store.create_run
+
+    async def create_run_after_draft_cleanup(
+        *,
+        run_id: str,
+        profile: RoastProfile,
+        config: AppConfig,
+        agent_phase: RoastPhase,
+        started_at_utc: str | None = None,
+    ) -> None:
+        assert cleanup_finished.is_set(), "draft cancellation must drain before persistence"
+        await original_create_run(
+            run_id=run_id,
+            profile=profile,
+            config=config,
+            agent_phase=agent_phase,
+            started_at_utc=started_at_utc,
+        )
 
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", slow_draft)
+    monkeypatch.setattr(store, "create_run", create_run_after_draft_cleanup)
 
     draft_task = asyncio.create_task(
         service.draft_bean_from_url("https://vendor.example/products/kenya")
@@ -4759,25 +4778,191 @@ async def test_draft_bean_from_url_and_start_roast_are_mutually_exclusive(
     await asyncio.wait_for(draft_entered.wait(), timeout=2.0)
 
     start_task = asyncio.create_task(service.start_roast(_profile()))
-    # Give the event loop a beat: start_roast must be BLOCKED on the shared
-    # _start_lock, not proceeding concurrently with the in-flight draft.
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    assert not start_task.done(), "start_roast must wait for the shared lock"
-    events.append("start_still_blocked_while_draft_in_flight")
+    try:
+        await asyncio.wait_for(cancellation_received.wait(), timeout=2.0)
+        assert not start_task.done(), "start must briefly drain provider cancellation"
+        release_cleanup.set()
+        detail = await asyncio.wait_for(start_task, timeout=2.0)
+        with pytest.raises(RoastRunConflictError, match="preempted by a roast-start attempt"):
+            await draft_task
+    finally:
+        release_cleanup.set()
+        for task in (draft_task, start_task):
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
-    release_draft.set()
-    draft = await draft_task
-    detail = await start_task
-
-    assert events == [
-        "draft_entered",
-        "start_still_blocked_while_draft_in_flight",
-        "draft_exited",
-    ]
-    assert isinstance(draft, BeanProfileDraft)
+    assert cleanup_finished.is_set()
     assert isinstance(detail, RoastDetail)
     assert detail.id
+
+
+@pytest.mark.asyncio
+async def test_draft_preemption_before_inner_task_first_runs(service: RoastService) -> None:
+    """#657: a registered-but-not-yet-started pipeline is cancellable."""
+    provider_started = False
+
+    async def not_yet_started() -> BeanProfileDraft:
+        nonlocal provider_started
+        provider_started = True
+        return _draft_from("https://vendor.example/products/kenya")
+
+    inner_task = asyncio.create_task(not_yet_started())
+    operation = api_module._BeanDraftOperation(inner_task)  # pyright: ignore[reportPrivateUsage]
+    service._bean_draft_operations[inner_task] = operation  # pyright: ignore[reportPrivateUsage]
+    try:
+        async with service._start_lock:  # pyright: ignore[reportPrivateUsage]
+            await service._preempt_bean_drafts_for_roast_start()  # pyright: ignore[reportPrivateUsage]
+        assert inner_task.cancelled()
+        assert operation.preempted_by_start is True
+        assert provider_started is False
+    finally:
+        service._bean_draft_operations.pop(inner_task, None)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("post_cancel_outcome", ["return", "error"])
+async def test_direct_draft_request_cancellation_propagates_and_unregisters(
+    service: RoastService,
+    monkeypatch: pytest.MonkeyPatch,
+    post_cancel_outcome: Literal["return", "error"],
+) -> None:
+    """#657: caller cancellation wins even if the inner task suppresses it."""
+    draft_entered = asyncio.Event()
+    provider_cancelled = asyncio.Event()
+
+    async def slow_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        draft_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            provider_cancelled.set()
+            if post_cancel_outcome == "error":
+                raise BeanFetchError("synthetic error after cancellation") from None
+            return _draft_from(url)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", slow_draft)
+    draft_task = asyncio.create_task(
+        service.draft_bean_from_url("https://vendor.example/products/kenya")
+    )
+    await asyncio.wait_for(draft_entered.wait(), timeout=2.0)
+
+    draft_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await draft_task
+
+    assert provider_cancelled.is_set()
+    assert not service._bean_draft_operations  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_external_cancellation_wins_race_with_roast_start(
+    service: RoastService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#657: simultaneous caller cancellation remains cancellation, not 409."""
+    draft_entered = asyncio.Event()
+    start_preemption_received = asyncio.Event()
+    hold_cleanup = asyncio.Event()
+
+    async def slow_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        draft_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            start_preemption_received.set()
+            await hold_cleanup.wait()
+            raise
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", slow_draft)
+    draft_task = asyncio.create_task(
+        service.draft_bean_from_url("https://vendor.example/products/kenya")
+    )
+    await asyncio.wait_for(draft_entered.wait(), timeout=2.0)
+    start_task = asyncio.create_task(service.start_roast(_profile()))
+    await asyncio.wait_for(start_preemption_received.wait(), timeout=2.0)
+
+    draft_task.cancel()
+    hold_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await draft_task
+    detail = await asyncio.wait_for(start_task, timeout=2.0)
+
+    assert isinstance(detail, RoastDetail)
+    assert not service._bean_draft_operations  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_draft_preemption_message_is_honest_when_roast_start_fails(
+    service: RoastService,
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#657: preemption reports an attempted start, not a guaranteed run."""
+    draft_entered = asyncio.Event()
+
+    async def slow_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        draft_entered.set()
+        await asyncio.Event().wait()
+
+    async def fail_create_run(**kwargs: object) -> None:
+        raise RuntimeError("synthetic create failure")
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", slow_draft)
+    monkeypatch.setattr(store, "create_run", fail_create_run)
+    draft_task = asyncio.create_task(
+        service.draft_bean_from_url("https://vendor.example/products/kenya")
+    )
+    await asyncio.wait_for(draft_entered.wait(), timeout=2.0)
+
+    with pytest.raises(RuntimeError, match="synthetic create failure"):
+        await service.start_roast(_profile())
+    with pytest.raises(RoastRunConflictError) as error:
+        await draft_task
+
+    assert "roast-start attempt" in str(error.value)
+    assert "if the start failed" in str(error.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("post_cancel_outcome", ["return", "error"])
+async def test_uncooperative_draft_cleanup_cannot_indefinitely_block_start(
+    service: RoastService,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    post_cancel_outcome: Literal["return", "error"],
+) -> None:
+    """#657: preemption wins even when cleanup suppresses cancellation."""
+    draft_entered = asyncio.Event()
+    cancellation_received = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def slow_cleanup(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        draft_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_received.set()
+            await release_cleanup.wait()
+            if post_cancel_outcome == "error":
+                raise BeanFetchError("synthetic error after preemption") from None
+            return _draft_from(url)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", slow_cleanup)
+    monkeypatch.setattr(api_module, "_BEAN_DRAFT_CANCELLATION_GRACE_SECONDS", 0.0)
+    draft_task = asyncio.create_task(
+        service.draft_bean_from_url("https://vendor.example/products/kenya")
+    )
+    await asyncio.wait_for(draft_entered.wait(), timeout=2.0)
+
+    detail = await asyncio.wait_for(service.start_roast(_profile()), timeout=2.0)
+    await asyncio.wait_for(cancellation_received.wait(), timeout=2.0)
+    assert "cancellation grace" in caplog.text
+    assert isinstance(detail, RoastDetail)
+
+    release_cleanup.set()
+    with pytest.raises(RoastRunConflictError, match="preempted"):
+        await draft_task
 
 
 @pytest.mark.asyncio
@@ -4786,15 +4971,11 @@ async def test_draft_bean_from_url_returns_429_when_concurrency_exhausted(
 ) -> None:
     """#587 fix 5: each draft-from-url call is a billable BYOK LLM request,
     so a module-level semaphore bounds how many requests can be ADMITTED at
-    once. Fixed at 1, not 2 (#587 P2, round 6): ``draft_bean_from_url``
-    also shares ``start_roast``'s ``_start_lock`` (#587 P1 round 5, held
-    across the WHOLE fetch+extraction — see
-    ``test_draft_bean_from_url_and_start_roast_are_mutually_exclusive``),
-    and that lock is acquired FAIRLY (FIFO), so admitting MORE than one
-    draft at a time would let a roast-start wait behind however many are
-    admitted, not just one. With the cap at 1, a SECOND concurrent request
-    must fail fast with 429 (no queuing at all — the single slot is
-    already taken); releasing the first then lets it complete normally."""
+    once. Fixed at 1, not 2 (#587 P2, round 6), so a SECOND concurrent
+    request must fail fast with 429 (no queuing at all — the single slot is
+    already taken); releasing the first then lets it complete normally.
+    #657 keeps this draft-only admission control while letting roast starts
+    proceed independently."""
     entered = 0
     first_entered = asyncio.Event()
     release = asyncio.Event()
@@ -4808,8 +4989,7 @@ async def test_draft_bean_from_url_returns_429_when_concurrency_exhausted(
 
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
 
-    # The one admission slot: taken and executing (blocked inside
-    # fake_draft, holding the shared _start_lock too).
+    # The one admission slot is taken and executing inside fake_draft.
     task1 = asyncio.create_task(
         client.post("/api/beans/draft-from-url", json={"url": "https://vendor.example/products/1"})
     )
