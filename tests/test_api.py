@@ -4514,14 +4514,14 @@ async def test_draft_bean_from_url_fetch_error_is_422(
             "https:user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
             id="zero-slash-scheme-separator",
         ),
-        pytest.param(
-            "https:///user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
-            id="three-slash-scheme-separator",
+        *(
+            f"{slashes}user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656"
+            for slashes in ("///", "////")
         ),
         *(
-            f"https{colon}//user:SECRET-QUERY-656{userinfo}vendor.example/path"
+            f"{prefix}//user:SECRET-QUERY-656{userinfo}vendor.example/path"
             "?access_token=SECRET-QUERY-656"
-            for colon, userinfo in (("：", "@"), ("﹕", "＠"))
+            for prefix, userinfo in (("https：", "@"), ("1https﹕", "＠"), ("1https:", "@"))
         ),
         pytest.param(
             " //user:SECRET-QUERY-656＠vendor.example/path"

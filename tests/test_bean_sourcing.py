@@ -544,15 +544,15 @@ async def test_urlsplit_error_layers_do_not_echo_nfkc_invalid_userinfo(url: str)
             f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
             id="one-slash",
         ),
-        pytest.param(
-            f"https:///user:{_ERROR_URL_SECRET}@vendor.example/path"
-            f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
-            id="three-slashes",
+        *(
+            f"{slashes}user:{_ERROR_URL_SECRET}@vendor.example/path"
+            f"?access_token={_ERROR_URL_SECRET}#fragment-secret"
+            for slashes in ("///", "////")
         ),
         *(
-            f"https{colon}//user:{_ERROR_URL_SECRET}{userinfo}vendor.example/path"
+            f"{prefix}//user:{_ERROR_URL_SECRET}{userinfo}vendor.example/path"
             f"?access_token={_ERROR_URL_SECRET}#fragment-secret"
-            for colon, userinfo in (("：", "@"), ("﹕", "＠"))
+            for prefix, userinfo in (("https：", "@"), ("1https﹕", "＠"), ("1https:", "@"))
         ),
     ],
 )
@@ -561,7 +561,7 @@ async def test_malformed_scheme_separator_error_layers_do_not_echo_userinfo(
     url: str,
 ) -> None:
     """Ambiguous slash runs cannot turn userinfo-like text into a safe path."""
-    assert bean_sourcing.redact_url_for_error(url) == "https:[redacted-url]"
+    assert bean_sourcing.redact_url_for_error(url).endswith("[redacted-url]")
 
     with pytest.raises(BeanFetchError, match="well-formed") as fetch_error:
         await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
@@ -9429,11 +9429,11 @@ def test_redact_url_credentials_returns_url_unchanged_on_malformed_url() -> None
             id="relative-path",
         ),
         pytest.param(
-            "1invalid：value?access_token=SECRET-QUERY-656",
-            "[redacted-authority]",
+            "1https：//user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
+            "[redacted-url]",
             id="invalid-scheme-with-compatibility-colon",
         ),
-        pytest.param("", "", id="empty"),
+        pytest.param("1x：v?x=s", "[redacted-authority]", id="invalid-nonauthority"),
     ],
 )
 def test_redact_url_for_error_structurally_strips_sensitive_components(

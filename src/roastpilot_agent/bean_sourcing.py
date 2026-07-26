@@ -415,14 +415,14 @@ def _url_authority_bounds(url: str) -> tuple[int, int]:
 
 
 def _nfkc_compatibility_scheme(url: str) -> str | None:
-    """Return an apparent scheme ending in an NFKC-equivalent colon."""
+    """Return a normalized apparent scheme, empty if invalid, or ``None``."""
     for position, character in enumerate(url):
         normalized_character = unicodedata.normalize("NFKC", character)
-        if character != ":" and ":" in normalized_character:
+        if ":" in normalized_character:
             normalized_scheme = unicodedata.normalize("NFKC", url[:position])
             if _URL_SCHEME_NAME_RE.fullmatch(normalized_scheme) is not None:
                 return normalized_scheme
-            return None
+            return "" if url[position + 1 :].startswith("//") else None
         if any(marker in normalized_character for marker in "/?#:"):
             return None
     return None
@@ -457,11 +457,14 @@ def redact_url_for_error(url: str) -> str:
     if scheme_prefix is None:
         compatibility_scheme = _nfkc_compatibility_scheme(normalized)
         if compatibility_scheme is not None:
-            return compatibility_scheme + ":[redacted-url]"
+            prefix = compatibility_scheme + ":" if compatibility_scheme else ""
+            return prefix + "[redacted-url]"
     if scheme_prefix is not None:
         suffix = normalized[scheme_prefix.end() :]
         if not suffix.startswith("//") or suffix.startswith("///"):
             return normalized[: scheme_prefix.end()] + "[redacted-url]"
+    if normalized.startswith("///"):
+        return "[redacted-url]"
     authority_start, authority_end = _url_authority_bounds(normalized)
     authority = normalized[authority_start:authority_end]
     if any(
