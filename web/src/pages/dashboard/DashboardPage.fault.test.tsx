@@ -42,6 +42,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ConnectionStatus } from "@/hooks/useRoastStream";
 import { roastKeys } from "@/hooks/queries";
+import type { RoastTimeline } from "@/lib/types";
 import { DashboardPage } from "./DashboardPage";
 
 // Spy on the typed REST client so the acknowledge-fault POST can be asserted (#206).
@@ -84,6 +85,14 @@ const healthState = {
 // supply a faulted `agent_phase` + `fault_reason` + `enabled_actions` (the restore /
 // reload path that has NO live `fault` SSE frame).
 const roastState: { data: unknown } = { data: undefined };
+const timelineRefetchMock = vi.hoisted(() => vi.fn(async () => undefined));
+const timelineState: {
+  data: RoastTimeline | undefined;
+  refetch: typeof timelineRefetchMock;
+} = {
+  data: undefined,
+  refetch: timelineRefetchMock,
+};
 
 // A minimal RoastProfile for the snapshot fixtures — the page reads the charge band
 // off `detail.data.profile`, so the snapshot must carry a profile to render.
@@ -106,6 +115,7 @@ vi.mock("@/hooks/queries", async () => {
     ...actual,
     useHealth: () => healthState,
     useRoast: () => roastState,
+    useTimeline: () => timelineState,
   };
 });
 
@@ -183,7 +193,33 @@ beforeEach(() => {
   viewState.fault = null;
   streamState.enabledActions = null;
   streamState.phase = null;
+  streamState.status = "connecting";
   capturedDrainCallback = null;
+  timelineState.data = {
+    run_id: "run-live",
+    events: [],
+    safety_evaluations: [],
+    advisor_decisions: [],
+    commands: [],
+  };
+  timelineRefetchMock.mockClear();
+  timelineRefetchMock.mockImplementation(async () => {
+    timelineState.data = {
+      run_id: "run-live",
+      events: [
+        {
+          kind: "first_crack",
+          source: "mcp",
+          monotonic_seconds: 1034,
+          recorded_at_utc: "2026-07-26T18:02:45Z",
+          payload: { source: "mcp", bean_temp_c: 196 },
+        },
+      ],
+      safety_evaluations: [],
+      advisor_decisions: [],
+      commands: [],
+    };
+  });
   operatorActionMock.mockClear();
   healthApiMock.mockClear();
   healthApiMock.mockImplementation(async () => ({
@@ -192,6 +228,54 @@ beforeEach(() => {
     mcp_child: "connected" as const,
     active_run_id: "run-new",
   }));
+});
+
+describe("DashboardPage FC timeline subscription barrier (#592)", () => {
+  it("refreshes once on first telemetry and re-arms after reconnect", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-live", mcp_child: "running" };
+    const rendered = renderPage();
+
+    expect(timelineRefetchMock).not.toHaveBeenCalled();
+    streamState.status = "live";
+    rendered.rerender(
+      <QueryClientProvider client={rendered.client}>
+        <MemoryRouter>
+          <DashboardPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    capturedDrainCallback?.({ event: "telemetry" });
+    capturedDrainCallback?.({ event: "telemetry" });
+    expect(timelineRefetchMock).toHaveBeenCalledTimes(1);
+    rendered.rerender(
+      <QueryClientProvider client={rendered.client}>
+        <MemoryRouter>
+          <DashboardPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId("bean-fc-reference")).toHaveTextContent("▲ FC 196.0 °C");
+
+    streamState.status = "reconnecting";
+    rendered.rerender(
+      <QueryClientProvider client={rendered.client}>
+        <MemoryRouter>
+          <DashboardPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    streamState.status = "live";
+    rendered.rerender(
+      <QueryClientProvider client={rendered.client}>
+        <MemoryRouter>
+          <DashboardPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    capturedDrainCallback?.({ event: "telemetry" });
+    expect(timelineRefetchMock).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("DashboardPage faulted-run sticky banner (#124)", () => {

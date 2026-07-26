@@ -78,6 +78,19 @@ export function DashboardPage(): React.JSX.Element {
   // the full roast curve, not just the frames it personally witnessed (#153).
   const view = useDashboardEvents(frames, frameCount, runId, status);
 
+  // #592: the mount read gives an early persisted-FC fallback, then the first
+  // post-subscription telemetry frame acts as the persistence barrier for the
+  // snapshot→EventSource gap (the runner flushes buffered events before publishing
+  // telemetry). Refresh exactly once per connection, re-armed below.
+  const timeline = useTimeline(runId);
+  const timelineRefreshArmedRef = useRef(true);
+  useEffect(() => {
+    timelineRefreshArmedRef.current = true;
+  }, [runId]);
+  useEffect(() => {
+    if (status !== "live") timelineRefreshArmedRef.current = true;
+  }, [status]);
+
   // P2-1 (#423): a normal roast completion emits `run_completed` on the SSE stream.
   // `useHealth` is not refetched by default on this path (health invalidation lives
   // at start + fault-ack only), so `active_run_id` stays non-null in the cache and
@@ -93,6 +106,10 @@ export function DashboardPage(): React.JSX.Element {
   // reconnect is a no-op via invalidation).
   const queryClientForCompletion = useQueryClient();
   useFrameDrain(frames, frameCount, (frame) => {
+    if (frame.event === "telemetry" && timelineRefreshArmedRef.current) {
+      timelineRefreshArmedRef.current = false;
+      void timeline.refetch();
+    }
     if (frame.event === "run_completed") {
       void queryClientForCompletion.invalidateQueries({ queryKey: roastKeys.health });
       void queryClientForCompletion.invalidateQueries({ queryKey: roastKeys.history });
@@ -105,7 +122,6 @@ export function DashboardPage(): React.JSX.Element {
   // #592 reload fallback: SSE does not replay the one-shot first_crack event.
   // The timeline carries that SAME persisted server event (payload + source), so
   // a reload keeps the FC landmark without inferring it from phase/curve data.
-  const timeline = useTimeline(runId);
   const persistedFirstCrack = firstCrackFromTimeline(timeline.data);
   const firstCrack = view.firstCrack ?? persistedFirstCrack;
 
