@@ -104,15 +104,24 @@ export function DashboardPage(): React.JSX.Element {
   // is the established non-lossy drain pattern (#122); fire-once via an early-exit
   // in the callback (the event is one-shot per run; re-delivering it on a
   // reconnect is a no-op via invalidation).
-  const queryClientForCompletion = useQueryClient();
+  const queryClientForStream = useQueryClient();
   useFrameDrain(frames, frameCount, (frame) => {
-    if (frame.event === "telemetry" && timelineRefreshArmedRef.current) {
+    if (
+      frame.event === "telemetry" &&
+      timelineRefreshArmedRef.current &&
+      runId !== null
+    ) {
       timelineRefreshArmedRef.current = false;
-      void timeline.refetch();
+      // TanStack deduplicates refetch() against an initial in-flight query when
+      // that query has no cached data. Cancel it explicitly at the persistence
+      // barrier, then start a guaranteed post-barrier read (#592 / Codex P2).
+      void queryClientForStream
+        .cancelQueries({ queryKey: roastKeys.timeline(runId) })
+        .then(() => timeline.refetch());
     }
     if (frame.event === "run_completed") {
-      void queryClientForCompletion.invalidateQueries({ queryKey: roastKeys.health });
-      void queryClientForCompletion.invalidateQueries({ queryKey: roastKeys.history });
+      void queryClientForStream.invalidateQueries({ queryKey: roastKeys.health });
+      void queryClientForStream.invalidateQueries({ queryKey: roastKeys.history });
     }
   });
 
@@ -323,7 +332,9 @@ export function DashboardPage(): React.JSX.Element {
   const latestBeanTempC =
     telemetry?.bean_temp_c ?? latestSnapshotPoint?.bean ?? null;
   const latestBeanRorCPerMin =
-    telemetry?.bean_ror_c_per_min ?? latestSnapshotPoint?.ror ?? null;
+    telemetry === null
+      ? latestSnapshotPoint?.ror ?? null
+      : telemetry.bean_ror_c_per_min;
 
   return (
     <AppFrame headerRight={<ConnectionIndicator status={status} />}>

@@ -35,11 +35,19 @@
  * mocks below; nothing here exercises them any more.
  */
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { CurvePoint } from "@/components/shared/LiveCurve";
 import type { ConnectionStatus } from "@/hooks/useRoastStream";
 import { roastKeys } from "@/hooks/queries";
 import type { RoastTimeline } from "@/lib/types";
@@ -63,6 +71,9 @@ const healthApiMock = vi.hoisted(() =>
     active_run_id: "run-new" as string | null,
   })),
 );
+const timelineApiMock = vi.hoisted(() =>
+  vi.fn<(runId: string) => Promise<RoastTimeline>>(),
+);
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
@@ -71,6 +82,7 @@ vi.mock("@/lib/api", async () => {
       ...actual.api,
       operatorAction: operatorActionMock,
       health: healthApiMock,
+      timeline: timelineApiMock,
     },
   };
 });
@@ -93,6 +105,7 @@ const timelineState: {
   data: undefined,
   refetch: timelineRefetchMock,
 };
+const queryHookState = vi.hoisted(() => ({ useRealTimeline: false }));
 
 // A minimal RoastProfile for the snapshot fixtures — the page reads the charge band
 // off `detail.data.profile`, so the snapshot must carry a profile to render.
@@ -115,7 +128,8 @@ vi.mock("@/hooks/queries", async () => {
     ...actual,
     useHealth: () => healthState,
     useRoast: () => roastState,
-    useTimeline: () => timelineState,
+    useTimeline: (runId: string | null) =>
+      queryHookState.useRealTimeline ? actual.useTimeline(runId) : timelineState,
   };
 });
 
@@ -153,14 +167,17 @@ vi.mock("@/hooks/useRoastStream", () => ({
 // `fault` is mutable so the #124 sticky-faulted-pin behavior can be exercised.
 // `snapshotFault` is the REAL helper (the page uses it for the #329 restore/reload
 // banner) — only `useDashboardEvents` is stubbed; the pure synthesizer is genuine.
-const viewState: { fault: unknown } = { fault: null };
+const viewState: { fault: unknown; points: CurvePoint[] } = {
+  fault: null,
+  points: [],
+};
 vi.mock("./useDashboardEvents", async () => {
   const actual =
     await vi.importActual<typeof import("./useDashboardEvents")>("./useDashboardEvents");
   return {
     ...actual,
     useDashboardEvents: () => ({
-      points: [],
+      points: viewState.points,
       markers: [],
       fault: viewState.fault,
       firstCrack: null,
@@ -191,10 +208,13 @@ beforeEach(() => {
   healthState.isSuccess = false;
   roastState.data = undefined;
   viewState.fault = null;
+  viewState.points = [];
   streamState.enabledActions = null;
   streamState.phase = null;
   streamState.status = "connecting";
+  streamState.telemetry = null;
   capturedDrainCallback = null;
+  queryHookState.useRealTimeline = false;
   timelineState.data = {
     run_id: "run-live",
     events: [],
@@ -220,6 +240,14 @@ beforeEach(() => {
       commands: [],
     };
   });
+  timelineApiMock.mockReset();
+  timelineApiMock.mockResolvedValue({
+    run_id: "run-live",
+    events: [],
+    safety_evaluations: [],
+    advisor_decisions: [],
+    commands: [],
+  });
   operatorActionMock.mockClear();
   healthApiMock.mockClear();
   healthApiMock.mockImplementation(async () => ({
@@ -231,7 +259,7 @@ beforeEach(() => {
 });
 
 describe("DashboardPage FC timeline subscription barrier (#592)", () => {
-  it("refreshes once on first telemetry and re-arms after reconnect", () => {
+  it("refreshes once on first telemetry and re-arms after reconnect", async () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-live", mcp_child: "running" };
     const rendered = renderPage();
@@ -247,7 +275,7 @@ describe("DashboardPage FC timeline subscription barrier (#592)", () => {
     );
     capturedDrainCallback?.({ event: "telemetry" });
     capturedDrainCallback?.({ event: "telemetry" });
-    expect(timelineRefetchMock).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(timelineRefetchMock).toHaveBeenCalledTimes(1));
     rendered.rerender(
       <QueryClientProvider client={rendered.client}>
         <MemoryRouter>
@@ -274,7 +302,108 @@ describe("DashboardPage FC timeline subscription barrier (#592)", () => {
       </QueryClientProvider>,
     );
     capturedDrainCallback?.({ event: "telemetry" });
-    expect(timelineRefetchMock).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(timelineRefetchMock).toHaveBeenCalledTimes(2));
+  });
+
+  it("cancels an in-flight empty read so the post-barrier FC response wins", async () => {
+    const emptyTimeline: RoastTimeline = {
+      run_id: "run-live",
+      events: [],
+      safety_evaluations: [],
+      advisor_decisions: [],
+      commands: [],
+    };
+    const persistedFirstCrack: RoastTimeline = {
+      ...emptyTimeline,
+      events: [
+        {
+          kind: "first_crack",
+          source: "mcp",
+          monotonic_seconds: 1034,
+          recorded_at_utc: "2026-07-26T18:02:45Z",
+          payload: { source: "mcp", bean_temp_c: 196 },
+        },
+      ],
+    };
+    let resolveInitialRead: (timeline: RoastTimeline) => void = () => undefined;
+    const initialRead = new Promise<RoastTimeline>((resolve) => {
+      resolveInitialRead = resolve;
+    });
+    timelineApiMock.mockReset();
+    timelineApiMock
+      .mockImplementationOnce(() => initialRead)
+      .mockResolvedValueOnce(persistedFirstCrack);
+    queryHookState.useRealTimeline = true;
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-live", mcp_child: "running" };
+
+    const rendered = renderPage();
+    await waitFor(() => expect(timelineApiMock).toHaveBeenCalledTimes(1));
+
+    streamState.status = "live";
+    rendered.rerender(
+      <QueryClientProvider client={rendered.client}>
+        <MemoryRouter>
+          <DashboardPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    capturedDrainCallback?.({ event: "telemetry" });
+
+    await waitFor(() => expect(timelineApiMock).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.getByTestId("bean-fc-reference")).toHaveTextContent(
+        "▲ FC 196.0 °C",
+      ),
+    );
+
+    // The cancelled pre-barrier request may still settle at the transport
+    // layer, but TanStack must not let its stale empty response overwrite FC.
+    await act(async () => {
+      resolveInitialRead(emptyTimeline);
+      await initialRead;
+    });
+    expect(screen.getByTestId("bean-fc-reference")).toHaveTextContent(
+      "▲ FC 196.0 °C",
+    );
+    expect(timelineApiMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("DashboardPage live readout authority (#592)", () => {
+  it("uses persisted RoR only before live telemetry, then honors an explicit null", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-live", mcp_child: "running" };
+    viewState.points = [
+      { t: 60, bean: 170, env: 190, ror: 8.5, heat: 65, fan: 30 },
+    ];
+    const rendered = renderPage();
+    expect(screen.getByTestId("ror-readout")).toHaveTextContent("8.5 °C/min");
+
+    streamState.telemetry = {
+      agent_phase: "roasting_pre_first_crack",
+      bean_temp_c: 171,
+      env_temp_c: 191,
+      bean_ror_c_per_min: null,
+      env_ror_c_per_min: null,
+      heat_percent: 65,
+      fan_percent: 30,
+      cooling_on: false,
+      elapsed_seconds: 121,
+      charge_elapsed_seconds: 61,
+      development_elapsed_seconds: null,
+      development_percent: null,
+      t0_detected: true,
+      first_crack_detected: false,
+    };
+    rendered.rerender(
+      <QueryClientProvider client={rendered.client}>
+        <MemoryRouter>
+          <DashboardPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId("ror-readout")).toHaveTextContent("— °C/min");
   });
 });
 
