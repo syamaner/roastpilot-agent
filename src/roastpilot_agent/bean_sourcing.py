@@ -110,10 +110,13 @@ to hang indefinitely. Draft admission shares
 :meth:`~roastpilot_agent.api.RoastService.start_roast`'s lock only for its
 persisted active-run check: a new draft is rejected once a roast is active,
 but the lock is released before fetch+extraction so a slow or abandoned
-draft never delays an operator's roast start (#657). A draft admitted while
-idle may therefore overlap a later roast. The route's concurrency limit and
-these deadlines bound that overlap; they do not eliminate provider
-contention with the active roast's advisor.
+draft cannot hold it for the duration of remote work (#657). The service
+registers the whole async pipeline under that lock; a later start marks and
+cancels registered drafts, waits only through a short bounded cancellation
+grace, then persists the run. Local cancellation is cooperative throughout
+this module, including the provider await. It is still best-effort at the
+remote boundary: a provider may continue processing or billing a request it
+accepted before local cancellation.
 
 **Deterministic JSON-LD extraction, ahead of the LLM (#590 slice B):**
 before the LLM sees the page, :func:`_match_json_ld_product_facts` looks for a
@@ -153,8 +156,10 @@ overridden) — see :func:`_extract_page_markdown`. Dispatched off the event
 loop via :func:`_extract_page_markdown_bounded` in :func:`_fetch_page_text`
 (checklist class 6), BOUNDED by that same call's
 ``config.fetch_timeout_seconds`` deadline (#590 slice C P1 fix). A draft
-admitted while idle may overlap a later roast (#657), so unbounded
-synchronous parsing here could stall that roast's controller event loop.
+admitted while idle is preempted by a later roast start (#657), but a
+dedicated parser worker already running cannot be stopped by canceling its
+async waiter. Keeping that worker off-loop and bounded to its isolated pool
+prevents it from stalling the roast controller's event loop.
 On timeout the draft FALLS BACK to the linear-strip pass rather than failing
 (#590 slice C P2 fix — a slow-to-parse page must not regress from "draft
 succeeds via linear-strip", true before this slice, to a 422 that didn't
@@ -2406,9 +2411,10 @@ async def _fetch_and_extract(
     # avoids a new config field, but this is still a SECOND, SEQUENTIAL
     # timeout on the same value — so the fetch term counts TWICE in the
     # draft request's worst-case wait, before the separate extraction
-    # timeout. The bound protects request resources and limits how long an
-    # idle-admitted draft can overlap a later roast; it is not a
-    # roast-start lock-hold bound (#657).
+    # timeout. The bound protects request resources; roast start separately
+    # preempts the local draft task with a bounded cancellation drain
+    # (#657). A dedicated parser thread may finish after local cancellation,
+    # but it remains isolated from the event loop and shared executor.
     #
     # DISPATCHED via :func:`_extract_page_markdown_bounded` (#607), not
     # bare ``asyncio.timeout(...)`` + ``asyncio.to_thread(...)`` as
@@ -4307,8 +4313,9 @@ def _heading_compound_marker_prefix_counts(
     ``"a,a,a,..."`` with a 1-character anchor produces O(n) occurrences,
     and the old per-occurrence slice-and-scan did O(n) work for each —
     O(n²) total, an event-loop stall in the shared server process that could
-    overlap a later-started roast (#657). Every occurrence now costs O(1)
-    array lookups instead (:func:`_heading_matches_anchor`).
+    delay a queued roast start before cancellation can run (#657). Every
+    occurrence now costs O(1) array lookups instead
+    (:func:`_heading_matches_anchor`).
 
     Args:
         heading_text: The raw heading line's text.
@@ -4722,8 +4729,8 @@ def _phrase_token_spans(
     naive per-position slice-and-compare this replaced was
     O(len(corpus_tokens) * len(phrase_tokens)) — synchronous, adversarial
     input on both sides (a long anchor sharing most tokens with a long
-    heading) could stall the shared event loop, including a roast started
-    after the draft was admitted (#657). Overlapping matches are still all
+    heading) could stall the shared event loop and delay a queued roast start
+    before cancellation can run (#657). Overlapping matches are still all
     reported, identical to the naive scan (a successful match resumes from
     the failure table's fallback, not from scratch).
 

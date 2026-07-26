@@ -134,9 +134,11 @@ Each item: the check, the failure it prevents, and the fix pattern. Cite `file:l
       the safety fallback — a background extraction on the same backend can starve it.
       Make admission **race-free** by checking the active-run signal (→ 409) under the
       roast-start lock, but release that lock before remote work: an abandoned request must
-      never queue an operator's start (#657). If work admitted while idle can overlap a
-      later roast, explicitly bound and isolate that contention (concurrency rejection,
-      end-to-end deadlines, off-loop CPU work, and cancellation where effective).
+      never queue an operator's start (#657). Register admitted work under the same lock so
+      roast start can mark and cancel it, then perform a bounded cancellation drain before
+      persisting the run. Also bound and isolate contention (concurrency rejection,
+      end-to-end deadlines, off-loop CPU work). Local cancellation is only best-effort at a
+      remote provider boundary; claim guaranteed non-overlap only with provider isolation.
 - [ ] **CPU-heavy synchronous parsing counts as contention too, not just provider calls.**
       The same process runs the roast controller, so a synchronous HTML/markup/decompression
       parse (see the ReDoS + compression-bomb items in §3) blocks the event loop and can stall

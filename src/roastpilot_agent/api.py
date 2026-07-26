@@ -396,6 +396,9 @@ class EventBroadcaster:
 LogArtifactName = str
 
 
+_BEAN_DRAFT_CANCELLATION_GRACE_SECONDS = 0.5
+
+
 class RoastRunConflictError(Exception):
     """A request conflicts with the current run state (maps to HTTP 409):
     starting a roast while one is active, or rating an in-progress run."""
@@ -410,6 +413,14 @@ class RoastRunGoneError(Exception):
 
     A completed or faulted run has no live controller loop draining its queue and
     no hot hardware to act on; the action is gone, not merely conflicting."""
+
+
+@dataclass
+class _BeanDraftOperation:
+    """One registered bean-draft pipeline and its cancellation reason."""
+
+    task: asyncio.Task[BeanProfileDraft]
+    preempted_by_start: bool = False
 
 
 def _before_the_minute(tasted_at_utc: str, completed_at_utc: str) -> bool:
@@ -1378,6 +1389,10 @@ class RoastService:
         # tick makes this rare, but the at-most-one-active invariant is held
         # here, not left to chance.
         self._start_lock = asyncio.Lock()
+        # Whole fetch+extraction tasks admitted while idle. Registration and
+        # roast-start preemption both happen under _start_lock, closing the
+        # check/register/start race without holding the lock across remote work.
+        self._bean_draft_operations: dict[asyncio.Task[BeanProfileDraft], _BeanDraftOperation] = {}
         # The phase-validity pre-check shares the run's configured safety
         # limits, so the queue's verdict matches the controller's on drain.
         self._safety = SafetyPolicy(self._config.safety)
@@ -1539,6 +1554,13 @@ class RoastService:
         changes apply next-roast.  The respawn is between-roast only (the
         active-run guard runs first) and never auto-resumes heat or fan.
 
+        **Bean-draft preemption (#657):** drafts register their whole async
+        fetch/extraction task under ``_start_lock``. Before any config reload,
+        MCP work, or run persistence, start marks and cancels all unfinished
+        drafts and waits briefly for cooperative cleanup. That drain is bounded
+        so an uncooperative request cannot recreate the long start delay; a
+        timeout is logged as explicit best-effort remote cancellation.
+
         Safety limits are **env-resolved** by :func:`load_app_config` — the
         :func:`~roastpilot_agent.config_store._inject_saved_as_env` injector
         skips the ``ROASTPILOT_SAFETY__`` prefix unconditionally, so no saved
@@ -1559,6 +1581,7 @@ class RoastService:
                     f"a roast is already active (run {active.run_id}, phase "
                     f"{active.agent_phase.value}); end it before starting another"
                 )
+            await self._preempt_bean_drafts_for_roast_start()
             # Reload effective config from the saved file + env (D76/D78).
             # Only in live-serve mode (``_live_serve_mode=True``, set by
             # ``build_live_service`` in live.py): both the config and the advisor
@@ -2018,6 +2041,32 @@ class RoastService:
             if mic_status is not None:
                 detail = detail.model_copy(update={"mic_status": mic_status})
         return detail
+
+    async def _preempt_bean_drafts_for_roast_start(self) -> None:
+        """Cancel idle-admitted bean drafts before a roast is persisted."""
+        operations = tuple(
+            operation
+            for operation in self._bean_draft_operations.values()
+            if not operation.task.done()
+        )
+        for operation in operations:
+            operation.preempted_by_start = True
+            operation.task.cancel()
+        if not operations:
+            return
+
+        _, pending = await asyncio.wait(
+            tuple(operation.task for operation in operations),
+            timeout=_BEAN_DRAFT_CANCELLATION_GRACE_SECONDS,
+        )
+        if pending:
+            _log.error(
+                "roast start proceeding after %.3gs bean-draft cancellation grace "
+                "with %d local task(s) still pending; cancellation is best-effort "
+                "for remote provider work",
+                _BEAN_DRAFT_CANCELLATION_GRACE_SECONDS,
+                len(pending),
+            )
 
     def _live_mic_status(self, run_id: str) -> MicStatus | None:
         """The active run's live capture-alive mic status, or ``None`` (#197).
@@ -2652,13 +2701,14 @@ class RoastService:
         ``ControllerConfig.advisory_timeout_seconds`` and 3 consecutive
         availability failures trip the sustained-outage safety fallback.
 
-        The persisted active-run check shares :attr:`_start_lock` with
-        :meth:`start_roast`, so a draft cannot pass the check while a roast
-        is being created. The lock is released before the remote fetch and
-        provider call (#657): a slow or abandoned draft must never delay an
-        operator's roast start. A draft admitted while idle may therefore
-        finish after a roast starts; once the run is persisted, new drafts
-        are rejected by the same check.
+        The persisted active-run check and task registration share
+        :attr:`_start_lock` with :meth:`start_roast`, so a draft cannot pass
+        the check while a roast is being created. The lock is released before
+        the remote fetch and provider call (#657). If a roast start wins
+        later, it marks and cancels every registered draft, briefly drains
+        cooperative cancellation, then persists the run. The drain is bounded:
+        local cancellation is reliable in this async pipeline, but cannot
+        guarantee a remote provider stops processing an accepted request.
 
         Raises:
             RoastRunConflictError: A roast is currently active (maps to
@@ -2675,11 +2725,52 @@ class RoastService:
                 )
             advisor_config = self._config.advisor
             sourcing_config = self._config.bean_sourcing
-        return await draft_bean_profile_from_url(
-            url,
-            advisor_config=advisor_config,
-            sourcing_config=sourcing_config,
-        )
+            task = asyncio.create_task(
+                draft_bean_profile_from_url(
+                    url,
+                    advisor_config=advisor_config,
+                    sourcing_config=sourcing_config,
+                )
+            )
+            operation = _BeanDraftOperation(task=task)
+            self._bean_draft_operations[task] = operation
+        try:
+            try:
+                result = await task
+            except asyncio.CancelledError:
+                outer_task = asyncio.current_task()
+                if (
+                    outer_task is not None
+                    and outer_task.cancelling() == 0
+                    and operation.preempted_by_start
+                ):
+                    raise RoastRunConflictError(
+                        "bean drafting was preempted by a roast-start attempt; "
+                        "retry once the roast ends, or retry now if the start failed"
+                    ) from None
+                raise
+            except Exception:
+                outer_task = asyncio.current_task()
+                if outer_task is not None and outer_task.cancelling() > 0:
+                    raise asyncio.CancelledError from None
+                if operation.preempted_by_start:
+                    raise RoastRunConflictError(
+                        "bean drafting was preempted by a roast-start attempt; "
+                        "retry once the roast ends, or retry now if the start failed"
+                    ) from None
+                raise
+
+            outer_task = asyncio.current_task()
+            if outer_task is not None and outer_task.cancelling() > 0:
+                raise asyncio.CancelledError
+            if operation.preempted_by_start:
+                raise RoastRunConflictError(
+                    "bean drafting was preempted by a roast-start attempt; "
+                    "retry once the roast ends, or retry now if the start failed"
+                ) from None
+            return result
+        finally:
+            self._bean_draft_operations.pop(task, None)
 
 
 def _get_service(request: Request) -> RoastService:
