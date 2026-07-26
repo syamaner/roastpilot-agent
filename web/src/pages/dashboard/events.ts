@@ -11,7 +11,7 @@
  * page reads the persisted timeline, not the live frames).
  */
 
-import type { SafetyVerdict } from "@/lib/types";
+import type { RoastTimeline, SafetyVerdict } from "@/lib/types";
 
 /** A safety handshake (`safety.SafetyEvaluation.model_dump`). Carried by
  *  `recovery_required`, `fault`, `safety_alert`, and inside an `advisory`'s
@@ -77,6 +77,36 @@ export interface T0DetectedData {
 export interface FirstCrackData {
   source: string;
   bean_temp_c?: number;
+}
+
+/**
+ * Recover the first-crack event from the persisted server timeline.
+ *
+ * The live dashboard normally receives this payload over SSE. SSE does not
+ * replay one-shot events after a reload, so the same server-persisted event is
+ * the reload-safe fallback; this never infers FC from phase or curve points.
+ */
+export function firstCrackFromTimeline(
+  timeline: RoastTimeline | undefined,
+): FirstCrackData | null {
+  const event = timeline?.events.find((candidate) => candidate.kind === "first_crack");
+  if (event === undefined) return null;
+
+  const payload = event.payload;
+  const source =
+    payload !== null && typeof payload.source === "string"
+      ? payload.source
+      : event.source;
+  const beanTempC =
+    payload !== null &&
+    typeof payload.bean_temp_c === "number" &&
+    Number.isFinite(payload.bean_temp_c)
+      ? payload.bean_temp_c
+      : undefined;
+
+  return beanTempC === undefined
+    ? { source }
+    : { source, bean_temp_c: beanTempC };
 }
 
 /** The `turning_point` payload (#409) — the post-charge bean-temp minimum. Carries

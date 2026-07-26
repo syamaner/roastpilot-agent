@@ -12,6 +12,9 @@
  * earlier serve-referenced clock (the #220 hold) per the operator.
  *
  * Renders only REAL contract state (kickoff §8 — surface gaps, never invent):
+ *  - Bean temperature is the latest server telemetry value, independent of the
+ *    chart cursor/legend. The FC reference is the fixed server first-crack event
+ *    landmark; neither value is derived locally (#592).
  *  - Development time + DTR (#220, closes the #112 gap): the live `telemetry`
  *    frame now carries BOTH `development_elapsed_seconds` (time since first crack)
  *    and `development_percent` (DTR — that duration as a share of the WHOLE,
@@ -19,9 +22,10 @@
  *    them as TWO DISTINCT readouts post-FC (a duration and a ratio); both hidden
  *    pre-FC. No client-side derivation — the server is authoritative.
  *  - First-crack-audio health: the contract carries no FC-audio pipeline health
- *    signal, so we show real FC STATE — "listening" pre-FC, then "detected at
- *    HH:MM · X °C · source" from the real `first_crack` event — not a mock
- *    "audio: green" dot. The roaster-link dot reflects `mcp_child` health.
+ *    signal, so we show real FC STATE — "listening" pre-FC, then "detected ·
+ *    source" from the real `first_crack` event — not a mock "audio: green" dot.
+ *    Its temperature is elevated once, in the BEAN landmark above. The
+ *    roaster-link dot reflects `mcp_child` health.
  *
  * Phase comes from the server only. All temperatures Celsius; numerics tabular.
  */
@@ -84,6 +88,12 @@ export interface RoastHeaderProps {
    * meaningful post-charge RoR begins (#165, operator clarification 13 Jun).
    */
   beanRorCPerMin: number | null;
+  /**
+   * Live bean temperature from the latest server telemetry frame; null before
+   * telemetry arrives. This is deliberately independent of the chart cursor,
+   * whose legend may display an older point (#592).
+   */
+  beanTempC: number | null;
   profileName: string | null;
   /** Real FC detection from the `first_crack` event; null until it fires. */
   firstCrack: FirstCrackData | null;
@@ -113,6 +123,7 @@ export function RoastHeader({
   developmentSeconds,
   developmentPercent,
   beanRorCPerMin,
+  beanTempC,
   profileName,
   firstCrack,
   mcpChild,
@@ -182,6 +193,10 @@ export function RoastHeader({
           testid="ror-readout"
           accent="var(--roast-nominal)"
         />
+        {/* Latest server telemetry, not the chart cursor value (#592). The FC
+            reference is the fixed server event landmark, not another live
+            temperature. */}
+        <BeanTemperatureReadout beanTempC={beanTempC} firstCrack={firstCrack} />
         {/* Post-FC only (#220): TWO distinct readouts — the development TIME
             (since first crack) and DTR (that time as a % of the whole roast).
             Both server-authoritative; hidden pre-FC (no development yet). */}
@@ -227,6 +242,50 @@ export function RoastHeader({
   );
 }
 
+/**
+ * Prominent live bean temperature with the fixed first-crack landmark.
+ *
+ * Both inputs are server-authored: `beanTempC` is the latest telemetry frame,
+ * while `firstCrack` is the one-shot FC event retained by the dashboard view
+ * model. Keeping them separate prevents chart-cursor state from leaking into
+ * the operator's glanceable live readout.
+ */
+function BeanTemperatureReadout({
+  beanTempC,
+  firstCrack,
+}: {
+  beanTempC: number | null;
+  firstCrack: FirstCrackData | null;
+}): React.JSX.Element {
+  const firstCrackTempC = firstCrack?.bean_temp_c;
+  const hasFirstCrackTemp =
+    firstCrackTempC !== undefined && Number.isFinite(firstCrackTempC);
+
+  return (
+    <div
+      data-testid="bean-temperature-readout"
+      data-fc-detected={hasFirstCrackTemp ? "true" : "false"}
+      className="relative flex min-w-36 flex-col pb-1 after:absolute after:bottom-0 after:left-0 after:h-0.5 after:w-24 after:rounded-full after:bg-roast-coffee"
+    >
+      <span className="text-xs uppercase tracking-wide text-muted-foreground">Bean</span>
+      <div className="flex items-baseline gap-2">
+        <span
+          data-testid="bean-temp-readout"
+          className="numeric whitespace-nowrap text-xl font-bold text-roast-coffee"
+        >
+          {formatTempC(beanTempC)}
+        </span>
+        <span
+          data-testid="bean-fc-reference"
+          className="numeric whitespace-nowrap text-xs font-semibold text-muted-foreground"
+        >
+          {hasFirstCrackTemp ? `▲ FC ${formatTempC(firstCrackTempC)}` : "▲ FC —"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function Metric({
   label,
   value,
@@ -267,8 +326,9 @@ function FirstCrackStatus({
   let label: string;
   let dot: string;
   if (firstCrack) {
-    const temp = firstCrack.bean_temp_c != null ? ` · ${formatTempC(firstCrack.bean_temp_c)}` : "";
-    label = `FC detected${temp} · ${firstCrack.source}`;
+    // #592: the fixed FC temperature now has one prominent home beside BEAN.
+    // This remains the pipeline state/source chip, without duplicating the value.
+    label = `FC detected · ${firstCrack.source}`;
     dot = "bg-roast-nominal";
   } else if (listening) {
     label = "FC: listening";

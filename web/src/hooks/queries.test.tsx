@@ -147,6 +147,38 @@ describe("useTimeline (skipToken when runId is null)", () => {
     renderHook(() => useTimeline("r1"), { wrapper: wrapper() });
     await waitFor(() => expect(spy).toHaveBeenCalledWith("r1"));
   });
+
+  it("refetches a fresh FC-free cache entry on remount (#592)", async () => {
+    const cached = {
+      run_id: "r1",
+      events: [],
+      safety_evaluations: [],
+      advisor_decisions: [],
+      commands: [],
+    } as Awaited<ReturnType<typeof api.timeline>>;
+    const persistedFirstCrack = {
+      ...cached,
+      events: [
+        {
+          kind: "first_crack",
+          source: "mcp",
+          monotonic_seconds: 1034,
+          recorded_at_utc: "2026-07-26T18:02:45Z",
+          payload: { source: "mcp", bean_temp_c: 178 },
+        },
+      ],
+    } as Awaited<ReturnType<typeof api.timeline>>;
+    const { Wrapper, client } = appDefaultsWrapper();
+    client.setQueryData(roastKeys.timeline("r1"), cached);
+    const spy = vi.spyOn(api, "timeline").mockResolvedValue(persistedFirstCrack);
+
+    const { result } = renderHook(() => useTimeline("r1"), { wrapper: Wrapper });
+    expect(result.current.data?.events).toEqual([]);
+    await waitFor(() => expect(spy).toHaveBeenCalledWith("r1"));
+    await waitFor(() =>
+      expect(result.current.data?.events[0]?.kind).toBe("first_crack"),
+    );
+  });
 });
 
 describe("useTelemetry (skipToken when runId is null)", () => {

@@ -15,6 +15,7 @@ const BASE = {
   developmentSeconds: 72,
   developmentPercent: 18.5,
   beanRorCPerMin: 8.4,
+  beanTempC: 205.0,
   profileName: "Ethiopian Yirgacheffe — Medium",
   firstCrack: null,
   mcpChild: "running" as const,
@@ -162,6 +163,65 @@ describe("RoastHeader", () => {
     expect(screen.getByTestId("ror-readout")).toHaveTextContent("— °C/min");
   });
 
+  it("prominently renders the latest bean temperature with the fixed FC landmark (#592)", () => {
+    render(
+      <RoastHeader
+        {...BASE}
+        beanTempC={205}
+        firstCrack={{ source: "mcp", bean_temp_c: 196 }}
+      />,
+    );
+    const readout = screen.getByTestId("bean-temperature-readout");
+    expect(readout).toHaveAttribute("data-fc-detected", "true");
+    expect(readout).toHaveClass("after:bg-roast-coffee");
+    expect(screen.getByTestId("bean-temp-readout")).toHaveTextContent("205.0 °C");
+    expect(screen.getByTestId("bean-temp-readout")).toHaveClass("text-roast-coffee");
+    expect(screen.getByTestId("bean-fc-reference")).toHaveTextContent("▲ FC 196.0 °C");
+  });
+
+  it("shows stable placeholders before telemetry and first-crack detection (#592)", () => {
+    render(<RoastHeader {...BASE} beanTempC={null} firstCrack={null} />);
+    expect(screen.getByTestId("bean-temp-readout")).toHaveTextContent("— °C");
+    expect(screen.getByTestId("bean-fc-reference")).toHaveTextContent("▲ FC —");
+    expect(screen.getByTestId("bean-temperature-readout")).toHaveAttribute(
+      "data-fc-detected",
+      "false",
+    );
+  });
+
+  it("updates from each server bean value while keeping the FC landmark fixed (#592)", () => {
+    const firstCrack = { source: "mcp", bean_temp_c: 196 };
+    const { rerender } = render(
+      <RoastHeader {...BASE} beanTempC={199.4} firstCrack={firstCrack} />,
+    );
+    expect(screen.getByTestId("bean-temp-readout")).toHaveTextContent("199.4 °C");
+    expect(screen.getByTestId("bean-fc-reference")).toHaveTextContent("196.0 °C");
+
+    rerender(
+      <RoastHeader
+        {...BASE}
+        phase="cooling"
+        beanTempC={184.1}
+        firstCrack={firstCrack}
+      />,
+    );
+    expect(screen.getByTestId("bean-temp-readout")).toHaveTextContent("184.1 °C");
+    expect(screen.getByTestId("bean-fc-reference")).toHaveTextContent("196.0 °C");
+  });
+
+  it("never renders NaN for invalid bean or FC telemetry (#592)", () => {
+    render(
+      <RoastHeader
+        {...BASE}
+        beanTempC={Number.NaN}
+        firstCrack={{ source: "mcp", bean_temp_c: Number.NaN }}
+      />,
+    );
+    expect(screen.getByTestId("bean-temp-readout")).toHaveTextContent("— °C");
+    expect(screen.getByTestId("bean-fc-reference")).toHaveTextContent("▲ FC —");
+    expect(screen.getByTestId("roast-header")).not.toHaveTextContent("NaN");
+  });
+
   it("omits the development timer before first crack (GAP A — no dev% invented)", () => {
     render(<RoastHeader {...BASE} developmentSeconds={null} />);
     expect(screen.queryByTestId("development-timer")).toBeNull();
@@ -197,14 +257,15 @@ describe("RoastHeader", () => {
     expect(fc).toHaveTextContent(/listening/i);
   });
 
-  it("shows the real FC detection (temp + source) once it fires", () => {
+  it("shows the real FC detection source without duplicating the landmark temperature", () => {
     render(
       <RoastHeader {...BASE} firstCrack={{ source: "mcp", bean_temp_c: 201.2 }} />,
     );
     const fc = screen.getByTestId("fc-status");
     expect(fc).toHaveAttribute("data-detected", "true");
-    expect(fc).toHaveTextContent("201.2 °C");
     expect(fc).toHaveTextContent("mcp");
+    expect(fc).not.toHaveTextContent("201.2 °C");
+    expect(screen.getByTestId("bean-fc-reference")).toHaveTextContent("201.2 °C");
   });
 
   it("reflects the MCP child health on the roaster-link dot", () => {
