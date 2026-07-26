@@ -1945,6 +1945,21 @@ def test_decompress_within_cap_rejects_deflate_decompression_bomb() -> None:
         decode(compressed, "deflate", max_bytes=1000, url="https://x/y")
 
 
+def test_decompress_within_cap_rejects_truncated_deflate_body() -> None:
+    """A cut-off deflate stream fails closed without exposing URL secrets."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    compressed = zlib.compress(b"complete vendor page")
+    secret_url = "https://user:pass@example.com/y?token=secret#private"
+
+    with pytest.raises(BeanFetchError, match="truncated/incomplete") as exc_info:
+        decode(compressed[:-2], "deflate", max_bytes=1000, url=secret_url)
+
+    detail = str(exc_info.value)
+    assert "user:pass" not in detail
+    assert "token=secret" not in detail
+    assert "private" not in detail
+
+
 def test_decompress_within_cap_rejects_unsupported_encoding() -> None:
     """#587 P2: only gzip/deflate are requested/decoded — brotli, zstd, or
     an unknown value fails closed rather than being silently mistreated as
