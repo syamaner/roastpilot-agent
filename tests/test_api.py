@@ -4468,11 +4468,8 @@ async def test_draft_bean_from_url_fetch_error_is_422(
     [
         "https://user:password@[bad?access_token=SECRET-QUERY-656#fragment-secret",
         "ftp://vendor.example/products/kenya?x='\"&access_token=SECRET-QUERY-656",
-        pytest.param(
-            "https:\n//user:SECRET-QUERY-656／password@vendor.example/path"
-            "?access_token=SECRET-QUERY-656#fragment-secret",
-            id="parser-ignored-control-and-nfkc-invalid-userinfo",
-        ),
+        "https:\n//user:SECRET-QUERY-656／password@vendor.example/path"
+        "?access_token=SECRET-QUERY-656#fragment-secret",
         "https://user:SECRET-QUERY-656＠vendor.example/path"
         "?access_token=SECRET-QUERY-656#fragment-secret",
         "https://vendor.example？access_token=SECRET-QUERY-656/path",
@@ -4481,11 +4478,8 @@ async def test_draft_bean_from_url_fetch_error_is_422(
         "?access_token=SECRET-QUERY-656#fragment-secret",
         "https://SECRET-QUERY-656＃x@vendor.example/path"
         "?access_token=SECRET-QUERY-656#fragment-secret",
-        pytest.param(
-            "https://SECRET-QUERY-656？x＠vendor.example/path"
-            "?access_token=SECRET-QUERY-656#fragment-secret",
-            id="nfkc-equivalent-query-and-userinfo-delimiters",
-        ),
+        "https://SECRET-QUERY-656？x＠vendor.example/path"
+        "?access_token=SECRET-QUERY-656#fragment-secret",
         "https:/user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
         "https:user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
         *(
@@ -4497,11 +4491,8 @@ async def test_draft_bean_from_url_fetch_error_is_422(
             "?access_token=SECRET-QUERY-656"
             for prefix, userinfo in (("https：", "@"), ("1https﹕", "＠"), ("1https:", "@"))
         ),
-        pytest.param(
-            " //user:SECRET-QUERY-656＠vendor.example/path"
-            "?access_token=SECRET-QUERY-656#fragment-secret",
-            id="leading-parser-ignored-space-and-nfkc-userinfo",
-        ),
+        " //user:SECRET-QUERY-656＠vendor.example/path"
+        "?access_token=SECRET-QUERY-656#fragment-secret",
     ],
 )
 @pytest.mark.asyncio
@@ -4525,11 +4516,18 @@ async def test_draft_bean_from_url_bounds_body_before_framework_parsing(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Declared, chunked, and understated oversized bodies fail before the endpoint."""
+    admission = mock.Mock()
+    admission.acquire = mock.AsyncMock()
     provider = mock.AsyncMock(side_effect=AssertionError("must not reach provider"))
     redact = mock.Mock(side_effect=AssertionError("must not redact oversized body"))
+    monkeypatch.setattr("roastpilot_agent.api._draft_bean_from_url_semaphore", admission)
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", provider)
     monkeypatch.setattr("roastpilot_agent.api.redact_url_for_error", redact)
     too_large = b'{"url":"' + (b"x" * _DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES) + b'"}'
+    valid_prefix = b'{"url":"https://vendor.example/bean"}'
+    streamed_prefix = valid_prefix + (
+        b" " * (_DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES - len(valid_prefix))
+    )
     headers = {"content-type": "application/json"}
     expected = {"detail": "request body exceeds 65536-byte limit"}
 
@@ -4538,8 +4536,8 @@ async def test_draft_bean_from_url_bounds_body_before_framework_parsing(
     assert response.json() == expected
 
     async def streamed_body() -> AsyncIterator[bytes]:
-        yield too_large[:_DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES]
-        yield too_large[_DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES:]
+        yield streamed_prefix
+        yield b" "
 
     response = await client.post(
         "/api/beans/draft-from-url", content=streamed_body(), headers=headers
@@ -4553,6 +4551,7 @@ async def test_draft_bean_from_url_bounds_body_before_framework_parsing(
     )
     assert response.status_code == 413
     assert response.json() == expected
+    admission.acquire.assert_not_awaited()
     provider.assert_not_awaited()
     redact.assert_not_called()
 

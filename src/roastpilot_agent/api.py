@@ -3028,26 +3028,31 @@ class _RouteBodyLimitMiddleware:
             await self._reject(scope, receive, send)
             return
 
+        captured_messages: list[Message] = []
         received_body_bytes = 0
-        body_too_large = False
-
-        async def bounded_receive() -> Message:
-            nonlocal body_too_large, received_body_bytes
+        while True:
             message = await receive()
+            captured_messages.append(message)
             if message["type"] == "http.request":  # pragma: no branch - disconnect passes through.
                 received_body_bytes += len(message.get("body", b""))
                 if received_body_bytes > self._max_body_bytes:
-                    body_too_large = True
-                    return {"type": "http.request", "body": b"", "more_body": False}
-            return message
+                    await self._reject(scope, receive, send)
+                    return
+                if message.get("more_body", False):
+                    continue
+            break
 
-        async def bounded_send(message: Message) -> None:
-            if not body_too_large:
-                await send(message)
+        replay_position = 0
 
-        await self._app(scope, bounded_receive, bounded_send)
-        if body_too_large:
-            await self._reject(scope, receive, send)
+        async def replay_receive() -> Message:
+            nonlocal replay_position
+            if replay_position < len(captured_messages):  # pragma: no branch - end stops reads.
+                message = captured_messages[replay_position]
+                replay_position += 1
+                return message
+            return await receive()  # pragma: no cover - defensive post-body receive.
+
+        await self._app(scope, replay_receive, send)
 
     async def _reject(self, scope: Scope, receive: Receive, send: Send) -> None:
         response = JSONResponse(

@@ -9368,22 +9368,19 @@ def test_redact_url_credentials_returns_url_unchanged_on_malformed_url() -> None
             "?access_token=SECRET-QUERY-656#fragment-secret",
             "//[redacted-authority]/path",
         ),
-        pytest.param(
+        (
             "//user:password@vendor.example/path?access_token=SECRET-QUERY-656",
             "//vendor.example/path",
-            id="scheme-relative",
         ),
-        pytest.param(
+        (
             "/products/kenya?access_token=SECRET-QUERY-656#fragment-secret",
             "/products/kenya",
-            id="relative-path",
         ),
-        pytest.param(
+        (
             "1https：//user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
             "[redacted-url]",
-            id="invalid-scheme-with-compatibility-colon",
         ),
-        pytest.param("1x：v?x=s", "[redacted-authority]", id="invalid-nonauthority"),
+        ("1x：v?x=s", "[redacted-authority]"),
     ],
 )
 def test_redact_url_for_error_structurally_strips_sensitive_components(
