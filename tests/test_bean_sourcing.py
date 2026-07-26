@@ -4484,7 +4484,7 @@ def test_heading_matches_anchor_is_linear_not_quadratic_on_a_crafted_heading() -
     re-scanned it for EVERY anchor occurrence — O(n) work per
     occurrence, O(n²) total on a heading engineered to produce O(n)
     occurrences, a synchronous event-loop stall held behind
-    ``draft_bean_from_url``'s start-lock. A ~19,900-char heading of
+    the draft request task. A ~19,900-char heading of
     repeated "a," (each "a" its own occurrence of the 1-character
     anchor "a") must complete in comfortably sub-second time — the
     bound is loose (well under the O(n²) case's expected multi-second
@@ -7840,9 +7840,7 @@ async def test_fetch_page_text_bounds_a_hanging_markdown_extraction_with_a_timeo
 ) -> None:
     """#590 slice C P1 fix: the trafilatura call runs AFTER the fetch's own
     ``asyncio.timeout`` block already closed, and under
-    ``RoastService.draft_bean_from_url``'s ``_start_lock`` — SHARED with
-    ``start_roast`` — so an unbounded call here would hang every roast
-    start, not just this draft. A pathologically slow/hanging
+    the draft request task. A pathologically slow/hanging
     ``_extract_page_markdown`` must not hang past ``config.fetch_timeout_seconds``.
 
     #590 slice C P2 fix (Codex fold, #608): on that timeout the draft FALLS
@@ -7851,8 +7849,7 @@ async def test_fetch_page_text_bounds_a_hanging_markdown_extraction_with_a_timeo
     slice every page used the fast, synchronous linear-strip path; a
     slow-to-parse page timing out here must not regress that page from
     "draft succeeds via linear-strip" to a 422 that didn't exist before
-    this slice. The lock-hold bound still holds (the wait is capped, only
-    the OUTCOME changed from fail to fall back).
+    this slice.
 
     #607: the hung worker now runs on the DEDICATED
     ``bean-sourcing-parse`` pool, not the process's shared default

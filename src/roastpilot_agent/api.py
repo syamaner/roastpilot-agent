@@ -2652,27 +2652,13 @@ class RoastService:
         ``ControllerConfig.advisory_timeout_seconds`` and 3 consecutive
         availability failures trip the sustained-outage safety fallback.
 
-        Mutually exclusive with :meth:`start_roast` (#587 P1 round 5): both
-        share ``self._start_lock``, and THIS method holds it across the
-        active-run check AND THE WHOLE fetch+extraction, not just the
-        check. An unsynchronized check-then-fetch would leave a race: the
-        check could pass, yield during the (multi-second) fetch/LLM call,
-        and let a concurrent ``POST /api/roasts`` start a roast underneath
-        it — reopening the exact advisor-starvation window this guard
-        exists to close. The trade-off is a roast-start issued while a
-        draft is in flight WAITS for the draft to finish (bounded by the
-        fetch + extraction timeouts, so at most
-        ``2 * sourcing_config.fetch_timeout_seconds +
-        sourcing_config.extraction_timeout_seconds`` — #590 slice A moved
-        the extraction bound off ``advisor_config.timeout_seconds`` onto
-        its own, longer, ``BeanSourcingConfig`` setting; the fetch term
-        counts TWICE because #590 slice C's markdown-extraction step
-        reuses ``fetch_timeout_seconds`` for its OWN ``asyncio.timeout``
-        block, SEQUENTIALLY after the page-fetch's own,
-        identically-bounded block already closed — see
-        ``bean_sourcing._fetch_page_text``) rather than racing it — a
-        rare, bounded delay is the safe side of this trade; a single
-        operator is unlikely to issue both at once regardless.
+        The persisted active-run check shares :attr:`_start_lock` with
+        :meth:`start_roast`, so a draft cannot pass the check while a roast
+        is being created. The lock is released before the remote fetch and
+        provider call (#657): a slow or abandoned draft must never delay an
+        operator's roast start. A draft admitted while idle may therefore
+        finish after a roast starts; once the run is persisted, new drafts
+        are rejected by the same check.
 
         Raises:
             RoastRunConflictError: A roast is currently active (maps to
@@ -2687,11 +2673,13 @@ class RoastService:
                     "would compete with the roast advisor for the same backend; "
                     "try again once the roast ends"
                 )
-            return await draft_bean_profile_from_url(
-                url,
-                advisor_config=self._config.advisor,
-                sourcing_config=self._config.bean_sourcing,
-            )
+            advisor_config = self._config.advisor
+            sourcing_config = self._config.bean_sourcing
+        return await draft_bean_profile_from_url(
+            url,
+            advisor_config=advisor_config,
+            sourcing_config=sourcing_config,
+        )
 
 
 def _get_service(request: Request) -> RoastService:
@@ -2984,15 +2972,11 @@ class DraftBeanFromUrlRequest(BaseModel):
 #: auth would be an app-wide architectural decision, not something to bolt
 #: onto one route, and is out of scope here by design.
 #:
-#: Fixed at 1, not 2 (#587 P2, round 6): ``RoastService.draft_bean_from_url``
-#: shares ``start_roast``'s ``_start_lock`` (holding it across the WHOLE
-#: fetch+extraction, #587 P1 round 5), so admitted requests already execute
-#: SERIALLY, not concurrently — a ``_start_lock`` acquired FAIRLY (FIFO)
-#: means a roast-start issued while ``N`` drafts are admitted waits behind
-#: ALL ``N`` of them. Capping admission at 1 caps that wait at a single
-#: fetch+extraction, which is the whole point of round 5's mutual-exclusion
-#: fix — allowing 2 admitted (but serialized) drafts would let a
-#: roast-start wait behind TWO of them instead of one.
+#: Fixed at 1, not 2 (#587 P2, round 6): only one billable fetch+provider
+#: operation may be in flight. A second draft fails fast with 429 instead
+#: of silently queuing behind the first. Roast starts do not use this
+#: semaphore and therefore retain priority over a slow or abandoned draft
+#: (#657).
 _DRAFT_BEAN_FROM_URL_CONCURRENCY = 1
 
 #: How long a request waits for a free concurrency slot before it fails
@@ -3097,12 +3081,10 @@ async def draft_bean_from_url(
     Concurrency-bounded (#587 fix 5; fixed at 1, #587 P2 round 6): at most
     :data:`_DRAFT_BEAN_FROM_URL_CONCURRENCY` (one) request is ADMITTED at a
     time — each is a billable BYOK LLM request, so this is a cost/resource-
-    exhaustion mitigation, not an access-control one. Because
-    ``RoastService.draft_bean_from_url`` also shares ``start_roast``'s
-    ``_start_lock`` (#587 P1 round 5), an admitted request actually runs
-    SERIALLY with any other in-flight draft or roast-start anyway — the
-    semaphore here is what turns a SECOND concurrent request into a fast
-    429 instead of it silently queuing behind an unbounded chain of others.
+    exhaustion mitigation, not an access-control one. The semaphore turns a
+    SECOND concurrent request into a fast 429 instead of silently queuing
+    it, while roast starts remain independent of this draft-only admission
+    control (#657).
     A request that cannot acquire the single slot within
     :data:`_DRAFT_BEAN_FROM_URL_ACQUIRE_TIMEOUT_SECONDS` gets 429. This
     endpoint has NO authentication, matching every other route in this

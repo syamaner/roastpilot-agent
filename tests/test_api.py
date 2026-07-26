@@ -4729,26 +4729,16 @@ async def test_roast_service_draft_bean_from_url_raises_when_a_roast_is_active(
 
 
 @pytest.mark.asyncio
-async def test_draft_bean_from_url_and_start_roast_are_mutually_exclusive(
+async def test_slow_draft_bean_from_url_does_not_block_start_roast(
     service: RoastService, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#587 P1 (round 5): ``draft_bean_from_url`` shares ``start_roast``'s
-    ``_start_lock``, held across the WHOLE fetch+extraction — not just the
-    active-run check — so a roast-start issued while a draft is in flight
-    cannot interleave and start underneath it. Without this, an
-    unsynchronized ``active_run()`` snapshot could pass, yield during the
-    (multi-second) fetch/LLM call, and let a concurrent roast start in that
-    window — reopening the exact advisor-starvation race the #587 P1 guard
-    exists to close."""
+    """#657: a stalled draft releases ``_start_lock`` after its state check."""
     draft_entered = asyncio.Event()
     release_draft = asyncio.Event()
-    events: list[str] = []
 
     async def slow_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
-        events.append("draft_entered")
         draft_entered.set()
         await release_draft.wait()
-        events.append("draft_exited")
         return _draft_from(url)
 
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", slow_draft)
@@ -4758,23 +4748,13 @@ async def test_draft_bean_from_url_and_start_roast_are_mutually_exclusive(
     )
     await asyncio.wait_for(draft_entered.wait(), timeout=2.0)
 
-    start_task = asyncio.create_task(service.start_roast(_profile()))
-    # Give the event loop a beat: start_roast must be BLOCKED on the shared
-    # _start_lock, not proceeding concurrently with the in-flight draft.
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    assert not start_task.done(), "start_roast must wait for the shared lock"
-    events.append("start_still_blocked_while_draft_in_flight")
-
-    release_draft.set()
+    try:
+        detail = await asyncio.wait_for(service.start_roast(_profile()), timeout=2.0)
+        assert not draft_task.done(), "the draft should still be waiting on its provider"
+    finally:
+        release_draft.set()
     draft = await draft_task
-    detail = await start_task
 
-    assert events == [
-        "draft_entered",
-        "start_still_blocked_while_draft_in_flight",
-        "draft_exited",
-    ]
     assert isinstance(draft, BeanProfileDraft)
     assert isinstance(detail, RoastDetail)
     assert detail.id
@@ -4786,15 +4766,11 @@ async def test_draft_bean_from_url_returns_429_when_concurrency_exhausted(
 ) -> None:
     """#587 fix 5: each draft-from-url call is a billable BYOK LLM request,
     so a module-level semaphore bounds how many requests can be ADMITTED at
-    once. Fixed at 1, not 2 (#587 P2, round 6): ``draft_bean_from_url``
-    also shares ``start_roast``'s ``_start_lock`` (#587 P1 round 5, held
-    across the WHOLE fetch+extraction — see
-    ``test_draft_bean_from_url_and_start_roast_are_mutually_exclusive``),
-    and that lock is acquired FAIRLY (FIFO), so admitting MORE than one
-    draft at a time would let a roast-start wait behind however many are
-    admitted, not just one. With the cap at 1, a SECOND concurrent request
-    must fail fast with 429 (no queuing at all — the single slot is
-    already taken); releasing the first then lets it complete normally."""
+    once. Fixed at 1, not 2 (#587 P2, round 6), so a SECOND concurrent
+    request must fail fast with 429 (no queuing at all — the single slot is
+    already taken); releasing the first then lets it complete normally.
+    #657 keeps this draft-only admission control while letting roast starts
+    proceed independently."""
     entered = 0
     first_entered = asyncio.Event()
     release = asyncio.Event()
@@ -4808,8 +4784,7 @@ async def test_draft_bean_from_url_returns_429_when_concurrency_exhausted(
 
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
 
-    # The one admission slot: taken and executing (blocked inside
-    # fake_draft, holding the shared _start_lock too).
+    # The one admission slot is taken and executing inside fake_draft.
     task1 = asyncio.create_task(
         client.post("/api/beans/draft-from-url", json={"url": "https://vendor.example/products/1"})
     )
