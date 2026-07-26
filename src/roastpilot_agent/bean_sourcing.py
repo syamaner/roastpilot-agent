@@ -202,6 +202,7 @@ import logging
 import re
 import socket
 import threading
+import unicodedata
 import zlib
 from dataclasses import dataclass
 from html import unescape
@@ -365,6 +366,141 @@ def _redact_url_credentials(url: str) -> str:
     if redacted_netloc == parsed.netloc and redacted_query == parsed.query and not parsed.fragment:
         return url
     return urlunsplit(parsed._replace(netloc=redacted_netloc, query=redacted_query, fragment=""))
+
+
+_URL_PARSER_IGNORED_LEADING_CHARS = "".join(chr(codepoint) for codepoint in range(0x21))
+_URL_SCHEME_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*")
+_URL_SCHEME_PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+
+
+def _redact_invalid_port(authority: str) -> str:
+    """Remove an invalid port whose text may itself contain a secret."""
+    if authority.startswith("["):
+        bracket_end = authority.find("]")
+        if bracket_end < 0:
+            return "[redacted-authority]"
+        suffix = authority[bracket_end + 1 :]
+        if not suffix:
+            return authority
+        if not suffix.startswith(":"):
+            return "[redacted-authority]"
+        port = suffix[1:]
+        if port == "" or (
+            len(port) <= 5 and port.isascii() and port.isdigit() and int(port) <= 65535
+        ):
+            return authority
+        return authority[: bracket_end + 1]
+
+    host, separator, port = authority.rpartition(":")
+    if not separator:
+        return authority
+    if ":" in host:
+        return "[redacted-authority]"
+    if port == "" or (len(port) <= 5 and port.isascii() and port.isdigit() and int(port) <= 65535):
+        return authority
+    return host
+
+
+def _url_authority_bounds(url: str) -> tuple[int, int]:
+    """Return the best-effort authority bounds for a possibly malformed URL."""
+    scheme_end = url.find("://")
+    if scheme_end >= 0:
+        authority_start = scheme_end + 3
+    elif url.startswith("//"):
+        authority_start = 2
+    else:
+        authority_start = 0
+    path_start = url.find("/", authority_start)
+    return authority_start, path_start if path_start >= 0 else len(url)
+
+
+def _nfkc_compatibility_scheme(url: str) -> str | None:
+    """Return a normalized apparent scheme, empty if invalid, or ``None``."""
+    for position, character in enumerate(url):
+        normalized_character = unicodedata.normalize("NFKC", character)
+        if ":" in normalized_character:
+            normalized_scheme = unicodedata.normalize("NFKC", url[:position])
+            if _URL_SCHEME_NAME_RE.fullmatch(normalized_scheme) is not None:
+                return normalized_scheme
+            return "" if url[position + 1 :].startswith("//") else None
+        if any(marker in normalized_character for marker in "/?#:"):
+            return None
+    return None
+
+
+def redact_url_for_error(url: str) -> str:
+    """Return a URL safe to interpolate into a client-visible error detail.
+
+    The query string and fragment are removed wholesale, and any userinfo is
+    removed from the authority. This deliberately uses a small structural
+    scan rather than :func:`urllib.parse.urlsplit`: malformed input such as an
+    unclosed IPv6 literal is exactly where an error-detail sanitizer is
+    needed, and ``urlsplit`` raises before it can redact that input. Tabs,
+    carriage returns, and newlines are removed first, and leading WHATWG C0
+    controls/spaces are stripped, because ``urlsplit`` also ignores them;
+    otherwise they could hide authority syntax from this scan while still
+    being treated as such by the parser. NFKC-equivalent reserved delimiters
+    are handled fail-closed, and invalid port text is removed because either
+    can itself contain a secret. The scan never raises and runs before
+    ``repr``/f-string interpolation, so quotes inside a secret query cannot
+    confuse a downstream display-layer parser.
+
+    Args:
+        url: The possibly malformed, untrusted URL.
+
+    Returns:
+        A display-only URL with userinfo, query, and fragment removed.
+    """
+    normalized = url.translate({ord("\t"): None, ord("\r"): None, ord("\n"): None})
+    normalized = normalized.lstrip(_URL_PARSER_IGNORED_LEADING_CHARS)
+    scheme_prefix = _URL_SCHEME_PREFIX_RE.match(normalized)
+    if scheme_prefix is None:
+        compatibility_scheme = _nfkc_compatibility_scheme(normalized)
+        if compatibility_scheme is not None:
+            prefix = compatibility_scheme + ":" if compatibility_scheme else ""
+            return prefix + "[redacted-url]"
+    if scheme_prefix is not None:
+        suffix = normalized[scheme_prefix.end() :]
+        if not suffix.startswith("//") or suffix.startswith("///"):
+            return normalized[: scheme_prefix.end()] + "[redacted-url]"
+    if normalized.startswith("///"):
+        return "[redacted-url]"
+    authority_start, authority_end = _url_authority_bounds(normalized)
+    authority = normalized[authority_start:authority_end]
+    if any(
+        character not in "?#"
+        and any(marker in unicodedata.normalize("NFKC", character) for marker in ("?", "#"))
+        for character in authority
+    ):
+        normalized = (
+            normalized[:authority_start] + "[redacted-authority]" + normalized[authority_end:]
+        )
+    tail_position = next(
+        (
+            position
+            for position, character in enumerate(normalized)
+            if any(marker in unicodedata.normalize("NFKC", character) for marker in ("?", "#"))
+        ),
+        None,
+    )
+    without_tail = normalized[:tail_position] if tail_position is not None else normalized
+
+    authority_start, authority_end = _url_authority_bounds(without_tail)
+    authority = without_tail[authority_start:authority_end]
+    normalized_authority = unicodedata.normalize("NFKC", authority)
+    introduces_reserved_delimiter = any(
+        normalized_authority.count(marker) > authority.count(marker) for marker in "/?#@:"
+    )
+    if introduces_reserved_delimiter:
+        safe_authority = "[redacted-authority]"
+    elif "@" in normalized_authority:
+        safe_authority = authority.rsplit("@", 1)[-1]
+    else:
+        safe_authority = authority
+    safe_authority = _redact_invalid_port(safe_authority)
+    if safe_authority == authority:
+        return without_tail
+    return without_tail[:authority_start] + safe_authority + without_tail[authority_end:]
 
 
 _INLINE_WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
@@ -1226,9 +1362,11 @@ async def _assert_public_destination(
         # check (#587 P2).
         parsed = urlsplit(url)
     except ValueError as exc:
-        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r} ({exc})") from exc
+        raise BeanFetchError(
+            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} (invalid URL syntax)"
+        ) from exc
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r}")
+        raise BeanFetchError(f"not a well-formed http(s) URL: {redact_url_for_error(url)!r}")
 
     host = parsed.hostname
     try:
@@ -1238,7 +1376,9 @@ async def _assert_public_destination(
         # fail-soft error every other malformed-URL case gets here.
         explicit_port = parsed.port
     except ValueError as exc:
-        raise BeanFetchError(f"malformed port in {url!r}: {exc}") from exc
+        raise BeanFetchError(
+            f"malformed port in {redact_url_for_error(url)!r} (invalid port syntax)"
+        ) from exc
     port = explicit_port or (443 if parsed.scheme == "https" else 80)
 
     try:
@@ -1258,23 +1398,27 @@ async def _assert_public_destination(
             # UTF-16 surrogate, for instance. Left uncaught this escapes as
             # an unhandled 500 instead of the typed fail-soft error every
             # other malformed-host case here gets (#587 P2, round 6).
-            raise BeanFetchError(f"could not resolve host {host!r} for {url!r}: {exc}") from exc
+            raise BeanFetchError(
+                f"could not resolve host {host!r} for {redact_url_for_error(url)!r}: {exc}"
+            ) from exc
         addresses = [ipaddress.ip_address(info[4][0]) for info in resolved]
         if not addresses:
             raise BeanFetchError(
-                f"host {host!r} resolved to no usable address for {url!r}"
+                f"host {host!r} resolved to no usable address for {redact_url_for_error(url)!r}"
             ) from None
 
     for address in addresses:
         if _is_non_public_address(address):
             raise BeanFetchError(
-                f"fetch destination {url!r} resolves to a non-public address "
+                f"fetch destination {redact_url_for_error(url)!r} "
+                "resolves to a non-public address "
                 f"({address}) — blocked by the SSRF guard (#587)"
             )
         embedded_v4 = _extract_embedded_ipv4(address)
         if embedded_v4 is not None and _is_non_public_address(embedded_v4):
             raise BeanFetchError(
-                f"fetch destination {url!r} resolves to {address}, which embeds "
+                f"fetch destination {redact_url_for_error(url)!r} resolves to "
+                f"{address}, which embeds "
                 f"a non-public IPv4 address ({embedded_v4}) — blocked by the "
                 "SSRF guard (#587)"
             )
@@ -1308,7 +1452,9 @@ def _append_within_cap(body: bytearray, chunk: bytes, *, max_bytes: int, url: st
         BeanFetchError: Appending ``chunk`` would exceed ``max_bytes``.
     """
     if len(body) + len(chunk) > max_bytes:
-        raise BeanFetchError(f"vendor page exceeded the {max_bytes}-byte fetch cap: {url!r}")
+        raise BeanFetchError(
+            f"vendor page exceeded the {max_bytes}-byte fetch cap: {redact_url_for_error(url)!r}"
+        )
     body.extend(chunk)
 
 
@@ -1381,7 +1527,8 @@ def _decompress_within_cap(
     if normalized not in ("gzip", "x-gzip", "deflate"):
         raise BeanFetchError(
             f"vendor page used an unsupported Content-Encoding "
-            f"{content_encoding!r} for {url!r} (only gzip/deflate are "
+            f"{content_encoding!r} for {redact_url_for_error(url)!r} "
+            "(only gzip/deflate are "
             "requested and decoded)"
         )
     try:
@@ -1403,12 +1550,13 @@ def _decompress_within_cap(
             # process — the decoded output would have exceeded the cap.
             raise BeanFetchError(
                 f"vendor page exceeded the {max_bytes}-byte fetch cap "
-                f"(after decompression) for {url!r}"
+                f"(after decompression) for {redact_url_for_error(url)!r}"
             )
         decoded += decompressor.flush()
     except zlib.error as exc:
         raise BeanFetchError(
-            f"vendor page failed to decompress ({content_encoding!r}) for {url!r}: {exc}"
+            f"vendor page failed to decompress ({content_encoding!r}) for "
+            f"{redact_url_for_error(url)!r}: {exc}"
         ) from exc
     if not decompressor.eof:
         # A truncated stream (connection cut mid-body, or a misbehaving
@@ -1418,11 +1566,13 @@ def _decompress_within_cap(
         # would silently draft from an incomplete page instead of failing
         # the fetch outright.
         raise BeanFetchError(
-            f"vendor page sent a truncated/incomplete {content_encoding!r} body for {url!r}"
+            f"vendor page sent a truncated/incomplete {content_encoding!r} "
+            f"body for {redact_url_for_error(url)!r}"
         )
     if len(decoded) > max_bytes:
         raise BeanFetchError(
-            f"vendor page exceeded the {max_bytes}-byte fetch cap (after decompression) for {url!r}"
+            f"vendor page exceeded the {max_bytes}-byte fetch cap "
+            f"(after decompression) for {redact_url_for_error(url)!r}"
         )
     return decoded
 
@@ -1538,7 +1688,10 @@ async def _fetch_one_hop(
         # (#587 P2).
         original_url = httpx.URL(current_url)
     except httpx.InvalidURL as exc:
-        raise BeanFetchError(f"not a well-formed http(s) URL: {current_url!r} ({exc})") from exc
+        raise BeanFetchError(
+            f"not a well-formed http(s) URL: "
+            f"{redact_url_for_error(current_url)!r} (invalid URL syntax)"
+        ) from exc
     pinned_headers = {**headers, "Host": original_url.netloc.decode("ascii")}
     per_address_timeout = timeout
     if len(candidate_addresses) > 1 and timeout.connect is not None:
@@ -1564,7 +1717,7 @@ async def _fetch_one_hop(
                     if not location:
                         raise BeanFetchError(
                             f"vendor page redirected (HTTP {response.status_code}) with no "
-                            f"Location header for {current_url!r}"
+                            f"Location header for {redact_url_for_error(current_url)!r}"
                         )
                     try:
                         # A malformed Location (e.g. an unclosed IPv6
@@ -1575,12 +1728,15 @@ async def _fetch_one_hop(
                     except ValueError as exc:
                         raise BeanFetchError(
                             f"vendor page redirected to a malformed Location "
-                            f"{location!r} for {current_url!r}: {exc}"
+                            f"{redact_url_for_error(location)!r} for "
+                            f"{redact_url_for_error(current_url)!r} "
+                            "(invalid redirect URL syntax)"
                         ) from exc
                     return next_url, True
                 if response.status_code >= 400:
                     raise BeanFetchError(
-                        f"vendor page fetch failed: HTTP {response.status_code} for {current_url!r}"
+                        f"vendor page fetch failed: HTTP {response.status_code} for "
+                        f"{redact_url_for_error(current_url)!r}"
                     )
                 # aiter_raw(), never aiter_bytes() (#587 P1 round 2):
                 # aiter_bytes() runs httpx's OWN internal decompression per
@@ -1607,7 +1763,9 @@ async def _fetch_one_hop(
             last_connect_error = exc
             continue
     raise BeanFetchError(
-        f"could not connect to any resolved address for {current_url!r}: {last_connect_error}"
+        f"could not connect to any resolved address for "
+        f"{redact_url_for_error(current_url)!r}: "
+        f"{type(last_connect_error).__name__}"
     ) from last_connect_error
 
 
@@ -1683,7 +1841,9 @@ async def _fetch_with_ssrf_guard(
             current_url = result
             continue
         return result, current_url
-    raise BeanFetchError(f"too many redirects (> {_MAX_REDIRECTS}) fetching {url!r}")
+    raise BeanFetchError(
+        f"too many redirects (> {_MAX_REDIRECTS}) fetching {redact_url_for_error(url)!r}"
+    )
 
 
 # --- #590 slice B: deterministic JSON-LD product extraction, ahead of the LLM ---
@@ -2136,9 +2296,11 @@ async def _fetch_and_extract(
         # every other malformed-URL case here gets (#587 P2).
         parsed = urlsplit(url)
     except ValueError as exc:
-        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r} ({exc})") from exc
+        raise BeanFetchError(
+            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} (invalid URL syntax)"
+        ) from exc
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r}")
+        raise BeanFetchError(f"not a well-formed http(s) URL: {redact_url_for_error(url)!r}")
 
     headers = {"User-Agent": config.user_agent, "Accept-Encoding": _ACCEPT_ENCODING}
     timeout = httpx.Timeout(config.fetch_timeout_seconds)
@@ -2183,7 +2345,8 @@ async def _fetch_and_extract(
                 async with client.stream("GET", url, headers=headers, timeout=timeout) as response:
                     if response.status_code >= 400:
                         raise BeanFetchError(
-                            f"vendor page fetch failed: HTTP {response.status_code} for {url!r}"
+                            f"vendor page fetch failed: HTTP {response.status_code} for "
+                            f"{redact_url_for_error(url)!r}"
                         )
                     # aiter_raw() + our own bounded decompress — see the
                     # owns-client path's identical comment in
@@ -2204,7 +2367,7 @@ async def _fetch_and_extract(
     except TimeoutError as exc:
         raise BeanFetchError(
             f"vendor page fetch exceeded the {config.fetch_timeout_seconds:g}s end-to-end "
-            f"deadline for {url!r}"
+            f"deadline for {redact_url_for_error(url)!r}"
         ) from exc
     except BeanFetchError:
         raise
@@ -2217,9 +2380,13 @@ async def _fetch_and_extract(
         # injected-client path's client.stream(url) internally parsing
         # ``url``; the owns-client path's own httpx.URL() call (in
         # _fetch_one_hop) is already guarded at the source.
-        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r} ({exc})") from exc
+        raise BeanFetchError(
+            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} (invalid URL syntax)"
+        ) from exc
     except httpx.HTTPError as exc:
-        raise BeanFetchError(f"vendor page fetch failed for {url!r}: {exc}") from exc
+        raise BeanFetchError(
+            f"vendor page fetch failed for {redact_url_for_error(url)!r}: {type(exc).__name__}"
+        ) from exc
     finally:
         if owns_client:
             await client.aclose()
@@ -4913,7 +5080,8 @@ def _draft_from_identity(
     description = _normalize_optional_text(identity.description)
     if not name or not bean_origin:
         raise BeanExtractionError(
-            f"could not determine a bean name and origin from the page ({url!r}) "
+            "could not determine a bean name and origin from the page "
+            f"({redact_url_for_error(url)!r}) "
             "— add the profile manually instead"
         )
 
@@ -5124,7 +5292,9 @@ def _draft_from_identity(
         # URL can still fail here (#587) — fail soft, not an unhandled
         # pydantic.ValidationError.
         raise BeanExtractionError(
-            f"drafted bean profile failed validation for {url!r}: {exc}"
+            f"drafted bean profile failed validation for "
+            f"{redact_url_for_error(url)!r}: "
+            f"{exc.error_count()} validation error(s)"
         ) from exc
 
 
@@ -5216,7 +5386,9 @@ async def draft_bean_profile_from_url(
     try:
         parsed_url = urlsplit(url)
     except ValueError as exc:
-        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r} ({exc})") from exc
+        raise BeanFetchError(
+            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} (invalid URL syntax)"
+        ) from exc
     if parsed_url.username is not None or parsed_url.password is not None:
         _log.warning(
             "draft_bean_profile_from_url: rejected a URL with embedded credentials: %r",

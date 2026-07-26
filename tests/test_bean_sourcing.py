@@ -27,9 +27,11 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import unittest.mock
 import zlib
 from collections.abc import AsyncGenerator, Callable
+from pathlib import Path
 from typing import Literal
 
 import extruct  # type: ignore[import-untyped]
@@ -193,6 +195,17 @@ def _function_model_hanging() -> FunctionModel:
 
 
 _ADVISOR_CONFIG = AdvisorConfig()
+_ERROR_URL_SECRET = "SECRET-QUERY-656"
+
+
+def _assert_error_url_is_safe(error: BaseException) -> None:
+    """Assert a URL-bearing client error contains no sensitive URL tail."""
+    detail = str(error)
+    assert _ERROR_URL_SECRET not in detail
+    assert "access_token" not in detail
+    assert "user:password@" not in detail
+    assert "fragment-secret" not in detail
+    assert "?" not in detail
 
 
 # --- _extract_page_text ---
@@ -376,16 +389,50 @@ async def test_fetch_page_text_rejects_scheme_without_host() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetch_error_layers_never_echo_sensitive_url_components() -> None:
+    """Parser, destination, and HTTP-status failures all return safe details."""
+    quoted_query_url = f"ftp://vendor.example/products/kenya?x='\"&access_token={_ERROR_URL_SECRET}"
+    with pytest.raises(BeanFetchError, match="well-formed") as parse_error:
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            quoted_query_url, config=BeanSourcingConfig()
+        )
+    _assert_error_url_is_safe(parse_error.value)
+
+    non_public_url = (
+        f"https://127.0.0.1/products/kenya?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    )
+    with pytest.raises(BeanFetchError, match="non-public address") as destination_error:
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            non_public_url
+        )
+    _assert_error_url_is_safe(destination_error.value)
+
+    async with _mock_client(_html_response(404, "not found")) as client:
+        with pytest.raises(BeanFetchError, match="HTTP 404") as status_error:
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                (
+                    "https://vendor.example/products/missing"
+                    f"?access_token={_ERROR_URL_SECRET}#fragment-secret"
+                ),
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+    _assert_error_url_is_safe(status_error.value)
+
+
+@pytest.mark.asyncio
 async def test_fetch_page_text_rejects_url_with_unclosed_ipv6_bracket() -> None:
     """#587 P2: ``urlsplit()`` raises ``ValueError`` EAGERLY (unlike a bad
     port, which it only raises lazily via ``.port``) for a malformed IPv6
     bracket like ``http://[::1`` — left unguarded this escapes as an
     unhandled 500 instead of the typed fail-soft error every other
     malformed-URL case here gets."""
-    with pytest.raises(BeanFetchError, match="well-formed"):
+    url = f"https://user:password@[bad?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    with pytest.raises(BeanFetchError, match="well-formed") as error:
         await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "http://[::1", config=BeanSourcingConfig()
+            url, config=BeanSourcingConfig()
         )
+    _assert_error_url_is_safe(error.value)
 
 
 @pytest.mark.asyncio
@@ -394,10 +441,12 @@ async def test_assert_public_destination_rejects_url_with_unclosed_ipv6_bracket(
     directly — this function is called per-hop (including redirect targets
     ``_fetch_page_text``'s own initial check never sees), so it needs its
     own guard independent of that one (#587 P2)."""
-    with pytest.raises(BeanFetchError, match="well-formed"):
+    url = f"https://user:password@[bad?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    with pytest.raises(BeanFetchError, match="well-formed") as error:
         await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
-            "http://[::1"
+            url
         )
+    _assert_error_url_is_safe(error.value)
 
 
 @pytest.mark.asyncio
@@ -405,12 +454,105 @@ async def test_draft_bean_profile_from_url_rejects_url_with_unclosed_ipv6_bracke
     """Same malformed-bracket case, but reached via the PUBLIC entry point's
     own credential-check ``urlsplit()`` call — the very first thing ANY url
     goes through (#587 P2)."""
-    with pytest.raises(BeanFetchError, match="well-formed"):
+    url = f"https://user:password@[bad?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    with pytest.raises(BeanFetchError, match="well-formed") as error:
         await draft_bean_profile_from_url(
-            "http://[::1",
+            url,
             advisor_config=_ADVISOR_CONFIG,
             model=_function_model_returning(_identity_args()),
         )
+    _assert_error_url_is_safe(error.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"https:\n//user:{_ERROR_URL_SECRET}／password@vendor.example/path"
+        f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+        f"https://user:{_ERROR_URL_SECRET}＠vendor.example/path"
+        f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+        f"https://vendor.example？access_token={_ERROR_URL_SECRET}/path",
+        f"https://vendor.example＃access_token={_ERROR_URL_SECRET}/path",
+        f"https://{_ERROR_URL_SECRET}？x@vendor.example/path"
+        f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+        f"https://{_ERROR_URL_SECRET}＃x@vendor.example/path"
+        f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+        f"https://{_ERROR_URL_SECRET}？x＠vendor.example/path"
+        f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+        f" \x00//user:{_ERROR_URL_SECRET}＠vendor.example/path"
+        f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+    ],
+)
+@pytest.mark.asyncio
+async def test_urlsplit_error_layers_do_not_echo_nfkc_invalid_userinfo(url: str) -> None:
+    """Parser exception text and ignored controls cannot bypass redaction."""
+    with pytest.raises(BeanFetchError, match="invalid URL syntax") as fetch_error:
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            url, config=BeanSourcingConfig()
+        )
+    _assert_error_url_is_safe(fetch_error.value)
+
+    with pytest.raises(BeanFetchError, match="invalid URL syntax") as destination_error:
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            url
+        )
+    _assert_error_url_is_safe(destination_error.value)
+
+    with pytest.raises(BeanFetchError, match="invalid URL syntax") as public_error:
+        await draft_bean_profile_from_url(
+            url,
+            advisor_config=_ADVISOR_CONFIG,
+            model=_function_model_returning(_identity_args()),
+        )
+    _assert_error_url_is_safe(public_error.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"https:user:{_ERROR_URL_SECRET}@vendor.example/path"
+        f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+        f"https:/user:{_ERROR_URL_SECRET}@vendor.example/path"
+        f"?access_token={_ERROR_URL_SECRET}#fragment-secret",
+        *(
+            f"{slashes}user:{_ERROR_URL_SECRET}@vendor.example/path"
+            f"?access_token={_ERROR_URL_SECRET}#fragment-secret"
+            for slashes in ("///", "////")
+        ),
+        *(
+            f"{prefix}//user:{_ERROR_URL_SECRET}{userinfo}vendor.example/path"
+            f"?access_token={_ERROR_URL_SECRET}#fragment-secret"
+            for prefix, userinfo in (("https：", "@"), ("1https﹕", "＠"), ("1https:", "@"))
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_malformed_scheme_separator_error_layers_do_not_echo_userinfo(
+    url: str,
+) -> None:
+    """Ambiguous slash runs cannot turn userinfo-like text into a safe path."""
+    assert bean_sourcing.redact_url_for_error(url).endswith("[redacted-url]")
+
+    with pytest.raises(BeanFetchError, match="well-formed") as fetch_error:
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            url, config=BeanSourcingConfig()
+        )
+    _assert_error_url_is_safe(fetch_error.value)
+
+    with pytest.raises(BeanFetchError, match="well-formed") as destination_error:
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            url
+        )
+    _assert_error_url_is_safe(destination_error.value)
+
+    public_url = url.rsplit("#", 1)[0]
+    with pytest.raises(BeanFetchError, match="well-formed") as public_error:
+        await draft_bean_profile_from_url(
+            public_url,
+            advisor_config=_ADVISOR_CONFIG,
+            model=_function_model_returning(_identity_args()),
+        )
+    _assert_error_url_is_safe(public_error.value)
 
 
 @pytest.mark.asyncio
@@ -454,13 +596,17 @@ async def test_fetch_page_text_fails_soft_on_transport_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused", request=request)
 
+    sensitive_url = (
+        f"https://vendor.example/products/down?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    )
     async with _mock_client(httpx.MockTransport(handler)) as client:
-        with pytest.raises(BeanFetchError, match="fetch failed"):
+        with pytest.raises(BeanFetchError, match="fetch failed") as error:
             await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-                "https://vendor.example/products/down",
+                sensitive_url,
                 config=BeanSourcingConfig(),
                 http_client=client,
             )
+    _assert_error_url_is_safe(error.value)
 
 
 @pytest.mark.asyncio
@@ -1086,10 +1232,14 @@ async def test_fetch_with_ssrf_guard_raises_when_every_address_fails_to_connect(
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    with pytest.raises(BeanFetchError, match="could not connect to any resolved address"):
+    sensitive_url = (
+        f"https://vendor.example/products/kenya?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    )
+    with pytest.raises(BeanFetchError, match="could not connect to any resolved address") as error:
         await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/products/kenya", config=BeanSourcingConfig()
+            sensitive_url, config=BeanSourcingConfig()
         )
+    _assert_error_url_is_safe(error.value)
 
 
 @pytest.mark.asyncio
@@ -1280,10 +1430,12 @@ async def test_fetch_page_text_exhausting_max_redirects_raises(
     monkeypatch.setattr(
         bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
     )
-    with pytest.raises(BeanFetchError, match="too many redirects"):
+    sensitive_url = f"https://vendor.example/x?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    with pytest.raises(BeanFetchError, match="too many redirects") as error:
         await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/x", config=BeanSourcingConfig()
+            sensitive_url, config=BeanSourcingConfig()
         )
+    _assert_error_url_is_safe(error.value)
 
 
 @pytest.mark.asyncio
@@ -1303,10 +1455,12 @@ async def test_fetch_page_text_bare_redirect_with_no_location_raises(
     monkeypatch.setattr(
         bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
     )
-    with pytest.raises(BeanFetchError, match="no Location header"):
+    sensitive_url = f"https://vendor.example/x?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    with pytest.raises(BeanFetchError, match="no Location header") as error:
         await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/x", config=BeanSourcingConfig()
+            sensitive_url, config=BeanSourcingConfig()
         )
+    _assert_error_url_is_safe(error.value)
 
 
 @pytest.mark.asyncio
@@ -1335,19 +1489,19 @@ async def test_fetch_page_text_rejects_redirect_to_non_http_scheme(
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    with pytest.raises(BeanFetchError, match="well-formed"):
+    sensitive_url = f"https://vendor.example/x?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    with pytest.raises(BeanFetchError, match="well-formed") as error:
         await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/x", config=BeanSourcingConfig()
+            sensitive_url, config=BeanSourcingConfig()
         )
+    _assert_error_url_is_safe(error.value)
 
 
 @pytest.mark.asyncio
 async def test_fetch_page_text_rejects_redirect_to_malformed_location(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#587 P2: a malformed redirect ``Location`` (an unclosed IPv6 bracket,
-    ``http://[::1``) makes ``urljoin()`` raise ``ValueError`` — left
-    unguarded this escapes as an unhandled 500 instead of failing soft.
+    """A malformed redirect ``Location`` can echo credentials from urljoin.
 
     Uses HTTP 300 (Multiple Choices), not 302: ``httpx`` itself EAGERLY
     parses the ``Location`` header for the standard redirect codes
@@ -1362,10 +1516,23 @@ async def test_fetch_page_text_rejects_redirect_to_malformed_location(
     ``False`` for it) but still inside this module's own broader
     ``300 <= status_code < 400`` redirect-hop range, so httpx hands us the
     raw header untouched and OUR OWN ``urljoin()`` call — the one this test
-    targets — is what has to catch the malformed value."""
+    targets — is what has to catch the malformed value. ``httpx`` restricts
+    response-header strings to ASCII in this mock seam, so ``urljoin`` is
+    patched to raise the exact credential-bearing NFKC error shape the stdlib
+    produces; the mapped client detail must use a constant syntax reason."""
+
+    malformed_location = (
+        f"https://vendor.example/path?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    )
+
+    def fail_with_credential_bearing_parser_error(base: str, location: str) -> str:
+        raise ValueError(
+            f"netloc 'user:{_ERROR_URL_SECRET}／password@vendor.example' "
+            "contains invalid characters under NFKC normalization"
+        )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(300, headers={"Location": "http://[::1"})
+        return httpx.Response(300, headers={"Location": malformed_location})
 
     transport = httpx.MockTransport(handler)
     real_async_client = httpx.AsyncClient
@@ -1374,13 +1541,16 @@ async def test_fetch_page_text_rejects_redirect_to_malformed_location(
         return real_async_client(transport=transport)
 
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(bean_sourcing, "urljoin", fail_with_credential_bearing_parser_error)
     monkeypatch.setattr(
         bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
     )
-    with pytest.raises(BeanFetchError, match="malformed Location"):
+    sensitive_url = f"https://vendor.example/x?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    with pytest.raises(BeanFetchError, match="malformed Location") as error:
         await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/x", config=BeanSourcingConfig()
+            sensitive_url, config=BeanSourcingConfig()
         )
+    _assert_error_url_is_safe(error.value)
 
 
 @pytest.mark.asyncio
@@ -1394,8 +1564,10 @@ async def test_fetch_page_text_rejects_standard_redirect_code_with_malformed_loc
     proving this path was ALREADY fail-soft even before this module's own
     ``urljoin()`` guard, and stays fail-soft with it."""
 
+    malformed_location = f"http://[::1?access_token={_ERROR_URL_SECRET}#fragment-secret"
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(302, headers={"Location": "http://[::1"})
+        return httpx.Response(302, headers={"Location": malformed_location})
 
     transport = httpx.MockTransport(handler)
     real_async_client = httpx.AsyncClient
@@ -1407,10 +1579,12 @@ async def test_fetch_page_text_rejects_standard_redirect_code_with_malformed_loc
     monkeypatch.setattr(
         bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
     )
-    with pytest.raises(BeanFetchError, match="fetch failed"):
+    sensitive_url = f"https://vendor.example/x?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    with pytest.raises(BeanFetchError, match="fetch failed") as error:
         await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/x", config=BeanSourcingConfig()
+            sensitive_url, config=BeanSourcingConfig()
         )
+    _assert_error_url_is_safe(error.value)
 
 
 @pytest.mark.asyncio
@@ -1504,6 +1678,24 @@ async def test_assert_public_destination_rejects_non_numeric_port() -> None:
         await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
             "https://vendor.example:bad/x"
         )
+
+
+@pytest.mark.asyncio
+async def test_malformed_port_error_does_not_echo_sensitive_port_text() -> None:
+    """A nonnumeric port and its lazy parser error are both client-visible."""
+    url = (
+        f"https://vendor.example:access_token={_ERROR_URL_SECRET}/path"
+        f"?query_secret={_ERROR_URL_SECRET}#fragment-secret"
+    )
+    with pytest.raises(BeanFetchError, match="malformed port") as error:
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            url
+        )
+
+    _assert_error_url_is_safe(error.value)
+    detail = str(error.value)
+    assert "Port could not be cast" not in detail
+    assert "query_secret" not in detail
 
 
 @pytest.mark.asyncio
@@ -1970,11 +2162,13 @@ async def test_fetch_page_text_end_to_end_timeout_raises_bean_fetch_error(
     monkeypatch.setattr(
         bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
     )
-    with pytest.raises(BeanFetchError, match="deadline"):
+    sensitive_url = f"https://vendor.example/x?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    with pytest.raises(BeanFetchError, match="deadline") as error:
         await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/x",
+            sensitive_url,
             config=BeanSourcingConfig(fetch_timeout_seconds=0.15),
         )
+    _assert_error_url_is_safe(error.value)
 
 
 # --- _bean_sourcing_agent / _extract_bean_identity ---
@@ -9079,6 +9273,199 @@ def test_redact_url_credentials_returns_url_unchanged_on_malformed_url() -> None
     original."""
     url = "http://[::1"
     assert bean_sourcing._redact_url_credentials(url) == url  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "https://user:password@vendor.example/products/kenya"
+            "?x='\"&access_token=SECRET-QUERY-656#fragment-secret",
+            "https://vendor.example/products/kenya",
+        ),
+        (
+            "https://user:password@[bad?access_token=SECRET-QUERY-656#fragment-secret",
+            "https://[redacted-authority]",
+        ),
+        (
+            "https:\n//user:password@vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https://vendor.example/path",
+        ),
+        (
+            "https://user:password＠vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https://[redacted-authority]/path",
+        ),
+        (
+            "https://vendor.example？access_token=SECRET-QUERY-656/path",
+            "https://[redacted-authority]/path",
+        ),
+        (
+            "https://vendor.example＃access_token=SECRET-QUERY-656/path",
+            "https://[redacted-authority]/path",
+        ),
+        (
+            "https://SECRET-QUERY-656？x@vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https://[redacted-authority]/path",
+        ),
+        (
+            "https://SECRET-QUERY-656＃x@vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https://[redacted-authority]/path",
+        ),
+        (
+            "https://SECRET-QUERY-656？x＠vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https://[redacted-authority]/path",
+        ),
+        (
+            "https:/user:SECRET-QUERY-656@vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https:[redacted-url]",
+        ),
+        (
+            "https:user:SECRET-QUERY-656@vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https:[redacted-url]",
+        ),
+        (
+            "https:///user:SECRET-QUERY-656@vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "https:[redacted-url]",
+        ),
+        (
+            "https://vendor.example:access_token=SECRET-QUERY-656/path",
+            "https://vendor.example/path",
+        ),
+        (
+            "https://[2001:db8::1]/path",
+            "https://[2001:db8::1]/path",
+        ),
+        (
+            "https://[2001:db8::1]:443/path",
+            "https://[2001:db8::1]:443/path",
+        ),
+        (
+            "https://[2001:db8::1]:access_token=SECRET-QUERY-656/path",
+            "https://[2001:db8::1]/path",
+        ),
+        (
+            "https://[2001:db8::1]access_token=SECRET-QUERY-656/path",
+            "https://[redacted-authority]/path",
+        ),
+        (
+            "https://2001:db8::1/path",
+            "https://[redacted-authority]/path",
+        ),
+        (
+            "https://vendor.example:443/path",
+            "https://vendor.example:443/path",
+        ),
+        (
+            " \x00//user:password＠vendor.example/path"
+            "?access_token=SECRET-QUERY-656#fragment-secret",
+            "//[redacted-authority]/path",
+        ),
+        (
+            "//user:password@vendor.example/path?access_token=SECRET-QUERY-656",
+            "//vendor.example/path",
+        ),
+        (
+            "/products/kenya?access_token=SECRET-QUERY-656#fragment-secret",
+            "/products/kenya",
+        ),
+        (
+            "1https：//user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
+            "[redacted-url]",
+        ),
+        ("1x：v?x=s", "[redacted-authority]"),
+    ],
+)
+def test_redact_url_for_error_structurally_strips_sensitive_components(
+    url: str, expected: str
+) -> None:
+    """#656: redaction succeeds before repr, even when URL parsing cannot."""
+    assert bean_sourcing.redact_url_for_error(url) == expected
+
+
+def test_redact_url_for_error_stops_scanning_after_first_tail_delimiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An early query marker must not allocate or scan over a huge suffix."""
+    real_normalize = unicodedata.normalize
+    normalize_calls = 0
+
+    def counting_normalize(form: Literal["NFC", "NFD", "NFKC", "NFKD"], text: str, /) -> str:
+        nonlocal normalize_calls
+        normalize_calls += 1
+        return real_normalize(form, text)
+
+    monkeypatch.setattr(unicodedata, "normalize", counting_normalize)
+    url = "https://vendor.example?" + ("#" * 100_000)
+
+    assert bean_sourcing.redact_url_for_error(url) == "https://vendor.example"
+    assert normalize_calls < 128
+
+
+def test_url_bearing_error_constructors_never_interpolate_raw_url_variables() -> None:
+    """Every URL-bearing error path must call the structural sanitizer.
+
+    This source-level guard covers the full error-constructor inventory,
+    including branches that are expensive or mutually exclusive to trigger.
+    The behavioral tests above prove the sanitizer against the issue's
+    escaped-quote and unclosed-IPv6 cases.
+    """
+    source = Path(bean_sourcing.__file__).read_text(encoding="utf-8")
+    for raw_interpolation in ("{url!r}", "{current_url!r}", "{location!r}"):
+        assert raw_interpolation not in source
+
+
+def test_pure_error_paths_strip_query_userinfo_and_fragment_from_details() -> None:
+    """Cap, decode, extraction, and validation errors all sanitize URLs."""
+    sensitive_url = (
+        "https://user:password@vendor.example/products/kenya"
+        f"?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    )
+
+    with pytest.raises(BeanFetchError, match="fetch cap") as cap_error:
+        bean_sourcing._append_within_cap(  # pyright: ignore[reportPrivateUsage]
+            bytearray(), b"too large", max_bytes=1, url=sensitive_url
+        )
+    _assert_error_url_is_safe(cap_error.value)
+
+    with pytest.raises(BeanFetchError, match="unsupported Content-Encoding") as decode_error:
+        bean_sourcing._decompress_within_cap(  # pyright: ignore[reportPrivateUsage]
+            b"body", "br", max_bytes=100, url=sensitive_url
+        )
+    _assert_error_url_is_safe(decode_error.value)
+
+    missing_identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(name="", country="", bean_origin="")
+    )
+    with pytest.raises(BeanExtractionError, match="could not determine") as extraction_error:
+        bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+            missing_identity,
+            url=sensitive_url,
+            corpus="",
+        )
+    _assert_error_url_is_safe(extraction_error.value)
+
+    valid_identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args()
+    )
+    malformed_port_url = (
+        "https://vendor.example:99999/products/kenya"
+        f"?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    )
+    with pytest.raises(BeanExtractionError, match="failed validation") as validation_error:
+        bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+            valid_identity,
+            url=malformed_port_url,
+            corpus=_IDENTITY_PAGE_TEXT,
+        )
+    _assert_error_url_is_safe(validation_error.value)
 
 
 @pytest.mark.asyncio

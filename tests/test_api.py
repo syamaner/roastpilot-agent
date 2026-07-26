@@ -28,6 +28,7 @@ from httpx import ASGITransport, AsyncClient
 from roastpilot_agent import __version__
 from roastpilot_agent.advisor import AdvisorContext, FakeAdvisor, RoastDecision
 from roastpilot_agent.api import (
+    _DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     EventBroadcaster,
     QueuedOperatorAction,
     RoastRunConflictError,
@@ -4460,6 +4461,158 @@ async def test_draft_bean_from_url_fetch_error_is_422(
     )
     assert response.status_code == 422
     assert "fetch failed" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:password@[bad?access_token=SECRET-QUERY-656#fragment-secret",
+        "ftp://vendor.example/products/kenya?x='\"&access_token=SECRET-QUERY-656",
+        "https:\n//user:SECRET-QUERY-656／password@vendor.example/path"
+        "?access_token=SECRET-QUERY-656#fragment-secret",
+        "https://user:SECRET-QUERY-656＠vendor.example/path"
+        "?access_token=SECRET-QUERY-656#fragment-secret",
+        "https://vendor.example？access_token=SECRET-QUERY-656/path",
+        "https://vendor.example＃access_token=SECRET-QUERY-656/path",
+        "https://SECRET-QUERY-656？x@vendor.example/path"
+        "?access_token=SECRET-QUERY-656#fragment-secret",
+        "https://SECRET-QUERY-656＃x@vendor.example/path"
+        "?access_token=SECRET-QUERY-656#fragment-secret",
+        "https://SECRET-QUERY-656？x＠vendor.example/path"
+        "?access_token=SECRET-QUERY-656#fragment-secret",
+        "https:/user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
+        "https:user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656",
+        *(
+            f"{slashes}user:SECRET-QUERY-656@vendor.example/path?access_token=SECRET-QUERY-656"
+            for slashes in ("///", "////")
+        ),
+        *(
+            f"{prefix}//user:SECRET-QUERY-656{userinfo}vendor.example/path"
+            "?access_token=SECRET-QUERY-656"
+            for prefix, userinfo in (("https：", "@"), ("1https﹕", "＠"), ("1https:", "@"))
+        ),
+        " //user:SECRET-QUERY-656＠vendor.example/path"
+        "?access_token=SECRET-QUERY-656#fragment-secret",
+    ],
+)
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_parse_failure_detail_strips_sensitive_url_parts(
+    client: AsyncClient, url: str
+) -> None:
+    """#656: malformed URL details are sanitized before repr/interpolation."""
+    response = await client.post("/api/beans/draft-from-url", json={"url": url})
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "SECRET-QUERY-656" not in detail
+    assert "access_token" not in detail
+    assert "user:password@" not in detail
+    assert "fragment-secret" not in detail
+    assert "?" not in detail
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_bounds_body_before_framework_parsing(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Declared, chunked, and understated oversized bodies fail before the endpoint."""
+    admission = mock.Mock()
+    admission.acquire = mock.AsyncMock()
+    provider = mock.AsyncMock(side_effect=AssertionError("must not reach provider"))
+    redact = mock.Mock(side_effect=AssertionError("must not redact oversized body"))
+    monkeypatch.setattr("roastpilot_agent.api._draft_bean_from_url_semaphore", admission)
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", provider)
+    monkeypatch.setattr("roastpilot_agent.api.redact_url_for_error", redact)
+    too_large = b'{"url":"' + (b"x" * _DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES) + b'"}'
+    valid_prefix = b'{"url":"https://vendor.example/bean"}'
+    streamed_prefix = valid_prefix + (
+        b" " * (_DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES - len(valid_prefix))
+    )
+    headers = {"content-type": "application/json"}
+    expected = {"detail": "request body exceeds 65536-byte limit"}
+
+    response = await client.post("/api/beans/draft-from-url", content=too_large, headers=headers)
+    assert response.status_code == 413
+    assert response.json() == expected
+
+    async def streamed_body() -> AsyncIterator[bytes]:
+        yield streamed_prefix
+        yield b" "
+
+    response = await client.post(
+        "/api/beans/draft-from-url", content=streamed_body(), headers=headers
+    )
+    assert response.status_code == 413
+    assert response.json() == expected
+    response = await client.post(
+        "/api/beans/draft-from-url",
+        content=streamed_body(),
+        headers={**headers, "content-length": "1"},
+    )
+    assert response.status_code == 413
+    assert response.json() == expected
+    admission.acquire.assert_not_awaited()
+    provider.assert_not_awaited()
+    redact.assert_not_called()
+
+    exact = (b" " * (_DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES - 2)) + b"{}"
+    assert (
+        await client.post("/api/beans/draft-from-url", content=exact, headers=headers)
+    ).status_code == 422
+    assert (
+        await client.post("/api/bean-profiles", content=too_large, headers=headers)
+    ).status_code != 413
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_bounds_url_before_redaction_or_admission(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An oversized malformed URL is rejected in constant work with no secret echo."""
+    admission = mock.Mock()
+    admission.acquire = mock.AsyncMock()
+    redact = mock.Mock(side_effect=AssertionError("must not redact oversized URL"))
+    provider = mock.AsyncMock(side_effect=BeanFetchError("boundary URL reached provider"))
+    monkeypatch.setattr("roastpilot_agent.api._draft_bean_from_url_semaphore", admission)
+    monkeypatch.setattr("roastpilot_agent.api.redact_url_for_error", redact)
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", provider)
+
+    oversized = "https://user:SECRET-QUERY-656@[" + ("x" * 4096)
+    response = await client.post("/api/beans/draft-from-url", json={"url": oversized})
+    assert response.status_code == 422
+    assert response.json() == {"detail": "URL exceeds 4096-character limit"}
+    redact.assert_not_called()
+    admission.acquire.assert_not_awaited()
+    provider.assert_not_awaited()
+
+    prefix = "https://vendor.example/"
+    boundary = prefix + ("😀" * (4096 - len(prefix)))
+    encoded = json.dumps({"url": boundary}).encode()
+    assert len(encoded) < _DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES
+    response = await client.post(
+        "/api/beans/draft-from-url", content=encoded, headers={"content-type": "application/json"}
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "boundary URL reached provider"
+    admission.acquire.assert_awaited_once()
+    provider.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_malformed_port_detail_strips_sensitive_text(
+    client: AsyncClient,
+) -> None:
+    """#656: lazy port parse failures do not echo port or URL secrets."""
+    url = "https://vendor.example:access_token=SECRET-QUERY-656/path?query_secret=SECRET-QUERY-656"
+    response = await client.post("/api/beans/draft-from-url", json={"url": url})
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "malformed port" in detail
+    assert "SECRET-QUERY-656" not in detail
+    assert "access_token" not in detail
+    assert "query_secret" not in detail
+    assert "Port could not be cast" not in detail
 
 
 @pytest.mark.asyncio
