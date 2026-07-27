@@ -1438,7 +1438,10 @@ def test_decode_response_body_falls_back_to_utf8_on_unknown_charset() -> None:
     assert result == "hello"
 
 
-@pytest.mark.parametrize("label", ["punycode", "idna", "unicode_escape", "not-a-codec"])
+@pytest.mark.parametrize(
+    "label",
+    ["punycode", "idna", "unicode_escape", "x-user-defined", "replacement", "not-a-codec"],
+)
 @pytest.mark.parametrize("source", ["http-header", "html-meta"])
 def test_decode_response_body_rejects_non_html_transform_codec(label: str, source: str) -> None:
     """#597 security review: arbitrary Python codecs must not decode HTML."""
@@ -1497,7 +1500,6 @@ def test_decode_response_body_honors_safe_legacy_http_charset_aliases(
         "iso-8859-1",
         "iso-ir-100",
         "iso8859-1",
-        "iso8859-1:1987",
         "iso88591",
         "iso_8859-1",
         "iso_8859-1:1987",
@@ -1523,7 +1525,6 @@ def test_decode_response_body_uses_windows_1252_for_web_latin1_labels(label: str
         ("x-mac-cyrillic", "mac-cyrillic", "Кофе"),
         ("gb2312", "gbk", "镕"),
         ("chinese", "gbk", "镕"),
-        ("euc-cn", "gbk", "镕"),
         ("csiso58gb231280", "gbk", "镕"),
         ("iso-ir-58", "gbk", "镕"),
         ("csgb2312", "gbk", "镕"),
@@ -1540,7 +1541,6 @@ def test_decode_response_body_uses_windows_1252_for_web_latin1_labels(label: str
         ("csisolatin5", "cp1254", "€"),
         ("iso-ir-148", "cp1254", "€"),
         ("iso8859-9", "cp1254", "€"),
-        ("iso8859-9:1989", "cp1254", "€"),
         ("iso88599", "cp1254", "€"),
         ("iso_8859-9", "cp1254", "€"),
         ("iso_8859-9:1989", "cp1254", "€"),
@@ -1560,6 +1560,37 @@ def test_decode_response_body_applies_web_compatibility_label_overrides(
         body, response
     )
     assert result == f"<p>{text}</p>"
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("unicode-1-1-utf-8", "utf-8"),
+        ("iso88592", "iso8859-2"),
+        ("iso-8859-8-i", "iso8859-8"),
+        ("x-mac-ukrainian", "mac-cyrillic"),
+        ("windows-31j", "shift_jis"),
+        ("windows-949", "euc_kr"),
+        ("ms932", "shift_jis"),
+        ("utf-16", "utf-16-le"),
+        ("unicode11utf8", "utf-8"),
+        ("unicode20utf8", "utf-8"),
+        ("x-unicode20utf8", "utf-8"),
+        ("koi8-ru", "koi8-u"),
+        ("unicodefffe", "utf-16-be"),
+        ("csunicode", "utf-16-le"),
+        ("iso-10646-ucs-2", "utf-16-le"),
+        ("ucs-2", "utf-16-le"),
+        ("unicode", "utf-16-le"),
+        ("unicodefeff", "utf-16-le"),
+    ],
+)
+def test_resolve_html_encoding_uses_whatwg_label_registry(label: str, expected: str) -> None:
+    """Official browser labels resolve independently of Python aliases."""
+    assert (
+        bean_sourcing._resolve_html_encoding(label)  # pyright: ignore[reportPrivateUsage]
+        == expected
+    )
 
 
 @pytest.mark.parametrize(

@@ -225,6 +225,7 @@ from pydantic_ai import Agent, ModelAPIError, ModelSettings, UnexpectedModelBeha
 from pydantic_ai.messages import ModelRequest, RetryPromptPart
 from pydantic_ai.models import Model
 from pydantic_ai.usage import RunUsage
+from webencodings import lookup as lookup_html_encoding
 
 from roastpilot_agent.advisor import (
     AdvisorDependencyError,
@@ -1649,32 +1650,21 @@ _HTML_UNQUOTED_VALUE_END: Final = _HTML_ATTRIBUTE_WHITESPACE | frozenset(b">")
 _HTML_OTHER_TAG_START_BYTES: Final = (
     b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" + b"/!?"
 )
-_HTML_ENCODING_LABEL_OVERRIDES: Final = {
-    "csgb2312": "gbk",
-    "dos-874": "cp874",
-    "gb_2312": "gbk",
-    "gb_2312-80": "gbk",
-    "iso8859-1:1987": "cp1252",
-    "iso8859-9:1989": "cp1254",
-    "iso88591": "cp1252",
-    "iso88599": "cp1254",
-    "iso885911": "cp874",
-    "windows-874": "cp874",
-    "x-cp1254": "cp1254",
-    "x-cp1252": "cp1252",
-    "x-gbk": "gbk",
-    "x-mac-cyrillic": "mac-cyrillic",
-}
-_HTML_CANONICAL_ENCODING_OVERRIDES: Final = {
-    "ascii": "cp1252",
-    "gb2312": "gbk",
-    "iso8859-1": "cp1252",
-    "iso8859-9": "cp1254",
-    "iso8859-11": "cp874",
-    "tis-620": "cp874",
+_HTML_MISSING_LABEL_OVERRIDES: Final = {
+    "csunicode": "utf-16-le",
+    "iso-10646-ucs-2": "utf-16-le",
+    "koi8-ru": "koi8-u",
+    "ms932": "shift_jis",
+    "ucs-2": "utf-16-le",
+    "unicode": "utf-16-le",
+    "unicode11utf8": "utf-8",
+    "unicode20utf8": "utf-8",
+    "unicodefeff": "utf-16-le",
+    "unicodefffe": "utf-16-be",
+    "x-unicode20utf8": "utf-8",
 }
 # Canonical Python codec names for browser-relevant text encodings. Resolve
-# labels through ``codecs.lookup`` for aliases, then require membership here:
+# labels through the WHATWG registry, then require membership here:
 # Python also registers non-HTML transforms such as ``punycode`` whose
 # synchronous decoder can be superlinear on attacker-controlled input.
 _HTML_SAFE_CODEC_NAMES: Final = frozenset(
@@ -1756,14 +1746,15 @@ def _resolve_html_encoding(label: str, *, from_meta: bool = False) -> str | None
         The canonical Python codec name, or ``None`` for unknown and
         non-browser transform codecs.
     """
-    normalized_label = label.strip().lower()
-    normalized_label = _HTML_ENCODING_LABEL_OVERRIDES.get(normalized_label, normalized_label)
     try:
-        canonical_name = codecs.lookup(normalized_label).name
+        python_name: str | None = codecs.lookup(label).name
     except LookupError:
-        return None
-    canonical_name = _HTML_CANONICAL_ENCODING_OVERRIDES.get(canonical_name, canonical_name)
-    if canonical_name not in _HTML_SAFE_CODEC_NAMES:
+        python_name = None
+    html_encoding = lookup_html_encoding(label)
+    canonical_name = _HTML_MISSING_LABEL_OVERRIDES.get(label.strip().lower()) or (
+        html_encoding.codec_info.name if html_encoding is not None else python_name
+    )
+    if canonical_name is None or canonical_name not in _HTML_SAFE_CODEC_NAMES:
         return None
     if from_meta and canonical_name in _HTML_WIDE_CODEC_NAMES:
         return "utf-8"
@@ -1943,7 +1934,8 @@ def _decode_response_body(body: bytes, response: httpx.Response) -> str:
         encoding = _resolve_html_encoding(http_encoding) or "utf-8"
     else:
         encoding = _sniff_html_encoding(body) or "utf-8"
-    return body.decode(encoding, errors="replace")
+    decoded = body.decode(encoding, errors="replace")
+    return decoded.removeprefix("\ufeff")
 
 
 async def _fetch_one_hop(

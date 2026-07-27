@@ -68,6 +68,7 @@ dependencies = [
   "pyserial>=3.5,<4",
   "sounddevice>=0.5,<1",
   "uvicorn>=0.34,<1",
+  "webencodings>=0.5.1,<1",
   # #590 slice B: deterministic JSON-LD product extraction ahead of the
   # bean-sourcing LLM call (bean_sourcing._build_json_ld_context). Pinned to
   # the 0.18 surface this module calls (extruct.extract(..., syntaxes=
