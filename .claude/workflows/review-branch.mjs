@@ -22,17 +22,46 @@ phase('Scope')
 const SCOPE_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['touchesWeb', 'touchesPython', 'touchesSafetyControllerEnums', 'changedFiles', 'summary'],
+  required: [
+    'touchesWeb',
+    'touchesPython',
+    'touchesSafetyControllerEnums',
+    'touchesExternalInput',
+    'addsProviderCallPath',
+    'changedFiles',
+    'summary',
+  ],
   properties: {
     touchesWeb: { type: 'boolean' },
     touchesPython: { type: 'boolean' },
     touchesSafetyControllerEnums: { type: 'boolean' },
+    // Capability-based, NOT file-based (AGENTS.md): the #587 lesson is that the
+    // highest-risk diff touched no safety file, so a path allow-list would never
+    // have fired. Mirrors the "When this applies" test in
+    // docs/review/untrusted-input-checklist.md.
+    touchesExternalInput: { type: 'boolean' },
+    // Checklist class 6: a NEW provider-calling path can contend with the roast
+    // advisor, so AGENTS.md routes it to safety-reviewer as well as security-reviewer.
+    // Tracked separately so a plain parse/fetch change doesn't spin up the Opus
+    // safety lens it doesn't need.
+    addsProviderCallPath: { type: 'boolean' },
     changedFiles: { type: 'array', items: { type: 'string' } },
     summary: { type: 'string' },
   },
 }
 const scope = await agent(
-  `Scope a code review of the current branch. Run \`git fetch origin -q\` first so the base ref is current, then \`git diff --name-only ${base}...HEAD\` and \`git diff --stat ${base}...HEAD\` in this repo. Report which areas changed: web/ (the SPA), Python (src/roastpilot_agent or tests/), and specifically safety.py / controller.py / a models.py enum (the safety-critical surface). List the changed files and a one-line summary. Do NOT review the content yet.`,
+  `Scope a code review of the current branch. Run \`git fetch origin -q\` first so the base ref is current, then \`git diff --name-only ${base}...HEAD\` and \`git diff --stat ${base}...HEAD\` in this repo. Report which areas changed: web/ (the SPA), Python (src/roastpilot_agent or tests/), and specifically safety.py / controller.py / a models.py enum (the safety-critical surface). List the changed files and a one-line summary.
+
+Also decide \`touchesExternalInput\`. Judge this by CAPABILITY, not by file path — read the changed hunks, because the highest-risk case (#587) touched no safety-critical file and a path allow-list would have missed it. Set it true if the diff, ON THE SERVER, does any of:
+- fetches a URL / opens a connection whose target is influenced by operator or external input (a pasted URL, a redirect \`Location\`, a webhook, a config value);
+- parses or decodes untrusted bytes/strings (URL parsing, HTML/JSON/charset decode, number/port parsing, deserialization);
+- adds an external-input endpoint (a route taking client-supplied data);
+- adds a **new** LLM/model-provider call path (anything that can contend with the roast advisor for the same backend).
+Otherwise set it false — do not stretch the test to fit an unrelated diff.
+
+Finally, set \`addsProviderCallPath\` true only for the last bullet specifically — the diff adds a NEW call site against the shared LLM/model provider. This is narrower than \`touchesExternalInput\` and routes the safety lens as well, so do not set it for a diff that merely fetches or parses.
+
+Do NOT review the content yet.`,
   { label: 'scope', phase: 'Scope', schema: SCOPE_SCHEMA },
 )
 if (scope) log(scope.summary)
@@ -64,14 +93,23 @@ const FINDINGS_SCHEMA = {
 }
 const reviewBase = `Review ONLY the changes in ${diffScope} of this repo (read the changed files for context; ignore pre-existing issues outside the diff). Return findings as structured data — an empty list if the diff is clean from your lens.`
 
-// Always-on lenses; safety + ui are added only when the diff touches them.
+// Always-on lenses; safety, security + ui are added only when the diff touches them.
 const lenses = [
   { key: 'correctness', prompt: `${reviewBase}\n\nLens: CORRECTNESS — logic bugs, edge cases, error handling, races, off-by-one, missing await, broken invariants.` },
   { key: 'qa', agentType: 'qa', prompt: `${reviewBase}\n\nLens: TEST QUALITY — do tests assert real behavior (not smoke)? Coverage delta, acceptance criteria with no test, Playwright/screenshot paths, over-mocking. Findings = weak/missing tests.` },
   { key: 'product', agentType: 'product-pm', prompt: `${reviewBase}\n\nLens: PRODUCT/PLAN — does it match the plan/epic/decisions? Dropped requirements, undefined "done", drift between registry/epic tables and code, violated architecture invariants. Review only — do NOT edit anything.` },
 ]
-if (scope && scope.touchesSafetyControllerEnums) {
-  lenses.push({ key: 'safety', agentType: 'safety-reviewer', prompt: `${reviewBase}\n\nLens: SAFETY (adversarial) — any roaster write bypassing safety, transition-table errors, string-compared verdicts, restart auto-resume, non-Celsius, fail-open paths.` })
+// Safety fires on the file-based surface, and ALSO on a new provider-calling path:
+// checklist class 6 (contention with the roast advisor) is safety-adjacent, and
+// AGENTS.md routes it to both reviewers.
+if (scope && (scope.touchesSafetyControllerEnums || scope.addsProviderCallPath)) {
+  lenses.push({ key: 'safety', agentType: 'safety-reviewer', prompt: `${reviewBase}\n\nLens: SAFETY (adversarial) — any roaster write bypassing safety, transition-table errors, string-compared verdicts, restart auto-resume, non-Celsius, fail-open paths.${scope.addsProviderCallPath ? ' This diff adds a NEW provider-calling path: also check checklist class 6 — it must not begin during an active roast or delay an operator roast start, and admission must be race-free under the roast-start lock.' : ''}` })
+}
+// Capability-based routing (AGENTS.md): a new fetch/parse surface is the highest-risk
+// case and the easiest to miss, because it can touch no safety file at all — #587 is
+// the specimen. Keeps the roster pass and the pre-open pr-preflight pass in agreement.
+if (scope && scope.touchesExternalInput) {
+  lenses.push({ key: 'security', agentType: 'security-reviewer', prompt: `${reviewBase}\n\nLens: WEB/APPLICATION SECURITY — work docs/review/untrusted-input-checklist.md in full against this diff: SSRF / fetch-destination control, secret + PII hygiene, resource exhaustion (timeouts, byte caps, bounded decompression, ReDoS, concurrency/rate bounds), fail-soft typed errors (never an unhandled 500) mapped by origin, normalization consistency, cross-feature contention, LLM prompt-injection + tool boundary, and invariant separation. Prefer a CLASS-SWEEP: on finding one instance of a class, grep for every instance and report them together. Cite file:line. A clean pass is a valid result — do not invent findings.` })
 }
 if (scope && scope.touchesWeb) {
   lenses.push({ key: 'ui', agentType: 'ui-reviewer', prompt: `${reviewBase}\n\nLens: UI/UX (code-level — no live browser this run) — review changed web/ components against component plan §7, ui-prompts.md, and the frozen baselines in the plan repo sketches/: five-series curve, verdict badges (ALLOW/CLAMP/REJECT), phase-from-server-events-only, Celsius, rebuild-not-port. Check the required Playwright/screenshot states exist as tests. Note that the full visual screenshot pass needs the live replay harness (a separate step).` })
