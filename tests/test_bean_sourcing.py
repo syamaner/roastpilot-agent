@@ -1438,14 +1438,26 @@ def test_decode_response_body_falls_back_to_utf8_on_unknown_charset() -> None:
     assert result == "hello"
 
 
-def test_decode_response_body_invalid_http_charset_falls_back_to_valid_meta() -> None:
-    """Codex P2: an invalid HTTP label does not suppress valid HTML metadata."""
+@pytest.mark.parametrize("invalid_label", ["not-a-codec", "\vunicode11utf8\v"])
+def test_decode_response_body_invalid_http_charset_falls_back_to_valid_meta(
+    invalid_label: str,
+) -> None:
     body = b'<meta charset="windows-1252"><p>Caf\xe9</p>'
-    response = httpx.Response(200, headers={"Content-Type": "text/html; charset=not-a-codec"})
+    response = httpx.Response(200, headers={"Content-Type": f"text/html; charset={invalid_label}"})
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
         body, response
     )
     assert "Café" in result
+
+
+def test_decode_response_body_allows_obs_text_in_other_header_parameter() -> None:
+    response = httpx.Response(
+        200, headers={b"Content-Type": b'text/html; note="a\xa0b"; charset=windows-1252'}
+    )
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        b"<p>Caf\xe9</p>", response
+    )
+    assert result == "<p>Café</p>"
 
 
 @pytest.mark.parametrize(
@@ -1454,7 +1466,6 @@ def test_decode_response_body_invalid_http_charset_falls_back_to_valid_meta() ->
 )
 @pytest.mark.parametrize("source", ["http-header", "html-meta"])
 def test_decode_response_body_rejects_non_html_transform_codec(label: str, source: str) -> None:
-    """#597 security review: arbitrary Python codecs must not decode HTML."""
     body = (
         b"<p>-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</p>"
         if source == "http-header"
@@ -1489,7 +1500,6 @@ def test_decode_response_body_rejects_non_html_transform_codec(label: str, sourc
 def test_decode_response_body_honors_safe_legacy_http_charset_aliases(
     label: str, codec: str, text: str
 ) -> None:
-    """Codex P2: explicit safe HTTP codecs retain pre-#597 behavior."""
     body = f"<p>{text}</p>".encode(codec)
     response = httpx.Response(200, headers={"Content-Type": f"text/html; charset={label}"})
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
@@ -1521,7 +1531,6 @@ def test_decode_response_body_honors_safe_legacy_http_charset_aliases(
     ],
 )
 def test_decode_response_body_uses_windows_1252_for_web_latin1_labels(label: str) -> None:
-    """Codex P2: browser Latin-1/ASCII labels use Windows-1252 semantics."""
     response = httpx.Response(200, headers={"Content-Type": f"text/html; charset={label}"})
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
         b"<p>\x80</p>", response
@@ -1558,12 +1567,14 @@ def test_decode_response_body_uses_windows_1252_for_web_latin1_labels(label: str
         ("latin5", "cp1254", "€"),
         ("windows-1254", "cp1254", "€"),
         ("x-cp1254", "cp1254", "€"),
+        ("euc-kr", "cp949", "갂"),
+        ("ksc_5601", "cp949", "갂"),
+        ("windows-949", "cp949", "갂"),
     ],
 )
 def test_decode_response_body_applies_web_compatibility_label_overrides(
     label: str, codec: str, text: str
 ) -> None:
-    """Browser labels resolve before the finite safe-codec check."""
     response = httpx.Response(200, headers={"Content-Type": f"text/html; charset={label}"})
     body = f"<p>{text}</p>".encode(codec)
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
@@ -1580,7 +1591,7 @@ def test_decode_response_body_applies_web_compatibility_label_overrides(
         ("iso-8859-8-i", "iso8859-8"),
         ("x-mac-ukrainian", "mac-cyrillic"),
         ("windows-31j", "shift_jis"),
-        ("windows-949", "euc_kr"),
+        ("windows-949", "cp949"),
         ("ms932", "shift_jis"),
         ("utf-16", "utf-16-le"),
         ("unicode11utf8", "utf-8"),
@@ -1590,13 +1601,13 @@ def test_decode_response_body_applies_web_compatibility_label_overrides(
         ("unicodefffe", "utf-16-be"),
         ("csunicode", "utf-16-le"),
         ("iso-10646-ucs-2", "utf-16-le"),
+        ("\vunicode11utf8\v", None),
         ("ucs-2", "utf-16-le"),
         ("unicode", "utf-16-le"),
         ("unicodefeff", "utf-16-le"),
     ],
 )
-def test_resolve_html_encoding_uses_whatwg_label_registry(label: str, expected: str) -> None:
-    """Official browser labels resolve independently of Python aliases."""
+def test_resolve_html_encoding_uses_whatwg_label_registry(label: str, expected: str | None) -> None:
     assert (
         bean_sourcing._resolve_html_encoding(label)  # pyright: ignore[reportPrivateUsage]
         == expected
@@ -1613,7 +1624,6 @@ def test_resolve_html_encoding_uses_whatwg_label_registry(label: str, expected: 
     ids=["utf-8-bom", "utf-16-bom", "utf-32-bom"],
 )
 def test_decode_response_body_sniffs_bom_without_http_charset(body: bytes, expected: str) -> None:
-    """#597: a BOM supplies the encoding when HTTP omits charset."""
     response = httpx.Response(200, headers={"Content-Type": "text/html"})
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
         body, response
@@ -1626,11 +1636,10 @@ def test_decode_response_body_sniffs_bom_without_http_charset(body: bytes, expec
     [
         '<meta charset="windows-1252">',
         '<meta http-equiv="Content-Type" content="text/html; charset=windows-1252">',
+        """<meta http-equiv=Content-Type content="text/html; charset=' windows-1252 '">""",
     ],
-    ids=["charset-attribute", "http-equiv-content"],
 )
 def test_decode_response_body_sniffs_html_meta_without_http_charset(meta: str) -> None:
-    """#597: legacy HTML declarations prevent replacement corruption."""
     body = f"{meta}<p>Café — Kenya</p>".encode("windows-1252")
     response = httpx.Response(200, headers={"Content-Type": "text/html"})
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
@@ -1646,12 +1655,18 @@ def test_decode_response_body_sniffs_html_meta_without_http_charset(meta: str) -
         '<meta data-note="charset=utf-8">',
         '<meta data-charset="utf-8">',
         '<meta content="text/html; charset=utf-8">',
+        '<meta charset="\x0bwindows-1252\x0b">',
+        '<meta http-equiv="\x0bContent-Type\x0b" content="text/html; charset=utf-8">',
+        '<meta http-equiv="Content-Type" content="text/html; charset=\x0butf-8\x0b">',
+        '<meta http-equiv="Content-Type" content="text/html; charset=utf-8\x0b">',
+        """<meta http-equiv="Content-Type" content="text/html; charset=utf-8'junk">""",
+        """<meta http-equiv="Content-Type" content="text/html; charset='utf-8">""",
+        """<meta http-equiv="Content-Type" content='text/html; charset="utf-8'>""",
     ],
 )
 def test_decode_response_body_ignores_charset_text_outside_real_meta_declaration(
     false_meta: str,
 ) -> None:
-    """Codex P2: unrelated attributes cannot suppress a real declaration."""
     body = (f'{false_meta}<meta charset="windows-1252"><p>Café — Kenya</p>').encode("windows-1252")
     response = httpx.Response(200, headers={"Content-Type": "text/html"})
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
@@ -1668,7 +1683,6 @@ def test_decode_response_body_ignores_charset_text_outside_real_meta_declaration
     ],
 )
 def test_decode_response_body_accepts_reordered_legacy_meta_attributes(meta: str) -> None:
-    """The legacy form requires the matching http-equiv on the same tag."""
     body = f"{meta}<p>Café — Kenya</p>".encode("windows-1252")
     response = httpx.Response(200, headers={"Content-Type": "text/html"})
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
@@ -1685,7 +1699,6 @@ def test_decode_response_body_accepts_reordered_legacy_meta_attributes(meta: str
     ],
 )
 def test_decode_response_body_meta_scanner_respects_quoted_greater_than(meta: str) -> None:
-    """Independent triage: quoted ``>`` does not truncate a meta tag."""
     body = f"{meta}<p>Café — Kenya</p>".encode("windows-1252")
     response = httpx.Response(200, headers={"Content-Type": "text/html"})
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
@@ -1695,7 +1708,6 @@ def test_decode_response_body_meta_scanner_respects_quoted_greater_than(meta: st
 
 
 def test_decode_response_body_ignores_commented_meta_before_real_declaration() -> None:
-    """Codex P2: declarations inside HTML comments are inert."""
     commented_meta = b'<!-- <meta charset="utf-8"> -->'
     body = commented_meta + b'<meta charset="windows-1252"><p>Caf\xe9</p>'
     response = httpx.Response(200, headers={"Content-Type": "text/html"})
@@ -1707,7 +1719,6 @@ def test_decode_response_body_ignores_commented_meta_before_real_declaration() -
 
 @pytest.mark.parametrize("comment", [b"<!-->", b"<!--->", b"<!--x--!>"])
 def test_decode_response_body_honors_browser_comment_terminators(comment: bytes) -> None:
-    """Codex P2: browser comment terminators do not hide later metadata."""
     body = comment + b'<meta charset="windows-1252"><p>Caf\xe9</p>'
     response = httpx.Response(200, headers={"Content-Type": "text/html"})
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
@@ -1717,7 +1728,6 @@ def test_decode_response_body_honors_browser_comment_terminators(comment: bytes)
 
 
 def test_sniff_html_encoding_keeps_single_dash_bang_inside_comment() -> None:
-    """A single dash before ``!>`` does not close an HTML comment."""
     body = b'<!---!><meta charset="windows-1252"><p>Caf\xe9</p>'
     assert (
         bean_sourcing._sniff_html_encoding(body)  # pyright: ignore[reportPrivateUsage]
@@ -1730,7 +1740,6 @@ def test_sniff_html_encoding_keeps_single_dash_bang_inside_comment() -> None:
     ["script", "style", "title", "textarea", "xmp", "iframe", "noembed", "noframes", "noscript"],
 )
 def test_decode_response_body_ignores_meta_like_text_in_raw_text(tag: str) -> None:
-    """Codex P2: raw-text and RCDATA content cannot declare page encoding."""
     body = (
         f'<{tag} data-note=">"><meta charset="utf-8"></{tag}>'
         '<meta charset="windows-1252"><p>Café</p>'
@@ -1743,7 +1752,6 @@ def test_decode_response_body_ignores_meta_like_text_in_raw_text(tag: str) -> No
 
 
 def test_decode_response_body_raw_text_close_requires_exact_tag_boundary() -> None:
-    """Longer close-tag names do not expose meta-like raw-text content."""
     body = (
         b'<script><meta charset="utf-8"></script-x>'
         b'</script><meta charset="windows-1252"><p>Caf\xe9</p>'
@@ -1756,7 +1764,6 @@ def test_decode_response_body_raw_text_close_requires_exact_tag_boundary() -> No
 
 
 def test_decode_response_body_raw_text_ignores_quoted_close_in_opening_tag() -> None:
-    """A close-like attribute value cannot expose raw-text metadata."""
     body = (
         b'<script data-note="</script>"><meta charset="utf-8"></script>'
         b'<meta charset="windows-1252"><p>Caf\xe9</p>'
@@ -1769,7 +1776,6 @@ def test_decode_response_body_raw_text_ignores_quoted_close_in_opening_tag() -> 
 
 
 def test_sniff_html_encoding_unclosed_raw_text_fails_closed() -> None:
-    """An unclosed raw-text element hides all following meta-like bytes."""
     body = b'<script><meta charset="utf-8"><meta charset="windows-1252">'
     assert (
         bean_sourcing._sniff_html_encoding(body)  # pyright: ignore[reportPrivateUsage]
@@ -1779,7 +1785,6 @@ def test_sniff_html_encoding_unclosed_raw_text_fails_closed() -> None:
 
 @pytest.mark.parametrize("body", [b"<script ", b"<script>x</script "])
 def test_sniff_html_encoding_unterminated_raw_tag_fails_closed(body: bytes) -> None:
-    """Unterminated raw opening and closing tags cannot expose metadata."""
     assert (
         bean_sourcing._sniff_html_encoding(body)  # pyright: ignore[reportPrivateUsage]
         is None
@@ -1787,7 +1792,6 @@ def test_sniff_html_encoding_unterminated_raw_tag_fails_closed(body: bytes) -> N
 
 
 def test_sniff_html_encoding_plaintext_fails_closed() -> None:
-    """A plaintext element makes all later meta-like bytes inert."""
     body = b'<plaintext><meta charset="windows-1252"><p>Caf\xe9</p>'
     assert (
         bean_sourcing._sniff_html_encoding(body)  # pyright: ignore[reportPrivateUsage]
@@ -1796,7 +1800,6 @@ def test_sniff_html_encoding_plaintext_fails_closed() -> None:
 
 
 def test_decode_response_body_vertical_tab_is_not_html_tag_whitespace() -> None:
-    """A vertical tab cannot turn an unknown element into raw text."""
     body = b'<script\x0b><meta charset="windows-1252"><p>Caf\xe9</p>'
     response = httpx.Response(200, headers={"Content-Type": "text/html"})
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
@@ -1805,9 +1808,17 @@ def test_decode_response_body_vertical_tab_is_not_html_tag_whitespace() -> None:
     assert "Café" in result
 
 
-def test_decode_response_body_comment_marker_inside_attribute_is_not_a_comment() -> None:
-    """Comment-like text inside another tag cannot suppress a later meta."""
-    unrelated_tag = b'<div data-note="<!--"></div>'
+@pytest.mark.parametrize(
+    "unrelated_tag",
+    [
+        b'<div data-note = "<!--"></div>',
+        b"<div data-note=foo=farmer's>",
+        b'<div data-note=foo=farmer"s>',
+    ],
+)
+def test_decode_response_body_other_tag_content_cannot_suppress_later_meta(
+    unrelated_tag: bytes,
+) -> None:
     body = unrelated_tag + b'<meta charset="windows-1252"><p>Caf\xe9</p>'
     response = httpx.Response(200, headers={"Content-Type": "text/html"})
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
@@ -1823,7 +1834,6 @@ def test_decode_response_body_comment_marker_inside_attribute_is_not_a_comment()
 def test_decode_response_body_rejected_meta_prefix_stays_inside_other_tag(
     data_note: str,
 ) -> None:
-    """A longer tag's attribute content cannot become document markup."""
     other_tag = f"<metadata data-note={data_note}></metadata>".encode()
     body = other_tag + b'<meta charset="windows-1252"><p>Caf\xe9</p>'
     response = httpx.Response(200, headers={"Content-Type": "text/html"})
@@ -1834,7 +1844,6 @@ def test_decode_response_body_rejected_meta_prefix_stays_inside_other_tag(
 
 
 def test_parse_html_meta_attributes_handles_spacing_and_malformed_edges() -> None:
-    """Cover bounded scanner branches without relying on regex tokenization."""
     parse = bean_sourcing._parse_html_meta_attributes  # pyright: ignore[reportPrivateUsage]
     assert parse(b'<meta disabled CHARSET \n= \t"windows-1252">') == {
         b"disabled": b"",
@@ -1846,8 +1855,8 @@ def test_parse_html_meta_attributes_handles_spacing_and_malformed_edges() -> Non
 
 
 def test_find_html_meta_tags_handles_false_and_unterminated_candidates() -> None:
-    """Exercise bounded scanner rejection and fail-closed branches."""
     find_tags = bean_sourcing._find_html_meta_tags  # pyright: ignore[reportPrivateUsage]
+    assert find_tags(b'<1<meta charset="cp1252">') == [b'<meta charset="cp1252">']
     assert find_tags(b'<metadata charset="utf-8"><meta charset="cp1252">') == [
         b'<meta charset="cp1252">'
     ]
@@ -1857,7 +1866,6 @@ def test_find_html_meta_tags_handles_false_and_unterminated_candidates() -> None
 
 
 def test_sniff_html_encoding_skips_invalid_direct_charset_before_valid_meta() -> None:
-    """A malformed direct value cannot suppress a later usable declaration."""
     result = bean_sourcing._sniff_html_encoding(  # pyright: ignore[reportPrivateUsage]
         b'<meta charset="utf 8"><meta charset="windows-1252">'
     )
@@ -1871,7 +1879,6 @@ def test_sniff_html_encoding_skips_invalid_direct_charset_before_valid_meta() ->
 def test_decode_response_body_normalizes_bomless_wide_meta_charset_to_utf8(
     encoding: str,
 ) -> None:
-    """Codex P2: ASCII-visible wide declarations cannot produce gibberish."""
     body = f'<meta charset="{encoding}"><p>Café Kenya</p>'.encode()
     response = httpx.Response(200, headers={"Content-Type": "text/html"})
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]

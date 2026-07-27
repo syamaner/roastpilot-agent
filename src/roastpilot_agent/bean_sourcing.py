@@ -647,8 +647,7 @@ def _strip_script_and_style_blocks(html: str) -> str:
         while close_tag_start != -1 and not _tag_name_starts_at(
             lower_html, close_tag_start, tag_name, closing=True
         ):
-            # A longer tag name (e.g. "</scripty>") is not this element's
-            # close. Resume after the matched prefix; the cursor remains
+            # A longer tag name is not this element's close. The cursor remains
             # monotonic, preserving the function's linear-time bound.
             close_tag_start = lower_html.find(close_prefix, close_tag_start + len(close_prefix))
         if close_tag_start == -1:
@@ -1640,7 +1639,8 @@ def _decompress_within_cap(
 
 _HTML_ENCODING_SNIFF_BYTES: Final = 1024
 _HTML_CONTENT_CHARSET_RE = re.compile(
-    rb"(?<![a-z0-9_-])charset\s*=\s*[\"']?\s*([a-z0-9._:-]+)",
+    rb"(?<![a-z0-9_-])charset[ \t\n\f\r]*=[ \t\n\f\r]*(?P<quote>[\"'])?[ \t\n\f\r]*"
+    rb"(?P<label>[a-z0-9._:-]+)[ \t\n\f\r]*(?(quote)(?P=quote)|(?=[ \t\n\f\r;]|$))",
     re.IGNORECASE,
 )
 _HTML_CHARSET_LABEL_RE = re.compile(rb"[a-z0-9._:-]+", re.IGNORECASE)
@@ -1688,7 +1688,6 @@ _HTML_SAFE_CODEC_NAMES: Final = frozenset(
         "cp1257",
         "cp1258",
         "euc_jp",
-        "euc_kr",
         "gb18030",
         "gbk",
         "iso2022_jp",
@@ -1734,15 +1733,22 @@ _HTML_BOM_ENCODINGS: Final = (
 
 
 def _resolve_html_encoding(label: str, *, from_meta: bool = False) -> str | None:
-    """Resolve a browser label only when it maps to safe HTML text."""
+    normalized_label = label.strip(" \t\n\f\r")
+    if (
+        not normalized_label.isascii()
+        or _HTML_CHARSET_LABEL_RE.fullmatch(normalized_label.encode()) is None
+    ):
+        return None
     try:
-        python_name: str | None = codecs.lookup(label).name
+        python_name: str | None = codecs.lookup(normalized_label).name
     except LookupError:
         python_name = None
-    html_encoding = lookup_html_encoding(label)
-    canonical_name = _HTML_MISSING_LABEL_OVERRIDES.get(label.strip().lower()) or (
+    html_encoding = lookup_html_encoding(normalized_label)
+    canonical_name = _HTML_MISSING_LABEL_OVERRIDES.get(normalized_label.lower()) or (
         html_encoding.codec_info.name if html_encoding is not None else python_name
     )
+    if canonical_name == "euc_kr":
+        canonical_name = "cp949"
     if canonical_name is None or canonical_name not in _HTML_SAFE_CODEC_NAMES:
         return None
     if from_meta and canonical_name in _HTML_WIDE_CODEC_NAMES:
@@ -1790,15 +1796,26 @@ def _parse_html_meta_attributes(meta_tag: bytes) -> dict[bytes, bytes]:
 
 def _find_html_tag_end(prefix: bytes, cursor: int) -> int | None:
     quote: int | None = None
+    awaiting_value = in_unquoted_value = False
     while cursor < len(prefix):
         char = prefix[cursor]
         if quote is not None:
             if char == quote:
                 quote = None
-        elif char in b"\"'":
-            quote = char
         elif char == ord(">"):
             return cursor
+        elif awaiting_value:
+            if char not in _HTML_ATTRIBUTE_WHITESPACE:
+                awaiting_value = False
+                if char in b"\"'":
+                    quote = char
+                else:
+                    in_unquoted_value = True
+        elif in_unquoted_value:
+            if char in _HTML_ATTRIBUTE_WHITESPACE:
+                in_unquoted_value = False
+        elif char == ord("="):
+            awaiting_value = True
         cursor += 1
     return None
 
@@ -1807,20 +1824,8 @@ def _find_html_meta_tags(prefix: bytes) -> list[bytes]:
     tags: list[bytes] = []
     lower_prefix = prefix.lower()
     cursor = 0
-    in_other_tag = False
-    other_tag_quote: int | None = None
     while cursor < len(prefix):
         char = prefix[cursor]
-        if in_other_tag:
-            if other_tag_quote is not None:
-                if char == other_tag_quote:
-                    other_tag_quote = None
-            elif char in b"\"'":
-                other_tag_quote = char
-            elif char == ord(">"):
-                in_other_tag = False
-            cursor += 1
-            continue
         if prefix.startswith(b"<!-->", cursor):
             cursor += len(b"<!-->")
             continue
@@ -1859,14 +1864,21 @@ def _find_html_meta_tags(prefix: bytes) -> list[bytes]:
         if not lower_prefix.startswith(b"<meta", cursor):
             if char == ord("<") and cursor + 1 < len(prefix):
                 next_char = prefix[cursor + 1]
-                in_other_tag = next_char in _HTML_OTHER_TAG_START_BYTES
+                if next_char in _HTML_OTHER_TAG_START_BYTES:
+                    tag_end = _find_html_tag_end(prefix, cursor + 2)
+                    if tag_end is None:
+                        break
+                    cursor = tag_end + 1
+                    continue
             cursor += 1
             continue
         tag_start = cursor
         name_end = tag_start + len(b"<meta")
         if name_end >= len(prefix) or prefix[name_end] not in b" \t\n\f\r/>":
-            in_other_tag = True
-            cursor = name_end
+            tag_end = _find_html_tag_end(prefix, name_end)
+            if tag_end is None:
+                break
+            cursor = tag_end + 1
             continue
         tag_end = _find_html_tag_end(prefix, name_end)
         if tag_end is None:
@@ -1877,7 +1889,7 @@ def _find_html_meta_tags(prefix: bytes) -> list[bytes]:
 
 
 def _resolve_meta_charset(value: bytes) -> str | None:
-    label = value.strip()
+    label = value.strip(b" \t\n\f\r")
     if _HTML_CHARSET_LABEL_RE.fullmatch(label) is None:
         return None
     return _resolve_html_encoding(label.decode("ascii"), from_meta=True)
@@ -1888,30 +1900,15 @@ def _encoding_from_meta_tag(meta_tag: bytes) -> str | None:
     charset = attributes.get(b"charset")
     if charset is not None:
         return _resolve_meta_charset(charset)
-    http_equiv = attributes.get(b"http-equiv", b"").strip().lower()
+    http_equiv = attributes.get(b"http-equiv", b"").strip(b" \t\n\f\r").lower()
     content = attributes.get(b"content")
     if http_equiv != b"content-type" or content is None:
         return None
     match = _HTML_CONTENT_CHARSET_RE.search(content)
-    return _resolve_meta_charset(match.group(1)) if match is not None else None
+    return _resolve_meta_charset(match.group("label")) if match is not None else None
 
 
 def _sniff_html_encoding(body: bytes) -> str | None:
-    """Return a BOM/meta-declared encoding from a bounded HTML prefix.
-
-    A real HTTP ``charset`` remains authoritative; this helper is used only
-    when that header parameter is absent. BOMs take precedence over HTML
-    metadata. The meta scan is capped at the first 1024 bytes, matching the
-    browser-facing placement expectation while bounding all regex work.
-    Unknown and non-browser codec labels are skipped.
-
-    Args:
-        body: The already-size-capped raw response body.
-
-    Returns:
-        A registered Python codec name, or ``None`` when no usable
-        declaration is present.
-    """
     for bom, encoding in _HTML_BOM_ENCODINGS:
         if body.startswith(bom):
             return encoding
@@ -1942,7 +1939,10 @@ def _decode_response_body(body: bytes, response: httpx.Response) -> str:
     Returns:
         The decoded text.
     """
+    content_type = response.headers.get("content-type", "")
     http_encoding = response.charset_encoding
+    if any(char in "\n\r\f\v" for char in content_type):
+        http_encoding = None
     encoding = _resolve_html_encoding(http_encoding) if http_encoding is not None else None
     if encoding is None:
         encoding = _sniff_html_encoding(body) or "utf-8"
