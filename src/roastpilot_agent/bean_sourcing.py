@@ -1650,6 +1650,11 @@ _HTML_UNQUOTED_VALUE_END: Final = _HTML_ATTRIBUTE_WHITESPACE | frozenset(b">")
 _HTML_OTHER_TAG_START_BYTES: Final = (
     b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" + b"/!?"
 )
+_HTML_RAW_TEXT_START_RE = re.compile(
+    rb"<(script|style|title|textarea|xmp|iframe|noembed|noframes|noscript|plaintext)"
+    rb"(?=[ \t\n\f\r/>])",
+    re.IGNORECASE,
+)
 _HTML_MISSING_LABEL_OVERRIDES: Final = {
     "csunicode": "utf-16-le",
     "iso-10646-ucs-2": "utf-16-le",
@@ -1663,10 +1668,6 @@ _HTML_MISSING_LABEL_OVERRIDES: Final = {
     "unicodefffe": "utf-16-be",
     "x-unicode20utf8": "utf-8",
 }
-# Canonical Python codec names for browser-relevant text encodings. Resolve
-# labels through the WHATWG registry, then require membership here:
-# Python also registers non-HTML transforms such as ``punycode`` whose
-# synchronous decoder can be superlinear on attacker-controlled input.
 _HTML_SAFE_CODEC_NAMES: Final = frozenset(
     {
         "ascii",
@@ -1733,19 +1734,7 @@ _HTML_BOM_ENCODINGS: Final = (
 
 
 def _resolve_html_encoding(label: str, *, from_meta: bool = False) -> str | None:
-    """Resolve an encoding label only when it is safe for HTML text.
-
-    Args:
-        label: An HTTP or HTML-declared encoding label.
-        from_meta: Whether the label came from in-document metadata. Wide
-            Unicode encodings require a BOM or explicit HTTP declaration;
-            an ASCII-visible meta declaration naming one is normalized to
-            UTF-8 instead of decoding the page into gibberish.
-
-    Returns:
-        The canonical Python codec name, or ``None`` for unknown and
-        non-browser transform codecs.
-    """
+    """Resolve a browser label only when it maps to safe HTML text."""
     try:
         python_name: str | None = codecs.lookup(label).name
     except LookupError:
@@ -1762,7 +1751,6 @@ def _resolve_html_encoding(label: str, *, from_meta: bool = False) -> str | None
 
 
 def _parse_html_meta_attributes(meta_tag: bytes) -> dict[bytes, bytes]:
-    """Parse attributes from one bounded raw ``<meta>`` tag."""
     attributes: dict[bytes, bytes] = {}
     pos = len(b"<meta")
     while pos < len(meta_tag):
@@ -1800,8 +1788,22 @@ def _parse_html_meta_attributes(meta_tag: bytes) -> dict[bytes, bytes]:
     return attributes
 
 
+def _find_html_tag_end(prefix: bytes, cursor: int) -> int | None:
+    quote: int | None = None
+    while cursor < len(prefix):
+        char = prefix[cursor]
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char in b"\"'":
+            quote = char
+        elif char == ord(">"):
+            return cursor
+        cursor += 1
+    return None
+
+
 def _find_html_meta_tags(prefix: bytes) -> list[bytes]:
-    """Find complete meta tags while respecting quoted ``>`` characters."""
     tags: list[bytes] = []
     lower_prefix = prefix.lower()
     cursor = 0
@@ -1832,6 +1834,28 @@ def _find_html_meta_tags(prefix: bytes) -> list[bytes]:
                 break
             cursor = comment_end + (len(b"--!>") if prefix.startswith(b"--!>", comment_end) else 3)
             continue
+        raw_start = _HTML_RAW_TEXT_START_RE.match(prefix, cursor)
+        if raw_start is not None:
+            open_end = _find_html_tag_end(prefix, raw_start.end())
+            if open_end is None:
+                break
+            raw_tag = raw_start.group(1).lower()
+            if raw_tag == b"plaintext":
+                break
+            close_prefix = b"</" + raw_tag
+            close_start = lower_prefix.find(close_prefix, open_end + 1)
+            while close_start != -1:
+                name_end = close_start + len(close_prefix)
+                if name_end < len(prefix) and prefix[name_end] in b" \t\n\f\r/>":
+                    break
+                close_start = lower_prefix.find(close_prefix, name_end)
+            if close_start == -1:
+                break
+            close_end = _find_html_tag_end(prefix, close_start + len(close_prefix))
+            if close_end is None:
+                break
+            cursor = close_end + 1
+            continue
         if not lower_prefix.startswith(b"<meta", cursor):
             if char == ord("<") and cursor + 1 < len(prefix):
                 next_char = prefix[cursor + 1]
@@ -1844,27 +1868,15 @@ def _find_html_meta_tags(prefix: bytes) -> list[bytes]:
             in_other_tag = True
             cursor = name_end
             continue
-        quote: int | None = None
-        tag_end = name_end
-        while tag_end < len(prefix):
-            char = prefix[tag_end]
-            if quote is not None:
-                if char == quote:
-                    quote = None
-            elif char in b"\"'":
-                quote = char
-            elif char == ord(">"):
-                tags.append(prefix[tag_start : tag_end + 1])
-                cursor = tag_end + 1
-                break
-            tag_end += 1
-        else:
+        tag_end = _find_html_tag_end(prefix, name_end)
+        if tag_end is None:
             break
+        tags.append(prefix[tag_start : tag_end + 1])
+        cursor = tag_end + 1
     return tags
 
 
 def _resolve_meta_charset(value: bytes) -> str | None:
-    """Resolve one bounded, ASCII-compatible meta charset value."""
     label = value.strip()
     if _HTML_CHARSET_LABEL_RE.fullmatch(label) is None:
         return None
@@ -1872,7 +1884,6 @@ def _resolve_meta_charset(value: bytes) -> str | None:
 
 
 def _encoding_from_meta_tag(meta_tag: bytes) -> str | None:
-    """Return an encoding only from a real HTML meta declaration."""
     attributes = _parse_html_meta_attributes(meta_tag)
     charset = attributes.get(b"charset")
     if charset is not None:
@@ -1921,11 +1932,6 @@ def _decode_response_body(body: bytes, response: httpx.Response) -> str:
     declaration before the existing UTF-8 default is used. This matters for
     legacy vendor pages whose non-UTF-8 bytes would otherwise be irreversibly
     replaced before extraction.
-
-    Both HTTP and meta labels pass through a finite browser-text allowlist
-    before decoding. Unknown labels and Python transform codecs fall back to
-    UTF-8, preventing a bad declaration from becoming a 500 or a synchronous
-    CPU-exhaustion primitive on the shared roast event loop.
 
     Args:
         body: The raw fetched bytes (already capped to the configured size

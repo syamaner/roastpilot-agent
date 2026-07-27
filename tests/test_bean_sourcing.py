@@ -1725,6 +1725,86 @@ def test_sniff_html_encoding_keeps_single_dash_bang_inside_comment() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "tag",
+    ["script", "style", "title", "textarea", "xmp", "iframe", "noembed", "noframes", "noscript"],
+)
+def test_decode_response_body_ignores_meta_like_text_in_raw_text(tag: str) -> None:
+    """Codex P2: raw-text and RCDATA content cannot declare page encoding."""
+    body = (
+        f'<{tag} data-note=">"><meta charset="utf-8"></{tag}>'
+        '<meta charset="windows-1252"><p>Café</p>'
+    ).encode("windows-1252")
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+def test_decode_response_body_raw_text_close_requires_exact_tag_boundary() -> None:
+    """Longer close-tag names do not expose meta-like raw-text content."""
+    body = (
+        b'<script><meta charset="utf-8"></script-x>'
+        b'</script><meta charset="windows-1252"><p>Caf\xe9</p>'
+    )
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+def test_decode_response_body_raw_text_ignores_quoted_close_in_opening_tag() -> None:
+    """A close-like attribute value cannot expose raw-text metadata."""
+    body = (
+        b'<script data-note="</script>"><meta charset="utf-8"></script>'
+        b'<meta charset="windows-1252"><p>Caf\xe9</p>'
+    )
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+def test_sniff_html_encoding_unclosed_raw_text_fails_closed() -> None:
+    """An unclosed raw-text element hides all following meta-like bytes."""
+    body = b'<script><meta charset="utf-8"><meta charset="windows-1252">'
+    assert (
+        bean_sourcing._sniff_html_encoding(body)  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
+
+
+@pytest.mark.parametrize("body", [b"<script ", b"<script>x</script "])
+def test_sniff_html_encoding_unterminated_raw_tag_fails_closed(body: bytes) -> None:
+    """Unterminated raw opening and closing tags cannot expose metadata."""
+    assert (
+        bean_sourcing._sniff_html_encoding(body)  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
+
+
+def test_sniff_html_encoding_plaintext_fails_closed() -> None:
+    """A plaintext element makes all later meta-like bytes inert."""
+    body = b'<plaintext><meta charset="windows-1252"><p>Caf\xe9</p>'
+    assert (
+        bean_sourcing._sniff_html_encoding(body)  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
+
+
+def test_decode_response_body_vertical_tab_is_not_html_tag_whitespace() -> None:
+    """A vertical tab cannot turn an unknown element into raw text."""
+    body = b'<script\x0b><meta charset="windows-1252"><p>Caf\xe9</p>'
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
 def test_decode_response_body_comment_marker_inside_attribute_is_not_a_comment() -> None:
     """Comment-like text inside another tag cannot suppress a later meta."""
     unrelated_tag = b'<div data-note="<!--"></div>'
