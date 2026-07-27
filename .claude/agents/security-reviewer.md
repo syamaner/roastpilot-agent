@@ -22,7 +22,11 @@ Any diff that, on the server:
 - fetches a URL / opens a connection to an input-influenced target;
 - parses or decodes untrusted bytes/strings (URL, HTML, charset, number/port, deserialization);
 - adds an external-input endpoint (a route taking client-supplied data);
-- adds a **new** LLM/model-provider call path (contention with the roast advisor).
+- adds a **new** LLM/model-provider call path — **any** provider or model service, not
+  only the backend the roast advisor uses. A path to a separate model service still
+  carries the provider risks below (secret hygiene, fail-soft, resource exhaustion,
+  prompt injection). Contention with the advisor is an *additional* concern on top
+  (class 6), not the thing that puts the diff in scope.
 
 If the diff matches none of these, say so and stop — don't invent scope.
 
