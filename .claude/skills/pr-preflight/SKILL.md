@@ -123,7 +123,10 @@ bots because this pass was skipped).
 - touches `safety.py` / `controller.py` / `models.py` enums / the recovery or
   command×phase path → **safety-reviewer** (Agent);
 - **fetches or parses untrusted external input, adds an external-input endpoint, or
-  adds a new LLM-provider call path** → **security-reviewer** (Agent), working
+  adds a new LLM/model-provider call path — ANY provider or model service, not only the
+  backend the roast advisor uses, and in ANY process (a provider-calling CLI, offline job,
+  script or test harness counts; the "on the server" framing does not apply to that
+  bullet)** → **security-reviewer** (Agent), working
   `docs/review/untrusted-input-checklist.md`. This routing is **capability-based, not
   file-based**: it fires even when the diff touches none of the safety files — a brand-new
   fetch/parse surface is the highest-risk case *and* the easiest to miss (the #587 lesson:

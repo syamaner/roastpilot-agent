@@ -1,7 +1,7 @@
 export const meta = {
   name: 'review-branch',
   description:
-    'Cross-checked roster review of the current branch diff: fan out the role agents as lenses (correctness, qa, product-pm, + safety/ui when relevant), adversarially verify each finding, then a single pr-triage verdict.',
+    'Cross-checked roster review of the current branch diff: fan out the role agents as lenses (correctness, qa, product-pm, + safety/security/ui when relevant), adversarially verify each finding, then a single pr-triage verdict.',
   whenToUse:
     'Run on a PR/branch before merge for a multi-lens, cross-checked review you can rerun. Pass {base:"<ref>"} to diff against a non-default base.',
   phases: [
@@ -22,20 +22,68 @@ phase('Scope')
 const SCOPE_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['touchesWeb', 'touchesPython', 'touchesSafetyControllerEnums', 'changedFiles', 'summary'],
+  required: [
+    'touchesWeb',
+    'touchesPython',
+    'touchesSafetyControllerEnums',
+    'touchesExternalInput',
+    'addsProviderCallPath',
+    'changedFiles',
+    'summary',
+  ],
   properties: {
     touchesWeb: { type: 'boolean' },
     touchesPython: { type: 'boolean' },
     touchesSafetyControllerEnums: { type: 'boolean' },
+    // Capability-based, NOT file-based (AGENTS.md): the #587 lesson is that the
+    // highest-risk diff touched no safety file, so a path allow-list would never
+    // have fired.
+    //
+    // FOUR COPIES — CHANGE THEM TOGETHER. This trigger test is stated in four
+    // places and they must agree or the routing silently no-ops: the scope prompt
+    // below, the Scope section of .claude/agents/security-reviewer.md, the
+    // "When this applies" test in docs/review/untrusted-input-checklist.md, and the
+    // reviewer-routing list in .claude/skills/pr-preflight/SKILL.md. The
+    // agent definition is the one that bites — it ends with "if the diff matches
+    // none of these, say so and stop", so a reviewer routed here by a widened
+    // workflow will still stop if its own copy stayed narrow. Widening one copy
+    // and not the others is the most repeated mistake in this file's history.
+    touchesExternalInput: { type: 'boolean' },
+    // Checklist class 6: a NEW provider-calling path can contend with the roast
+    // advisor, so AGENTS.md routes it to safety-reviewer as well as security-reviewer.
+    // Tracked separately so a plain parse/fetch change doesn't spin up the Opus
+    // safety lens it doesn't need.
+    addsProviderCallPath: { type: 'boolean' },
     changedFiles: { type: 'array', items: { type: 'string' } },
     summary: { type: 'string' },
   },
 }
 const scope = await agent(
-  `Scope a code review of the current branch. Run \`git fetch origin -q\` first so the base ref is current, then \`git diff --name-only ${base}...HEAD\` and \`git diff --stat ${base}...HEAD\` in this repo. Report which areas changed: web/ (the SPA), Python (src/roastpilot_agent or tests/), and specifically safety.py / controller.py / a models.py enum (the safety-critical surface). List the changed files and a one-line summary. Do NOT review the content yet.`,
+  `Scope a code review of the current branch. Run \`git fetch origin -q\` first so the base ref is current, then \`git diff --name-only ${base}...HEAD\` and \`git diff --stat ${base}...HEAD\` in this repo. Report which areas changed: web/ (the SPA), Python (src/roastpilot_agent or tests/), and specifically safety.py / controller.py / a models.py enum (the safety-critical surface). List the changed files and a one-line summary.
+
+Also decide \`touchesExternalInput\`. Judge this by CAPABILITY, not by file path — read the changed hunks, because the highest-risk case (#587) touched no safety-critical file and a path allow-list would have missed it. Set it true if the diff, ON THE SERVER, does any of:
+- fetches a URL / opens a connection whose target is influenced by operator or external input (a pasted URL, a redirect \`Location\`, a webhook, a config value);
+- parses or decodes untrusted bytes/strings (URL parsing, HTML/JSON/charset decode, number/port parsing, deserialization);
+- adds an external-input endpoint (a route taking client-supplied data);
+- adds a **new** LLM/model-provider call path — ANY provider or model service, not only the one the roast advisor uses, and wherever it runs: the "ON THE SERVER" qualifier above does NOT apply to this bullet, so a new provider-calling CLI, offline job, script or test harness counts too. The provider risks the checklist covers (secret hygiene, fail-soft, resource exhaustion, prompt injection) apply regardless of which service is called or which process calls it.
+Otherwise set it false — do not stretch the test to fit an unrelated diff.
+
+Finally, set \`addsProviderCallPath\` for the narrower CONTENTION case, which routes the safety lens. The test is capability to contend with the roast advisor, NOT whether the remote backend is byte-identical: a path to a *separate* model service still contends if it can consume the same host CPU, event loop, memory, network, or provider rate limit during an active roast (checklist class 6 explicitly covers bounding provider AND CPU contention). Set it true whenever the diff adds such a path, EVEN IF it already appears to carry an active-roast admission guard, a lock, or a queue — whether that mitigation is correct is precisely what the safety lens exists to verify, so a present-looking guard is a reason to route the review, never a reason to skip it. "New path" means new REACHABILITY, not a new call site: a diff adding an endpoint, route, job, or service method that reaches a provider through an EXISTING helper still counts. Set it FALSE when the diff only modifies an EXISTING provider path without creating a new way to reach one (tweaking the roast advisor's own integration is not a new path), and when it reaches no provider at all.
+
+Do NOT review the content yet.`,
   { label: 'scope', phase: 'Scope', schema: SCOPE_SCHEMA },
 )
 if (scope) log(scope.summary)
+
+// Fail CLOSED on an unusable scope result. agent() returns null on a schema-validation
+// failure, a terminal API error, or a user skip — and every conditional lens below is
+// gated on `scope`, so a null would silently drop safety, security AND ui, letting the
+// always-on lenses come back empty and the run report CLEAR TO MERGE with no security
+// review having happened. An unknown diff is treated as touching everything.
+const scopeUnknown = !scope
+if (scopeUnknown) {
+  log('scope agent returned no usable result — running ALL conditional lenses (failing closed)')
+}
 
 // --- Phase 2: Review — fan out the roster as lenses ---------------------------
 phase('Review')
@@ -62,18 +110,32 @@ const FINDINGS_SCHEMA = {
     },
   },
 }
-const reviewBase = `Review ONLY the changes in ${diffScope} of this repo (read the changed files for context; ignore pre-existing issues outside the diff). Return findings as structured data — an empty list if the diff is clean from your lens.`
+const reviewBase = `Review ONLY the changes in ${diffScope} of this repo (read the changed files for context; ignore pre-existing issues outside the diff). Return findings as structured data — an empty list if the diff is clean from your lens.\n\nSCOPE OVERRIDE: use ${diffScope} as the diff for this run. If your own agent definition tells you to scope with a different command (several hard-code a diff against origin/main), ignore that instruction here — this run may target a non-default base.\n\nSEVERITY MAPPING: the schema accepts EXACTLY 'must-fix', 'fix-now' or 'nit'. Your own agent definition probably uses a different vocabulary. Do NOT emit yours. Map EVERY finding onto one of the three by rank, whatever words you would normally use: your most severe / blocking tier -> 'must-fix'; your middle tier -> 'fix-now'; your lowest, informational or cosmetic tier -> 'nit'. (Worked examples: security-reviewer's blocker/medium/low and safety-reviewer's blocker/concern/note both map in that order.) If a severity has no obvious rank, choose the closest and say so in the detail. Never emit a value outside the three — the response fails schema validation, and this workflow treats that as your lens having failed to run at all, which blocks the whole review.`
 
-// Always-on lenses; safety + ui are added only when the diff touches them.
+// Always-on lenses; safety, security + ui are added when the diff touches them —
+// or unconditionally when the scope result is unusable (fail closed, see above).
 const lenses = [
   { key: 'correctness', prompt: `${reviewBase}\n\nLens: CORRECTNESS — logic bugs, edge cases, error handling, races, off-by-one, missing await, broken invariants.` },
   { key: 'qa', agentType: 'qa', prompt: `${reviewBase}\n\nLens: TEST QUALITY — do tests assert real behavior (not smoke)? Coverage delta, acceptance criteria with no test, Playwright/screenshot paths, over-mocking. Findings = weak/missing tests.` },
   { key: 'product', agentType: 'product-pm', prompt: `${reviewBase}\n\nLens: PRODUCT/PLAN — does it match the plan/epic/decisions? Dropped requirements, undefined "done", drift between registry/epic tables and code, violated architecture invariants. Review only — do NOT edit anything.` },
 ]
-if (scope && scope.touchesSafetyControllerEnums) {
-  lenses.push({ key: 'safety', agentType: 'safety-reviewer', prompt: `${reviewBase}\n\nLens: SAFETY (adversarial) — any roaster write bypassing safety, transition-table errors, string-compared verdicts, restart auto-resume, non-Celsius, fail-open paths.` })
+// Safety fires on the file-based surface, and ALSO on a new provider-calling path:
+// checklist class 6 (contention with the roast advisor) is safety-adjacent, and
+// AGENTS.md routes it to both reviewers.
+if (scopeUnknown || scope.touchesSafetyControllerEnums || scope.addsProviderCallPath) {
+  lenses.push({ key: 'safety', agentType: 'safety-reviewer', prompt: `${reviewBase}\n\nLens: SAFETY (adversarial) — any roaster write bypassing safety, transition-table errors, string-compared verdicts, restart auto-resume, non-Celsius, fail-open paths.${scopeUnknown ? ' Scope could not be determined for this run, so check IF this diff adds a provider-calling path; if it does, also work checklist class 6 — it must not begin during an active roast or delay an operator roast start, and admission must be race-free under the roast-start lock.' : scope.addsProviderCallPath ? ' This diff adds a NEW provider-calling path: also check checklist class 6 — it must not begin during an active roast or delay an operator roast start, and admission must be race-free under the roast-start lock.' : ''}` })
 }
-if (scope && scope.touchesWeb) {
+// Capability-based routing (AGENTS.md): a new fetch/parse surface is the highest-risk
+// case and the easiest to miss, because it can touch no safety file at all — #587 is
+// the specimen. Keeps the roster pass and the pre-open pr-preflight pass in agreement.
+// OR'd with addsProviderCallPath even though the prompt describes it as a strict subset:
+// the two are independent model-filled booleans with no enforced dependency, so an
+// inconsistent {touchesExternalInput:false, addsProviderCallPath:true} would otherwise
+// skip security-reviewer on exactly the class-6 path this routing exists to cover.
+if (scopeUnknown || scope.touchesExternalInput || scope.addsProviderCallPath) {
+  lenses.push({ key: 'security', agentType: 'security-reviewer', prompt: `${reviewBase}\n\nLens: WEB/APPLICATION SECURITY — work docs/review/untrusted-input-checklist.md in full against this diff: SSRF / fetch-destination control, secret + PII hygiene, resource exhaustion (timeouts, byte caps, bounded decompression, ReDoS, concurrency/rate bounds), fail-soft typed errors (never an unhandled 500) mapped by origin, normalization consistency, cross-feature contention, LLM prompt-injection + tool boundary, and invariant separation. Prefer a CLASS-SWEEP: on finding one instance of a class, grep for every instance and report them together. Cite file:line. A clean pass is a valid result — do not invent findings.` })
+}
+if (scopeUnknown || scope.touchesWeb) {
   lenses.push({ key: 'ui', agentType: 'ui-reviewer', prompt: `${reviewBase}\n\nLens: UI/UX (code-level — no live browser this run) — review changed web/ components against component plan §7, ui-prompts.md, and the frozen baselines in the plan repo sketches/: five-series curve, verdict badges (ALLOW/CLAMP/REJECT), phase-from-server-events-only, Celsius, rebuild-not-port. Check the required Playwright/screenshot states exist as tests. Note that the full visual screenshot pass needs the live replay harness (a separate step).` })
 }
 
@@ -82,7 +144,28 @@ const reviews = await parallel(
     const opts = { label: `review:${l.key}`, phase: 'Review', schema: FINDINGS_SCHEMA }
     if (l.agentType) opts.agentType = l.agentType
     const r = await agent(l.prompt, opts)
-    return { lens: l.key, findings: (r && r.findings) || [] }
+    // Fail CLOSED, same reasoning as the scope gate: a lens that returned nothing did
+    // NOT pass — it failed to run. Flattening that to an empty findings list makes a
+    // dead security-reviewer indistinguishable from a clean one, which is the single
+    // most dangerous way for this workflow to be wrong. Emit a synthetic must-fix so
+    // the run blocks and says why.
+    if (!r) {
+      return {
+        lens: l.key,
+        findings: [
+          {
+            title: `The ${l.key} lens returned no result — it did not review this diff`,
+            severity: 'must-fix',
+            file: '.claude/workflows/review-branch.mjs',
+            line: null,
+            detail: `The ${l.key} review agent returned nothing (schema-validation failure, terminal API error, or skip). This is NOT a clean pass from that lens — the diff went unreviewed by it. Re-run before trusting any verdict.`,
+            suggestion: `Re-run review-branch, or run the ${l.key} reviewer standalone against the branch.`,
+            lensFailure: true,
+          },
+        ],
+      }
+    }
+    return { lens: l.key, findings: r.findings || [] }
   }),
 )
 const allFindings = reviews
@@ -92,12 +175,15 @@ log(`${allFindings.length} raw findings across ${lenses.length} lenses`)
 
 if (allFindings.length === 0) {
   return {
-    verdict: 'CLEAR TO MERGE',
+    verdict: scopeUnknown ? 'CLEAR TO MERGE (degraded — scope unknown)' : 'CLEAR TO MERGE',
     scope: scope ? scope.summary : null,
+    scopeUnknown,
     lenses: lenses.map((l) => l.key),
     rawFindings: 0,
     survivors: 0,
-    note: 'no findings from any lens',
+    note: scopeUnknown
+      ? 'no findings from any lens, but the scope agent failed — every conditional lens was run blind; re-run before trusting this verdict'
+      : 'no findings from any lens',
   }
 }
 
@@ -109,16 +195,28 @@ const VERDICT_SCHEMA = {
   required: ['survives', 'reason'],
   properties: { survives: { type: 'boolean' }, reason: { type: 'string' } },
 }
+// A lens-failure finding is a FACT about this run, not a claim about the diff, so it
+// never goes to a refuter — an adversarial verifier reading the cited file would find
+// nothing wrong with it and vote survives=false, silently restoring the fail-open the
+// synthetic finding exists to prevent. It bypasses Verify and lands straight in Triage.
+const lensFailures = allFindings.filter((f) => f.lensFailure)
+const claimFindings = allFindings.filter((f) => !f.lensFailure)
+if (lensFailures.length) {
+  log(`${lensFailures.length} lens(es) failed to return a result — bypassing Verify, blocking`)
+}
 const verified = await parallel(
-  allFindings.map((f) => () =>
+  claimFindings.map((f) => () =>
     agent(
       `A reviewer raised this finding on ${diffScope}:\n\nTitle: ${f.title}\nSeverity: ${f.severity}\nFile: ${f.file}${f.line ? ':' + f.line : ''}\nDetail: ${f.detail}\n\nRun ${diffScope} and read the cited file for context first, then adversarially VERIFY it against the actual diff + code. Try to REFUTE it. Does it survive — a real, in-scope issue this change introduced? Default to survives=false if uncertain, already-handled, pre-existing, or out of scope.`,
       { label: `verify:${f.lens}`, phase: 'Verify', schema: VERDICT_SCHEMA },
     ).then((v) => ({ ...f, survives: v ? v.survives : false, verifyReason: v ? v.reason : 'verifier failed' })),
   ),
 )
-const survivors = verified.filter(Boolean).filter((f) => f.survives)
-log(`${survivors.length}/${allFindings.length} findings survived adversarial verification`)
+const survivors = [...lensFailures, ...verified.filter(Boolean).filter((f) => f.survives)]
+log(
+  `${survivors.length - lensFailures.length}/${claimFindings.length} findings survived adversarial verification` +
+    (lensFailures.length ? ` (+${lensFailures.length} lens failure(s), unrefutable)` : ''),
+)
 
 // --- Phase 4: Triage — one consolidated verdict -------------------------------
 phase('Triage')
@@ -144,13 +242,24 @@ const payload = survivors.map((f) => ({
   suggestion: f.suggestion,
 }))
 const triage = await agent(
-  `You are the pr-triage adjudicator. Consolidate these adversarially-verified findings on the current branch into a single triage report. Classify each: must-fix (correctness/safety/unmet acceptance/coverage regression — blocks merge), fix-now (cheap, clearly correct), defer (file a follow-up issue), rejected (with reason) — map any 'nit'-severity finding to defer or rejected. Then a single verdict: BLOCK if any must-fix, else CLEAR TO MERGE. Be the skeptical second opinion — do not rubber-stamp.\n\nFindings:\n${JSON.stringify(payload, null, 2)}`,
+  `You are the pr-triage adjudicator. Consolidate these adversarially-verified findings on the current branch into a single triage report. Classify each: must-fix (correctness/safety/unmet acceptance/coverage regression — blocks merge), fix-now (cheap, clearly correct), defer (file a follow-up issue), rejected (with reason) — map any 'nit'-severity finding to defer or rejected. Then a single verdict: BLOCK if any must-fix OR any fix-now remains outstanding, else CLEAR TO MERGE. 'fix-now' means the fix has not been made yet, so it is not clear to merge — a security or safety finding of middling severity must not read as CLEAR TO MERGE just because it was cheap to fix. EXCEPTION, and read it precisely: a 'ui' finding is advisory ONLY when it is a direction-match or visual-judgement deviation — D24 keeps THAT off the merge gate, because the scripted Playwright snapshot suite is the gate. Classify those defer and never let one alone drive BLOCK. This does NOT extend to architecture invariants: a ui finding that the SPA infers roast phase locally, calls MCP directly, renders Fahrenheit, or otherwise breaks an AGENTS.md invariant is must-fix and DOES block, exactly like the same violation from any other lens. The ui lens is often the only one positioned to see those, so advisory-by-default must not swallow them. Be the skeptical second opinion — do not rubber-stamp.\n\nNOTE: any finding titled 'The <lens> lens returned no result' means that reviewer FAILED TO RUN. It is not a claim you can refute or defer — that lens simply did not review the diff. Classify it must-fix, with ONE exception: a failure of the 'ui' lens is advisory like its findings (D24), so classify that one defer and never let it drive BLOCK. (For every other lens the workflow also forces BLOCK in code, so a contrary verdict here would just be inconsistent.)\n\nFindings:\n${JSON.stringify(payload, null, 2)}`,
   { label: 'triage', phase: 'Triage', schema: TRIAGE_SCHEMA, agentType: 'pr-triage' },
 )
 
+// A lens failure BLOCKS deterministically, in code — never at the triage agent's
+// discretion. pr-triage is an unconstrained LLM that could classify the synthetic
+// finding as "defer" or "rejected" and hand back CLEAR TO MERGE, which would undo the
+// whole fail-closed chain at the last step. "A lens did not run" is not a judgement call.
+// The ui lens is advisory by design (D24 keeps direction-match review off the merge
+// gate), so its FAILURE cannot block either — blocking on it would contradict the
+// triage rule that its findings never drive BLOCK. It is still reported.
+const blockingLensFailures = lensFailures.filter((f) => f.lens !== 'ui')
+const forcedBlock = blockingLensFailures.length > 0
 return {
-  verdict: triage ? triage.verdict : 'BLOCK',
+  verdict: forcedBlock ? 'BLOCK' : triage ? triage.verdict : 'BLOCK',
+  blockedBy: forcedBlock ? blockingLensFailures.map((f) => `${f.lens} lens failed to run`) : undefined,
   scope: scope ? scope.summary : null,
+  scopeUnknown,
   lenses: lenses.map((l) => l.key),
   rawFindings: allFindings.length,
   survivors: survivors.length,
