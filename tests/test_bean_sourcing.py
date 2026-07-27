@@ -268,6 +268,31 @@ def test_strip_script_and_style_blocks_handles_unterminated_script_tag() -> None
     assert "var x" not in result
 
 
+@pytest.mark.parametrize("tag_name", ["script", "style"])
+@pytest.mark.parametrize("suffix", ["y", "-x", ":x", ".x"])
+def test_strip_script_and_style_blocks_requires_closing_tag_name_boundary(
+    tag_name: str, suffix: str
+) -> None:
+    """#597: a longer closing tag name must not terminate the block."""
+    strip = bean_sourcing._strip_script_and_style_blocks  # pyright: ignore[reportPrivateUsage]
+    html = (
+        f"<p>Before</p><{tag_name}>secret before "
+        f"</{tag_name}{suffix}><p>still secret</p></{tag_name}><p>After</p>"
+    )
+    result = strip(html)
+    assert "Before" in result
+    assert "After" in result
+    assert "secret" not in result
+
+
+def test_strip_script_and_style_blocks_false_closer_does_not_preserve_tail() -> None:
+    """#597: without a genuine closer, a false prefix cannot expose content."""
+    strip = bean_sourcing._strip_script_and_style_blocks  # pyright: ignore[reportPrivateUsage]
+    result = strip("<p>Before</p><script>secret</scripty><p>still secret</p>")
+    assert "Before" in result
+    assert "secret" not in result
+
+
 def test_extract_page_text_handles_unterminated_script_tag() -> None:
     text = bean_sourcing._extract_page_text(  # pyright: ignore[reportPrivateUsage]
         "<p>Kenya Kiambu AA</p><script>var x = 1;"
@@ -306,9 +331,11 @@ def test_tag_name_starts_at_handles_tag_name_at_string_end() -> None:
     starts_at = bean_sourcing._tag_name_starts_at  # pyright: ignore[reportPrivateUsage]
     assert starts_at("<script", 0, "script") is True
     assert starts_at("<style", 0, "style") is True
-    # "<scripty" is NOT a "script" tag — the char right after "script" is a
-    # word character, so this is a longer, different tag name.
+    # These are longer, different tag names, not "script".
     assert starts_at("<scripty", 0, "script") is False
+    assert starts_at("<script-x", 0, "script") is False
+    assert starts_at("<script:x", 0, "script") is False
+    assert starts_at("<script.x", 0, "script") is False
 
 
 def test_strip_script_and_style_blocks_handles_missing_open_tag_close_bracket() -> None:
@@ -1409,6 +1436,138 @@ def test_decode_response_body_falls_back_to_utf8_on_unknown_charset() -> None:
         b"hello", response
     )
     assert result == "hello"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, headers={"Content-Type": "text/html; charset=punycode"}),
+        httpx.Response(200, headers={"Content-Type": "text/html"}),
+    ],
+    ids=["http-header", "html-meta"],
+)
+def test_decode_response_body_rejects_non_html_transform_codec(
+    response: httpx.Response,
+) -> None:
+    """#597 security review: arbitrary Python codecs must not decode HTML."""
+    body = (
+        b"<p>-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</p>"
+        if response.charset_encoding is not None
+        else b'<meta charset="punycode"><p>-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</p>'
+    )
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert result == body.decode()
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("\ufeff<p>Café</p>".encode("utf-8"), "<p>Café</p>"),
+        ("<p>Café</p>".encode("utf-16"), "<p>Café</p>"),
+        ("<p>Café</p>".encode("utf-32"), "<p>Café</p>"),
+    ],
+    ids=["utf-8-bom", "utf-16-bom", "utf-32-bom"],
+)
+def test_decode_response_body_sniffs_bom_without_http_charset(body: bytes, expected: str) -> None:
+    """#597: a BOM supplies the encoding when HTTP omits charset."""
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert result == expected
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        '<meta charset="windows-1252">',
+        '<meta http-equiv="Content-Type" content="text/html; charset=windows-1252">',
+    ],
+    ids=["charset-attribute", "http-equiv-content"],
+)
+def test_decode_response_body_sniffs_html_meta_without_http_charset(meta: str) -> None:
+    """#597: legacy HTML declarations prevent replacement corruption."""
+    body = f"{meta}<p>Café — Kenya</p>".encode("windows-1252")
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café — Kenya" in result
+
+
+def test_decode_response_body_http_charset_overrides_conflicting_html_meta() -> None:
+    """An explicit HTTP charset remains authoritative over page metadata."""
+    body = '<meta charset="windows-1252"><p>Café</p>'.encode()
+    response = httpx.Response(200, headers={"Content-Type": "text/html; charset=utf-8"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+def test_decode_response_body_bom_overrides_conflicting_html_meta() -> None:
+    """Without HTTP charset, a BOM wins over a conflicting meta declaration."""
+    body = '\ufeff<meta charset="windows-1252"><p>Café</p>'.encode()
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+    assert not result.startswith("\ufeff")
+
+
+def test_decode_response_body_ignores_meta_after_bounded_sniff_prefix() -> None:
+    """The untrusted metadata scan never grows with the full response body."""
+    body = (
+        b"a" * bean_sourcing._HTML_ENCODING_SNIFF_BYTES  # pyright: ignore[reportPrivateUsage]
+        + b'<meta charset="windows-1252"><p>Caf\xe9</p>'
+    )
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Caf�" in result
+
+
+def test_sniff_html_encoding_skips_meta_without_charset() -> None:
+    """Unrelated meta elements are ignored."""
+    result = bean_sourcing._sniff_html_encoding(  # pyright: ignore[reportPrivateUsage]
+        b'<meta name="description" content="coffee">'
+    )
+    assert result is None
+
+
+def test_sniff_html_encoding_skips_unknown_codec_before_valid_meta() -> None:
+    """An attacker-controlled unknown label cannot suppress a later valid one."""
+    result = bean_sourcing._sniff_html_encoding(  # pyright: ignore[reportPrivateUsage]
+        b'<meta charset="not-a-codec"><meta charset="windows-1252">'
+    )
+    assert result == "cp1252"
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_decodes_html_meta_without_http_charset() -> None:
+    """#597: the full fetch pipeline honors page-declared legacy charset."""
+    html = '<meta charset="windows-1252"><p>Café — Kenya</p>'.encode("windows-1252")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=_bytes_stream(html),
+            headers={"Content-Type": "text/html"},
+        )
+
+    async with _mock_client(httpx.MockTransport(handler)) as client:
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/cafe",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+        ).prompt_text
+    assert "Café — Kenya" in text
 
 
 @pytest.mark.asyncio
@@ -3082,6 +3241,42 @@ async def test_extract_bean_identity_maps_build_model_dependency_error(
     with pytest.raises(BeanExtractionUnavailableError, match="could not build its model"):
         await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
             "page text", advisor_config=_ADVISOR_CONFIG
+        )
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_maps_unexpected_provider_construction_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#597: SDK construction failures fail soft without leaking secrets."""
+
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
+        raise ValueError("invalid provider config api_key=TOP-SECRET")
+
+    monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
+    with pytest.raises(
+        BeanExtractionUnavailableError, match="could not construct its provider"
+    ) as error:
+        await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+            "page text", advisor_config=_ADVISOR_CONFIG
+        )
+    assert "TOP-SECRET" not in str(error.value)
+    assert isinstance(error.value.__cause__, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_does_not_mask_unexpected_provider_run_error() -> None:
+    """The broad #597 boundary applies to construction, not provider execution."""
+    with pytest.raises(RuntimeError, match="unexpected provider runtime defect"):
+        await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+            "page text",
+            advisor_config=_ADVISOR_CONFIG,
+            model=_function_model_raising(RuntimeError("unexpected provider runtime defect")),
         )
 
 

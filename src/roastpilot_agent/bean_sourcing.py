@@ -200,6 +200,7 @@ contract.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import concurrent.futures
 import ipaddress
 import logging
@@ -509,6 +510,7 @@ def redact_url_for_error(url: str) -> str:
 
 _INLINE_WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
 _BLANK_LINES_RE = re.compile(r"\n{3,}")
+_HTML_TAG_NAME_DELIMITERS: Final = frozenset(" \t\n\f\r/>")
 
 #: Extracted page text is truncated to this many characters before it is
 #: handed to the LLM — a token/cost bound independent of the raw HTTP fetch
@@ -517,29 +519,31 @@ _BLANK_LINES_RE = re.compile(r"\n{3,}")
 _MAX_EXTRACTED_CHARS = 20_000
 
 
-def _tag_name_starts_at(lower_html: str, pos: int, tag_name: str) -> bool:
-    """``True`` if ``lower_html[pos:]`` starts with ``"<" + tag_name`` at a
-    genuine TAG-NAME boundary — e.g. matches ``"<script>"``/``"<script "``/
-    ``"<script/>"`` but NOT ``"<scripty>"`` (mirrors a regex ``\\b`` after
-    the tag name, without using one).
+def _tag_name_starts_at(lower_html: str, pos: int, tag_name: str, *, closing: bool = False) -> bool:
+    """Check for an opening or closing tag at a genuine name boundary.
+
+    Matches e.g. ``<script>``/``<script ``/``<script/>`` but not longer
+    names such as ``<scripty>`` or ``<script-x>``. With ``closing=True``,
+    applies the identical boundary rule to ``</script...``. HTML tag names
+    end only at ASCII whitespace, ``/``, or ``>``.
 
     Args:
         lower_html: ``html.lower()`` (case-INsensitive tag-name matching,
             like the regex this replaces used ``re.IGNORECASE`` for).
         pos: The index of the ``"<"`` to check.
         tag_name: The lowercase tag name to match (``"script"``/``"style"``).
+        closing: Whether to require a ``"</"`` prefix instead of ``"<"``.
 
     Returns:
         Whether a tag with exactly this name starts at ``pos``.
     """
-    prefix = "<" + tag_name
+    prefix = ("</" if closing else "<") + tag_name
     end = pos + len(prefix)
     if not lower_html.startswith(prefix, pos):
         return False
     if end >= len(lower_html):
         return True
-    next_char = lower_html[end]
-    return not (next_char.isalnum() or next_char == "_")
+    return lower_html[end] in _HTML_TAG_NAME_DELIMITERS
 
 
 def _strip_script_and_style_blocks(html: str) -> str:
@@ -577,8 +581,9 @@ def _strip_script_and_style_blocks(html: str) -> str:
        O(n) total across the whole call.
     3. ``html.find(">", ...)`` to find where the OPENING tag itself ends.
     4. ``html.lower().find("</script"/"</style", ...)`` to find the start
-       of the matching CLOSING tag, then another ``html.find(">", ...)``
-       for where THAT ends.
+       of the matching CLOSING tag, skipping longer names such as
+       ``</scripty>`` with the same boundary check used for opening tags,
+       then another ``html.find(">", ...)`` for where THAT ends.
 
     The critical safety property: EVERY ``str.find`` call in steps 3–4
     either (a) succeeds within a BOUNDED distance that does not overlap
@@ -636,7 +641,15 @@ def _strip_script_and_style_blocks(html: str) -> str:
             # tag itself never closes, so nothing after it can either.
             pieces.append(html[pos:open_pos])
             break
-        close_tag_start = lower_html.find(f"</{tag_name}", open_tag_end + 1)
+        close_prefix = f"</{tag_name}"
+        close_tag_start = lower_html.find(close_prefix, open_tag_end + 1)
+        while close_tag_start != -1 and not _tag_name_starts_at(
+            lower_html, close_tag_start, tag_name, closing=True
+        ):
+            # A longer tag name (e.g. "</scripty>") is not this element's
+            # close. Resume after the matched prefix; the cursor remains
+            # monotonic, preserving the function's linear-time bound.
+            close_tag_start = lower_html.find(close_prefix, close_tag_start + len(close_prefix))
         if close_tag_start == -1:
             pieces.append(html[pos:open_pos])
             pieces.append(" ")
@@ -1624,33 +1637,135 @@ def _decompress_within_cap(
     return decoded
 
 
+_HTML_ENCODING_SNIFF_BYTES: Final = 1024
+_HTML_META_TAG_RE = re.compile(rb"<meta(?=[\t\n\f\r />])[^>]*>", re.IGNORECASE)
+_HTML_META_CHARSET_RE = re.compile(
+    rb"(?<![a-z0-9_-])charset\s*=\s*[\"']?\s*([a-z0-9._:-]+)",
+    re.IGNORECASE,
+)
+# Canonical Python codec names for browser-relevant text encodings. Resolve
+# labels through ``codecs.lookup`` for aliases, then require membership here:
+# Python also registers non-HTML transforms such as ``punycode`` whose
+# synchronous decoder can be superlinear on attacker-controlled input.
+_HTML_SAFE_CODEC_NAMES: Final = frozenset(
+    {
+        "ascii",
+        "big5",
+        "cp874",
+        "cp1250",
+        "cp1251",
+        "cp1252",
+        "cp1253",
+        "cp1254",
+        "cp1255",
+        "cp1256",
+        "cp1257",
+        "cp1258",
+        "euc_jp",
+        "euc_kr",
+        "gb18030",
+        "gbk",
+        "iso2022_jp",
+        "iso8859-1",
+        "iso8859-2",
+        "iso8859-3",
+        "iso8859-4",
+        "iso8859-5",
+        "iso8859-6",
+        "iso8859-7",
+        "iso8859-8",
+        "iso8859-9",
+        "iso8859-10",
+        "iso8859-11",
+        "iso8859-13",
+        "iso8859-14",
+        "iso8859-15",
+        "iso8859-16",
+        "koi8-r",
+        "koi8-u",
+        "mac-cyrillic",
+        "mac-roman",
+        "shift_jis",
+        "utf-8",
+        "utf-8-sig",
+        "utf-16",
+        "utf-16-be",
+        "utf-16-le",
+        "utf-32",
+        "utf-32-be",
+        "utf-32-le",
+    }
+)
+_HTML_BOM_ENCODINGS: Final = (
+    (b"\x00\x00\xfe\xff", "utf-32"),
+    (b"\xff\xfe\x00\x00", "utf-32"),
+    (b"\xef\xbb\xbf", "utf-8-sig"),
+    (b"\xfe\xff", "utf-16"),
+    (b"\xff\xfe", "utf-16"),
+)
+
+
+def _resolve_html_encoding(label: str) -> str | None:
+    """Resolve an encoding label only when it is safe for HTML text.
+
+    Args:
+        label: An HTTP or HTML-declared encoding label.
+
+    Returns:
+        The canonical Python codec name, or ``None`` for unknown and
+        non-browser transform codecs.
+    """
+    try:
+        canonical_name = codecs.lookup(label).name
+    except LookupError:
+        return None
+    return canonical_name if canonical_name in _HTML_SAFE_CODEC_NAMES else None
+
+
+def _sniff_html_encoding(body: bytes) -> str | None:
+    """Return a BOM/meta-declared encoding from a bounded HTML prefix.
+
+    A real HTTP ``charset`` remains authoritative; this helper is used only
+    when that header parameter is absent. BOMs take precedence over HTML
+    metadata. The meta scan is capped at the first 1024 bytes, matching the
+    browser-facing placement expectation while bounding all regex work.
+    Unknown and non-browser codec labels are skipped.
+
+    Args:
+        body: The already-size-capped raw response body.
+
+    Returns:
+        A registered Python codec name, or ``None`` when no usable
+        declaration is present.
+    """
+    for bom, encoding in _HTML_BOM_ENCODINGS:
+        if body.startswith(bom):
+            return encoding
+
+    prefix = body[:_HTML_ENCODING_SNIFF_BYTES]
+    for meta_match in _HTML_META_TAG_RE.finditer(prefix):
+        charset_match = _HTML_META_CHARSET_RE.search(meta_match.group())
+        if charset_match is None:
+            continue
+        encoding = _resolve_html_encoding(charset_match.group(1).decode("ascii"))
+        if encoding is not None:
+            return encoding
+    return None
+
+
 def _decode_response_body(body: bytes, response: httpx.Response) -> str:
-    """Decode a raw fetched body using the response's declared charset
-    (#587 P2) instead of assuming UTF-8.
+    """Decode a raw fetched body using HTTP, BOM, or HTML charset metadata.
 
-    ``response.encoding`` reads the ``charset`` parameter off the
-    ``Content-Type`` header when present, falling back to UTF-8 otherwise —
-    it is safe to read here even though the body was collected manually via
-    ``aiter_bytes()`` (to enforce the streaming size cap) rather than
-    ``response.read()``/``response.text``, because the default
-    ``default_encoding="utf-8"`` never needs the body itself to resolve. A
-    vendor page served as e.g. ``text/html; charset=iso-8859-1`` must decode
-    under ITS declared charset, not get silently corrupted into replacement
-    characters by an unconditional UTF-8 decode. ``errors="replace"`` is
-    kept as the final fallback so a body that does not even decode cleanly
-    under its own declared charset still yields text rather than raising.
+    An explicit HTTP ``Content-Type`` charset wins. Without one, a bounded
+    prefix is sniffed for a BOM or ``<meta charset=...>``/content-type meta
+    declaration before the existing UTF-8 default is used. This matters for
+    legacy vendor pages whose non-UTF-8 bytes would otherwise be irreversibly
+    replaced before extraction.
 
-    ``response.encoding`` is NOT a hard guarantee of a decodable codec name
-    (#587 P2, round 8): it is validated against the codec registry in the
-    common case, but that is an ``httpx``-internal implementation detail
-    this module does not control (and the ``encoding`` SETTER, used
-    elsewhere in ``httpx``'s own internals, does not re-validate at all) —
-    an unrecognized charset name raises ``LookupError`` from
-    ``bytes.decode()``, which ``errors="replace"`` does NOT protect against
-    (that parameter only governs DECODE errors within an already-resolved
-    codec, not an unknown codec NAME). Caught here and treated the same as
-    a garbled body under a recognized charset: fail soft to UTF-8, never a
-    500 over a vendor's bad ``Content-Type`` header.
+    Both HTTP and meta labels pass through a finite browser-text allowlist
+    before decoding. Unknown labels and Python transform codecs fall back to
+    UTF-8, preventing a bad declaration from becoming a 500 or a synchronous
+    CPU-exhaustion primitive on the shared roast event loop.
 
     Args:
         body: The raw fetched bytes (already capped to the configured size
@@ -1661,11 +1776,12 @@ def _decode_response_body(body: bytes, response: httpx.Response) -> str:
     Returns:
         The decoded text.
     """
-    encoding = response.encoding or "utf-8"
-    try:
-        return body.decode(encoding, errors="replace")
-    except LookupError:
-        return body.decode("utf-8", errors="replace")
+    http_encoding = response.charset_encoding
+    if http_encoding is not None:
+        encoding = _resolve_html_encoding(http_encoding) or "utf-8"
+    else:
+        encoding = _sniff_html_encoding(body) or "utf-8"
+    return body.decode(encoding, errors="replace")
 
 
 async def _fetch_one_hop(
@@ -3092,19 +3208,26 @@ async def _extract_bean_identity(
     bespoke_client: AsyncOpenAI | None = None
     bespoke_model_name: str | None = None
     try:
-        # Agent construction (which calls ``build_model`` when ``model`` is
-        # omitted) lives INSIDE the try: it can raise ``AdvisorDependencyError``
-        # / ``AdvisorError`` on a misconfigured or under-installed provider,
-        # and that must fail soft as ``BeanExtractionError`` too, not escape
-        # as an unhandled exception (#587).
-        agent = _bean_sourcing_agent(
-            advisor_config,
-            sourcing_config=sourcing_config,
-            model=model,
-            reasoning_effort=reasoning_effort,
-            max_output_tokens=max_output_tokens,
-            disable_transport_retries=disable_transport_retries,
-        )
+        # Construction lives inside its own broad fail-soft boundary. Provider
+        # SDKs can raise validation/config exceptions outside our typed advisor
+        # hierarchy before any remote call begins (#597). Do not broaden the
+        # provider AWAIT below: unexpected runtime defects there must remain
+        # distinguishable from operator configuration failures.
+        try:
+            agent = _bean_sourcing_agent(
+                advisor_config,
+                sourcing_config=sourcing_config,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                max_output_tokens=max_output_tokens,
+                disable_transport_retries=disable_transport_retries,
+            )
+        except (AdvisorDependencyError, AdvisorError):
+            raise
+        except Exception as exc:
+            raise BeanExtractionUnavailableError(
+                "bean identity extraction could not construct its provider"
+            ) from exc
         if model is None and disable_transport_retries:
             from pydantic_ai.models.openai import OpenAIChatModel  # noqa: PLC0415
 
