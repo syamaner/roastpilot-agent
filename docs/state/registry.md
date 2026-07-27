@@ -2,7 +2,46 @@
 
 ## Active Epic
 
-> **STATUS UPDATE — 21 Jun 2026 (supersedes the PREP framing below):** the D35 control work
+> **STATUS UPDATE — 27 Jul 2026 (supersedes every framing below).** Read this block
+> first; everything under it is retained history, and several of its forward-looking
+> statements (June hardware target, "harness complete target: July 2026", #327 as the
+> open P1) are now spent. Nothing below this line should be treated as a live plan
+> without checking the GitHub issue.
+>
+> **Control loop.** The D35 split shipped and is hardware-validated across roasts
+> 3–15. **#327 (deterministic anticipatory trim) and #228 (pre-FC advisory layer) are
+> both CLOSED** — the "trim is the P1 control priority" line below is spent. The live
+> control thread is **#559** (D96 recovery law): merged **dormant** and awaiting the
+> operator's flag-on hardware validation roast. It is the only control work that is
+> ready-but-unproven; the watch-list is on the issue, and an agent analyses the trace
+> after the operator runs it. **#567** (reference curves) shipped disabled and is
+> **PARKED** after a negative offline bake-off (#578) — if revisited, fix the data
+> representation, not the c9 prose. **#396** (prompt/model A/B) and **#653** (visual
+> tolerance) are operator decisions: propose, never decide.
+>
+> **Bean sourcing (the July build).** Draft-a-BeanProfile-from-a-vendor-URL shipped as
+> a second, human-gated LLM surface outside the safety envelope: backend #587, the
+> #590 containment gates (shipping dormant), the #601 reasoning-arm bake-off and
+> spend-integrity stack (results in `docs/advisor/bean-sourcing-bakeoff-2026-07-22.md`),
+> and the #637 draft-from-URL UI. Residual hardening #596/#597 closed 26–27 Jul.
+> Open follow-ups: **#573** (catalogue scope — operator-gated), **#588** (eval
+> harness), **#591** (socket-level SSRF pinning), **#595** (rate-limit/auth on the
+> billable endpoint).
+>
+> **Review + process.** PR size is a **reviewability guide, not a hard cap** (#661,
+> 26 Jul) — a cohesive single-slice story stays one PR. `security-reviewer` is now
+> wired into the `review-branch` roster (#598/#678); **#680** tracks two fail-opens
+> found in that workflow post-merge. Claude Code Review remains **optional** under the
+> 25-Jul outage exception; its replacement is **#663 / D108**, in flight as draft
+> PR #679 with four unresolved P1/P2 findings and companion plan PR #16.
+>
+> **Milestone reality.** M1 build continues; the "July 2026 harness complete" and
+> "first supervised hardware session in June" targets below are historical. E11
+> (packaging) and E12 (validation/demo) remain operator-gated and not started, with
+> E11-S1 split (SPA bundling shipped; the `[pi]` extra still blocked on D27 Phase 2).
+> Next free plan decision number: **D109** (D108 is in draft plan PR #16).
+
+> **STATUS UPDATE — 21 Jun 2026 (superseded by the 27 Jul block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
 > deterministic floor (#222) + post-FC LLM loop (#223/#226/#276) + model pin (gpt-4o + c1, D43)
 > all SHIPPED. The floor shipped FLAT (heat 100 → FC); the §3 anticipatory **trim** was never
@@ -78,13 +117,17 @@
 - Package: `roastpilot-agent`
 - Import package: `roastpilot_agent`
 - Console entrypoint: `roastpilot-agent`
-- Current phase: M1 build (harness complete target: July 2026)
+- Current phase: M1 build. **The July-2026 "harness complete" target below was not
+  met as written and is retained as history** — the vertical slice and dashboard are
+  green and multiple supervised hardware roasts are done (3–15), but E11/E12 remain
+  operator-gated. See the 27 Jul status block at the top for the live position.
 - **July milestone (D17)** — "harness complete" = (1) E9 vertical slice
   green in CI + (2) E10 dashboard usable for a live roast + (3) one
   supervised real-hardware roast end-to-end. E11/E12 polish may run into
   August; demo assets recorded by end of August. Every session optimizes
-  for this finish line; the first supervised hardware session is targeted
-  for **June**.
+  for this finish line. *(Historical: the first supervised hardware session was
+  targeted for June and happened — roasts 3 onward; roast 15 is the most recent,
+  tracked in #559. The end-of-August demo-asset date is still live.)*
 
 ## Working Rules
 
