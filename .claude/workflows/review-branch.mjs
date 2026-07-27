@@ -59,12 +59,22 @@ Also decide \`touchesExternalInput\`. Judge this by CAPABILITY, not by file path
 - adds a **new** LLM/model-provider call path (anything that can contend with the roast advisor for the same backend).
 Otherwise set it false — do not stretch the test to fit an unrelated diff.
 
-Finally, set \`addsProviderCallPath\` true only for the last bullet specifically — the diff adds a NEW call site against the shared LLM/model provider. This is narrower than \`touchesExternalInput\` and routes the safety lens as well, so do not set it for a diff that merely fetches or parses.
+Finally, set \`addsProviderCallPath\` true for the last bullet specifically. "New path" means new REACHABILITY to the shared provider, not a new call site: a diff that adds an endpoint, route, job, or service method which reaches the provider through an EXISTING helper still creates a new way to contend with the roast advisor, and counts. Only a diff that merely fetches or parses, with no route to the provider, does not. This is narrower than \`touchesExternalInput\` and routes the safety lens as well.
 
 Do NOT review the content yet.`,
   { label: 'scope', phase: 'Scope', schema: SCOPE_SCHEMA },
 )
 if (scope) log(scope.summary)
+
+// Fail CLOSED on an unusable scope result. agent() returns null on a schema-validation
+// failure, a terminal API error, or a user skip — and every conditional lens below is
+// gated on `scope`, so a null would silently drop safety, security AND ui, letting the
+// always-on lenses come back empty and the run report CLEAR TO MERGE with no security
+// review having happened. An unknown diff is treated as touching everything.
+const scopeUnknown = !scope
+if (scopeUnknown) {
+  log('scope agent returned no usable result — running ALL conditional lenses (failing closed)')
+}
 
 // --- Phase 2: Review — fan out the roster as lenses ---------------------------
 phase('Review')
@@ -93,7 +103,8 @@ const FINDINGS_SCHEMA = {
 }
 const reviewBase = `Review ONLY the changes in ${diffScope} of this repo (read the changed files for context; ignore pre-existing issues outside the diff). Return findings as structured data — an empty list if the diff is clean from your lens.`
 
-// Always-on lenses; safety, security + ui are added only when the diff touches them.
+// Always-on lenses; safety, security + ui are added when the diff touches them —
+// or unconditionally when the scope result is unusable (fail closed, see above).
 const lenses = [
   { key: 'correctness', prompt: `${reviewBase}\n\nLens: CORRECTNESS — logic bugs, edge cases, error handling, races, off-by-one, missing await, broken invariants.` },
   { key: 'qa', agentType: 'qa', prompt: `${reviewBase}\n\nLens: TEST QUALITY — do tests assert real behavior (not smoke)? Coverage delta, acceptance criteria with no test, Playwright/screenshot paths, over-mocking. Findings = weak/missing tests.` },
@@ -102,8 +113,8 @@ const lenses = [
 // Safety fires on the file-based surface, and ALSO on a new provider-calling path:
 // checklist class 6 (contention with the roast advisor) is safety-adjacent, and
 // AGENTS.md routes it to both reviewers.
-if (scope && (scope.touchesSafetyControllerEnums || scope.addsProviderCallPath)) {
-  lenses.push({ key: 'safety', agentType: 'safety-reviewer', prompt: `${reviewBase}\n\nLens: SAFETY (adversarial) — any roaster write bypassing safety, transition-table errors, string-compared verdicts, restart auto-resume, non-Celsius, fail-open paths.${scope.addsProviderCallPath ? ' This diff adds a NEW provider-calling path: also check checklist class 6 — it must not begin during an active roast or delay an operator roast start, and admission must be race-free under the roast-start lock.' : ''}` })
+if (scopeUnknown || scope.touchesSafetyControllerEnums || scope.addsProviderCallPath) {
+  lenses.push({ key: 'safety', agentType: 'safety-reviewer', prompt: `${reviewBase}\n\nLens: SAFETY (adversarial) — any roaster write bypassing safety, transition-table errors, string-compared verdicts, restart auto-resume, non-Celsius, fail-open paths.${!scopeUnknown && scope.addsProviderCallPath ? ' This diff adds a NEW provider-calling path: also check checklist class 6 — it must not begin during an active roast or delay an operator roast start, and admission must be race-free under the roast-start lock.' : ''}` })
 }
 // Capability-based routing (AGENTS.md): a new fetch/parse surface is the highest-risk
 // case and the easiest to miss, because it can touch no safety file at all — #587 is
@@ -112,10 +123,10 @@ if (scope && (scope.touchesSafetyControllerEnums || scope.addsProviderCallPath))
 // the two are independent model-filled booleans with no enforced dependency, so an
 // inconsistent {touchesExternalInput:false, addsProviderCallPath:true} would otherwise
 // skip security-reviewer on exactly the class-6 path this routing exists to cover.
-if (scope && (scope.touchesExternalInput || scope.addsProviderCallPath)) {
+if (scopeUnknown || scope.touchesExternalInput || scope.addsProviderCallPath) {
   lenses.push({ key: 'security', agentType: 'security-reviewer', prompt: `${reviewBase}\n\nLens: WEB/APPLICATION SECURITY — work docs/review/untrusted-input-checklist.md in full against this diff: SSRF / fetch-destination control, secret + PII hygiene, resource exhaustion (timeouts, byte caps, bounded decompression, ReDoS, concurrency/rate bounds), fail-soft typed errors (never an unhandled 500) mapped by origin, normalization consistency, cross-feature contention, LLM prompt-injection + tool boundary, and invariant separation. Prefer a CLASS-SWEEP: on finding one instance of a class, grep for every instance and report them together. Cite file:line. A clean pass is a valid result — do not invent findings.` })
 }
-if (scope && scope.touchesWeb) {
+if (scopeUnknown || scope.touchesWeb) {
   lenses.push({ key: 'ui', agentType: 'ui-reviewer', prompt: `${reviewBase}\n\nLens: UI/UX (code-level — no live browser this run) — review changed web/ components against component plan §7, ui-prompts.md, and the frozen baselines in the plan repo sketches/: five-series curve, verdict badges (ALLOW/CLAMP/REJECT), phase-from-server-events-only, Celsius, rebuild-not-port. Check the required Playwright/screenshot states exist as tests. Note that the full visual screenshot pass needs the live replay harness (a separate step).` })
 }
 
@@ -134,12 +145,15 @@ log(`${allFindings.length} raw findings across ${lenses.length} lenses`)
 
 if (allFindings.length === 0) {
   return {
-    verdict: 'CLEAR TO MERGE',
+    verdict: scopeUnknown ? 'CLEAR TO MERGE (degraded — scope unknown)' : 'CLEAR TO MERGE',
     scope: scope ? scope.summary : null,
+    scopeUnknown,
     lenses: lenses.map((l) => l.key),
     rawFindings: 0,
     survivors: 0,
-    note: 'no findings from any lens',
+    note: scopeUnknown
+      ? 'no findings from any lens, but the scope agent failed — every conditional lens was run blind; re-run before trusting this verdict'
+      : 'no findings from any lens',
   }
 }
 
@@ -193,6 +207,7 @@ const triage = await agent(
 return {
   verdict: triage ? triage.verdict : 'BLOCK',
   scope: scope ? scope.summary : null,
+  scopeUnknown,
   lenses: lenses.map((l) => l.key),
   rawFindings: allFindings.length,
   survivors: survivors.length,
