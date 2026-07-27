@@ -211,20 +211,25 @@ clean.
   comments** (`--comment`) + conversation-resolution, not the check itself. Don't
   re-add it as required (it would deadlock workflow PRs). Green CI alone never
   means mergeable.
-- **Temporary Claude outage state (25 Jul 2026, operator-authorized).**
-  `review-gate` is temporarily NOT required after the SHA-scoped suspension
-  experiment #662 was closed unmerged: commit statuses cannot prove PR-specific
-  review coverage or atomically invalidate a draft review on `ready_for_review`.
+- **PR-scoped Claude restoration (#663 / D108; activation follows the mechanism
+  PR).** `review-gate` remains permanently retired: commit statuses cannot prove
+  PR-specific review coverage, distinguish two PRs sharing a head SHA, or bind a
+  draft review to the intended PR generation. The trusted
+  `claude-review-approval` workflow instead posts an exact-commit approval on the
+  exact PR only after that PR's newest Claude workflow run succeeds. Branch
+  protection then requires one approving review and dismisses stale approvals on
+  every code push; Claude's inline findings remain separately gated by
+  conversation resolution. A human approval satisfies GitHub's numeric platform
+  rule but is an explicit operator override, not evidence that Claude ran.
+- **Activation state while #663 slice 1 is in flight.**
   The live required status set is `Checks`, `Web (lint + typecheck + unit)`,
   `Web (Playwright snapshots)`, and `codecov/patch`, all app-pinned; strict mode,
   `required_conversation_resolution`, and `enforce_admins` remain enabled.
   Codecov ingestion recovered on 26 Jul and #646 restored its patch gate.
-  Until #663 delivers a genuinely PR-scoped gate, Claude is optional and must
-  not be waited on; the exact-head Codex trigger/wait/triage protocol (including
-  its bounded silent/stalled fallback) and independent lead/`pr-triage`
-  adjudication remain mandatory before merge.
-  Restore automated review enforcement only through #663, never by re-requiring
-  the known-unsafe SHA-scoped `review-gate`.
+  Slice 2 enables Actions approvals and the one-approval rule only after the
+  trusted bridge is present on `main` and live adversarial proofs pass. Until
+  then, the 25-Jul outage exception remains in force. Never restore enforcement
+  by re-requiring the known-unsafe SHA-scoped `review-gate`.
 - **Independent triage when work is delivered by an agent team (D23).** PR
   review feedback (the review roster below — **Claude Code Review** and any human
   reviewer — plus codecov and a `/review-branch` roster pass) is
@@ -335,8 +340,42 @@ checklist before you open.
 (`.github/workflows/claude-code-review.yml`, running `/code-review --comment`), the
 **Codex** connector, and any human reviewer follow this rubric. **CodeRabbit stays
 disabled (15 Jun) and the Augment Code trial ENDED (28 Jun).**
-During the temporary 25-Jul outage above, Claude drops from this roster; the applicable
-shift-left domain reviewer plus independent triage are the required replacement lenses.
+Until #663 slice 2 activates D108, the temporary 25-Jul outage exception remains
+in force; applicable shift-left domain reviewers plus independent triage are the
+required replacement lenses.
+
+**WAIT for Claude's PR-scoped approval before merging (D108, after #663
+activation).** The required evidence is a `github-actions[bot]` approval whose
+body starts `[claude-review-approval]` and names the current PR head SHA. The raw
+`claude-review` check is diagnostic, not the required primitive: it passes when
+Claude posts findings and legitimately cannot run for workflow-editing or
+Dependabot PRs. Operate the gate as follows:
+
+- Opening a normal PR starts Claude. A code push dismisses the prior approval
+  and automatically starts a fresh review; do not manually re-trigger between
+  ordinary fix pushes.
+- A draft approval remains valid when the same head is marked ready or reopened.
+  Those no-code lifecycle changes do not start duplicate reviews.
+- Read and independently triage every Claude comment. Fixes produce a new head
+  and therefore require a fresh successful run; resolved threads alone never
+  revive a stale approval.
+- Before manually rerunning an already-approved same head, dismiss the bridge
+  approval in the PR UI/API, then dispatch the rerun; webhook delivery cannot
+  make those two operations atomic. The bridge's `in_progress` and non-success
+  handlers dismiss defensively, and a delayed older event also revokes old
+  evidence when it observes a newer unfinished/failed attempt. The newest
+  attempt must succeed. The bridge reruns a first cancelled attempt once; for a
+  service or infrastructure error, re-run the failed Actions job after recovery
+  and wait again. Failure, timeout, action-required, repeated cancellation,
+  stale/ambiguous PR association, or silence never receives a timeout bypass.
+- Dependabot receives a labelled `[claude-review-exempt]` approval from trusted
+  default-branch code. A workflow-editing PR can alter the upstream reviewer
+  workflow itself, so its apparent success is never trusted and it requires an
+  explicit maintainer approval with the reason recorded. Neither path executes
+  PR code with the bridge token. CI, codecov, exact-head Codex, conversation
+  resolution, and independent-triage requirements remain unchanged.
+- A human approval is not a silent substitute. If the operator deliberately
+  overrides Claude, record the reason in the PR before merge.
 
 **Codex (`chatgpt-codex-connector[bot]`) was RE-ENABLED 30 Jun** after its 15-Jun
 disable, because on real PRs it catches bugs the other lenses miss (on the Config UI

@@ -105,10 +105,11 @@
 
 ## Active Context
 
-**25 Jul 2026 — TEMPORARY CLAUDE REVIEW OUTAGE; SHA-scoped `review-gate`
-unrequired, PR-scoped replacement tracked in #663 (D103).** Operator authorized
-Claude Code Review to be optional during the service outage. Shift-left security,
-QA, and independent triage rejected draft PR #662's attempted suspension protocol:
+**27 Jul 2026 — CLAUDE RESTORATION IN PROGRESS; PR-scoped approval mechanism is
+slice 1 of #663 (D108), activation remains slice 2.** The 25-Jul operator-authorized
+outage exception remains active until the replacement is merged and live-proved.
+Shift-left security, QA, and independent triage rejected draft PR #662's attempted
+suspension protocol:
 GitHub commit statuses are SHA-scoped while review findings and conversation
 resolution are PR-scoped; two PRs may share a SHA, a draft success can remain
 visible during `ready_for_review`, and `concurrency.queue: max` serializes without
@@ -121,10 +122,16 @@ ingestion recovered on 26 Jul and #646 restored its patch gate. Merge policy sti
 requires full
 local gates, applicable local domain reviewers, an exact-head authenticated
 Codex trigger/wait/triage pass (including the documented bounded silent/stalled
-fallback), and independent lead/`pr-triage` adjudication; do not wait for Claude.
-**Restoration is #663:** evaluate and live-prove a genuinely PR-scoped merge
-primitive, including same-SHA/different-PR and draft→ready cases, before restoring
-automated review enforcement. Board: #663 = Todo / M1 / P2 later.
+fallback), and independent lead/`pr-triage` adjudication.
+**Restoration design (D108):** retire the SHA status and use a trusted
+default-branch bridge to turn the newest successful exact-PR/head Claude run into
+an exact-commit PR approval. A push dismisses stale approval; draft approval
+survives ready/reopen when the bytes do not change; Dependabot uses a trusted
+labelled exemption, while workflow edits require an explicit recorded maintainer
+approval because their upstream review result is untrusted. Slice 1 ships the mechanism and operating policy
+without changing protection. Slice 2 enables Actions approvals plus one required
+approval only after live same-SHA/different-PR, draft→ready, stale-push, rerun,
+and workflow-exemption proofs. Board: #663 = In Progress / M1 / P2.
 
 **25 Jul 2026 — #665 MCP/pytest shutdown hardening completed (D104).** Three CI runs reached
 the complete pytest summary and then failed to exit, exposing lifecycle ownership bugs rather than
