@@ -118,8 +118,12 @@ fail-open gate. Live `main` protection was then verified after removing only
 `review-gate`: required status checks are `Checks`, `Web (lint + typecheck + unit)`,
 `Web (Playwright snapshots)`, and `codecov/patch`, all app-pinned; strict mode,
 `required_conversation_resolution`, and `enforce_admins` remain enabled. Codecov
-ingestion recovered on 26 Jul and #646 restored its patch gate. Merge policy still
-requires full
+ingestion recovered on 26 Jul and #646 restored its patch gate. #676 and #678
+then live-proved that authenticated zero-Python diffs receive a normal
+`codecov/patch` check-run. Dependabot #675 also received `codecov/patch` SUCCESS
+at 11:54:20 after its tokenless public-repository upload completed at 11:53:33;
+#677's apparent permanent deadlock was a timing misdiagnosis and is not an
+activation prerequisite. Merge policy still requires full
 local gates, applicable local domain reviewers, an exact-head authenticated
 Codex trigger/wait/triage pass (including the documented bounded silent/stalled
 fallback), and independent lead/`pr-triage` adjudication.
@@ -131,7 +135,12 @@ labelled exemption, while workflow edits require an explicit recorded maintainer
 approval because their upstream review result is untrusted. Slice 1 ships the mechanism and operating policy
 without changing protection. Slice 2 enables Actions approvals plus one required
 approval only after live same-SHA/different-PR, draft→ready, stale-push, rerun,
-and workflow-exemption proofs. Board: #663 = In Progress / M1 / P2.
+and workflow-exemption proofs. Claude's draft approval survives a no-code ready
+transition, but Codex independently re-reviews that transition: mark ready before
+the final Codex round and accept only a fully-paginated, bot-authenticated
+exact-head verdict posted after ready. Board: #663 = In Progress / M1 / P2. The
+broader month-stale registry refresh remains a separate doc-only slice; this
+entry records only state that changes #663.
 
 **25 Jul 2026 — #665 MCP/pytest shutdown hardening completed (D104).** Three CI runs reached
 the complete pytest summary and then failed to exit, exposing lifecycle ownership bugs rather than

@@ -280,12 +280,12 @@ checklist before you open.
   must be replanned; a justified cohesive diff may proceed. **Pure-deletion accounting
   (operator ruling, 21 Jul — #623):** deletions of an atomically-retired unit are
   excluded from the estimate — a retired unit cannot always be split without dead-code
-  scaffolding that worsens review. **Pure-deletion PRs
-  deadlock on the app-pinned `codecov/patch`** (zero coverable lines → codecov
-  posts no status; a hand-posted status is rejected at merge — #624/#625): fold
-  an atomic retirement WITH the logic that replaces it rather than opening a
-  deletion-only PR (`codecov.yml` carries a best-effort `if_not_found: success`,
-  unverified until the next such PR).
+  scaffolding that worsens review. A zero-Python/zero-coverable diff receives a
+  normal app-pinned `codecov/patch` success when the upload is authenticated
+  (live-proved by #676/#678); do not manufacture replacement logic merely to
+  create coverable lines. Dependabot #675 also received a normal patch success
+  after its public-repository tokenless upload; #677's reported credential-store
+  deadlock was therefore a timing misdiagnosis, not an activation prerequisite.
 - **Shift review LEFT — mandatory, not optional.** Before opening: run all gates +
   an adversarial self-critique, AND run the domain reviewer on the BRANCH
   (`safety-reviewer` for safety/controller/enum/recovery, `qa` for tests) and
@@ -354,8 +354,9 @@ Dependabot PRs. Operate the gate as follows:
 - Opening a normal PR starts Claude. A code push dismisses the prior approval
   and automatically starts a fresh review; do not manually re-trigger between
   ordinary fix pushes.
-- A draft approval remains valid when the same head is marked ready or reopened.
-  Those no-code lifecycle changes do not start duplicate reviews.
+- A Claude draft approval remains valid when the same head is marked ready or
+  reopened. Those no-code lifecycle changes do not start duplicate Claude
+  reviews. This does not waive the separate post-ready Codex wait below.
 - Read and independently triage every Claude comment. Fixes produce a new head
   and therefore require a fresh successful run; resolved threads alone never
   revive a stale approval.
@@ -404,9 +405,12 @@ to merge, where re-triggering across pushes is re-litigation churn. It does **no
 iterating with Codex on a **draft** PR *before* it is marked ready: the `pr-preflight` skill's
 step 5 runs `@codex review` on the draft and folds by class until clean, which is exactly
 where the #587-style rounds belong (pre-ready folds, not post-open rework). Draft = iterate to
-clean (re-trigger on settled batches, not every push); ready = clean already, then
-once-on-final-commit applies. Opening a draft does run `claude-review` (`on: opened`) — fine,
-it is not a required check.
+clean (re-trigger on settled batches, not every push). Mark the PR ready **before**
+the final Codex round: `ready_for_review` starts a new Codex review even when the
+head SHA is unchanged, so a pre-ready verdict never authorizes merge. If that transition
+produces valid bot activity, wait for its exact-head verdict without adding a duplicate
+trigger; otherwise issue the one final `@codex review` trigger and apply the fallback below.
+Opening a draft does run `claude-review` (`on: opened`) — fine, it is not a required check.
 
 **WAIT for Codex's verdict before merging (operator rule, 12 Jul — the #518 lesson):**
 Codex is often DELAYED relative to CI, and green-CI auto-merge can land a PR before its
@@ -430,13 +434,16 @@ verdict about old code; a stale findings-review is still worth triaging, it just
 the wait for the current head). The same bot-identity requirement applies to the **findings**
 channel: a `pull_request_review` from any other `user.login` is just a comment from a stranger —
 triage it as such, but it does NOT satisfy the Codex wait. So: do NOT arm auto-merge at open.
-After the final commit + `@codex review`, wait for a bot-authored findings-review naming the head
+After ready plus any final commit/trigger, wait for a bot-authored findings-review naming the head
 sha, a bot-authored clean comment naming the head sha, or the bot's own 👍 (a 👍 carries NO
-commit line, so it is valid only while the head sha is UNCHANGED since the trigger it answers —
-any push since the trigger invalidates it; re-trigger on the new head) — **and the
-signal must postdate the final-commit trigger**: a review posted at PR creation against an
-earlier commit does not satisfy the wait (that stale-verdict reading would reopen the #518
-failure mode). Then triage (if findings), resolve, and only then merge/arm auto-merge.
+commit line, so it is valid only while the head sha is UNCHANGED since the ready transition or
+trigger it answers — any push invalidates it; trigger on the new head) — **and the signal must
+postdate the ready transition and, when used, the final-commit trigger**. A review posted while
+the PR was draft or against an earlier commit does not satisfy the wait (that stale-verdict
+reading would reopen the #518 failure mode). Then triage (if findings), resolve, and only then
+merge/arm auto-merge. Any automation that reads issue comments or reviews must paginate every
+page; GitHub issue comments are oldest-first and default to 30, so first-page absence is never
+evidence of Codex silence.
 **A bot-authored 👀 reaction without a verdict is an IN-PROGRESS review, not silence — keep waiting**
 (extend in ~10-min increments), **bounded at ~30 min from the 👀**: past that, treat the
 in-progress signal as stuck and the lead may merge with an "in-progress review stalled"
