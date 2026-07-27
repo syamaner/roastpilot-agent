@@ -101,7 +101,7 @@ const FINDINGS_SCHEMA = {
     },
   },
 }
-const reviewBase = `Review ONLY the changes in ${diffScope} of this repo (read the changed files for context; ignore pre-existing issues outside the diff). Return findings as structured data — an empty list if the diff is clean from your lens.`
+const reviewBase = `Review ONLY the changes in ${diffScope} of this repo (read the changed files for context; ignore pre-existing issues outside the diff). Return findings as structured data — an empty list if the diff is clean from your lens.\n\nSCOPE OVERRIDE: use ${diffScope} as the diff for this run. If your own agent definition tells you to scope with a different command (several hard-code a diff against origin/main), ignore that instruction here — this run may target a non-default base.`
 
 // Always-on lenses; safety, security + ui are added when the diff touches them —
 // or unconditionally when the scope result is unusable (fail closed, see above).
@@ -114,7 +114,7 @@ const lenses = [
 // checklist class 6 (contention with the roast advisor) is safety-adjacent, and
 // AGENTS.md routes it to both reviewers.
 if (scopeUnknown || scope.touchesSafetyControllerEnums || scope.addsProviderCallPath) {
-  lenses.push({ key: 'safety', agentType: 'safety-reviewer', prompt: `${reviewBase}\n\nLens: SAFETY (adversarial) — any roaster write bypassing safety, transition-table errors, string-compared verdicts, restart auto-resume, non-Celsius, fail-open paths.${!scopeUnknown && scope.addsProviderCallPath ? ' This diff adds a NEW provider-calling path: also check checklist class 6 — it must not begin during an active roast or delay an operator roast start, and admission must be race-free under the roast-start lock.' : ''}` })
+  lenses.push({ key: 'safety', agentType: 'safety-reviewer', prompt: `${reviewBase}\n\nLens: SAFETY (adversarial) — any roaster write bypassing safety, transition-table errors, string-compared verdicts, restart auto-resume, non-Celsius, fail-open paths.${scopeUnknown || scope.addsProviderCallPath ? ' This diff adds a NEW provider-calling path: also check checklist class 6 — it must not begin during an active roast or delay an operator roast start, and admission must be race-free under the roast-start lock.' : ''}` })
 }
 // Capability-based routing (AGENTS.md): a new fetch/parse surface is the highest-risk
 // case and the easiest to miss, because it can touch no safety file at all — #587 is
@@ -135,7 +135,28 @@ const reviews = await parallel(
     const opts = { label: `review:${l.key}`, phase: 'Review', schema: FINDINGS_SCHEMA }
     if (l.agentType) opts.agentType = l.agentType
     const r = await agent(l.prompt, opts)
-    return { lens: l.key, findings: (r && r.findings) || [] }
+    // Fail CLOSED, same reasoning as the scope gate: a lens that returned nothing did
+    // NOT pass — it failed to run. Flattening that to an empty findings list makes a
+    // dead security-reviewer indistinguishable from a clean one, which is the single
+    // most dangerous way for this workflow to be wrong. Emit a synthetic must-fix so
+    // the run blocks and says why.
+    if (!r) {
+      return {
+        lens: l.key,
+        findings: [
+          {
+            title: `The ${l.key} lens returned no result — it did not review this diff`,
+            severity: 'must-fix',
+            file: '.claude/workflows/review-branch.mjs',
+            line: null,
+            detail: `The ${l.key} review agent returned nothing (schema-validation failure, terminal API error, or skip). This is NOT a clean pass from that lens — the diff went unreviewed by it. Re-run before trusting any verdict.`,
+            suggestion: `Re-run review-branch, or run the ${l.key} reviewer standalone against the branch.`,
+            lensFailure: true,
+          },
+        ],
+      }
+    }
+    return { lens: l.key, findings: r.findings || [] }
   }),
 )
 const allFindings = reviews
@@ -165,16 +186,28 @@ const VERDICT_SCHEMA = {
   required: ['survives', 'reason'],
   properties: { survives: { type: 'boolean' }, reason: { type: 'string' } },
 }
+// A lens-failure finding is a FACT about this run, not a claim about the diff, so it
+// never goes to a refuter — an adversarial verifier reading the cited file would find
+// nothing wrong with it and vote survives=false, silently restoring the fail-open the
+// synthetic finding exists to prevent. It bypasses Verify and lands straight in Triage.
+const lensFailures = allFindings.filter((f) => f.lensFailure)
+const claimFindings = allFindings.filter((f) => !f.lensFailure)
+if (lensFailures.length) {
+  log(`${lensFailures.length} lens(es) failed to return a result — bypassing Verify, blocking`)
+}
 const verified = await parallel(
-  allFindings.map((f) => () =>
+  claimFindings.map((f) => () =>
     agent(
       `A reviewer raised this finding on ${diffScope}:\n\nTitle: ${f.title}\nSeverity: ${f.severity}\nFile: ${f.file}${f.line ? ':' + f.line : ''}\nDetail: ${f.detail}\n\nRun ${diffScope} and read the cited file for context first, then adversarially VERIFY it against the actual diff + code. Try to REFUTE it. Does it survive — a real, in-scope issue this change introduced? Default to survives=false if uncertain, already-handled, pre-existing, or out of scope.`,
       { label: `verify:${f.lens}`, phase: 'Verify', schema: VERDICT_SCHEMA },
     ).then((v) => ({ ...f, survives: v ? v.survives : false, verifyReason: v ? v.reason : 'verifier failed' })),
   ),
 )
-const survivors = verified.filter(Boolean).filter((f) => f.survives)
-log(`${survivors.length}/${allFindings.length} findings survived adversarial verification`)
+const survivors = [...lensFailures, ...verified.filter(Boolean).filter((f) => f.survives)]
+log(
+  `${survivors.length - lensFailures.length}/${claimFindings.length} findings survived adversarial verification` +
+    (lensFailures.length ? ` (+${lensFailures.length} lens failure(s), unrefutable)` : ''),
+)
 
 // --- Phase 4: Triage — one consolidated verdict -------------------------------
 phase('Triage')
