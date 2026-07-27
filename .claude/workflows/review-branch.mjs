@@ -1,7 +1,7 @@
 export const meta = {
   name: 'review-branch',
   description:
-    'Cross-checked roster review of the current branch diff: fan out the role agents as lenses (correctness, qa, product-pm, + safety/ui when relevant), adversarially verify each finding, then a single pr-triage verdict.',
+    'Cross-checked roster review of the current branch diff: fan out the role agents as lenses (correctness, qa, product-pm, + safety/security/ui when relevant), adversarially verify each finding, then a single pr-triage verdict.',
   whenToUse:
     'Run on a PR/branch before merge for a multi-lens, cross-checked review you can rerun. Pass {base:"<ref>"} to diff against a non-default base.',
   phases: [
@@ -108,7 +108,11 @@ if (scope && (scope.touchesSafetyControllerEnums || scope.addsProviderCallPath))
 // Capability-based routing (AGENTS.md): a new fetch/parse surface is the highest-risk
 // case and the easiest to miss, because it can touch no safety file at all — #587 is
 // the specimen. Keeps the roster pass and the pre-open pr-preflight pass in agreement.
-if (scope && scope.touchesExternalInput) {
+// OR'd with addsProviderCallPath even though the prompt describes it as a strict subset:
+// the two are independent model-filled booleans with no enforced dependency, so an
+// inconsistent {touchesExternalInput:false, addsProviderCallPath:true} would otherwise
+// skip security-reviewer on exactly the class-6 path this routing exists to cover.
+if (scope && (scope.touchesExternalInput || scope.addsProviderCallPath)) {
   lenses.push({ key: 'security', agentType: 'security-reviewer', prompt: `${reviewBase}\n\nLens: WEB/APPLICATION SECURITY — work docs/review/untrusted-input-checklist.md in full against this diff: SSRF / fetch-destination control, secret + PII hygiene, resource exhaustion (timeouts, byte caps, bounded decompression, ReDoS, concurrency/rate bounds), fail-soft typed errors (never an unhandled 500) mapped by origin, normalization consistency, cross-feature contention, LLM prompt-injection + tool boundary, and invariant separation. Prefer a CLASS-SWEEP: on finding one instance of a class, grep for every instance and report them together. Cite file:line. A clean pass is a valid result — do not invent findings.` })
 }
 if (scope && scope.touchesWeb) {

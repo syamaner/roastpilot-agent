@@ -439,7 +439,7 @@ untrusted external input, adds an external-input endpoint, or adds a new LLM-pro
 call path** → route to `security-reviewer` with `docs/review/untrusted-input-checklist.md`,
 **pre-open**. This fires even when the diff touches none of the safety files — a new
 fetch/parse surface is the highest-risk case and the easiest to miss. (The #587 lesson:
-the bean-sourcing fetch endpoint took **five** post-open Codex rounds — SSRF, fail-soft,
+the bean-sourcing fetch endpoint took **nine** post-open Codex rounds — SSRF, fail-soft,
 resource-exhaustion, secret-hygiene, cross-feature-contention — because no pre-open lens
 covered web/application security; the file-based routing above never fired since it
 touched no safety file. `security-reviewer` + the checklist close that gap.) If the change
