@@ -1468,6 +1468,9 @@ def test_decode_response_body_rejects_non_html_transform_codec(label: str, sourc
         ("ms932", "cp932", "珈琲 東京"),
         ("uhc", "cp949", "커피 서울"),
         ("ms950", "cp950", "咖啡 臺灣"),
+        ("gb2312", "gb2312", "咖啡 中国"),
+        ("tis-620", "tis-620", "กาแฟ ไทย"),
+        ("big5hkscs", "big5hkscs", "咖啡 香港"),
     ],
 )
 def test_decode_response_body_honors_safe_legacy_http_charset_aliases(
@@ -1556,6 +1559,23 @@ def test_decode_response_body_accepts_reordered_legacy_meta_attributes(meta: str
     assert "Café — Kenya" in result
 
 
+@pytest.mark.parametrize(
+    "meta",
+    [
+        '<meta data-note="x>y" charset="windows-1252">',
+        '<meta charset="windows-1252" data-note="x>y">',
+    ],
+)
+def test_decode_response_body_meta_scanner_respects_quoted_greater_than(meta: str) -> None:
+    """Independent triage: quoted ``>`` does not truncate a meta tag."""
+    body = f"{meta}<p>Café — Kenya</p>".encode("windows-1252")
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café — Kenya" in result
+
+
 def test_parse_html_meta_attributes_handles_spacing_and_malformed_edges() -> None:
     """Cover bounded scanner branches without relying on regex tokenization."""
     parse = bean_sourcing._parse_html_meta_attributes  # pyright: ignore[reportPrivateUsage]
@@ -1566,6 +1586,16 @@ def test_parse_html_meta_attributes_handles_spacing_and_malformed_edges() -> Non
     assert parse(b'<meta charset="utf-8>') == {b"charset": b"utf-8>"}
     assert parse(b"<meta =ignored>") == {}
     assert parse(b"<meta") == {}
+
+
+def test_find_html_meta_tags_handles_false_and_unterminated_candidates() -> None:
+    """Exercise bounded scanner rejection and fail-closed branches."""
+    find_tags = bean_sourcing._find_html_meta_tags  # pyright: ignore[reportPrivateUsage]
+    assert find_tags(b'<metadata charset="utf-8"><meta charset="cp1252">') == [
+        b'<meta charset="cp1252">'
+    ]
+    assert find_tags(b'<meta charset="utf-8"') == []
+    assert find_tags(b"<meta") == []
 
 
 def test_sniff_html_encoding_skips_invalid_direct_charset_before_valid_meta() -> None:

@@ -1638,7 +1638,6 @@ def _decompress_within_cap(
 
 
 _HTML_ENCODING_SNIFF_BYTES: Final = 1024
-_HTML_META_TAG_RE = re.compile(rb"<meta(?=[\t\n\f\r />])[^>]*>", re.IGNORECASE)
 _HTML_CONTENT_CHARSET_RE = re.compile(
     rb"(?<![a-z0-9_-])charset\s*=\s*[\"']?\s*([a-z0-9._:-]+)",
     re.IGNORECASE,
@@ -1655,6 +1654,7 @@ _HTML_SAFE_CODEC_NAMES: Final = frozenset(
     {
         "ascii",
         "big5",
+        "big5hkscs",
         "cp874",
         "cp866",
         "cp932",
@@ -1672,6 +1672,7 @@ _HTML_SAFE_CODEC_NAMES: Final = frozenset(
         "euc_jp",
         "euc_kr",
         "gb18030",
+        "gb2312",
         "gbk",
         "iso2022_jp",
         "iso8859-1",
@@ -1694,6 +1695,7 @@ _HTML_SAFE_CODEC_NAMES: Final = frozenset(
         "mac-cyrillic",
         "mac-roman",
         "shift_jis",
+        "tis-620",
         "utf-8",
         "utf-8-sig",
         "utf-16",
@@ -1792,6 +1794,45 @@ def _parse_html_meta_attributes(meta_tag: bytes) -> dict[bytes, bytes]:
     return attributes
 
 
+def _find_html_meta_tags(prefix: bytes) -> list[bytes]:
+    """Find complete meta tags while respecting quoted ``>`` characters.
+
+    Args:
+        prefix: The bounded raw HTML prefix to scan.
+
+    Returns:
+        Complete, non-overlapping raw meta tags.
+    """
+    tags: list[bytes] = []
+    lower_prefix = prefix.lower()
+    cursor = 0
+    while True:
+        tag_start = lower_prefix.find(b"<meta", cursor)
+        if tag_start == -1:
+            break
+        name_end = tag_start + len(b"<meta")
+        if name_end >= len(prefix) or prefix[name_end] not in b" \t\n\f\r/>":
+            cursor = name_end
+            continue
+        quote: int | None = None
+        tag_end = name_end
+        while tag_end < len(prefix):
+            char = prefix[tag_end]
+            if quote is not None:
+                if char == quote:
+                    quote = None
+            elif char in b"\"'":
+                quote = char
+            elif char == ord(">"):
+                tags.append(prefix[tag_start : tag_end + 1])
+                cursor = tag_end + 1
+                break
+            tag_end += 1
+        else:
+            break
+    return tags
+
+
 def _resolve_meta_charset(value: bytes) -> str | None:
     """Resolve one bounded, ASCII-compatible meta charset value."""
     label = value.strip()
@@ -1835,8 +1876,8 @@ def _sniff_html_encoding(body: bytes) -> str | None:
             return encoding
 
     prefix = body[:_HTML_ENCODING_SNIFF_BYTES]
-    for meta_match in _HTML_META_TAG_RE.finditer(prefix):
-        encoding = _encoding_from_meta_tag(meta_match.group())
+    for meta_tag in _find_html_meta_tags(prefix):
+        encoding = _encoding_from_meta_tag(meta_tag)
         if encoding is not None:
             return encoding
     return None
