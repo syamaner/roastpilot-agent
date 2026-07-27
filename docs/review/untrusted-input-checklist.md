@@ -6,8 +6,11 @@
   external input (a pasted URL, a redirect `Location`, a webhook, a config value);
 - **parses or decodes untrusted bytes/strings** (URL parsing, HTML/JSON/charset
   decode, number/port parsing, deserialization);
-- **calls the shared LLM/model provider** from a *new* code path (anything that can
-  contend with the roast advisor for the same backend);
+- **calls an LLM/model provider** from a *new* code path — **any** provider or model
+  service, not only the backend the roast advisor uses, since the provider risks below
+  (secret hygiene, fail-soft, resource exhaustion, prompt injection) apply regardless of
+  which service is called. Whether it can additionally *contend* with the roast advisor
+  is the separate class-6 question, and is what routes `safety-reviewer` as well;
 - accepts a new **external-input endpoint** (a route taking client-supplied data).
 
 If a diff matches, run this list pre-open and route it to **`security-reviewer`**.
