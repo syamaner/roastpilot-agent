@@ -170,12 +170,17 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
    review lens has been spent. A manual `@codex review` on a draft is not forbidden and does
    post findings, but per D105 it never completes the clean-verdict flow on a draft, so it
    can supplement the local pass and can **never** satisfy the merge wait.
-3. **Mark ready only once the head is expected to hold** (`gh pr ready`). That transition is
+3. **Mark ready only once the head is expected to hold** (`gh pr ready`), and **RE-RECORD the
+   head sha at that moment** — the sha you noted in step 2 is from draft-creation time, and
+   step 2 is precisely where runner-gate fixes land, so it is very likely stale by now. Every
+   "recorded head sha" below means this re-recorded one, not step 2's. (Missing this is the
+   same stale-sha class the wait rule exists to close, and it was reintroduced by omission in
+   an earlier draft of this very step.) That transition is
    what fires the automatic Codex review, and in this repo it also re-runs `claude-review`.
-   The verdict you wait on must match the current head **and postdate the `ready_for_review`
-   transition**: a findings-review left on the draft describes the same sha, so a
-   head-match alone would let a pre-ready verdict satisfy the wait while the automatic
-   review it triggered is still in flight.
+   The verdict you wait on must match the re-recorded head **and postdate the
+   `ready_for_review` transition**: a findings-review left on the draft describes the same
+   sha, so a head-match alone would let a pre-ready verdict satisfy the wait while the
+   automatic review it triggered is still in flight.
    **Wait for the verdict on the recorded head sha** — a **posted review** carries a
    `Reviewed commit:` line (match it to the head); a **top-level "Codex Review: Didn't find
    any major issues" COMMENT with a `Reviewed commit:` line matching the head = complete-clean**
