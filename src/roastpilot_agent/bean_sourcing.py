@@ -1649,6 +1649,30 @@ _HTML_UNQUOTED_VALUE_END: Final = _HTML_ATTRIBUTE_WHITESPACE | frozenset(b">")
 _HTML_OTHER_TAG_START_BYTES: Final = (
     b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" + b"/!?"
 )
+_HTML_ENCODING_LABEL_OVERRIDES: Final = {
+    "csgb2312": "gbk",
+    "dos-874": "cp874",
+    "gb_2312": "gbk",
+    "gb_2312-80": "gbk",
+    "iso8859-1:1987": "cp1252",
+    "iso8859-9:1989": "cp1254",
+    "iso88591": "cp1252",
+    "iso88599": "cp1254",
+    "iso885911": "cp874",
+    "windows-874": "cp874",
+    "x-cp1254": "cp1254",
+    "x-cp1252": "cp1252",
+    "x-gbk": "gbk",
+    "x-mac-cyrillic": "mac-cyrillic",
+}
+_HTML_CANONICAL_ENCODING_OVERRIDES: Final = {
+    "ascii": "cp1252",
+    "gb2312": "gbk",
+    "iso8859-1": "cp1252",
+    "iso8859-9": "cp1254",
+    "iso8859-11": "cp874",
+    "tis-620": "cp874",
+}
 # Canonical Python codec names for browser-relevant text encodings. Resolve
 # labels through ``codecs.lookup`` for aliases, then require membership here:
 # Python also registers non-HTML transforms such as ``punycode`` whose
@@ -1675,7 +1699,6 @@ _HTML_SAFE_CODEC_NAMES: Final = frozenset(
         "euc_jp",
         "euc_kr",
         "gb18030",
-        "gb2312",
         "gbk",
         "iso2022_jp",
         "iso8859-1",
@@ -1686,7 +1709,6 @@ _HTML_SAFE_CODEC_NAMES: Final = frozenset(
         "iso8859-6",
         "iso8859-7",
         "iso8859-8",
-        "iso8859-9",
         "iso8859-10",
         "iso8859-11",
         "iso8859-13",
@@ -1698,7 +1720,6 @@ _HTML_SAFE_CODEC_NAMES: Final = frozenset(
         "mac-cyrillic",
         "mac-roman",
         "shift_jis",
-        "tis-620",
         "utf-8",
         "utf-8-sig",
         "utf-16",
@@ -1735,10 +1756,13 @@ def _resolve_html_encoding(label: str, *, from_meta: bool = False) -> str | None
         The canonical Python codec name, or ``None`` for unknown and
         non-browser transform codecs.
     """
+    normalized_label = label.strip().lower()
+    normalized_label = _HTML_ENCODING_LABEL_OVERRIDES.get(normalized_label, normalized_label)
     try:
-        canonical_name = codecs.lookup(label).name
+        canonical_name = codecs.lookup(normalized_label).name
     except LookupError:
         return None
+    canonical_name = _HTML_CANONICAL_ENCODING_OVERRIDES.get(canonical_name, canonical_name)
     if canonical_name not in _HTML_SAFE_CODEC_NAMES:
         return None
     if from_meta and canonical_name in _HTML_WIDE_CODEC_NAMES:
@@ -1747,19 +1771,7 @@ def _resolve_html_encoding(label: str, *, from_meta: bool = False) -> str | None
 
 
 def _parse_html_meta_attributes(meta_tag: bytes) -> dict[bytes, bytes]:
-    """Parse attributes from one bounded raw ``<meta>`` tag.
-
-    The caller supplies at most the first 1024 response bytes. This
-    single-pass parser tracks quoted values so text resembling
-    ``charset=...`` inside an unrelated attribute cannot become a separate
-    declaration.
-
-    Args:
-        meta_tag: A complete raw meta tag found in the bounded prefix.
-
-    Returns:
-        Lowercase attribute names mapped to their first value.
-    """
+    """Parse attributes from one bounded raw ``<meta>`` tag."""
     attributes: dict[bytes, bytes] = {}
     pos = len(b"<meta")
     while pos < len(meta_tag):
@@ -1798,14 +1810,7 @@ def _parse_html_meta_attributes(meta_tag: bytes) -> dict[bytes, bytes]:
 
 
 def _find_html_meta_tags(prefix: bytes) -> list[bytes]:
-    """Find complete meta tags while respecting quoted ``>`` characters.
-
-    Args:
-        prefix: The bounded raw HTML prefix to scan.
-
-    Returns:
-        Complete, non-overlapping raw meta tags.
-    """
+    """Find complete meta tags while respecting quoted ``>`` characters."""
     tags: list[bytes] = []
     lower_prefix = prefix.lower()
     cursor = 0

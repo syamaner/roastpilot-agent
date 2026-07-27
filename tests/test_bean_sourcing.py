@@ -1486,6 +1486,83 @@ def test_decode_response_body_honors_safe_legacy_http_charset_aliases(
 
 
 @pytest.mark.parametrize(
+    "label",
+    [
+        "ansi_x3.4-1968",
+        "ascii",
+        "cp1252",
+        "cp819",
+        "csisolatin1",
+        "ibm819",
+        "iso-8859-1",
+        "iso-ir-100",
+        "iso8859-1",
+        "iso8859-1:1987",
+        "iso88591",
+        "iso_8859-1",
+        "iso_8859-1:1987",
+        "l1",
+        "latin1",
+        "us-ascii",
+        "windows-1252",
+        "x-cp1252",
+    ],
+)
+def test_decode_response_body_uses_windows_1252_for_web_latin1_labels(label: str) -> None:
+    """Codex P2: browser Latin-1/ASCII labels use Windows-1252 semantics."""
+    response = httpx.Response(200, headers={"Content-Type": f"text/html; charset={label}"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        b"<p>\x80</p>", response
+    )
+    assert result == "<p>€</p>"
+
+
+@pytest.mark.parametrize(
+    ("label", "codec", "text"),
+    [
+        ("x-mac-cyrillic", "mac-cyrillic", "Кофе"),
+        ("gb2312", "gbk", "镕"),
+        ("chinese", "gbk", "镕"),
+        ("euc-cn", "gbk", "镕"),
+        ("csiso58gb231280", "gbk", "镕"),
+        ("iso-ir-58", "gbk", "镕"),
+        ("csgb2312", "gbk", "镕"),
+        ("gb_2312", "gbk", "镕"),
+        ("gb_2312-80", "gbk", "镕"),
+        ("x-gbk", "gbk", "镕"),
+        ("tis-620", "cp874", "€"),
+        ("iso-8859-11", "cp874", "€"),
+        ("iso8859-11", "cp874", "€"),
+        ("iso885911", "cp874", "€"),
+        ("dos-874", "cp874", "€"),
+        ("windows-874", "cp874", "€"),
+        ("iso-8859-9", "cp1254", "€"),
+        ("csisolatin5", "cp1254", "€"),
+        ("iso-ir-148", "cp1254", "€"),
+        ("iso8859-9", "cp1254", "€"),
+        ("iso8859-9:1989", "cp1254", "€"),
+        ("iso88599", "cp1254", "€"),
+        ("iso_8859-9", "cp1254", "€"),
+        ("iso_8859-9:1989", "cp1254", "€"),
+        ("l5", "cp1254", "€"),
+        ("latin5", "cp1254", "€"),
+        ("windows-1254", "cp1254", "€"),
+        ("x-cp1254", "cp1254", "€"),
+    ],
+)
+def test_decode_response_body_applies_web_compatibility_label_overrides(
+    label: str, codec: str, text: str
+) -> None:
+    """Browser labels resolve before the finite safe-codec check."""
+    response = httpx.Response(200, headers={"Content-Type": f"text/html; charset={label}"})
+    body = f"<p>{text}</p>".encode(codec)
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert result == f"<p>{text}</p>"
+
+
+@pytest.mark.parametrize(
     ("body", "expected"),
     [
         ("\ufeff<p>Café</p>".encode("utf-8"), "<p>Café</p>"),
