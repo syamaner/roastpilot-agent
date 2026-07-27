@@ -413,11 +413,15 @@ bot-authored signal following a fresh `@codex review` re-trigger on the new fina
 a bot-authored findings-review naming the head sha, a bot-authored clean comment naming the
 head sha, or the bot's own 👍 (a 👍 carries NO commit line, so it is valid only while the
 head sha is UNCHANGED since it was left; any push since invalidates it, so re-trigger on the
-new head). **The signal must correspond to the current head**, not merely postdate some
-earlier trigger, since the first review has no manual trigger to postdate: a review or
-comment naming an earlier commit sha does not satisfy the wait (that stale-verdict reading
-would reopen the #518 failure mode). Then triage (if findings), resolve, and only then
-merge/arm auto-merge.
+new head). **The signal must correspond to the current head AND postdate the
+`ready_for_review` transition** (or, after a later push, the fresh re-trigger on that new
+final commit). Head-match alone is NOT sufficient, and this is a real hole rather than a
+theoretical one: a manually requested review on the DRAFT posts findings against the very
+same sha, so if nothing needed changing before marking ready, a head-match-only rule would
+let that pre-ready verdict satisfy the wait while the automatic review the ready transition
+just started is still in flight. A review or comment naming an earlier commit sha does not
+satisfy the wait either (that stale-verdict reading would reopen the #518 failure mode).
+Then triage (if findings), resolve, and only then merge/arm auto-merge.
 **A bot-authored 👀 reaction without a verdict is an IN-PROGRESS review, not silence — keep waiting**
 (extend in ~10-min increments), **bounded at ~30 min from the 👀**: past that, treat the
 in-progress signal as stuck and the lead may merge with an "in-progress review stalled"

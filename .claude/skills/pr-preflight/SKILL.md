@@ -149,20 +149,34 @@ prevented).
   defect is the system working. Remove the *catchable-pre-open* findings, not the
   review itself.
 
-## 5. Fold the DIVERSE lens on a DRAFT before "ready" — draft → `@codex review` → fold
+## 5. Fold the DIVERSE lens LOCALLY before pushing, then let the draft run the gates
 
 Steps 1–4 are the Claude family (author + subagent reviewers); they share blind spots —
 a same-family lens co-accepts a bug the author already rationalised. **Codex is a
 different model family and catches exactly that class**, and the measured gap is large
 (#587: nine Codex rounds, all real; roastpilot-cloud F1-S8: 5 rounds, ~15 real P1s on a
-security keystone two Opus safety passes called clean — all post-open). Put Codex in the
-loop **while the PR is still a draft**, so its finds fold instead of becoming post-ready
-rework:
+security keystone two Opus safety passes called clean — all post-open). Get Codex in
+**before the branch is pushed**, so its finds fold instead of becoming post-ready rework:
 
-1. Open the PR as a **draft** (`gh pr create --draft`), and **record the current head sha**.
-2. **Codex auto-reviews at PR creation** (AGENTS.md), so opening the draft usually fires it —
-   only post `@codex review` if it did *not* fire. Don't double-trigger.
-3. **Wait for the verdict on the recorded head sha** — a **posted review** carries a
+1. **Run `codex review --base <branch>` LOCALLY, before pushing anything.** This is the
+   pre-ready diverse lens. Corrected 27 Jul 2026 (D142): Codex does **not** auto-review a
+   draft. Its connector fires automatically only at the **ready** transition, so a draft
+   cannot converge the Codex lens at all, and a workflow that waits for a clean verdict
+   there stalls forever. Fold every real finding by CLASS (step 4) before pushing.
+2. Open the PR as a **draft** (`gh pr create --draft`), and **record the current head sha**.
+   The draft phase exists for the **runner-only gates** (`ci.yml`, tests, `ruff`, `pyright`,
+   CodeQL): they run on draft pushes and catch a class local runs cannot, including
+   environment-dependent failures that only reproduce on a runner. Fold those here, while no
+   review lens has been spent. A manual `@codex review` on a draft is not forbidden and does
+   post findings, but per D105 it never completes the clean-verdict flow on a draft, so it
+   can supplement the local pass and can **never** satisfy the merge wait.
+3. **Mark ready only once the head is expected to hold** (`gh pr ready`). That transition is
+   what fires the automatic Codex review, and in this repo it also re-runs `claude-review`.
+   The verdict you wait on must match the current head **and postdate the `ready_for_review`
+   transition**: a findings-review left on the draft describes the same sha, so a
+   head-match alone would let a pre-ready verdict satisfy the wait while the automatic
+   review it triggered is still in flight.
+   **Wait for the verdict on the recorded head sha** — a **posted review** carries a
    `Reviewed commit:` line (match it to the head); a **top-level "Codex Review: Didn't find
    any major issues" COMMENT with a `Reviewed commit:` line matching the head = complete-clean**
    (the MOST COMMON clean channel — don't record a run as "silent" without checking the issue
@@ -184,14 +198,16 @@ rework:
 5. **Re-run the branch gates + domain review (steps 1–4) after any code change** — a Codex
    fold can break a gate or reopen a review finding; the pre-ready results only count if
    they reflect the final draft state.
-6. Re-trigger Codex only after a **settled** batch of folds (not on every intermediate
-   push — the draft phase is where iteration lives, but don't spam the trigger), and
-   re-match the new head sha.
+6. If a fold moves the head **after** the automatic review, re-trigger with a single
+   `@codex review` on the new final commit and re-match the sha. Only then, and never on
+   intermediate pushes.
 
-**Iterating with Codex here is expected and correct** — this is the pre-ready phase. The
-AGENTS.md **"once-on-final-commit, don't re-litigate"** rule governs the **post-ready**
-phase (a marked-ready PR heading to merge), where re-triggering across pushes is the churn
-we avoid. Draft = iterate to clean; ready = clean already.
+**Iterate LOCALLY, not on the draft.** Re-running `codex review --base <branch>` costs
+nothing on GitHub and can be repeated freely while folding, which is where iteration now
+lives. The AGENTS.md **"once-on-final-commit, don't re-litigate"** rule governs the
+**post-ready** phase (a marked-ready PR heading to merge), where re-triggering across
+pushes is the churn we avoid. Local = iterate to clean; draft = fold the runner gates;
+ready = commit the whole review roster to a head you expect to hold.
 
 > Note on `claude-review`: opening a draft does run `.github/workflows/claude-code-review.yml`
 > (it listens to `opened`). That is fine — `claude-review` is **not** a required check and
