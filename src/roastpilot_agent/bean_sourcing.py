@@ -1651,7 +1651,7 @@ _HTML_OTHER_TAG_START_BYTES: Final = (
     b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" + b"/!?"
 )
 _HTML_RAW_TEXT_START_RE = re.compile(
-    rb"<(script|style|title|textarea|xmp|iframe|noembed|noframes|noscript|plaintext)"
+    rb"<(script|style|title|textarea|xmp|iframe|noembed|noframes|plaintext)"
     rb"(?=[ \t\n\f\r/>])",
     re.IGNORECASE,
 )

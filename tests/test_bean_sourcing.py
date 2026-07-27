@@ -1642,6 +1642,7 @@ def test_decode_response_body_sniffs_bom_without_http_charset(body: bytes, expec
         """<meta http-equiv=Content-Type content="text/html; charset=' windows-1252 '">""",
         '<meta/charset="windows-1252">',
         '<meta/ charset="windows-1252">',
+        '<head><noscript><meta charset="windows-1252"></noscript></head>',
     ],
 )
 def test_decode_response_body_sniffs_html_meta_without_http_charset(meta: str) -> None:
@@ -1743,7 +1744,7 @@ def test_sniff_html_encoding_keeps_single_dash_bang_inside_comment() -> None:
 
 @pytest.mark.parametrize(
     "tag",
-    ["script", "style", "title", "textarea", "xmp", "iframe", "noembed", "noframes", "noscript"],
+    ["script", "style", "title", "textarea", "xmp", "iframe", "noembed", "noframes"],
 )
 def test_decode_response_body_ignores_meta_like_text_in_raw_text(tag: str) -> None:
     body = (
@@ -1950,7 +1951,6 @@ def test_sniff_html_encoding_skips_unknown_codec_before_valid_meta() -> None:
 
 @pytest.mark.asyncio
 async def test_fetch_page_text_decodes_html_meta_without_http_charset() -> None:
-    """#597: the full fetch pipeline honors page-declared legacy charset."""
     html = '<meta charset="windows-1252"><p>Café — Kenya</p>'.encode("windows-1252")
 
     def handler(request: httpx.Request) -> httpx.Response:
