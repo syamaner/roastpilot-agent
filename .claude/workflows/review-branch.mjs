@@ -56,10 +56,10 @@ Also decide \`touchesExternalInput\`. Judge this by CAPABILITY, not by file path
 - fetches a URL / opens a connection whose target is influenced by operator or external input (a pasted URL, a redirect \`Location\`, a webhook, a config value);
 - parses or decodes untrusted bytes/strings (URL parsing, HTML/JSON/charset decode, number/port parsing, deserialization);
 - adds an external-input endpoint (a route taking client-supplied data);
-- adds a **new** LLM/model-provider call path (anything that can contend with the roast advisor for the same backend).
+- adds a **new** LLM/model-provider call path — ANY provider or model service, not only the one the roast advisor uses. A job calling a separate model service still carries the provider risks the checklist covers (secret hygiene, fail-soft, resource exhaustion, prompt injection), so it counts here.
 Otherwise set it false — do not stretch the test to fit an unrelated diff.
 
-Finally, set \`addsProviderCallPath\` true for the last bullet specifically. "New path" means new REACHABILITY to the shared provider, not a new call site: a diff that adds an endpoint, route, job, or service method which reaches the provider through an EXISTING helper still creates a new way to contend with the roast advisor, and counts. Only a diff that merely fetches or parses, with no route to the provider, does not. This is narrower than \`touchesExternalInput\` and routes the safety lens as well.
+Finally, set \`addsProviderCallPath\` true for the narrower contention case: a new path to the provider backend the roast advisor SHARES, which is what routes the safety lens (checklist class 6 is about contending with the advisor, so a separate model service does not qualify — that is a security concern only, already covered above). "New path" means new REACHABILITY, not a new call site: a diff adding an endpoint, route, job, or service method that reaches the shared provider through an EXISTING helper still creates a new way to contend, and counts.
 
 Do NOT review the content yet.`,
   { label: 'scope', phase: 'Scope', schema: SCOPE_SCHEMA },
@@ -233,12 +233,18 @@ const payload = survivors.map((f) => ({
   suggestion: f.suggestion,
 }))
 const triage = await agent(
-  `You are the pr-triage adjudicator. Consolidate these adversarially-verified findings on the current branch into a single triage report. Classify each: must-fix (correctness/safety/unmet acceptance/coverage regression — blocks merge), fix-now (cheap, clearly correct), defer (file a follow-up issue), rejected (with reason) — map any 'nit'-severity finding to defer or rejected. Then a single verdict: BLOCK if any must-fix, else CLEAR TO MERGE. Be the skeptical second opinion — do not rubber-stamp.\n\nFindings:\n${JSON.stringify(payload, null, 2)}`,
+  `You are the pr-triage adjudicator. Consolidate these adversarially-verified findings on the current branch into a single triage report. Classify each: must-fix (correctness/safety/unmet acceptance/coverage regression — blocks merge), fix-now (cheap, clearly correct), defer (file a follow-up issue), rejected (with reason) — map any 'nit'-severity finding to defer or rejected. Then a single verdict: BLOCK if any must-fix, else CLEAR TO MERGE. Be the skeptical second opinion — do not rubber-stamp.\n\nNOTE: any finding titled 'The <lens> lens returned no result' means that reviewer FAILED TO RUN. It is not a claim you can refute or defer — that lens simply did not review the diff. Always classify it must-fix. (The workflow also forces BLOCK on it in code, so a contrary verdict here would just be inconsistent.)\n\nFindings:\n${JSON.stringify(payload, null, 2)}`,
   { label: 'triage', phase: 'Triage', schema: TRIAGE_SCHEMA, agentType: 'pr-triage' },
 )
 
+// A lens failure BLOCKS deterministically, in code — never at the triage agent's
+// discretion. pr-triage is an unconstrained LLM that could classify the synthetic
+// finding as "defer" or "rejected" and hand back CLEAR TO MERGE, which would undo the
+// whole fail-closed chain at the last step. "A lens did not run" is not a judgement call.
+const forcedBlock = lensFailures.length > 0
 return {
-  verdict: triage ? triage.verdict : 'BLOCK',
+  verdict: forcedBlock ? 'BLOCK' : triage ? triage.verdict : 'BLOCK',
+  blockedBy: forcedBlock ? lensFailures.map((f) => `${f.lens} lens failed to run`) : undefined,
   scope: scope ? scope.summary : null,
   scopeUnknown,
   lenses: lenses.map((l) => l.key),
