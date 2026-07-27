@@ -1,6 +1,6 @@
 ---
 name: pr-preflight
-description: Run the full pre-open preflight on the current branch BEFORE opening a PR — gates, a size + data/logic split check, an adversarial self-critique, the domain reviewer (incl. security-reviewer for external-input surfaces), and a draft-PR Codex diverse-lens loop before marking ready — so review findings and lint fold into the first push instead of becoming post-open rework. Use before opening any PR.
+description: Run the full pre-open preflight on the current branch BEFORE opening a PR — gates, a size + data/logic split check, an adversarial self-critique, the domain reviewer (incl. security-reviewer for external-input surfaces), and a LOCAL `codex review` diverse-lens pass before the branch is even pushed — so review findings and lint fold into the first push instead of becoming post-open rework. Use before opening any PR.
 ---
 
 Run this on the PR branch **before** `gh pr create`. The build's PR-flow metrics
@@ -158,14 +158,15 @@ different model family and catches exactly that class**, and the measured gap is
 security keystone two Opus safety passes called clean — all post-open). Get Codex in
 **before the branch is pushed**, so its finds fold instead of becoming post-ready rework:
 
-1. **Run `codex review --base <branch>` LOCALLY, before pushing anything.** This is the
+1. **Run `codex review --base origin/main` LOCALLY, before pushing anything.** This is the
    pre-ready diverse lens. Corrected 27 Jul 2026 (D142): Codex does **not** auto-review a
    draft. Its connector fires automatically only at the **ready** transition, so a draft
    cannot converge the Codex lens at all, and a workflow that waits for a clean verdict
    there stalls forever. Fold every real finding by CLASS (step 4) before pushing.
 2. Open the PR as a **draft** (`gh pr create --draft`), and **record the current head sha**.
-   The draft phase exists for the **runner-only gates** (`ci.yml`, tests, `ruff`, `pyright`,
-   CodeQL): they run on draft pushes and catch a class local runs cannot, including
+   The draft phase exists for the **runner-only gates** (`ci.yml`: `ruff`, `pyright`, `pytest`,
+   and the web jobs -- this repository has NO CodeQL workflow, so do not expect a
+   security-analysis lens here): they run on draft pushes and catch a class local runs cannot, including
    environment-dependent failures that only reproduce on a runner. Fold those here, while no
    review lens has been spent. A manual `@codex review` on a draft is not forbidden and does
    post findings, but per D105 it never completes the clean-verdict flow on a draft, so it
@@ -208,7 +209,7 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
    `@codex review` on the new final commit and re-match the sha. Only then, and never on
    intermediate pushes.
 
-**Iterate LOCALLY, not on the draft.** Re-running `codex review --base <branch>` costs
+**Iterate LOCALLY, not on the draft.** Re-running `codex review --base origin/main` costs
 nothing on GitHub and can be repeated freely while folding, which is where iteration now
 lives. The AGENTS.md **"once-on-final-commit, don't re-litigate"** rule governs the
 **post-ready** phase (a marked-ready PR heading to merge), where re-triggering across
@@ -226,12 +227,20 @@ folds are a distinct, additional shift-left category. Both counts trending up is
 
 ## Only when 1–5 pass
 
-Mark the PR **ready** (`gh pr ready`), then follow the **PR Merge Policy** in AGENTS.md
+Step 5 is where `gh pr ready` is actually run, so this section is the POST-ready gate rather than
+a second ready transition (Codex P2, #682: reading it as one made the two sections circular,
+since step 5 cannot complete until the ready transition has fired the automatic review). Once
+step 5's verdict is in, follow the **PR Merge Policy** in AGENTS.md
 (independent triage — the author never triages its own PR; every conversation resolved;
 `codecov/patch` green; the post-ready once-on-final-commit Codex discipline; squash-merge;
 delete the branch).
 
-**No redundant post-ready re-trigger.** If the last draft-phase Codex pass already reviewed the
-**exact head sha** you're marking ready (no commit added between the clean draft verdict and
-`gh pr ready`), that verdict already satisfies once-on-final-commit — don't re-trigger Codex just
-because the PR flipped ready. Re-trigger post-ready only if the head sha actually changed.
+**A draft-phase verdict does NOT satisfy the post-ready wait** (corrected 27 Jul 2026, Codex P1
+on #682). An earlier version of this footer said a draft review of the exact head already
+satisfied once-on-final-commit, so no re-trigger was needed when the PR flipped ready. That is a
+stale-verdict race: the `ready_for_review` transition starts a NEW automatic review, so merging
+on the older draft verdict means merging while that review is still in flight, even though both
+name the same sha. The accepted verdict must postdate the boundary event for this PR's shape
+(`ready_for_review` for a draft you marked ready, `opened` for a PR created ready). A manual
+draft review's findings are still real and worth folding; they simply are not the signal you
+merge on.

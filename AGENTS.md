@@ -431,7 +431,14 @@ in-progress signal as stuck and the lead may merge with an "in-progress review s
 note, triaging any late review post-merge. The silent fallback applies only when NO signal
 at all (no *valid bot-authored* post-trigger 👀, review, clean comment, or 👍 — an invalid signal
 per the rules above, e.g. a stranger's reaction or a stale-sha comment, does NOT count as
-Codex activity and must not suppress this fallback) has appeared ~15 min after green CI: re-trigger
+Codex activity and must not suppress this fallback) has appeared ~15 min after **the boundary
+event that starts this PR's automatic review** (`ready_for_review` for a draft you marked ready,
+`opened` for a PR created ready, or the fresh re-trigger after a later push). **NOT ~15 min after
+green CI** (corrected 27 Jul 2026, Codex P1 on #682): under the draft-first flow CI is
+deliberately allowed to go green well before `gh pr ready`, often by much more than 15 minutes,
+so a CI-timed window can elapse before the review has even been requested, permitting an
+immediate duplicate re-trigger and then a merge on a fallback that never actually waited for
+anything. Time the window from the review boundary, never from CI. Then re-trigger
 once more on the same commit and **wait a full second window (~10 min)**; only if still
 nothing is merging allowed — note "Codex silent" in the merge context so a late review is
 triaged as post-merge follow-up, not a surprise.
