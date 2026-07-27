@@ -1646,6 +1646,9 @@ _HTML_CHARSET_LABEL_RE = re.compile(rb"[a-z0-9._:-]+", re.IGNORECASE)
 _HTML_ATTRIBUTE_WHITESPACE: Final = frozenset(b" \t\n\f\r")
 _HTML_ATTRIBUTE_NAME_END: Final = _HTML_ATTRIBUTE_WHITESPACE | frozenset(b"=/>")
 _HTML_UNQUOTED_VALUE_END: Final = _HTML_ATTRIBUTE_WHITESPACE | frozenset(b">")
+_HTML_OTHER_TAG_START_BYTES: Final = (
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" + b"/!?"
+)
 # Canonical Python codec names for browser-relevant text encodings. Resolve
 # labels through ``codecs.lookup`` for aliases, then require membership here:
 # Python also registers non-HTML transforms such as ``punycode`` whose
@@ -1806,12 +1809,36 @@ def _find_html_meta_tags(prefix: bytes) -> list[bytes]:
     tags: list[bytes] = []
     lower_prefix = prefix.lower()
     cursor = 0
-    while True:
-        tag_start = lower_prefix.find(b"<meta", cursor)
-        if tag_start == -1:
-            break
+    in_other_tag = False
+    other_tag_quote: int | None = None
+    while cursor < len(prefix):
+        char = prefix[cursor]
+        if in_other_tag:
+            if other_tag_quote is not None:
+                if char == other_tag_quote:
+                    other_tag_quote = None
+            elif char in b"\"'":
+                other_tag_quote = char
+            elif char == ord(">"):
+                in_other_tag = False
+            cursor += 1
+            continue
+        if prefix.startswith(b"<!--", cursor):
+            comment_end = prefix.find(b"-->", cursor + len(b"<!--"))
+            if comment_end == -1:
+                break
+            cursor = comment_end + len(b"-->")
+            continue
+        if not lower_prefix.startswith(b"<meta", cursor):
+            if char == ord("<") and cursor + 1 < len(prefix):
+                next_char = prefix[cursor + 1]
+                in_other_tag = next_char in _HTML_OTHER_TAG_START_BYTES
+            cursor += 1
+            continue
+        tag_start = cursor
         name_end = tag_start + len(b"<meta")
         if name_end >= len(prefix) or prefix[name_end] not in b" \t\n\f\r/>":
+            in_other_tag = True
             cursor = name_end
             continue
         quote: int | None = None

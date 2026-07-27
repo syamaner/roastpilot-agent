@@ -1576,6 +1576,45 @@ def test_decode_response_body_meta_scanner_respects_quoted_greater_than(meta: st
     assert "Café — Kenya" in result
 
 
+def test_decode_response_body_ignores_commented_meta_before_real_declaration() -> None:
+    """Codex P2: declarations inside HTML comments are inert."""
+    commented_meta = b'<!-- <meta charset="utf-8"> -->'
+    body = commented_meta + b'<meta charset="windows-1252"><p>Caf\xe9</p>'
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+def test_decode_response_body_comment_marker_inside_attribute_is_not_a_comment() -> None:
+    """Comment-like text inside another tag cannot suppress a later meta."""
+    unrelated_tag = b'<div data-note="<!--"></div>'
+    body = unrelated_tag + b'<meta charset="windows-1252"><p>Caf\xe9</p>'
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+@pytest.mark.parametrize(
+    "data_note",
+    ['"<!--"', '"<meta charset=utf-8>"'],
+)
+def test_decode_response_body_rejected_meta_prefix_stays_inside_other_tag(
+    data_note: str,
+) -> None:
+    """A longer tag's attribute content cannot become document markup."""
+    other_tag = f"<metadata data-note={data_note}></metadata>".encode()
+    body = other_tag + b'<meta charset="windows-1252"><p>Caf\xe9</p>'
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
 def test_parse_html_meta_attributes_handles_spacing_and_malformed_edges() -> None:
     """Cover bounded scanner branches without relying on regex tokenization."""
     parse = bean_sourcing._parse_html_meta_attributes  # pyright: ignore[reportPrivateUsage]
@@ -1596,6 +1635,7 @@ def test_find_html_meta_tags_handles_false_and_unterminated_candidates() -> None
     ]
     assert find_tags(b'<meta charset="utf-8"') == []
     assert find_tags(b"<meta") == []
+    assert find_tags(b'<!-- <meta charset="utf-8">') == []
 
 
 def test_sniff_html_encoding_skips_invalid_direct_charset_before_valid_meta() -> None:
