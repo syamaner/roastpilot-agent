@@ -1438,27 +1438,48 @@ def test_decode_response_body_falls_back_to_utf8_on_unknown_charset() -> None:
     assert result == "hello"
 
 
-@pytest.mark.parametrize(
-    "response",
-    [
-        httpx.Response(200, headers={"Content-Type": "text/html; charset=punycode"}),
-        httpx.Response(200, headers={"Content-Type": "text/html"}),
-    ],
-    ids=["http-header", "html-meta"],
-)
-def test_decode_response_body_rejects_non_html_transform_codec(
-    response: httpx.Response,
-) -> None:
+@pytest.mark.parametrize("label", ["punycode", "idna", "unicode_escape", "not-a-codec"])
+@pytest.mark.parametrize("source", ["http-header", "html-meta"])
+def test_decode_response_body_rejects_non_html_transform_codec(label: str, source: str) -> None:
     """#597 security review: arbitrary Python codecs must not decode HTML."""
     body = (
         b"<p>-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</p>"
-        if response.charset_encoding is not None
-        else b'<meta charset="punycode"><p>-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</p>'
+        if source == "http-header"
+        else f'<meta charset="{label}"><p>-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</p>'.encode()
+    )
+    response = httpx.Response(
+        200,
+        headers={
+            "Content-Type": (
+                f"text/html; charset={label}" if source == "http-header" else "text/html"
+            )
+        },
     )
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
         body, response
     )
     assert result == body.decode()
+
+
+@pytest.mark.parametrize(
+    ("label", "codec", "text"),
+    [
+        ("ibm866", "cp866", "Привет кофе"),
+        ("ms932", "cp932", "珈琲 東京"),
+        ("uhc", "cp949", "커피 서울"),
+        ("ms950", "cp950", "咖啡 臺灣"),
+    ],
+)
+def test_decode_response_body_honors_safe_legacy_http_charset_aliases(
+    label: str, codec: str, text: str
+) -> None:
+    """Codex P2: explicit safe HTTP codecs retain pre-#597 behavior."""
+    body = f"<p>{text}</p>".encode(codec)
+    response = httpx.Response(200, headers={"Content-Type": f"text/html; charset={label}"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert result == f"<p>{text}</p>"
 
 
 @pytest.mark.parametrize(
@@ -1495,6 +1516,91 @@ def test_decode_response_body_sniffs_html_meta_without_http_charset(meta: str) -
         body, response
     )
     assert "Café — Kenya" in result
+
+
+@pytest.mark.parametrize(
+    "false_meta",
+    [
+        '<meta content="example charset=utf-16">',
+        '<meta data-note="charset=utf-8">',
+        '<meta data-charset="utf-8">',
+        '<meta content="text/html; charset=utf-8">',
+    ],
+)
+def test_decode_response_body_ignores_charset_text_outside_real_meta_declaration(
+    false_meta: str,
+) -> None:
+    """Codex P2: unrelated attributes cannot suppress a real declaration."""
+    body = (f'{false_meta}<meta charset="windows-1252"><p>Café — Kenya</p>').encode("windows-1252")
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café — Kenya" in result
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        '<META CONTENT="text/html; CHARSET=windows-1252" HTTP-EQUIV=Content-Type>',
+        '<meta http-equiv=CONTENT-TYPE content="text/html; charset=windows-1252">',
+    ],
+)
+def test_decode_response_body_accepts_reordered_legacy_meta_attributes(meta: str) -> None:
+    """The legacy form requires the matching http-equiv on the same tag."""
+    body = f"{meta}<p>Café — Kenya</p>".encode("windows-1252")
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café — Kenya" in result
+
+
+def test_parse_html_meta_attributes_handles_spacing_and_malformed_edges() -> None:
+    """Cover bounded scanner branches without relying on regex tokenization."""
+    parse = bean_sourcing._parse_html_meta_attributes  # pyright: ignore[reportPrivateUsage]
+    assert parse(b'<meta disabled CHARSET \n= \t"windows-1252">') == {
+        b"disabled": b"",
+        b"charset": b"windows-1252",
+    }
+    assert parse(b'<meta charset="utf-8>') == {b"charset": b"utf-8>"}
+    assert parse(b"<meta =ignored>") == {}
+    assert parse(b"<meta") == {}
+
+
+def test_sniff_html_encoding_skips_invalid_direct_charset_before_valid_meta() -> None:
+    """A malformed direct value cannot suppress a later usable declaration."""
+    result = bean_sourcing._sniff_html_encoding(  # pyright: ignore[reportPrivateUsage]
+        b'<meta charset="utf 8"><meta charset="windows-1252">'
+    )
+    assert result == "cp1252"
+
+
+@pytest.mark.parametrize(
+    "encoding",
+    ["utf-16", "utf-16-le", "utf-16-be", "utf-32", "utf-32-le", "utf-32-be"],
+)
+def test_decode_response_body_normalizes_bomless_wide_meta_charset_to_utf8(
+    encoding: str,
+) -> None:
+    """Codex P2: ASCII-visible wide declarations cannot produce gibberish."""
+    body = f'<meta charset="{encoding}"><p>Café Kenya</p>'.encode()
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert result == body.decode()
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-32"])
+def test_decode_response_body_honors_explicit_wide_http_charset(encoding: str) -> None:
+    """Wide codecs remain valid when supplied out of band by HTTP."""
+    body = "<p>Café Kenya</p>".encode(encoding)
+    response = httpx.Response(200, headers={"Content-Type": f"text/html; charset={encoding}"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert result == "<p>Café Kenya</p>"
 
 
 def test_decode_response_body_http_charset_overrides_conflicting_html_meta() -> None:

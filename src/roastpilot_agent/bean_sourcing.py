@@ -1639,10 +1639,14 @@ def _decompress_within_cap(
 
 _HTML_ENCODING_SNIFF_BYTES: Final = 1024
 _HTML_META_TAG_RE = re.compile(rb"<meta(?=[\t\n\f\r />])[^>]*>", re.IGNORECASE)
-_HTML_META_CHARSET_RE = re.compile(
+_HTML_CONTENT_CHARSET_RE = re.compile(
     rb"(?<![a-z0-9_-])charset\s*=\s*[\"']?\s*([a-z0-9._:-]+)",
     re.IGNORECASE,
 )
+_HTML_CHARSET_LABEL_RE = re.compile(rb"[a-z0-9._:-]+", re.IGNORECASE)
+_HTML_ATTRIBUTE_WHITESPACE: Final = frozenset(b" \t\n\f\r")
+_HTML_ATTRIBUTE_NAME_END: Final = _HTML_ATTRIBUTE_WHITESPACE | frozenset(b"=/>")
+_HTML_UNQUOTED_VALUE_END: Final = _HTML_ATTRIBUTE_WHITESPACE | frozenset(b">")
 # Canonical Python codec names for browser-relevant text encodings. Resolve
 # labels through ``codecs.lookup`` for aliases, then require membership here:
 # Python also registers non-HTML transforms such as ``punycode`` whose
@@ -1652,6 +1656,10 @@ _HTML_SAFE_CODEC_NAMES: Final = frozenset(
         "ascii",
         "big5",
         "cp874",
+        "cp866",
+        "cp932",
+        "cp949",
+        "cp950",
         "cp1250",
         "cp1251",
         "cp1252",
@@ -1696,6 +1704,9 @@ _HTML_SAFE_CODEC_NAMES: Final = frozenset(
         "utf-32-le",
     }
 )
+_HTML_WIDE_CODEC_NAMES: Final = frozenset(
+    {"utf-16", "utf-16-be", "utf-16-le", "utf-32", "utf-32-be", "utf-32-le"}
+)
 _HTML_BOM_ENCODINGS: Final = (
     (b"\x00\x00\xfe\xff", "utf-32"),
     (b"\xff\xfe\x00\x00", "utf-32"),
@@ -1705,11 +1716,15 @@ _HTML_BOM_ENCODINGS: Final = (
 )
 
 
-def _resolve_html_encoding(label: str) -> str | None:
+def _resolve_html_encoding(label: str, *, from_meta: bool = False) -> str | None:
     """Resolve an encoding label only when it is safe for HTML text.
 
     Args:
         label: An HTTP or HTML-declared encoding label.
+        from_meta: Whether the label came from in-document metadata. Wide
+            Unicode encodings require a BOM or explicit HTTP declaration;
+            an ASCII-visible meta declaration naming one is normalized to
+            UTF-8 instead of decoding the page into gibberish.
 
     Returns:
         The canonical Python codec name, or ``None`` for unknown and
@@ -1719,7 +1734,84 @@ def _resolve_html_encoding(label: str) -> str | None:
         canonical_name = codecs.lookup(label).name
     except LookupError:
         return None
-    return canonical_name if canonical_name in _HTML_SAFE_CODEC_NAMES else None
+    if canonical_name not in _HTML_SAFE_CODEC_NAMES:
+        return None
+    if from_meta and canonical_name in _HTML_WIDE_CODEC_NAMES:
+        return "utf-8"
+    return canonical_name
+
+
+def _parse_html_meta_attributes(meta_tag: bytes) -> dict[bytes, bytes]:
+    """Parse attributes from one bounded raw ``<meta>`` tag.
+
+    The caller supplies at most the first 1024 response bytes. This
+    single-pass parser tracks quoted values so text resembling
+    ``charset=...`` inside an unrelated attribute cannot become a separate
+    declaration.
+
+    Args:
+        meta_tag: A complete raw meta tag found in the bounded prefix.
+
+    Returns:
+        Lowercase attribute names mapped to their first value.
+    """
+    attributes: dict[bytes, bytes] = {}
+    pos = len(b"<meta")
+    while pos < len(meta_tag):
+        while pos < len(meta_tag) and meta_tag[pos] in _HTML_ATTRIBUTE_WHITESPACE:
+            pos += 1
+        if pos >= len(meta_tag) or meta_tag[pos] in b"/>":
+            break
+        name_start = pos
+        while pos < len(meta_tag) and meta_tag[pos] not in _HTML_ATTRIBUTE_NAME_END:
+            pos += 1
+        name = meta_tag[name_start:pos].lower()
+        while pos < len(meta_tag) and meta_tag[pos] in _HTML_ATTRIBUTE_WHITESPACE:
+            pos += 1
+        value = b""
+        if pos < len(meta_tag) and meta_tag[pos] == ord("="):
+            pos += 1
+            while pos < len(meta_tag) and meta_tag[pos] in _HTML_ATTRIBUTE_WHITESPACE:
+                pos += 1
+            if pos < len(meta_tag) and meta_tag[pos] in b"\"'":
+                quote = meta_tag[pos]
+                pos += 1
+                value_start = pos
+                while pos < len(meta_tag) and meta_tag[pos] != quote:
+                    pos += 1
+                value = meta_tag[value_start:pos]
+                if pos < len(meta_tag):
+                    pos += 1
+            else:
+                value_start = pos
+                while pos < len(meta_tag) and meta_tag[pos] not in _HTML_UNQUOTED_VALUE_END:
+                    pos += 1
+                value = meta_tag[value_start:pos]
+        if name:
+            attributes.setdefault(name, value)
+    return attributes
+
+
+def _resolve_meta_charset(value: bytes) -> str | None:
+    """Resolve one bounded, ASCII-compatible meta charset value."""
+    label = value.strip()
+    if _HTML_CHARSET_LABEL_RE.fullmatch(label) is None:
+        return None
+    return _resolve_html_encoding(label.decode("ascii"), from_meta=True)
+
+
+def _encoding_from_meta_tag(meta_tag: bytes) -> str | None:
+    """Return an encoding only from a real HTML meta declaration."""
+    attributes = _parse_html_meta_attributes(meta_tag)
+    charset = attributes.get(b"charset")
+    if charset is not None:
+        return _resolve_meta_charset(charset)
+    http_equiv = attributes.get(b"http-equiv", b"").strip().lower()
+    content = attributes.get(b"content")
+    if http_equiv != b"content-type" or content is None:
+        return None
+    match = _HTML_CONTENT_CHARSET_RE.search(content)
+    return _resolve_meta_charset(match.group(1)) if match is not None else None
 
 
 def _sniff_html_encoding(body: bytes) -> str | None:
@@ -1744,10 +1836,7 @@ def _sniff_html_encoding(body: bytes) -> str | None:
 
     prefix = body[:_HTML_ENCODING_SNIFF_BYTES]
     for meta_match in _HTML_META_TAG_RE.finditer(prefix):
-        charset_match = _HTML_META_CHARSET_RE.search(meta_match.group())
-        if charset_match is None:
-            continue
-        encoding = _resolve_html_encoding(charset_match.group(1).decode("ascii"))
+        encoding = _encoding_from_meta_tag(meta_match.group())
         if encoding is not None:
             return encoding
     return None
