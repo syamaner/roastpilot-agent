@@ -200,6 +200,7 @@ contract.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import concurrent.futures
 import ipaddress
 import logging
@@ -224,6 +225,7 @@ from pydantic_ai import Agent, ModelAPIError, ModelSettings, UnexpectedModelBeha
 from pydantic_ai.messages import ModelRequest, RetryPromptPart
 from pydantic_ai.models import Model
 from pydantic_ai.usage import RunUsage
+from webencodings import lookup as lookup_html_encoding
 
 from roastpilot_agent.advisor import (
     AdvisorDependencyError,
@@ -509,6 +511,7 @@ def redact_url_for_error(url: str) -> str:
 
 _INLINE_WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
 _BLANK_LINES_RE = re.compile(r"\n{3,}")
+_HTML_TAG_NAME_DELIMITERS: Final = frozenset(" \t\n\f\r/>")
 
 #: Extracted page text is truncated to this many characters before it is
 #: handed to the LLM — a token/cost bound independent of the raw HTTP fetch
@@ -517,29 +520,31 @@ _BLANK_LINES_RE = re.compile(r"\n{3,}")
 _MAX_EXTRACTED_CHARS = 20_000
 
 
-def _tag_name_starts_at(lower_html: str, pos: int, tag_name: str) -> bool:
-    """``True`` if ``lower_html[pos:]`` starts with ``"<" + tag_name`` at a
-    genuine TAG-NAME boundary — e.g. matches ``"<script>"``/``"<script "``/
-    ``"<script/>"`` but NOT ``"<scripty>"`` (mirrors a regex ``\\b`` after
-    the tag name, without using one).
+def _tag_name_starts_at(lower_html: str, pos: int, tag_name: str, *, closing: bool = False) -> bool:
+    """Check for an opening or closing tag at a genuine name boundary.
+
+    Matches e.g. ``<script>``/``<script ``/``<script/>`` but not longer
+    names such as ``<scripty>`` or ``<script-x>``. With ``closing=True``,
+    applies the identical boundary rule to ``</script...``. HTML tag names
+    end only at ASCII whitespace, ``/``, or ``>``.
 
     Args:
         lower_html: ``html.lower()`` (case-INsensitive tag-name matching,
             like the regex this replaces used ``re.IGNORECASE`` for).
         pos: The index of the ``"<"`` to check.
         tag_name: The lowercase tag name to match (``"script"``/``"style"``).
+        closing: Whether to require a ``"</"`` prefix instead of ``"<"``.
 
     Returns:
         Whether a tag with exactly this name starts at ``pos``.
     """
-    prefix = "<" + tag_name
+    prefix = ("</" if closing else "<") + tag_name
     end = pos + len(prefix)
     if not lower_html.startswith(prefix, pos):
         return False
     if end >= len(lower_html):
         return True
-    next_char = lower_html[end]
-    return not (next_char.isalnum() or next_char == "_")
+    return lower_html[end] in _HTML_TAG_NAME_DELIMITERS
 
 
 def _strip_script_and_style_blocks(html: str) -> str:
@@ -577,8 +582,9 @@ def _strip_script_and_style_blocks(html: str) -> str:
        O(n) total across the whole call.
     3. ``html.find(">", ...)`` to find where the OPENING tag itself ends.
     4. ``html.lower().find("</script"/"</style", ...)`` to find the start
-       of the matching CLOSING tag, then another ``html.find(">", ...)``
-       for where THAT ends.
+       of the matching CLOSING tag, skipping longer names such as
+       ``</scripty>`` with the same boundary check used for opening tags,
+       then another ``html.find(">", ...)`` for where THAT ends.
 
     The critical safety property: EVERY ``str.find`` call in steps 3–4
     either (a) succeeds within a BOUNDED distance that does not overlap
@@ -636,7 +642,14 @@ def _strip_script_and_style_blocks(html: str) -> str:
             # tag itself never closes, so nothing after it can either.
             pieces.append(html[pos:open_pos])
             break
-        close_tag_start = lower_html.find(f"</{tag_name}", open_tag_end + 1)
+        close_prefix = f"</{tag_name}"
+        close_tag_start = lower_html.find(close_prefix, open_tag_end + 1)
+        while close_tag_start != -1 and not _tag_name_starts_at(
+            lower_html, close_tag_start, tag_name, closing=True
+        ):
+            # A longer tag name is not this element's close. The cursor remains
+            # monotonic, preserving the function's linear-time bound.
+            close_tag_start = lower_html.find(close_prefix, close_tag_start + len(close_prefix))
         if close_tag_start == -1:
             pieces.append(html[pos:open_pos])
             pieces.append(" ")
@@ -1624,33 +1637,298 @@ def _decompress_within_cap(
     return decoded
 
 
+_HTML_ENCODING_SNIFF_BYTES: Final = 1024
+_HTML_CONTENT_CHARSET_RE = re.compile(
+    rb"(?<![a-z0-9_-])charset[ \t\n\f\r]*=[ \t\n\f\r]*(?P<quote>[\"'])?[ \t\n\f\r]*"
+    rb"(?P<label>[a-z0-9._:-]+)[ \t\n\f\r]*(?(quote)(?P=quote)|(?=[ \t\n\f\r;]|$))",
+    re.IGNORECASE,
+)
+_HTML_CHARSET_LABEL_RE = re.compile(rb"[a-z0-9._:-]+", re.IGNORECASE)
+_HTML_ATTRIBUTE_WHITESPACE: Final = frozenset(b" \t\n\f\r")
+_HTML_ATTRIBUTE_NAME_END: Final = _HTML_ATTRIBUTE_WHITESPACE | frozenset(b"=/>")
+_HTML_UNQUOTED_VALUE_END: Final = _HTML_ATTRIBUTE_WHITESPACE | frozenset(b">")
+_HTML_OTHER_TAG_START_BYTES: Final = (
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" + b"/!?"
+)
+_HTML_RAW_TEXT_START_RE = re.compile(
+    rb"<(script|style|title|textarea|xmp|iframe|noembed|noframes|plaintext)"
+    rb"(?=[ \t\n\f\r/>])",
+    re.IGNORECASE,
+)
+_HTML_MISSING_LABEL_OVERRIDES: Final = {
+    "csunicode": "utf-16-le",
+    "iso-10646-ucs-2": "utf-16-le",
+    "koi8-ru": "koi8-u",
+    "ms932": "shift_jis",
+    "ucs-2": "utf-16-le",
+    "unicode": "utf-16-le",
+    "unicode11utf8": "utf-8",
+    "unicode20utf8": "utf-8",
+    "unicodefeff": "utf-16-le",
+    "unicodefffe": "utf-16-be",
+    "x-unicode20utf8": "utf-8",
+}
+_HTML_SAFE_CODEC_NAMES: Final = frozenset(
+    {
+        "ascii",
+        "big5",
+        "big5hkscs",
+        "cp874",
+        "cp866",
+        "cp932",
+        "cp949",
+        "cp950",
+        "cp1250",
+        "cp1251",
+        "cp1252",
+        "cp1253",
+        "cp1254",
+        "cp1255",
+        "cp1256",
+        "cp1257",
+        "cp1258",
+        "euc_jp",
+        "gb18030",
+        "gbk",
+        "iso2022_jp",
+        "iso8859-1",
+        "iso8859-2",
+        "iso8859-3",
+        "iso8859-4",
+        "iso8859-5",
+        "iso8859-6",
+        "iso8859-7",
+        "iso8859-8",
+        "iso8859-10",
+        "iso8859-11",
+        "iso8859-13",
+        "iso8859-14",
+        "iso8859-15",
+        "iso8859-16",
+        "koi8-r",
+        "koi8-u",
+        "mac-cyrillic",
+        "mac-roman",
+        "shift_jis",
+        "utf-8",
+        "utf-8-sig",
+        "utf-16",
+        "utf-16-be",
+        "utf-16-le",
+        "utf-32",
+        "utf-32-be",
+        "utf-32-le",
+    }
+)
+_HTML_WIDE_CODEC_NAMES: Final = frozenset(
+    {"utf-16", "utf-16-be", "utf-16-le", "utf-32", "utf-32-be", "utf-32-le"}
+)
+_HTML_BOM_ENCODINGS: Final = (
+    (b"\x00\x00\xfe\xff", "utf-32"),
+    (b"\xff\xfe\x00\x00", "utf-32"),
+    (b"\xef\xbb\xbf", "utf-8-sig"),
+    (b"\xfe\xff", "utf-16"),
+    (b"\xff\xfe", "utf-16"),
+)
+
+
+def _resolve_html_encoding(label: str, *, from_meta: bool = False) -> str | None:
+    normalized_label = label.strip(" \t\n\f\r")
+    if (
+        not normalized_label.isascii()
+        or _HTML_CHARSET_LABEL_RE.fullmatch(normalized_label.encode()) is None
+    ):
+        return None
+    try:
+        python_name: str | None = codecs.lookup(normalized_label).name
+    except LookupError:
+        python_name = None
+    html_encoding = lookup_html_encoding(normalized_label)
+    canonical_name = _HTML_MISSING_LABEL_OVERRIDES.get(normalized_label.lower()) or (
+        html_encoding.codec_info.name if html_encoding is not None else python_name
+    )
+    canonical_name = "cp949" if canonical_name == "euc_kr" else canonical_name
+    canonical_name = "cp932" if canonical_name == "shift_jis" else canonical_name
+    if canonical_name is None or canonical_name not in _HTML_SAFE_CODEC_NAMES:
+        return None
+    if from_meta and canonical_name in _HTML_WIDE_CODEC_NAMES:
+        return "utf-8"
+    return canonical_name
+
+
+def _parse_html_meta_attributes(meta_tag: bytes) -> dict[bytes, bytes]:
+    attributes: dict[bytes, bytes] = {}
+    pos = len(b"<meta")
+    while pos < len(meta_tag):
+        while pos < len(meta_tag) and meta_tag[pos] in b" \t\n\f\r/":
+            pos += 1
+        if pos >= len(meta_tag) or meta_tag[pos] == ord(">"):
+            break
+        name_start = pos
+        while pos < len(meta_tag) and meta_tag[pos] not in _HTML_ATTRIBUTE_NAME_END:
+            pos += 1
+        name = meta_tag[name_start:pos].lower()
+        while pos < len(meta_tag) and meta_tag[pos] in _HTML_ATTRIBUTE_WHITESPACE:
+            pos += 1
+        value = b""
+        if pos < len(meta_tag) and meta_tag[pos] == ord("="):
+            pos += 1
+            while pos < len(meta_tag) and meta_tag[pos] in _HTML_ATTRIBUTE_WHITESPACE:
+                pos += 1
+            if pos < len(meta_tag) and meta_tag[pos] in b"\"'":
+                quote = meta_tag[pos]
+                pos += 1
+                value_start = pos
+                while pos < len(meta_tag) and meta_tag[pos] != quote:
+                    pos += 1
+                value = meta_tag[value_start:pos]
+                if pos < len(meta_tag):
+                    pos += 1
+            else:
+                value_start = pos
+                while pos < len(meta_tag) and meta_tag[pos] not in _HTML_UNQUOTED_VALUE_END:
+                    pos += 1
+                value = meta_tag[value_start:pos]
+        if name:
+            attributes.setdefault(name, value)
+    return attributes
+
+
+def _find_html_tag_end(prefix: bytes, cursor: int) -> int | None:
+    quote: int | None = None
+    awaiting_value = in_unquoted_value = False
+    while cursor < len(prefix):
+        char = prefix[cursor]
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char == ord(">"):
+            return cursor
+        elif awaiting_value:
+            if char not in _HTML_ATTRIBUTE_WHITESPACE:
+                awaiting_value = False
+                if char in b"\"'":
+                    quote = char
+                else:
+                    in_unquoted_value = True
+        elif in_unquoted_value:
+            if char in _HTML_ATTRIBUTE_WHITESPACE:
+                in_unquoted_value = False
+        elif char == ord("="):
+            awaiting_value = True
+        cursor += 1
+    return None
+
+
+def _find_html_meta_tags(prefix: bytes) -> list[bytes]:
+    tags: list[bytes] = []
+    lower_prefix = prefix.lower()
+    cursor = 0
+    while cursor < len(prefix):
+        char = prefix[cursor]
+        if prefix.startswith(b"<!-->", cursor):
+            cursor += len(b"<!-->")
+            continue
+        if prefix.startswith(b"<!--", cursor):
+            comment_ends = (
+                prefix.find(b"-->", cursor + len(b"<!--") - 1),
+                prefix.find(b"--!>", cursor + len(b"<!--")),
+            )
+            comment_end = min((end for end in comment_ends if end != -1), default=-1)
+            if comment_end == -1:
+                break
+            cursor = comment_end + (len(b"--!>") if prefix.startswith(b"--!>", comment_end) else 3)
+            continue
+        raw_start = _HTML_RAW_TEXT_START_RE.match(prefix, cursor)
+        if raw_start is not None:
+            open_end = _find_html_tag_end(prefix, raw_start.end())
+            if open_end is None:
+                break
+            raw_tag = raw_start.group(1).lower()
+            if raw_tag == b"plaintext":
+                break
+            close_prefix = b"</" + raw_tag
+            close_start = lower_prefix.find(close_prefix, open_end + 1)
+            while close_start != -1:
+                name_end = close_start + len(close_prefix)
+                if name_end < len(prefix) and prefix[name_end] in b" \t\n\f\r/>":
+                    break
+                close_start = lower_prefix.find(close_prefix, name_end)
+            if close_start == -1:
+                break
+            close_end = _find_html_tag_end(prefix, close_start + len(close_prefix))
+            if close_end is None:
+                break
+            cursor = close_end + 1
+            continue
+        if not lower_prefix.startswith(b"<meta", cursor):
+            if char == ord("<") and cursor + 1 < len(prefix):
+                next_char = prefix[cursor + 1]
+                if next_char in _HTML_OTHER_TAG_START_BYTES:
+                    tag_end = _find_html_tag_end(prefix, cursor + 2)
+                    if tag_end is None:
+                        break
+                    cursor = tag_end + 1
+                    continue
+            cursor += 1
+            continue
+        tag_start = cursor
+        name_end = tag_start + len(b"<meta")
+        if name_end >= len(prefix) or prefix[name_end] not in b" \t\n\f\r/>":
+            tag_end = _find_html_tag_end(prefix, name_end)
+            if tag_end is None:
+                break
+            cursor = tag_end + 1
+            continue
+        tag_end = _find_html_tag_end(prefix, name_end)
+        if tag_end is None:
+            break
+        tags.append(prefix[tag_start : tag_end + 1])
+        cursor = tag_end + 1
+    return tags
+
+
+def _resolve_meta_charset(value: bytes) -> str | None:
+    label = value.strip(b" \t\n\f\r")
+    if _HTML_CHARSET_LABEL_RE.fullmatch(label) is None:
+        return None
+    return _resolve_html_encoding(label.decode("ascii"), from_meta=True)
+
+
+def _encoding_from_meta_tag(meta_tag: bytes) -> str | None:
+    attributes = _parse_html_meta_attributes(meta_tag)
+    charset = attributes.get(b"charset")
+    if charset is not None:
+        return _resolve_meta_charset(charset)
+    http_equiv = attributes.get(b"http-equiv", b"").strip(b" \t\n\f\r").lower()
+    content = attributes.get(b"content")
+    if http_equiv != b"content-type" or content is None:
+        return None
+    match = _HTML_CONTENT_CHARSET_RE.search(content)
+    return _resolve_meta_charset(match.group("label")) if match is not None else None
+
+
+def _sniff_html_encoding(body: bytes) -> str | None:
+    for bom, encoding in _HTML_BOM_ENCODINGS:
+        if body.startswith(bom):
+            return encoding
+
+    prefix = body[:_HTML_ENCODING_SNIFF_BYTES]
+    for meta_tag in _find_html_meta_tags(prefix):
+        encoding = _encoding_from_meta_tag(meta_tag)
+        if encoding is not None:
+            return encoding
+    return None
+
+
 def _decode_response_body(body: bytes, response: httpx.Response) -> str:
-    """Decode a raw fetched body using the response's declared charset
-    (#587 P2) instead of assuming UTF-8.
+    """Decode a raw fetched body using HTTP, BOM, or HTML charset metadata.
 
-    ``response.encoding`` reads the ``charset`` parameter off the
-    ``Content-Type`` header when present, falling back to UTF-8 otherwise —
-    it is safe to read here even though the body was collected manually via
-    ``aiter_bytes()`` (to enforce the streaming size cap) rather than
-    ``response.read()``/``response.text``, because the default
-    ``default_encoding="utf-8"`` never needs the body itself to resolve. A
-    vendor page served as e.g. ``text/html; charset=iso-8859-1`` must decode
-    under ITS declared charset, not get silently corrupted into replacement
-    characters by an unconditional UTF-8 decode. ``errors="replace"`` is
-    kept as the final fallback so a body that does not even decode cleanly
-    under its own declared charset still yields text rather than raising.
-
-    ``response.encoding`` is NOT a hard guarantee of a decodable codec name
-    (#587 P2, round 8): it is validated against the codec registry in the
-    common case, but that is an ``httpx``-internal implementation detail
-    this module does not control (and the ``encoding`` SETTER, used
-    elsewhere in ``httpx``'s own internals, does not re-validate at all) —
-    an unrecognized charset name raises ``LookupError`` from
-    ``bytes.decode()``, which ``errors="replace"`` does NOT protect against
-    (that parameter only governs DECODE errors within an already-resolved
-    codec, not an unknown codec NAME). Caught here and treated the same as
-    a garbled body under a recognized charset: fail soft to UTF-8, never a
-    500 over a vendor's bad ``Content-Type`` header.
+    An explicit HTTP ``Content-Type`` charset wins. Without one, a bounded
+    prefix is sniffed for a BOM or ``<meta charset=...>``/content-type meta
+    declaration before the existing UTF-8 default is used. This matters for
+    legacy vendor pages whose non-UTF-8 bytes would otherwise be irreversibly
+    replaced before extraction.
 
     Args:
         body: The raw fetched bytes (already capped to the configured size
@@ -1661,11 +1939,15 @@ def _decode_response_body(body: bytes, response: httpx.Response) -> str:
     Returns:
         The decoded text.
     """
-    encoding = response.encoding or "utf-8"
-    try:
-        return body.decode(encoding, errors="replace")
-    except LookupError:
-        return body.decode("utf-8", errors="replace")
+    content_type = response.headers.get("content-type", "")
+    http_encoding = response.charset_encoding
+    if any(char in "\n\r\f\v" for char in content_type):
+        http_encoding = None
+    encoding = _resolve_html_encoding(http_encoding) if http_encoding is not None else None
+    if encoding is None:
+        encoding = _sniff_html_encoding(body) or "utf-8"
+    decoded = body.decode(encoding, errors="replace")
+    return decoded.removeprefix("\ufeff")
 
 
 async def _fetch_one_hop(
@@ -3092,19 +3374,26 @@ async def _extract_bean_identity(
     bespoke_client: AsyncOpenAI | None = None
     bespoke_model_name: str | None = None
     try:
-        # Agent construction (which calls ``build_model`` when ``model`` is
-        # omitted) lives INSIDE the try: it can raise ``AdvisorDependencyError``
-        # / ``AdvisorError`` on a misconfigured or under-installed provider,
-        # and that must fail soft as ``BeanExtractionError`` too, not escape
-        # as an unhandled exception (#587).
-        agent = _bean_sourcing_agent(
-            advisor_config,
-            sourcing_config=sourcing_config,
-            model=model,
-            reasoning_effort=reasoning_effort,
-            max_output_tokens=max_output_tokens,
-            disable_transport_retries=disable_transport_retries,
-        )
+        # Construction lives inside its own broad fail-soft boundary. Provider
+        # SDKs can raise validation/config exceptions outside our typed advisor
+        # hierarchy before any remote call begins (#597). Do not broaden the
+        # provider AWAIT below: unexpected runtime defects there must remain
+        # distinguishable from operator configuration failures.
+        try:
+            agent = _bean_sourcing_agent(
+                advisor_config,
+                sourcing_config=sourcing_config,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                max_output_tokens=max_output_tokens,
+                disable_transport_retries=disable_transport_retries,
+            )
+        except (AdvisorDependencyError, AdvisorError):
+            raise
+        except Exception as exc:
+            raise BeanExtractionUnavailableError(
+                "bean identity extraction could not construct its provider"
+            ) from exc
         if model is None and disable_transport_retries:
             from pydantic_ai.models.openai import OpenAIChatModel  # noqa: PLC0415
 

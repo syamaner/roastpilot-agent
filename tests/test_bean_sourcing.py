@@ -268,6 +268,31 @@ def test_strip_script_and_style_blocks_handles_unterminated_script_tag() -> None
     assert "var x" not in result
 
 
+@pytest.mark.parametrize("tag_name", ["script", "style"])
+@pytest.mark.parametrize("suffix", ["y", "-x", ":x", ".x"])
+def test_strip_script_and_style_blocks_requires_closing_tag_name_boundary(
+    tag_name: str, suffix: str
+) -> None:
+    """#597: a longer closing tag name must not terminate the block."""
+    strip = bean_sourcing._strip_script_and_style_blocks  # pyright: ignore[reportPrivateUsage]
+    html = (
+        f"<p>Before</p><{tag_name}>secret before "
+        f"</{tag_name}{suffix}><p>still secret</p></{tag_name}><p>After</p>"
+    )
+    result = strip(html)
+    assert "Before" in result
+    assert "After" in result
+    assert "secret" not in result
+
+
+def test_strip_script_and_style_blocks_false_closer_does_not_preserve_tail() -> None:
+    """#597: without a genuine closer, a false prefix cannot expose content."""
+    strip = bean_sourcing._strip_script_and_style_blocks  # pyright: ignore[reportPrivateUsage]
+    result = strip("<p>Before</p><script>secret</scripty><p>still secret</p>")
+    assert "Before" in result
+    assert "secret" not in result
+
+
 def test_extract_page_text_handles_unterminated_script_tag() -> None:
     text = bean_sourcing._extract_page_text(  # pyright: ignore[reportPrivateUsage]
         "<p>Kenya Kiambu AA</p><script>var x = 1;"
@@ -306,9 +331,11 @@ def test_tag_name_starts_at_handles_tag_name_at_string_end() -> None:
     starts_at = bean_sourcing._tag_name_starts_at  # pyright: ignore[reportPrivateUsage]
     assert starts_at("<script", 0, "script") is True
     assert starts_at("<style", 0, "style") is True
-    # "<scripty" is NOT a "script" tag — the char right after "script" is a
-    # word character, so this is a longer, different tag name.
+    # These are longer, different tag names, not "script".
     assert starts_at("<scripty", 0, "script") is False
+    assert starts_at("<script-x", 0, "script") is False
+    assert starts_at("<script:x", 0, "script") is False
+    assert starts_at("<script.x", 0, "script") is False
 
 
 def test_strip_script_and_style_blocks_handles_missing_open_tag_close_bracket() -> None:
@@ -1409,6 +1436,539 @@ def test_decode_response_body_falls_back_to_utf8_on_unknown_charset() -> None:
         b"hello", response
     )
     assert result == "hello"
+
+
+@pytest.mark.parametrize("invalid_label", ["not-a-codec", "\vunicode11utf8\v"])
+def test_decode_response_body_invalid_http_charset_falls_back_to_valid_meta(
+    invalid_label: str,
+) -> None:
+    body = b'<meta charset="windows-1252"><p>Caf\xe9</p>'
+    response = httpx.Response(200, headers={"Content-Type": f"text/html; charset={invalid_label}"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+def test_decode_response_body_allows_obs_text_in_other_header_parameter() -> None:
+    response = httpx.Response(
+        200, headers={b"Content-Type": b'text/html; note="a\xa0b"; charset=windows-1252'}
+    )
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        b"<p>Caf\xe9</p>", response
+    )
+    assert result == "<p>Café</p>"
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["punycode", "idna", "unicode_escape", "x-user-defined", "replacement", "not-a-codec"],
+)
+@pytest.mark.parametrize("source", ["http-header", "html-meta"])
+def test_decode_response_body_rejects_non_html_transform_codec(label: str, source: str) -> None:
+    body = (
+        b"<p>-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</p>"
+        if source == "http-header"
+        else f'<meta charset="{label}"><p>-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</p>'.encode()
+    )
+    response = httpx.Response(
+        200,
+        headers={
+            "Content-Type": (
+                f"text/html; charset={label}" if source == "http-header" else "text/html"
+            )
+        },
+    )
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert result == body.decode()
+
+
+@pytest.mark.parametrize(
+    ("label", "codec", "text"),
+    [
+        ("ibm866", "cp866", "Привет кофе"),
+        ("ms932", "cp932", "珈琲 東京"),
+        ("uhc", "cp949", "커피 서울"),
+        ("ms950", "cp950", "咖啡 臺灣"),
+        ("gb2312", "gb2312", "咖啡 中国"),
+        ("tis-620", "tis-620", "กาแฟ ไทย"),
+        ("big5hkscs", "big5hkscs", "咖啡 香港"),
+    ],
+)
+def test_decode_response_body_honors_safe_legacy_http_charset_aliases(
+    label: str, codec: str, text: str
+) -> None:
+    body = f"<p>{text}</p>".encode(codec)
+    response = httpx.Response(200, headers={"Content-Type": f"text/html; charset={label}"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert result == f"<p>{text}</p>"
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "ansi_x3.4-1968",
+        "ascii",
+        "cp1252",
+        "cp819",
+        "csisolatin1",
+        "ibm819",
+        "iso-8859-1",
+        "iso-ir-100",
+        "iso8859-1",
+        "iso88591",
+        "iso_8859-1",
+        "iso_8859-1:1987",
+        "l1",
+        "latin1",
+        "us-ascii",
+        "windows-1252",
+        "x-cp1252",
+    ],
+)
+def test_decode_response_body_uses_windows_1252_for_web_latin1_labels(label: str) -> None:
+    response = httpx.Response(200, headers={"Content-Type": f"text/html; charset={label}"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        b"<p>\x80</p>", response
+    )
+    assert result == "<p>€</p>"
+
+
+@pytest.mark.parametrize(
+    ("label", "codec", "text"),
+    [
+        ("x-mac-cyrillic", "mac-cyrillic", "Кофе"),
+        ("gb2312", "gbk", "镕"),
+        ("chinese", "gbk", "镕"),
+        ("csiso58gb231280", "gbk", "镕"),
+        ("iso-ir-58", "gbk", "镕"),
+        ("csgb2312", "gbk", "镕"),
+        ("gb_2312", "gbk", "镕"),
+        ("gb_2312-80", "gbk", "镕"),
+        ("x-gbk", "gbk", "镕"),
+        ("tis-620", "cp874", "€"),
+        ("iso-8859-11", "cp874", "€"),
+        ("iso8859-11", "cp874", "€"),
+        ("iso885911", "cp874", "€"),
+        ("dos-874", "cp874", "€"),
+        ("windows-874", "cp874", "€"),
+        ("iso-8859-9", "cp1254", "€"),
+        ("csisolatin5", "cp1254", "€"),
+        ("iso-ir-148", "cp1254", "€"),
+        ("iso8859-9", "cp1254", "€"),
+        ("iso88599", "cp1254", "€"),
+        ("iso_8859-9", "cp1254", "€"),
+        ("iso_8859-9:1989", "cp1254", "€"),
+        ("l5", "cp1254", "€"),
+        ("latin5", "cp1254", "€"),
+        ("windows-1254", "cp1254", "€"),
+        ("x-cp1254", "cp1254", "€"),
+        ("euc-kr", "cp949", "갂"),
+        ("ksc_5601", "cp949", "갂"),
+        ("windows-949", "cp949", "갂"),
+        ("shift_jis", "cp932", "髙"),
+        ("windows-31j", "cp932", "髙"),
+        ("ms932", "cp932", "髙"),
+    ],
+)
+def test_decode_response_body_applies_web_compatibility_label_overrides(
+    label: str, codec: str, text: str
+) -> None:
+    response = httpx.Response(200, headers={"Content-Type": f"text/html; charset={label}"})
+    body = f"<p>{text}</p>".encode(codec)
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert result == f"<p>{text}</p>"
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("unicode-1-1-utf-8", "utf-8"),
+        ("iso88592", "iso8859-2"),
+        ("iso-8859-8-i", "iso8859-8"),
+        ("x-mac-ukrainian", "mac-cyrillic"),
+        ("windows-31j", "cp932"),
+        ("windows-949", "cp949"),
+        ("ms932", "cp932"),
+        ("utf-16", "utf-16-le"),
+        ("unicode11utf8", "utf-8"),
+        ("unicode20utf8", "utf-8"),
+        ("x-unicode20utf8", "utf-8"),
+        ("koi8-ru", "koi8-u"),
+        ("unicodefffe", "utf-16-be"),
+        ("csunicode", "utf-16-le"),
+        ("iso-10646-ucs-2", "utf-16-le"),
+        ("\vunicode11utf8\v", None),
+        ("ucs-2", "utf-16-le"),
+        ("unicode", "utf-16-le"),
+        ("unicodefeff", "utf-16-le"),
+    ],
+)
+def test_resolve_html_encoding_uses_whatwg_label_registry(label: str, expected: str | None) -> None:
+    assert (
+        bean_sourcing._resolve_html_encoding(label)  # pyright: ignore[reportPrivateUsage]
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("\ufeff<p>Café</p>".encode("utf-8"), "<p>Café</p>"),
+        ("<p>Café</p>".encode("utf-16"), "<p>Café</p>"),
+        ("<p>Café</p>".encode("utf-32"), "<p>Café</p>"),
+    ],
+    ids=["utf-8-bom", "utf-16-bom", "utf-32-bom"],
+)
+def test_decode_response_body_sniffs_bom_without_http_charset(body: bytes, expected: str) -> None:
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert result == expected
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        '<meta charset="windows-1252">',
+        '<meta http-equiv="Content-Type" content="text/html; charset=windows-1252">',
+        """<meta http-equiv=Content-Type content="text/html; charset=' windows-1252 '">""",
+        '<meta/charset="windows-1252">',
+        '<meta/ charset="windows-1252">',
+        '<head><noscript><meta charset="windows-1252"></noscript></head>',
+    ],
+)
+def test_decode_response_body_sniffs_html_meta_without_http_charset(meta: str) -> None:
+    body = f"{meta}<p>Café — Kenya</p>".encode("windows-1252")
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café — Kenya" in result
+
+
+@pytest.mark.parametrize(
+    "false_meta",
+    [
+        '<meta content="example charset=utf-16">',
+        '<meta data-note="charset=utf-8">',
+        '<meta data-charset="utf-8">',
+        '<meta content="text/html; charset=utf-8">',
+        '<meta charset="\x0bwindows-1252\x0b">',
+        '<meta http-equiv="\x0bContent-Type\x0b" content="text/html; charset=utf-8">',
+        '<meta http-equiv="Content-Type" content="text/html; charset=\x0butf-8\x0b">',
+        '<meta http-equiv="Content-Type" content="text/html; charset=utf-8\x0b">',
+        "<meta charset=utf-8/foo>",
+        """<meta http-equiv="Content-Type" content="text/html; charset=utf-8'junk">""",
+        """<meta http-equiv="Content-Type" content="text/html; charset='utf-8">""",
+        """<meta http-equiv="Content-Type" content='text/html; charset="utf-8'>""",
+    ],
+)
+def test_decode_response_body_ignores_charset_text_outside_real_meta_declaration(
+    false_meta: str,
+) -> None:
+    body = (f'{false_meta}<meta charset="windows-1252"><p>Café — Kenya</p>').encode("windows-1252")
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café — Kenya" in result
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        '<META CONTENT="text/html; CHARSET=windows-1252" HTTP-EQUIV=Content-Type>',
+        '<meta http-equiv=CONTENT-TYPE content="text/html; charset=windows-1252">',
+    ],
+)
+def test_decode_response_body_accepts_reordered_legacy_meta_attributes(meta: str) -> None:
+    body = f"{meta}<p>Café — Kenya</p>".encode("windows-1252")
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café — Kenya" in result
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        '<meta data-note="x>y" charset="windows-1252">',
+        '<meta charset="windows-1252" data-note="x>y">',
+    ],
+)
+def test_decode_response_body_meta_scanner_respects_quoted_greater_than(meta: str) -> None:
+    body = f"{meta}<p>Café — Kenya</p>".encode("windows-1252")
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café — Kenya" in result
+
+
+def test_decode_response_body_ignores_commented_meta_before_real_declaration() -> None:
+    commented_meta = b'<!-- <meta charset="utf-8"> -->'
+    body = commented_meta + b'<meta charset="windows-1252"><p>Caf\xe9</p>'
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+@pytest.mark.parametrize("comment", [b"<!-->", b"<!--->", b"<!--x--!>"])
+def test_decode_response_body_honors_browser_comment_terminators(comment: bytes) -> None:
+    body = comment + b'<meta charset="windows-1252"><p>Caf\xe9</p>'
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+def test_sniff_html_encoding_keeps_single_dash_bang_inside_comment() -> None:
+    body = b'<!---!><meta charset="windows-1252"><p>Caf\xe9</p>'
+    assert (
+        bean_sourcing._sniff_html_encoding(body)  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "tag",
+    ["script", "style", "title", "textarea", "xmp", "iframe", "noembed", "noframes"],
+)
+def test_decode_response_body_ignores_meta_like_text_in_raw_text(tag: str) -> None:
+    body = (
+        f'<{tag} data-note=">"><meta charset="utf-8"></{tag}>'
+        '<meta charset="windows-1252"><p>Café</p>'
+    ).encode("windows-1252")
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+def test_decode_response_body_raw_text_close_requires_exact_tag_boundary() -> None:
+    body = (
+        b'<script><meta charset="utf-8"></script-x>'
+        b'</script><meta charset="windows-1252"><p>Caf\xe9</p>'
+    )
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+def test_decode_response_body_raw_text_ignores_quoted_close_in_opening_tag() -> None:
+    body = (
+        b'<script data-note="</script>"><meta charset="utf-8"></script>'
+        b'<meta charset="windows-1252"><p>Caf\xe9</p>'
+    )
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+def test_sniff_html_encoding_unclosed_raw_text_fails_closed() -> None:
+    body = b'<script><meta charset="utf-8"><meta charset="windows-1252">'
+    assert (
+        bean_sourcing._sniff_html_encoding(body)  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
+
+
+@pytest.mark.parametrize("body", [b"<script ", b"<script>x</script "])
+def test_sniff_html_encoding_unterminated_raw_tag_fails_closed(body: bytes) -> None:
+    assert (
+        bean_sourcing._sniff_html_encoding(body)  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
+
+
+def test_sniff_html_encoding_plaintext_fails_closed() -> None:
+    body = b'<plaintext><meta charset="windows-1252"><p>Caf\xe9</p>'
+    assert (
+        bean_sourcing._sniff_html_encoding(body)  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
+
+
+def test_decode_response_body_vertical_tab_is_not_html_tag_whitespace() -> None:
+    body = b'<script\x0b><meta charset="windows-1252"><p>Caf\xe9</p>'
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+@pytest.mark.parametrize(
+    "unrelated_tag",
+    [
+        b'<div data-note = "<!--"></div>',
+        b"<div data-note=foo=farmer's>",
+        b'<div data-note=foo=farmer"s>',
+    ],
+)
+def test_decode_response_body_other_tag_content_cannot_suppress_later_meta(
+    unrelated_tag: bytes,
+) -> None:
+    body = unrelated_tag + b'<meta charset="windows-1252"><p>Caf\xe9</p>'
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+@pytest.mark.parametrize(
+    "data_note",
+    ['"<!--"', '"<meta charset=utf-8>"'],
+)
+def test_decode_response_body_rejected_meta_prefix_stays_inside_other_tag(
+    data_note: str,
+) -> None:
+    other_tag = f"<metadata data-note={data_note}></metadata>".encode()
+    body = other_tag + b'<meta charset="windows-1252"><p>Caf\xe9</p>'
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+def test_parse_html_meta_attributes_handles_spacing_and_malformed_edges() -> None:
+    parse = bean_sourcing._parse_html_meta_attributes  # pyright: ignore[reportPrivateUsage]
+    assert parse(b'<meta disabled CHARSET \n= \t"windows-1252">') == {
+        b"disabled": b"",
+        b"charset": b"windows-1252",
+    }
+    assert parse(b'<meta charset="utf-8>') == {b"charset": b"utf-8>"}
+    assert parse(b"<meta =ignored>") == {}
+    assert parse(b"<meta") == {}
+
+
+def test_find_html_meta_tags_handles_false_and_unterminated_candidates() -> None:
+    find_tags = bean_sourcing._find_html_meta_tags  # pyright: ignore[reportPrivateUsage]
+    assert find_tags(b'<1<meta charset="cp1252">') == [b'<meta charset="cp1252">']
+    assert find_tags(b'<metadata charset="utf-8"><meta charset="cp1252">') == [
+        b'<meta charset="cp1252">'
+    ]
+    assert find_tags(b'<meta charset="utf-8"') == []
+    assert find_tags(b"<meta") == []
+    assert find_tags(b'<!-- <meta charset="utf-8">') == []
+
+
+def test_sniff_html_encoding_skips_invalid_direct_charset_before_valid_meta() -> None:
+    result = bean_sourcing._sniff_html_encoding(  # pyright: ignore[reportPrivateUsage]
+        b'<meta charset="utf 8"><meta charset="windows-1252">'
+    )
+    assert result == "cp1252"
+
+
+@pytest.mark.parametrize(
+    "encoding",
+    ["utf-16", "utf-16-le", "utf-16-be", "utf-32", "utf-32-le", "utf-32-be"],
+)
+def test_decode_response_body_normalizes_bomless_wide_meta_charset_to_utf8(
+    encoding: str,
+) -> None:
+    body = f'<meta charset="{encoding}"><p>Café Kenya</p>'.encode()
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert result == body.decode()
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-32"])
+def test_decode_response_body_honors_explicit_wide_http_charset(encoding: str) -> None:
+    body = "<p>Café Kenya</p>".encode(encoding)
+    response = httpx.Response(200, headers={"Content-Type": f"text/html; charset={encoding}"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert result == "<p>Café Kenya</p>"
+
+
+def test_decode_response_body_http_charset_overrides_conflicting_html_meta() -> None:
+    body = '<meta charset="windows-1252"><p>Café</p>'.encode()
+    response = httpx.Response(200, headers={"Content-Type": "text/html; charset=utf-8"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+def test_decode_response_body_bom_overrides_conflicting_html_meta() -> None:
+    body = '\ufeff<meta charset="windows-1252"><p>Café</p>'.encode()
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+    assert not result.startswith("\ufeff")
+
+
+def test_decode_response_body_ignores_meta_after_bounded_sniff_prefix() -> None:
+    body = (
+        b"a" * bean_sourcing._HTML_ENCODING_SNIFF_BYTES  # pyright: ignore[reportPrivateUsage]
+        + b'<meta charset="windows-1252"><p>Caf\xe9</p>'
+    )
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Caf�" in result
+
+
+def test_sniff_html_encoding_skips_meta_without_charset() -> None:
+    result = bean_sourcing._sniff_html_encoding(  # pyright: ignore[reportPrivateUsage]
+        b'<meta name="description" content="coffee">'
+    )
+    assert result is None
+
+
+def test_sniff_html_encoding_skips_unknown_codec_before_valid_meta() -> None:
+    result = bean_sourcing._sniff_html_encoding(  # pyright: ignore[reportPrivateUsage]
+        b'<meta charset="not-a-codec"><meta charset="windows-1252">'
+    )
+    assert result == "cp1252"
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_decodes_html_meta_without_http_charset() -> None:
+    html = '<meta charset="windows-1252"><p>Café — Kenya</p>'.encode("windows-1252")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=_bytes_stream(html),
+            headers={"Content-Type": "text/html"},
+        )
+
+    async with _mock_client(httpx.MockTransport(handler)) as client:
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/cafe",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+        ).prompt_text
+    assert "Café — Kenya" in text
 
 
 @pytest.mark.asyncio
@@ -3082,6 +3642,42 @@ async def test_extract_bean_identity_maps_build_model_dependency_error(
     with pytest.raises(BeanExtractionUnavailableError, match="could not build its model"):
         await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
             "page text", advisor_config=_ADVISOR_CONFIG
+        )
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_maps_unexpected_provider_construction_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#597: SDK construction failures fail soft without leaking secrets."""
+
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
+        raise ValueError("invalid provider config api_key=TOP-SECRET")
+
+    monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
+    with pytest.raises(
+        BeanExtractionUnavailableError, match="could not construct its provider"
+    ) as error:
+        await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+            "page text", advisor_config=_ADVISOR_CONFIG
+        )
+    assert "TOP-SECRET" not in str(error.value)
+    assert isinstance(error.value.__cause__, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_does_not_mask_unexpected_provider_run_error() -> None:
+    """The broad #597 boundary applies to construction, not provider execution."""
+    with pytest.raises(RuntimeError, match="unexpected provider runtime defect"):
+        await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+            "page text",
+            advisor_config=_ADVISOR_CONFIG,
+            model=_function_model_raising(RuntimeError("unexpected provider runtime defect")),
         )
 
 
