@@ -39,10 +39,11 @@ const SCOPE_SCHEMA = {
     // highest-risk diff touched no safety file, so a path allow-list would never
     // have fired.
     //
-    // THREE COPIES — CHANGE THEM TOGETHER. This trigger test is stated in three
+    // FOUR COPIES — CHANGE THEM TOGETHER. This trigger test is stated in four
     // places and they must agree or the routing silently no-ops: the scope prompt
-    // below, the Scope section of .claude/agents/security-reviewer.md, and the
-    // "When this applies" test in docs/review/untrusted-input-checklist.md. The
+    // below, the Scope section of .claude/agents/security-reviewer.md, the
+    // "When this applies" test in docs/review/untrusted-input-checklist.md, and the
+    // reviewer-routing list in .claude/skills/pr-preflight/SKILL.md. The
     // agent definition is the one that bites — it ends with "if the diff matches
     // none of these, say so and stop", so a reviewer routed here by a widened
     // workflow will still stop if its own copy stayed narrow. Widening one copy
@@ -64,7 +65,7 @@ Also decide \`touchesExternalInput\`. Judge this by CAPABILITY, not by file path
 - fetches a URL / opens a connection whose target is influenced by operator or external input (a pasted URL, a redirect \`Location\`, a webhook, a config value);
 - parses or decodes untrusted bytes/strings (URL parsing, HTML/JSON/charset decode, number/port parsing, deserialization);
 - adds an external-input endpoint (a route taking client-supplied data);
-- adds a **new** LLM/model-provider call path — ANY provider or model service, not only the one the roast advisor uses, and wherever it runs: the "ON THE SERVER" qualifier above does NOT apply to this bullet, so a new provider-calling CLI, offline job, script or test harness counts too (secret hygiene and prompt injection do not care which process makes the call). A job calling a separate model service still carries the provider risks the checklist covers (secret hygiene, fail-soft, resource exhaustion, prompt injection), so it counts here.
+- adds a **new** LLM/model-provider call path — ANY provider or model service, not only the one the roast advisor uses, and wherever it runs: the "ON THE SERVER" qualifier above does NOT apply to this bullet, so a new provider-calling CLI, offline job, script or test harness counts too. The provider risks the checklist covers (secret hygiene, fail-soft, resource exhaustion, prompt injection) apply regardless of which service is called or which process calls it.
 Otherwise set it false — do not stretch the test to fit an unrelated diff.
 
 Finally, set \`addsProviderCallPath\` for the narrower CONTENTION case, which routes the safety lens. The test is capability to contend with the roast advisor, NOT whether the remote backend is byte-identical: a path to a *separate* model service still contends if it can consume the same host CPU, event loop, memory, network, or provider rate limit during an active roast (checklist class 6 explicitly covers bounding provider AND CPU contention). Set it true whenever the diff adds such a path, EVEN IF it already appears to carry an active-roast admission guard, a lock, or a queue — whether that mitigation is correct is precisely what the safety lens exists to verify, so a present-looking guard is a reason to route the review, never a reason to skip it. "New path" means new REACHABILITY, not a new call site: a diff adding an endpoint, route, job, or service method that reaches a provider through an EXISTING helper still counts. Set it FALSE when the diff only modifies an EXISTING provider path without creating a new way to reach one (tweaking the roast advisor's own integration is not a new path), and when it reaches no provider at all.
@@ -122,7 +123,7 @@ const lenses = [
 // checklist class 6 (contention with the roast advisor) is safety-adjacent, and
 // AGENTS.md routes it to both reviewers.
 if (scopeUnknown || scope.touchesSafetyControllerEnums || scope.addsProviderCallPath) {
-  lenses.push({ key: 'safety', agentType: 'safety-reviewer', prompt: `${reviewBase}\n\nLens: SAFETY (adversarial) — any roaster write bypassing safety, transition-table errors, string-compared verdicts, restart auto-resume, non-Celsius, fail-open paths.${scopeUnknown || scope.addsProviderCallPath ? ' This diff adds a NEW provider-calling path: also check checklist class 6 — it must not begin during an active roast or delay an operator roast start, and admission must be race-free under the roast-start lock.' : ''}` })
+  lenses.push({ key: 'safety', agentType: 'safety-reviewer', prompt: `${reviewBase}\n\nLens: SAFETY (adversarial) — any roaster write bypassing safety, transition-table errors, string-compared verdicts, restart auto-resume, non-Celsius, fail-open paths.${scopeUnknown ? ' Scope could not be determined for this run, so check IF this diff adds a provider-calling path; if it does, also work checklist class 6 — it must not begin during an active roast or delay an operator roast start, and admission must be race-free under the roast-start lock.' : scope.addsProviderCallPath ? ' This diff adds a NEW provider-calling path: also check checklist class 6 — it must not begin during an active roast or delay an operator roast start, and admission must be race-free under the roast-start lock.' : ''}` })
 }
 // Capability-based routing (AGENTS.md): a new fetch/parse surface is the highest-risk
 // case and the easiest to miss, because it can touch no safety file at all — #587 is
@@ -249,10 +250,14 @@ const triage = await agent(
 // discretion. pr-triage is an unconstrained LLM that could classify the synthetic
 // finding as "defer" or "rejected" and hand back CLEAR TO MERGE, which would undo the
 // whole fail-closed chain at the last step. "A lens did not run" is not a judgement call.
-const forcedBlock = lensFailures.length > 0
+// The ui lens is advisory by design (D24 keeps direction-match review off the merge
+// gate), so its FAILURE cannot block either — blocking on it would contradict the
+// triage rule that its findings never drive BLOCK. It is still reported.
+const blockingLensFailures = lensFailures.filter((f) => f.lens !== 'ui')
+const forcedBlock = blockingLensFailures.length > 0
 return {
   verdict: forcedBlock ? 'BLOCK' : triage ? triage.verdict : 'BLOCK',
-  blockedBy: forcedBlock ? lensFailures.map((f) => `${f.lens} lens failed to run`) : undefined,
+  blockedBy: forcedBlock ? blockingLensFailures.map((f) => `${f.lens} lens failed to run`) : undefined,
   scope: scope ? scope.summary : null,
   scopeUnknown,
   lenses: lenses.map((l) => l.key),
