@@ -1570,6 +1570,9 @@ def test_decode_response_body_uses_windows_1252_for_web_latin1_labels(label: str
         ("euc-kr", "cp949", "갂"),
         ("ksc_5601", "cp949", "갂"),
         ("windows-949", "cp949", "갂"),
+        ("shift_jis", "cp932", "髙"),
+        ("windows-31j", "cp932", "髙"),
+        ("ms932", "cp932", "髙"),
     ],
 )
 def test_decode_response_body_applies_web_compatibility_label_overrides(
@@ -1590,9 +1593,9 @@ def test_decode_response_body_applies_web_compatibility_label_overrides(
         ("iso88592", "iso8859-2"),
         ("iso-8859-8-i", "iso8859-8"),
         ("x-mac-ukrainian", "mac-cyrillic"),
-        ("windows-31j", "shift_jis"),
+        ("windows-31j", "cp932"),
         ("windows-949", "cp949"),
-        ("ms932", "shift_jis"),
+        ("ms932", "cp932"),
         ("utf-16", "utf-16-le"),
         ("unicode11utf8", "utf-8"),
         ("unicode20utf8", "utf-8"),
@@ -1637,6 +1640,8 @@ def test_decode_response_body_sniffs_bom_without_http_charset(body: bytes, expec
         '<meta charset="windows-1252">',
         '<meta http-equiv="Content-Type" content="text/html; charset=windows-1252">',
         """<meta http-equiv=Content-Type content="text/html; charset=' windows-1252 '">""",
+        '<meta/charset="windows-1252">',
+        '<meta/ charset="windows-1252">',
     ],
 )
 def test_decode_response_body_sniffs_html_meta_without_http_charset(meta: str) -> None:
@@ -1659,6 +1664,7 @@ def test_decode_response_body_sniffs_html_meta_without_http_charset(meta: str) -
         '<meta http-equiv="\x0bContent-Type\x0b" content="text/html; charset=utf-8">',
         '<meta http-equiv="Content-Type" content="text/html; charset=\x0butf-8\x0b">',
         '<meta http-equiv="Content-Type" content="text/html; charset=utf-8\x0b">',
+        "<meta charset=utf-8/foo>",
         """<meta http-equiv="Content-Type" content="text/html; charset=utf-8'junk">""",
         """<meta http-equiv="Content-Type" content="text/html; charset='utf-8">""",
         """<meta http-equiv="Content-Type" content='text/html; charset="utf-8'>""",
@@ -1889,7 +1895,6 @@ def test_decode_response_body_normalizes_bomless_wide_meta_charset_to_utf8(
 
 @pytest.mark.parametrize("encoding", ["utf-16", "utf-32"])
 def test_decode_response_body_honors_explicit_wide_http_charset(encoding: str) -> None:
-    """Wide codecs remain valid when supplied out of band by HTTP."""
     body = "<p>Café Kenya</p>".encode(encoding)
     response = httpx.Response(200, headers={"Content-Type": f"text/html; charset={encoding}"})
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
@@ -1899,7 +1904,6 @@ def test_decode_response_body_honors_explicit_wide_http_charset(encoding: str) -
 
 
 def test_decode_response_body_http_charset_overrides_conflicting_html_meta() -> None:
-    """An explicit HTTP charset remains authoritative over page metadata."""
     body = '<meta charset="windows-1252"><p>Café</p>'.encode()
     response = httpx.Response(200, headers={"Content-Type": "text/html; charset=utf-8"})
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
@@ -1909,7 +1913,6 @@ def test_decode_response_body_http_charset_overrides_conflicting_html_meta() -> 
 
 
 def test_decode_response_body_bom_overrides_conflicting_html_meta() -> None:
-    """Without HTTP charset, a BOM wins over a conflicting meta declaration."""
     body = '\ufeff<meta charset="windows-1252"><p>Café</p>'.encode()
     response = httpx.Response(200, headers={"Content-Type": "text/html"})
     result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
@@ -1920,7 +1923,6 @@ def test_decode_response_body_bom_overrides_conflicting_html_meta() -> None:
 
 
 def test_decode_response_body_ignores_meta_after_bounded_sniff_prefix() -> None:
-    """The untrusted metadata scan never grows with the full response body."""
     body = (
         b"a" * bean_sourcing._HTML_ENCODING_SNIFF_BYTES  # pyright: ignore[reportPrivateUsage]
         + b'<meta charset="windows-1252"><p>Caf\xe9</p>'
@@ -1933,7 +1935,6 @@ def test_decode_response_body_ignores_meta_after_bounded_sniff_prefix() -> None:
 
 
 def test_sniff_html_encoding_skips_meta_without_charset() -> None:
-    """Unrelated meta elements are ignored."""
     result = bean_sourcing._sniff_html_encoding(  # pyright: ignore[reportPrivateUsage]
         b'<meta name="description" content="coffee">'
     )
@@ -1941,7 +1942,6 @@ def test_sniff_html_encoding_skips_meta_without_charset() -> None:
 
 
 def test_sniff_html_encoding_skips_unknown_codec_before_valid_meta() -> None:
-    """An attacker-controlled unknown label cannot suppress a later valid one."""
     result = bean_sourcing._sniff_html_encoding(  # pyright: ignore[reportPrivateUsage]
         b'<meta charset="not-a-codec"><meta charset="windows-1252">'
     )

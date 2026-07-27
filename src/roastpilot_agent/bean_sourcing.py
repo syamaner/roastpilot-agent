@@ -1747,8 +1747,8 @@ def _resolve_html_encoding(label: str, *, from_meta: bool = False) -> str | None
     canonical_name = _HTML_MISSING_LABEL_OVERRIDES.get(normalized_label.lower()) or (
         html_encoding.codec_info.name if html_encoding is not None else python_name
     )
-    if canonical_name == "euc_kr":
-        canonical_name = "cp949"
+    canonical_name = "cp949" if canonical_name == "euc_kr" else canonical_name
+    canonical_name = "cp932" if canonical_name == "shift_jis" else canonical_name
     if canonical_name is None or canonical_name not in _HTML_SAFE_CODEC_NAMES:
         return None
     if from_meta and canonical_name in _HTML_WIDE_CODEC_NAMES:
@@ -1760,9 +1760,9 @@ def _parse_html_meta_attributes(meta_tag: bytes) -> dict[bytes, bytes]:
     attributes: dict[bytes, bytes] = {}
     pos = len(b"<meta")
     while pos < len(meta_tag):
-        while pos < len(meta_tag) and meta_tag[pos] in _HTML_ATTRIBUTE_WHITESPACE:
+        while pos < len(meta_tag) and meta_tag[pos] in b" \t\n\f\r/":
             pos += 1
-        if pos >= len(meta_tag) or meta_tag[pos] in b"/>":
+        if pos >= len(meta_tag) or meta_tag[pos] == ord(">"):
             break
         name_start = pos
         while pos < len(meta_tag) and meta_tag[pos] not in _HTML_ATTRIBUTE_NAME_END:
