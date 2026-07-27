@@ -37,8 +37,16 @@ const SCOPE_SCHEMA = {
     touchesSafetyControllerEnums: { type: 'boolean' },
     // Capability-based, NOT file-based (AGENTS.md): the #587 lesson is that the
     // highest-risk diff touched no safety file, so a path allow-list would never
-    // have fired. Mirrors the "When this applies" test in
-    // docs/review/untrusted-input-checklist.md.
+    // have fired.
+    //
+    // THREE COPIES — CHANGE THEM TOGETHER. This trigger test is stated in three
+    // places and they must agree or the routing silently no-ops: the scope prompt
+    // below, the Scope section of .claude/agents/security-reviewer.md, and the
+    // "When this applies" test in docs/review/untrusted-input-checklist.md. The
+    // agent definition is the one that bites — it ends with "if the diff matches
+    // none of these, say so and stop", so a reviewer routed here by a widened
+    // workflow will still stop if its own copy stayed narrow. Widening one copy
+    // and not the others is the most repeated mistake in this file's history.
     touchesExternalInput: { type: 'boolean' },
     // Checklist class 6: a NEW provider-calling path can contend with the roast
     // advisor, so AGENTS.md routes it to safety-reviewer as well as security-reviewer.

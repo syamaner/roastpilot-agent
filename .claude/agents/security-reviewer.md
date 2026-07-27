@@ -22,8 +22,12 @@ Any diff that, on the server:
 - fetches a URL / opens a connection to an input-influenced target;
 - parses or decodes untrusted bytes/strings (URL, HTML, charset, number/port, deserialization);
 - adds an external-input endpoint (a route taking client-supplied data);
+
+…or, **in any process — the "on the server" qualifier above does not apply to this one**:
 - adds a **new** LLM/model-provider call path — **any** provider or model service, not
-  only the backend the roast advisor uses. A path to a separate model service still
+  only the backend the roast advisor uses, and wherever it runs: a provider-calling CLI,
+  offline job, script or test harness counts, because secret hygiene and prompt injection
+  do not care which process makes the call. A path to a separate model service still
   carries the provider risks below (secret hygiene, fail-soft, resource exhaustion,
   prompt injection). Contention with the advisor is an *additional* concern on top
   (class 6), not the thing that puts the diff in scope.
