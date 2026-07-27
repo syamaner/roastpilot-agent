@@ -413,9 +413,12 @@ bot-authored signal following a fresh `@codex review` re-trigger on the new fina
 a bot-authored findings-review naming the head sha, a bot-authored clean comment naming the
 head sha, or the bot's own 👍 (a 👍 carries NO commit line, so it is valid only while the
 head sha is UNCHANGED since it was left; any push since invalidates it, so re-trigger on the
-new head). **The signal must correspond to the current head AND postdate the
-`ready_for_review` transition** (or, after a later push, the fresh re-trigger on that new
-final commit). Head-match alone is NOT sufficient, and this is a real hole rather than a
+new head). **The signal must correspond to the current head AND postdate the event that
+started this PR's automatic review**, which differs by PR shape (Codex P1, cloud #155): a PR
+**created ready** emits `opened` and NEVER emits `ready_for_review`, so `opened` is its
+boundary and requiring the later event would be unsatisfiable; a **draft marked ready** uses
+`ready_for_review`; and after any later push the boundary is the fresh single re-trigger on
+that new final commit. Head-match alone is NOT sufficient, and this is a real hole rather than a
 theoretical one: a manually requested review on the DRAFT posts findings against the very
 same sha, so if nothing needed changing before marking ready, a head-match-only rule would
 let that pre-ready verdict satisfy the wait while the automatic review the ready transition

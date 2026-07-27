@@ -177,8 +177,9 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
    same stale-sha class the wait rule exists to close, and it was reintroduced by omission in
    an earlier draft of this very step.) That transition is
    what fires the automatic Codex review, and in this repo it also re-runs `claude-review`.
-   The verdict you wait on must match the re-recorded head **and postdate the
-   `ready_for_review` transition**: a findings-review left on the draft describes the same
+   The verdict you wait on must match the re-recorded head **and postdate the event that
+   started the automatic review**: `ready_for_review` for a draft you marked ready, or
+   `opened` for a PR that was created ready (which never emits `ready_for_review` at all). a findings-review left on the draft describes the same
    sha, so a head-match alone would let a pre-ready verdict satisfy the wait while the
    automatic review it triggered is still in flight.
    **Wait for the verdict on the recorded head sha** — a **posted review** carries a
