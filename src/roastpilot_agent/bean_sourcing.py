@@ -1819,11 +1819,18 @@ def _find_html_meta_tags(prefix: bytes) -> list[bytes]:
                 in_other_tag = False
             cursor += 1
             continue
+        if prefix.startswith(b"<!-->", cursor):
+            cursor += len(b"<!-->")
+            continue
         if prefix.startswith(b"<!--", cursor):
-            comment_end = prefix.find(b"-->", cursor + len(b"<!--"))
+            comment_ends = (
+                prefix.find(b"-->", cursor + len(b"<!--") - 1),
+                prefix.find(b"--!>", cursor + len(b"<!--")),
+            )
+            comment_end = min((end for end in comment_ends if end != -1), default=-1)
             if comment_end == -1:
                 break
-            cursor = comment_end + len(b"-->")
+            cursor = comment_end + (len(b"--!>") if prefix.startswith(b"--!>", comment_end) else 3)
             continue
         if not lower_prefix.startswith(b"<meta", cursor):
             if char == ord("<") and cursor + 1 < len(prefix):
@@ -1930,9 +1937,8 @@ def _decode_response_body(body: bytes, response: httpx.Response) -> str:
         The decoded text.
     """
     http_encoding = response.charset_encoding
-    if http_encoding is not None:
-        encoding = _resolve_html_encoding(http_encoding) or "utf-8"
-    else:
+    encoding = _resolve_html_encoding(http_encoding) if http_encoding is not None else None
+    if encoding is None:
         encoding = _sniff_html_encoding(body) or "utf-8"
     decoded = body.decode(encoding, errors="replace")
     return decoded.removeprefix("\ufeff")

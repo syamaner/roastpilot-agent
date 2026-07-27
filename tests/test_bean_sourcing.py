@@ -1438,6 +1438,16 @@ def test_decode_response_body_falls_back_to_utf8_on_unknown_charset() -> None:
     assert result == "hello"
 
 
+def test_decode_response_body_invalid_http_charset_falls_back_to_valid_meta() -> None:
+    """Codex P2: an invalid HTTP label does not suppress valid HTML metadata."""
+    body = b'<meta charset="windows-1252"><p>Caf\xe9</p>'
+    response = httpx.Response(200, headers={"Content-Type": "text/html; charset=not-a-codec"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
 @pytest.mark.parametrize(
     "label",
     ["punycode", "idna", "unicode_escape", "x-user-defined", "replacement", "not-a-codec"],
@@ -1693,6 +1703,26 @@ def test_decode_response_body_ignores_commented_meta_before_real_declaration() -
         body, response
     )
     assert "Café" in result
+
+
+@pytest.mark.parametrize("comment", [b"<!-->", b"<!--->", b"<!--x--!>"])
+def test_decode_response_body_honors_browser_comment_terminators(comment: bytes) -> None:
+    """Codex P2: browser comment terminators do not hide later metadata."""
+    body = comment + b'<meta charset="windows-1252"><p>Caf\xe9</p>'
+    response = httpx.Response(200, headers={"Content-Type": "text/html"})
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        body, response
+    )
+    assert "Café" in result
+
+
+def test_sniff_html_encoding_keeps_single_dash_bang_inside_comment() -> None:
+    """A single dash before ``!>`` does not close an HTML comment."""
+    body = b'<!---!><meta charset="windows-1252"><p>Caf\xe9</p>'
+    assert (
+        bean_sourcing._sniff_html_encoding(body)  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
 
 
 def test_decode_response_body_comment_marker_inside_attribute_is_not_a_comment() -> None:
