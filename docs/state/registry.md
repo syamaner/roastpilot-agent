@@ -794,7 +794,7 @@ roast would spawn the MCP on defaults, dropping the Hottop config), a credential
 cross-request `os.environ` mutation, and the apply-next-roast gap itself. **Operator decision (30 Jun): Codex is ADVISORY-BUT-TRIAGED, NOT a required gate — the
 planned `review-gate` flip-on-BOTH-reviews wiring is CANCELLED** (its re-post-on-every-trigger
 churn would deadlock conversation-resolution if its inline threads gated merge). Operating rule:
-auto-reviews at PR creation, re-trigger with `codex review` only ONCE on the final commit; the lead
+auto-reviews at PR creation, re-trigger with `codex review` only ONCE on the final commit **[SUPERSEDED 27 Jul 2026 by plan D142: Codex auto-reviews at the READY transition, not at creation; this line records the 30 Jun operating rule and is kept as history, see AGENTS.md for the current one]**; the lead
 verifies each finding vs current code, folds the real ones, resolves the stale re-posts by hand
 (D23 — author never self-triages). AGENTS.md roster updated to match (this PR). Memories:
 `agent-config-ui-story`, `claude-review-not-a-required-check`. **This does not change roast priorities —
