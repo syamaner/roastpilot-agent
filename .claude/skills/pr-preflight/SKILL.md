@@ -10,8 +10,10 @@ so the post-open review/rework loop shrinks. Work the five steps in order; fix a
 before moving on. **Steps 1-4 must pass BEFORE the branch is pushed**, and step 5 carries
 the PR from draft to ready, so it is the only step that touches GitHub at all.
 
-**Prerequisite for step 5:** the `codex` CLI must be installed and authenticated
-(`codex --version`). It is a separate subscription, not part of this repo's toolchain. If it
+**Prerequisite for step 5:** the `codex` CLI must be installed AND authenticated. Check both:
+`codex --version` proves only that the binary exists and exits zero even when credentials are
+missing or expired, so also confirm login status (`codex login status`, or whatever the
+installed version calls it) before relying on the pass. It is a separate subscription, not part of this repo's toolchain. If it
 is genuinely unavailable, say so explicitly in the PR body rather than skipping the diverse
 lens silently, and compensate by running the domain reviewer plus `qa` on the branch; a
 missing cross-family lens is a stated risk, never an unrecorded gap.
@@ -172,9 +174,11 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
    there stalls forever. Fold every real finding by CLASS (step 4) before pushing. **Triage
    stays author-independent here too (D23):** when an agent teammate produced the diff, it
    fixes but does not decide which local Codex findings are real or dismissable; route them
-   through the lead or `pr-triage`, exactly as for post-open findings. Then **push the
-   reviewed branch** so the draft in step 2 is created from the folded state, not the
-   pre-review one.
+   through the lead or `pr-triage`, exactly as for post-open findings. **Re-run steps 1-4 after
+   folding anything**, before pushing: the gates and domain review you ran describe the
+   PRE-fold tree, so pushing straight from a fold ships a state nothing has checked. Then
+   **push the reviewed branch**, so the draft in step 2 is created from the folded state
+   rather than the pre-review one.
 2. Open the PR as a **draft** (`gh pr create --draft`), and **record the current head sha**.
    The draft phase exists for the **runner-only gates** (`ci.yml`: `ruff`, `pyright`, `pytest`,
    and the web jobs -- this repository has NO CodeQL workflow, so do not expect a
@@ -182,8 +186,11 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
    environment-dependent failures that only reproduce on a runner. Fold those here, while no
    review lens with a MERGE-GATING signal has been spent. Note this repository's
    `claude-review` DOES run on draft `opened`/`synchronize` (unlike the cloud repository's,
-   which is draft-suppressed), so its findings appear during the draft phase; they are cheap
-   signal rather than a gate, but they are real and worth folding. **Re-run the step-1 gates
+   which is draft-suppressed), so its findings appear during the draft phase. **Those findings
+   ARE merge-gating**: they are inline threads, and `main` requires every conversation
+   resolved, so they block merge exactly like post-ready ones. Only the workflow's status
+   check is non-required, which is a different thing from the findings being optional. Fold
+   or explicitly resolve each one. **Re-run the step-1 gates
    and any domain review after folding a runner failure**, before moving to step 3: the
    pre-push results only describe the pre-fold tree. A manual `@codex review` on a draft is not forbidden and does
    post findings, but per D105 it never completes the clean-verdict flow on a draft, so it
@@ -234,8 +241,10 @@ pushes is the churn we avoid. Local = iterate to clean; draft = fold the runner 
 ready = commit the whole review roster to a head you expect to hold.
 
 > Note on `claude-review`: opening a draft does run `.github/workflows/claude-code-review.yml`
-> (it listens to `opened`). That is fine — `claude-review` is **not** a required check and
-> passes-on-findings; its draft runs are cheap signal, not a gate. Don't churn on them.
+> (it listens to `opened`). Its STATUS CHECK is not required and passes on findings, so a green
+> check there proves nothing. Its FINDINGS are a different matter: they are inline threads, and
+> `main` requires every conversation resolved, so draft findings block merge exactly like
+> post-ready ones. Fold or explicitly resolve each; do not treat them as optional noise.
 
 **KPI:** local `codex review` folds now happen BEFORE the branch is pushed, so they count as
 **pre-open** folds on AGENTS.md's own boundary, not as a separate pre-ready bucket. Count
