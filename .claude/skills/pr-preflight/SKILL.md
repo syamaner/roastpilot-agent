@@ -171,7 +171,8 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
    pre-ready diverse lens. Corrected 27 Jul 2026 (D142): Codex does **not** auto-review a
    draft. Its connector fires automatically only at the **ready** transition, so a draft
    cannot converge the Codex lens at all, and a workflow that waits for a clean verdict
-   there stalls forever. Fold every real finding by CLASS (step 4) before pushing. **Triage
+   there stalls forever. Fold every real finding by CLASS (step 3, which defines the
+   categorical fix and the repository-wide sibling sweep) before pushing. **Triage
    stays author-independent here too (D23):** when an agent teammate produced the diff, it
    fixes but does not decide which local Codex findings are real or dismissable; route them
    through the lead or `pr-triage`, exactly as for post-open findings. **Re-run steps 1-4 after
@@ -183,16 +184,20 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
    The draft phase exists for the **runner-only gates** (`ci.yml`: `ruff`, `pyright`, `pytest`,
    and the web jobs -- this repository has NO CodeQL workflow, so do not expect a
    security-analysis lens here): they run on draft pushes and catch a class local runs cannot, including
-   environment-dependent failures that only reproduce on a runner. Fold those here, while no
-   review lens with a MERGE-GATING signal has been spent. Note this repository's
+   environment-dependent failures that only reproduce on a runner. Fold those here, while the
+   CODEX lens is still unspent: its automatic trigger does not fire until ready, so nothing
+   you do in this phase consumes it. That is the only lens the draft phase protects. Note
+   this repository's
    `claude-review` DOES run on draft `opened`/`synchronize` (unlike the cloud repository's,
    which is draft-suppressed), so its findings appear during the draft phase. **Those findings
    ARE merge-gating**: they are inline threads, and `main` requires every conversation
    resolved, so they block merge exactly like post-ready ones. Only the workflow's status
    check is non-required, which is a different thing from the findings being optional. Fold
-   or explicitly resolve each one. **Re-run the step-1 gates
-   and any domain review after folding a runner failure**, before moving to step 3: the
-   pre-push results only describe the pre-fold tree. A manual `@codex review` on a draft is not forbidden and does
+   or explicitly resolve each one. **Re-run the step-1 gates and any domain review after
+   folding ANYTHING in this phase**, before moving on: a runner failure, a draft
+   `claude-review` finding, or a manual Codex finding alike. The pre-push results describe
+   the pre-fold tree, and step 5's own re-run is not reached until later, so a fold here that
+   is never re-gated ships unchecked. A manual `@codex review` on a draft is not forbidden and does
    post findings, but per D105 it never completes the clean-verdict flow on a draft, so it
    can supplement the local pass and can **never** satisfy the merge wait.
 3. **Mark ready only once the head is expected to hold** (`gh pr ready`), and **RE-RECORD the
