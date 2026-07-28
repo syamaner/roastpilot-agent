@@ -14,9 +14,15 @@ the PR from draft to ready, so it is the only step that touches GitHub at all.
 `codex --version` proves only that the binary exists and exits zero even when credentials are
 missing or expired, so also confirm login status (`codex login status`, or whatever the
 installed version calls it) before relying on the pass. It is a separate subscription, not part of this repo's toolchain. If it
-is genuinely unavailable, say so explicitly in the PR body rather than skipping the diverse
-lens silently, and compensate by running the domain reviewer plus `qa` on the branch; a
-missing cross-family lens is a stated risk, never an unrecorded gap.
+is genuinely unavailable, **STOP and ask the operator**; do not proceed on your own judgement
+(Codex P2, #682). An earlier version of this note said to record the gap and compensate by
+running the domain reviewer plus `qa`. That is not a substitute, and offering it was a real
+weakening: both are Claude-family lenses, and the entire measured value of this step is that a
+DIFFERENT model family catches what a same-family lens co-accepts (F1-S8: five rounds and
+roughly fifteen real P1s on a diff two Opus passes had called clean). Substituting more of the
+same family rebuilds precisely the gap this step closes, while reading like diligence. Only the
+operator may accept shipping a review-worthy PR without the diverse lens, and that acceptance
+goes in the PR body.
 
 ## 0. Orient
 
@@ -175,11 +181,13 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
    categorical fix and the repository-wide sibling sweep) before pushing. **Triage
    stays author-independent here too (D23):** when an agent teammate produced the diff, it
    fixes but does not decide which local Codex findings are real or dismissable; route them
-   through the lead or `pr-triage`, exactly as for post-open findings. **Re-run steps 1-4 after
-   folding anything**, before pushing: the gates and domain review you ran describe the
-   PRE-fold tree, so pushing straight from a fold ships a state nothing has checked. Then
-   **push the reviewed branch**, so the draft in step 2 is created from the folded state
-   rather than the pre-review one.
+   through the lead or `pr-triage`, exactly as for post-open findings. **Close the loop before
+   pushing** (Codex P2, #682): after folding anything, re-run steps 1-4 AND re-run
+   `codex review --base origin/main`, repeating until a Codex pass comes back clean with the
+   gates green on that same tree. Only then **push the reviewed branch**. Pushing after the
+   re-gate but before the next Codex pass ships a tree the diverse lens has never seen, which
+   is the gap this step exists to close: the gates describe the pre-fold tree until they are
+   re-run, and Codex describes it until IT is re-run.
 2. Open the PR as a **draft** (`gh pr create --draft`), and **record the current head sha**.
    The draft phase exists for the **runner-only gates** (`ci.yml`: `ruff`, `pyright`, `pytest`,
    and the web jobs -- this repository has NO CodeQL workflow, so do not expect a
