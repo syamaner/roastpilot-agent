@@ -6,8 +6,15 @@ description: Run the full pre-open preflight on the current branch BEFORE openin
 Run this on the PR branch **before** `gh pr create`. The build's PR-flow metrics
 flag **large PRs** and **high rework** (most rework is review findings landing
 *after* the PR opens). This checklist opens a PR that is already small and clean,
-so the post-open review/rework loop shrinks. Work the four steps in order; fix at
-each before moving on; **do not open the PR until all four pass.**
+so the post-open review/rework loop shrinks. Work the five steps in order; fix at each
+before moving on. **Steps 1-4 must pass BEFORE the branch is pushed**, and step 5 carries
+the PR from draft to ready, so it is the only step that touches GitHub at all.
+
+**Prerequisite for step 5:** the `codex` CLI must be installed and authenticated
+(`codex --version`). It is a separate subscription, not part of this repo's toolchain. If it
+is genuinely unavailable, say so explicitly in the PR body rather than skipping the diverse
+lens silently, and compensate by running the domain reviewer plus `qa` on the branch; a
+missing cross-family lens is a stated risk, never an unrecorded gap.
 
 ## 0. Orient
 
@@ -162,13 +169,23 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
    pre-ready diverse lens. Corrected 27 Jul 2026 (D142): Codex does **not** auto-review a
    draft. Its connector fires automatically only at the **ready** transition, so a draft
    cannot converge the Codex lens at all, and a workflow that waits for a clean verdict
-   there stalls forever. Fold every real finding by CLASS (step 4) before pushing.
+   there stalls forever. Fold every real finding by CLASS (step 4) before pushing. **Triage
+   stays author-independent here too (D23):** when an agent teammate produced the diff, it
+   fixes but does not decide which local Codex findings are real or dismissable; route them
+   through the lead or `pr-triage`, exactly as for post-open findings. Then **push the
+   reviewed branch** so the draft in step 2 is created from the folded state, not the
+   pre-review one.
 2. Open the PR as a **draft** (`gh pr create --draft`), and **record the current head sha**.
    The draft phase exists for the **runner-only gates** (`ci.yml`: `ruff`, `pyright`, `pytest`,
    and the web jobs -- this repository has NO CodeQL workflow, so do not expect a
    security-analysis lens here): they run on draft pushes and catch a class local runs cannot, including
    environment-dependent failures that only reproduce on a runner. Fold those here, while no
-   review lens has been spent. A manual `@codex review` on a draft is not forbidden and does
+   review lens with a MERGE-GATING signal has been spent. Note this repository's
+   `claude-review` DOES run on draft `opened`/`synchronize` (unlike the cloud repository's,
+   which is draft-suppressed), so its findings appear during the draft phase; they are cheap
+   signal rather than a gate, but they are real and worth folding. **Re-run the step-1 gates
+   and any domain review after folding a runner failure**, before moving to step 3: the
+   pre-push results only describe the pre-fold tree. A manual `@codex review` on a draft is not forbidden and does
    post findings, but per D105 it never completes the clean-verdict flow on a draft, so it
    can supplement the local pass and can **never** satisfy the merge wait.
 3. **Mark ready only once the head is expected to hold** (`gh pr ready`), and **RE-RECORD the
@@ -220,10 +237,11 @@ ready = commit the whole review roster to a head you expect to hold.
 > (it listens to `opened`). That is fine — `claude-review` is **not** a required check and
 > passes-on-findings; its draft runs are cheap signal, not a gate. Don't churn on them.
 
-**KPI:** count **pre-ready Codex folds** as their own line in the PR body (alongside the
-step-4 pre-open review count). This does NOT redefine AGENTS.md's *pre-open* rework
-boundary (findings folded before the PR is *opened*) — a draft PR is open, so draft-phase
-folds are a distinct, additional shift-left category. Both counts trending up is the win.
+**KPI:** local `codex review` folds now happen BEFORE the branch is pushed, so they count as
+**pre-open** folds on AGENTS.md's own boundary, not as a separate pre-ready bucket. Count
+them alongside the step-4 pre-open review count. Keep the draft-phase line only for what is
+genuinely folded after the draft exists: runner-gate failures, and this repository's
+draft-run `claude-review` findings. Both counts trending up is the win.
 
 ## Only when 1–5 pass
 

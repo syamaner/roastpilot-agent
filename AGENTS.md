@@ -372,7 +372,7 @@ connector fires automatically only at the ready transition (opened ready, or a d
 marked ready), confirmed against roastpilot-cloud PR #150 (27 Jul 2026), where Codex
 produced no review during the draft phase and then reviewed automatically the moment the
 PR was marked ready. So the pre-ready fold for Codex specifically has to happen locally,
-via `codex review --base <branch>` (the `pr-preflight` skill's step 5), before the diff is
+via `codex review --base origin/main` (the `pr-preflight` skill's step 5), before the diff is
 even pushed; that is exactly where the #587-style rounds belong (a local pre-push fold,
 not post-open rework). A GitHub-side `@codex review` comment left on a draft is a
 different thing again, and is NOT simply inert: D105 observed on 19 Jul 2026 that it does
