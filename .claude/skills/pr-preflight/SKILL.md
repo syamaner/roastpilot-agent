@@ -288,9 +288,15 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
    draft-phase exit condition (this bullet was the third, unreported instance of that class,
    swept #682): item 6's GitHub re-trigger will see this tree either way, but it sees it as a
    post-ready round, and a local pass that is free collapses that round before it costs one.
-6. If a fold moves the head **after** the automatic review, re-trigger with a single
-   `@codex review` on the new final commit — then **go back to step 3 and wait out a valid
-   verdict on THAT head before preflight is complete** (Codex P1, #682). Re-triggering is a
+6. If a fold moves the head **after** the automatic review, **push it and confirm
+   `gh pr view --json headRefOid` matches your local `HEAD` BEFORE re-triggering** (Codex P1,
+   #682) — this is the same push-and-verify clause the draft-phase exit condition carries, and
+   it was missing here, which is the identical class in its third location. Re-triggering
+   against an unpushed fold makes GitHub review the PREVIOUS remote commit, and since that
+   review then legitimately comes back clean and names a real head, nothing downstream can tell
+   it apart from a verdict on the tree you actually intend to merge. Only then re-trigger with a
+   single `@codex review` on the new final commit — and then **go back to step 3 and wait out a
+   valid verdict on THAT head before preflight is complete**. Re-triggering is a
    request, not a result: the verdict already "in" describes the superseded head, so treating
    the re-trigger itself as the end of this step merges while the final-head review is still in
    flight — exactly the #518 race AGENTS.md's wait rule exists to close. Every head-moving fold
