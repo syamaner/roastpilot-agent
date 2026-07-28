@@ -238,9 +238,12 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
    `@codex review` on the new final commit and re-match the sha. Only then, and never on
    intermediate pushes.
 
-**Iterate LOCALLY, not on the draft.** Re-running `codex review --base origin/main` costs
-nothing on GitHub and can be repeated freely while folding, which is where iteration now
-lives. The AGENTS.md **"once-on-final-commit, don't re-litigate"** rule governs the
+**Iterate LOCALLY, not on the draft.** After folding a Codex finding that changed code, you
+**MUST** re-run `codex review --base origin/main` and keep going until a pass is clean, not
+merely "can" (Codex P2, #682): a fold routinely introduces or exposes the next
+Codex-specific issue, and step 5's re-run covers the gates and domain review rather than
+the Codex lens, so a single local pass would leave that class unreviewed. It costs nothing
+on GitHub, so there is no reason to ration it. This is where iteration now lives. The AGENTS.md **"once-on-final-commit, don't re-litigate"** rule governs the
 **post-ready** phase (a marked-ready PR heading to merge), where re-triggering across
 pushes is the churn we avoid. Local = iterate to clean; draft = fold the runner gates;
 ready = commit the whole review roster to a head you expect to hold.
