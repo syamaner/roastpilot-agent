@@ -182,9 +182,13 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
    stays author-independent here too (D23):** when an agent teammate produced the diff, it
    fixes but does not decide which local Codex findings are real or dismissable; route them
    through the lead or `pr-triage`, exactly as for post-open findings. **Close the loop before
-   pushing** (Codex P2, #682): after folding anything, re-run steps 1-4 AND re-run
-   `codex review --base origin/main`, repeating until a Codex pass comes back clean with the
-   gates green on that same tree. Only then **push the reviewed branch**. Pushing after the
+   pushing** (Codex P2, #682): after folding anything, **COMMIT the fold first**, then re-run
+   steps 1-4 AND re-run `codex review --base origin/main`, repeating until a Codex pass comes
+   back clean with the gates green on that same tree. Committing first is load-bearing, not
+   tidiness (Codex P1, #682): `--base` reviews the COMMITTED branch diff, not the working
+   tree, so re-running it over an uncommitted fold certifies the previous HEAD and returns
+   clean while the actual fix has been seen by nothing. Use `codex review --uncommitted` if
+   you genuinely want the working tree reviewed instead, but do not confuse the two. Only then **push the reviewed branch**. Pushing after the
    re-gate but before the next Codex pass ships a tree the diverse lens has never seen, which
    is the gap this step exists to close: the gates describe the pre-fold tree until they are
    re-run, and Codex describes it until IT is re-run.
