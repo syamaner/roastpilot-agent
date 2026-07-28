@@ -21,11 +21,18 @@
 >
 > **Bean sourcing (the July build).** Draft-a-BeanProfile-from-a-vendor-URL shipped as
 > a second, human-gated LLM surface outside the safety envelope: backend #587, the
-> #590 containment gates (shipping dormant), the #601 reasoning-arm bake-off and
+> #590 containment gates (the D1 free-text gate is LIVE — `_draft_from_identity`
+> applies whole-phrase containment to `name`/`country`/`bean_origin`/`farm`/
+> `bean_varietal`, demoting anything not code-verified on the page; only the four
+> typed-field lexical certification gates are parked, and per #617 no lexical
+> hardening will be attempted on them again), the #601 reasoning-arm bake-off and
 > spend-integrity stack (results in `docs/advisor/bean-sourcing-bakeoff-2026-07-22.md`),
 > and the #637 draft-from-URL UI. Residual hardening #596/#597 closed 26–27 Jul.
-> Open follow-ups: **#573** (catalogue scope — operator-gated), **#588** (eval
-> harness), **#591** (socket-level SSRF pinning), **#595** (rate-limit/auth on the
+> Open follow-ups: **#573** (catalogue scope — operator-gated), **#588** (draft→saved
+> RUNTIME MONITORING — one row per extraction ATTEMPT including the ones that never
+> produce a draft; the scoring/small-N bake-off harness itself already shipped as
+> `scripts/bakeoff_bean_sourcing.py`, so "eval harness" pointed at finished work),
+> **#591** (socket-level SSRF pinning), **#595** (rate-limit/auth on the
 > billable endpoint).
 >
 > **Review + process.** PR size is a **reviewability guide, not a hard cap** (#661,
@@ -37,8 +44,12 @@
 >
 > **Milestone reality.** M1 build continues; the "July 2026 harness complete" and
 > "first supervised hardware session in June" targets below are historical. E11
-> (packaging) and E12 (validation/demo) remain operator-gated and not started, with
-> E11-S1 split (SPA bundling shipped; the `[pi]` extra still blocked on D27 Phase 2).
+> (packaging) is operator-gated and IN PROGRESS — E11-S1 is split, with SPA bundling
+> shipped and the `[pi]` extra still blocked on D27 Phase 2, while E11-S2 and E11-S3
+> are not started. E12 (validation/demo) is operator-gated and not started. (Codex P2,
+> #681: this line previously called E11 "not started" and then described its shipped
+> half in the same sentence, which would have a cold-start session plan E11 from
+> scratch.)
 > Next free plan decision number: **D109** (D108 is in draft plan PR #16).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 27 Jul block above):** the D35 control work
@@ -117,10 +128,13 @@
 - Package: `roastpilot-agent`
 - Import package: `roastpilot_agent`
 - Console entrypoint: `roastpilot-agent`
-- Current phase: M1 build. **The July-2026 "harness complete" target below was not
-  met as written and is retained as history** — the vertical slice and dashboard are
-  green and multiple supervised hardware roasts are done (3–15), but E11/E12 remain
-  operator-gated. See the 27 Jul status block at the top for the live position.
+- Current phase: M1 build. **The July-2026 "harness complete" target below WAS met as
+  written** (Codex P2, #681, correcting this line): the definition is exactly three
+  conditions — E9 vertical slice green in CI, E10 dashboard usable for a live roast,
+  and one supervised real-hardware roast end-to-end — and all three hold (roasts 3–15).
+  The definition itself says E11/E12 polish may run into August, so their being
+  operator-gated is the milestone working as specified, not a miss. See the 27 Jul
+  status block at the top for the live position.
 - **July milestone (D17)** — "harness complete" = (1) E9 vertical slice
   green in CI + (2) E10 dashboard usable for a live roast + (3) one
   supervised real-hardware roast end-to-end. E11/E12 polish may run into
