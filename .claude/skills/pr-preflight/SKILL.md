@@ -228,10 +228,10 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
    - the **step-1 gates and any applicable domain review (steps 1-4) have been re-run** on that
      committed tree. The pre-push results describe the pre-fold tree;
    - **`codex review --base origin/main` has been re-run and comes back clean** on that same
-     tree. Step 5's own later re-run covers the gates and the domain review but **not** the
-     Codex lens, so without this bullet a draft-phase fold reaches the ready transition having
-     been seen by no diverse lens at all — and it then surfaces as post-ready rework, which is
-     the precise cost this entire step exists to avoid;
+     tree. The draft phase runs BEFORE step 5's own re-run, so at this point nothing later has
+     covered this tree yet; without this bullet a draft-phase fold reaches the ready transition
+     having been seen by no diverse lens at all, and it then surfaces as post-ready rework,
+     which is the precise cost this entire step exists to avoid;
    - the committed fold is **pushed**, and the draft's **required runner checks are GREEN on the
      pushed head**, not merely started: confirm `gh pr view --json headRefOid` matches your local
      `HEAD`, then `gh pr checks --required --watch`. Both halves are load-bearing, and both were
@@ -299,8 +299,8 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
 **Iterate LOCALLY, not on the draft.** After folding a Codex finding that changed code, you
 **MUST** re-run `codex review --base origin/main` and keep going until a pass is clean, not
 merely "can" (Codex P2, #682): a fold routinely introduces or exposes the next
-Codex-specific issue, and step 5's re-run covers the gates and domain review rather than
-the Codex lens, so a single local pass would leave that class unreviewed. It costs nothing
+Codex-specific issue, so a single local pass only ever certifies the tree that produced the
+finding, never the tree that answered it. It costs nothing
 on GitHub, so there is no reason to ration it. This is where iteration now lives. The AGENTS.md **"once-on-final-commit, don't re-litigate"** rule governs the
 **post-ready** phase (a marked-ready PR heading to merge), where re-triggering across
 pushes is the churn we avoid. Local = iterate to clean; draft = fold the runner gates **and
