@@ -1,0 +1,7 @@
+name: "RoastPilot CodeQL configuration"
+
+# Vendor pages are retained byte-for-byte as parser contract fixtures. Their
+# embedded storefront JavaScript is neither authored nor executed by RoastPilot;
+# scanning it creates thousands of alerts that cannot be fixed in this repo.
+paths-ignore:
+  - "tests/fixtures/bean-sourcing/**"
