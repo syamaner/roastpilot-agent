@@ -246,11 +246,17 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
      environment-only failure is about to invalidate, forcing a post-ready fix, push, and
      re-trigger — the draft phase's whole purpose, spent;
    - the latest CodeQL `Analyze (actions)`, `Analyze (javascript-typescript)`, and
-     `Analyze (python)` jobs are **successful for that same pushed head**. CodeQL is deliberately
-     not branch-required, so `gh pr checks --required --watch` does not wait for it: inspect the
-     CodeQL entries in `gh pr checks` and verify their workflow run's `headSha` equals the current
-     `headRefOid` before accepting the results. A stale green analysis from an earlier head does
-     not satisfy this exit condition;
+     `Analyze (python)` jobs are **successful for that same pushed head**, and the separate
+     `CodeQL` check posted by the `github-advanced-security` app is green with a "No new alerts
+     in code changed by this pull request" result. The three job successes prove that SARIF
+     uploads completed; they do not prove the diff is clean. CodeQL is deliberately not
+     branch-required, so `gh pr checks --required --watch` does not wait for these results:
+     inspect every CodeQL entry in `gh pr checks`, verify the workflow run's `headSha` equals
+     the current `headRefOid`, and inspect/triage any new-alert result before accepting the
+     gate. A stale green analysis from an earlier head does not satisfy this exit condition.
+     The repository switched from default to advanced setup on 29 Jul 2026; if initialization
+     or upload later fails because the setups conflict, restore that prerequisite in Settings
+     -> Code security rather than treating the failure as a code defect;
    - every draft `claude-review` inline thread is folded or explicitly resolved.
 
    A fold made to satisfy any bullet restarts this list from the top.
