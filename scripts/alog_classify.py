@@ -184,7 +184,7 @@ def load_alog(path: Path) -> dict[str, Any]:
     return cast("dict[str, Any]", parsed)
 
 
-def _anon_id(profile: dict[str, Any], fallback: str) -> str:
+def anon_id(profile: dict[str, Any], fallback: str) -> str:
     """Derive a stable anonymised id from the roast UUID (or a fallback string).
 
     Args:
@@ -196,7 +196,7 @@ def _anon_id(profile: dict[str, Any], fallback: str) -> str:
         the bean or origin.
     """
     seed = str(profile.get("roastUUID") or fallback)
-    return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:10]  # noqa: S324
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:10]
 
 
 def infer_origin(basename: str) -> str:
@@ -357,7 +357,7 @@ def compute_metrics(profile: dict[str, Any], fallback_id: str) -> RoastMetrics |
         flick = max(flick, r - seen_min)
 
     return RoastMetrics(
-        anon_id=_anon_id(profile, fallback_id),
+        anon_id=anon_id(profile, fallback_id),
         roast_date=str(profile.get("roastisodate") or profile.get("roastdate") or "unknown"),
         charge_bt=round(bt[charge_idx], 1),
         turning_bt=round(turning_bt, 1),
