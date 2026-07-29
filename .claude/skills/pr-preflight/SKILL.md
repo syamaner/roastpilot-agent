@@ -201,8 +201,8 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
    re-run, and Codex describes it until IT is re-run.
 2. Open the PR as a **draft** (`gh pr create --draft`), and **record the current head sha**.
    The draft phase exists for the **runner-only gates** (`ci.yml`: `ruff`, `pyright`, `pytest`,
-   and the web jobs -- this repository has NO CodeQL workflow, so do not expect a
-   security-analysis lens here): they run on draft pushes and catch a class local runs cannot, including
+   and the web jobs, plus the non-required CodeQL workflow's Actions / JavaScript-TypeScript /
+   Python analyses): they run on draft pushes and catch a class local runs cannot, including
    environment-dependent failures that only reproduce on a runner. Fold those here, while the
    CODEX lens is still unspent: its automatic trigger does not fire until ready, so nothing
    you do in this phase consumes it. That is the only lens the draft phase protects. Note
@@ -245,6 +245,18 @@ security keystone two Opus safety passes called clean — all post-open). Get Co
      ready underneath them fires the automatic Codex review against a head that an
      environment-only failure is about to invalidate, forcing a post-ready fix, push, and
      re-trigger — the draft phase's whole purpose, spent;
+   - the latest CodeQL `Analyze (actions)`, `Analyze (javascript-typescript)`, and
+     `Analyze (python)` jobs are **successful for that same pushed head**, and the separate
+     `CodeQL` check posted by the `github-advanced-security` app is green with a "No new alerts
+     in code changed by this pull request" result. The three job successes prove that SARIF
+     uploads completed; they do not prove the diff is clean. CodeQL is deliberately not
+     branch-required, so `gh pr checks --required --watch` does not wait for these results:
+     inspect every CodeQL entry in `gh pr checks`, verify the workflow run's `headSha` equals
+     the current `headRefOid`, and inspect/triage any new-alert result before accepting the
+     gate. A stale green analysis from an earlier head does not satisfy this exit condition.
+     The repository switched from default to advanced setup on 29 Jul 2026; if initialization
+     or upload later fails because the setups conflict, restore that prerequisite in Settings
+     -> Code security rather than treating the failure as a code defect;
    - every draft `claude-review` inline thread is folded or explicitly resolved.
 
    A fold made to satisfy any bullet restarts this list from the top.
