@@ -67,6 +67,12 @@ def _ramp(n: int, start: float, step: float) -> list[float]:
     return [start + i * step for i in range(n)]
 
 
+def test_anon_id_uses_sha256_for_uuid_or_fallback() -> None:
+    """Anonymous identifiers are stable SHA-256 prefixes for either seed."""
+    assert ac.anon_id({"roastUUID": "uuid-x"}, "ignored.alog") == "821326cd08"
+    assert ac.anon_id({}, "fallback.alog") == "3b47e68ab0"
+
+
 def test_unset_charge_yields_no_metrics() -> None:
     """A CHARGE slot left at the ``-1`` sentinel produces no metrics."""
     timex = _ramp(760, 0.0, 1.0)
