@@ -4,17 +4,30 @@ on:
     workflows: ["Claude Code Review"]
     types: [in_progress, completed]
   pull_request_target:
-    types: [opened, synchronize]
+    types: [opened, synchronize, reopened, edited]
 permissions:
   contents: read
   pull-requests: write
   actions: write
+concurrency:
+  # Serialize the final newest-run check and approval mutation per exact head.
+  # A head-SHA key remains stable even when GitHub's eventually-consistent
+  # workflow_run payload temporarily omits its pull_requests association.
+  group: >-
+    claude-review-approval-${{
+      github.event.workflow_run.head_sha ||
+      github.event.pull_request.head.sha ||
+      github.run_id
+    }}
+  cancel-in-progress: false
 jobs:
   approve:
     name: Publish PR-scoped Claude approval
     if: >-
       github.event_name == 'workflow_run' ||
-      github.event.pull_request.user.login == 'dependabot[bot]'
+      github.event.pull_request.user.login == 'dependabot[bot]' ||
+      github.event.action == 'reopened' ||
+      github.event.changes.base.ref.from != ''
     runs-on: ubuntu-latest
     steps:
       # LOAD-BEARING: never execute untrusted PR code on privileged events.
@@ -26,4 +39,6 @@ jobs:
       - name: Approve reviewed or explicitly exempt PR
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 scripts/claude_review_approval.py
+        # -I prevents a future scripts/json.py (or similar) from shadowing the
+        # standard library under this job's write-capable token.
+        run: python3 -I scripts/claude_review_approval.py

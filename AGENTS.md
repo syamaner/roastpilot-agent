@@ -355,8 +355,13 @@ Dependabot PRs. Operate the gate as follows:
   and automatically starts a fresh review; do not manually re-trigger between
   ordinary fix pushes.
 - A Claude draft approval remains valid when the same head is marked ready or
-  reopened. Those no-code lifecycle changes do not start duplicate Claude
-  reviews. This does not waive the separate post-ready Codex wait below.
+  reopened. Reopening an unapproved PR reruns its newest exact PR/head/base
+  review (or leaves an already-active run alone), so a close/reopen cycle cannot
+  strand the PR without evidence. This does not waive the separate post-ready
+  Codex wait below.
+- Retargeting the base branch can expand the effective diff without changing
+  the head SHA. A base edit dismisses the bridge approval and starts a fresh
+  Claude review; title/body-only edits do neither.
 - Read and independently triage every Claude comment. Fixes produce a new head
   and therefore require a fresh successful run; resolved threads alone never
   revive a stale approval.
@@ -364,17 +369,21 @@ Dependabot PRs. Operate the gate as follows:
   approval in the PR UI/API, then dispatch the rerun; webhook delivery cannot
   make those two operations atomic. The bridge's `in_progress` and non-success
   handlers dismiss defensively, and a delayed older event also revokes old
-  evidence when it observes a newer unfinished/failed attempt. The newest
-  attempt must succeed. The bridge reruns a first cancelled attempt once; for a
+  evidence when it observes a newer unfinished/failed attempt. Bridge handlers
+  are serialized per exact head so the final newest-run check and approval
+  mutation cannot race another same-head attempt, even when run-to-PR
+  association is temporarily absent. The newest attempt must succeed. The
+  bridge reruns a first cancelled attempt once; for a
   service or infrastructure error, re-run the failed Actions job after recovery
   and wait again. Failure, timeout, action-required, repeated cancellation,
   stale/ambiguous PR association, or silence never receives a timeout bypass.
 - Dependabot receives a labelled `[claude-review-exempt]` approval from trusted
-  default-branch code. A workflow-editing PR can alter the upstream reviewer
-  workflow itself, so its apparent success is never trusted and it requires an
-  explicit maintainer approval with the reason recorded. Neither path executes
-  PR code with the bridge token. CI, codecov, exact-head Codex, conversation
-  resolution, and independent-triage requirements remain unchanged.
+  default-branch code. A PR editing either a workflow or the privileged bridge
+  helper can alter the approval path itself, so its apparent success is never
+  trusted and it requires an explicit maintainer approval with the reason
+  recorded. Neither path executes PR code with the bridge token. CI, codecov,
+  exact-head Codex, conversation resolution, and independent-triage
+  requirements remain unchanged.
 - A human approval is not a silent substitute. If the operator deliberately
   overrides Claude, record the reason in the PR before merge.
 

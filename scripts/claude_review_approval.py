@@ -18,6 +18,7 @@ JsonObject = dict[str, JsonValue]
 _APPROVAL_MARKER = "[claude-review-approval]"
 _EXEMPTION_MARKER = "[claude-review-exempt]"
 _BOT_LOGIN = "github-actions[bot]"
+_WORKFLOW_FILE = "claude-code-review.yml"
 _WORKFLOW_PATH = ".github/workflows/claude-code-review.yml"
 
 
@@ -107,6 +108,7 @@ def process_event(event: JsonObject, api: _GitHubAPI) -> str:
         return _process_pull_request_target(
             _object(event["pull_request"], "pull_request"),
             _string(event.get("action"), "action"),
+            _object(event.get("changes", {}), "changes"),
             api,
         )
     raise ValueError("unsupported event: expected workflow_run or pull_request")
@@ -118,8 +120,8 @@ def _process_workflow_run(run: JsonObject, action: str, api: _GitHubAPI) -> str:
     pr = _pull_request_for_run(run, api)
     if pr is None:
         return "no exact open pull request is associated with the review run; fail closed"
-    if _pull_request_edits_workflow(pr.number, api):
-        return "workflow-editing PR requires an explicit maintainer approval"
+    if _pull_request_edits_privileged_code(pr.number, api):
+        return "privileged-code-editing PR requires an explicit maintainer approval"
     newest = _newest_run_for_pull_request(run, pr, api)
     run_id = _integer(run.get("id"), "workflow_run.id")
     attempt = _integer(run.get("run_attempt", 1), "workflow_run.run_attempt")
@@ -153,20 +155,38 @@ def _process_workflow_run(run: JsonObject, action: str, api: _GitHubAPI) -> str:
 def _process_pull_request_target(
     pr_payload: JsonObject,
     action: str,
+    changes: JsonObject,
     api: _GitHubAPI,
 ) -> str:
-    if action not in {"opened", "synchronize"}:
+    if action == "edited":
+        if "base" not in changes:
+            return "non-base pull request edit does not require approval work"
+        pr = _pull_request_from_payload(pr_payload)
+        dismissed = _dismiss_approval(pr, api, include_exemption=True)
+        suffix = " and dismissed the prior approval" if dismissed else ""
+        if pr.author == "dependabot[bot]":
+            if _pull_request_edits_privileged_code(pr.number, api):
+                return (
+                    f"base branch changed{suffix}; privileged-code-editing PR "
+                    "requires an explicit maintainer approval"
+                )
+            approved = _approve_dependabot(pr, api, skip_existing_check=dismissed)
+            return f"base branch changed{suffix}; {approved}"
+        return f"base branch changed{suffix}; fresh Claude review required"
+    if action not in {"opened", "synchronize", "reopened"}:
         return f"pull_request_target action {action!r} does not require approval work"
     pr = _pull_request_from_payload(pr_payload)
-    if pr.author != "dependabot[bot]":
-        return "normal PR waits for its PR-scoped Claude review"
-    body = (
-        f"{_EXEMPTION_MARKER} `{pr.head[0]}` is explicitly exempt: "
-        "Dependabot cannot receive repository secrets. "
-        "CI, codecov, exact-head Codex, conversation resolution, and independent "
-        "triage remain required."
-    )
-    return _approve(pr, body, api)
+    if pr.author == "dependabot[bot]":
+        if _pull_request_edits_privileged_code(pr.number, api):
+            return "privileged-code-editing PR requires an explicit maintainer approval"
+        return _approve_dependabot(pr, api)
+    if action == "reopened":
+        if _approval_review(pr, api) is not None:
+            return f"reopened PR #{pr.number} retains its exact-head approval"
+        if _pull_request_edits_privileged_code(pr.number, api):
+            return "privileged-code-editing PR requires an explicit maintainer approval"
+        return _rerun_latest_review(pr, api)
+    return "normal PR waits for its PR-scoped Claude review"
 
 
 def _pull_request_for_run(run: JsonObject, api: _GitHubAPI) -> _PullRequest | None:
@@ -195,16 +215,7 @@ def _newest_run_for_pull_request(
         api.get(f"/actions/workflows/{workflow_id}/runs?head_sha={encoded_sha}&per_page=100"),
         "workflow runs response",
     )
-    matches: list[JsonObject] = []
-    for value in _array(response.get("workflow_runs"), "workflow_runs"):
-        candidate = _object(value, "workflow_runs[]")
-        if _string(candidate.get("head_branch"), "run.head_branch") != pr.head[1]:
-            continue
-        if any(
-            _summary_matches_pr(_object(item, "run.pull_requests[]"), pr)
-            for item in _array(candidate.get("pull_requests"), "run.pull_requests")
-        ):
-            matches.append(candidate)
+    matches = _matching_runs_for_pull_request(response, pr)
     if not matches:
         raise ValueError("no workflow run matched the exact pull request and head")
     return max(matches, key=_run_order)
@@ -226,18 +237,81 @@ def _summary_matches_pr(summary: JsonObject, pr: _PullRequest) -> bool:
     )
 
 
-def _pull_request_edits_workflow(number: int, api: _GitHubAPI) -> bool:
+def _pull_request_edits_privileged_code(number: int, api: _GitHubAPI) -> bool:
     values = _array(api.get(f"/pulls/{number}/files?per_page=100"), "files")
     for value in values:
         file = _object(value, "files[]")
         paths = (file.get("filename"), file.get("previous_filename"))
-        if any(isinstance(path, str) and path.startswith(".github/workflows/") for path in paths):
+        if any(
+            isinstance(path, str)
+            and (
+                path.startswith(".github/workflows/") or path == "scripts/claude_review_approval.py"
+            )
+            for path in paths
+        ):
             return True
     return len(values) == 100
 
 
-def _approve(pr: _PullRequest, body: str, api: _GitHubAPI) -> str:
-    if _approval_review(pr, api) is not None:
+def _rerun_latest_review(pr: _PullRequest, api: _GitHubAPI) -> str:
+    encoded_workflow = quote(_WORKFLOW_FILE, safe="")
+    encoded_sha = quote(pr.head[0], safe="")
+    response = _object(
+        api.get(f"/actions/workflows/{encoded_workflow}/runs?head_sha={encoded_sha}&per_page=100"),
+        "workflow runs response",
+    )
+    matches = _matching_runs_for_pull_request(response, pr)
+    if not matches:
+        raise ValueError("no prior Claude review run matched the reopened pull request")
+    newest = max(matches, key=_run_order)
+    run_id = _integer(newest.get("id"), "run.id")
+    status = _string(newest.get("status"), "run.status")
+    if status != "completed":
+        return f"reopened PR #{pr.number} already has review run {run_id} {status}"
+    api.post(f"/actions/runs/{run_id}/rerun")
+    return f"reopened PR #{pr.number} re-ran Claude review run {run_id}"
+
+
+def _matching_runs_for_pull_request(
+    response: JsonObject,
+    pr: _PullRequest,
+) -> list[JsonObject]:
+    matches: list[JsonObject] = []
+    for value in _array(response.get("workflow_runs"), "workflow_runs"):
+        candidate = _object(value, "workflow_runs[]")
+        if _string(candidate.get("head_branch"), "run.head_branch") != pr.head[1]:
+            continue
+        if any(
+            _summary_matches_pr(_object(item, "run.pull_requests[]"), pr)
+            for item in _array(candidate.get("pull_requests"), "run.pull_requests")
+        ):
+            matches.append(candidate)
+    return matches
+
+
+def _approve_dependabot(
+    pr: _PullRequest,
+    api: _GitHubAPI,
+    *,
+    skip_existing_check: bool = False,
+) -> str:
+    body = (
+        f"{_EXEMPTION_MARKER} `{pr.head[0]}` is explicitly exempt: "
+        "Dependabot cannot receive repository secrets. "
+        "CI, codecov, exact-head Codex, conversation resolution, and independent "
+        "triage remain required."
+    )
+    return _approve(pr, body, api, skip_existing_check=skip_existing_check)
+
+
+def _approve(
+    pr: _PullRequest,
+    body: str,
+    api: _GitHubAPI,
+    *,
+    skip_existing_check: bool = False,
+) -> str:
+    if not skip_existing_check and _approval_review(pr, api) is not None:
         return f"PR #{pr.number} already has a bot approval for {pr.head[0]}"
     api.post(
         f"/pulls/{pr.number}/reviews",
@@ -246,8 +320,13 @@ def _approve(pr: _PullRequest, body: str, api: _GitHubAPI) -> str:
     return f"approved PR #{pr.number} at {pr.head[0]}"
 
 
-def _dismiss_approval(pr: _PullRequest, api: _GitHubAPI) -> bool:
-    review = _approval_review(pr, api, approval_only=True)
+def _dismiss_approval(
+    pr: _PullRequest,
+    api: _GitHubAPI,
+    *,
+    include_exemption: bool = False,
+) -> bool:
+    review = _approval_review(pr, api, approval_only=not include_exemption)
     if review is None:
         return False
     review_id = _integer(review.get("id"), "review.id")

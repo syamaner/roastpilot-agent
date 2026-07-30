@@ -186,10 +186,12 @@ Codex trigger/wait/triage pass (including the documented bounded silent/stalled
 fallback), and independent lead/`pr-triage` adjudication.
 **Restoration design (D108):** retire the SHA status and use a trusted
 default-branch bridge to turn the newest successful exact-PR/head Claude run into
-an exact-commit PR approval. A push dismisses stale approval; draft approval
-survives ready/reopen when the bytes do not change; Dependabot uses a trusted
-labelled exemption, while workflow edits require an explicit recorded maintainer
-approval because their upstream review result is untrusted. Slice 1 ships the mechanism and operating policy
+an exact-commit PR approval. A push or base retarget dismisses stale approval;
+draft approval survives ready/reopen when the bytes do not change, while reopening
+without approval reruns the newest exact review; same-head bridge handlers serialize
+the newest-run check and approval mutation. Dependabot uses a trusted labelled
+exemption, while workflow or privileged-helper edits require an explicit recorded
+maintainer approval because their upstream review result is untrusted. Slice 1 ships the mechanism and operating policy
 without changing protection. Slice 2 enables Actions approvals plus one required
 approval only after live same-SHA/different-PR, draft→ready, stale-push, rerun,
 and workflow-exemption proofs. Claude's draft approval survives a no-code ready

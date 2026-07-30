@@ -80,6 +80,7 @@ def _run_payload(
         "path": ".github/workflows/claude-code-review.yml",
         "head_sha": sha,
         "head_branch": ref,
+        "status": "completed",
         "conclusion": conclusion,
         "created_at": "2026-07-27T12:00:00Z",
         "pull_requests": [
@@ -518,6 +519,7 @@ def test_dependabot_receives_explicit_exemption_approval() -> None:
     pr = _pr_payload(author="dependabot[bot]")
     api = FakeAPI(
         {
+            "/pulls/10/files?per_page=100": [],
             "/pulls/10/reviews?per_page=100&page=1": [],
         }
     )
@@ -532,6 +534,25 @@ def test_dependabot_receives_explicit_exemption_approval() -> None:
     assert "Dependabot cannot receive repository secrets" in str(api.posts[0][1])
 
 
+def test_dependabot_privileged_edit_requires_maintainer() -> None:
+    """Dependency automation cannot alter the bridge and self-exempt."""
+
+    api = FakeAPI(
+        {"/pulls/10/files?per_page=100": [{"filename": "scripts/claude_review_approval.py"}]}
+    )
+
+    result = approval.process_event(
+        {
+            "action": "opened",
+            "pull_request": _pr_payload(author="dependabot[bot]"),
+        },
+        api,
+    )
+
+    assert result == "privileged-code-editing PR requires an explicit maintainer approval"
+    assert api.posts == []
+
+
 @pytest.mark.parametrize(
     "file",
     [
@@ -540,12 +561,17 @@ def test_dependabot_receives_explicit_exemption_approval() -> None:
             "filename": "docs/retired.yml",
             "previous_filename": ".github/workflows/claude-code-review.yml",
         },
+        {"filename": "scripts/claude_review_approval.py"},
+        {
+            "filename": "scripts/replacement.py",
+            "previous_filename": "scripts/claude_review_approval.py",
+        },
     ],
 )
-def test_successful_untrusted_workflow_edit_cannot_approve(
+def test_successful_untrusted_privileged_code_edit_cannot_approve(
     file: approval.JsonObject,
 ) -> None:
-    """A PR cannot replace or rename the reviewer workflow to self-approve."""
+    """A PR cannot replace or rename privileged bridge code to self-approve."""
 
     run = _run_payload()
     api = _workflow_api(run)
@@ -553,7 +579,7 @@ def test_successful_untrusted_workflow_edit_cannot_approve(
 
     result = approval.process_event({"workflow_run": run}, api)
 
-    assert result == "workflow-editing PR requires an explicit maintainer approval"
+    assert result == "privileged-code-editing PR requires an explicit maintainer approval"
     assert api.posts == []
 
 
@@ -568,7 +594,7 @@ def test_full_file_page_fails_closed_as_possible_workflow_edit() -> None:
 
     result = approval.process_event({"workflow_run": run}, api)
 
-    assert result == "workflow-editing PR requires an explicit maintainer approval"
+    assert result == "privileged-code-editing PR requires an explicit maintainer approval"
     assert api.posts == []
 
 
@@ -608,7 +634,7 @@ def test_normal_pr_waits_for_claude() -> None:
     assert api.posts == []
 
 
-@pytest.mark.parametrize("action", ["ready_for_review", "reopened", "closed"])
+@pytest.mark.parametrize("action", ["ready_for_review", "closed"])
 def test_lifecycle_toggle_does_not_reapprove_unchanged_head(action: str) -> None:
     """Exact-head approval persists across non-code lifecycle toggles."""
 
@@ -620,6 +646,283 @@ def test_lifecycle_toggle_does_not_reapprove_unchanged_head(action: str) -> None
     )
 
     assert result == f"pull_request_target action {action!r} does not require approval work"
+
+
+def test_reopened_pr_preserves_existing_exact_head_approval() -> None:
+    """Reopening reviewed bytes does not invalidate their exact-head approval."""
+
+    api = FakeAPI(
+        {
+            "/pulls/10/reviews?per_page=100&page=1": [
+                {
+                    "id": 70,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": "[claude-review-approval] prior run",
+                }
+            ]
+        }
+    )
+
+    result = approval.process_event(
+        {"action": "reopened", "pull_request": _pr_payload()},
+        api,
+    )
+
+    assert result == "reopened PR #10 retains its exact-head approval"
+    assert api.posts == []
+    assert api.puts == []
+
+
+def test_reopened_unapproved_pr_reruns_latest_exact_review() -> None:
+    """A reopened PR without approval automatically restarts its exact review."""
+
+    run = _run_payload(run_id=101, run_number=21)
+    api = FakeAPI(
+        {
+            "/pulls/10/reviews?per_page=100&page=1": [],
+            "/pulls/10/files?per_page=100": [],
+            ("/actions/workflows/claude-code-review.yml/runs?head_sha=abc123&per_page=100"): {
+                "workflow_runs": [run]
+            },
+        }
+    )
+
+    result = approval.process_event(
+        {"action": "reopened", "pull_request": _pr_payload()},
+        api,
+    )
+
+    assert result == "reopened PR #10 re-ran Claude review run 101"
+    assert api.posts == [("/actions/runs/101/rerun", None)]
+
+
+def test_reopened_pr_with_active_review_does_not_duplicate_it() -> None:
+    """A queued or running exact review is recovery already in progress."""
+
+    run = _run_payload(run_id=102, run_number=22)
+    run["status"] = "in_progress"
+    run["conclusion"] = None
+    api = FakeAPI(
+        {
+            "/pulls/10/reviews?per_page=100&page=1": [],
+            "/pulls/10/files?per_page=100": [],
+            ("/actions/workflows/claude-code-review.yml/runs?head_sha=abc123&per_page=100"): {
+                "workflow_runs": [run]
+            },
+        }
+    )
+
+    result = approval.process_event(
+        {"action": "reopened", "pull_request": _pr_payload()},
+        api,
+    )
+
+    assert result == "reopened PR #10 already has review run 102 in_progress"
+    assert api.posts == []
+
+
+def test_reopened_privileged_edit_never_reruns_untrusted_review() -> None:
+    """Workflow or bridge edits still require the recorded maintainer path."""
+
+    api = FakeAPI(
+        {
+            "/pulls/10/reviews?per_page=100&page=1": [],
+            "/pulls/10/files?per_page=100": [{"filename": "scripts/claude_review_approval.py"}],
+        }
+    )
+
+    result = approval.process_event(
+        {"action": "reopened", "pull_request": _pr_payload()},
+        api,
+    )
+
+    assert result == "privileged-code-editing PR requires an explicit maintainer approval"
+    assert api.posts == []
+
+
+def test_reopened_pr_without_prior_run_fails_closed() -> None:
+    """Missing review history is visible failure, never silent approval."""
+
+    api = FakeAPI(
+        {
+            "/pulls/10/reviews?per_page=100&page=1": [],
+            "/pulls/10/files?per_page=100": [],
+            ("/actions/workflows/claude-code-review.yml/runs?head_sha=abc123&per_page=100"): {
+                "workflow_runs": []
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="no prior Claude review run matched"):
+        approval.process_event(
+            {"action": "reopened", "pull_request": _pr_payload()},
+            api,
+        )
+
+
+def test_base_retarget_dismisses_approval_for_fresh_review() -> None:
+    """Changing the base invalidates same-head approval before re-review."""
+
+    api = FakeAPI(
+        {
+            "/pulls/10/reviews?per_page=100&page=1": [
+                {
+                    "id": 71,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": "[claude-review-approval] old base",
+                }
+            ]
+        }
+    )
+
+    result = approval.process_event(
+        {
+            "action": "edited",
+            "changes": {"base": {"ref": {"from": "release"}}},
+            "pull_request": _pr_payload(),
+        },
+        api,
+    )
+
+    assert result == (
+        "base branch changed and dismissed the prior approval; fresh Claude review required"
+    )
+    assert api.puts == [
+        (
+            "/pulls/10/reviews/71/dismissals",
+            {"message": "A newer Claude review attempt must succeed before merge."},
+        )
+    ]
+
+
+def test_dependabot_base_retarget_replaces_exemption_after_recheck() -> None:
+    """A safe retarget receives fresh exemption evidence without deadlock."""
+
+    api = FakeAPI(
+        {
+            "/pulls/10/files?per_page=100": [],
+            "/pulls/10/reviews?per_page=100&page=1": [
+                {
+                    "id": 72,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": "[claude-review-exempt] Dependabot",
+                }
+            ],
+        }
+    )
+
+    result = approval.process_event(
+        {
+            "action": "edited",
+            "changes": {"base": {"ref": {"from": "release"}}},
+            "pull_request": _pr_payload(author="dependabot[bot]"),
+        },
+        api,
+    )
+
+    assert result == (
+        "base branch changed and dismissed the prior approval; approved PR #10 at abc123"
+    )
+    assert api.puts == [
+        (
+            "/pulls/10/reviews/72/dismissals",
+            {"message": "A newer Claude review attempt must succeed before merge."},
+        )
+    ]
+    assert api.posts == [
+        (
+            "/pulls/10/reviews",
+            {
+                "body": (
+                    "[claude-review-exempt] `abc123` is explicitly exempt: "
+                    "Dependabot cannot receive repository secrets. CI, codecov, "
+                    "exact-head Codex, conversation resolution, and independent "
+                    "triage remain required."
+                ),
+                "commit_id": "abc123",
+                "event": "APPROVE",
+            },
+        )
+    ]
+
+
+def test_dependabot_privileged_base_retarget_remains_unapproved() -> None:
+    """Retargeting cannot exempt Dependabot after privileged code enters the diff."""
+
+    api = FakeAPI(
+        {
+            "/pulls/10/files?per_page=100": [
+                {"filename": ".github/workflows/claude-code-review.yml"}
+            ],
+            "/pulls/10/reviews?per_page=100&page=1": [
+                {
+                    "id": 73,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": "[claude-review-exempt] Dependabot",
+                }
+            ],
+        }
+    )
+
+    result = approval.process_event(
+        {
+            "action": "edited",
+            "changes": {"base": {"ref": {"from": "release"}}},
+            "pull_request": _pr_payload(author="dependabot[bot]"),
+        },
+        api,
+    )
+
+    assert result == (
+        "base branch changed and dismissed the prior approval; "
+        "privileged-code-editing PR requires an explicit maintainer approval"
+    )
+    assert api.puts[0][0] == "/pulls/10/reviews/73/dismissals"
+    assert api.posts == []
+
+
+def test_non_base_edit_does_not_touch_approval() -> None:
+    """Editing title or body does not churn exact-head review evidence."""
+
+    api = FakeAPI({})
+
+    result = approval.process_event(
+        {
+            "action": "edited",
+            "changes": {"title": {"from": "old"}},
+            "pull_request": _pr_payload(),
+        },
+        api,
+    )
+
+    assert result == "non-base pull request edit does not require approval work"
+    assert api.posts == []
+    assert api.puts == []
+
+
+def test_workflows_serialize_bridge_and_review_only_base_edits() -> None:
+    """Workflow triggers preserve race and retarget protections."""
+
+    root = Path(__file__).resolve().parents[1]
+    bridge = (root / ".github/workflows/claude-review-approval.yml").read_text(encoding="utf-8")
+    reviewer = (root / ".github/workflows/claude-code-review.yml").read_text(encoding="utf-8")
+
+    assert "types: [opened, synchronize, reopened, edited]" in bridge
+    assert "claude-review-approval-${{" in bridge
+    assert "github.event.workflow_run.head_sha ||" in bridge
+    assert "github.event.pull_request.head.sha ||" in bridge
+    assert "cancel-in-progress: false" in bridge
+    assert "run: python3 -I scripts/claude_review_approval.py" in bridge
+    assert "types: [opened, synchronize, edited]" in reviewer
+    assert "github.event.changes.base.ref.from != ''" in reviewer
 
 
 def test_missing_matching_runs_raises() -> None:

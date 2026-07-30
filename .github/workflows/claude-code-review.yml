@@ -2,8 +2,9 @@ name: Claude Code Review
 
 on:
   pull_request:
-    # D108: no-code draft/ready/reopen transitions preserve reviewed bytes.
-    types: [opened, synchronize]
+    # Base retargeting can expand the effective diff without changing the head
+    # SHA. The job-level condition below ignores title/body-only edits.
+    types: [opened, synchronize, edited]
     # Optional: Only run on specific file changes
     # paths:
     #   - "src/**/*.ts"
@@ -28,7 +29,9 @@ jobs:
     # and the action fails. Dependency bumps don't need a Claude code review —
     # CI + codecov cover them. (claude-review is not a required check, so a
     # Dependabot PR is never blocked; this just removes the spurious red X.)
-    if: ${{ github.actor != 'dependabot[bot]' }}
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      (github.event.action != 'edited' || github.event.changes.base.ref.from != '')
 
     runs-on: ubuntu-latest
     permissions:
