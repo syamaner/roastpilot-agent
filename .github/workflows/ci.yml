@@ -12,6 +12,9 @@ concurrency:
   # can serve as a Codecov base report for future PRs.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+permissions:
+  contents: read
+
 jobs:
   checks:
     name: Checks

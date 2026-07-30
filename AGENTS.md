@@ -387,10 +387,15 @@ auto-blocker**: it re-reviews the whole diff from scratch and re-posts already-f
 findings as new inline threads, which would deadlock `required_conversation_resolution`
 if its threads gated merge. **So the planned `review-gate` "flip-on-BOTH-reviews" wiring
 is CANCELLED — do not make Codex a required check.** Operating rule (the lead, per D23 —
-the author never self-triages): Codex auto-reviews at PR creation; **re-trigger it with an
-`@codex review` comment ONCE on the final commit**, never on intermediate pushes (the
-once-only discipline targets re-litigation across pushes; the silent-fallback below may add
-at most one extra trigger on that SAME final commit); the lead
+the author never self-triages): Codex auto-reviews the moment the PR reaches
+ready-for-review (opened ready, or a draft marked ready); it does not auto-review while
+the PR sits in draft (confirmed against roastpilot-cloud PR #150, 27 Jul 2026), so a
+manual comment is not needed for that first review. **Re-trigger it with an `@codex
+review` comment only after a later push changes the head, and then only ONCE, on that
+final commit**, never on intermediate pushes (the once-only discipline targets
+re-litigation across
+pushes; the silent-fallback below may add at most one extra trigger on that SAME final
+commit); the lead
 verifies each finding against the *current* code, folds the real ones, and **resolves the
 stale re-posts by hand** (GraphQL `resolveReviewThread`). Its signal type is a
 `pull_request_review` with inline threads, which DO block via conversation-resolution, so
@@ -399,18 +404,27 @@ catches what a strong single lens misses; the constraint Codex must satisfy is *
 re-litigating resolved threads on every push*, which the once-on-final-commit discipline
 enforces. (Memory: `claude-review-not-a-required-check`.)
 
-**Draft phase vs ready phase (the shift-left reconciliation, D103-adjacent).** The
-once-on-final-commit rule above governs the **post-ready** phase — a marked-ready PR heading
-to merge, where re-triggering across pushes is re-litigation churn. It does **not** forbid
-iterating with Codex on a **draft** PR *before* it is marked ready: the `pr-preflight` skill's
-step 5 runs `@codex review` on the draft and folds by class until clean, which is exactly
-where the #587-style rounds belong (pre-ready folds, not post-open rework). Draft = iterate to
-clean (re-trigger on settled batches, not every push). Mark the PR ready **before**
-the final Codex round: `ready_for_review` starts a new Codex review even when the
-head SHA is unchanged, so a pre-ready verdict never authorizes merge. If that transition
-produces valid bot activity, wait for its exact-head verdict without adding a duplicate
-trigger; otherwise issue the one final `@codex review` trigger and apply the fallback below.
-Opening a draft does run `claude-review` (`on: opened`) — fine, it is not a required check.
+**Draft phase vs ready phase (the shift-left reconciliation, D103-adjacent; corrected 27
+Jul 2026).** The once-on-final-commit rule above governs the **post-ready** phase: a
+marked-ready PR heading to merge, where re-triggering across pushes is re-litigation
+churn. Codex itself does not review a PR while it sits in **draft**: GitHub's Codex
+connector fires automatically only at the ready transition (opened ready, or a draft
+marked ready), confirmed against roastpilot-cloud PR #150 (27 Jul 2026), where Codex
+produced no review during the draft phase and then reviewed automatically the moment the
+PR was marked ready. So the pre-ready fold for Codex specifically has to happen locally,
+via `codex review --base origin/main` (the `pr-preflight` skill's step 5), before the diff is
+even pushed; that is exactly where the #587-style rounds belong (a local pre-push fold,
+not post-open rework). A GitHub-side `@codex review` comment left on a draft is a
+different thing again, and is NOT simply inert: D105 observed on 19 Jul 2026 that it does
+run and does post findings-reviews, but never completes the clean-verdict flow on a draft,
+so a draft waiting on a clean signal waits forever. Both facts hold, because they describe
+different mechanisms: the automatic trigger does not fire until ready, while an explicit
+comment runs but cannot produce a clean verdict there. Neither makes the draft a place to
+converge to clean. Draft = fold locally and let the runner
+gates (`ci.yml`, tests, `ruff`, `pyright`) run; ready = the automatic Codex review fires on
+that head, then once-on-final-commit applies to any later push. Opening a draft does still
+run `claude-review` (`on: opened`), fine, it is not a required check; unlike Codex, that
+workflow is not suppressed on draft, so its findings there are real and worth folding.
 
 **WAIT for Codex's verdict before merging (operator rule, 12 Jul — the #518 lesson):**
 Codex is often DELAYED relative to CI, and green-CI auto-merge can land a PR before its
@@ -434,23 +448,37 @@ verdict about old code; a stale findings-review is still worth triaging, it just
 the wait for the current head). The same bot-identity requirement applies to the **findings**
 channel: a `pull_request_review` from any other `user.login` is just a comment from a stranger —
 triage it as such, but it does NOT satisfy the Codex wait. So: do NOT arm auto-merge at open.
-After ready plus any final commit/trigger, wait for a bot-authored findings-review naming the head
-sha, a bot-authored clean comment naming the head sha, or the bot's own 👍 (a 👍 carries NO
-commit line, so it is valid only while the head sha is UNCHANGED since the ready transition or
-trigger it answers — any push invalidates it; trigger on the new head) — **and the signal must
-postdate the ready transition and, when used, the final-commit trigger**. A review posted while
-the PR was draft or against an earlier commit does not satisfy the wait (that stale-verdict
-reading would reopen the #518 failure mode). Then triage (if findings), resolve, and only then
-merge/arm auto-merge. Any automation that reads issue comments or reviews must paginate every
-page; GitHub issue comments are oldest-first and default to 30, so first-page absence is never
-evidence of Codex silence.
+Wait for Codex's automatic review on the ready head (or, after a later push, for a
+bot-authored signal following a fresh `@codex review` re-trigger on the new final commit):
+a bot-authored findings-review naming the head sha, a bot-authored clean comment naming the
+head sha, or the bot's own 👍 (a 👍 carries NO commit line, so it is valid only while the
+head sha is UNCHANGED since it was left; any push since invalidates it, so re-trigger on the
+new head). **The signal must correspond to the current head AND postdate the event that
+started this PR's automatic review**, which differs by PR shape (Codex P1, cloud #155): a PR
+**created ready** emits `opened` and NEVER emits `ready_for_review`, so `opened` is its
+boundary and requiring the later event would be unsatisfiable; a **draft marked ready** uses
+`ready_for_review`; and after any later push the boundary is the fresh single re-trigger on
+that new final commit. Head-match alone is NOT sufficient, and this is a real hole rather than a
+theoretical one: a manually requested review on the DRAFT posts findings against the very
+same sha, so if nothing needed changing before marking ready, a head-match-only rule would
+let that pre-ready verdict satisfy the wait while the automatic review the ready transition
+just started is still in flight. A review or comment naming an earlier commit sha does not
+satisfy the wait either (that stale-verdict reading would reopen the #518 failure mode).
+Then triage (if findings), resolve, and only then merge/arm auto-merge.
 **A bot-authored 👀 reaction without a verdict is an IN-PROGRESS review, not silence — keep waiting**
 (extend in ~10-min increments), **bounded at ~30 min from the 👀**: past that, treat the
 in-progress signal as stuck and the lead may merge with an "in-progress review stalled"
 note, triaging any late review post-merge. The silent fallback applies only when NO signal
 at all (no *valid bot-authored* post-trigger 👀, review, clean comment, or 👍 — an invalid signal
 per the rules above, e.g. a stranger's reaction or a stale-sha comment, does NOT count as
-Codex activity and must not suppress this fallback) has appeared ~15 min after green CI: re-trigger
+Codex activity and must not suppress this fallback) has appeared ~15 min after **the boundary
+event that starts this PR's automatic review** (`ready_for_review` for a draft you marked ready,
+`opened` for a PR created ready, or the fresh re-trigger after a later push). **NOT ~15 min after
+green CI** (corrected 27 Jul 2026, Codex P1 on #682): under the draft-first flow CI is
+deliberately allowed to go green well before `gh pr ready`, often by much more than 15 minutes,
+so a CI-timed window can elapse before the review has even been requested, permitting an
+immediate duplicate re-trigger and then a merge on a fallback that never actually waited for
+anything. Time the window from the review boundary, never from CI. Then re-trigger
 once more on the same commit and **wait a full second window (~10 min)**; only if still
 nothing is merging allowed — note "Codex silent" in the merge context so a late review is
 triaged as post-merge follow-up, not a surprise.
