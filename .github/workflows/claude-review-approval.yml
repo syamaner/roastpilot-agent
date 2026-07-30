@@ -10,7 +10,7 @@ permissions:
   pull-requests: write
   actions: write
 concurrency:
-  # Serialize the final newest-run check and approval mutation per exact head.
+  # Serialize bridge handlers per exact head as an idempotency aid.
   # A head-SHA key remains stable even when GitHub's eventually-consistent
   # workflow_run payload temporarily omits its pull_requests association.
   group: >-

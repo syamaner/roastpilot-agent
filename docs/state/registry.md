@@ -50,7 +50,7 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D109** (D108 is in draft plan PR #16).
+> Next free plan decision number: **D110** (D109 is in focused plan follow-up).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 27 Jul block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
@@ -184,12 +184,14 @@ activation prerequisite. Merge policy still requires full
 local gates, applicable local domain reviewers, an exact-head authenticated
 Codex trigger/wait/triage pass (including the documented bounded silent/stalled
 fallback), and independent lead/`pr-triage` adjudication.
-**Restoration design (D108):** retire the SHA status and use a trusted
-default-branch bridge to turn the newest successful exact-PR/head Claude run into
-an exact-commit PR approval. A push or base retarget dismisses stale approval;
+**Restoration design (D108 amended by D109):** retire the SHA status and use a trusted
+default-branch bridge to turn a successful exact-PR/head/base Claude run into
+an exact-commit PR approval. That evidence is monotonic for unchanged identity:
+later same-head runs are additive and cannot revoke it; an intentional replacement
+requires recording the reason, preventing auto-merge, dismissing first, and only
+then rerunning. A push or base retarget dismisses stale approval;
 draft approval survives ready/reopen when the bytes do not change, while reopening
-without approval reruns the newest exact review; same-head bridge handlers serialize
-the newest-run check and approval mutation. Dependabot uses a trusted labelled
+without approval reruns the newest exact review. Dependabot uses a trusted labelled
 exemption, while workflow or privileged-helper edits require an explicit recorded
 maintainer approval because their upstream review result is untrusted. Slice 1 ships the mechanism and operating policy
 without changing protection. Slice 2 enables Actions approvals plus one required

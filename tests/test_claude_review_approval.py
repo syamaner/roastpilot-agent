@@ -242,7 +242,7 @@ def test_ambiguous_pr_association_fails_closed() -> None:
 
 
 def test_delayed_older_run_defers_to_newest_pr_run() -> None:
-    """A late completion revokes old evidence while a newer run is active."""
+    """A late completion cannot revoke valid identical-byte evidence."""
 
     old = _run_payload()
     new = _run_payload(run_id=101, run_number=21)
@@ -265,7 +265,7 @@ def test_delayed_older_run_defers_to_newest_pr_run() -> None:
 
     assert result == "review run is not the newest run for this PR/head; deferred"
     assert api.posts == []
-    assert api.puts[0][0] == "/pulls/10/reviews/54/dismissals"
+    assert api.puts == []
 
 
 def test_older_attempt_of_same_run_defers() -> None:
@@ -317,8 +317,8 @@ def test_cancelled_second_attempt_does_not_loop() -> None:
     assert api.posts == []
 
 
-def test_new_attempt_dismisses_same_head_approval_before_completion() -> None:
-    """A same-head rerun cannot inherit an earlier successful approval."""
+def test_new_attempt_preserves_same_head_approval_before_completion() -> None:
+    """A same-head rerun cannot revoke an earlier successful approval."""
 
     run = _run_payload(attempt=2, conclusion="success")
     run["conclusion"] = None
@@ -340,15 +340,8 @@ def test_new_attempt_dismisses_same_head_approval_before_completion() -> None:
         api,
     )
 
-    assert result == (
-        "newest review run is in_progress and dismissed the prior approval; approval remains absent"
-    )
-    assert api.puts == [
-        (
-            "/pulls/10/reviews/55/dismissals",
-            {"message": "A newer Claude review attempt must succeed before merge."},
-        )
-    ]
+    assert result == "newest review run is in_progress; exact-head approval preserved"
+    assert api.puts == []
     assert api.posts == []
 
 
@@ -356,7 +349,7 @@ def test_new_attempt_dismisses_same_head_approval_before_completion() -> None:
     ("action", "conclusion"),
     [("in_progress", None), ("completed", "failure"), ("completed", "success")],
 )
-def test_new_attempt_dismisses_when_run_inventory_is_stale(
+def test_new_attempt_preserves_when_run_inventory_is_stale(
     action: str,
     conclusion: str | None,
 ) -> None:
@@ -381,7 +374,7 @@ def test_new_attempt_dismisses_when_run_inventory_is_stale(
 
     result = approval.process_event({"action": action, "workflow_run": incoming}, api)
 
-    assert api.puts[0][0] == "/pulls/10/reviews/58/dismissals"
+    assert api.puts == []
     assert api.posts == []
     assert result == "review run is not the newest run for this PR/head; deferred"
 
@@ -415,8 +408,8 @@ def test_delayed_start_after_success_does_not_revoke_current_approval() -> None:
     assert api.puts == []
 
 
-def test_failed_rerun_dismisses_approval_if_start_event_was_delayed() -> None:
-    """A failure completion revokes stale evidence even without a start event."""
+def test_failed_rerun_preserves_approval_if_start_event_was_delayed() -> None:
+    """A failure completion cannot revoke valid identical-byte evidence."""
 
     run = _run_payload(attempt=2, conclusion="failure")
     api = _workflow_api(
@@ -437,8 +430,32 @@ def test_failed_rerun_dismisses_approval_if_start_event_was_delayed() -> None:
         api,
     )
 
-    assert result == "review conclusion 'failure' is not success; approval remains absent"
-    assert api.puts[0][0] == "/pulls/10/reviews/56/dismissals"
+    assert result == "review conclusion 'failure' is not success; exact-head approval preserved"
+    assert api.puts == []
+
+
+def test_cancelled_first_rerun_preserves_existing_approval() -> None:
+    """A bounded retry is additive when identical bytes are already approved."""
+
+    run = _run_payload(conclusion="cancelled")
+    api = _workflow_api(
+        run,
+        reviews=[
+            {
+                "id": 60,
+                "user": {"login": "github-actions[bot]"},
+                "state": "APPROVED",
+                "commit_id": "abc123",
+                "body": "[claude-review-approval] earlier success",
+            }
+        ],
+    )
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "cancelled review run 100 re-run once; exact-head approval preserved"
+    assert api.posts == [("/actions/runs/100/rerun", None)]
+    assert api.puts == []
 
 
 def test_existing_exact_bot_approval_is_idempotent() -> None:

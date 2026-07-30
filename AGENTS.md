@@ -211,12 +211,14 @@ clean.
   comments** (`--comment`) + conversation-resolution, not the check itself. Don't
   re-add it as required (it would deadlock workflow PRs). Green CI alone never
   means mergeable.
-- **PR-scoped Claude restoration (#663 / D108; activation follows the mechanism
+- **PR-scoped Claude restoration (#663 / D108+D109; activation follows the mechanism
   PR).** `review-gate` remains permanently retired: commit statuses cannot prove
   PR-specific review coverage, distinguish two PRs sharing a head SHA, or bind a
   draft review to the intended PR generation. The trusted
   `claude-review-approval` workflow instead posts an exact-commit approval on the
-  exact PR only after that PR's newest Claude workflow run succeeds. Branch
+  exact PR after an exact-identity Claude workflow run succeeds. That approval
+  is monotonic while repository, PR, head, and base remain unchanged: later
+  same-head attempts add evidence but cannot revoke already-valid evidence. Branch
   protection then requires one approving review and dismisses stale approvals on
   every code push; Claude's inline findings remain separately gated by
   conversation resolution. A human approval satisfies GitHub's numeric platform
@@ -344,7 +346,8 @@ Until #663 slice 2 activates D108, the temporary 25-Jul outage exception remains
 in force; applicable shift-left domain reviewers plus independent triage are the
 required replacement lenses.
 
-**WAIT for Claude's PR-scoped approval before merging (D108, after #663
+**WAIT for Claude's PR-scoped approval before merging (D108 amended by D109,
+after #663
 activation).** The required evidence is a `github-actions[bot]` approval whose
 body starts `[claude-review-approval]` and names the current PR head SHA. The raw
 `claude-review` check is diagnostic, not the required primitive: it passes when
@@ -365,15 +368,15 @@ Dependabot PRs. Operate the gate as follows:
 - Read and independently triage every Claude comment. Fixes produce a new head
   and therefore require a fresh successful run; resolved threads alone never
   revive a stale approval.
-- Before manually rerunning an already-approved same head, dismiss the bridge
-  approval in the PR UI/API, then dispatch the rerun; webhook delivery cannot
-  make those two operations atomic. The bridge's `in_progress` and non-success
-  handlers dismiss defensively, and a delayed older event also revokes old
-  evidence when it observes a newer unfinished/failed attempt. Bridge handlers
-  are serialized per exact head so the final newest-run check and approval
-  mutation cannot race another same-head attempt, even when run-to-PR
-  association is temporarily absent. The newest attempt must succeed. The
-  bridge reruns a first cancelled attempt once; for a
+- Same-head reruns are additive: an existing exact repository/PR/head/base
+  approval survives later starts, failures, cancellations, and out-of-order
+  delivery because the reviewed bytes have not changed. If a rerun is intended
+  to replace that evidence, record the reason, ensure auto-merge is not armed,
+  dismiss the approval first, and only then dispatch the rerun. Once dismissed,
+  the replacement attempt must succeed. An intentionally started rerun must
+  still finish and have its findings independently triaged before merge.
+  Same-head concurrency remains an idempotency aid, not an atomic replacement
+  transaction. The bridge reruns a first cancelled attempt once; for a
   service or infrastructure error, re-run the failed Actions job after recovery
   and wait again. Failure, timeout, action-required, repeated cancellation,
   stale/ambiguous PR association, or silence never receives a timeout bypass.

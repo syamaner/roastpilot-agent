@@ -122,20 +122,18 @@ def _process_workflow_run(run: JsonObject, action: str, api: _GitHubAPI) -> str:
         return "no exact open pull request is associated with the review run; fail closed"
     if _pull_request_edits_privileged_code(pr.number, api):
         return "privileged-code-editing PR requires an explicit maintainer approval"
+    existing_approval = _approval_review(pr, api) is not None
     newest = _newest_run_for_pull_request(run, pr, api)
     run_id = _integer(run.get("id"), "workflow_run.id")
     attempt = _integer(run.get("run_attempt", 1), "workflow_run.run_attempt")
     incoming_order, newest_order = _run_order(run), _run_order(newest)
     if incoming_order != newest_order:
-        if incoming_order > newest_order or newest.get("conclusion") != "success":
-            _dismiss_approval(pr, api)
         return "review run is not the newest run for this PR/head; deferred"
     if action != "completed":
         if newest.get("conclusion") == "success":
             return "stale start event arrived after successful completion; ignored"
-        dismissed = _dismiss_approval(pr, api)
-        suffix = " and dismissed the prior approval" if dismissed else ""
-        return f"newest review run is {action}{suffix}; approval remains absent"
+        state = "exact-head approval preserved" if existing_approval else "approval remains absent"
+        return f"newest review run is {action}; {state}"
 
     conclusion = _string(run.get("conclusion"), "workflow_run.conclusion")
     if conclusion == "success":
@@ -145,11 +143,12 @@ def _process_workflow_run(run: JsonObject, action: str, api: _GitHubAPI) -> str:
             "by required conversation resolution."
         )
         return _approve(pr, body, api)
-    _dismiss_approval(pr, api)
     if conclusion == "cancelled" and attempt == 1:
         api.post(f"/actions/runs/{run_id}/rerun")
-        return f"cancelled review run {run_id} re-run once; approval remains absent"
-    return f"review conclusion {conclusion!r} is not success; approval remains absent"
+        state = "exact-head approval preserved" if existing_approval else "approval remains absent"
+        return f"cancelled review run {run_id} re-run once; {state}"
+    state = "exact-head approval preserved" if existing_approval else "approval remains absent"
+    return f"review conclusion {conclusion!r} is not success; {state}"
 
 
 def _process_pull_request_target(
