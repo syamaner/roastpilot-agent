@@ -211,13 +211,13 @@ clean.
   comments** (`--comment`) + conversation-resolution, not the check itself. Don't
   re-add it as required (it would deadlock workflow PRs). Green CI alone never
   means mergeable.
-- **PR-scoped Claude restoration (#663 / D108+D109; activation follows the mechanism
+- **PR-scoped Claude restoration (#663 / D108-D110; activation follows the mechanism
   PR).** `review-gate` remains permanently retired: commit statuses cannot prove
   PR-specific review coverage, distinguish two PRs sharing a head SHA, or bind a
   draft review to the intended PR generation. The trusted
   `claude-review-approval` workflow instead posts an exact-commit approval on the
   exact PR after an exact-identity Claude workflow run succeeds. That approval
-  is monotonic while repository, PR, head, and base remain unchanged: later
+  is monotonic while repository, PR, head, and base branch remain unchanged: later
   same-head attempts add evidence but cannot revoke already-valid evidence. Branch
   protection then requires one approving review and dismisses stale approvals on
   every code push; Claude's inline findings remain separately gated by
@@ -346,11 +346,12 @@ Until #663 slice 2 activates D108, the temporary 25-Jul outage exception remains
 in force; applicable shift-left domain reviewers plus independent triage are the
 required replacement lenses.
 
-**WAIT for Claude's PR-scoped approval before merging (D108 amended by D109,
+**WAIT for Claude's PR-scoped approval before merging (D108 amended by D109/D110,
 after #663
 activation).** The required evidence is a `github-actions[bot]` approval whose
 body starts `[claude-review-approval]` and embeds the exact repository/PR/head/base
-identity. On a base retarget, the bridge dismisses only older embedded identities,
+branch identity; the reviewed base-tip SHA remains audit metadata. On a base
+retarget, the bridge dismisses only older embedded identities,
 so a fresh current-base approval survives either event ordering. The raw
 `claude-review` check is diagnostic, not the required primitive: it passes when
 Claude posts findings and legitimately cannot run for workflow-editing or
@@ -367,6 +368,11 @@ Dependabot PRs. Operate the gate as follows:
 - Retargeting the base branch can expand the effective diff without changing
   the head SHA. A base edit dismisses the bridge approval and starts a fresh
   Claude review; title/body-only edits do neither.
+- An ordinary base-tip advance does not invalidate approval by itself. Strict
+  branch protection prevents the now-behind head from merging until it is
+  updated; that head change dismisses approval and starts fresh review. Strict
+  mode, stale-review dismissal, admin enforcement, and disabled protected-base
+  force-push/deletion are load-bearing activation invariants.
 - Read and independently triage every Claude comment. Fixes produce a new head
   and therefore require a fresh successful run; resolved threads alone never
   revive a stale approval.

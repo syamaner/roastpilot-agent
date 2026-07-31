@@ -50,7 +50,7 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D110** (D109 is in focused plan follow-up).
+> Next free plan decision number: **D111** (D110 is in focused plan follow-up).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 27 Jul block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
@@ -184,13 +184,14 @@ activation prerequisite. Merge policy still requires full
 local gates, applicable local domain reviewers, an exact-head authenticated
 Codex trigger/wait/triage pass (including the documented bounded silent/stalled
 fallback), and independent lead/`pr-triage` adjudication.
-**Restoration design (D108 amended by D109):** retire the SHA status and use a trusted
+**Restoration design (D108 amended by D109/D110):** retire the SHA status and use a trusted
 default-branch bridge to turn a successful exact-PR/head/base Claude run into
 an exact-commit PR approval. That evidence is monotonic for unchanged identity:
 later same-head runs are additive and cannot revoke it; an intentional replacement
 requires recording the reason, preventing auto-merge, dismissing first, and only
-then rerunning. Approval/exemption bodies embed the full PR identity, so a push or
-base retarget invalidates stale evidence without a delayed retarget handler
+then rerunning. Approval/exemption bodies embed the full PR/head/base-branch
+identity and retain the reviewed base-tip SHA as audit metadata. A push or base
+retarget invalidates stale evidence without a delayed retarget handler
 dismissing fresh current-base evidence;
 draft approval survives ready/reopen when the bytes do not change, while reopening
 without approval reruns the newest exact review. Dependabot uses a trusted labelled
@@ -204,6 +205,10 @@ the final Codex round and accept only a fully-paginated, bot-authenticated
 exact-head verdict posted after ready. Board: #663 = In Progress / M1 / P2. The
 broader month-stale registry refresh remains a separate doc-only slice; this
 entry records only state that changes #663.
+Strict required-status mode, stale-review dismissal, admin enforcement, and
+disabled protected-base force-push/deletion are load-bearing for D110: a normal
+base-tip advance cannot merge a behind head, and the required head update
+dismisses approval and starts fresh review.
 
 **25 Jul 2026 — #665 MCP/pytest shutdown hardening completed (D104).** Three CI runs reached
 the complete pytest summary and then failed to exit, exposing lifecycle ownership bugs rather than

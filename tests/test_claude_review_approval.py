@@ -67,13 +67,12 @@ def _identity_marker(
     number: int = 10,
     head_sha: str = "abc123",
     head_ref: str = "feature/test",
-    base_sha: str = "base123",
     base_ref: str = "main",
 ) -> str:
     return (
-        f"[claude-review-identity] pr={number} "
+        f"[claude-review-identity-v1] pr={number} "
         f"head=1:{head_ref.replace('/', '%2F')}:{head_sha} "
-        f"base=2:{base_ref.replace('/', '%2F')}:{base_sha}"
+        f"base=2:{base_ref.replace('/', '%2F')}"
     )
 
 
@@ -156,6 +155,7 @@ def test_successful_exact_head_review_approves_pr() -> None:
                 "body": (
                     "[claude-review-approval] Claude Code Review run 100 attempt 1 "
                     f"completed successfully for `abc123`. {_identity_marker()} "
+                    "reviewed-base-sha=base123 "
                     "Inline findings remain gated "
                     "by required conversation resolution."
                 ),
@@ -204,7 +204,6 @@ def test_stale_head_run_fails_closed() -> None:
 @pytest.mark.parametrize(
     ("side", "field", "value"),
     [
-        ("base", "sha", "new-base"),
         ("base", "ref", "release"),
         ("base", "repo", {"id": 3}),
         ("head", "repo", {"id": 3}),
@@ -215,7 +214,7 @@ def test_changed_pr_identity_fails_closed(
     field: str,
     value: approval.JsonValue,
 ) -> None:
-    """A base advance, retarget, or repository mismatch invalidates the run."""
+    """A retarget or repository mismatch invalidates the run."""
 
     run = _run_payload()
     pr = _pr_payload()
@@ -228,6 +227,23 @@ def test_changed_pr_identity_fails_closed(
 
     assert result == "no exact open pull request is associated with the review run; fail closed"
     assert api.posts == []
+
+
+def test_base_tip_advance_preserves_unchanged_head_review() -> None:
+    """A moving base tip cannot strand an otherwise exact PR/head review."""
+
+    run = _run_payload()
+    pr = _pr_payload()
+    base = pr["base"]
+    assert isinstance(base, dict)
+    base["sha"] = "new-base"
+    api = _workflow_api(run, pr=pr)
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "approved PR #10 at abc123"
+    assert _identity_marker() in str(api.posts[0][1])
+    assert "reviewed-base-sha=base123" in str(api.posts[0][1])
 
 
 def test_unexpected_workflow_path_fails_closed() -> None:
@@ -514,8 +530,7 @@ def test_old_base_identity_cannot_suppress_fresh_workflow_approval() -> None:
                 "state": "APPROVED",
                 "commit_id": "abc123",
                 "body": (
-                    "[claude-review-approval] old base "
-                    f"{_identity_marker(base_sha='oldbase', base_ref='release')}"
+                    f"[claude-review-approval] old base {_identity_marker(base_ref='release')}"
                 ),
             }
         ],
@@ -985,6 +1000,7 @@ def test_dependabot_base_retarget_replaces_exemption_after_recheck() -> None:
                 "body": (
                     "[claude-review-exempt] `abc123` is explicitly exempt: "
                     f"Dependabot cannot receive repository secrets. {_identity_marker()} "
+                    "reviewed-base-sha=base123 "
                     "CI, codecov, "
                     "exact-head Codex, conversation resolution, and independent "
                     "triage remain required."

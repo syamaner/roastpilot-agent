@@ -140,6 +140,7 @@ def _process_workflow_run(run: JsonObject, action: str, api: _GitHubAPI) -> str:
         body = (
             f"{_APPROVAL_MARKER} Claude Code Review run {run_id} attempt {attempt} "
             f"completed successfully for `{pr.head[0]}`. {_identity_marker(pr)} "
+            f"reviewed-base-sha={_reviewed_base_sha(run, pr)} "
             "Inline findings remain gated by required conversation resolution."
         )
         return _approve(pr, body, api)
@@ -236,11 +237,20 @@ def _run_order(run: JsonObject) -> tuple[int, int, str]:
 
 
 def _summary_matches_pr(summary: JsonObject, pr: _PullRequest) -> bool:
+    summary_base = _ref_identity(summary.get("base"), "summary.base")
     return (
         _integer(summary.get("number"), "summary.number") == pr.number
         and _ref_identity(summary.get("head"), "summary.head") == pr.head
-        and _ref_identity(summary.get("base"), "summary.base") == pr.base
+        and summary_base[1:] == pr.base[1:]
     )
+
+
+def _reviewed_base_sha(run: JsonObject, pr: _PullRequest) -> str:
+    for value in _array(run.get("pull_requests"), "workflow_run.pull_requests"):
+        summary = _object(value, "workflow_run.pull_requests[]")
+        if _summary_matches_pr(summary, pr):
+            return _ref_identity(summary.get("base"), "summary.base")[0]
+    raise ValueError("workflow run has no matching reviewed base identity")
 
 
 def _pull_request_edits_privileged_code(number: int, api: _GitHubAPI) -> bool:
@@ -299,6 +309,7 @@ def _approve_dependabot(pr: _PullRequest, api: _GitHubAPI) -> str:
     body = (
         f"{_EXEMPTION_MARKER} `{pr.head[0]}` is explicitly exempt: "
         f"Dependabot cannot receive repository secrets. {_identity_marker(pr)} "
+        f"reviewed-base-sha={pr.base[0]} "
         "CI, codecov, exact-head Codex, conversation resolution, and independent "
         "triage remain required."
     )
@@ -374,9 +385,9 @@ def _identity_marker(pr: _PullRequest) -> str:
     head_ref = quote(pr.head[1], safe="")
     base_ref = quote(pr.base[1], safe="")
     return (
-        f"[claude-review-identity] pr={pr.number} "
+        f"[claude-review-identity-v1] pr={pr.number} "
         f"head={pr.head[2]}:{head_ref}:{pr.head[0]} "
-        f"base={pr.base[2]}:{base_ref}:{pr.base[0]}"
+        f"base={pr.base[2]}:{base_ref}"
     )
 
 
