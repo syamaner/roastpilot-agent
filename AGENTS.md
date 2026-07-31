@@ -211,7 +211,7 @@ clean.
   comments** (`--comment`) + conversation-resolution, not the check itself. Don't
   re-add it as required (it would deadlock workflow PRs). Green CI alone never
   means mergeable.
-- **PR-scoped Claude restoration (#663 / D108-D111; activation follows the mechanism
+- **PR-scoped Claude restoration (#663 / D108-D118; activation follows the mechanism
   PR).** `review-gate` remains permanently retired: commit statuses cannot prove
   PR-specific review coverage, distinguish two PRs sharing a head SHA, or bind a
   draft review to the intended PR generation. The trusted
@@ -436,12 +436,26 @@ Dependabot PRs. Operate the gate as follows:
   evidence is dismissed; privileged Dependabot edits lose all automated
   evidence and require a maintainer. A PR editing either a workflow or the privileged bridge
   helper can alter the approval path itself, so its apparent success is never
-  trusted and it requires an explicit maintainer approval with the reason
-  recorded. Neither path executes PR code with the bridge token. CI, codecov,
+  trusted. In this solo-maintainer repository, GitHub forbids the author from
+  supplying the required approval directly. D118 therefore provides one audited
+  exception: after all other review requirements pass, a current `maintain`/`admin`
+  operator sends the default-branch-only `privileged_review_override`
+  `repository_dispatch` with the PR number and a non-empty reason. The handler
+  accepts only an open PR whose fully available file inventory proves a workflow
+  or bridge-helper edit; an ordinary or 3,000-file-indeterminate PR is ineligible.
+  It publishes a distinct `[claude-review-operator-override]` approval bound to
+  the exact current identity and records the actor and URL-encoded reason (so
+  audit text cannot inject bridge identity syntax). Use:
+  `gh api --method POST repos/syamaner/roastpilot-agent/dispatches -f
+  event_type=privileged_review_override -f 'client_payload[pull_request]=N' -f
+  'client_payload[reason]=WHY'`. Never use a ref-selectable `workflow_dispatch`
+  for this privilege. Neither exception path executes PR code with the bridge token. CI, codecov,
   exact-head Codex, conversation resolution, and independent-triage
   requirements remain unchanged.
-- A human approval is not a silent substitute. If the operator deliberately
-  overrides Claude, record the reason in the PR before merge.
+- A human approval is not a silent substitute. For ordinary PRs, if the operator
+  deliberately overrides Claude, record the reason in the PR before merge. For
+  privileged PRs, use only the D118 dispatch above so the counting approval itself
+  carries the operator and reason.
 
 **Codex (`chatgpt-codex-connector[bot]`) was RE-ENABLED 30 Jun** after its 15-Jun
 disable, because on real PRs it catches bugs the other lenses miss (on the Config UI

@@ -8,6 +8,7 @@ import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -18,7 +19,13 @@ JsonObject = dict[str, JsonValue]
 
 _APPROVAL_MARKER = "[claude-review-approval]"
 _EXEMPTION_MARKER = "[claude-review-exempt]"
+_OPERATOR_OVERRIDE_MARKER = "[claude-review-operator-override]"
 _RUN_ORDER_MARKER = "[claude-review-run-v1"
+_BRIDGE_MARKERS = {
+    _APPROVAL_MARKER,
+    _EXEMPTION_MARKER,
+    _OPERATOR_OVERRIDE_MARKER,
+}
 _BOT_LOGIN = "github-actions[bot]"
 _WORKFLOW_PATH = ".github/workflows/claude-code-review.yml"
 _ASSOCIATION_REFRESH_DELAYS_SECONDS = (0.0, 1.0, 2.0)
@@ -40,6 +47,12 @@ class _PullRequest:
     head: tuple[str, str, int]
     base: tuple[str, str, int]
     author: str
+
+
+class _PrivilegedDiff(Enum):
+    MATCH = "match"
+    NO_MATCH = "no_match"
+    INDETERMINATE = "indeterminate"
 
 
 class RESTClient:
@@ -111,6 +124,12 @@ def process_event(event: JsonObject, api: _GitHubAPI) -> str:
 
     """
 
+    if event.get("action") == "privileged_review_override" and "client_payload" in event:
+        return _process_operator_override(
+            _object(event["client_payload"], "client_payload"),
+            _object(event["sender"], "sender"),
+            api,
+        )
     if "workflow_run" in event:
         return _process_workflow_run(
             _object(event["workflow_run"], "workflow_run"),
@@ -124,7 +143,66 @@ def process_event(event: JsonObject, api: _GitHubAPI) -> str:
             _object(event.get("changes", {}), "changes"),
             api,
         )
-    raise ValueError("unsupported event: expected workflow_run or pull_request")
+    raise ValueError(
+        "unsupported event: expected repository_dispatch, workflow_run, or pull_request"
+    )
+
+
+def _process_operator_override(
+    inputs: JsonObject,
+    sender: JsonObject,
+    api: _GitHubAPI,
+) -> str:
+    actor = _string(sender.get("login"), "sender.login")
+    permission = _object(
+        api.get(f"/collaborators/{quote(actor, safe='')}/permission"),
+        "actor permission",
+    )
+    legacy_permission = _string(permission.get("permission"), "actor permission.permission")
+    role_name_value = permission.get("role_name")
+    role_name = (
+        None if role_name_value is None else _string(role_name_value, "actor permission.role_name")
+    )
+    if legacy_permission != "admin" and role_name not in {"admin", "maintain"}:
+        raise ValueError("operator override requires current repository maintain permission")
+
+    raw_number = _string(inputs.get("pull_request"), "client_payload.pull_request")
+    try:
+        number = int(raw_number)
+    except ValueError as exc:
+        raise ValueError("client_payload.pull_request must be a positive integer") from exc
+    if number <= 0 or str(number) != raw_number:
+        raise ValueError("client_payload.pull_request must be a positive integer")
+
+    reason = _string(inputs.get("reason"), "client_payload.reason").strip()
+    if not reason:
+        raise ValueError("client_payload.reason must not be empty")
+    if len(reason) > 500:
+        raise ValueError("client_payload.reason must be at most 500 characters")
+
+    payload = _object(api.get(f"/pulls/{number}"), f"pull request #{number}")
+    if _string(payload.get("state"), "pull_request.state") != "open":
+        raise ValueError("operator override requires an open pull request")
+    pr = _pull_request_from_payload(payload)
+    privileged_diff = _privileged_diff(pr.number, api)
+    if privileged_diff is _PrivilegedDiff.INDETERMINATE:
+        raise ValueError("operator override cannot prove privileged scope from the PR file list")
+    if privileged_diff is not _PrivilegedDiff.MATCH:
+        raise ValueError("operator override is restricted to privileged-code-editing PRs")
+    if _operator_override_review(pr, api) is not None:
+        return f"PR #{pr.number} already has a recorded operator override for {pr.head[0]}"
+
+    _dismiss_approval(pr, api, include_exemption=True)
+    encoded_reason = quote(reason, safe="")
+    body = (
+        f"{_OPERATOR_OVERRIDE_MARKER} Maintainer @{actor} explicitly authorized "
+        f"privileged PR #{pr.number} at `{pr.head[0]}`. "
+        f"reason-urlencoded={encoded_reason} {_identity_marker(pr)} "
+        f"reviewed-base-sha={pr.base[0]} This override does not attest to the "
+        "untrusted Claude workflow result; CI, codecov, exact-head Codex, "
+        "conversation resolution, and independent triage remain required."
+    )
+    return _approve(pr, body, api)
 
 
 def _process_workflow_run(run: JsonObject, action: str, api: _GitHubAPI) -> str:
@@ -314,19 +392,29 @@ def _reviewed_base_sha(run: JsonObject, pr: _PullRequest) -> str:
 
 
 def _pull_request_edits_privileged_code(number: int, api: _GitHubAPI) -> bool:
-    values = _array(api.get(f"/pulls/{number}/files?per_page=100"), "files")
-    for value in values:
-        file = _object(value, "files[]")
-        paths = (file.get("filename"), file.get("previous_filename"))
-        if any(
-            isinstance(path, str)
-            and (
-                path.startswith(".github/workflows/") or path == "scripts/claude_review_approval.py"
-            )
-            for path in paths
-        ):
-            return True
-    return len(values) == 100
+    return _privileged_diff(number, api) is not _PrivilegedDiff.NO_MATCH
+
+
+def _privileged_diff(number: int, api: _GitHubAPI) -> _PrivilegedDiff:
+    matched = False
+    for page in range(1, 31):
+        suffix = "" if page == 1 else f"&page={page}"
+        values = _array(api.get(f"/pulls/{number}/files?per_page=100{suffix}"), "files")
+        for value in values:
+            file = _object(value, "files[]")
+            paths = (file.get("filename"), file.get("previous_filename"))
+            if any(
+                isinstance(path, str)
+                and (
+                    path.startswith(".github/workflows/")
+                    or path == "scripts/claude_review_approval.py"
+                )
+                for path in paths
+            ):
+                matched = True
+        if len(values) < 100:
+            return _PrivilegedDiff.MATCH if matched else _PrivilegedDiff.NO_MATCH
+    return _PrivilegedDiff.INDETERMINATE
 
 
 def _matching_runs_for_pull_request(
@@ -371,11 +459,12 @@ def _approve(
     if not _same_approval_identity(pr, current):
         return f"PR #{pr.number} identity changed before approval; approval remains absent"
     marker = body.split(" ", 1)[0]
-    existing = (
-        _exemption_review(pr, api)
-        if marker == _EXEMPTION_MARKER
-        else _approval_review(pr, api, approval_only=True)
-    )
+    if marker == _EXEMPTION_MARKER:
+        existing = _exemption_review(pr, api)
+    elif marker == _OPERATOR_OVERRIDE_MARKER:
+        existing = _operator_override_review(pr, api)
+    else:
+        existing = _approval_review(pr, api, approval_only=True)
     if existing is not None:
         return f"PR #{pr.number} already has a bot approval for {pr.head[0]}"
     if run_order is not None:
@@ -546,7 +635,7 @@ def _pending_bridge_reviews(
             _string(user.get("login"), "review.user.login") == _BOT_LOGIN
             and _string(review.get("state"), "review.state") == "PENDING"
             and _string(review.get("commit_id"), "review.commit_id") == pr.head[0]
-            and body.split(" ", 1)[0] in {_APPROVAL_MARKER, _EXEMPTION_MARKER}
+            and body.split(" ", 1)[0] in _BRIDGE_MARKERS
             and identity in body
         ):
             matches.append(review)
@@ -567,7 +656,7 @@ def _delete_stale_pending_reviews(
         if not (
             _string(user.get("login"), "review.user.login") == _BOT_LOGIN
             and _string(review.get("state"), "review.state") == "PENDING"
-            and body.split(" ", 1)[0] in {_APPROVAL_MARKER, _EXEMPTION_MARKER}
+            and body.split(" ", 1)[0] in _BRIDGE_MARKERS
         ):
             continue
         if (
@@ -697,9 +786,10 @@ def _dismiss_approval(
         user = _object(review.get("user"), "review.user")
         body = _review_body(review)
         marker = body.split(" ", 1)[0]
-        is_bridge_marker = marker == _APPROVAL_MARKER or (
-            include_exemption and marker == _EXEMPTION_MARKER
-        )
+        allowed_markers = {_APPROVAL_MARKER}
+        if include_exemption:
+            allowed_markers.add(_EXEMPTION_MARKER)
+        is_bridge_marker = marker in allowed_markers
         is_bot_commit = (
             _string(user.get("login"), "review.user.login") == _BOT_LOGIN
             and _string(review.get("commit_id"), "review.commit_id") == pr.head[0]
@@ -716,7 +806,11 @@ def _dismiss_approval(
             )
             dismissed = True
             continue
-        if not _is_bridge_approval(review, pr, approval_only=not include_exemption):
+        if not (
+            is_bot_commit
+            and is_bridge_marker
+            and _string(review.get("state"), "review.state") == "APPROVED"
+        ):
             continue
         review_id = _integer(review.get("id"), "review.id")
         api.put(
@@ -743,7 +837,7 @@ def _reconcile_retarget_reviews(
         state = _string(review.get("state"), "review.state")
         if not (
             _string(user.get("login"), "review.user.login") == _BOT_LOGIN
-            and marker in {_APPROVAL_MARKER, _EXEMPTION_MARKER}
+            and marker in _BRIDGE_MARKERS
             and state in {"APPROVED", "PENDING"}
         ):
             continue
@@ -793,6 +887,19 @@ def _exemption_review(pr: _PullRequest, api: _GitHubAPI) -> JsonObject | None:
     return None
 
 
+def _operator_override_review(pr: _PullRequest, api: _GitHubAPI) -> JsonObject | None:
+    for value in _all_reviews(pr.number, api):
+        review = _object(value, "reviews[]")
+        body = _review_body(review)
+        if (
+            _is_bridge_approval(review, pr, approval_only=False)
+            and body.split(" ", 1)[0] == _OPERATOR_OVERRIDE_MARKER
+            and _identity_marker(pr) in body
+        ):
+            return review
+    return None
+
+
 def _is_bridge_approval(
     review: JsonObject,
     pr: _PullRequest,
@@ -805,7 +912,7 @@ def _is_bridge_approval(
         _string(user.get("login"), "review.user.login") == _BOT_LOGIN
         and _string(review.get("state"), "review.state") == "APPROVED"
         and _string(review.get("commit_id"), "review.commit_id") == pr.head[0]
-        and (marker == _APPROVAL_MARKER or (not approval_only and marker == _EXEMPTION_MARKER))
+        and (marker == _APPROVAL_MARKER or (not approval_only and marker in _BRIDGE_MARKERS))
     )
 
 

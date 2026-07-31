@@ -39,8 +39,9 @@
 > 26 Jul) — a cohesive single-slice story stays one PR. `security-reviewer` is now
 > wired into the `review-branch` roster (#598/#678); **#680** tracks two fail-opens
 > found in that workflow post-merge. Claude Code Review remains **optional** under the
-> 25-Jul outage exception; its replacement is **#663 / D108**, in flight as draft
-> PR #679; the exact-head follow-up is implementing two P1 findings under D112.
+> 25-Jul outage exception; its replacement is **#663 / D108**, whose bridge mechanism
+> merged in PR #679. Activation preflight then found the solo-maintainer privileged-PR
+> deadlock; the bounded D118 override mechanism is the remaining pre-activation change.
 >
 > **Milestone reality.** M1 build continues; the "July 2026 harness complete" and
 > "first supervised hardware session in June" targets below are historical. E11
@@ -50,7 +51,7 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D118** (D117 is in focused plan follow-up).
+> Next free plan decision number: **D119** (D118 records the privileged-PR override).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 27 Jul block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
@@ -184,7 +185,7 @@ activation prerequisite. Merge policy still requires full
 local gates, applicable local domain reviewers, an exact-head authenticated
 Codex trigger/wait/triage pass (including the documented bounded silent/stalled
 fallback), and independent lead/`pr-triage` adjudication.
-**Restoration design (D108 amended by D109-D117):** retire the SHA status and use a trusted
+**Restoration design (D108 amended by D109-D118):** retire the SHA status and use a trusted
 default-branch bridge to turn a successful exact-PR/head/base Claude run into
 an exact-commit PR approval. That evidence is monotonic for unchanged identity:
 later same-head runs are additive and cannot revoke it; an intentional replacement
@@ -224,6 +225,13 @@ pending same-group event; their identity checks and tombstones are deliberately
 order-safe. JSON mutations declare their media type. Dependabot author routing
 is enforced in both event channels, removes false normal evidence, and leaves
 privileged changes for explicit maintainer approval.
+Because `syamaner` is the only maintainer and GitHub forbids author self-approval,
+D118 supplies one capability-scoped operator path for privileged PRs: a typed
+`repository_dispatch` that always executes trusted default-branch code, rechecks
+the sender has `maintain`/`admin`, requires an affirmative workflow/helper file
+match (ordinary and 3,000-file-indeterminate inventories are rejected), and records
+the exact identity, actor, and reason in a labelled bot approval. It is not available
+to ordinary PRs and never checks out PR code.
 Because REST cannot make that sequence atomic, slice 2 must live-prove that an
 approval bound to a non-current commit never satisfies merge; failed proof blocks
 activation. Dependabot uses a trusted labelled
