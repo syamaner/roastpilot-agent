@@ -501,6 +501,34 @@ def test_existing_exact_bot_approval_is_idempotent() -> None:
     assert api.posts == []
 
 
+def test_old_base_identity_cannot_suppress_fresh_workflow_approval() -> None:
+    """Same-commit evidence for an old base is not current-identity approval."""
+
+    run = _run_payload()
+    api = _workflow_api(
+        run,
+        reviews=[
+            {
+                "id": 61,
+                "user": {"login": "github-actions[bot]"},
+                "state": "APPROVED",
+                "commit_id": "abc123",
+                "body": (
+                    "[claude-review-approval] old base "
+                    f"{_identity_marker(base_sha='oldbase', base_ref='release')}"
+                ),
+            }
+        ],
+    )
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "approved PR #10 at abc123"
+    assert len(api.posts) == 1
+    assert _identity_marker() in str(api.posts[0][1])
+    assert api.puts == []
+
+
 def test_unrelated_approval_does_not_satisfy_idempotency() -> None:
     """Another identity or stale commit cannot suppress the exact approval."""
 
@@ -997,6 +1025,53 @@ def test_dependabot_base_retarget_preserves_fresh_current_exemption() -> None:
 
     assert result == "base branch changed; PR #10 already has a bot approval for abc123"
     assert api.puts == []
+    assert api.posts == []
+
+
+def test_dependabot_base_retarget_dismisses_only_stale_exemption() -> None:
+    """Fresh exemption is preserved when stale and current evidence coexist."""
+
+    api = FakeAPI(
+        {
+            "/pulls/10/files?per_page=100": [],
+            "/pulls/10/reviews?per_page=100&page=1": [
+                {
+                    "id": 78,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": "[claude-review-exempt] old base",
+                },
+                {
+                    "id": 79,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": _approval_body("Dependabot", exempt=True),
+                },
+            ],
+        }
+    )
+
+    result = approval.process_event(
+        {
+            "action": "edited",
+            "changes": {"base": {"ref": {"from": "release"}}},
+            "pull_request": _pr_payload(author="dependabot[bot]"),
+        },
+        api,
+    )
+
+    assert result == (
+        "base branch changed and dismissed the prior approval; "
+        "PR #10 already has a bot approval for abc123"
+    )
+    assert api.puts == [
+        (
+            "/pulls/10/reviews/78/dismissals",
+            {"message": "A newer Claude review attempt must succeed before merge."},
+        )
+    ]
     assert api.posts == []
 
 
