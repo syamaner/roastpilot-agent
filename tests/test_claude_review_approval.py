@@ -29,6 +29,8 @@ class FakeAPI:
         }
         self.posts: list[tuple[str, Mapping[str, approval.JsonValue] | None]] = []
         self.puts: list[tuple[str, Mapping[str, approval.JsonValue]]] = []
+        self.deletes: list[str] = []
+        self.review_bodies: dict[int, str] = {}
 
     def get(self, path: str) -> approval.JsonValue:
         """Return one canned GET response."""
@@ -37,6 +39,12 @@ class FakeAPI:
             return self.response_sequences[path].pop(0)
         if path not in self.responses and path.startswith("/pulls/") and path.count("/") == 2:
             return _pr_payload(number=int(path.rsplit("/", 1)[1]))
+        if path == "/pulls/10/reviews/900":
+            return {
+                "state": "APPROVED",
+                "commit_id": "abc123",
+                "body": self.review_bodies[900],
+            }
         return self.responses[path]
 
     def post(
@@ -48,8 +56,28 @@ class FakeAPI:
 
         self.posts.append((path, payload))
         if path.endswith("/reviews"):
+            assert payload is not None
+            body = payload.get("body")
+            assert isinstance(body, str)
+            self.review_bodies[900] = body
             return {"id": 900}
         return {}
+
+    def delete(self, path: str) -> approval.JsonValue:
+        """Record one DELETE."""
+
+        self.deletes.append(path)
+        if path.startswith("/pulls/10/reviews/"):
+            review_id = int(path.rsplit("/", 1)[1])
+            reviews_path = "/pulls/10/reviews?per_page=100&page=1"
+            reviews = self.responses.get(reviews_path)
+            if isinstance(reviews, list):
+                self.responses[reviews_path] = [
+                    value
+                    for value in reviews
+                    if not (isinstance(value, dict) and value.get("id") == review_id)
+                ]
+        return None
 
     def put(
         self,
@@ -67,11 +95,13 @@ def _pr_payload(
     sha: str = "abc123",
     ref: str = "feature/test",
     author: str = "syamaner",
+    base_sha: str = "base123",
+    base_ref: str = "main",
 ) -> approval.JsonObject:
     return {
         "number": number,
         "head": {"sha": sha, "ref": ref, "repo": {"id": 1}},
-        "base": {"sha": "base123", "ref": "main", "repo": {"id": 2}},
+        "base": {"sha": base_sha, "ref": base_ref, "repo": {"id": 2}},
         "user": {"login": author},
     }
 
@@ -188,9 +218,9 @@ def test_successful_exact_head_review_approves_pr() -> None:
                     "by required conversation resolution."
                 ),
                 "commit_id": "abc123",
-                "event": "APPROVE",
             },
-        )
+        ),
+        ("/pulls/10/reviews/900/events", {"event": "APPROVE"}),
     ]
 
 
@@ -252,7 +282,13 @@ def test_head_change_after_approval_dismisses_created_review() -> None:
     original = _pr_payload()
     changed = _pr_payload(sha="new-sha")
     api = _workflow_api(run, pr=original)
-    api.response_sequences["/pulls/10"] = [original, original, changed]
+    api.response_sequences["/pulls/10"] = [
+        original,
+        original,
+        original,
+        original,
+        changed,
+    ]
 
     result = approval.process_event({"workflow_run": run}, api)
 
@@ -272,7 +308,7 @@ def test_post_approval_malformed_pr_response_dismisses_created_review() -> None:
     run = _run_payload()
     original = _pr_payload()
     api = _workflow_api(run, pr=original)
-    api.response_sequences["/pulls/10"] = [original, original, {}]
+    api.response_sequences["/pulls/10"] = [original, original, original, original, {}]
 
     with pytest.raises(ValueError, match="pull_request.user must be an object"):
         approval.process_event({"workflow_run": run}, api)
@@ -295,7 +331,7 @@ def test_post_approval_api_failure_dismisses_created_review() -> None:
         def get(self, path: str) -> approval.JsonValue:
             if path == "/pulls/10":
                 self.pull_reads += 1
-                if self.pull_reads == 3:
+                if self.pull_reads == 5:
                     raise RuntimeError("temporary API failure")
             return super().get(path)
 
@@ -323,7 +359,7 @@ def test_post_approval_cleanup_failure_is_activation_blocker() -> None:
         def get(self, path: str) -> approval.JsonValue:
             if path == "/pulls/10":
                 self.pull_reads += 1
-                if self.pull_reads == 3:
+                if self.pull_reads == 5:
                     raise RuntimeError("temporary API failure")
             return super().get(path)
 
@@ -358,7 +394,450 @@ def test_identity_change_cleanup_failure_is_activation_blocker() -> None:
     changed = _pr_payload(sha="new-sha")
     base = _workflow_api(run, pr=original)
     api = FailingCleanupAPI(base.responses)
-    api.response_sequences["/pulls/10"] = [original, original, changed]
+    api.response_sequences["/pulls/10"] = [
+        original,
+        original,
+        original,
+        original,
+        changed,
+    ]
+
+    with pytest.raises(RuntimeError, match="operator audit required before activation"):
+        approval.process_event({"workflow_run": run}, api)
+
+
+def test_lost_pending_review_create_response_cannot_publish_approval() -> None:
+    """An indeterminate initial create leaves only non-counting pending evidence."""
+
+    class LostCreateResponseAPI(FakeAPI):
+        lost_body: str | None = None
+
+        def get(self, path: str) -> approval.JsonValue:
+            if path == "/pulls/10/reviews?per_page=100&page=1" and self.lost_body is not None:
+                return [
+                    {
+                        "id": 900,
+                        "user": {"login": "github-actions[bot]"},
+                        "state": "PENDING",
+                        "commit_id": "abc123",
+                        "body": self.lost_body,
+                    }
+                ]
+            return super().get(path)
+
+        def post(
+            self,
+            path: str,
+            payload: Mapping[str, approval.JsonValue] | None = None,
+        ) -> approval.JsonValue:
+            if path.endswith("/reviews"):
+                self.posts.append((path, payload))
+                assert payload is not None
+                raw_body = payload.get("body")
+                assert isinstance(raw_body, str)
+                self.lost_body = raw_body
+                raise RuntimeError("response lost")
+            return super().post(path, payload)
+
+    run = _run_payload()
+    base = _workflow_api(run)
+    api = LostCreateResponseAPI(base.responses)
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "approved PR #10 at abc123"
+    assert api.posts[0][1] is not None
+    assert "event" not in api.posts[0][1]
+    assert api.puts == []
+    assert api.deletes == []
+
+
+def test_identity_change_before_submit_deletes_pending_review() -> None:
+    """A pre-submit identity race cannot strand the bot's pending review."""
+
+    run = _run_payload()
+    original = _pr_payload()
+    changed = _pr_payload(sha="new-sha")
+    api = _workflow_api(run, pr=original)
+    api.response_sequences["/pulls/10"] = [original, original, original, changed]
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == ("PR #10 identity changed before approval submission; approval remains absent")
+    assert api.deletes == ["/pulls/10/reviews/900"]
+    assert all(not path.endswith("/events") for path, _payload in api.posts)
+
+
+def test_pending_review_delete_failure_is_activation_blocker() -> None:
+    """Failure to remove a known pending review requires operator audit."""
+
+    class FailingDeleteAPI(FakeAPI):
+        def delete(self, path: str) -> approval.JsonValue:
+            raise RuntimeError("delete failed")
+
+    run = _run_payload()
+    original = _pr_payload()
+    changed = _pr_payload(sha="new-sha")
+    base = _workflow_api(run, pr=original)
+    api = FailingDeleteAPI(base.responses)
+    api.response_sequences["/pulls/10"] = [original, original, original, changed]
+
+    with pytest.raises(RuntimeError, match="operator audit required before activation"):
+        approval.process_event({"workflow_run": run}, api)
+
+
+def test_exact_pending_review_is_resumed_before_retry() -> None:
+    """A duplicate exact-run handler resumes the existing pending review."""
+
+    run = _run_payload()
+    body = (
+        "[claude-review-approval] Claude Code Review run 100 attempt 1 "
+        "[claude-review-run-v1 workflow=7 number=20 attempt=1] "
+        f"completed successfully for `abc123`. {_identity_marker()} "
+        "reviewed-base-sha=base123 "
+        "Inline findings remain gated by required conversation resolution."
+    )
+    api = _workflow_api(
+        run,
+        reviews=[
+            {
+                "id": 899,
+                "user": {"login": "github-actions[bot]"},
+                "state": "PENDING",
+                "commit_id": "abc123",
+                "body": body,
+            }
+        ],
+    )
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "approved PR #10 at abc123"
+    assert api.deletes == []
+    assert api.posts == [("/pulls/10/reviews/899/events", {"event": "APPROVE"})]
+
+
+def test_different_run_pending_review_is_not_deleted() -> None:
+    """Concurrent different-run work remains owned by its original handler."""
+
+    run = _run_payload()
+    api = _workflow_api(
+        run,
+        reviews=[
+            {
+                "id": 898,
+                "user": {"login": "github-actions[bot]"},
+                "state": "PENDING",
+                "commit_id": "abc123",
+                "body": _approval_body("newer handler", run_order=(7, 21, 1)),
+            }
+        ],
+    )
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "another bridge handler owns pending review evidence for PR #10; deferred"
+    assert api.deletes == []
+    assert api.posts == []
+
+
+def test_old_head_pending_is_deleted_before_new_head_create() -> None:
+    """A push cannot leave prior-head pending evidence blocking the new review."""
+
+    run = _run_payload(sha="new-sha")
+    api = _workflow_api(
+        run,
+        pr=_pr_payload(sha="new-sha"),
+        reviews=[
+            {
+                "id": 897,
+                "user": {"login": "github-actions[bot]"},
+                "state": "PENDING",
+                "commit_id": "abc123",
+                "body": (
+                    f"[claude-review-approval] old head {_identity_marker(head_sha='abc123')}"
+                ),
+            }
+        ],
+    )
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "approved PR #10 at new-sha"
+    assert api.deletes == ["/pulls/10/reviews/897"]
+    assert api.posts[-1] == ("/pulls/10/reviews/900/events", {"event": "APPROVE"})
+
+
+def test_old_base_pending_is_deleted_before_current_base_create() -> None:
+    """A current handler removes stale-base pending evidence before creating."""
+
+    run = _run_payload()
+    api = _workflow_api(
+        run,
+        reviews=[
+            {
+                "id": 896,
+                "user": {"login": "github-actions[bot]"},
+                "state": "PENDING",
+                "commit_id": "abc123",
+                "body": (
+                    f"[claude-review-approval] old base {_identity_marker(base_ref='release')}"
+                ),
+            }
+        ],
+    )
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "approved PR #10 at abc123"
+    assert api.deletes == ["/pulls/10/reviews/896"]
+    assert api.posts[-1] == ("/pulls/10/reviews/900/events", {"event": "APPROVE"})
+
+
+def test_stale_handler_preserves_new_live_identity_pending() -> None:
+    """An old handler classifies its review snapshot against reloaded live identity."""
+
+    run = _run_payload()
+    old = _pr_payload()
+    new = _pr_payload(sha="new-sha")
+    api = _workflow_api(
+        run,
+        pr=old,
+        reviews=[
+            {
+                "id": 894,
+                "user": {"login": "github-actions[bot]"},
+                "state": "PENDING",
+                "commit_id": "abc123",
+                "body": (
+                    f"[claude-review-approval] old head {_identity_marker(head_sha='abc123')}"
+                ),
+            },
+            {
+                "id": 895,
+                "user": {"login": "github-actions[bot]"},
+                "state": "PENDING",
+                "commit_id": "new-sha",
+                "body": (
+                    f"[claude-review-approval] new head {_identity_marker(head_sha='new-sha')}"
+                ),
+            },
+        ],
+    )
+    api.response_sequences["/pulls/10"] = [old, old, new]
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "PR #10 identity changed during pending cleanup; approval remains absent"
+    assert api.deletes == ["/pulls/10/reviews/894"]
+    assert api.posts == []
+
+
+def test_lost_submit_response_dismisses_known_review() -> None:
+    """An indeterminate submit is cleaned up using the pending review ID."""
+
+    class LostSubmitResponseAPI(FakeAPI):
+        def post(
+            self,
+            path: str,
+            payload: Mapping[str, approval.JsonValue] | None = None,
+        ) -> approval.JsonValue:
+            result = super().post(path, payload)
+            if path.endswith("/events"):
+                raise RuntimeError("response lost")
+            return result
+
+    run = _run_payload()
+    base = _workflow_api(run)
+    api = LostSubmitResponseAPI(base.responses)
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "approved PR #10 at abc123 after response reconciliation"
+    assert api.posts[-1] == ("/pulls/10/reviews/900/events", {"event": "APPROVE"})
+    assert api.puts == []
+
+
+def test_lost_submit_while_pending_retains_review_for_retry() -> None:
+    """An unaccepted submit retains exact pending evidence for explicit retry."""
+
+    class PendingLostSubmitAPI(FakeAPI):
+        def get(self, path: str) -> approval.JsonValue:
+            if path == "/pulls/10/reviews/900":
+                return {
+                    "state": "PENDING",
+                    "commit_id": "abc123",
+                    "body": self.review_bodies[900],
+                }
+            return super().get(path)
+
+        def post(
+            self,
+            path: str,
+            payload: Mapping[str, approval.JsonValue] | None = None,
+        ) -> approval.JsonValue:
+            result = super().post(path, payload)
+            if path.endswith("/events"):
+                raise RuntimeError("response lost")
+            return result
+
+    run = _run_payload()
+    base = _workflow_api(run)
+    api = PendingLostSubmitAPI(base.responses)
+
+    with pytest.raises(RuntimeError, match="exact pending review retained for retry"):
+        approval.process_event({"workflow_run": run}, api)
+
+    assert api.deletes == []
+    assert api.puts == []
+
+
+def test_lost_submit_unknown_state_is_activation_blocker() -> None:
+    """An indeterminate submit with an unknown state requires operator audit."""
+
+    class PendingLostSubmitCleanupAPI(FakeAPI):
+        def get(self, path: str) -> approval.JsonValue:
+            if path == "/pulls/10/reviews/900":
+                return {
+                    "state": "UNKNOWN",
+                    "commit_id": "abc123",
+                    "body": self.review_bodies[900],
+                }
+            return super().get(path)
+
+        def post(
+            self,
+            path: str,
+            payload: Mapping[str, approval.JsonValue] | None = None,
+        ) -> approval.JsonValue:
+            result = super().post(path, payload)
+            if path.endswith("/events"):
+                raise RuntimeError("response lost")
+            return result
+
+    run = _run_payload()
+    base = _workflow_api(run)
+    api = PendingLostSubmitCleanupAPI(base.responses)
+
+    with pytest.raises(RuntimeError, match="operator audit required before activation"):
+        approval.process_event({"workflow_run": run}, api)
+
+
+def test_lost_submit_state_lookup_failure_is_activation_blocker() -> None:
+    """An indeterminate submit plus failed state lookup requires operator audit."""
+
+    class LostSubmitAndCleanupAPI(FakeAPI):
+        def post(
+            self,
+            path: str,
+            payload: Mapping[str, approval.JsonValue] | None = None,
+        ) -> approval.JsonValue:
+            result = super().post(path, payload)
+            if path.endswith("/events"):
+                raise RuntimeError("response lost")
+            return result
+
+        def get(self, path: str) -> approval.JsonValue:
+            if path == "/pulls/10/reviews/900":
+                raise RuntimeError("state lookup failed")
+            return super().get(path)
+
+    run = _run_payload()
+    base = _workflow_api(run)
+    api = LostSubmitAndCleanupAPI(base.responses)
+
+    with pytest.raises(RuntimeError, match="operator audit required before activation"):
+        approval.process_event({"workflow_run": run}, api)
+
+
+def test_post_publication_dismissal_epoch_removes_old_approval() -> None:
+    """A dismissal racing publication prevents an older handler from restoring evidence."""
+
+    run = _run_payload()
+    dismissed: approval.JsonObject = {
+        "id": 901,
+        "user": {"login": "github-actions[bot]"},
+        "state": "DISMISSED",
+        "commit_id": "abc123",
+        "body": _approval_body("replacement started", run_order=(7, 20, 1)),
+    }
+    api = _workflow_api(run)
+    review_sequence: list[approval.JsonValue] = [
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [dismissed],
+    ]
+    api.response_sequences["/pulls/10/reviews?per_page=100&page=1"] = review_sequence
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == (
+        "review run is not newer than the post-publication dismissal epoch for PR "
+        "#10; new review dismissed"
+    )
+    assert api.puts == [
+        (
+            "/pulls/10/reviews/900/dismissals",
+            {"message": "A newer dismissal epoch appeared while approval was published."},
+        )
+    ]
+
+
+def test_post_publication_epoch_api_failure_dismisses_approval() -> None:
+    """A failed final epoch lookup cannot leave the submitted approval active."""
+
+    class FailingFinalEpochAPI(FakeAPI):
+        review_reads = 0
+
+        def get(self, path: str) -> approval.JsonValue:
+            if path == "/pulls/10/reviews?per_page=100&page=1":
+                self.review_reads += 1
+                if self.review_reads == 7:
+                    raise RuntimeError("epoch lookup failed")
+            return super().get(path)
+
+    run = _run_payload()
+    base = _workflow_api(run)
+    api = FailingFinalEpochAPI(base.responses)
+
+    with pytest.raises(RuntimeError, match="epoch lookup failed"):
+        approval.process_event({"workflow_run": run}, api)
+
+    assert api.puts == [
+        (
+            "/pulls/10/reviews/900/dismissals",
+            {"message": "Post-publication dismissal-epoch validation failed."},
+        )
+    ]
+
+
+def test_post_publication_epoch_cleanup_failure_is_activation_blocker() -> None:
+    """A failed final epoch lookup plus failed dismissal requires operator audit."""
+
+    class FailingFinalEpochCleanupAPI(FakeAPI):
+        review_reads = 0
+
+        def get(self, path: str) -> approval.JsonValue:
+            if path == "/pulls/10/reviews?per_page=100&page=1":
+                self.review_reads += 1
+                if self.review_reads == 7:
+                    raise RuntimeError("epoch lookup failed")
+            return super().get(path)
+
+        def put(
+            self,
+            path: str,
+            payload: Mapping[str, approval.JsonValue],
+        ) -> approval.JsonValue:
+            raise RuntimeError("dismissal failed")
+
+    run = _run_payload()
+    base = _workflow_api(run)
+    api = FailingFinalEpochCleanupAPI(base.responses)
 
     with pytest.raises(RuntimeError, match="operator audit required before activation"):
         approval.process_event({"workflow_run": run}, api)
@@ -818,7 +1297,7 @@ def test_newer_replacement_run_can_approve_after_dismissal(
     result = approval.process_event({"workflow_run": run}, api)
 
     assert result == "approved PR #10 at abc123"
-    assert len(api.posts) == 1
+    assert len(api.posts) == 2
 
 
 def test_unrelated_dismissal_does_not_create_epoch() -> None:
@@ -931,7 +1410,7 @@ def test_old_base_identity_cannot_suppress_fresh_workflow_approval() -> None:
     result = approval.process_event({"workflow_run": run}, api)
 
     assert result == "approved PR #10 at abc123"
-    assert len(api.posts) == 1
+    assert len(api.posts) == 2
     assert _identity_marker() in str(api.posts[0][1])
     assert api.puts == []
 
@@ -992,6 +1471,7 @@ def test_dependabot_receives_explicit_exemption_approval() -> None:
     pr = _pr_payload(author="dependabot[bot]")
     api = FakeAPI(
         {
+            "/pulls/10": _pr_payload(author="dependabot[bot]"),
             "/pulls/10/files?per_page=100": [],
             "/pulls/10/reviews?per_page=100&page=1": [],
         }
@@ -1016,7 +1496,7 @@ def test_dependabot_workflow_run_routes_only_to_exemption() -> None:
     result = approval.process_event({"workflow_run": run}, api)
 
     assert result == "approved PR #10 at abc123"
-    assert len(api.posts) == 1
+    assert len(api.posts) == 2
     assert "[claude-review-exempt]" in str(api.posts[0][1])
     assert "[claude-review-approval]" not in str(api.posts[0][1])
 
@@ -1358,7 +1838,9 @@ def test_base_retarget_dismisses_approval_for_fresh_review() -> None:
                     "user": {"login": "github-actions[bot]"},
                     "state": "APPROVED",
                     "commit_id": "abc123",
-                    "body": "[claude-review-approval] old base",
+                    "body": (
+                        f"[claude-review-approval] old base {_identity_marker(base_ref='release')}"
+                    ),
                 }
             ]
         }
@@ -1467,7 +1949,9 @@ def test_base_retarget_dismisses_only_stale_identity_when_fresh_exists() -> None
                     "user": {"login": "github-actions[bot]"},
                     "state": "APPROVED",
                     "commit_id": "abc123",
-                    "body": "[claude-review-approval] old base",
+                    "body": (
+                        f"[claude-review-approval] old base {_identity_marker(base_ref='release')}"
+                    ),
                 },
                 {
                     "id": 76,
@@ -1502,11 +1986,163 @@ def test_base_retarget_dismisses_only_stale_identity_when_fresh_exists() -> None
     assert api.posts == []
 
 
+def test_delayed_base_retarget_dismisses_only_departed_identity() -> None:
+    """A delayed A-to-B event cannot remove approval already published for C."""
+
+    api = FakeAPI(
+        {
+            "/pulls/10": _pr_payload(base_sha="base-c", base_ref="target-c"),
+            "/pulls/10/reviews?per_page=100&page=1": [
+                {
+                    "id": 81,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": (
+                        f"[claude-review-approval] target A {_identity_marker(base_ref='target-a')}"
+                    ),
+                },
+                {
+                    "id": 82,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": (
+                        f"[claude-review-approval] target C {_identity_marker(base_ref='target-c')}"
+                    ),
+                },
+            ],
+        }
+    )
+
+    result = approval.process_event(
+        {
+            "action": "edited",
+            "changes": {"base": {"ref": {"from": "target-a"}}},
+            "pull_request": _pr_payload(base_sha="base-b", base_ref="target-b"),
+        },
+        api,
+    )
+
+    assert result == (
+        "base branch changed and dismissed the prior approval; "
+        "fresh current-base approval preserved"
+    )
+    assert api.puts == [
+        (
+            "/pulls/10/reviews/81/dismissals",
+            {"message": "A newer Claude review attempt must succeed before merge."},
+        )
+    ]
+    assert api.posts == []
+
+
+def test_base_retarget_deletes_only_departed_pending_review() -> None:
+    """A delayed A-to-B event deletes A pending evidence but preserves C."""
+
+    api = FakeAPI(
+        {
+            "/pulls/10": _pr_payload(base_sha="base-c", base_ref="target-c"),
+            "/pulls/10/reviews?per_page=100&page=1": [
+                {
+                    "id": 83,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "PENDING",
+                    "commit_id": "abc123",
+                    "body": (
+                        f"[claude-review-approval] target A {_identity_marker(base_ref='target-a')}"
+                    ),
+                },
+                {
+                    "id": 84,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "PENDING",
+                    "commit_id": "abc123",
+                    "body": (
+                        f"[claude-review-approval] target C {_identity_marker(base_ref='target-c')}"
+                    ),
+                },
+            ],
+        }
+    )
+
+    result = approval.process_event(
+        {
+            "action": "edited",
+            "changes": {"base": {"ref": {"from": "target-a"}}},
+            "pull_request": _pr_payload(base_sha="base-b", base_ref="target-b"),
+        },
+        api,
+    )
+
+    assert result == (
+        "base branch changed and dismissed the prior approval; fresh Claude review required"
+    )
+    assert api.deletes == ["/pulls/10/reviews/83"]
+    assert api.puts == []
+
+
+def test_dependabot_retarget_preserves_current_pending_exemption() -> None:
+    """A delayed retarget deletes departed exemption pending, not current work."""
+
+    api = FakeAPI(
+        {
+            "/pulls/10": _pr_payload(
+                author="dependabot[bot]",
+                base_sha="base-c",
+                base_ref="target-c",
+            ),
+            "/pulls/10/files?per_page=100": [],
+            "/pulls/10/reviews?per_page=100&page=1": [
+                {
+                    "id": 85,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "PENDING",
+                    "commit_id": "abc123",
+                    "body": (
+                        f"[claude-review-exempt] target A {_identity_marker(base_ref='target-a')}"
+                    ),
+                },
+                {
+                    "id": 86,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "PENDING",
+                    "commit_id": "abc123",
+                    "body": (
+                        f"[claude-review-exempt] target C {_identity_marker(base_ref='target-c')}"
+                    ),
+                },
+            ],
+        }
+    )
+
+    result = approval.process_event(
+        {
+            "action": "edited",
+            "changes": {"base": {"ref": {"from": "target-a"}}},
+            "pull_request": _pr_payload(
+                author="dependabot[bot]",
+                base_sha="base-b",
+                base_ref="target-b",
+            ),
+        },
+        api,
+    )
+
+    assert result == (
+        "base branch changed and dismissed the prior approval; "
+        "another bridge handler owns pending review evidence for PR #10; deferred"
+    )
+    assert api.deletes == ["/pulls/10/reviews/85"]
+    assert api.posts == []
+
+
 def test_dependabot_base_retarget_replaces_exemption_after_recheck() -> None:
     """A safe retarget receives fresh exemption evidence without deadlock."""
 
     api = FakeAPI(
         {
+            "/pulls/10": _pr_payload(author="dependabot[bot]"),
             "/pulls/10/files?per_page=100": [],
             "/pulls/10/reviews?per_page=100&page=1": [
                 {
@@ -1514,7 +2150,9 @@ def test_dependabot_base_retarget_replaces_exemption_after_recheck() -> None:
                     "user": {"login": "github-actions[bot]"},
                     "state": "APPROVED",
                     "commit_id": "abc123",
-                    "body": "[claude-review-exempt] Dependabot",
+                    "body": (
+                        f"[claude-review-exempt] Dependabot {_identity_marker(base_ref='release')}"
+                    ),
                 }
             ],
         }
@@ -1551,9 +2189,9 @@ def test_dependabot_base_retarget_replaces_exemption_after_recheck() -> None:
                     "triage remain required."
                 ),
                 "commit_id": "abc123",
-                "event": "APPROVE",
             },
-        )
+        ),
+        ("/pulls/10/reviews/900/events", {"event": "APPROVE"}),
     ]
 
 
@@ -1562,6 +2200,7 @@ def test_dependabot_base_retarget_preserves_fresh_current_exemption() -> None:
 
     api = FakeAPI(
         {
+            "/pulls/10": _pr_payload(author="dependabot[bot]"),
             "/pulls/10/files?per_page=100": [],
             "/pulls/10/reviews?per_page=100&page=1": [
                 {
@@ -1594,6 +2233,7 @@ def test_dependabot_base_retarget_dismisses_only_stale_exemption() -> None:
 
     api = FakeAPI(
         {
+            "/pulls/10": _pr_payload(author="dependabot[bot]"),
             "/pulls/10/files?per_page=100": [],
             "/pulls/10/reviews?per_page=100&page=1": [
                 {
@@ -1601,7 +2241,9 @@ def test_dependabot_base_retarget_dismisses_only_stale_exemption() -> None:
                     "user": {"login": "github-actions[bot]"},
                     "state": "APPROVED",
                     "commit_id": "abc123",
-                    "body": "[claude-review-exempt] old base",
+                    "body": (
+                        f"[claude-review-exempt] old base {_identity_marker(base_ref='release')}"
+                    ),
                 },
                 {
                     "id": 79,
@@ -1641,6 +2283,7 @@ def test_dependabot_privileged_base_retarget_remains_unapproved() -> None:
 
     api = FakeAPI(
         {
+            "/pulls/10": _pr_payload(author="dependabot[bot]"),
             "/pulls/10/files?per_page=100": [
                 {"filename": ".github/workflows/claude-code-review.yml"}
             ],
@@ -1650,7 +2293,9 @@ def test_dependabot_privileged_base_retarget_remains_unapproved() -> None:
                     "user": {"login": "github-actions[bot]"},
                     "state": "APPROVED",
                     "commit_id": "abc123",
-                    "body": "[claude-review-exempt] Dependabot",
+                    "body": (
+                        f"[claude-review-exempt] Dependabot {_identity_marker(base_ref='release')}"
+                    ),
                 }
             ],
         }

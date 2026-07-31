@@ -27,6 +27,8 @@ _ASSOCIATION_REFRESH_DELAYS_SECONDS = (0.0, 1.0, 2.0)
 class _GitHubAPI(Protocol):
     def get(self, path: str) -> JsonValue: ...
 
+    def delete(self, path: str) -> JsonValue: ...
+
     def post(self, path: str, payload: Mapping[str, JsonValue] | None = None) -> JsonValue: ...
 
     def put(self, path: str, payload: Mapping[str, JsonValue]) -> JsonValue: ...
@@ -56,6 +58,10 @@ class RESTClient:
     def get(self, path: str) -> JsonValue:
         """Return decoded JSON from a GET request."""
         return self._request("GET", path, None)
+
+    def delete(self, path: str) -> JsonValue:
+        """Delete one repository resource."""
+        return self._request("DELETE", path, None)
 
     def post(self, path: str, payload: Mapping[str, JsonValue] | None = None) -> JsonValue:
         """Return decoded JSON from a POST request."""
@@ -186,7 +192,15 @@ def _process_pull_request_target(
     if action == "edited":
         if "base" not in changes:
             return "non-base pull request edit does not require approval work"
-        pr = _pull_request_from_payload(pr_payload)
+        event_pr = _pull_request_from_payload(pr_payload)
+        pr = _load_pull_request(event_pr.number, api)
+        departed_base_ref = _string(
+            _object(
+                _object(changes.get("base"), "changes.base").get("ref"),
+                "changes.base.ref",
+            ).get("from"),
+            "changes.base.ref.from",
+        )
         if pr.author == "dependabot[bot]" and _pull_request_edits_privileged_code(pr.number, api):
             dismissed = _dismiss_approval(pr, api, include_exemption=True)
             suffix = " and dismissed the prior approval" if dismissed else ""
@@ -198,7 +212,7 @@ def _process_pull_request_target(
             pr,
             api,
             include_exemption=True,
-            stale_identity_only=True,
+            departed_base_ref=departed_base_ref,
         )
         suffix = " and dismissed the prior approval" if dismissed else ""
         if pr.author == "dependabot[bot]":
@@ -387,14 +401,94 @@ def _approve(
                     f"review run is not newer than the dismissed evidence epoch for PR "
                     f"#{pr.number}; approval remains absent"
                 )
-    created = _object(
+    live_after_cleanup = _delete_stale_pending_reviews(pr, api)
+    if not _same_approval_identity(pr, live_after_cleanup):
+        return f"PR #{pr.number} identity changed during pending cleanup; approval remains absent"
+    pending = _pending_bridge_reviews(pr, api)
+    exact_pending = [
+        review for review in pending if _string(review.get("body", ""), "review.body") == body
+    ]
+    if len(exact_pending) > 1:
+        raise RuntimeError("multiple exact pending reviews require operator audit")
+    if exact_pending:
+        review_id = _integer(exact_pending[0].get("id"), "review.id")
+    elif pending:
+        return f"another bridge handler owns pending review evidence for PR #{pr.number}; deferred"
+    else:
+        try:
+            created = _object(
+                api.post(
+                    f"/pulls/{pr.number}/reviews",
+                    {"body": body, "commit_id": pr.head[0]},
+                ),
+                "created review",
+            )
+            review_id = _integer(created.get("id"), "created review.id")
+        except (RuntimeError, ValueError):
+            exact_pending = [
+                review
+                for review in _pending_bridge_reviews(pr, api)
+                if _string(review.get("body", ""), "review.body") == body
+            ]
+            if len(exact_pending) != 1:
+                raise
+            review_id = _integer(exact_pending[0].get("id"), "review.id")
+    try:
+        current = _load_pull_request(pr.number, api)
+    except (RuntimeError, ValueError):
+        _delete_pending_review_or_block(pr.number, review_id, api)
+        raise
+    if not _same_approval_identity(pr, current):
+        _delete_pending_review_or_block(pr.number, review_id, api)
+        return (
+            f"PR #{pr.number} identity changed before approval submission; approval remains absent"
+        )
+    if run_order is not None:
+        try:
+            after_epoch = _run_is_after_dismissal_epoch(pr, run_order, api)
+        except (RuntimeError, ValueError):
+            _delete_pending_review_or_block(pr.number, review_id, api)
+            raise
+        if not after_epoch:
+            _delete_pending_review_or_block(pr.number, review_id, api)
+            return (
+                f"review run is not newer than the dismissed evidence epoch for PR "
+                f"#{pr.number}; approval remains absent"
+            )
+    submit_error: RuntimeError | ValueError | None = None
+    try:
         api.post(
-            f"/pulls/{pr.number}/reviews",
-            {"body": body, "commit_id": pr.head[0], "event": "APPROVE"},
-        ),
-        "created review",
-    )
-    review_id = _integer(created.get("id"), "created review.id")
+            f"/pulls/{pr.number}/reviews/{review_id}/events",
+            {"event": "APPROVE"},
+        )
+    except (RuntimeError, ValueError) as exc:
+        submit_error = exc
+        try:
+            submitted = _object(
+                api.get(f"/pulls/{pr.number}/reviews/{review_id}"),
+                "indeterminate review",
+            )
+            state = _string(submitted.get("state"), "indeterminate review.state")
+            submitted_body = _string(
+                submitted.get("body", ""),
+                "indeterminate review.body",
+            )
+            submitted_commit = _string(
+                submitted.get("commit_id"),
+                "indeterminate review.commit_id",
+            )
+        except (RuntimeError, ValueError) as inspection_error:
+            raise RuntimeError(
+                "indeterminate review state; operator audit required before activation"
+            ) from inspection_error
+        if state == "PENDING" and submitted_body == body and submitted_commit == pr.head[0]:
+            raise RuntimeError(
+                "approval submission did not complete; exact pending review retained for retry"
+            ) from exc
+        if not (state == "APPROVED" and submitted_body == body and submitted_commit == pr.head[0]):
+            raise RuntimeError(
+                "indeterminate review state; operator audit required before activation"
+            ) from exc
     try:
         current = _load_pull_request(pr.number, api)
     except (RuntimeError, ValueError):
@@ -413,7 +507,107 @@ def _approve(
             "The pull request identity changed while approval was published.",
         )
         return f"PR #{pr.number} identity changed after approval; new review dismissed"
+    if run_order is not None:
+        try:
+            after_epoch = _run_is_after_dismissal_epoch(pr, run_order, api)
+        except (RuntimeError, ValueError):
+            _dismiss_created_review_or_block(
+                pr.number,
+                review_id,
+                api,
+                "Post-publication dismissal-epoch validation failed.",
+            )
+            raise
+        if not after_epoch:
+            _dismiss_created_review_or_block(
+                pr.number,
+                review_id,
+                api,
+                "A newer dismissal epoch appeared while approval was published.",
+            )
+            return (
+                f"review run is not newer than the post-publication dismissal epoch for PR "
+                f"#{pr.number}; new review dismissed"
+            )
+    if submit_error is not None:
+        return f"approved PR #{pr.number} at {pr.head[0]} after response reconciliation"
     return f"approved PR #{pr.number} at {pr.head[0]}"
+
+
+def _run_is_after_dismissal_epoch(
+    pr: _PullRequest,
+    run_order: tuple[int, int, int],
+    api: _GitHubAPI,
+) -> bool:
+    dismissed_order = _latest_dismissed_run_order(pr, api)
+    if dismissed_order is None:
+        return True
+    if run_order[0] != dismissed_order[0]:
+        raise ValueError("dismissed approval belongs to another review workflow")
+    return run_order > dismissed_order
+
+
+def _pending_bridge_reviews(
+    pr: _PullRequest,
+    api: _GitHubAPI,
+) -> list[JsonObject]:
+    identity = _identity_marker(pr)
+    matches: list[JsonObject] = []
+    for value in _all_reviews(pr.number, api):
+        review = _object(value, "reviews[]")
+        user = _object(review.get("user"), "review.user")
+        body = _string(review.get("body", ""), "review.body")
+        if (
+            _string(user.get("login"), "review.user.login") == _BOT_LOGIN
+            and _string(review.get("state"), "review.state") == "PENDING"
+            and _string(review.get("commit_id"), "review.commit_id") == pr.head[0]
+            and body.split(" ", 1)[0] in {_APPROVAL_MARKER, _EXEMPTION_MARKER}
+            and identity in body
+        ):
+            matches.append(review)
+    return matches
+
+
+def _delete_stale_pending_reviews(
+    pr: _PullRequest,
+    api: _GitHubAPI,
+) -> _PullRequest:
+    reviews = _all_reviews(pr.number, api)
+    live = _load_pull_request(pr.number, api)
+    identity = _identity_marker(live)
+    for value in reviews:
+        review = _object(value, "reviews[]")
+        user = _object(review.get("user"), "review.user")
+        body = _string(review.get("body", ""), "review.body")
+        if not (
+            _string(user.get("login"), "review.user.login") == _BOT_LOGIN
+            and _string(review.get("state"), "review.state") == "PENDING"
+            and body.split(" ", 1)[0] in {_APPROVAL_MARKER, _EXEMPTION_MARKER}
+        ):
+            continue
+        if (
+            _string(review.get("commit_id"), "review.commit_id") != live.head[0]
+            or identity not in body
+        ):
+            _delete_pending_review_or_block(
+                live.number,
+                _integer(review.get("id"), "review.id"),
+                api,
+            )
+    return live
+
+
+def _delete_pending_review_or_block(
+    number: int,
+    review_id: int,
+    api: _GitHubAPI,
+) -> None:
+    try:
+        api.delete(f"/pulls/{number}/reviews/{review_id}")
+    except (RuntimeError, ValueError) as cleanup_error:
+        raise RuntimeError(
+            "pending-review cleanup failed; operator audit required before activation"
+        ) from cleanup_error
 
 
 def _dismiss_created_review_or_block(
@@ -511,16 +705,48 @@ def _dismiss_approval(
     api: _GitHubAPI,
     *,
     include_exemption: bool = False,
-    stale_identity_only: bool = False,
+    departed_base_ref: str | None = None,
 ) -> bool:
     dismissed = False
-    identity = _identity_marker(pr)
+    departed_identity = (
+        None
+        if departed_base_ref is None
+        else _identity_marker(
+            _PullRequest(
+                number=pr.number,
+                head=pr.head,
+                base=(pr.base[0], departed_base_ref, pr.base[2]),
+                author=pr.author,
+            )
+        )
+    )
     for value in _all_reviews(pr.number, api):
         review = _object(value, "reviews[]")
-        if not _is_bridge_approval(review, pr, approval_only=not include_exemption):
-            continue
+        user = _object(review.get("user"), "review.user")
         body = _string(review.get("body", ""), "review.body")
-        if stale_identity_only and identity in body:
+        marker = body.split(" ", 1)[0]
+        is_bridge_marker = marker == _APPROVAL_MARKER or (
+            include_exemption and marker == _EXEMPTION_MARKER
+        )
+        is_bot_commit = (
+            _string(user.get("login"), "review.user.login") == _BOT_LOGIN
+            and _string(review.get("commit_id"), "review.commit_id") == pr.head[0]
+        )
+        if departed_identity is not None and departed_identity not in body:
+            continue
+        if (
+            is_bot_commit
+            and is_bridge_marker
+            and _string(review.get("state"), "review.state") == "PENDING"
+        ):
+            _delete_pending_review_or_block(
+                pr.number,
+                _integer(review.get("id"), "review.id"),
+                api,
+            )
+            dismissed = True
+            continue
+        if not _is_bridge_approval(review, pr, approval_only=not include_exemption):
             continue
         review_id = _integer(review.get("id"), "review.id")
         api.put(

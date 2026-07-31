@@ -50,7 +50,7 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D115** (D114 is in focused plan follow-up).
+> Next free plan decision number: **D116** (D115 is in focused plan follow-up).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 27 Jul block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
@@ -184,7 +184,7 @@ activation prerequisite. Merge policy still requires full
 local gates, applicable local domain reviewers, an exact-head authenticated
 Codex trigger/wait/triage pass (including the documented bounded silent/stalled
 fallback), and independent lead/`pr-triage` adjudication.
-**Restoration design (D108 amended by D109-D112):** retire the SHA status and use a trusted
+**Restoration design (D108 amended by D109-D115):** retire the SHA status and use a trusted
 default-branch bridge to turn a successful exact-PR/head/base Claude run into
 an exact-commit PR approval. That evidence is monotonic for unchanged identity:
 later same-head runs are additive and cannot revoke it; an intentional replacement
@@ -193,8 +193,9 @@ then rerunning. That dismissal creates a durable exact-identity evidence epoch:
 approval bodies carry versioned workflow/run-number/attempt order, and only a
 strictly newer run may approve. Approval/exemption bodies embed the full PR/head/base-branch
 identity and retain the reviewed base-tip SHA as audit metadata. A push or base
-retarget invalidates stale evidence without a delayed retarget handler
-dismissing fresh current-base evidence;
+retarget invalidates stale evidence; reconciliation reloads the live PR and
+dismisses only the departed `changes.base.ref.from` identity, so a delayed
+A-to-B handler cannot remove fresh C evidence;
 draft approval survives ready/reopen when the bytes do not change, while both
 lifecycle events start a fresh additive review so failed/missing history recovers.
 Every normal-PR metadata edit likewise starts an additive review because GitHub
@@ -202,9 +203,18 @@ orders its workflow run before job conditions; only a base retarget dismisses
 identity-bound evidence. Dependabot exclusion follows PR authorship.
 An exact incoming run newer than stale inventory is authoritative; temporarily
 empty run association receives bounded exact-run refresh plus one retry. Approval
-publication revalidates identity before and after POST and dismisses a raced review
-or any review whose post-publication validation fails; cleanup failure blocks
-activation pending operator audit.
+publication creates a non-counting pending review, revalidates identity and the
+dismissal epoch, submits the known review as `APPROVE`, then revalidates both
+again. Lost create responses cannot publish active evidence; exact full-body/run
+pending evidence is adopted and resumed, while different-run pending work is
+never deleted by a concurrent handler. Pending reviews are snapshotted before
+the live PR is reloaded; only superseded-head/base evidence in that snapshot is
+deleted and the stale handler aborts, so later-created current work is safe.
+Known owned pending evidence is deleted on pre-submit identity or epoch abort.
+Lost submit responses are state-checked:
+exact approved evidence proceeds to validation and exact pending evidence is
+retained for explicit retry. Any raced approval is dismissed; cleanup or
+validation failure blocks activation pending operator audit.
 Bridge handlers run without workflow concurrency because GitHub can replace a
 pending same-group event; their identity checks and tombstones are deliberately
 order-safe. JSON mutations declare their media type. Dependabot author routing

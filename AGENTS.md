@@ -404,10 +404,24 @@ Dependabot PRs. Operate the gate as follows:
   empty, the bridge boundedly refreshes that exact run and reruns the first
   attempt once if association remains absent; ambiguity or a repeated absence
   still fails closed.
-- Approval publication revalidates the live PR identity immediately before and
-  after the mutation, dismissing the just-created review if the identity moved
-  or post-publication validation fails. Cleanup failure is an explicit
-  activation blocker requiring operator audit.
+- Approval publication is two-phase: create a non-counting pending review,
+  revalidate identity and the dismissal epoch, then submit the known review as
+  `APPROVE`. An indeterminate create can leave only pending evidence; an
+  exact full-body/run pending review is adopted and resumed; different-run
+  current-identity pending work is never deleted by a concurrent handler.
+  Pending reviews are snapshotted before the live PR is reloaded; only
+  superseded-head/base evidence in that snapshot is deleted, and the stale
+  handler aborts so it cannot delete later-created current work. Known owned
+  pending reviews are deleted on pre-submit identity or epoch abort. An indeterminate
+  submit is state-checked: exact approved evidence continues to validation,
+  while exact pending evidence is retained for an explicit retry.
+  The bridge revalidates identity and the dismissal epoch again after
+  submission, dismissing the just-created review if either moved or validation
+  fails. Cleanup failure is an explicit
+  activation blocker requiring operator audit. Retarget handlers reload the
+  live PR and dismiss only evidence for `changes.base.ref.from`, so a delayed
+  A-to-B event cannot remove current C evidence; departed pending evidence is
+  deleted while current or later-base pending work is preserved.
   This is not a REST transaction: slice-2 activation must live-prove that GitHub
   never counts an approval bound to a non-current commit, alongside strict mode
   and stale-review dismissal. If that adversarial proof fails, do not activate
