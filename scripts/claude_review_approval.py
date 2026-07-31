@@ -385,9 +385,9 @@ def _identity_marker(pr: _PullRequest) -> str:
     head_ref = quote(pr.head[1], safe="")
     base_ref = quote(pr.base[1], safe="")
     return (
-        f"[claude-review-identity-v1] pr={pr.number} "
+        f"[claude-review-identity-v1 pr={pr.number} "
         f"head={pr.head[2]}:{head_ref}:{pr.head[0]} "
-        f"base={pr.base[2]}:{base_ref}"
+        f"base={pr.base[2]}:{base_ref}]"
     )
 
 

@@ -70,9 +70,9 @@ def _identity_marker(
     base_ref: str = "main",
 ) -> str:
     return (
-        f"[claude-review-identity-v1] pr={number} "
+        f"[claude-review-identity-v1 pr={number} "
         f"head=1:{head_ref.replace('/', '%2F')}:{head_sha} "
-        f"base=2:{base_ref.replace('/', '%2F')}"
+        f"base=2:{base_ref.replace('/', '%2F')}]"
     )
 
 
@@ -908,6 +908,47 @@ def test_base_retarget_preserves_fresh_current_identity_approval() -> None:
 
     assert result == "base branch changed; fresh current-base approval preserved"
     assert api.puts == []
+    assert api.posts == []
+
+
+def test_base_retarget_rejects_prefix_matching_stale_identity() -> None:
+    """Base refs with a current-ref prefix cannot satisfy exact identity."""
+
+    api = FakeAPI(
+        {
+            "/pulls/10/reviews?per_page=100&page=1": [
+                {
+                    "id": 80,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": (
+                        "[claude-review-approval] stale prefixed base "
+                        f"{_identity_marker(base_ref='main-old')}"
+                    ),
+                }
+            ]
+        }
+    )
+
+    result = approval.process_event(
+        {
+            "action": "edited",
+            "changes": {"base": {"ref": {"from": "main-old"}}},
+            "pull_request": _pr_payload(),
+        },
+        api,
+    )
+
+    assert result == (
+        "base branch changed and dismissed the prior approval; fresh Claude review required"
+    )
+    assert api.puts == [
+        (
+            "/pulls/10/reviews/80/dismissals",
+            {"message": "A newer Claude review attempt must succeed before merge."},
+        )
+    ]
     assert api.posts == []
 
 
