@@ -13,6 +13,7 @@ permissions:
   actions: write
 jobs:
   approve:
+    # D118 live-proof marker; this disposable branch is never merged.
     name: Publish PR-scoped Claude approval
     if: >-
       github.event_name == 'repository_dispatch' ||
