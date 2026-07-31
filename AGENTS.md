@@ -349,7 +349,9 @@ required replacement lenses.
 **WAIT for Claude's PR-scoped approval before merging (D108 amended by D109,
 after #663
 activation).** The required evidence is a `github-actions[bot]` approval whose
-body starts `[claude-review-approval]` and names the current PR head SHA. The raw
+body starts `[claude-review-approval]` and embeds the exact repository/PR/head/base
+identity. On a base retarget, the bridge dismisses only older embedded identities,
+so a fresh current-base approval survives either event ordering. The raw
 `claude-review` check is diagnostic, not the required primitive: it passes when
 Claude posts findings and legitimately cannot run for workflow-editing or
 Dependabot PRs. Operate the gate as follows:

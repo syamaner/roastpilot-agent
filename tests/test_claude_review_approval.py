@@ -62,6 +62,26 @@ def _pr_payload(
     }
 
 
+def _identity_marker(
+    *,
+    number: int = 10,
+    head_sha: str = "abc123",
+    head_ref: str = "feature/test",
+    base_sha: str = "base123",
+    base_ref: str = "main",
+) -> str:
+    return (
+        f"[claude-review-identity] pr={number} "
+        f"head=1:{head_ref.replace('/', '%2F')}:{head_sha} "
+        f"base=2:{base_ref.replace('/', '%2F')}:{base_sha}"
+    )
+
+
+def _approval_body(text: str, *, exempt: bool = False) -> str:
+    marker = "[claude-review-exempt]" if exempt else "[claude-review-approval]"
+    return f"{marker} {text} {_identity_marker()}"
+
+
 def _run_payload(
     *,
     run_id: int = 100,
@@ -135,7 +155,8 @@ def test_successful_exact_head_review_approves_pr() -> None:
             {
                 "body": (
                     "[claude-review-approval] Claude Code Review run 100 attempt 1 "
-                    "completed successfully for `abc123`. Inline findings remain gated "
+                    f"completed successfully for `abc123`. {_identity_marker()} "
+                    "Inline findings remain gated "
                     "by required conversation resolution."
                 ),
                 "commit_id": "abc123",
@@ -256,7 +277,7 @@ def test_delayed_older_run_defers_to_newest_pr_run() -> None:
                 "user": {"login": "github-actions[bot]"},
                 "state": "APPROVED",
                 "commit_id": "abc123",
-                "body": "[claude-review-approval] old run",
+                "body": _approval_body("old run"),
             }
         ],
     )
@@ -330,7 +351,7 @@ def test_new_attempt_preserves_same_head_approval_before_completion() -> None:
                 "user": {"login": "github-actions[bot]"},
                 "state": "APPROVED",
                 "commit_id": "abc123",
-                "body": "[claude-review-approval] attempt one",
+                "body": _approval_body("attempt one"),
             }
         ],
     )
@@ -367,7 +388,7 @@ def test_new_attempt_preserves_when_run_inventory_is_stale(
                 "user": {"login": "github-actions[bot]"},
                 "state": "APPROVED",
                 "commit_id": "abc123",
-                "body": "[claude-review-approval] attempt one",
+                "body": _approval_body("attempt one"),
             }
         ],
     )
@@ -394,7 +415,7 @@ def test_delayed_start_after_success_does_not_revoke_current_approval() -> None:
                 "user": {"login": "github-actions[bot]"},
                 "state": "APPROVED",
                 "commit_id": "abc123",
-                "body": "[claude-review-approval] completed",
+                "body": _approval_body("completed"),
             }
         ],
     )
@@ -420,7 +441,7 @@ def test_failed_rerun_preserves_approval_if_start_event_was_delayed() -> None:
                 "user": {"login": "github-actions[bot]"},
                 "state": "APPROVED",
                 "commit_id": "abc123",
-                "body": "[claude-review-approval] attempt one",
+                "body": _approval_body("attempt one"),
             }
         ],
     )
@@ -446,7 +467,7 @@ def test_cancelled_first_rerun_preserves_existing_approval() -> None:
                 "user": {"login": "github-actions[bot]"},
                 "state": "APPROVED",
                 "commit_id": "abc123",
-                "body": "[claude-review-approval] earlier success",
+                "body": _approval_body("earlier success"),
             }
         ],
     )
@@ -469,7 +490,7 @@ def test_existing_exact_bot_approval_is_idempotent() -> None:
                 "user": {"login": "github-actions[bot]"},
                 "state": "APPROVED",
                 "commit_id": "abc123",
-                "body": "[claude-review-approval] already done",
+                "body": _approval_body("already done"),
             }
         ],
     )
@@ -520,7 +541,7 @@ def test_review_lookup_paginates() -> None:
             "user": {"login": "github-actions[bot]"},
             "state": "APPROVED",
             "commit_id": "abc123",
-            "body": "[claude-review-approval] current",
+            "body": _approval_body("current"),
         }
     ]
 
@@ -627,7 +648,7 @@ def test_skipped_claude_run_preserves_dependabot_exemption() -> None:
                 "user": {"login": "github-actions[bot]"},
                 "state": "APPROVED",
                 "commit_id": "abc123",
-                "body": "[claude-review-exempt] Dependabot",
+                "body": _approval_body("Dependabot", exempt=True),
             }
         ],
     )
@@ -676,7 +697,7 @@ def test_reopened_pr_preserves_existing_exact_head_approval() -> None:
                     "user": {"login": "github-actions[bot]"},
                     "state": "APPROVED",
                     "commit_id": "abc123",
-                    "body": "[claude-review-approval] prior run",
+                    "body": _approval_body("prior run"),
                 }
             ]
         }
@@ -816,6 +837,83 @@ def test_base_retarget_dismisses_approval_for_fresh_review() -> None:
     ]
 
 
+def test_base_retarget_preserves_fresh_current_identity_approval() -> None:
+    """A delayed retarget handler cannot dismiss a fresh current-base approval."""
+
+    api = FakeAPI(
+        {
+            "/pulls/10/reviews?per_page=100&page=1": [
+                {
+                    "id": 74,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": _approval_body("fresh current base"),
+                }
+            ]
+        }
+    )
+
+    result = approval.process_event(
+        {
+            "action": "edited",
+            "changes": {"base": {"ref": {"from": "release"}}},
+            "pull_request": _pr_payload(),
+        },
+        api,
+    )
+
+    assert result == "base branch changed; fresh current-base approval preserved"
+    assert api.puts == []
+    assert api.posts == []
+
+
+def test_base_retarget_dismisses_only_stale_identity_when_fresh_exists() -> None:
+    """Both retarget event orderings converge on current-base evidence."""
+
+    api = FakeAPI(
+        {
+            "/pulls/10/reviews?per_page=100&page=1": [
+                {
+                    "id": 75,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": "[claude-review-approval] old base",
+                },
+                {
+                    "id": 76,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": _approval_body("fresh current base"),
+                },
+            ]
+        }
+    )
+
+    result = approval.process_event(
+        {
+            "action": "edited",
+            "changes": {"base": {"ref": {"from": "release"}}},
+            "pull_request": _pr_payload(),
+        },
+        api,
+    )
+
+    assert result == (
+        "base branch changed and dismissed the prior approval; "
+        "fresh current-base approval preserved"
+    )
+    assert api.puts == [
+        (
+            "/pulls/10/reviews/75/dismissals",
+            {"message": "A newer Claude review attempt must succeed before merge."},
+        )
+    ]
+    assert api.posts == []
+
+
 def test_dependabot_base_retarget_replaces_exemption_after_recheck() -> None:
     """A safe retarget receives fresh exemption evidence without deadlock."""
 
@@ -858,7 +956,8 @@ def test_dependabot_base_retarget_replaces_exemption_after_recheck() -> None:
             {
                 "body": (
                     "[claude-review-exempt] `abc123` is explicitly exempt: "
-                    "Dependabot cannot receive repository secrets. CI, codecov, "
+                    f"Dependabot cannot receive repository secrets. {_identity_marker()} "
+                    "CI, codecov, "
                     "exact-head Codex, conversation resolution, and independent "
                     "triage remain required."
                 ),
@@ -867,6 +966,38 @@ def test_dependabot_base_retarget_replaces_exemption_after_recheck() -> None:
             },
         )
     ]
+
+
+def test_dependabot_base_retarget_preserves_fresh_current_exemption() -> None:
+    """A delayed retarget handler cannot replace current exemption evidence."""
+
+    api = FakeAPI(
+        {
+            "/pulls/10/files?per_page=100": [],
+            "/pulls/10/reviews?per_page=100&page=1": [
+                {
+                    "id": 77,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": _approval_body("Dependabot", exempt=True),
+                }
+            ],
+        }
+    )
+
+    result = approval.process_event(
+        {
+            "action": "edited",
+            "changes": {"base": {"ref": {"from": "release"}}},
+            "pull_request": _pr_payload(author="dependabot[bot]"),
+        },
+        api,
+    )
+
+    assert result == "base branch changed; PR #10 already has a bot approval for abc123"
+    assert api.puts == []
+    assert api.posts == []
 
 
 def test_dependabot_privileged_base_retarget_remains_unapproved() -> None:

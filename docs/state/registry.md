@@ -189,7 +189,9 @@ default-branch bridge to turn a successful exact-PR/head/base Claude run into
 an exact-commit PR approval. That evidence is monotonic for unchanged identity:
 later same-head runs are additive and cannot revoke it; an intentional replacement
 requires recording the reason, preventing auto-merge, dismissing first, and only
-then rerunning. A push or base retarget dismisses stale approval;
+then rerunning. Approval/exemption bodies embed the full PR identity, so a push or
+base retarget invalidates stale evidence without a delayed retarget handler
+dismissing fresh current-base evidence;
 draft approval survives ready/reopen when the bytes do not change, while reopening
 without approval reruns the newest exact review. Dependabot uses a trusted labelled
 exemption, while workflow or privileged-helper edits require an explicit recorded

@@ -139,8 +139,8 @@ def _process_workflow_run(run: JsonObject, action: str, api: _GitHubAPI) -> str:
     if conclusion == "success":
         body = (
             f"{_APPROVAL_MARKER} Claude Code Review run {run_id} attempt {attempt} "
-            f"completed successfully for `{pr.head[0]}`. Inline findings remain gated "
-            "by required conversation resolution."
+            f"completed successfully for `{pr.head[0]}`. {_identity_marker(pr)} "
+            "Inline findings remain gated by required conversation resolution."
         )
         return _approve(pr, body, api)
     if conclusion == "cancelled" and attempt == 1:
@@ -161,7 +161,12 @@ def _process_pull_request_target(
         if "base" not in changes:
             return "non-base pull request edit does not require approval work"
         pr = _pull_request_from_payload(pr_payload)
-        dismissed = _dismiss_approval(pr, api, include_exemption=True)
+        dismissed = _dismiss_approval(
+            pr,
+            api,
+            include_exemption=True,
+            stale_identity_only=True,
+        )
         suffix = " and dismissed the prior approval" if dismissed else ""
         if pr.author == "dependabot[bot]":
             if _pull_request_edits_privileged_code(pr.number, api):
@@ -169,8 +174,10 @@ def _process_pull_request_target(
                     f"base branch changed{suffix}; privileged-code-editing PR "
                     "requires an explicit maintainer approval"
                 )
-            approved = _approve_dependabot(pr, api, skip_existing_check=dismissed)
+            approved = _approve_dependabot(pr, api)
             return f"base branch changed{suffix}; {approved}"
+        if _approval_review(pr, api) is not None:
+            return f"base branch changed{suffix}; fresh current-base approval preserved"
         return f"base branch changed{suffix}; fresh Claude review required"
     if action not in {"opened", "synchronize", "reopened"}:
         return f"pull_request_target action {action!r} does not require approval work"
@@ -288,29 +295,18 @@ def _matching_runs_for_pull_request(
     return matches
 
 
-def _approve_dependabot(
-    pr: _PullRequest,
-    api: _GitHubAPI,
-    *,
-    skip_existing_check: bool = False,
-) -> str:
+def _approve_dependabot(pr: _PullRequest, api: _GitHubAPI) -> str:
     body = (
         f"{_EXEMPTION_MARKER} `{pr.head[0]}` is explicitly exempt: "
-        "Dependabot cannot receive repository secrets. "
+        f"Dependabot cannot receive repository secrets. {_identity_marker(pr)} "
         "CI, codecov, exact-head Codex, conversation resolution, and independent "
         "triage remain required."
     )
-    return _approve(pr, body, api, skip_existing_check=skip_existing_check)
+    return _approve(pr, body, api)
 
 
-def _approve(
-    pr: _PullRequest,
-    body: str,
-    api: _GitHubAPI,
-    *,
-    skip_existing_check: bool = False,
-) -> str:
-    if not skip_existing_check and _approval_review(pr, api) is not None:
+def _approve(pr: _PullRequest, body: str, api: _GitHubAPI) -> str:
+    if _approval_review(pr, api) is not None:
         return f"PR #{pr.number} already has a bot approval for {pr.head[0]}"
     api.post(
         f"/pulls/{pr.number}/reviews",
@@ -324,16 +320,24 @@ def _dismiss_approval(
     api: _GitHubAPI,
     *,
     include_exemption: bool = False,
+    stale_identity_only: bool = False,
 ) -> bool:
-    review = _approval_review(pr, api, approval_only=not include_exemption)
-    if review is None:
-        return False
-    review_id = _integer(review.get("id"), "review.id")
-    api.put(
-        f"/pulls/{pr.number}/reviews/{review_id}/dismissals",
-        {"message": "A newer Claude review attempt must succeed before merge."},
-    )
-    return True
+    dismissed = False
+    identity = _identity_marker(pr)
+    for value in _all_reviews(pr.number, api):
+        review = _object(value, "reviews[]")
+        if not _is_bridge_approval(review, pr, approval_only=not include_exemption):
+            continue
+        body = _string(review.get("body", ""), "review.body")
+        if stale_identity_only and identity in body:
+            continue
+        review_id = _integer(review.get("id"), "review.id")
+        api.put(
+            f"/pulls/{pr.number}/reviews/{review_id}/dismissals",
+            {"message": "A newer Claude review attempt must succeed before merge."},
+        )
+        dismissed = True
+    return dismissed
 
 
 def _approval_review(
@@ -341,19 +345,39 @@ def _approval_review(
 ) -> JsonObject | None:
     for value in _all_reviews(pr.number, api):
         review = _object(value, "reviews[]")
-        user = _object(review.get("user"), "review.user")
-        if (
-            _string(user.get("login"), "review.user.login") == _BOT_LOGIN
-            and _string(review.get("state"), "review.state") == "APPROVED"
-            and _string(review.get("commit_id"), "review.commit_id") == pr.head[0]
-            and (
-                (marker := _string(review.get("body", ""), "review.body").split(" ", 1)[0])
-                == _APPROVAL_MARKER
-                or (not approval_only and marker == _EXEMPTION_MARKER)
-            )
-        ):
+        if _is_bridge_approval(
+            review,
+            pr,
+            approval_only=approval_only,
+        ) and _identity_marker(pr) in _string(review.get("body", ""), "review.body"):
             return review
     return None
+
+
+def _is_bridge_approval(
+    review: JsonObject,
+    pr: _PullRequest,
+    *,
+    approval_only: bool,
+) -> bool:
+    user = _object(review.get("user"), "review.user")
+    marker = _string(review.get("body", ""), "review.body").split(" ", 1)[0]
+    return (
+        _string(user.get("login"), "review.user.login") == _BOT_LOGIN
+        and _string(review.get("state"), "review.state") == "APPROVED"
+        and _string(review.get("commit_id"), "review.commit_id") == pr.head[0]
+        and (marker == _APPROVAL_MARKER or (not approval_only and marker == _EXEMPTION_MARKER))
+    )
+
+
+def _identity_marker(pr: _PullRequest) -> str:
+    head_ref = quote(pr.head[1], safe="")
+    base_ref = quote(pr.base[1], safe="")
+    return (
+        f"[claude-review-identity] pr={pr.number} "
+        f"head={pr.head[2]}:{head_ref}:{pr.head[0]} "
+        f"base={pr.base[2]}:{base_ref}:{pr.base[0]}"
+    )
 
 
 def _all_reviews(number: int, api: _GitHubAPI) -> list[JsonValue]:
