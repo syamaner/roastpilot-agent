@@ -826,6 +826,9 @@ precedent: this is bean metadata, not a safety verdict, so it stays OUT of
 the enum surface the safety-reviewer escalation routes on."""
 
 
+_BEAN_DRAFT_BIDI_CONTROLS = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
 class BeanProfileDraft(_BeanProfileFieldsBase):
     """A drafted, NOT-YET-SAVED bean profile from add-bean-from-URL (#573 phase 1).
 
@@ -863,6 +866,23 @@ class BeanProfileDraft(_BeanProfileFieldsBase):
     default_bean_weight_grams: float = Field(gt=0)
     """The charge weight (grams) that would pre-fill a new roast's form if
     this draft is saved; adjustable per roast like every other profile."""
+
+    @field_validator(
+        "name",
+        "bean_origin",
+        "bean_varietal",
+        "country",
+        "farm",
+        "description",
+        "source_url",
+        mode="before",
+    )
+    @classmethod
+    def _strip_bidi_controls(cls, value: object) -> object:
+        """Remove non-content bidi controls from untrusted drafted identity text."""
+        if isinstance(value, str):
+            return _BEAN_DRAFT_BIDI_CONTROLS.sub("", value)
+        return value
 
     draft_attempt_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     """Opaque, one-use id joining this draft to an explicit later save.

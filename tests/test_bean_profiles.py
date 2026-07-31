@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from pydantic import ValidationError
 
 from roastpilot_agent import store as store_module
 from roastpilot_agent.config import AppConfig
@@ -262,6 +263,73 @@ async def test_v14_attempt_snapshot_excludes_url_evidence_and_prose(store: Roast
     assert "token=secret" not in snapshot
     assert "secret evidence quote" not in snapshot
     assert "private scouting prose" not in snapshot
+
+
+@pytest.mark.asyncio
+async def test_v14_bidi_controls_do_not_create_false_operator_corrections(
+    store: RoastStore,
+) -> None:
+    """Backend draft canonicalization keeps hostile formatting out of telemetry."""
+    controls = "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+    draft = _draft(
+        name=f"Colom{controls}bia washed",
+        bean_origin=f"Colom{controls}bia",
+        bean_varietal=f"Catur{controls}ra",
+        country=f"Colom{controls}bia",
+        farm=f"El Para{controls}iso",
+        description=f"Sweet and {controls}clean",
+        source_url=f"https://vendor.example/{controls}bean",
+    )
+    for field in (
+        "name",
+        "bean_origin",
+        "bean_varietal",
+        "country",
+        "farm",
+        "description",
+        "source_url",
+    ):
+        assert not any(control in str(getattr(draft, field)) for control in controls)
+    with pytest.raises(ValidationError):
+        _draft(name=123)
+
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="provider", model_slug="model", prompt_version="v1"
+    )
+    await store.finish_bean_sourcing_attempt(
+        attempt_id,
+        outcome="success",
+        latency_ms=1,
+        request_tokens=1,
+        response_tokens=1,
+        usage_evidence="exact",
+        timed_out_runs=0,
+        draft=draft,
+    )
+    async with store.connection.execute(
+        "SELECT draft_snapshot_json FROM bean_sourcing_attempts WHERE id = ?",
+        (attempt_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    snapshot = json.loads(str(row["draft_snapshot_json"]))
+    assert all(
+        not any(control in value for control in controls)
+        for value in snapshot.values()
+        if isinstance(value, str)
+    )
+
+    saved_input = BeanProfileInput.model_validate(
+        {field: getattr(draft, field) for field in BeanProfileInput.model_fields}
+    )
+    await store.create_bean_profile(saved_input, draft_attempt_id=attempt_id)
+    async with store.connection.execute(
+        "SELECT changed_fields_json FROM bean_sourcing_attempts WHERE id = ?",
+        (attempt_id,),
+    ) as cursor:
+        corrections = await cursor.fetchone()
+    assert corrections is not None
+    assert json.loads(str(corrections["changed_fields_json"])) == []
 
 
 @pytest.mark.asyncio
