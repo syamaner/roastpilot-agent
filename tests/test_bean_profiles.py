@@ -178,7 +178,7 @@ async def test_v14_orderly_shutdown_clear_retains_aggregate_telemetry(store: Roa
         draft=_draft(),
     )
 
-    assert await store.clear_unclaimed_bean_sourcing_drafts() == 1
+    assert await store.clear_unclaimed_bean_sourcing_drafts(owner_instance_id="direct-store") == 1
     async with store.connection.execute(
         "SELECT outcome, latency_ms, request_tokens, response_tokens,"
         " draft_snapshot_json, claim_expires_at_utc FROM bean_sourcing_attempts WHERE id = ?",
@@ -187,6 +187,52 @@ async def test_v14_orderly_shutdown_clear_retains_aggregate_telemetry(store: Roa
         row = await cursor.fetchone()
     assert row is not None
     assert tuple(row) == ("success", 12, 3, 4, None, None)
+
+
+@pytest.mark.asyncio
+async def test_v14_shutdown_clear_preserves_live_peer_draft(store: RoastStore) -> None:
+    """One service shutdown cannot invalidate another owner's live draft."""
+    attempt_ids: list[str] = []
+    for owner in ("stopping-owner", "live-peer"):
+        attempt_id = await store.start_bean_sourcing_attempt(
+            provider="provider",
+            model_slug="model",
+            prompt_version="v1",
+            owner_instance_id=owner,
+        )
+        await store.finish_bean_sourcing_attempt(
+            attempt_id,
+            outcome="success",
+            latency_ms=1,
+            request_tokens=1,
+            response_tokens=1,
+            usage_evidence="exact",
+            timed_out_runs=0,
+            draft=_draft(),
+        )
+        attempt_ids.append(attempt_id)
+
+    assert await store.clear_unclaimed_bean_sourcing_drafts(owner_instance_id="stopping-owner") == 1
+    async with store.connection.execute(
+        "SELECT id, draft_snapshot_json FROM bean_sourcing_attempts WHERE id IN (?, ?) ORDER BY id",
+        attempt_ids,
+    ) as cursor:
+        rows = {str(row["id"]): row["draft_snapshot_json"] for row in await cursor.fetchall()}
+    assert rows[attempt_ids[0]] is None
+    assert rows[attempt_ids[1]] is not None
+
+
+@pytest.mark.asyncio
+async def test_v14_shutdown_clear_is_idempotent_after_store_close(tmp_path: Path) -> None:
+    """Repeated service teardown does not reopen or mutate a closed store."""
+    closed_store = RoastStore(tmp_path / "closed.sqlite3")
+    await closed_store.initialize()
+    await closed_store.close()
+
+    assert (
+        await closed_store.clear_unclaimed_bean_sourcing_drafts(owner_instance_id="stopping-owner")
+        == 0
+    )
 
 
 @pytest.mark.asyncio

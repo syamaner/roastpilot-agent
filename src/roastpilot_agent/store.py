@@ -2351,8 +2351,12 @@ class RoastStore:
         await self.connection.commit()
         return cursor.rowcount
 
-    async def clear_unclaimed_bean_sourcing_drafts(self) -> int:
-        """Clear every unclaimed draft snapshot during orderly shutdown.
+    async def clear_unclaimed_bean_sourcing_drafts(self, *, owner_instance_id: str) -> int:
+        """Clear one service owner's unclaimed drafts during orderly shutdown.
+
+        Args:
+            owner_instance_id: The shutting-down service instance. A live peer's
+                drafts in the shared SQLite database are left untouched.
 
         Returns:
             The number of snapshots cleared. Aggregate attempt telemetry remains.
@@ -2362,7 +2366,8 @@ class RoastStore:
         cursor = await self._connection.execute(
             "UPDATE bean_sourcing_attempts SET draft_snapshot_json = NULL,"
             " claim_expires_at_utc = NULL WHERE saved_profile_id IS NULL"
-            " AND draft_snapshot_json IS NOT NULL"
+            " AND draft_snapshot_json IS NOT NULL AND owner_instance_id = ?",
+            (owner_instance_id,),
         )
         await self._connection.commit()
         return cursor.rowcount

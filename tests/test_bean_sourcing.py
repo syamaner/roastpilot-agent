@@ -3521,6 +3521,42 @@ async def test_extract_bean_identity_provider_named_estimate_is_unreported() -> 
 
 
 @pytest.mark.asyncio
+async def test_extract_bean_identity_trusts_supported_adapter_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Internally constructed adapters may contribute reported usage evidence."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        return ModelResponse(
+            parts=[ToolCallPart(info.output_tools[0].name, _identity_args())],
+            usage=RequestUsage(input_tokens=19, output_tokens=7),
+            provider_name="openai",
+        )
+
+    def fake_build_model(
+        config: AdvisorConfig,
+        *,
+        model_slug: str | None = None,
+        disable_transport_retries: bool = False,
+    ) -> Model:
+        del config, model_slug, disable_transport_retries
+        return FunctionModel(respond)
+
+    monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
+    diagnostics = bean_sourcing.BeanSourcingDiagnostics()
+    await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "page text",
+        advisor_config=_ADVISOR_CONFIG,
+        diagnostics=diagnostics,
+    )
+
+    assert (diagnostics.request_tokens, diagnostics.response_tokens) == (19, 7)
+    assert diagnostics.usage_reported_requests == 1
+    assert diagnostics.usage_unreported_requests == 0
+
+
+@pytest.mark.asyncio
 async def test_extract_bean_identity_token_usage_includes_the_retry_round_trip() -> None:
     """PydanticAI's own ``RunUsage`` already SUMS every request in the run, so a
     retry-recovered extraction's captured tokens include the retry round trip, not

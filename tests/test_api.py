@@ -4229,6 +4229,13 @@ async def test_create_bean_profile_claims_draft_header_once(
     )
     assert mismatch.status_code == 409
     assert mismatch.headers["X-RoastPilot-Conflict-Code"] == "draft_attempt_already_claimed"
+    unknown = await client.post(
+        "/api/bean-profiles",
+        json=_bean_input(name="Unknown attempt"),
+        headers={"X-RoastPilot-Draft-Attempt-Id": "0" * 32},
+    )
+    assert unknown.status_code == 409
+    assert "X-RoastPilot-Conflict-Code" not in unknown.headers
     malformed = await client.post(
         "/api/bean-profiles",
         json=_bean_input(name="Malformed"),
@@ -5142,7 +5149,10 @@ async def test_shutdown_clears_unclaimed_draft_snapshot(
 ) -> None:
     """#588: orderly shutdown removes a still-live correlation baseline."""
     attempt_id = await store.start_bean_sourcing_attempt(
-        provider="provider", model_slug="model", prompt_version="v1"
+        provider="provider",
+        model_slug="model",
+        prompt_version="v1",
+        owner_instance_id=service.instance_id,
     )
     await store.finish_bean_sourcing_attempt(
         attempt_id,

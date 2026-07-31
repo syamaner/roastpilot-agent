@@ -2003,7 +2003,7 @@ class RoastService:
             expiry_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await expiry_task
-        await self._store.clear_unclaimed_bean_sourcing_drafts()
+        await self._store.clear_unclaimed_bean_sourcing_drafts(owner_instance_id=self.instance_id)
 
     async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
         """Persist a marker if the MCP child stop went unconfirmed (#177).
