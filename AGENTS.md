@@ -204,7 +204,7 @@ clean.
   Required: the CI checks + `codecov/patch`,
   `required_conversation_resolution` (every review thread resolved), and
   `enforce_admins` (no bypass for owner or agents); force-push/deletion off; repo
-  auto-merge on. See the temporary Claude exception below. **`claude-review` is
+  auto-merge on. See the live PR-scoped Claude approval policy below. **`claude-review` is
   intentionally NOT a required check** — it fails by design on PRs that edit a
   workflow file (the App's workflow-validation guard) and on Dependabot PRs (no
   secrets), and it passes-on-findings; so the findings gate is its **inline
@@ -223,15 +223,17 @@ clean.
   every code push; Claude's inline findings remain separately gated by
   conversation resolution. A human approval satisfies GitHub's numeric platform
   rule but is an explicit operator override, not evidence that Claude ran.
-- **Activation state while #663 slice 1 is in flight.**
+- **Activation state — LIVE 31 Jul 2026 (#663 / D108-D118).**
   The live required status set is `Checks`, `Web (lint + typecheck + unit)`,
   `Web (Playwright snapshots)`, and `codecov/patch`, all app-pinned; strict mode,
   `required_conversation_resolution`, and `enforce_admins` remain enabled.
   Codecov ingestion recovered on 26 Jul and #646 restored its patch gate.
-  Slice 2 enables Actions approvals and the one-approval rule only after the
-  trusted bridge is present on `main` and live adversarial proofs pass. Until
-  then, the 25-Jul outage exception remains in force. Never restore enforcement
-  by re-requiring the known-unsafe SHA-scoped `review-gate`.
+  Actions keeps read-only default permissions with PR-review approval enabled;
+  `main` requires one approving review and dismisses stale approvals. The trusted
+  bridge is on `main`, and the live PR-scoping, draft/ready, stale-push, rerun,
+  privileged-override, ordinary-rejection, and exact-current-head proofs passed.
+  The 25-Jul outage exception is closed. Never restore enforcement by re-requiring
+  the known-unsafe SHA-scoped `review-gate`.
 - **Independent triage when work is delivered by an agent team (D23).** PR
   review feedback (the review roster below — **Claude Code Review** and any human
   reviewer — plus codecov and a `/review-branch` roster pass) is
@@ -342,13 +344,12 @@ checklist before you open.
 (`.github/workflows/claude-code-review.yml`, running `/code-review --comment`), the
 **Codex** connector, and any human reviewer follow this rubric. **CodeRabbit stays
 disabled (15 Jun) and the Augment Code trial ENDED (28 Jun).**
-Until #663 slice 2 activates D108, the temporary 25-Jul outage exception remains
-in force; applicable shift-left domain reviewers plus independent triage are the
-required replacement lenses.
+D108-D118 are active as of 31 Jul 2026. The temporary 25-Jul outage exception is
+closed; the PR-scoped approval, applicable shift-left domain reviewers, and
+independent triage are required lenses.
 
-**WAIT for Claude's PR-scoped approval before merging (D108 amended by D109-D111,
-after #663
-activation).** The required evidence is a `github-actions[bot]` approval whose
+**WAIT for Claude's PR-scoped approval before merging (D108 amended by D109-D118;
+active 31 Jul 2026).** The required evidence is a `github-actions[bot]` approval whose
 body starts `[claude-review-approval]` and embeds the exact repository/PR/head/base
 branch identity; the reviewed base-tip SHA remains audit metadata. On a base
 retarget, the bridge dismisses only older embedded identities,
