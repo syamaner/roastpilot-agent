@@ -4,7 +4,7 @@ on:
     workflows: ["Claude Code Review"]
     types: [in_progress, completed]
   pull_request_target:
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, ready_for_review, reopened, edited]
 permissions:
   contents: read
   pull-requests: write
@@ -26,6 +26,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_run' ||
       github.event.pull_request.user.login == 'dependabot[bot]' ||
+      github.event.action == 'ready_for_review' ||
       github.event.action == 'reopened' ||
       github.event.changes.base.ref.from != ''
     runs-on: ubuntu-latest

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol, cast
@@ -18,8 +19,8 @@ JsonObject = dict[str, JsonValue]
 _APPROVAL_MARKER = "[claude-review-approval]"
 _EXEMPTION_MARKER = "[claude-review-exempt]"
 _BOT_LOGIN = "github-actions[bot]"
-_WORKFLOW_FILE = "claude-code-review.yml"
 _WORKFLOW_PATH = ".github/workflows/claude-code-review.yml"
+_ASSOCIATION_REFRESH_DELAYS_SECONDS = (0.0, 1.0, 2.0)
 
 
 class _GitHubAPI(Protocol):
@@ -117,6 +118,18 @@ def process_event(event: JsonObject, api: _GitHubAPI) -> str:
 def _process_workflow_run(run: JsonObject, action: str, api: _GitHubAPI) -> str:
     if _string(run.get("path"), "workflow_run.path") != _WORKFLOW_PATH:
         return "review run has an unexpected workflow path; fail closed"
+    associated_run = _run_with_association(run, api)
+    if associated_run is None:
+        attempt = _integer(run.get("run_attempt", 1), "workflow_run.run_attempt")
+        run_id = _integer(run.get("id"), "workflow_run.id")
+        if action == "completed" and attempt == 1:
+            api.post(f"/actions/runs/{run_id}/rerun")
+            return (
+                f"review run {run_id} had no recoverable PR association; "
+                "re-run once; approval remains absent"
+            )
+        return "review run has no recoverable PR association; fail closed"
+    run = associated_run
     pr = _pull_request_for_run(run, api)
     if pr is None:
         return "no exact open pull request is associated with the review run; fail closed"
@@ -127,10 +140,10 @@ def _process_workflow_run(run: JsonObject, action: str, api: _GitHubAPI) -> str:
     run_id = _integer(run.get("id"), "workflow_run.id")
     attempt = _integer(run.get("run_attempt", 1), "workflow_run.run_attempt")
     incoming_order, newest_order = _run_order(run), _run_order(newest)
-    if incoming_order != newest_order:
+    if incoming_order < newest_order:
         return "review run is not the newest run for this PR/head; deferred"
     if action != "completed":
-        if newest.get("conclusion") == "success":
+        if incoming_order == newest_order and newest.get("conclusion") == "success":
             return "stale start event arrived after successful completion; ignored"
         state = "exact-head approval preserved" if existing_approval else "approval remains absent"
         return f"newest review run is {action}; {state}"
@@ -180,20 +193,51 @@ def _process_pull_request_target(
         if _approval_review(pr, api) is not None:
             return f"base branch changed{suffix}; fresh current-base approval preserved"
         return f"base branch changed{suffix}; fresh Claude review required"
-    if action not in {"opened", "synchronize", "reopened"}:
+    if action not in {"opened", "synchronize", "ready_for_review", "reopened"}:
         return f"pull_request_target action {action!r} does not require approval work"
     pr = _pull_request_from_payload(pr_payload)
     if pr.author == "dependabot[bot]":
         if _pull_request_edits_privileged_code(pr.number, api):
             return "privileged-code-editing PR requires an explicit maintainer approval"
         return _approve_dependabot(pr, api)
-    if action == "reopened":
+    if action in {"reopened", "ready_for_review"}:
         if _approval_review(pr, api) is not None:
-            return f"reopened PR #{pr.number} retains its exact-head approval"
+            return f"{action} PR #{pr.number} retains its exact-head approval"
         if _pull_request_edits_privileged_code(pr.number, api):
             return "privileged-code-editing PR requires an explicit maintainer approval"
-        return _rerun_latest_review(pr, api)
+        return f"{action} PR #{pr.number} waits for its automatically started Claude review"
     return "normal PR waits for its PR-scoped Claude review"
+
+
+def _run_with_association(run: JsonObject, api: _GitHubAPI) -> JsonObject | None:
+    if _array(run.get("pull_requests"), "workflow_run.pull_requests"):
+        return run
+    run_id = _integer(run.get("id"), "workflow_run.id")
+    for delay in _ASSOCIATION_REFRESH_DELAYS_SECONDS:
+        if delay:
+            time.sleep(delay)
+        refreshed = _object(api.get(f"/actions/runs/{run_id}"), f"workflow run {run_id}")
+        if not _same_run_identity(run, refreshed):
+            raise ValueError("refreshed workflow run identity changed")
+        if _array(refreshed.get("pull_requests"), "workflow_run.pull_requests"):
+            return refreshed
+    return None
+
+
+def _same_run_identity(left: JsonObject, right: JsonObject) -> bool:
+    return (
+        _integer(left.get("id"), "id") == _integer(right.get("id"), "id")
+        and _integer(left.get("workflow_id"), "workflow_id")
+        == _integer(right.get("workflow_id"), "workflow_id")
+        and _string(left.get("path"), "path") == _string(right.get("path"), "path")
+        and _string(left.get("head_sha"), "head_sha") == _string(right.get("head_sha"), "head_sha")
+        and _string(left.get("head_branch"), "head_branch")
+        == _string(right.get("head_branch"), "head_branch")
+        and _integer(left.get("run_number"), "run_number")
+        == _integer(right.get("run_number"), "run_number")
+        and _integer(left.get("run_attempt", 1), "run_attempt")
+        == _integer(right.get("run_attempt", 1), "run_attempt")
+    )
 
 
 def _pull_request_for_run(run: JsonObject, api: _GitHubAPI) -> _PullRequest | None:
@@ -224,7 +268,7 @@ def _newest_run_for_pull_request(
     )
     matches = _matching_runs_for_pull_request(response, pr)
     if not matches:
-        raise ValueError("no workflow run matched the exact pull request and head")
+        return run
     return max(matches, key=_run_order)
 
 
@@ -269,25 +313,6 @@ def _pull_request_edits_privileged_code(number: int, api: _GitHubAPI) -> bool:
     return len(values) == 100
 
 
-def _rerun_latest_review(pr: _PullRequest, api: _GitHubAPI) -> str:
-    encoded_workflow = quote(_WORKFLOW_FILE, safe="")
-    encoded_sha = quote(pr.head[0], safe="")
-    response = _object(
-        api.get(f"/actions/workflows/{encoded_workflow}/runs?head_sha={encoded_sha}&per_page=100"),
-        "workflow runs response",
-    )
-    matches = _matching_runs_for_pull_request(response, pr)
-    if not matches:
-        raise ValueError("no prior Claude review run matched the reopened pull request")
-    newest = max(matches, key=_run_order)
-    run_id = _integer(newest.get("id"), "run.id")
-    status = _string(newest.get("status"), "run.status")
-    if status != "completed":
-        return f"reopened PR #{pr.number} already has review run {run_id} {status}"
-    api.post(f"/actions/runs/{run_id}/rerun")
-    return f"reopened PR #{pr.number} re-ran Claude review run {run_id}"
-
-
 def _matching_runs_for_pull_request(
     response: JsonObject,
     pr: _PullRequest,
@@ -317,13 +342,33 @@ def _approve_dependabot(pr: _PullRequest, api: _GitHubAPI) -> str:
 
 
 def _approve(pr: _PullRequest, body: str, api: _GitHubAPI) -> str:
+    current = _load_pull_request(pr.number, api)
+    if not _same_approval_identity(pr, current):
+        return f"PR #{pr.number} identity changed before approval; approval remains absent"
     if _approval_review(pr, api) is not None:
         return f"PR #{pr.number} already has a bot approval for {pr.head[0]}"
-    api.post(
-        f"/pulls/{pr.number}/reviews",
-        {"body": body, "commit_id": pr.head[0], "event": "APPROVE"},
+    created = _object(
+        api.post(
+            f"/pulls/{pr.number}/reviews",
+            {"body": body, "commit_id": pr.head[0], "event": "APPROVE"},
+        ),
+        "created review",
     )
+    review_id = _integer(created.get("id"), "created review.id")
+    current = _load_pull_request(pr.number, api)
+    if not _same_approval_identity(pr, current):
+        api.put(
+            f"/pulls/{pr.number}/reviews/{review_id}/dismissals",
+            {"message": "The pull request identity changed while approval was published."},
+        )
+        return f"PR #{pr.number} identity changed after approval; new review dismissed"
     return f"approved PR #{pr.number} at {pr.head[0]}"
+
+
+def _same_approval_identity(left: _PullRequest, right: _PullRequest) -> bool:
+    return (
+        left.number == right.number and left.head == right.head and left.base[1:] == right.base[1:]
+    )
 
 
 def _dismiss_approval(

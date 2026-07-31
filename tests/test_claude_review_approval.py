@@ -15,16 +15,28 @@ import pytest
 class FakeAPI:
     """Deterministic GitHub API double."""
 
-    def __init__(self, responses: Mapping[str, approval.JsonValue]) -> None:
+    def __init__(
+        self,
+        responses: Mapping[str, approval.JsonValue],
+        *,
+        response_sequences: Mapping[str, list[approval.JsonValue]] | None = None,
+    ) -> None:
         """Initialize canned GET responses."""
 
         self.responses = dict(responses)
+        self.response_sequences = {
+            path: list(values) for path, values in (response_sequences or {}).items()
+        }
         self.posts: list[tuple[str, Mapping[str, approval.JsonValue] | None]] = []
         self.puts: list[tuple[str, Mapping[str, approval.JsonValue]]] = []
 
     def get(self, path: str) -> approval.JsonValue:
         """Return one canned GET response."""
 
+        if path in self.response_sequences:
+            return self.response_sequences[path].pop(0)
+        if path not in self.responses and path.startswith("/pulls/") and path.count("/") == 2:
+            return _pr_payload(number=int(path.rsplit("/", 1)[1]))
         return self.responses[path]
 
     def post(
@@ -35,6 +47,8 @@ class FakeAPI:
         """Record one POST."""
 
         self.posts.append((path, payload))
+        if path.endswith("/reviews"):
+            return {"id": 900}
         return {}
 
     def put(
@@ -201,6 +215,43 @@ def test_stale_head_run_fails_closed() -> None:
     assert api.posts == []
 
 
+def test_head_change_before_approval_prevents_post() -> None:
+    """A push before approval mutation cannot receive stale evidence."""
+
+    run = _run_payload()
+    original = _pr_payload()
+    changed = _pr_payload(sha="new-sha")
+    api = _workflow_api(run, pr=original)
+    api.response_sequences["/pulls/10"] = [original, changed]
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "PR #10 identity changed before approval; approval remains absent"
+    assert api.posts == []
+    assert api.puts == []
+
+
+def test_head_change_after_approval_dismisses_created_review() -> None:
+    """A push racing the approval POST causes immediate review dismissal."""
+
+    run = _run_payload()
+    original = _pr_payload()
+    changed = _pr_payload(sha="new-sha")
+    api = _workflow_api(run, pr=original)
+    api.response_sequences["/pulls/10"] = [original, original, changed]
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "PR #10 identity changed after approval; new review dismissed"
+    assert api.posts[0][0] == "/pulls/10/reviews"
+    assert api.puts == [
+        (
+            "/pulls/10/reviews/900/dismissals",
+            {"message": "The pull request identity changed while approval was published."},
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     ("side", "field", "value"),
     [
@@ -276,6 +327,74 @@ def test_ambiguous_pr_association_fails_closed() -> None:
     result = approval.process_event({"workflow_run": run}, api)
 
     assert result == "no exact open pull request is associated with the review run; fail closed"
+
+
+def test_empty_run_association_refreshes_from_trusted_run_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A temporarily empty event association recovers from the exact run."""
+
+    run = _run_payload()
+    empty = dict(run)
+    empty["pull_requests"] = []
+    api = _workflow_api(run)
+    api.responses["/actions/runs/100"] = run
+    monkeypatch.setattr(approval, "_ASSOCIATION_REFRESH_DELAYS_SECONDS", (0.0,))
+
+    result = approval.process_event({"workflow_run": empty}, api)
+
+    assert result == "approved PR #10 at abc123"
+    assert api.posts[0][0] == "/pulls/10/reviews"
+
+
+def test_persistently_empty_association_reruns_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing trusted association gets one bounded automatic recovery run."""
+
+    run = _run_payload()
+    run["pull_requests"] = []
+    api = FakeAPI({"/actions/runs/100": run})
+    monkeypatch.setattr(approval, "_ASSOCIATION_REFRESH_DELAYS_SECONDS", (0.0,))
+
+    result = approval.process_event({"action": "completed", "workflow_run": run}, api)
+
+    assert result == (
+        "review run 100 had no recoverable PR association; re-run once; approval remains absent"
+    )
+    assert api.posts == [("/actions/runs/100/rerun", None)]
+
+
+def test_persistently_empty_retry_association_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second association failure cannot loop reruns indefinitely."""
+
+    run = _run_payload(attempt=2)
+    run["pull_requests"] = []
+    api = FakeAPI({"/actions/runs/100": run})
+    monkeypatch.setattr(approval, "_ASSOCIATION_REFRESH_DELAYS_SECONDS", (0.0,))
+
+    result = approval.process_event({"action": "completed", "workflow_run": run}, api)
+
+    assert result == "review run has no recoverable PR association; fail closed"
+    assert api.posts == []
+
+
+def test_empty_association_rejects_changed_refreshed_run_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Association recovery cannot swap in metadata from another run."""
+
+    run = _run_payload()
+    run["pull_requests"] = []
+    changed = dict(run)
+    changed["head_sha"] = "different"
+    api = FakeAPI({"/actions/runs/100": changed})
+    monkeypatch.setattr(approval, "_ASSOCIATION_REFRESH_DELAYS_SECONDS", (0.0,))
+
+    with pytest.raises(ValueError, match="refreshed workflow run identity changed"):
+        approval.process_event({"action": "completed", "workflow_run": run}, api)
 
 
 def test_delayed_older_run_defers_to_newest_pr_run() -> None:
@@ -383,12 +502,29 @@ def test_new_attempt_preserves_same_head_approval_before_completion() -> None:
 
 
 @pytest.mark.parametrize(
-    ("action", "conclusion"),
-    [("in_progress", None), ("completed", "failure"), ("completed", "success")],
+    ("action", "conclusion", "expected"),
+    [
+        (
+            "in_progress",
+            None,
+            "newest review run is in_progress; exact-head approval preserved",
+        ),
+        (
+            "completed",
+            "failure",
+            "review conclusion 'failure' is not success; exact-head approval preserved",
+        ),
+        (
+            "completed",
+            "success",
+            "PR #10 already has a bot approval for abc123",
+        ),
+    ],
 )
 def test_new_attempt_preserves_when_run_inventory_is_stale(
     action: str,
     conclusion: str | None,
+    expected: str,
 ) -> None:
     """A newer event outranks an eventually-consistent old success inventory."""
 
@@ -413,7 +549,7 @@ def test_new_attempt_preserves_when_run_inventory_is_stale(
 
     assert api.puts == []
     assert api.posts == []
-    assert result == "review run is not the newest run for this PR/head; deferred"
+    assert result == expected
 
 
 def test_delayed_start_after_success_does_not_revoke_current_approval() -> None:
@@ -715,22 +851,22 @@ def test_normal_pr_waits_for_claude() -> None:
     assert api.posts == []
 
 
-@pytest.mark.parametrize("action", ["ready_for_review", "closed"])
-def test_lifecycle_toggle_does_not_reapprove_unchanged_head(action: str) -> None:
-    """Exact-head approval persists across non-code lifecycle toggles."""
+def test_closed_lifecycle_event_does_not_touch_approval() -> None:
+    """Closing a PR does not mutate review evidence."""
 
     api = FakeAPI({})
 
     result = approval.process_event(
-        {"action": action, "pull_request": _pr_payload()},
+        {"action": "closed", "pull_request": _pr_payload()},
         api,
     )
 
-    assert result == f"pull_request_target action {action!r} does not require approval work"
+    assert result == "pull_request_target action 'closed' does not require approval work"
 
 
-def test_reopened_pr_preserves_existing_exact_head_approval() -> None:
-    """Reopening reviewed bytes does not invalidate their exact-head approval."""
+@pytest.mark.parametrize("action", ["reopened", "ready_for_review"])
+def test_recovery_lifecycle_preserves_existing_exact_head_approval(action: str) -> None:
+    """Recovery transitions preserve valid evidence while starting additive review."""
 
     api = FakeAPI(
         {
@@ -747,64 +883,37 @@ def test_reopened_pr_preserves_existing_exact_head_approval() -> None:
     )
 
     result = approval.process_event(
-        {"action": "reopened", "pull_request": _pr_payload()},
+        {"action": action, "pull_request": _pr_payload()},
         api,
     )
 
-    assert result == "reopened PR #10 retains its exact-head approval"
+    assert result == f"{action} PR #10 retains its exact-head approval"
     assert api.posts == []
     assert api.puts == []
 
 
-def test_reopened_unapproved_pr_reruns_latest_exact_review() -> None:
-    """A reopened PR without approval automatically restarts its exact review."""
+@pytest.mark.parametrize("action", ["reopened", "ready_for_review"])
+def test_unapproved_recovery_lifecycle_waits_for_automatic_review(action: str) -> None:
+    """Lifecycle recovery needs no prior run history or bridge-side dispatch."""
 
-    run = _run_payload(run_id=101, run_number=21)
     api = FakeAPI(
         {
             "/pulls/10/reviews?per_page=100&page=1": [],
             "/pulls/10/files?per_page=100": [],
-            ("/actions/workflows/claude-code-review.yml/runs?head_sha=abc123&per_page=100"): {
-                "workflow_runs": [run]
-            },
         }
     )
 
     result = approval.process_event(
-        {"action": "reopened", "pull_request": _pr_payload()},
+        {"action": action, "pull_request": _pr_payload()},
         api,
     )
 
-    assert result == "reopened PR #10 re-ran Claude review run 101"
-    assert api.posts == [("/actions/runs/101/rerun", None)]
-
-
-def test_reopened_pr_with_active_review_does_not_duplicate_it() -> None:
-    """A queued or running exact review is recovery already in progress."""
-
-    run = _run_payload(run_id=102, run_number=22)
-    run["status"] = "in_progress"
-    run["conclusion"] = None
-    api = FakeAPI(
-        {
-            "/pulls/10/reviews?per_page=100&page=1": [],
-            "/pulls/10/files?per_page=100": [],
-            ("/actions/workflows/claude-code-review.yml/runs?head_sha=abc123&per_page=100"): {
-                "workflow_runs": [run]
-            },
-        }
-    )
-
-    result = approval.process_event(
-        {"action": "reopened", "pull_request": _pr_payload()},
-        api,
-    )
-
-    assert result == "reopened PR #10 already has review run 102 in_progress"
+    assert result == f"{action} PR #10 waits for its automatically started Claude review"
     assert api.posts == []
 
 
-def test_reopened_privileged_edit_never_reruns_untrusted_review() -> None:
+@pytest.mark.parametrize("action", ["reopened", "ready_for_review"])
+def test_privileged_recovery_lifecycle_never_trusts_review(action: str) -> None:
     """Workflow or bridge edits still require the recorded maintainer path."""
 
     api = FakeAPI(
@@ -815,32 +924,12 @@ def test_reopened_privileged_edit_never_reruns_untrusted_review() -> None:
     )
 
     result = approval.process_event(
-        {"action": "reopened", "pull_request": _pr_payload()},
+        {"action": action, "pull_request": _pr_payload()},
         api,
     )
 
     assert result == "privileged-code-editing PR requires an explicit maintainer approval"
     assert api.posts == []
-
-
-def test_reopened_pr_without_prior_run_fails_closed() -> None:
-    """Missing review history is visible failure, never silent approval."""
-
-    api = FakeAPI(
-        {
-            "/pulls/10/reviews?per_page=100&page=1": [],
-            "/pulls/10/files?per_page=100": [],
-            ("/actions/workflows/claude-code-review.yml/runs?head_sha=abc123&per_page=100"): {
-                "workflow_runs": []
-            },
-        }
-    )
-
-    with pytest.raises(ValueError, match="no prior Claude review run matched"):
-        approval.process_event(
-            {"action": "reopened", "pull_request": _pr_payload()},
-            api,
-        )
 
 
 def test_base_retarget_dismisses_approval_for_fresh_review() -> None:
@@ -1195,24 +1284,25 @@ def test_workflows_serialize_bridge_and_review_only_base_edits() -> None:
     bridge = (root / ".github/workflows/claude-review-approval.yml").read_text(encoding="utf-8")
     reviewer = (root / ".github/workflows/claude-code-review.yml").read_text(encoding="utf-8")
 
-    assert "types: [opened, synchronize, reopened, edited]" in bridge
+    assert "types: [opened, synchronize, ready_for_review, reopened, edited]" in bridge
     assert "claude-review-approval-${{" in bridge
     assert "github.event.workflow_run.head_sha ||" in bridge
     assert "github.event.pull_request.head.sha ||" in bridge
     assert "cancel-in-progress: false" in bridge
     assert "run: python3 -I scripts/claude_review_approval.py" in bridge
-    assert "types: [opened, synchronize, edited]" in reviewer
+    assert "types: [opened, synchronize, ready_for_review, reopened, edited]" in reviewer
     assert "github.event.changes.base.ref.from != ''" in reviewer
 
 
-def test_missing_matching_runs_raises() -> None:
-    """A malformed run inventory fails closed."""
+def test_missing_matching_inventory_uses_authoritative_incoming_event() -> None:
+    """A lagging inventory cannot permanently defer exact incoming success."""
 
     run = _run_payload()
     api = _workflow_api(run, runs=[_run_payload(number=11)])
 
-    with pytest.raises(ValueError, match="no workflow run matched"):
-        approval.process_event({"workflow_run": run}, api)
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "approved PR #10 at abc123"
 
 
 @pytest.mark.parametrize(
@@ -1305,7 +1395,7 @@ def test_main_processes_event(
 
     event_path = tmp_path / "event.json"
     event_path.write_text(
-        json.dumps({"action": "ready_for_review", "pull_request": _pr_payload()}),
+        json.dumps({"action": "closed", "pull_request": _pr_payload()}),
         encoding="utf-8",
     )
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))

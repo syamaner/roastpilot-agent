@@ -211,7 +211,7 @@ clean.
   comments** (`--comment`) + conversation-resolution, not the check itself. Don't
   re-add it as required (it would deadlock workflow PRs). Green CI alone never
   means mergeable.
-- **PR-scoped Claude restoration (#663 / D108-D110; activation follows the mechanism
+- **PR-scoped Claude restoration (#663 / D108-D111; activation follows the mechanism
   PR).** `review-gate` remains permanently retired: commit statuses cannot prove
   PR-specific review coverage, distinguish two PRs sharing a head SHA, or bind a
   draft review to the intended PR generation. The trusted
@@ -346,7 +346,7 @@ Until #663 slice 2 activates D108, the temporary 25-Jul outage exception remains
 in force; applicable shift-left domain reviewers plus independent triage are the
 required replacement lenses.
 
-**WAIT for Claude's PR-scoped approval before merging (D108 amended by D109/D110,
+**WAIT for Claude's PR-scoped approval before merging (D108 amended by D109-D111,
 after #663
 activation).** The required evidence is a `github-actions[bot]` approval whose
 body starts `[claude-review-approval]` and embeds the exact repository/PR/head/base
@@ -361,10 +361,10 @@ Dependabot PRs. Operate the gate as follows:
   and automatically starts a fresh review; do not manually re-trigger between
   ordinary fix pushes.
 - A Claude draft approval remains valid when the same head is marked ready or
-  reopened. Reopening an unapproved PR reruns its newest exact PR/head/base
-  review (or leaves an already-active run alone), so a close/reopen cycle cannot
-  strand the PR without evidence. This does not waive the separate post-ready
-  Codex wait below.
+  reopened. Both lifecycle events also start a fresh additive Claude run, so a
+  failed or missing draft/closed-phase run cannot strand an unapproved PR.
+  Existing same-identity evidence stays valid under D109. This does not waive
+  the separate post-ready Codex wait below.
 - Retargeting the base branch can expand the effective diff without changing
   the head SHA. A base edit dismisses the bridge approval and starts a fresh
   Claude review; title/body-only edits do neither.
@@ -388,6 +388,18 @@ Dependabot PRs. Operate the gate as follows:
   service or infrastructure error, re-run the failed Actions job after recovery
   and wait again. Failure, timeout, action-required, repeated cancellation,
   stale/ambiguous PR association, or silence never receives a timeout bypass.
+- A successful incoming run newer than an eventually-consistent run inventory
+  is authoritative exact-identity evidence; only an inventory entry newer than
+  the incoming event defers it. If `workflow_run.pull_requests` is temporarily
+  empty, the bridge boundedly refreshes that exact run and reruns the first
+  attempt once if association remains absent; ambiguity or a repeated absence
+  still fails closed.
+- Approval publication revalidates the live PR identity immediately before and
+  after the mutation, dismissing the just-created review if the identity moved.
+  This is not a REST transaction: slice-2 activation must live-prove that GitHub
+  never counts an approval bound to a non-current commit, alongside strict mode
+  and stale-review dismissal. If that adversarial proof fails, do not activate
+  this design.
 - Dependabot receives a labelled `[claude-review-exempt]` approval from trusted
   default-branch code. A PR editing either a workflow or the privileged bridge
   helper can alter the approval path itself, so its apparent success is never

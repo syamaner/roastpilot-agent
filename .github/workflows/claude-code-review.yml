@@ -4,7 +4,7 @@ on:
   pull_request:
     # Base retargeting can expand the effective diff without changing the head
     # SHA. The job-level condition below ignores title/body-only edits.
-    types: [opened, synchronize, edited]
+    types: [opened, synchronize, ready_for_review, reopened, edited]
     # Optional: Only run on specific file changes
     # paths:
     #   - "src/**/*.ts"
