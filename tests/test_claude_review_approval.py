@@ -1549,7 +1549,9 @@ def test_workflows_serialize_bridge_and_review_only_base_edits() -> None:
     assert "cancel-in-progress: false" in bridge
     assert "run: python3 -I scripts/claude_review_approval.py" in bridge
     assert "types: [opened, synchronize, ready_for_review, reopened, edited]" in reviewer
-    assert "github.event.changes.base.ref.from != ''" in reviewer
+    assert "github.event.pull_request.user.login != 'dependabot[bot]'" in reviewer
+    assert "github.event.action != 'edited'" not in reviewer
+    assert "github.event.changes.base.ref.from" not in reviewer
 
 
 def test_missing_matching_inventory_uses_authoritative_incoming_event() -> None:

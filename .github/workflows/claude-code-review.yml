@@ -3,7 +3,8 @@ name: Claude Code Review
 on:
   pull_request:
     # Base retargeting can expand the effective diff without changing the head
-    # SHA. The job-level condition below ignores title/body-only edits.
+    # SHA. Metadata edits also run: GitHub orders the workflow before evaluating
+    # job conditions, so a skipped run could cancel and supersede real evidence.
     types: [opened, synchronize, ready_for_review, reopened, edited]
     # Optional: Only run on specific file changes
     # paths:
@@ -29,9 +30,7 @@ jobs:
     # and the action fails. Dependency bumps don't need a Claude code review —
     # CI + codecov cover them. (claude-review is not a required check, so a
     # Dependabot PR is never blocked; this just removes the spurious red X.)
-    if: >-
-      github.actor != 'dependabot[bot]' &&
-      (github.event.action != 'edited' || github.event.changes.base.ref.from != '')
+    if: ${{ github.event.pull_request.user.login != 'dependabot[bot]' }}
 
     runs-on: ubuntu-latest
     permissions:

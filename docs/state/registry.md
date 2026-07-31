@@ -50,7 +50,7 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D113** (D112 is in focused plan follow-up).
+> Next free plan decision number: **D114** (D113 is in focused plan follow-up).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 27 Jul block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
@@ -197,6 +197,9 @@ retarget invalidates stale evidence without a delayed retarget handler
 dismissing fresh current-base evidence;
 draft approval survives ready/reopen when the bytes do not change, while both
 lifecycle events start a fresh additive review so failed/missing history recovers.
+Every normal-PR metadata edit likewise starts an additive review because GitHub
+orders its workflow run before job conditions; only a base retarget dismisses
+identity-bound evidence. Dependabot exclusion follows PR authorship.
 An exact incoming run newer than stale inventory is authoritative; temporarily
 empty run association receives bounded exact-run refresh plus one retry. Approval
 publication revalidates identity before and after POST and dismisses a raced review

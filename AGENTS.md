@@ -367,7 +367,11 @@ Dependabot PRs. Operate the gate as follows:
   the separate post-ready Codex wait below.
 - Retargeting the base branch can expand the effective diff without changing
   the head SHA. A base edit dismisses the bridge approval and starts a fresh
-  Claude review; title/body-only edits do neither.
+  Claude review. Every normal-PR title/body edit also starts a same-identity
+  additive review because GitHub creates and orders the workflow run before
+  evaluating job conditions; skipping that job could cancel and supersede the
+  real review. Metadata edits do not dismiss current evidence or change
+  identity. Dependabot exclusion follows PR authorship, not the editing actor.
 - An ordinary base-tip advance does not invalidate approval by itself. Strict
   branch protection prevents the now-behind head from merging until it is
   updated; that head change dismisses approval and starts fresh review. Strict
