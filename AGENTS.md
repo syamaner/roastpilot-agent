@@ -211,20 +211,27 @@ clean.
   comments** (`--comment`) + conversation-resolution, not the check itself. Don't
   re-add it as required (it would deadlock workflow PRs). Green CI alone never
   means mergeable.
-- **Temporary Claude outage state (25 Jul 2026, operator-authorized).**
-  `review-gate` is temporarily NOT required after the SHA-scoped suspension
-  experiment #662 was closed unmerged: commit statuses cannot prove PR-specific
-  review coverage or atomically invalidate a draft review on `ready_for_review`.
+- **PR-scoped Claude restoration (#663 / D108-D111; activation follows the mechanism
+  PR).** `review-gate` remains permanently retired: commit statuses cannot prove
+  PR-specific review coverage, distinguish two PRs sharing a head SHA, or bind a
+  draft review to the intended PR generation. The trusted
+  `claude-review-approval` workflow instead posts an exact-commit approval on the
+  exact PR after an exact-identity Claude workflow run succeeds. That approval
+  is monotonic while repository, PR, head, and base branch remain unchanged: later
+  same-head attempts add evidence but cannot revoke already-valid evidence. Branch
+  protection then requires one approving review and dismisses stale approvals on
+  every code push; Claude's inline findings remain separately gated by
+  conversation resolution. A human approval satisfies GitHub's numeric platform
+  rule but is an explicit operator override, not evidence that Claude ran.
+- **Activation state while #663 slice 1 is in flight.**
   The live required status set is `Checks`, `Web (lint + typecheck + unit)`,
   `Web (Playwright snapshots)`, and `codecov/patch`, all app-pinned; strict mode,
   `required_conversation_resolution`, and `enforce_admins` remain enabled.
   Codecov ingestion recovered on 26 Jul and #646 restored its patch gate.
-  Until #663 delivers a genuinely PR-scoped gate, Claude is optional and must
-  not be waited on; the exact-head Codex trigger/wait/triage protocol (including
-  its bounded silent/stalled fallback) and independent lead/`pr-triage`
-  adjudication remain mandatory before merge.
-  Restore automated review enforcement only through #663, never by re-requiring
-  the known-unsafe SHA-scoped `review-gate`.
+  Slice 2 enables Actions approvals and the one-approval rule only after the
+  trusted bridge is present on `main` and live adversarial proofs pass. Until
+  then, the 25-Jul outage exception remains in force. Never restore enforcement
+  by re-requiring the known-unsafe SHA-scoped `review-gate`.
 - **Independent triage when work is delivered by an agent team (D23).** PR
   review feedback (the review roster below — **Claude Code Review** and any human
   reviewer — plus codecov and a `/review-branch` roster pass) is
@@ -275,12 +282,12 @@ checklist before you open.
   must be replanned; a justified cohesive diff may proceed. **Pure-deletion accounting
   (operator ruling, 21 Jul — #623):** deletions of an atomically-retired unit are
   excluded from the estimate — a retired unit cannot always be split without dead-code
-  scaffolding that worsens review. **Pure-deletion PRs
-  deadlock on the app-pinned `codecov/patch`** (zero coverable lines → codecov
-  posts no status; a hand-posted status is rejected at merge — #624/#625): fold
-  an atomic retirement WITH the logic that replaces it rather than opening a
-  deletion-only PR (`codecov.yml` carries a best-effort `if_not_found: success`,
-  unverified until the next such PR).
+  scaffolding that worsens review. A zero-Python/zero-coverable diff receives a
+  normal app-pinned `codecov/patch` success when the upload is authenticated
+  (live-proved by #676/#678); do not manufacture replacement logic merely to
+  create coverable lines. Dependabot #675 also received a normal patch success
+  after its public-repository tokenless upload; #677's reported credential-store
+  deadlock was therefore a timing misdiagnosis, not an activation prerequisite.
 - **Shift review LEFT — mandatory, not optional.** Before opening: run all gates +
   an adversarial self-critique, AND run the domain reviewer on the BRANCH
   (`safety-reviewer` for safety/controller/enum/recovery, `qa` for tests) and
@@ -335,8 +342,106 @@ checklist before you open.
 (`.github/workflows/claude-code-review.yml`, running `/code-review --comment`), the
 **Codex** connector, and any human reviewer follow this rubric. **CodeRabbit stays
 disabled (15 Jun) and the Augment Code trial ENDED (28 Jun).**
-During the temporary 25-Jul outage above, Claude drops from this roster; the applicable
-shift-left domain reviewer plus independent triage are the required replacement lenses.
+Until #663 slice 2 activates D108, the temporary 25-Jul outage exception remains
+in force; applicable shift-left domain reviewers plus independent triage are the
+required replacement lenses.
+
+**WAIT for Claude's PR-scoped approval before merging (D108 amended by D109-D111,
+after #663
+activation).** The required evidence is a `github-actions[bot]` approval whose
+body starts `[claude-review-approval]` and embeds the exact repository/PR/head/base
+branch identity; the reviewed base-tip SHA remains audit metadata. On a base
+retarget, the bridge dismisses only older embedded identities,
+so a fresh current-base approval survives either event ordering. The raw
+`claude-review` check is diagnostic, not the required primitive: it passes when
+Claude posts findings and legitimately cannot run for workflow-editing or
+Dependabot PRs. Operate the gate as follows:
+
+- Opening a normal PR starts Claude. A code push dismisses the prior approval
+  and automatically starts a fresh review; do not manually re-trigger between
+  ordinary fix pushes.
+- A Claude draft approval remains valid when the same head is marked ready or
+  reopened. Both lifecycle events also start a fresh additive Claude run, so a
+  failed or missing draft/closed-phase run cannot strand an unapproved PR.
+  Existing same-identity evidence stays valid under D109. This does not waive
+  the separate post-ready Codex wait below.
+- Retargeting the base branch can expand the effective diff without changing
+  the head SHA. A base edit dismisses the bridge approval and starts a fresh
+  Claude review. Every normal-PR title/body edit also starts a same-identity
+  additive review because GitHub creates and orders the workflow run before
+  evaluating job conditions; skipping that job could cancel and supersede the
+  real review. Metadata edits do not dismiss current evidence or change
+  identity. Dependabot exclusion follows PR authorship, not the editing actor.
+- An ordinary base-tip advance does not invalidate approval by itself. Strict
+  branch protection prevents the now-behind head from merging until it is
+  updated; that head change dismisses approval and starts fresh review. Strict
+  mode, stale-review dismissal, admin enforcement, and disabled protected-base
+  force-push/deletion are load-bearing activation invariants.
+- Read and independently triage every Claude comment. Fixes produce a new head
+  and therefore require a fresh successful run; resolved threads alone never
+  revive a stale approval.
+- Same-head reruns are additive: an existing exact repository/PR/head/base
+  approval survives later starts, failures, cancellations, and out-of-order
+  delivery because the reviewed bytes have not changed. If a rerun is intended
+  to replace that evidence, record the reason, ensure auto-merge is not armed,
+  dismiss the approval first, and only then dispatch the rerun. Once dismissed,
+  the dismissal starts a durable evidence epoch: approval bodies carry a
+  versioned workflow/run-number/attempt order, and only a strictly newer run
+  may approve. Missing or malformed current-identity tombstone order fails
+  closed. The replacement attempt must succeed. An intentionally started rerun must
+  still finish and have its findings independently triaged before merge.
+  Bridge handlers deliberately run without workflow concurrency: GitHub may
+  replace a pending same-group run even when cancellation is disabled, so
+  serialization could discard a base-retarget reconciliation event. Identity
+  checks, tombstones, pagination, and idempotency make concurrent/out-of-order
+  handlers safe. The bridge reruns a first cancelled attempt once; for a
+  service or infrastructure error, re-run the failed Actions job after recovery
+  and wait again. Failure, timeout, action-required, repeated cancellation,
+  stale/ambiguous PR association, or silence never receives a timeout bypass.
+- A successful incoming run newer than an eventually-consistent run inventory
+  is authoritative exact-identity evidence; only an inventory entry newer than
+  the incoming event defers it. If `workflow_run.pull_requests` is temporarily
+  empty, the bridge boundedly refreshes that exact run and reruns the first
+  attempt once if association remains absent; ambiguity or a repeated absence
+  still fails closed.
+- Approval publication is two-phase: create a non-counting pending review,
+  revalidate identity and the dismissal epoch, then submit the known review as
+  `APPROVE`. An indeterminate create can leave only pending evidence; an
+  exact full-body/run pending review is adopted and resumed; different-run
+  current-identity pending work is never deleted by a concurrent handler.
+  Pending reviews are snapshotted before the live PR is reloaded; only
+  superseded-head/base evidence in that snapshot is deleted, and the stale
+  handler aborts so it cannot delete later-created current work. Known owned
+  pending reviews are deleted on pre-submit identity or epoch abort. An indeterminate
+  submit is state-checked: exact approved evidence continues to validation,
+  while exact pending evidence is retained for an explicit retry.
+  The bridge revalidates identity and the dismissal epoch again after
+  submission, dismissing the just-created review if either moved or validation
+  fails. Cleanup failure is an explicit
+  activation blocker requiring operator audit. Retarget handlers snapshot all
+  bridge reviews before reloading the live PR, then reconcile only that
+  immutable snapshot against the live identity. Stale approved/pending evidence
+  is removed and live-identity evidence is preserved, including A-to-B-to-A
+  cycles; evidence created after the snapshot is never touched.
+  GitHub review bodies are nullable; scanners normalize only `null` to empty
+  text before marker filtering. A missing `body` member or any other non-string
+  value remains a strict input error.
+  This is not a REST transaction: slice-2 activation must live-prove that GitHub
+  never counts an approval bound to a non-current commit, alongside strict mode
+  and stale-review dismissal. If that adversarial proof fails, do not activate
+  this design.
+- Dependabot receives only a labelled `[claude-review-exempt]` approval from
+  trusted default-branch code, regardless of whether `pull_request_target` or
+  a skipped reviewer `workflow_run` arrives first. Any false normal bridge
+  evidence is dismissed; privileged Dependabot edits lose all automated
+  evidence and require a maintainer. A PR editing either a workflow or the privileged bridge
+  helper can alter the approval path itself, so its apparent success is never
+  trusted and it requires an explicit maintainer approval with the reason
+  recorded. Neither path executes PR code with the bridge token. CI, codecov,
+  exact-head Codex, conversation resolution, and independent-triage
+  requirements remain unchanged.
+- A human approval is not a silent substitute. If the operator deliberately
+  overrides Claude, record the reason in the PR before merge.
 
 **Codex (`chatgpt-codex-connector[bot]`) was RE-ENABLED 30 Jun** after its 15-Jun
 disable, because on real PRs it catches bugs the other lenses miss (on the Config UI

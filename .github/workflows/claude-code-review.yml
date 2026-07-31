@@ -2,7 +2,10 @@ name: Claude Code Review
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
+    # Base retargeting can expand the effective diff without changing the head
+    # SHA. Metadata edits also run: GitHub orders the workflow before evaluating
+    # job conditions, so a skipped run could cancel and supersede real evidence.
+    types: [opened, synchronize, ready_for_review, reopened, edited]
     # Optional: Only run on specific file changes
     # paths:
     #   - "src/**/*.ts"
@@ -27,7 +30,7 @@ jobs:
     # and the action fails. Dependency bumps don't need a Claude code review —
     # CI + codecov cover them. (claude-review is not a required check, so a
     # Dependabot PR is never blocked; this just removes the spurious red X.)
-    if: ${{ github.actor != 'dependabot[bot]' }}
+    if: ${{ github.event.pull_request.user.login != 'dependabot[bot]' }}
 
     runs-on: ubuntu-latest
     permissions:
@@ -116,4 +119,3 @@ jobs:
           prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-

@@ -40,7 +40,7 @@
 > wired into the `review-branch` roster (#598/#678); **#680** tracks two fail-opens
 > found in that workflow post-merge. Claude Code Review remains **optional** under the
 > 25-Jul outage exception; its replacement is **#663 / D108**, in flight as draft
-> PR #679 with four unresolved P1/P2 findings and companion plan PR #16.
+> PR #679; the exact-head follow-up is implementing two P1 findings under D112.
 >
 > **Milestone reality.** M1 build continues; the "July 2026 harness complete" and
 > "first supervised hardware session in June" targets below are historical. E11
@@ -50,7 +50,7 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D109** (D108 is in draft plan PR #16).
+> Next free plan decision number: **D118** (D117 is in focused plan follow-up).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 27 Jul block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
@@ -162,10 +162,11 @@
 
 ## Active Context
 
-**25 Jul 2026 — TEMPORARY CLAUDE REVIEW OUTAGE; SHA-scoped `review-gate`
-unrequired, PR-scoped replacement tracked in #663 (D103).** Operator authorized
-Claude Code Review to be optional during the service outage. Shift-left security,
-QA, and independent triage rejected draft PR #662's attempted suspension protocol:
+**27 Jul 2026 — CLAUDE RESTORATION IN PROGRESS; PR-scoped approval mechanism is
+slice 1 of #663 (D108), activation remains slice 2.** The 25-Jul operator-authorized
+outage exception remains active until the replacement is merged and live-proved.
+Shift-left security, QA, and independent triage rejected draft PR #662's attempted
+suspension protocol:
 GitHub commit statuses are SHA-scoped while review findings and conversation
 resolution are PR-scoped; two PRs may share a SHA, a draft success can remain
 visible during `ready_for_review`, and `concurrency.queue: max` serializes without
@@ -174,14 +175,72 @@ fail-open gate. Live `main` protection was then verified after removing only
 `review-gate`: required status checks are `Checks`, `Web (lint + typecheck + unit)`,
 `Web (Playwright snapshots)`, and `codecov/patch`, all app-pinned; strict mode,
 `required_conversation_resolution`, and `enforce_admins` remain enabled. Codecov
-ingestion recovered on 26 Jul and #646 restored its patch gate. Merge policy still
-requires full
+ingestion recovered on 26 Jul and #646 restored its patch gate. #676 and #678
+then live-proved that authenticated zero-Python diffs receive a normal
+`codecov/patch` check-run. Dependabot #675 also received `codecov/patch` SUCCESS
+at 11:54:20 after its tokenless public-repository upload completed at 11:53:33;
+#677's apparent permanent deadlock was a timing misdiagnosis and is not an
+activation prerequisite. Merge policy still requires full
 local gates, applicable local domain reviewers, an exact-head authenticated
 Codex trigger/wait/triage pass (including the documented bounded silent/stalled
-fallback), and independent lead/`pr-triage` adjudication; do not wait for Claude.
-**Restoration is #663:** evaluate and live-prove a genuinely PR-scoped merge
-primitive, including same-SHA/different-PR and draft→ready cases, before restoring
-automated review enforcement. Board: #663 = Todo / M1 / P2 later.
+fallback), and independent lead/`pr-triage` adjudication.
+**Restoration design (D108 amended by D109-D117):** retire the SHA status and use a trusted
+default-branch bridge to turn a successful exact-PR/head/base Claude run into
+an exact-commit PR approval. That evidence is monotonic for unchanged identity:
+later same-head runs are additive and cannot revoke it; an intentional replacement
+requires recording the reason, preventing auto-merge, dismissing first, and only
+then rerunning. That dismissal creates a durable exact-identity evidence epoch:
+approval bodies carry versioned workflow/run-number/attempt order, and only a
+strictly newer run may approve. Approval/exemption bodies embed the full PR/head/base-branch
+identity and retain the reviewed base-tip SHA as audit metadata. A push or base
+retarget invalidates stale evidence. Retarget reconciliation snapshots bridge
+reviews before reloading the live PR, removes stale identities only from that
+snapshot, and preserves the live identity. This handles delayed A-to-B-to-C and
+A-to-B-to-A delivery without touching evidence created after the snapshot;
+draft approval survives ready/reopen when the bytes do not change, while both
+lifecycle events start a fresh additive review so failed/missing history recovers.
+Every normal-PR metadata edit likewise starts an additive review because GitHub
+orders its workflow run before job conditions; only a base retarget dismisses
+identity-bound evidence. Dependabot exclusion follows PR authorship.
+An exact incoming run newer than stale inventory is authoritative; temporarily
+empty run association receives bounded exact-run refresh plus one retry. Approval
+publication creates a non-counting pending review, revalidates identity and the
+dismissal epoch, submits the known review as `APPROVE`, then revalidates both
+again. Lost create responses cannot publish active evidence; exact full-body/run
+pending evidence is adopted and resumed, while different-run pending work is
+never deleted by a concurrent handler. Pending reviews are snapshotted before
+the live PR is reloaded; only superseded-head/base evidence in that snapshot is
+deleted and the stale handler aborts, so later-created current work is safe.
+Known owned pending evidence is deleted on pre-submit identity or epoch abort.
+Lost submit responses are state-checked:
+exact approved evidence proceeds to validation and exact pending evidence is
+retained for explicit retry. Any raced approval is dismissed; cleanup or
+validation failure blocks activation pending operator audit.
+GitHub review `body` is nullable; collection scanners normalize only `null` to
+empty text before marker filtering. A missing member or any other non-string
+value remains malformed and fails closed.
+Bridge handlers run without workflow concurrency because GitHub can replace a
+pending same-group event; their identity checks and tombstones are deliberately
+order-safe. JSON mutations declare their media type. Dependabot author routing
+is enforced in both event channels, removes false normal evidence, and leaves
+privileged changes for explicit maintainer approval.
+Because REST cannot make that sequence atomic, slice 2 must live-prove that an
+approval bound to a non-current commit never satisfies merge; failed proof blocks
+activation. Dependabot uses a trusted labelled
+exemption, while workflow or privileged-helper edits require an explicit recorded
+maintainer approval because their upstream review result is untrusted. Slice 1 ships the mechanism and operating policy
+without changing protection. Slice 2 enables Actions approvals plus one required
+approval only after live same-SHA/different-PR, draft→ready, stale-push, rerun,
+and workflow-exemption proofs. Claude's draft approval survives a no-code ready
+transition, but Codex independently re-reviews that transition: mark ready before
+the final Codex round and accept only a fully-paginated, bot-authenticated
+exact-head verdict posted after ready. Board: #663 = In Progress / M1 / P2. The
+broader month-stale registry refresh remains a separate doc-only slice; this
+entry records only state that changes #663.
+Strict required-status mode, stale-review dismissal, admin enforcement, and
+disabled protected-base force-push/deletion are load-bearing for D110: a normal
+base-tip advance cannot merge a behind head, and the required head update
+dismisses approval and starts fresh review.
 
 **25 Jul 2026 — #665 MCP/pytest shutdown hardening completed (D104).** Three CI runs reached
 the complete pytest summary and then failed to exit, exposing lifecycle ownership bugs rather than

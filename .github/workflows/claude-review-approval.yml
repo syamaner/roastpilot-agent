@@ -1,0 +1,34 @@
+name: Claude review approval
+on:
+  workflow_run:
+    workflows: ["Claude Code Review"]
+    types: [in_progress, completed]
+  pull_request_target:
+    types: [opened, synchronize, ready_for_review, reopened, edited]
+permissions:
+  contents: read
+  pull-requests: write
+  actions: write
+jobs:
+  approve:
+    name: Publish PR-scoped Claude approval
+    if: >-
+      github.event_name == 'workflow_run' ||
+      github.event.pull_request.user.login == 'dependabot[bot]' ||
+      github.event.action == 'ready_for_review' ||
+      github.event.action == 'reopened' ||
+      github.event.changes.base.ref.from != ''
+    runs-on: ubuntu-latest
+    steps:
+      # LOAD-BEARING: never execute untrusted PR code on privileged events.
+      - name: Check out trusted default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Approve reviewed or explicitly exempt PR
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        # -I prevents a future scripts/json.py (or similar) from shadowing the
+        # standard library under this job's write-capable token.
+        run: python3 -I scripts/claude_review_approval.py
