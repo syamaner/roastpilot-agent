@@ -204,7 +204,7 @@ clean.
   Required: the CI checks + `codecov/patch`,
   `required_conversation_resolution` (every review thread resolved), and
   `enforce_admins` (no bypass for owner or agents); force-push/deletion off; repo
-  auto-merge on. See the temporary Claude exception below. **`claude-review` is
+  auto-merge on. See the live PR-scoped Claude approval policy below. **`claude-review` is
   intentionally NOT a required check** — it fails by design on PRs that edit a
   workflow file (the App's workflow-validation guard) and on Dependabot PRs (no
   secrets), and it passes-on-findings; so the findings gate is its **inline
