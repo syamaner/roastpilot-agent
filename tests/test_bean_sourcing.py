@@ -3470,8 +3470,8 @@ async def test_extract_bean_identity_captures_token_usage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_extract_bean_identity_distinguishes_provider_reported_usage() -> None:
-    """Explicit provider usage is distinguished from FunctionModel estimates."""
+async def test_extract_bean_identity_does_not_trust_injected_model_usage() -> None:
+    """Custom models cannot assert exact usage merely by naming a provider."""
 
     def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         del messages
@@ -3491,8 +3491,33 @@ async def test_extract_bean_identity_distinguishes_provider_reported_usage() -> 
 
     assert identity.name == "Kenya Kiambu AA (Washed)"
     assert (diagnostics.request_tokens, diagnostics.response_tokens) == (19, 7)
-    assert diagnostics.usage_reported_requests == 1
-    assert diagnostics.usage_unreported_requests == 0
+    assert diagnostics.usage_reported_requests == 0
+    assert diagnostics.usage_unreported_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_provider_named_estimate_is_unreported() -> None:
+    """A provider name plus FunctionModel estimates is not raw usage evidence."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        return ModelResponse(
+            parts=[ToolCallPart(info.output_tools[0].name, _identity_args())],
+            provider_name="openai",
+        )
+
+    diagnostics = bean_sourcing.BeanSourcingDiagnostics()
+    await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "page text",
+        advisor_config=_ADVISOR_CONFIG,
+        model=FunctionModel(respond),
+        diagnostics=diagnostics,
+    )
+
+    assert diagnostics.request_tokens > 0
+    assert diagnostics.response_tokens > 0
+    assert diagnostics.usage_reported_requests == 0
+    assert diagnostics.usage_unreported_requests == 1
 
 
 @pytest.mark.asyncio

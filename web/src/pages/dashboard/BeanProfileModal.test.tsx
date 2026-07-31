@@ -418,6 +418,35 @@ describe("BeanProfileModal draft-from-URL (#573 phase 1, #627, #637)", () => {
     await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
   });
 
+  it("does not offer a duplicate manual save after an already-claimed mismatch", async () => {
+    vi.spyOn(api, "draftBeanFromUrl").mockResolvedValue(FIXTURE_DRAFT_RESPONSE);
+    const onSave = vi.fn().mockRejectedValue(
+      new ApiError(
+        409,
+        "draft attempt was already saved with different profile values",
+        "draft_attempt_already_claimed",
+      ),
+    );
+    render(
+      <BeanProfileModal mode="add" onSave={onSave} onSaved={vi.fn()} onClose={vi.fn()} />,
+    );
+    fireEvent.change(screen.getByTestId("bean-profile-draft-url"), {
+      target: { value: "https://roaster.example.com/bean" },
+    });
+    fireEvent.click(screen.getByTestId("bean-profile-draft-button"));
+    await waitFor(() =>
+      expect(screen.getByTestId("bean-profile-name")).toHaveValue(FIXTURE_DRAFT_RESPONSE.name),
+    );
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+
+    expect(screen.getByTestId("bean-profile-error")).toHaveTextContent(/already saved/i);
+    expect(screen.getByTestId("bean-profile-error")).not.toHaveTextContent(/save again/i);
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
+    expect(onSave.mock.calls[1][1]).toBe(FIXTURE_DRAFT_RESPONSE.draft_attempt_id);
+  });
+
   it("editing a field seeded with real provenance clears its badge (closes the #627b seam)", async () => {
     vi.spyOn(api, "draftBeanFromUrl").mockResolvedValue(FIXTURE_DRAFT_RESPONSE);
     const { container } = render(

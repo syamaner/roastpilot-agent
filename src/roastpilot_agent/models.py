@@ -809,8 +809,9 @@ class BeanProfileList(BaseModel):
 # never persisted as a saved profile automatically: the endpoint fetches a
 # vendor product page, extracts a bean identity, and drafts conservative
 # first-roast targets for operator review. Runtime telemetry retains only a
-# sanitized field-value baseline (no URL/evidence/prose) for at most 24 hours,
-# clearing it on claim or expiry. Saving still uses the explicit
+# sanitized field-value baseline (no URL/evidence/prose) with a 24-hour claim
+# deadline, clearing it on claim or orderly shutdown, or at the deadline
+# (including after restart following an abrupt stop). Saving still uses the explicit
 # ``POST /api/bean-profiles`` (``BeanProfileInput``) action. Human-in-the-loop
 # by construction: there is no code path from a fetched URL to a saved
 # profile that does not pass back through the operator.
@@ -831,8 +832,10 @@ class BeanProfileDraft(_BeanProfileFieldsBase):
     Returned by ``POST /api/beans/draft-from-url`` for the operator to
     review, edit, and save — this type is read-only advisory output. Neither
     it as a saved profile automatically. Runtime telemetry retains a sanitized
-    field-value baseline (excluding URL, evidence, and prose) for at most 24
-    hours, clearing it on claim or expiry; saving remains ``POST /api/bean-profiles``
+    field-value baseline (excluding URL, evidence, and prose) with a 24-hour
+    claim deadline, clearing it on claim or orderly shutdown, or at the deadline
+    (including after restart following an abrupt stop); saving remains
+    ``POST /api/bean-profiles``
     (:class:`BeanProfileInput`) action, unchanged, so a saved profile is
     always the result of an explicit operator action, never an automatic
     side effect of drafting one.

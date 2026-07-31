@@ -2,13 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError, api } from "./api";
 
-function mockFetch(status: number, body: unknown): void {
+function mockFetch(status: number, body: unknown, headers?: Record<string, string>): void {
   vi.stubGlobal(
     "fetch",
     vi.fn(async () =>
       new Response(typeof body === "string" ? body : JSON.stringify(body), {
         status,
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...headers },
       }),
     ),
   );
@@ -53,6 +53,19 @@ describe("api client", () => {
       name: "ApiError",
       status: 409,
       detail: "a roast is already active",
+    });
+  });
+
+  it("carries a typed conflict code from the response header", async () => {
+    mockFetch(
+      409,
+      { detail: "already saved" },
+      { "X-RoastPilot-Conflict-Code": "draft_attempt_already_claimed" },
+    );
+    await expect(api.createBeanProfile({} as never, "0".repeat(32))).rejects.toMatchObject({
+      status: 409,
+      detail: "already saved",
+      code: "draft_attempt_already_claimed",
     });
   });
 

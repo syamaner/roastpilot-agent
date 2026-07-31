@@ -219,10 +219,18 @@ export function BeanProfileModal({
       onSaved(saved);
     } catch (err) {
       if (err instanceof ApiError) {
-        if (err.status === 409 && draftAttemptId !== undefined) {
+        if (
+          err.status === 409 &&
+          draftAttemptId !== undefined &&
+          err.code !== "draft_attempt_already_claimed"
+        ) {
           setDraftAttemptId(undefined);
           setSubmitError(
             `${err.detail || "The drafted save link is no longer valid."} Review the fields, then Save again to create this profile manually.`,
+          );
+        } else if (err.code === "draft_attempt_already_claimed") {
+          setSubmitError(
+            "This drafted profile was already saved with different values. Reload the bean library before making further edits; a duplicate was not created.",
           );
         } else {
           setSubmitError(err.detail || `Request failed (${err.status}).`);

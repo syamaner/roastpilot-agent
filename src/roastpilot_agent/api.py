@@ -123,6 +123,7 @@ from roastpilot_agent.safety import (
 )
 from roastpilot_agent.seed import SEED_BEAN_PROFILES
 from roastpilot_agent.store import (
+    BeanDraftAttemptAlreadyClaimedError,
     BeanDraftAttemptClaimError,
     BeanProfileNotFoundError,
     PhysicallyImpossibleWeightError,
@@ -410,6 +411,10 @@ _BEAN_ATTEMPT_LEASE_HEARTBEAT_SECONDS = 30.0
 class RoastRunConflictError(Exception):
     """A request conflicts with the current run state (maps to HTTP 409):
     starting a roast while one is active, or rating an in-progress run."""
+
+
+class BeanDraftAlreadyClaimedConflictError(RoastRunConflictError):
+    """A draft id was already claimed using different profile values."""
 
 
 class RoastRunNotFoundError(Exception):
@@ -1998,6 +2003,7 @@ class RoastService:
             expiry_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await expiry_task
+        await self._store.clear_unclaimed_bean_sourcing_drafts()
 
     async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
         """Persist a marker if the MCP child stop went unconfirmed (#177).
@@ -2731,6 +2737,8 @@ class RoastService:
             profile = await self._store.create_bean_profile(
                 profile_input, draft_attempt_id=draft_attempt_id
             )
+        except BeanDraftAttemptAlreadyClaimedError as exc:
+            raise BeanDraftAlreadyClaimedConflictError(str(exc)) from exc
         except BeanDraftAttemptClaimError as exc:
             raise RoastRunConflictError(str(exc)) from exc
         self._ensure_bean_draft_expiry_task()
@@ -2756,8 +2764,9 @@ class RoastService:
     #
     # Fetch a vendor product URL + LLM-extract a draft profile. Deliberately
     # Returns an unsaved draft. Runtime telemetry retains only a sanitized
-    # field-value baseline (no URL/evidence/prose) for at most 24 hours, cleared
-    # on claim or expiry. Saving remains the explicit create action above.
+    # field-value baseline (no URL/evidence/prose) with a 24-hour claim deadline.
+    # It is cleared on claim or orderly shutdown, or at the deadline (including
+    # after restart following an abrupt stop). Saving remains explicit.
 
     @staticmethod
     def _bean_attempt_usage(
@@ -2879,8 +2888,9 @@ class RoastService:
         """Draft an unsaved bean profile from a vendor URL (#573 phase 1).
 
         A sanitized field-value baseline (excluding URL, evidence, and prose)
-        is retained for at most 24 hours for explicit save-time correlation,
-        then cleared on claim or expiry. No saved profile is created here.
+        has a 24-hour claim deadline for explicit save-time correlation. It is
+        cleared on claim or orderly shutdown, or at the deadline (including
+        after restart following an abrupt stop). No saved profile is created here.
 
         Delegates to :func:`roastpilot_agent.bean_sourcing.draft_bean_profile_from_url`
         with this service's configured advisor provider/key (BYOK, a SEPARATE
@@ -3283,6 +3293,12 @@ async def create_bean_profile(
     """``POST /api/bean-profiles`` — create and optionally claim a draft."""
     try:
         return await service.create_bean_profile(profile, draft_attempt_id=draft_attempt_id)
+    except BeanDraftAlreadyClaimedConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+            headers={"X-RoastPilot-Conflict-Code": "draft_attempt_already_claimed"},
+        ) from exc
     except RoastRunConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

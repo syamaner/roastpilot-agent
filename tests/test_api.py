@@ -4220,9 +4220,15 @@ async def test_create_bean_profile_claims_draft_header_once(
     )
     assert created.status_code == 201
     replay = await client.post(
+        "/api/bean-profiles", json=_bean_input(name="Edited"), headers=headers
+    )
+    assert replay.status_code == 201
+    assert replay.json()["id"] == created.json()["id"]
+    mismatch = await client.post(
         "/api/bean-profiles", json=_bean_input(name="Replay"), headers=headers
     )
-    assert replay.status_code == 409
+    assert mismatch.status_code == 409
+    assert mismatch.headers["X-RoastPilot-Conflict-Code"] == "draft_attempt_already_claimed"
     malformed = await client.post(
         "/api/bean-profiles",
         json=_bean_input(name="Malformed"),
@@ -5128,6 +5134,37 @@ async def test_seed_starts_expiry_owner_and_ensure_wakes_existing_task(
     service._ensure_bean_draft_expiry_task()  # pyright: ignore[reportPrivateUsage]
     assert service._bean_draft_expiry_wakeup.is_set()  # pyright: ignore[reportPrivateUsage]
     await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_clears_unclaimed_draft_snapshot(
+    service: RoastService, store: RoastStore
+) -> None:
+    """#588: orderly shutdown removes a still-live correlation baseline."""
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="provider", model_slug="model", prompt_version="v1"
+    )
+    await store.finish_bean_sourcing_attempt(
+        attempt_id,
+        outcome="success",
+        latency_ms=1,
+        request_tokens=1,
+        response_tokens=1,
+        usage_evidence="exact",
+        timed_out_runs=0,
+        draft=_draft_from("https://vendor.example/bean"),
+    )
+
+    await service.shutdown()
+
+    async with store.connection.execute(
+        "SELECT outcome, draft_snapshot_json, claim_expires_at_utc"
+        " FROM bean_sourcing_attempts WHERE id = ?",
+        (attempt_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert tuple(row) == ("success", None, None)
 
 
 @pytest.mark.asyncio

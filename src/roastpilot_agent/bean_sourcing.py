@@ -3406,6 +3406,11 @@ async def _extract_bean_identity(
     run_usage = RunUsage() if diagnostics is not None else None
     captured_messages: list[ModelMessage] = []
     invocation_timed_out = False
+    # Only models constructed through our supported provider adapters have a
+    # known raw-usage mapping contract. Injected/custom models may synthesize
+    # RequestUsage while still setting provider_name, so treat them as
+    # unreported rather than overstating billing accuracy.
+    trust_provider_usage = model is None
     # #601 fold round 9 (E FOLD 3): tracks the bespoke, retry-disabled client
     # ONLY when WE constructed one (model not injected, disable_transport_retries
     # requested) -- never an injected test double, never an SDK-managed default
@@ -3481,7 +3486,8 @@ async def _extract_bean_identity(
             for response in responses:
                 usage = response.usage
                 if (
-                    response.provider_name is not None
+                    trust_provider_usage
+                    and response.provider_name is not None
                     and usage.input_tokens + usage.output_tokens > 0
                 ):
                     diagnostics.usage_reported_requests += 1

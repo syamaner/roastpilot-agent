@@ -40,6 +40,7 @@ export class ApiError extends Error {
   constructor(
     readonly status: number,
     readonly detail: string,
+    readonly code?: string,
   ) {
     super(`API ${status}: ${detail}`);
     this.name = "ApiError";
@@ -52,7 +53,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { "Content-Type": "application/json", ...init?.headers },
   });
   if (!response.ok) {
-    throw new ApiError(response.status, await readDetail(response));
+    throw new ApiError(
+      response.status,
+      await readDetail(response),
+      response.headers.get("X-RoastPilot-Conflict-Code") ?? undefined,
+    );
   }
   // 204/empty bodies never occur on these routes, but guard anyway.
   const text = await response.text();
@@ -203,8 +208,9 @@ export const api = {
     }),
 
   /** `POST /api/beans/draft-from-url` — draft a bean profile from a vendor
-   *  product page (#573 phase 1, #637). Never persists anything; saving stays
-   *  the operator's explicit `createBeanProfile` action. 422: bad/unreachable
+   *  product page (#573 phase 1, #637). Creates no saved profile; a sanitized
+   *  baseline supports bounded correction correlation until claim/cleanup.
+   *  Saving stays the operator's explicit `createBeanProfile` action. 422: bad/unreachable
    *  URL, or the page yielded too little identity to draft from. 503: the
    *  extraction provider/transport failed — the page itself may be fine,
    *  retry. 409: a roast is active. 429: too many concurrent draft requests

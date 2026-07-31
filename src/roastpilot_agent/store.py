@@ -542,6 +542,10 @@ class BeanDraftAttemptClaimError(Exception):
     """A draft attempt id cannot be attached to a new saved profile (#588)."""
 
 
+class BeanDraftAttemptAlreadyClaimedError(BeanDraftAttemptClaimError):
+    """A claimed draft was replayed with values unlike its saved profile."""
+
+
 class PhysicallyImpossibleWeightError(Exception):
     """A weight/charge write would violate the roasted<=charge physical
     invariant (#520 round-2 P3), caught ATOMICALLY at the store layer.
@@ -2347,6 +2351,22 @@ class RoastStore:
         await self.connection.commit()
         return cursor.rowcount
 
+    async def clear_unclaimed_bean_sourcing_drafts(self) -> int:
+        """Clear every unclaimed draft snapshot during orderly shutdown.
+
+        Returns:
+            The number of snapshots cleared. Aggregate attempt telemetry remains.
+        """
+        if self._connection is None:
+            return 0
+        cursor = await self._connection.execute(
+            "UPDATE bean_sourcing_attempts SET draft_snapshot_json = NULL,"
+            " claim_expires_at_utc = NULL WHERE saved_profile_id IS NULL"
+            " AND draft_snapshot_json IS NOT NULL"
+        )
+        await self._connection.commit()
+        return cursor.rowcount
+
     async def next_bean_sourcing_expiry(self) -> str | None:
         """Return the earliest unclaimed draft expiry, if one exists."""
         async with self.connection.execute(
@@ -2611,15 +2631,36 @@ class RoastStore:
                     (now,),
                 )
                 async with claim_connection.execute(
-                    "SELECT draft_snapshot_json FROM bean_sourcing_attempts"
-                    " WHERE id = ? AND outcome = 'success' AND saved_profile_id IS NULL"
-                    " AND draft_snapshot_json IS NOT NULL AND claim_expires_at_utc > ?",
-                    (draft_attempt_id, now),
+                    "SELECT draft_snapshot_json, saved_profile_id, outcome,"
+                    " claim_expires_at_utc FROM bean_sourcing_attempts WHERE id = ?",
+                    (draft_attempt_id,),
                 ) as cursor:
                     attempt = await cursor.fetchone()
-                if attempt is None:
+                if attempt is not None and attempt["saved_profile_id"] is not None:
+                    async with claim_connection.execute(
+                        "SELECT profile_json FROM bean_profiles WHERE id = ?",
+                        (attempt["saved_profile_id"],),
+                    ) as cursor:
+                        saved_row = await cursor.fetchone()
+                    if saved_row is None:  # pragma: no cover - protected by the schema FK
+                        raise RuntimeError("claimed draft references a missing bean profile")
+                    saved_profile = BeanProfile.model_validate_json(str(saved_row["profile_json"]))
+                    saved_input = BeanProfileInput.model_validate(saved_profile.model_dump())
+                    if saved_input == profile_input:
+                        await claim_connection.rollback()
+                        return saved_profile
+                    raise BeanDraftAttemptAlreadyClaimedError(
+                        "draft attempt was already saved with different profile values"
+                    )
+                if (
+                    attempt is None
+                    or attempt["outcome"] != "success"
+                    or attempt["draft_snapshot_json"] is None
+                    or attempt["claim_expires_at_utc"] is None
+                    or str(attempt["claim_expires_at_utc"]) <= now
+                ):
                     raise BeanDraftAttemptClaimError(
-                        "draft attempt is unknown, expired, unsuccessful, or already saved"
+                        "draft attempt is unknown, expired, or unsuccessful"
                     )
                 baseline = cast(dict[str, Any], json.loads(str(attempt["draft_snapshot_json"])))
                 saved_values = profile_input.model_dump(mode="json")

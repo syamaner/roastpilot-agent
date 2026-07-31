@@ -313,8 +313,8 @@ export type BeanFieldSource = "on_page" | "origin_estimated";
  *  drafted, NOT-YET-SAVED profile the operator reviews/edits/saves via the
  *  existing `createBeanProfile` action. It is never persisted as a saved
  *  profile; a sanitized field-value baseline (excluding URL, evidence, and
- *  prose) is retained server-side for at most 24 hours for correction
- *  correlation, then cleared on claim or expiry. Carries
+ *  prose) has a 24-hour correction-correlation deadline and is cleared on claim
+ *  or orderly shutdown, or at the deadline (including after restart). Carries
  *  every `BeanProfileFields` field plus honest per-field provenance
  *  (`field_sources`), the model-cited vendor-page quotes backing the four
  *  typed fields (`field_evidence`), and the conservative "scouting run"

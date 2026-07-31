@@ -36,6 +36,7 @@ from roastpilot_agent.seed import (
     SUMATRA_MANDHELING_SEED,
 )
 from roastpilot_agent.store import (
+    BeanDraftAttemptAlreadyClaimedError,
     BeanDraftAttemptClaimError,
     BeanProfileNotFoundError,
     RoastStore,
@@ -132,9 +133,10 @@ async def test_v14_attempt_claim_is_atomic_one_use_and_records_corrections(
         )
     finally:
         await second_store.close()
-    results = (first, second)
-    saved = next(result for result in results if isinstance(result, BeanProfile))
-    assert sum(isinstance(result, BeanDraftAttemptClaimError) for result in results) == 1
+    assert isinstance(first, BeanProfile)
+    assert isinstance(second, BeanProfile)
+    assert first.id == second.id
+    saved = first
 
     async with store.connection.execute(
         "SELECT saved_profile_id, changed_fields_json, draft_snapshot_json"
@@ -150,6 +152,41 @@ async def test_v14_attempt_claim_is_atomic_one_use_and_records_corrections(
         "SELECT COUNT(*) FROM bean_profiles WHERE id = ?", (saved.id,)
     ) as cursor:
         assert (await cursor.fetchone())[0] == 1  # type: ignore[index]
+
+    with pytest.raises(BeanDraftAttemptAlreadyClaimedError):
+        await store.create_bean_profile(
+            _input(name="A different replay"), draft_attempt_id=attempt_id
+        )
+    async with store.connection.execute("SELECT COUNT(*) FROM bean_profiles") as cursor:
+        assert (await cursor.fetchone())[0] == 1  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_v14_orderly_shutdown_clear_retains_aggregate_telemetry(store: RoastStore) -> None:
+    """Orderly teardown removes unclaimed baselines without deleting metrics."""
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="provider", model_slug="model", prompt_version="v1"
+    )
+    await store.finish_bean_sourcing_attempt(
+        attempt_id,
+        outcome="success",
+        latency_ms=12,
+        request_tokens=3,
+        response_tokens=4,
+        usage_evidence="exact",
+        timed_out_runs=0,
+        draft=_draft(),
+    )
+
+    assert await store.clear_unclaimed_bean_sourcing_drafts() == 1
+    async with store.connection.execute(
+        "SELECT outcome, latency_ms, request_tokens, response_tokens,"
+        " draft_snapshot_json, claim_expires_at_utc FROM bean_sourcing_attempts WHERE id = ?",
+        (attempt_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert tuple(row) == ("success", 12, 3, 4, None, None)
 
 
 @pytest.mark.asyncio
