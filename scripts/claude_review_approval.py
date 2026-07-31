@@ -9,7 +9,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol, cast
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -18,6 +18,7 @@ JsonObject = dict[str, JsonValue]
 
 _APPROVAL_MARKER = "[claude-review-approval]"
 _EXEMPTION_MARKER = "[claude-review-exempt]"
+_RUN_ORDER_MARKER = "[claude-review-run-v1"
 _BOT_LOGIN = "github-actions[bot]"
 _WORKFLOW_PATH = ".github/workflows/claude-code-review.yml"
 _ASSOCIATION_REFRESH_DELAYS_SECONDS = (0.0, 1.0, 2.0)
@@ -82,6 +83,8 @@ class RESTClient:
                 body = response.read()
         except HTTPError as exc:
             raise RuntimeError(f"GitHub API {method} {path} failed with HTTP {exc.code}") from exc
+        except (URLError, TimeoutError) as exc:
+            raise RuntimeError(f"GitHub API {method} {path} transport failed") from exc
         if not body:
             return None
         return cast(JsonValue, json.loads(body))
@@ -152,11 +155,12 @@ def _process_workflow_run(run: JsonObject, action: str, api: _GitHubAPI) -> str:
     if conclusion == "success":
         body = (
             f"{_APPROVAL_MARKER} Claude Code Review run {run_id} attempt {attempt} "
+            f"{_run_order_marker(run)} "
             f"completed successfully for `{pr.head[0]}`. {_identity_marker(pr)} "
             f"reviewed-base-sha={_reviewed_base_sha(run, pr)} "
             "Inline findings remain gated by required conversation resolution."
         )
-        return _approve(pr, body, api)
+        return _approve(pr, body, api, run_order=_review_run_order(run))
     if conclusion == "cancelled" and attempt == 1:
         api.post(f"/actions/runs/{run_id}/rerun")
         state = "exact-head approval preserved" if existing_approval else "approval remains absent"
@@ -341,12 +345,28 @@ def _approve_dependabot(pr: _PullRequest, api: _GitHubAPI) -> str:
     return _approve(pr, body, api)
 
 
-def _approve(pr: _PullRequest, body: str, api: _GitHubAPI) -> str:
+def _approve(
+    pr: _PullRequest,
+    body: str,
+    api: _GitHubAPI,
+    *,
+    run_order: tuple[int, int, int] | None = None,
+) -> str:
     current = _load_pull_request(pr.number, api)
     if not _same_approval_identity(pr, current):
         return f"PR #{pr.number} identity changed before approval; approval remains absent"
     if _approval_review(pr, api) is not None:
         return f"PR #{pr.number} already has a bot approval for {pr.head[0]}"
+    if run_order is not None:
+        dismissed_order = _latest_dismissed_run_order(pr, api)
+        if dismissed_order is not None:
+            if run_order[0] != dismissed_order[0]:
+                raise ValueError("dismissed approval belongs to another review workflow")
+            if run_order <= dismissed_order:
+                return (
+                    f"review run is not newer than the dismissed evidence epoch for PR "
+                    f"#{pr.number}; approval remains absent"
+                )
     created = _object(
         api.post(
             f"/pulls/{pr.number}/reviews",
@@ -355,14 +375,109 @@ def _approve(pr: _PullRequest, body: str, api: _GitHubAPI) -> str:
         "created review",
     )
     review_id = _integer(created.get("id"), "created review.id")
-    current = _load_pull_request(pr.number, api)
+    try:
+        current = _load_pull_request(pr.number, api)
+    except (RuntimeError, ValueError):
+        _dismiss_created_review_or_block(
+            pr.number,
+            review_id,
+            api,
+            "Post-publication pull request validation failed.",
+        )
+        raise
     if not _same_approval_identity(pr, current):
-        api.put(
-            f"/pulls/{pr.number}/reviews/{review_id}/dismissals",
-            {"message": "The pull request identity changed while approval was published."},
+        _dismiss_created_review_or_block(
+            pr.number,
+            review_id,
+            api,
+            "The pull request identity changed while approval was published.",
         )
         return f"PR #{pr.number} identity changed after approval; new review dismissed"
     return f"approved PR #{pr.number} at {pr.head[0]}"
+
+
+def _dismiss_created_review_or_block(
+    number: int,
+    review_id: int,
+    api: _GitHubAPI,
+    message: str,
+) -> None:
+    try:
+        _dismiss_created_review(number, review_id, api, message)
+    except (RuntimeError, ValueError) as cleanup_error:
+        raise RuntimeError(
+            "created-review cleanup failed; operator audit required before activation"
+        ) from cleanup_error
+
+
+def _dismiss_created_review(
+    number: int,
+    review_id: int,
+    api: _GitHubAPI,
+    message: str,
+) -> None:
+    api.put(
+        f"/pulls/{number}/reviews/{review_id}/dismissals",
+        {"message": message},
+    )
+
+
+def _review_run_order(run: JsonObject) -> tuple[int, int, int]:
+    return (
+        _integer(run.get("workflow_id"), "workflow_id"),
+        _integer(run.get("run_number"), "run_number"),
+        _integer(run.get("run_attempt", 1), "run_attempt"),
+    )
+
+
+def _run_order_marker(run: JsonObject) -> str:
+    workflow_id, run_number, run_attempt = _review_run_order(run)
+    return f"{_RUN_ORDER_MARKER} workflow={workflow_id} number={run_number} attempt={run_attempt}]"
+
+
+def _latest_dismissed_run_order(
+    pr: _PullRequest,
+    api: _GitHubAPI,
+) -> tuple[int, int, int] | None:
+    orders: list[tuple[int, int, int]] = []
+    identity = _identity_marker(pr)
+    for value in _all_reviews(pr.number, api):
+        review = _object(value, "reviews[]")
+        user = _object(review.get("user"), "review.user")
+        body = _string(review.get("body", ""), "review.body")
+        if not (
+            _string(user.get("login"), "review.user.login") == _BOT_LOGIN
+            and _string(review.get("state"), "review.state") == "DISMISSED"
+            and _string(review.get("commit_id"), "review.commit_id") == pr.head[0]
+            and body.split(" ", 1)[0] == _APPROVAL_MARKER
+            and identity in body
+        ):
+            continue
+        orders.append(_parse_run_order_marker(body))
+    return max(orders) if orders else None
+
+
+def _parse_run_order_marker(body: str) -> tuple[int, int, int]:
+    start = body.find(f"{_RUN_ORDER_MARKER} ")
+    if start < 0:
+        raise ValueError("dismissed current-identity approval lacks a run-order marker")
+    end = body.find("]", start)
+    if end < 0:
+        raise ValueError("dismissed current-identity approval has a malformed run-order marker")
+    fields: dict[str, int] = {}
+    for item in body[start + len(_RUN_ORDER_MARKER) + 1 : end].split():
+        name, separator, raw_value = item.partition("=")
+        if not separator or name not in {"workflow", "number", "attempt"}:
+            raise ValueError("dismissed current-identity approval has a malformed run-order marker")
+        try:
+            fields[name] = int(raw_value)
+        except ValueError as exc:
+            raise ValueError(
+                "dismissed current-identity approval has a malformed run-order marker"
+            ) from exc
+    if set(fields) != {"workflow", "number", "attempt"}:
+        raise ValueError("dismissed current-identity approval has a malformed run-order marker")
+    return fields["workflow"], fields["number"], fields["attempt"]
 
 
 def _same_approval_identity(left: _PullRequest, right: _PullRequest) -> bool:

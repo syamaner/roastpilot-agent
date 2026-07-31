@@ -381,7 +381,10 @@ Dependabot PRs. Operate the gate as follows:
   delivery because the reviewed bytes have not changed. If a rerun is intended
   to replace that evidence, record the reason, ensure auto-merge is not armed,
   dismiss the approval first, and only then dispatch the rerun. Once dismissed,
-  the replacement attempt must succeed. An intentionally started rerun must
+  the dismissal starts a durable evidence epoch: approval bodies carry a
+  versioned workflow/run-number/attempt order, and only a strictly newer run
+  may approve. Missing or malformed current-identity tombstone order fails
+  closed. The replacement attempt must succeed. An intentionally started rerun must
   still finish and have its findings independently triaged before merge.
   Same-head concurrency remains an idempotency aid, not an atomic replacement
   transaction. The bridge reruns a first cancelled attempt once; for a
@@ -395,7 +398,9 @@ Dependabot PRs. Operate the gate as follows:
   attempt once if association remains absent; ambiguity or a repeated absence
   still fails closed.
 - Approval publication revalidates the live PR identity immediately before and
-  after the mutation, dismissing the just-created review if the identity moved.
+  after the mutation, dismissing the just-created review if the identity moved
+  or post-publication validation fails. Cleanup failure is an explicit
+  activation blocker requiring operator audit.
   This is not a REST transaction: slice-2 activation must live-prove that GitHub
   never counts an approval bound to a non-current commit, alongside strict mode
   and stale-review dismissal. If that adversarial proof fails, do not activate

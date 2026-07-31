@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping
 from email.message import Message
 from pathlib import Path
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 import claude_review_approval as approval
 import pytest
@@ -90,9 +90,22 @@ def _identity_marker(
     )
 
 
-def _approval_body(text: str, *, exempt: bool = False) -> str:
+def _approval_body(
+    text: str,
+    *,
+    exempt: bool = False,
+    run_order: tuple[int, int, int] | None = None,
+) -> str:
     marker = "[claude-review-exempt]" if exempt else "[claude-review-approval]"
-    return f"{marker} {text} {_identity_marker()}"
+    order = (
+        ""
+        if run_order is None
+        else (
+            f" [claude-review-run-v1 workflow={run_order[0]} "
+            f"number={run_order[1]} attempt={run_order[2]}]"
+        )
+    )
+    return f"{marker} {text}{order} {_identity_marker()}"
 
 
 def _run_payload(
@@ -168,6 +181,7 @@ def test_successful_exact_head_review_approves_pr() -> None:
             {
                 "body": (
                     "[claude-review-approval] Claude Code Review run 100 attempt 1 "
+                    "[claude-review-run-v1 workflow=7 number=20 attempt=1] "
                     f"completed successfully for `abc123`. {_identity_marker()} "
                     "reviewed-base-sha=base123 "
                     "Inline findings remain gated "
@@ -250,6 +264,104 @@ def test_head_change_after_approval_dismisses_created_review() -> None:
             {"message": "The pull request identity changed while approval was published."},
         )
     ]
+
+
+def test_post_approval_malformed_pr_response_dismisses_created_review() -> None:
+    """Malformed post-publication identity data cannot leave approval active."""
+
+    run = _run_payload()
+    original = _pr_payload()
+    api = _workflow_api(run, pr=original)
+    api.response_sequences["/pulls/10"] = [original, original, {}]
+
+    with pytest.raises(ValueError, match="pull_request.user must be an object"):
+        approval.process_event({"workflow_run": run}, api)
+
+    assert api.posts[0][0] == "/pulls/10/reviews"
+    assert api.puts == [
+        (
+            "/pulls/10/reviews/900/dismissals",
+            {"message": "Post-publication pull request validation failed."},
+        )
+    ]
+
+
+def test_post_approval_api_failure_dismisses_created_review() -> None:
+    """A failed post-publication reload dismisses the exact created review."""
+
+    class FailingReloadAPI(FakeAPI):
+        pull_reads = 0
+
+        def get(self, path: str) -> approval.JsonValue:
+            if path == "/pulls/10":
+                self.pull_reads += 1
+                if self.pull_reads == 3:
+                    raise RuntimeError("temporary API failure")
+            return super().get(path)
+
+    run = _run_payload()
+    base = _workflow_api(run)
+    api = FailingReloadAPI(base.responses)
+
+    with pytest.raises(RuntimeError, match="temporary API failure"):
+        approval.process_event({"workflow_run": run}, api)
+
+    assert api.puts == [
+        (
+            "/pulls/10/reviews/900/dismissals",
+            {"message": "Post-publication pull request validation failed."},
+        )
+    ]
+
+
+def test_post_approval_cleanup_failure_is_activation_blocker() -> None:
+    """A validation plus dismissal failure remains loud for operator audit."""
+
+    class FailingCleanupAPI(FakeAPI):
+        pull_reads = 0
+
+        def get(self, path: str) -> approval.JsonValue:
+            if path == "/pulls/10":
+                self.pull_reads += 1
+                if self.pull_reads == 3:
+                    raise RuntimeError("temporary API failure")
+            return super().get(path)
+
+        def put(
+            self,
+            path: str,
+            payload: Mapping[str, approval.JsonValue],
+        ) -> approval.JsonValue:
+            raise RuntimeError("dismissal failed")
+
+    run = _run_payload()
+    base = _workflow_api(run)
+    api = FailingCleanupAPI(base.responses)
+
+    with pytest.raises(RuntimeError, match="operator audit required before activation"):
+        approval.process_event({"workflow_run": run}, api)
+
+
+def test_identity_change_cleanup_failure_is_activation_blocker() -> None:
+    """A raced identity plus dismissal failure requires operator audit."""
+
+    class FailingCleanupAPI(FakeAPI):
+        def put(
+            self,
+            path: str,
+            payload: Mapping[str, approval.JsonValue],
+        ) -> approval.JsonValue:
+            raise RuntimeError("dismissal failed")
+
+    run = _run_payload()
+    original = _pr_payload()
+    changed = _pr_payload(sha="new-sha")
+    base = _workflow_api(run, pr=original)
+    api = FailingCleanupAPI(base.responses)
+    api.response_sequences["/pulls/10"] = [original, original, changed]
+
+    with pytest.raises(RuntimeError, match="operator audit required before activation"):
+        approval.process_event({"workflow_run": run}, api)
 
 
 @pytest.mark.parametrize(
@@ -650,6 +762,150 @@ def test_existing_exact_bot_approval_is_idempotent() -> None:
     result = approval.process_event({"workflow_run": run}, api)
 
     assert result == "PR #10 already has a bot approval for abc123"
+    assert api.posts == []
+
+
+def test_dismissed_same_run_cannot_recreate_replaced_approval() -> None:
+    """A delayed completion before the dismissal epoch cannot reapprove."""
+
+    run = _run_payload()
+    api = _workflow_api(
+        run,
+        reviews=[
+            {
+                "id": 91,
+                "user": {"login": "github-actions[bot]"},
+                "state": "DISMISSED",
+                "commit_id": "abc123",
+                "body": _approval_body("replaced", run_order=(7, 20, 1)),
+            }
+        ],
+    )
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == (
+        "review run is not newer than the dismissed evidence epoch for PR #10; "
+        "approval remains absent"
+    )
+    assert api.posts == []
+
+
+@pytest.mark.parametrize(
+    ("run_number", "attempt"),
+    [(20, 2), (21, 1)],
+)
+def test_newer_replacement_run_can_approve_after_dismissal(
+    run_number: int,
+    attempt: int,
+) -> None:
+    """A strictly newer attempt or run may cross the dismissal epoch."""
+
+    run = _run_payload(run_id=101, run_number=run_number, attempt=attempt)
+    api = _workflow_api(
+        run,
+        reviews=[
+            {
+                "id": 91,
+                "user": {"login": "github-actions[bot]"},
+                "state": "DISMISSED",
+                "commit_id": "abc123",
+                "body": _approval_body("replaced", run_order=(7, 20, 1)),
+            }
+        ],
+    )
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "approved PR #10 at abc123"
+    assert len(api.posts) == 1
+
+
+def test_unrelated_dismissal_does_not_create_epoch() -> None:
+    """A stranger or another PR identity cannot suppress trusted evidence."""
+
+    run = _run_payload()
+    api = _workflow_api(
+        run,
+        reviews=[
+            {
+                "id": 91,
+                "user": {"login": "someone"},
+                "state": "DISMISSED",
+                "commit_id": "abc123",
+                "body": _approval_body("lookalike", run_order=(7, 99, 1)),
+            },
+            {
+                "id": 92,
+                "user": {"login": "github-actions[bot]"},
+                "state": "DISMISSED",
+                "commit_id": "abc123",
+                "body": (
+                    "[claude-review-approval] old base "
+                    "[claude-review-run-v1 workflow=7 number=99 attempt=1] "
+                    f"{_identity_marker(base_ref='release')}"
+                ),
+            },
+        ],
+    )
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "approved PR #10 at abc123"
+
+
+def test_malformed_current_identity_tombstone_fails_closed() -> None:
+    """An unparseable current-identity dismissal cannot be bypassed."""
+
+    run = _run_payload()
+    api = _workflow_api(
+        run,
+        reviews=[
+            {
+                "id": 91,
+                "user": {"login": "github-actions[bot]"},
+                "state": "DISMISSED",
+                "commit_id": "abc123",
+                "body": _approval_body("legacy evidence"),
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="lacks a run-order marker"):
+        approval.process_event({"workflow_run": run}, api)
+
+    assert api.posts == []
+
+
+def test_dismissed_epoch_lookup_paginates_and_uses_latest_order() -> None:
+    """The newest tombstone is enforced across every review page."""
+
+    run = _run_payload(run_number=21)
+    filler: list[approval.JsonValue] = [{"user": {"login": "someone"}} for _ in range(100)]
+    api = _workflow_api(run, reviews=filler)
+    api.responses["/pulls/10/reviews?per_page=100&page=2"] = [
+        {
+            "id": 91,
+            "user": {"login": "github-actions[bot]"},
+            "state": "DISMISSED",
+            "commit_id": "abc123",
+            "body": _approval_body("older", run_order=(7, 19, 1)),
+        },
+        {
+            "id": 92,
+            "user": {"login": "github-actions[bot]"},
+            "state": "DISMISSED",
+            "commit_id": "abc123",
+            "body": _approval_body("latest", run_order=(7, 21, 1)),
+        },
+    ]
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == (
+        "review run is not newer than the dismissed evidence epoch for PR #10; "
+        "approval remains absent"
+    )
     assert api.posts == []
 
 
@@ -1372,6 +1628,22 @@ def test_rest_client_redacts_http_error_body(
     monkeypatch.setattr(approval, "urlopen", fail)
 
     with pytest.raises(RuntimeError, match=r"GET /value failed with HTTP 403"):
+        approval.RESTClient("owner/repo", "secret").get("/value")
+
+
+@pytest.mark.parametrize("error", [URLError("dns failed"), TimeoutError("timed out")])
+def test_rest_client_normalizes_transport_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    error: OSError,
+) -> None:
+    """Connection failures become cleanup-aware runtime failures."""
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(approval, "urlopen", fail)
+
+    with pytest.raises(RuntimeError, match=r"GET /value transport failed"):
         approval.RESTClient("owner/repo", "secret").get("/value")
 
 
