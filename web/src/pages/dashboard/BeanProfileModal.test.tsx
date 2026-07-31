@@ -61,7 +61,9 @@ function fireOverlappingDraftRequests(button: HTMLElement, input: HTMLElement): 
 
 describe("BeanProfileModal add mode (#303)", () => {
   it("POSTs the captured input and reports the saved profile", async () => {
-    const onSave = vi.fn(async (input: BeanProfileInput) => savedFrom(input));
+    const onSave = vi.fn(async (input: BeanProfileInput, _draftAttemptId?: string) =>
+      savedFrom(input),
+    );
     const onSaved = vi.fn();
     render(
       <BeanProfileModal mode="add" onSave={onSave} onSaved={onSaved} onClose={vi.fn()} />,
@@ -80,11 +82,14 @@ describe("BeanProfileModal add mode (#303)", () => {
     expect(input.bean_origin).toBe("Brazil");
     // The modal owns the default charge weight (pre-filled 250).
     expect(input.default_bean_weight_grams).toBe(250);
+    expect(onSave.mock.calls[0][1]).toBeUndefined();
     await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
   });
 
   it("captures the product URL on the saved profile (#315)", async () => {
-    const onSave = vi.fn(async (input: BeanProfileInput) => savedFrom(input));
+    const onSave = vi.fn(async (input: BeanProfileInput, _draftAttemptId?: string) =>
+      savedFrom(input),
+    );
     render(
       <BeanProfileModal mode="add" onSave={onSave} onSaved={vi.fn()} onClose={vi.fn()} />,
     );
@@ -142,7 +147,9 @@ describe("BeanProfileModal add mode (#303)", () => {
 
 describe("BeanProfileModal edit mode (#303)", () => {
   it("pre-fills from the profile and PUTs the edited input", async () => {
-    const onSave = vi.fn(async (input: BeanProfileInput) => savedFrom(input));
+    const onSave = vi.fn(async (input: BeanProfileInput, _draftAttemptId?: string) =>
+      savedFrom(input),
+    );
     render(
       <BeanProfileModal
         mode="edit"
@@ -162,6 +169,7 @@ describe("BeanProfileModal edit mode (#303)", () => {
     fireEvent.submit(screen.getByTestId("bean-profile-form"));
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
     expect(onSave.mock.calls[0][0].target_drop_temp_c).toBe(192);
+    expect(onSave.mock.calls[0][1]).toBeUndefined();
   });
 
   it("shows the future-roasts-only note in edit mode", () => {
@@ -317,6 +325,126 @@ describe("BeanProfileModal draft-from-URL (#573 phase 1, #627, #637)", () => {
 
     // The conservative "scouting run" framing renders alongside the drafted targets.
     expect(screen.getByTestId("bean-profile-scouting-note")).toHaveTextContent(/scouting run/i);
+  });
+
+  it("carries the latest successful attempt id through edits and a failed retry", async () => {
+    vi.spyOn(api, "draftBeanFromUrl")
+      .mockResolvedValueOnce(FIXTURE_DRAFT_RESPONSE)
+      .mockRejectedValueOnce(new ApiError(503, "provider unavailable"));
+    const onSave = vi.fn(async (input: BeanProfileInput, _draftAttemptId?: string) =>
+      savedFrom(input),
+    );
+    render(
+      <BeanProfileModal mode="add" onSave={onSave} onSaved={vi.fn()} onClose={vi.fn()} />,
+    );
+    const url = screen.getByTestId("bean-profile-draft-url");
+    fireEvent.change(url, { target: { value: "https://roaster.example.com/guji-uraga" } });
+    fireEvent.click(screen.getByTestId("bean-profile-draft-button"));
+    await waitFor(() =>
+      expect(screen.getByTestId("bean-profile-name")).toHaveValue(FIXTURE_DRAFT_RESPONSE.name),
+    );
+    fireEvent.change(screen.getByTestId("bean-profile-name"), {
+      target: { value: "Operator edited name" },
+    });
+    fireEvent.click(screen.getByTestId("bean-profile-draft-button"));
+    await waitFor(() =>
+      expect(screen.getByTestId("bean-profile-draft-error")).toBeInTheDocument(),
+    );
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "Operator edited name" }),
+      FIXTURE_DRAFT_RESPONSE.draft_attempt_id,
+    );
+  });
+
+  it("replaces correlation metadata on a newer successful draft", async () => {
+    vi.spyOn(api, "draftBeanFromUrl")
+      .mockResolvedValueOnce(FIXTURE_DRAFT_RESPONSE)
+      .mockResolvedValueOnce({
+        ...FIXTURE_DRAFT_RESPONSE,
+        draft_attempt_id: "fedcba9876543210fedcba9876543210",
+      });
+    const onSave = vi.fn(async (input: BeanProfileInput, _draftAttemptId?: string) =>
+      savedFrom(input),
+    );
+    render(
+      <BeanProfileModal mode="add" onSave={onSave} onSaved={vi.fn()} onClose={vi.fn()} />,
+    );
+    fireEvent.change(screen.getByTestId("bean-profile-draft-url"), {
+      target: { value: "https://roaster.example.com/bean" },
+    });
+    fireEvent.click(screen.getByTestId("bean-profile-draft-button"));
+    await waitFor(() => expect(screen.getByTestId("bean-profile-name")).toHaveValue(FIXTURE_DRAFT_RESPONSE.name));
+    fireEvent.click(screen.getByTestId("bean-profile-draft-button"));
+    await waitFor(() => expect(api.draftBeanFromUrl).toHaveBeenCalledTimes(2));
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave.mock.calls[0][1]).toBe("fedcba9876543210fedcba9876543210");
+  });
+
+  it("clears an invalid correlation after 409 and requires an explicit manual retry", async () => {
+    vi.spyOn(api, "draftBeanFromUrl").mockResolvedValue(FIXTURE_DRAFT_RESPONSE);
+    const onSave = vi
+      .fn<(input: BeanProfileInput, draftAttemptId?: string) => Promise<BeanProfile>>()
+      .mockRejectedValueOnce(new ApiError(409, "draft attempt expired"))
+      .mockImplementationOnce(async (input) => savedFrom(input));
+    const onSaved = vi.fn();
+    render(
+      <BeanProfileModal mode="add" onSave={onSave} onSaved={onSaved} onClose={vi.fn()} />,
+    );
+    fireEvent.change(screen.getByTestId("bean-profile-draft-url"), {
+      target: { value: "https://roaster.example.com/bean" },
+    });
+    fireEvent.click(screen.getByTestId("bean-profile-draft-button"));
+    await waitFor(() =>
+      expect(screen.getByTestId("bean-profile-name")).toHaveValue(FIXTURE_DRAFT_RESPONSE.name),
+    );
+    fireEvent.change(screen.getByTestId("bean-profile-name"), {
+      target: { value: "Operator keeps this edit" },
+    });
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave.mock.calls[0][1]).toBe(FIXTURE_DRAFT_RESPONSE.draft_attempt_id);
+    expect(screen.getByTestId("bean-profile-error")).toHaveTextContent(/save again.*manually/i);
+    expect(screen.getByTestId("bean-profile-name")).toHaveValue("Operator keeps this edit");
+
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
+    expect(onSave.mock.calls[1][0]).toEqual(
+      expect.objectContaining({ name: "Operator keeps this edit" }),
+    );
+    expect(onSave.mock.calls[1][1]).toBeUndefined();
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not offer a duplicate manual save after an already-claimed mismatch", async () => {
+    vi.spyOn(api, "draftBeanFromUrl").mockResolvedValue(FIXTURE_DRAFT_RESPONSE);
+    const onSave = vi.fn().mockRejectedValue(
+      new ApiError(
+        409,
+        "draft attempt was already saved with different profile values",
+        "draft_attempt_already_claimed",
+      ),
+    );
+    render(
+      <BeanProfileModal mode="add" onSave={onSave} onSaved={vi.fn()} onClose={vi.fn()} />,
+    );
+    fireEvent.change(screen.getByTestId("bean-profile-draft-url"), {
+      target: { value: "https://roaster.example.com/bean" },
+    });
+    fireEvent.click(screen.getByTestId("bean-profile-draft-button"));
+    await waitFor(() =>
+      expect(screen.getByTestId("bean-profile-name")).toHaveValue(FIXTURE_DRAFT_RESPONSE.name),
+    );
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+
+    expect(screen.getByTestId("bean-profile-error")).toHaveTextContent(/already saved/i);
+    expect(screen.getByTestId("bean-profile-error")).not.toHaveTextContent(/save again/i);
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
+    expect(onSave.mock.calls[1][1]).toBe(FIXTURE_DRAFT_RESPONSE.draft_attempt_id);
   });
 
   it("editing a field seeded with real provenance clears its badge (closes the #627b seam)", async () => {

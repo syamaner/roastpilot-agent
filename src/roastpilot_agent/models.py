@@ -806,10 +806,12 @@ class BeanProfileList(BaseModel):
 # --- #573 phase 1: add-bean-from-URL draft (add-bean-profile skill, productised) ---
 #
 # ``POST /api/beans/draft-from-url`` response contract. This is DELIBERATELY
-# not persisted anywhere: the endpoint (``roastpilot_agent.bean_sourcing`` +
-# the API route) fetches a vendor product page, extracts a bean identity, and
-# drafts conservative first-roast targets for the operator to review, edit,
-# and — only if they choose — save via the EXISTING, unchanged
+# never persisted as a saved profile automatically: the endpoint fetches a
+# vendor product page, extracts a bean identity, and drafts conservative
+# first-roast targets for operator review. Runtime telemetry retains only a
+# sanitized field-value baseline (no URL/evidence/prose) with a 24-hour claim
+# deadline, clearing it on claim or orderly shutdown, or at the deadline
+# (including after restart following an abrupt stop). Saving still uses the explicit
 # ``POST /api/bean-profiles`` (``BeanProfileInput``) action. Human-in-the-loop
 # by construction: there is no code path from a fetched URL to a saved
 # profile that does not pass back through the operator.
@@ -824,13 +826,19 @@ precedent: this is bean metadata, not a safety verdict, so it stays OUT of
 the enum surface the safety-reviewer escalation routes on."""
 
 
+_BEAN_DRAFT_BIDI_CONTROLS = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
 class BeanProfileDraft(_BeanProfileFieldsBase):
     """A drafted, NOT-YET-SAVED bean profile from add-bean-from-URL (#573 phase 1).
 
     Returned by ``POST /api/beans/draft-from-url`` for the operator to
     review, edit, and save — this type is read-only advisory output. Neither
-    this model nor anything in :mod:`roastpilot_agent.bean_sourcing` persists
-    it; saving remains the existing ``POST /api/bean-profiles``
+    it as a saved profile automatically. Runtime telemetry retains a sanitized
+    field-value baseline (excluding URL, evidence, and prose) with a 24-hour
+    claim deadline, clearing it on claim or orderly shutdown, or at the deadline
+    (including after restart following an abrupt stop); saving remains
+    ``POST /api/bean-profiles``
     (:class:`BeanProfileInput`) action, unchanged, so a saved profile is
     always the result of an explicit operator action, never an automatic
     side effect of drafting one.
@@ -858,6 +866,31 @@ class BeanProfileDraft(_BeanProfileFieldsBase):
     default_bean_weight_grams: float = Field(gt=0)
     """The charge weight (grams) that would pre-fill a new roast's form if
     this draft is saved; adjustable per roast like every other profile."""
+
+    @field_validator(
+        "name",
+        "bean_origin",
+        "bean_varietal",
+        "country",
+        "farm",
+        "description",
+        "source_url",
+        mode="before",
+    )
+    @classmethod
+    def _strip_bidi_controls(cls, value: object) -> object:
+        """Remove non-content bidi controls from untrusted drafted identity text."""
+        if isinstance(value, str):
+            return _BEAN_DRAFT_BIDI_CONTROLS.sub("", value)
+        return value
+
+    draft_attempt_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    """Opaque, one-use id joining this draft to an explicit later save.
+
+    The extraction helper leaves it unset; the API service adds it only after
+    durably recording a successful attempt. It never authorizes an automatic
+    save.
+    """
 
     is_blend: bool | None = None  # pyright: ignore[reportIncompatibleVariableOverride]
     """Overrides the shared base's plain ``bool`` (#587): a DRAFT's blend

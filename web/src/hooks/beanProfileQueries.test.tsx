@@ -64,12 +64,22 @@ describe("useCreateBeanProfile", () => {
     const { result } = renderHook(() => useCreateBeanProfile(), {
       wrapper: wrapperFor(client),
     });
-    const saved = await result.current.mutateAsync(INPUT);
-    expect(post).toHaveBeenCalledWith(INPUT);
+    const saved = await result.current.mutateAsync({ input: INPUT });
+    expect(post).toHaveBeenCalledWith(INPUT, undefined);
     expect(saved.id).toBe("p1");
     await waitFor(() =>
       expect(invalidate).toHaveBeenCalledWith({ queryKey: beanProfileKeys.all }),
     );
+  });
+
+  it("forwards draft correlation metadata", async () => {
+    const post = vi.spyOn(api, "createBeanProfile").mockResolvedValue(SAVED);
+    const client = makeClient();
+    const { result } = renderHook(() => useCreateBeanProfile(), {
+      wrapper: wrapperFor(client),
+    });
+    await result.current.mutateAsync({ input: INPUT, draftAttemptId: "attempt-b" });
+    expect(post).toHaveBeenCalledWith(INPUT, "attempt-b");
   });
 });
 

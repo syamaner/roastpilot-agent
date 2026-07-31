@@ -2,13 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError, api } from "./api";
 
-function mockFetch(status: number, body: unknown): void {
+function mockFetch(status: number, body: unknown, headers?: Record<string, string>): void {
   vi.stubGlobal(
     "fetch",
     vi.fn(async () =>
       new Response(typeof body === "string" ? body : JSON.stringify(body), {
         status,
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...headers },
       }),
     ),
   );
@@ -34,12 +34,38 @@ describe("api client", () => {
     expect(JSON.parse((init as RequestInit).body as string)).toEqual({ action: "drop_beans" });
   });
 
+  it("draft-correlated profile create preserves JSON and attempt headers", async () => {
+    mockFetch(201, { id: "bean-1", name: "Kenya" });
+    const input = { name: "Kenya" } as never;
+    await api.createBeanProfile(input, "0123456789abcdef0123456789abcdef");
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    const headers = new Headers((init as RequestInit).headers);
+    expect(headers.get("Content-Type")).toBe("application/json");
+    expect(headers.get("X-RoastPilot-Draft-Attempt-Id")).toBe(
+      "0123456789abcdef0123456789abcdef",
+    );
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual(input);
+  });
+
   it("throws ApiError carrying the server detail on a non-ok response", async () => {
     mockFetch(409, { detail: "a roast is already active" });
     await expect(api.startRoast({} as never)).rejects.toMatchObject({
       name: "ApiError",
       status: 409,
       detail: "a roast is already active",
+    });
+  });
+
+  it("carries a typed conflict code from the response header", async () => {
+    mockFetch(
+      409,
+      { detail: "already saved" },
+      { "X-RoastPilot-Conflict-Code": "draft_attempt_already_claimed" },
+    );
+    await expect(api.createBeanProfile({} as never, "0".repeat(32))).rejects.toMatchObject({
+      status: 409,
+      detail: "already saved",
+      code: "draft_attempt_already_claimed",
     });
   });
 

@@ -311,7 +311,10 @@ export type BeanFieldSource = "on_page" | "origin_estimated";
 
 /** `POST /api/beans/draft-from-url` response (models.BeanProfileDraft) — a
  *  drafted, NOT-YET-SAVED profile the operator reviews/edits/saves via the
- *  existing `createBeanProfile` action. Never persisted server-side. Carries
+ *  existing `createBeanProfile` action. It is never persisted as a saved
+ *  profile; a sanitized field-value baseline (excluding URL, evidence, and
+ *  prose) has a 24-hour correction-correlation deadline and is cleared on claim
+ *  or orderly shutdown, or at the deadline (including after restart). Carries
  *  every `BeanProfileFields` field plus honest per-field provenance
  *  (`field_sources`), the model-cited vendor-page quotes backing the four
  *  typed fields (`field_evidence`), and the conservative "scouting run"
@@ -319,6 +322,7 @@ export type BeanFieldSource = "on_page" | "origin_estimated";
  *  `boolean` with a tri-state: `null` means the page never addressed
  *  blending at all (distinct from the page confirming single-origin). */
 export interface BeanProfileDraftResponse extends Omit<BeanProfileFields, "is_blend"> {
+  draft_attempt_id: string;
   is_blend: boolean | null;
   field_sources: Record<string, BeanFieldSource>;
   field_evidence: Record<string, string>;

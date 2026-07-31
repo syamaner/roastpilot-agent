@@ -25,7 +25,7 @@ function echoSaved(id: string, input: BeanProfileInput): BeanProfile {
 
 export function StartRoastHarnessPage(): React.JSX.Element {
   const onStart = (_profile: RoastProfile): Promise<void> => Promise.resolve();
-  const onCreateProfile = (input: BeanProfileInput): Promise<BeanProfile> =>
+  const onCreateProfile = (input: BeanProfileInput, _draftAttemptId?: string): Promise<BeanProfile> =>
     Promise.resolve(echoSaved("harness-created", input));
   const onUpdateProfile = (id: string, input: BeanProfileInput): Promise<BeanProfile> =>
     Promise.resolve(echoSaved(id, input));
