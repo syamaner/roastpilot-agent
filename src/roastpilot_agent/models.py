@@ -859,6 +859,14 @@ class BeanProfileDraft(_BeanProfileFieldsBase):
     """The charge weight (grams) that would pre-fill a new roast's form if
     this draft is saved; adjustable per roast like every other profile."""
 
+    draft_attempt_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    """Opaque, one-use id joining this draft to an explicit later save.
+
+    The extraction helper leaves it unset; the API service adds it only after
+    durably recording a successful attempt. It never authorizes an automatic
+    save.
+    """
+
     is_blend: bool | None = None  # pyright: ignore[reportIncompatibleVariableOverride]
     """Overrides the shared base's plain ``bool`` (#587): a DRAFT's blend
     flag is honestly tri-state, because "the page never mentioned blending"

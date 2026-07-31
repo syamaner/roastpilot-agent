@@ -5,6 +5,8 @@ the seed (present + idempotent), and that the additive v4 migration leaves
 ``roast_runs`` untouched (corpus integrity).
 """
 
+import asyncio
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -13,7 +15,13 @@ import pytest_asyncio
 
 from roastpilot_agent import store as store_module
 from roastpilot_agent.config import AppConfig
-from roastpilot_agent.models import BeanProfile, BeanProfileInput, RoastPhase, RoastProfile
+from roastpilot_agent.models import (
+    BeanProfile,
+    BeanProfileDraft,
+    BeanProfileInput,
+    RoastPhase,
+    RoastProfile,
+)
 from roastpilot_agent.seed import (
     COLOMBIA_HUILA_ID,
     COLOMBIA_HUILA_SEED,
@@ -27,7 +35,11 @@ from roastpilot_agent.seed import (
     SUMATRA_MANDHELING_ID,
     SUMATRA_MANDHELING_SEED,
 )
-from roastpilot_agent.store import BeanProfileNotFoundError, RoastStore
+from roastpilot_agent.store import (
+    BeanDraftAttemptClaimError,
+    BeanProfileNotFoundError,
+    RoastStore,
+)
 
 
 def _input(**overrides: object) -> BeanProfileInput:
@@ -43,6 +55,24 @@ def _input(**overrides: object) -> BeanProfileInput:
     }
     base.update(overrides)
     return BeanProfileInput.model_validate(base)
+
+
+def _draft(**overrides: object) -> BeanProfileDraft:
+    """A successful extracted draft with sensitive provenance fields."""
+    base = _input().model_dump()
+    base.update(
+        {
+            "source_url": "https://vendor.example/bean?token=secret",
+            "field_sources": {
+                "name": "on_page",
+                "target_drop_temp_c": "origin_estimated",
+            },
+            "field_evidence": {"name": "secret evidence quote"},
+            "scouting_note": "private scouting prose",
+        }
+    )
+    base.update(overrides)
+    return BeanProfileDraft.model_validate(base)
 
 
 @pytest_asyncio.fixture
@@ -69,6 +99,174 @@ async def test_v4_migration_creates_bean_profiles_table(store: RoastStore) -> No
     ) as cursor:
         tables = {str(row[0]) for row in await cursor.fetchall()}
     assert "bean_profiles" in tables
+
+
+@pytest.mark.asyncio
+async def test_v14_attempt_claim_is_atomic_one_use_and_records_corrections(
+    store: RoastStore,
+) -> None:
+    """#588: one successful attempt can correlate to exactly one explicit save."""
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="openai_compatible",
+        model_slug="openai/gpt-5-mini",
+        prompt_version="v1",
+    )
+    await store.finish_bean_sourcing_attempt(
+        attempt_id,
+        outcome="success",
+        latency_ms=123,
+        request_tokens=100,
+        response_tokens=20,
+        usage_evidence="exact",
+        timed_out_runs=0,
+        draft=_draft(),
+    )
+    saved_input = _input(name="Operator correction", source_url="https://safe.example/bean")
+    second_store = RoastStore(store.db_path)
+    await second_store.initialize()
+    try:
+        first, second = await asyncio.gather(
+            store.create_bean_profile(saved_input, draft_attempt_id=attempt_id),
+            second_store.create_bean_profile(saved_input, draft_attempt_id=attempt_id),
+            return_exceptions=True,
+        )
+    finally:
+        await second_store.close()
+    results = (first, second)
+    saved = next(result for result in results if isinstance(result, BeanProfile))
+    assert sum(isinstance(result, BeanDraftAttemptClaimError) for result in results) == 1
+
+    async with store.connection.execute(
+        "SELECT saved_profile_id, changed_fields_json, draft_snapshot_json"
+        " FROM bean_sourcing_attempts WHERE id = ?",
+        (attempt_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert row["saved_profile_id"] == saved.id
+    assert json.loads(str(row["changed_fields_json"])) == ["name"]
+    assert row["draft_snapshot_json"] is None
+    async with store.connection.execute(
+        "SELECT COUNT(*) FROM bean_profiles WHERE id = ?", (saved.id,)
+    ) as cursor:
+        assert (await cursor.fetchone())[0] == 1  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_v14_attempt_snapshot_excludes_url_evidence_and_prose(store: RoastStore) -> None:
+    """#588: bounded baseline storage never copies sensitive fetch artifacts."""
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="openai_compatible", model_slug="model", prompt_version="v1"
+    )
+    await store.finish_bean_sourcing_attempt(
+        attempt_id,
+        outcome="success",
+        latency_ms=1,
+        request_tokens=1,
+        response_tokens=1,
+        usage_evidence="exact",
+        timed_out_runs=0,
+        draft=_draft(),
+    )
+    async with store.connection.execute(
+        "SELECT draft_snapshot_json FROM bean_sourcing_attempts WHERE id = ?",
+        (attempt_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    snapshot = str(row["draft_snapshot_json"])
+    assert "source_url" not in snapshot
+    assert "token=secret" not in snapshot
+    assert "secret evidence quote" not in snapshot
+    assert "private scouting prose" not in snapshot
+
+
+@pytest.mark.asyncio
+async def test_v14_expiry_clears_snapshot_and_fails_claim_closed(store: RoastStore) -> None:
+    """#588: expired ids retain metrics but cannot create a profile."""
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="provider",
+        model_slug="model",
+        prompt_version="v1",
+        started_at_utc="2026-07-29T00:00:00+00:00",
+    )
+    await store.finish_bean_sourcing_attempt(
+        attempt_id,
+        outcome="success",
+        latency_ms=10,
+        request_tokens=None,
+        response_tokens=None,
+        usage_evidence="unknown",
+        timed_out_runs=1,
+        draft=_draft(),
+        completed_at_utc="2026-07-29T00:01:00+00:00",
+    )
+    assert await store.expire_bean_sourcing_drafts(now_utc="2026-07-31T00:00:00+00:00") == 1
+    with pytest.raises(BeanDraftAttemptClaimError):
+        await store.create_bean_profile(_input(), draft_attempt_id=attempt_id)
+    async with store.connection.execute(
+        "SELECT outcome, timed_out_runs, usage_evidence, draft_snapshot_json"
+        " FROM bean_sourcing_attempts WHERE id = ?",
+        (attempt_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert tuple(row) == ("success", 1, "unknown", None)
+
+
+@pytest.mark.asyncio
+async def test_v14_startup_reconciles_interrupted_attempt(store: RoastStore) -> None:
+    """#588: a committed admission cannot remain in-progress after restart."""
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="provider", model_slug="model", prompt_version="v1"
+    )
+    assert (
+        await store.reconcile_interrupted_bean_sourcing_attempts(
+            completed_at_utc="2026-07-31T12:00:00+00:00"
+        )
+        == 1
+    )
+    async with store.connection.execute(
+        "SELECT outcome, completed_at_utc, usage_evidence FROM bean_sourcing_attempts WHERE id = ?",
+        (attempt_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert tuple(row) == ("cancelled", "2026-07-31T12:00:00+00:00", "unknown")
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["fetch_error", "extraction_error", "provider_error", "preempted", "cancelled"],
+)
+@pytest.mark.asyncio
+async def test_v14_every_failure_outcome_is_terminal(
+    store: RoastStore,
+    outcome: str,
+) -> None:
+    """#588: every admitted non-success path remains countable."""
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="provider", model_slug="model", prompt_version="v1"
+    )
+    await store.finish_bean_sourcing_attempt(
+        attempt_id,
+        outcome=outcome,  # pyright: ignore[reportArgumentType]
+        latency_ms=5,
+        request_tokens=None,
+        response_tokens=None,
+        usage_evidence="unknown",
+        timed_out_runs=0,
+    )
+    async with store.connection.execute(
+        "SELECT outcome, completed_at_utc, draft_snapshot_json"
+        " FROM bean_sourcing_attempts WHERE id = ?",
+        (attempt_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert row["outcome"] == outcome
+    assert row["completed_at_utc"] is not None
+    assert row["draft_snapshot_json"] is None
 
 
 @pytest.mark.asyncio

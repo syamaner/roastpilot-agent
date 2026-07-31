@@ -68,6 +68,7 @@ export const FIXTURE_BEAN_PROFILES: BeanProfile[] = [FIXTURE_KOKE, FIXTURE_COLOM
  *  evidence quote, one origin-estimated typed field with none — exercises
  *  both provenance states through the real seeding path. */
 export const FIXTURE_DRAFT_RESPONSE: BeanProfileDraftResponse = {
+  draft_attempt_id: "0123456789abcdef0123456789abcdef",
   name: "Guji Uraga Natural",
   bean_origin: "Ethiopia",
   bean_varietal: "Heirloom",

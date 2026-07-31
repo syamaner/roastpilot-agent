@@ -893,7 +893,12 @@ def test_bean_profile_draft_shares_bean_profile_input_fields() -> None:
     input_fields = set(BeanProfileInput.model_fields)
     draft_fields = set(BeanProfileDraft.model_fields)
     assert input_fields <= draft_fields
-    assert draft_fields - input_fields == {"field_sources", "field_evidence", "scouting_note"}
+    assert draft_fields - input_fields == {
+        "draft_attempt_id",
+        "field_sources",
+        "field_evidence",
+        "scouting_note",
+    }
 
 
 def test_bean_profile_draft_validates_and_strips_like_bean_profile() -> None:

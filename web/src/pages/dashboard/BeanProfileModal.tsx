@@ -73,7 +73,7 @@ export interface BeanProfileModalProps {
   profile?: BeanProfile;
   /** Persist the captured input — wired to the create/update mutation. Resolves to
    *  the saved `BeanProfile`; rejects (ApiError) on a 4xx/5xx (e.g. 422). */
-  onSave: (input: BeanProfileInput) => Promise<BeanProfile>;
+  onSave: (input: BeanProfileInput, draftAttemptId?: string) => Promise<BeanProfile>;
   /** Called with the saved profile so the parent can select it + close. */
   onSaved: (saved: BeanProfile) => void;
   /** Close without saving. */
@@ -116,6 +116,7 @@ export function BeanProfileModal({
   );
   const [draftErrorDetail, setDraftErrorDetail] = useState<string | null>(null);
   const [scoutingNote, setScoutingNote] = useState<string | null>(null);
+  const [draftAttemptId, setDraftAttemptId] = useState<string | undefined>(undefined);
   // Race guard (#637, #654 round 2): the latest fired request "wins" — a token
   // bumped whenever the in-flight draft is invalidated (a newer request, or an
   // operator edit made while it was pending), captured at fire time, and
@@ -214,7 +215,7 @@ export function BeanProfileModal({
     setErrors({});
     setSubmitting(true);
     try {
-      const saved = await onSave(result.input);
+      const saved = await onSave(result.input, draftAttemptId);
       onSaved(saved);
     } catch (err) {
       if (err instanceof ApiError) {
@@ -279,6 +280,7 @@ export function BeanProfileModal({
       // attempt — a failed retry must not erase the still-active prior draft's
       // explanation.
       setScoutingNote(note);
+      setDraftAttemptId(response.draft_attempt_id);
     } catch (err) {
       if (draftRequestIdRef.current !== requestId || !mountedRef.current) return;
       if (err instanceof ApiError && err.status === 422) {

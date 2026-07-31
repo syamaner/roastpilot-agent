@@ -47,7 +47,10 @@ export interface StartRoastFormProps {
   /** Whether the library query is still loading. */
   profilesLoading?: boolean;
   /** Create a saved profile (wired to `useCreateBeanProfile`). */
-  onCreateProfile?: (input: BeanProfileInput) => Promise<BeanProfile>;
+  onCreateProfile?: (
+    input: BeanProfileInput,
+    draftAttemptId?: string,
+  ) => Promise<BeanProfile>;
   /** Edit a saved profile (wired to `useUpdateBeanProfile`). */
   onUpdateProfile?: (id: string, input: BeanProfileInput) => Promise<BeanProfile>;
   /** Archive a saved profile (wired to `useDeleteBeanProfile`); omit to hide it. */
@@ -277,10 +280,10 @@ export function StartRoastForm({
         <BeanProfileModal
           mode={modal.mode}
           profile={modal.mode === "edit" ? modal.profile : undefined}
-          onSave={(input) =>
+          onSave={(input, draftAttemptId) =>
             modal.mode === "edit"
               ? onUpdateProfile!(modal.profile.id, input)
-              : onCreateProfile!(input)
+              : onCreateProfile!(input, draftAttemptId)
           }
           onSaved={handleSaved}
           onClose={() => setModal(null)}

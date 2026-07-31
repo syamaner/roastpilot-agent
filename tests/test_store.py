@@ -34,6 +34,7 @@ EXPECTED_TABLES = {
     "sync_jobs",
     "reference_roasts",
     "bean_profiles",
+    "bean_sourcing_attempts",
     "roast_tastings",
 }
 
@@ -45,6 +46,7 @@ EXPECTED_INDEXES = {
     "idx_command_run_tick",
     "idx_roast_runs_sync_status",
     "idx_bean_profiles_archived",
+    "idx_bean_sourcing_attempt_expiry",
     "idx_roast_tastings_run",
 }
 
@@ -366,7 +368,7 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
     upgraded = RoastStore(db_path=db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 13 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 14 == len(MIGRATIONS)
         row = await fetch_one(upgraded, "SELECT excluded FROM roast_runs WHERE id = 'run-1'")
         assert row == (0,)
         detail = await upgraded.read_run("run-1")
@@ -382,13 +384,40 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
 
 
 @pytest.mark.asyncio
-async def test_fresh_store_is_v13(tmp_store: RoastStore) -> None:
-    """A brand-new store lands on the current (v13) schema version."""
+async def test_fresh_store_is_v14(tmp_store: RoastStore) -> None:
+    """A brand-new store lands on the current (v14) schema version."""
     await tmp_store.initialize()
     try:
-        assert await tmp_store.schema_version() == 13 == len(MIGRATIONS)
+        assert await tmp_store.schema_version() == 14 == len(MIGRATIONS)
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_v14_migration_upgrades_real_v13_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#588: v13 roast data survives the additive attempt-ledger migration."""
+    db_path = tmp_path / "v14upgrade.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:13])
+    old = RoastStore(db_path)
+    await old.initialize()
+    try:
+        assert await old.schema_version() == 13
+        await seeded_store(old)
+    finally:
+        await old.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(db_path)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == 14
+        assert await upgraded.read_run("run-1") is not None
+        assert "bean_sourcing_attempts" in await fetch_names(upgraded, "table")
+        assert "idx_bean_sourcing_attempt_expiry" in await fetch_names(upgraded, "index")
+    finally:
+        await upgraded.close()
 
 
 @pytest.mark.asyncio

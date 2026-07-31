@@ -228,7 +228,10 @@ export function useBeanProfiles() {
 export function useCreateBeanProfile() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (input: BeanProfileInput) => api.createBeanProfile(input),
+    mutationFn: ({ input, draftAttemptId }: {
+      input: BeanProfileInput;
+      draftAttemptId?: string;
+    }) => api.createBeanProfile(input, draftAttemptId),
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: beanProfileKeys.all }),
   });

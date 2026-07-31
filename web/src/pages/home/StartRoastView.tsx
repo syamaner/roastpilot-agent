@@ -255,7 +255,8 @@ export function StartRoastView(): React.JSX.Element {
   const deleteBeanProfile = useDeleteBeanProfile();
 
   const handleCreateProfile = useCallback(
-    (input: BeanProfileInput) => createBeanProfile.mutateAsync(input),
+    (input: BeanProfileInput, draftAttemptId?: string) =>
+      createBeanProfile.mutateAsync({ input, draftAttemptId }),
     [createBeanProfile],
   );
   const handleUpdateProfile = useCallback(

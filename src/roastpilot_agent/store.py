@@ -6,6 +6,7 @@ power-loss protection is the default bias), and a ``PRAGMA user_version``
 migration mechanism. Write paths land in E6-S2, recovery reads in E6-S3.
 """
 
+import asyncio
 import hashlib
 import json
 import re
@@ -22,6 +23,7 @@ from roastpilot_agent.config import AppConfig
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
     BeanProfile,
+    BeanProfileDraft,
     BeanProfileInput,
     BrewMethod,
     CommandTraceSource,
@@ -465,6 +467,42 @@ ALTER TABLE roast_runs ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0
   CHECK (excluded IN (0, 1));
 """
 
+SCHEMA_V14_BEAN_SOURCING_ATTEMPTS = """
+-- #588 / D119: durable runtime monitoring for every admitted URL-draft
+-- attempt. Sensitive normalized draft values exist only during the bounded
+-- operator review window and are cleared on claim/expiry.
+CREATE TABLE bean_sourcing_attempts (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  model_slug TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  started_at_utc TEXT NOT NULL,
+  completed_at_utc TEXT,
+  latency_ms INTEGER CHECK (latency_ms IS NULL OR latency_ms >= 0),
+  outcome TEXT NOT NULL CHECK (outcome IN (
+    'in_progress', 'success', 'fetch_error', 'extraction_error',
+    'provider_error', 'preempted', 'cancelled')),
+  request_tokens INTEGER CHECK (request_tokens IS NULL OR request_tokens >= 0),
+  response_tokens INTEGER CHECK (response_tokens IS NULL OR response_tokens >= 0),
+  usage_evidence TEXT NOT NULL DEFAULT 'unknown'
+    CHECK (usage_evidence IN ('exact', 'partial', 'unknown')),
+  timed_out_runs INTEGER NOT NULL DEFAULT 0 CHECK (timed_out_runs >= 0),
+  on_page_field_count INTEGER CHECK (
+    on_page_field_count IS NULL OR on_page_field_count >= 0),
+  origin_estimated_field_count INTEGER CHECK (
+    origin_estimated_field_count IS NULL OR origin_estimated_field_count >= 0),
+  draft_snapshot_json TEXT,
+  claim_expires_at_utc TEXT,
+  saved_profile_id TEXT REFERENCES bean_profiles(id),
+  changed_fields_json TEXT,
+  claimed_at_utc TEXT
+);
+
+CREATE INDEX idx_bean_sourcing_attempt_expiry
+  ON bean_sourcing_attempts(claim_expires_at_utc)
+  WHERE draft_snapshot_json IS NOT NULL AND saved_profile_id IS NULL;
+"""
+
 #: Ordered migration scripts; index+1 is the resulting PRAGMA user_version.
 #: Append-only — never edit a shipped migration (plan §8: schema migration
 #: is test-covered).
@@ -482,6 +520,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V11_TASTINGS,
     SCHEMA_V12_CORRECTED_CHARGE,
     SCHEMA_V13_EXCLUDED,
+    SCHEMA_V14_BEAN_SOURCING_ATTEMPTS,
 )
 
 
@@ -491,6 +530,10 @@ class BeanProfileNotFoundError(Exception):
     Raised by :meth:`RoastStore.update_bean_profile` /
     :meth:`RoastStore.delete_bean_profile` for an unknown or already-archived id;
     the API maps it to HTTP 404."""
+
+
+class BeanDraftAttemptClaimError(Exception):
+    """A draft attempt id cannot be attached to a new saved profile (#588)."""
 
 
 class PhysicallyImpossibleWeightError(Exception):
@@ -563,6 +606,7 @@ class RoastStore:
         self._db_path = db_path
         self._connection: aiosqlite.Connection | None = None
         self._last_telemetry_elapsed: dict[str, float] = {}
+        self._bean_profile_write_lock = asyncio.Lock()
 
     @property
     def db_path(self) -> Path:
@@ -2278,7 +2322,171 @@ class RoastStore:
     # archive (``archived = 1``), never a hard DELETE, so a profile referenced by
     # a past roast's notes is never dangling.
 
-    async def create_bean_profile(self, profile_input: BeanProfileInput) -> BeanProfile:
+    async def expire_bean_sourcing_drafts(self, *, now_utc: str | None = None) -> int:
+        """Clear expired, unclaimed draft snapshots while retaining metrics.
+
+        Args:
+            now_utc: Injectable UTC boundary for deterministic tests.
+
+        Returns:
+            The number of snapshots cleared.
+        """
+        now = now_utc or _utc_now()
+        cursor = await self.connection.execute(
+            "UPDATE bean_sourcing_attempts SET draft_snapshot_json = NULL,"
+            " claim_expires_at_utc = NULL WHERE saved_profile_id IS NULL"
+            " AND draft_snapshot_json IS NOT NULL AND claim_expires_at_utc <= ?",
+            (now,),
+        )
+        await self.connection.commit()
+        return cursor.rowcount
+
+    async def next_bean_sourcing_expiry(self) -> str | None:
+        """Return the earliest unclaimed draft expiry, if one exists."""
+        async with self.connection.execute(
+            "SELECT MIN(claim_expires_at_utc) AS expires_at"
+            " FROM bean_sourcing_attempts WHERE saved_profile_id IS NULL"
+            " AND draft_snapshot_json IS NOT NULL"
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None or row["expires_at"] is None:
+            return None
+        return str(row["expires_at"])
+
+    async def start_bean_sourcing_attempt(
+        self,
+        *,
+        provider: str,
+        model_slug: str,
+        prompt_version: str,
+        started_at_utc: str | None = None,
+    ) -> str:
+        """Durably admit one bean-sourcing attempt before remote work starts."""
+        attempt_id = uuid.uuid4().hex
+        started = started_at_utc or _utc_now()
+        admission_connection = await aiosqlite.connect(self._db_path)
+        try:
+            await admission_connection.execute("PRAGMA busy_timeout=500")
+            await admission_connection.execute("BEGIN IMMEDIATE")
+            await admission_connection.execute(
+                "UPDATE bean_sourcing_attempts SET draft_snapshot_json = NULL,"
+                " claim_expires_at_utc = NULL WHERE saved_profile_id IS NULL"
+                " AND draft_snapshot_json IS NOT NULL AND claim_expires_at_utc <= ?",
+                (started,),
+            )
+            await admission_connection.execute(
+                "INSERT INTO bean_sourcing_attempts"
+                " (id, provider, model_slug, prompt_version, started_at_utc, outcome)"
+                " VALUES (?, ?, ?, ?, ?, 'in_progress')",
+                (attempt_id, provider, model_slug, prompt_version, started),
+            )
+            await admission_connection.commit()
+        except BaseException:
+            await admission_connection.rollback()
+            raise
+        finally:
+            await admission_connection.close()
+        return attempt_id
+
+    async def reconcile_interrupted_bean_sourcing_attempts(
+        self, *, completed_at_utc: str | None = None
+    ) -> int:
+        """Terminalize admissions left in progress by a previous process exit.
+
+        Args:
+            completed_at_utc: Injectable startup timestamp for deterministic tests.
+
+        Returns:
+            The number of orphaned attempts marked cancelled.
+        """
+        cursor = await self.connection.execute(
+            "UPDATE bean_sourcing_attempts SET completed_at_utc = ?,"
+            " outcome = 'cancelled', usage_evidence = 'unknown'"
+            " WHERE outcome = 'in_progress'",
+            (completed_at_utc or _utc_now(),),
+        )
+        await self.connection.commit()
+        return cursor.rowcount
+
+    async def finish_bean_sourcing_attempt(
+        self,
+        attempt_id: str,
+        *,
+        outcome: Literal[
+            "success",
+            "fetch_error",
+            "extraction_error",
+            "provider_error",
+            "preempted",
+            "cancelled",
+        ],
+        latency_ms: int,
+        request_tokens: int | None,
+        response_tokens: int | None,
+        usage_evidence: Literal["exact", "partial", "unknown"],
+        timed_out_runs: int,
+        draft: BeanProfileDraft | None = None,
+        completed_at_utc: str | None = None,
+    ) -> None:
+        """Commit one terminal attempt outcome without retaining unsafe inputs."""
+        completed = completed_at_utc or _utc_now()
+        snapshot: str | None = None
+        expires: str | None = None
+        on_page_count: int | None = None
+        estimated_count: int | None = None
+        if outcome == "success":
+            if draft is None:
+                raise ValueError("a successful bean-sourcing attempt requires a draft")
+            snapshot_fields = BeanProfileInput.model_fields.keys()
+            snapshot_data = {
+                field: getattr(draft, field) for field in snapshot_fields if field != "source_url"
+            }
+            snapshot = json.dumps(snapshot_data, sort_keys=True, separators=(",", ":"))
+            expires = (datetime.fromisoformat(completed) + timedelta(hours=24)).isoformat()
+            on_page_count = sum(value == "on_page" for value in draft.field_sources.values())
+            estimated_count = sum(
+                value == "origin_estimated" for value in draft.field_sources.values()
+            )
+        finish_connection = await aiosqlite.connect(self._db_path)
+        try:
+            await finish_connection.execute("PRAGMA busy_timeout=500")
+            await finish_connection.execute("BEGIN IMMEDIATE")
+            cursor = await finish_connection.execute(
+                "UPDATE bean_sourcing_attempts SET completed_at_utc = ?, latency_ms = ?,"
+                " outcome = ?, request_tokens = ?, response_tokens = ?, usage_evidence = ?,"
+                " timed_out_runs = ?, on_page_field_count = ?,"
+                " origin_estimated_field_count = ?, draft_snapshot_json = ?,"
+                " claim_expires_at_utc = ? WHERE id = ? AND outcome = 'in_progress'",
+                (
+                    completed,
+                    latency_ms,
+                    outcome,
+                    request_tokens,
+                    response_tokens,
+                    usage_evidence,
+                    timed_out_runs,
+                    on_page_count,
+                    estimated_count,
+                    snapshot,
+                    expires,
+                    attempt_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"bean-sourcing attempt {attempt_id} was not in progress")
+            await finish_connection.commit()
+        except BaseException:
+            await finish_connection.rollback()
+            raise
+        finally:
+            await finish_connection.close()
+
+    async def create_bean_profile(
+        self,
+        profile_input: BeanProfileInput,
+        *,
+        draft_attempt_id: str | None = None,
+    ) -> BeanProfile:
         """Persist a new saved bean profile and return it with its id + timestamps.
 
         Mints a fresh uuid4 id and stamps ``created_at`` == ``updated_at`` at the
@@ -2292,20 +2500,74 @@ class RoastStore:
         Returns:
             The saved :class:`BeanProfile`, with id and timestamps populated.
         """
-        now = _utc_now()
-        profile = BeanProfile(
-            id=uuid.uuid4().hex,
-            created_at=now,
-            updated_at=now,
-            **profile_input.model_dump(),
-        )
-        await self.connection.execute(
-            "INSERT INTO bean_profiles (id, name, profile_json, archived,"
-            " created_at_utc, updated_at_utc) VALUES (?, ?, ?, 0, ?, ?)",
-            (profile.id, profile.name, profile.model_dump_json(), now, now),
-        )
-        await self.connection.commit()
-        return profile
+        async with self._bean_profile_write_lock:
+            now = _utc_now()
+            profile = BeanProfile(
+                id=uuid.uuid4().hex,
+                created_at=now,
+                updated_at=now,
+                **profile_input.model_dump(),
+            )
+            if draft_attempt_id is None:
+                await self.connection.execute(
+                    "INSERT INTO bean_profiles (id, name, profile_json, archived,"
+                    " created_at_utc, updated_at_utc) VALUES (?, ?, ?, 0, ?, ?)",
+                    (profile.id, profile.name, profile.model_dump_json(), now, now),
+                )
+                await self.connection.commit()
+                return profile
+
+            # A dedicated connection owns this transaction. The main store
+            # connection also serves the periodic expiry task; sharing it here
+            # would let an unrelated commit split the claim transaction.
+            claim_connection = await aiosqlite.connect(self._db_path)
+            claim_connection.row_factory = aiosqlite.Row
+            try:
+                await claim_connection.execute("PRAGMA foreign_keys=ON")
+                await claim_connection.execute("BEGIN IMMEDIATE")
+                await claim_connection.execute(
+                    "UPDATE bean_sourcing_attempts SET draft_snapshot_json = NULL,"
+                    " claim_expires_at_utc = NULL WHERE saved_profile_id IS NULL"
+                    " AND draft_snapshot_json IS NOT NULL AND claim_expires_at_utc <= ?",
+                    (now,),
+                )
+                async with claim_connection.execute(
+                    "SELECT draft_snapshot_json FROM bean_sourcing_attempts"
+                    " WHERE id = ? AND outcome = 'success' AND saved_profile_id IS NULL"
+                    " AND draft_snapshot_json IS NOT NULL AND claim_expires_at_utc > ?",
+                    (draft_attempt_id, now),
+                ) as cursor:
+                    attempt = await cursor.fetchone()
+                if attempt is None:
+                    raise BeanDraftAttemptClaimError(
+                        "draft attempt is unknown, expired, unsuccessful, or already saved"
+                    )
+                baseline = cast(dict[str, Any], json.loads(str(attempt["draft_snapshot_json"])))
+                saved_values = profile_input.model_dump(mode="json")
+                changed_fields = sorted(
+                    field for field, value in baseline.items() if saved_values[field] != value
+                )
+                await claim_connection.execute(
+                    "INSERT INTO bean_profiles (id, name, profile_json, archived,"
+                    " created_at_utc, updated_at_utc) VALUES (?, ?, ?, 0, ?, ?)",
+                    (profile.id, profile.name, profile.model_dump_json(), now, now),
+                )
+                claim = await claim_connection.execute(
+                    "UPDATE bean_sourcing_attempts SET saved_profile_id = ?,"
+                    " changed_fields_json = ?, claimed_at_utc = ?,"
+                    " draft_snapshot_json = NULL, claim_expires_at_utc = NULL"
+                    " WHERE id = ? AND outcome = 'success' AND saved_profile_id IS NULL",
+                    (profile.id, json.dumps(changed_fields), now, draft_attempt_id),
+                )
+                if claim.rowcount != 1:  # pragma: no cover - lock + transaction defence
+                    raise BeanDraftAttemptClaimError("draft attempt was already saved")
+                await claim_connection.commit()
+            except BaseException:
+                await claim_connection.rollback()
+                raise
+            finally:
+                await claim_connection.close()
+            return profile
 
     async def list_bean_profiles(self) -> list[BeanProfile]:
         """The active (non-archived) saved profiles, name-ordered (#303).

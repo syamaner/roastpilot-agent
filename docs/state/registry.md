@@ -28,11 +28,13 @@
 > hardening will be attempted on them again), the #601 reasoning-arm bake-off and
 > spend-integrity stack (results in `docs/advisor/bean-sourcing-bakeoff-2026-07-22.md`),
 > and the #637 draft-from-URL UI. Residual hardening #596/#597 closed 26–27 Jul.
-> Open follow-ups: **#573** (catalogue scope — operator-gated), **#588** (draft→saved
-> RUNTIME MONITORING — one row per extraction ATTEMPT including the ones that never
-> produce a draft; the scoring/small-N bake-off harness itself already shipped as
-> `scripts/bakeoff_bean_sourcing.py`, so "eval harness" pointed at finished work),
-> **#591** (socket-level SSRF pinning), **#595** (rate-limit/auth on the
+> **#588 / D119 closes the runtime-monitoring gap:** schema v14 records every
+> admitted extraction attempt (including failures/preemption), qualified usage,
+> latency and provenance counts, then atomically correlates at most one explicit
+> save to a bounded, server-held baseline without retaining URLs/evidence/error
+> text. The scoring/small-N bake-off harness already shipped as
+> `scripts/bakeoff_bean_sourcing.py`. Open follow-ups: **#573** (catalogue scope —
+> operator-gated), **#591** (socket-level SSRF pinning), **#595** (rate-limit/auth on the
 > billable endpoint).
 >
 > **Review + process.** PR size is a **reviewability guide, not a hard cap** (#661,
@@ -52,7 +54,7 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D119** (D118 records the privileged-PR override).
+> Next free plan decision number: **D120** (D119 records bean-sourcing runtime telemetry).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 27 Jul block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC

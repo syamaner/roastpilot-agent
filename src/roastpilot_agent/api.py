@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -43,11 +43,14 @@ from roastpilot_agent.advisor import (
     RoastDecision,
 )
 from roastpilot_agent.bean_sourcing import (
+    BEAN_EXTRACTION_PROMPT_VERSION,
     BeanExtractionError,
     BeanExtractionUnavailableError,
     BeanFetchError,
+    BeanSourcingDiagnostics,
     draft_bean_profile_from_url,
     redact_url_for_error,
+    resolve_extraction_model_slug,
 )
 from roastpilot_agent.config import AppConfig, MCPDeviceConfig
 from roastpilot_agent.config_store import (
@@ -120,6 +123,7 @@ from roastpilot_agent.safety import (
 )
 from roastpilot_agent.seed import SEED_BEAN_PROFILES
 from roastpilot_agent.store import (
+    BeanDraftAttemptClaimError,
     BeanProfileNotFoundError,
     PhysicallyImpossibleWeightError,
     RoastStore,
@@ -397,6 +401,8 @@ LogArtifactName = str
 
 
 _BEAN_DRAFT_CANCELLATION_GRACE_SECONDS = 0.5
+_BEAN_DRAFT_FINALIZE_TIMEOUT_SECONDS = 1.0
+_BEAN_DRAFT_EXPIRY_RETRY_SECONDS = 1.0
 
 
 class RoastRunConflictError(Exception):
@@ -1393,6 +1399,8 @@ class RoastService:
         # roast-start preemption both happen under _start_lock, closing the
         # check/register/start race without holding the lock across remote work.
         self._bean_draft_operations: dict[asyncio.Task[BeanProfileDraft], _BeanDraftOperation] = {}
+        self._bean_draft_expiry_wakeup = asyncio.Event()
+        self._bean_draft_expiry_task: asyncio.Task[None] | None = None
         # The phase-validity pre-check shares the run's configured safety
         # limits, so the queue's verdict matches the controller's on drain.
         self._safety = SafetyPolicy(self._config.safety)
@@ -1982,6 +1990,12 @@ class RoastService:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        expiry_task = self._bean_draft_expiry_task
+        self._bean_draft_expiry_task = None
+        if expiry_task is not None and not expiry_task.done():
+            expiry_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await expiry_task
 
     async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
         """Persist a marker if the MCP child stop went unconfirmed (#177).
@@ -2651,14 +2665,67 @@ class RoastService:
         """
         for seed in SEED_BEAN_PROFILES:
             await self._store.seed_bean_profile(seed)
+        await self._store.reconcile_interrupted_bean_sourcing_attempts()
+        await self._store.expire_bean_sourcing_drafts()
+        if await self._store.next_bean_sourcing_expiry() is not None:
+            self._ensure_bean_draft_expiry_task()
+
+    def _ensure_bean_draft_expiry_task(self) -> None:
+        """Start or wake the service-owned bounded-retention timer (#588)."""
+        task = self._bean_draft_expiry_task
+        if task is None or task.done():
+            self._bean_draft_expiry_task = asyncio.create_task(
+                self._bean_draft_expiry_loop(), name="bean-draft-expiry"
+            )
+        else:
+            self._bean_draft_expiry_wakeup.set()
+
+    async def _bean_draft_expiry_loop(self) -> None:
+        """Clear successful unsaved draft snapshots at their 24-hour boundary."""
+        while True:
+            self._bean_draft_expiry_wakeup.clear()
+            try:
+                await self._store.expire_bean_sourcing_drafts()
+                next_expiry = await self._store.next_bean_sourcing_expiry()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - retention retries after visible failure
+                _log.error("bean-draft expiry pass failed; retrying", exc_info=True)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._bean_draft_expiry_wakeup.wait(),
+                        timeout=_BEAN_DRAFT_EXPIRY_RETRY_SECONDS,
+                    )
+                continue
+            if next_expiry is None:
+                await self._bean_draft_expiry_wakeup.wait()
+                continue
+            delay = max(
+                0.0,
+                (datetime.fromisoformat(next_expiry) - datetime.now(UTC)).total_seconds(),
+            )
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._bean_draft_expiry_wakeup.wait(), timeout=delay)
 
     async def list_bean_profiles(self) -> BeanProfileList:
         """The active saved bean profiles for the dropdown, name-ordered (#303)."""
         return BeanProfileList(profiles=await self._store.list_bean_profiles())
 
-    async def create_bean_profile(self, profile_input: BeanProfileInput) -> BeanProfile:
-        """Create a saved bean profile (#303)."""
-        return await self._store.create_bean_profile(profile_input)
+    async def create_bean_profile(
+        self,
+        profile_input: BeanProfileInput,
+        *,
+        draft_attempt_id: str | None = None,
+    ) -> BeanProfile:
+        """Create a saved profile, optionally claiming one drafted attempt."""
+        try:
+            profile = await self._store.create_bean_profile(
+                profile_input, draft_attempt_id=draft_attempt_id
+            )
+        except BeanDraftAttemptClaimError as exc:
+            raise RoastRunConflictError(str(exc)) from exc
+        self._ensure_bean_draft_expiry_task()
+        return profile
 
     async def update_bean_profile(
         self, profile_id: str, profile_input: BeanProfileInput
@@ -2682,6 +2749,108 @@ class RoastService:
     # NOT store-backed: this returns a draft only, never persists it. Saving
     # remains the unchanged create_bean_profile action above, driven by the
     # operator explicitly submitting the (possibly edited) draft.
+
+    @staticmethod
+    def _bean_attempt_usage(
+        diagnostics: BeanSourcingDiagnostics,
+        *,
+        provider_response_missing: bool,
+    ) -> tuple[int | None, int | None, Literal["exact", "partial", "unknown"]]:
+        """Qualify retry-inclusive usage without treating unknown as zero."""
+        if not provider_response_missing:
+            return diagnostics.request_tokens, diagnostics.response_tokens, "exact"
+        if diagnostics.request_tokens > 0 or diagnostics.response_tokens > 0:
+            return diagnostics.request_tokens, diagnostics.response_tokens, "partial"
+        return None, None, "unknown"
+
+    async def _start_bean_attempt_bounded(
+        self, *, provider: str, model_slug: str, prompt_version: str
+    ) -> tuple[str, bool]:
+        """Own admission until commit/rollback and report deferred cancellation."""
+        admission = asyncio.create_task(
+            self._store.start_bean_sourcing_attempt(
+                provider=provider, model_slug=model_slug, prompt_version=prompt_version
+            ),
+            name="admit-bean-attempt",
+        )
+        cancellation_received = False
+        while not admission.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(admission), timeout=_BEAN_DRAFT_FINALIZE_TIMEOUT_SECONDS
+                )
+            except asyncio.CancelledError:
+                cancellation_received = True
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+            except TimeoutError as exc:
+                admission.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await admission
+                raise RuntimeError("timed out admitting bean-sourcing attempt") from exc
+        return admission.result(), cancellation_received
+
+    async def _finish_bean_attempt_bounded(
+        self,
+        attempt_id: str,
+        *,
+        outcome: Literal[
+            "success",
+            "fetch_error",
+            "extraction_error",
+            "provider_error",
+            "preempted",
+            "cancelled",
+        ],
+        started_monotonic: float,
+        diagnostics: BeanSourcingDiagnostics,
+        provider_response_missing: bool,
+        draft: BeanProfileDraft | None = None,
+    ) -> None:
+        """Commit terminal telemetry in a separately owned shielded task."""
+        request_tokens, response_tokens, evidence = self._bean_attempt_usage(
+            diagnostics, provider_response_missing=provider_response_missing
+        )
+        finalizer = asyncio.create_task(
+            self._store.finish_bean_sourcing_attempt(
+                attempt_id,
+                outcome=outcome,
+                latency_ms=max(0, round((self._clock() - started_monotonic) * 1000)),
+                request_tokens=request_tokens,
+                response_tokens=response_tokens,
+                usage_evidence=evidence,
+                timed_out_runs=diagnostics.timed_out_runs,
+                draft=draft,
+            ),
+            name=f"finish-bean-attempt-{attempt_id}",
+        )
+        deadline = self._clock() + _BEAN_DRAFT_FINALIZE_TIMEOUT_SECONDS
+        cancellation_received = False
+        while not finalizer.done():
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                finalizer.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await finalizer
+                raise RuntimeError(f"timed out finalizing bean-sourcing attempt {attempt_id}")
+            try:
+                await asyncio.wait_for(asyncio.shield(finalizer), timeout=remaining)
+            except asyncio.CancelledError:
+                cancellation_received = True
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+            except TimeoutError as exc:
+                finalizer.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await finalizer
+                raise RuntimeError(
+                    f"timed out finalizing bean-sourcing attempt {attempt_id}"
+                ) from exc
+        finalizer.result()
+        if cancellation_received:
+            raise asyncio.CancelledError
 
     async def draft_bean_from_url(self, url: str) -> BeanProfileDraft:
         """Draft (never persist) a bean profile from a vendor URL (#573 phase 1).
@@ -2725,11 +2894,28 @@ class RoastService:
                 )
             advisor_config = self._config.advisor
             sourcing_config = self._config.bean_sourcing
+            started_monotonic = self._clock()
+            diagnostics = BeanSourcingDiagnostics()
+            attempt_id, cancelled_during_admission = await self._start_bean_attempt_bounded(
+                provider=advisor_config.provider,
+                model_slug=resolve_extraction_model_slug(advisor_config, sourcing_config),
+                prompt_version=BEAN_EXTRACTION_PROMPT_VERSION,
+            )
+            if cancelled_during_admission:
+                await self._finish_bean_attempt_bounded(
+                    attempt_id,
+                    outcome="cancelled",
+                    started_monotonic=started_monotonic,
+                    diagnostics=diagnostics,
+                    provider_response_missing=True,
+                )
+                raise asyncio.CancelledError
             task = asyncio.create_task(
                 draft_bean_profile_from_url(
                     url,
                     advisor_config=advisor_config,
                     sourcing_config=sourcing_config,
+                    diagnostics=diagnostics,
                 )
             )
             operation = _BeanDraftOperation(task=task)
@@ -2739,36 +2925,96 @@ class RoastService:
                 result = await task
             except asyncio.CancelledError:
                 outer_task = asyncio.current_task()
-                if (
-                    outer_task is not None
-                    and outer_task.cancelling() == 0
-                    and operation.preempted_by_start
-                ):
+                preempted = operation.preempted_by_start
+                await self._finish_bean_attempt_bounded(
+                    attempt_id,
+                    outcome="preempted" if preempted else "cancelled",
+                    started_monotonic=started_monotonic,
+                    diagnostics=diagnostics,
+                    provider_response_missing=True,
+                )
+                if outer_task is not None and outer_task.cancelling() == 0 and preempted:
                     raise RoastRunConflictError(
                         "bean drafting was preempted by a roast-start attempt; "
                         "retry once the roast ends, or retry now if the start failed"
                     ) from None
                 raise
-            except Exception:
+            except Exception as exc:
                 outer_task = asyncio.current_task()
                 if outer_task is not None and outer_task.cancelling() > 0:
+                    await self._finish_bean_attempt_bounded(
+                        attempt_id,
+                        outcome="cancelled",
+                        started_monotonic=started_monotonic,
+                        diagnostics=diagnostics,
+                        provider_response_missing=True,
+                    )
                     raise asyncio.CancelledError from None
                 if operation.preempted_by_start:
+                    await self._finish_bean_attempt_bounded(
+                        attempt_id,
+                        outcome="preempted",
+                        started_monotonic=started_monotonic,
+                        diagnostics=diagnostics,
+                        provider_response_missing=True,
+                    )
                     raise RoastRunConflictError(
                         "bean drafting was preempted by a roast-start attempt; "
                         "retry once the roast ends, or retry now if the start failed"
                     ) from None
+                if isinstance(exc, BeanFetchError):
+                    outcome = "fetch_error"
+                    missing_usage = False
+                elif isinstance(exc, BeanExtractionUnavailableError):
+                    outcome = "provider_error"
+                    missing_usage = True
+                elif isinstance(exc, BeanExtractionError):
+                    outcome = "extraction_error"
+                    missing_usage = False
+                else:
+                    outcome = "provider_error"
+                    missing_usage = True
+                await self._finish_bean_attempt_bounded(
+                    attempt_id,
+                    outcome=outcome,
+                    started_monotonic=started_monotonic,
+                    diagnostics=diagnostics,
+                    provider_response_missing=missing_usage,
+                )
                 raise
 
             outer_task = asyncio.current_task()
             if outer_task is not None and outer_task.cancelling() > 0:
+                await self._finish_bean_attempt_bounded(
+                    attempt_id,
+                    outcome="cancelled",
+                    started_monotonic=started_monotonic,
+                    diagnostics=diagnostics,
+                    provider_response_missing=True,
+                )
                 raise asyncio.CancelledError
             if operation.preempted_by_start:
+                await self._finish_bean_attempt_bounded(
+                    attempt_id,
+                    outcome="preempted",
+                    started_monotonic=started_monotonic,
+                    diagnostics=diagnostics,
+                    provider_response_missing=True,
+                )
                 raise RoastRunConflictError(
                     "bean drafting was preempted by a roast-start attempt; "
                     "retry once the roast ends, or retry now if the start failed"
                 ) from None
-            return result
+            await self._finish_bean_attempt_bounded(
+                attempt_id,
+                outcome="success",
+                started_monotonic=started_monotonic,
+                diagnostics=diagnostics,
+                provider_response_missing=False,
+                draft=result,
+            )
+            self._ensure_bean_draft_expiry_task()
+            return result.model_copy(update={"draft_attempt_id": attempt_id})
         finally:
             self._bean_draft_operations.pop(task, None)
 
@@ -3003,9 +3249,19 @@ async def list_bean_profiles(service: ServiceDep) -> BeanProfileList:
     return await service.list_bean_profiles()
 
 
-async def create_bean_profile(profile: BeanProfileInput, service: ServiceDep) -> BeanProfile:
-    """``POST /api/bean-profiles`` — create a saved bean profile (#303)."""
-    return await service.create_bean_profile(profile)
+async def create_bean_profile(
+    profile: BeanProfileInput,
+    service: ServiceDep,
+    draft_attempt_id: Annotated[
+        str | None,
+        Header(alias="X-RoastPilot-Draft-Attempt-Id", pattern=r"^[0-9a-f]{32}$"),
+    ] = None,
+) -> BeanProfile:
+    """``POST /api/bean-profiles`` — create and optionally claim a draft."""
+    try:
+        return await service.create_bean_profile(profile, draft_attempt_id=draft_attempt_id)
+    except RoastRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 async def update_bean_profile(

@@ -46,6 +46,7 @@ from roastpilot_agent.bean_sourcing import (
     BeanExtractionError,
     BeanExtractionUnavailableError,
     BeanFetchError,
+    BeanSourcingDiagnostics,
 )
 from roastpilot_agent.config import AppConfig, ControllerConfig, ReferenceCurve
 from roastpilot_agent.mcp_client import (
@@ -115,6 +116,7 @@ async def client(service: RoastService) -> AsyncIterator[AsyncClient]:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as instance:
         yield instance
+    await service.shutdown()
 
 
 # --- health ---
@@ -4195,6 +4197,41 @@ async def test_create_bean_profile_returns_201_with_id_and_timestamps(
 
 
 @pytest.mark.asyncio
+async def test_create_bean_profile_claims_draft_header_once(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#588: the opaque metadata header is fail-closed and one-use."""
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="provider", model_slug="model", prompt_version="v1"
+    )
+    await store.finish_bean_sourcing_attempt(
+        attempt_id,
+        outcome="success",
+        latency_ms=1,
+        request_tokens=1,
+        response_tokens=1,
+        usage_evidence="exact",
+        timed_out_runs=0,
+        draft=_draft_from("https://vendor.example/bean"),
+    )
+    headers = {"X-RoastPilot-Draft-Attempt-Id": attempt_id}
+    created = await client.post(
+        "/api/bean-profiles", json=_bean_input(name="Edited"), headers=headers
+    )
+    assert created.status_code == 201
+    replay = await client.post(
+        "/api/bean-profiles", json=_bean_input(name="Replay"), headers=headers
+    )
+    assert replay.status_code == 409
+    malformed = await client.post(
+        "/api/bean-profiles",
+        json=_bean_input(name="Malformed"),
+        headers={"X-RoastPilot-Draft-Attempt-Id": "not-an-id"},
+    )
+    assert malformed.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_create_bean_profile_validation_error_is_422(client: AsyncClient) -> None:
     response = await client.post(
         "/api/bean-profiles", json=_bean_input(default_bean_weight_grams=0)
@@ -4372,12 +4409,17 @@ def _draft_from(url: str) -> BeanProfileDraft:
 
 @pytest.mark.asyncio
 async def test_draft_bean_from_url_happy_path(
-    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+    client: AsyncClient, store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[tuple[str, object, object]] = []
 
-    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+    async def fake_draft(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
         calls.append((url, advisor_config, sourcing_config))
+        assert isinstance(diagnostics, BeanSourcingDiagnostics)
+        diagnostics.request_tokens = 101
+        diagnostics.response_tokens = 22
         return _draft_from(url)
 
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
@@ -4393,10 +4435,61 @@ async def test_draft_bean_from_url_happy_path(
     # #627: the empty form — a draft with no captured evidence quotes still
     # carries the key, as an empty object, not an omission.
     assert body["field_evidence"] == {}
+    assert len(body["draft_attempt_id"]) == 32
     assert "id" not in body  # never persisted / never mints a library id
     # It reused the service's configured advisor + bean_sourcing config (BYOK).
     assert len(calls) == 1
     assert calls[0][0] == "https://vendor.example/products/kenya-kiambu"
+    async with store.connection.execute(
+        "SELECT provider, model_slug, prompt_version, outcome, request_tokens,"
+        " response_tokens, usage_evidence FROM bean_sourcing_attempts WHERE id = ?",
+        (body["draft_attempt_id"],),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert row["prompt_version"] == "v1"
+    assert row["outcome"] == "success"
+    assert (row["request_tokens"], row["response_tokens"], row["usage_evidence"]) == (
+        101,
+        22,
+        "exact",
+    )
+
+
+@pytest.mark.asyncio
+async def test_draft_timeout_records_unknown_usage_without_sensitive_error(
+    client: AsyncClient, store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#588: a provider timeout is countable but never misreported as zero spend."""
+
+    async def timed_out(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
+        assert isinstance(diagnostics, BeanSourcingDiagnostics)
+        diagnostics.timed_out_runs = 1
+        raise BeanExtractionUnavailableError("provider secret raw error")
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", timed_out)
+    response = await client.post(
+        "/api/beans/draft-from-url", json={"url": "https://vendor.example/private?key=x"}
+    )
+    assert response.status_code == 503
+    async with store.connection.execute(
+        "SELECT outcome, request_tokens, response_tokens, usage_evidence,"
+        " timed_out_runs FROM bean_sourcing_attempts ORDER BY started_at_utc DESC LIMIT 1"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert tuple(row) == ("provider_error", None, None, "unknown", 1)
+    async with store.connection.execute(
+        "SELECT * FROM bean_sourcing_attempts ORDER BY started_at_utc DESC LIMIT 1"
+    ) as cursor:
+        full_row = await cursor.fetchone()
+    assert full_row is not None
+    persisted = json.dumps(dict(full_row), sort_keys=True)
+    assert "provider secret raw error" not in persisted
+    assert "vendor.example" not in persisted
+    assert "key=x" not in persisted
 
 
 @pytest.mark.asyncio
@@ -4426,7 +4519,9 @@ async def test_draft_bean_from_url_response_carries_field_evidence(
             scouting_note="Scouting run — de-risked first-roast targets.",
         )
 
-    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+    async def fake_draft(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
         return _draft_with_evidence(url)
 
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
@@ -4450,7 +4545,9 @@ async def test_draft_bean_from_url_never_creates_a_saved_profile(
     bean-profile library — it stays empty until the operator explicitly
     POSTs to /api/bean-profiles."""
 
-    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+    async def fake_draft(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
         return _draft_from(url)
 
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
@@ -4465,7 +4562,9 @@ async def test_draft_bean_from_url_never_creates_a_saved_profile(
 async def test_draft_bean_from_url_fetch_error_is_422(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+    async def fake_draft(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
         raise BeanFetchError(f"vendor page fetch failed for {url!r}")
 
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
@@ -4632,7 +4731,9 @@ async def test_draft_bean_from_url_malformed_port_detail_strips_sensitive_text(
 async def test_draft_bean_from_url_extraction_error_is_422(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+    async def fake_draft(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
         raise BeanExtractionError("could not determine a bean name and origin from the page")
 
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
@@ -4673,7 +4774,9 @@ async def test_draft_bean_from_url_dependency_origin_extraction_error_is_503(
     uniform 422 a bare ``BeanExtractionError`` used to get — the vendor page
     may have been fine; the failure is operational, not the caller's input."""
 
-    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+    async def fake_draft(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
         raise BeanExtractionUnavailableError(message)
 
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
@@ -4708,7 +4811,9 @@ async def test_roast_service_draft_bean_from_url_uses_activated_config_without_r
     def fail_if_reloaded() -> tuple[AppConfig, set[str]]:
         raise AssertionError("drafting must not reload saved configuration")
 
-    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+    async def fake_draft(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
         captured["url"] = url
         captured["advisor_config"] = advisor_config
         captured["sourcing_config"] = sourcing_config
@@ -4749,6 +4854,160 @@ async def test_roast_service_draft_bean_from_url_raises_when_a_roast_is_active(
 
 
 @pytest.mark.asyncio
+async def test_cancellation_during_success_finalization_commits_then_propagates(
+    service: RoastService, store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#588: shielding telemetry never consumes request cancellation."""
+    finalizer_entered = asyncio.Event()
+    release_finalizer = asyncio.Event()
+    original_finish = store.finish_bean_sourcing_attempt
+
+    async def delayed_finish(*args: object, **kwargs: object) -> None:
+        finalizer_entered.set()
+        await release_finalizer.wait()
+        await original_finish(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    async def successful_draft(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
+        return _draft_from(url)
+
+    monkeypatch.setattr(store, "finish_bean_sourcing_attempt", delayed_finish)
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", successful_draft)
+    request_task = asyncio.create_task(
+        service.draft_bean_from_url("https://vendor.example/products/kenya")
+    )
+    await asyncio.wait_for(finalizer_entered.wait(), timeout=2.0)
+    request_task.cancel()
+    release_finalizer.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+    async with store.connection.execute(
+        "SELECT outcome FROM bean_sourcing_attempts ORDER BY started_at_utc DESC LIMIT 1"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert row["outcome"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_admission_terminalizes_then_propagates(
+    service: RoastService, store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#588: cancellation cannot strand admission or an open transaction."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_start = store.start_bean_sourcing_attempt
+
+    async def delayed_start(**kwargs: object) -> str:
+        entered.set()
+        await release.wait()
+        return await original_start(**kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(store, "start_bean_sourcing_attempt", delayed_start)
+    request_task = asyncio.create_task(
+        service.draft_bean_from_url("https://vendor.example/products/kenya")
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
+    request_task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+    async with store.connection.execute(
+        "SELECT outcome FROM bean_sourcing_attempts ORDER BY started_at_utc DESC LIMIT 1"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert row["outcome"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_expiry_scheduler_does_not_lose_wakeup_after_empty_query(
+    service: RoastService, store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#588: a success notification racing an empty query forces a re-query."""
+    calls = 0
+    queried_twice = asyncio.Event()
+
+    async def racing_next_expiry() -> str | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            service._bean_draft_expiry_wakeup.set()  # pyright: ignore[reportPrivateUsage]
+        else:
+            queried_twice.set()
+        return None
+
+    monkeypatch.setattr(store, "next_bean_sourcing_expiry", racing_next_expiry)
+    service._ensure_bean_draft_expiry_task()  # pyright: ignore[reportPrivateUsage]
+    await asyncio.wait_for(queried_twice.wait(), timeout=2.0)
+    assert calls >= 2
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_expiry_scheduler_retries_transient_store_failure(
+    service: RoastService, store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#588: one SQLite failure cannot permanently disable retention."""
+    calls = 0
+    retried = asyncio.Event()
+
+    async def flaky_expiry(*, now_utc: str | None = None) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient SQLite failure")
+        retried.set()
+        return 0
+
+    monkeypatch.setattr(store, "expire_bean_sourcing_drafts", flaky_expiry)
+    monkeypatch.setattr(api_module, "_BEAN_DRAFT_EXPIRY_RETRY_SECONDS", 0.01)
+    service._ensure_bean_draft_expiry_task()  # pyright: ignore[reportPrivateUsage]
+    await asyncio.wait_for(retried.wait(), timeout=2.0)
+    assert calls >= 2
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_expiry_scheduler_clears_persisted_snapshot_at_boundary(
+    service: RoastService, store: RoastStore
+) -> None:
+    """#588: the real service timer clears an expired persisted draft."""
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="openrouter",
+        model_slug="test/model",
+        prompt_version="v1",
+    )
+    completed = datetime.now(UTC) - timedelta(hours=24) + timedelta(milliseconds=50)
+    await store.finish_bean_sourcing_attempt(
+        attempt_id,
+        outcome="success",
+        latency_ms=10,
+        request_tokens=3,
+        response_tokens=4,
+        usage_evidence="exact",
+        timed_out_runs=0,
+        draft=_draft_from("https://vendor.example/products/kenya"),
+        completed_at_utc=completed.isoformat(),
+    )
+    service._ensure_bean_draft_expiry_task()  # pyright: ignore[reportPrivateUsage]
+
+    async def snapshot_is_cleared() -> bool:
+        async with store.connection.execute(
+            "SELECT draft_snapshot_json FROM bean_sourcing_attempts WHERE id = ?",
+            (attempt_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row is not None and row["draft_snapshot_json"] is None
+
+    async with asyncio.timeout(2.0):
+        while not await snapshot_is_cleared():
+            await asyncio.sleep(0.01)
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_slow_draft_bean_from_url_does_not_block_start_roast(
     service: RoastService, store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4758,7 +5017,9 @@ async def test_slow_draft_bean_from_url_does_not_block_start_roast(
     release_cleanup = asyncio.Event()
     cleanup_finished = asyncio.Event()
 
-    async def slow_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+    async def slow_draft(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
         draft_entered.set()
         try:
             await asyncio.Event().wait()
@@ -4850,7 +5111,9 @@ async def test_direct_draft_request_cancellation_propagates_and_unregisters(
     draft_entered = asyncio.Event()
     provider_cancelled = asyncio.Event()
 
-    async def slow_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+    async def slow_draft(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
         draft_entered.set()
         try:
             await asyncio.Event().wait()
@@ -4883,7 +5146,9 @@ async def test_external_cancellation_wins_race_with_roast_start(
     start_preemption_received = asyncio.Event()
     hold_cleanup = asyncio.Event()
 
-    async def slow_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+    async def slow_draft(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
         draft_entered.set()
         try:
             await asyncio.Event().wait()
@@ -4919,7 +5184,9 @@ async def test_draft_preemption_message_is_honest_when_roast_start_fails(
     """#657: preemption reports an attempted start, not a guaranteed run."""
     draft_entered = asyncio.Event()
 
-    async def slow_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+    async def slow_draft(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
         draft_entered.set()
         await asyncio.Event().wait()
 
@@ -4955,7 +5222,9 @@ async def test_uncooperative_draft_cleanup_cannot_indefinitely_block_start(
     cancellation_received = asyncio.Event()
     release_cleanup = asyncio.Event()
 
-    async def slow_cleanup(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+    async def slow_cleanup(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
         draft_entered.set()
         try:
             await asyncio.Event().wait()
@@ -4998,7 +5267,9 @@ async def test_draft_bean_from_url_returns_429_when_concurrency_exhausted(
     first_entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+    async def fake_draft(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
         nonlocal entered
         entered += 1
         first_entered.set()
@@ -5064,7 +5335,9 @@ async def test_draft_bean_from_url_works_when_idle(
     """The #587 P1 active-roast guard must not false-positive when idle —
     the ordinary happy path keeps working once the guard is added."""
 
-    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+    async def fake_draft(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
         return _draft_from(url)
 
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)

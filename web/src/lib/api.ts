@@ -177,10 +177,14 @@ export const api = {
   beanProfiles: () => request<BeanProfileList>("/api/bean-profiles"),
 
   /** `POST /api/bean-profiles` — create a saved profile (201; 422 invalid). */
-  createBeanProfile: (input: BeanProfileInput) =>
+  createBeanProfile: (input: BeanProfileInput, draftAttemptId?: string) =>
     request<BeanProfile>("/api/bean-profiles", {
       method: "POST",
       body: JSON.stringify(input),
+      headers:
+        draftAttemptId === undefined
+          ? undefined
+          : { "X-RoastPilot-Draft-Attempt-Id": draftAttemptId },
     }),
 
   /** `PUT /api/bean-profiles/{id}` — edit a saved profile (200; 404/422). Edits

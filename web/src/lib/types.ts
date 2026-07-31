@@ -319,6 +319,7 @@ export type BeanFieldSource = "on_page" | "origin_estimated";
  *  `boolean` with a tri-state: `null` means the page never addressed
  *  blending at all (distinct from the page confirming single-origin). */
 export interface BeanProfileDraftResponse extends Omit<BeanProfileFields, "is_blend"> {
+  draft_attempt_id: string;
   is_blend: boolean | null;
   field_sources: Record<string, BeanFieldSource>;
   field_evidence: Record<string, string>;

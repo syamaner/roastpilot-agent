@@ -3130,6 +3130,12 @@ def _is_openrouter_endpoint(advisor_config: AdvisorConfig) -> bool:
     ) == _normalize_base_url(OPENROUTER_BASE_URL)
 
 
+#: Controlled identity for the extraction instructions + output schema.
+#: Attempt telemetry persists it with provider/model so results from future
+#: prompt revisions never silently mix (#588).
+BEAN_EXTRACTION_PROMPT_VERSION = "v1"
+
+
 def _resolve_extraction_model_slug(
     advisor_config: AdvisorConfig, sourcing_config: BeanSourcingConfig | None
 ) -> str:
@@ -3170,6 +3176,22 @@ def _resolve_extraction_model_slug(
     if _is_openrouter_endpoint(advisor_config):
         return _DEFAULT_EXTRACTION_MODEL_SLUG
     return advisor_config.model_slug
+
+
+def resolve_extraction_model_slug(
+    advisor_config: AdvisorConfig,
+    sourcing_config: BeanSourcingConfig | None = None,
+) -> str:
+    """Return the provider-aware model slug used for bean extraction.
+
+    Args:
+        advisor_config: Provider and fallback model configuration.
+        sourcing_config: Optional bean-sourcing model override.
+
+    Returns:
+        The resolved model slug passed to the extraction provider.
+    """
+    return _resolve_extraction_model_slug(advisor_config, sourcing_config)
 
 
 #: The bean-identity extraction agent's retry budget (#601), PINNED explicitly
