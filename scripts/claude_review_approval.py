@@ -158,10 +158,12 @@ def _process_operator_override(
         api.get(f"/collaborators/{quote(actor, safe='')}/permission"),
         "actor permission",
     )
-    if _string(permission.get("permission"), "actor permission.permission") not in {
-        "admin",
-        "maintain",
-    }:
+    legacy_permission = _string(permission.get("permission"), "actor permission.permission")
+    role_name_value = permission.get("role_name")
+    role_name = (
+        None if role_name_value is None else _string(role_name_value, "actor permission.role_name")
+    )
+    if legacy_permission != "admin" and role_name not in {"admin", "maintain"}:
         raise ValueError("operator override requires current repository maintain permission")
 
     raw_number = _string(inputs.get("pull_request"), "client_payload.pull_request")
@@ -191,10 +193,11 @@ def _process_operator_override(
         return f"PR #{pr.number} already has a recorded operator override for {pr.head[0]}"
 
     _dismiss_approval(pr, api, include_exemption=True)
+    encoded_reason = quote(reason, safe="")
     body = (
         f"{_OPERATOR_OVERRIDE_MARKER} Maintainer @{actor} explicitly authorized "
         f"privileged PR #{pr.number} at `{pr.head[0]}`. "
-        f"reason={json.dumps(reason, ensure_ascii=True)} {_identity_marker(pr)} "
+        f"reason-urlencoded={encoded_reason} {_identity_marker(pr)} "
         f"reviewed-base-sha={pr.base[0]} This override does not attest to the "
         "untrusted Claude workflow result; CI, codecov, exact-head Codex, "
         "conversation resolution, and independent triage remain required."
@@ -393,6 +396,7 @@ def _pull_request_edits_privileged_code(number: int, api: _GitHubAPI) -> bool:
 
 
 def _privileged_diff(number: int, api: _GitHubAPI) -> _PrivilegedDiff:
+    matched = False
     for page in range(1, 31):
         suffix = "" if page == 1 else f"&page={page}"
         values = _array(api.get(f"/pulls/{number}/files?per_page=100{suffix}"), "files")
@@ -407,9 +411,9 @@ def _privileged_diff(number: int, api: _GitHubAPI) -> _PrivilegedDiff:
                 )
                 for path in paths
             ):
-                return _PrivilegedDiff.MATCH
+                matched = True
         if len(values) < 100:
-            return _PrivilegedDiff.NO_MATCH
+            return _PrivilegedDiff.MATCH if matched else _PrivilegedDiff.NO_MATCH
     return _PrivilegedDiff.INDETERMINATE
 
 
@@ -782,9 +786,10 @@ def _dismiss_approval(
         user = _object(review.get("user"), "review.user")
         body = _review_body(review)
         marker = body.split(" ", 1)[0]
-        is_bridge_marker = marker == _APPROVAL_MARKER or (
-            include_exemption and marker == _EXEMPTION_MARKER
-        )
+        allowed_markers = {_APPROVAL_MARKER}
+        if include_exemption:
+            allowed_markers.add(_EXEMPTION_MARKER)
+        is_bridge_marker = marker in allowed_markers
         is_bot_commit = (
             _string(user.get("login"), "review.user.login") == _BOT_LOGIN
             and _string(review.get("commit_id"), "review.commit_id") == pr.head[0]
@@ -801,7 +806,11 @@ def _dismiss_approval(
             )
             dismissed = True
             continue
-        if not _is_bridge_approval(review, pr, approval_only=not include_exemption):
+        if not (
+            is_bot_commit
+            and is_bridge_marker
+            and _string(review.get("state"), "review.state") == "APPROVED"
+        ):
             continue
         review_id = _integer(review.get("id"), "review.id")
         api.put(

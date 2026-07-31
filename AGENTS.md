@@ -444,7 +444,8 @@ Dependabot PRs. Operate the gate as follows:
   accepts only an open PR whose fully available file inventory proves a workflow
   or bridge-helper edit; an ordinary or 3,000-file-indeterminate PR is ineligible.
   It publishes a distinct `[claude-review-operator-override]` approval bound to
-  the exact current identity and records the actor and JSON-escaped reason. Use:
+  the exact current identity and records the actor and URL-encoded reason (so
+  audit text cannot inject bridge identity syntax). Use:
   `gh api --method POST repos/syamaner/roastpilot-agent/dispatches -f
   event_type=privileged_review_override -f 'client_payload[pull_request]=N' -f
   'client_payload[reason]=WHY'`. Never use a ref-selectable `workflow_dispatch`

@@ -1554,15 +1554,19 @@ def test_review_lookup_paginates() -> None:
 def _operator_api(
     *,
     permission: str = "admin",
+    role_name: str | None = None,
     state: str = "open",
     files: list[approval.JsonValue] | None = None,
     reviews: list[approval.JsonValue] | None = None,
 ) -> FakeAPI:
     pr = _pr_payload()
     pr["state"] = state
+    permission_response: approval.JsonObject = {"permission": permission}
+    if role_name is not None:
+        permission_response["role_name"] = role_name
     return FakeAPI(
         {
-            "/collaborators/syamaner/permission": {"permission": permission},
+            "/collaborators/syamaner/permission": permission_response,
             "/pulls/10": pr,
             "/pulls/10/files?per_page=100": (
                 [{"filename": ".github/workflows/example.yml"}] if files is None else files
@@ -1572,11 +1576,17 @@ def _operator_api(
     )
 
 
-@pytest.mark.parametrize("permission", ["maintain", "admin"])
-def test_operator_override_approves_only_current_privileged_identity(permission: str) -> None:
+@pytest.mark.parametrize(
+    ("permission", "role_name"),
+    [("admin", "admin"), ("write", "maintain")],
+)
+def test_operator_override_approves_only_current_privileged_identity(
+    permission: str,
+    role_name: str,
+) -> None:
     """A current maintainer can explicitly approve a privileged PR with audit evidence."""
 
-    api = _operator_api(permission=permission)
+    api = _operator_api(permission=permission, role_name=role_name)
 
     result = approval.process_event(_operator_event(reason='Reviewed "workflow" change.'), api)
 
@@ -1588,16 +1598,22 @@ def test_operator_override_approves_only_current_privileged_identity(permission:
     assert isinstance(body, str)
     assert "[claude-review-operator-override]" in body
     assert "Maintainer @syamaner" in body
-    assert 'reason="Reviewed \\"workflow\\" change."' in body
+    assert "reason-urlencoded=Reviewed%20%22workflow%22%20change." in body
     assert _identity_marker() in body
     assert api.posts[1] == ("/pulls/10/reviews/900/events", {"event": "APPROVE"})
 
 
-@pytest.mark.parametrize("permission", ["write", "read", "triage", "none"])
-def test_operator_override_rejects_actor_without_maintain(permission: str) -> None:
+@pytest.mark.parametrize(
+    ("permission", "role_name"),
+    [("write", "write"), ("write", None), ("read", "read"), ("none", "none")],
+)
+def test_operator_override_rejects_actor_without_maintain(
+    permission: str,
+    role_name: str | None,
+) -> None:
     """The event sender must still hold repository maintainer authority."""
 
-    api = _operator_api(permission=permission)
+    api = _operator_api(permission=permission, role_name=role_name)
 
     with pytest.raises(ValueError, match="current repository maintain permission"):
         approval.process_event(_operator_event(), api)
@@ -1681,9 +1697,11 @@ def test_operator_override_rejects_large_ordinary_pr_after_pagination() -> None:
 
 
 def test_operator_override_rejects_indeterminate_maximum_file_inventory() -> None:
-    """The 3,000-file ceiling blocks but cannot positively qualify an override."""
+    """The 3,000-file ceiling blocks even with an early privileged match."""
 
-    api = _operator_api(files=[{"filename": f"docs/1-{index}.md"} for index in range(100)])
+    first_page: list[approval.JsonValue] = [{"filename": ".github/workflows/ci.yml"}]
+    first_page.extend({"filename": f"docs/1-{index}.md"} for index in range(99))
+    api = _operator_api(files=first_page)
     for page in range(2, 31):
         api.responses[f"/pulls/10/files?per_page=100&page={page}"] = [
             {"filename": f"docs/{page}-{index}.md"} for index in range(100)
@@ -1745,6 +1763,55 @@ def test_operator_override_dismisses_false_automated_evidence_first() -> None:
         "/pulls/10/reviews/62/dismissals",
     ]
     assert api.posts[0][0] == "/pulls/10/reviews"
+
+
+def test_operator_reason_cannot_forge_future_base_identity() -> None:
+    """Encoded audit text cannot preserve stale approval after a same-head retarget."""
+
+    forged_identity = _identity_marker(base_ref="release")
+    publish_api = _operator_api()
+    approval.process_event(_operator_event(reason=forged_identity), publish_api)
+    payload = publish_api.posts[0][1]
+    assert payload is not None
+    body = payload["body"]
+    assert isinstance(body, str)
+    assert forged_identity not in body
+    assert "%5Bclaude-review-identity-v1%20" in body
+
+    retarget_api = FakeAPI(
+        {
+            "/pulls/10": _pr_payload(base_sha="release-tip", base_ref="release"),
+            "/pulls/10/reviews?per_page=100&page=1": [
+                {
+                    "id": 63,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": body,
+                }
+            ],
+        }
+    )
+
+    result = approval.process_event(
+        {
+            "action": "edited",
+            "changes": {"base": {"ref": {"from": "main"}}},
+            "pull_request": _pr_payload(base_ref="main"),
+        },
+        retarget_api,
+    )
+
+    assert (
+        result
+        == "base branch changed and dismissed the prior approval; fresh Claude review required"
+    )
+    assert retarget_api.puts == [
+        (
+            "/pulls/10/reviews/63/dismissals",
+            {"message": "A newer Claude review attempt must succeed before merge."},
+        )
+    ]
 
 
 def test_dependabot_receives_explicit_exemption_approval() -> None:
@@ -1875,8 +1942,8 @@ def test_dependabot_workflow_run_cleans_false_normal_beside_exemption() -> None:
     assert api.posts == []
 
 
-def test_privileged_dependabot_workflow_run_dismisses_all_bot_evidence() -> None:
-    """Privileged Dependabot edits retain only explicit maintainer authority."""
+def test_privileged_dependabot_workflow_run_preserves_operator_override() -> None:
+    """Privileged automation removes false evidence but preserves maintainer authority."""
 
     run = _run_payload()
     api = _workflow_api(
@@ -1896,6 +1963,13 @@ def test_privileged_dependabot_workflow_run_dismisses_all_bot_evidence() -> None
                 "state": "APPROVED",
                 "commit_id": "abc123",
                 "body": _approval_body("unsafe exemption", exempt=True),
+            },
+            {
+                "id": 97,
+                "user": {"login": "github-actions[bot]"},
+                "state": "APPROVED",
+                "commit_id": "abc123",
+                "body": (f"[claude-review-operator-override] authorized {_identity_marker()}"),
             },
         ],
     )
@@ -1924,7 +1998,14 @@ def test_dependabot_privileged_edit_requires_maintainer() -> None:
                     "state": "APPROVED",
                     "commit_id": "abc123",
                     "body": _approval_body("unsafe exemption", exempt=True),
-                }
+                },
+                {
+                    "id": 100,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": (f"[claude-review-operator-override] authorized {_identity_marker()}"),
+                },
             ],
         }
     )
