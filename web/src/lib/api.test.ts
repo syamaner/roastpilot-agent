@@ -34,6 +34,19 @@ describe("api client", () => {
     expect(JSON.parse((init as RequestInit).body as string)).toEqual({ action: "drop_beans" });
   });
 
+  it("draft-correlated profile create preserves JSON and attempt headers", async () => {
+    mockFetch(201, { id: "bean-1", name: "Kenya" });
+    const input = { name: "Kenya" } as never;
+    await api.createBeanProfile(input, "0123456789abcdef0123456789abcdef");
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    const headers = new Headers((init as RequestInit).headers);
+    expect(headers.get("Content-Type")).toBe("application/json");
+    expect(headers.get("X-RoastPilot-Draft-Attempt-Id")).toBe(
+      "0123456789abcdef0123456789abcdef",
+    );
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual(input);
+  });
+
   it("throws ApiError carrying the server detail on a non-ok response", async () => {
     mockFetch(409, { detail: "a roast is already active" });
     await expect(api.startRoast({} as never)).rejects.toMatchObject({

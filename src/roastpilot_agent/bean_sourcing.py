@@ -3070,11 +3070,10 @@ def _normalize_base_url(url: str) -> str:
     ``"https://openrouter.ai:443/api/v1"`` all normalise identically. A
     NON-default explicit port (e.g. a LAN reverse-proxy on ``:8443``) is
     preserved — dropping it would be the exact false-positive this
-    tolerant match must NOT introduce. Never raises: :func:`urlsplit` on a
-    non-URL string degrades to a mostly-empty ``SplitResult`` rather than
-    raising (unlike the eager-raising cases this module guards elsewhere
-    for the FETCH path), and a malformed/non-numeric port is caught
-    explicitly — either way, a malformed ``provider_base_url`` here just
+    tolerant match must NOT introduce. Never raises: most non-URL strings
+    degrade to a mostly-empty ``SplitResult``; eager malformed-bracket errors
+    and malformed/non-numeric ports are caught explicitly. Either way, a
+    malformed ``provider_base_url`` here just
     fails the equality check harmlessly (falls through to the
     native-provider branch) rather than crashing model resolution.
 
@@ -3085,7 +3084,12 @@ def _normalize_base_url(url: str) -> str:
         The normalised URL for ``==`` comparison.
     """
     stripped = url.strip().rstrip("/")
-    parsed = urlsplit(stripped)
+    try:
+        parsed = urlsplit(stripped)
+    except ValueError:
+        # Malformed bracketed hosts raise eagerly. Treat them like every other
+        # non-matching provider URL so attempt admission can still be recorded.
+        return stripped
     netloc = parsed.netloc.lower()
     try:
         port = parsed.port

@@ -4493,6 +4493,34 @@ async def test_draft_timeout_records_unknown_usage_without_sensitive_error(
 
 
 @pytest.mark.asyncio
+async def test_malformed_provider_url_is_admitted_and_terminalized(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#588: malformed provider metadata cannot bypass attempt telemetry."""
+    config = AppConfig()
+    config = config.model_copy(
+        update={"advisor": config.advisor.model_copy(update={"provider_base_url": "https://["})}
+    )
+    service = RoastService(store, config=config)
+
+    async def unavailable(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
+        del url, advisor_config, sourcing_config, diagnostics
+        raise BeanExtractionUnavailableError("malformed provider configuration")
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", unavailable)
+    with pytest.raises(BeanExtractionUnavailableError):
+        await service.draft_bean_from_url("https://vendor.example/bean")
+    async with store.connection.execute(
+        "SELECT model_slug, outcome FROM bean_sourcing_attempts"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert tuple(row) == (config.advisor.model_slug, "provider_error")
+
+
+@pytest.mark.asyncio
 async def test_draft_bean_from_url_response_carries_field_evidence(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4942,6 +4970,57 @@ async def test_attempt_admission_timeout_cancels_owned_task(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("first_result", [False, RuntimeError("temporary lock")])
+async def test_attempt_lease_heartbeat_stops_or_retries(
+    service: RoastService,
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    first_result: bool | RuntimeError,
+) -> None:
+    """#588: lease heartbeats stop on terminal rows and retry transient errors."""
+
+    async def no_wait(_: float) -> None:
+        return None
+
+    outcomes: list[bool | RuntimeError] = (
+        [first_result, False] if isinstance(first_result, RuntimeError) else [first_result]
+    )
+
+    async def renew(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, RuntimeError):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(api_module.asyncio, "sleep", no_wait)  # pyright: ignore[reportPrivateImportUsage]
+    monkeypatch.setattr(store, "renew_bean_sourcing_attempt_lease", renew)
+    await service._renew_bean_attempt_lease("attempt")  # pyright: ignore[reportPrivateUsage]
+    assert not outcomes
+
+
+@pytest.mark.asyncio
+async def test_attempt_lease_heartbeat_propagates_cancellation(
+    service: RoastService, store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#588: service shutdown cancellation is never swallowed by renewal."""
+
+    async def no_wait(_: float) -> None:
+        return None
+
+    async def cancelled(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(api_module.asyncio, "sleep", no_wait)  # pyright: ignore[reportPrivateImportUsage]
+    monkeypatch.setattr(store, "renew_bean_sourcing_attempt_lease", cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await service._renew_bean_attempt_lease(  # pyright: ignore[reportPrivateUsage]
+            "attempt"
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("expired_deadline", [False, True])
 async def test_attempt_finalization_timeout_cancels_owned_task(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch, expired_deadline: bool
@@ -5070,6 +5149,33 @@ async def test_expiry_scheduler_retries_transient_store_failure(
     await asyncio.wait_for(retried.wait(), timeout=2.0)
     assert calls >= 2
     await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_expiry_scheduler_caps_sleep_before_rechecking_wall_clock(
+    service: RoastService, store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#588: long UTC expiries are rechecked after a bounded monotonic sleep."""
+    future = (datetime.now(UTC) + timedelta(hours=24)).isoformat()
+    monkeypatch.setattr(store, "next_bean_sourcing_expiry", mock.AsyncMock(return_value=future))
+    observed_timeout: float | None = None
+
+    async def capture_wait(awaitable: object, *, timeout: float) -> None:
+        nonlocal observed_timeout
+        observed_timeout = timeout
+        close = getattr(awaitable, "close", None)
+        if close is not None:
+            close()
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        api_module.asyncio,  # pyright: ignore[reportPrivateImportUsage]
+        "wait_for",
+        capture_wait,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await service._bean_draft_expiry_loop()  # pyright: ignore[reportPrivateUsage]
+    assert observed_timeout == api_module._BEAN_DRAFT_EXPIRY_MAX_SLEEP_SECONDS  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio

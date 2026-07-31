@@ -476,7 +476,10 @@ CREATE TABLE bean_sourcing_attempts (
   provider TEXT NOT NULL,
   model_slug TEXT NOT NULL,
   prompt_version TEXT NOT NULL,
+  owner_instance_id TEXT NOT NULL,
   started_at_utc TEXT NOT NULL,
+  lease_expires_at_utc TEXT NOT NULL,
+  lease_expired_observed_at_utc TEXT,
   completed_at_utc TEXT,
   latency_ms INTEGER CHECK (latency_ms IS NULL OR latency_ms >= 0),
   outcome TEXT NOT NULL CHECK (outcome IN (
@@ -502,6 +505,9 @@ CREATE INDEX idx_bean_sourcing_attempt_expiry
   ON bean_sourcing_attempts(claim_expires_at_utc)
   WHERE draft_snapshot_json IS NOT NULL AND saved_profile_id IS NULL;
 """
+
+_BEAN_SOURCING_LEASE_DURATION = timedelta(minutes=2)
+_BEAN_SOURCING_LEASE_CONFIRMATION = timedelta(seconds=60)
 
 #: Ordered migration scripts; index+1 is the resulting PRAGMA user_version.
 #: Append-only — never edit a shipped migration (plan §8: schema migration
@@ -2359,15 +2365,35 @@ class RoastStore:
         provider: str,
         model_slug: str,
         prompt_version: str,
+        owner_instance_id: str = "direct-store",
         started_at_utc: str | None = None,
     ) -> str:
         """Durably admit one bean-sourcing attempt before remote work starts."""
         attempt_id = uuid.uuid4().hex
         started = started_at_utc or _utc_now()
+        lease_expires = (
+            datetime.fromisoformat(started) + _BEAN_SOURCING_LEASE_DURATION
+        ).isoformat()
+        confirmation_cutoff = (
+            datetime.fromisoformat(started) - _BEAN_SOURCING_LEASE_CONFIRMATION
+        ).isoformat()
         admission_connection = await aiosqlite.connect(self._db_path)
         try:
             await admission_connection.execute("PRAGMA busy_timeout=500")
             await admission_connection.execute("BEGIN IMMEDIATE")
+            await admission_connection.execute(
+                "UPDATE bean_sourcing_attempts SET completed_at_utc = ?,"
+                " outcome = 'cancelled', usage_evidence = 'unknown'"
+                " WHERE outcome = 'in_progress' AND lease_expires_at_utc <= ?"
+                " AND lease_expired_observed_at_utc <= ?",
+                (started, started, confirmation_cutoff),
+            )
+            await admission_connection.execute(
+                "UPDATE bean_sourcing_attempts SET lease_expired_observed_at_utc = ?"
+                " WHERE outcome = 'in_progress' AND lease_expires_at_utc <= ?"
+                " AND lease_expired_observed_at_utc IS NULL",
+                (started, started),
+            )
             await admission_connection.execute(
                 "UPDATE bean_sourcing_attempts SET draft_snapshot_json = NULL,"
                 " claim_expires_at_utc = NULL WHERE saved_profile_id IS NULL"
@@ -2376,9 +2402,18 @@ class RoastStore:
             )
             await admission_connection.execute(
                 "INSERT INTO bean_sourcing_attempts"
-                " (id, provider, model_slug, prompt_version, started_at_utc, outcome)"
-                " VALUES (?, ?, ?, ?, ?, 'in_progress')",
-                (attempt_id, provider, model_slug, prompt_version, started),
+                " (id, provider, model_slug, prompt_version, owner_instance_id,"
+                " started_at_utc, lease_expires_at_utc, outcome)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, 'in_progress')",
+                (
+                    attempt_id,
+                    provider,
+                    model_slug,
+                    prompt_version,
+                    owner_instance_id,
+                    started,
+                    lease_expires,
+                ),
             )
             await admission_connection.commit()
         except BaseException:
@@ -2389,24 +2424,67 @@ class RoastStore:
         return attempt_id
 
     async def reconcile_interrupted_bean_sourcing_attempts(
-        self, *, completed_at_utc: str | None = None
+        self,
+        *,
+        completed_at_utc: str | None = None,
+        lease_deadline_utc: str | None = None,
     ) -> int:
         """Terminalize admissions left in progress by a previous process exit.
 
         Args:
             completed_at_utc: Injectable startup timestamp for deterministic tests.
+            lease_deadline_utc: Optional lease cutoff; defaults to completion time.
 
         Returns:
             The number of orphaned attempts marked cancelled.
         """
+        completed = completed_at_utc or _utc_now()
+        lease_deadline = lease_deadline_utc or completed
+        confirmation_cutoff = (
+            datetime.fromisoformat(completed) - _BEAN_SOURCING_LEASE_CONFIRMATION
+        ).isoformat()
         cursor = await self.connection.execute(
             "UPDATE bean_sourcing_attempts SET completed_at_utc = ?,"
             " outcome = 'cancelled', usage_evidence = 'unknown'"
-            " WHERE outcome = 'in_progress'",
-            (completed_at_utc or _utc_now(),),
+            " WHERE outcome = 'in_progress' AND lease_expires_at_utc <= ?"
+            " AND lease_expired_observed_at_utc <= ?",
+            (completed, lease_deadline, confirmation_cutoff),
+        )
+        await self.connection.execute(
+            "UPDATE bean_sourcing_attempts SET lease_expired_observed_at_utc = ?"
+            " WHERE outcome = 'in_progress' AND lease_expires_at_utc <= ?"
+            " AND lease_expired_observed_at_utc IS NULL",
+            (completed, lease_deadline),
         )
         await self.connection.commit()
         return cursor.rowcount
+
+    async def renew_bean_sourcing_attempt_lease(
+        self,
+        attempt_id: str,
+        *,
+        owner_instance_id: str,
+        renewed_at_utc: str | None = None,
+    ) -> bool:
+        """Extend a live attempt lease only for its owning service instance."""
+        renewed = renewed_at_utc or _utc_now()
+        expires = (datetime.fromisoformat(renewed) + _BEAN_SOURCING_LEASE_DURATION).isoformat()
+        lease_connection = await aiosqlite.connect(self._db_path)
+        try:
+            await lease_connection.execute("PRAGMA busy_timeout=500")
+            cursor = await lease_connection.execute(
+                "UPDATE bean_sourcing_attempts SET lease_expires_at_utc = ?,"
+                " lease_expired_observed_at_utc = NULL"
+                " WHERE id = ? AND owner_instance_id = ? AND outcome = 'in_progress'",
+                (expires, attempt_id, owner_instance_id),
+            )
+            await lease_connection.commit()
+            return cursor.rowcount == 1
+        except BaseException:
+            await lease_connection.rollback()
+            raise
+        finally:
+            await lease_connection.close()
 
     async def finish_bean_sourcing_attempt(
         self,
@@ -2524,6 +2602,7 @@ class RoastStore:
             claim_connection.row_factory = aiosqlite.Row
             try:
                 await claim_connection.execute("PRAGMA foreign_keys=ON")
+                await claim_connection.execute("PRAGMA busy_timeout=500")
                 await claim_connection.execute("BEGIN IMMEDIATE")
                 await claim_connection.execute(
                     "UPDATE bean_sourcing_attempts SET draft_snapshot_json = NULL,"

@@ -218,11 +218,21 @@ async def test_v14_expiry_clears_snapshot_and_fails_claim_closed(store: RoastSto
 async def test_v14_startup_reconciles_interrupted_attempt(store: RoastStore) -> None:
     """#588: a committed admission cannot remain in-progress after restart."""
     attempt_id = await store.start_bean_sourcing_attempt(
-        provider="provider", model_slug="model", prompt_version="v1"
+        provider="provider",
+        model_slug="model",
+        prompt_version="v1",
+        owner_instance_id="dead-owner",
+        started_at_utc="2026-07-31T11:00:00+00:00",
     )
     assert (
         await store.reconcile_interrupted_bean_sourcing_attempts(
             completed_at_utc="2026-07-31T12:00:00+00:00"
+        )
+        == 0
+    )
+    assert (
+        await store.reconcile_interrupted_bean_sourcing_attempts(
+            completed_at_utc="2026-07-31T12:01:01+00:00"
         )
         == 1
     )
@@ -232,7 +242,138 @@ async def test_v14_startup_reconciles_interrupted_attempt(store: RoastStore) -> 
     ) as cursor:
         row = await cursor.fetchone()
     assert row is not None
-    assert tuple(row) == ("cancelled", "2026-07-31T12:00:00+00:00", "unknown")
+    assert tuple(row) == ("cancelled", "2026-07-31T12:01:01+00:00", "unknown")
+
+
+@pytest.mark.asyncio
+async def test_v14_live_peer_lease_survives_reconcile_and_renewal(store: RoastStore) -> None:
+    """#588: an overlapping process cannot cancel a live peer's leased attempt."""
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="provider",
+        model_slug="model",
+        prompt_version="v1",
+        owner_instance_id="peer-a",
+        started_at_utc="2026-07-31T12:00:00+00:00",
+    )
+    assert (
+        await store.reconcile_interrupted_bean_sourcing_attempts(
+            completed_at_utc="2026-07-31T12:01:00+00:00"
+        )
+        == 0
+    )
+    assert await store.renew_bean_sourcing_attempt_lease(
+        attempt_id,
+        owner_instance_id="peer-a",
+        renewed_at_utc="2026-07-31T12:01:00+00:00",
+    )
+    assert not await store.renew_bean_sourcing_attempt_lease(
+        attempt_id,
+        owner_instance_id="peer-b",
+        renewed_at_utc="2026-07-31T12:01:00+00:00",
+    )
+    assert (
+        await store.reconcile_interrupted_bean_sourcing_attempts(
+            completed_at_utc="2026-07-31T12:02:30+00:00"
+        )
+        == 0
+    )
+    assert (
+        await store.reconcile_interrupted_bean_sourcing_attempts(
+            completed_at_utc="2026-07-31T12:03:01+00:00"
+        )
+        == 0
+    )
+    # The old 30-second boundary cannot cancel before a heartbeat opportunity.
+    assert (
+        await store.reconcile_interrupted_bean_sourcing_attempts(
+            completed_at_utc="2026-07-31T12:03:31+00:00"
+        )
+        == 0
+    )
+    assert (
+        await store.reconcile_interrupted_bean_sourcing_attempts(
+            completed_at_utc="2026-07-31T12:04:02+00:00"
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_v14_clock_jump_candidate_is_cleared_by_live_renewal(store: RoastStore) -> None:
+    """#588: one jumped-clock expiry observation cannot cancel a live owner."""
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="provider",
+        model_slug="model",
+        prompt_version="v1",
+        owner_instance_id="peer-a",
+        started_at_utc="2026-07-31T12:00:00+00:00",
+    )
+    assert (
+        await store.reconcile_interrupted_bean_sourcing_attempts(
+            completed_at_utc="2026-07-31T13:00:00+00:00"
+        )
+        == 0
+    )
+    assert await store.renew_bean_sourcing_attempt_lease(
+        attempt_id,
+        owner_instance_id="peer-a",
+        renewed_at_utc="2026-07-31T13:00:10+00:00",
+    )
+    assert (
+        await store.reconcile_interrupted_bean_sourcing_attempts(
+            completed_at_utc="2026-07-31T13:00:31+00:00"
+        )
+        == 0
+    )
+    async with store.connection.execute(
+        "SELECT outcome, lease_expired_observed_at_utc FROM bean_sourcing_attempts WHERE id = ?",
+        (attempt_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert tuple(row) == ("in_progress", None)
+
+
+@pytest.mark.asyncio
+async def test_v14_lease_renewal_rolls_back_on_lock_timeout(store: RoastStore) -> None:
+    """#588: a failed heartbeat owns and rolls back its dedicated transaction."""
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="provider",
+        model_slug="model",
+        prompt_version="v1",
+        owner_instance_id="peer-a",
+    )
+    await store.connection.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(Exception, match="database is locked"):
+            await store.renew_bean_sourcing_attempt_lease(attempt_id, owner_instance_id="peer-a")
+    finally:
+        await store.connection.rollback()
+
+
+@pytest.mark.asyncio
+async def test_v14_claim_waits_for_short_writer_contention(store: RoastStore) -> None:
+    """#588: the claim connection waits briefly instead of failing locked."""
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="provider", model_slug="model", prompt_version="v1"
+    )
+    await store.finish_bean_sourcing_attempt(
+        attempt_id,
+        outcome="success",
+        latency_ms=1,
+        request_tokens=1,
+        response_tokens=1,
+        usage_evidence="exact",
+        timed_out_runs=0,
+        draft=_draft(),
+    )
+    await store.connection.execute("BEGIN IMMEDIATE")
+    claim = asyncio.create_task(store.create_bean_profile(_input(), draft_attempt_id=attempt_id))
+    await asyncio.sleep(0.05)
+    assert not claim.done()
+    await store.connection.commit()
+    saved = await asyncio.wait_for(claim, timeout=1.0)
+    assert saved.name == _input().name
 
 
 @pytest.mark.parametrize(

@@ -403,6 +403,8 @@ LogArtifactName = str
 _BEAN_DRAFT_CANCELLATION_GRACE_SECONDS = 0.5
 _BEAN_DRAFT_FINALIZE_TIMEOUT_SECONDS = 1.0
 _BEAN_DRAFT_EXPIRY_RETRY_SECONDS = 1.0
+_BEAN_DRAFT_EXPIRY_MAX_SLEEP_SECONDS = 60.0
+_BEAN_ATTEMPT_LEASE_HEARTBEAT_SECONDS = 30.0
 
 
 class RoastRunConflictError(Exception):
@@ -2667,8 +2669,7 @@ class RoastService:
             await self._store.seed_bean_profile(seed)
         await self._store.reconcile_interrupted_bean_sourcing_attempts()
         await self._store.expire_bean_sourcing_drafts()
-        if await self._store.next_bean_sourcing_expiry() is not None:
-            self._ensure_bean_draft_expiry_task()
+        self._ensure_bean_draft_expiry_task()
 
     def _ensure_bean_draft_expiry_task(self) -> None:
         """Start or wake the service-owned bounded-retention timer (#588)."""
@@ -2685,6 +2686,7 @@ class RoastService:
         while True:
             self._bean_draft_expiry_wakeup.clear()
             try:
+                await self._store.reconcile_interrupted_bean_sourcing_attempts()
                 await self._store.expire_bean_sourcing_drafts()
                 next_expiry = await self._store.next_bean_sourcing_expiry()
             except asyncio.CancelledError:
@@ -2698,11 +2700,18 @@ class RoastService:
                     )
                 continue
             if next_expiry is None:
-                await self._bean_draft_expiry_wakeup.wait()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._bean_draft_expiry_wakeup.wait(),
+                        timeout=_BEAN_DRAFT_EXPIRY_MAX_SLEEP_SECONDS,
+                    )
                 continue
-            delay = max(
-                0.0,
-                (datetime.fromisoformat(next_expiry) - datetime.now(UTC)).total_seconds(),
+            delay = min(
+                _BEAN_DRAFT_EXPIRY_MAX_SLEEP_SECONDS,
+                max(
+                    0.0,
+                    (datetime.fromisoformat(next_expiry) - datetime.now(UTC)).total_seconds(),
+                ),
             )
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._bean_draft_expiry_wakeup.wait(), timeout=delay)
@@ -2769,7 +2778,10 @@ class RoastService:
         """Own admission until commit/rollback and report deferred cancellation."""
         admission = asyncio.create_task(
             self._store.start_bean_sourcing_attempt(
-                provider=provider, model_slug=model_slug, prompt_version=prompt_version
+                provider=provider,
+                model_slug=model_slug,
+                prompt_version=prompt_version,
+                owner_instance_id=self.instance_id,
             ),
             name="admit-bean-attempt",
         )
@@ -2790,6 +2802,22 @@ class RoastService:
                     await admission
                 raise RuntimeError("timed out admitting bean-sourcing attempt") from exc
         return admission.result(), cancellation_received
+
+    async def _renew_bean_attempt_lease(self, attempt_id: str) -> None:
+        """Keep this process's live attempt from cross-process reconciliation."""
+        while True:
+            await asyncio.sleep(_BEAN_ATTEMPT_LEASE_HEARTBEAT_SECONDS)
+            try:
+                renewed = await self._store.renew_bean_sourcing_attempt_lease(
+                    attempt_id, owner_instance_id=self.instance_id
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - retry while the request remains live
+                _log.error("bean-sourcing lease renewal failed; retrying", exc_info=True)
+                continue
+            if not renewed:
+                return
 
     async def _finish_bean_attempt_bounded(
         self,
@@ -2910,6 +2938,10 @@ class RoastService:
                     provider_response_missing=True,
                 )
                 raise asyncio.CancelledError
+            lease_heartbeat = asyncio.create_task(
+                self._renew_bean_attempt_lease(attempt_id),
+                name=f"renew-bean-attempt-{attempt_id}",
+            )
             task = asyncio.create_task(
                 draft_bean_profile_from_url(
                     url,
@@ -3016,6 +3048,10 @@ class RoastService:
             self._ensure_bean_draft_expiry_task()
             return result.model_copy(update={"draft_attempt_id": attempt_id})
         finally:
+            if "lease_heartbeat" in locals():
+                lease_heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await lease_heartbeat
             self._bean_draft_operations.pop(task, None)
 
 
