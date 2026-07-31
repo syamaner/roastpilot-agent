@@ -6,8 +6,9 @@ with a structured LLM call, and draft a
 :class:`~roastpilot_agent.models.BeanProfileDraft` with conservative
 first-roast targets plus honest per-field imputation. The operator reviews,
 edits, and saves the draft via the EXISTING, unchanged create-bean-profile
-action (``POST /api/bean-profiles``) — this module never persists anything
-and never auto-saves (human-in-the-loop by construction, per the #573
+action (``POST /api/bean-profiles``). Drafting never creates a saved profile;
+the service layer retains only a sanitized field-value baseline for bounded
+correction telemetry (human-in-the-loop by construction, per the #573
 safeguards).
 
 **Cleanly separate from the roast advisor and the roaster/control path**
@@ -221,8 +222,14 @@ import lxml.html  # type: ignore[import-untyped]
 import trafilatura
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, ValidationError
-from pydantic_ai import Agent, ModelAPIError, ModelSettings, UnexpectedModelBehavior
-from pydantic_ai.messages import ModelRequest, RetryPromptPart
+from pydantic_ai import (
+    Agent,
+    ModelAPIError,
+    ModelSettings,
+    UnexpectedModelBehavior,
+    capture_run_messages,
+)
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, RetryPromptPart
 from pydantic_ai.models import Model
 from pydantic_ai.usage import RunUsage
 from webencodings import lookup as lookup_html_encoding
@@ -3310,12 +3317,18 @@ class BeanSourcingDiagnostics:
             ``request_tokens``/``response_tokens`` can legitimately be zero for
             it) -- spend enforcement must charge these at a conservative
             reserve, never zero.
+        usage_reported_requests: Provider responses carrying explicit, non-zero
+            usage metadata.
+        usage_unreported_requests: Responses with missing/estimated usage, plus
+            accepted requests whose response was not observable after timeout.
     """
 
     schema_retries: int = 0
     request_tokens: int = 0
     response_tokens: int = 0
     timed_out_runs: int = 0
+    usage_reported_requests: int = 0
+    usage_unreported_requests: int = 0
 
 
 async def _extract_bean_identity(
@@ -3391,6 +3404,8 @@ async def _extract_bean_identity(
     # undercounted every failing, still-billed call. ``None`` when no diagnostics is
     # passed, so a caller that omits it pays no extra bookkeeping.
     run_usage = RunUsage() if diagnostics is not None else None
+    captured_messages: list[ModelMessage] = []
+    invocation_timed_out = False
     # #601 fold round 9 (E FOLD 3): tracks the bespoke, retry-disabled client
     # ONLY when WE constructed one (model not injected, disable_transport_retries
     # requested) -- never an injected test double, never an SDK-managed default
@@ -3426,15 +3441,17 @@ async def _extract_bean_identity(
             if isinstance(agent.model, OpenAIChatModel):
                 bespoke_client = agent.model.client
                 bespoke_model_name = agent.model.model_name
-        async with asyncio.timeout(extraction_timeout_seconds):
-            result = (
-                await agent.run(page_text, usage=run_usage)
-                if run_usage is not None
-                else await agent.run(page_text)
-            )
+        with capture_run_messages() as captured_messages:
+            async with asyncio.timeout(extraction_timeout_seconds):
+                result = (
+                    await agent.run(page_text, usage=run_usage)
+                    if run_usage is not None
+                    else await agent.run(page_text)
+                )
     except TimeoutError as exc:
         if diagnostics is not None:
             diagnostics.timed_out_runs += 1
+            invocation_timed_out = True
         raise BeanExtractionUnavailableError(
             f"bean identity extraction exceeded the {extraction_timeout_seconds:g}s deadline"
         ) from exc
@@ -3458,6 +3475,19 @@ async def _extract_bean_identity(
             assert diagnostics is not None  # narrows: run_usage is only ever set alongside it
             diagnostics.request_tokens += run_usage.input_tokens
             diagnostics.response_tokens += run_usage.output_tokens
+            responses = [
+                message for message in captured_messages if isinstance(message, ModelResponse)
+            ]
+            for response in responses:
+                usage = response.usage
+                if (
+                    response.provider_name is not None
+                    and usage.input_tokens + usage.output_tokens > 0
+                ):
+                    diagnostics.usage_reported_requests += 1
+                else:
+                    diagnostics.usage_unreported_requests += 1
+            diagnostics.usage_unreported_requests += int(invocation_timed_out)
         if bespoke_client is not None:
             # #601 fold round 10 (E FOLD): teardown must never OUTRANK the
             # primary outcome -- an unconditional close() that itself raises
@@ -5676,8 +5706,9 @@ async def draft_bean_profile_from_url(
     structured LLM call scoped to bean identity only (a dedicated agent,
     never the roast advisor, no MCP tools), then deterministically apply
     conservative first-roast targets and honest per-field imputation.
-    Returns a DRAFT only — nothing is persisted here; saving is the caller's
-    existing ``POST /api/bean-profiles`` action.
+    Returns a DRAFT only and creates no saved profile; saving is the caller's
+    existing ``POST /api/bean-profiles`` action. The service caller may retain
+    a sanitized field-value baseline for bounded correction telemetry.
 
     Args:
         url: The vendor product page URL.

@@ -383,6 +383,41 @@ describe("BeanProfileModal draft-from-URL (#573 phase 1, #627, #637)", () => {
     expect(onSave.mock.calls[0][1]).toBe("fedcba9876543210fedcba9876543210");
   });
 
+  it("clears an invalid correlation after 409 and requires an explicit manual retry", async () => {
+    vi.spyOn(api, "draftBeanFromUrl").mockResolvedValue(FIXTURE_DRAFT_RESPONSE);
+    const onSave = vi
+      .fn<(input: BeanProfileInput, draftAttemptId?: string) => Promise<BeanProfile>>()
+      .mockRejectedValueOnce(new ApiError(409, "draft attempt expired"))
+      .mockImplementationOnce(async (input) => savedFrom(input));
+    const onSaved = vi.fn();
+    render(
+      <BeanProfileModal mode="add" onSave={onSave} onSaved={onSaved} onClose={vi.fn()} />,
+    );
+    fireEvent.change(screen.getByTestId("bean-profile-draft-url"), {
+      target: { value: "https://roaster.example.com/bean" },
+    });
+    fireEvent.click(screen.getByTestId("bean-profile-draft-button"));
+    await waitFor(() =>
+      expect(screen.getByTestId("bean-profile-name")).toHaveValue(FIXTURE_DRAFT_RESPONSE.name),
+    );
+    fireEvent.change(screen.getByTestId("bean-profile-name"), {
+      target: { value: "Operator keeps this edit" },
+    });
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave.mock.calls[0][1]).toBe(FIXTURE_DRAFT_RESPONSE.draft_attempt_id);
+    expect(screen.getByTestId("bean-profile-error")).toHaveTextContent(/save again.*manually/i);
+    expect(screen.getByTestId("bean-profile-name")).toHaveValue("Operator keeps this edit");
+
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
+    expect(onSave.mock.calls[1][0]).toEqual(
+      expect.objectContaining({ name: "Operator keeps this edit" }),
+    );
+    expect(onSave.mock.calls[1][1]).toBeUndefined();
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+  });
+
   it("editing a field seeded with real provenance clears its badge (closes the #627b seam)", async () => {
     vi.spyOn(api, "draftBeanFromUrl").mockResolvedValue(FIXTURE_DRAFT_RESPONSE);
     const { container } = render(

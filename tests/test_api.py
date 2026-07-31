@@ -4388,7 +4388,8 @@ async def test_seeded_ethiopia_profile_is_served_over_http(store: RoastStore) ->
 # these tests monkeypatch that reference on ``roastpilot_agent.api`` to a
 # deterministic double, so no real fetch/LLM call happens here either — this
 # level is only about the route's request/response/error-code wiring, and
-# that this DRAFT endpoint never persists anything.
+# that this DRAFT endpoint creates no saved profile. The bounded, sanitized
+# telemetry baseline is asserted separately below.
 
 
 def _draft_from(url: str) -> BeanProfileDraft:
@@ -4420,6 +4421,7 @@ async def test_draft_bean_from_url_happy_path(
         assert isinstance(diagnostics, BeanSourcingDiagnostics)
         diagnostics.request_tokens = 101
         diagnostics.response_tokens = 22
+        diagnostics.usage_reported_requests = 1
         return _draft_from(url)
 
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
@@ -5046,7 +5048,6 @@ async def test_attempt_finalization_timeout_cancels_owned_task(
             outcome="cancelled",
             started_monotonic=0.0,
             diagnostics=BeanSourcingDiagnostics(),
-            provider_response_missing=True,
         )
 
 
@@ -5062,6 +5063,8 @@ async def test_unexpected_provider_failure_records_partial_usage(
         del url, advisor_config, sourcing_config
         assert isinstance(diagnostics, BeanSourcingDiagnostics)
         diagnostics.request_tokens = 17
+        diagnostics.usage_reported_requests = 1
+        diagnostics.usage_unreported_requests = 1
         raise RuntimeError("provider transport broke")
 
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", failed)

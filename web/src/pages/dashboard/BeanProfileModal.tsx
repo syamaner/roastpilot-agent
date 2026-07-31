@@ -219,7 +219,14 @@ export function BeanProfileModal({
       onSaved(saved);
     } catch (err) {
       if (err instanceof ApiError) {
-        setSubmitError(err.detail || `Request failed (${err.status}).`);
+        if (err.status === 409 && draftAttemptId !== undefined) {
+          setDraftAttemptId(undefined);
+          setSubmitError(
+            `${err.detail || "The drafted save link is no longer valid."} Review the fields, then Save again to create this profile manually.`,
+          );
+        } else {
+          setSubmitError(err.detail || `Request failed (${err.status}).`);
+        }
       } else {
         setSubmitError(err instanceof Error ? err.message : "Request failed.");
       }

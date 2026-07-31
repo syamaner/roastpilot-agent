@@ -2755,20 +2755,18 @@ class RoastService:
     # --- #573 phase 1: add-bean-from-URL (bean-sourcing assistant) ---
     #
     # Fetch a vendor product URL + LLM-extract a draft profile. Deliberately
-    # NOT store-backed: this returns a draft only, never persists it. Saving
-    # remains the unchanged create_bean_profile action above, driven by the
-    # operator explicitly submitting the (possibly edited) draft.
+    # Returns an unsaved draft. Runtime telemetry retains only a sanitized
+    # field-value baseline (no URL/evidence/prose) for at most 24 hours, cleared
+    # on claim or expiry. Saving remains the explicit create action above.
 
     @staticmethod
     def _bean_attempt_usage(
         diagnostics: BeanSourcingDiagnostics,
-        *,
-        provider_response_missing: bool,
     ) -> tuple[int | None, int | None, Literal["exact", "partial", "unknown"]]:
-        """Qualify retry-inclusive usage without treating unknown as zero."""
-        if not provider_response_missing:
+        """Qualify retry-inclusive usage from provider-response provenance."""
+        if diagnostics.usage_reported_requests > 0 and diagnostics.usage_unreported_requests == 0:
             return diagnostics.request_tokens, diagnostics.response_tokens, "exact"
-        if diagnostics.request_tokens > 0 or diagnostics.response_tokens > 0:
+        if diagnostics.usage_reported_requests > 0:
             return diagnostics.request_tokens, diagnostics.response_tokens, "partial"
         return None, None, "unknown"
 
@@ -2833,13 +2831,10 @@ class RoastService:
         ],
         started_monotonic: float,
         diagnostics: BeanSourcingDiagnostics,
-        provider_response_missing: bool,
         draft: BeanProfileDraft | None = None,
     ) -> None:
         """Commit terminal telemetry in a separately owned shielded task."""
-        request_tokens, response_tokens, evidence = self._bean_attempt_usage(
-            diagnostics, provider_response_missing=provider_response_missing
-        )
+        request_tokens, response_tokens, evidence = self._bean_attempt_usage(diagnostics)
         finalizer = asyncio.create_task(
             self._store.finish_bean_sourcing_attempt(
                 attempt_id,
@@ -2881,7 +2876,11 @@ class RoastService:
             raise asyncio.CancelledError
 
     async def draft_bean_from_url(self, url: str) -> BeanProfileDraft:
-        """Draft (never persist) a bean profile from a vendor URL (#573 phase 1).
+        """Draft an unsaved bean profile from a vendor URL (#573 phase 1).
+
+        A sanitized field-value baseline (excluding URL, evidence, and prose)
+        is retained for at most 24 hours for explicit save-time correlation,
+        then cleared on claim or expiry. No saved profile is created here.
 
         Delegates to :func:`roastpilot_agent.bean_sourcing.draft_bean_profile_from_url`
         with this service's configured advisor provider/key (BYOK, a SEPARATE
@@ -2935,7 +2934,6 @@ class RoastService:
                     outcome="cancelled",
                     started_monotonic=started_monotonic,
                     diagnostics=diagnostics,
-                    provider_response_missing=True,
                 )
                 raise asyncio.CancelledError
             lease_heartbeat = asyncio.create_task(
@@ -2963,7 +2961,6 @@ class RoastService:
                     outcome="preempted" if preempted else "cancelled",
                     started_monotonic=started_monotonic,
                     diagnostics=diagnostics,
-                    provider_response_missing=True,
                 )
                 if outer_task is not None and outer_task.cancelling() == 0 and preempted:
                     raise RoastRunConflictError(
@@ -2979,7 +2976,6 @@ class RoastService:
                         outcome="cancelled",
                         started_monotonic=started_monotonic,
                         diagnostics=diagnostics,
-                        provider_response_missing=True,
                     )
                     raise asyncio.CancelledError from None
                 if operation.preempted_by_start:
@@ -2988,7 +2984,6 @@ class RoastService:
                         outcome="preempted",
                         started_monotonic=started_monotonic,
                         diagnostics=diagnostics,
-                        provider_response_missing=True,
                     )
                     raise RoastRunConflictError(
                         "bean drafting was preempted by a roast-start attempt; "
@@ -2996,22 +2991,17 @@ class RoastService:
                     ) from None
                 if isinstance(exc, BeanFetchError):
                     outcome = "fetch_error"
-                    missing_usage = False
                 elif isinstance(exc, BeanExtractionUnavailableError):
                     outcome = "provider_error"
-                    missing_usage = True
                 elif isinstance(exc, BeanExtractionError):
                     outcome = "extraction_error"
-                    missing_usage = False
                 else:
                     outcome = "provider_error"
-                    missing_usage = True
                 await self._finish_bean_attempt_bounded(
                     attempt_id,
                     outcome=outcome,
                     started_monotonic=started_monotonic,
                     diagnostics=diagnostics,
-                    provider_response_missing=missing_usage,
                 )
                 raise
 
@@ -3022,7 +3012,6 @@ class RoastService:
                     outcome="cancelled",
                     started_monotonic=started_monotonic,
                     diagnostics=diagnostics,
-                    provider_response_missing=True,
                 )
                 raise asyncio.CancelledError
             if operation.preempted_by_start:
@@ -3031,7 +3020,6 @@ class RoastService:
                     outcome="preempted",
                     started_monotonic=started_monotonic,
                     diagnostics=diagnostics,
-                    provider_response_missing=True,
                 )
                 raise RoastRunConflictError(
                     "bean drafting was preempted by a roast-start attempt; "
@@ -3042,7 +3030,6 @@ class RoastService:
                 outcome="success",
                 started_monotonic=started_monotonic,
                 diagnostics=diagnostics,
-                provider_response_missing=False,
                 draft=result,
             )
             self._ensure_bean_draft_expiry_task()

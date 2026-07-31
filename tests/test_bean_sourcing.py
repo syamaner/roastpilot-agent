@@ -44,6 +44,7 @@ from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCall
 from pydantic_ai.models import Model
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.usage import RequestUsage
 
 from roastpilot_agent import bean_sourcing
 from roastpilot_agent.advisor import AdvisorDependencyError
@@ -3420,6 +3421,8 @@ async def test_extract_bean_identity_captures_token_usage_when_it_raises() -> No
         )
     assert diagnostics.request_tokens > 0
     assert diagnostics.response_tokens > 0
+    assert diagnostics.usage_reported_requests == 0
+    assert diagnostics.usage_unreported_requests == 2
 
 
 @pytest.mark.asyncio
@@ -3462,6 +3465,34 @@ async def test_extract_bean_identity_captures_token_usage() -> None:
     assert identity.name == "Kenya Kiambu AA (Washed)"
     assert diagnostics.request_tokens > 0
     assert diagnostics.response_tokens > 0
+    assert diagnostics.usage_reported_requests == 0
+    assert diagnostics.usage_unreported_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_distinguishes_provider_reported_usage() -> None:
+    """Explicit provider usage is distinguished from FunctionModel estimates."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        return ModelResponse(
+            parts=[ToolCallPart(info.output_tools[0].name, _identity_args())],
+            usage=RequestUsage(input_tokens=19, output_tokens=7),
+            provider_name="openai",
+        )
+
+    diagnostics = bean_sourcing.BeanSourcingDiagnostics()
+    identity = await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "page text",
+        advisor_config=_ADVISOR_CONFIG,
+        model=FunctionModel(respond),
+        diagnostics=diagnostics,
+    )
+
+    assert identity.name == "Kenya Kiambu AA (Washed)"
+    assert (diagnostics.request_tokens, diagnostics.response_tokens) == (19, 7)
+    assert diagnostics.usage_reported_requests == 1
+    assert diagnostics.usage_unreported_requests == 0
 
 
 @pytest.mark.asyncio
@@ -3563,6 +3594,21 @@ async def test_extract_bean_identity_flags_timed_out_runs() -> None:
             diagnostics=diagnostics,
         )
     assert diagnostics.timed_out_runs == 1
+    assert diagnostics.usage_reported_requests == 0
+    assert diagnostics.usage_unreported_requests == 1
+
+    # Reusing the accumulator counts only this invocation's response; it must
+    # not re-add the historical timeout.
+    identity = await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "page text",
+        advisor_config=_ADVISOR_CONFIG,
+        model=_function_model_returning(_identity_args()),
+        diagnostics=diagnostics,
+    )
+    assert identity.name == "Kenya Kiambu AA (Washed)"
+    assert diagnostics.timed_out_runs == 1
+    assert diagnostics.usage_reported_requests == 0
+    assert diagnostics.usage_unreported_requests == 2
 
     # non-timeout failure paths must NOT flag it.
     other_failure = bean_sourcing.BeanSourcingDiagnostics()
