@@ -72,10 +72,13 @@ class RESTClient:
         payload: Mapping[str, JsonValue] | None,
     ) -> JsonValue:
         data = None if payload is None else json.dumps(payload).encode()
+        headers = dict(self._headers)
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
         request = Request(
             f"{self._base_url}{path}",
             data=data,
-            headers=self._headers,
+            headers=headers,
             method=method,
         )
         try:
@@ -136,6 +139,11 @@ def _process_workflow_run(run: JsonObject, action: str, api: _GitHubAPI) -> str:
     pr = _pull_request_for_run(run, api)
     if pr is None:
         return "no exact open pull request is associated with the review run; fail closed"
+    if pr.author == "dependabot[bot]":
+        if _pull_request_edits_privileged_code(pr.number, api):
+            _dismiss_approval(pr, api, include_exemption=True)
+            return "privileged-code-editing PR requires an explicit maintainer approval"
+        return _approve_dependabot(pr, api)
     if _pull_request_edits_privileged_code(pr.number, api):
         return "privileged-code-editing PR requires an explicit maintainer approval"
     existing_approval = _approval_review(pr, api) is not None
@@ -179,6 +187,13 @@ def _process_pull_request_target(
         if "base" not in changes:
             return "non-base pull request edit does not require approval work"
         pr = _pull_request_from_payload(pr_payload)
+        if pr.author == "dependabot[bot]" and _pull_request_edits_privileged_code(pr.number, api):
+            dismissed = _dismiss_approval(pr, api, include_exemption=True)
+            suffix = " and dismissed the prior approval" if dismissed else ""
+            return (
+                f"base branch changed{suffix}; privileged-code-editing PR "
+                "requires an explicit maintainer approval"
+            )
         dismissed = _dismiss_approval(
             pr,
             api,
@@ -187,11 +202,6 @@ def _process_pull_request_target(
         )
         suffix = " and dismissed the prior approval" if dismissed else ""
         if pr.author == "dependabot[bot]":
-            if _pull_request_edits_privileged_code(pr.number, api):
-                return (
-                    f"base branch changed{suffix}; privileged-code-editing PR "
-                    "requires an explicit maintainer approval"
-                )
             approved = _approve_dependabot(pr, api)
             return f"base branch changed{suffix}; {approved}"
         if _approval_review(pr, api) is not None:
@@ -202,6 +212,7 @@ def _process_pull_request_target(
     pr = _pull_request_from_payload(pr_payload)
     if pr.author == "dependabot[bot]":
         if _pull_request_edits_privileged_code(pr.number, api):
+            _dismiss_approval(pr, api, include_exemption=True)
             return "privileged-code-editing PR requires an explicit maintainer approval"
         return _approve_dependabot(pr, api)
     if action in {"reopened", "ready_for_review"}:
@@ -335,6 +346,9 @@ def _matching_runs_for_pull_request(
 
 
 def _approve_dependabot(pr: _PullRequest, api: _GitHubAPI) -> str:
+    _dismiss_approval(pr, api)
+    if _exemption_review(pr, api) is not None:
+        return f"PR #{pr.number} already has a bot exemption for {pr.head[0]}"
     body = (
         f"{_EXEMPTION_MARKER} `{pr.head[0]}` is explicitly exempt: "
         f"Dependabot cannot receive repository secrets. {_identity_marker(pr)} "
@@ -355,7 +369,13 @@ def _approve(
     current = _load_pull_request(pr.number, api)
     if not _same_approval_identity(pr, current):
         return f"PR #{pr.number} identity changed before approval; approval remains absent"
-    if _approval_review(pr, api) is not None:
+    marker = body.split(" ", 1)[0]
+    existing = (
+        _exemption_review(pr, api)
+        if marker == _EXEMPTION_MARKER
+        else _approval_review(pr, api, approval_only=True)
+    )
+    if existing is not None:
         return f"PR #{pr.number} already has a bot approval for {pr.head[0]}"
     if run_order is not None:
         dismissed_order = _latest_dismissed_run_order(pr, api)
@@ -521,6 +541,19 @@ def _approval_review(
             pr,
             approval_only=approval_only,
         ) and _identity_marker(pr) in _string(review.get("body", ""), "review.body"):
+            return review
+    return None
+
+
+def _exemption_review(pr: _PullRequest, api: _GitHubAPI) -> JsonObject | None:
+    for value in _all_reviews(pr.number, api):
+        review = _object(value, "reviews[]")
+        body = _string(review.get("body", ""), "review.body")
+        if (
+            _is_bridge_approval(review, pr, approval_only=False)
+            and body.split(" ", 1)[0] == _EXEMPTION_MARKER
+            and _identity_marker(pr) in body
+        ):
             return review
     return None
 

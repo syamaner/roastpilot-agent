@@ -1007,11 +1007,164 @@ def test_dependabot_receives_explicit_exemption_approval() -> None:
     assert "Dependabot cannot receive repository secrets" in str(api.posts[0][1])
 
 
+def test_dependabot_workflow_run_routes_only_to_exemption() -> None:
+    """A skipped review workflow cannot become false Claude evidence."""
+
+    run = _run_payload()
+    api = _workflow_api(run, pr=_pr_payload(author="dependabot[bot]"))
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "approved PR #10 at abc123"
+    assert len(api.posts) == 1
+    assert "[claude-review-exempt]" in str(api.posts[0][1])
+    assert "[claude-review-approval]" not in str(api.posts[0][1])
+
+
+def test_dependabot_workflow_run_replaces_false_normal_approval() -> None:
+    """Author routing dismisses false normal evidence before exemption."""
+
+    run = _run_payload()
+    api = _workflow_api(
+        run,
+        pr=_pr_payload(author="dependabot[bot]"),
+        reviews=[
+            {
+                "id": 93,
+                "user": {"login": "github-actions[bot]"},
+                "state": "APPROVED",
+                "commit_id": "abc123",
+                "body": _approval_body("false normal evidence"),
+            }
+        ],
+    )
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "approved PR #10 at abc123"
+    assert api.puts == [
+        (
+            "/pulls/10/reviews/93/dismissals",
+            {"message": "A newer Claude review attempt must succeed before merge."},
+        )
+    ]
+    assert "[claude-review-exempt]" in str(api.posts[0][1])
+
+
+def test_dependabot_workflow_run_preserves_existing_exemption() -> None:
+    """Either event ordering converges on one explicit exemption."""
+
+    run = _run_payload()
+    api = _workflow_api(
+        run,
+        pr=_pr_payload(author="dependabot[bot]"),
+        reviews=[
+            {
+                "id": 94,
+                "user": {"login": "github-actions[bot]"},
+                "state": "APPROVED",
+                "commit_id": "abc123",
+                "body": _approval_body("safe exemption", exempt=True),
+            }
+        ],
+    )
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "PR #10 already has a bot exemption for abc123"
+    assert api.posts == []
+    assert api.puts == []
+
+
+def test_dependabot_workflow_run_cleans_false_normal_beside_exemption() -> None:
+    """Mixed evidence converges to only the labelled exemption."""
+
+    run = _run_payload()
+    api = _workflow_api(
+        run,
+        pr=_pr_payload(author="dependabot[bot]"),
+        reviews=[
+            {
+                "id": 97,
+                "user": {"login": "github-actions[bot]"},
+                "state": "APPROVED",
+                "commit_id": "abc123",
+                "body": _approval_body("false normal evidence"),
+            },
+            {
+                "id": 98,
+                "user": {"login": "github-actions[bot]"},
+                "state": "APPROVED",
+                "commit_id": "abc123",
+                "body": _approval_body("safe exemption", exempt=True),
+            },
+        ],
+    )
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "PR #10 already has a bot exemption for abc123"
+    assert api.puts == [
+        (
+            "/pulls/10/reviews/97/dismissals",
+            {"message": "A newer Claude review attempt must succeed before merge."},
+        )
+    ]
+    assert api.posts == []
+
+
+def test_privileged_dependabot_workflow_run_dismisses_all_bot_evidence() -> None:
+    """Privileged Dependabot edits retain only explicit maintainer authority."""
+
+    run = _run_payload()
+    api = _workflow_api(
+        run,
+        pr=_pr_payload(author="dependabot[bot]"),
+        reviews=[
+            {
+                "id": 95,
+                "user": {"login": "github-actions[bot]"},
+                "state": "APPROVED",
+                "commit_id": "abc123",
+                "body": _approval_body("false normal evidence"),
+            },
+            {
+                "id": 96,
+                "user": {"login": "github-actions[bot]"},
+                "state": "APPROVED",
+                "commit_id": "abc123",
+                "body": _approval_body("unsafe exemption", exempt=True),
+            },
+        ],
+    )
+    api.responses["/pulls/10/files?per_page=100"] = [{"filename": ".github/workflows/ci.yml"}]
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "privileged-code-editing PR requires an explicit maintainer approval"
+    assert [path for path, _payload in api.puts] == [
+        "/pulls/10/reviews/95/dismissals",
+        "/pulls/10/reviews/96/dismissals",
+    ]
+    assert api.posts == []
+
+
 def test_dependabot_privileged_edit_requires_maintainer() -> None:
     """Dependency automation cannot alter the bridge and self-exempt."""
 
     api = FakeAPI(
-        {"/pulls/10/files?per_page=100": [{"filename": "scripts/claude_review_approval.py"}]}
+        {
+            "/pulls/10/files?per_page=100": [{"filename": "scripts/claude_review_approval.py"}],
+            "/pulls/10/reviews?per_page=100&page=1": [
+                {
+                    "id": 99,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": _approval_body("unsafe exemption", exempt=True),
+                }
+            ],
+        }
     )
 
     result = approval.process_event(
@@ -1024,6 +1177,12 @@ def test_dependabot_privileged_edit_requires_maintainer() -> None:
 
     assert result == "privileged-code-editing PR requires an explicit maintainer approval"
     assert api.posts == []
+    assert api.puts == [
+        (
+            "/pulls/10/reviews/99/dismissals",
+            {"message": "A newer Claude review attempt must succeed before merge."},
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1425,7 +1584,7 @@ def test_dependabot_base_retarget_preserves_fresh_current_exemption() -> None:
         api,
     )
 
-    assert result == "base branch changed; PR #10 already has a bot approval for abc123"
+    assert result == "base branch changed; PR #10 already has a bot exemption for abc123"
     assert api.puts == []
     assert api.posts == []
 
@@ -1466,7 +1625,7 @@ def test_dependabot_base_retarget_dismisses_only_stale_exemption() -> None:
 
     assert result == (
         "base branch changed and dismissed the prior approval; "
-        "PR #10 already has a bot approval for abc123"
+        "PR #10 already has a bot exemption for abc123"
     )
     assert api.puts == [
         (
@@ -1533,8 +1692,8 @@ def test_non_base_edit_does_not_touch_approval() -> None:
     assert api.puts == []
 
 
-def test_workflows_serialize_bridge_and_review_only_base_edits() -> None:
-    """Workflow triggers preserve race and retarget protections."""
+def test_workflows_preserve_all_bridge_events_and_metadata_reviews() -> None:
+    """Workflow triggers preserve every reconciliation and review event."""
 
     root = Path(__file__).resolve().parents[1]
     bridge = (root / ".github/workflows/claude-review-approval.yml").read_text(encoding="utf-8")
@@ -1543,10 +1702,7 @@ def test_workflows_serialize_bridge_and_review_only_base_edits() -> None:
     assert "types: [opened, synchronize, ready_for_review, reopened, edited]" in bridge
     assert "github.event.action == 'ready_for_review' ||" in bridge
     assert "github.event.action == 'reopened' ||" in bridge
-    assert "claude-review-approval-${{" in bridge
-    assert "github.event.workflow_run.head_sha ||" in bridge
-    assert "github.event.pull_request.head.sha ||" in bridge
-    assert "cancel-in-progress: false" in bridge
+    assert "concurrency:" not in bridge
     assert "run: python3 -I scripts/claude_review_approval.py" in bridge
     assert "types: [opened, synchronize, ready_for_review, reopened, edited]" in reviewer
     assert "github.event.pull_request.user.login != 'dependabot[bot]'" in reviewer
@@ -1607,8 +1763,10 @@ def test_rest_client_decodes_json_and_empty_responses(
     """The stdlib REST client handles JSON and no-content responses."""
 
     bodies = iter([b'{"ok": true}', b"", b'{"dismissed": true}'])
+    requests: list[object] = []
 
-    def fake_urlopen(*_args: object, **_kwargs: object) -> _Response:
+    def fake_urlopen(*args: object, **_kwargs: object) -> _Response:
+        requests.append(args[0])
         return _Response(next(bodies))
 
     monkeypatch.setattr(approval, "urlopen", fake_urlopen)
@@ -1617,6 +1775,15 @@ def test_rest_client_decodes_json_and_empty_responses(
     assert client.get("/value") == {"ok": True}
     assert client.post("/empty", {"value": 1}) is None
     assert client.put("/review", {"message": "stale"}) == {"dismissed": True}
+    get_request, post_request, put_request = requests
+    assert isinstance(get_request, approval.Request)
+    assert isinstance(post_request, approval.Request)
+    assert isinstance(put_request, approval.Request)
+    assert get_request.get_header("Content-type") is None
+    assert post_request.get_header("Content-type") == "application/json"
+    assert post_request.data == b'{"value": 1}'
+    assert put_request.get_header("Content-type") == "application/json"
+    assert put_request.data == b'{"message": "stale"}'
 
 
 def test_rest_client_redacts_http_error_body(

@@ -9,17 +9,6 @@ permissions:
   contents: read
   pull-requests: write
   actions: write
-concurrency:
-  # Serialize bridge handlers per exact head as an idempotency aid.
-  # A head-SHA key remains stable even when GitHub's eventually-consistent
-  # workflow_run payload temporarily omits its pull_requests association.
-  group: >-
-    claude-review-approval-${{
-      github.event.workflow_run.head_sha ||
-      github.event.pull_request.head.sha ||
-      github.run_id
-    }}
-  cancel-in-progress: false
 jobs:
   approve:
     name: Publish PR-scoped Claude approval

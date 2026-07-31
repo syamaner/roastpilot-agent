@@ -390,8 +390,11 @@ Dependabot PRs. Operate the gate as follows:
   may approve. Missing or malformed current-identity tombstone order fails
   closed. The replacement attempt must succeed. An intentionally started rerun must
   still finish and have its findings independently triaged before merge.
-  Same-head concurrency remains an idempotency aid, not an atomic replacement
-  transaction. The bridge reruns a first cancelled attempt once; for a
+  Bridge handlers deliberately run without workflow concurrency: GitHub may
+  replace a pending same-group run even when cancellation is disabled, so
+  serialization could discard a base-retarget reconciliation event. Identity
+  checks, tombstones, pagination, and idempotency make concurrent/out-of-order
+  handlers safe. The bridge reruns a first cancelled attempt once; for a
   service or infrastructure error, re-run the failed Actions job after recovery
   and wait again. Failure, timeout, action-required, repeated cancellation,
   stale/ambiguous PR association, or silence never receives a timeout bypass.
@@ -409,8 +412,11 @@ Dependabot PRs. Operate the gate as follows:
   never counts an approval bound to a non-current commit, alongside strict mode
   and stale-review dismissal. If that adversarial proof fails, do not activate
   this design.
-- Dependabot receives a labelled `[claude-review-exempt]` approval from trusted
-  default-branch code. A PR editing either a workflow or the privileged bridge
+- Dependabot receives only a labelled `[claude-review-exempt]` approval from
+  trusted default-branch code, regardless of whether `pull_request_target` or
+  a skipped reviewer `workflow_run` arrives first. Any false normal bridge
+  evidence is dismissed; privileged Dependabot edits lose all automated
+  evidence and require a maintainer. A PR editing either a workflow or the privileged bridge
   helper can alter the approval path itself, so its apparent success is never
   trusted and it requires an explicit maintainer approval with the reason
   recorded. Neither path executes PR code with the bridge token. CI, codecov,

@@ -50,7 +50,7 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D114** (D113 is in focused plan follow-up).
+> Next free plan decision number: **D115** (D114 is in focused plan follow-up).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 27 Jul block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
@@ -205,6 +205,11 @@ empty run association receives bounded exact-run refresh plus one retry. Approva
 publication revalidates identity before and after POST and dismisses a raced review
 or any review whose post-publication validation fails; cleanup failure blocks
 activation pending operator audit.
+Bridge handlers run without workflow concurrency because GitHub can replace a
+pending same-group event; their identity checks and tombstones are deliberately
+order-safe. JSON mutations declare their media type. Dependabot author routing
+is enforced in both event channels, removes false normal evidence, and leaves
+privileged changes for explicit maintainer approval.
 Because REST cannot make that sequence atomic, slice 2 must live-prove that an
 approval bound to a non-current commit never satisfies merge; failed proof blocks
 activation. Dependabot uses a trusted labelled
