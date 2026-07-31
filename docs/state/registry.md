@@ -50,7 +50,7 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D117** (D116 is in focused plan follow-up).
+> Next free plan decision number: **D118** (D117 is in focused plan follow-up).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 27 Jul block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
@@ -184,7 +184,7 @@ activation prerequisite. Merge policy still requires full
 local gates, applicable local domain reviewers, an exact-head authenticated
 Codex trigger/wait/triage pass (including the documented bounded silent/stalled
 fallback), and independent lead/`pr-triage` adjudication.
-**Restoration design (D108 amended by D109-D116):** retire the SHA status and use a trusted
+**Restoration design (D108 amended by D109-D117):** retire the SHA status and use a trusted
 default-branch bridge to turn a successful exact-PR/head/base Claude run into
 an exact-commit PR approval. That evidence is monotonic for unchanged identity:
 later same-head runs are additive and cannot revoke it; an intentional replacement
@@ -216,6 +216,9 @@ Lost submit responses are state-checked:
 exact approved evidence proceeds to validation and exact pending evidence is
 retained for explicit retry. Any raced approval is dismissed; cleanup or
 validation failure blocks activation pending operator audit.
+GitHub review `body` is nullable; collection scanners normalize only `null` to
+empty text before marker filtering. A missing member or any other non-string
+value remains malformed and fails closed.
 Bridge handlers run without workflow concurrency because GitHub can replace a
 pending same-group event; their identity checks and tombstones are deliberately
 order-safe. JSON mutations declare their media type. Dependabot author routing

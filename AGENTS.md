@@ -423,6 +423,9 @@ Dependabot PRs. Operate the gate as follows:
   immutable snapshot against the live identity. Stale approved/pending evidence
   is removed and live-identity evidence is preserved, including A-to-B-to-A
   cycles; evidence created after the snapshot is never touched.
+  GitHub review bodies are nullable; scanners normalize only `null` to empty
+  text before marker filtering. A missing `body` member or any other non-string
+  value remains a strict input error.
   This is not a REST transaction: slice-2 activation must live-prove that GitHub
   never counts an approval bound to a non-current commit, alongside strict mode
   and stale-review dismissal. If that adversarial proof fails, do not activate

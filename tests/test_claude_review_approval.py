@@ -224,6 +224,77 @@ def test_successful_exact_head_review_approves_pr() -> None:
     ]
 
 
+def test_null_body_ordinary_review_does_not_block_approval() -> None:
+    """GitHub reviews without summary text are ignored by bridge scans."""
+
+    run = _run_payload()
+    api = _workflow_api(
+        run,
+        reviews=[
+            {
+                "id": 50,
+                "user": {"login": "human-reviewer"},
+                "state": "APPROVED",
+                "commit_id": "abc123",
+                "body": None,
+            },
+            {
+                "id": 51,
+                "user": {"login": "github-actions[bot]"},
+                "state": "COMMENTED",
+                "commit_id": "abc123",
+                "body": None,
+            },
+        ],
+    )
+
+    result = approval.process_event({"workflow_run": run}, api)
+
+    assert result == "approved PR #10 at abc123"
+    assert api.posts[-1] == ("/pulls/10/reviews/900/events", {"event": "APPROVE"})
+
+
+def test_non_string_review_body_fails_closed() -> None:
+    """Malformed non-null review bodies remain strict input errors."""
+
+    run = _run_payload()
+    api = _workflow_api(
+        run,
+        reviews=[
+            {
+                "id": 52,
+                "user": {"login": "human-reviewer"},
+                "state": "COMMENTED",
+                "commit_id": "abc123",
+                "body": {"unexpected": "object"},
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="review.body must be a string"):
+        approval.process_event({"workflow_run": run}, api)
+
+
+def test_missing_review_body_fails_closed() -> None:
+    """A missing body member is malformed, unlike an explicit JSON null."""
+
+    run = _run_payload()
+    api = _workflow_api(
+        run,
+        reviews=[
+            {
+                "id": 53,
+                "user": {"login": "human-reviewer"},
+                "state": "COMMENTED",
+                "commit_id": "abc123",
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="review.body is required"):
+        approval.process_event({"workflow_run": run}, api)
+
+
 def test_shared_sha_runs_approve_only_their_associated_pr() -> None:
     """Two PRs sharing a SHA receive separate review objects."""
 
@@ -1360,7 +1431,9 @@ def test_dismissed_epoch_lookup_paginates_and_uses_latest_order() -> None:
     """The newest tombstone is enforced across every review page."""
 
     run = _run_payload(run_number=21)
-    filler: list[approval.JsonValue] = [{"user": {"login": "someone"}} for _ in range(100)]
+    filler: list[approval.JsonValue] = [
+        {"user": {"login": "someone"}, "body": None} for _ in range(100)
+    ]
     api = _workflow_api(run, reviews=filler)
     api.responses["/pulls/10/reviews?per_page=100&page=2"] = [
         {
@@ -1448,7 +1521,7 @@ def test_review_lookup_paginates() -> None:
     run = _run_payload()
     api = _workflow_api(
         run,
-        reviews=[{"user": {"login": "someone"}} for _ in range(100)],
+        reviews=[{"user": {"login": "someone"}, "body": None} for _ in range(100)],
     )
     api.responses["/pulls/10/reviews?per_page=100&page=2"] = [
         {
@@ -2076,6 +2149,13 @@ def test_delayed_retarget_after_base_cycle_preserves_current_approval() -> None:
                         "[claude-review-approval] stale target B "
                         f"{_identity_marker(base_ref='target-b')}"
                     ),
+                },
+                {
+                    "id": 91,
+                    "user": {"login": "human-reviewer"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": None,
                 },
             ],
         }

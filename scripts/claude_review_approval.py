@@ -392,9 +392,7 @@ def _approve(
     if not _same_approval_identity(pr, live_after_cleanup):
         return f"PR #{pr.number} identity changed during pending cleanup; approval remains absent"
     pending = _pending_bridge_reviews(pr, api)
-    exact_pending = [
-        review for review in pending if _string(review.get("body", ""), "review.body") == body
-    ]
+    exact_pending = [review for review in pending if _review_body(review) == body]
     if len(exact_pending) > 1:
         raise RuntimeError("multiple exact pending reviews require operator audit")
     if exact_pending:
@@ -415,7 +413,7 @@ def _approve(
             exact_pending = [
                 review
                 for review in _pending_bridge_reviews(pr, api)
-                if _string(review.get("body", ""), "review.body") == body
+                if _review_body(review) == body
             ]
             if len(exact_pending) != 1:
                 raise
@@ -543,7 +541,7 @@ def _pending_bridge_reviews(
     for value in _all_reviews(pr.number, api):
         review = _object(value, "reviews[]")
         user = _object(review.get("user"), "review.user")
-        body = _string(review.get("body", ""), "review.body")
+        body = _review_body(review)
         if (
             _string(user.get("login"), "review.user.login") == _BOT_LOGIN
             and _string(review.get("state"), "review.state") == "PENDING"
@@ -565,7 +563,7 @@ def _delete_stale_pending_reviews(
     for value in reviews:
         review = _object(value, "reviews[]")
         user = _object(review.get("user"), "review.user")
-        body = _string(review.get("body", ""), "review.body")
+        body = _review_body(review)
         if not (
             _string(user.get("login"), "review.user.login") == _BOT_LOGIN
             and _string(review.get("state"), "review.state") == "PENDING"
@@ -645,7 +643,7 @@ def _latest_dismissed_run_order(
     for value in _all_reviews(pr.number, api):
         review = _object(value, "reviews[]")
         user = _object(review.get("user"), "review.user")
-        body = _string(review.get("body", ""), "review.body")
+        body = _review_body(review)
         if not (
             _string(user.get("login"), "review.user.login") == _BOT_LOGIN
             and _string(review.get("state"), "review.state") == "DISMISSED"
@@ -697,7 +695,7 @@ def _dismiss_approval(
     for value in _all_reviews(pr.number, api):
         review = _object(value, "reviews[]")
         user = _object(review.get("user"), "review.user")
-        body = _string(review.get("body", ""), "review.body")
+        body = _review_body(review)
         marker = body.split(" ", 1)[0]
         is_bridge_marker = marker == _APPROVAL_MARKER or (
             include_exemption and marker == _EXEMPTION_MARKER
@@ -740,7 +738,7 @@ def _reconcile_retarget_reviews(
     for value in reviews:
         review = _object(value, "reviews[]")
         user = _object(review.get("user"), "review.user")
-        body = _string(review.get("body", ""), "review.body")
+        body = _review_body(review)
         marker = body.split(" ", 1)[0]
         state = _string(review.get("state"), "review.state")
         if not (
@@ -777,7 +775,7 @@ def _approval_review(
             review,
             pr,
             approval_only=approval_only,
-        ) and _identity_marker(pr) in _string(review.get("body", ""), "review.body"):
+        ) and _identity_marker(pr) in _review_body(review):
             return review
     return None
 
@@ -785,7 +783,7 @@ def _approval_review(
 def _exemption_review(pr: _PullRequest, api: _GitHubAPI) -> JsonObject | None:
     for value in _all_reviews(pr.number, api):
         review = _object(value, "reviews[]")
-        body = _string(review.get("body", ""), "review.body")
+        body = _review_body(review)
         if (
             _is_bridge_approval(review, pr, approval_only=False)
             and body.split(" ", 1)[0] == _EXEMPTION_MARKER
@@ -802,7 +800,7 @@ def _is_bridge_approval(
     approval_only: bool,
 ) -> bool:
     user = _object(review.get("user"), "review.user")
-    marker = _string(review.get("body", ""), "review.body").split(" ", 1)[0]
+    marker = _review_body(review).split(" ", 1)[0]
     return (
         _string(user.get("login"), "review.user.login") == _BOT_LOGIN
         and _string(review.get("state"), "review.state") == "APPROVED"
@@ -819,6 +817,15 @@ def _identity_marker(pr: _PullRequest) -> str:
         f"head={pr.head[2]}:{head_ref}:{pr.head[0]} "
         f"base={pr.base[2]}:{base_ref}]"
     )
+
+
+def _review_body(review: JsonObject) -> str:
+    if "body" not in review:
+        raise ValueError("review.body is required")
+    value = review["body"]
+    if value is None:
+        return ""
+    return _string(value, "review.body")
 
 
 def _all_reviews(number: int, api: _GitHubAPI) -> list[JsonValue]:
