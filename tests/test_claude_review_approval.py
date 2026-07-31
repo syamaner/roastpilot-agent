@@ -169,6 +169,19 @@ def _run_payload(
     }
 
 
+def _operator_event(
+    *,
+    number: str = "10",
+    reason: str = "Workflow change independently reviewed and approved.",
+    actor: str = "syamaner",
+) -> approval.JsonObject:
+    return {
+        "action": "privileged_review_override",
+        "client_payload": {"pull_request": number, "reason": reason},
+        "sender": {"login": actor},
+    }
+
+
 def _workflow_api(
     run: approval.JsonObject,
     *,
@@ -1538,6 +1551,202 @@ def test_review_lookup_paginates() -> None:
     assert api.posts == []
 
 
+def _operator_api(
+    *,
+    permission: str = "admin",
+    state: str = "open",
+    files: list[approval.JsonValue] | None = None,
+    reviews: list[approval.JsonValue] | None = None,
+) -> FakeAPI:
+    pr = _pr_payload()
+    pr["state"] = state
+    return FakeAPI(
+        {
+            "/collaborators/syamaner/permission": {"permission": permission},
+            "/pulls/10": pr,
+            "/pulls/10/files?per_page=100": (
+                [{"filename": ".github/workflows/example.yml"}] if files is None else files
+            ),
+            "/pulls/10/reviews?per_page=100&page=1": [] if reviews is None else reviews,
+        }
+    )
+
+
+@pytest.mark.parametrize("permission", ["maintain", "admin"])
+def test_operator_override_approves_only_current_privileged_identity(permission: str) -> None:
+    """A current maintainer can explicitly approve a privileged PR with audit evidence."""
+
+    api = _operator_api(permission=permission)
+
+    result = approval.process_event(_operator_event(reason='Reviewed "workflow" change.'), api)
+
+    assert result == "approved PR #10 at abc123"
+    assert api.posts[0][0] == "/pulls/10/reviews"
+    payload = api.posts[0][1]
+    assert payload is not None
+    body = payload["body"]
+    assert isinstance(body, str)
+    assert "[claude-review-operator-override]" in body
+    assert "Maintainer @syamaner" in body
+    assert 'reason="Reviewed \\"workflow\\" change."' in body
+    assert _identity_marker() in body
+    assert api.posts[1] == ("/pulls/10/reviews/900/events", {"event": "APPROVE"})
+
+
+@pytest.mark.parametrize("permission", ["write", "read", "triage", "none"])
+def test_operator_override_rejects_actor_without_maintain(permission: str) -> None:
+    """The event sender must still hold repository maintainer authority."""
+
+    api = _operator_api(permission=permission)
+
+    with pytest.raises(ValueError, match="current repository maintain permission"):
+        approval.process_event(_operator_event(), api)
+
+    assert api.posts == []
+
+
+@pytest.mark.parametrize("number", ["0", "-1", "01", "not-a-number"])
+def test_operator_override_rejects_invalid_pr_number(number: str) -> None:
+    """The workflow input must identify one canonical positive PR number."""
+
+    api = _operator_api()
+
+    with pytest.raises(ValueError, match="positive integer"):
+        approval.process_event(_operator_event(number=number), api)
+
+    assert api.posts == []
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "x" * 501])
+def test_operator_override_rejects_invalid_reason(reason: str) -> None:
+    """Every override carries a bounded non-empty audit reason."""
+
+    api = _operator_api()
+
+    with pytest.raises(ValueError, match="client_payload.reason"):
+        approval.process_event(_operator_event(reason=reason), api)
+
+    assert api.posts == []
+
+
+def test_operator_override_rejects_closed_pr() -> None:
+    """A dispatch cannot publish evidence onto a closed pull request."""
+
+    api = _operator_api(state="closed")
+
+    with pytest.raises(ValueError, match="open pull request"):
+        approval.process_event(_operator_event(), api)
+
+    assert api.posts == []
+
+
+def test_operator_override_rejects_ordinary_pr() -> None:
+    """The manual path cannot bypass normal Claude review requirements."""
+
+    api = _operator_api(files=[{"filename": "docs/example.md"}])
+
+    with pytest.raises(ValueError, match="restricted to privileged-code-editing PRs"):
+        approval.process_event(_operator_event(), api)
+
+    assert api.posts == []
+
+
+def test_operator_override_finds_privileged_rename_on_later_file_page() -> None:
+    """The override eligibility scan covers every available PR-files page."""
+
+    api = _operator_api(files=[{"filename": f"docs/{index}.md"} for index in range(100)])
+    api.responses["/pulls/10/files?per_page=100&page=2"] = [
+        {
+            "filename": "docs/moved.yml",
+            "previous_filename": ".github/workflows/ci.yml",
+        }
+    ]
+
+    result = approval.process_event(_operator_event(), api)
+
+    assert result == "approved PR #10 at abc123"
+    assert api.posts[0][0] == "/pulls/10/reviews"
+
+
+def test_operator_override_rejects_large_ordinary_pr_after_pagination() -> None:
+    """One full ordinary page is not itself treated as override eligibility."""
+
+    api = _operator_api(files=[{"filename": f"docs/{index}.md"} for index in range(100)])
+    api.responses["/pulls/10/files?per_page=100&page=2"] = []
+
+    with pytest.raises(ValueError, match="restricted to privileged-code-editing PRs"):
+        approval.process_event(_operator_event(), api)
+
+    assert api.posts == []
+
+
+def test_operator_override_rejects_indeterminate_maximum_file_inventory() -> None:
+    """The 3,000-file ceiling blocks but cannot positively qualify an override."""
+
+    api = _operator_api(files=[{"filename": f"docs/1-{index}.md"} for index in range(100)])
+    for page in range(2, 31):
+        api.responses[f"/pulls/10/files?per_page=100&page={page}"] = [
+            {"filename": f"docs/{page}-{index}.md"} for index in range(100)
+        ]
+
+    with pytest.raises(ValueError, match="cannot prove privileged scope"):
+        approval.process_event(_operator_event(), api)
+
+    assert api.posts == []
+
+
+def test_operator_override_is_idempotent_for_exact_identity() -> None:
+    """A repeated dispatch does not accumulate counting approvals."""
+
+    body = f"[claude-review-operator-override] recorded {_identity_marker()}"
+    api = _operator_api(
+        reviews=[
+            {
+                "id": 61,
+                "user": {"login": "github-actions[bot]"},
+                "state": "APPROVED",
+                "commit_id": "abc123",
+                "body": body,
+            }
+        ]
+    )
+
+    result = approval.process_event(_operator_event(), api)
+
+    assert result == "PR #10 already has a recorded operator override for abc123"
+    assert api.posts == []
+
+
+def test_operator_override_dismisses_false_automated_evidence_first() -> None:
+    """Privileged override replaces any normal or Dependabot-labelled bot evidence."""
+
+    reviews: list[approval.JsonValue] = [
+        {
+            "id": 61,
+            "user": {"login": "github-actions[bot]"},
+            "state": "APPROVED",
+            "commit_id": "abc123",
+            "body": _approval_body("normal"),
+        },
+        {
+            "id": 62,
+            "user": {"login": "github-actions[bot]"},
+            "state": "APPROVED",
+            "commit_id": "abc123",
+            "body": _approval_body("exemption", exempt=True),
+        },
+    ]
+    api = _operator_api(reviews=reviews)
+
+    approval.process_event(_operator_event(), api)
+
+    assert [path for path, _payload in api.puts] == [
+        "/pulls/10/reviews/61/dismissals",
+        "/pulls/10/reviews/62/dismissals",
+    ]
+    assert api.posts[0][0] == "/pulls/10/reviews"
+
+
 def test_dependabot_receives_explicit_exemption_approval() -> None:
     """Dependabot is approved through the trusted exemption path."""
 
@@ -1768,14 +1977,18 @@ def test_successful_untrusted_privileged_code_edit_cannot_approve(
     assert api.posts == []
 
 
-def test_full_file_page_fails_closed_as_possible_workflow_edit() -> None:
-    """An unpaginated 100-file inventory cannot hide a workflow edit."""
+def test_maximum_file_inventory_fails_closed_as_possible_workflow_edit() -> None:
+    """GitHub's 3,000-file listing ceiling cannot hide a workflow edit."""
 
     run = _run_payload()
     api = _workflow_api(run)
     api.responses["/pulls/10/files?per_page=100"] = [
         {"filename": f"src/file-{index}.py"} for index in range(100)
     ]
+    for page in range(2, 31):
+        api.responses[f"/pulls/10/files?per_page=100&page={page}"] = [
+            {"filename": f"src/page-{page}-file-{index}.py"} for index in range(100)
+        ]
 
     result = approval.process_event({"workflow_run": run}, api)
 

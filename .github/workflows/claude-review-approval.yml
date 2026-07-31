@@ -1,5 +1,7 @@
 name: Claude review approval
 on:
+  repository_dispatch:
+    types: [privileged_review_override]
   workflow_run:
     workflows: ["Claude Code Review"]
     types: [in_progress, completed]
@@ -13,6 +15,7 @@ jobs:
   approve:
     name: Publish PR-scoped Claude approval
     if: >-
+      github.event_name == 'repository_dispatch' ||
       github.event_name == 'workflow_run' ||
       github.event.pull_request.user.login == 'dependabot[bot]' ||
       github.event.action == 'ready_for_review' ||
