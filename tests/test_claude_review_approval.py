@@ -2011,6 +2011,15 @@ def test_delayed_base_retarget_dismisses_only_departed_identity() -> None:
                         f"[claude-review-approval] target C {_identity_marker(base_ref='target-c')}"
                     ),
                 },
+                {
+                    "id": 88,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": (
+                        f"[claude-review-approval] target B {_identity_marker(base_ref='target-b')}"
+                    ),
+                },
             ],
         }
     )
@@ -2032,8 +2041,66 @@ def test_delayed_base_retarget_dismisses_only_departed_identity() -> None:
         (
             "/pulls/10/reviews/81/dismissals",
             {"message": "A newer Claude review attempt must succeed before merge."},
+        ),
+        (
+            "/pulls/10/reviews/88/dismissals",
+            {"message": "A newer Claude review attempt must succeed before merge."},
+        ),
+    ]
+    assert api.posts == []
+
+
+def test_delayed_retarget_after_base_cycle_preserves_current_approval() -> None:
+    """A delayed A-to-B handler cannot remove fresh evidence after B-to-A."""
+
+    api = FakeAPI(
+        {
+            "/pulls/10": _pr_payload(base_sha="base-a-new", base_ref="target-a"),
+            "/pulls/10/reviews?per_page=100&page=1": [
+                {
+                    "id": 87,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": (
+                        "[claude-review-approval] fresh target A "
+                        f"{_identity_marker(base_ref='target-a')}"
+                    ),
+                },
+                {
+                    "id": 89,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "body": (
+                        "[claude-review-approval] stale target B "
+                        f"{_identity_marker(base_ref='target-b')}"
+                    ),
+                },
+            ],
+        }
+    )
+
+    result = approval.process_event(
+        {
+            "action": "edited",
+            "changes": {"base": {"ref": {"from": "target-a"}}},
+            "pull_request": _pr_payload(base_sha="base-b", base_ref="target-b"),
+        },
+        api,
+    )
+
+    assert result == (
+        "base branch changed and dismissed the prior approval; "
+        "fresh current-base approval preserved"
+    )
+    assert api.puts == [
+        (
+            "/pulls/10/reviews/89/dismissals",
+            {"message": "A newer Claude review attempt must succeed before merge."},
         )
     ]
+    assert api.deletes == []
     assert api.posts == []
 
 
@@ -2062,6 +2129,15 @@ def test_base_retarget_deletes_only_departed_pending_review() -> None:
                         f"[claude-review-approval] target C {_identity_marker(base_ref='target-c')}"
                     ),
                 },
+                {
+                    "id": 90,
+                    "user": {"login": "github-actions[bot]"},
+                    "state": "PENDING",
+                    "commit_id": "abc123",
+                    "body": (
+                        f"[claude-review-approval] target B {_identity_marker(base_ref='target-b')}"
+                    ),
+                },
             ],
         }
     )
@@ -2078,7 +2154,7 @@ def test_base_retarget_deletes_only_departed_pending_review() -> None:
     assert result == (
         "base branch changed and dismissed the prior approval; fresh Claude review required"
     )
-    assert api.deletes == ["/pulls/10/reviews/83"]
+    assert api.deletes == ["/pulls/10/reviews/83", "/pulls/10/reviews/90"]
     assert api.puts == []
 
 

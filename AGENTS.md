@@ -418,10 +418,11 @@ Dependabot PRs. Operate the gate as follows:
   The bridge revalidates identity and the dismissal epoch again after
   submission, dismissing the just-created review if either moved or validation
   fails. Cleanup failure is an explicit
-  activation blocker requiring operator audit. Retarget handlers reload the
-  live PR and dismiss only evidence for `changes.base.ref.from`, so a delayed
-  A-to-B event cannot remove current C evidence; departed pending evidence is
-  deleted while current or later-base pending work is preserved.
+  activation blocker requiring operator audit. Retarget handlers snapshot all
+  bridge reviews before reloading the live PR, then reconcile only that
+  immutable snapshot against the live identity. Stale approved/pending evidence
+  is removed and live-identity evidence is preserved, including A-to-B-to-A
+  cycles; evidence created after the snapshot is never touched.
   This is not a REST transaction: slice-2 activation must live-prove that GitHub
   never counts an approval bound to a non-current commit, alongside strict mode
   and stale-review dismissal. If that adversarial proof fails, do not activate

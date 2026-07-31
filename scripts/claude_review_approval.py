@@ -193,27 +193,14 @@ def _process_pull_request_target(
         if "base" not in changes:
             return "non-base pull request edit does not require approval work"
         event_pr = _pull_request_from_payload(pr_payload)
-        pr = _load_pull_request(event_pr.number, api)
-        departed_base_ref = _string(
-            _object(
-                _object(changes.get("base"), "changes.base").get("ref"),
-                "changes.base.ref",
-            ).get("from"),
-            "changes.base.ref.from",
-        )
+        pr, dismissed = _reconcile_retarget_reviews(event_pr.number, api)
         if pr.author == "dependabot[bot]" and _pull_request_edits_privileged_code(pr.number, api):
-            dismissed = _dismiss_approval(pr, api, include_exemption=True)
+            dismissed = _dismiss_approval(pr, api, include_exemption=True) or dismissed
             suffix = " and dismissed the prior approval" if dismissed else ""
             return (
                 f"base branch changed{suffix}; privileged-code-editing PR "
                 "requires an explicit maintainer approval"
             )
-        dismissed = _dismiss_approval(
-            pr,
-            api,
-            include_exemption=True,
-            departed_base_ref=departed_base_ref,
-        )
         suffix = " and dismissed the prior approval" if dismissed else ""
         if pr.author == "dependabot[bot]":
             approved = _approve_dependabot(pr, api)
@@ -705,21 +692,8 @@ def _dismiss_approval(
     api: _GitHubAPI,
     *,
     include_exemption: bool = False,
-    departed_base_ref: str | None = None,
 ) -> bool:
     dismissed = False
-    departed_identity = (
-        None
-        if departed_base_ref is None
-        else _identity_marker(
-            _PullRequest(
-                number=pr.number,
-                head=pr.head,
-                base=(pr.base[0], departed_base_ref, pr.base[2]),
-                author=pr.author,
-            )
-        )
-    )
     for value in _all_reviews(pr.number, api):
         review = _object(value, "reviews[]")
         user = _object(review.get("user"), "review.user")
@@ -732,8 +706,6 @@ def _dismiss_approval(
             _string(user.get("login"), "review.user.login") == _BOT_LOGIN
             and _string(review.get("commit_id"), "review.commit_id") == pr.head[0]
         )
-        if departed_identity is not None and departed_identity not in body:
-            continue
         if (
             is_bot_commit
             and is_bridge_marker
@@ -755,6 +727,45 @@ def _dismiss_approval(
         )
         dismissed = True
     return dismissed
+
+
+def _reconcile_retarget_reviews(
+    number: int,
+    api: _GitHubAPI,
+) -> tuple[_PullRequest, bool]:
+    reviews = _all_reviews(number, api)
+    live = _load_pull_request(number, api)
+    identity = _identity_marker(live)
+    dismissed = False
+    for value in reviews:
+        review = _object(value, "reviews[]")
+        user = _object(review.get("user"), "review.user")
+        body = _string(review.get("body", ""), "review.body")
+        marker = body.split(" ", 1)[0]
+        state = _string(review.get("state"), "review.state")
+        if not (
+            _string(user.get("login"), "review.user.login") == _BOT_LOGIN
+            and marker in {_APPROVAL_MARKER, _EXEMPTION_MARKER}
+            and state in {"APPROVED", "PENDING"}
+        ):
+            continue
+        if (
+            _string(review.get("commit_id"), "review.commit_id") == live.head[0]
+            and identity in body
+        ):
+            continue
+        review_id = _integer(review.get("id"), "review.id")
+        if state == "PENDING":
+            _delete_pending_review_or_block(number, review_id, api)
+        else:
+            _dismiss_created_review_or_block(
+                number,
+                review_id,
+                api,
+                "A newer Claude review attempt must succeed before merge.",
+            )
+        dismissed = True
+    return live, dismissed
 
 
 def _approval_review(
