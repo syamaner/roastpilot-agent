@@ -1285,6 +1285,8 @@ def test_workflows_serialize_bridge_and_review_only_base_edits() -> None:
     reviewer = (root / ".github/workflows/claude-code-review.yml").read_text(encoding="utf-8")
 
     assert "types: [opened, synchronize, ready_for_review, reopened, edited]" in bridge
+    assert "github.event.action == 'ready_for_review' ||" in bridge
+    assert "github.event.action == 'reopened' ||" in bridge
     assert "claude-review-approval-${{" in bridge
     assert "github.event.workflow_run.head_sha ||" in bridge
     assert "github.event.pull_request.head.sha ||" in bridge
