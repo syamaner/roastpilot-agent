@@ -4922,6 +4922,82 @@ async def test_cancellation_during_admission_terminalizes_then_propagates(
 
 
 @pytest.mark.asyncio
+async def test_attempt_admission_timeout_cancels_owned_task(
+    service: RoastService, store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#588: a wedged admission is cancelled and fails before remote work."""
+    never = asyncio.Event()
+
+    async def stalled_start(**kwargs: object) -> str:
+        del kwargs
+        await never.wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(store, "start_bean_sourcing_attempt", stalled_start)
+    monkeypatch.setattr(api_module, "_BEAN_DRAFT_FINALIZE_TIMEOUT_SECONDS", 0.01)
+    with pytest.raises(RuntimeError, match="timed out admitting"):
+        await service._start_bean_attempt_bounded(  # pyright: ignore[reportPrivateUsage]
+            provider="provider", model_slug="model", prompt_version="v1"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expired_deadline", [False, True])
+async def test_attempt_finalization_timeout_cancels_owned_task(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, expired_deadline: bool
+) -> None:
+    """#588: both timeout guards cancel a wedged terminal ledger write."""
+    never = asyncio.Event()
+
+    async def stalled_finish(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        await never.wait()
+
+    monkeypatch.setattr(store, "finish_bean_sourcing_attempt", stalled_finish)
+    monkeypatch.setattr(api_module, "_BEAN_DRAFT_FINALIZE_TIMEOUT_SECONDS", 0.01)
+    if expired_deadline:
+        # latency, deadline, then the first remaining-time calculation
+        ticks = iter((0.0, 0.0, 1.0))
+        service = RoastService(store, clock=lambda: next(ticks))
+    else:
+        service = RoastService(store)
+    with pytest.raises(RuntimeError, match="timed out finalizing"):
+        await service._finish_bean_attempt_bounded(  # pyright: ignore[reportPrivateUsage]
+            "attempt",
+            outcome="cancelled",
+            started_monotonic=0.0,
+            diagnostics=BeanSourcingDiagnostics(),
+            provider_response_missing=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_unexpected_provider_failure_records_partial_usage(
+    client: AsyncClient, store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#588: unexpected failures retain observed usage without claiming exactness."""
+
+    async def failed(
+        url: str, *, advisor_config: object, sourcing_config: object, diagnostics: object
+    ) -> object:
+        del url, advisor_config, sourcing_config
+        assert isinstance(diagnostics, BeanSourcingDiagnostics)
+        diagnostics.request_tokens = 17
+        raise RuntimeError("provider transport broke")
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", failed)
+    with pytest.raises(RuntimeError, match="provider transport broke"):
+        await client.post("/api/beans/draft-from-url", json={"url": "https://vendor.example/bean"})
+    async with store.connection.execute(
+        "SELECT outcome, request_tokens, response_tokens, usage_evidence"
+        " FROM bean_sourcing_attempts ORDER BY started_at_utc DESC LIMIT 1"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert tuple(row) == ("provider_error", 17, 0, "partial")
+
+
+@pytest.mark.asyncio
 async def test_expiry_scheduler_does_not_lose_wakeup_after_empty_query(
     service: RoastService, store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4942,6 +5018,33 @@ async def test_expiry_scheduler_does_not_lose_wakeup_after_empty_query(
     service._ensure_bean_draft_expiry_task()  # pyright: ignore[reportPrivateUsage]
     await asyncio.wait_for(queried_twice.wait(), timeout=2.0)
     assert calls >= 2
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_seed_starts_expiry_owner_and_ensure_wakes_existing_task(
+    service: RoastService, store: RoastStore
+) -> None:
+    """#588: startup owns future expiry and later saves wake that same owner."""
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="provider", model_slug="model", prompt_version="v1"
+    )
+    await store.finish_bean_sourcing_attempt(
+        attempt_id,
+        outcome="success",
+        latency_ms=1,
+        request_tokens=1,
+        response_tokens=1,
+        usage_evidence="exact",
+        timed_out_runs=0,
+        draft=_draft_from("https://vendor.example/bean"),
+    )
+    await service.seed_bean_profiles()
+    task = service._bean_draft_expiry_task  # pyright: ignore[reportPrivateUsage]
+    assert task is not None and not task.done()
+    service._bean_draft_expiry_wakeup.clear()  # pyright: ignore[reportPrivateUsage]
+    service._ensure_bean_draft_expiry_task()  # pyright: ignore[reportPrivateUsage]
+    assert service._bean_draft_expiry_wakeup.is_set()  # pyright: ignore[reportPrivateUsage]
     await service.shutdown()
 
 

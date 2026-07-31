@@ -270,6 +270,57 @@ async def test_v14_every_failure_outcome_is_terminal(
 
 
 @pytest.mark.asyncio
+async def test_v14_success_requires_draft_and_attempt_finalizes_once(store: RoastStore) -> None:
+    """#588: invalid success rolls back and a terminal row cannot be rewritten."""
+    attempt_id = await store.start_bean_sourcing_attempt(
+        provider="provider", model_slug="model", prompt_version="v1"
+    )
+    with pytest.raises(ValueError, match="requires a draft"):
+        await store.finish_bean_sourcing_attempt(
+            attempt_id,
+            outcome="success",
+            latency_ms=1,
+            request_tokens=1,
+            response_tokens=1,
+            usage_evidence="exact",
+            timed_out_runs=0,
+        )
+    await store.finish_bean_sourcing_attempt(
+        attempt_id,
+        outcome="cancelled",
+        latency_ms=1,
+        request_tokens=None,
+        response_tokens=None,
+        usage_evidence="unknown",
+        timed_out_runs=0,
+    )
+    with pytest.raises(RuntimeError, match="was not in progress"):
+        await store.finish_bean_sourcing_attempt(
+            attempt_id,
+            outcome="cancelled",
+            latency_ms=2,
+            request_tokens=None,
+            response_tokens=None,
+            usage_evidence="unknown",
+            timed_out_runs=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_v14_admission_constraint_failure_rolls_back(store: RoastStore) -> None:
+    """#588: an invalid admission rolls back its dedicated transaction."""
+    with pytest.raises(Exception, match="NOT NULL constraint failed"):
+        await store.start_bean_sourcing_attempt(
+            provider=None,  # pyright: ignore[reportArgumentType]
+            model_slug="model",
+            prompt_version="v1",
+        )
+    async with store.connection.execute("SELECT COUNT(*) FROM bean_sourcing_attempts") as cursor:
+        row = await cursor.fetchone()
+    assert row is not None and row[0] == 0
+
+
+@pytest.mark.asyncio
 async def test_v4_migration_does_not_disturb_roast_runs(store: RoastStore) -> None:
     """#303: the additive migration touches no existing roast_runs row.
 
