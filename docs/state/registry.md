@@ -38,10 +38,11 @@
 > **Review + process.** PR size is a **reviewability guide, not a hard cap** (#661,
 > 26 Jul) — a cohesive single-slice story stays one PR. `security-reviewer` is now
 > wired into the `review-branch` roster (#598/#678); **#680** tracks two fail-opens
-> found in that workflow post-merge. Claude Code Review remains **optional** under the
-> 25-Jul outage exception; its replacement is **#663 / D108**, whose bridge mechanism
-> merged in PR #679. Activation preflight then found the solo-maintainer privileged-PR
-> deadlock; the bounded D118 override mechanism is the remaining pre-activation change.
+> found in that workflow post-merge. **#663 / D108-D118 is ACTIVE (31 Jul):** the
+> PR-scoped Claude approval bridge and bounded solo-maintainer privileged override are
+> on `main`; live adversarial proofs passed; `main` now requires one stale-dismissing
+> approval. The temporary 25-Jul Claude outage exception is closed. The retired
+> SHA-scoped `review-gate` must not be restored.
 >
 > **Milestone reality.** M1 build continues; the "July 2026 harness complete" and
 > "first supervised hardware session in June" targets below are historical. E11
@@ -163,9 +164,11 @@
 
 ## Active Context
 
-**27 Jul 2026 — CLAUDE RESTORATION IN PROGRESS; PR-scoped approval mechanism is
-slice 1 of #663 (D108), activation remains slice 2.** The 25-Jul operator-authorized
-outage exception remains active until the replacement is merged and live-proved.
+**31 Jul 2026 — CLAUDE PR-SCOPED APPROVAL RESTORED (#663 / D108-D118).** The
+25-Jul operator-authorized outage exception is closed. The trusted bridge merged in
+#679 and the bounded privileged-PR override merged in #688. The pre-activation
+adversarial proofs passed before protection changed; the ordinary-PR enforcement
+proof and final protection verification passed immediately after activation.
 Shift-left security, QA, and independent triage rejected draft PR #662's attempted
 suspension protocol:
 GitHub commit statuses are SHA-scoped while review findings and conversation
@@ -232,18 +235,27 @@ the sender has `maintain`/`admin`, requires an affirmative workflow/helper file
 match (ordinary and 3,000-file-indeterminate inventories are rejected), and records
 the exact identity, actor, and reason in a labelled bot approval. It is not available
 to ordinary PRs and never checks out PR code.
-Because REST cannot make that sequence atomic, slice 2 must live-prove that an
-approval bound to a non-current commit never satisfies merge; failed proof blocks
-activation. Dependabot uses a trusted labelled
+Because REST cannot make that sequence atomic, slice 2 had to live-prove that an
+approval bound to a non-current commit never satisfies merge. Dependabot uses a
+trusted labelled
 exemption, while workflow or privileged-helper edits require an explicit recorded
-maintainer approval because their upstream review result is untrusted. Slice 1 ships the mechanism and operating policy
-without changing protection. Slice 2 enables Actions approvals plus one required
-approval only after live same-SHA/different-PR, draft→ready, stale-push, rerun,
-and workflow-exemption proofs. Claude's draft approval survives a no-code ready
+maintainer approval because their upstream review result is untrusted. Slice 1 shipped
+the mechanism and operating policy without changing protection. Slice 2 live-proved
+same-SHA/different-PR, draft→ready, stale-push, rerun, privileged-path, and ordinary-path
+behavior, then enabled Actions PR approvals plus one required stale-dismissing approval.
+PR #689 proved a labelled operator override on exact head `4469208`, dismissal after
+the head advanced to `f744af6`, and a fresh exact-head approval; documentation-only
+PR #686 was rejected by the privileged path. After enforcement, ordinary PR #690 was
+`REVIEW_REQUIRED` with no reviews, then received a normal bridge approval bound to exact
+head `aaa8d95` only after Claude run 30635910889 completed successfully. All disposable
+proof PRs #686/#687/#689/#690 were closed unmerged. Live protection was re-read after
+activation: strict app-pinned `Checks`, both Web checks, and `codecov/patch`; one approval
+with stale dismissal; conversation resolution and admin enforcement on; protected-base
+force-push/deletion off. Claude's draft approval survives a no-code ready
 transition, but Codex independently re-reviews that transition: mark ready before
 the final Codex round and accept only a fully-paginated, bot-authenticated
-exact-head verdict posted after ready. Board: #663 = In Progress / M1 / P2. The
-broader month-stale registry refresh remains a separate doc-only slice; this
+exact-head verdict posted after ready. Board: #663 closes with the activation-record
+PR. The broader month-stale registry refresh remains a separate doc-only slice; this
 entry records only state that changes #663.
 Strict required-status mode, stale-review dismissal, admin enforcement, and
 disabled protected-base force-push/deletion are load-bearing for D110: a normal
