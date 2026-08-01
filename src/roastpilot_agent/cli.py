@@ -1115,12 +1115,13 @@ def main() -> int:
                     # graceful-shutdown path.
                     _propagate_live_termination(signal_guard.received_signal)
                     raise  # pragma: no cover - defensive non-signal cancellation passthrough
-                # A signal can arrive after _serve_live's final check while
-                # asyncio.run() is cancelling residual tasks, shutting down
-                # async generators, or joining its executor. Preserve that
-                # late termination request instead of returning success.
-                _propagate_live_termination(signal_guard.received_signal)
-                return result
+            # Leave the guard before the final sticky check. A signal arriving
+            # during restoration is still recorded and seen here; one arriving
+            # afterwards reaches the restored OS handler instead of an already-
+            # finished Uvicorn server. This also preserves signals received while
+            # asyncio.run() was finalizing residual tasks and executors.
+            _propagate_live_termination(signal_guard.received_signal)
+            return result
         finally:
             exit_guard.disarm()
     if args.replay is not None:

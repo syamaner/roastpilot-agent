@@ -9,7 +9,7 @@ import asyncio
 import os
 import signal
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Coroutine, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -637,6 +637,77 @@ def test_serve_arms_exit_guard_after_unexpected_build_cleanup(
         cli.main()
 
     assert calls == ["arm", "disarm"]
+
+
+@pytest.mark.usefixtures("no_serve")
+def test_serve_restores_signal_handlers_before_final_termination_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The last sticky-signal read occurs only after handler restoration."""
+    order: list[str] = []
+
+    class _ExitGuard:
+        def disarm(self) -> None:
+            order.append("disarm")
+
+    class _SignalGuard:
+        received_signal: int | None = None
+
+        def __enter__(self) -> "_SignalGuard":
+            order.append("enter")
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            order.append("restore")
+
+    def _run(coroutine: Coroutine[object, object, int]) -> int:
+        order.append("run")
+        coroutine.close()
+        return 0
+
+    def _propagate(_signum: int | None) -> None:
+        order.append("final-check")
+
+    monkeypatch.setattr(cli, "_LiveExitGuard", _ExitGuard)
+    monkeypatch.setattr(cli, "_LiveSignalGuard", _SignalGuard)
+    monkeypatch.setattr(asyncio, "run", _run)
+    monkeypatch.setattr(cli, "_propagate_live_termination", _propagate)
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
+
+    assert cli.main() == 0
+    assert order == ["enter", "run", "restore", "final-check", "disarm"]
+
+
+@pytest.mark.usefixtures("no_serve")
+def test_serve_propagates_signal_received_during_handler_restoration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A SIGTERM in ``__exit__`` is observed by the post-guard check."""
+    original_guard = cli._LiveSignalGuard  # pyright: ignore[reportPrivateUsage]
+
+    class _RestorationSignalGuard(original_guard):
+        def __exit__(self, *_args: object) -> None:
+            signal.raise_signal(signal.SIGTERM)
+            super().__exit__(*_args)
+
+    async def _serve(
+        _args: object,
+        *,
+        exit_guard: object,
+        signal_guard: _RestorationSignalGuard,
+    ) -> int:
+        del exit_guard
+        signal_guard.bind_graceful_handler(lambda _signum, _frame: None)
+        return 0
+
+    monkeypatch.setattr(cli, "_LiveSignalGuard", _RestorationSignalGuard)
+    monkeypatch.setattr(cli, "_serve_live", _serve)
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 128 + signal.SIGTERM
 
 
 @pytest.mark.usefixtures("no_serve")
