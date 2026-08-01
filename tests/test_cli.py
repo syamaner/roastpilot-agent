@@ -179,15 +179,16 @@ def test_live_signal_guard_repeated_sigterm_remains_graceful(
 
 
 @pytest.mark.parametrize(
-    ("first", "second"),
+    ("first", "second", "expected_graceful"),
     [
-        (signal.SIGINT, signal.SIGTERM),
-        (signal.SIGTERM, signal.SIGINT),
+        (signal.SIGINT, signal.SIGTERM, [signal.SIGINT, signal.SIGTERM]),
+        (signal.SIGTERM, signal.SIGINT, [signal.SIGTERM]),
     ],
 )
 def test_live_signal_guard_preserves_first_signal_for_exit_semantics(
     first: int,
     second: int,
+    expected_graceful: list[int],
 ) -> None:
     """Mixed graceful signals retain the first signal's process outcome."""
     graceful: list[int] = []
@@ -198,7 +199,42 @@ def test_live_signal_guard_preserves_first_signal_for_exit_semantics(
     guard._handle(second, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
 
     assert guard.received_signal == first
-    assert graceful == [first, second]
+    assert graceful == expected_graceful
+
+
+def test_sigterm_then_sigint_does_not_force_uvicorn_exit() -> None:
+    """A first SIGINT after SIGTERM cannot skip application shutdown."""
+    server = cli._SignalManagedServer(uvicorn.Config("tests.test_cli:app"))  # pyright: ignore[reportPrivateUsage]
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard.bind_graceful_handler(server.handle_exit)
+
+    guard._handle(signal.SIGTERM, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    guard._handle(signal.SIGINT, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert server.should_exit is True
+    assert server.force_exit is False
+    assert guard.received_signal == signal.SIGTERM
+
+
+def test_sigterm_then_two_sigints_still_forces_explicit_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the second actual SIGINT forces exit, even after SIGTERM."""
+    graceful: list[int] = []
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard.bind_graceful_handler(lambda signum, _frame: graceful.append(signum))
+
+    def _forced_exit(code: int) -> None:
+        raise _ForcedProcessExit(code)
+
+    monkeypatch.setattr(os, "_exit", _forced_exit)
+    guard._handle(signal.SIGTERM, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    guard._handle(signal.SIGINT, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(_ForcedProcessExit) as exc:
+        guard._handle(signal.SIGINT, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert exc.value.code == 70
+    assert graceful == [signal.SIGTERM]
 
 
 def test_live_signal_guard_handles_platform_sigbreak(

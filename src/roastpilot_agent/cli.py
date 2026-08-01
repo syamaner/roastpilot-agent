@@ -151,6 +151,12 @@ class _LiveSignalGuard:
             return
         self._sigint_count += 1
         if self._sigint_count < 2:
+            # Uvicorn treats any SIGINT received after should_exit is already
+            # set as a forced exit, even when SIGTERM/SIGBREAK—not SIGINT—was
+            # the first signal. Keep that first non-SIGINT shutdown graceful;
+            # only two actual SIGINTs activate our explicit force-exit path.
+            if self._received_signal != signal.SIGINT:
+                return
             if self._graceful_handler is not None:
                 self._graceful_handler(_signum, _frame)
             else:
