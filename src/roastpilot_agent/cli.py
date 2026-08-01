@@ -116,10 +116,15 @@ class _LiveSignalGuard:
             int, signal.Handlers | int | Callable[[int, FrameType | None], None] | None
         ] = {}
         self._graceful_handler: Callable[[int, FrameType | None], None] | None = None
+        self._pending_graceful_signal: int | None = None
 
     def bind_graceful_handler(self, handler: Callable[[int, FrameType | None], None]) -> None:
         """Bind Uvicorn's first-signal graceful-shutdown handler."""
         self._graceful_handler = handler
+        pending = self._pending_graceful_signal
+        self._pending_graceful_signal = None
+        if pending is not None:
+            handler(pending, None)
 
     @property
     def received_signal(self) -> int | None:
@@ -127,8 +132,16 @@ class _LiveSignalGuard:
         return self._received_signal
 
     def __enter__(self) -> "_LiveSignalGuard":
-        for signum in _LIVE_TERMINATION_SIGNALS:
-            self._previous[signum] = signal.signal(signum, self._handle)
+        try:
+            for signum in _LIVE_TERMINATION_SIGNALS:
+                # Record the prior disposition before exposing _handle. A
+                # signal can run between signal.signal() installing a handler
+                # and that call returning to Python for an assignment.
+                self._previous[signum] = signal.getsignal(signum)
+                signal.signal(signum, self._handle)
+        except BaseException:
+            self.__exit__()
+            raise
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -139,6 +152,11 @@ class _LiveSignalGuard:
     def _handle(self, _signum: int, _frame: FrameType | None) -> None:
         if self._received_signal is None:
             self._received_signal = _signum
+        if self._graceful_handler is None and self._pending_graceful_signal is None:
+            # If installation/startup has not bound its cancellation handler
+            # yet, replay the first signal exactly once when that handler is
+            # available. The prior disposition still runs below where safe.
+            self._pending_graceful_signal = _signum
         if _signum != signal.SIGINT:
             if self._graceful_handler is not None:
                 self._graceful_handler(_signum, _frame)

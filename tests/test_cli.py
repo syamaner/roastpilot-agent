@@ -249,11 +249,15 @@ def test_live_signal_guard_handles_platform_sigbreak(
         installed.append(signum)
         return signal.SIG_DFL
 
+    def _default_handler(_signum: int) -> signal.Handlers:
+        return signal.SIG_DFL
+
     monkeypatch.setattr(
         cli,
         "_LIVE_TERMINATION_SIGNALS",
         (signal.SIGINT, signal.SIGTERM, sigbreak),
     )
+    monkeypatch.setattr(signal, "getsignal", _default_handler)
     monkeypatch.setattr(signal, "signal", _capture_signal)
     guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
     guard.bind_graceful_handler(lambda signum, _frame: graceful.append(signum))
@@ -325,6 +329,70 @@ def test_live_signal_guard_exit_skips_missing_previous_handler(
     monkeypatch.setattr(signal, "signal", _unexpected_restore)
 
     guard.__exit__()
+
+
+def test_live_signal_guard_replays_sigint_from_handler_installation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A SIGINT during ``signal.signal`` is not lost before graceful bind."""
+    prior_calls: list[int] = []
+    graceful: list[int] = []
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    raised = False
+
+    def prior(signum: int, _frame: object) -> None:
+        prior_calls.append(signum)
+
+    def _get_prior(_signum: int) -> Callable[[int, object], None]:
+        return prior
+
+    monkeypatch.setattr(signal, "getsignal", _get_prior)
+
+    def _install(signum: int, handler: object) -> Callable[[int, object], None]:
+        nonlocal raised
+        if signum == signal.SIGINT and getattr(handler, "__self__", None) is guard and not raised:
+            raised = True
+            handler(signum, None)  # type: ignore[operator]
+        return prior
+
+    monkeypatch.setattr(signal, "signal", _install)
+
+    with guard:
+        guard.bind_graceful_handler(lambda signum, _frame: graceful.append(signum))
+
+    assert prior_calls == [signal.SIGINT]
+    assert graceful == [signal.SIGINT]
+    assert guard.received_signal == signal.SIGINT
+
+
+def test_live_signal_guard_restores_handlers_when_installation_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception inside handler installation cannot leave our guard exposed."""
+    restored: list[int] = []
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+
+    def _prior(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    def _get_prior(_signum: int) -> Callable[[int, object], None]:
+        return _prior
+
+    monkeypatch.setattr(signal, "getsignal", _get_prior)
+
+    def _install(signum: int, handler: object) -> Callable[[int, object], None]:
+        if getattr(handler, "__self__", None) is guard:
+            handler(signum, None)  # type: ignore[operator]
+        else:
+            restored.append(signum)
+        return _prior
+
+    monkeypatch.setattr(signal, "signal", _install)
+
+    with pytest.raises(KeyboardInterrupt):
+        guard.__enter__()
+
+    assert restored == [signal.SIGINT]
 
 
 def test_signal_managed_server_does_not_replace_process_handlers() -> None:
