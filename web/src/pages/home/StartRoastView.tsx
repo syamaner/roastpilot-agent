@@ -173,12 +173,16 @@ export function HardwareClearAcknowledgementCard({
       className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-roast-fault/50 bg-roast-fault/10 p-8 text-center"
       data-testid="hardware-clear-required"
     >
-      <h2 className="text-lg font-bold uppercase tracking-wide">Hardware verification required</h2>
-      <p className="text-sm text-muted-foreground">
-        RoastPilot could not confirm that the previous MCP child stopped. Do not start another
-        roast until you have physically verified the roaster is inactive and the old child no
-        longer holds its serial or audio devices.
-      </p>
+      <div role="alert" aria-atomic="true" className="flex flex-col gap-4">
+        <h2 className="text-lg font-bold uppercase tracking-wide">
+          Hardware verification required
+        </h2>
+        <p className="text-sm text-muted-foreground">
+          RoastPilot could not confirm that the previous MCP child stopped. Do not start another
+          roast until you have physically verified the roaster is inactive and the old child no
+          longer holds its serial or audio devices.
+        </p>
+      </div>
       <p className="text-xs text-muted-foreground">
         This acknowledgement only clears process-local stale child state. It never turns heat,
         fan, or cooling on. You may instead perform a controlled agent restart after the same
@@ -487,13 +491,21 @@ export function StartRoastView(): React.JSX.Element {
   // falls back to its plain fresh-health gate with no expected id to check.
   const handleStartRoast = useCallback(
     async (profile: RoastProfile) => {
-      const started = await api.startRoast(profile);
-      const state: LiveNavigationState | undefined = started.instance_id
-        ? { expectedInstanceId: started.instance_id }
-        : undefined;
-      navigate("/live", { state });
+      try {
+        const started = await api.startRoast(profile);
+        const state: LiveNavigationState | undefined = started.instance_id
+          ? { expectedInstanceId: started.instance_id }
+          : undefined;
+        navigate("/live", { state });
+      } catch (error) {
+        // A failed device-config respawn can create the hardware-clear
+        // incident that rejected this very start. Refresh before surfacing
+        // the error so the operator is not stranded on a stale start form.
+        await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+        throw error;
+      }
     },
-    [navigate],
+    [navigate, queryClient],
   );
 
   // #513 follow-up (post-#514/#515 review): hold until health has produced a

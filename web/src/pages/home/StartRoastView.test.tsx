@@ -312,6 +312,9 @@ describe("StartRoastView — hardware-clear acknowledgement (#668)", () => {
   it("replaces the start form with an explicit physical-verification warning", () => {
     renderHardwareClear();
     expect(screen.getByTestId("hardware-clear-required")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      /could not confirm that the previous MCP child stopped/i,
+    );
     expect(screen.getByText(/physically verified the roaster is inactive/i)).toBeInTheDocument();
     expect(screen.getByText(/never turns heat, fan, or cooling on/i)).toBeInTheDocument();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
@@ -404,7 +407,8 @@ describe("StartRoastView — hardware-clear acknowledgement (#668)", () => {
     openAndConfirm();
     fireEvent.click(screen.getByTestId("hardware-clear-submit"));
 
-    const alert = await screen.findByRole("alert");
+    const alert = await screen.findByTestId("hardware-clear-error");
+    expect(alert).toHaveAttribute("role", "alert");
     expect(alert).toHaveTextContent(/check current status/i);
     expect(screen.getByTestId("hardware-clear-submit")).not.toBeDisabled();
   });
@@ -434,6 +438,26 @@ describe("StartRoastView — hardware-clear acknowledgement (#668)", () => {
     renderView();
     expect(screen.getByTestId("start-roast-active-run-banner")).toBeInTheDocument();
     expect(screen.queryByTestId("hardware-clear-required")).toBeNull();
+  });
+
+  it("refreshes health after a rejected start and reveals its new teardown incident", async () => {
+    startRoastMock.mockRejectedValueOnce(new Error("hardware-clear acknowledgement required"));
+    const view = renderView();
+    const invalidate = vi.spyOn(view.client, "invalidateQueries").mockImplementation(async () => {
+      healthState.data = {
+        active_run_id: null,
+        mcp_hardware_clear_required: true,
+        mcp_teardown_incident_id: "c".repeat(32),
+      };
+      view.rerender();
+      return undefined;
+    });
+    fillMinimum();
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["health"] }));
+    expect(screen.getByTestId("hardware-clear-required")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
   });
 });
 
