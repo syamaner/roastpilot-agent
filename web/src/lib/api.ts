@@ -18,6 +18,8 @@ import type {
   ClearStaleSessionResult,
   DevicesSnapshot,
   HealthResponse,
+  HardwareClearAcknowledgementRequest,
+  HardwareClearAcknowledgementResult,
   OperatorActionRequest,
   OperatorActionResult,
   OperatorRatingRequest,
@@ -141,6 +143,18 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+
+  /** `POST /api/mcp/acknowledge-hardware-clear` — consume one exact
+   * process-local teardown incident after explicit physical verification.
+   * This never issues an MCP tool call or resumes heat/fan/cooling. */
+  acknowledgeHardwareClear: (body: HardwareClearAcknowledgementRequest) =>
+    request<HardwareClearAcknowledgementResult>(
+      "/api/mcp/acknowledge-hardware-clear",
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      },
+    ),
 
   /** `GET /api/roasts/{id}/tastings` — the run's tasting entries (#522, D91). */
   tastings: (runId: string) => request<TastingList>(`/api/roasts/${runId}/tastings`),

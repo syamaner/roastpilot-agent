@@ -147,6 +147,8 @@ const IDLE_HEALTH: HealthResponse = {
   version: "e2e-fixture",
   instance_id: "e2e-fixture-instance",
   mcp_child: "running",
+  mcp_hardware_clear_required: false,
+  mcp_teardown_incident_id: null,
   active_run_id: null,
 };
 

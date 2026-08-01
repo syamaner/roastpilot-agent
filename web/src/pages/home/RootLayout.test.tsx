@@ -30,7 +30,13 @@ vi.mock("@/lib/api", async () => {
 // actually calls — so a single state change drives the page branch and the
 // nav's active-run slot together, exactly like the real app.
 const healthState: {
-  data: { active_run_id: string | null } | undefined;
+  data:
+    | {
+        active_run_id: string | null;
+        mcp_hardware_clear_required: boolean;
+        mcp_teardown_incident_id: string | null;
+      }
+    | undefined;
   isSuccess: boolean;
   isError: boolean;
   isFresh: boolean;
@@ -110,7 +116,11 @@ describe("RootLayout — nav renders on every route and state (#523)", () => {
     healthState.isSuccess = true;
     healthState.isError = false;
     healthState.isFresh = true;
-    healthState.data = { active_run_id: null };
+    healthState.data = {
+      active_run_id: null,
+      mcp_hardware_clear_required: false,
+      mcp_teardown_incident_id: null,
+    };
     renderLayout();
     expect(screen.getByTestId("app-nav")).toBeInTheDocument();
     expect(screen.getByTestId("start-roast-view")).toBeInTheDocument();
@@ -123,7 +133,11 @@ describe("RootLayout — nav renders on every route and state (#523)", () => {
     healthState.isSuccess = true;
     healthState.isError = false;
     healthState.isFresh = true;
-    healthState.data = { active_run_id: "run-42" };
+    healthState.data = {
+      active_run_id: "run-42",
+      mcp_hardware_clear_required: false,
+      mcp_teardown_incident_id: null,
+    };
     renderLayout();
     expect(screen.getByTestId("app-nav")).toBeInTheDocument();
     // The active-run banner replaces the form; the nav still renders above it.
