@@ -117,6 +117,19 @@ def test_candidate_url_normalization_fails_closed(value: str, require_product_pa
     )
 
 
+def test_candidate_url_normalization_rejects_oversized_product_url() -> None:
+    normalize = catalogue._same_origin_product_url  # pyright: ignore[reportPrivateUsage]
+    oversized = "/products/" + "a" * 4096
+    assert (
+        normalize(
+            oversized,
+            base_url="https://vendor.example/collections/green",
+            require_product_path=True,
+        )
+        is None
+    )
+
+
 def test_discovery_fails_soft_on_empty_and_malformed_json_ld() -> None:
     assert discover_catalogue_candidates(_page("")) == []
     assert (
@@ -134,11 +147,28 @@ def test_discovery_fails_soft_on_empty_and_malformed_json_ld() -> None:
     )
 
 
+def test_discovery_fails_soft_on_unexpected_parser_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failed(page: FetchedVendorPage) -> list[catalogue.CatalogueCandidate]:
+        del page
+        raise RuntimeError("synthetic parser escape")
+
+    monkeypatch.setattr(catalogue, "_discover_catalogue_candidates_unchecked", failed)
+    assert discover_catalogue_candidates(_page("<p>ignored</p>")) == []
+
+
 def test_discovery_caps_candidates_at_twenty_four() -> None:
     html = "".join(f'<a href="/products/{i}">Bean {i}</a>' for i in range(40))
     candidates = discover_catalogue_candidates(_page(html))
     assert len(candidates) == 24
     assert candidates[-1].candidate_id == "candidate-24"
+
+
+def test_discovery_caps_anchor_inspection_work() -> None:
+    html = "".join(f'<a href="/about/{index}">Noise {index}</a>' for index in range(192))
+    html += '<a href="/products/after-cap">After cap</a>'
+    assert discover_catalogue_candidates(_page(html)) == []
 
 
 def test_deterministic_rank_combines_roster_gap_and_rated_affinity() -> None:
@@ -178,21 +208,19 @@ def test_deterministic_rank_combines_roster_gap_and_rated_affinity() -> None:
         roster_countries=frozenset({"brazil"}),
         roster_processes=frozenset({"natural"}),
         roster_pairs=frozenset({("brazil", "natural")}),
-        rated_countries=frozenset({"kenya"}),
-        rated_processes=frozenset({"washed"}),
+        rated_pairs=frozenset({("kenya", "washed")}),
     )
     result = rank_catalogue_candidates(candidates, extracted, context)
     assert [item.candidate_id for item in result.recommendations] == [
         "candidate-01",
         "candidate-02",
     ]
-    assert result.recommendations[0].score == 5
+    assert result.recommendations[0].score == 4
     assert result.recommendations[0].reason_codes == [
         "missing_country",
         "missing_processing",
         "novel_country_processing",
-        "rated_country_affinity",
-        "rated_processing_affinity",
+        "rated_pair_affinity",
     ]
     assert result.recommendations[1].score == 0
 
@@ -217,8 +245,7 @@ def test_rank_ties_preserve_collection_source_order_and_caps_at_three() -> None:
         roster_countries=frozenset(),
         roster_processes=frozenset(),
         roster_pairs=frozenset(),
-        rated_countries=frozenset(),
-        rated_processes=frozenset(),
+        rated_pairs=frozenset(),
     )
     result = rank_catalogue_candidates(candidates, extracted, empty)
     assert [item.candidate_id for item in result.recommendations] == [
@@ -230,13 +257,37 @@ def test_rank_ties_preserve_collection_source_order_and_caps_at_three() -> None:
     assert result.extracted_count == 4
 
 
+def test_rated_affinity_requires_an_exact_country_processing_pair() -> None:
+    candidate = catalogue.CatalogueCandidate(
+        candidate_id="candidate-01",
+        product_url="https://vendor.example/products/ethiopia-natural",
+        label="Ethiopia Natural",
+        source_order=0,
+    )
+    extracted = catalogue._ExtractedCatalogueCandidate(  # pyright: ignore[reportPrivateUsage]
+        candidate_id="candidate-01",
+        name="Ethiopia Natural",
+        country="Ethiopia",
+        processing="natural",
+    )
+    context = CatalogueRankingContext(
+        roster_countries=frozenset({"ethiopia"}),
+        roster_processes=frozenset({"natural"}),
+        roster_pairs=frozenset({("ethiopia", "natural")}),
+        rated_pairs=frozenset({("ethiopia", "washed"), ("colombia", "natural")}),
+    )
+    result = rank_catalogue_candidates([candidate], [extracted], context)
+    assert result.recommendations[0].score == 0
+    assert "rated_pair_affinity" not in result.recommendations[0].reason_codes
+
+
 @pytest.mark.asyncio
 async def test_full_catalogue_pipeline_fetches_once_extracts_once_and_ranks_locally() -> None:
     html = b"""
     <html><body>
       <a href="/products/kenya">Kenya Kiambu Washed</a>
       <p>Kenya Kiambu is a washed green coffee.</p>
-      <a href="https://vendor.example/privacy">https://vendor.example/private?token=x</a>
+      <a href="/products/private">https://vendor.example/private?token=x</a>
     </body></html>
     """
     fetches = 0
@@ -281,8 +332,7 @@ async def test_full_catalogue_pipeline_fetches_once_extracts_once_and_ranks_loca
                 roster_countries=frozenset(),
                 roster_processes=frozenset(),
                 roster_pairs=frozenset(),
-                rated_countries=frozenset(),
-                rated_processes=frozenset(),
+                rated_pairs=frozenset(),
             ),
             advisor_config=AdvisorConfig(),
             sourcing_config=BeanSourcingConfig(),
@@ -370,6 +420,93 @@ async def test_extraction_drops_unstated_country_and_processing_metadata() -> No
     )
     assert extracted[0].country is None
     assert extracted[0].processing is None
+
+
+@pytest.mark.asyncio
+async def test_extraction_requires_candidate_local_metadata_evidence() -> None:
+    page = FetchedVendorPage(
+        prompt_text="",
+        extracted_text="Kenya Kiambu Washed\nBrazil Santos Natural",
+        json_ld_values="",
+        raw_html=(
+            '<a href="/products/kenya">Kenya Kiambu Washed</a>'
+            '<a href="/products/brazil">Brazil Santos Natural</a>'
+        ),
+        final_url="https://vendor.example/collections/green-coffee",
+    )
+    candidates = discover_catalogue_candidates(page)
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "candidates": [
+                            {
+                                "candidate_id": "candidate-01",
+                                "name": "Kenya Kiambu",
+                                "country": "Brazil",
+                                "processing": "natural",
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+
+    extracted = await catalogue._extract(  # pyright: ignore[reportPrivateUsage]
+        page,
+        candidates,
+        advisor_config=AdvisorConfig(),
+        sourcing_config=BeanSourcingConfig(),
+        diagnostics=BeanSourcingDiagnostics(),
+        model=FunctionModel(respond),
+    )
+    assert extracted[0].country is None
+    assert extracted[0].processing is None
+
+
+@pytest.mark.asyncio
+async def test_provider_input_is_capped_at_twelve_server_candidates() -> None:
+    html = "".join(f'<a href="/products/{index}">Bean {index}</a>' for index in range(1, 14))
+    page = FetchedVendorPage(
+        prompt_text="",
+        extracted_text=" ".join(f"Bean {index}" for index in range(1, 14)),
+        json_ld_values="",
+        raw_html=html,
+        final_url="https://vendor.example/collections/green-coffee",
+    )
+    candidates = discover_catalogue_candidates(page)
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        rendered = str(messages)
+        assert "candidate-12" in rendered
+        assert "candidate-13" not in rendered
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "candidates": [
+                            {"candidate_id": "candidate-12", "name": "Bean 12"},
+                            {"candidate_id": "candidate-13", "name": "Bean 13"},
+                        ]
+                    },
+                )
+            ]
+        )
+
+    extracted = await catalogue._extract(  # pyright: ignore[reportPrivateUsage]
+        page,
+        candidates,
+        advisor_config=AdvisorConfig(),
+        sourcing_config=BeanSourcingConfig(),
+        diagnostics=BeanSourcingDiagnostics(),
+        model=FunctionModel(respond),
+    )
+    assert [item.candidate_id for item in extracted] == ["candidate-12"]
 
 
 @pytest.mark.asyncio
@@ -508,8 +645,7 @@ async def test_catalogue_discovery_deadline_maps_to_client_actionable_error(
                 roster_countries=frozenset(),
                 roster_processes=frozenset(),
                 roster_pairs=frozenset(),
-                rated_countries=frozenset(),
-                rated_processes=frozenset(),
+                rated_pairs=frozenset(),
             ),
             advisor_config=AdvisorConfig(),
             sourcing_config=BeanSourcingConfig(fetch_timeout_seconds=0.001),
@@ -535,8 +671,7 @@ async def test_catalogue_end_to_end_deadline_maps_to_dependency_error(
                 roster_countries=frozenset(),
                 roster_processes=frozenset(),
                 roster_pairs=frozenset(),
-                rated_countries=frozenset(),
-                rated_processes=frozenset(),
+                rated_pairs=frozenset(),
             ),
             advisor_config=AdvisorConfig(),
             sourcing_config=BeanSourcingConfig(
@@ -560,8 +695,7 @@ async def test_full_pipeline_rejects_catalogue_without_product_links() -> None:
                     roster_countries=frozenset(),
                     roster_processes=frozenset(),
                     roster_pairs=frozenset(),
-                    rated_countries=frozenset(),
-                    rated_processes=frozenset(),
+                    rated_pairs=frozenset(),
                 ),
                 advisor_config=AdvisorConfig(),
                 sourcing_config=BeanSourcingConfig(),
@@ -569,3 +703,47 @@ async def test_full_pipeline_rejects_catalogue_without_product_links() -> None:
                 http_client=client,
                 model=FunctionModel(lambda messages, info: ModelResponse(parts=[])),
             )
+
+
+def test_catalogue_module_does_not_import_roast_control_modules() -> None:
+    """Catalogue extraction stays directly outside the safety/control envelope."""
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path(catalogue.__file__).read_text())
+    imported = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    }
+    imported.update(
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    )
+    forbidden = {
+        "roastpilot_agent.controller",
+        "roastpilot_agent.safety",
+        "roastpilot_agent.mcp_client",
+    }
+    assert imported.isdisjoint(forbidden)
+
+
+def test_catalogue_module_does_not_transitively_import_roast_control_modules() -> None:
+    """A fresh catalogue import cannot make controller write paths reachable."""
+    import subprocess
+    import sys
+
+    script = (
+        "import sys\n"
+        "import roastpilot_agent.catalogue_recommendations\n"
+        "loaded = {m for m in sys.modules if m.startswith('roastpilot_agent.')}\n"
+        "forbidden = {'roastpilot_agent.controller', 'roastpilot_agent.safety', "
+        "'roastpilot_agent.mcp_client'}\n"
+        "print(','.join(sorted(loaded & forbidden)))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == "", result.stderr

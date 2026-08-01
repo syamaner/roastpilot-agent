@@ -3182,18 +3182,20 @@ class RoastService:
             for profile in profiles
             if profile.country and profile.processing is not None
         )
-        rated = [run for run in runs if run.rating is not None and run.rating >= 4]
-        rated_processes: frozenset[ProcessingMethod] = frozenset(
-            run.processing for run in rated if run.processing is not None
-        )
+        rated = [
+            run
+            for run in runs
+            if run.outcome == "completed" and run.rating is not None and run.rating >= 4
+        ]
         return CatalogueRankingContext(
             roster_countries=roster_countries,
             roster_processes=roster_processes,
             roster_pairs=roster_pairs,
-            rated_countries=frozenset(
-                run.country.strip().casefold() for run in rated if run.country
+            rated_pairs=frozenset(
+                (run.country.strip().casefold(), run.processing)
+                for run in rated
+                if run.country and run.processing is not None
             ),
-            rated_processes=rated_processes,
         )
 
     async def recommend_beans_from_catalogue(self, url: str) -> CatalogueRecommendationList:
@@ -3205,9 +3207,6 @@ class RoastService:
                     "catalogue recommendations are unavailable while a roast is active "
                     f"(run {active.run_id}, phase {active.agent_phase.value})"
                 )
-            advisor_config = self._config.advisor
-            sourcing_config = self._config.bean_sourcing
-
         # This reads potentially large history tables. It performs no remote work and
         # grants no provider-call admission, so keep it outside the roast-start lock.
         context = await self._catalogue_ranking_context()
@@ -3221,6 +3220,8 @@ class RoastService:
                     "catalogue recommendations are unavailable while a roast is active "
                     f"(run {active.run_id}, phase {active.agent_phase.value})"
                 )
+            advisor_config = self._config.advisor
+            sourcing_config = self._config.bean_sourcing
             started_monotonic = self._clock()
             diagnostics = BeanSourcingDiagnostics()
             attempt_id, cancelled_during_admission = await self._start_bean_attempt_bounded(

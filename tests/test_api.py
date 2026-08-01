@@ -58,6 +58,7 @@ from roastpilot_agent.mcp_client import (
 )
 from roastpilot_agent.models import (
     BeanProfileDraft,
+    BeanProfileInput,
     ChargeWeightRequest,
     ClearStaleSessionRequest,
     HardwareClearAcknowledgementRequest,
@@ -4862,6 +4863,119 @@ async def test_catalogue_service_records_nonclaimable_terminal_attempt(
     assert "vendor.example" not in json.dumps(dict(row))
 
 
+@pytest.mark.asyncio
+async def test_catalogue_ranking_context_uses_active_roster_and_completed_high_ratings(
+    service: RoastService, store: RoastStore
+) -> None:
+    profile_input = BeanProfileInput.model_validate(
+        _draft_from("https://vendor.example/products/guatemala").model_dump()
+        | {"country": "Guatemala", "processing": "honey", "is_blend": False}
+    )
+    await store.create_bean_profile(profile_input)
+
+    async def add_rated_run(
+        run_id: str,
+        *,
+        country: str,
+        processing: Literal["washed", "natural", "honey"],
+        outcome: Literal["completed", "faulted"],
+        rating: Literal[3, 4, 5],
+        excluded: bool = False,
+    ) -> None:
+        profile = _profile(name=run_id, origin=country).model_copy(
+            update={"country": country, "processing": processing}
+        )
+        await store.create_run(
+            run_id=run_id,
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await store.complete_run(
+            run_id=run_id,
+            outcome=outcome,
+            agent_phase=RoastPhase.COMPLETE if outcome == "completed" else RoastPhase.FAULTED,
+        )
+        await store.set_operator_rating(run_id, rating=rating)
+        if excluded:
+            await store.set_run_excluded(run_id, excluded=True)
+
+    await add_rated_run("high", country="Kenya", processing="washed", outcome="completed", rating=4)
+    await add_rated_run(
+        "low", country="Colombia", processing="natural", outcome="completed", rating=3
+    )
+    await add_rated_run(
+        "faulted", country="Brazil", processing="natural", outcome="faulted", rating=5
+    )
+    await add_rated_run(
+        "excluded",
+        country="Ethiopia",
+        processing="washed",
+        outcome="completed",
+        rating=5,
+        excluded=True,
+    )
+
+    context = await service._catalogue_ranking_context()  # pyright: ignore[reportPrivateUsage]
+    assert context.roster_countries == frozenset({"guatemala"})
+    assert context.roster_processes == frozenset({"honey"})
+    assert context.roster_pairs == frozenset({("guatemala", "honey")})
+    assert context.rated_pairs == frozenset({("kenya", "washed")})
+
+
+@pytest.mark.asyncio
+async def test_catalogue_route_rejects_concurrent_and_oversized_requests(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from roastpilot_agent.models import CatalogueRecommendationList
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    # Isolate this cross-request test from the module singleton so binding its
+    # waiter to pytest's per-test loop cannot affect the existing draft-route test.
+    monkeypatch.setattr(api_module, "_draft_bean_from_url_semaphore", asyncio.Semaphore(1))
+
+    async def slow_recommend(self: object, url: str) -> CatalogueRecommendationList:
+        del self, url
+        entered.set()
+        await release.wait()
+        return CatalogueRecommendationList(
+            recommendations=[], discovered_count=1, extracted_count=1
+        )
+
+    monkeypatch.setattr(RoastService, "recommend_beans_from_catalogue", slow_recommend)
+    first = asyncio.create_task(
+        client.post(
+            "/api/beans/recommend-from-catalogue",
+            json={"url": "https://vendor.example/collections/green"},
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
+    concurrent = await client.post(
+        "/api/beans/recommend-from-catalogue",
+        json={"url": "https://vendor.example/collections/other"},
+    )
+    assert concurrent.status_code == 429
+    release.set()
+    assert (await first).status_code == 200
+
+    oversized_url = await client.post(
+        "/api/beans/recommend-from-catalogue", json={"url": "x" * 4097}
+    )
+    assert oversized_url.status_code == 422
+    assert oversized_url.json()["detail"] == "URL exceeds 4096-character limit"
+    oversized_body = await client.post(
+        "/api/beans/recommend-from-catalogue",
+        json={"url": "https://vendor.example/collections/green", "padding": "x" * 70_000},
+    )
+    assert oversized_body.status_code == 413
+    malformed = await client.post(
+        "/api/beans/recommend-from-catalogue", json={"url": "https://[::1"}
+    )
+    assert malformed.status_code == 422
+    assert "invalid URL syntax" in malformed.json()["detail"]
+
+
 def _empty_catalogue_result() -> object:
     """Build the minimal typed catalogue result used by service lifecycle tests."""
     from roastpilot_agent.models import CatalogueRecommendationList
@@ -4905,8 +5019,7 @@ async def test_catalogue_service_rechecks_active_roast_after_context_snapshot(
             roster_countries=frozenset(),
             roster_processes=frozenset(),
             roster_pairs=frozenset(),
-            rated_countries=frozenset(),
-            rated_processes=frozenset(),
+            rated_pairs=frozenset(),
         )
 
     async def fail_if_called(*args: object, **kwargs: object) -> object:

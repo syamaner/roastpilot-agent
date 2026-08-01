@@ -946,8 +946,7 @@ CatalogueReasonCode = Literal[
     "missing_country",
     "missing_processing",
     "novel_country_processing",
-    "rated_country_affinity",
-    "rated_processing_affinity",
+    "rated_pair_affinity",
 ]
 """Deterministic local reason codes for a catalogue recommendation (D121)."""
 

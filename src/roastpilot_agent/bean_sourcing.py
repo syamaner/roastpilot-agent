@@ -210,9 +210,10 @@ import socket
 import threading
 import unicodedata
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from html import unescape
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, Literal, TypeVar, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import extruct  # type: ignore[import-untyped]
@@ -1112,17 +1113,21 @@ def _parse_wrapper_entry_seam() -> None:
     "dequeued, future RUNNING" and "reached the handshake"."""
 
 
-async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -> str | None:
-    """Run :func:`_extract_page_markdown` on the dedicated, bounded parse
-    pool, admission-controlled by actual worker availability (#607).
+_ParseResultT = TypeVar("_ParseResultT")
+
+
+async def run_untrusted_parse_bounded(
+    operation: Callable[[], _ParseResultT], *, timeout_seconds: float
+) -> _ParseResultT | None:
+    """Run bounded untrusted parsing on the dedicated parser pool (#607).
 
     Isolation: the parse runs via ``_get_parse_executor().submit(...)`` —
     a separately-owned pool, so an orphaned hung worker can only exhaust
     THIS pool's :data:`_MAX_CONCURRENT_PARSES` slots. Admission control:
     when :data:`_inflight_parse_count` already reports every worker busy,
-    a new call skips the markdown attempt immediately. The parse is
+    a new call skips the parse attempt immediately. The parse is
     submitted wrapped in a :class:`_ParseSlotToken`-owned closure, not the
-    bare :func:`_extract_page_markdown` call, so the slot rides WITH the
+    bare operation call, so the slot rides WITH the
     work item. Submission failure replaces the executor
     (:func:`_replace_poisoned_parse_executor`) then reclaims the slot only
     if the ``started``/``reclaimed`` handshake proves the item never ran
@@ -1137,23 +1142,20 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
     ``concurrent_future.cancelled()`` (still PENDING when cancelled) — a
     still-RUNNING item's own ``finally`` releases it instead.
 
-    Either branch returns exactly like the pre-#607 call site: ``None``
-    tells the caller to fall back to the linear-strip pass
-    (:func:`_extract_page_text`) — this module's never-worse-than-before,
-    never-an-unhandled-exception fail-soft contract is unchanged.
+    ``None`` tells the caller its operation was not completed because the
+    parser boundary was saturated, timed out, or could not submit work.
 
     Args:
-        html: The raw, already-fetched, already-capped page HTML.
+        operation: Synchronous parse over already-fetched, byte-capped input.
         timeout_seconds: The bound on this call's OWN wait (reuses
             ``config.fetch_timeout_seconds`` — see
             :func:`_fetch_and_extract`'s comment on the resulting
             draft-request latency bound).
 
     Returns:
-        The extracted markdown, or ``None`` on a timeout, a saturated
-        pool, a submission failure, or whatever
-        :func:`_extract_page_markdown` itself already returns
-        ``None``/raises for.
+        The operation result, or ``None`` on a timeout, saturated pool,
+        or submission failure. Exceptions raised by ``operation`` propagate
+        so its caller can map them to the appropriate typed fail-soft error.
     """
     global _inflight_parse_count
     with _parse_slot_lock:
@@ -1161,7 +1163,7 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
             _log.warning(
                 "bean_sourcing: dedicated parse pool saturated (%d/%d workers busy "
                 "— likely orphaned by prior timed-out parses, #607); skipping "
-                "markdown extraction, falling back to linear-strip",
+                "untrusted parse",
                 _inflight_parse_count,
                 _MAX_CONCURRENT_PARSES,
             )
@@ -1170,7 +1172,7 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
 
     token = _ParseSlotToken()
 
-    def _run_and_release() -> str | None:
+    def _run_and_release() -> _ParseResultT | None:
         # Runs once (and only if) actually dequeued and started; the
         # reclaimed check-then-set is the wrapper's half of the
         # handshake with the submission-failure path below (#607 fold 5).
@@ -1180,7 +1182,7 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
                 return None
             token.started = True
         try:
-            return _extract_page_markdown(html)
+            return operation()
         finally:
             _release_parse_slot_once(token)
 
@@ -1202,7 +1204,7 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
             _release_parse_slot_once(token)
         _log.warning(
             "bean_sourcing: dedicated parse pool submission failed; replaced the "
-            "poisoned executor; falling back to linear-strip (slot already_started=%s)",
+            "poisoned executor; parse unavailable (slot already_started=%s)",
             already_started,
             exc_info=True,
         )
@@ -1214,8 +1216,8 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
             return await asyncio.wrap_future(concurrent_future, loop=loop)
     except TimeoutError:
         _log.debug(
-            "bean_sourcing: trafilatura markdown extraction exceeded the %.3gs "
-            "deadline; falling back to linear-strip (the worker keeps running in "
+            "bean_sourcing: untrusted parse exceeded the %.3gs deadline; "
+            "falling back (the worker keeps running in "
             "the dedicated pool — contained to that pool alone, #607)",
             timeout_seconds,
         )
@@ -1236,9 +1238,16 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
         _log.debug(
             "bean_sourcing: dedicated parse pool item cancelled by a "
             "concurrent submission-failure replacement (#607 fold 3); "
-            "falling back to linear-strip"
+            "falling back"
         )
         return None
+
+
+async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -> str | None:
+    """Extract page markdown through the shared dedicated parser boundary."""
+    return await run_untrusted_parse_bounded(
+        lambda: _extract_page_markdown(html), timeout_seconds=timeout_seconds
+    )
 
 
 #: Redirect hops the internally-constructed client will follow manually
