@@ -655,6 +655,71 @@ def test_serve_first_signal_tears_down_then_propagates(
     assert order == ["heat-off", "service.shutdown", "mcp.stop", "store.close"]
 
 
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_serve_startup_signal_tears_down_then_translates_cancellation(
+    signum: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-Uvicorn signal translates cancellation after ordered teardown."""
+    from roastpilot_agent import live
+    from roastpilot_agent.api import RoastService
+    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.store import RoastStore
+
+    order: list[str] = []
+
+    class _FakeMCP:
+        running = True
+        stop_unconfirmed = False
+        call_tool = staticmethod(_make_call_tool())
+
+        async def stop(self) -> None:
+            order.append("mcp.stop")
+
+    class _SignalDuringInitializeStore(RoastStore):
+        async def initialize(self) -> None:
+            signal.raise_signal(signum)
+            await asyncio.sleep(0)
+
+        async def close(self) -> None:
+            order.append("store.close")
+
+    async def _fake_build(
+        config: AppConfig, *, store_path: Path
+    ) -> tuple[RoastService, _FakeMCP, RoastStore]:
+        store = _SignalDuringInitializeStore(store_path)
+        service = RoastService(store)
+        original_shutdown = service.shutdown
+
+        async def _tracked_heat_off() -> bool:
+            order.append("heat-off")
+            return True
+
+        async def _tracked_shutdown() -> None:
+            order.append("service.shutdown")
+            await original_shutdown()
+
+        monkeypatch.setattr(service, "safe_shutdown_heat_off", _tracked_heat_off)
+        monkeypatch.setattr(service, "shutdown", _tracked_shutdown)
+        return service, _FakeMCP(), store
+
+    monkeypatch.setattr(live, "build_live_service", _fake_build)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "serve", "--port", "0", "--db", str(tmp_path / "live.sqlite3")],
+    )
+
+    if signum == signal.SIGINT:
+        with pytest.raises(KeyboardInterrupt):
+            cli.main()
+    else:
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 128 + signal.SIGTERM
+    assert order == ["heat-off", "service.shutdown", "mcp.stop", "store.close"]
+
+
 @pytest.mark.usefixtures("no_serve")
 def test_serve_live_path_installs_recovery_lifespan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
