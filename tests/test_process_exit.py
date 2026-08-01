@@ -166,3 +166,242 @@ def test_parse_and_real_mcp_subprocess_exits_cleanly(tmp_path: Path) -> None:
     assert child.returncode == 0, (
         f"lifecycle probe exited {child.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}"
     )
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="requires POSIX process groups")
+def test_live_exit_watchdog_bounds_cancellation_resistant_owner(tmp_path: Path) -> None:
+    """Ordered teardown is durable before a stuck owner forces exit 70."""
+    evidence_file = tmp_path / "teardown-evidence.txt"
+    child_pid_file = tmp_path / "mcp-child.pid"
+    probe = textwrap.dedent(
+        """
+        import asyncio
+        import os
+        import signal
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        from roastpilot_agent.cli import _LiveExitGuard, _finish_live_teardown
+
+        evidence = Path(sys.argv[1])
+        pid_file = Path(sys.argv[2])
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            start_new_session=True,
+        )
+        pid_file.write_text(str(child.pid))
+
+        def record(value: str) -> None:
+            with evidence.open("a", encoding="utf-8") as stream:
+                stream.write(value + "\\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+
+        class Service:
+            async def safe_shutdown_heat_off(self) -> None:
+                record("heat-off")
+
+            async def shutdown(self) -> None:
+                record("service-stop")
+
+            async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
+                record(f"unconfirmed:{stop_unconfirmed}")
+
+        class MCP:
+            stop_unconfirmed = True
+
+            async def stop(self) -> None:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait(timeout=5)
+                record("mcp-stop")
+
+        class Store:
+            async def close(self) -> None:
+                record("store-close")
+
+        async def cancellation_resistant_owner() -> None:
+            while True:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    pass
+
+        guard = _LiveExitGuard(grace_seconds=0.25)
+
+        async def main() -> None:
+            asyncio.create_task(cancellation_resistant_owner(), name="retained-mcp-owner")
+            await _finish_live_teardown(Service(), MCP(), Store(), guard)
+
+        asyncio.run(main())
+        guard.disarm()
+        """
+    )
+    process = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", probe, str(evidence_file), str(child_pid_file)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        _kill_probe_process_groups(process.pid, child_pid_file)
+        stdout, stderr = process.communicate(timeout=2.0)
+        pytest.fail(f"live-exit probe exceeded bound\nstdout:\n{stdout}\nstderr:\n{stderr}")
+
+    assert process.returncode == 70, stderr
+    assert evidence_file.read_text(encoding="utf-8").splitlines() == [
+        "heat-off",
+        "service-stop",
+        "mcp-stop",
+        "unconfirmed:True",
+        "store-close",
+    ]
+    assert "retained-mcp-owner" in stderr
+    child_pid = int(child_pid_file.read_text().strip())
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
+def test_live_exit_watchdog_bounds_startup_failure_owner(tmp_path: Path) -> None:
+    """Startup cleanup arms the watchdog even before a service is returned."""
+    evidence_file = tmp_path / "startup-cleanup.txt"
+    probe = textwrap.dedent(
+        """
+        import asyncio
+        import sys
+        from pathlib import Path
+
+        from roastpilot_agent import cli, config_store, live
+        from roastpilot_agent.config import AppConfig
+        from roastpilot_agent.mcp_client import MCPConnectionError
+
+        evidence = Path(sys.argv[1])
+
+        async def cancellation_resistant_owner() -> None:
+            while True:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    pass
+
+        async def fail_after_cleanup(_config: object, *, store_path: object) -> object:
+            asyncio.create_task(
+                cancellation_resistant_owner(),
+                name="retained-startup-mcp-owner",
+            )
+            evidence.write_text("startup-cleanup-complete", encoding="utf-8")
+            raise MCPConnectionError("startup failed after bounded cleanup")
+
+        config_store.load_app_config = lambda: (AppConfig(), set())
+        live.forward_coffee_env = lambda _config: None
+        live.build_live_service = fail_after_cleanup
+        args = cli._build_parser().parse_args(["serve", "--port", "0"])
+        guard = cli._LiveExitGuard(grace_seconds=0.25)
+        signal_guard = cli._LiveSignalGuard()
+        asyncio.run(cli._serve_live(args, exit_guard=guard, signal_guard=signal_guard))
+        guard.disarm()
+        """
+    )
+    process = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", probe, str(evidence_file)],
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        check=False,
+    )
+
+    assert process.returncode == 70, process.stderr
+    assert evidence_file.read_text(encoding="utf-8") == "startup-cleanup-complete"
+    assert "retained-startup-mcp-owner" in process.stderr
+
+
+def test_signal_during_asyncio_run_finalization_is_propagated(tmp_path: Path) -> None:
+    """A late SIGTERM cannot be swallowed after the live coroutine returns."""
+    finalizing_file = tmp_path / "asyncio-finalizing.txt"
+    probe = textwrap.dedent(
+        """
+        import asyncio
+        import os
+        import signal
+        import sys
+        import threading
+        import time
+        from pathlib import Path
+
+        from roastpilot_agent import cli
+
+        finalizing = Path(sys.argv[1])
+
+        async def residual_task() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                finalizing.write_text("cancelling", encoding="utf-8")
+                await asyncio.sleep(0.35)
+
+        async def fake_serve(
+            _args: object,
+            *,
+            exit_guard: object,
+            signal_guard: cli._LiveSignalGuard,
+        ) -> int:
+            del exit_guard
+            signal_guard.bind_graceful_handler(lambda _signum, _frame: None)
+            asyncio.create_task(residual_task(), name="late-finalization-task")
+            return 0
+
+        def send_during_finalization() -> None:
+            deadline = time.monotonic() + 3.0
+            while not finalizing.exists():
+                if time.monotonic() >= deadline:
+                    return
+                time.sleep(0.01)
+            signal.raise_signal(signal.SIGTERM)
+
+        cli._serve_live = fake_serve
+        threading.Thread(target=send_during_finalization, daemon=True).start()
+        sys.argv = ["roastpilot-agent", "serve", "--port", "0"]
+        raise SystemExit(cli.main())
+        """
+    )
+    process = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", probe, str(finalizing_file)],
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        check=False,
+    )
+
+    assert finalizing_file.read_text(encoding="utf-8") == "cancelling"
+    assert process.returncode == 128 + signal.SIGTERM, process.stderr
+
+
+def test_second_sigint_forces_uncertain_exit() -> None:
+    """The first SIGINT delegates gracefully; the second exits 70."""
+    probe = textwrap.dedent(
+        """
+        import os
+        import signal
+
+        from roastpilot_agent.cli import _LiveSignalGuard
+
+        guard = _LiveSignalGuard()
+        guard.bind_graceful_handler(lambda _signum, _frame: os.write(1, b"first\\n"))
+        with guard:
+            signal.raise_signal(signal.SIGINT)
+            signal.raise_signal(signal.SIGINT)
+        """
+    )
+    process = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        check=False,
+    )
+    assert process.returncode == 70
+    assert process.stdout == "first\n"
+    assert "hardware state is uncertain" in process.stderr

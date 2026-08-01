@@ -6,13 +6,25 @@ driven without binding a socket.
 """
 
 import asyncio
-from collections.abc import Callable, Iterator
+import os
+import signal
+import threading
+from collections.abc import Callable, Coroutine, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+import uvicorn
 
 from roastpilot_agent import cli
+
+
+class _ForcedProcessExit(BaseException):
+    """Test sentinel replacing ``os._exit`` in guard unit tests."""
+
+    def __init__(self, code: int) -> None:
+        """Record the requested process exit code."""
+        self.code = code
 
 
 @pytest.fixture(autouse=True)
@@ -77,6 +89,331 @@ def test_version_flag_exits_zero(
         cli.main()
     assert exc.value.code == 0
     assert "roastpilot-agent" in capsys.readouterr().out
+
+
+def test_live_exit_guard_reports_survivors_before_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Watchdog expiry reports safe task labels and requests exit 70."""
+    guard = object.__new__(cli._LiveExitGuard)  # pyright: ignore[reportPrivateUsage]
+    guard._grace_seconds = 0.0  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    guard._armed = threading.Event()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    guard._armed.set()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    guard._disarmed = threading.Event()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    guard._residual_labels = (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        "retained-mcp-owner",
+    )
+    written: list[bytes] = []
+
+    def _capture_write(_fd: int, data: bytes) -> int:
+        written.append(data)
+        return len(data)
+
+    monkeypatch.setattr(os, "write", _capture_write)
+
+    def _forced_exit(code: int) -> None:
+        raise _ForcedProcessExit(code)
+
+    monkeypatch.setattr(os, "_exit", _forced_exit)
+    with pytest.raises(_ForcedProcessExit) as exc:
+        guard._watch()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert exc.value.code == 70
+    assert b"retained-mcp-owner" in b"".join(written)
+
+
+def test_live_signal_guard_delegates_first_and_forces_second(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First SIGINT is graceful; a second reports uncertainty and exits 70."""
+    graceful: list[int] = []
+    written: list[bytes] = []
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard.bind_graceful_handler(lambda signum, _frame: graceful.append(signum))
+
+    def _capture_write(_fd: int, data: bytes) -> int:
+        written.append(data)
+        return len(data)
+
+    monkeypatch.setattr(os, "write", _capture_write)
+
+    def _forced_exit(code: int) -> None:
+        raise _ForcedProcessExit(code)
+
+    monkeypatch.setattr(os, "_exit", _forced_exit)
+    guard._handle(2, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert guard.received_signal == signal.SIGINT
+    assert graceful == [2]
+    with pytest.raises(_ForcedProcessExit) as exc:
+        guard._handle(2, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    assert exc.value.code == 70
+    assert b"hardware state is uncertain" in b"".join(written)
+
+
+def test_live_signal_guard_delegates_sigterm_to_graceful_shutdown() -> None:
+    """SIGTERM retains Uvicorn's graceful path instead of bypassing teardown."""
+    graceful: list[int] = []
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard.bind_graceful_handler(lambda signum, _frame: graceful.append(signum))
+
+    guard._handle(signal.SIGTERM, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert guard.received_signal == signal.SIGTERM
+    assert graceful == [signal.SIGTERM]
+
+
+def test_live_signal_guard_repeated_sigterm_remains_graceful(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated SIGTERM never takes SIGINT's immediate-force escape path."""
+    graceful: list[int] = []
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard.bind_graceful_handler(lambda signum, _frame: graceful.append(signum))
+    forced: list[int] = []
+    monkeypatch.setattr(os, "_exit", forced.append)
+
+    guard._handle(signal.SIGTERM, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    guard._handle(signal.SIGTERM, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert graceful == [signal.SIGTERM, signal.SIGTERM]
+    assert forced == []
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "expected_graceful"),
+    [
+        (signal.SIGINT, signal.SIGTERM, [signal.SIGINT, signal.SIGTERM]),
+        (signal.SIGTERM, signal.SIGINT, [signal.SIGTERM]),
+    ],
+)
+def test_live_signal_guard_preserves_first_signal_for_exit_semantics(
+    first: int,
+    second: int,
+    expected_graceful: list[int],
+) -> None:
+    """Mixed graceful signals retain the first signal's process outcome."""
+    graceful: list[int] = []
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard.bind_graceful_handler(lambda signum, _frame: graceful.append(signum))
+
+    guard._handle(first, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    guard._handle(second, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert guard.received_signal == first
+    assert graceful == expected_graceful
+
+
+def test_sigterm_then_sigint_does_not_force_uvicorn_exit() -> None:
+    """A first SIGINT after SIGTERM cannot skip application shutdown."""
+    server = cli._SignalManagedServer(uvicorn.Config("tests.test_cli:app"))  # pyright: ignore[reportPrivateUsage]
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard.bind_graceful_handler(server.handle_exit)
+
+    guard._handle(signal.SIGTERM, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    guard._handle(signal.SIGINT, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert server.should_exit is True
+    assert server.force_exit is False
+    assert guard.received_signal == signal.SIGTERM
+
+
+def test_sigterm_then_two_sigints_still_forces_explicit_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the second actual SIGINT forces exit, even after SIGTERM."""
+    graceful: list[int] = []
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard.bind_graceful_handler(lambda signum, _frame: graceful.append(signum))
+
+    def _forced_exit(code: int) -> None:
+        raise _ForcedProcessExit(code)
+
+    monkeypatch.setattr(os, "_exit", _forced_exit)
+    guard._handle(signal.SIGTERM, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    guard._handle(signal.SIGINT, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(_ForcedProcessExit) as exc:
+        guard._handle(signal.SIGINT, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert exc.value.code == 70
+    assert graceful == [signal.SIGTERM]
+
+
+def test_live_signal_guard_handles_platform_sigbreak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A platform SIGBREAK is installed and remains a graceful signal."""
+    sigbreak = 99
+    installed: list[int] = []
+    graceful: list[int] = []
+
+    def _capture_signal(signum: int, _handler: object) -> signal.Handlers:
+        installed.append(signum)
+        return signal.SIG_DFL
+
+    def _default_handler(_signum: int) -> signal.Handlers:
+        return signal.SIG_DFL
+
+    monkeypatch.setattr(
+        cli,
+        "_LIVE_TERMINATION_SIGNALS",
+        (signal.SIGINT, signal.SIGTERM, sigbreak),
+    )
+    monkeypatch.setattr(signal, "getsignal", _default_handler)
+    monkeypatch.setattr(signal, "signal", _capture_signal)
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard.bind_graceful_handler(lambda signum, _frame: graceful.append(signum))
+
+    with guard:
+        guard._handle(sigbreak, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        guard._handle(sigbreak, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert installed[:3] == [signal.SIGINT, signal.SIGTERM, sigbreak]
+    assert graceful == [sigbreak, sigbreak]
+    assert guard.received_signal == sigbreak
+    with pytest.raises(SystemExit) as exc:
+        cli._propagate_live_termination(sigbreak)  # pyright: ignore[reportPrivateUsage]
+    assert exc.value.code == 128 + sigbreak
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_live_signal_guard_prebind_falls_back_to_previous_handler(signum: int) -> None:
+    """A startup signal before Uvicorn binds still reaches the prior handler."""
+    delegated: list[int] = []
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard._previous[signum] = (  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        lambda received, _frame: delegated.append(received)
+    )
+
+    guard._handle(signum, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert delegated == [signum]
+
+
+def test_live_signal_guard_prebind_sigterm_preserves_default_termination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real non-callable SIG_DFL disposition cannot swallow early SIGTERM."""
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard._previous[signal.SIGTERM] = signal.SIG_DFL  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    def _forced_exit(code: int) -> None:
+        raise _ForcedProcessExit(code)
+
+    monkeypatch.setattr(os, "_exit", _forced_exit)
+    with pytest.raises(_ForcedProcessExit) as exc:
+        guard._handle(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            signal.SIGTERM, None
+        )
+    assert exc.value.code == 128 + signal.SIGTERM
+
+
+def test_live_signal_guard_prebind_sigint_ignores_noncallable_previous_handler() -> None:
+    """A default pre-bind SIGINT records shutdown without calling a sentinel."""
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard._previous[signal.SIGINT] = signal.SIG_DFL  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    guard._handle(signal.SIGINT, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert guard.received_signal == signal.SIGINT
+
+
+def test_live_signal_guard_exit_skips_missing_previous_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restoration tolerates a platform reporting no prior signal handler."""
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard._previous[signal.SIGINT] = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    def _unexpected_restore(_signum: int, _handler: object) -> None:
+        pytest.fail("a missing prior handler must not be restored")
+
+    monkeypatch.setattr(signal, "signal", _unexpected_restore)
+
+    guard.__exit__()
+
+
+def test_live_signal_guard_replays_sigint_from_handler_installation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A SIGINT during ``signal.signal`` is not lost before graceful bind."""
+    prior_calls: list[int] = []
+    graceful: list[int] = []
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    raised = False
+
+    def prior(signum: int, _frame: object) -> None:
+        prior_calls.append(signum)
+
+    def _get_prior(_signum: int) -> Callable[[int, object], None]:
+        return prior
+
+    monkeypatch.setattr(signal, "getsignal", _get_prior)
+
+    def _install(signum: int, handler: object) -> Callable[[int, object], None]:
+        nonlocal raised
+        if signum == signal.SIGINT and getattr(handler, "__self__", None) is guard and not raised:
+            raised = True
+            handler(signum, None)  # type: ignore[operator]
+        return prior
+
+    monkeypatch.setattr(signal, "signal", _install)
+
+    with guard:
+        guard.bind_graceful_handler(lambda signum, _frame: graceful.append(signum))
+
+    assert prior_calls == [signal.SIGINT]
+    assert graceful == [signal.SIGINT]
+    assert guard.received_signal == signal.SIGINT
+
+
+def test_live_signal_guard_restores_handlers_when_installation_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception inside handler installation cannot leave our guard exposed."""
+    restored: list[int] = []
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+
+    def _prior(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    def _get_prior(_signum: int) -> Callable[[int, object], None]:
+        return _prior
+
+    monkeypatch.setattr(signal, "getsignal", _get_prior)
+
+    def _install(signum: int, handler: object) -> Callable[[int, object], None]:
+        if getattr(handler, "__self__", None) is guard:
+            handler(signum, None)  # type: ignore[operator]
+        else:
+            restored.append(signum)
+        return _prior
+
+    monkeypatch.setattr(signal, "signal", _install)
+
+    with pytest.raises(KeyboardInterrupt):
+        guard.__enter__()
+
+    assert restored == [signal.SIGINT]
+
+
+def test_signal_managed_server_does_not_replace_process_handlers() -> None:
+    """The Uvicorn override's context executes without installing handlers."""
+    server = cli._SignalManagedServer(uvicorn.Config("tests.test_cli:app"))  # pyright: ignore[reportPrivateUsage]
+    before_int = signal.getsignal(signal.SIGINT)
+    before_term = signal.getsignal(signal.SIGTERM)
+
+    with server.capture_signals():
+        assert signal.getsignal(signal.SIGINT) is before_int
+        assert signal.getsignal(signal.SIGTERM) is before_term
+
+
+def test_live_termination_propagates_conventional_exit_semantics() -> None:
+    """Post-teardown SIGINT/SIGTERM translation is explicit and stable."""
+    with pytest.raises(KeyboardInterrupt):
+        cli._propagate_live_termination(signal.SIGINT)  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(SystemExit) as exc:
+        cli._propagate_live_termination(signal.SIGTERM)  # pyright: ignore[reportPrivateUsage]
+    assert exc.value.code == 128 + signal.SIGTERM
+    assert cli._propagate_live_termination(None) is None  # pyright: ignore[reportPrivateUsage]
 
 
 def test_no_args_prints_help(
@@ -342,6 +679,106 @@ def test_serve_fails_closed_on_mcp_start_failure(
 
 
 @pytest.mark.usefixtures("no_serve")
+def test_serve_arms_exit_guard_after_unexpected_build_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected post-cleanup build failure still bounds finalization."""
+    from roastpilot_agent import live
+
+    calls: list[str] = []
+
+    class _Guard:
+        def arm(self, _labels: tuple[str, ...]) -> None:
+            calls.append("arm")
+
+        def disarm(self) -> None:
+            calls.append("disarm")
+
+    async def _boom(config: object, *, store_path: object) -> object:  # noqa: ANN401
+        raise RuntimeError("unexpected build failure after owned cleanup")
+
+    monkeypatch.setattr(cli, "_LiveExitGuard", _Guard)
+    monkeypatch.setattr(live, "build_live_service", _boom)
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
+
+    with pytest.raises(RuntimeError, match="unexpected build failure"):
+        cli.main()
+
+    assert calls == ["arm", "disarm"]
+
+
+@pytest.mark.usefixtures("no_serve")
+def test_serve_restores_signal_handlers_before_final_termination_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The last sticky-signal read occurs only after handler restoration."""
+    order: list[str] = []
+
+    class _ExitGuard:
+        def disarm(self) -> None:
+            order.append("disarm")
+
+    class _SignalGuard:
+        received_signal: int | None = None
+
+        def __enter__(self) -> "_SignalGuard":
+            order.append("enter")
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            order.append("restore")
+
+    def _run(coroutine: Coroutine[object, object, int]) -> int:
+        order.append("run")
+        coroutine.close()
+        return 0
+
+    def _propagate(_signum: int | None) -> None:
+        order.append("final-check")
+
+    monkeypatch.setattr(cli, "_LiveExitGuard", _ExitGuard)
+    monkeypatch.setattr(cli, "_LiveSignalGuard", _SignalGuard)
+    monkeypatch.setattr(asyncio, "run", _run)
+    monkeypatch.setattr(cli, "_propagate_live_termination", _propagate)
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
+
+    assert cli.main() == 0
+    assert order == ["enter", "run", "restore", "final-check", "disarm"]
+
+
+@pytest.mark.usefixtures("no_serve")
+def test_serve_propagates_signal_received_during_handler_restoration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A SIGTERM in ``__exit__`` is observed by the post-guard check."""
+    original_guard = cli._LiveSignalGuard  # pyright: ignore[reportPrivateUsage]
+
+    class _RestorationSignalGuard(original_guard):
+        def __exit__(self, *_args: object) -> None:
+            signal.raise_signal(signal.SIGTERM)
+            super().__exit__(*_args)
+
+    async def _serve(
+        _args: object,
+        *,
+        exit_guard: object,
+        signal_guard: _RestorationSignalGuard,
+    ) -> int:
+        del exit_guard
+        signal_guard.bind_graceful_handler(lambda _signum, _frame: None)
+        return 0
+
+    monkeypatch.setattr(cli, "_LiveSignalGuard", _RestorationSignalGuard)
+    monkeypatch.setattr(cli, "_serve_live", _serve)
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 128 + signal.SIGTERM
+
+
+@pytest.mark.usefixtures("no_serve")
 def test_serve_live_happy_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -391,10 +828,15 @@ def test_serve_live_happy_path(
         service = RoastService(store)
         original_shutdown = service.shutdown
 
+        async def _tracked_heat_off() -> bool:
+            order.append("heat-off")
+            return True
+
         async def _tracked_shutdown() -> None:
             order.append("service.shutdown")
             await original_shutdown()
 
+        monkeypatch.setattr(service, "safe_shutdown_heat_off", _tracked_heat_off)
         monkeypatch.setattr(service, "shutdown", _tracked_shutdown)
         return service, _FakeMCP(), store
 
@@ -426,7 +868,141 @@ def test_serve_live_happy_path(
     # COFFEE_* was forwarded through the CLI into config.mcp.env.
     assert captured["coffee_driver"] == "mock"
     # The finally teardown ran in order: service.shutdown → mcp.stop → store.close.
-    assert order == ["service.shutdown", "mcp.stop", "store.close"]
+    assert order == ["heat-off", "service.shutdown", "mcp.stop", "store.close"]
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_serve_first_signal_tears_down_then_propagates(
+    signum: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real first signal crosses the live object graph and exits after teardown."""
+    from roastpilot_agent import live
+    from roastpilot_agent.api import RoastService
+    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.store import RoastStore
+
+    order: list[str] = []
+
+    class _FakeMCP:
+        running = True
+        stop_unconfirmed = False
+        call_tool = staticmethod(_make_call_tool(_runtime_config_payload(roaster_driver="mock")))
+
+        async def stop(self) -> None:
+            order.append("mcp.stop")
+
+    class _RecordingStore(RoastStore):
+        async def close(self) -> None:
+            order.append("store.close")
+            await super().close()
+
+    async def _fake_build(
+        config: AppConfig, *, store_path: Path
+    ) -> tuple[RoastService, _FakeMCP, RoastStore]:
+        store = _RecordingStore(store_path)
+        service = RoastService(store)
+        original_shutdown = service.shutdown
+
+        async def _tracked_heat_off() -> bool:
+            order.append("heat-off")
+            return True
+
+        async def _tracked_shutdown() -> None:
+            order.append("service.shutdown")
+            await original_shutdown()
+
+        monkeypatch.setattr(service, "safe_shutdown_heat_off", _tracked_heat_off)
+        monkeypatch.setattr(service, "shutdown", _tracked_shutdown)
+        return service, _FakeMCP(), store
+
+    async def _raise_first_signal(
+        _server: cli._SignalManagedServer,  # pyright: ignore[reportPrivateUsage]
+        _sockets: object = None,
+    ) -> None:
+        signal.raise_signal(signum)
+
+    monkeypatch.setattr(live, "build_live_service", _fake_build)
+    monkeypatch.setattr(cli._SignalManagedServer, "_serve", _raise_first_signal)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "serve", "--port", "0", "--db", str(tmp_path / "live.sqlite3")],
+    )
+
+    if signum == signal.SIGINT:
+        with pytest.raises(KeyboardInterrupt):
+            cli.main()
+    else:
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 128 + signal.SIGTERM
+    assert order == ["heat-off", "service.shutdown", "mcp.stop", "store.close"]
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_serve_startup_signal_tears_down_then_translates_cancellation(
+    signum: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-Uvicorn signal translates cancellation after ordered teardown."""
+    from roastpilot_agent import live
+    from roastpilot_agent.api import RoastService
+    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.store import RoastStore
+
+    order: list[str] = []
+
+    class _FakeMCP:
+        running = True
+        stop_unconfirmed = False
+        call_tool = staticmethod(_make_call_tool())
+
+        async def stop(self) -> None:
+            order.append("mcp.stop")
+
+    class _SignalDuringInitializeStore(RoastStore):
+        async def initialize(self) -> None:
+            signal.raise_signal(signum)
+            await asyncio.sleep(0)
+
+        async def close(self) -> None:
+            order.append("store.close")
+
+    async def _fake_build(
+        config: AppConfig, *, store_path: Path
+    ) -> tuple[RoastService, _FakeMCP, RoastStore]:
+        store = _SignalDuringInitializeStore(store_path)
+        service = RoastService(store)
+        original_shutdown = service.shutdown
+
+        async def _tracked_heat_off() -> bool:
+            order.append("heat-off")
+            return True
+
+        async def _tracked_shutdown() -> None:
+            order.append("service.shutdown")
+            await original_shutdown()
+
+        monkeypatch.setattr(service, "safe_shutdown_heat_off", _tracked_heat_off)
+        monkeypatch.setattr(service, "shutdown", _tracked_shutdown)
+        return service, _FakeMCP(), store
+
+    monkeypatch.setattr(live, "build_live_service", _fake_build)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "serve", "--port", "0", "--db", str(tmp_path / "live.sqlite3")],
+    )
+
+    if signum == signal.SIGINT:
+        with pytest.raises(KeyboardInterrupt):
+            cli.main()
+    else:
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 128 + signal.SIGTERM
+    assert order == ["heat-off", "service.shutdown", "mcp.stop", "store.close"]
 
 
 @pytest.mark.usefixtures("no_serve")
@@ -697,6 +1273,60 @@ def test_serve_teardown_failure_is_logged_not_raised(
     # The failing mcp.stop was logged, not raised; store.close still ran after it.
     assert "mcp.stop" in caplog.text
     assert ran == ["mcp.stop", "store.close"]
+
+
+@pytest.mark.asyncio
+async def test_live_teardown_resists_repeated_cancellation() -> None:
+    """First/repeated cancellation cannot interrupt ordered live teardown."""
+    order: list[str] = []
+    heat_started = asyncio.Event()
+    allow_heat_done = asyncio.Event()
+
+    class _Service:
+        async def safe_shutdown_heat_off(self) -> None:
+            heat_started.set()
+            await allow_heat_done.wait()
+            order.append("heat-off")
+
+        async def shutdown(self) -> None:
+            order.append("service-stop")
+
+        async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
+            order.append(f"unconfirmed:{stop_unconfirmed}")
+
+    class _MCP:
+        stop_unconfirmed = True
+
+        async def stop(self) -> None:
+            order.append("mcp-stop")
+
+    class _Store:
+        async def close(self) -> None:
+            order.append("store-close")
+
+    teardown = asyncio.create_task(
+        cli._finish_live_teardown(  # pyright: ignore[reportPrivateUsage]
+            _Service(),  # type: ignore[arg-type]
+            _MCP(),  # type: ignore[arg-type]
+            _Store(),  # type: ignore[arg-type]
+            None,
+        )
+    )
+    await heat_started.wait()
+    teardown.cancel()
+    await asyncio.sleep(0)
+    teardown.cancel()
+    allow_heat_done.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await teardown
+    assert order == [
+        "heat-off",
+        "service-stop",
+        "mcp-stop",
+        "unconfirmed:True",
+        "store-close",
+    ]
 
 
 # --- startup runtime readout (#134) ---------------------------------------------
