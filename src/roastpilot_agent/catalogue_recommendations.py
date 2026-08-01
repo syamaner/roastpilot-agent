@@ -62,7 +62,11 @@ _MAX_ANCHORS_INSPECTED: Final = _MAX_DISCOVERED * 8
 _MAX_SCRIPTS_INSPECTED: Final = _MAX_DISCOVERED * 8
 _PRODUCT_PATH_SEGMENTS: Final = frozenset({"product", "products"})
 _URL_START = re.compile(
-    r"(?:[a-z][a-z0-9+.-]*://|(?<![\w])//|(?<![\w/])/(?!/)(?=[a-z0-9])|"
+    r"(?:[a-z][a-z0-9+.-]*://|(?<![\w])//|"
+    r"(?<![\w@.])(?:\.\.?/)(?=[a-z0-9])|"
+    r"(?<![\w@./])/(?!/|\d+(?:[.,]\d+)?(?=\s|$))(?=[a-z0-9])|"
+    r"(?<![\w@.])(?:[a-z0-9._~-]+/)+(?!\d+(?=\s|$))(?=[a-z0-9])|"
+    r"(?<![\w@.?])(?:\?|#)(?=[a-z0-9._~-]+(?:=|%3d))|"
     r"(?<![\w@.])(?:www\.|"
     r"(?:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.)+"
     r"(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})(?=[:/?#\s]|$)|"
@@ -424,7 +428,7 @@ def _agent(
 
 
 def _redact_urls(text: str) -> str:
-    """Remove absolute, protocol-relative, and bare URLs in one monotonic scan."""
+    """Remove absolute, bare, and relative URL references in one monotonic scan."""
     output: list[str] = []
     cursor = 0
     length = len(text)

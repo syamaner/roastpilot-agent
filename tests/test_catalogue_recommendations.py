@@ -172,6 +172,13 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
     assert redact("example.xn--p1ai/private?token=x washed") == "[link] washed"
     assert redact("https://[2001:db8::1]/private?token=x washed") == "[link] washed"
     assert redact("/products/a?token=secret washed") == "[link] washed"
+    assert redact("./products/a?token=secret washed") == "[link] washed"
+    assert redact("../products/a?token=secret washed") == "[link] washed"
+    assert redact("products/a?token=secret washed") == "[link] washed"
+    assert redact("products/a washed") == "[link] washed"
+    assert redact("?token=secret washed") == "[link] washed"
+    assert redact("#access_token=secret washed") == "[link] washed"
+    assert redact("1 /2 lb and 1/2 kg") == "1 /2 lb and 1/2 kg"
     assert redact("farmer@vendor.example washed") == "farmer@vendor.example washed"
 
 

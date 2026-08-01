@@ -3237,6 +3237,10 @@ class RoastService:
                     raise RoastRunConflictError(
                         "catalogue recommendation was preempted by a roast-start attempt"
                     ) from None
+                _log.warning(
+                    "catalogue recommendation context snapshot failed",
+                    exc_info=True,
+                )
                 raise
             outer_task = asyncio.current_task()
             if outer_task is not None and outer_task.cancelling() > 0:

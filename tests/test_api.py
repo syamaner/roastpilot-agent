@@ -4910,6 +4910,18 @@ async def test_catalogue_ranking_context_uses_active_roster_and_completed_high_r
         | {"country": "Guatemala", "processing": "honey", "is_blend": False}
     )
     await store.create_bean_profile(profile_input)
+    incomplete_profile = BeanProfileInput.model_validate(
+        _draft_from("https://vendor.example/products/mystery").model_dump()
+        | {"country": None, "processing": None, "is_blend": False}
+    )
+    await store.create_bean_profile(incomplete_profile)
+    archived_profile = await store.create_bean_profile(
+        BeanProfileInput.model_validate(
+            _draft_from("https://vendor.example/products/archived").model_dump()
+            | {"country": "Archived", "processing": "natural", "is_blend": False}
+        )
+    )
+    await store.delete_bean_profile(archived_profile.id)
 
     async def add_rated_run(
         run_id: str,
@@ -4955,6 +4967,8 @@ async def test_catalogue_ranking_context_uses_active_roster_and_completed_high_r
     )
 
     context = await service._catalogue_ranking_context()  # pyright: ignore[reportPrivateUsage]
+    profile_axes, _ = await store.catalogue_ranking_axes()
+    assert (None, None) in profile_axes
     assert context.roster_countries == frozenset({"guatemala"})
     assert context.roster_processes == frozenset({"honey"})
     assert context.roster_pairs == frozenset({("guatemala", "honey")})
@@ -5126,8 +5140,10 @@ async def test_direct_catalogue_cancellation_during_context_wins(
 
 
 @pytest.mark.asyncio
-async def test_catalogue_context_error_propagates_and_unregisters(
-    service: RoastService, monkeypatch: pytest.MonkeyPatch
+async def test_catalogue_context_error_propagates_logs_and_unregisters(
+    service: RoastService,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     async def failed_context() -> object:
         raise RuntimeError("synthetic context read failure")
@@ -5135,6 +5151,7 @@ async def test_catalogue_context_error_propagates_and_unregisters(
     monkeypatch.setattr(service, "_catalogue_ranking_context", failed_context)
     with pytest.raises(RuntimeError, match="context read failure"):
         await service.recommend_beans_from_catalogue("https://vendor.example/collections/green")
+    assert "catalogue recommendation context snapshot failed" in caplog.text
     assert not service._bean_draft_operations  # pyright: ignore[reportPrivateUsage]
 
 
