@@ -71,6 +71,11 @@ const StartRoastHarnessPage = lazy(() =>
     default: m.StartRoastHarnessPage,
   })),
 );
+const HardwareClearHarnessPage = lazy(() =>
+  import("@/pages/harness/HardwareClearHarnessPage").then((m) => ({
+    default: m.HardwareClearHarnessPage,
+  })),
+);
 // #324 home snapshot — the persistent nav + the landing hub over a seeded idle
 // `/health` snapshot (no active run), the deterministic `home` baseline target.
 const HomeHarnessPage = lazy(() =>
@@ -130,6 +135,8 @@ export const routes: RouteObject[] = [
   { path: "/__detail-harness-dry-end", element: <DetailHarnessDryEndPage /> },
   // __start-roast-harness: idle Start form + bean-profile library (#303 snapshot).
   { path: "/__start-roast-harness", element: <StartRoastHarnessPage /> },
+  // __hardware-clear-harness: explicit #668 physical-verification warning.
+  { path: "/__hardware-clear-harness", element: <HardwareClearHarnessPage /> },
   // __home-harness: persistent nav + landing hub over a seeded idle health snapshot.
   { path: "/__home-harness", element: <HomeHarnessPage /> },
   // __live-finished-harness: persistent nav + LiveFinishedView over a seeded

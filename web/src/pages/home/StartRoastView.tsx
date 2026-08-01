@@ -78,7 +78,7 @@
  * class this whole file already guards for health.
  */
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
 
@@ -93,10 +93,209 @@ import {
   useUpdateBeanProfile,
 } from "@/hooks/queries";
 import { api } from "@/lib/api";
-import type { BeanProfileInput, RoastProfile } from "@/lib/types";
+import type {
+  BeanProfileInput,
+  HardwareClearAcknowledgementRequest,
+  HardwareClearAcknowledgementResult,
+  RoastProfile,
+} from "@/lib/types";
 import type { LiveNavigationState } from "@/pages/live/LivePage";
 
 import { StartRoastForm } from "@/pages/dashboard/StartRoastForm";
+
+interface HardwareClearAcknowledgementCardProps {
+  incidentId: string;
+  onAcknowledge: (
+    request: HardwareClearAcknowledgementRequest,
+  ) => Promise<HardwareClearAcknowledgementResult>;
+}
+
+/** Explicit operator safety decision for one unconfirmed MCP teardown (#668). */
+export function HardwareClearAcknowledgementCard({
+  incidentId,
+  onAcknowledge,
+}: HardwareClearAcknowledgementCardProps): React.JSX.Element {
+  const [confirming, setConfirming] = useState(false);
+  const [physicallyVerified, setPhysicallyVerified] = useState(false);
+  const [reason, setReason] = useState("");
+  const submissionInFlight = useRef(false);
+  const physicalCheckRef = useRef<HTMLInputElement>(null);
+  const successRef = useRef<HTMLDivElement>(null);
+  const mutation = useMutation({
+    mutationFn: () =>
+      onAcknowledge({
+        hardware_clear: true,
+        teardown_incident_id: incidentId,
+        reason: reason.trim(),
+      }),
+    onSettled: () => {
+      submissionInFlight.current = false;
+    },
+  });
+
+  const submit = () => {
+    if (submissionInFlight.current) return;
+    submissionInFlight.current = true;
+    mutation.mutate();
+  };
+
+  useEffect(() => {
+    if (confirming) physicalCheckRef.current?.focus();
+  }, [confirming]);
+
+  useEffect(() => {
+    if (mutation.isSuccess) successRef.current?.focus();
+  }, [mutation.isSuccess]);
+
+  if (mutation.isSuccess) {
+    return (
+      <div
+        ref={successRef}
+        role="status"
+        aria-live="polite"
+        tabIndex={-1}
+        className="mx-auto flex max-w-xl flex-col items-center gap-3 rounded-lg border border-roast-nominal/50 bg-roast-nominal/10 p-8 text-center"
+        data-testid="hardware-clear-acknowledged"
+      >
+        <h2 className="text-lg font-bold uppercase tracking-wide">Acknowledgement recorded</h2>
+        <p className="text-sm text-muted-foreground">
+          The stale MCP generation was cleared. A new child may be started on your next roast
+          attempt; no heat, fan, or cooling command was issued.
+        </p>
+      </div>
+    );
+  }
+
+  const trimmedReason = reason.trim();
+
+  return (
+    <div
+      className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-roast-fault/50 bg-roast-fault/10 p-8 text-center"
+      data-testid="hardware-clear-required"
+    >
+      <h2 className="text-lg font-bold uppercase tracking-wide">Hardware verification required</h2>
+      <p className="text-sm text-muted-foreground">
+        RoastPilot could not confirm that the previous MCP child stopped. Do not start another
+        roast until you have physically verified the roaster is inactive and the old child no
+        longer holds its serial or audio devices.
+      </p>
+      <p className="text-xs text-muted-foreground">
+        This acknowledgement only clears process-local stale child state. It never turns heat,
+        fan, or cooling on. You may instead perform a controlled agent restart after the same
+        physical verification.
+      </p>
+
+      {!confirming ? (
+        <button
+          type="button"
+          data-testid="hardware-clear-open"
+          onClick={() => setConfirming(true)}
+          className="rounded-md border border-roast-fault/50 px-5 py-3 text-sm font-semibold text-roast-fault transition-colors hover:bg-roast-fault/10"
+        >
+          I have checked the hardware
+        </button>
+      ) : (
+        <div className="flex w-full flex-col gap-3" data-testid="hardware-clear-confirm">
+          <label className="flex items-start gap-3 text-left text-sm text-foreground">
+            <input
+              ref={physicalCheckRef}
+              type="checkbox"
+              data-testid="hardware-clear-physical-check"
+              checked={physicallyVerified}
+              disabled={mutation.isPending}
+              onChange={(event) => setPhysicallyVerified(event.target.checked)}
+              className="mt-0.5 h-4 w-4"
+            />
+            <span>
+              I physically verified that the roaster is inactive and the previous MCP child
+              resources are released.
+            </span>
+          </label>
+          <label htmlFor="hardware-clear-reason" className="text-left text-sm text-foreground">
+            Verification notes (required)
+          </label>
+          <textarea
+            id="hardware-clear-reason"
+            data-testid="hardware-clear-reason"
+            value={reason}
+            disabled={mutation.isPending}
+            maxLength={500}
+            onChange={(event) => setReason(event.target.value)}
+            placeholder="What did you verify?"
+            className="min-h-20 w-full rounded-md border border-border bg-input px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
+          />
+          <div className="flex items-center justify-center gap-2">
+            <button
+              type="button"
+              data-testid="hardware-clear-submit"
+              disabled={!physicallyVerified || trimmedReason.length === 0 || mutation.isPending}
+              onClick={submit}
+              className="rounded-md bg-roast-fault px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {mutation.isPending ? "Recording…" : "Acknowledge and permit fresh spawn"}
+            </button>
+            {mutation.isPending && (
+              <span role="status" className="sr-only">
+                Recording hardware-clear acknowledgement
+              </span>
+            )}
+            <button
+              type="button"
+              data-testid="hardware-clear-cancel"
+              disabled={mutation.isPending}
+              onClick={() => {
+                setConfirming(false);
+                setPhysicallyVerified(false);
+                setReason("");
+                mutation.reset();
+              }}
+              className="rounded-md border border-border px-4 py-2 text-sm font-medium text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
+          {mutation.isError && (
+            <span
+              role="alert"
+              data-testid="hardware-clear-error"
+              className="text-xs text-roast-fault"
+            >
+              {mutation.error instanceof Error
+                ? mutation.error.message
+                : "Could not record the acknowledgement — check current status and retry."}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HardwareClearStatusIncomplete(): React.JSX.Element {
+  return (
+    <AppFrame
+      headerRight={
+        <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+          Start blocked
+        </span>
+      }
+    >
+      <div
+        className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-roast-fault/50 bg-roast-fault/10 p-8 text-center"
+        data-testid="hardware-clear-incident-unknown"
+      >
+        <h2 className="text-lg font-bold uppercase tracking-wide">
+          Hardware verification status is incomplete
+        </h2>
+        <p className="text-sm text-muted-foreground">
+          RoastPilot received inconsistent teardown status. Starting remains blocked. Reload the
+          page or perform a controlled agent restart after physically verifying the roaster is
+          inactive.
+        </p>
+      </div>
+    </AppFrame>
+  );
+}
 
 /**
  * The #525 clear/end-stale-run confirm step, embedded in `StartRoastView`'s
@@ -195,6 +394,7 @@ function ClearStaleSessionAction({ runId }: { runId: string }): React.JSX.Elemen
 
 export function StartRoastView(): React.JSX.Element {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   // #513 Codex follow-up: gate on `useFreshHealthGate`, not plain `useHealth`
   // — see its doc for the full rationale (a within-staleTime remount must
   // not render a cached "idle" snapshot as proof no run is active).
@@ -351,6 +551,43 @@ export function StartRoastView(): React.JSX.Element {
             Open live dashboard
           </Link>
         </div>
+      </AppFrame>
+    );
+  }
+
+  if (
+    health.isSuccess &&
+    health.data.mcp_hardware_clear_required !==
+      (health.data.mcp_teardown_incident_id !== null)
+  ) {
+    return <HardwareClearStatusIncomplete />;
+  }
+
+  if (health.isSuccess && health.data.mcp_hardware_clear_required) {
+    const incidentId = health.data.mcp_teardown_incident_id;
+    if (incidentId === null) return <HardwareClearStatusIncomplete />;
+    return (
+      <AppFrame
+        headerRight={
+          <span className="text-xs font-semibold uppercase tracking-wide text-roast-fault">
+            Start blocked
+          </span>
+        }
+      >
+        <HardwareClearAcknowledgementCard
+          key={incidentId}
+          incidentId={incidentId}
+          onAcknowledge={async (request) => {
+            try {
+              const result = await api.acknowledgeHardwareClear(request);
+              void queryClient.invalidateQueries({ queryKey: roastKeys.health });
+              return result;
+            } catch (error) {
+              await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+              throw error;
+            }
+          }}
+        />
       </AppFrame>
     );
   }

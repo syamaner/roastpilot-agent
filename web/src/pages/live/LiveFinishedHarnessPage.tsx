@@ -38,6 +38,8 @@ const IDLE_HEALTH: HealthResponse = {
   version: "harness",
   instance_id: "harness-instance",
   mcp_child: "running",
+  mcp_hardware_clear_required: false,
+  mcp_teardown_incident_id: null,
   active_run_id: null,
 };
 queryClient.setQueryData(roastKeys.health, IDLE_HEALTH);

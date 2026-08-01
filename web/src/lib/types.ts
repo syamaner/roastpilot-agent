@@ -608,6 +608,22 @@ export interface ClearStaleSessionResult {
   completed_at_utc: string;
 }
 
+/** Explicit physical hardware-clear confirmation after an unconfirmed MCP
+ * teardown (#668). The incident id binds the decision to the generation the
+ * operator inspected; `hardware_clear` is always the literal JSON `true`. */
+export interface HardwareClearAcknowledgementRequest {
+  hardware_clear: true;
+  teardown_incident_id: string;
+  reason: string;
+}
+
+export interface HardwareClearAcknowledgementResult {
+  result: "accepted";
+  hardware_clear: true;
+  teardown_incident_id: string;
+  fresh_spawn_permitted: true;
+}
+
 // --- Tastings (models.RoastTasting / TastingEntryRequest / TastingList, #522, D91) ---
 
 export type BrewMethod =
@@ -672,6 +688,8 @@ export interface HealthResponse {
   // HealthResponse's Python docstring for the full rationale.
   instance_id: string;
   mcp_child: MCPChildStatus;
+  mcp_hardware_clear_required: boolean;
+  mcp_teardown_incident_id: string | null;
   active_run_id: string | null;
 }
 

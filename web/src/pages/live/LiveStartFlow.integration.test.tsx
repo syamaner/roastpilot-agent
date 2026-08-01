@@ -62,6 +62,8 @@ function fakeFetch(opts: {
           version: "test",
           instance_id: opts.instanceId?.() ?? "server-a",
           mcp_child: "running",
+          mcp_hardware_clear_required: false,
+          mcp_teardown_incident_id: null,
           active_run_id: opts.activeRunId(),
         }),
         { status: 200 },
@@ -209,6 +211,8 @@ describe("#523 real-integration — /start start flow, real handoff to /live", (
       status: "ok",
       version: "test",
       mcp_child: "running",
+      mcp_hardware_clear_required: false,
+      mcp_teardown_incident_id: null,
       active_run_id: null,
     });
 
@@ -232,6 +236,8 @@ describe("#523 real-integration — /start start flow, real handoff to /live", (
             status: "ok",
             version: "test",
             mcp_child: "running",
+            mcp_hardware_clear_required: false,
+            mcp_teardown_incident_id: null,
             active_run_id: null,
           }),
           { status: 200 },
@@ -310,6 +316,8 @@ describe("#513 real-integration — /start active-run guard", () => {
       status: "ok",
       version: "test",
       mcp_child: "running",
+      mcp_hardware_clear_required: false,
+      mcp_teardown_incident_id: null,
       active_run_id: null,
     });
 
@@ -327,6 +335,8 @@ describe("#513 real-integration — /start active-run guard", () => {
             status: "ok",
             version: "test",
             mcp_child: "running",
+            mcp_hardware_clear_required: false,
+            mcp_teardown_incident_id: null,
             active_run_id: "run-from-another-tab",
           }),
           { status: 200 },
@@ -455,6 +465,8 @@ describe("#523 real-integration — /live idle state reads REAL history for the 
             status: "ok",
             version: "test",
             mcp_child: "running",
+            mcp_hardware_clear_required: false,
+            mcp_teardown_incident_id: null,
             active_run_id: null,
           }),
           { status: 200 },
@@ -613,7 +625,14 @@ describe("#523 real-integration — /live idle state reads REAL history for the 
       const u = String(url);
       if (u === "/api/health") {
         return new Response(
-          JSON.stringify({ status: "ok", version: "test", mcp_child: "running", active_run_id: null }),
+          JSON.stringify({
+            status: "ok",
+            version: "test",
+            mcp_child: "running",
+            mcp_hardware_clear_required: false,
+            mcp_teardown_incident_id: null,
+            active_run_id: null,
+          }),
           { status: 200 },
         );
       }
@@ -742,7 +761,14 @@ describe("#523 real-integration — /live idle state reads REAL history for the 
       const u = String(url);
       if (u === "/api/health") {
         return new Response(
-          JSON.stringify({ status: "ok", version: "test", mcp_child: "running", active_run_id: null }),
+          JSON.stringify({
+            status: "ok",
+            version: "test",
+            mcp_child: "running",
+            mcp_hardware_clear_required: false,
+            mcp_teardown_incident_id: null,
+            active_run_id: null,
+          }),
           { status: 200 },
         );
       }
@@ -841,7 +867,14 @@ describe("#523 real-integration — /live idle state reads REAL history for the 
       const u = String(url);
       if (u === "/api/health") {
         return new Response(
-          JSON.stringify({ status: "ok", version: "test", mcp_child: "running", active_run_id: null }),
+          JSON.stringify({
+            status: "ok",
+            version: "test",
+            mcp_child: "running",
+            mcp_hardware_clear_required: false,
+            mcp_teardown_incident_id: null,
+            active_run_id: null,
+          }),
           { status: 200 },
         );
       }

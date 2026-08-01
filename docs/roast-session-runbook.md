@@ -37,6 +37,20 @@
 ## Between roasts
 - **Cool the drum** (physical gate). Stop `roast-live.sh` (Ctrl-C).
 
+### If MCP teardown cannot be confirmed
+
+- Start remains blocked. Do not treat retrying Start as confirmation.
+- Physically verify that the roaster is inactive and that the previous MCP child no longer holds
+  the serial or audio devices.
+- On `/start`, open **I have checked the hardware**, tick the explicit verification checkbox, enter
+  what you verified, and submit the acknowledgement. It clears only the matching process-local stale
+  MCP generation; it never issues heat, fan, cooling, or another MCP command.
+- If the incident changed or a run became active/recovering, the server rejects the request. Recheck
+  the current state rather than replaying the old confirmation.
+- A controlled full agent restart after the same physical verification remains the cross-process
+  recovery alternative. A possibly-active persisted roast still enters
+  `operator_recovery_required` and cannot be bypassed by this acknowledgement.
+
 ## Roast 2 — D88 ON (validation)
 1. `POST_FC_LOOP=1 CEILING_GUARD=1 ./scripts/roast-live.sh` — as run in this
    session. **Since the 12 Jul promotion this is now the DEFAULT** (both flags

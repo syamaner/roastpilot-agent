@@ -32,11 +32,24 @@ const startRoastMock = vi.hoisted(() =>
 const clearStaleSessionMock = vi.hoisted(() =>
   vi.fn(async () => ({ run_id: "run-stranded", outcome: "aborted", completed_at_utc: "now" })),
 );
+const acknowledgeHardwareClearMock = vi.hoisted(() =>
+  vi.fn(async (request: { teardown_incident_id: string }) => ({
+    result: "accepted",
+    hardware_clear: true,
+    teardown_incident_id: request.teardown_incident_id,
+    fresh_spawn_permitted: true,
+  })),
+);
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
     ...actual,
-    api: { ...actual.api, startRoast: startRoastMock, clearStaleSession: clearStaleSessionMock },
+    api: {
+      ...actual.api,
+      startRoast: startRoastMock,
+      clearStaleSession: clearStaleSessionMock,
+      acknowledgeHardwareClear: acknowledgeHardwareClearMock,
+    },
   };
 });
 
@@ -46,7 +59,13 @@ vi.mock("@/lib/api", async () => {
 // follow-up: false while pending OR while `isSuccess` is true only from a
 // stale cache entry with the genuinely fresh refetch still in flight.
 const healthState: {
-  data: { active_run_id: string | null } | undefined;
+  data:
+    | {
+        active_run_id: string | null;
+        mcp_hardware_clear_required?: boolean;
+        mcp_teardown_incident_id?: string | null;
+      }
+    | undefined;
   isSuccess: boolean;
   isError: boolean;
   isFresh: boolean;
@@ -72,7 +91,17 @@ vi.mock("@/hooks/queries", async () => {
   const noopMutation = () => ({ mutateAsync: vi.fn(async () => undefined) });
   return {
     ...actual,
-    useFreshHealthGate: () => healthState,
+    useFreshHealthGate: () => ({
+      ...healthState,
+      data:
+        healthState.data === undefined
+          ? undefined
+          : {
+              mcp_hardware_clear_required: false,
+              mcp_teardown_incident_id: null,
+              ...healthState.data,
+            },
+    }),
     useFreshHistoryGate: () => historyState,
     useBeanProfiles: () => ({ data: { profiles: FIXTURE_BEAN_PROFILES }, isLoading: false }),
     useCreateBeanProfile: noopMutation,
@@ -111,19 +140,24 @@ function renderView() {
   function rerender() {
     result.rerender(wrapper(<StartRoastView />));
   }
-  return { rerender };
+  return { client, rerender };
 }
 
 afterEach(cleanup);
 beforeEach(() => {
   startRoastMock.mockClear();
   clearStaleSessionMock.mockClear();
+  acknowledgeHardwareClearMock.mockClear();
   clearStaleSessionMock.mockResolvedValue({
     run_id: "run-stranded",
     outcome: "aborted",
     completed_at_utc: "now",
   } as never);
-  healthState.data = { active_run_id: null };
+  healthState.data = {
+    active_run_id: null,
+    mcp_hardware_clear_required: false,
+    mcp_teardown_incident_id: null,
+  };
   healthState.isSuccess = true;
   healthState.isError = false;
   healthState.isFresh = true;
@@ -252,6 +286,154 @@ describe("StartRoastView (#324)", () => {
     expect(screen.getByTestId("start-roast-status-unknown")).toBeInTheDocument();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
     expect(screen.queryByTestId("start-roast-active-run-banner")).toBeNull();
+  });
+});
+
+describe("StartRoastView — hardware-clear acknowledgement (#668)", () => {
+  function renderHardwareClear(incidentId = "a".repeat(32)) {
+    healthState.data = {
+      active_run_id: null,
+      mcp_hardware_clear_required: true,
+      mcp_teardown_incident_id: incidentId,
+    };
+    healthState.isSuccess = true;
+    healthState.isFresh = true;
+    return renderView();
+  }
+
+  function openAndConfirm(reason = "roaster cold and child resources released") {
+    fireEvent.click(screen.getByTestId("hardware-clear-open"));
+    fireEvent.click(screen.getByTestId("hardware-clear-physical-check"));
+    fireEvent.change(screen.getByTestId("hardware-clear-reason"), {
+      target: { value: reason },
+    });
+  }
+
+  it("replaces the start form with an explicit physical-verification warning", () => {
+    renderHardwareClear();
+    expect(screen.getByTestId("hardware-clear-required")).toBeInTheDocument();
+    expect(screen.getByText(/physically verified the roaster is inactive/i)).toBeInTheDocument();
+    expect(screen.getByText(/never turns heat, fan, or cooling on/i)).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("fails closed when verification is required without an incident identity", () => {
+    healthState.data = {
+      active_run_id: null,
+      mcp_hardware_clear_required: true,
+      mcp_teardown_incident_id: null,
+    };
+    renderView();
+    expect(screen.getByTestId("hardware-clear-incident-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("hardware-clear-required")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("fails closed when an incident identity exists without the required flag", () => {
+    healthState.data = {
+      active_run_id: null,
+      mcp_hardware_clear_required: false,
+      mcp_teardown_incident_id: "a".repeat(32),
+    };
+    renderView();
+    expect(screen.getByTestId("hardware-clear-incident-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("hardware-clear-required")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("requires both the physical-verification checkbox and a nonblank reason", () => {
+    renderHardwareClear();
+    fireEvent.click(screen.getByTestId("hardware-clear-open"));
+    expect(screen.getByTestId("hardware-clear-physical-check")).toHaveFocus();
+    const submit = screen.getByTestId("hardware-clear-submit");
+    expect(submit).toBeDisabled();
+    fireEvent.click(screen.getByTestId("hardware-clear-physical-check"));
+    fireEvent.change(screen.getByTestId("hardware-clear-reason"), {
+      target: { value: "   " },
+    });
+    expect(submit).toBeDisabled();
+    fireEvent.change(screen.getByTestId("hardware-clear-reason"), {
+      target: { value: "verified physical controls" },
+    });
+    expect(submit).not.toBeDisabled();
+  });
+
+  it("submits the exact incident and trimmed reason once, then latches success", async () => {
+    renderHardwareClear();
+    openAndConfirm("  roaster cold and ports released  ");
+    fireEvent.click(screen.getByTestId("hardware-clear-submit"));
+    fireEvent.click(screen.getByTestId("hardware-clear-submit"));
+
+    await waitFor(() => expect(acknowledgeHardwareClearMock).toHaveBeenCalledTimes(1));
+    expect(acknowledgeHardwareClearMock).toHaveBeenCalledWith({
+      hardware_clear: true,
+      teardown_incident_id: "a".repeat(32),
+      reason: "roaster cold and ports released",
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("hardware-clear-acknowledged")).toBeInTheDocument(),
+    );
+    expect(screen.getByRole("status")).toHaveFocus();
+    expect(screen.queryByTestId("hardware-clear-submit")).toBeNull();
+  });
+
+  it("announces a stale-token rejection and refreshes to the current incident", async () => {
+    acknowledgeHardwareClearMock.mockRejectedValueOnce(new Error("incident no longer matches"));
+    const view = renderHardwareClear();
+    const invalidate = vi.spyOn(view.client, "invalidateQueries").mockImplementation(async () => {
+      healthState.data = {
+        active_run_id: null,
+        mcp_hardware_clear_required: true,
+        mcp_teardown_incident_id: "b".repeat(32),
+      };
+      view.rerender();
+      return undefined;
+    });
+    openAndConfirm();
+    fireEvent.click(screen.getByTestId("hardware-clear-submit"));
+
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["health"] }));
+    expect(screen.getByTestId("hardware-clear-open")).toBeInTheDocument();
+    expect(screen.queryByTestId("hardware-clear-error")).toBeNull();
+    expect(screen.queryByTestId("hardware-clear-confirm")).toBeNull();
+  });
+
+  it("announces a rejection when refreshed health still reports the same incident", async () => {
+    acknowledgeHardwareClearMock.mockRejectedValueOnce(new Error("check current status"));
+    renderHardwareClear();
+    openAndConfirm();
+    fireEvent.click(screen.getByTestId("hardware-clear-submit"));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/check current status/i);
+    expect(screen.getByTestId("hardware-clear-submit")).not.toBeDisabled();
+  });
+
+  it("discards confirmation state when health reports a different incident", () => {
+    const { rerender } = renderHardwareClear("a".repeat(32));
+    openAndConfirm("reason bound to incident A");
+    expect(screen.getByTestId("hardware-clear-confirm")).toBeInTheDocument();
+
+    healthState.data = {
+      active_run_id: null,
+      mcp_hardware_clear_required: true,
+      mcp_teardown_incident_id: "b".repeat(32),
+    };
+    rerender();
+
+    expect(screen.getByTestId("hardware-clear-open")).toBeInTheDocument();
+    expect(screen.queryByTestId("hardware-clear-confirm")).toBeNull();
+  });
+
+  it("never offers acknowledgement over an active run", () => {
+    healthState.data = {
+      active_run_id: "run-recovery",
+      mcp_hardware_clear_required: true,
+      mcp_teardown_incident_id: "a".repeat(32),
+    };
+    renderView();
+    expect(screen.getByTestId("start-roast-active-run-banner")).toBeInTheDocument();
+    expect(screen.queryByTestId("hardware-clear-required")).toBeNull();
   });
 });
 

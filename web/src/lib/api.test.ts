@@ -34,6 +34,30 @@ describe("api client", () => {
     expect(JSON.parse((init as RequestInit).body as string)).toEqual({ action: "drop_beans" });
   });
 
+  it("POST /api/mcp/acknowledge-hardware-clear sends the incident-bound decision", async () => {
+    mockFetch(200, {
+      result: "accepted",
+      hardware_clear: true,
+      teardown_incident_id: "a".repeat(32),
+      fresh_spawn_permitted: true,
+    });
+    await api.acknowledgeHardwareClear({
+      hardware_clear: true,
+      teardown_incident_id: "a".repeat(32),
+      reason: "roaster cold and child resources released",
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/mcp/acknowledge-hardware-clear",
+      expect.objectContaining({ method: "POST" }),
+    );
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+      hardware_clear: true,
+      teardown_incident_id: "a".repeat(32),
+      reason: "roaster cold and child resources released",
+    });
+  });
+
   it("draft-correlated profile create preserves JSON and attempt headers", async () => {
     mockFetch(201, { id: "bean-1", name: "Kenya" });
     const input = { name: "Kenya" } as never;
