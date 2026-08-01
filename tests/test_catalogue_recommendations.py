@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from collections.abc import AsyncIterator
 
 import httpx
@@ -68,6 +67,24 @@ def test_discovery_prefers_json_ld_and_bounds_links_to_same_origin_products() ->
     ]
 
 
+def test_discovery_retains_candidate_local_card_and_json_ld_evidence() -> None:
+    html = """
+    <script type="application/ld+json">
+      {"@type":"Product","name":"Rwanda Nyamasheke","url":"/products/rwanda",
+       "countryOfOrigin":{"name":"Rwanda"},"process":"honey"}
+    </script>
+    <article><a href="/products/kiambu">Kiambu Lot</a><span>Kenya · Washed</span></article>
+    <article><a href="/products/santos">Santos Lot</a><span>Brazil · Natural</span></article>
+    """
+    candidates = discover_catalogue_candidates(_page(html))
+    assert "Rwanda" in candidates[0].evidence
+    assert "honey" in candidates[0].evidence
+    assert candidates[1].evidence == "Kiambu Lot Kenya · Washed"
+    assert "Brazil" not in candidates[1].evidence
+    assert candidates[2].evidence == "Santos Lot Brazil · Natural"
+    assert "Kenya" not in candidates[2].evidence
+
+
 def test_discovery_rejects_userinfo_and_non_product_anchor_paths() -> None:
     page = _page(
         '<a href="https://user:secret@vendor.example/products/a">A</a><a href="/about">About</a>'
@@ -79,6 +96,9 @@ def test_provider_text_redacts_absolute_urls_without_touching_product_words() ->
     redact = catalogue._redact_absolute_urls  # pyright: ignore[reportPrivateUsage]
     assert redact("Kenya HTTPS://vendor.example/products/a?token=x washed") == (
         "Kenya [link] washed"
+    )
+    assert redact("ß" * 45 + "https://vendor.example/products/a?token=x washed") == (
+        "ß" * 45 + "[link] washed"
     )
 
 
@@ -94,6 +114,10 @@ def test_json_ld_flattener_handles_graph_item_list_nested_item_and_noise() -> No
         ]
     )
     assert [block["name"] for block in blocks] == ["A", "B"]
+    evidence = catalogue._json_ld_product_evidence(  # pyright: ignore[reportPrivateUsage]
+        {"origin": {"name": 7}, "description": "Washed lot"}, "A"
+    )
+    assert evidence == "A Washed lot"
 
 
 @pytest.mark.parametrize(
@@ -135,6 +159,7 @@ def test_discovery_fails_soft_on_empty_and_malformed_json_ld() -> None:
     assert (
         discover_catalogue_candidates(
             _page(
+                "<script>ordinary script</script>"
                 '<script type="application/ld+json"></script>'
                 '<script type="application/ld+json">{bad</script>'
                 '<script type="application/ld+json">'
@@ -177,12 +202,14 @@ def test_deterministic_rank_combines_roster_gap_and_rated_affinity() -> None:
             candidate_id="candidate-01",
             product_url="https://vendor.example/products/kenya",
             label="Kenya Kiambu",
+            evidence="Kenya Kiambu",
             source_order=0,
         ),
         catalogue.CatalogueCandidate(
             candidate_id="candidate-02",
             product_url="https://vendor.example/products/brazil",
             label="Brazil Santos",
+            evidence="Brazil Santos",
             source_order=1,
         ),
     ]
@@ -231,6 +258,7 @@ def test_rank_ties_preserve_collection_source_order_and_caps_at_three() -> None:
             candidate_id=f"candidate-{index:02d}",
             product_url=f"https://vendor.example/products/{index}",
             label=f"Bean {index}",
+            evidence=f"Bean {index}",
             source_order=index - 1,
         )
         for index in range(1, 5)
@@ -262,6 +290,7 @@ def test_rated_affinity_requires_an_exact_country_processing_pair() -> None:
         candidate_id="candidate-01",
         product_url="https://vendor.example/products/ethiopia-natural",
         label="Ethiopia Natural",
+        evidence="Ethiopia Natural",
         source_order=0,
     )
     extracted = catalogue._ExtractedCatalogueCandidate(  # pyright: ignore[reportPrivateUsage]
@@ -279,6 +308,10 @@ def test_rated_affinity_requires_an_exact_country_processing_pair() -> None:
     result = rank_catalogue_candidates([candidate], [extracted], context)
     assert result.recommendations[0].score == 0
     assert "rated_pair_affinity" not in result.recommendations[0].reason_codes
+    unknown = catalogue._ExtractedCatalogueCandidate(  # pyright: ignore[reportPrivateUsage]
+        candidate_id="candidate-02", name="Unknown"
+    )
+    assert rank_catalogue_candidates([candidate], [unknown], context).recommendations == []
 
 
 @pytest.mark.asyncio
@@ -469,6 +502,53 @@ async def test_extraction_requires_candidate_local_metadata_evidence() -> None:
 
 
 @pytest.mark.asyncio
+async def test_extraction_preserves_metadata_from_candidate_local_card_context() -> None:
+    page = FetchedVendorPage(
+        prompt_text="",
+        extracted_text="Kiambu Lot Kenya Washed",
+        json_ld_values="",
+        raw_html=(
+            '<article><a href="/products/kiambu">Kiambu Lot</a>'
+            "<span>Kenya · Washed</span></article>"
+        ),
+        final_url="https://vendor.example/collections/green-coffee",
+    )
+    candidates = discover_catalogue_candidates(page)
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        rendered = str(messages)
+        assert "Kiambu Lot Kenya · Washed" in rendered
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "candidates": [
+                            {
+                                "candidate_id": "candidate-01",
+                                "name": "Kiambu Lot",
+                                "country": "Kenya",
+                                "processing": "washed",
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+
+    extracted = await catalogue._extract(  # pyright: ignore[reportPrivateUsage]
+        page,
+        candidates,
+        advisor_config=AdvisorConfig(),
+        sourcing_config=BeanSourcingConfig(),
+        diagnostics=BeanSourcingDiagnostics(),
+        model=FunctionModel(respond),
+    )
+    assert extracted[0].country == "Kenya"
+    assert extracted[0].processing == "washed"
+
+
+@pytest.mark.asyncio
 async def test_provider_input_is_capped_at_twelve_server_candidates() -> None:
     html = "".join(f'<a href="/products/{index}">Bean {index}</a>' for index in range(1, 14))
     page = FetchedVendorPage(
@@ -540,6 +620,14 @@ async def test_name_evidence_requires_normalized_word_boundaries() -> None:
             diagnostics=BeanSourcingDiagnostics(),
             model=FunctionModel(respond),
         )
+    assert not catalogue._page_states_value("punctuation only", "---")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_extracted_candidate_rejects_non_text_name_after_bidi_filter() -> None:
+    with pytest.raises(ValueError, match="name"):
+        catalogue._ExtractedCatalogueCandidate.model_validate(  # pyright: ignore[reportPrivateUsage]
+            {"candidate_id": "candidate-01", "name": 7}
+        )
 
 
 @pytest.mark.asyncio
@@ -552,6 +640,26 @@ async def test_provider_error_is_mapped_to_typed_unavailable_error() -> None:
         raise ModelAPIError("test", "down")
 
     with pytest.raises(BeanExtractionUnavailableError, match="no usable"):
+        await catalogue._extract(  # pyright: ignore[reportPrivateUsage]
+            page,
+            candidates,
+            advisor_config=AdvisorConfig(),
+            sourcing_config=BeanSourcingConfig(),
+            diagnostics=BeanSourcingDiagnostics(),
+            model=FunctionModel(respond),
+        )
+
+
+@pytest.mark.asyncio
+async def test_unexpected_provider_escape_is_mapped_to_typed_unavailable_error() -> None:
+    page = _page('<a href="/products/kenya">Kenya Kiambu</a>')
+    candidates = discover_catalogue_candidates(page)
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        raise RuntimeError("synthetic sdk teardown")
+
+    with pytest.raises(BeanExtractionUnavailableError, match="RuntimeError"):
         await catalogue._extract(  # pyright: ignore[reportPrivateUsage]
             page,
             candidates,
@@ -624,21 +732,20 @@ async def test_provider_deadline_is_mapped_and_recorded(
 
 
 @pytest.mark.asyncio
-async def test_catalogue_discovery_deadline_maps_to_client_actionable_error(
+async def test_catalogue_discovery_boundary_unavailable_maps_to_dependency_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def fetched(*args: object, **kwargs: object) -> FetchedVendorPage:
         del args, kwargs
         return _page('<a href="/products/kenya">Kenya Kiambu</a>')
 
-    def slow_discovery(page: FetchedVendorPage) -> list[catalogue.CatalogueCandidate]:
-        del page
-        time.sleep(0.02)
-        return []
+    async def unavailable_parse(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
 
     monkeypatch.setattr(catalogue, "fetch_vendor_page", fetched)
-    monkeypatch.setattr(catalogue, "discover_catalogue_candidates", slow_discovery)
-    with pytest.raises(BeanExtractionError, match="product discovery exceeded"):
+    monkeypatch.setattr(catalogue, "run_untrusted_parse_bounded", unavailable_parse)
+    with pytest.raises(BeanExtractionUnavailableError, match="temporarily unavailable"):
         await recommend_from_catalogue(
             "https://vendor.example/collections/green",
             context=CatalogueRankingContext(

@@ -17,6 +17,7 @@ from roastpilot_agent.models import (
     BeanProfile,
     BeanProfileDraft,
     BeanProfileInput,
+    CatalogueRecommendation,
     MicHealth,
     MicStatus,
     RoastCommand,
@@ -980,6 +981,22 @@ def test_bean_profile_draft_field_evidence_round_trip() -> None:
     # field with no captured quote.
     assert "bean_species" not in restored.field_evidence
     assert "is_blend" not in restored.field_evidence
+
+
+def test_catalogue_recommendation_strips_bidi_controls_from_display_text() -> None:
+    recommendation = CatalogueRecommendation(
+        candidate_id="candidate-01",
+        product_url="https://vendor.example/products/kiambu",
+        name="Kiambu \u202eLot",
+        country="Ken\u2066ya",
+        processing="washed",
+        score=1,
+        reason_codes=["missing_country"],
+        reasons=["Adds Ken\u202eya to the active bean roster."],
+    )
+    assert recommendation.name == "Kiambu Lot"
+    assert recommendation.country == "Kenya"
+    assert recommendation.reasons == ["Adds Kenya to the active bean roster."]
 
 
 @pytest.mark.parametrize(

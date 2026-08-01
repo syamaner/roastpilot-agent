@@ -13,7 +13,7 @@ import json
 import re
 from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
@@ -826,7 +826,7 @@ precedent: this is bean metadata, not a safety verdict, so it stays OUT of
 the enum surface the safety-reviewer escalation routes on."""
 
 
-_BEAN_DRAFT_BIDI_CONTROLS = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+_UNTRUSTED_TEXT_BIDI_CONTROLS = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 
 class BeanProfileDraft(_BeanProfileFieldsBase):
@@ -881,7 +881,7 @@ class BeanProfileDraft(_BeanProfileFieldsBase):
     def _strip_bidi_controls(cls, value: object) -> object:
         """Remove non-content bidi controls from untrusted drafted identity text."""
         if isinstance(value, str):
-            return _BEAN_DRAFT_BIDI_CONTROLS.sub("", value)
+            return _UNTRUSTED_TEXT_BIDI_CONTROLS.sub("", value)
         return value
 
     draft_attempt_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
@@ -962,6 +962,19 @@ class CatalogueRecommendation(BaseModel):
     score: int = Field(ge=0)
     reason_codes: list[CatalogueReasonCode] = Field(max_length=5)
     reasons: list[str] = Field(max_length=5)
+
+    @field_validator("name", "country", "reasons", mode="before")
+    @classmethod
+    def _strip_bidi_controls(cls, value: object) -> object:
+        """Remove display-reordering controls from untrusted recommendation text."""
+        if isinstance(value, str):
+            return _UNTRUSTED_TEXT_BIDI_CONTROLS.sub("", value)
+        if isinstance(value, list):
+            return [
+                _UNTRUSTED_TEXT_BIDI_CONTROLS.sub("", item) if isinstance(item, str) else item
+                for item in cast(list[object], value)
+            ]
+        return value
 
 
 class CatalogueRecommendationList(BaseModel):
