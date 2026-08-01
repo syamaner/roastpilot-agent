@@ -179,15 +179,18 @@ async def test_catalogue_success_retains_metrics_without_claimable_snapshot(
         usage_evidence="exact",
         timed_out_runs=0,
         claimable_draft=False,
+        catalogue_discovered_count=2,
+        catalogue_extracted_count=1,
     )
     async with store.connection.execute(
-        "SELECT prompt_version, outcome, draft_snapshot_json, claim_expires_at_utc"
+        "SELECT prompt_version, outcome, catalogue_discovered_count,"
+        " catalogue_extracted_count, draft_snapshot_json, claim_expires_at_utc"
         " FROM bean_sourcing_attempts WHERE id = ?",
         (attempt_id,),
     ) as cursor:
         row = await cursor.fetchone()
     assert row is not None
-    assert tuple(row) == ("v1-catalogue-v1", "success", None, None)
+    assert tuple(row) == ("v1-catalogue-v1", "success", 2, 1, None, None)
     with pytest.raises(BeanDraftAttemptClaimError):
         await store.create_bean_profile(_input(), draft_attempt_id=attempt_id)
     with pytest.raises(ValueError, match="nonclaimable.*cannot carry a draft"):
@@ -201,6 +204,32 @@ async def test_catalogue_success_retains_metrics_without_claimable_snapshot(
             timed_out_runs=0,
             draft=_draft(),
             claimable_draft=False,
+            catalogue_discovered_count=2,
+            catalogue_extracted_count=1,
+        )
+    with pytest.raises(ValueError, match="requires aggregate counts"):
+        await store.finish_bean_sourcing_attempt(
+            attempt_id,
+            outcome="success",
+            latency_ms=20,
+            request_tokens=4,
+            response_tokens=2,
+            usage_evidence="exact",
+            timed_out_runs=0,
+            claimable_draft=False,
+        )
+    with pytest.raises(ValueError, match="cannot carry catalogue counts"):
+        await store.finish_bean_sourcing_attempt(
+            attempt_id,
+            outcome="success",
+            latency_ms=20,
+            request_tokens=4,
+            response_tokens=2,
+            usage_evidence="exact",
+            timed_out_runs=0,
+            draft=_draft(),
+            catalogue_discovered_count=2,
+            catalogue_extracted_count=1,
         )
 
 

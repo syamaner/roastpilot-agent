@@ -4821,6 +4821,41 @@ async def test_recommend_from_catalogue_route_returns_read_only_ranked_products(
     assert (await client.get("/api/bean-profiles")).json() == {"profiles": []}
 
 
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_detail"),
+    [
+        (BeanFetchError("catalogue fetch rejected"), 422, "catalogue fetch rejected"),
+        (
+            BeanExtractionUnavailableError("provider unavailable"),
+            503,
+            "catalogue extraction temporarily unavailable",
+        ),
+        (BeanExtractionError("no supported products"), 422, "no supported products"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recommend_from_catalogue_route_maps_domain_errors(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    expected_status: int,
+    expected_detail: str,
+) -> None:
+    """D121: catalogue route preserves input-versus-dependency status semantics."""
+
+    async def fail_recommend(self: object, url: str) -> object:
+        del self, url
+        raise error
+
+    monkeypatch.setattr(RoastService, "recommend_beans_from_catalogue", fail_recommend)
+    response = await client.post(
+        "/api/beans/recommend-from-catalogue",
+        json={"url": "https://vendor.example/collections/green"},
+    )
+    assert response.status_code == expected_status
+    assert expected_detail in response.json()["detail"]
+
+
 @pytest.mark.asyncio
 async def test_catalogue_service_records_nonclaimable_terminal_attempt(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
@@ -4855,11 +4890,12 @@ async def test_catalogue_service_records_nonclaimable_terminal_attempt(
     assert result.discovered_count == 2
     async with store.connection.execute(
         "SELECT prompt_version, outcome, request_tokens, response_tokens,"
+        " catalogue_discovered_count, catalogue_extracted_count,"
         " draft_snapshot_json FROM bean_sourcing_attempts"
     ) as cursor:
         row = await cursor.fetchone()
     assert row is not None
-    assert tuple(row) == ("v1-catalogue-v1", "success", 9, 3, None)
+    assert tuple(row) == ("v1-catalogue-v1", "success", 9, 3, 2, 1, None)
     assert "vendor.example" not in json.dumps(dict(row))
 
 

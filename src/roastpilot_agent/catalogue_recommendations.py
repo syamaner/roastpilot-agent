@@ -13,10 +13,10 @@ import asyncio
 import json
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import islice
 from typing import Any, Final, cast
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 import lxml.etree  # type: ignore[import-untyped]
@@ -208,6 +208,8 @@ def _same_origin_product_url(
     value: str, *, base_url: str, require_product_path: bool
 ) -> str | None:
     """Return a normalized same-origin product URL, or ``None`` fail-soft."""
+    if _BIDI_CONTROLS.search(value):
+        return None
     try:
         absolute = urljoin(base_url, value)
         parsed = urlsplit(absolute)
@@ -216,22 +218,57 @@ def _same_origin_product_url(
         base_port = base.port
     except (TypeError, ValueError):
         return None
-    if parsed.scheme not in ("http", "https") or parsed.username or parsed.password:
-        return None
+    parsed_scheme = parsed.scheme.lower()
+    base_scheme = base.scheme.lower()
+    parsed_host = (parsed.hostname or "").lower()
+    base_host = (base.hostname or "").lower()
     if (
-        parsed.scheme.lower(),
-        (parsed.hostname or "").lower(),
-        parsed_port,
-    ) != (base.scheme.lower(), (base.hostname or "").lower(), base_port):
+        parsed_scheme not in ("http", "https")
+        or not parsed_host
+        or parsed.username
+        or parsed.password
+    ):
+        return None
+    parsed_default_port = 443 if parsed_scheme == "https" else 80
+    base_default_port = 443 if base_scheme == "https" else 80
+    parsed_effective_port = parsed_port if parsed_port is not None else parsed_default_port
+    base_effective_port = base_port if base_port is not None else base_default_port
+    if (
+        parsed_scheme,
+        parsed_host,
+        parsed_effective_port,
+    ) != (
+        base_scheme,
+        base_host,
+        base_effective_port,
+    ):
         return None
     segments = {segment.casefold() for segment in parsed.path.split("/") if segment}
     if require_product_path and not segments.intersection(_PRODUCT_PATH_SEGMENTS):
         return None
-    query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
+    rendered_host = f"[{parsed_host}]" if ":" in parsed_host else parsed_host
+    normalized_netloc = rendered_host
+    if parsed_port is not None and parsed_port != parsed_default_port:
+        normalized_netloc = f"{rendered_host}:{parsed_port}"
     normalized = urlunsplit(
-        (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", query, "")
+        (parsed_scheme, normalized_netloc, parsed.path or "/", parsed.query, "")
     )
     return normalized if len(normalized) <= _MAX_PRODUCT_URL_CHARS else None
+
+
+def _merge_candidate_evidence(existing: str, additional: str) -> str:
+    """Merge two bounded representations of the same server-owned product."""
+    if _normalized_words(additional) in _normalized_words(existing):
+        return existing
+    if _normalized_words(existing) in _normalized_words(additional):
+        return additional
+    return (
+        _clean_text(
+            f"{existing} {additional}",
+            limit=_MAX_CANDIDATE_CONTEXT_CHARS,
+        )
+        or existing
+    )
 
 
 def _discover_catalogue_candidates_unchecked(
@@ -278,17 +315,27 @@ def _discover_catalogue_candidates_unchecked(
         if isinstance(href, str) and label:
             raw.append((href, label, _anchor_candidate_evidence(anchor, label)))
 
-    seen: set[str] = set()
     candidates: list[CatalogueCandidate] = []
+    positions: dict[str, int] = {}
     for index, (value, label, evidence) in enumerate(raw):
         product_url = _same_origin_product_url(
             value,
             base_url=page.final_url,
             require_product_path=index >= json_ld_count,
         )
-        if product_url is None or product_url in seen:
+        if product_url is None:
             continue
-        seen.add(product_url)
+        duplicate_position = positions.get(product_url)
+        if duplicate_position is not None:
+            existing = candidates[duplicate_position]
+            candidates[duplicate_position] = replace(
+                existing,
+                evidence=_merge_candidate_evidence(existing.evidence, evidence),
+            )
+            continue
+        if len(candidates) >= _MAX_DISCOVERED:
+            continue
+        positions[product_url] = len(candidates)
         candidates.append(
             CatalogueCandidate(
                 candidate_id=f"candidate-{len(candidates) + 1:02d}",
@@ -298,8 +345,6 @@ def _discover_catalogue_candidates_unchecked(
                 source_order=len(candidates),
             )
         )
-        if len(candidates) >= _MAX_DISCOVERED:
-            break
     return candidates
 
 

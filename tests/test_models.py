@@ -999,6 +999,20 @@ def test_catalogue_recommendation_strips_bidi_controls_from_display_text() -> No
     assert recommendation.reasons == ["Adds Kenya to the active bean roster."]
 
 
+def test_catalogue_recommendation_rejects_bidi_controls_in_product_url() -> None:
+    with pytest.raises(pydantic.ValidationError, match="bidirectional controls"):
+        CatalogueRecommendation(
+            candidate_id="candidate-01",
+            product_url="https://vendor.example/products/\u202ekiambu",
+            name="Kiambu Lot",
+            country="Kenya",
+            processing="washed",
+            score=1,
+            reason_codes=["missing_country"],
+            reasons=["Adds Kenya to the active bean roster."],
+        )
+
+
 @pytest.mark.parametrize(
     ("charge", "roasted", "expected"),
     [

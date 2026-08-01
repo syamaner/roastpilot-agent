@@ -506,6 +506,19 @@ CREATE INDEX idx_bean_sourcing_attempt_expiry
   WHERE draft_snapshot_json IS NOT NULL AND saved_profile_id IS NULL;
 """
 
+SCHEMA_V15_CATALOGUE_ATTEMPT_COUNTS = """
+-- #573 / D121: successful catalogue attempts retain only bounded aggregate
+-- discovery/extraction counts, never URLs, HTML, provider output, or result text.
+ALTER TABLE bean_sourcing_attempts ADD COLUMN catalogue_discovered_count INTEGER
+  CHECK (catalogue_discovered_count IS NULL OR
+         catalogue_discovered_count BETWEEN 0 AND 24);
+ALTER TABLE bean_sourcing_attempts ADD COLUMN catalogue_extracted_count INTEGER
+  CHECK (catalogue_extracted_count IS NULL OR
+         (catalogue_extracted_count BETWEEN 0 AND 12 AND
+          catalogue_discovered_count IS NOT NULL AND
+          catalogue_extracted_count <= catalogue_discovered_count));
+"""
+
 _BEAN_SOURCING_LEASE_DURATION = timedelta(minutes=2)
 _BEAN_SOURCING_LEASE_CONFIRMATION = timedelta(seconds=60)
 
@@ -527,6 +540,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V12_CORRECTED_CHARGE,
     SCHEMA_V13_EXCLUDED,
     SCHEMA_V14_BEAN_SOURCING_ATTEMPTS,
+    SCHEMA_V15_CATALOGUE_ATTEMPT_COUNTS,
 )
 
 
@@ -2530,6 +2544,8 @@ class RoastStore:
         timed_out_runs: int,
         draft: BeanProfileDraft | None = None,
         claimable_draft: bool = True,
+        catalogue_discovered_count: int | None = None,
+        catalogue_extracted_count: int | None = None,
         completed_at_utc: str | None = None,
     ) -> None:
         """Commit one terminal attempt outcome without retaining unsafe inputs."""
@@ -2542,6 +2558,11 @@ class RoastStore:
             raise ValueError("a successful bean-sourcing attempt requires a draft")
         if outcome == "success" and not claimable_draft and draft is not None:
             raise ValueError("a nonclaimable bean-sourcing success cannot carry a draft")
+        catalogue_counts = (catalogue_discovered_count, catalogue_extracted_count)
+        if outcome == "success" and not claimable_draft and None in catalogue_counts:
+            raise ValueError("a nonclaimable catalogue success requires aggregate counts")
+        if claimable_draft and any(value is not None for value in catalogue_counts):
+            raise ValueError("a claimable bean draft cannot carry catalogue counts")
         if outcome == "success" and draft is not None:
             # Single-product success carries one claimable draft baseline.
             # Catalogue success deliberately carries no draft: it records only
@@ -2565,7 +2586,8 @@ class RoastStore:
                 "UPDATE bean_sourcing_attempts SET completed_at_utc = ?, latency_ms = ?,"
                 " outcome = ?, request_tokens = ?, response_tokens = ?, usage_evidence = ?,"
                 " timed_out_runs = ?, on_page_field_count = ?,"
-                " origin_estimated_field_count = ?, draft_snapshot_json = ?,"
+                " origin_estimated_field_count = ?, catalogue_discovered_count = ?,"
+                " catalogue_extracted_count = ?, draft_snapshot_json = ?,"
                 " claim_expires_at_utc = ? WHERE id = ? AND outcome = 'in_progress'",
                 (
                     completed,
@@ -2577,6 +2599,8 @@ class RoastStore:
                     timed_out_runs,
                     on_page_count,
                     estimated_count,
+                    catalogue_discovered_count,
+                    catalogue_extracted_count,
                     snapshot,
                     expires,
                     attempt_id,

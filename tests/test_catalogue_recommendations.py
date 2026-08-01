@@ -85,6 +85,32 @@ def test_discovery_retains_candidate_local_card_and_json_ld_evidence() -> None:
     assert "Kenya" not in candidates[2].evidence
 
 
+def test_discovery_merges_richer_card_evidence_for_duplicate_json_ld_url() -> None:
+    html = """
+    <script type="application/ld+json">
+      {"@type":"Product","name":"Kiambu Lot","url":"/products/kiambu"}
+    </script>
+    <article><a href="/products/kiambu">Kiambu Lot</a><span>Kenya · Washed</span></article>
+    """
+    candidates = discover_catalogue_candidates(_page(html))
+    assert len(candidates) == 1
+    assert candidates[0].evidence == "Kiambu Lot Kenya · Washed"
+
+
+def test_discovery_keeps_richer_json_ld_evidence_for_sparse_duplicate_link() -> None:
+    html = """
+    <script type="application/ld+json">
+      {"@type":"Product","name":"Kiambu Lot","url":"/products/kiambu",
+       "countryOfOrigin":{"name":"Kenya"},"process":"washed"}
+    </script>
+    <a href="/products/kiambu">Kiambu Lot</a>
+    """
+    candidates = discover_catalogue_candidates(_page(html))
+    assert len(candidates) == 1
+    assert "Kenya" in candidates[0].evidence
+    assert "washed" in candidates[0].evidence
+
+
 def test_discovery_rejects_userinfo_and_non_product_anchor_paths() -> None:
     page = _page(
         '<a href="https://user:secret@vendor.example/products/a">A</a><a href="/about">About</a>'
@@ -147,6 +173,43 @@ def test_candidate_url_normalization_rejects_oversized_product_url() -> None:
     assert (
         normalize(
             oversized,
+            base_url="https://vendor.example/collections/green",
+            require_product_path=True,
+        )
+        is None
+    )
+
+
+def test_candidate_url_normalization_preserves_query_order_and_default_ports() -> None:
+    normalize = catalogue._same_origin_product_url  # pyright: ignore[reportPrivateUsage]
+    value = "https://vendor.example:443/products/a?variant=red&variant=blue&sig=a%2Fb"
+    assert normalize(
+        value,
+        base_url="https://vendor.example/collections/green",
+        require_product_path=True,
+    ) == ("https://vendor.example/products/a?variant=red&variant=blue&sig=a%2Fb")
+    assert (
+        normalize(
+            "https://vendor.example:8443/products/a",
+            base_url="https://vendor.example:8443/collections/green",
+            require_product_path=True,
+        )
+        == "https://vendor.example:8443/products/a"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://vendor.example:0/products/a",
+        "https://vendor.example/products/\u202ea",
+    ],
+)
+def test_candidate_url_normalization_rejects_wrong_port_and_bidi(value: str) -> None:
+    normalize = catalogue._same_origin_product_url  # pyright: ignore[reportPrivateUsage]
+    assert (
+        normalize(
+            value,
             base_url="https://vendor.example/collections/green",
             require_product_path=True,
         )

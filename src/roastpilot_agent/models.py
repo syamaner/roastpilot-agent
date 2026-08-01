@@ -963,6 +963,14 @@ class CatalogueRecommendation(BaseModel):
     reason_codes: list[CatalogueReasonCode] = Field(max_length=5)
     reasons: list[str] = Field(max_length=5)
 
+    @field_validator("product_url", mode="before")
+    @classmethod
+    def _reject_bidi_controls_in_product_url(cls, value: object) -> object:
+        """Reject display-reordering controls without changing URL semantics."""
+        if isinstance(value, str) and _UNTRUSTED_TEXT_BIDI_CONTROLS.search(value):
+            raise ValueError("product URL must not contain bidirectional controls")
+        return value
+
     @field_validator("name", "country", "reasons", mode="before")
     @classmethod
     def _strip_bidi_controls(cls, value: object) -> object:

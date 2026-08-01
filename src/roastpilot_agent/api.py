@@ -2956,6 +2956,8 @@ class RoastService:
         diagnostics: BeanSourcingDiagnostics,
         draft: BeanProfileDraft | None = None,
         claimable_draft: bool = True,
+        catalogue_discovered_count: int | None = None,
+        catalogue_extracted_count: int | None = None,
     ) -> None:
         """Commit terminal telemetry in a separately owned shielded task."""
         request_tokens, response_tokens, evidence = self._bean_attempt_usage(diagnostics)
@@ -2970,6 +2972,8 @@ class RoastService:
                 timed_out_runs=diagnostics.timed_out_runs,
                 draft=draft,
                 claimable_draft=claimable_draft,
+                catalogue_discovered_count=catalogue_discovered_count,
+                catalogue_extracted_count=catalogue_extracted_count,
             ),
             name=f"finish-bean-attempt-{attempt_id}",
         )
@@ -3329,6 +3333,8 @@ class RoastService:
                 started_monotonic=started_monotonic,
                 diagnostics=diagnostics,
                 claimable_draft=False,
+                catalogue_discovered_count=result.discovered_count,
+                catalogue_extracted_count=result.extracted_count,
             )
             return result
         finally:
