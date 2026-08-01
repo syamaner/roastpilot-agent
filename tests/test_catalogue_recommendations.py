@@ -206,11 +206,15 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
     assert redact("redirect=https%253A%252F%252Fvendor.example%252Fa%253Ftoken%253Dx washed") == (
         "[link] washed"
     )
+    assert redact("https%25253A%25252F%25252Fvendor.example%25252Fa washed") == "[link] washed"
     assert redact("1 /2 lb and 1/2 kg") == "1 /2 lb and 1/2 kg"
     assert redact("SL28/SL34 and Caturra/Castillo") == "SL28/SL34 and Caturra/Castillo"
     assert redact("washed/natural 12oz/340g AA/AB") == "washed/natural 12oz/340g AA/AB"
     assert redact("faq/shipping washed") == "faq/shipping washed"
     assert redact("Country: Kenya Process: washed") == "Country: Kenya Process: washed"
+    assert redact("Country:Kenya Process:Washed SKU:ABC123") == (
+        "Country:Kenya Process:Washed SKU:ABC123"
+    )
     assert redact("farmer@vendor.example washed") == "farmer@vendor.example washed"
 
 
@@ -257,6 +261,7 @@ def test_json_ld_evidence_preserves_structured_fields_before_long_description() 
         ("/products", True),
         ("/products?page=2", True),
         ("/shop/product/", True),
+        ("/shop/all", True),
     ],
 )
 def test_candidate_url_normalization_fails_closed(value: str, require_product_path: bool) -> None:
@@ -316,6 +321,22 @@ def test_candidate_url_normalization_preserves_query_order_and_default_ports() -
             require_product_path=True,
         )
         == "https://[2001:db8::1]/products/a"
+    )
+    assert (
+        normalize(
+            "/coffee/kenya-aa",
+            base_url="https://vendor.example/collections/green",
+            require_product_path=True,
+        )
+        == "https://vendor.example/coffee/kenya-aa"
+    )
+    assert (
+        normalize(
+            "/shop/kenya-aa",
+            base_url="https://vendor.example/collections/green",
+            require_product_path=True,
+        )
+        == "https://vendor.example/shop/kenya-aa"
     )
 
 
@@ -781,7 +802,8 @@ async def test_extraction_cannot_ground_metadata_in_redacted_url_tokens() -> Non
             label="Mystery Lot",
             evidence=(
                 "Mystery Lot https://vendor.example/kenya/washed?token=secret "
-                "https%3A%2F%2Fvendor.example%2Fproducts%2Fa%3Fencoded_token%3Dsecret"
+                "https%3A%2F%2Fvendor.example%2Fproducts%2Fa%3Fencoded_token%3Dsecret "
+                "https%253A%252F%252Fvendor.example%252Fa%253Fnested_token%253Dsecret"
             ),
             source_order=0,
         )
@@ -792,7 +814,9 @@ async def test_extraction_cannot_ground_metadata_in_redacted_url_tokens() -> Non
         assert "token=secret" not in rendered
         assert "kenya/washed" not in rendered.casefold()
         assert "encoded_token" not in rendered
+        assert "nested_token" not in rendered
         assert "https%3a" not in rendered.casefold()
+        assert "https%253a" not in rendered.casefold()
         return ModelResponse(
             parts=[
                 ToolCallPart(
@@ -822,6 +846,52 @@ async def test_extraction_cannot_ground_metadata_in_redacted_url_tokens() -> Non
     assert extracted[0].name == "Mystery Lot"
     assert extracted[0].country is None
     assert extracted[0].processing is None
+
+
+@pytest.mark.asyncio
+async def test_extraction_does_not_ground_redaction_sentinel() -> None:
+    assert not catalogue._page_states_value(  # pyright: ignore[reportPrivateUsage]
+        "Mystery Lot [link]", "link"
+    )
+    page = _page("")
+    candidates = [
+        catalogue.CatalogueCandidate(
+            candidate_id="candidate-01",
+            product_url="https://vendor.example/products/mystery",
+            label="Mystery Lot",
+            evidence="Mystery Lot https://vendor.example/private?token=secret",
+            source_order=0,
+        )
+    ]
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert "[link]" in str(messages)
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "candidates": [
+                            {
+                                "candidate_id": "candidate-01",
+                                "name": "Mystery Lot",
+                                "country": "link",
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+
+    extracted = await catalogue._extract(  # pyright: ignore[reportPrivateUsage]
+        page,
+        candidates,
+        advisor_config=AdvisorConfig(),
+        sourcing_config=BeanSourcingConfig(),
+        diagnostics=BeanSourcingDiagnostics(),
+        model=FunctionModel(respond),
+    )
+    assert extracted[0].country is None
 
 
 @pytest.mark.asyncio

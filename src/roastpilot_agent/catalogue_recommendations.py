@@ -61,9 +61,15 @@ _MAX_CONTEXT_LINKS: Final = 8
 _MAX_PRODUCT_URL_CHARS: Final = 4096
 _MAX_ANCHORS_INSPECTED: Final = _MAX_DISCOVERED * 8
 _MAX_SCRIPTS_INSPECTED: Final = _MAX_DISCOVERED * 8
-_PRODUCT_PATH_SEGMENTS: Final = frozenset({"product", "products"})
+_PRODUCT_PATH_SEGMENTS: Final = frozenset(
+    {"bean", "beans", "coffee", "coffees", "item", "items", "product", "products", "shop", "store"}
+)
+_NAVIGATION_ROOT_SEGMENTS: Final = _PRODUCT_PATH_SEGMENTS | frozenset(
+    {"all", "catalog", "catalogue", "collection", "collections"}
+)
+_REDACTED_REFERENCE: Final = "[link]"
 _URL_START = re.compile(
-    r"(?:[a-z][a-z0-9+.-]*://|(?<![\w])[a-z][a-z0-9+.-]*:(?!//)(?=\S)|"
+    r"(?:[a-z][a-z0-9+.-]*://|(?<![\w])(?:blob|data|file|javascript|magnet|mailto|sms|tel|urn):(?=\S)|"
     r"(?<![\w])//|"
     r"(?<![\w@.])(?:\.\.?/)(?=[a-z0-9])|"
     r"(?<![\w@./])/(?!/|\d+(?:[.,]\d+)?(?=\s|$))(?=[a-z0-9])|"
@@ -293,10 +299,11 @@ def _same_origin_product_url(
     ):
         return None
     segments = [segment.casefold() for segment in parsed.path.split("/") if segment]
-    if require_product_path and not any(
-        segment in _PRODUCT_PATH_SEGMENTS for segment in segments[:-1]
-    ):
-        return None
+    if require_product_path:
+        if not segments or segments[-1] in _NAVIGATION_ROOT_SEGMENTS:
+            return None
+        if not any(segment in _PRODUCT_PATH_SEGMENTS for segment in segments[:-1]):
+            return None
     rendered_host = f"[{parsed_host}]" if ":" in parsed_host else parsed_host
     normalized_netloc = rendered_host
     if parsed_port is not None and parsed_port != parsed_default_port:
@@ -520,7 +527,11 @@ def _token_reference_spans(text: str) -> list[tuple[int, int]]:
             continue
         token = text[candidate_start:token_end]
         decoded_token = token
-        for _ in range(2):
+        # Every successful percent-decoding round shortens the token, so this
+        # input-derived limit reaches a stable value without an attacker being
+        # able to create an unbounded loop. Candidate evidence is capped at
+        # 1,200 characters before this helper runs.
+        for _ in range(len(token) // 2 + 1):
             next_token = unquote(decoded_token)
             if next_token == decoded_token:
                 break
@@ -528,7 +539,7 @@ def _token_reference_spans(text: str) -> list[tuple[int, int]]:
         if decoded_token != token and _URL_START.search(decoded_token) is not None:
             # Redact the original encoded token as one span. Decoding only
             # for classification preserves source offsets while covering
-            # encoded locators and query secrets, including one nested layer.
+            # encoded locators and query secrets at any representable depth.
             spans.append((candidate_start, token_end))
             continue
         # An unambiguous absolute/domain/root/dot-relative match gets a more
@@ -562,7 +573,7 @@ def _redact_urls(text: str) -> str:
     output: list[str] = []
     cursor = 0
     for start, end in merged:
-        output.extend((text[cursor:start], "[link]"))
+        output.extend((text[cursor:start], _REDACTED_REFERENCE))
         cursor = end
     output.append(text[cursor:])
     return "".join(output)
@@ -580,7 +591,8 @@ def _page_states_value(page_text: str, value: str) -> bool:
     needle = _normalized_words(value)
     if not needle:
         return False
-    return f" {needle} " in f" {_normalized_words(page_text)} "
+    grounding_text = page_text.replace(_REDACTED_REFERENCE, " ")
+    return f" {needle} " in f" {_normalized_words(grounding_text)} "
 
 
 async def _extract(
