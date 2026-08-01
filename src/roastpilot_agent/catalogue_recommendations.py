@@ -376,7 +376,11 @@ def _discover_catalogue_candidates_unchecked(
     )
     for anchor in anchors:
         href = anchor.get("href")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
-        label = _clean_text(" ".join(anchor.itertext()))  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        label = _clean_text(  # type: ignore[reportUnknownVariableType]
+            " ".join(  # type: ignore[reportUnknownMemberType]
+                islice(anchor.itertext(), _MAX_CONTEXT_TEXT_NODES)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+            )
+        )
         if isinstance(href, str) and label:
             raw.append((href, label, _anchor_candidate_evidence(anchor, label), True))
 

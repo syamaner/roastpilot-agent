@@ -116,6 +116,16 @@ def test_discovery_caps_card_evidence_text_nodes() -> None:
     assert "Node 69" not in candidates[0].evidence
 
 
+def test_discovery_caps_anchor_label_text_nodes() -> None:
+    nodes = "".join(f"<span>{index:02x}</span>" for index in range(70))
+    candidates = discover_catalogue_candidates(
+        _page(f'<a href="/products/kiambu">Kiambu{nodes}</a>')
+    )
+    assert "3e" in candidates[0].label
+    assert "3f" not in candidates[0].label
+    assert "45" not in candidates[0].label
+
+
 def test_discovery_rejects_evidence_from_wrapper_beyond_link_scan_cap() -> None:
     repeated = "".join('<a href="/products/kiambu">Kiambu</a>' for _ in range(9))
     html = f"<section>{repeated}<span>Neighbour Kenya Natural</span></section>"
