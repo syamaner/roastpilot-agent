@@ -5193,6 +5193,31 @@ async def test_catalogue_cancellation_while_waiting_to_swap_context_is_terminal(
 
 
 @pytest.mark.asyncio
+async def test_catalogue_active_run_recheck_error_is_terminal(
+    service: RoastService,
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    calls = 0
+    original_active_run = store.active_run
+
+    async def failing_second_active_run() -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return await original_active_run()
+        raise RuntimeError("synthetic active-run recheck failure")
+
+    monkeypatch.setattr(store, "active_run", failing_second_active_run)
+    with pytest.raises(RuntimeError, match="active-run recheck failure"):
+        await service.recommend_beans_from_catalogue("https://vendor.example/collections/green")
+    assert "catalogue recommendation active-run recheck failed" in caplog.text
+    assert await _catalogue_attempt_outcomes(store) == ["provider_error"]
+    assert not service._bean_draft_operations  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
 async def test_catalogue_context_error_propagates_logs_and_unregisters(
     service: RoastService,
     store: RoastStore,

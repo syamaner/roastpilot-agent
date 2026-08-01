@@ -1,10 +1,11 @@
 """Bounded, explainable green-coffee catalogue recommendations (D121, #573).
 
 The provider extracts typed identity metadata from one fetched collection page.
-It receives no URLs, tools, roast history, or operator notes. Product URLs are
-discovered and owned by deterministic code; ranking is deterministic local
-policy over aggregate roster/rating context. Selecting a result remains the
-existing single-product draft flow and explicit operator save.
+It receives no product locators, absolute or parameter-bearing references,
+tools, roast history, or operator notes. Product URLs are discovered and owned
+by deterministic code; ranking is deterministic local policy over aggregate
+roster/rating context. Selecting a result remains the existing single-product
+draft flow and explicit operator save.
 """
 
 from __future__ import annotations
@@ -62,7 +63,8 @@ _MAX_ANCHORS_INSPECTED: Final = _MAX_DISCOVERED * 8
 _MAX_SCRIPTS_INSPECTED: Final = _MAX_DISCOVERED * 8
 _PRODUCT_PATH_SEGMENTS: Final = frozenset({"product", "products"})
 _URL_START = re.compile(
-    r"(?:[a-z][a-z0-9+.-]*://|(?<![\w])//|"
+    r"(?:[a-z][a-z0-9+.-]*://|(?<![\w])[a-z][a-z0-9+.-]*:(?!//)(?=\S)|"
+    r"(?<![\w])//|"
     r"(?<![\w@.])(?:\.\.?/)(?=[a-z0-9])|"
     r"(?<![\w@./])/(?!/|\d+(?:[.,]\d+)?(?=\s|$))(?=[a-z0-9])|"
     r"(?<![\w@.?])(?:\?|#)(?=[a-z0-9._~-]+(?:=|%3d))|"
@@ -79,6 +81,8 @@ _KNOWN_RELATIVE_PATH_PREFIXES: Final = frozenset(
     {
         "bean",
         "beans",
+        "catalog",
+        "catalogue",
         "coffee",
         "coffees",
         "collection",
@@ -452,6 +456,16 @@ def _reference_end(text: str, start: int) -> int:
     end = start
     while end < len(text) and not text[end].isspace() and text[end] not in _REFERENCE_TERMINATORS:
         end += 1
+    if (
+        end < len(text)
+        and text[end] == ")"
+        and text[start] not in _REFERENCE_LEADING_PUNCTUATION
+        and "(" in text[start:end]
+    ):
+        # Consume the URI's own closing parenthesis (for example
+        # ``javascript:alert(1)``), while leaving an additional wrapper
+        # parenthesis outside the redacted span.
+        end += 1
     return end
 
 
@@ -476,6 +490,8 @@ def _token_reference_spans(text: str) -> list[tuple[int, int]]:
     preserved. A token is treated as a relative reference only when it carries
     a query/fragment assignment (including word- or email-glued spellings), or
     begins with a conventional catalogue path segment such as ``products/``.
+    Ambiguous bare ``word/word`` text is deliberately preserved: exhaustively
+    classifying it as a link would erase legitimate variety/process evidence.
     """
     spans: list[tuple[int, int]] = []
     cursor = 0

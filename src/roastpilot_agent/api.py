@@ -3350,6 +3350,19 @@ class RoastService:
                     claimable_draft=False,
                 )
                 raise
+            except Exception:
+                _log.warning(
+                    "catalogue recommendation active-run recheck failed",
+                    exc_info=True,
+                )
+                await self._finish_bean_attempt_bounded(
+                    attempt_id,
+                    outcome="provider_error",
+                    started_monotonic=started_monotonic,
+                    diagnostics=diagnostics,
+                    claimable_draft=False,
+                )
+                raise
             if active is not None:
                 await self._finish_bean_attempt_bounded(
                     attempt_id,

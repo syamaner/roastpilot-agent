@@ -168,6 +168,9 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
     assert redact("www.vendor.example/private?token=x washed") == "[link] washed"
     assert redact("vendor.example/private?token=x washed") == "[link] washed"
     assert redact("ftp://user:secret@vendor.example/private washed") == "[link] washed"
+    assert redact("data:text/plain;base64,c2VjcmV0 washed") == "[link] washed"
+    assert redact("mailto:sales@vendor.example washed") == "[link] washed"
+    assert redact("javascript:alert(1) washed") == "[link] washed"
     assert redact("192.0.2.1/private?token=x washed") == "[link] washed"
     assert redact("example.xn--p1ai/private?token=x washed") == "[link] washed"
     assert redact("https://[2001:db8::1]/private?token=x washed") == "[link] washed"
@@ -176,6 +179,8 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
     assert redact("../products/a?token=secret washed") == "[link] washed"
     assert redact("products/a?token=secret washed") == "[link] washed"
     assert redact("products/a washed") == "[link] washed"
+    assert redact("catalog/kenya washed") == "[link] washed"
+    assert redact("catalogue/kenya washed") == "[link] washed"
     assert redact("?token=secret washed") == "[link] washed"
     assert redact("#access_token=secret washed") == "[link] washed"
     assert redact("checkout?token=secret washed") == "[link] washed"
@@ -188,6 +193,8 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
     assert redact("1 /2 lb and 1/2 kg") == "1 /2 lb and 1/2 kg"
     assert redact("SL28/SL34 and Caturra/Castillo") == "SL28/SL34 and Caturra/Castillo"
     assert redact("washed/natural 12oz/340g AA/AB") == "washed/natural 12oz/340g AA/AB"
+    assert redact("faq/shipping washed") == "faq/shipping washed"
+    assert redact("Country: Kenya Process: washed") == "Country: Kenya Process: washed"
     assert redact("farmer@vendor.example washed") == "farmer@vendor.example washed"
 
 
