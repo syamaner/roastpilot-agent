@@ -97,6 +97,13 @@ def test_discovery_does_not_borrow_evidence_from_multi_product_wrapper() -> None
     assert [candidate.evidence for candidate in candidates] == ["Kiambu Lot", "Santos Lot"]
 
 
+def test_discovery_rejects_evidence_from_wrapper_beyond_link_scan_cap() -> None:
+    repeated = "".join('<a href="/products/kiambu">Kiambu</a>' for _ in range(9))
+    html = f"<section>{repeated}<span>Neighbour Kenya Natural</span></section>"
+    candidates = discover_catalogue_candidates(_page(html))
+    assert candidates[0].evidence == "Kiambu"
+
+
 def test_discovery_merges_richer_card_evidence_for_duplicate_json_ld_url() -> None:
     html = """
     <script type="application/ld+json">
@@ -141,6 +148,10 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
     assert redact("//vendor.example/private?token=x washed") == "[link] washed"
     assert redact("www.vendor.example/private?token=x washed") == "[link] washed"
     assert redact("vendor.example/private?token=x washed") == "[link] washed"
+    assert redact("ftp://user:secret@vendor.example/private washed") == "[link] washed"
+    assert redact("192.0.2.1/private?token=x washed") == "[link] washed"
+    assert redact("example.xn--p1ai/private?token=x washed") == "[link] washed"
+    assert redact("https://[2001:db8::1]/private?token=x washed") == "[link] washed"
     assert redact("farmer@vendor.example washed") == "farmer@vendor.example washed"
 
 
@@ -417,6 +428,39 @@ def test_rank_ties_preserve_collection_source_order_and_caps_at_three() -> None:
     assert result.extracted_count == 4
 
 
+def test_rank_maps_server_candidate_validation_drift_to_typed_error() -> None:
+    candidate = catalogue.CatalogueCandidate(
+        candidate_id="candidate-01",
+        product_url=r"https://vendor.example/\evil.example/products/a",
+        label="Kiambu",
+        evidence="Kiambu",
+        source_order=0,
+    )
+    extracted = catalogue._ExtractedCatalogueCandidate(  # pyright: ignore[reportPrivateUsage]
+        candidate_id="candidate-01", name="Kiambu"
+    )
+    empty = CatalogueRankingContext(
+        roster_countries=frozenset(),
+        roster_processes=frozenset(),
+        roster_pairs=frozenset(),
+        rated_pairs=frozenset(),
+    )
+    with pytest.raises(BeanExtractionError, match="failed output validation"):
+        rank_catalogue_candidates([candidate], [extracted], empty)
+    oversized = [
+        catalogue.CatalogueCandidate(
+            candidate_id=f"candidate-{index:02d}",
+            product_url=f"https://vendor.example/products/{index}",
+            label=f"Bean {index}",
+            evidence=f"Bean {index}",
+            source_order=index,
+        )
+        for index in range(1, 26)
+    ]
+    with pytest.raises(BeanExtractionError, match="list failed validation"):
+        rank_catalogue_candidates(oversized, [], empty)
+
+
 def test_rated_affinity_requires_an_exact_country_processing_pair() -> None:
     candidate = catalogue.CatalogueCandidate(
         candidate_id="candidate-01",
@@ -610,6 +654,54 @@ async def test_extraction_drops_unstated_country_and_processing_metadata() -> No
         diagnostics=BeanSourcingDiagnostics(),
         model=FunctionModel(respond),
     )
+    assert extracted[0].country is None
+    assert extracted[0].processing is None
+
+
+@pytest.mark.asyncio
+async def test_extraction_cannot_ground_metadata_in_redacted_url_tokens() -> None:
+    page = _page("")
+    candidates = [
+        catalogue.CatalogueCandidate(
+            candidate_id="candidate-01",
+            product_url="https://vendor.example/products/mystery",
+            label="Mystery Lot",
+            evidence="Mystery Lot https://vendor.example/kenya/washed?token=secret",
+            source_order=0,
+        )
+    ]
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        rendered = str(messages)
+        assert "token=secret" not in rendered
+        assert "kenya/washed" not in rendered.casefold()
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "candidates": [
+                            {
+                                "candidate_id": "candidate-01",
+                                "name": "Mystery Lot",
+                                "country": "Kenya",
+                                "processing": "washed",
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+
+    extracted = await catalogue._extract(  # pyright: ignore[reportPrivateUsage]
+        page,
+        candidates,
+        advisor_config=AdvisorConfig(),
+        sourcing_config=BeanSourcingConfig(),
+        diagnostics=BeanSourcingDiagnostics(),
+        model=FunctionModel(respond),
+    )
+    assert extracted[0].name == "Mystery Lot"
     assert extracted[0].country is None
     assert extracted[0].processing is None
 

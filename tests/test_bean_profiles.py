@@ -231,6 +231,19 @@ async def test_catalogue_success_retains_metrics_without_claimable_snapshot(
             catalogue_discovered_count=2,
             catalogue_extracted_count=1,
         )
+    with pytest.raises(ValueError, match="extracted count cannot exceed discovered count"):
+        await store.finish_bean_sourcing_attempt(
+            attempt_id,
+            outcome="success",
+            latency_ms=20,
+            request_tokens=4,
+            response_tokens=2,
+            usage_evidence="exact",
+            timed_out_runs=0,
+            claimable_draft=False,
+            catalogue_discovered_count=1,
+            catalogue_extracted_count=2,
+        )
 
 
 @pytest.mark.asyncio

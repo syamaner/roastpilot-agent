@@ -448,7 +448,7 @@ class RoastRunGoneError(Exception):
 class _BeanDraftOperation:
     """One registered bean-draft pipeline and its cancellation reason."""
 
-    task: asyncio.Task[Any]
+    task: asyncio.Task[BeanProfileDraft | CatalogueRecommendationList]
     preempted_by_start: bool = False
 
 
@@ -1423,7 +1423,9 @@ class RoastService:
         # Whole fetch+extraction tasks admitted while idle. Registration and
         # roast-start preemption both happen under _start_lock, closing the
         # check/register/start race without holding the lock across remote work.
-        self._bean_draft_operations: dict[asyncio.Task[Any], _BeanDraftOperation] = {}
+        self._bean_draft_operations: dict[
+            asyncio.Task[BeanProfileDraft | CatalogueRecommendationList], _BeanDraftOperation
+        ] = {}
         self._bean_draft_expiry_wakeup = asyncio.Event()
         self._bean_draft_expiry_task: asyncio.Task[None] | None = None
         # The phase-validity pre-check shares the run's configured safety
@@ -3239,6 +3241,7 @@ class RoastService:
                     outcome="cancelled",
                     started_monotonic=started_monotonic,
                     diagnostics=diagnostics,
+                    claimable_draft=False,
                 )
                 raise asyncio.CancelledError
             lease_heartbeat = asyncio.create_task(
@@ -3267,6 +3270,7 @@ class RoastService:
                     outcome="preempted" if preempted else "cancelled",
                     started_monotonic=started_monotonic,
                     diagnostics=diagnostics,
+                    claimable_draft=False,
                 )
                 if outer_task is not None and outer_task.cancelling() == 0 and preempted:
                     raise RoastRunConflictError(
@@ -3281,6 +3285,7 @@ class RoastService:
                         outcome="cancelled",
                         started_monotonic=started_monotonic,
                         diagnostics=diagnostics,
+                        claimable_draft=False,
                     )
                     raise asyncio.CancelledError from None
                 if operation.preempted_by_start:
@@ -3289,6 +3294,7 @@ class RoastService:
                         outcome="preempted",
                         started_monotonic=started_monotonic,
                         diagnostics=diagnostics,
+                        claimable_draft=False,
                     )
                     raise RoastRunConflictError(
                         "catalogue recommendation was preempted by a roast-start attempt"
@@ -3306,6 +3312,7 @@ class RoastService:
                     outcome=outcome,
                     started_monotonic=started_monotonic,
                     diagnostics=diagnostics,
+                    claimable_draft=False,
                 )
                 raise
             outer_task = asyncio.current_task()
@@ -3315,6 +3322,7 @@ class RoastService:
                     outcome="cancelled",
                     started_monotonic=started_monotonic,
                     diagnostics=diagnostics,
+                    claimable_draft=False,
                 )
                 raise asyncio.CancelledError
             if operation.preempted_by_start:
@@ -3323,6 +3331,7 @@ class RoastService:
                     outcome="preempted",
                     started_monotonic=started_monotonic,
                     diagnostics=diagnostics,
+                    claimable_draft=False,
                 )
                 raise RoastRunConflictError(
                     "catalogue recommendation was preempted by a roast-start attempt"

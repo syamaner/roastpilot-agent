@@ -826,8 +826,8 @@ precedent: this is bean metadata, not a safety verdict, so it stays OUT of
 the enum surface the safety-reviewer escalation routes on."""
 
 
-_UNTRUSTED_TEXT_BIDI_CONTROLS = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
-_UNTRUSTED_URL_UNSAFE_CHARACTERS = re.compile(r"[\x00-\x20\\\x7f]")
+UNTRUSTED_TEXT_BIDI_CONTROLS = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+UNTRUSTED_URL_UNSAFE_CHARACTERS = re.compile(r"[\x00-\x20\\\x7f]")
 
 
 class BeanProfileDraft(_BeanProfileFieldsBase):
@@ -882,7 +882,7 @@ class BeanProfileDraft(_BeanProfileFieldsBase):
     def _strip_bidi_controls(cls, value: object) -> object:
         """Remove non-content bidi controls from untrusted drafted identity text."""
         if isinstance(value, str):
-            return _UNTRUSTED_TEXT_BIDI_CONTROLS.sub("", value)
+            return UNTRUSTED_TEXT_BIDI_CONTROLS.sub("", value)
         return value
 
     draft_attempt_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
@@ -969,8 +969,8 @@ class CatalogueRecommendation(BaseModel):
     def _reject_bidi_controls_in_product_url(cls, value: object) -> object:
         """Reject display-reordering and browser-ambiguous URL characters."""
         if isinstance(value, str) and (
-            _UNTRUSTED_TEXT_BIDI_CONTROLS.search(value)
-            or _UNTRUSTED_URL_UNSAFE_CHARACTERS.search(value)
+            UNTRUSTED_TEXT_BIDI_CONTROLS.search(value)
+            or UNTRUSTED_URL_UNSAFE_CHARACTERS.search(value)
         ):
             raise ValueError("product URL contains unsafe display characters")
         return value
@@ -980,10 +980,10 @@ class CatalogueRecommendation(BaseModel):
     def _strip_bidi_controls(cls, value: object) -> object:
         """Remove display-reordering controls from untrusted recommendation text."""
         if isinstance(value, str):
-            return _UNTRUSTED_TEXT_BIDI_CONTROLS.sub("", value)
+            return UNTRUSTED_TEXT_BIDI_CONTROLS.sub("", value)
         if isinstance(value, list):
             return [
-                _UNTRUSTED_TEXT_BIDI_CONTROLS.sub("", item) if isinstance(item, str) else item
+                UNTRUSTED_TEXT_BIDI_CONTROLS.sub("", item) if isinstance(item, str) else item
                 for item in cast(list[object], value)
             ]
         return value

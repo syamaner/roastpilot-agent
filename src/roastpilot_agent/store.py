@@ -2563,6 +2563,12 @@ class RoastStore:
             raise ValueError("a nonclaimable catalogue success requires aggregate counts")
         if claimable_draft and any(value is not None for value in catalogue_counts):
             raise ValueError("a claimable bean draft cannot carry catalogue counts")
+        if (
+            catalogue_discovered_count is not None
+            and catalogue_extracted_count is not None
+            and catalogue_extracted_count > catalogue_discovered_count
+        ):
+            raise ValueError("catalogue extracted count cannot exceed discovered count")
         if outcome == "success" and draft is not None:
             # Single-product success carries one claimable draft baseline.
             # Catalogue success deliberately carries no draft: it records only
