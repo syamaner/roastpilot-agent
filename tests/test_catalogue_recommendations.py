@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
@@ -207,6 +208,7 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
         "[link] washed"
     )
     assert redact("https%25253A%25252F%25252Fvendor.example%25252Fa washed") == "[link] washed"
+    assert redact("products%2Fkenya%3Ftoken%3DSECRET washed") == "[link] washed"
     assert redact("products%252Fkenya%253Ftoken%253DSECRET washed") == "[link] washed"
     assert redact("1 /2 lb and 1/2 kg") == "1 /2 lb and 1/2 kg"
     assert redact("SL28/SL34 and Caturra/Castillo") == "SL28/SL34 and Caturra/Castillo"
@@ -1279,60 +1281,69 @@ async def test_provider_owns_full_timeout_and_records_usage_after_preparation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     timeout_budgets: list[float | None] = []
+    active_timeout_budgets: list[float | None] = []
+    provider_timeout_context: tuple[float | None, ...] | None = None
     real_timeout = asyncio.timeout
 
-    def tracked_timeout(delay: float | None) -> asyncio.Timeout:
+    @asynccontextmanager
+    async def tracked_timeout(delay: float | None) -> AsyncGenerator[asyncio.Timeout]:
         timeout_budgets.append(delay)
-        return real_timeout(delay)
+        async with real_timeout(delay) as deadline:
+            active_timeout_budgets.append(delay)
+            try:
+                yield deadline
+            finally:
+                assert active_timeout_budgets.pop() == delay
 
     async def fetched(*args: object, **kwargs: object) -> FetchedVendorPage:
         del args, kwargs
         return _page('<a href="/products/kenya">Kenya Kiambu</a>')
 
-    observed_diagnostics: BeanSourcingDiagnostics | None = None
-
-    async def timed_out_extract(
-        page: FetchedVendorPage,
-        candidates: list[catalogue.CatalogueCandidate],
-        *,
-        advisor_config: AdvisorConfig,
-        sourcing_config: BeanSourcingConfig,
-        diagnostics: BeanSourcingDiagnostics,
-        model: Model | None,
-    ) -> list[object]:
-        del page, candidates, advisor_config, sourcing_config, model
-        nonlocal observed_diagnostics
-        observed_diagnostics = diagnostics
-        diagnostics.timed_out_runs += 1
-        diagnostics.usage_unreported_requests += 1
-        raise BeanExtractionUnavailableError("catalogue extraction exceeded its deadline")
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        nonlocal provider_timeout_context
+        provider_timeout_context = tuple(active_timeout_budgets)
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "candidates": [
+                            {
+                                "candidate_id": "candidate-01",
+                                "name": "Kenya Kiambu",
+                            }
+                        ]
+                    },
+                )
+            ],
+            usage=RequestUsage(input_tokens=5, output_tokens=2),
+        )
 
     monkeypatch.setattr(catalogue, "fetch_vendor_page", fetched)
-    monkeypatch.setattr(catalogue, "_extract", timed_out_extract)
     monkeypatch.setattr(asyncio, "timeout", tracked_timeout)
     diagnostics = BeanSourcingDiagnostics()
-    with pytest.raises(BeanExtractionUnavailableError, match="extraction exceeded"):
-        await recommend_from_catalogue(
-            "https://vendor.example/collections/green",
-            context=CatalogueRankingContext(
-                roster_countries=frozenset(),
-                roster_processes=frozenset(),
-                roster_pairs=frozenset(),
-                rated_pairs=frozenset(),
-            ),
-            advisor_config=AdvisorConfig(),
-            sourcing_config=BeanSourcingConfig(
-                fetch_timeout_seconds=2.0,
-                extraction_timeout_seconds=11.0,
-            ),
-            diagnostics=diagnostics,
-            model=FunctionModel(lambda messages, info: ModelResponse(parts=[])),
-        )
-    assert observed_diagnostics is diagnostics
-    assert timeout_budgets == [6.0, 2.0]
-    assert 11.0 not in timeout_budgets
-    assert diagnostics.timed_out_runs == 1
-    assert diagnostics.usage_unreported_requests == 1
+    result = await recommend_from_catalogue(
+        "https://vendor.example/collections/green",
+        context=CatalogueRankingContext(
+            roster_countries=frozenset(),
+            roster_processes=frozenset(),
+            roster_pairs=frozenset(),
+            rated_pairs=frozenset(),
+        ),
+        advisor_config=AdvisorConfig(),
+        sourcing_config=BeanSourcingConfig(
+            fetch_timeout_seconds=2.0,
+            extraction_timeout_seconds=11.0,
+        ),
+        diagnostics=diagnostics,
+        model=FunctionModel(respond),
+    )
+    assert result.recommendations[0].candidate_id == "candidate-01"
+    assert timeout_budgets == [6.0, 2.0, 11.0]
+    assert provider_timeout_context == (11.0,)
+    assert diagnostics.timed_out_runs == 0
+    assert (diagnostics.request_tokens, diagnostics.response_tokens) == (5, 2)
 
 
 @pytest.mark.asyncio
