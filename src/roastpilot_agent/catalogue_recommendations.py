@@ -18,7 +18,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from itertools import islice
 from typing import Any, Final, cast
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 import httpx
 import lxml.etree  # type: ignore[import-untyped]
@@ -162,13 +162,15 @@ def _json_ld_product_evidence(block: dict[str, object], name: str) -> str:
     """Build bounded, product-local evidence from selected JSON-LD fields."""
     values: list[str] = [name]
     for key in (
-        "description",
         "country",
         "countryOfOrigin",
         "origin",
         "processing",
         "process",
         "category",
+        # Free-form copy can consume the entire evidence budget. Keep it
+        # last so exact structured identity fields always reach the model.
+        "description",
     ):
         value = block.get(key)
         if isinstance(value, str):
@@ -517,6 +519,18 @@ def _token_reference_spans(text: str) -> list[tuple[int, int]]:
         if candidate_start >= token_end:
             continue
         token = text[candidate_start:token_end]
+        decoded_token = token
+        for _ in range(2):
+            next_token = unquote(decoded_token)
+            if next_token == decoded_token:
+                break
+            decoded_token = next_token
+        if decoded_token != token and _URL_START.search(decoded_token) is not None:
+            # Redact the original encoded token as one span. Decoding only
+            # for classification preserves source offsets while covering
+            # encoded locators and query secrets, including one nested layer.
+            spans.append((candidate_start, token_end))
+            continue
         # An unambiguous absolute/domain/root/dot-relative match gets a more
         # precise span from ``_URL_START`` below; do not widen it to swallow a
         # legitimate product word glued immediately before the URL.

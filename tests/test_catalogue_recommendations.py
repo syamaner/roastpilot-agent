@@ -200,6 +200,12 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
     assert redact("((( washed") == "((( washed"
     assert redact("orders@vendor.example/track?id=1 washed") == "[link] washed"
     assert redact("misc/path?token=secret washed") == "[link] washed"
+    assert redact("https%3A%2F%2Fvendor.example%2Fproducts%2Fa%3Ftoken%3Dx washed") == (
+        "[link] washed"
+    )
+    assert redact("redirect=https%253A%252F%252Fvendor.example%252Fa%253Ftoken%253Dx washed") == (
+        "[link] washed"
+    )
     assert redact("1 /2 lb and 1/2 kg") == "1 /2 lb and 1/2 kg"
     assert redact("SL28/SL34 and Caturra/Castillo") == "SL28/SL34 and Caturra/Castillo"
     assert redact("washed/natural 12oz/340g AA/AB") == "washed/natural 12oz/340g AA/AB"
@@ -224,6 +230,21 @@ def test_json_ld_flattener_handles_graph_item_list_nested_item_and_noise() -> No
         {"origin": {"name": 7}, "description": "Washed lot"}, "A"
     )
     assert evidence == "A Washed lot"
+
+
+def test_json_ld_evidence_preserves_structured_fields_before_long_description() -> None:
+    evidence = catalogue._json_ld_product_evidence(  # pyright: ignore[reportPrivateUsage]
+        {
+            "description": "marketing " * 300,
+            "countryOfOrigin": {"name": "Kenya"},
+            "process": "washed",
+        },
+        "Kiambu Lot",
+    )
+
+    assert len(evidence) <= 1200
+    assert "Kenya" in evidence
+    assert "washed" in evidence
 
 
 @pytest.mark.parametrize(
@@ -758,7 +779,10 @@ async def test_extraction_cannot_ground_metadata_in_redacted_url_tokens() -> Non
             candidate_id="candidate-01",
             product_url="https://vendor.example/products/mystery",
             label="Mystery Lot",
-            evidence="Mystery Lot https://vendor.example/kenya/washed?token=secret",
+            evidence=(
+                "Mystery Lot https://vendor.example/kenya/washed?token=secret "
+                "https%3A%2F%2Fvendor.example%2Fproducts%2Fa%3Fencoded_token%3Dsecret"
+            ),
             source_order=0,
         )
     ]
@@ -767,6 +791,8 @@ async def test_extraction_cannot_ground_metadata_in_redacted_url_tokens() -> Non
         rendered = str(messages)
         assert "token=secret" not in rendered
         assert "kenya/washed" not in rendered.casefold()
+        assert "encoded_token" not in rendered
+        assert "https%3a" not in rendered.casefold()
         return ModelResponse(
             parts=[
                 ToolCallPart(
