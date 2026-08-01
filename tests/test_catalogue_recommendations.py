@@ -85,6 +85,18 @@ def test_discovery_retains_candidate_local_card_and_json_ld_evidence() -> None:
     assert "Kenya" not in candidates[2].evidence
 
 
+def test_discovery_does_not_borrow_evidence_from_multi_product_wrapper() -> None:
+    html = """
+    <section>
+      <a href="/products/kiambu">Kiambu Lot</a>
+      <a href="/products/santos">Santos Lot</a>
+      <span>Kenya · Washed</span>
+    </section>
+    """
+    candidates = discover_catalogue_candidates(_page(html))
+    assert [candidate.evidence for candidate in candidates] == ["Kiambu Lot", "Santos Lot"]
+
+
 def test_discovery_merges_richer_card_evidence_for_duplicate_json_ld_url() -> None:
     html = """
     <script type="application/ld+json">
@@ -118,14 +130,18 @@ def test_discovery_rejects_userinfo_and_non_product_anchor_paths() -> None:
     assert discover_catalogue_candidates(page) == []
 
 
-def test_provider_text_redacts_absolute_urls_without_touching_product_words() -> None:
-    redact = catalogue._redact_absolute_urls  # pyright: ignore[reportPrivateUsage]
+def test_provider_text_redacts_url_forms_without_touching_product_words() -> None:
+    redact = catalogue._redact_urls  # pyright: ignore[reportPrivateUsage]
     assert redact("Kenya HTTPS://vendor.example/products/a?token=x washed") == (
         "Kenya [link] washed"
     )
     assert redact("ß" * 45 + "https://vendor.example/products/a?token=x washed") == (
         "ß" * 45 + "[link] washed"
     )
+    assert redact("//vendor.example/private?token=x washed") == "[link] washed"
+    assert redact("www.vendor.example/private?token=x washed") == "[link] washed"
+    assert redact("vendor.example/private?token=x washed") == "[link] washed"
+    assert redact("farmer@vendor.example washed") == "farmer@vendor.example washed"
 
 
 def test_json_ld_flattener_handles_graph_item_list_nested_item_and_noise() -> None:
@@ -196,6 +212,14 @@ def test_candidate_url_normalization_preserves_query_order_and_default_ports() -
         )
         == "https://vendor.example:8443/products/a"
     )
+    assert (
+        normalize(
+            "https://[2001:db8::1]/products/a",
+            base_url="https://[2001:db8::1]/collections/green",
+            require_product_path=True,
+        )
+        == "https://[2001:db8::1]/products/a"
+    )
 
 
 @pytest.mark.parametrize(
@@ -217,6 +241,19 @@ def test_candidate_url_normalization_rejects_wrong_port_and_bidi(value: str) -> 
     )
 
 
+def test_candidate_url_normalization_rejects_browser_ambiguous_characters() -> None:
+    normalize = catalogue._same_origin_product_url  # pyright: ignore[reportPrivateUsage]
+    for value in (r"/\evil.example/products/a", "/products/a\nignored"):
+        assert (
+            normalize(
+                value,
+                base_url="https://vendor.example/collections/green",
+                require_product_path=True,
+            )
+            is None
+        )
+
+
 def test_discovery_fails_soft_on_empty_and_malformed_json_ld() -> None:
     assert discover_catalogue_candidates(_page("")) == []
     assert (
@@ -233,6 +270,28 @@ def test_discovery_fails_soft_on_empty_and_malformed_json_ld() -> None:
         )
         == []
     )
+
+
+def test_discovery_ignores_fragment_only_json_ld_product_identifier() -> None:
+    html = """
+    <script type="application/ld+json">
+      {"@type":"Product","name":"Not a locator","@id":"#product"}
+    </script>
+    """
+    assert discover_catalogue_candidates(_page(html)) == []
+
+
+def test_discovery_caps_matching_json_ld_after_skipping_ordinary_scripts() -> None:
+    html = "".join("<script>analytics</script>" for _ in range(24))
+    html += """
+    <script type="Application/LD+JSON; charset=utf-8">
+      {"@type":"Product","name":"Bean Route","url":"/beans/route"}
+    </script>
+    """
+    candidates = discover_catalogue_candidates(_page(html))
+    assert [(candidate.label, candidate.product_url) for candidate in candidates] == [
+        ("Bean Route", "https://vendor.example/beans/route")
+    ]
 
 
 def test_discovery_fails_soft_on_unexpected_parser_escape(
@@ -252,6 +311,16 @@ def test_discovery_caps_candidates_at_twenty_four() -> None:
     assert len(candidates) == 24
     assert candidates[-1].candidate_id == "candidate-24"
 
+    json_ld_html = "".join(
+        '<script type="application/ld+json">'
+        f'{{"@type":"Product","name":"Bean {index}","url":"/beans/{index}"}}'
+        "</script>"
+        for index in range(25)
+    )
+    json_ld_candidates = discover_catalogue_candidates(_page(json_ld_html))
+    assert len(json_ld_candidates) == 24
+    assert json_ld_candidates[-1].label == "Bean 23"
+
 
 def test_discovery_caps_anchor_inspection_work() -> None:
     html = "".join(f'<a href="/about/{index}">Noise {index}</a>' for index in range(192))
@@ -263,16 +332,16 @@ def test_deterministic_rank_combines_roster_gap_and_rated_affinity() -> None:
     candidates = [
         catalogue.CatalogueCandidate(
             candidate_id="candidate-01",
-            product_url="https://vendor.example/products/kenya",
-            label="Kenya Kiambu",
-            evidence="Kenya Kiambu",
+            product_url="https://vendor.example/products/brazil",
+            label="Brazil Santos",
+            evidence="Brazil Santos",
             source_order=0,
         ),
         catalogue.CatalogueCandidate(
             candidate_id="candidate-02",
-            product_url="https://vendor.example/products/brazil",
-            label="Brazil Santos",
-            evidence="Brazil Santos",
+            product_url="https://vendor.example/products/kenya",
+            label="Kenya Kiambu",
+            evidence="Kenya Kiambu",
             source_order=1,
         ),
     ]
@@ -280,17 +349,17 @@ def test_deterministic_rank_combines_roster_gap_and_rated_affinity() -> None:
         catalogue._ExtractedCatalogueCandidate.model_validate(  # pyright: ignore[reportPrivateUsage]
             {
                 "candidate_id": "candidate-01",
-                "name": "Kenya Kiambu",
-                "country": "Kenya",
-                "processing": "washed",
+                "name": "Brazil Santos",
+                "country": "Brazil",
+                "processing": "natural",
             }
         ),
         catalogue._ExtractedCatalogueCandidate.model_validate(  # pyright: ignore[reportPrivateUsage]
             {
                 "candidate_id": "candidate-02",
-                "name": "Brazil Santos",
-                "country": "Brazil",
-                "processing": "natural",
+                "name": "Kenya Kiambu",
+                "country": "Kenya",
+                "processing": "washed",
             }
         ),
     ]
@@ -302,8 +371,8 @@ def test_deterministic_rank_combines_roster_gap_and_rated_affinity() -> None:
     )
     result = rank_catalogue_candidates(candidates, extracted, context)
     assert [item.candidate_id for item in result.recommendations] == [
-        "candidate-01",
         "candidate-02",
+        "candidate-01",
     ]
     assert result.recommendations[0].score == 4
     assert result.recommendations[0].reason_codes == [
@@ -465,6 +534,33 @@ async def test_extraction_drops_unknown_and_invented_candidate_results() -> None
         )
 
     with pytest.raises(BeanExtractionError, match="no supported"):
+        await catalogue._extract(  # pyright: ignore[reportPrivateUsage]
+            page,
+            candidates,
+            advisor_config=AdvisorConfig(),
+            sourcing_config=BeanSourcingConfig(),
+            diagnostics=BeanSourcingDiagnostics(),
+            model=FunctionModel(respond),
+        )
+
+
+@pytest.mark.asyncio
+async def test_extraction_maps_malformed_candidate_id_to_typed_unavailable_error() -> None:
+    page = _page('<a href="/products/kenya">Kenya Kiambu</a>')
+    candidates = discover_catalogue_candidates(page)
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {"candidates": [{"candidate_id": "https://evil.example", "name": "Kenya"}]},
+                )
+            ]
+        )
+
+    with pytest.raises(BeanExtractionUnavailableError, match="no usable result"):
         await catalogue._extract(  # pyright: ignore[reportPrivateUsage]
             page,
             candidates,

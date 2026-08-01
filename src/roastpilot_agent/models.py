@@ -13,7 +13,7 @@ import json
 import re
 from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
@@ -827,6 +827,7 @@ the enum surface the safety-reviewer escalation routes on."""
 
 
 _UNTRUSTED_TEXT_BIDI_CONTROLS = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+_UNTRUSTED_URL_UNSAFE_CHARACTERS = re.compile(r"[\x00-\x20\\\x7f]")
 
 
 class BeanProfileDraft(_BeanProfileFieldsBase):
@@ -961,14 +962,17 @@ class CatalogueRecommendation(BaseModel):
     processing: ProcessingMethod | None = None
     score: int = Field(ge=0)
     reason_codes: list[CatalogueReasonCode] = Field(max_length=5)
-    reasons: list[str] = Field(max_length=5)
+    reasons: list[Annotated[str, Field(max_length=600)]] = Field(max_length=5)
 
     @field_validator("product_url", mode="before")
     @classmethod
     def _reject_bidi_controls_in_product_url(cls, value: object) -> object:
-        """Reject display-reordering controls without changing URL semantics."""
-        if isinstance(value, str) and _UNTRUSTED_TEXT_BIDI_CONTROLS.search(value):
-            raise ValueError("product URL must not contain bidirectional controls")
+        """Reject display-reordering and browser-ambiguous URL characters."""
+        if isinstance(value, str) and (
+            _UNTRUSTED_TEXT_BIDI_CONTROLS.search(value)
+            or _UNTRUSTED_URL_UNSAFE_CHARACTERS.search(value)
+        ):
+            raise ValueError("product URL contains unsafe display characters")
         return value
 
     @field_validator("name", "country", "reasons", mode="before")

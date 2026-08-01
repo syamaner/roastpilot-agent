@@ -4888,15 +4888,17 @@ async def test_catalogue_service_records_nonclaimable_terminal_attempt(
         "https://vendor.example/collections/green?secret=no-store"
     )
     assert result.discovered_count == 2
-    async with store.connection.execute(
-        "SELECT prompt_version, outcome, request_tokens, response_tokens,"
-        " catalogue_discovered_count, catalogue_extracted_count,"
-        " draft_snapshot_json FROM bean_sourcing_attempts"
-    ) as cursor:
+    async with store.connection.execute("SELECT * FROM bean_sourcing_attempts") as cursor:
         row = await cursor.fetchone()
     assert row is not None
-    assert tuple(row) == ("v1-catalogue-v1", "success", 9, 3, 2, 1, None)
-    assert "vendor.example" not in json.dumps(dict(row))
+    assert row["prompt_version"] == "v1-catalogue-v1"
+    assert row["outcome"] == "success"
+    assert (row["request_tokens"], row["response_tokens"]) == (9, 3)
+    assert (row["catalogue_discovered_count"], row["catalogue_extracted_count"]) == (2, 1)
+    assert row["draft_snapshot_json"] is None
+    persisted = json.dumps(dict(row))
+    assert "vendor.example" not in persisted
+    assert "secret=no-store" not in persisted
 
 
 @pytest.mark.asyncio

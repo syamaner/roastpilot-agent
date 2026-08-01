@@ -449,6 +449,14 @@ async def test_v15_migration_adds_catalogue_counts_to_real_v14_database(
             (attempt_id,),
         )
         assert row == (None, None)
+        for discovered_count, extracted_count in ((25, 1), (1, 2)):
+            with pytest.raises(aiosqlite_module.IntegrityError):
+                await upgraded.connection.execute(
+                    "UPDATE bean_sourcing_attempts SET catalogue_discovered_count = ?,"
+                    " catalogue_extracted_count = ? WHERE id = ?",
+                    (discovered_count, extracted_count, attempt_id),
+                )
+            await upgraded.connection.rollback()
     finally:
         await upgraded.close()
 
