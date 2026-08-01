@@ -1614,6 +1614,12 @@ class RoastService:
                     f"a roast is already active (run {active.run_id}, phase "
                     f"{active.agent_phase.value}); end it before starting another"
                 )
+            if self._mcp is not None and self._mcp.stop_unconfirmed:
+                raise RoastRunConflictError(
+                    "MCP child teardown was unconfirmed; verify the roaster and old MCP "
+                    "child resources are inactive, complete the explicit hardware-clear "
+                    "acknowledgement, then retry"
+                )
             await self._preempt_bean_drafts_for_roast_start()
             # Reload effective config from the saved file + env (D76/D78).
             # Only in live-serve mode (``_live_serve_mode=True``, set by
@@ -3453,9 +3459,6 @@ _DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES = 64 * 1024
 _DRAFT_BEAN_FROM_URL_TOO_LONG_DETAIL = (
     f"URL exceeds {_DRAFT_BEAN_FROM_URL_MAX_URL_CHARS}-character limit"
 )
-_DRAFT_BEAN_FROM_URL_BODY_TOO_LARGE_DETAIL = (
-    f"request body exceeds {_DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES}-byte limit"
-)
 
 
 class DraftBeanFromUrlRequest(BaseModel):
@@ -3545,7 +3548,7 @@ class _RouteBodyLimitMiddleware:
     async def _reject(self, scope: Scope, receive: Receive, send: Send) -> None:
         response = JSONResponse(
             status_code=413,
-            content={"detail": _DRAFT_BEAN_FROM_URL_BODY_TOO_LARGE_DETAIL},
+            content={"detail": f"request body exceeds {self._max_body_bytes}-byte limit"},
         )
         await response(scope, receive, send)
 

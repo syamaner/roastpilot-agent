@@ -29,7 +29,7 @@ import pytest
 import pytest_asyncio
 from mcp import StdioServerParameters
 
-from roastpilot_agent.api import RoastService
+from roastpilot_agent.api import RoastRunConflictError, RoastService
 from roastpilot_agent.config import MCPDeviceConfig
 from roastpilot_agent.config_store import (
     AppConfigEdit,
@@ -627,9 +627,9 @@ async def test_unconfirmed_stop_aborts_respawn(
     # Baseline must be None — not the stale old value.
     assert svc._spawned_mcp_device is None  # pyright: ignore[reportPrivateUsage]
 
-    with pytest.raises(MCPConnErr, match=restart_message):
+    with pytest.raises(RoastRunConflictError, match=restart_message):
         await svc.start_roast(RoastProfile(**_profile()))
-    assert fake_mcp.calls == ["stop", "stop"]
+    assert fake_mcp.calls == ["stop"]
 
 
 # ---------------------------------------------------------------------------

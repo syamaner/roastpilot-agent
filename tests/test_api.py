@@ -465,6 +465,28 @@ async def test_start_roast_rejects_invalid_profile(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_roast_requires_pending_hardware_clear_acknowledgement(
+    store: RoastStore,
+) -> None:
+    """A matching saved device config cannot bypass teardown uncertainty."""
+    process = MCPServerProcess()
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
+    roaster = mock.Mock()
+    service = RoastService(store, mcp=process, roaster=roaster)
+    service.set_spawned_mcp_device(MCPDeviceConfig())
+
+    with pytest.raises(RoastRunConflictError, match="hardware-clear acknowledgement"):
+        await service.start_roast(_profile())
+
+    assert await store.active_run() is None
+    assert service.active_run_id is None
+    assert process.stop_unconfirmed is True
+    assert process.teardown_incident_id == "a" * 32
+    assert roaster.mock_calls == []
+
+
+@pytest.mark.asyncio
 async def test_acknowledge_hardware_clear_audits_before_clearing_process_state(
     store: RoastStore,
 ) -> None:
@@ -690,6 +712,7 @@ async def test_acknowledge_hardware_clear_rate_limits_without_audit_growth(
     assert limited.status_code == 429
     assert limited.headers["retry-after"] == "1"
     assert oversized.status_code == 413
+    assert oversized.json() == {"detail": "request body exceeds 2048-byte limit"}
     async with store.connection.execute(
         "SELECT COUNT(*) FROM operator_actions WHERE action = 'acknowledge_mcp_hardware_clear'"
     ) as cursor:
