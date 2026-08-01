@@ -589,6 +589,20 @@ async def test_acknowledge_hardware_clear_rejects_active_recovery_and_replay(
 
 
 @pytest.mark.asyncio
+async def test_acknowledge_hardware_clear_requires_configured_mcp(store: RoastStore) -> None:
+    """API-only mode cannot acknowledge a lifecycle it does not own."""
+    service = RoastService(store)
+    request = HardwareClearAcknowledgementRequest(
+        hardware_clear=True,
+        teardown_incident_id="a" * 32,
+        reason="physical controls verified off",
+    )
+
+    with pytest.raises(RoastRunConflictError, match="no MCP child lifecycle"):
+        await service.acknowledge_hardware_clear(request)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "payload",
     [

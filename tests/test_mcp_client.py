@@ -1625,6 +1625,34 @@ def test_hardware_clear_acknowledgement_rejects_attached_session() -> None:
     assert process.teardown_incident_id == "a" * 32
 
 
+def test_hardware_clear_acknowledgement_requires_incident_identity() -> None:
+    """Legacy/corrupt uncertain state without an incident remains blocked."""
+    process = MCPServerProcess()
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(MCPConnectionError, match="no acknowledgement identity"):
+        process.acknowledge_hardware_clear("a" * 32)
+
+    assert process.stop_unconfirmed is True
+
+
+def test_hardware_clear_acknowledgement_removes_rendered_generation_config(
+    tmp_path: Path,
+) -> None:
+    """Acknowledgement discards the uncertain generation's rendered config."""
+    rendered = tmp_path / "rendered-config"
+    rendered.mkdir()
+    process = MCPServerProcess()
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
+    process._rendered_yaml_dir = rendered  # pyright: ignore[reportPrivateUsage]
+
+    process.acknowledge_hardware_clear("a" * 32)
+
+    assert not rendered.exists()
+    assert process._rendered_yaml_dir is None  # pyright: ignore[reportPrivateUsage]
+
+
 def test_unconfirmed_teardown_mints_a_distinct_incident_per_lifecycle() -> None:
     """A delayed acknowledgement token cannot name a later teardown incident."""
     process = MCPServerProcess(force_terminate=lambda: True)
