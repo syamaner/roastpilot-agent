@@ -942,6 +942,37 @@ class BeanProfileDraft(_BeanProfileFieldsBase):
     fixed recipe."""
 
 
+CatalogueReasonCode = Literal[
+    "missing_country",
+    "missing_processing",
+    "novel_country_processing",
+    "rated_country_affinity",
+    "rated_processing_affinity",
+]
+"""Deterministic local reason codes for a catalogue recommendation (D121)."""
+
+
+class CatalogueRecommendation(BaseModel):
+    """One read-only, explainable product recommendation from a catalogue."""
+
+    candidate_id: str = Field(pattern=r"^candidate-[0-9]{2}$")
+    product_url: str = Field(min_length=1, max_length=4096)
+    name: str = Field(min_length=1, max_length=500)
+    country: str | None = Field(default=None, max_length=500)
+    processing: ProcessingMethod | None = None
+    score: int = Field(ge=0)
+    reason_codes: list[CatalogueReasonCode] = Field(max_length=5)
+    reasons: list[str] = Field(max_length=5)
+
+
+class CatalogueRecommendationList(BaseModel):
+    """Bounded recommendations returned for one fetch-fresh catalogue page."""
+
+    recommendations: list[CatalogueRecommendation] = Field(max_length=3)
+    discovered_count: int = Field(ge=0, le=24)
+    extracted_count: int = Field(ge=0, le=12)
+
+
 # --- #567 Slice A: reference-curve retrieval + representation models ---
 #
 # A completed, well-rated past roast of THIS SAME bean, retrieved by

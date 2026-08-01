@@ -4779,6 +4779,269 @@ def _draft_from(url: str) -> BeanProfileDraft:
 
 
 @pytest.mark.asyncio
+async def test_recommend_from_catalogue_route_returns_read_only_ranked_products(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D121: catalogue selection returns products but creates no saved profile."""
+    from roastpilot_agent.models import CatalogueRecommendationList
+
+    async def fake_recommend(self: object, url: str) -> CatalogueRecommendationList:
+        assert url == "https://vendor.example/collections/green"
+        return CatalogueRecommendationList.model_validate(
+            {
+                "recommendations": [
+                    {
+                        "candidate_id": "candidate-01",
+                        "product_url": "https://vendor.example/products/kenya",
+                        "name": "Kenya Kiambu",
+                        "country": "Kenya",
+                        "processing": "washed",
+                        "score": 3,
+                        "reason_codes": [
+                            "missing_country",
+                            "missing_processing",
+                            "novel_country_processing",
+                        ],
+                        "reasons": ["country", "process", "pair"],
+                    }
+                ],
+                "discovered_count": 4,
+                "extracted_count": 3,
+            }
+        )
+
+    monkeypatch.setattr(RoastService, "recommend_beans_from_catalogue", fake_recommend)
+    response = await client.post(
+        "/api/beans/recommend-from-catalogue",
+        json={"url": "https://vendor.example/collections/green"},
+    )
+    assert response.status_code == 200
+    assert response.json()["recommendations"][0]["product_url"].endswith("/products/kenya")
+    assert (await client.get("/api/bean-profiles")).json() == {"profiles": []}
+
+
+@pytest.mark.asyncio
+async def test_catalogue_service_records_nonclaimable_terminal_attempt(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D121: successful catalogue work is monitored without storing its products."""
+    from roastpilot_agent.catalogue_recommendations import CatalogueRankingContext
+    from roastpilot_agent.models import CatalogueRecommendationList
+
+    async def fake_recommend(
+        url: str,
+        *,
+        context: CatalogueRankingContext,
+        advisor_config: object,
+        sourcing_config: object,
+        diagnostics: BeanSourcingDiagnostics,
+    ) -> CatalogueRecommendationList:
+        del advisor_config, sourcing_config
+        assert url == "https://vendor.example/collections/green?secret=no-store"
+        assert context.roster_countries == frozenset()
+        diagnostics.request_tokens = 9
+        diagnostics.response_tokens = 3
+        diagnostics.usage_reported_requests = 1
+        return CatalogueRecommendationList(
+            recommendations=[], discovered_count=2, extracted_count=1
+        )
+
+    monkeypatch.setattr("roastpilot_agent.api.recommend_from_catalogue", fake_recommend)
+    service = RoastService(store)
+    result = await service.recommend_beans_from_catalogue(
+        "https://vendor.example/collections/green?secret=no-store"
+    )
+    assert result.discovered_count == 2
+    async with store.connection.execute(
+        "SELECT prompt_version, outcome, request_tokens, response_tokens,"
+        " draft_snapshot_json FROM bean_sourcing_attempts"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert tuple(row) == ("v1-catalogue-v1", "success", 9, 3, None)
+    assert "vendor.example" not in json.dumps(dict(row))
+
+
+def _empty_catalogue_result() -> object:
+    """Build the minimal typed catalogue result used by service lifecycle tests."""
+    from roastpilot_agent.models import CatalogueRecommendationList
+
+    return CatalogueRecommendationList(recommendations=[], discovered_count=1, extracted_count=1)
+
+
+@pytest.mark.asyncio
+async def test_catalogue_service_rejects_before_context_work_when_roast_is_active(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fail_if_called(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        pytest.fail("must not build catalogue context or call a provider while roasting")
+
+    monkeypatch.setattr(RoastService, "_catalogue_ranking_context", fail_if_called)
+    started = await client.post("/api/roasts", json=_profile().model_dump())
+    assert started.status_code == 201
+
+    response = await client.post(
+        "/api/beans/recommend-from-catalogue",
+        json={"url": "https://vendor.example/collections/green"},
+    )
+    assert response.status_code == 409
+    assert "active" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_catalogue_service_rechecks_active_roast_after_context_snapshot(
+    service: RoastService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from roastpilot_agent.catalogue_recommendations import CatalogueRankingContext
+
+    context_started = asyncio.Event()
+    release_context = asyncio.Event()
+
+    async def delayed_context() -> CatalogueRankingContext:
+        context_started.set()
+        await release_context.wait()
+        return CatalogueRankingContext(
+            roster_countries=frozenset(),
+            roster_processes=frozenset(),
+            roster_pairs=frozenset(),
+            rated_countries=frozenset(),
+            rated_processes=frozenset(),
+        )
+
+    async def fail_if_called(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        pytest.fail("provider must not run after a roast wins the context-build race")
+
+    monkeypatch.setattr(service, "_catalogue_ranking_context", delayed_context)
+    monkeypatch.setattr("roastpilot_agent.api.recommend_from_catalogue", fail_if_called)
+    recommendation = asyncio.create_task(
+        service.recommend_beans_from_catalogue("https://vendor.example/collections/green")
+    )
+    await asyncio.wait_for(context_started.wait(), timeout=2.0)
+    await service.start_roast(_profile())
+    release_context.set()
+    with pytest.raises(RoastRunConflictError, match="active"):
+        await recommendation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("post_cancel_outcome", ["raise", "return", "error"])
+async def test_catalogue_service_preemption_is_reported_and_unregistered(
+    service: RoastService,
+    monkeypatch: pytest.MonkeyPatch,
+    post_cancel_outcome: Literal["raise", "return", "error"],
+) -> None:
+    entered = asyncio.Event()
+
+    async def slow_recommend(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if post_cancel_outcome == "return":
+                return _empty_catalogue_result()
+            if post_cancel_outcome == "error":
+                raise BeanFetchError("synthetic post-preemption error") from None
+            raise
+
+    monkeypatch.setattr("roastpilot_agent.api.recommend_from_catalogue", slow_recommend)
+    task = asyncio.create_task(
+        service.recommend_beans_from_catalogue("https://vendor.example/collections/green")
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
+    async with service._start_lock:  # pyright: ignore[reportPrivateUsage]
+        await service._preempt_bean_drafts_for_roast_start()  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(RoastRunConflictError, match="preempted"):
+        await task
+    assert not service._bean_draft_operations  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("post_cancel_outcome", ["raise", "return", "error"])
+async def test_direct_catalogue_cancellation_wins_when_inner_suppresses_it(
+    service: RoastService,
+    monkeypatch: pytest.MonkeyPatch,
+    post_cancel_outcome: Literal["raise", "return", "error"],
+) -> None:
+    entered = asyncio.Event()
+
+    async def uncooperative_recommend(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if post_cancel_outcome == "error":
+                raise BeanFetchError("synthetic post-cancel error") from None
+            if post_cancel_outcome == "return":
+                return _empty_catalogue_result()
+            raise
+
+    monkeypatch.setattr("roastpilot_agent.api.recommend_from_catalogue", uncooperative_recommend)
+    task = asyncio.create_task(
+        service.recommend_beans_from_catalogue("https://vendor.example/collections/green")
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not service._bean_draft_operations  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_catalogue_cancellation_during_attempt_admission_is_terminally_recorded(
+    service: RoastService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    finished: list[str] = []
+
+    async def cancelled_admission(**kwargs: object) -> tuple[str, bool]:
+        del kwargs
+        return "attempt-id", True
+
+    async def record_finish(attempt_id: str, **kwargs: object) -> None:
+        assert attempt_id == "attempt-id"
+        finished.append(cast(str, kwargs["outcome"]))
+
+    monkeypatch.setattr(service, "_start_bean_attempt_bounded", cancelled_admission)
+    monkeypatch.setattr(service, "_finish_bean_attempt_bounded", record_finish)
+    with pytest.raises(asyncio.CancelledError):
+        await service.recommend_beans_from_catalogue("https://vendor.example/collections/green")
+    assert finished == ["cancelled"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_outcome"),
+    [
+        (BeanFetchError("fetch"), "fetch_error"),
+        (BeanExtractionUnavailableError("provider"), "provider_error"),
+        (BeanExtractionError("page"), "extraction_error"),
+        (RuntimeError("unexpected"), "provider_error"),
+    ],
+)
+async def test_catalogue_service_classifies_terminal_failures(
+    service: RoastService,
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    expected_outcome: str,
+) -> None:
+    async def failed(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise failure
+
+    monkeypatch.setattr("roastpilot_agent.api.recommend_from_catalogue", failed)
+    with pytest.raises(type(failure), match=str(failure)):
+        await service.recommend_beans_from_catalogue("https://vendor.example/collections/green")
+    async with store.connection.execute("SELECT outcome FROM bean_sourcing_attempts") as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert row["outcome"] == expected_outcome
+
+
+@pytest.mark.asyncio
 async def test_draft_bean_from_url_happy_path(
     client: AsyncClient, store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -2529,6 +2529,7 @@ class RoastStore:
         usage_evidence: Literal["exact", "partial", "unknown"],
         timed_out_runs: int,
         draft: BeanProfileDraft | None = None,
+        claimable_draft: bool = True,
         completed_at_utc: str | None = None,
     ) -> None:
         """Commit one terminal attempt outcome without retaining unsafe inputs."""
@@ -2537,9 +2538,15 @@ class RoastStore:
         expires: str | None = None
         on_page_count: int | None = None
         estimated_count: int | None = None
-        if outcome == "success":
-            if draft is None:
-                raise ValueError("a successful bean-sourcing attempt requires a draft")
+        if outcome == "success" and claimable_draft and draft is None:
+            raise ValueError("a successful bean-sourcing attempt requires a draft")
+        if outcome == "success" and not claimable_draft and draft is not None:
+            raise ValueError("a nonclaimable bean-sourcing success cannot carry a draft")
+        if outcome == "success" and draft is not None:
+            # Single-product success carries one claimable draft baseline.
+            # Catalogue success deliberately carries no draft: it records only
+            # aggregate attempt metrics and the distinct catalogue prompt version;
+            # choosing a result starts the existing single-product flow (D121).
             snapshot_fields = BeanProfileInput.model_fields.keys()
             snapshot_data = {
                 field: getattr(draft, field) for field in snapshot_fields if field != "source_url"

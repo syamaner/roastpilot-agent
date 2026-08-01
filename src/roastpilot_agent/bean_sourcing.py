@@ -2552,7 +2552,7 @@ async def _fetch_and_extract(
     *,
     config: BeanSourcingConfig,
     http_client: httpx.AsyncClient | None = None,
-) -> tuple[str, _JsonLdProductFacts | None]:
+) -> tuple[str, _JsonLdProductFacts | None, str, str]:
     """Respectfully fetch ``url`` and return its extracted plain text plus
     any identity-matched JSON-LD Product facts.
 
@@ -2784,11 +2784,11 @@ async def _fetch_and_extract(
     # final_url, not url (#590 P1 fix) — a redirect commonly canonicalises
     # the URL, and the fetched HTML's own JSON-LD reflects the FINAL one.
     facts = _match_json_ld_product_facts(html, final_url)
-    return extracted_text, facts
+    return extracted_text, facts, html, final_url
 
 
 @dataclass(frozen=True)
-class _FetchedPage:
+class FetchedVendorPage:
     """A fetched vendor page's text forms (#590 D1 fold 1; parts split
     #590 slice E1).
 
@@ -2810,6 +2810,8 @@ class _FetchedPage:
     extracted_text: str
     json_ld_values: str
     json_ld_name: str = ""
+    raw_html: str = ""
+    final_url: str = ""
 
     @property
     def verification_corpus(self) -> str:
@@ -2823,30 +2825,39 @@ class _FetchedPage:
         )
 
 
+# Compatibility alias for the focused private-contract tests written before
+# catalogue sourcing made the fetched page a public package-internal value.
+_FetchedPage = FetchedVendorPage
+
+
 async def _fetch_page_text(
     url: str,
     *,
     config: BeanSourcingConfig,
     http_client: httpx.AsyncClient | None = None,
-) -> _FetchedPage:
-    """Fetch ``url`` and return both of :class:`_FetchedPage`'s text
+) -> FetchedVendorPage:
+    """Fetch ``url`` and return both of :class:`FetchedVendorPage`'s text
     forms (#590 D1 fold 1 — this function's return type changed from a
-    bare ``str`` to :class:`_FetchedPage`, so ``.prompt_text`` is the
+    bare ``str`` to :class:`FetchedVendorPage`, so ``.prompt_text`` is the
     pre-fold return value; ``.extracted_text``/``.json_ld_values`` are
     the #590 slice E1 split of what was one stored ``verification_corpus``
     field). See :func:`_fetch_and_extract` for the fetch/extraction
     behavior and failure modes."""
-    extracted_text, facts = await _fetch_and_extract(url, config=config, http_client=http_client)
+    extracted_text, facts, raw_html, final_url = await _fetch_and_extract(
+        url, config=config, http_client=http_client
+    )
     json_ld_context = _format_json_ld_context(facts) if facts is not None else None
     prompt_text = (
         extracted_text if json_ld_context is None else f"{json_ld_context}\n\n{extracted_text}"
     )
     fact_values = _json_ld_fact_values(facts)
-    return _FetchedPage(
+    return FetchedVendorPage(
         prompt_text=prompt_text,
         extracted_text=extracted_text,
         json_ld_values=fact_values,
         json_ld_name=(facts.name if facts is not None else None) or "",
+        raw_html=raw_html,
+        final_url=final_url,
     )
 
 
@@ -5693,6 +5704,60 @@ def _draft_from_identity(
         ) from exc
 
 
+async def fetch_vendor_page(
+    url: str,
+    *,
+    config: BeanSourcingConfig,
+    http_client: httpx.AsyncClient | None = None,
+) -> FetchedVendorPage:
+    """Validate and fetch one vendor page through the hardened sourcing boundary.
+
+    This shared entry point keeps product drafting and catalogue recommendation
+    on the same credential, fragment, SSRF, redirect, decompression, deadline,
+    and off-loop parsing contract.
+
+    Args:
+        url: Operator-supplied vendor page URL.
+        config: Bean-sourcing resource and timeout limits.
+        http_client: Optional injected test client.
+
+    Returns:
+        The bounded page representations and final redirect URL.
+
+    Raises:
+        BeanFetchError: The URL or fetched response violates the sourcing
+            boundary.
+    """
+    try:
+        parsed_url = urlsplit(url)
+    except ValueError as exc:
+        raise BeanFetchError(
+            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} (invalid URL syntax)"
+        ) from exc
+    if parsed_url.username is not None or parsed_url.password is not None:
+        _log.warning(
+            "bean_sourcing: rejected a URL with embedded credentials: %r",
+            _redact_url_credentials(url),
+        )
+        raise BeanFetchError(
+            "vendor URLs with embedded credentials (user:pass@host) are not "
+            "supported — remove the credentials from the URL and, if the "
+            "page needs authentication, save the profile manually instead"
+        )
+    if parsed_url.fragment:
+        _log.warning(
+            "bean_sourcing: rejected a URL with a fragment: %r",
+            _redact_url_credentials(url),
+        )
+        raise BeanFetchError(
+            "vendor URLs with a fragment (#...) are not supported — a "
+            "fragment can carry a sensitive token that must never be fetched, "
+            "logged, or stored; remove the fragment from the URL"
+        )
+    _log.info("bean_sourcing: fetching %r", _redact_url_credentials(url))
+    return await _fetch_page_text(url, config=config, http_client=http_client)
+
+
 async def draft_bean_profile_from_url(
     url: str,
     *,
@@ -5771,55 +5836,8 @@ async def draft_bean_profile_from_url(
             name/origin) to draft a profile from, or the assembled draft
             failed its own field validation — both client-actionable.
     """
-    # Credential-leak guard (#587 P1): checked before ANYTHING else — no
-    # logging, no fetch, no billable LLM call — so a URL with embedded
-    # basic-auth credentials is never sent over the wire (to the vendor OR
-    # to the LLM provider) and never appears in a log line even transiently.
-    # A malformed URL (e.g. an unclosed IPv6 bracket) makes urlsplit() raise
-    # ValueError eagerly (#587 P2) — this is the very first thing ANY url
-    # goes through, so it needs its own guard rather than relying on a
-    # later call site to catch it.
-    try:
-        parsed_url = urlsplit(url)
-    except ValueError as exc:
-        raise BeanFetchError(
-            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} (invalid URL syntax)"
-        ) from exc
-    if parsed_url.username is not None or parsed_url.password is not None:
-        _log.warning(
-            "draft_bean_profile_from_url: rejected a URL with embedded credentials: %r",
-            _redact_url_credentials(url),
-        )
-        raise BeanFetchError(
-            "vendor URLs with embedded credentials (user:pass@host) are not "
-            "supported — remove the credentials from the URL and, if the "
-            "page needs authentication, save the profile manually instead"
-        )
-    if parsed_url.fragment:
-        # A fragment (#587 P2, round 5) is never sent to the vendor over
-        # HTTP (fragments are client-side-only, per the URL spec) — the
-        # risk is entirely in what THIS module does with the raw ``url``
-        # value itself: it is logged (mirroring the credential leak above)
-        # and, worse, carried verbatim into the returned draft's
-        # ``source_url`` — so a URL an operator pasted straight out of an
-        # OAuth redirect (``#access_token=...``) or a hash-router page
-        # would leak that token into logs and into a saved bean profile.
-        # Mirrors the credential check exactly: rejected up front, logged
-        # only in fragment-and-credential-redacted form.
-        _log.warning(
-            "draft_bean_profile_from_url: rejected a URL with a fragment: %r",
-            _redact_url_credentials(url),
-        )
-        raise BeanFetchError(
-            "vendor URLs with a fragment (#...) are not supported — a "
-            "fragment can carry a sensitive token (e.g. an OAuth redirect's "
-            "#access_token=...) that must never be fetched, logged, or "
-            "stored; remove the fragment from the URL"
-        )
-
     config = sourcing_config if sourcing_config is not None else BeanSourcingConfig()
-    _log.info("draft_bean_profile_from_url: fetching %r", _redact_url_credentials(url))
-    page = await _fetch_page_text(url, config=config, http_client=http_client)
+    page = await fetch_vendor_page(url, config=config, http_client=http_client)
     # config (never sourcing_config directly) — the fetch's already-resolved
     # default, so the extraction step's model/timeout resolution stays
     # consistent with the fetch's, rather than re-deriving its own None
