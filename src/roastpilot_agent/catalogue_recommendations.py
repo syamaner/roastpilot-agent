@@ -498,6 +498,14 @@ def _has_parameter_assignment(token: str) -> bool:
     return False
 
 
+def _is_relative_reference_token(token: str) -> bool:
+    """Whether ``token`` is an ambiguous parameterized or product-path reference."""
+    first_segment, separator, _rest = token.casefold().partition("/")
+    return _has_parameter_assignment(token) or (
+        bool(separator) and first_segment in _KNOWN_RELATIVE_PATH_PREFIXES
+    )
+
+
 def _token_reference_spans(text: str) -> list[tuple[int, int]]:
     """Find ambiguous relative references by bounded, linear token inspection.
 
@@ -536,7 +544,10 @@ def _token_reference_spans(text: str) -> list[tuple[int, int]]:
             if next_token == decoded_token:
                 break
             decoded_token = next_token
-        if decoded_token != token and _URL_START.search(decoded_token) is not None:
+        if decoded_token != token and (
+            _URL_START.search(decoded_token) is not None
+            or _is_relative_reference_token(decoded_token)
+        ):
             # Redact the original encoded token as one span. Decoding only
             # for classification preserves source offsets while covering
             # encoded locators and query secrets at any representable depth.
@@ -547,10 +558,7 @@ def _token_reference_spans(text: str) -> list[tuple[int, int]]:
         # legitimate product word glued immediately before the URL.
         if _URL_START.search(token) is not None:
             continue
-        first_segment, separator, _rest = token.casefold().partition("/")
-        if _has_parameter_assignment(token) or (
-            bool(separator) and first_segment in _KNOWN_RELATIVE_PATH_PREFIXES
-        ):
+        if _is_relative_reference_token(token):
             spans.append((candidate_start, token_end))
     return spans
 
@@ -766,11 +774,13 @@ async def recommend_from_catalogue(
     model: Model | None = None,
 ) -> CatalogueRecommendationList:
     """Fetch, extract once, and deterministically rank one vendor catalogue."""
-    total_timeout = (
-        sourcing_config.fetch_timeout_seconds * 3 + sourcing_config.extraction_timeout_seconds
-    )
+    preparation_timeout = sourcing_config.fetch_timeout_seconds * 3
     try:
-        async with asyncio.timeout(total_timeout):
+        # Bound the two fetch/vendor-page parsing stages plus catalogue
+        # discovery here, then leave provider timing to ``_extract``. Wrapping
+        # both in one aggregate deadline can steal time from the configured
+        # extraction budget and bypass its timeout-usage accounting.
+        async with asyncio.timeout(preparation_timeout):
             page = await fetch_vendor_page(url, config=sourcing_config, http_client=http_client)
             candidates = await run_untrusted_parse_bounded(
                 lambda: discover_catalogue_candidates(page),
@@ -782,16 +792,16 @@ async def recommend_from_catalogue(
                 )
             if not candidates:
                 raise BeanExtractionError("catalogue page yielded no same-origin product links")
-            extracted = await _extract(
-                page,
-                candidates,
-                advisor_config=advisor_config,
-                sourcing_config=sourcing_config,
-                diagnostics=diagnostics,
-                model=model,
-            )
-            return rank_catalogue_candidates(candidates, extracted, context)
     except TimeoutError as exc:
         raise BeanExtractionUnavailableError(
-            "catalogue recommendation exceeded its end-to-end deadline"
+            "catalogue recommendation preparation exceeded its end-to-end deadline"
         ) from exc
+    extracted = await _extract(
+        page,
+        candidates,
+        advisor_config=advisor_config,
+        sourcing_config=sourcing_config,
+        diagnostics=diagnostics,
+        model=model,
+    )
+    return rank_catalogue_candidates(candidates, extracted, context)

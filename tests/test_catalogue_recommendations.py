@@ -207,6 +207,7 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
         "[link] washed"
     )
     assert redact("https%25253A%25252F%25252Fvendor.example%25252Fa washed") == "[link] washed"
+    assert redact("products%252Fkenya%253Ftoken%253DSECRET washed") == "[link] washed"
     assert redact("1 /2 lb and 1/2 kg") == "1 /2 lb and 1/2 kg"
     assert redact("SL28/SL34 and Caturra/Castillo") == "SL28/SL34 and Caturra/Castillo"
     assert redact("washed/natural 12oz/340g AA/AB") == "washed/natural 12oz/340g AA/AB"
@@ -803,7 +804,8 @@ async def test_extraction_cannot_ground_metadata_in_redacted_url_tokens() -> Non
             evidence=(
                 "Mystery Lot https://vendor.example/kenya/washed?token=secret "
                 "https%3A%2F%2Fvendor.example%2Fproducts%2Fa%3Fencoded_token%3Dsecret "
-                "https%253A%252F%252Fvendor.example%252Fa%253Fnested_token%253Dsecret"
+                "https%253A%252F%252Fvendor.example%252Fa%253Fnested_token%253Dsecret "
+                "products%252Fkenya%253Frelative_token%253Dsecret"
             ),
             source_order=0,
         )
@@ -815,6 +817,7 @@ async def test_extraction_cannot_ground_metadata_in_redacted_url_tokens() -> Non
         assert "kenya/washed" not in rendered.casefold()
         assert "encoded_token" not in rendered
         assert "nested_token" not in rendered
+        assert "relative_token" not in rendered
         assert "https%3a" not in rendered.casefold()
         assert "https%253a" not in rendered.casefold()
         return ModelResponse(
@@ -1269,6 +1272,67 @@ async def test_catalogue_end_to_end_deadline_maps_to_dependency_error(
             diagnostics=BeanSourcingDiagnostics(),
             model=FunctionModel(lambda messages, info: ModelResponse(parts=[])),
         )
+
+
+@pytest.mark.asyncio
+async def test_provider_owns_full_timeout_and_records_usage_after_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeout_budgets: list[float | None] = []
+    real_timeout = asyncio.timeout
+
+    def tracked_timeout(delay: float | None) -> asyncio.Timeout:
+        timeout_budgets.append(delay)
+        return real_timeout(delay)
+
+    async def fetched(*args: object, **kwargs: object) -> FetchedVendorPage:
+        del args, kwargs
+        return _page('<a href="/products/kenya">Kenya Kiambu</a>')
+
+    observed_diagnostics: BeanSourcingDiagnostics | None = None
+
+    async def timed_out_extract(
+        page: FetchedVendorPage,
+        candidates: list[catalogue.CatalogueCandidate],
+        *,
+        advisor_config: AdvisorConfig,
+        sourcing_config: BeanSourcingConfig,
+        diagnostics: BeanSourcingDiagnostics,
+        model: Model | None,
+    ) -> list[object]:
+        del page, candidates, advisor_config, sourcing_config, model
+        nonlocal observed_diagnostics
+        observed_diagnostics = diagnostics
+        diagnostics.timed_out_runs += 1
+        diagnostics.usage_unreported_requests += 1
+        raise BeanExtractionUnavailableError("catalogue extraction exceeded its deadline")
+
+    monkeypatch.setattr(catalogue, "fetch_vendor_page", fetched)
+    monkeypatch.setattr(catalogue, "_extract", timed_out_extract)
+    monkeypatch.setattr(asyncio, "timeout", tracked_timeout)
+    diagnostics = BeanSourcingDiagnostics()
+    with pytest.raises(BeanExtractionUnavailableError, match="extraction exceeded"):
+        await recommend_from_catalogue(
+            "https://vendor.example/collections/green",
+            context=CatalogueRankingContext(
+                roster_countries=frozenset(),
+                roster_processes=frozenset(),
+                roster_pairs=frozenset(),
+                rated_pairs=frozenset(),
+            ),
+            advisor_config=AdvisorConfig(),
+            sourcing_config=BeanSourcingConfig(
+                fetch_timeout_seconds=2.0,
+                extraction_timeout_seconds=11.0,
+            ),
+            diagnostics=diagnostics,
+            model=FunctionModel(lambda messages, info: ModelResponse(parts=[])),
+        )
+    assert observed_diagnostics is diagnostics
+    assert timeout_budgets == [6.0, 2.0]
+    assert 11.0 not in timeout_budgets
+    assert diagnostics.timed_out_runs == 1
+    assert diagnostics.usage_unreported_requests == 1
 
 
 @pytest.mark.asyncio
