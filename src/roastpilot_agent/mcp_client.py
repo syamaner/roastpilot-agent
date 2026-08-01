@@ -1498,9 +1498,13 @@ class MCPServerProcess:
         awaits its ``ready`` signal.  This is what lets a respawn driven from a
         request-handler task tear the child down without a cross-task scope exit.
 
-        An unconfirmed teardown and its incident identity block every new
-        owner until the explicit hardware-clear acknowledgement consumes that
-        exact incident (#668). ``start`` never clears that verdict itself.
+        Within one running agent process, an unconfirmed teardown and its
+        incident identity block every new owner until the explicit
+        hardware-clear acknowledgement consumes that exact incident (#668).
+        ``start`` never clears that process-local verdict itself. A controlled
+        full agent restart after physical verification remains the legacy
+        recovery boundary; persisting incidents across processes is outside
+        this in-process contract.
         A prior owner retained after a bounded teardown attempt must be
         finalized by :meth:`stop` before another child can start, even if the
         owner task has since finished. Otherwise an old stop body/finalizer

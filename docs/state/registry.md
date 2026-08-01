@@ -280,7 +280,9 @@ and plan decisions D104/D105 carry its acceptance and ownership contract. Residu
 explicit: P1 #667 owns a live-mode event-loop policy for a pathological MCP owner that suppresses
 cancellation indefinitely. The backend slice of P1 #668 adds D120's audited, incident-bound
 in-process operator acknowledgement after unconfirmed teardown; its UI/operator surface remains a
-separate slice. Restart recovery still never auto-resumes heat or fan.
+separate slice. The incident and acknowledgement gate are process-local: physical verification plus
+a controlled full agent restart remains the legacy recovery boundary and is not represented by an
+acknowledgement audit row. Restart recovery still never auto-resumes heat or fan.
 
 **18 Jul 2026 (later — D102 plant-model experiment + the discard-roast feature).** After #567
 parked, the operator's diagnosis that the system lacks RoR PROJECTION (only the pre-FC FC-ETA
