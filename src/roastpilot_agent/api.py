@@ -3321,25 +3321,35 @@ class RoastService:
                     "catalogue recommendation was preempted by a roast-start attempt"
                 )
 
-            async with self._start_lock:
-                # A roast may have started after the context task completed but
-                # before this lock was acquired. Swap context for provider work
-                # atomically with the final active-run check.
-                self._bean_draft_operations.pop(context_task, None)
-                active = await self._store.active_run()
-                if active is None:
-                    task = asyncio.create_task(
-                        recommend_from_catalogue(
-                            url,
-                            context=context,
-                            advisor_config=advisor_config,
-                            sourcing_config=sourcing_config,
-                            diagnostics=diagnostics,
+            try:
+                async with self._start_lock:
+                    # A roast may have started after the context task completed but
+                    # before this lock was acquired. Swap context for provider work
+                    # atomically with the final active-run check.
+                    self._bean_draft_operations.pop(context_task, None)
+                    active = await self._store.active_run()
+                    if active is None:
+                        task = asyncio.create_task(
+                            recommend_from_catalogue(
+                                url,
+                                context=context,
+                                advisor_config=advisor_config,
+                                sourcing_config=sourcing_config,
+                                diagnostics=diagnostics,
+                            )
                         )
-                    )
-                    operation = _BeanSourcingOperation(task=task)
-                    self._bean_draft_operations[task] = operation
-                    provider_started = True
+                        operation = _BeanSourcingOperation(task=task)
+                        self._bean_draft_operations[task] = operation
+                        provider_started = True
+            except asyncio.CancelledError:
+                await self._finish_bean_attempt_bounded(
+                    attempt_id,
+                    outcome="cancelled",
+                    started_monotonic=started_monotonic,
+                    diagnostics=diagnostics,
+                    claimable_draft=False,
+                )
+                raise
             if active is not None:
                 await self._finish_bean_attempt_bounded(
                     attempt_id,

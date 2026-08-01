@@ -5157,6 +5157,42 @@ async def test_direct_catalogue_cancellation_during_context_wins(
 
 
 @pytest.mark.asyncio
+async def test_catalogue_cancellation_while_waiting_to_swap_context_is_terminal(
+    service: RoastService,
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from roastpilot_agent.catalogue_recommendations import CatalogueRankingContext
+
+    swap_lock_held = asyncio.Event()
+
+    async def context_holding_swap_lock() -> CatalogueRankingContext:
+        await service._start_lock.acquire()  # pyright: ignore[reportPrivateUsage]
+        swap_lock_held.set()
+        return CatalogueRankingContext(
+            roster_countries=frozenset(),
+            roster_processes=frozenset(),
+            roster_pairs=frozenset(),
+            rated_pairs=frozenset(),
+        )
+
+    monkeypatch.setattr(service, "_catalogue_ranking_context", context_holding_swap_lock)
+    recommendation = asyncio.create_task(
+        service.recommend_beans_from_catalogue("https://vendor.example/collections/green")
+    )
+    await asyncio.wait_for(swap_lock_held.wait(), timeout=2.0)
+    await asyncio.sleep(0)
+    try:
+        recommendation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await recommendation
+    finally:
+        service._start_lock.release()  # pyright: ignore[reportPrivateUsage]
+    assert await _catalogue_attempt_outcomes(store) == ["cancelled"]
+    assert not service._bean_draft_operations  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
 async def test_catalogue_context_error_propagates_logs_and_unregisters(
     service: RoastService,
     store: RoastStore,
