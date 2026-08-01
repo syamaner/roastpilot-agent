@@ -48,6 +48,7 @@ from roastpilot_agent.bean_sourcing import (
     BeanFetchError,
     BeanSourcingDiagnostics,
 )
+from roastpilot_agent.catalogue_recommendations import CATALOGUE_EXTRACTION_PROMPT_VERSION
 from roastpilot_agent.config import AppConfig, ControllerConfig, MCPDeviceConfig, ReferenceCurve
 from roastpilot_agent.mcp_client import (
     AmbientStatus,
@@ -4969,6 +4970,7 @@ async def test_catalogue_ranking_context_uses_active_roster_and_completed_high_r
     context = await service._catalogue_ranking_context()  # pyright: ignore[reportPrivateUsage]
     profile_axes, _ = await store.catalogue_ranking_axes()
     assert (None, None) in profile_axes
+    assert ("Archived", "natural") not in profile_axes
     assert context.roster_countries == frozenset({"guatemala"})
     assert context.roster_processes == frozenset({"honey"})
     assert context.roster_pairs == frozenset({("guatemala", "honey")})
@@ -5035,6 +5037,17 @@ def _empty_catalogue_result() -> object:
     return CatalogueRecommendationList(recommendations=[], discovered_count=1, extracted_count=1)
 
 
+async def _catalogue_attempt_outcomes(store: RoastStore) -> list[str]:
+    """Return persisted catalogue outcomes in admission order for lifecycle tests."""
+    async with store.connection.execute(
+        "SELECT outcome FROM bean_sourcing_attempts"
+        " WHERE prompt_version = ? ORDER BY started_at_utc, id",
+        (CATALOGUE_EXTRACTION_PROMPT_VERSION,),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return [str(row["outcome"]) for row in rows]
+
+
 @pytest.mark.asyncio
 async def test_catalogue_service_rejects_before_context_work_when_roast_is_active(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
@@ -5059,6 +5072,7 @@ async def test_catalogue_service_rejects_before_context_work_when_roast_is_activ
 @pytest.mark.parametrize("post_cancel_outcome", ["raise", "return", "error"])
 async def test_catalogue_service_rechecks_active_roast_after_context_snapshot(
     service: RoastService,
+    store: RoastStore,
     monkeypatch: pytest.MonkeyPatch,
     post_cancel_outcome: Literal["raise", "return", "error"],
 ) -> None:
@@ -5097,6 +5111,7 @@ async def test_catalogue_service_rechecks_active_roast_after_context_snapshot(
     await service.start_roast(_profile())
     with pytest.raises(RoastRunConflictError, match="preempted"):
         await recommendation
+    assert await _catalogue_attempt_outcomes(store) == ["preempted"]
     assert not service._bean_draft_operations  # pyright: ignore[reportPrivateUsage]
 
 
@@ -5104,6 +5119,7 @@ async def test_catalogue_service_rechecks_active_roast_after_context_snapshot(
 @pytest.mark.parametrize("post_cancel_outcome", ["raise", "return", "error"])
 async def test_direct_catalogue_cancellation_during_context_wins(
     service: RoastService,
+    store: RoastStore,
     monkeypatch: pytest.MonkeyPatch,
     post_cancel_outcome: Literal["raise", "return", "error"],
 ) -> None:
@@ -5136,12 +5152,14 @@ async def test_direct_catalogue_cancellation_during_context_wins(
     recommendation.cancel()
     with pytest.raises(asyncio.CancelledError):
         await recommendation
+    assert await _catalogue_attempt_outcomes(store) == ["cancelled"]
     assert not service._bean_draft_operations  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
 async def test_catalogue_context_error_propagates_logs_and_unregisters(
     service: RoastService,
+    store: RoastStore,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -5152,6 +5170,7 @@ async def test_catalogue_context_error_propagates_logs_and_unregisters(
     with pytest.raises(RuntimeError, match="context read failure"):
         await service.recommend_beans_from_catalogue("https://vendor.example/collections/green")
     assert "catalogue recommendation context snapshot failed" in caplog.text
+    assert await _catalogue_attempt_outcomes(store) == ["provider_error"]
     assert not service._bean_draft_operations  # pyright: ignore[reportPrivateUsage]
 
 
@@ -5183,6 +5202,7 @@ async def test_catalogue_rechecks_active_run_after_completed_context_task(
     monkeypatch.setattr("roastpilot_agent.api.recommend_from_catalogue", fail_if_called)
     with pytest.raises(RoastRunConflictError, match="active"):
         await service.recommend_beans_from_catalogue("https://vendor.example/collections/green")
+    assert await _catalogue_attempt_outcomes(store) == ["preempted"]
     assert not service._bean_draft_operations  # pyright: ignore[reportPrivateUsage]
 
 

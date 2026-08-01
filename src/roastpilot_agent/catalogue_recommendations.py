@@ -65,7 +65,6 @@ _URL_START = re.compile(
     r"(?:[a-z][a-z0-9+.-]*://|(?<![\w])//|"
     r"(?<![\w@.])(?:\.\.?/)(?=[a-z0-9])|"
     r"(?<![\w@./])/(?!/|\d+(?:[.,]\d+)?(?=\s|$))(?=[a-z0-9])|"
-    r"(?<![\w@.])(?:[a-z0-9._~-]+/)+(?!\d+(?=\s|$))(?=[a-z0-9])|"
     r"(?<![\w@.?])(?:\?|#)(?=[a-z0-9._~-]+(?:=|%3d))|"
     r"(?<![\w@.])(?:www\.|"
     r"(?:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.)+"
@@ -73,6 +72,24 @@ _URL_START = re.compile(
     r"(?:\d{1,3}\.){3}\d{1,3}(?=[:/?#\s]|$)|"
     r"\[[0-9a-f:.]+\](?=[:/?#\s]|$)))",
     re.IGNORECASE,
+)
+_REFERENCE_TERMINATORS: Final = frozenset(")>\"'")
+_REFERENCE_LEADING_PUNCTUATION: Final = frozenset("([{<,:;")
+_KNOWN_RELATIVE_PATH_PREFIXES: Final = frozenset(
+    {
+        "bean",
+        "beans",
+        "coffee",
+        "coffees",
+        "collection",
+        "collections",
+        "item",
+        "items",
+        "product",
+        "products",
+        "shop",
+        "store",
+    }
 )
 _log = logging.getLogger(__name__)
 
@@ -312,7 +329,7 @@ def _discover_catalogue_candidates_unchecked(
     except (lxml.etree.LxmlError, ValueError):  # type: ignore[reportUnknownMemberType]
         return []
 
-    raw: list[tuple[str, str, str]] = []
+    raw: list[tuple[str, str, str, bool]] = []
     scripts = cast(
         Iterable[Any],
         islice(
@@ -339,13 +356,16 @@ def _discover_catalogue_candidates_unchecked(
             continue
         for block in _json_ld_product_blocks(decoded):
             name = _clean_text(block.get("name"))
-            for key in ("url", "@id"):
-                value = block.get(key)
-                if isinstance(value, str) and name:
-                    raw.append((value, name, _json_ld_product_evidence(block, name)))
-                    break
+            url_value = block.get("url")
+            identifier = block.get("@id")
+            if isinstance(url_value, str) and name:
+                raw.append((url_value, name, _json_ld_product_evidence(block, name), False))
+            elif isinstance(identifier, str) and name:
+                # JSON-LD ``@id`` is frequently an opaque entity identifier, not
+                # a locator. Require the same explicit product-path evidence as
+                # an anchor before treating it as a dereferenceable product URL.
+                raw.append((identifier, name, _json_ld_product_evidence(block, name), True))
 
-    json_ld_count = len(raw)
     anchors = cast(
         Iterable[Any],
         islice(tree.iter("a"), _MAX_ANCHORS_INSPECTED),  # type: ignore[reportUnknownMemberType]
@@ -354,15 +374,15 @@ def _discover_catalogue_candidates_unchecked(
         href = anchor.get("href")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
         label = _clean_text(" ".join(anchor.itertext()))  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
         if isinstance(href, str) and label:
-            raw.append((href, label, _anchor_candidate_evidence(anchor, label)))
+            raw.append((href, label, _anchor_candidate_evidence(anchor, label), True))
 
     candidates: list[CatalogueCandidate] = []
     positions: dict[str, int] = {}
-    for index, (value, label, evidence) in enumerate(raw):
+    for value, label, evidence, require_product_path in raw:
         product_url = _same_origin_product_url(
             value,
             base_url=page.final_url,
-            require_product_path=index >= json_ld_count,
+            require_product_path=require_product_path,
         )
         if product_url is None:
             continue
@@ -427,23 +447,88 @@ def _agent(
     )
 
 
+def _reference_end(text: str, start: int) -> int:
+    """Return the first whitespace or closing-delimiter position after ``start``."""
+    end = start
+    while end < len(text) and not text[end].isspace() and text[end] not in _REFERENCE_TERMINATORS:
+        end += 1
+    return end
+
+
+def _has_parameter_assignment(token: str) -> bool:
+    """Whether a token carries a query/fragment key-value assignment."""
+    folded = token.casefold()
+    for marker in ("?", "#"):
+        position = folded.find(marker)
+        while position >= 0:
+            tail = folded[position + 1 :]
+            fields = tail.replace(";", "&").split("&")
+            if any("=" in field or "%3d" in field for field in fields):
+                return True
+            position = folded.find(marker, position + 1)
+    return False
+
+
+def _token_reference_spans(text: str) -> list[tuple[int, int]]:
+    """Find ambiguous relative references by bounded, linear token inspection.
+
+    Plain slash-joined coffee data such as ``SL28/SL34`` or ``12oz/340g`` is
+    preserved. A token is treated as a relative reference only when it carries
+    a query/fragment assignment (including word- or email-glued spellings), or
+    begins with a conventional catalogue path segment such as ``products/``.
+    """
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while cursor < len(text):
+        while cursor < len(text) and (
+            text[cursor].isspace() or text[cursor] in _REFERENCE_TERMINATORS
+        ):
+            cursor += 1
+        token_start = cursor
+        token_end = _reference_end(text, token_start)
+        cursor = max(token_end, cursor + 1)
+        candidate_start = token_start
+        while (
+            candidate_start < token_end and text[candidate_start] in _REFERENCE_LEADING_PUNCTUATION
+        ):
+            candidate_start += 1
+        if candidate_start >= token_end:
+            continue
+        token = text[candidate_start:token_end]
+        # An unambiguous absolute/domain/root/dot-relative match gets a more
+        # precise span from ``_URL_START`` below; do not widen it to swallow a
+        # legitimate product word glued immediately before the URL.
+        if _URL_START.search(token) is not None:
+            continue
+        first_segment, separator, _rest = token.casefold().partition("/")
+        if _has_parameter_assignment(token) or (
+            bool(separator) and first_segment in _KNOWN_RELATIVE_PATH_PREFIXES
+        ):
+            spans.append((candidate_start, token_end))
+    return spans
+
+
 def _redact_urls(text: str) -> str:
-    """Remove absolute, bare, and relative URL references in one monotonic scan."""
+    """Remove absolute, bare, and relative URL references in one bounded scan."""
+    spans = [
+        (match.start(), _reference_end(text, match.start())) for match in _URL_START.finditer(text)
+    ]
+    spans.extend(_token_reference_spans(text))
+    if not spans:
+        return text
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
     output: list[str] = []
     cursor = 0
-    length = len(text)
-    while cursor < length:
-        match = _URL_START.search(text, cursor)
-        if match is None:
-            output.append(text[cursor:])
-            break
-        start = match.start()
-        output.append(text[cursor:start])
-        end = start
-        while end < length and not text[end].isspace() and text[end] not in ")>\"'":
-            end += 1
-        output.append("[link]")
+    for start, end in merged:
+        output.extend((text[cursor:start], "[link]"))
         cursor = end
+    output.append(text[cursor:])
     return "".join(output)
 
 

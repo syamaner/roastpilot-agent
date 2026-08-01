@@ -3206,7 +3206,32 @@ class RoastService:
                     "catalogue recommendations are unavailable while a roast is active "
                     f"(run {active.run_id}, phase {active.agent_phase.value})"
                 )
-            # The lightweight aggregate read still belongs to this sourcing
+            advisor_config = self._config.advisor
+            sourcing_config = self._config.bean_sourcing
+            started_monotonic = self._clock()
+            diagnostics = BeanSourcingDiagnostics()
+            # Admit monitoring before any context work so cancellation,
+            # preemption, and local-store failures all reach a terminal ledger
+            # outcome rather than disappearing before the provider stage.
+            attempt_id, cancelled_during_admission = await self._start_bean_attempt_bounded(
+                provider=advisor_config.provider,
+                model_slug=resolve_extraction_model_slug(advisor_config, sourcing_config),
+                prompt_version=CATALOGUE_EXTRACTION_PROMPT_VERSION,
+            )
+            if cancelled_during_admission:
+                await self._finish_bean_attempt_bounded(
+                    attempt_id,
+                    outcome="cancelled",
+                    started_monotonic=started_monotonic,
+                    diagnostics=diagnostics,
+                    claimable_draft=False,
+                )
+                raise asyncio.CancelledError
+            lease_heartbeat = asyncio.create_task(
+                self._renew_bean_attempt_lease(attempt_id),
+                name=f"renew-catalogue-attempt-{attempt_id}",
+            )
+            # The lightweight aggregate read still belongs to this admitted
             # request. Register it before releasing the start lock so roast start
             # can preempt even a slow/local context snapshot, not only provider work.
             context_task = asyncio.create_task(
@@ -3215,16 +3240,27 @@ class RoastService:
             )
             context_operation = _BeanSourcingOperation(task=context_task)
             self._bean_draft_operations[context_task] = context_operation
+        provider_started = False
+        task: asyncio.Task[CatalogueRecommendationList] | None = None
+        operation: _BeanSourcingOperation | None = None
         try:
             try:
                 context = await context_task
             except asyncio.CancelledError:
                 outer_task = asyncio.current_task()
-                if (
+                preempted = (
                     outer_task is not None
                     and outer_task.cancelling() == 0
                     and context_operation.preempted_by_start
-                ):
+                )
+                await self._finish_bean_attempt_bounded(
+                    attempt_id,
+                    outcome="preempted" if preempted else "cancelled",
+                    started_monotonic=started_monotonic,
+                    diagnostics=diagnostics,
+                    claimable_draft=False,
+                )
+                if preempted:
                     raise RoastRunConflictError(
                         "catalogue recommendation was preempted by a roast-start attempt"
                     ) from None
@@ -3232,8 +3268,22 @@ class RoastService:
             except Exception:
                 outer_task = asyncio.current_task()
                 if outer_task is not None and outer_task.cancelling() > 0:
+                    await self._finish_bean_attempt_bounded(
+                        attempt_id,
+                        outcome="cancelled",
+                        started_monotonic=started_monotonic,
+                        diagnostics=diagnostics,
+                        claimable_draft=False,
+                    )
                     raise asyncio.CancelledError from None
                 if context_operation.preempted_by_start:
+                    await self._finish_bean_attempt_bounded(
+                        attempt_id,
+                        outcome="preempted",
+                        started_monotonic=started_monotonic,
+                        diagnostics=diagnostics,
+                        claimable_draft=False,
+                    )
                     raise RoastRunConflictError(
                         "catalogue recommendation was preempted by a roast-start attempt"
                     ) from None
@@ -3241,11 +3291,32 @@ class RoastService:
                     "catalogue recommendation context snapshot failed",
                     exc_info=True,
                 )
+                await self._finish_bean_attempt_bounded(
+                    attempt_id,
+                    outcome="provider_error",
+                    started_monotonic=started_monotonic,
+                    diagnostics=diagnostics,
+                    claimable_draft=False,
+                )
                 raise
             outer_task = asyncio.current_task()
             if outer_task is not None and outer_task.cancelling() > 0:
+                await self._finish_bean_attempt_bounded(
+                    attempt_id,
+                    outcome="cancelled",
+                    started_monotonic=started_monotonic,
+                    diagnostics=diagnostics,
+                    claimable_draft=False,
+                )
                 raise asyncio.CancelledError
             if context_operation.preempted_by_start:
+                await self._finish_bean_attempt_bounded(
+                    attempt_id,
+                    outcome="preempted",
+                    started_monotonic=started_monotonic,
+                    diagnostics=diagnostics,
+                    claimable_draft=False,
+                )
                 raise RoastRunConflictError(
                     "catalogue recommendation was preempted by a roast-start attempt"
                 )
@@ -3256,46 +3327,39 @@ class RoastService:
                 # atomically with the final active-run check.
                 self._bean_draft_operations.pop(context_task, None)
                 active = await self._store.active_run()
-                if active is not None:
-                    raise RoastRunConflictError(
-                        "catalogue recommendations are unavailable while a roast is active "
-                        f"(run {active.run_id}, phase {active.agent_phase.value})"
+                if active is None:
+                    task = asyncio.create_task(
+                        recommend_from_catalogue(
+                            url,
+                            context=context,
+                            advisor_config=advisor_config,
+                            sourcing_config=sourcing_config,
+                            diagnostics=diagnostics,
+                        )
                     )
-                advisor_config = self._config.advisor
-                sourcing_config = self._config.bean_sourcing
-                started_monotonic = self._clock()
-                diagnostics = BeanSourcingDiagnostics()
-                attempt_id, cancelled_during_admission = await self._start_bean_attempt_bounded(
-                    provider=advisor_config.provider,
-                    model_slug=resolve_extraction_model_slug(advisor_config, sourcing_config),
-                    prompt_version=CATALOGUE_EXTRACTION_PROMPT_VERSION,
+                    operation = _BeanSourcingOperation(task=task)
+                    self._bean_draft_operations[task] = operation
+                    provider_started = True
+            if active is not None:
+                await self._finish_bean_attempt_bounded(
+                    attempt_id,
+                    outcome="preempted",
+                    started_monotonic=started_monotonic,
+                    diagnostics=diagnostics,
+                    claimable_draft=False,
                 )
-                if cancelled_during_admission:
-                    await self._finish_bean_attempt_bounded(
-                        attempt_id,
-                        outcome="cancelled",
-                        started_monotonic=started_monotonic,
-                        diagnostics=diagnostics,
-                        claimable_draft=False,
-                    )
-                    raise asyncio.CancelledError
-                lease_heartbeat = asyncio.create_task(
-                    self._renew_bean_attempt_lease(attempt_id),
-                    name=f"renew-catalogue-attempt-{attempt_id}",
+                raise RoastRunConflictError(
+                    "catalogue recommendations are unavailable while a roast is active "
+                    f"(run {active.run_id}, phase {active.agent_phase.value})"
                 )
-                task = asyncio.create_task(
-                    recommend_from_catalogue(
-                        url,
-                        context=context,
-                        advisor_config=advisor_config,
-                        sourcing_config=sourcing_config,
-                        diagnostics=diagnostics,
-                    )
-                )
-                operation = _BeanSourcingOperation(task=task)
-                self._bean_draft_operations[task] = operation
         finally:
             self._bean_draft_operations.pop(context_task, None)
+            if not provider_started:
+                lease_heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await lease_heartbeat
+        assert task is not None
+        assert operation is not None
         try:
             try:
                 result = await task

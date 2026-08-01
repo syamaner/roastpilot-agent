@@ -178,7 +178,16 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
     assert redact("products/a washed") == "[link] washed"
     assert redact("?token=secret washed") == "[link] washed"
     assert redact("#access_token=secret washed") == "[link] washed"
+    assert redact("checkout?token=secret washed") == "[link] washed"
+    assert redact("checkout?flag&token=secret washed") == "[link] washed"
+    assert redact("checkout?flag#section washed") == "checkout?flag#section washed"
+    assert redact("(checkout?token=secret) washed") == "([link]) washed"
+    assert redact("((( washed") == "((( washed"
+    assert redact("orders@vendor.example/track?id=1 washed") == "[link] washed"
+    assert redact("misc/path?token=secret washed") == "[link] washed"
     assert redact("1 /2 lb and 1/2 kg") == "1 /2 lb and 1/2 kg"
+    assert redact("SL28/SL34 and Caturra/Castillo") == "SL28/SL34 and Caturra/Castillo"
+    assert redact("washed/natural 12oz/340g AA/AB") == "washed/natural 12oz/340g AA/AB"
     assert redact("farmer@vendor.example washed") == "farmer@vendor.example washed"
 
 
@@ -317,6 +326,24 @@ def test_discovery_ignores_fragment_only_json_ld_product_identifier() -> None:
     </script>
     """
     assert discover_catalogue_candidates(_page(html)) == []
+
+
+def test_discovery_rejects_opaque_and_non_product_json_ld_identifiers() -> None:
+    html = """
+    <script type="application/ld+json">
+      {"@type":"Product","name":"Opaque","@id":"sku-123"}
+    </script>
+    <script type="application/ld+json">
+      {"@type":"Product","name":"Collection","@id":"/collections/green#sku-123"}
+    </script>
+    <script type="application/ld+json">
+      {"@type":"Product","name":"Locator","@id":"/products/locator#sku-123"}
+    </script>
+    """
+    candidates = discover_catalogue_candidates(_page(html))
+    assert [(item.label, item.product_url) for item in candidates] == [
+        ("Locator", "https://vendor.example/products/locator")
+    ]
 
 
 def test_discovery_accepts_decoded_xhtml_with_xml_encoding_declaration() -> None:
