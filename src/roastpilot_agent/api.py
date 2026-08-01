@@ -88,6 +88,8 @@ from roastpilot_agent.models import (
     ChargeWeightRequest,
     ClearStaleSessionRequest,
     ClearStaleSessionResult,
+    HardwareClearAcknowledgementRequest,
+    HardwareClearAcknowledgementResult,
     HealthResponse,
     LogManifest,
     MCPChildStatus,
@@ -406,11 +408,18 @@ _BEAN_DRAFT_FINALIZE_TIMEOUT_SECONDS = 1.0
 _BEAN_DRAFT_EXPIRY_RETRY_SECONDS = 1.0
 _BEAN_DRAFT_EXPIRY_MAX_SLEEP_SECONDS = 60.0
 _BEAN_ATTEMPT_LEASE_HEARTBEAT_SECONDS = 30.0
+_HARDWARE_CLEAR_PATH = "/api/mcp/acknowledge-hardware-clear"
+_HARDWARE_CLEAR_MAX_BODY_BYTES = 2048
+_HARDWARE_CLEAR_MIN_INTERVAL_SECONDS = 1.0
 
 
 class RoastRunConflictError(Exception):
     """A request conflicts with the current run state (maps to HTTP 409):
     starting a roast while one is active, or rating an in-progress run."""
+
+
+class OperatorActionRateLimitError(Exception):
+    """A safety-relevant operator mutation exceeded its admission bound."""
 
 
 class BeanDraftAlreadyClaimedConflictError(RoastRunConflictError):
@@ -1402,6 +1411,8 @@ class RoastService:
         # tick makes this rare, but the at-most-one-active invariant is held
         # here, not left to chance.
         self._start_lock = asyncio.Lock()
+        self._hardware_clear_request_in_flight = False
+        self._last_hardware_clear_attempt_at: float | None = None
         # Whole fetch+extraction tasks admitted while idle. Registration and
         # roast-start preemption both happen under _start_lock, closing the
         # check/register/start race without holding the lock across remote work.
@@ -1495,7 +1506,8 @@ class RoastService:
         Fail-closed: if stop or re-start raises, the exception propagates out
         of :meth:`start_roast`. The baseline is invalidated before the sequence
         so a failed restart is retried on the next request. An unconfirmed stop
-        instead requires hardware verification and an agent restart (#668).
+        instead requires physical verification and the explicit, audited
+        hardware-clear acknowledgement (#668).
         Only a successful start records the new baseline.
 
         Args:
@@ -1512,18 +1524,20 @@ class RoastService:
         # failure is retried rather than hidden by a stale baseline.
         self._spawned_mcp_device = None
         # stop() bypasses record_child_stop_unconfirmed intentionally: there
-        # is no active run to key a marker to, and start() resets the flag.
+        # is no active run to key a marker to. An uncertain stop remains
+        # process-local and blocks start until the explicit acknowledgement.
         await self._mcp.stop()
         # If stop() could not confirm clean teardown, the old process may still
         # be holding the serial port or audio device. Starting a new child into
         # that state risks a resource conflict or a hidden live process. Abort
-        # the respawn. After the operator verifies the hardware is inactive, a
-        # controlled agent restart clears process-local teardown uncertainty.
+        # the respawn. After the operator verifies the hardware is inactive,
+        # only the explicit hardware-clear endpoint may clear process-local
+        # teardown uncertainty.
         if self._mcp.stop_unconfirmed:
             raise MCPConnectionError(
                 "old MCP child teardown was unconfirmed; "
                 "aborting respawn - verify the roaster and old MCP child resources are inactive, "
-                "restart the agent, then retry"
+                "complete the explicit hardware-clear acknowledgement, then retry"
             )
         self._mcp.set_device_config(new_device_config)
         await self._mcp.start()
@@ -1547,6 +1561,10 @@ class RoastService:
             version=__version__,
             instance_id=self.instance_id,
             mcp_child=self.mcp_child_status(),
+            mcp_hardware_clear_required=(self._mcp is not None and self._mcp.stop_unconfirmed),
+            mcp_teardown_incident_id=(
+                None if self._mcp is None else self._mcp.teardown_incident_id
+            ),
             active_run_id=None if active is None else active.run_id,
             advisor=self._advisor_health,
         )
@@ -1655,7 +1673,7 @@ class RoastService:
                 #      production never does.  A None baseline with a live _mcp
                 #      is treated conservatively as "respawn needed".
                 #   2. After a failed respawn: the None baseline re-detects drift.
-                #      Unconfirmed teardown remains restart-only (#668).
+                #      Unconfirmed teardown requires the explicit #668 acknowledgement.
                 # Between-roasts guarantee: the active_run() check above (under
                 # _start_lock) confirms no roast is active before this block.
                 if self._mcp is not None and (
@@ -1681,6 +1699,89 @@ class RoastService:
         # docstring). A store read carries no process identity; the store
         # layer must stay unaware of this process-scoped value.
         return detail.model_copy(update={"instance_id": self.instance_id})
+
+    async def acknowledge_hardware_clear(
+        self, request: HardwareClearAcknowledgementRequest
+    ) -> HardwareClearAcknowledgementResult:
+        """Accept explicit physical-clear confirmation after uncertain teardown.
+
+        The whole decision is serialized with roast start. A persisted or
+        process-tracked run blocks it, as does any live/unwinding MCP owner.
+        The operator decision is committed to the global audit trail before
+        stale process-generation state is cleared. This method never calls an
+        MCP tool and never resumes heat, fan, or cooling.
+
+        Args:
+            request: Literal hardware-clear confirmation plus required reason.
+
+        Returns:
+            Confirmation that a later roast start may attempt one fresh spawn.
+
+        Raises:
+            RoastRunConflictError: A run is active/recovering, MCP is absent,
+                or its generation is not safe and eligible to clear.
+        """
+        now = self._clock()
+        last_attempt = self._last_hardware_clear_attempt_at
+        if self._hardware_clear_request_in_flight or (
+            last_attempt is not None and now - last_attempt < _HARDWARE_CLEAR_MIN_INTERVAL_SECONDS
+        ):
+            raise OperatorActionRateLimitError(
+                "hardware-clear acknowledgement is rate limited; retry shortly"
+            )
+        # Set synchronously before the first await: competing requests are
+        # rejected instead of queuing behind the roast-start safety lock.
+        self._hardware_clear_request_in_flight = True
+        self._last_hardware_clear_attempt_at = now
+        try:
+            async with self._start_lock:
+                active = await self._store.active_run()
+
+                if active is not None or self.active_run_id is not None:
+                    run_id = active.run_id if active is not None else self.active_run_id
+                    message = (
+                        f"run {run_id} is active or recovering; hardware-clear acknowledgement "
+                        "cannot bypass the run recovery flow"
+                    )
+                    raise RoastRunConflictError(message)
+                if self._mcp is None:
+                    raise RoastRunConflictError("no MCP child lifecycle is configured")
+                blocker = self._mcp.hardware_clear_acknowledgement_blocker(
+                    request.teardown_incident_id
+                )
+                if blocker is not None:
+                    raise RoastRunConflictError(blocker)
+
+                await self._store.record_operator_action(
+                    action="acknowledge_mcp_hardware_clear",
+                    result="accepted",
+                    payload={
+                        "reason": request.reason,
+                        "hardware_clear": request.hardware_clear,
+                        "teardown_incident_id": request.teardown_incident_id,
+                    },
+                )
+                try:
+                    self._mcp.acknowledge_hardware_clear(request.teardown_incident_id)
+                except MCPConnectionError as exc:
+                    await self._store.record_operator_action(
+                        action="acknowledge_mcp_hardware_clear",
+                        result="failed",
+                        payload={
+                            "reason": request.reason,
+                            "failure": str(exc),
+                            "teardown_incident_id": request.teardown_incident_id,
+                        },
+                    )
+                    raise RoastRunConflictError(str(exc)) from exc
+                # Force the next start through the spawn path. This assignment is
+                # deliberately after the durable audit and MCP generation cleanup.
+                self._spawned_mcp_device = None
+                return HardwareClearAcknowledgementResult(
+                    teardown_incident_id=request.teardown_incident_id
+                )
+        finally:
+            self._hardware_clear_request_in_flight = False
 
     async def _begin_live_run(self, profile: RoastProfile, run_id: str) -> None:
         """Construct and start the live controller loop for a run (E9).
@@ -3234,6 +3335,23 @@ async def clear_stale_session(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+async def acknowledge_hardware_clear(
+    request: HardwareClearAcknowledgementRequest,
+    service: ServiceDep,
+) -> HardwareClearAcknowledgementResult:
+    """``POST /api/mcp/acknowledge-hardware-clear`` (#668)."""
+    try:
+        return await service.acknowledge_hardware_clear(request)
+    except RoastRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OperatorActionRateLimitError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=str(exc),
+            headers={"Retry-After": str(int(_HARDWARE_CLEAR_MIN_INTERVAL_SECONDS))},
+        ) from exc
+
+
 async def add_tasting(
     run_id: str,
     request: TastingEntryRequest,
@@ -3910,6 +4028,11 @@ def create_app(
         path=_DRAFT_BEAN_FROM_URL_PATH,
         max_body_bytes=_DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES,
     )
+    app.add_middleware(
+        _RouteBodyLimitMiddleware,
+        path=_HARDWARE_CLEAR_PATH,
+        max_body_bytes=_HARDWARE_CLEAR_MAX_BODY_BYTES,
+    )
     app.state.service = service
     app.add_exception_handler(RequestValidationError, _request_validation_error_handler)
     app.get(HEALTH_PATH)(health)
@@ -3929,6 +4052,7 @@ def create_app(
     app.post("/api/roasts/{run_id}/discard")(discard_roast)
     app.post("/api/roasts/{run_id}/restore")(restore_roast)
     app.post("/api/roasts/{run_id}/clear-stale-session")(clear_stale_session)
+    app.post(_HARDWARE_CLEAR_PATH)(acknowledge_hardware_clear)
     app.post("/api/roasts/{run_id}/tastings", status_code=201)(add_tasting)
     app.get("/api/roasts/{run_id}/tastings")(list_tastings)
     app.post("/api/roasts/{run_id}/operator-actions")(submit_operator_action)

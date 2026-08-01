@@ -614,7 +614,10 @@ async def test_unconfirmed_stop_aborts_respawn(
 
     persist_config_edit(AppConfigEdit(mcp_device=MCPDeviceConfigEdit(serial_port="/dev/ttyUSB1")))
 
-    restart_message = "verify the roaster and old MCP child resources are inactive.*restart.*retry"
+    restart_message = (
+        "verify the roaster and old MCP child resources are inactive"
+        ".*hardware-clear acknowledgement.*retry"
+    )
     with pytest.raises(MCPConnErr, match=restart_message):
         await svc.start_roast(RoastProfile(**_profile()))
 
