@@ -178,6 +178,29 @@ def test_live_signal_guard_repeated_sigterm_remains_graceful(
     assert forced == []
 
 
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (signal.SIGINT, signal.SIGTERM),
+        (signal.SIGTERM, signal.SIGINT),
+    ],
+)
+def test_live_signal_guard_preserves_first_signal_for_exit_semantics(
+    first: int,
+    second: int,
+) -> None:
+    """Mixed graceful signals retain the first signal's process outcome."""
+    graceful: list[int] = []
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard.bind_graceful_handler(lambda signum, _frame: graceful.append(signum))
+
+    guard._handle(first, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    guard._handle(second, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert guard.received_signal == first
+    assert graceful == [first, second]
+
+
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
 def test_live_signal_guard_prebind_falls_back_to_previous_handler(signum: int) -> None:
     """A startup signal before Uvicorn binds still reaches the prior handler."""

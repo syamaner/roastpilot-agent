@@ -133,7 +133,8 @@ class _LiveSignalGuard:
                 signal.signal(signum, handler)
 
     def _handle(self, _signum: int, _frame: FrameType | None) -> None:
-        self._received_signal = _signum
+        if self._received_signal is None:
+            self._received_signal = _signum
         if _signum == signal.SIGTERM:
             if self._graceful_handler is not None:
                 self._graceful_handler(_signum, _frame)
