@@ -18,6 +18,7 @@ from roastpilot_agent.models import (
     BeanProfileDraft,
     BeanProfileInput,
     CatalogueRecommendation,
+    CatalogueRecommendationList,
     MicHealth,
     MicStatus,
     RoastCommand,
@@ -1030,6 +1031,11 @@ def test_catalogue_recommendation_rejects_unsafe_url_and_oversized_reason() -> N
         )
     with pytest.raises(pydantic.ValidationError, match="at most 600 characters"):
         CatalogueRecommendation.model_validate(base | {"reasons": ["x" * 601]})
+
+
+def test_catalogue_recommendation_list_requires_extracted_subset() -> None:
+    with pytest.raises(pydantic.ValidationError, match="extracted_count cannot exceed"):
+        CatalogueRecommendationList(recommendations=[], discovered_count=1, extracted_count=2)
 
 
 @pytest.mark.parametrize(

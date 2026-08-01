@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
@@ -61,13 +62,15 @@ _MAX_ANCHORS_INSPECTED: Final = _MAX_DISCOVERED * 8
 _MAX_SCRIPTS_INSPECTED: Final = _MAX_DISCOVERED * 8
 _PRODUCT_PATH_SEGMENTS: Final = frozenset({"product", "products"})
 _URL_START = re.compile(
-    r"(?:[a-z][a-z0-9+.-]*://|(?<![\w])//|(?<![\w@.])(?:www\.|"
+    r"(?:[a-z][a-z0-9+.-]*://|(?<![\w])//|(?<![\w/])/(?!/)(?=[a-z0-9])|"
+    r"(?<![\w@.])(?:www\.|"
     r"(?:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.)+"
     r"(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})(?=[:/?#\s]|$)|"
     r"(?:\d{1,3}\.){3}\d{1,3}(?=[:/?#\s]|$)|"
     r"\[[0-9a-f:.]+\](?=[:/?#\s]|$)))",
     re.IGNORECASE,
 )
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -296,7 +299,12 @@ def _discover_catalogue_candidates_unchecked(
     """Implement bounded discovery; the public wrapper owns fail-soft mapping."""
     try:
         parser = lxml.html.HTMLParser(encoding="utf-8", no_network=True)
-        tree = lxml.html.fromstring(page.raw_html, parser=parser)  # type: ignore[reportUnknownVariableType]
+        raw_html = page.raw_html.lstrip("\ufeff \t\r\n")
+        if raw_html.casefold().startswith("<?xml"):
+            declaration_end = raw_html.find("?>", 5, 1024)
+            if declaration_end >= 0:
+                raw_html = raw_html[declaration_end + 2 :]
+        tree = lxml.html.fromstring(raw_html, parser=parser)  # type: ignore[reportUnknownVariableType]
     except (lxml.etree.LxmlError, ValueError):  # type: ignore[reportUnknownMemberType]
         return []
 
@@ -391,6 +399,7 @@ def discover_catalogue_candidates(page: FetchedVendorPage) -> list[CatalogueCand
     try:
         return _discover_catalogue_candidates_unchecked(page)
     except Exception:  # noqa: BLE001 - fail-soft boundary for adversarial parser input
+        _log.warning("catalogue discovery failed soft", exc_info=True)
         return []
 
 
@@ -524,6 +533,7 @@ async def _extract(
         processing = (
             item.processing
             if item.processing is not None
+            and item.processing != "other"
             and _page_states_value(provider_evidence, item.processing.replace("_", " "))
             else None
         )

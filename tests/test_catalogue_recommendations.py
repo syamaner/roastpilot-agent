@@ -97,6 +97,25 @@ def test_discovery_does_not_borrow_evidence_from_multi_product_wrapper() -> None
     assert [candidate.evidence for candidate in candidates] == ["Kiambu Lot", "Santos Lot"]
 
 
+def test_discovery_stops_card_evidence_at_ancestor_cap() -> None:
+    html = (
+        "<section><span>Kenya Natural neighbour</span><div><div><div><div>"
+        '<a href="/products/kiambu">Kiambu</a>'
+        "</div></div></div></div></section>"
+    )
+    candidates = discover_catalogue_candidates(_page(html))
+    assert candidates[0].evidence == "Kiambu"
+
+
+def test_discovery_caps_card_evidence_text_nodes() -> None:
+    nodes = "".join(f"<span>Node {index}</span>" for index in range(70))
+    candidates = discover_catalogue_candidates(
+        _page(f'<article><a href="/products/kiambu">Kiambu</a>{nodes}</article>')
+    )
+    assert "Node 62" in candidates[0].evidence
+    assert "Node 69" not in candidates[0].evidence
+
+
 def test_discovery_rejects_evidence_from_wrapper_beyond_link_scan_cap() -> None:
     repeated = "".join('<a href="/products/kiambu">Kiambu</a>' for _ in range(9))
     html = f"<section>{repeated}<span>Neighbour Kenya Natural</span></section>"
@@ -152,6 +171,7 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
     assert redact("192.0.2.1/private?token=x washed") == "[link] washed"
     assert redact("example.xn--p1ai/private?token=x washed") == "[link] washed"
     assert redact("https://[2001:db8::1]/private?token=x washed") == "[link] washed"
+    assert redact("/products/a?token=secret washed") == "[link] washed"
     assert redact("farmer@vendor.example washed") == "farmer@vendor.example washed"
 
 
@@ -292,6 +312,14 @@ def test_discovery_ignores_fragment_only_json_ld_product_identifier() -> None:
     assert discover_catalogue_candidates(_page(html)) == []
 
 
+def test_discovery_accepts_decoded_xhtml_with_xml_encoding_declaration() -> None:
+    html = '<?xml version="1.0" encoding="UTF-8"?><a href="/products/a">Café A</a>'
+    candidates = discover_catalogue_candidates(_page(html))
+    assert [(item.label, item.product_url) for item in candidates] == [
+        ("Café A", "https://vendor.example/products/a")
+    ]
+
+
 def test_discovery_caps_matching_json_ld_after_skipping_ordinary_scripts() -> None:
     html = "".join("<script>analytics</script>" for _ in range(24))
     html += """
@@ -306,7 +334,7 @@ def test_discovery_caps_matching_json_ld_after_skipping_ordinary_scripts() -> No
 
 
 def test_discovery_fails_soft_on_unexpected_parser_escape(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     def failed(page: FetchedVendorPage) -> list[catalogue.CatalogueCandidate]:
         del page
@@ -314,6 +342,7 @@ def test_discovery_fails_soft_on_unexpected_parser_escape(
 
     monkeypatch.setattr(catalogue, "_discover_catalogue_candidates_unchecked", failed)
     assert discover_catalogue_candidates(_page("<p>ignored</p>")) == []
+    assert "catalogue discovery failed soft" in caplog.text
 
 
 def test_discovery_caps_candidates_at_twenty_four() -> None:
@@ -703,6 +732,49 @@ async def test_extraction_cannot_ground_metadata_in_redacted_url_tokens() -> Non
     )
     assert extracted[0].name == "Mystery Lot"
     assert extracted[0].country is None
+    assert extracted[0].processing is None
+
+
+@pytest.mark.asyncio
+async def test_extraction_does_not_ground_ambiguous_other_processing() -> None:
+    page = _page("")
+    candidates = [
+        catalogue.CatalogueCandidate(
+            candidate_id="candidate-01",
+            product_url="https://vendor.example/products/mystery",
+            label="Mystery Lot",
+            evidence="Mystery Lot and other origins",
+            source_order=0,
+        )
+    ]
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "candidates": [
+                            {
+                                "candidate_id": "candidate-01",
+                                "name": "Mystery Lot",
+                                "processing": "other",
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+
+    extracted = await catalogue._extract(  # pyright: ignore[reportPrivateUsage]
+        page,
+        candidates,
+        advisor_config=AdvisorConfig(),
+        sourcing_config=BeanSourcingConfig(),
+        diagnostics=BeanSourcingDiagnostics(),
+        model=FunctionModel(respond),
+    )
     assert extracted[0].processing is None
 
 

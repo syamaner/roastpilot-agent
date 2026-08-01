@@ -445,10 +445,10 @@ class RoastRunGoneError(Exception):
 
 
 @dataclass
-class _BeanDraftOperation:
-    """One registered bean-draft pipeline and its cancellation reason."""
+class _BeanSourcingOperation:
+    """One registered bean-sourcing task and its cancellation reason."""
 
-    task: asyncio.Task[BeanProfileDraft | CatalogueRecommendationList]
+    task: asyncio.Task[BeanProfileDraft | CatalogueRankingContext | CatalogueRecommendationList]
     preempted_by_start: bool = False
 
 
@@ -1424,7 +1424,8 @@ class RoastService:
         # roast-start preemption both happen under _start_lock, closing the
         # check/register/start race without holding the lock across remote work.
         self._bean_draft_operations: dict[
-            asyncio.Task[BeanProfileDraft | CatalogueRecommendationList], _BeanDraftOperation
+            asyncio.Task[BeanProfileDraft | CatalogueRankingContext | CatalogueRecommendationList],
+            _BeanSourcingOperation,
         ] = {}
         self._bean_draft_expiry_wakeup = asyncio.Event()
         self._bean_draft_expiry_task: asyncio.Task[None] | None = None
@@ -3080,7 +3081,7 @@ class RoastService:
                     diagnostics=diagnostics,
                 )
             )
-            operation = _BeanDraftOperation(task=task)
+            operation = _BeanSourcingOperation(task=task)
             self._bean_draft_operations[task] = operation
         try:
             try:
@@ -3175,32 +3176,24 @@ class RoastService:
 
     async def _catalogue_ranking_context(self) -> CatalogueRankingContext:
         """Build aggregate local ranking facts without exposing history to the model."""
-        profiles = await self._store.list_bean_profiles()
-        runs = await self._store.list_runs()
+        profile_axes, rated_axes = await self._store.catalogue_ranking_axes()
         roster_countries = frozenset(
-            profile.country.strip().casefold() for profile in profiles if profile.country
+            country.strip().casefold() for country, _ in profile_axes if country
         )
         roster_processes: frozenset[ProcessingMethod] = frozenset(
-            profile.processing for profile in profiles if profile.processing is not None
+            processing for _, processing in profile_axes if processing is not None
         )
         roster_pairs: frozenset[tuple[str, ProcessingMethod]] = frozenset(
-            (profile.country.strip().casefold(), profile.processing)
-            for profile in profiles
-            if profile.country and profile.processing is not None
+            (country.strip().casefold(), processing)
+            for country, processing in profile_axes
+            if country and processing is not None
         )
-        rated = [
-            run
-            for run in runs
-            if run.outcome == "completed" and run.rating is not None and run.rating >= 4
-        ]
         return CatalogueRankingContext(
             roster_countries=roster_countries,
             roster_processes=roster_processes,
             roster_pairs=roster_pairs,
             rated_pairs=frozenset(
-                (run.country.strip().casefold(), run.processing)
-                for run in rated
-                if run.country and run.processing is not None
+                (country.strip().casefold(), processing) for country, processing in rated_axes
             ),
         )
 
@@ -3213,52 +3206,92 @@ class RoastService:
                     "catalogue recommendations are unavailable while a roast is active "
                     f"(run {active.run_id}, phase {active.agent_phase.value})"
                 )
-        # This reads potentially large history tables. It performs no remote work and
-        # grants no provider-call admission, so keep it outside the roast-start lock.
-        context = await self._catalogue_ranking_context()
-
-        async with self._start_lock:
-            # A roast may have started while the ranking snapshot was built. Re-check
-            # atomically with provider-task registration before granting admission.
-            active = await self._store.active_run()
-            if active is not None:
-                raise RoastRunConflictError(
-                    "catalogue recommendations are unavailable while a roast is active "
-                    f"(run {active.run_id}, phase {active.agent_phase.value})"
-                )
-            advisor_config = self._config.advisor
-            sourcing_config = self._config.bean_sourcing
-            started_monotonic = self._clock()
-            diagnostics = BeanSourcingDiagnostics()
-            attempt_id, cancelled_during_admission = await self._start_bean_attempt_bounded(
-                provider=advisor_config.provider,
-                model_slug=resolve_extraction_model_slug(advisor_config, sourcing_config),
-                prompt_version=CATALOGUE_EXTRACTION_PROMPT_VERSION,
+            # The lightweight aggregate read still belongs to this sourcing
+            # request. Register it before releasing the start lock so roast start
+            # can preempt even a slow/local context snapshot, not only provider work.
+            context_task = asyncio.create_task(
+                self._catalogue_ranking_context(),
+                name="build-catalogue-ranking-context",
             )
-            if cancelled_during_admission:
-                await self._finish_bean_attempt_bounded(
-                    attempt_id,
-                    outcome="cancelled",
-                    started_monotonic=started_monotonic,
-                    diagnostics=diagnostics,
-                    claimable_draft=False,
-                )
+            context_operation = _BeanSourcingOperation(task=context_task)
+            self._bean_draft_operations[context_task] = context_operation
+        try:
+            try:
+                context = await context_task
+            except asyncio.CancelledError:
+                outer_task = asyncio.current_task()
+                if (
+                    outer_task is not None
+                    and outer_task.cancelling() == 0
+                    and context_operation.preempted_by_start
+                ):
+                    raise RoastRunConflictError(
+                        "catalogue recommendation was preempted by a roast-start attempt"
+                    ) from None
+                raise
+            except Exception:
+                outer_task = asyncio.current_task()
+                if outer_task is not None and outer_task.cancelling() > 0:
+                    raise asyncio.CancelledError from None
+                if context_operation.preempted_by_start:
+                    raise RoastRunConflictError(
+                        "catalogue recommendation was preempted by a roast-start attempt"
+                    ) from None
+                raise
+            outer_task = asyncio.current_task()
+            if outer_task is not None and outer_task.cancelling() > 0:
                 raise asyncio.CancelledError
-            lease_heartbeat = asyncio.create_task(
-                self._renew_bean_attempt_lease(attempt_id),
-                name=f"renew-catalogue-attempt-{attempt_id}",
-            )
-            task = asyncio.create_task(
-                recommend_from_catalogue(
-                    url,
-                    context=context,
-                    advisor_config=advisor_config,
-                    sourcing_config=sourcing_config,
-                    diagnostics=diagnostics,
+            if context_operation.preempted_by_start:
+                raise RoastRunConflictError(
+                    "catalogue recommendation was preempted by a roast-start attempt"
                 )
-            )
-            operation = _BeanDraftOperation(task=task)
-            self._bean_draft_operations[task] = operation
+
+            async with self._start_lock:
+                # A roast may have started after the context task completed but
+                # before this lock was acquired. Swap context for provider work
+                # atomically with the final active-run check.
+                self._bean_draft_operations.pop(context_task, None)
+                active = await self._store.active_run()
+                if active is not None:
+                    raise RoastRunConflictError(
+                        "catalogue recommendations are unavailable while a roast is active "
+                        f"(run {active.run_id}, phase {active.agent_phase.value})"
+                    )
+                advisor_config = self._config.advisor
+                sourcing_config = self._config.bean_sourcing
+                started_monotonic = self._clock()
+                diagnostics = BeanSourcingDiagnostics()
+                attempt_id, cancelled_during_admission = await self._start_bean_attempt_bounded(
+                    provider=advisor_config.provider,
+                    model_slug=resolve_extraction_model_slug(advisor_config, sourcing_config),
+                    prompt_version=CATALOGUE_EXTRACTION_PROMPT_VERSION,
+                )
+                if cancelled_during_admission:
+                    await self._finish_bean_attempt_bounded(
+                        attempt_id,
+                        outcome="cancelled",
+                        started_monotonic=started_monotonic,
+                        diagnostics=diagnostics,
+                        claimable_draft=False,
+                    )
+                    raise asyncio.CancelledError
+                lease_heartbeat = asyncio.create_task(
+                    self._renew_bean_attempt_lease(attempt_id),
+                    name=f"renew-catalogue-attempt-{attempt_id}",
+                )
+                task = asyncio.create_task(
+                    recommend_from_catalogue(
+                        url,
+                        context=context,
+                        advisor_config=advisor_config,
+                        sourcing_config=sourcing_config,
+                        diagnostics=diagnostics,
+                    )
+                )
+                operation = _BeanSourcingOperation(task=task)
+                self._bean_draft_operations[task] = operation
+        finally:
+            self._bean_draft_operations.pop(context_task, None)
         try:
             try:
                 result = await task

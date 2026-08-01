@@ -5042,8 +5042,11 @@ async def test_catalogue_service_rejects_before_context_work_when_roast_is_activ
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("post_cancel_outcome", ["raise", "return", "error"])
 async def test_catalogue_service_rechecks_active_roast_after_context_snapshot(
-    service: RoastService, monkeypatch: pytest.MonkeyPatch
+    service: RoastService,
+    monkeypatch: pytest.MonkeyPatch,
+    post_cancel_outcome: Literal["raise", "return", "error"],
 ) -> None:
     from roastpilot_agent.catalogue_recommendations import CatalogueRankingContext
 
@@ -5052,13 +5055,20 @@ async def test_catalogue_service_rechecks_active_roast_after_context_snapshot(
 
     async def delayed_context() -> CatalogueRankingContext:
         context_started.set()
-        await release_context.wait()
-        return CatalogueRankingContext(
-            roster_countries=frozenset(),
-            roster_processes=frozenset(),
-            roster_pairs=frozenset(),
-            rated_pairs=frozenset(),
-        )
+        try:
+            await release_context.wait()
+        except asyncio.CancelledError:
+            if post_cancel_outcome == "return":
+                return CatalogueRankingContext(
+                    roster_countries=frozenset(),
+                    roster_processes=frozenset(),
+                    roster_pairs=frozenset(),
+                    rated_pairs=frozenset(),
+                )
+            if post_cancel_outcome == "error":
+                raise RuntimeError("synthetic post-preemption context error") from None
+            raise
+        raise AssertionError("roast start failed to preempt context building")
 
     async def fail_if_called(*args: object, **kwargs: object) -> object:
         del args, kwargs
@@ -5071,9 +5081,92 @@ async def test_catalogue_service_rechecks_active_roast_after_context_snapshot(
     )
     await asyncio.wait_for(context_started.wait(), timeout=2.0)
     await service.start_roast(_profile())
-    release_context.set()
-    with pytest.raises(RoastRunConflictError, match="active"):
+    with pytest.raises(RoastRunConflictError, match="preempted"):
         await recommendation
+    assert not service._bean_draft_operations  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("post_cancel_outcome", ["raise", "return", "error"])
+async def test_direct_catalogue_cancellation_during_context_wins(
+    service: RoastService,
+    monkeypatch: pytest.MonkeyPatch,
+    post_cancel_outcome: Literal["raise", "return", "error"],
+) -> None:
+    from roastpilot_agent.catalogue_recommendations import CatalogueRankingContext
+
+    entered = asyncio.Event()
+
+    async def delayed_context() -> CatalogueRankingContext:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if post_cancel_outcome == "return":
+                return CatalogueRankingContext(
+                    roster_countries=frozenset(),
+                    roster_processes=frozenset(),
+                    roster_pairs=frozenset(),
+                    rated_pairs=frozenset(),
+                )
+            if post_cancel_outcome == "error":
+                raise RuntimeError("synthetic post-cancel context error") from None
+            raise
+        raise AssertionError("direct cancellation failed to stop context building")
+
+    monkeypatch.setattr(service, "_catalogue_ranking_context", delayed_context)
+    recommendation = asyncio.create_task(
+        service.recommend_beans_from_catalogue("https://vendor.example/collections/green")
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
+    recommendation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await recommendation
+    assert not service._bean_draft_operations  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_catalogue_context_error_propagates_and_unregisters(
+    service: RoastService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def failed_context() -> object:
+        raise RuntimeError("synthetic context read failure")
+
+    monkeypatch.setattr(service, "_catalogue_ranking_context", failed_context)
+    with pytest.raises(RuntimeError, match="context read failure"):
+        await service.recommend_beans_from_catalogue("https://vendor.example/collections/green")
+    assert not service._bean_draft_operations  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_catalogue_rechecks_active_run_after_completed_context_task(
+    service: RoastService, store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from roastpilot_agent.catalogue_recommendations import CatalogueRankingContext
+
+    async def context_that_observes_concurrent_run() -> CatalogueRankingContext:
+        await store.create_run(
+            run_id="context-race",
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        return CatalogueRankingContext(
+            roster_countries=frozenset(),
+            roster_processes=frozenset(),
+            roster_pairs=frozenset(),
+            rated_pairs=frozenset(),
+        )
+
+    async def fail_if_called(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        pytest.fail("provider must not run after an active run appears")
+
+    monkeypatch.setattr(service, "_catalogue_ranking_context", context_that_observes_concurrent_run)
+    monkeypatch.setattr("roastpilot_agent.api.recommend_from_catalogue", fail_if_called)
+    with pytest.raises(RoastRunConflictError, match="active"):
+        await service.recommend_beans_from_catalogue("https://vendor.example/collections/green")
+    assert not service._bean_draft_operations  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -6118,7 +6211,7 @@ async def test_draft_preemption_before_inner_task_first_runs(service: RoastServi
         return _draft_from("https://vendor.example/products/kenya")
 
     inner_task = asyncio.create_task(not_yet_started())
-    operation = api_module._BeanDraftOperation(inner_task)  # pyright: ignore[reportPrivateUsage]
+    operation = api_module._BeanSourcingOperation(inner_task)  # pyright: ignore[reportPrivateUsage]
     service._bean_draft_operations[inner_task] = operation  # pyright: ignore[reportPrivateUsage]
     try:
         async with service._start_lock:  # pyright: ignore[reportPrivateUsage]

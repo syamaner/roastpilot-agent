@@ -29,6 +29,7 @@ from roastpilot_agent.models import (
     CommandTraceSource,
     CommandTraceStatus,
     LogManifest,
+    ProcessingMethod,
     ReferenceCurveSample,
     ReferenceLandmarks,
     ReferenceRoast,
@@ -2744,6 +2745,57 @@ class RoastStore:
         ) as cursor:
             rows = await cursor.fetchall()
         return [BeanProfile.model_validate_json(str(row["profile_json"])) for row in rows]
+
+    async def catalogue_ranking_axes(
+        self,
+    ) -> tuple[
+        list[tuple[str | None, ProcessingMethod | None]],
+        list[tuple[str, ProcessingMethod]],
+    ]:
+        """Read only the distinct local facts used by catalogue ranking.
+
+        This deliberately avoids :meth:`list_runs`, whose history projection
+        materializes full profiles and correlated telemetry/advisor aggregates.
+        Catalogue ranking needs only active-profile country/process axes and
+        completed, non-excluded 4--5-star country/process pairs.
+
+        Returns:
+            ``(profile_axes, rated_pairs)``. Profile axes retain either nullable
+            component so missing-country and missing-processing sets can be
+            built independently; rated pairs require both components.
+        """
+        async with self.connection.execute(
+            "SELECT DISTINCT json_extract(profile_json, '$.country') AS country,"
+            " json_extract(profile_json, '$.processing') AS processing"
+            " FROM bean_profiles WHERE archived = 0"
+        ) as cursor:
+            profile_rows = await cursor.fetchall()
+        async with self.connection.execute(
+            "SELECT DISTINCT json_extract(profile_json, '$.country') AS country,"
+            " json_extract(profile_json, '$.processing') AS processing"
+            " FROM roast_runs WHERE excluded = 0 AND outcome = 'completed'"
+            " AND operator_rating >= 4"
+            " AND json_extract(profile_json, '$.country') IS NOT NULL"
+            " AND json_extract(profile_json, '$.processing') IS NOT NULL"
+        ) as cursor:
+            rated_rows = await cursor.fetchall()
+        profile_axes: list[tuple[str | None, ProcessingMethod | None]] = [
+            (
+                None if row["country"] is None else str(row["country"]),
+                None
+                if row["processing"] is None
+                else cast(ProcessingMethod, str(row["processing"])),
+            )
+            for row in profile_rows
+        ]
+        rated_pairs: list[tuple[str, ProcessingMethod]] = [
+            (
+                str(row["country"]),
+                cast(ProcessingMethod, str(row["processing"])),
+            )
+            for row in rated_rows
+        ]
+        return profile_axes, rated_pairs
 
     async def get_bean_profile(self, profile_id: str) -> BeanProfile | None:
         """One active saved profile by id, or ``None`` (unknown or archived)."""

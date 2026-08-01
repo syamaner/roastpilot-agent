@@ -996,6 +996,13 @@ class CatalogueRecommendationList(BaseModel):
     discovered_count: int = Field(ge=0, le=24)
     extracted_count: int = Field(ge=0, le=12)
 
+    @model_validator(mode="after")
+    def _check_extracted_subset(self) -> "CatalogueRecommendationList":
+        """Extracted candidates cannot outnumber server discovery candidates."""
+        if self.extracted_count > self.discovered_count:
+            raise ValueError("extracted_count cannot exceed discovered_count")
+        return self
+
 
 # --- #567 Slice A: reference-curve retrieval + representation models ---
 #
