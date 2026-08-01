@@ -290,8 +290,10 @@ def _same_origin_product_url(
         base_effective_port,
     ):
         return None
-    segments = {segment.casefold() for segment in parsed.path.split("/") if segment}
-    if require_product_path and not segments.intersection(_PRODUCT_PATH_SEGMENTS):
+    segments = [segment.casefold() for segment in parsed.path.split("/") if segment]
+    if require_product_path and not any(
+        segment in _PRODUCT_PATH_SEGMENTS for segment in segments[:-1]
+    ):
         return None
     rendered_host = f"[{parsed_host}]" if ":" in parsed_host else parsed_host
     normalized_netloc = rendered_host

@@ -233,6 +233,9 @@ def test_json_ld_flattener_handles_graph_item_list_nested_item_and_noise() -> No
         ("ftp://vendor.example/products/a", False),
         ("https://other.example/products/a", False),
         ("/collections/all", True),
+        ("/products", True),
+        ("/products?page=2", True),
+        ("/shop/product/", True),
     ],
 )
 def test_candidate_url_normalization_fails_closed(value: str, require_product_path: bool) -> None:
@@ -258,6 +261,15 @@ def test_candidate_url_normalization_rejects_oversized_product_url() -> None:
         )
         is None
     )
+
+
+def test_discovery_navigation_root_does_not_displace_first_twelve_products() -> None:
+    navigation = '<a href="/products?page=2">All products</a>'
+    products = "".join(f'<a href="/products/{index}">Bean {index}</a>' for index in range(1, 13))
+    candidates = discover_catalogue_candidates(_page(navigation + products))
+    assert [candidate.product_url for candidate in candidates[:12]] == [
+        f"https://vendor.example/products/{index}" for index in range(1, 13)
+    ]
 
 
 def test_candidate_url_normalization_preserves_query_order_and_default_ports() -> None:
