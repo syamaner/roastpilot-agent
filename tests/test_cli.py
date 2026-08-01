@@ -210,6 +210,31 @@ def test_live_signal_guard_prebind_sigterm_preserves_default_termination(
     assert exc.value.code == 128 + signal.SIGTERM
 
 
+def test_live_signal_guard_prebind_sigint_ignores_noncallable_previous_handler() -> None:
+    """A default pre-bind SIGINT records shutdown without calling a sentinel."""
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard._previous[signal.SIGINT] = signal.SIG_DFL  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    guard._handle(signal.SIGINT, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert guard.received_signal == signal.SIGINT
+
+
+def test_live_signal_guard_exit_skips_missing_previous_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restoration tolerates a platform reporting no prior signal handler."""
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard._previous[signal.SIGINT] = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    def _unexpected_restore(_signum: int, _handler: object) -> None:
+        pytest.fail("a missing prior handler must not be restored")
+
+    monkeypatch.setattr(signal, "signal", _unexpected_restore)
+
+    guard.__exit__()
+
+
 def test_signal_managed_server_does_not_replace_process_handlers() -> None:
     """The Uvicorn override's context executes without installing handlers."""
     server = cli._SignalManagedServer(uvicorn.Config("tests.test_cli:app"))  # pyright: ignore[reportPrivateUsage]
