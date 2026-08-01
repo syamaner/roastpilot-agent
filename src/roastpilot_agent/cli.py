@@ -16,12 +16,18 @@ Two run modes plus the scaffold default:
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
+import signal
 import tempfile
-from collections.abc import Awaitable, Callable, Sequence
+import threading
+from collections.abc import Awaitable, Callable, Generator, Sequence
 from pathlib import Path
+from types import FrameType
 from typing import TYPE_CHECKING, cast
+
+import uvicorn
 
 from roastpilot_agent import __version__
 
@@ -39,6 +45,138 @@ _log = logging.getLogger(__name__)
 _ACCESS_LOG_MODES = ("quiet", "full", "off")
 #: The uvicorn logger that emits the per-request ``GET /… 200 OK`` access lines.
 _UVICORN_ACCESS_LOGGER = "uvicorn.access"
+_LIVE_EXIT_GRACE_SECONDS = 10.0
+_LIVE_EXIT_CODE = 70
+
+
+class _LiveExitGuard:
+    """Bound live-process finalization after safety teardown completes.
+
+    The daemon thread is started before ``asyncio.run`` so it remains able to
+    terminate the process if asyncio's residual-task or executor shutdown
+    blocks. It is deliberately armed only after the live store has closed.
+    """
+
+    def __init__(self, *, grace_seconds: float = _LIVE_EXIT_GRACE_SECONDS) -> None:
+        """Start an unarmed live-exit watchdog.
+
+        Args:
+            grace_seconds: Fixed post-teardown finalization grace period.
+        """
+        self._grace_seconds = grace_seconds
+        self._armed = threading.Event()
+        self._disarmed = threading.Event()
+        self._residual_labels: tuple[str, ...] = ()
+        self._thread = threading.Thread(
+            target=self._watch,
+            name="roastpilot-live-exit-watchdog",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def arm(self, residual_labels: tuple[str, ...]) -> None:
+        """Arm the process bound with safe residual-task labels."""
+        self._residual_labels = residual_labels
+        self._armed.set()
+
+    def disarm(self) -> None:
+        """Disarm the watchdog after ``asyncio.run`` finishes."""
+        self._disarmed.set()
+        # Also release a never-armed watchdog (for example an MCP startup
+        # failure before a live service was established) so its daemon thread
+        # does not linger for the rest of an embedding process's lifetime.
+        self._armed.set()
+
+    def _watch(self) -> None:
+        self._armed.wait()
+        if self._disarmed.wait(self._grace_seconds):
+            return
+        labels = ", ".join(self._residual_labels) or "unidentified residual finalization"
+        message = (
+            "roastpilot-agent: live teardown completed, but process finalization "
+            f"exceeded {self._grace_seconds:g}s; survivors: {labels}\n"
+        )
+        with contextlib.suppress(OSError):
+            os.write(2, message.encode("utf-8", errors="replace"))
+        os._exit(_LIVE_EXIT_CODE)
+
+
+class _LiveSignalGuard:
+    """Preserve first-SIGINT teardown and force an explicit second abort."""
+
+    def __init__(self) -> None:
+        """Install no handlers until entering the guard."""
+        self._sigint_count = 0
+        self._received_signal: int | None = None
+        self._previous: dict[
+            int, signal.Handlers | int | Callable[[int, FrameType | None], None] | None
+        ] = {}
+        self._graceful_handler: Callable[[int, FrameType | None], None] | None = None
+
+    def bind_graceful_handler(self, handler: Callable[[int, FrameType | None], None]) -> None:
+        """Bind Uvicorn's first-signal graceful-shutdown handler."""
+        self._graceful_handler = handler
+
+    @property
+    def received_signal(self) -> int | None:
+        """Return the graceful termination signal received, if any."""
+        return self._received_signal
+
+    def __enter__(self) -> "_LiveSignalGuard":
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            self._previous[signum] = signal.signal(signum, self._handle)
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        for signum, handler in self._previous.items():
+            if handler is not None:
+                signal.signal(signum, handler)
+
+    def _handle(self, _signum: int, _frame: FrameType | None) -> None:
+        self._received_signal = _signum
+        if _signum == signal.SIGTERM:
+            if self._graceful_handler is not None:
+                self._graceful_handler(_signum, _frame)
+            else:
+                previous = self._previous.get(_signum)
+                if callable(previous):
+                    previous(_signum, _frame)
+                else:
+                    os._exit(128 + _signum)
+            return
+        self._sigint_count += 1
+        if self._sigint_count < 2:
+            if self._graceful_handler is not None:
+                self._graceful_handler(_signum, _frame)
+            else:
+                previous = self._previous.get(_signum)
+                if callable(previous):
+                    previous(_signum, _frame)
+            return
+        message = (
+            "roastpilot-agent: second SIGINT forced immediate exit; live teardown "
+            "may be incomplete and hardware state is uncertain\n"
+        )
+        with contextlib.suppress(OSError):
+            os.write(2, message.encode("utf-8"))
+        os._exit(_LIVE_EXIT_CODE)
+
+
+class _SignalManagedServer(uvicorn.Server):
+    """Uvicorn server whose signals are owned by ``_LiveSignalGuard``."""
+
+    @contextlib.contextmanager
+    def capture_signals(self) -> Generator[None]:
+        """Keep Uvicorn from replacing the process-level live handlers."""
+        yield
+
+
+def _propagate_live_termination(signum: int | None) -> None:
+    """Propagate a graceful live termination after ordered teardown."""
+    if signum == signal.SIGINT:
+        raise KeyboardInterrupt
+    if signum == signal.SIGTERM:
+        raise SystemExit(128 + signal.SIGTERM)
 
 
 def _access_path_matches(request_path: str, pattern: str) -> bool:
@@ -622,7 +760,47 @@ def _format_post_fc_loop_readout(
     return lines
 
 
-async def _serve_live(args: argparse.Namespace) -> int:
+def _residual_task_labels() -> tuple[str, ...]:
+    """Return stable, non-sensitive labels for unfinished asyncio tasks."""
+    current = asyncio.current_task()
+    labels = {
+        task.get_name() for task in asyncio.all_tasks() if task is not current and not task.done()
+    }
+    return tuple(sorted(labels))
+
+
+async def _finish_live_teardown(
+    service: "RoastService",
+    mcp: "MCPServerProcess",
+    store: "RoastStore",
+    exit_guard: _LiveExitGuard | None,
+) -> None:
+    """Complete ordered teardown despite cancellation, then arm the exit bound."""
+    teardown = asyncio.create_task(
+        _teardown_live(service, mcp, store),
+        name="roastpilot-live-ordered-teardown",
+    )
+    cancelled = False
+    while not teardown.done():
+        try:
+            await asyncio.shield(teardown)
+        except asyncio.CancelledError:
+            cancelled = True
+    # Retrieve an unexpected BaseException even though ordinary teardown-step
+    # exceptions are contained by _cleanup_step.
+    teardown.result()
+    if exit_guard is not None:
+        exit_guard.arm(_residual_task_labels())
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+async def _serve_live(
+    args: argparse.Namespace,
+    *,
+    exit_guard: _LiveExitGuard,
+    signal_guard: _LiveSignalGuard,
+) -> int:
     """Build and serve the live roast app, then clean up the MCP child.
 
     Uses the recovery lifespan (``create_app``'s default — restart →
@@ -630,7 +808,16 @@ async def _serve_live(args: argparse.Namespace) -> int:
     Fail-closed: an MCP start failure prints a clear message and returns a
     non-zero exit, with the child cleaned up by
     :func:`~roastpilot_agent.live.build_live_service`."""
-    import uvicorn
+    live_task = asyncio.current_task()
+    if live_task is None:  # pragma: no cover - asyncio always owns a running coroutine
+        raise RuntimeError("live serve requires an asyncio task")
+
+    def _cancel_live_task(_signum: int, _frame: FrameType | None) -> None:
+        """Cancel startup safely until Uvicorn's graceful handler is bound."""
+        live_task.cancel()
+
+    signal_guard.bind_graceful_handler(_cancel_live_task)
+
     from pydantic import ValidationError
 
     from roastpilot_agent.api import create_app
@@ -720,13 +907,15 @@ async def _serve_live(args: argparse.Namespace) -> int:
             log_level=log_level,
             access_log=access_log,
         )
-        server = uvicorn.Server(uv)
+        server = _SignalManagedServer(uv)
+        signal_guard.bind_graceful_handler(server.handle_exit)
         # _lifespan runs recover_on_start (restart → recovery) on startup and
         # service.shutdown() on teardown; we stop the MCP child after the
         # server returns (graceful shutdown / SIGINT) and close the store.
         await server.serve()
     finally:
-        await _teardown_live(service, mcp, store)
+        await _finish_live_teardown(service, mcp, store, exit_guard)
+    _propagate_live_termination(signal_guard.received_signal)
     return 0
 
 
@@ -890,7 +1079,15 @@ def main() -> int:
     if args.replay is not None and args.db is not None:
         parser.error("--db is only valid for 'serve'; replay uses an ephemeral store")
     if args.action == "serve":
-        return asyncio.run(_serve_live(args))
+        exit_guard = _LiveExitGuard()
+        signal_guard = _LiveSignalGuard()
+        try:
+            with signal_guard:
+                return asyncio.run(
+                    _serve_live(args, exit_guard=exit_guard, signal_guard=signal_guard)
+                )
+        finally:
+            exit_guard.disarm()
     if args.replay is not None:
         return asyncio.run(_serve_replay(args))
     parser.print_help()
