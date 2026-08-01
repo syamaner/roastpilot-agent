@@ -33,9 +33,12 @@
 > latency and provenance counts, then atomically correlates at most one explicit
 > save to a bounded, server-held baseline without retaining URLs/evidence/error
 > text. The scoring/small-N bake-off harness already shipped as
-> `scripts/bakeoff_bean_sourcing.py`. Open follow-ups: **#573** (catalogue scope —
-> operator-gated), **#591** (socket-level SSRF pinning), **#595** (rate-limit/auth on the
-> billable endpoint).
+> `scripts/bakeoff_bean_sourcing.py`. **#573 / D121 catalogue recommendations is IN
+> PROGRESS:** backend slice PR #696 owns the bounded discovery, one-call extraction,
+> deterministic local ranking, roast-start pre-emption, and aggregate schema-v15
+> telemetry boundary; the UI/story-close slice follows only after that backend merges.
+> Other open follow-ups: **#591** (socket-level SSRF pinning), **#595**
+> (rate-limit/auth on the billable endpoint).
 >
 > **Review + process.** PR size is a **reviewability guide, not a hard cap** (#661,
 > 26 Jul) — a cohesive single-slice story stays one PR. `security-reviewer` is now
@@ -54,7 +57,7 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D121** (D120 records incident-bound hardware-clear acknowledgement).
+> Next free plan decision number: **D122** (D121 records catalogue recommendations).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 27 Jul block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
