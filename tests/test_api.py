@@ -48,10 +48,11 @@ from roastpilot_agent.bean_sourcing import (
     BeanFetchError,
     BeanSourcingDiagnostics,
 )
-from roastpilot_agent.config import AppConfig, ControllerConfig, ReferenceCurve
+from roastpilot_agent.config import AppConfig, ControllerConfig, MCPDeviceConfig, ReferenceCurve
 from roastpilot_agent.mcp_client import (
     AmbientStatus,
     FirstCrackStatus,
+    MCPConnectionError,
     MCPServerProcess,
     RoastSessionState,
 )
@@ -476,6 +477,10 @@ async def test_acknowledge_hardware_clear_audits_before_clearing_process_state(
     app = create_app(service)
     transport = ASGITransport(app=app)
 
+    before = await service.health()
+    assert before.mcp_hardware_clear_required is True
+    assert before.mcp_teardown_incident_id == "a" * 32
+
     original = process.acknowledge_hardware_clear
     audit = mock.AsyncMock(wraps=store.record_operator_action)
 
@@ -509,7 +514,9 @@ async def test_acknowledge_hardware_clear_audits_before_clearing_process_state(
         "fresh_spawn_permitted": True,
     }
     assert process.stop_unconfirmed is False
-    assert (await service.health()).mcp_hardware_clear_required is False
+    after = await service.health()
+    assert after.mcp_hardware_clear_required is False
+    assert after.mcp_teardown_incident_id is None
     assert roaster.mock_calls == []
     async with store.connection.execute(
         "SELECT payload_json FROM operator_actions ORDER BY id DESC LIMIT 1"
@@ -555,6 +562,9 @@ async def test_acknowledge_hardware_clear_rejects_active_recovery_and_replay(
         outcome="aborted",
         agent_phase=RoastPhase.OPERATOR_RECOVERY_REQUIRED,
     )
+    # The process pointer deliberately survives finalization; persisted state
+    # is authoritative for whether the run is still active/recovering.
+    service.active_run_id = "run-recovery-block"
     accepted = await service.acknowledge_hardware_clear(request)
     assert accepted.fresh_spawn_permitted is True
     process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
@@ -586,6 +596,21 @@ async def test_acknowledge_hardware_clear_rejects_active_recovery_and_replay(
             "hardware_clear": False,
             "teardown_incident_id": "a" * 32,
             "reason": "not actually checked",
+        },
+        {
+            "hardware_clear": 1,
+            "teardown_incident_id": "a" * 32,
+            "reason": "numeric coercion is forbidden",
+        },
+        {
+            "hardware_clear": 0,
+            "teardown_incident_id": "a" * 32,
+            "reason": "numeric coercion is forbidden",
+        },
+        {
+            "hardware_clear": "true",
+            "teardown_incident_id": "a" * 32,
+            "reason": "string coercion is forbidden",
         },
         {"hardware_clear": True, "teardown_incident_id": "a" * 32, "reason": "   "},
         {"hardware_clear": True, "teardown_incident_id": "a" * 32, "reason": "x" * 501},
@@ -657,6 +682,49 @@ async def test_acknowledge_hardware_clear_rate_limits_without_audit_growth(
         row = await cursor.fetchone()
     assert row is not None
     assert int(row[0]) == 0
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_hardware_clear_audits_post_check_race_failure(
+    store: RoastStore,
+) -> None:
+    """A lifecycle change after preflight is durably recorded and retryable."""
+    process = MCPServerProcess()
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
+    clock = FakeClock()
+    service = RoastService(store, mcp=process, clock=clock)
+    service._spawned_mcp_device = MCPDeviceConfig()  # pyright: ignore[reportPrivateUsage]
+    request = HardwareClearAcknowledgementRequest(
+        hardware_clear=True,
+        teardown_incident_id="a" * 32,
+        reason="physical controls verified off",
+    )
+
+    with (
+        mock.patch.object(
+            process,
+            "acknowledge_hardware_clear",
+            side_effect=MCPConnectionError("generation changed after audit"),
+        ),
+        pytest.raises(RoastRunConflictError, match="generation changed"),
+    ):
+        await service.acknowledge_hardware_clear(request)
+
+    assert process.stop_unconfirmed is True
+    assert process.teardown_incident_id == "a" * 32
+    assert service._spawned_mcp_device == MCPDeviceConfig()  # pyright: ignore[reportPrivateUsage]
+    async with store.connection.execute(
+        "SELECT result, payload_json FROM operator_actions"
+        " WHERE action = 'acknowledge_mcp_hardware_clear' ORDER BY id"
+    ) as cursor:
+        rows = await cursor.fetchall()
+    assert [str(row[0]) for row in rows] == ["accepted", "failed"]
+    assert all(json.loads(str(row[1]))["teardown_incident_id"] == "a" * 32 for row in rows)
+
+    clock.advance(1.0)
+    accepted = await service.acknowledge_hardware_clear(request)
+    assert accepted.fresh_spawn_permitted is True
 
 
 @pytest.mark.asyncio

@@ -1737,10 +1737,10 @@ class RoastService:
             async with self._start_lock:
                 active = await self._store.active_run()
 
-                if active is not None or self.active_run_id is not None:
-                    run_id = active.run_id if active is not None else self.active_run_id
+                if active is not None:
                     message = (
-                        f"run {run_id} is active or recovering; hardware-clear acknowledgement "
+                        f"run {active.run_id} is active or recovering; "
+                        "hardware-clear acknowledgement "
                         "cannot bypass the run recovery flow"
                     )
                     raise RoastRunConflictError(message)

@@ -16,7 +16,7 @@ from enum import Enum
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
 
 
 class RoastPhase(Enum):
@@ -1576,9 +1576,17 @@ class HardwareClearAcknowledgementRequest(BaseModel):
     stripped and required for the process-global operator audit row.
     """
 
-    hardware_clear: Literal[True]
+    hardware_clear: StrictBool
     teardown_incident_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("hardware_clear")
+    @classmethod
+    def _require_hardware_clear(cls, value: bool) -> bool:
+        """Require the exact JSON boolean ``true``, without coercion."""
+        if value is not True:
+            raise ValueError("must be true")
+        return value
 
     @field_validator("reason")
     @classmethod

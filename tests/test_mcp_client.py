@@ -1610,6 +1610,21 @@ async def test_hardware_clear_acknowledgement_rejects_owner_in_flight() -> None:
         await owner
 
 
+def test_hardware_clear_acknowledgement_rejects_attached_session() -> None:
+    """Physical confirmation cannot discard a still-attached MCP session."""
+    session = FakeInitializableSession(info_result())
+    process = MCPServerProcess(session=session)
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(MCPConnectionError, match="session is still attached"):
+        process.acknowledge_hardware_clear("a" * 32)
+
+    assert process.running is True
+    assert process.stop_unconfirmed is True
+    assert process.teardown_incident_id == "a" * 32
+
+
 def test_unconfirmed_teardown_mints_a_distinct_incident_per_lifecycle() -> None:
     """A delayed acknowledgement token cannot name a later teardown incident."""
     process = MCPServerProcess(force_terminate=lambda: True)
