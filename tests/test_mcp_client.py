@@ -1500,6 +1500,11 @@ async def test_stop_cancellation_reap_stays_bounded_when_owner_delays_cancel() -
     await process.stop()
     assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
     assert force_terminate_calls == [1]
+    incident_id = process.teardown_incident_id
+    assert incident_id is not None
+    with pytest.raises(MCPConnectionError, match="hardware-clear acknowledgement"):
+        await process.start()
+    process.acknowledge_hardware_clear(incident_id)
     await process.start()
     replacement_owner = process._owner_task  # pyright: ignore[reportPrivateUsage]
     assert replacement_owner is not None
@@ -1528,6 +1533,7 @@ async def test_start_refuses_completed_owner_until_stop_finalizes_it() -> None:
     process._owner_task = previous_owner  # pyright: ignore[reportPrivateUsage]
     process._stop_requested = asyncio.Event()  # pyright: ignore[reportPrivateUsage]
     process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
 
     with pytest.raises(MCPConnectionError, match="awaiting stop finalization"):
         await process.start()
@@ -1535,12 +1541,134 @@ async def test_start_refuses_completed_owner_until_stop_finalizes_it() -> None:
     await process.stop()
     assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
 
+    with pytest.raises(MCPConnectionError, match="hardware-clear acknowledgement"):
+        await process.start()
+    process.acknowledge_hardware_clear("a" * 32)
     await process.start()
     replacement_owner = process._owner_task  # pyright: ignore[reportPrivateUsage]
     assert replacement_owner is not None
     assert replacement_owner is not previous_owner
     assert process.stop_unconfirmed is False
     await process.stop()
+
+
+@pytest.mark.asyncio
+async def test_hardware_clear_acknowledgement_permits_one_fresh_spawn() -> None:
+    """A completed uncertain generation is cleared without any MCP write."""
+    session = FakeInitializableSession(info_result())
+    probe = FactoryProbe(session)
+    process = MCPServerProcess(session_factory=probe)
+
+    async def cancelled_owner() -> None:
+        raise asyncio.CancelledError
+
+    previous_owner = asyncio.create_task(cancelled_owner())
+    done, _pending = await asyncio.wait({previous_owner}, timeout=0.5)
+    assert previous_owner in done
+    process._owner_task = previous_owner  # pyright: ignore[reportPrivateUsage]
+    process._stop_requested = asyncio.Event()  # pyright: ignore[reportPrivateUsage]
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
+
+    process.acknowledge_hardware_clear("a" * 32)
+    assert process.stop_unconfirmed is False
+    assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
+
+    await process.start()
+    replacement_owner = process._owner_task  # pyright: ignore[reportPrivateUsage]
+    assert replacement_owner is not None
+    await process.start()
+    assert process._owner_task is replacement_owner  # pyright: ignore[reportPrivateUsage]
+    assert session.calls == [("get_server_info", {})]
+    await process.stop()
+
+    with pytest.raises(MCPConnectionError, match="no unconfirmed"):
+        process.acknowledge_hardware_clear("a" * 32)
+
+
+@pytest.mark.asyncio
+async def test_hardware_clear_acknowledgement_rejects_owner_in_flight() -> None:
+    """Physical confirmation cannot erase an owner that is still unwinding."""
+    release = asyncio.Event()
+
+    async def running_owner() -> None:
+        await release.wait()
+
+    owner = asyncio.create_task(running_owner())
+    process = MCPServerProcess()
+    process._owner_task = owner  # pyright: ignore[reportPrivateUsage]
+    process._stop_requested = asyncio.Event()  # pyright: ignore[reportPrivateUsage]
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(MCPConnectionError, match="still tearing down"):
+            process.acknowledge_hardware_clear("a" * 32)
+        assert process._owner_task is owner  # pyright: ignore[reportPrivateUsage]
+        assert process.stop_unconfirmed is True
+    finally:
+        release.set()
+        await owner
+
+
+def test_hardware_clear_acknowledgement_rejects_attached_session() -> None:
+    """Physical confirmation cannot discard a still-attached MCP session."""
+    session = FakeInitializableSession(info_result())
+    process = MCPServerProcess(session=session)
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(MCPConnectionError, match="session is still attached"):
+        process.acknowledge_hardware_clear("a" * 32)
+
+    assert process.running is True
+    assert process.stop_unconfirmed is True
+    assert process.teardown_incident_id == "a" * 32
+
+
+def test_hardware_clear_acknowledgement_requires_incident_identity() -> None:
+    """Legacy/corrupt uncertain state without an incident remains blocked."""
+    process = MCPServerProcess()
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(MCPConnectionError, match="no acknowledgement identity"):
+        process.acknowledge_hardware_clear("a" * 32)
+
+    assert process.stop_unconfirmed is True
+
+
+def test_hardware_clear_acknowledgement_removes_rendered_generation_config(
+    tmp_path: Path,
+) -> None:
+    """Acknowledgement discards the uncertain generation's rendered config."""
+    rendered = tmp_path / "rendered-config"
+    rendered.mkdir()
+    process = MCPServerProcess()
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
+    process._rendered_yaml_dir = rendered  # pyright: ignore[reportPrivateUsage]
+
+    process.acknowledge_hardware_clear("a" * 32)
+
+    assert not rendered.exists()
+    assert process._rendered_yaml_dir is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_unconfirmed_teardown_mints_a_distinct_incident_per_lifecycle() -> None:
+    """A delayed acknowledgement token cannot name a later teardown incident."""
+    process = MCPServerProcess(force_terminate=lambda: True)
+
+    process._fail_closed_teardown("incident A")  # pyright: ignore[reportPrivateUsage]
+    first = process.teardown_incident_id
+    assert first is not None
+    assert len(first) == 32
+    process._fail_closed_teardown("same incident")  # pyright: ignore[reportPrivateUsage]
+    assert process.teardown_incident_id == first
+
+    process.acknowledge_hardware_clear(first)
+    process._fail_closed_teardown("incident B")  # pyright: ignore[reportPrivateUsage]
+    second = process.teardown_incident_id
+    assert second is not None
+    assert second != first
 
 
 @pytest.mark.asyncio
@@ -1781,6 +1909,11 @@ async def test_old_stop_body_cannot_fail_close_a_concurrent_replacement(
         assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
         assert force_terminate_calls == [1]
 
+        incident_id = process.teardown_incident_id
+        assert incident_id is not None
+        with pytest.raises(MCPConnectionError, match="hardware-clear acknowledgement"):
+            await process.start()
+        process.acknowledge_hardware_clear(incident_id)
         await process.start()
         replacement_owner = process._owner_task  # pyright: ignore[reportPrivateUsage]
         assert replacement_owner is not None
@@ -1837,11 +1970,8 @@ async def test_stop_swallows_a_raising_force_terminate_hook() -> None:
 
 
 @pytest.mark.asyncio
-async def test_start_resets_stop_unconfirmed_for_a_reused_process() -> None:
-    """Multi-start safety (#177, deferred from #365 triage): stop_unconfirmed
-    describes the MOST RECENT teardown, so a reused process (start → wedged stop
-    → start) must not carry the prior run's unconfirmed verdict into the new run
-    — start() resets it to False before spawning."""
+async def test_start_requires_acknowledgement_after_unconfirmed_teardown() -> None:
+    """A reused process cannot discard an unaudited teardown incident (#668)."""
     session = FakeInitializableSession(info_result())
     process = MCPServerProcess(
         MCPConfig(stop_timeout_seconds=0.05),
@@ -1852,7 +1982,13 @@ async def test_start_resets_stop_unconfirmed_for_a_reused_process() -> None:
     await asyncio.wait_for(process.stop(), timeout=1.0)
     assert process.stop_unconfirmed is True  # first teardown went unconfirmed
 
-    # A fresh start must clear the stale flag (the reset is at the top of start).
+    incident_id = process.teardown_incident_id
+    assert incident_id is not None
+    with pytest.raises(MCPConnectionError, match="hardware-clear acknowledgement"):
+        await process.start()
+    assert process.stop_unconfirmed is True
+
+    process.acknowledge_hardware_clear(incident_id)
     await process.start()
     try:
         assert process.stop_unconfirmed is False

@@ -16,7 +16,7 @@ from enum import Enum
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
 
 
 class RoastPhase(Enum):
@@ -1116,6 +1116,15 @@ class HealthResponse(BaseModel):
     version: str
     instance_id: str
     mcp_child: MCPChildStatus
+    mcp_hardware_clear_required: bool = False
+    """Whether an unconfirmed child teardown blocks a fresh MCP spawn (#668).
+
+    Read-only process state for the operator UI. ``True`` never proves the
+    hardware is safe; it means the operator must verify it physically before
+    using the explicit acknowledgement endpoint.
+    """
+    mcp_teardown_incident_id: str | None = None
+    """Opaque ID the explicit acknowledgement must echo for this incident."""
     active_run_id: str | None = None
     advisor: AdvisorHealth | None = None
 
@@ -1557,6 +1566,45 @@ class ClearStaleSessionResult(BaseModel):
     run_id: str
     outcome: Literal["aborted"]
     completed_at_utc: str
+
+
+class HardwareClearAcknowledgementRequest(BaseModel):
+    """Explicit operator confirmation after an unconfirmed MCP teardown (#668).
+
+    ``hardware_clear`` must be the literal value ``true`` so a retry of another
+    request can never be mistaken for this acknowledgement. ``reason`` is
+    stripped and required for the process-global operator audit row.
+    """
+
+    hardware_clear: StrictBool
+    teardown_incident_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("hardware_clear")
+    @classmethod
+    def _require_hardware_clear(cls, value: bool) -> bool:
+        """Require the exact JSON boolean ``true``, without coercion."""
+        if value is not True:
+            raise ValueError("must be true")
+        return value
+
+    @field_validator("reason")
+    @classmethod
+    def _strip_and_require_reason(cls, value: str) -> str:
+        """Reject and avoid persisting an empty or padded audit reason."""
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be empty or whitespace-only")
+        return stripped
+
+
+class HardwareClearAcknowledgementResult(BaseModel):
+    """Successful process-global hardware-clear acknowledgement (#668)."""
+
+    result: Literal["accepted"] = "accepted"
+    hardware_clear: Literal[True] = True
+    teardown_incident_id: str
+    fresh_spawn_permitted: Literal[True] = True
 
 
 # --- #522 (D91): structured tasting entries ---

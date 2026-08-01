@@ -54,7 +54,7 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D120** (D119 records bean-sourcing runtime telemetry).
+> Next free plan decision number: **D121** (D120 records incident-bound hardware-clear acknowledgement).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 27 Jul block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
@@ -278,10 +278,11 @@ and captured MCP child exit. Final evidence: an unprivileged Linux full suite re
 steps after pytest. This is cross-cutting process/CI hardening, not a new E11 story row; issue #665
 and plan decisions D104/D105 carry its acceptance and ownership contract. Residual boundaries are
 explicit: P1 #667 owns a live-mode event-loop policy for a pathological MCP owner that suppresses
-cancellation indefinitely, and P1 #668 owns an audited in-process operator acknowledgement after
-unconfirmed teardown. Until #668 ships, the supported recovery is to verify the roaster and old MCP
-child resources are inactive, restart the agent, and retry; restart recovery still never auto-resumes
-heat or fan.
+cancellation indefinitely. The backend slice of P1 #668 adds D120's audited, incident-bound
+in-process operator acknowledgement after unconfirmed teardown; its UI/operator surface remains a
+separate slice. The incident and acknowledgement gate are process-local: physical verification plus
+a controlled full agent restart remains the legacy recovery boundary and is not represented by an
+acknowledgement audit row. Restart recovery still never auto-resumes heat or fan.
 
 **18 Jul 2026 (later — D102 plant-model experiment + the discard-roast feature).** After #567
 parked, the operator's diagnosis that the system lacks RoR PROJECTION (only the pre-FC FC-ETA

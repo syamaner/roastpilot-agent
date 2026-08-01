@@ -48,10 +48,11 @@ from roastpilot_agent.bean_sourcing import (
     BeanFetchError,
     BeanSourcingDiagnostics,
 )
-from roastpilot_agent.config import AppConfig, ControllerConfig, ReferenceCurve
+from roastpilot_agent.config import AppConfig, ControllerConfig, MCPDeviceConfig, ReferenceCurve
 from roastpilot_agent.mcp_client import (
     AmbientStatus,
     FirstCrackStatus,
+    MCPConnectionError,
     MCPServerProcess,
     RoastSessionState,
 )
@@ -59,6 +60,7 @@ from roastpilot_agent.models import (
     BeanProfileDraft,
     ChargeWeightRequest,
     ClearStaleSessionRequest,
+    HardwareClearAcknowledgementRequest,
     MicHealth,
     OperatorAction,
     OperatorActionRequest,
@@ -76,7 +78,7 @@ from roastpilot_agent.models import (
     TelemetryEventData,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
-from roastpilot_agent.store import RoastStore
+from roastpilot_agent.store import PersistedRun, RoastStore
 from tests.conftest import FakeClock, FakeMCPClient
 
 
@@ -457,6 +459,361 @@ async def test_start_roast_allowed_after_prior_run_completes(
 async def test_start_roast_rejects_invalid_profile(client: AsyncClient) -> None:
     response = await client.post("/api/roasts", json={"name": "bad"})
     assert response.status_code == 422
+
+
+# --- #668 unconfirmed-teardown hardware-clear acknowledgement ---
+
+
+@pytest.mark.asyncio
+async def test_start_roast_requires_pending_hardware_clear_acknowledgement(
+    store: RoastStore,
+) -> None:
+    """A matching saved device config cannot bypass teardown uncertainty."""
+    process = MCPServerProcess()
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
+    roaster = mock.Mock()
+    service = RoastService(store, mcp=process, roaster=roaster)
+    service.set_spawned_mcp_device(MCPDeviceConfig())
+
+    with pytest.raises(RoastRunConflictError, match="hardware-clear acknowledgement"):
+        await service.start_roast(_profile())
+
+    assert await store.active_run() is None
+    assert service.active_run_id is None
+    assert process.stop_unconfirmed is True
+    assert process.teardown_incident_id == "a" * 32
+    assert roaster.mock_calls == []
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_hardware_clear_audits_before_clearing_process_state(
+    store: RoastStore,
+) -> None:
+    """The explicit decision is durable before stale generation state clears."""
+    process = MCPServerProcess()
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
+    roaster = mock.Mock()
+    service = RoastService(store, mcp=process, roaster=roaster)
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+
+    before = await service.health()
+    assert before.mcp_hardware_clear_required is True
+    assert before.mcp_teardown_incident_id == "a" * 32
+
+    original = process.acknowledge_hardware_clear
+    audit = mock.AsyncMock(wraps=store.record_operator_action)
+
+    def _assert_audit_then_clear(teardown_incident_id: str) -> None:
+        assert audit.await_count == 1
+        awaited = audit.await_args
+        assert awaited is not None
+        assert awaited.kwargs["action"] == "acknowledge_mcp_hardware_clear"
+        assert awaited.kwargs["result"] == "accepted"
+        original(teardown_incident_id)
+
+    with (
+        mock.patch.object(store, "record_operator_action", audit),
+        mock.patch.object(process, "acknowledge_hardware_clear", _assert_audit_then_clear),
+    ):
+        async with AsyncClient(transport=transport, base_url="http://test") as instance:
+            response = await instance.post(
+                "/api/mcp/acknowledge-hardware-clear",
+                json={
+                    "hardware_clear": True,
+                    "teardown_incident_id": "a" * 32,
+                    "reason": "  roaster cold; ports released  ",
+                },
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "result": "accepted",
+        "hardware_clear": True,
+        "teardown_incident_id": "a" * 32,
+        "fresh_spawn_permitted": True,
+    }
+    assert process.stop_unconfirmed is False
+    after = await service.health()
+    assert after.mcp_hardware_clear_required is False
+    assert after.mcp_teardown_incident_id is None
+    assert roaster.mock_calls == []
+    async with store.connection.execute(
+        "SELECT payload_json FROM operator_actions ORDER BY id DESC LIMIT 1"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert json.loads(str(row[0])) == {
+        "hardware_clear": True,
+        "reason": "roaster cold; ports released",
+        "teardown_incident_id": "a" * 32,
+    }
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_hardware_clear_rejects_active_recovery_and_replay(
+    store: RoastStore,
+) -> None:
+    """A persisted recovery run and a duplicate acknowledgement both 409."""
+    process = MCPServerProcess()
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
+    clock = FakeClock()
+    service = RoastService(store, mcp=process, clock=clock)
+    request = HardwareClearAcknowledgementRequest(
+        hardware_clear=True,
+        teardown_incident_id="a" * 32,
+        reason="physical controls verified off",
+    )
+    await store.create_run(
+        run_id="run-recovery-block",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+    )
+
+    with pytest.raises(RoastRunConflictError, match="cannot bypass"):
+        await service.acknowledge_hardware_clear(request)
+    assert process.stop_unconfirmed is True
+    clock.advance(1.0)
+
+    await store.complete_run(
+        run_id="run-recovery-block",
+        outcome="aborted",
+        agent_phase=RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+    )
+    # The process pointer deliberately survives finalization; persisted state
+    # is authoritative for whether the run is still active/recovering.
+    service.active_run_id = "run-recovery-block"
+    accepted = await service.acknowledge_hardware_clear(request)
+    assert accepted.fresh_spawn_permitted is True
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "b" * 32  # pyright: ignore[reportPrivateUsage]
+    clock.advance(1.0)
+    with pytest.raises(RoastRunConflictError, match="does not match"):
+        await service.acknowledge_hardware_clear(request)
+    assert process.stop_unconfirmed is True
+    assert process.teardown_incident_id == "b" * 32
+    clock.advance(1.0)
+    second = await service.acknowledge_hardware_clear(
+        request.model_copy(update={"teardown_incident_id": "b" * 32})
+    )
+    assert second.teardown_incident_id == "b" * 32
+
+    async with store.connection.execute(
+        "SELECT result FROM operator_actions"
+        " WHERE action = 'acknowledge_mcp_hardware_clear' ORDER BY id"
+    ) as cursor:
+        rows = await cursor.fetchall()
+    assert [str(row[0]) for row in rows] == ["accepted", "accepted"]
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_hardware_clear_requires_configured_mcp(store: RoastStore) -> None:
+    """API-only mode cannot acknowledge a lifecycle it does not own."""
+    service = RoastService(store)
+    request = HardwareClearAcknowledgementRequest(
+        hardware_clear=True,
+        teardown_incident_id="a" * 32,
+        reason="physical controls verified off",
+    )
+
+    with pytest.raises(RoastRunConflictError, match="no MCP child lifecycle"):
+        await service.acknowledge_hardware_clear(request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "hardware_clear": False,
+            "teardown_incident_id": "a" * 32,
+            "reason": "not actually checked",
+        },
+        {
+            "hardware_clear": 1,
+            "teardown_incident_id": "a" * 32,
+            "reason": "numeric coercion is forbidden",
+        },
+        {
+            "hardware_clear": 0,
+            "teardown_incident_id": "a" * 32,
+            "reason": "numeric coercion is forbidden",
+        },
+        {
+            "hardware_clear": "true",
+            "teardown_incident_id": "a" * 32,
+            "reason": "string coercion is forbidden",
+        },
+        {"hardware_clear": True, "teardown_incident_id": "a" * 32, "reason": "   "},
+        {"hardware_clear": True, "teardown_incident_id": "a" * 32, "reason": "x" * 501},
+        {"hardware_clear": True, "teardown_incident_id": "wrong", "reason": "checked"},
+    ],
+)
+async def test_acknowledge_hardware_clear_requires_bounded_explicit_confirmation(
+    store: RoastStore, payload: dict[str, object]
+) -> None:
+    """A generic retry, empty reason, or oversized audit text cannot confirm."""
+    process = MCPServerProcess()
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
+    app = create_app(RoastService(store, mcp=process))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.post(
+            "/api/mcp/acknowledge-hardware-clear",
+            json=payload,
+        )
+    assert response.status_code == 422
+    assert process.stop_unconfirmed is True
+    assert (await RoastService(store, mcp=process).health()).mcp_hardware_clear_required is True
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_hardware_clear_rate_limits_without_audit_growth(
+    store: RoastStore,
+) -> None:
+    """Rejected probes neither queue freely nor append durable audit rows."""
+    process = MCPServerProcess()
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
+    clock = FakeClock()
+    service = RoastService(store, mcp=process, clock=clock)
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        stale = await instance.post(
+            "/api/mcp/acknowledge-hardware-clear",
+            json={
+                "hardware_clear": True,
+                "teardown_incident_id": "b" * 32,
+                "reason": "stale request",
+            },
+        )
+        limited = await instance.post(
+            "/api/mcp/acknowledge-hardware-clear",
+            json={
+                "hardware_clear": True,
+                "teardown_incident_id": "a" * 32,
+                "reason": "physical controls verified off",
+            },
+        )
+        clock.advance(1.0)
+        oversized = await instance.post(
+            "/api/mcp/acknowledge-hardware-clear",
+            content=b"x" * 2049,
+            headers={"content-type": "application/json"},
+        )
+
+    assert stale.status_code == 409
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"] == "1"
+    assert oversized.status_code == 413
+    assert oversized.json() == {"detail": "request body exceeds 2048-byte limit"}
+    async with store.connection.execute(
+        "SELECT COUNT(*) FROM operator_actions WHERE action = 'acknowledge_mcp_hardware_clear'"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert int(row[0]) == 0
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_hardware_clear_audits_post_check_race_failure(
+    store: RoastStore,
+) -> None:
+    """A lifecycle change after preflight is durably recorded and retryable."""
+    process = MCPServerProcess()
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
+    clock = FakeClock()
+    service = RoastService(store, mcp=process, clock=clock)
+    service._spawned_mcp_device = MCPDeviceConfig()  # pyright: ignore[reportPrivateUsage]
+    request = HardwareClearAcknowledgementRequest(
+        hardware_clear=True,
+        teardown_incident_id="a" * 32,
+        reason="physical controls verified off",
+    )
+
+    with (
+        mock.patch.object(
+            process,
+            "acknowledge_hardware_clear",
+            side_effect=MCPConnectionError("generation changed after audit"),
+        ),
+        pytest.raises(RoastRunConflictError, match="generation changed"),
+    ):
+        await service.acknowledge_hardware_clear(request)
+
+    assert process.stop_unconfirmed is True
+    assert process.teardown_incident_id == "a" * 32
+    assert service._spawned_mcp_device == MCPDeviceConfig()  # pyright: ignore[reportPrivateUsage]
+    async with store.connection.execute(
+        "SELECT result, payload_json FROM operator_actions"
+        " WHERE action = 'acknowledge_mcp_hardware_clear' ORDER BY id"
+    ) as cursor:
+        rows = await cursor.fetchall()
+    assert [str(row[0]) for row in rows] == ["accepted", "failed"]
+    assert all(json.loads(str(row[1]))["teardown_incident_id"] == "a" * 32 for row in rows)
+
+    clock.advance(1.0)
+    accepted = await service.acknowledge_hardware_clear(request)
+    assert accepted.fresh_spawn_permitted is True
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_hardware_clear_rejects_concurrent_request_without_queueing(
+    store: RoastStore,
+) -> None:
+    """Only one acknowledgement may wait on the roast-start critical section."""
+    process = MCPServerProcess()
+    process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+    process._teardown_incident_id = "a" * 32  # pyright: ignore[reportPrivateUsage]
+    clock = FakeClock()
+    service = RoastService(store, mcp=process, clock=clock)
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_active_run = store.active_run
+
+    async def _paused_active_run() -> PersistedRun | None:
+        entered.set()
+        await release.wait()
+        return await original_active_run()
+
+    payload = {
+        "hardware_clear": True,
+        "teardown_incident_id": "a" * 32,
+        "reason": "physical controls verified off",
+    }
+    with mock.patch.object(store, "active_run", _paused_active_run):
+        async with AsyncClient(transport=transport, base_url="http://test") as instance:
+            first_task = asyncio.create_task(
+                instance.post("/api/mcp/acknowledge-hardware-clear", json=payload)
+            )
+            await asyncio.wait_for(entered.wait(), timeout=0.5)
+            competing = await asyncio.wait_for(
+                instance.post("/api/mcp/acknowledge-hardware-clear", json=payload),
+                timeout=0.5,
+            )
+            release.set()
+            first = await asyncio.wait_for(first_task, timeout=0.5)
+            clock.advance(1.0)
+            later = await instance.post("/api/mcp/acknowledge-hardware-clear", json=payload)
+
+    assert competing.status_code == 429
+    assert first.status_code == 200
+    assert later.status_code == 409  # admitted after release; incident already consumed
+    async with store.connection.execute(
+        "SELECT COUNT(*) FROM operator_actions WHERE action = 'acknowledge_mcp_hardware_clear'"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert int(row[0]) == 1
 
 
 # --- history / detail ---

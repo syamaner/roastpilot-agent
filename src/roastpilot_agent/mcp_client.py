@@ -37,6 +37,7 @@ import json
 import logging
 import math
 import os
+import secrets
 import shutil
 import signal
 import sys
@@ -1139,6 +1140,10 @@ class MCPServerProcess:
         #: clean shutdown. Force-termination is best-effort; #177 persists the
         #: flag so a restart enters ``operator_recovery_required``.
         self._stop_unconfirmed = False
+        #: Opaque identity for the current uncertain lifecycle. Acknowledgements
+        #: must name this exact incident so a delayed retry cannot clear a later
+        #: generation's unrelated teardown failure (#668).
+        self._teardown_incident_id: str | None = None
         #: Best-effort force-terminate of the spawned child group, populated by
         #: the default factory once the pid is known (or injected for tests).
         self._force_terminate: ForceTerminate | None = force_terminate
@@ -1326,14 +1331,63 @@ class MCPServerProcess:
         ``True`` means an owner exited unexpectedly or graceful teardown could
         not be confirmed within ``stop_timeout_seconds``. Force-termination is
         attempted when a current child hook is available, but the flag does not
-        claim that attempt succeeded. It is reset to ``False`` immediately
-        before :meth:`start` spawns a new owner, so a fresh run never inherits a
-        previous run's unconfirmed verdict. A confirmed clean stop leaves it
-        ``False``. #177 persists this to the decision trace so an unconfirmed
+        claim that attempt succeeded. It remains ``True`` until the operator
+        acknowledges the matching teardown incident after physical verification;
+        :meth:`start` refuses to spawn a new owner while it is set. A confirmed
+        clean stop leaves it ``False``. #177 persists this to the decision trace so an unconfirmed
         lifecycle is visible post-roast (observability for diagnosis / recovery
         — never an auto-resume trigger).
         """
         return self._stop_unconfirmed
+
+    @property
+    def teardown_incident_id(self) -> str | None:
+        """Opaque identity of the current unconfirmed teardown, if any (#668)."""
+        return self._teardown_incident_id
+
+    def acknowledge_hardware_clear(self, teardown_incident_id: str) -> None:
+        """Clear an idle generation after explicit physical verification (#668).
+
+        This is process-state cleanup only: it never starts a child, opens an
+        MCP session, or writes heat/fan/cooling state. The service records the
+        operator's durable acknowledgement before calling this method.
+
+        Raises:
+            MCPConnectionError: Teardown is not unconfirmed, or a session/owner
+                can still be live or unwinding.
+        """
+        blocker = self.hardware_clear_acknowledgement_blocker(teardown_incident_id)
+        if blocker is not None:
+            raise MCPConnectionError(blocker)
+        owner = self._owner_task
+
+        if owner is not None:
+            with contextlib.suppress(BaseException):
+                owner.result()
+        self._owner_task = None
+        self._stop_requested = None
+        self._stop_unconfirmed = False
+        self._teardown_incident_id = None
+        if not self._force_terminate_injected:
+            self._force_terminate = None
+        if self._rendered_yaml_dir is not None:
+            shutil.rmtree(self._rendered_yaml_dir, ignore_errors=True)
+            self._rendered_yaml_dir = None
+
+    def hardware_clear_acknowledgement_blocker(self, teardown_incident_id: str) -> str | None:
+        """Return why generation state cannot currently be acknowledged (#668)."""
+        if not self._stop_unconfirmed:
+            return "no unconfirmed MCP teardown requires acknowledgement"
+        if self._teardown_incident_id is None:
+            return "unconfirmed MCP teardown has no acknowledgement identity"
+        if teardown_incident_id != self._teardown_incident_id:
+            return "teardown incident does not match the current unconfirmed lifecycle"
+        if self._session is not None:
+            return "an MCP session is still attached"
+        owner = self._owner_task
+        if owner is not None and not owner.done():
+            return "the MCP owner is still tearing down"
+        return None
 
     async def _run_session(self, ready: asyncio.Future[ToolSession]) -> None:
         """Own the spawned session's context stack for its whole lifetime (#484).
@@ -1444,10 +1498,13 @@ class MCPServerProcess:
         awaits its ``ready`` signal.  This is what lets a respawn driven from a
         request-handler task tear the child down without a cross-task scope exit.
 
-        Resets :attr:`stop_unconfirmed` to ``False`` only immediately before
-        spawning a new owner: a reused process (start → stop → start) must not
-        carry a prior run's unconfirmed verdict into the new run, while a
-        refused start must preserve it.
+        Within one running agent process, an unconfirmed teardown and its
+        incident identity block every new owner until the explicit
+        hardware-clear acknowledgement consumes that exact incident (#668).
+        ``start`` never clears that process-local verdict itself. A controlled
+        full agent restart after physical verification remains the legacy
+        recovery boundary; persisting incidents across processes is outside
+        this in-process contract.
         A prior owner retained after a bounded teardown attempt must be
         finalized by :meth:`stop` before another child can start, even if the
         owner task has since finished. Otherwise an old stop body/finalizer
@@ -1475,7 +1532,11 @@ class MCPServerProcess:
             raise MCPConnectionError(
                 "previous MCP owner is awaiting stop finalization; refusing to start a second child"
             )
-        self._stop_unconfirmed = False
+        if self._stop_unconfirmed:
+            raise MCPConnectionError(
+                "previous MCP teardown was unconfirmed; explicit hardware-clear "
+                "acknowledgement is required before a fresh child can start"
+            )
         # Re-arm: clear the auto-registered hook before each spawn so
         # _register_force_terminate captures the new pid, not the previous one.
         # Injected hooks (test seam) are left untouched.
@@ -1614,8 +1675,7 @@ class MCPServerProcess:
         top-level exit when a retained task suppresses cancellation indefinitely.
 
         On a clean stop within the bound, ``stop_unconfirmed`` is left ``False``
-        (it was reset by the preceding :meth:`start`, and the clean path never
-        sets it) and the force-terminate hook is not invoked — so a
+        (the clean path never sets it) and the force-terminate hook is not invoked — so a
         ``start → stop`` cycle that confirms cleanly always reports
         ``stop_unconfirmed is False``, even after a previous run's stop went
         unconfirmed. **Any UNCERTAIN teardown fails closed identically**: both a
@@ -1714,6 +1774,8 @@ class MCPServerProcess:
         Args:
             reason: Human-readable cause, logged at ERROR for post-roast diagnosis.
         """
+        if not self._stop_unconfirmed or self._teardown_incident_id is None:
+            self._teardown_incident_id = secrets.token_hex(16)
         self._stop_unconfirmed = True
         _log.error(
             "%s — force-terminating; restart will enter operator_recovery_required",
