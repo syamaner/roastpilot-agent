@@ -265,6 +265,120 @@ def test_live_exit_watchdog_bounds_cancellation_resistant_owner(tmp_path: Path) 
         os.kill(child_pid, 0)
 
 
+def test_live_exit_watchdog_bounds_startup_failure_owner(tmp_path: Path) -> None:
+    """Startup cleanup arms the watchdog even before a service is returned."""
+    evidence_file = tmp_path / "startup-cleanup.txt"
+    probe = textwrap.dedent(
+        """
+        import asyncio
+        import sys
+        from pathlib import Path
+
+        from roastpilot_agent import cli, config_store, live
+        from roastpilot_agent.config import AppConfig
+        from roastpilot_agent.mcp_client import MCPConnectionError
+
+        evidence = Path(sys.argv[1])
+
+        async def cancellation_resistant_owner() -> None:
+            while True:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    pass
+
+        async def fail_after_cleanup(_config: object, *, store_path: object) -> object:
+            asyncio.create_task(
+                cancellation_resistant_owner(),
+                name="retained-startup-mcp-owner",
+            )
+            evidence.write_text("startup-cleanup-complete", encoding="utf-8")
+            raise MCPConnectionError("startup failed after bounded cleanup")
+
+        config_store.load_app_config = lambda: (AppConfig(), set())
+        live.forward_coffee_env = lambda _config: None
+        live.build_live_service = fail_after_cleanup
+        args = cli._build_parser().parse_args(["serve", "--port", "0"])
+        guard = cli._LiveExitGuard(grace_seconds=0.25)
+        signal_guard = cli._LiveSignalGuard()
+        asyncio.run(cli._serve_live(args, exit_guard=guard, signal_guard=signal_guard))
+        guard.disarm()
+        """
+    )
+    process = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", probe, str(evidence_file)],
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        check=False,
+    )
+
+    assert process.returncode == 70, process.stderr
+    assert evidence_file.read_text(encoding="utf-8") == "startup-cleanup-complete"
+    assert "retained-startup-mcp-owner" in process.stderr
+
+
+def test_signal_during_asyncio_run_finalization_is_propagated(tmp_path: Path) -> None:
+    """A late SIGTERM cannot be swallowed after the live coroutine returns."""
+    finalizing_file = tmp_path / "asyncio-finalizing.txt"
+    probe = textwrap.dedent(
+        """
+        import asyncio
+        import os
+        import signal
+        import sys
+        import threading
+        import time
+        from pathlib import Path
+
+        from roastpilot_agent import cli
+
+        finalizing = Path(sys.argv[1])
+
+        async def residual_task() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                finalizing.write_text("cancelling", encoding="utf-8")
+                await asyncio.sleep(0.35)
+
+        async def fake_serve(
+            _args: object,
+            *,
+            exit_guard: object,
+            signal_guard: cli._LiveSignalGuard,
+        ) -> int:
+            del exit_guard
+            signal_guard.bind_graceful_handler(lambda _signum, _frame: None)
+            asyncio.create_task(residual_task(), name="late-finalization-task")
+            return 0
+
+        def send_during_finalization() -> None:
+            deadline = time.monotonic() + 3.0
+            while not finalizing.exists():
+                if time.monotonic() >= deadline:
+                    return
+                time.sleep(0.01)
+            signal.raise_signal(signal.SIGTERM)
+
+        cli._serve_live = fake_serve
+        threading.Thread(target=send_during_finalization, daemon=True).start()
+        sys.argv = ["roastpilot-agent", "serve", "--port", "0"]
+        raise SystemExit(cli.main())
+        """
+    )
+    process = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", probe, str(finalizing_file)],
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        check=False,
+    )
+
+    assert finalizing_file.read_text(encoding="utf-8") == "cancelling"
+    assert process.returncode == 128 + signal.SIGTERM, process.stderr
+
+
 def test_second_sigint_forces_uncertain_exit() -> None:
     """The first SIGINT delegates gracefully; the second exits 70."""
     probe = textwrap.dedent(

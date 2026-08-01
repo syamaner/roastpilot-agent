@@ -201,6 +201,39 @@ def test_live_signal_guard_preserves_first_signal_for_exit_semantics(
     assert graceful == [first, second]
 
 
+def test_live_signal_guard_handles_platform_sigbreak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A platform SIGBREAK is installed and remains a graceful signal."""
+    sigbreak = 99
+    installed: list[int] = []
+    graceful: list[int] = []
+
+    def _capture_signal(signum: int, _handler: object) -> signal.Handlers:
+        installed.append(signum)
+        return signal.SIG_DFL
+
+    monkeypatch.setattr(
+        cli,
+        "_LIVE_TERMINATION_SIGNALS",
+        (signal.SIGINT, signal.SIGTERM, sigbreak),
+    )
+    monkeypatch.setattr(signal, "signal", _capture_signal)
+    guard = cli._LiveSignalGuard()  # pyright: ignore[reportPrivateUsage]
+    guard.bind_graceful_handler(lambda signum, _frame: graceful.append(signum))
+
+    with guard:
+        guard._handle(sigbreak, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        guard._handle(sigbreak, None)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert installed[:3] == [signal.SIGINT, signal.SIGTERM, sigbreak]
+    assert graceful == [sigbreak, sigbreak]
+    assert guard.received_signal == sigbreak
+    with pytest.raises(SystemExit) as exc:
+        cli._propagate_live_termination(sigbreak)  # pyright: ignore[reportPrivateUsage]
+    assert exc.value.code == 128 + sigbreak
+
+
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
 def test_live_signal_guard_prebind_falls_back_to_previous_handler(signum: int) -> None:
     """A startup signal before Uvicorn binds still reaches the prior handler."""
@@ -539,6 +572,35 @@ def test_serve_fails_closed_on_mcp_start_failure(
     monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
     assert cli.main() == 1
     assert "could not start coffee-roaster-mcp" in capsys.readouterr().out
+
+
+@pytest.mark.usefixtures("no_serve")
+def test_serve_arms_exit_guard_after_unexpected_build_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected post-cleanup build failure still bounds finalization."""
+    from roastpilot_agent import live
+
+    calls: list[str] = []
+
+    class _Guard:
+        def arm(self, _labels: tuple[str, ...]) -> None:
+            calls.append("arm")
+
+        def disarm(self) -> None:
+            calls.append("disarm")
+
+    async def _boom(config: object, *, store_path: object) -> object:  # noqa: ANN401
+        raise RuntimeError("unexpected build failure after owned cleanup")
+
+    monkeypatch.setattr(cli, "_LiveExitGuard", _Guard)
+    monkeypatch.setattr(live, "build_live_service", _boom)
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
+
+    with pytest.raises(RuntimeError, match="unexpected build failure"):
+        cli.main()
+
+    assert calls == ["arm", "disarm"]
 
 
 @pytest.mark.usefixtures("no_serve")

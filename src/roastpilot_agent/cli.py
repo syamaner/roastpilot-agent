@@ -47,6 +47,10 @@ _ACCESS_LOG_MODES = ("quiet", "full", "off")
 _UVICORN_ACCESS_LOGGER = "uvicorn.access"
 _LIVE_EXIT_GRACE_SECONDS = 10.0
 _LIVE_EXIT_CODE = 70
+_SIGBREAK = cast(int | None, getattr(signal, "SIGBREAK", None))
+_LIVE_TERMINATION_SIGNALS: tuple[int, ...] = (signal.SIGINT, signal.SIGTERM) + (
+    () if _SIGBREAK is None else (_SIGBREAK,)
+)
 
 
 class _LiveExitGuard:
@@ -123,7 +127,7 @@ class _LiveSignalGuard:
         return self._received_signal
 
     def __enter__(self) -> "_LiveSignalGuard":
-        for signum in (signal.SIGINT, signal.SIGTERM):
+        for signum in _LIVE_TERMINATION_SIGNALS:
             self._previous[signum] = signal.signal(signum, self._handle)
         return self
 
@@ -135,7 +139,7 @@ class _LiveSignalGuard:
     def _handle(self, _signum: int, _frame: FrameType | None) -> None:
         if self._received_signal is None:
             self._received_signal = _signum
-        if _signum == signal.SIGTERM:
+        if _signum != signal.SIGINT:
             if self._graceful_handler is not None:
                 self._graceful_handler(_signum, _frame)
             else:
@@ -176,8 +180,8 @@ def _propagate_live_termination(signum: int | None) -> None:
     """Propagate a graceful live termination after ordered teardown."""
     if signum == signal.SIGINT:
         raise KeyboardInterrupt
-    if signum == signal.SIGTERM:
-        raise SystemExit(128 + signal.SIGTERM)
+    if signum is not None:
+        raise SystemExit(128 + signum)
 
 
 def _access_path_matches(request_path: str, pattern: str) -> bool:
@@ -848,8 +852,16 @@ async def _serve_live(
         service, mcp, store = await build_live_service(config, store_path=store_path)
     except MCPConnectionError as exc:
         # Fail closed: the child is already stopped by build_live_service.
+        exit_guard.arm(_residual_task_labels())
         print(f"error: could not start coffee-roaster-mcp: {exc}")
         return 1
+    except BaseException:
+        # build_live_service owns cleanup of a half-started MCP child. Arm the
+        # process bound after that cleanup even though no service/store exists,
+        # so a retained cancellation-resistant MCP owner cannot wedge
+        # asyncio.run() finalization forever.
+        exit_guard.arm(_residual_task_labels())
+        raise
 
     # The MCP child is RUNNING the moment build_live_service returns, so the
     # ENTIRE post-build phase (store init, app build, serve) is wrapped: a
@@ -1085,7 +1097,7 @@ def main() -> int:
         try:
             with signal_guard:
                 try:
-                    return asyncio.run(
+                    result = asyncio.run(
                         _serve_live(args, exit_guard=exit_guard, signal_guard=signal_guard)
                     )
                 except asyncio.CancelledError:
@@ -1097,6 +1109,12 @@ def main() -> int:
                     # graceful-shutdown path.
                     _propagate_live_termination(signal_guard.received_signal)
                     raise  # pragma: no cover - defensive non-signal cancellation passthrough
+                # A signal can arrive after _serve_live's final check while
+                # asyncio.run() is cancelling residual tasks, shutting down
+                # async generators, or joining its executor. Preserve that
+                # late termination request instead of returning success.
+                _propagate_live_termination(signal_guard.received_signal)
+                return result
         finally:
             exit_guard.disarm()
     if args.replay is not None:
