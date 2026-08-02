@@ -315,10 +315,12 @@ attacker-controlled short-TTL DNS name that answers public on the check and
 this fetch-user-URL-for-LLM shape** (CVE-2026-27826 / GHSA-489g-7rxv-6c8q mcp-atlassian,
 Prefect PR #21591, FastGPT, RAGFlow).
 
-**The fix — IP pinning.** The validator **returns the validated IP**; connect to that
-literal IP via a custom `httpx.HTTPTransport`/`AsyncHTTPTransport` that preserves the
-original `Host` header and TLS SNI, so the connection cannot re-resolve. Prefect's
-`SSRFProtectedAsyncHTTPTransport` (PR #21591) is a ~30-line copyable reference.
+**The fix — socket-level IP pinning.** Wrap httpcore's async network backend: resolve
+and validate immediately before every new TCP connection, then pass only a validated
+IP literal to the wrapped dialer. HTTPX/httpcore retain the original hostname origin,
+so cookie scoping, keepalive pooling, `Host`, TLS SNI, and certificate validation stay
+natural; there is no URL rewrite or routing/TLS-header workaround. Prefect's merged
+`SSRFProtectedAsyncHTTPTransport` (PR #21591) is the upstream reference.
 Assessment for our tool: **worth doing, not overkill** — it is the one control that
 actually holds against a competent attacker, and this exact tool shape is where the
 2026 CVEs landed. (Overkill and skipped: egress proxy, DNSSEC, network-namespace
@@ -373,10 +375,10 @@ SSRF — relevant to the extraction-trust story, not the fetch).
 
 ## 8. Actionable deltas (what this changes)
 
-- **#587 (in review):** add **DNS-rebind IP-pinning** to the SSRF fix (custom httpx
-  transport) so the feature ships a complete defence, not a rebind-defeatable one.
-  Confirms the rest of the fold (denylist via `ipaddress` flags, per-hop revalidation,
-  dual timeouts, response-byte cap).
+- **#587 + #591 (shipped):** the original URL-rewrite pin closed rebinding; #591
+  replaced it with socket-level connect pinning while preserving hostname cookies,
+  pooling, `Host`, and TLS identity. The denylist, per-hop redirect validation, dual
+  timeouts, and compressed/decompressed response caps remain unchanged.
 - **#573 extractor (near-term):** add `extruct` JSON-LD-first extraction ahead of the
   LLM, `trafilatura`-markdown instead of raw HTML, and the free provenance levers
   (evidence-quote + containment gate, locality check, constrained enums, abstention
