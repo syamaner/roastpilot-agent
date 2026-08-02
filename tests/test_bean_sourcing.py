@@ -104,11 +104,19 @@ async def _noop_assert_public_destination(
 class _ScriptedAsyncNetworkStream(httpcore.AsyncNetworkStream):
     """Minimal network-free HTTP/1.1 stream for transport contract tests."""
 
-    def __init__(self, response: bytes = b"") -> None:
+    def __init__(
+        self,
+        response: bytes = b"",
+        *,
+        tls_failure: BaseException | None = None,
+    ) -> None:
         self._response = response
+        self._tls_failure = tls_failure
         self.writes: list[bytes] = []
         self.tls_server_names: list[str | None] = []
         self.tls_contexts: list[ssl.SSLContext] = []
+        self.tls_timeouts: list[float | None] = []
+        self.closed = False
 
     async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         del max_bytes, timeout
@@ -120,7 +128,7 @@ class _ScriptedAsyncNetworkStream(httpcore.AsyncNetworkStream):
         self.writes.append(buffer)
 
     async def aclose(self) -> None:
-        return None
+        self.closed = True
 
     async def start_tls(
         self,
@@ -128,9 +136,11 @@ class _ScriptedAsyncNetworkStream(httpcore.AsyncNetworkStream):
         server_hostname: str | None = None,
         timeout: float | None = None,
     ) -> httpcore.AsyncNetworkStream:
-        del timeout
         self.tls_contexts.append(ssl_context)
         self.tls_server_names.append(server_hostname)
+        self.tls_timeouts.append(timeout)
+        if self._tls_failure is not None:
+            raise self._tls_failure
         return self
 
 
@@ -1233,6 +1243,200 @@ async def test_socket_backend_raises_last_error_when_all_addresses_fail(
     with pytest.raises(httpcore.ConnectError, match="second failed"):
         await backend.connect_tcp("vendor.example", 443)
     assert wrapped.hosts == [first_ip, second_ip]
+
+
+@pytest.mark.parametrize(
+    "tls_error_kind",
+    ["timeout", "oserror"],
+)
+@pytest.mark.parametrize(
+    "tcp_error_kind",
+    ["timeout", "oserror"],
+)
+@pytest.mark.asyncio
+async def test_transport_retries_next_validated_ip_after_tls_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tls_error_kind: Literal["timeout", "oserror"],
+    tcp_error_kind: Literal["timeout", "oserror"],
+) -> None:
+    """A TCP-success/TLS-failure candidate does not hide a healthy alternate."""
+    first_ip = "1.1.1.1"
+    second_ip = "8.8.8.8"
+    third_ip = "93.184.216.34"
+    body = _SAMPLE_HTML.encode()
+    response = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+        + body
+    )
+    tls_error: BaseException = (
+        httpcore.ConnectTimeout("TLS timed out")
+        if tls_error_kind == "timeout"
+        else OSError("TLS socket failed")
+    )
+    tcp_error: BaseException = (
+        httpcore.ConnectTimeout("second TCP timed out")
+        if tcp_error_kind == "timeout"
+        else OSError("second TCP socket failed")
+    )
+    first_stream = _ScriptedAsyncNetworkStream(tls_failure=tls_error)
+    third_stream = _ScriptedAsyncNetworkStream(response)
+    wrapped = _RecordingAsyncNetworkBackend(
+        streams=[first_stream, third_stream],
+        failures={second_ip: tcp_error},
+    )
+
+    async def two_address_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+            (None, None, None, "", (third_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", two_address_getaddrinfo)
+    transport = bean_sourcing._SSRFProtectedAsyncHTTPTransport(  # pyright: ignore[reportPrivateUsage]
+        network_backend=wrapped
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        result = await client.get("https://vendor.example/products/kenya", timeout=10.0)
+
+    assert "Kenya Kiambu AA" in result.text
+    assert wrapped.hosts == [first_ip, second_ip, third_ip]
+    assert wrapped.timeouts == pytest.approx([10.0 / 3, 10.0 / 3, 10.0 / 3])
+    assert first_stream.tls_server_names == ["vendor.example"]
+    assert third_stream.tls_server_names == ["vendor.example"]
+    assert first_stream.tls_contexts[0] is third_stream.tls_contexts[0]
+    assert first_stream.tls_timeouts == pytest.approx([10.0 / 3])
+    assert third_stream.tls_timeouts == pytest.approx([10.0 / 3])
+    assert first_stream.closed is True
+    assert third_stream.closed is True
+
+
+@pytest.mark.parametrize(
+    ("final_error_kind", "expected_error"),
+    [
+        ("timeout", httpx.ConnectTimeout),
+        ("oserror", httpx.ConnectError),
+    ],
+)
+@pytest.mark.asyncio
+async def test_transport_raises_last_tls_error_after_all_addresses_fail(
+    monkeypatch: pytest.MonkeyPatch,
+    final_error_kind: Literal["timeout", "oserror"],
+    expected_error: type[httpx.TransportError],
+) -> None:
+    """Exhausting TLS setup on every validated IP returns the final failure."""
+    first_ip = "1.1.1.1"
+    second_ip = "93.184.216.34"
+    first_stream = _ScriptedAsyncNetworkStream(
+        tls_failure=httpcore.ConnectError("first TLS failed")
+    )
+    final_error: BaseException = (
+        httpcore.ConnectTimeout("second TLS failed")
+        if final_error_kind == "timeout"
+        else OSError("second TLS failed")
+    )
+    second_stream = _ScriptedAsyncNetworkStream(tls_failure=final_error)
+    wrapped = _RecordingAsyncNetworkBackend(streams=[first_stream, second_stream])
+
+    async def two_address_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", two_address_getaddrinfo)
+    transport = bean_sourcing._SSRFProtectedAsyncHTTPTransport(  # pyright: ignore[reportPrivateUsage]
+        network_backend=wrapped
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(expected_error, match="second TLS failed"):
+            await client.get("https://vendor.example/products/kenya", timeout=10.0)
+
+    assert wrapped.hosts == [first_ip, second_ip]
+    assert first_stream.closed is True
+    assert second_stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_tls_fallback_closes_stream_and_propagates_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Roast-start preemption closes the raw socket and never dials a fallback."""
+    first_ip = "1.1.1.1"
+    second_ip = "93.184.216.34"
+    cancellation = asyncio.CancelledError("sourcing cancelled")
+    first_stream = _ScriptedAsyncNetworkStream(tls_failure=cancellation)
+    wrapped = _RecordingAsyncNetworkBackend(streams=[first_stream])
+
+    async def two_address_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", two_address_getaddrinfo)
+    transport = bean_sourcing._SSRFProtectedAsyncHTTPTransport(  # pyright: ignore[reportPrivateUsage]
+        network_backend=wrapped
+    )
+    client = httpx.AsyncClient(transport=transport)
+    try:
+        with pytest.raises(asyncio.CancelledError) as error:
+            await client.get("https://vendor.example/products/kenya", timeout=10.0)
+        assert error.value is cancellation
+        assert first_stream.closed is True
+        assert wrapped.hosts == [first_ip]
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_multi_address_plain_http_stream_delegates_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The TLS-fallback wrapper remains a transparent stream for plain HTTP."""
+    first_ip = "1.1.1.1"
+    second_ip = "93.184.216.34"
+    scripted = _ScriptedAsyncNetworkStream(b"response")
+    wrapped = _RecordingAsyncNetworkBackend(stream=scripted)
+
+    async def two_address_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", two_address_getaddrinfo)
+    backend = bean_sourcing._SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+        wrapped
+    )
+    stream = await backend.connect_tcp("vendor.example", 80, timeout=10.0)
+    assert isinstance(
+        stream,
+        bean_sourcing._TLSFallbackAsyncNetworkStream,  # pyright: ignore[reportPrivateUsage]
+    )
+    await stream.write(b"request", timeout=2.0)
+    assert await stream.read(1024, timeout=2.0) == b"response"
+    assert stream.get_extra_info("unknown") is None
+    await stream.aclose()
+    assert scripted.writes == [b"request"]
+    assert scripted.closed is True
 
 
 @pytest.mark.asyncio

@@ -200,10 +200,12 @@ import ipaddress
 import logging
 import re
 import socket
+import ssl
 import threading
 import unicodedata
 import zlib
 from collections.abc import Callable, Iterable
+from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from html import unescape
@@ -1510,6 +1512,94 @@ async def _assert_public_destination(
     )
 
 
+class _TLSFallbackAsyncNetworkStream(httpcore.AsyncNetworkStream):
+    """Retry validated alternate IPs when TLS setup fails after TCP connects."""
+
+    def __init__(
+        self,
+        stream: httpcore.AsyncNetworkStream,
+        *,
+        wrapped_backend: httpcore.AsyncNetworkBackend,
+        remaining_addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address],
+        port: int,
+        timeout: float | None,
+        local_address: str | None,
+        socket_options: tuple[Any, ...] | None,
+    ) -> None:
+        self._stream = stream
+        self._wrapped_backend = wrapped_backend
+        self._remaining_addresses = remaining_addresses
+        self._port = port
+        self._timeout = timeout
+        self._local_address = local_address
+        self._socket_options = socket_options
+
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        """Delegate reads for non-TLS HTTP connections."""
+        return await self._stream.read(max_bytes, timeout)
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        """Delegate writes for non-TLS HTTP connections."""
+        await self._stream.write(buffer, timeout)
+
+    async def aclose(self) -> None:
+        """Close the currently connected stream."""
+        await self._stream.aclose()
+
+    async def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        """Negotiate TLS, advancing through validated IPs on connect failures."""
+        candidate_stream: httpcore.AsyncNetworkStream | None = self._stream
+        last_error: httpcore.ConnectError | httpcore.ConnectTimeout | None = None
+        addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address | None] = [
+            None,
+            *self._remaining_addresses,
+        ]
+        tls_timeout = timeout
+        if self._timeout is not None and (tls_timeout is None or self._timeout < tls_timeout):
+            tls_timeout = self._timeout
+        for address in addresses:
+            try:
+                if address is not None:
+                    candidate_stream = await self._wrapped_backend.connect_tcp(
+                        str(address),
+                        self._port,
+                        timeout=self._timeout,
+                        local_address=self._local_address,
+                        socket_options=self._socket_options,
+                    )
+                assert candidate_stream is not None
+                return await candidate_stream.start_tls(
+                    ssl_context,
+                    server_hostname=server_hostname,
+                    timeout=tls_timeout,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                last_error = exc
+            except OSError as exc:
+                last_error = httpcore.ConnectError(str(exc))
+            except BaseException:
+                if candidate_stream is not None:
+                    with suppress(BaseException):
+                        await candidate_stream.aclose()
+                raise
+            if candidate_stream is not None:
+                with suppress(Exception):
+                    await candidate_stream.aclose()
+                candidate_stream = None
+        if last_error is None:  # pragma: no cover - at least the initial stream is attempted
+            raise httpcore.ConnectError("TLS setup had no connection candidate")
+        raise last_error
+
+    def get_extra_info(self, info: str) -> Any:
+        """Delegate socket metadata for non-TLS HTTP connections."""
+        return self._stream.get_extra_info(info)
+
+
 class _SSRFProtectedAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
     """Pin each TCP connection to an address validated at connect time.
 
@@ -1540,15 +1630,28 @@ class _SSRFProtectedAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
         per_address_timeout = (
             timeout / len(addresses) if timeout is not None and len(addresses) > 1 else timeout
         )
+        socket_options_tuple = tuple(socket_options) if socket_options is not None else None
         last_error: httpcore.ConnectError | httpcore.ConnectTimeout | None = None
-        for address in addresses:
+        for index, address in enumerate(addresses):
             try:
-                return await self._wrapped.connect_tcp(
+                stream = await self._wrapped.connect_tcp(
                     str(address),
                     port,
                     timeout=per_address_timeout,
                     local_address=local_address,
-                    socket_options=socket_options,
+                    socket_options=socket_options_tuple,
+                )
+                remaining_addresses = addresses[index + 1 :]
+                if not remaining_addresses:
+                    return stream
+                return _TLSFallbackAsyncNetworkStream(
+                    stream,
+                    wrapped_backend=self._wrapped,
+                    remaining_addresses=remaining_addresses,
+                    port=port,
+                    timeout=per_address_timeout,
+                    local_address=local_address,
+                    socket_options=socket_options_tuple,
                 )
             except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
                 last_error = exc
