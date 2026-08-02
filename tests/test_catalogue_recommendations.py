@@ -201,6 +201,46 @@ def test_discovery_accessible_label_precedence_prefers_visible_text() -> None:
     assert [candidate.label for candidate in candidates] == ["Visible"]
 
 
+def test_discovery_uses_name_from_product_schema_scope() -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            '<a href="/products/kiambu" itemscope itemtype="https://schema.org/Product">'
+            '<h3 itemprop="brand">Shop online</h3>'
+            '<span itemprop="name">Kiambu Lot</span><span>Kenya · Washed</span></a>'
+        )
+    )
+
+    assert candidates[0].label == "Kiambu Lot"
+    assert candidates[0].evidence == "Shop online Kiambu Lot Kenya · Washed"
+
+
+def test_discovery_uses_name_from_product_schema_scope_outside_anchor() -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            '<article itemscope itemtype="https://schema.org/Product">'
+            '<a href="/products/kiambu"><span itemprop="name">Kiambu Lot</span>'
+            "<span>Kenya · Washed</span></a></article>"
+        )
+    )
+
+    assert candidates[0].label == "Kiambu Lot"
+    assert candidates[0].evidence == "Kiambu Lot Kenya · Washed"
+
+
+@pytest.mark.parametrize("page_type", ["WebPage", "CollectionPage"])
+def test_discovery_uses_heading_inside_page_level_schema_scope(page_type: str) -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            f'<main itemscope itemtype="https://schema.org/{page_type}">'
+            '<a href="/products/kiambu"><h2>Kiambu Lot</h2>'
+            "<span>Kenya · Washed</span></a></main>"
+        )
+    )
+
+    assert candidates[0].label == "Kiambu Lot"
+    assert candidates[0].name_label_keys == frozenset({"kiambu lot"})
+
+
 @pytest.mark.parametrize(
     ("markup", "expected"),
     [
@@ -222,6 +262,37 @@ def test_discovery_keeps_accessible_label_with_sibling_card_metadata() -> None:
     )
     assert candidates[0].label == "Kiambu AA"
     assert candidates[0].evidence == "Kiambu AA Kenya · Washed"
+
+
+def test_discovery_keeps_sibling_metadata_when_anchor_has_extra_text() -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            '<article><a href="/products/kiambu"><h2>Kiambu Lot</h2>'
+            "<span>New</span></a><span>Kenya · Washed</span></article>"
+        )
+    )
+
+    assert candidates[0].label == "Kiambu Lot"
+    assert candidates[0].evidence == "Kiambu Lot New Kenya · Washed"
+
+
+def test_discovery_preserves_name_when_long_duplicate_evidence_is_split() -> None:
+    first_prefix = "P" * 700
+    second_prefix = "Q" * 700
+    candidates = discover_catalogue_candidates(
+        _page(
+            f'<article><a href="/products/kiambu">{first_prefix}'
+            "<h2>Kiambu Lot</h2></a></article>"
+            f'<article><a href="/products/kiambu">{second_prefix}'
+            "<h2>Kiambu Lot</h2></a></article>"
+        )
+    )
+
+    assert candidates[0].label == "Kiambu Lot"
+    assert catalogue._page_states_value(  # pyright: ignore[reportPrivateUsage]
+        candidates[0].evidence, "Kiambu Lot"
+    )
+    assert len(candidates[0].evidence) <= 1_200
 
 
 def test_discovery_keeps_accessible_label_when_card_has_longer_prefix_word() -> None:
@@ -285,6 +356,25 @@ def test_candidate_evidence_merge_uses_word_boundaries() -> None:
     assert merge("Kiambu AA Kenya", "Kiambu AA") == "Kiambu AA Kenya"
 
 
+@pytest.mark.parametrize("existing", ["description " * 200, "x" * 1200])
+def test_candidate_evidence_merge_reserves_space_for_late_card_metadata(existing: str) -> None:
+    merge = catalogue._merge_candidate_evidence  # pyright: ignore[reportPrivateUsage]
+    merged = merge(existing, "Kiambu Lot Kenya Washed")
+
+    assert len(merged) <= 1200
+    assert merged.endswith("Kiambu Lot Kenya Washed")
+
+
+def test_discovery_preserves_bounded_duplicate_name_keys_beyond_prompt_cap() -> None:
+    labels = [("A" * 299) + str(index) for index in range(4)]
+    html = "".join(f'<a href="/products/same">{label}</a>' for label in labels)
+
+    candidates = discover_catalogue_candidates(_page(html))
+
+    assert candidates[0].name_label_keys == frozenset(label.casefold() for label in labels)
+    assert len(candidates[0].evidence) <= 1200
+
+
 def test_discovery_rejects_userinfo_and_non_product_anchor_paths() -> None:
     page = _page(
         '<a href="https://user:secret@vendor.example/products/a">A</a><a href="/about">About</a>'
@@ -304,6 +394,8 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
     assert redact("www.vendor.example/private?token=x washed") == "[link] washed"
     assert redact("vendor.example/private?token=x washed") == "[link] washed"
     assert redact("ftp://user:secret@vendor.example/private washed") == "[link] washed"
+    assert redact("https:products/kenya-washed Kenya") == "[link] Kenya"
+    assert redact(r"https:\\vendor.example\products\kenya-washed Kenya") == "[link] Kenya"
     assert redact("data:text/plain;base64,c2VjcmV0 washed") == "[link] washed"
     assert redact("mailto:sales@vendor.example washed") == "[link] washed"
     assert redact("javascript:alert(1) washed") == "[link] washed"
@@ -570,6 +662,24 @@ def test_discovery_fails_soft_on_empty_and_malformed_json_ld() -> None:
         )
         == []
     )
+
+
+@pytest.mark.parametrize(
+    "unusable_url", ["", "https://vendor.example:bad/product", "https://evil.example/products/a"]
+)
+def test_discovery_falls_back_to_json_ld_id_when_url_is_unusable(unusable_url: str) -> None:
+    html = f"""
+    <script type="application/ld+json">
+      {{"@type":"Product","name":"Kiambu Lot","url":"{unusable_url}",
+       "@id":"/products/kiambu"}}
+    </script>
+    """
+
+    candidates = discover_catalogue_candidates(_page(html))
+
+    assert [(item.label, item.product_url) for item in candidates] == [
+        ("Kiambu Lot", "https://vendor.example/products/kiambu")
+    ]
 
 
 def test_discovery_ignores_fragment_only_json_ld_product_identifier() -> None:
@@ -840,7 +950,7 @@ async def test_full_catalogue_pipeline_fetches_once_extracts_once_and_ranks_loca
                         "candidates": [
                             {
                                 "candidate_id": "candidate-01",
-                                "name": "Kenya Kiambu",
+                                "name": "Kenya Kiambu Washed",
                                 "country": "Kenya",
                                 "processing": "washed",
                             }
@@ -1254,7 +1364,7 @@ async def test_extraction_requires_candidate_local_metadata_evidence() -> None:
                         "candidates": [
                             {
                                 "candidate_id": "candidate-01",
-                                "name": "Kenya Kiambu",
+                                "name": "Kenya Kiambu Washed",
                                 "country": "Brazil",
                                 "processing": "natural",
                             }
@@ -1396,6 +1506,132 @@ async def test_name_evidence_requires_normalized_word_boundaries() -> None:
             model=FunctionModel(respond),
         )
     assert not catalogue._page_states_value("punctuation only", "---")  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_name_grounding_uses_candidate_label_not_card_metadata() -> None:
+    page = _page(
+        '<article><a href="/products/kiambu">Kiambu Lot</a><span>Kenya · Washed</span></article>'
+    )
+    candidates = discover_catalogue_candidates(page)
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {"candidates": [{"candidate_id": "candidate-01", "name": "Kenya"}]},
+                )
+            ]
+        )
+
+    with pytest.raises(BeanExtractionError, match="no supported"):
+        await catalogue._extract(  # pyright: ignore[reportPrivateUsage]
+            page,
+            candidates,
+            advisor_config=AdvisorConfig(),
+            sourcing_config=BeanSourcingConfig(),
+            diagnostics=BeanSourcingDiagnostics(),
+            model=FunctionModel(respond),
+        )
+
+
+@pytest.mark.asyncio
+async def test_name_grounding_accepts_each_duplicate_product_label() -> None:
+    page = _page(
+        '<script type="application/ld+json">'
+        '{"@type":"Product","name":"Kiambu","url":"/products/kiambu"}'
+        "</script>"
+        '<article><a href="/products/kiambu">Kiambu AA Washed Coffee</a>'
+        "<span>Kenya</span></article>"
+    )
+    candidates = discover_catalogue_candidates(page)
+    assert candidates[0].name_label_keys == frozenset({"kiambu", "kiambu aa washed coffee"})
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "candidates": [
+                            {
+                                "candidate_id": "candidate-01",
+                                "name": "Kiambu AA Washed Coffee",
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+
+    extracted = await catalogue._extract(  # pyright: ignore[reportPrivateUsage]
+        page,
+        candidates,
+        advisor_config=AdvisorConfig(),
+        sourcing_config=BeanSourcingConfig(),
+        diagnostics=BeanSourcingDiagnostics(),
+        model=FunctionModel(respond),
+    )
+
+    assert [item.name for item in extracted] == ["Kiambu AA Washed Coffee"]
+
+
+@pytest.mark.asyncio
+async def test_name_grounding_rejects_metadata_inside_whole_card_anchor() -> None:
+    page = _page(
+        '<a href="/products/kiambu" itemscope itemtype="https://schema.org/Product">'
+        '<span itemprop="brand" itemscope itemtype="https://schema.org/Brand">'
+        '<h3 itemprop="name">Acme Roasters</h3></span>'
+        '<span itemprop="name">Kiambu Lot</span><span>Kenya · Washed</span></a>'
+    )
+    candidates = discover_catalogue_candidates(page)
+    assert candidates[0].name_label_keys == frozenset({"kiambu lot"})
+    assert candidates[0].evidence == "Acme Roasters Kiambu Lot Kenya · Washed"
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {"candidates": [{"candidate_id": "candidate-01", "name": "Kenya"}]},
+                )
+            ]
+        )
+
+    with pytest.raises(BeanExtractionError, match="no supported"):
+        await catalogue._extract(  # pyright: ignore[reportPrivateUsage]
+            page,
+            candidates,
+            advisor_config=AdvisorConfig(),
+            sourcing_config=BeanSourcingConfig(),
+            diagnostics=BeanSourcingDiagnostics(),
+            model=FunctionModel(respond),
+        )
+
+    def respond_with_heading_name(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {"candidates": [{"candidate_id": "candidate-01", "name": "Kiambu Lot"}]},
+                )
+            ]
+        )
+
+    extracted = await catalogue._extract(  # pyright: ignore[reportPrivateUsage]
+        page,
+        candidates,
+        advisor_config=AdvisorConfig(),
+        sourcing_config=BeanSourcingConfig(),
+        diagnostics=BeanSourcingDiagnostics(),
+        model=FunctionModel(respond_with_heading_name),
+    )
+    assert [item.name for item in extracted] == ["Kiambu Lot"]
 
 
 def test_extracted_candidate_rejects_non_text_name_after_bidi_filter() -> None:

@@ -62,6 +62,7 @@ _MAX_CONTEXT_LINKS: Final = 8
 _MAX_PRODUCT_URL_CHARS: Final = 4096
 _MAX_ANCHORS_INSPECTED: Final = _MAX_DISCOVERED * 8
 _MAX_SCRIPTS_INSPECTED: Final = _MAX_DISCOVERED * 8
+_MAX_NAME_LABELS_PER_CANDIDATE: Final = (_MAX_DISCOVERED * _MAX_DISCOVERED) + _MAX_ANCHORS_INSPECTED
 _PRODUCT_PATH_SEGMENTS: Final = frozenset(
     {"bean", "beans", "coffee", "coffees", "item", "items", "product", "products", "shop", "store"}
 )
@@ -70,7 +71,8 @@ _NAVIGATION_ROOT_SEGMENTS: Final = _PRODUCT_PATH_SEGMENTS | frozenset(
 )
 _REDACTED_REFERENCE: Final = "[link]"
 _URL_START = re.compile(
-    r"(?:[a-z][a-z0-9+.-]*://|(?<![\w])(?:blob|data|file|javascript|magnet|mailto|sms|tel|urn):(?=\S)|"
+    r"(?:[a-z][a-z0-9+.-]*://|(?<![\w])https?:(?=\S)|"
+    r"(?<![\w])(?:blob|data|file|javascript|magnet|mailto|sms|tel|urn):(?=\S)|"
     r"(?<![\w])//|"
     r"(?<![\w@.])(?:\.\.?/)(?=[a-z0-9])|"
     r"(?<![\w@./])/(?!/|\d+(?:[.,]\d+)?(?=\s|$))(?=[a-z0-9])|"
@@ -115,6 +117,7 @@ class CatalogueCandidate:
     label: str
     evidence: str
     source_order: int
+    name_label_keys: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -197,6 +200,23 @@ def _anchor_candidate_evidence(anchor: Any, label: str) -> str:
     preventing a grid/list ancestor from lending one product another product's
     metadata. Work is capped by ancestor, link, and text-node limits.
     """
+    anchor_text = _clean_text(
+        " ".join(islice(cast(Iterable[str], anchor.itertext()), _MAX_CONTEXT_TEXT_NODES)),
+        limit=_MAX_CANDIDATE_CONTEXT_CHARS,
+    )
+    anchor_evidence = label
+    if (
+        anchor_text
+        and _normalized_words(anchor_text) != _normalized_words(label)
+        and _page_states_value(anchor_text, label)
+    ):
+        # Some catalogues wrap a semantic product heading and its metadata in
+        # one link. The heading remains the name-bearing label; the complete
+        # link text remains valid product-local country/process evidence. Keep
+        # scanning the enclosing card because it can carry additional sibling
+        # metadata that is not inside the link.
+        anchor_evidence = anchor_text
+
     current = anchor.getparent()  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
     for _ in range(_MAX_CONTEXT_ANCESTORS):
         if current is None:
@@ -222,11 +242,71 @@ def _anchor_candidate_evidence(anchor: Any, label: str) -> str:
                     return text
                 return _clean_text(f"{label} {text}", limit=_MAX_CANDIDATE_CONTEXT_CHARS) or label
         current = current.getparent()  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
-    return label
+    return anchor_evidence
 
 
 def _anchor_label(anchor: Any) -> str | None:
     """Return bounded visible or accessible text for one product link."""
+    elements = list(islice(cast(Iterable[Any], anchor.iter()), _MAX_CONTEXT_TEXT_NODES))
+
+    def element_text(element: Any) -> str | None:
+        return _clean_text(
+            " ".join(
+                islice(
+                    cast(Iterable[str], element.itertext()),
+                    _MAX_CONTEXT_TEXT_NODES,
+                )
+            )
+        )
+
+    def nearest_scope_is_product(element: Any) -> bool | None:
+        scope = element
+        inside_anchor = True
+        for _ in range(_MAX_CONTEXT_TEXT_NODES):
+            if scope is None:
+                return None
+            if scope.get("itemscope") is not None:  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+                itemtype = scope.get("itemtype")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+                is_product = isinstance(itemtype, str) and any(
+                    token.rstrip("/").rsplit("/", 1)[-1].rsplit("#", 1)[-1].casefold() == "product"
+                    for token in itemtype.split()
+                )
+                if is_product:
+                    return True
+                # A nested typed entity such as Brand owns its own name, but a
+                # page-level WebPage/CollectionPage wrapper outside the link
+                # does not make an ordinary card heading non-product text.
+                return False if inside_anchor else None
+            if scope is anchor:
+                inside_anchor = False
+            scope = scope.getparent()  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        return None
+
+    for element in elements:
+        itemprop = element.get("itemprop")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        if not isinstance(itemprop, str) or "name" not in itemprop.casefold().split():
+            continue
+        if nearest_scope_is_product(element):
+            semantic_label = element_text(element)
+            if semantic_label:
+                return semantic_label
+
+    for element in elements:
+        tag = getattr(element, "tag", "")
+        if isinstance(tag, str) and tag.casefold() in {
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+        }:
+            if nearest_scope_is_product(element) is False:
+                continue
+            semantic_label = element_text(element)
+            if semantic_label:
+                return semantic_label
+
     visible = _clean_text(
         " ".join(
             islice(
@@ -341,21 +421,84 @@ def _same_origin_product_url(
     return normalized if len(normalized) <= _MAX_PRODUCT_URL_CHARS else None
 
 
-def _merge_candidate_evidence(existing: str, additional: str) -> str:
+def _merge_candidate_evidence(
+    existing: str,
+    additional: str,
+    *,
+    required_labels: tuple[str, ...] = (),
+) -> str:
     """Merge two bounded representations of the same server-owned product."""
+
+    def retain_required_labels(value: str) -> str:
+        missing: list[str] = []
+        seen: set[str] = set()
+        for label in required_labels:
+            key = _candidate_name_label_key(label)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            if not _page_states_value(value, label):
+                missing.append(label)
+        if not missing:
+            return value
+        return (
+            _clean_text(
+                f"{' '.join(missing)} {value}",
+                limit=_MAX_CANDIDATE_CONTEXT_CHARS,
+            )
+            or value
+        )
+
     existing_words = _normalized_words(existing)
     additional_words = _normalized_words(additional)
     if additional_words and f" {additional_words} " in f" {existing_words} ":
-        return existing
+        return retain_required_labels(existing)
     if existing_words and f" {existing_words} " in f" {additional_words} ":
-        return additional
-    return (
+        return retain_required_labels(additional)
+    combined = _clean_text(
+        f"{existing} {additional}",
+        # Both inputs are independently bounded to the candidate-context cap.
+        # Normalize their full combination so stripping a lone overflow
+        # separator cannot make an over-budget merge appear to fit.
+        limit=(_MAX_CANDIDATE_CONTEXT_CHARS * 2) + 1,
+    )
+    if combined is not None and len(combined) <= _MAX_CANDIDATE_CONTEXT_CHARS:
+        return retain_required_labels(combined)
+
+    # A long first representation must not consume the entire budget and
+    # erase structured metadata discovered later from the same product card.
+    # Reserve half the available text for the later representation, then give
+    # either side any budget the other does not need.
+    text_budget = _MAX_CANDIDATE_CONTEXT_CHARS - 1
+    additional_budget = min(len(additional), text_budget // 2)
+    existing_budget = min(len(existing), text_budget - additional_budget)
+    additional_budget += min(
+        len(additional) - additional_budget,
+        text_budget - existing_budget - additional_budget,
+    )
+    merged = (
         _clean_text(
-            f"{existing} {additional}",
+            f"{existing[:existing_budget]} {additional[:additional_budget]}",
             limit=_MAX_CANDIDATE_CONTEXT_CHARS,
         )
         or existing
     )
+    return retain_required_labels(merged)
+
+
+def _candidate_name_label_key(label: str) -> str:
+    """Return one URL-free normalized key for an exact product-name label."""
+    return _normalized_words(_redact_urls(label).replace(_REDACTED_REFERENCE, " "))
+
+
+def _merge_candidate_name_label_keys(existing: frozenset[str], additional: str) -> frozenset[str]:
+    """Add a distinct label key within the hard discovery-representation bound."""
+    key = _candidate_name_label_key(additional)
+    if not key or key in existing:
+        return existing
+    if len(existing) >= _MAX_NAME_LABELS_PER_CANDIDATE:
+        return existing
+    return existing | {key}
 
 
 def _discover_catalogue_candidates_unchecked(
@@ -402,8 +545,17 @@ def _discover_catalogue_candidates_unchecked(
             name = _clean_text(block.get("name"))
             url_value = block.get("url")
             identifier = block.get("@id")
-            if isinstance(url_value, str) and name:
-                raw.append((url_value, name, _json_ld_product_evidence(block, name), False))
+            usable_url = (
+                _same_origin_product_url(
+                    url_value,
+                    base_url=page.final_url,
+                    require_product_path=False,
+                )
+                if isinstance(url_value, str)
+                else None
+            )
+            if usable_url is not None and name:
+                raw.append((usable_url, name, _json_ld_product_evidence(block, name), False))
             elif isinstance(identifier, str) and name:
                 # JSON-LD ``@id`` is frequently an opaque entity identifier, not
                 # a locator. Require the same explicit product-path evidence as
@@ -435,7 +587,15 @@ def _discover_catalogue_candidates_unchecked(
             existing = candidates[duplicate_position]
             candidates[duplicate_position] = replace(
                 existing,
-                evidence=_merge_candidate_evidence(existing.evidence, evidence),
+                evidence=_merge_candidate_evidence(
+                    existing.evidence,
+                    evidence,
+                    required_labels=(existing.label, label),
+                ),
+                name_label_keys=_merge_candidate_name_label_keys(
+                    existing.name_label_keys,
+                    label,
+                ),
             )
             continue
         if len(candidates) >= _MAX_DISCOVERED:
@@ -448,6 +608,9 @@ def _discover_catalogue_candidates_unchecked(
                 label=label,
                 evidence=evidence,
                 source_order=len(candidates),
+                name_label_keys=frozenset(
+                    key for key in (_candidate_name_label_key(label),) if key
+                ),
             )
         )
     return candidates
@@ -680,6 +843,12 @@ def _page_states_value(page_text: str, value: str) -> bool:
     return f" {needle} " in f" {_normalized_words(grounding_text)} "
 
 
+def _candidate_label_keys_state_name(keys: frozenset[str], value: str) -> bool:
+    """Require a provider name to equal one complete normalized product label."""
+    needle = _normalized_words(value)
+    return bool(needle) and needle in keys
+
+
 async def _extract(
     page: FetchedVendorPage,
     candidates: list[CatalogueCandidate],
@@ -744,7 +913,10 @@ async def _extract(
         if candidate is None or item.candidate_id in seen:
             continue
         provider_evidence = redacted_evidence[item.candidate_id]
-        if not _page_states_value(provider_evidence, item.name):
+        name_label_keys = candidate.name_label_keys or frozenset(
+            key for key in (_candidate_name_label_key(candidate.label),) if key
+        )
+        if not _candidate_label_keys_state_name(name_label_keys, item.name):
             continue
         seen.add(item.candidate_id)
         country = (
