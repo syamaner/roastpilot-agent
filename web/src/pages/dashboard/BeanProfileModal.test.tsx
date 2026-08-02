@@ -1508,6 +1508,67 @@ describe("BeanProfileModal catalogue recommendations (#573 phase 2)", () => {
     expect(await screen.findByTestId("bean-profile-catalogue-results")).toBeInTheDocument();
   });
 
+  it("saves a manual profile before an independent catalogue lookup settles", async () => {
+    const pending = deferred<CatalogueRecommendationList>();
+    vi.spyOn(api, "recommendBeansFromCatalogue").mockReturnValue(pending.promise);
+    const onSave = vi.fn(
+      async (input: BeanProfileInput, _draftAttemptId?: string) => savedFrom(input),
+    );
+    const onSaved = vi.fn();
+    render(
+      <BeanProfileModal mode="add" onSave={onSave} onSaved={onSaved} onClose={vi.fn()} />,
+    );
+    fireEvent.change(screen.getByTestId("bean-profile-name"), {
+      target: { value: "Manual profile" },
+    });
+    fireEvent.change(screen.getByTestId("bean-profile-bean_origin"), {
+      target: { value: "Ethiopia" },
+    });
+    enterCatalogueUrl();
+    fireEvent.click(screen.getByTestId("bean-profile-catalogue-button"));
+
+    expect(screen.getByTestId("bean-profile-save")).toBeEnabled();
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave.mock.calls[0][0].name).toBe("Manual profile");
+    expect(onSave.mock.calls[0][1]).toBeUndefined();
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+
+    await act(async () => pending.resolve(recommendations));
+  });
+
+  it("preserves a prior draft attempt when saving during catalogue lookup", async () => {
+    vi.spyOn(api, "draftBeanFromUrl").mockResolvedValue(FIXTURE_DRAFT_RESPONSE);
+    const pending = deferred<CatalogueRecommendationList>();
+    vi.spyOn(api, "recommendBeansFromCatalogue").mockReturnValue(pending.promise);
+    const onSave = vi.fn(
+      async (input: BeanProfileInput, _draftAttemptId?: string) => savedFrom(input),
+    );
+    const onSaved = vi.fn();
+    render(
+      <BeanProfileModal mode="add" onSave={onSave} onSaved={onSaved} onClose={vi.fn()} />,
+    );
+    fireEvent.change(screen.getByTestId("bean-profile-draft-url"), {
+      target: { value: productUrl },
+    });
+    fireEvent.click(screen.getByTestId("bean-profile-draft-button"));
+    await waitFor(() =>
+      expect(screen.getByTestId("bean-profile-name")).toHaveValue(
+        FIXTURE_DRAFT_RESPONSE.name,
+      ),
+    );
+
+    enterCatalogueUrl();
+    fireEvent.click(screen.getByTestId("bean-profile-catalogue-button"));
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave.mock.calls[0][0].name).toBe(FIXTURE_DRAFT_RESPONSE.name);
+    expect(onSave.mock.calls[0][1]).toBe(FIXTURE_DRAFT_RESPONSE.draft_attempt_id);
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+
+    await act(async () => pending.resolve(recommendations));
+  });
+
   it("preserves successful results when a retry fails", async () => {
     vi.spyOn(api, "recommendBeansFromCatalogue")
       .mockResolvedValueOnce(recommendations)

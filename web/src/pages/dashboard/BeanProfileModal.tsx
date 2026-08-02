@@ -168,6 +168,12 @@ export function BeanProfileModal({
   const drafting = sourcingKind === "draft";
   const recommending = sourcingKind === "catalogue";
   const sourcingBusy = sourcingKind !== null;
+  // Drafting can replace the form fields when its response arrives, so Save
+  // must wait for it. Catalogue ranking is read-only with respect to the form:
+  // preserving the operator's work must not depend on that independent request
+  // settling. Include the module guard to cover the remount-before-effect gap.
+  const saveBlockedBySourcing =
+    mode === "add" && (sourcingInFlight?.kind ?? sourcingKind) === "draft";
 
   // Editing a field orphans any provenance/evidence it carried (#627): those
   // describe the value the SERVER extracted, not whatever the operator just
@@ -223,13 +229,10 @@ export function BeanProfileModal({
     e.preventDefault();
     // Guarded here (not just via the disabled Save button, #637): pressing Enter
     // with focus in any OTHER add-form field submits natively regardless of the
-    // button's disabled attribute. The module guard closes the brief remount
-    // window before local sourcing state is adopted. Edit mode has no sourcing
-    // controls and must remain independent of an abandoned add-modal request.
-    if (
-      submitting ||
-      (mode === "add" && (sourcingBusy || sourcingInFlight !== null))
-    ) {
+    // button's disabled attribute. Only draft sourcing can later overwrite the
+    // form; catalogue ranking is independent and must not prevent preservation.
+    // The derived guard also closes the brief remount-before-effect window.
+    if (submitting || saveBlockedBySourcing) {
       return;
     }
     setSubmitError(null);
@@ -765,12 +768,12 @@ export function BeanProfileModal({
           )}
           <button
             type="submit"
-            disabled={submitting || sourcingBusy}
-            aria-disabled={submitting || sourcingBusy}
+            disabled={submitting || saveBlockedBySourcing}
+            aria-disabled={submitting || saveBlockedBySourcing}
             data-testid="bean-profile-save"
             className={cn(
               "inline-flex items-center justify-center rounded-md border border-roast-coffee/60 bg-roast-coffee/20 px-6 py-2 text-sm font-semibold uppercase tracking-wide text-roast-coffee transition-colors",
-              submitting || sourcingBusy
+              submitting || saveBlockedBySourcing
                 ? "cursor-not-allowed opacity-60"
                 : "hover:bg-roast-coffee/30",
             )}
