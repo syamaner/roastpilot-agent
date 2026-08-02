@@ -1048,6 +1048,81 @@ async def test_telemetry_round_trips_d96_validation_trace(tmp_store: RoastStore)
 
 
 @pytest.mark.asyncio
+async def test_d96_authority_transitions_bypass_periodic_telemetry_throttle(
+    tmp_store: RoastStore,
+) -> None:
+    """#699: short D96 cycles remain observable at a slower sample cadence."""
+    await seeded_store(tmp_store)
+    try:
+        reading = RoastTelemetry(bean_temp_c=185.0, env_temp_c=205.0)
+        states = [
+            PostFcHeatAuthorityState.HOLDING,
+            PostFcHeatAuthorityState.RECOVERING,
+            PostFcHeatAuthorityState.GLIDING,
+            PostFcHeatAuthorityState.RECOVERING,
+            PostFcHeatAuthorityState.HOLDING,
+        ]
+        outcomes: list[bool] = []
+        for tick, state in enumerate(states):
+            outcomes.append(
+                await tmp_store.record_telemetry(
+                    run_id="run-1",
+                    tick=tick,
+                    agent_phase=RoastPhase.DEVELOPMENT,
+                    elapsed_seconds=float(tick * 5),
+                    interval_seconds=60.0,
+                    telemetry=reading,
+                    charge_elapsed_seconds=float(100 + tick * 5),
+                    post_fc_recovery_enabled=True,
+                    post_fc_heat_authority_state=state,
+                    post_fc_ror_setpoint_c_per_min=6.4,
+                    post_fc_smoothed_ror_c_per_min=4.8,
+                    post_fc_effective_heat_ceiling_percent=75,
+                )
+            )
+
+        # Every authority transition is durable even though none reaches the
+        # ordinary 60-second sample boundary; an unchanged state still throttles.
+        outcomes.append(
+            await tmp_store.record_telemetry(
+                run_id="run-1",
+                tick=5,
+                agent_phase=RoastPhase.DEVELOPMENT,
+                elapsed_seconds=25.0,
+                interval_seconds=60.0,
+                telemetry=reading,
+                charge_elapsed_seconds=125.0,
+                post_fc_recovery_enabled=True,
+                post_fc_heat_authority_state=PostFcHeatAuthorityState.HOLDING,
+            )
+        )
+        # Leaving DEVELOPMENT clears the controller output; persist that
+        # non-null -> null boundary even inside the periodic interval.
+        outcomes.append(
+            await tmp_store.record_telemetry(
+                run_id="run-1",
+                tick=6,
+                agent_phase=RoastPhase.COOLING,
+                elapsed_seconds=30.0,
+                interval_seconds=60.0,
+                telemetry=reading,
+                charge_elapsed_seconds=130.0,
+                post_fc_recovery_enabled=True,
+                post_fc_heat_authority_state=None,
+            )
+        )
+
+        assert outcomes == [True, True, True, True, True, False, True]
+        points = await tmp_store.read_telemetry_points("run-1")
+        assert [point.post_fc_heat_authority_state for point in points] == [
+            *states,
+            None,
+        ]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_drying_end_event_round_trips_through_timeline(tmp_store: RoastStore) -> None:
     """#351: the v6 ``drying_end`` event kind is accepted by the rebuilt
     roast_events CHECK and surfaces on the persisted timeline (the detail page),

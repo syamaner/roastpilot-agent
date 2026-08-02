@@ -648,6 +648,9 @@ class RoastStore:
         self._db_path = db_path
         self._connection: aiosqlite.Connection | None = None
         self._last_telemetry_elapsed: dict[str, float] = {}
+        self._last_telemetry_d96_state: dict[
+            str, tuple[bool | None, PostFcHeatAuthorityState | None]
+        ] = {}
         self._bean_profile_write_lock = asyncio.Lock()
 
     @property
@@ -983,14 +986,25 @@ class RoastStore:
         post_fc_effective_heat_ceiling_percent: int | None = None,
         raw_state_json: str | None = None,
     ) -> bool:
-        """Persist a telemetry row, throttled to ``interval_seconds``.
+        """Persist a periodic telemetry row or a D96 authority transition.
 
         The controller persists every tick; rows are only inserted every
-        ``telemetry_log_interval_seconds`` (plan §5, default 5 s). Returns
-        whether a row was written. The first row of a run always writes.
+        ``telemetry_log_interval_seconds`` (plan §5, default 5 s), except that
+        a change in the resolved D96 flag or authority state always writes so a
+        short recovery/glide cycle cannot disappear between periodic samples.
+        Returns whether a row was written. The first row of a run always writes.
         """
         last = self._last_telemetry_elapsed.get(run_id)
-        if last is not None and (elapsed_seconds - last) < interval_seconds:
+        d96_state = (post_fc_recovery_enabled, post_fc_heat_authority_state)
+        d96_state_changed = (
+            run_id in self._last_telemetry_d96_state
+            and self._last_telemetry_d96_state[run_id] != d96_state
+        )
+        if (
+            last is not None
+            and (elapsed_seconds - last) < interval_seconds
+            and not d96_state_changed
+        ):
             return False
         await self.connection.execute(
             "INSERT INTO telemetry_snapshots"
@@ -1032,6 +1046,7 @@ class RoastStore:
         )
         await self.connection.commit()
         self._last_telemetry_elapsed[run_id] = elapsed_seconds
+        self._last_telemetry_d96_state[run_id] = d96_state
         return True
 
     async def record_safety_evaluation(

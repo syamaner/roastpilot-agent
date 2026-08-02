@@ -6,6 +6,28 @@ import { PostFcRecoveryStatus } from "./PostFcRecoveryStatus";
 afterEach(cleanup);
 
 describe("PostFcRecoveryStatus", () => {
+  it("renders the armed state before a post-FC control output exists", () => {
+    render(
+      <PostFcRecoveryStatus
+        trace={{
+          recoveryEnabled: true,
+          heatAuthorityState: null,
+          rorSetpointCPerMin: null,
+          smoothedRorCPerMin: null,
+          effectiveHeatCeilingPercent: null,
+          atChargeElapsedSeconds: 300,
+        }}
+      />,
+    );
+
+    const status = screen.getByTestId("post-fc-recovery-status");
+    expect(status).toHaveAttribute("data-state", "armed");
+    expect(status).toHaveTextContent("Recovery armed");
+    expect(status).toHaveTextContent("RoR — °C/min");
+    expect(status).toHaveTextContent("Target — °C/min");
+    expect(status).toHaveTextContent("Heat ceiling — %");
+  });
+
   it("distinguishes the disabled feature from an armed HOLDING state", () => {
     const { rerender } = render(
       <PostFcRecoveryStatus
@@ -20,6 +42,10 @@ describe("PostFcRecoveryStatus", () => {
       />,
     );
     expect(screen.getByText("Recovery off")).toBeInTheDocument();
+    expect(screen.getByTestId("post-fc-recovery-status")).toHaveAttribute(
+      "data-state",
+      "off",
+    );
 
     rerender(
       <PostFcRecoveryStatus
@@ -34,6 +60,10 @@ describe("PostFcRecoveryStatus", () => {
       />,
     );
     expect(screen.getByText("Armed · Holding")).toBeInTheDocument();
+    expect(screen.getByTestId("post-fc-recovery-status")).toHaveAttribute(
+      "data-state",
+      "holding",
+    );
   });
 
   it("labels entry and exit glide and renders controller diagnostics", () => {

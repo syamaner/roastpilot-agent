@@ -61,7 +61,7 @@ export interface TraceRow {
 
 /** Title-block headline stats — all derived from telemetry + timeline markers. */
 export interface HeadlineStats {
-  /** Total roast duration in seconds (last telemetry `elapsed_seconds`). */
+  /** Total run duration across process-local serve-clock epochs. */
   totalSeconds: number | null;
   firstCrackSeconds: number | null;
   firstCrackTempC: number | null;
@@ -303,7 +303,7 @@ export function headlineStats(
 ): HeadlineStats {
   const points = series?.points ?? [];
   return {
-    totalSeconds: lastElapsed(points),
+    totalSeconds: accumulatedElapsed(points),
     firstCrackSeconds: firstPhaseSeconds(series, "development"),
     firstCrackTempC: firstPhaseBeanTemp(series, "development"),
     dropSeconds: firstPhaseSeconds(series, "cooling"),
@@ -348,11 +348,19 @@ function numberOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function lastElapsed(points: readonly TelemetryPoint[]): number | null {
-  for (let i = points.length - 1; i >= 0; i -= 1) {
-    if (points[i].elapsed_seconds !== null) return points[i].elapsed_seconds;
+/** Sum insertion-ordered process-local serve-clock epochs across restarts. */
+function accumulatedElapsed(points: readonly TelemetryPoint[]): number | null {
+  let offset = 0;
+  let previous: number | null = null;
+  let total: number | null = null;
+  for (const point of points) {
+    const elapsed = point.elapsed_seconds;
+    if (elapsed === null) continue;
+    if (previous !== null && elapsed < previous) offset += previous;
+    total = offset + elapsed;
+    previous = elapsed;
   }
-  return null;
+  return total;
 }
 
 function lastDevelopmentPercent(points: readonly TelemetryPoint[]): number | null {

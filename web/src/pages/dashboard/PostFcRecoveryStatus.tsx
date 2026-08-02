@@ -32,7 +32,11 @@ export function PostFcRecoveryStatus({
   return (
     <section
       data-testid="post-fc-recovery-status"
-      data-state={trace?.heatAuthorityState ?? (trace?.recoveryEnabled ? "armed" : "off")}
+      data-state={
+        trace?.recoveryEnabled === true
+          ? (trace.heatAuthorityState ?? "armed")
+          : "off"
+      }
       className="rounded-lg border border-border bg-card px-4 py-3"
       aria-label="Post-first-crack recovery authority"
     >

@@ -29,6 +29,16 @@ test("foundation chrome — full-page snapshot with the un-masked canvas", async
   await expect(page).toHaveScreenshot("foundation-chrome.png", { fullPage: true });
 });
 
+test("engaged D96 authority status exposes entry diagnostics", async ({ page }) => {
+  const status = page.getByTestId("post-fc-recovery-status");
+  await expect(status).toHaveAttribute("data-state", "recovering");
+  await expect(status).toContainText("Recovery entry");
+  await expect(status).toContainText("RoR 4.8 °C/min");
+  await expect(status).toContainText("Target 6.4 °C/min");
+  await expect(status).toContainText("Heat ceiling 75 %");
+  await expect(status).toHaveScreenshot("foundation-d96-recovering.png");
+});
+
 test("chart data hook exposes the five series + markers (D24)", async ({ page }) => {
   const hook = await readChartData(page);
   // Six columns: x + bean/env/ror/heat/fan.

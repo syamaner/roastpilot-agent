@@ -300,6 +300,23 @@ describe("headlineStats", () => {
     expect(stats.developmentPercent).not.toBeNull();
   });
 
+  it("accumulates total time across process-local clock resets", () => {
+    const elapsed = [0, 500, 0, 30];
+    const series: TelemetrySeries = {
+      run_id: "recovered-run",
+      downsample: 1,
+      point_count: elapsed.length,
+      points: elapsed.map((elapsedSeconds, index) => ({
+        ...FIXTURE_TELEMETRY.points[index],
+        elapsed_seconds: elapsedSeconds,
+        charge_elapsed_seconds: null,
+      })),
+    };
+
+    expect(headlineStats(undefined, series).totalSeconds).toBe(530);
+    expect(series.points.map((point) => point.elapsed_seconds)).toEqual(elapsed);
+  });
+
   it("returns all-null stats for empty telemetry", () => {
     const stats = headlineStats(undefined, undefined);
     expect(stats).toEqual({

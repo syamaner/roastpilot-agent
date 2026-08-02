@@ -220,6 +220,34 @@ describe("useDashboardEvents (hook)", () => {
     );
   });
 
+  it("retains an armed D96 flag before the first authority output on cold reload", async () => {
+    const persisted = series([500]);
+    persisted.points[0] = {
+      ...persisted.points[0],
+      charge_elapsed_seconds: 100,
+      post_fc_recovery_enabled: true,
+      post_fc_heat_authority_state: null,
+      post_fc_ror_setpoint_c_per_min: null,
+      post_fc_smoothed_ror_c_per_min: null,
+      post_fc_effective_heat_ceiling_percent: null,
+    };
+    const fetchTelemetry = vi.fn(() => Promise.resolve(persisted));
+    const { result } = renderHook(() =>
+      useDashboardEvents([], 0, "run-1", "live", { fetchTelemetry }),
+    );
+
+    await waitFor(() =>
+      expect(result.current.postFcControl).toEqual({
+        recoveryEnabled: true,
+        heatAuthorityState: null,
+        rorSetpointCPerMin: null,
+        smoothedRorCPerMin: null,
+        effectiveHeatCeilingPercent: null,
+        atChargeElapsedSeconds: 100,
+      }),
+    );
+  });
+
   it("backfills a PRE-charge snapshot row AND recovers the T0 origin on cold reload (#326)", async () => {
     // End-to-end through the real hook → pointFromSnapshot → seed path (the seed
     // action takes already-projected points, so this is the only test of the
