@@ -81,8 +81,9 @@ _URL_START = re.compile(
     r"\[[0-9a-f:.]+\](?=[:/?#\s]|$)))",
     re.IGNORECASE,
 )
-_REFERENCE_TERMINATORS: Final = frozenset(")>\"'")
-_REFERENCE_LEADING_PUNCTUATION: Final = frozenset("([{<,:;")
+_REFERENCE_TERMINATORS: Final = frozenset(")]}>\"'\u201d\u2019")
+_REFERENCE_LEADING_PUNCTUATION: Final = frozenset("([{<,:;\u201c\u2018")
+_REFERENCE_CONTINUATION_PREFIXES: Final = frozenset("&?#/;")
 _KNOWN_RELATIVE_PATH_PREFIXES: Final = frozenset(
     {
         "bean",
@@ -467,19 +468,71 @@ def _agent(
 
 
 def _reference_end(text: str, start: int) -> int:
-    """Return the first whitespace or closing-delimiter position after ``start``."""
+    """Return the end of one reference without consuming adjacent prose."""
+
+    def continuation_after_close(position: int) -> tuple[bool, int]:
+        probe = position + 1
+        while probe < len(text) and text[probe] in _REFERENCE_TERMINATORS:
+            probe += 1
+        if probe >= len(text) or text[probe].isspace():
+            return False, probe
+        suffix_end = probe
+        while (
+            suffix_end < len(text)
+            and not text[suffix_end].isspace()
+            and text[suffix_end] not in _REFERENCE_TERMINATORS
+        ):
+            suffix_end += 1
+        suffix = text[probe:suffix_end]
+        decoded_suffix = suffix
+        for _ in range(len(suffix) // 2 + 1):
+            next_suffix = unquote(decoded_suffix)
+            if next_suffix == decoded_suffix:
+                break
+            decoded_suffix = next_suffix
+        decoded_prefix = decoded_suffix[:1]
+        continues = (
+            text[probe] in _REFERENCE_CONTINUATION_PREFIXES
+            or decoded_prefix in _REFERENCE_CONTINUATION_PREFIXES
+        )
+        return continues, probe
+
     end = start
-    while end < len(text) and not text[end].isspace() and text[end] not in _REFERENCE_TERMINATORS:
-        end += 1
-    if (
-        end < len(text)
-        and text[end] == ")"
-        and text[start] not in _REFERENCE_LEADING_PUNCTUATION
-        and "(" in text[start:end]
-    ):
-        # Consume the URI's own closing parenthesis (for example
-        # ``javascript:alert(1)``), while leaving an additional wrapper
-        # parenthesis outside the redacted span.
+    delimiter_depths = {"(": 0, "[": 0, "{": 0}
+    closing_delimiters = {")": "(", "]": "[", "}": "{"}
+    while end < len(text) and not text[end].isspace():
+        character = text[end]
+        opener = closing_delimiters.get(character)
+        if opener is not None:
+            if delimiter_depths[opener] == 0:
+                continues, continuation_start = continuation_after_close(end)
+                if not continues:
+                    break
+                end = continuation_start
+                continue
+            else:
+                delimiter_depths[opener] -= 1
+            end += 1
+            if not any(delimiter_depths.values()) and end < len(text):
+                next_character = text[end]
+                ipv6_port = opener == "[" and next_character == ":"
+                ambiguous_wrapper_suffix = (
+                    next_character in _REFERENCE_TERMINATORS or next_character in ",!:"
+                )
+                if ambiguous_wrapper_suffix and not ipv6_port:
+                    continues, continuation_start = continuation_after_close(end - 1)
+                    if not continues:
+                        break
+                    end = continuation_start
+            continue
+        if character in _REFERENCE_TERMINATORS:
+            continues, continuation_start = continuation_after_close(end)
+            if not continues:
+                break
+            end = continuation_start
+            continue
+        if character in delimiter_depths:
+            delimiter_depths[character] += 1
         end += 1
     return end
 
@@ -524,13 +577,13 @@ def _token_reference_spans(text: str) -> list[tuple[int, int]]:
         ):
             cursor += 1
         token_start = cursor
-        token_end = _reference_end(text, token_start)
-        cursor = max(token_end, cursor + 1)
         candidate_start = token_start
         while (
-            candidate_start < token_end and text[candidate_start] in _REFERENCE_LEADING_PUNCTUATION
+            candidate_start < len(text) and text[candidate_start] in _REFERENCE_LEADING_PUNCTUATION
         ):
             candidate_start += 1
+        token_end = _reference_end(text, candidate_start)
+        cursor = max(token_end, cursor + 1)
         if candidate_start >= token_end:
             continue
         token = text[candidate_start:token_end]

@@ -182,6 +182,46 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
     assert redact("data:text/plain;base64,c2VjcmV0 washed") == "[link] washed"
     assert redact("mailto:sales@vendor.example washed") == "[link] washed"
     assert redact("javascript:alert(1) washed") == "[link] washed"
+    assert redact("https://vendor.example/page?ref=(x)&token=SECRET more") == "[link] more"
+    assert redact("https://vendor.example/page?ref=(a(b)c)&token=SECRET more") == "[link] more"
+    assert redact("https://vendor.example/page?ref=(a(b(c)d)e)&token=SECRET more") == "[link] more"
+    assert redact("https://vendor.example/page?ref=(a(b(c(d)e)f)g)&token=SECRET more") == (
+        "[link] more"
+    )
+    assert redact("https://vendor.example/page?ref=%28x%29&token=SECRET more") == "[link] more"
+    assert redact("https://vendor.example/page?ref=(x&token=SECRET more") == "[link] more"
+    assert redact("https://vendor.example/page?ref=x)&token=SECRET more") == "[link] more"
+    assert redact("https://vendor.example/page?ref=(x))&token=SECRET more") == "[link] more"
+    assert redact("https://vendor.example/a_(b).html?token=SECRET more") == "[link] more"
+    assert redact("https://vendor.example/a_(b):Country=Kenya washed") == (
+        "[link]:Country=Kenya washed"
+    )
+    assert redact("https://[2001:db8::1]:8443/products/private Kenya") == "[link] Kenya"
+    assert redact("https://vendor.example/page?ref=(x),Kenya washed") == "[link],Kenya washed"
+    assert redact("<https://vendor.example/products/a>Kenya washed") == "<[link]>Kenya washed"
+    assert redact("“https://vendor.example/products/a”Kenya washed") == "“[link]”Kenya washed"
+    assert redact("<https://vendor.example/products/a>Country=Kenya more") == (
+        "<[link]>Country=Kenya more"
+    )
+    assert redact("<https://vendor.example/products/a>&token=SECRET more") == "<[link] more"
+    assert redact("“https://vendor.example/products/a”&token=SECRET more") == "“[link] more"
+    assert redact("“https://vendor.example/products/a”%2523private more") == "“[link] more"
+    assert redact("(https://vendor.example/page?ref=(x)&token=SECRET) more") == "([link]) more"
+    assert redact("(checkout?ref=(x)&token=SECRET) more") == "([link]) more"
+    assert redact("((checkout?ref=(x)&token=SECRET)) more") == "(([link])) more"
+    assert redact("“https://vendor.example/a?token=x” Kenya") == "“[link]” Kenya"
+    assert redact("{https://vendor.example/a?token=x} Kenya") == "{[link]} Kenya"
+    assert redact("[https://[2001:db8::1]/a?token=x] Kenya") == "[[link]] Kenya"
+    assert redact("https://vendor.example/a?token=x and https://vendor.example/b?token=y") == (
+        "[link] and [link]"
+    )
+    assert (
+        redact(
+            "https://vendor.example/a?ref=(x)&token=a and https://vendor.example/b?ref=x)&token=b"
+        )
+        == "[link] and [link]"
+    )
+    assert redact("https://vendor.example/a?ref=(x[y)&token=SECRET] more") == "[link] more"
     assert redact("192.0.2.1/private?token=x washed") == "[link] washed"
     assert redact("example.xn--p1ai/private?token=x washed") == "[link] washed"
     assert redact("https://[2001:db8::1]/private?token=x washed") == "[link] washed"
@@ -218,7 +258,11 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
     assert redact("Country:Kenya Process:Washed SKU:ABC123") == (
         "Country:Kenya Process:Washed SKU:ABC123"
     )
+    assert redact("Country=Kenya;Process=Washed") == "Country=Kenya;Process=Washed"
+    assert redact("Country=Kenya&Process=Washed") == "Country=Kenya&Process=Washed"
     assert redact("farmer@vendor.example washed") == "farmer@vendor.example washed"
+    benign_unmatched = "Loved this batch (well, mostly - Sumatra Mandheling tasted clean"
+    assert redact(benign_unmatched) == benign_unmatched
 
 
 def test_json_ld_flattener_handles_graph_item_list_nested_item_and_noise() -> None:
