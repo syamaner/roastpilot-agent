@@ -664,6 +664,8 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
     assert redact("custom%3Asecret natural") == "[link] natural"
     assert redact("custom%253Asecret natural") == "[link] natural"
     assert redact("Origin:products/private Kenya") == "[link] Kenya"
+    assert redact("en/products/kenya-washed-lot washed") == "[link] washed"
+    assert redact("en/us/shop/kenya-washed-lot natural") == "[link] natural"
     assert redact("Origin:(products/private) Kenya") == "Origin:([link]) Kenya"
     assert redact("Origin:[products/private] Kenya") == "Origin:[[link]] Kenya"
     assert redact("Origin%253Aproducts%252Fprivate Kenya") == "[link] Kenya"

@@ -1001,11 +1001,17 @@ def _relative_reference_start(token: str) -> int | None:
         character = token[position]
         if not character.isalnum():
             continue
-        if position > 0 and (token[position - 1].isalnum() or token[position - 1] in "_./"):
+        if position > 0 and (token[position - 1].isalnum() or token[position - 1] in "_."):
             continue
         first_segment, separator, _rest = token[position:].casefold().partition("/")
         if bool(separator) and first_segment in _KNOWN_RELATIVE_PATH_PREFIXES:
-            candidates.append(position)
+            start = position
+            while start > 0:
+                previous = token[start - 1]
+                if not (previous.isalnum() or previous in "_./%-"):
+                    break
+                start -= 1
+            candidates.append(start)
     return min(candidates) if candidates else None
 
 
