@@ -202,6 +202,7 @@ import re
 import socket
 import ssl
 import threading
+import time
 import unicodedata
 import zlib
 from collections.abc import Callable, Iterable
@@ -1522,17 +1523,36 @@ class _TLSFallbackAsyncNetworkStream(httpcore.AsyncNetworkStream):
         wrapped_backend: httpcore.AsyncNetworkBackend,
         remaining_addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address],
         port: int,
-        timeout: float | None,
+        overall_deadline: float | None,
+        candidate_deadline: float | None,
         local_address: str | None,
         socket_options: tuple[Any, ...] | None,
+        clock: Callable[[], float],
     ) -> None:
         self._stream = stream
         self._wrapped_backend = wrapped_backend
         self._remaining_addresses = remaining_addresses
         self._port = port
-        self._timeout = timeout
+        self._overall_deadline = overall_deadline
+        self._candidate_deadline = candidate_deadline
         self._local_address = local_address
         self._socket_options = socket_options
+        self._clock = clock
+
+    def _allocate_candidate_budget(self, candidates_left: int) -> tuple[float | None, float | None]:
+        """Divide the remaining global budget among untried candidates."""
+        if self._overall_deadline is None:
+            return None, None
+        now = self._clock()
+        remaining = max(0.0, self._overall_deadline - now)
+        timeout = remaining / candidates_left
+        return now + timeout, timeout
+
+    def _remaining_candidate_budget(self, deadline: float | None) -> float | None:
+        """Return the unspent TCP+TLS budget for one candidate."""
+        if deadline is None:
+            return None
+        return max(0.0, deadline - self._clock())
 
     async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         """Delegate reads for non-TLS HTTP connections."""
@@ -1559,20 +1579,31 @@ class _TLSFallbackAsyncNetworkStream(httpcore.AsyncNetworkStream):
             None,
             *self._remaining_addresses,
         ]
-        tls_timeout = timeout
-        if self._timeout is not None and (tls_timeout is None or self._timeout < tls_timeout):
-            tls_timeout = self._timeout
-        for address in addresses:
+        for index, address in enumerate(addresses):
+            candidate_deadline = self._candidate_deadline
             try:
                 if address is not None:
+                    candidate_deadline, connect_timeout = self._allocate_candidate_budget(
+                        len(addresses) - index
+                    )
+                    if connect_timeout == 0.0:
+                        raise httpcore.ConnectTimeout("shared connect budget exhausted")
                     candidate_stream = await self._wrapped_backend.connect_tcp(
                         str(address),
                         self._port,
-                        timeout=self._timeout,
+                        timeout=connect_timeout,
                         local_address=self._local_address,
                         socket_options=self._socket_options,
                     )
                 assert candidate_stream is not None
+                candidate_budget = self._remaining_candidate_budget(candidate_deadline)
+                if candidate_budget == 0.0:
+                    raise httpcore.ConnectTimeout("shared connect budget exhausted")
+                tls_timeout = timeout
+                if candidate_budget is not None and (
+                    tls_timeout is None or candidate_budget < tls_timeout
+                ):
+                    tls_timeout = candidate_budget
                 return await candidate_stream.start_tls(
                     ssl_context,
                     server_hostname=server_hostname,
@@ -1610,8 +1641,14 @@ class _SSRFProtectedAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
     fresh validation; reusing an established public connection is safe.
     """
 
-    def __init__(self, wrapped: httpcore.AsyncNetworkBackend) -> None:
+    def __init__(
+        self,
+        wrapped: httpcore.AsyncNetworkBackend,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._wrapped = wrapped
+        self._clock = clock
 
     async def connect_tcp(
         self,
@@ -1622,36 +1659,54 @@ class _SSRFProtectedAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
         socket_options: Iterable[Any] | None = None,
     ) -> httpcore.AsyncNetworkStream:
         """Resolve, validate, and try public IPs within one timeout budget."""
-        addresses = await _resolve_public_addresses(
-            host,
-            port,
-            destination=host,
-        )
-        per_address_timeout = (
-            timeout / len(addresses) if timeout is not None and len(addresses) > 1 else timeout
-        )
+        overall_deadline = self._clock() + timeout if timeout is not None else None
+        try:
+            if timeout is None:
+                addresses = await _resolve_public_addresses(
+                    host,
+                    port,
+                    destination=host,
+                )
+            else:
+                async with asyncio.timeout(timeout):
+                    addresses = await _resolve_public_addresses(
+                        host,
+                        port,
+                        destination=host,
+                    )
+        except TimeoutError as exc:
+            raise httpcore.ConnectTimeout("DNS resolution exceeded shared connect budget") from exc
         socket_options_tuple = tuple(socket_options) if socket_options is not None else None
         last_error: httpcore.ConnectError | httpcore.ConnectTimeout | None = None
         for index, address in enumerate(addresses):
             try:
+                candidate_deadline: float | None = None
+                candidate_timeout: float | None = None
+                if overall_deadline is not None:
+                    now = self._clock()
+                    remaining = max(0.0, overall_deadline - now)
+                    candidate_timeout = remaining / (len(addresses) - index)
+                    candidate_deadline = now + candidate_timeout
+                    if candidate_timeout == 0.0:
+                        raise httpcore.ConnectTimeout("shared connect budget exhausted")
                 stream = await self._wrapped.connect_tcp(
                     str(address),
                     port,
-                    timeout=per_address_timeout,
+                    timeout=candidate_timeout,
                     local_address=local_address,
                     socket_options=socket_options_tuple,
                 )
                 remaining_addresses = addresses[index + 1 :]
-                if not remaining_addresses:
-                    return stream
                 return _TLSFallbackAsyncNetworkStream(
                     stream,
                     wrapped_backend=self._wrapped,
                     remaining_addresses=remaining_addresses,
                     port=port,
-                    timeout=per_address_timeout,
+                    overall_deadline=overall_deadline,
+                    candidate_deadline=candidate_deadline,
                     local_address=local_address,
                     socket_options=socket_options_tuple,
+                    clock=self._clock,
                 )
             except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
                 last_error = exc
@@ -1689,19 +1744,22 @@ class _SSRFProtectedAsyncHTTPTransport(httpx.AsyncHTTPTransport):
         self,
         *,
         network_backend: httpcore.AsyncNetworkBackend | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Build the transport, optionally around an injected test backend.
 
         Args:
             network_backend: Low-level backend override used by network-free
                 transport contract tests. Production leaves this unset.
+            clock: Monotonic clock override for deterministic timeout tests.
         """
         # Explicit transport construction means env proxies are never mounted;
         # trust_env=False also keeps SSL-context loading independent of env.
         super().__init__(trust_env=False)
         pool = cast(_AsyncPoolWithNetworkBackend, self._pool)
         pool._network_backend = _SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
-            network_backend if network_backend is not None else pool._network_backend  # pyright: ignore[reportPrivateUsage]
+            network_backend if network_backend is not None else pool._network_backend,  # pyright: ignore[reportPrivateUsage]
+            clock=clock,
         )
 
 
