@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 from html import unescape as unescape_html
 from itertools import islice
 from typing import Any, Final, cast
-from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urljoin, urlsplit, urlunsplit
 
 import httpx
 import lxml.etree  # type: ignore[import-untyped]
@@ -106,6 +106,8 @@ _KNOWN_RELATIVE_PATH_PREFIXES: Final = frozenset(
         "store",
     }
 )
+_ENCODED_DOT = re.compile(r"%2e", re.IGNORECASE)
+_PRODUCT_QUERY_KEYS: Final = frozenset({"product", "product-id", "product_id", "productid"})
 _log = logging.getLogger(__name__)
 
 
@@ -271,6 +273,9 @@ def _anchor_label(anchor: Any) -> str | None:
     elements = list(islice(cast(Iterable[Any], anchor.iter()), _MAX_CONTEXT_TEXT_NODES))
 
     def element_text(element: Any) -> str | None:
+        tag = getattr(element, "tag", "")
+        if isinstance(tag, str) and tag.casefold() == "meta":
+            return _clean_text(element.get("content"))  # type: ignore[reportUnknownMemberType]
         return _clean_text(
             " ".join(
                 islice(
@@ -391,6 +396,45 @@ def _json_ld_product_blocks(value: object) -> list[dict[str, object]]:
     return products[:_MAX_DISCOVERED]
 
 
+def _canonical_host(host: str) -> str:
+    """Return the ASCII browser-equivalent host used for origin checks."""
+    rendered = f"[{host}]" if ":" in host else host
+    try:
+        return httpx.URL(f"https://{rendered}").raw_host.decode("ascii").lower()
+    except (httpx.InvalidURL, UnicodeDecodeError):
+        return ""
+
+
+def _has_encoded_dot_segment(path: str) -> bool:
+    """Whether a path has a browser-equivalent encoded ``.`` or ``..`` segment."""
+    return any(_ENCODED_DOT.sub(".", segment) in {".", ".."} for segment in path.split("/"))
+
+
+def _query_selects_product(query: str) -> bool:
+    """Whether a bounded query explicitly identifies one product resource."""
+    try:
+        fields = parse_qsl(query, keep_blank_values=True, max_num_fields=16)
+    except ValueError:
+        return False
+    normalized = [(key.casefold(), value) for key, value in fields]
+    product_values = [value for key, value in normalized if key in _PRODUCT_QUERY_KEYS]
+    post_types = [value for key, value in normalized if key == "post_type"]
+    post_ids = [value for key, value in normalized if key == "p"]
+    if product_values:
+        return (
+            len(product_values) == 1
+            and bool(product_values[0].strip())
+            and not post_types
+            and not post_ids
+        )
+    return (
+        len(post_types) == 1
+        and post_types[0].casefold() == "product"
+        and len(post_ids) == 1
+        and bool(post_ids[0].strip())
+    )
+
+
 def _same_origin_product_url(
     value: str,
     *,
@@ -401,6 +445,7 @@ def _same_origin_product_url(
     """Return a normalized same-origin product URL, or ``None`` fail-soft."""
     if (
         not value
+        or len(value) > _MAX_PRODUCT_URL_CHARS
         or value.lstrip().startswith("#")
         or UNTRUSTED_TEXT_BIDI_CONTROLS.search(value)
         or UNTRUSTED_URL_UNSAFE_CHARACTERS.search(value)
@@ -410,17 +455,26 @@ def _same_origin_product_url(
         reference = urlsplit(value)
         if not allow_relative and not (reference.scheme and reference.netloc):
             return None
+        # RFC ``urljoin`` handles literal dot segments but not their WHATWG
+        # percent-encoded equivalents, and shortening can change meaningful
+        # repeated-slash paths. Reject those rare references rather than
+        # accepting a product-path bypass or rewriting a different resource.
+        if _has_encoded_dot_segment(reference.path):
+            return None
         absolute = urljoin(base_url, value)
         parsed = urlsplit(absolute)
         base = urlsplit(base_url)
+        if _has_encoded_dot_segment(base.path) or _has_encoded_dot_segment(parsed.path):
+            return None
         parsed_port = parsed.port
         base_port = base.port
     except (TypeError, ValueError):
         return None
     parsed_scheme = parsed.scheme.lower()
     base_scheme = base.scheme.lower()
-    parsed_host = (parsed.hostname or "").lower()
-    base_host = (base.hostname or "").lower()
+    parsed_host = _canonical_host(parsed.hostname or "")
+    base_host = _canonical_host(base.hostname or "")
+    parsed_path = parsed.path or "/"
     if (
         parsed_scheme not in ("http", "https")
         or not parsed_host
@@ -442,8 +496,8 @@ def _same_origin_product_url(
         base_effective_port,
     ):
         return None
-    segments = [segment.casefold() for segment in parsed.path.split("/") if segment]
-    if require_product_path:
+    segments = [segment.casefold() for segment in parsed_path.split("/") if segment]
+    if require_product_path and not _query_selects_product(parsed.query):
         if not segments or segments[-1] in _NAVIGATION_ROOT_SEGMENTS:
             return None
         if not any(segment in _PRODUCT_PATH_SEGMENTS for segment in segments[:-1]):
@@ -452,9 +506,7 @@ def _same_origin_product_url(
     normalized_netloc = rendered_host
     if parsed_port is not None and parsed_port != parsed_default_port:
         normalized_netloc = f"{rendered_host}:{parsed_port}"
-    normalized = urlunsplit(
-        (parsed_scheme, normalized_netloc, parsed.path or "/", parsed.query, "")
-    )
+    normalized = urlunsplit((parsed_scheme, normalized_netloc, parsed_path, parsed.query, ""))
     return normalized if len(normalized) <= _MAX_PRODUCT_URL_CHARS else None
 
 
@@ -965,6 +1017,18 @@ def _candidate_label_keys_state_name(keys: frozenset[str], value: str) -> bool:
     return bool(needle) and needle in keys
 
 
+def _processing_is_grounded(
+    evidence: str,
+    name_label_keys: frozenset[str],
+    processing: ProcessingMethod,
+) -> bool:
+    """Ground processing outside complete product-name labels."""
+    remaining = f" {_normalized_words(evidence.replace(_REDACTED_REFERENCE, ' '))} "
+    for label in sorted(name_label_keys, key=len, reverse=True):
+        remaining = remaining.replace(f" {label} ", " ")
+    return f" {_normalized_words(processing.replace('_', ' '))} " in remaining
+
+
 async def _extract(
     page: FetchedVendorPage,
     candidates: list[CatalogueCandidate],
@@ -1044,7 +1108,11 @@ async def _extract(
             item.processing
             if item.processing is not None
             and item.processing != "other"
-            and _page_states_value(provider_evidence, item.processing.replace("_", " "))
+            and _processing_is_grounded(
+                provider_evidence,
+                name_label_keys,
+                item.processing,
+            )
             else None
         )
         extracted.append(item.model_copy(update={"country": country, "processing": processing}))
@@ -1151,6 +1219,7 @@ async def recommend_from_catalogue(
                 config=sourcing_config,
                 http_client=http_client,
                 log_url=False,
+                extract_content=False,
             )
             candidates = await run_untrusted_parse_bounded(
                 lambda: discover_catalogue_candidates(page),

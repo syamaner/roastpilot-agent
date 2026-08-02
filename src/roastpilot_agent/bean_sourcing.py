@@ -2589,6 +2589,7 @@ async def _fetch_and_extract(
     *,
     config: BeanSourcingConfig,
     http_client: httpx.AsyncClient | None = None,
+    extract_content: bool = True,
 ) -> tuple[str, _JsonLdProductFacts | None, str, str]:
     """Respectfully fetch ``url`` and return its extracted plain text plus
     any identity-matched JSON-LD Product facts.
@@ -2642,6 +2643,9 @@ async def _fetch_and_extract(
         http_client: An injectable client (the fetch test seam — e.g. one
             built with ``httpx.MockTransport``). A real client is
             constructed, used, and closed when omitted.
+        extract_content: Whether to run the product-draft markdown and JSON-LD
+            identity passes after fetching. Catalogue discovery disables this
+            because it consumes the bounded raw HTML directly.
 
     Returns:
         A ``(extracted_text, facts)`` pair. ``extracted_text`` is the
@@ -2763,6 +2767,8 @@ async def _fetch_and_extract(
     finally:
         if owns_client:
             await client.aclose()
+    if not extract_content:
+        return "", None, html, final_url
     # #590 slice C: trafilatura's boilerplate-stripped markdown is the
     # PRIMARY page-body text; the linear-strip pass is only the fail-soft
     # fallback when trafilatura finds nothing usable or raises. Measured up
@@ -2872,6 +2878,7 @@ async def _fetch_page_text(
     *,
     config: BeanSourcingConfig,
     http_client: httpx.AsyncClient | None = None,
+    extract_content: bool = True,
 ) -> FetchedVendorPage:
     """Fetch ``url`` and return both of :class:`FetchedVendorPage`'s text
     forms (#590 D1 fold 1 — this function's return type changed from a
@@ -2881,7 +2888,10 @@ async def _fetch_page_text(
     field). See :func:`_fetch_and_extract` for the fetch/extraction
     behavior and failure modes."""
     extracted_text, facts, raw_html, final_url = await _fetch_and_extract(
-        url, config=config, http_client=http_client
+        url,
+        config=config,
+        http_client=http_client,
+        extract_content=extract_content,
     )
     json_ld_context = _format_json_ld_context(facts) if facts is not None else None
     prompt_text = (
@@ -5747,6 +5757,7 @@ async def fetch_vendor_page(
     config: BeanSourcingConfig,
     http_client: httpx.AsyncClient | None = None,
     log_url: bool = True,
+    extract_content: bool = True,
 ) -> FetchedVendorPage:
     """Validate and fetch one vendor page through the hardened sourcing boundary.
 
@@ -5763,6 +5774,9 @@ async def fetch_vendor_page(
             HTTPX/HTTPCore request logs; the existing single-product draft
             behavior remains unchanged. Suppression is ContextVar-scoped so a
             concurrent non-catalogue request keeps its normal dependency logs.
+        extract_content: Whether to run the product-draft text and JSON-LD
+            identity extraction passes. Catalogue discovery sets this false
+            and parses the bounded raw HTML through its own isolated stage.
 
     Returns:
         The bounded page representations and final redirect URL.
@@ -5805,7 +5819,12 @@ async def fetch_vendor_page(
         )
     if log_url:
         _log.info("bean_sourcing: fetching %r", _redact_url_credentials(url))
-        return await _fetch_page_text(url, config=config, http_client=http_client)
+        return await _fetch_page_text(
+            url,
+            config=config,
+            http_client=http_client,
+            extract_content=extract_content,
+        )
 
     _log.info("bean_sourcing: fetching catalogue page")
     transport_filter = _CatalogueTransportLogFilter()
@@ -5814,7 +5833,12 @@ async def fetch_vendor_page(
     for transport_logger in transport_loggers:
         transport_logger.addFilter(transport_filter)
     try:
-        return await _fetch_page_text(url, config=config, http_client=http_client)
+        return await _fetch_page_text(
+            url,
+            config=config,
+            http_client=http_client,
+            extract_content=extract_content,
+        )
     finally:
         for transport_logger in transport_loggers:
             transport_logger.removeFilter(transport_filter)

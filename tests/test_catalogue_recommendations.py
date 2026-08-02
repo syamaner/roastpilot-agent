@@ -15,6 +15,7 @@ from pydantic_ai.models import Model
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
+from roastpilot_agent import bean_sourcing
 from roastpilot_agent import catalogue_recommendations as catalogue
 from roastpilot_agent.advisor import AdvisorError
 from roastpilot_agent.bean_sourcing import (
@@ -349,6 +350,18 @@ def test_discovery_uses_name_from_product_schema_scope() -> None:
 
     assert candidates[0].label == "Kiambu Lot"
     assert candidates[0].evidence == "Shop online Kiambu Lot Kenya · Washed"
+
+
+def test_discovery_uses_metadata_backed_name_from_product_schema_scope() -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            '<a href="/products/kiambu" itemscope itemtype="https://schema.org/Product">'
+            '<meta itemprop="name" content="Kiambu Lot"><img src="kiambu.jpg"></a>'
+        )
+    )
+
+    assert candidates[0].label == "Kiambu Lot"
+    assert candidates[0].name_label_keys == frozenset({"kiambu lot"})
 
 
 def test_discovery_does_not_use_non_name_itemprop_heading_as_label() -> None:
@@ -726,6 +739,68 @@ def test_candidate_url_normalization_rejects_oversized_product_url() -> None:
     )
 
 
+@pytest.mark.parametrize("dot_segment", ["%2e%2e", "%2E.", ".%2e"])
+def test_candidate_url_normalization_rejects_encoded_dot_segments(
+    dot_segment: str,
+) -> None:
+    normalize = catalogue._same_origin_product_url  # pyright: ignore[reportPrivateUsage]
+
+    assert (
+        normalize(
+            f"/products/{dot_segment}/account",
+            base_url="https://vendor.example/collections/green",
+            require_product_path=True,
+        )
+        is None
+    )
+    assert (
+        normalize(
+            f"/products/kiambu/{dot_segment}/santos",
+            base_url="https://vendor.example/collections/green",
+            require_product_path=True,
+        )
+        is None
+    )
+    assert (
+        normalize(
+            f"/products/a/{dot_segment}/../account",
+            base_url="https://vendor.example/collections/green",
+            require_product_path=True,
+        )
+        is None
+    )
+    assert (
+        normalize(
+            f"/{dot_segment}//products/kiambu",
+            base_url="https://vendor.example/collections/green",
+            require_product_path=True,
+        )
+        is None
+    )
+
+
+def test_candidate_url_normalization_canonicalizes_idn_hosts() -> None:
+    normalize = catalogue._same_origin_product_url  # pyright: ignore[reportPrivateUsage]
+
+    assert (
+        normalize(
+            "https://xn--bcher-kva.example/products/kiambu",
+            base_url="https://bücher.example/collections/green",
+            require_product_path=True,
+        )
+        == "https://xn--bcher-kva.example/products/kiambu"
+    )
+
+    assert (
+        normalize(
+            "https://faß.de/products/kiambu",
+            base_url="https://fass.de/collections/green",
+            require_product_path=True,
+        )
+        is None
+    )
+
+
 def test_discovery_navigation_root_does_not_displace_first_twelve_products() -> None:
     navigation = '<a href="/products?page=2">All products</a>'
     products = "".join(f'<a href="/products/{index}">Bean {index}</a>' for index in range(1, 13))
@@ -774,6 +849,58 @@ def test_candidate_url_normalization_preserves_query_order_and_default_ports() -
             require_product_path=True,
         )
         == "https://vendor.example/shop/kenya-aa"
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("/shop?product=kiambu", "https://vendor.example/shop?product=kiambu"),
+        (
+            "/?post_type=product&p=123",
+            "https://vendor.example/?post_type=product&p=123",
+        ),
+    ],
+)
+def test_candidate_url_normalization_accepts_query_selected_products(
+    value: str,
+    expected: str,
+) -> None:
+    normalize = catalogue._same_origin_product_url  # pyright: ignore[reportPrivateUsage]
+
+    assert (
+        normalize(
+            value,
+            base_url="https://vendor.example/collections/green",
+            require_product_path=True,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/shop?product=",
+        "/?post_type=product",
+        "/?p=123",
+        "/shop?product=kiambu&product=santos",
+        "/shop?product=kiambu&product_id=42",
+        "/?post_type=product&p=123&p=456",
+        "/?product=kiambu&post_type=product&p=123",
+        "/?" + "&".join(f"field{index}=x" for index in range(17)),
+    ],
+)
+def test_candidate_url_normalization_rejects_incomplete_product_queries(value: str) -> None:
+    normalize = catalogue._same_origin_product_url  # pyright: ignore[reportPrivateUsage]
+
+    assert (
+        normalize(
+            value,
+            base_url="https://vendor.example/collections/green",
+            require_product_path=True,
+        )
+        is None
     )
 
 
@@ -1082,11 +1209,30 @@ def test_rated_affinity_requires_an_exact_country_processing_pair() -> None:
 @pytest.mark.asyncio
 async def test_full_catalogue_pipeline_fetches_once_extracts_once_and_ranks_locally(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    async def unexpected_markdown(*args: object, **kwargs: object) -> str | None:
+        del args, kwargs
+        raise AssertionError("catalogue fetch must not run markdown extraction")
+
+    def unexpected_json_ld(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("catalogue fetch must not run draft JSON-LD matching")
+
+    monkeypatch.setattr(
+        bean_sourcing,
+        "_extract_page_markdown_bounded",
+        unexpected_markdown,
+    )
+    monkeypatch.setattr(
+        bean_sourcing,
+        "_match_json_ld_product_facts",
+        unexpected_json_ld,
+    )
     html = b"""
     <html><body>
-      <a href="/products/kenya">Kenya Kiambu Washed</a>
-      <p>Kenya Kiambu is a washed green coffee.</p>
+      <article><a href="/products/kenya">Kenya Kiambu Washed</a>
+      <span>Kenya &middot; Washed</span></article>
       <a href="/products/private">https://vendor.example/private?token=x</a>
     </body></html>
     """
@@ -1354,6 +1500,60 @@ async def test_extraction_drops_unstated_country_and_processing_metadata() -> No
     )
     assert extracted[0].country is None
     assert extracted[0].processing is None
+
+
+@pytest.mark.asyncio
+async def test_extraction_does_not_ground_processing_inside_product_name() -> None:
+    page = _page("")
+    candidates = [
+        catalogue.CatalogueCandidate(
+            candidate_id="candidate-01",
+            product_url="https://vendor.example/products/natural-selection",
+            label="Natural Selection Kenya",
+            evidence="Natural Selection Kenya",
+            source_order=0,
+        )
+    ]
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "candidates": [
+                            {
+                                "candidate_id": "candidate-01",
+                                "name": "Natural Selection Kenya",
+                                "processing": "natural",
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+
+    extracted = await catalogue._extract(  # pyright: ignore[reportPrivateUsage]
+        page,
+        candidates,
+        advisor_config=AdvisorConfig(),
+        sourcing_config=BeanSourcingConfig(),
+        diagnostics=BeanSourcingDiagnostics(),
+        model=FunctionModel(respond),
+    )
+
+    assert extracted[0].processing is None
+
+
+def test_processing_grounding_removes_redacted_links_from_product_names() -> None:
+    grounded = catalogue._processing_is_grounded  # pyright: ignore[reportPrivateUsage]
+
+    assert not grounded(
+        "Kiambu [link] Natural",
+        frozenset({"kiambu natural"}),
+        "natural",
+    )
 
 
 @pytest.mark.asyncio
