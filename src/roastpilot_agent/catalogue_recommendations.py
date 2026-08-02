@@ -64,6 +64,13 @@ _MAX_ANCHORS_INSPECTED: Final = _MAX_DISCOVERED * 8
 _MAX_SCRIPTS_INSPECTED: Final = _MAX_DISCOVERED * 8
 _MAX_BASE_ELEMENTS_INSPECTED: Final = 16
 _MAX_NAME_LABELS_PER_CANDIDATE: Final = (_MAX_DISCOVERED * _MAX_DISCOVERED) + _MAX_ANCHORS_INSPECTED
+_MAX_FACT_CLASS_PROMPT_CHARS: Final = 400
+# Twelve maximum-length ASCII name/country pairs plus the typed JSON envelope
+# serialize to roughly 13 KiB (~3.5k common-model tokens). Keep generous
+# headroom for tokenizer variance while imposing a fixed one-request BYOK and
+# memory ceiling; pathological high-token Unicode truncates fail-closed through
+# the existing typed-output error mapping.
+_MAX_EXTRACTION_OUTPUT_TOKENS: Final = 8192
 _PRODUCT_PATH_SEGMENTS: Final = frozenset(
     {"bean", "beans", "coffee", "coffees", "item", "items", "product", "products", "shop", "store"}
 )
@@ -143,6 +150,8 @@ _KNOWN_RELATIVE_PATH_PREFIXES: Final = frozenset(
 )
 _ENCODED_DOT = re.compile(r"%2e", re.IGNORECASE)
 _PRODUCT_QUERY_KEYS: Final = frozenset({"product", "product-id", "product_id", "productid"})
+_COUNTRY_PROPERTY_LABELS: Final = frozenset({"country", "country of origin", "origin"})
+_PROCESS_PROPERTY_LABELS: Final = frozenset({"process", "processing", "processing method"})
 _log = logging.getLogger(__name__)
 
 
@@ -156,6 +165,9 @@ class CatalogueCandidate:
     evidence: str
     source_order: int
     name_label_keys: frozenset[str] = frozenset()
+    grounding_evidence: str | None = None
+    country_fact_values: tuple[str, ...] = ()
+    processing_fact_values: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -207,28 +219,163 @@ def _clean_text(value: object, *, limit: int = _MAX_LABEL_CHARS) -> str | None:
     return cleaned or None
 
 
-def _json_ld_product_evidence(block: dict[str, object], name: str) -> str:
+def _json_ld_structured_fact_values(
+    block: dict[str, object],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return bounded country and process facts without crossing field classes."""
+    country_values: list[str] = []
+    processing_values: list[str] = []
+
+    def add_structured_value(keys: tuple[str, ...], destination: list[str]) -> None:
+        for key in keys:
+            value = block.get(key)
+            candidate: object = value
+            if isinstance(value, dict):
+                candidate = cast(dict[str, object], value).get("name")
+            clean_value = _clean_text(candidate)
+            if clean_value is not None:
+                destination.append(clean_value)
+
+    add_structured_value(("country", "countryOfOrigin", "origin"), country_values)
+    add_structured_value(("processing", "process"), processing_values)
+
+    # Schema.org permits one PropertyValue or a list. Admit only the two fact
+    # classes D121 ranks; arbitrary properties are neither useful nor safe to
+    # add to the provider prompt. Per-entry cleaning and list slicing keep this
+    # branch within the same fixed context budget.
+    properties = block.get("additionalProperty")
+    property_items = (
+        cast(list[object], properties) if isinstance(properties, list) else [properties]
+    )
+    for property_item in property_items[:_MAX_DISCOVERED]:
+        if not isinstance(property_item, dict):
+            continue
+        property_block = cast(dict[str, object], property_item)
+        property_name = property_block.get("name")
+        property_value = property_block.get("value")
+        if not isinstance(property_name, str) or not isinstance(property_value, str):
+            continue
+        normalized_name = _normalized_words(property_name)
+        clean_value = _clean_text(property_value)
+        if clean_value is None:
+            continue
+        if normalized_name in _COUNTRY_PROPERTY_LABELS:
+            country_values.append(clean_value)
+        elif normalized_name in _PROCESS_PROPERTY_LABELS:
+            processing_values.append(clean_value)
+
+    return _bounded_fact_values(country_values), _bounded_fact_values(processing_values)
+
+
+def _bounded_fact_values(values: Iterable[str]) -> tuple[str, ...]:
+    """Deduplicate one fact class within deterministic count and text caps."""
+    bounded: list[str] = []
+    seen: set[str] = set()
+    used_characters = 0
+    for value in values:
+        cleaned = _clean_text(value)
+        if cleaned is None:
+            continue
+        key = _normalized_words(cleaned)
+        if not key or key in seen:
+            continue
+        separator_characters = int(bool(bounded))
+        if used_characters + separator_characters + len(cleaned) > _MAX_CANDIDATE_CONTEXT_CHARS:
+            continue
+        seen.add(key)
+        bounded.append(cleaned)
+        used_characters += separator_characters + len(cleaned)
+        if len(bounded) >= _MAX_DISCOVERED:
+            break
+    return tuple(bounded)
+
+
+def _compose_candidate_evidence(
+    label: str,
+    grounding_evidence: str,
+    country_values: Iterable[str],
+    processing_values: Iterable[str],
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Build prompt text while tracking only structured facts actually emitted."""
+    bounded_country = _bounded_fact_values(country_values)
+    bounded_processing = _bounded_fact_values(processing_values)
+    if not bounded_country and not bounded_processing:
+        return grounding_evidence, (), ()
+
+    prefix = _clean_text(label) or "product"
+    parts = [prefix]
+    used_characters = len(prefix)
+
+    def admit(
+        fact_label: str,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        nonlocal used_characters
+        admitted: list[str] = []
+        class_characters = 0
+        for value in values:
+            entry = f"{fact_label}: {value}"
+            entry_characters = len(entry) + 1
+            if class_characters + entry_characters > _MAX_FACT_CLASS_PROMPT_CHARS:
+                continue
+            if used_characters + entry_characters > _MAX_CANDIDATE_CONTEXT_CHARS:
+                break  # pragma: no cover - two class budgets plus a max label fit by construction
+            parts.append(entry)
+            admitted.append(value)
+            class_characters += entry_characters
+            used_characters += entry_characters
+        return tuple(admitted)
+
+    admitted_country = admit("country", bounded_country)
+    admitted_processing = admit("processing", bounded_processing)
+    prompt_evidence = (
+        _clean_text(
+            f"{' '.join(parts)} {grounding_evidence}",
+            limit=_MAX_CANDIDATE_CONTEXT_CHARS,
+        )
+        or prefix
+    )
+    return prompt_evidence, admitted_country, admitted_processing
+
+
+def _json_ld_product_evidence(
+    block: dict[str, object],
+    name: str,
+    *,
+    include_structured_facts: bool = True,
+) -> str:
     """Build bounded, product-local evidence from selected JSON-LD fields."""
     values: list[str] = [name]
-    for key in (
-        "country",
-        "countryOfOrigin",
-        "origin",
-        "processing",
-        "process",
-        "category",
-        # Free-form copy can consume the entire evidence budget. Keep it
-        # last so exact structured identity fields always reach the model.
-        "description",
-    ):
-        value = block.get(key)
-        if isinstance(value, str):
-            values.append(value)
-        elif isinstance(value, dict):
-            nested_name = cast(dict[str, object], value).get("name")
-            if isinstance(nested_name, str):
-                values.append(nested_name)
-    return _clean_text(" ".join(values), limit=_MAX_CANDIDATE_CONTEXT_CHARS) or name
+    category = block.get("category")
+    if isinstance(category, str):
+        values.append(category)
+    elif isinstance(category, dict):
+        category_name = cast(dict[str, object], category).get("name")
+        if isinstance(category_name, str):
+            values.append(category_name)
+
+    # Free-form copy can consume the entire evidence budget. Keep it last so
+    # exact structured identity fields and supported PropertyValues survive.
+    description = block.get("description")
+    if isinstance(description, str):
+        values.append(description)
+    grounding_evidence = (
+        _clean_text(
+            " ".join(values),
+            limit=_MAX_CANDIDATE_CONTEXT_CHARS,
+        )
+        or name
+    )
+    if not include_structured_facts:
+        return grounding_evidence
+    country_values, processing_values = _json_ld_structured_fact_values(block)
+    prompt_evidence, _, _ = _compose_candidate_evidence(
+        name,
+        grounding_evidence,
+        country_values,
+        processing_values,
+    )
+    return prompt_evidence
 
 
 def _anchor_candidate_evidence(
@@ -430,6 +577,11 @@ def _json_ld_product_blocks(value: object) -> list[dict[str, object]]:
         nested = block.get("item")
         if nested is not None:
             pending.append(nested)
+        main_entity = block.get("mainEntity")
+        if isinstance(main_entity, list):
+            pending.extend(cast(list[object], main_entity)[:_MAX_DISCOVERED])
+        elif isinstance(main_entity, dict):
+            pending.append(cast(dict[str, object], main_entity))
     return products[:_MAX_DISCOVERED]
 
 
@@ -732,7 +884,16 @@ def _discover_catalogue_candidates_unchecked(
         tree,
         final_url=page.final_url,
     )
-    raw: list[tuple[str, str, str, bool]] = []
+    raw: list[
+        tuple[
+            str,
+            str,
+            str,
+            tuple[str, ...],
+            tuple[str, ...],
+            bool,
+        ]
+    ] = []
     scripts = cast(
         Iterable[Any],
         islice(
@@ -777,12 +938,40 @@ def _discover_catalogue_candidates_unchecked(
                 None,
             )
             if usable_url is not None and name:
-                raw.append((usable_url, name, _json_ld_product_evidence(block, name), False))
+                country_values, processing_values = _json_ld_structured_fact_values(block)
+                raw.append(
+                    (
+                        usable_url,
+                        name,
+                        _json_ld_product_evidence(
+                            block,
+                            name,
+                            include_structured_facts=False,
+                        ),
+                        country_values,
+                        processing_values,
+                        False,
+                    )
+                )
             elif isinstance(identifier, str) and name:
                 # JSON-LD ``@id`` is frequently an opaque entity identifier, not
                 # a locator. Require the same explicit product-path evidence as
                 # an anchor before treating it as a dereferenceable product URL.
-                raw.append((identifier, name, _json_ld_product_evidence(block, name), True))
+                country_values, processing_values = _json_ld_structured_fact_values(block)
+                raw.append(
+                    (
+                        identifier,
+                        name,
+                        _json_ld_product_evidence(
+                            block,
+                            name,
+                            include_structured_facts=False,
+                        ),
+                        country_values,
+                        processing_values,
+                        True,
+                    )
+                )
 
     anchors = cast(
         Iterable[Any],
@@ -792,23 +981,39 @@ def _discover_catalogue_candidates_unchecked(
         href = anchor.get("href")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
         label = _anchor_label(anchor)
         if isinstance(href, str) and label:
+            anchor_evidence = _anchor_candidate_evidence(
+                anchor,
+                label,
+                base_url=document_base_url,
+                allow_relative_urls=allow_relative_urls,
+            )
             raw.append(
                 (
                     href,
                     label,
-                    _anchor_candidate_evidence(
-                        anchor,
-                        label,
-                        base_url=document_base_url,
-                        allow_relative_urls=allow_relative_urls,
-                    ),
+                    anchor_evidence,
+                    (),
+                    (),
                     True,
                 )
             )
 
     candidates: list[CatalogueCandidate] = []
     positions: dict[str, int] = {}
-    for value, label, evidence, require_product_path in raw:
+    for (
+        value,
+        label,
+        grounding_evidence,
+        country_fact_values,
+        processing_fact_values,
+        require_product_path,
+    ) in raw:
+        evidence, country_fact_values, processing_fact_values = _compose_candidate_evidence(
+            label,
+            grounding_evidence,
+            country_fact_values,
+            processing_fact_values,
+        )
         product_url = _same_origin_product_url(
             value,
             base_url=document_base_url,
@@ -820,17 +1025,31 @@ def _discover_catalogue_candidates_unchecked(
         duplicate_position = positions.get(product_url)
         if duplicate_position is not None:
             existing = candidates[duplicate_position]
+            merged_grounding_evidence = _merge_candidate_evidence(
+                existing.grounding_evidence or existing.evidence,
+                grounding_evidence,
+                required_labels=(existing.label, label),
+            )
+            (
+                merged_evidence,
+                merged_country_fact_values,
+                merged_processing_fact_values,
+            ) = _compose_candidate_evidence(
+                existing.label,
+                merged_grounding_evidence,
+                (*existing.country_fact_values, *country_fact_values),
+                (*existing.processing_fact_values, *processing_fact_values),
+            )
             candidates[duplicate_position] = replace(
                 existing,
-                evidence=_merge_candidate_evidence(
-                    existing.evidence,
-                    evidence,
-                    required_labels=(existing.label, label),
-                ),
+                evidence=merged_evidence,
+                grounding_evidence=merged_grounding_evidence,
                 name_label_keys=_merge_candidate_name_label_keys(
                     existing.name_label_keys,
                     label,
                 ),
+                country_fact_values=merged_country_fact_values,
+                processing_fact_values=merged_processing_fact_values,
             )
             continue
         if len(candidates) >= _MAX_DISCOVERED:
@@ -846,6 +1065,9 @@ def _discover_catalogue_candidates_unchecked(
                 name_label_keys=frozenset(
                     key for key in (_candidate_name_label_key(label),) if key
                 ),
+                grounding_evidence=grounding_evidence,
+                country_fact_values=country_fact_values,
+                processing_fact_values=processing_fact_values,
             )
         )
     return candidates
@@ -884,7 +1106,10 @@ def _agent(
         resolved,
         output_type=_ExtractedCatalogue,
         instructions=_CATALOGUE_INSTRUCTIONS,
-        model_settings=ModelSettings(temperature=0.0),
+        model_settings=ModelSettings(
+            temperature=0.0,
+            max_tokens=_MAX_EXTRACTION_OUTPUT_TOKENS,
+        ),
         retries=0,
     )
 
@@ -1345,6 +1570,10 @@ async def _extract(
     del page  # Discovery already reduced the fetched page to product-local contexts.
     selected = candidates[:_MAX_EXTRACTED]
     redacted_evidence = {item.candidate_id: _redact_urls(item.evidence) for item in selected}
+    redacted_grounding_evidence = {
+        item.candidate_id: _redact_urls(item.grounding_evidence or item.evidence)
+        for item in selected
+    }
     candidate_data = "\n".join(
         f"{item.candidate_id}: {redacted_evidence[item.candidate_id]}" for item in selected
     )
@@ -1395,29 +1624,40 @@ async def _extract(
         candidate = allowed.get(item.candidate_id)
         if candidate is None or item.candidate_id in seen:
             continue
-        provider_evidence = redacted_evidence[item.candidate_id]
+        provider_evidence = redacted_grounding_evidence[item.candidate_id]
         name_label_keys = candidate.name_label_keys or frozenset(
             key for key in (_candidate_name_label_key(candidate.label),) if key
         )
         if not _candidate_label_keys_state_name(name_label_keys, item.name):
             continue
         seen.add(item.candidate_id)
-        country = (
-            item.country
-            if item.country is not None and _page_states_value(provider_evidence, item.country)
-            else None
-        )
-        processing = (
-            item.processing
-            if item.processing is not None
-            and item.processing != "other"
-            and _processing_is_grounded(
-                provider_evidence,
-                name_label_keys,
-                item.processing,
+        country_grounded = item.country is not None and (
+            _page_states_value(provider_evidence, item.country)
+            or any(
+                _page_states_value(_redact_urls(fact), item.country)
+                for fact in candidate.country_fact_values
             )
-            else None
         )
+        country = item.country if country_grounded else None
+        processing_grounded = (
+            item.processing is not None
+            and item.processing != "other"
+            and (
+                _processing_is_grounded(
+                    provider_evidence,
+                    name_label_keys,
+                    item.processing,
+                )
+                or any(
+                    _page_states_value(
+                        _redact_urls(fact),
+                        item.processing.replace("_", " "),
+                    )
+                    for fact in candidate.processing_fact_values
+                )
+            )
+        )
+        processing = item.processing if processing_grounded else None
         extracted.append(item.model_copy(update={"country": country, "processing": processing}))
     if not extracted:
         raise BeanExtractionError("catalogue page yielded no supported green-coffee products")
