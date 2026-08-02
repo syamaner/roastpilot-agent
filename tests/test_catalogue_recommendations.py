@@ -351,6 +351,32 @@ def test_discovery_uses_name_from_product_schema_scope() -> None:
     assert candidates[0].evidence == "Shop online Kiambu Lot Kenya · Washed"
 
 
+def test_discovery_does_not_use_non_name_itemprop_heading_as_label() -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            '<a href="/products/kiambu" itemscope itemtype="https://schema.org/Product">'
+            '<h3 itemprop="brand">Acme Roasters</h3>'
+            "<span>Kenya · Washed</span></a>"
+        )
+    )
+
+    assert candidates[0].label == "Acme Roasters Kenya · Washed"
+    assert candidates[0].name_label_keys == frozenset({"acme roasters kenya washed"})
+
+
+def test_discovery_recognizes_url_valued_schema_name_property() -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            '<a href="/products/kiambu" itemscope itemtype="https://schema.org/Product">'
+            '<h3 itemprop="https://schema.org/name">Kiambu Lot</h3>'
+            "<span>Kenya · Washed</span></a>"
+        )
+    )
+
+    assert candidates[0].label == "Kiambu Lot"
+    assert candidates[0].name_label_keys == frozenset({"kiambu lot"})
+
+
 def test_discovery_uses_name_from_product_schema_scope_outside_anchor() -> None:
     candidates = discover_catalogue_candidates(
         _page(

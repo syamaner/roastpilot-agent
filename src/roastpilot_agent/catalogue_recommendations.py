@@ -280,6 +280,12 @@ def _anchor_label(anchor: Any) -> str | None:
             )
         )
 
+    def itemprop_has_name(value: object) -> bool:
+        return isinstance(value, str) and any(
+            token.rstrip("/").rsplit("/", 1)[-1].rsplit("#", 1)[-1].casefold() == "name"
+            for token in value.split()
+        )
+
     def nearest_scope_is_product(element: Any) -> bool | None:
         scope = element
         inside_anchor = True
@@ -305,7 +311,7 @@ def _anchor_label(anchor: Any) -> str | None:
 
     for element in elements:
         itemprop = element.get("itemprop")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
-        if not isinstance(itemprop, str) or "name" not in itemprop.casefold().split():
+        if not itemprop_has_name(itemprop):
             continue
         if nearest_scope_is_product(element):
             semantic_label = element_text(element)
@@ -322,6 +328,9 @@ def _anchor_label(anchor: Any) -> str | None:
             "h5",
             "h6",
         }:
+            heading_itemprop = element.get("itemprop")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+            if isinstance(heading_itemprop, str) and not itemprop_has_name(heading_itemprop):
+                continue
             if nearest_scope_is_product(element) is False:
                 continue
             semantic_label = element_text(element)
