@@ -211,6 +211,7 @@ import threading
 import unicodedata
 import zlib
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from html import unescape
 from typing import Any, Final, Literal, TypeVar, cast
@@ -250,6 +251,33 @@ from roastpilot_agent.models import (
 )
 
 _log = logging.getLogger(__name__)
+_catalogue_transport_logs_suppressed: ContextVar[bool] = ContextVar(
+    "catalogue_transport_logs_suppressed", default=False
+)
+_HTTP_TRANSPORT_LOGGER_NAMES: Final = (
+    "httpx",
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
+)
+
+
+class _CatalogueTransportLogFilter(logging.Filter):
+    """Suppress dependency request logs only in a catalogue-fetch task."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Return false while the current task owns a URL-free catalogue fetch.
+
+        Args:
+            record: The dependency log record being considered.
+
+        Returns:
+            Whether the record may be emitted.
+        """
+        del record
+        return not _catalogue_transport_logs_suppressed.get()
 
 
 class BeanSourcingError(Exception):
@@ -5718,6 +5746,7 @@ async def fetch_vendor_page(
     *,
     config: BeanSourcingConfig,
     http_client: httpx.AsyncClient | None = None,
+    log_url: bool = True,
 ) -> FetchedVendorPage:
     """Validate and fetch one vendor page through the hardened sourcing boundary.
 
@@ -5729,6 +5758,11 @@ async def fetch_vendor_page(
         url: Operator-supplied vendor page URL.
         config: Bean-sourcing resource and timeout limits.
         http_client: Optional injected test client.
+        log_url: Whether operational logs may retain the redacted locator.
+            Catalogue recommendation calls disable this under D121, including
+            HTTPX/HTTPCore request logs; the existing single-product draft
+            behavior remains unchanged. Suppression is ContextVar-scoped so a
+            concurrent non-catalogue request keeps its normal dependency logs.
 
     Returns:
         The bounded page representations and final redirect URL.
@@ -5744,27 +5778,47 @@ async def fetch_vendor_page(
             f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} (invalid URL syntax)"
         ) from exc
     if parsed_url.username is not None or parsed_url.password is not None:
-        _log.warning(
-            "bean_sourcing: rejected a URL with embedded credentials: %r",
-            _redact_url_credentials(url),
-        )
+        if log_url:
+            _log.warning(
+                "bean_sourcing: rejected a URL with embedded credentials: %r",
+                _redact_url_credentials(url),
+            )
+        else:
+            _log.warning("bean_sourcing: rejected a catalogue URL with embedded credentials")
         raise BeanFetchError(
             "vendor URLs with embedded credentials (user:pass@host) are not "
             "supported — remove the credentials from the URL and, if the "
             "page needs authentication, save the profile manually instead"
         )
     if parsed_url.fragment:
-        _log.warning(
-            "bean_sourcing: rejected a URL with a fragment: %r",
-            _redact_url_credentials(url),
-        )
+        if log_url:
+            _log.warning(
+                "bean_sourcing: rejected a URL with a fragment: %r",
+                _redact_url_credentials(url),
+            )
+        else:
+            _log.warning("bean_sourcing: rejected a catalogue URL with a fragment")
         raise BeanFetchError(
             "vendor URLs with a fragment (#...) are not supported — a "
             "fragment can carry a sensitive token that must never be fetched, "
             "logged, or stored; remove the fragment from the URL"
         )
-    _log.info("bean_sourcing: fetching %r", _redact_url_credentials(url))
-    return await _fetch_page_text(url, config=config, http_client=http_client)
+    if log_url:
+        _log.info("bean_sourcing: fetching %r", _redact_url_credentials(url))
+        return await _fetch_page_text(url, config=config, http_client=http_client)
+
+    _log.info("bean_sourcing: fetching catalogue page")
+    transport_filter = _CatalogueTransportLogFilter()
+    transport_loggers = tuple(logging.getLogger(name) for name in _HTTP_TRANSPORT_LOGGER_NAMES)
+    token = _catalogue_transport_logs_suppressed.set(True)
+    for transport_logger in transport_loggers:
+        transport_logger.addFilter(transport_filter)
+    try:
+        return await _fetch_page_text(url, config=config, http_client=http_client)
+    finally:
+        for transport_logger in transport_loggers:
+            transport_logger.removeFilter(transport_filter)
+        _catalogue_transport_logs_suppressed.reset(token)
 
 
 async def draft_bean_profile_from_url(

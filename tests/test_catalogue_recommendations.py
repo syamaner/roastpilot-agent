@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -19,8 +20,10 @@ from roastpilot_agent.advisor import AdvisorError
 from roastpilot_agent.bean_sourcing import (
     BeanExtractionError,
     BeanExtractionUnavailableError,
+    BeanFetchError,
     BeanSourcingDiagnostics,
     FetchedVendorPage,
+    fetch_vendor_page,
 )
 from roastpilot_agent.catalogue_recommendations import (
     CatalogueRankingContext,
@@ -127,6 +130,122 @@ def test_discovery_caps_anchor_label_text_nodes() -> None:
     assert "45" not in candidates[0].label
 
 
+@pytest.mark.parametrize(
+    ("markup", "expected"),
+    [
+        ('aria-label="Kenya Kiambu"', "Kenya Kiambu"),
+        ('title="Rwanda Nyamasheke"', "Rwanda Nyamasheke"),
+        ('><img alt="Brazil Santos" src="bean.jpg"', "Brazil Santos"),
+    ],
+)
+def test_discovery_uses_accessible_label_for_image_only_product_links(
+    markup: str, expected: str
+) -> None:
+    if markup.startswith(">"):
+        html = f'<a href="/products/kiambu"{markup}></a>'
+    else:
+        html = f'<a href="/products/kiambu" {markup}></a>'
+
+    candidates = discover_catalogue_candidates(_page(html))
+
+    assert len(candidates) == 1
+    assert candidates[0].label == expected
+    assert candidates[0].evidence == expected
+
+
+@pytest.mark.parametrize(
+    ("markup", "expected"),
+    [
+        (f'aria-label="{"A" * 320}"', "A" * 300),
+        (f'title="{"T" * 320}"', "T" * 300),
+        (f'><img alt="{"I" * 320}" src="bean.jpg"', "I" * 300),
+    ],
+)
+def test_discovery_caps_accessible_label_characters(markup: str, expected: str) -> None:
+    if markup.startswith(">"):
+        html = f'<a href="/products/kiambu"{markup}></a>'
+    else:
+        html = f'<a href="/products/kiambu" {markup}></a>'
+
+    candidates = discover_catalogue_candidates(_page(html))
+
+    assert [candidate.label for candidate in candidates] == [expected]
+    assert len(candidates[0].label) == 300
+
+
+def test_discovery_skips_unlabelled_images_and_caps_alt_scan() -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            '<a href="/products/kiambu"><img src="front.jpg">'
+            '<img alt="Kenya Kiambu" src="back.jpg"></a>'
+        )
+    )
+    assert [candidate.label for candidate in candidates] == ["Kenya Kiambu"]
+
+    unlabelled = '<img src="bean.jpg">' * 64
+    capped = discover_catalogue_candidates(
+        _page(
+            f'<a href="/products/kiambu">{unlabelled}<img alt="Outside bound" src="last.jpg"></a>'
+        )
+    )
+    assert capped == []
+
+
+def test_discovery_accessible_label_precedence_prefers_visible_text() -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            '<a href="/products/kiambu" aria-label="ARIA" title="Title">Visible'
+            '<img alt="Image alt" src="bean.jpg"></a>'
+        )
+    )
+    assert [candidate.label for candidate in candidates] == ["Visible"]
+
+
+@pytest.mark.parametrize(
+    ("markup", "expected"),
+    [
+        ('aria-label="ARIA" title="Title"', "ARIA"),
+        ('title="Title"><img alt="Image alt" src="bean.jpg"', "Title"),
+    ],
+)
+def test_discovery_accessible_label_fallback_precedence(markup: str, expected: str) -> None:
+    candidates = discover_catalogue_candidates(_page(f'<a href="/products/kiambu" {markup}></a>'))
+    assert [candidate.label for candidate in candidates] == [expected]
+
+
+def test_discovery_keeps_accessible_label_with_sibling_card_metadata() -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            '<article><a href="/products/kiambu"><img alt="Kiambu AA" src="bean.jpg"></a>'
+            "<span>Kenya · Washed</span></article>"
+        )
+    )
+    assert candidates[0].label == "Kiambu AA"
+    assert candidates[0].evidence == "Kiambu AA Kenya · Washed"
+
+
+def test_discovery_keeps_accessible_label_when_card_has_longer_prefix_word() -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            '<article><a href="/products/kiambu"><img alt="Kenya AA" src="bean.jpg"></a>'
+            "<span>Kenya AAA · Washed</span></article>"
+        )
+    )
+    assert candidates[0].label == "Kenya AA"
+    assert candidates[0].evidence == "Kenya AA Kenya AAA · Washed"
+
+
+def test_discovery_climbs_past_wrapper_that_only_repeats_visible_label() -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            '<article><h2><a href="/products/kiambu">Kenya Kiambu</a></h2>'
+            "<span>Washed · SL28</span></article>"
+        )
+    )
+    assert candidates[0].label == "Kenya Kiambu"
+    assert candidates[0].evidence == "Kenya Kiambu Washed · SL28"
+
+
 def test_discovery_rejects_evidence_from_wrapper_beyond_link_scan_cap() -> None:
     repeated = "".join('<a href="/products/kiambu">Kiambu</a>' for _ in range(9))
     html = f"<section>{repeated}<span>Neighbour Kenya Natural</span></section>"
@@ -158,6 +277,12 @@ def test_discovery_keeps_richer_json_ld_evidence_for_sparse_duplicate_link() -> 
     assert len(candidates) == 1
     assert "Kenya" in candidates[0].evidence
     assert "washed" in candidates[0].evidence
+
+
+def test_candidate_evidence_merge_uses_word_boundaries() -> None:
+    merge = catalogue._merge_candidate_evidence  # pyright: ignore[reportPrivateUsage]
+    assert merge("Kiambu AAA Kenya", "Kiambu AA") == "Kiambu AAA Kenya Kiambu AA"
+    assert merge("Kiambu AA Kenya", "Kiambu AA") == "Kiambu AA Kenya"
 
 
 def test_discovery_rejects_userinfo_and_non_product_anchor_paths() -> None:
@@ -248,6 +373,16 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
         "[link] washed"
     )
     assert redact("https%25253A%25252F%25252Fvendor.example%25252Fa washed") == "[link] washed"
+    assert (
+        redact(
+            "https&#58;&#47;&#47;vendor.example&#47;products&#47;kenya&#63;token&#61;secret washed"
+        )
+        == "[link] washed"
+    )
+    assert redact("https&amp;#58;&amp;#47;&amp;#47;vendor.example&amp;#47;private washed") == (
+        "[link] washed"
+    )
+    assert redact("Fair &amp; Trade Caf&eacute; washed") == "Fair &amp; Trade Caf&eacute; washed"
     assert redact("products%2Fkenya%3Ftoken%3DSECRET washed") == "[link] washed"
     assert redact("products%252Fkenya%253Ftoken%253DSECRET washed") == "[link] washed"
     assert redact("1 /2 lb and 1/2 kg") == "1 /2 lb and 1/2 kg"
@@ -672,7 +807,9 @@ def test_rated_affinity_requires_an_exact_country_processing_pair() -> None:
 
 
 @pytest.mark.asyncio
-async def test_full_catalogue_pipeline_fetches_once_extracts_once_and_ranks_locally() -> None:
+async def test_full_catalogue_pipeline_fetches_once_extracts_once_and_ranks_locally(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     html = b"""
     <html><body>
       <a href="/products/kenya">Kenya Kiambu Washed</a>
@@ -715,9 +852,10 @@ async def test_full_catalogue_pipeline_fetches_once_extracts_once_and_ranks_loca
         )
 
     diagnostics = BeanSourcingDiagnostics()
+    caplog.set_level("INFO")
     async with httpx.AsyncClient(transport=httpx.MockTransport(fetch)) as client:
         result = await recommend_from_catalogue(
-            "https://vendor.example/collections/green",
+            "https://vendor.example/collections/green?secret=no-log",
             context=CatalogueRankingContext(
                 roster_countries=frozenset(),
                 roster_processes=frozenset(),
@@ -735,6 +873,112 @@ async def test_full_catalogue_pipeline_fetches_once_extracts_once_and_ranks_loca
     assert result.recommendations[0].candidate_id == "candidate-01"
     assert result.recommendations[0].score == 3
     assert (diagnostics.request_tokens, diagnostics.response_tokens) == (10, 4)
+    assert "fetching catalogue page" in caplog.text
+    assert "vendor.example" not in caplog.text
+    assert "collections/green" not in caplog.text
+    assert "secret=no-log" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_catalogue_transport_log_suppression_is_task_scoped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    collection_url = "https://vendor.example/collections/private?secret=no-log"
+
+    async def fetch(request: httpx.Request) -> httpx.Response:
+        logging.getLogger("httpcore.http11").debug("request=%s", request.url)
+        entered.set()
+        await release.wait()
+        return httpx.Response(
+            200,
+            stream=_BytesStream(b"<html><body>catalogue</body></html>"),
+            request=request,
+        )
+
+    caplog.set_level("DEBUG")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fetch)) as client:
+        catalogue_fetch = asyncio.create_task(
+            fetch_vendor_page(
+                collection_url,
+                config=BeanSourcingConfig(),
+                http_client=client,
+                log_url=False,
+            )
+        )
+        await entered.wait()
+        logging.getLogger("httpx").info("unrelated request marker")
+        release.set()
+        await catalogue_fetch
+
+    assert "unrelated request marker" in caplog.text
+    assert "collections/private" not in caplog.text
+    assert "secret=no-log" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_catalogue_transport_log_suppression_cleans_up_after_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    collection_url = "https://vendor.example/collections/private?secret=no-log"
+    logger_names = ("httpx", "httpcore.http11")
+    original_filters = {name: tuple(logging.getLogger(name).filters) for name in logger_names}
+
+    def fail(request: httpx.Request) -> httpx.Response:
+        logging.getLogger("httpcore.http11").debug("request=%s", request.url)
+        raise httpx.ConnectError("catalogue transport failed", request=request)
+
+    caplog.set_level("DEBUG")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fail)) as client:
+        with pytest.raises(BeanFetchError, match="ConnectError"):
+            await fetch_vendor_page(
+                collection_url,
+                config=BeanSourcingConfig(),
+                http_client=client,
+                log_url=False,
+            )
+
+    logging.getLogger("httpx").info("post-failure transport marker")
+    assert "post-failure transport marker" in caplog.text
+    assert "collections/private" not in caplog.text
+    assert "secret=no-log" not in caplog.text
+    assert {
+        name: tuple(logging.getLogger(name).filters) for name in logger_names
+    } == original_filters
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:secret@vendor.example/collections/green",
+        "https://vendor.example/collections/green#access_token=secret",
+    ],
+)
+@pytest.mark.asyncio
+async def test_catalogue_rejection_logs_no_collection_locator(
+    url: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="roastpilot_agent.bean_sourcing")
+
+    with pytest.raises(BeanFetchError):
+        await recommend_from_catalogue(
+            url,
+            context=CatalogueRankingContext(
+                roster_countries=frozenset(),
+                roster_processes=frozenset(),
+                roster_pairs=frozenset(),
+                rated_pairs=frozenset(),
+            ),
+            advisor_config=AdvisorConfig(),
+            sourcing_config=BeanSourcingConfig(),
+            diagnostics=BeanSourcingDiagnostics(),
+        )
+
+    assert "rejected a catalogue URL" in caplog.text
+    assert "vendor.example" not in caplog.text
+    assert "collections/green" not in caplog.text
+    assert "secret" not in caplog.text
 
 
 @pytest.mark.asyncio

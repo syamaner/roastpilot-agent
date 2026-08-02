@@ -16,6 +16,7 @@ import logging
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from html import unescape as unescape_html
 from itertools import islice
 from typing import Any, Final, cast
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
@@ -216,10 +217,35 @@ def _anchor_candidate_evidence(anchor: Any, label: str) -> str:
                 " ".join(islice(current.itertext(), _MAX_CONTEXT_TEXT_NODES)),
                 limit=_MAX_CANDIDATE_CONTEXT_CHARS,
             )
-            if text and text != label and len(hrefs) <= 1:
-                return text
+            if text and len(hrefs) <= 1 and _normalized_words(text) != _normalized_words(label):
+                if _page_states_value(text, label):
+                    return text
+                return _clean_text(f"{label} {text}", limit=_MAX_CANDIDATE_CONTEXT_CHARS) or label
         current = current.getparent()  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
     return label
+
+
+def _anchor_label(anchor: Any) -> str | None:
+    """Return bounded visible or accessible text for one product link."""
+    visible = _clean_text(
+        " ".join(
+            islice(
+                cast(Iterable[str], anchor.itertext()),
+                _MAX_CONTEXT_TEXT_NODES,
+            )
+        )
+    )
+    if visible:
+        return visible
+    for attribute in ("aria-label", "title"):
+        label = _clean_text(anchor.get(attribute))  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        if label:
+            return label
+    for image in islice(cast(Iterable[Any], anchor.iter("img")), _MAX_CONTEXT_TEXT_NODES):
+        label = _clean_text(image.get("alt"))  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        if label:
+            return label
+    return None
 
 
 def _json_ld_product_blocks(value: object) -> list[dict[str, object]]:
@@ -317,9 +343,11 @@ def _same_origin_product_url(
 
 def _merge_candidate_evidence(existing: str, additional: str) -> str:
     """Merge two bounded representations of the same server-owned product."""
-    if _normalized_words(additional) in _normalized_words(existing):
+    existing_words = _normalized_words(existing)
+    additional_words = _normalized_words(additional)
+    if additional_words and f" {additional_words} " in f" {existing_words} ":
         return existing
-    if _normalized_words(existing) in _normalized_words(additional):
+    if existing_words and f" {existing_words} " in f" {additional_words} ":
         return additional
     return (
         _clean_text(
@@ -388,11 +416,7 @@ def _discover_catalogue_candidates_unchecked(
     )
     for anchor in anchors:
         href = anchor.get("href")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
-        label = _clean_text(  # type: ignore[reportUnknownVariableType]
-            " ".join(  # type: ignore[reportUnknownMemberType]
-                islice(anchor.itertext(), _MAX_CONTEXT_TEXT_NODES)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
-            )
-        )
+        label = _anchor_label(anchor)
         if isinstance(href, str) and label:
             raw.append((href, label, _anchor_candidate_evidence(anchor, label), True))
 
@@ -588,12 +612,12 @@ def _token_reference_spans(text: str) -> list[tuple[int, int]]:
             continue
         token = text[candidate_start:token_end]
         decoded_token = token
-        # Every successful percent-decoding round shortens the token, so this
-        # input-derived limit reaches a stable value without an attacker being
-        # able to create an unbounded loop. Candidate evidence is capped at
-        # 1,200 characters before this helper runs.
+        # Decode both URL and HTML character-reference layers for
+        # classification while preserving the original offsets for redaction.
+        # The input-derived cap keeps malformed or alternating encodings
+        # bounded; candidate evidence is capped at 1,200 characters.
         for _ in range(len(token) // 2 + 1):
-            next_token = unquote(decoded_token)
+            next_token = unescape_html(unquote(decoded_token))
             if next_token == decoded_token:
                 break
             decoded_token = next_token
@@ -834,7 +858,12 @@ async def recommend_from_catalogue(
         # both in one aggregate deadline can steal time from the configured
         # extraction budget and bypass its timeout-usage accounting.
         async with asyncio.timeout(preparation_timeout):
-            page = await fetch_vendor_page(url, config=sourcing_config, http_client=http_client)
+            page = await fetch_vendor_page(
+                url,
+                config=sourcing_config,
+                http_client=http_client,
+                log_url=False,
+            )
             candidates = await run_untrusted_parse_bounded(
                 lambda: discover_catalogue_candidates(page),
                 timeout_seconds=sourcing_config.fetch_timeout_seconds,
