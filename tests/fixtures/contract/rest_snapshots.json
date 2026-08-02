@@ -1,4 +1,40 @@
 {
+  "catalogue_recommendations": {
+    "discovered_count": 4,
+    "extracted_count": 2,
+    "recommendations": [
+      {
+        "candidate_id": "candidate-01",
+        "country": "Kenya",
+        "name": "Kiambu AA",
+        "processing": "washed",
+        "product_url": "https://vendor.example/products/kiambu-aa",
+        "reason_codes": [
+          "missing_country",
+          "missing_processing",
+          "novel_country_processing",
+          "rated_pair_affinity"
+        ],
+        "reasons": [
+          "Adds a country missing from the active bean roster.",
+          "Adds a processing method missing from the active bean roster.",
+          "Adds a new country and processing-method pairing.",
+          "Matches a country and processing-method pairing rated at least four stars."
+        ],
+        "score": 4
+      },
+      {
+        "candidate_id": "candidate-02",
+        "country": null,
+        "name": "Mystery Lot",
+        "processing": null,
+        "product_url": "https://vendor.example/products/mystery-lot",
+        "reason_codes": [],
+        "reasons": [],
+        "score": 0
+      }
+    ]
+  },
   "roast_detail": {
     "agent_phase": "complete",
     "ambient_humidity_pct": null,
