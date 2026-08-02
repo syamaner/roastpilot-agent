@@ -368,7 +368,7 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
     upgraded = RoastStore(db_path=db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 15 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 16 == len(MIGRATIONS)
         row = await fetch_one(upgraded, "SELECT excluded FROM roast_runs WHERE id = 'run-1'")
         assert row == (0,)
         detail = await upgraded.read_run("run-1")
@@ -384,11 +384,11 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
 
 
 @pytest.mark.asyncio
-async def test_fresh_store_is_v15(tmp_store: RoastStore) -> None:
-    """A brand-new store lands on the current (v15) schema version."""
+async def test_fresh_store_is_v16(tmp_store: RoastStore) -> None:
+    """A brand-new store lands on the current (v16) schema version."""
     await tmp_store.initialize()
     try:
-        assert await tmp_store.schema_version() == 15 == len(MIGRATIONS)
+        assert await tmp_store.schema_version() == 16 == len(MIGRATIONS)
     finally:
         await tmp_store.close()
 
@@ -412,7 +412,7 @@ async def test_v14_migration_upgrades_real_v13_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 15
+        assert await upgraded.schema_version() == 16
         assert await upgraded.read_run("run-1") is not None
         assert "bean_sourcing_attempts" in await fetch_names(upgraded, "table")
         assert "idx_bean_sourcing_attempt_expiry" in await fetch_names(upgraded, "index")
@@ -441,7 +441,7 @@ async def test_v15_migration_adds_catalogue_counts_to_real_v14_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 15 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 16 == len(MIGRATIONS)
         row = await fetch_one(
             upgraded,
             "SELECT catalogue_discovered_count, catalogue_extracted_count"
@@ -457,6 +457,54 @@ async def test_v15_migration_adds_catalogue_counts_to_real_v14_database(
                     (discovered_count, extracted_count, attempt_id),
                 )
             await upgraded.connection.rollback()
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_v16_migration_adds_nullable_d96_trace_to_real_v15_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#699: v15 telemetry survives the additive D96 trace migration."""
+    db_path = tmp_path / "v16upgrade.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:15])
+    old = RoastStore(db_path)
+    await old.initialize()
+    try:
+        assert await old.schema_version() == 15
+        await seeded_store(old)
+        # Use the actual v15 column set: the current write method quite
+        # correctly targets v16 and therefore cannot manufacture a pre-v16
+        # row after the migration list has been pinned back.
+        await old.connection.execute(
+            "INSERT INTO telemetry_snapshots"
+            " (run_id, tick, recorded_at_utc, elapsed_seconds, agent_phase,"
+            "  bean_temp_c, env_temp_c) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "run-1",
+                1,
+                datetime.now(UTC).isoformat(),
+                5.0,
+                RoastPhase.DEVELOPMENT.value,
+                184.0,
+                205.0,
+            ),
+        )
+        await old.connection.commit()
+    finally:
+        await old.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(db_path)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == 16 == len(MIGRATIONS)
+        [point] = await upgraded.read_telemetry_points("run-1")
+        assert point.post_fc_recovery_enabled is None
+        assert point.post_fc_heat_authority_state is None
+        assert point.post_fc_ror_setpoint_c_per_min is None
+        assert point.post_fc_smoothed_ror_c_per_min is None
+        assert point.post_fc_effective_heat_ceiling_percent is None
     finally:
         await upgraded.close()
 
@@ -705,6 +753,7 @@ async def test_migration_embedding_transaction_is_rejected(
 from roastpilot_agent.advisor import AdvisorContext, RoastDecision  # noqa: E402
 from roastpilot_agent.config import AppConfig  # noqa: E402
 from roastpilot_agent.models import (  # noqa: E402
+    PostFcHeatAuthorityState,
     RoastCommand,
     RoastEventKind,
     RoastEventSource,
@@ -920,6 +969,34 @@ async def test_telemetry_round_trips_charge_elapsed_seconds(tmp_store: RoastStor
         assert [p.charge_elapsed_seconds for p in points] == [None, 12.0]
         # The serve-referenced clock is retained and distinct (the chart's raw x).
         assert [p.elapsed_seconds for p in points] == [0.0, 30.0]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_telemetry_round_trips_d96_validation_trace(tmp_store: RoastStore) -> None:
+    """#699: retained telemetry preserves the controller-owned D96 trace."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.record_telemetry(
+            run_id="run-1",
+            tick=1,
+            agent_phase=RoastPhase.DEVELOPMENT,
+            elapsed_seconds=5.0,
+            interval_seconds=5.0,
+            telemetry=RoastTelemetry(bean_temp_c=184.0, env_temp_c=205.0),
+            post_fc_recovery_enabled=True,
+            post_fc_heat_authority_state=PostFcHeatAuthorityState.RECOVERING,
+            post_fc_ror_setpoint_c_per_min=6.4,
+            post_fc_smoothed_ror_c_per_min=4.8,
+            post_fc_effective_heat_ceiling_percent=75,
+        )
+        [point] = await tmp_store.read_telemetry_points("run-1")
+        assert point.post_fc_recovery_enabled is True
+        assert point.post_fc_heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+        assert point.post_fc_ror_setpoint_c_per_min == pytest.approx(6.4)
+        assert point.post_fc_smoothed_ror_c_per_min == pytest.approx(4.8)
+        assert point.post_fc_effective_heat_ceiling_percent == 75
     finally:
         await tmp_store.close()
 

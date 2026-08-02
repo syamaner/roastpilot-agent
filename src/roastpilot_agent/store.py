@@ -29,6 +29,7 @@ from roastpilot_agent.models import (
     CommandTraceSource,
     CommandTraceStatus,
     LogManifest,
+    PostFcHeatAuthorityState,
     ProcessingMethod,
     ReferenceCurveSample,
     ReferenceLandmarks,
@@ -520,6 +521,21 @@ ALTER TABLE bean_sourcing_attempts ADD COLUMN catalogue_extracted_count INTEGER
           catalogue_extracted_count <= catalogue_discovered_count));
 """
 
+SCHEMA_V16_D96_VALIDATION_TRACE = """
+-- #699 / D96: retain the controller-owned recovery-authority diagnostics used
+-- to validate the dormant post-FC recovery law during supervised roasts.
+ALTER TABLE telemetry_snapshots ADD COLUMN post_fc_recovery_enabled INTEGER
+  CHECK (post_fc_recovery_enabled IS NULL OR post_fc_recovery_enabled IN (0, 1));
+ALTER TABLE telemetry_snapshots ADD COLUMN post_fc_heat_authority_state TEXT
+  CHECK (post_fc_heat_authority_state IS NULL OR
+         post_fc_heat_authority_state IN ('holding', 'recovering', 'gliding'));
+ALTER TABLE telemetry_snapshots ADD COLUMN post_fc_ror_setpoint_c_per_min REAL;
+ALTER TABLE telemetry_snapshots ADD COLUMN post_fc_smoothed_ror_c_per_min REAL;
+ALTER TABLE telemetry_snapshots ADD COLUMN post_fc_effective_heat_ceiling_percent INTEGER
+  CHECK (post_fc_effective_heat_ceiling_percent IS NULL OR
+         post_fc_effective_heat_ceiling_percent BETWEEN 0 AND 100);
+"""
+
 _BEAN_SOURCING_LEASE_DURATION = timedelta(minutes=2)
 _BEAN_SOURCING_LEASE_CONFIRMATION = timedelta(seconds=60)
 
@@ -542,6 +558,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V13_EXCLUDED,
     SCHEMA_V14_BEAN_SOURCING_ATTEMPTS,
     SCHEMA_V15_CATALOGUE_ATTEMPT_COUNTS,
+    SCHEMA_V16_D96_VALIDATION_TRACE,
 )
 
 
@@ -959,6 +976,11 @@ class RoastStore:
         fan_level_percent: int | None = None,
         development_percent: float | None = None,
         charge_elapsed_seconds: float | None = None,
+        post_fc_recovery_enabled: bool | None = None,
+        post_fc_heat_authority_state: PostFcHeatAuthorityState | None = None,
+        post_fc_ror_setpoint_c_per_min: float | None = None,
+        post_fc_smoothed_ror_c_per_min: float | None = None,
+        post_fc_effective_heat_ceiling_percent: int | None = None,
         raw_state_json: str | None = None,
     ) -> bool:
         """Persist a telemetry row, throttled to ``interval_seconds``.
@@ -975,8 +997,11 @@ class RoastStore:
             " (run_id, tick, recorded_at_utc, elapsed_seconds, agent_phase, mcp_phase,"
             "  bean_temp_c, env_temp_c, bean_ror_c_per_min, env_ror_c_per_min,"
             "  heat_level_percent, fan_level_percent, cooling_on, development_percent,"
-            "  charge_elapsed_seconds, raw_state_json)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  charge_elapsed_seconds, post_fc_recovery_enabled,"
+            "  post_fc_heat_authority_state, post_fc_ror_setpoint_c_per_min,"
+            "  post_fc_smoothed_ror_c_per_min,"
+            "  post_fc_effective_heat_ceiling_percent, raw_state_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 tick,
@@ -993,6 +1018,15 @@ class RoastStore:
                 None if telemetry is None else int(telemetry.cooling_on),
                 development_percent,
                 charge_elapsed_seconds,
+                None if post_fc_recovery_enabled is None else int(post_fc_recovery_enabled),
+                (
+                    None
+                    if post_fc_heat_authority_state is None
+                    else post_fc_heat_authority_state.value
+                ),
+                post_fc_ror_setpoint_c_per_min,
+                post_fc_smoothed_ror_c_per_min,
+                post_fc_effective_heat_ceiling_percent,
                 raw_state_json,
             ),
         )
@@ -1895,6 +1929,9 @@ class RoastStore:
             "SELECT tick, elapsed_seconds, agent_phase, bean_temp_c, env_temp_c,"
             " bean_ror_c_per_min, env_ror_c_per_min, heat_level_percent,"
             " fan_level_percent, cooling_on, development_percent, charge_elapsed_seconds"
+            ", post_fc_recovery_enabled, post_fc_heat_authority_state,"
+            " post_fc_ror_setpoint_c_per_min, post_fc_smoothed_ror_c_per_min,"
+            " post_fc_effective_heat_ceiling_percent"
             " FROM telemetry_snapshots WHERE run_id = ? ORDER BY tick ASC, id ASC",
             (run_id,),
         ) as cursor:
@@ -1928,6 +1965,21 @@ class RoastStore:
                 charge_elapsed_seconds=None
                 if row["charge_elapsed_seconds"] is None
                 else float(row["charge_elapsed_seconds"]),
+                post_fc_recovery_enabled=None
+                if row["post_fc_recovery_enabled"] is None
+                else bool(row["post_fc_recovery_enabled"]),
+                post_fc_heat_authority_state=None
+                if row["post_fc_heat_authority_state"] is None
+                else PostFcHeatAuthorityState(str(row["post_fc_heat_authority_state"])),
+                post_fc_ror_setpoint_c_per_min=None
+                if row["post_fc_ror_setpoint_c_per_min"] is None
+                else float(row["post_fc_ror_setpoint_c_per_min"]),
+                post_fc_smoothed_ror_c_per_min=None
+                if row["post_fc_smoothed_ror_c_per_min"] is None
+                else float(row["post_fc_smoothed_ror_c_per_min"]),
+                post_fc_effective_heat_ceiling_percent=None
+                if row["post_fc_effective_heat_ceiling_percent"] is None
+                else int(row["post_fc_effective_heat_ceiling_percent"]),
             )
             for row in sampled
         ]

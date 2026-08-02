@@ -8022,8 +8022,14 @@ async def test_recovery_raises_heat_above_entry_end_to_end() -> None:
         harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=ror)]
         await harness.controller.tick()
 
-    assert harness.controller.snapshot().current_heat > entry_heat
-    assert harness.controller.snapshot().current_heat <= entry_heat + 15
+    snapshot = harness.controller.snapshot()
+    assert snapshot.current_heat > entry_heat
+    assert snapshot.current_heat <= entry_heat + 15
+    assert snapshot.post_fc_recovery_enabled is True
+    assert snapshot.post_fc_heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+    assert snapshot.post_fc_ror_setpoint_c_per_min is not None
+    assert snapshot.post_fc_smoothed_ror_c_per_min is not None
+    assert snapshot.post_fc_effective_heat_ceiling_percent == entry_heat + 15
 
 
 @pytest.mark.asyncio
@@ -8043,7 +8049,11 @@ async def test_recovery_stays_inert_when_flag_off_default() -> None:
         harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=ror)]
         await harness.controller.tick()
 
-    assert harness.controller.snapshot().current_heat <= entry_heat
+    snapshot = harness.controller.snapshot()
+    assert snapshot.current_heat <= entry_heat
+    assert snapshot.post_fc_recovery_enabled is False
+    assert snapshot.post_fc_heat_authority_state is PostFcHeatAuthorityState.HOLDING
+    assert snapshot.post_fc_effective_heat_ceiling_percent == entry_heat
 
 
 @pytest.mark.asyncio

@@ -20,7 +20,13 @@ import { useCallback, useEffect, useReducer, useRef } from "react";
 import type { CurveMarker, CurvePoint } from "@/components/shared/LiveCurve/types";
 import { useFrameDrain, type ConnectionStatus } from "@/hooks/useRoastStream";
 import { api } from "@/lib/api";
-import type { RoastPhase, SseEvent, TelemetryEventData, TelemetryPoint } from "@/lib/types";
+import type {
+  PostFcHeatAuthorityState,
+  RoastPhase,
+  SseEvent,
+  TelemetryEventData,
+  TelemetryPoint,
+} from "@/lib/types";
 import type {
   AdvisoryEventData,
   FirstCrackData,
@@ -58,6 +64,17 @@ export interface AdvisoryRecord {
 export interface SafetyTrailEntry {
   kind: "safety_alert" | "fault" | "recovery_required";
   evaluation: SafetyEvaluationData;
+}
+
+/** Latest server-owned D96 diagnostics, retained separately from chart points. */
+export interface PostFcControlTrace {
+  recoveryEnabled: boolean;
+  heatAuthorityState: PostFcHeatAuthorityState | null;
+  rorSetpointCPerMin: number | null;
+  smoothedRorCPerMin: number | null;
+  effectiveHeatCeilingPercent: number | null;
+  /** Serve-elapsed ordering key; null only for a malformed/legacy live frame. */
+  atElapsedSeconds: number | null;
 }
 
 export interface DashboardViewModel {
@@ -109,6 +126,8 @@ export interface DashboardViewModel {
    *  serve clock is dropped), so the curve is continuous through preheat → charge →
    *  roast → drop; the charge origin is applied as a display transform downstream. */
   points: CurvePoint[];
+  /** Latest typed D96 trace from SSE or the persisted reconnect backfill. */
+  postFcControl: PostFcControlTrace | null;
   /** Monotonic counter assigning each advisory record a stable key (per run). */
   advisorySeq: number;
 }
@@ -126,6 +145,7 @@ export const initialDashboardViewModel: DashboardViewModel = {
   pendingTurningPointChargeSeconds: null,
   markers: [],
   points: [],
+  postFcControl: null,
   advisorySeq: 0,
 };
 
@@ -183,6 +203,7 @@ type Action =
        *  origin isn't already known. Null/omitted when the snapshot has no post-charge
        *  point. */
       origin?: number | null;
+      postFcControl?: PostFcControlTrace | null;
     }
   | { kind: "reset" };
 
@@ -356,6 +377,50 @@ function withMarker(markers: CurveMarker[], marker: CurveMarker): CurveMarker[] 
   return [...markers, marker];
 }
 
+function postFcTraceFromTelemetry(data: TelemetryEventData): PostFcControlTrace | null {
+  if (typeof data.post_fc_recovery_enabled !== "boolean") return null;
+  return {
+    recoveryEnabled: data.post_fc_recovery_enabled,
+    heatAuthorityState: data.post_fc_heat_authority_state ?? null,
+    rorSetpointCPerMin: data.post_fc_ror_setpoint_c_per_min ?? null,
+    smoothedRorCPerMin: data.post_fc_smoothed_ror_c_per_min ?? null,
+    effectiveHeatCeilingPercent:
+      data.post_fc_effective_heat_ceiling_percent ?? null,
+    atElapsedSeconds: data.elapsed_seconds,
+  };
+}
+
+function postFcTraceFromSnapshot(point: TelemetryPoint): PostFcControlTrace | null {
+  if (typeof point.post_fc_recovery_enabled !== "boolean") return null;
+  return {
+    recoveryEnabled: point.post_fc_recovery_enabled,
+    heatAuthorityState: point.post_fc_heat_authority_state ?? null,
+    rorSetpointCPerMin: point.post_fc_ror_setpoint_c_per_min ?? null,
+    smoothedRorCPerMin: point.post_fc_smoothed_ror_c_per_min ?? null,
+    effectiveHeatCeilingPercent:
+      point.post_fc_effective_heat_ceiling_percent ?? null,
+    atElapsedSeconds: point.elapsed_seconds,
+  };
+}
+
+/** Accept a trace only when it is at least as recent as the one already shown. */
+function withPostFcTrace(
+  state: DashboardViewModel,
+  incoming: PostFcControlTrace | null | undefined,
+): DashboardViewModel {
+  if (incoming == null) return state;
+  const currentAt = state.postFcControl?.atElapsedSeconds;
+  const incomingAt = incoming.atElapsedSeconds;
+  if (
+    currentAt !== null &&
+    currentAt !== undefined &&
+    (incomingAt === null || incomingAt < currentAt)
+  ) {
+    return state;
+  }
+  return { ...state, postFcControl: incoming };
+}
+
 export function dashboardReducer(
   state: DashboardViewModel,
   action: Action,
@@ -368,9 +433,10 @@ export function dashboardReducer(
     // points themselves dedupe to a no-op (a reconnect re-seed of an already-present
     // window), so a reload still hydrates the axis origin.
     const withOrigin = withRecoveredOrigin(state, action.origin ?? null);
-    const merged = mergeSeed(withOrigin.points, action.points);
-    if (merged === withOrigin.points) return withOrigin;
-    return { ...withOrigin, points: merged };
+    const withTrace = withPostFcTrace(withOrigin, action.postFcControl);
+    const merged = mergeSeed(withTrace.points, action.points);
+    if (merged === withTrace.points) return withTrace;
+    return { ...withTrace, points: merged };
   }
 
   const event = action.event;
@@ -378,13 +444,14 @@ export function dashboardReducer(
     case "telemetry": {
       const data = event.data as unknown as TelemetryEventData;
       const point = pointFromTelemetry(data);
-      if (point === null) return state;
+      const withTrace = withPostFcTrace(state, postFcTraceFromTelemetry(data));
+      if (point === null) return withTrace;
       // Recover the T0 origin from the live frame's server clocks if it isn't yet
       // known (#326): SSE doesn't replay `t0_detected`, so a reload/reconnect mid-
       // roast recovers the charge origin from the first post-charge telemetry frame
       // (charge_elapsed_seconds non-null) rather than waiting on an event that
       // already fired. A no-op once the origin is set (the live `t0_detected` path).
-      const recovered = withRecoveredOrigin(state, originFromClocks(data.elapsed_seconds, data.charge_elapsed_seconds));
+      const recovered = withRecoveredOrigin(withTrace, originFromClocks(data.elapsed_seconds, data.charge_elapsed_seconds));
       return { ...recovered, points: upsertPoint(recovered.points, point) };
     }
     case "advisory": {
@@ -692,6 +759,7 @@ export function useDashboardEvents(
         // is the only place the origin can be recovered on a fresh page load. Earliest
         // post-charge point keeps the recovery deterministic regardless of order.
         let origin: number | null = null;
+        let postFcControl: PostFcControlTrace | null = null;
         for (const p of series.points) {
           const point = pointFromSnapshot(p);
           if (point !== null) seeded.push(point);
@@ -699,8 +767,17 @@ export function useDashboardEvents(
             const o = originFromClocks(p.elapsed_seconds, p.charge_elapsed_seconds);
             if (o !== null) origin = o;
           }
+          const trace = postFcTraceFromSnapshot(p);
+          if (
+            trace !== null &&
+            (postFcControl === null ||
+              (trace.atElapsedSeconds ?? -Infinity) >=
+                (postFcControl.atElapsedSeconds ?? -Infinity))
+          ) {
+            postFcControl = trace;
+          }
         }
-        dispatch({ kind: "seed", points: seeded, origin });
+        dispatch({ kind: "seed", points: seeded, origin, postFcControl });
       })
       .catch(() => {
         // A failed backfill leaves the live frames as-is and re-arms so a later

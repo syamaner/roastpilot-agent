@@ -185,6 +185,39 @@ describe("useDashboardEvents (hook)", () => {
     expect(result.current.points[0]).toMatchObject({ t: 0, bean: 100, env: 120, heat: 70, fan: 40 });
   });
 
+  it("restores the latest persisted D96 trace on a cold reload", async () => {
+    const persisted = series([500, 505]);
+    persisted.points[0] = {
+      ...persisted.points[0],
+      post_fc_recovery_enabled: true,
+      post_fc_heat_authority_state: "recovering",
+      post_fc_ror_setpoint_c_per_min: 6.4,
+      post_fc_smoothed_ror_c_per_min: 4.8,
+      post_fc_effective_heat_ceiling_percent: 75,
+    };
+    persisted.points[1] = {
+      ...persisted.points[1],
+      post_fc_recovery_enabled: true,
+      post_fc_heat_authority_state: "gliding",
+      post_fc_ror_setpoint_c_per_min: 6.2,
+      post_fc_smoothed_ror_c_per_min: 6.3,
+      post_fc_effective_heat_ceiling_percent: 70,
+    };
+    const fetchTelemetry = vi.fn(() => Promise.resolve(persisted));
+    const { result } = renderHook(() =>
+      useDashboardEvents([], 0, "run-1", "live", { fetchTelemetry }),
+    );
+
+    await waitFor(() =>
+      expect(result.current.postFcControl).toMatchObject({
+        recoveryEnabled: true,
+        heatAuthorityState: "gliding",
+        effectiveHeatCeilingPercent: 70,
+        atElapsedSeconds: 505,
+      }),
+    );
+  });
+
   it("backfills a PRE-charge snapshot row AND recovers the T0 origin on cold reload (#326)", async () => {
     // End-to-end through the real hook → pointFromSnapshot → seed path (the seed
     // action takes already-projected points, so this is the only test of the

@@ -1283,6 +1283,13 @@ class RoastRunner:
                     charge_elapsed_seconds=snapshot.charge_elapsed_seconds,
                     development_elapsed_seconds=snapshot.development_elapsed_seconds,
                     development_percent=snapshot.development_percent,
+                    post_fc_recovery_enabled=snapshot.post_fc_recovery_enabled,
+                    post_fc_heat_authority_state=(snapshot.post_fc_heat_authority_state),
+                    post_fc_ror_setpoint_c_per_min=(snapshot.post_fc_ror_setpoint_c_per_min),
+                    post_fc_smoothed_ror_c_per_min=(snapshot.post_fc_smoothed_ror_c_per_min),
+                    post_fc_effective_heat_ceiling_percent=(
+                        snapshot.post_fc_effective_heat_ceiling_percent
+                    ),
                     t0_detected=telemetry.t0_detected,
                     first_crack_detected=telemetry.first_crack_detected,
                     mic_status=telemetry.mic_status,
@@ -1315,6 +1322,13 @@ class RoastRunner:
             # re-origin the chart x-axis at charge on a history/reload read. None
             # before charge; frozen at the drop value in cooling. Display-only.
             charge_elapsed_seconds=snapshot.charge_elapsed_seconds,
+            post_fc_recovery_enabled=snapshot.post_fc_recovery_enabled,
+            post_fc_heat_authority_state=snapshot.post_fc_heat_authority_state,
+            post_fc_ror_setpoint_c_per_min=snapshot.post_fc_ror_setpoint_c_per_min,
+            post_fc_smoothed_ror_c_per_min=(snapshot.post_fc_smoothed_ror_c_per_min),
+            post_fc_effective_heat_ceiling_percent=(
+                snapshot.post_fc_effective_heat_ceiling_percent
+            ),
             raw_state_json=None if raw is None else raw.model_dump_json(),
         )
 

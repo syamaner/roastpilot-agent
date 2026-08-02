@@ -14,7 +14,13 @@
 > control thread is **#559** (D96 recovery law): merged **dormant** and awaiting the
 > operator's flag-on hardware validation roast. It is the only control work that is
 > ready-but-unproven; the watch-list is on the issue, and an agent analyses the trace
-> after the operator runs it. **#567** (reference curves) shipped disabled and is
+> after the operator runs it. **#699 adds the validation trace needed for that roast:**
+> the live dashboard exposes the resolved recovery flag, controller-owned authority
+> state, RoR target/measurement, and effective heat ceiling; schema v16 retains the
+> same fields for a deterministic post-roast summary (cycles, entry time, authority
+> durations, ceiling, and glide retriggers). This is observability only — it does not
+> enable or alter the dormant recovery law, and #559 remains the hardware-promotion
+> gate. **#567** (reference curves) shipped disabled and is
 > **PARKED** after a negative offline bake-off (#578) — if revisited, fix the data
 > representation, not the c9 prose. **#396** (prompt/model A/B) and **#653** (visual
 > tolerance) are operator decisions: propose, never decide.

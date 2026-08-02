@@ -84,6 +84,13 @@ afterEach(() => {
 });
 
 describe("DetailView composition", () => {
+  it("renders the retained D96 recovery summary", () => {
+    renderView();
+    expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
+      "No observed recovery",
+    );
+  });
+
   it("mounts ChargeWeight wired to the detail's frozen charge weight (#520) — the data-flows-to-the-render-tree check", () => {
     renderView();
     const frozen = screen.getByTestId("charge-weight-frozen");

@@ -576,6 +576,17 @@ class ControllerSnapshot:
     charge_elapsed_seconds: float | None
     development_elapsed_seconds: float | None
     development_percent: float | None
+    #: The resolved D96 feature flag for this run. This is surfaced separately
+    #: from ``post_fc_heat_authority_state`` because the dormant loop can report
+    #: ``HOLDING`` even when recovery authority is disabled; operators must be
+    #: able to distinguish OFF from ARMED-but-not-recovering.
+    post_fc_recovery_enabled: bool
+    #: Authoritative three-way D96 heat-authority state from the most recently
+    #: accepted post-FC control output in the current DEVELOPMENT dwell.
+    post_fc_heat_authority_state: PostFcHeatAuthorityState | None
+    post_fc_ror_setpoint_c_per_min: float | None
+    post_fc_smoothed_ror_c_per_min: float | None
+    post_fc_effective_heat_ceiling_percent: int | None
     telemetry: RoastTelemetry | None
     advisory_paused: bool
     #: Whether the charge/T0 clock has been stamped (``_charge_monotonic`` set,
@@ -875,6 +886,13 @@ class RoastController:
         the per-tick telemetry frame and persisted row — see
         :class:`ControllerSnapshot`. Pure: no side effects, no clock advance
         beyond reading elapsed."""
+        # ``_last_post_fc_output`` is already cleared whenever the loop
+        # disengages, but phase-gating here is deliberate defence-in-depth:
+        # diagnostics from a completed DEVELOPMENT dwell must never appear as
+        # current authority during cooling or a terminal/recovery phase.
+        post_fc_output = (
+            self._last_post_fc_output if self._phase is RoastPhase.DEVELOPMENT else None
+        )
         return ControllerSnapshot(
             phase=self._phase,
             current_heat=self._current_heat,
@@ -883,6 +901,19 @@ class RoastController:
             charge_elapsed_seconds=self._charge_elapsed_seconds_or_none(),
             development_elapsed_seconds=self._development_elapsed_seconds(),
             development_percent=self._development_percent(),
+            post_fc_recovery_enabled=(self._config.post_first_crack_control.recovery_enabled),
+            post_fc_heat_authority_state=(
+                None if post_fc_output is None else post_fc_output.heat_authority_state
+            ),
+            post_fc_ror_setpoint_c_per_min=(
+                None if post_fc_output is None else post_fc_output.setpoint_c_per_min
+            ),
+            post_fc_smoothed_ror_c_per_min=(
+                None if post_fc_output is None else post_fc_output.smoothed_ror_c_per_min
+            ),
+            post_fc_effective_heat_ceiling_percent=(
+                None if post_fc_output is None else post_fc_output.effective_ceiling_percent
+            ),
             telemetry=self._last_telemetry,
             advisory_paused=self._advisory_paused,
             charge_detected=self._charge_monotonic is not None,

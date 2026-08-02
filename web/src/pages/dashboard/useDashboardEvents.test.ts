@@ -29,6 +29,46 @@ const ADVISORY_DECISION = {
 };
 
 describe("dashboardReducer", () => {
+  it("retains the latest D96 trace and rejects an older reconnect seed", () => {
+    let s = dashboardReducer(
+      initialDashboardViewModel,
+      ev("telemetry", {
+        elapsed_seconds: 510,
+        charge_elapsed_seconds: 100,
+        bean_temp_c: 185,
+        env_temp_c: 205,
+        post_fc_recovery_enabled: true,
+        post_fc_heat_authority_state: "recovering",
+        post_fc_ror_setpoint_c_per_min: 6.4,
+        post_fc_smoothed_ror_c_per_min: 4.8,
+        post_fc_effective_heat_ceiling_percent: 75,
+      }),
+    );
+    expect(s.postFcControl).toMatchObject({
+      recoveryEnabled: true,
+      heatAuthorityState: "recovering",
+      atElapsedSeconds: 510,
+    });
+
+    s = dashboardReducer(s, {
+      kind: "seed",
+      points: [],
+      postFcControl: {
+        recoveryEnabled: false,
+        heatAuthorityState: "holding",
+        rorSetpointCPerMin: 6,
+        smoothedRorCPerMin: 6,
+        effectiveHeatCeilingPercent: 60,
+        atElapsedSeconds: 500,
+      },
+    });
+    expect(s.postFcControl).toMatchObject({
+      recoveryEnabled: true,
+      heatAuthorityState: "recovering",
+      atElapsedSeconds: 510,
+    });
+  });
+
   it("appends a curve point per telemetry frame (x = SERVE-elapsed seconds, #326)", () => {
     let s = initialDashboardViewModel;
     // The curve buffer keys `t` on serve elapsed_seconds (#326), NOT

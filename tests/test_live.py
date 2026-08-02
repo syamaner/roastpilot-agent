@@ -41,7 +41,12 @@ from roastpilot_agent.mcp_client import (
     RoasterControlAdapter,
     RoastSessionState,
 )
-from roastpilot_agent.models import RoastPhase, RoastProfile, RoastTelemetry
+from roastpilot_agent.models import (
+    PostFcHeatAuthorityState,
+    RoastPhase,
+    RoastProfile,
+    RoastTelemetry,
+)
 from roastpilot_agent.store import RoastStore
 
 # Reuse the canned tool fixtures + fake-session doubles from the mcp_client tests.
@@ -690,6 +695,11 @@ async def test_persisted_dev_percent_is_the_controller_value_not_mcp_raw(
             charge_elapsed_seconds=480.0,
             development_elapsed_seconds=75.0,
             development_percent=controller_dev_percent,
+            post_fc_recovery_enabled=True,
+            post_fc_heat_authority_state=PostFcHeatAuthorityState.RECOVERING,
+            post_fc_ror_setpoint_c_per_min=6.4,
+            post_fc_smoothed_ror_c_per_min=4.8,
+            post_fc_effective_heat_ceiling_percent=75,
             telemetry=RoastTelemetry.model_validate({"bean_temp_c": 196.0, "env_temp_c": 214.0}),
             advisory_paused=False,
             charge_detected=True,
@@ -716,5 +726,10 @@ async def test_persisted_dev_percent_is_the_controller_value_not_mcp_raw(
         # #308: the charge-referenced roast clock is persisted from the snapshot
         # (the REST telemetry series re-origins the chart x-axis at charge).
         assert points[0].charge_elapsed_seconds == 480.0
+        assert points[0].post_fc_recovery_enabled is True
+        assert points[0].post_fc_heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+        assert points[0].post_fc_ror_setpoint_c_per_min == pytest.approx(6.4)
+        assert points[0].post_fc_smoothed_ror_c_per_min == pytest.approx(4.8)
+        assert points[0].post_fc_effective_heat_ceiling_percent == 75
     finally:
         await store.close()

@@ -66,6 +66,7 @@ from roastpilot_agent.models import (
     MicHealth,
     OperatorAction,
     OperatorActionRequest,
+    PostFcHeatAuthorityState,
     ReferenceRoast,
     RoastCommand,
     RoastDetail,
@@ -2691,12 +2692,22 @@ def test_event_broadcaster_emits_typed_telemetry() -> None:
             env_temp_c=210.0,
             heat_percent=60,
             fan_percent=40,
+            post_fc_recovery_enabled=True,
+            post_fc_heat_authority_state=PostFcHeatAuthorityState.RECOVERING,
+            post_fc_ror_setpoint_c_per_min=6.4,
+            post_fc_smoothed_ror_c_per_min=4.8,
+            post_fc_effective_heat_ceiling_percent=75,
         )
     )
     event = queue.get_nowait()
     assert event.event is SseEventType.TELEMETRY
     assert event.data["agent_phase"] == "development"
     assert event.data["bean_temp_c"] == 200.0
+    assert event.data["post_fc_recovery_enabled"] is True
+    assert event.data["post_fc_heat_authority_state"] == "recovering"
+    assert event.data["post_fc_ror_setpoint_c_per_min"] == pytest.approx(6.4)
+    assert event.data["post_fc_smoothed_ror_c_per_min"] == pytest.approx(4.8)
+    assert event.data["post_fc_effective_heat_ceiling_percent"] == 75
 
 
 def test_event_broadcaster_wraps_non_dict_payload() -> None:

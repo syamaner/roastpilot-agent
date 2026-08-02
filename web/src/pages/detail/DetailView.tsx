@@ -30,6 +30,7 @@ import { ChargeWeight } from "./ChargeWeight";
 import { DecisionTraceTable } from "./DecisionTraceTable";
 import { EventTimeline } from "./EventTimeline";
 import { ExportOptions } from "./ExportOptions";
+import { PostFcRecoverySummary } from "./PostFcRecoverySummary";
 import { RoastConditions } from "./RoastConditions";
 import { RoastDiscard } from "./RoastDiscard";
 import { RoastRating } from "./RoastRating";
@@ -104,6 +105,8 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
           highlightTime={highlightTime}
         />
       </div>
+
+      <PostFcRecoverySummary telemetry={telemetry} />
 
       <section className="flex flex-col gap-2">
         <div className="flex flex-wrap items-center justify-between gap-2">
