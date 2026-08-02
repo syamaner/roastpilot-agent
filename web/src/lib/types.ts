@@ -400,23 +400,37 @@ function boundedInteger(value: unknown, field: string, max?: number): number {
   return value as number;
 }
 
+function boundedCodePointLength(value: string, max: number): number {
+  let length = 0;
+  for (const _character of value) {
+    length += 1;
+    if (length > max) return length;
+  }
+  return length;
+}
+
 function sanitizedText(value: unknown, field: string, max: number, min = 0): string {
   if (typeof value !== "string") return invalidCatalogueResponse(`${field} is not text`);
   // Bound work before the global replacement. A small allowance accepts a
   // handful of formatting controls while preventing a bidi-heavy payload from
   // allocating arbitrarily before the semantic post-strip contract is checked.
-  if (value.length > max + 64) {
+  if (boundedCodePointLength(value, max + 64) > max + 64) {
     return invalidCatalogueResponse(`${field} raw input is out of bounds`);
   }
   const sanitized = value.replace(catalogueBidiControls, "");
-  if (sanitized.length < min || sanitized.length > max) {
+  const sanitizedLength = boundedCodePointLength(sanitized, max);
+  if (sanitizedLength < min || sanitizedLength > max) {
     return invalidCatalogueResponse(`${field} is out of bounds`);
   }
   return sanitized;
 }
 
 function productUrl(value: unknown): string {
-  if (typeof value !== "string" || value.length < 1 || value.length > 4096) {
+  if (typeof value !== "string") {
+    return invalidCatalogueResponse("product_url is out of bounds");
+  }
+  const length = boundedCodePointLength(value, 4096);
+  if (length < 1 || length > 4096) {
     return invalidCatalogueResponse("product_url is out of bounds");
   }
   if (

@@ -222,11 +222,16 @@ export function BeanProfileModal({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     // Guarded here (not just via the disabled Save button, #637): pressing Enter
-    // with focus in any OTHER form field submits natively regardless of the
-    // button's disabled attribute, so a draft in flight must block at the
-    // handler too — the simplest-correct pairing with the request-token guard
-    // in `handleDraftFromUrl` (latest-token-wins + Save blocked meanwhile).
-    if (submitting || sourcingBusy || sourcingInFlight !== null) return;
+    // with focus in any OTHER add-form field submits natively regardless of the
+    // button's disabled attribute. The module guard closes the brief remount
+    // window before local sourcing state is adopted. Edit mode has no sourcing
+    // controls and must remain independent of an abandoned add-modal request.
+    if (
+      submitting ||
+      (mode === "add" && (sourcingBusy || sourcingInFlight !== null))
+    ) {
+      return;
+    }
     setSubmitError(null);
 
     const result = validateBeanProfile(draft);

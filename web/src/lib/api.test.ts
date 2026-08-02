@@ -108,6 +108,34 @@ describe("api client", () => {
     });
   });
 
+  it("counts catalogue text with the server's Unicode code-point semantics", async () => {
+    const name = "😀".repeat(300);
+    const reason = "🌱".repeat(600);
+    mockFetch(200, {
+      recommendations: [
+        {
+          candidate_id: "candidate-01",
+          product_url: "https://vendor.example/products/international-lot",
+          name,
+          country: "日本",
+          processing: "washed",
+          score: 3,
+          reason_codes: ["rated_pair_affinity"],
+          reasons: [reason],
+        },
+      ],
+      discovered_count: 1,
+      extracted_count: 1,
+    });
+
+    const result = await api.recommendBeansFromCatalogue(
+      "https://vendor.example/collections/green",
+    );
+
+    expect(result.recommendations[0]?.name).toBe(name);
+    expect(result.recommendations[0]?.reasons).toEqual([reason]);
+  });
+
   it.each([
     ["more than three recommendations", { recommendations: Array(4).fill({}), discovered_count: 4, extracted_count: 4 }],
     [
@@ -123,6 +151,63 @@ describe("api client", () => {
           reason_codes: ["invented"],
           reasons: [],
         }],
+        discovered_count: 1,
+        extracted_count: 1,
+      },
+    ],
+    [
+      "a name over 500 Unicode code points",
+      {
+        recommendations: [
+          {
+            candidate_id: "candidate-01",
+            product_url: "https://vendor.example/products/a",
+            name: "A".repeat(501),
+            country: null,
+            processing: null,
+            score: 0,
+            reason_codes: [],
+            reasons: [],
+          },
+        ],
+        discovered_count: 1,
+        extracted_count: 1,
+      },
+    ],
+    [
+      "a country over 500 Unicode code points",
+      {
+        recommendations: [
+          {
+            candidate_id: "candidate-01",
+            product_url: "https://vendor.example/products/a",
+            name: "A",
+            country: "C".repeat(501),
+            processing: null,
+            score: 0,
+            reason_codes: [],
+            reasons: [],
+          },
+        ],
+        discovered_count: 1,
+        extracted_count: 1,
+      },
+    ],
+    [
+      "a reason over 600 Unicode code points",
+      {
+        recommendations: [
+          {
+            candidate_id: "candidate-01",
+            product_url: "https://vendor.example/products/a",
+            name: "A",
+            country: null,
+            processing: null,
+            score: 0,
+            reason_codes: [],
+            reasons: ["R".repeat(601)],
+          },
+        ],
         discovered_count: 1,
         extracted_count: 1,
       },

@@ -1200,7 +1200,7 @@ describe("BeanProfileModal draft-from-URL — the single-flight guard survives u
     );
   });
 
-  it("edit mode never adopts a module-level in-flight draft (#654 P2): Save is enabled, no drafting state, even though the add-mode modal that started it is still abandoned", async () => {
+  it("edit mode can save while an add-mode sourcing request remains abandoned", async () => {
     // Edit mode renders no draft panel at all — its Save button never
     // depended on `draftInFlight` — so blindly inheriting `drafting` there
     // would disable Save with no visible cause and no way for the operator
@@ -1216,17 +1216,26 @@ describe("BeanProfileModal draft-from-URL — the single-flight guard survives u
     fireEvent.click(screen.getByTestId("bean-profile-draft-button"));
     addModal.unmount();
 
+    const onSave = vi.fn(async (input: BeanProfileInput) => savedFrom(input));
+    const onSaved = vi.fn();
     render(
       <BeanProfileModal
         mode="edit"
         profile={FIXTURE_KOKE}
-        onSave={vi.fn()}
-        onSaved={vi.fn()}
+        onSave={onSave}
+        onSaved={onSaved}
         onClose={vi.fn()}
       />,
     );
     expect(screen.getByTestId("bean-profile-save")).toBeEnabled();
     expect(screen.queryByTestId("bean-profile-draft-panel")).toBeNull();
+    fireEvent.change(screen.getByTestId("bean-profile-name"), {
+      target: { value: "Edited while sourcing settles" },
+    });
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave.mock.calls[0][0].name).toBe("Edited while sourcing settles");
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
 
     await act(async () => {
       abandoned.resolve(FIXTURE_DRAFT_RESPONSE);
