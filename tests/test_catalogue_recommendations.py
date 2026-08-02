@@ -89,6 +89,143 @@ def test_discovery_retains_candidate_local_card_and_json_ld_evidence() -> None:
     assert "Kenya" not in candidates[2].evidence
 
 
+def test_discovery_normalizes_equivalent_card_link_targets_for_shared_metadata() -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            '<article><a href="/products/kiambu">Kiambu image</a>'
+            '<a href="https://vendor.example/products/kiambu">Kiambu Lot</a>'
+            "<span>Kenya · Washed</span></article>"
+        )
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].product_url == "https://vendor.example/products/kiambu"
+    assert "Kenya · Washed" in candidates[0].evidence
+
+
+def test_discovery_honors_same_origin_document_base() -> None:
+    candidates = discover_catalogue_candidates(
+        _page('<base href="/"><a href="products/kiambu">Kiambu Lot</a>')
+    )
+
+    assert [candidate.product_url for candidate in candidates] == [
+        "https://vendor.example/products/kiambu"
+    ]
+
+
+def test_discovery_does_not_activate_base_after_off_origin_effective_base() -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            '<base href="https://elsewhere.example/store/">'
+            '<base href="/invented/">'
+            '<a href="products/kiambu">Kiambu Lot</a>'
+            '<a href="https://vendor.example/products/santos">Santos Lot</a>'
+        )
+    )
+
+    assert [candidate.product_url for candidate in candidates] == [
+        "https://vendor.example/products/santos"
+    ]
+
+
+def test_discovery_rejects_scheme_relative_url_when_base_is_off_origin() -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            '<base href="http://elsewhere.example/store/">'
+            '<a href="//vendor.example/products/kiambu">Kiambu Lot</a>'
+            '<a href="https://vendor.example/products/santos">Santos Lot</a>'
+        )
+    )
+
+    assert [candidate.product_url for candidate in candidates] == [
+        "https://vendor.example/products/santos"
+    ]
+
+
+def test_discovery_ignores_document_base_inside_template_contents() -> None:
+    candidates = discover_catalogue_candidates(
+        _page('<template><base href="/wrong/"></template><a href="products/kiambu">Kiambu Lot</a>')
+    )
+
+    assert [candidate.product_url for candidate in candidates] == [
+        "https://vendor.example/collections/products/kiambu"
+    ]
+
+
+@pytest.mark.parametrize("foreign_tag", ["svg", "math"])
+def test_discovery_ignores_base_inside_foreign_content(foreign_tag: str) -> None:
+    candidates = discover_catalogue_candidates(
+        _page(
+            f'<{foreign_tag}><base href="/wrong/"></{foreign_tag}>'
+            '<a href="products/kiambu">Kiambu Lot</a>'
+        )
+    )
+
+    assert [candidate.product_url for candidate in candidates] == [
+        "https://vendor.example/collections/products/kiambu"
+    ]
+
+
+@pytest.mark.parametrize(
+    "container",
+    [
+        '<svg><foreignObject><base href="/shop/"></foreignObject></svg>',
+        '<math><annotation-xml encoding="text/html"><base href="/shop/"></annotation-xml></math>',
+    ],
+)
+def test_discovery_honors_html_base_inside_foreign_integration_point(container: str) -> None:
+    candidates = discover_catalogue_candidates(
+        _page(f'{container}<a href="products/kiambu">Kiambu Lot</a>')
+    )
+
+    assert [candidate.product_url for candidate in candidates] == [
+        "https://vendor.example/shop/products/kiambu"
+    ]
+
+
+def test_discovery_disables_relative_urls_when_base_ancestry_exceeds_cap() -> None:
+    deep_open = "<div>" * 65
+    deep_close = "</div>" * 65
+    candidates = discover_catalogue_candidates(
+        _page(
+            f'{deep_open}<base href="https://elsewhere.example/store/">{deep_close}'
+            '<base href="/invented/">'
+            '<a href="products/kiambu">Kiambu Lot</a>'
+            '<a href="https://vendor.example/products/santos">Santos Lot</a>'
+        )
+    )
+
+    assert [candidate.product_url for candidate in candidates] == [
+        "https://vendor.example/products/santos"
+    ]
+
+
+@pytest.mark.parametrize("base_href", ["", "#catalogue"])
+def test_discovery_treats_fallback_equivalent_base_as_document_url(base_href: str) -> None:
+    candidates = discover_catalogue_candidates(
+        _page(f'<base href="{base_href}"><a href="products/kiambu">Kiambu Lot</a>')
+    )
+
+    assert [candidate.product_url for candidate in candidates] == [
+        "https://vendor.example/collections/products/kiambu"
+    ]
+
+
+def test_discovery_disables_relative_urls_when_effective_base_exceeds_scan_cap() -> None:
+    bases_without_href = "<base>" * 16
+    candidates = discover_catalogue_candidates(
+        _page(
+            f'{bases_without_href}<base href="https://elsewhere.example/store/">'
+            '<a href="products/kiambu">Kiambu Lot</a>'
+            '<a href="https://vendor.example/products/santos">Santos Lot</a>'
+        )
+    )
+
+    assert [candidate.product_url for candidate in candidates] == [
+        "https://vendor.example/products/santos"
+    ]
+
+
 def test_discovery_does_not_borrow_evidence_from_multi_product_wrapper() -> None:
     html = """
     <section>

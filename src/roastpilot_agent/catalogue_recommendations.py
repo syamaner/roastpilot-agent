@@ -62,6 +62,7 @@ _MAX_CONTEXT_LINKS: Final = 8
 _MAX_PRODUCT_URL_CHARS: Final = 4096
 _MAX_ANCHORS_INSPECTED: Final = _MAX_DISCOVERED * 8
 _MAX_SCRIPTS_INSPECTED: Final = _MAX_DISCOVERED * 8
+_MAX_BASE_ELEMENTS_INSPECTED: Final = 16
 _MAX_NAME_LABELS_PER_CANDIDATE: Final = (_MAX_DISCOVERED * _MAX_DISCOVERED) + _MAX_ANCHORS_INSPECTED
 _PRODUCT_PATH_SEGMENTS: Final = frozenset(
     {"bean", "beans", "coffee", "coffees", "item", "items", "product", "products", "shop", "store"}
@@ -193,7 +194,13 @@ def _json_ld_product_evidence(block: dict[str, object], name: str) -> str:
     return _clean_text(" ".join(values), limit=_MAX_CANDIDATE_CONTEXT_CHARS) or name
 
 
-def _anchor_candidate_evidence(anchor: Any, label: str) -> str:
+def _anchor_candidate_evidence(
+    anchor: Any,
+    label: str,
+    *,
+    base_url: str,
+    allow_relative_urls: bool,
+) -> str:
     """Return bounded text from the nearest structurally local product card.
 
     A wrapper is accepted only when it contains at most one distinct link target,
@@ -232,7 +239,21 @@ def _anchor_candidate_evidence(anchor: Any, label: str) -> str:
             if len(links) > _MAX_CONTEXT_LINKS:
                 current = current.getparent()  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
                 continue
-            hrefs = {href for child in links if isinstance((href := child.get("href")), str)}
+            hrefs: set[str] = set()
+            for child in links:
+                href = child.get("href")
+                if not isinstance(href, str):
+                    continue
+                normalized = _same_origin_product_url(
+                    href,
+                    base_url=base_url,
+                    require_product_path=False,
+                    allow_relative=allow_relative_urls,
+                )
+                # Preserve the old conservative distinction for invalid or
+                # off-origin targets while collapsing equivalent same-origin
+                # relative, absolute, query, and fragment spellings.
+                hrefs.add(normalized if normalized is not None else f"invalid:{href}")
             text = _clean_text(
                 " ".join(islice(current.itertext(), _MAX_CONTEXT_TEXT_NODES)),
                 limit=_MAX_CANDIDATE_CONTEXT_CHARS,
@@ -362,7 +383,11 @@ def _json_ld_product_blocks(value: object) -> list[dict[str, object]]:
 
 
 def _same_origin_product_url(
-    value: str, *, base_url: str, require_product_path: bool
+    value: str,
+    *,
+    base_url: str,
+    require_product_path: bool,
+    allow_relative: bool = True,
 ) -> str | None:
     """Return a normalized same-origin product URL, or ``None`` fail-soft."""
     if (
@@ -373,6 +398,9 @@ def _same_origin_product_url(
     ):
         return None
     try:
+        reference = urlsplit(value)
+        if not allow_relative and not (reference.scheme and reference.netloc):
+            return None
         absolute = urljoin(base_url, value)
         parsed = urlsplit(absolute)
         base = urlsplit(base_url)
@@ -419,6 +447,67 @@ def _same_origin_product_url(
         (parsed_scheme, normalized_netloc, parsed.path or "/", parsed.query, "")
     )
     return normalized if len(normalized) <= _MAX_PRODUCT_URL_CHARS else None
+
+
+def _document_base_url(tree: Any, *, final_url: str) -> tuple[str, bool]:
+    """Return the effective base plus whether relative locators remain usable."""
+    bases = cast(
+        Iterable[Any],
+        islice(tree.iter("base"), _MAX_BASE_ELEMENTS_INSPECTED + 1),  # type: ignore[reportUnknownMemberType]
+    )
+    for index, base in enumerate(bases):
+        if index >= _MAX_BASE_ELEMENTS_INSPECTED:
+            # An effective href may exist beyond the inspection budget. Treat
+            # relative resolution as ambiguous instead of inventing a target.
+            return final_url, False
+        ancestors = cast(
+            Iterable[Any],
+            islice(base.iterancestors(), _MAX_CONTEXT_TEXT_NODES + 1),  # type: ignore[reportUnknownMemberType]
+        )
+        outside_html_base_context = False
+        html_integration_point = False
+        ancestry_ambiguous = False
+        for ancestor_index, ancestor in enumerate(ancestors):
+            tag = getattr(ancestor, "tag", "")
+            if isinstance(tag, str):
+                normalized_tag = tag.casefold()
+                if normalized_tag in {"template", "noscript"}:
+                    outside_html_base_context = True
+                    break
+                if normalized_tag == "foreignobject":
+                    html_integration_point = True
+                elif normalized_tag == "annotation-xml":
+                    encoding = ancestor.get("encoding")
+                    html_integration_point = isinstance(encoding, str) and encoding.casefold() in {
+                        "text/html",
+                        "application/xhtml+xml",
+                    }
+                elif normalized_tag in {"svg", "math"}:
+                    outside_html_base_context = not html_integration_point
+                    break
+            if ancestor_index >= _MAX_CONTEXT_TEXT_NODES:
+                ancestry_ambiguous = True
+                break
+        if ancestry_ambiguous:
+            return final_url, False
+        if outside_html_base_context:
+            continue
+        href = base.get("href")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        if not isinstance(href, str):
+            continue
+        href = href.strip()
+        if not href or href.startswith("#"):
+            return final_url, True
+        normalized = _same_origin_product_url(
+            href,
+            base_url=final_url,
+            require_product_path=False,
+        )
+        # HTML uses the first base element carrying href. If that effective
+        # base is invalid or off-origin, fail closed to the fetched document
+        # URL; never activate a later base the browser would ignore.
+        return (normalized, True) if normalized is not None else (final_url, False)
+    return final_url, True
 
 
 def _merge_candidate_evidence(
@@ -516,6 +605,10 @@ def _discover_catalogue_candidates_unchecked(
     except (lxml.etree.LxmlError, ValueError):  # type: ignore[reportUnknownMemberType]
         return []
 
+    document_base_url, allow_relative_urls = _document_base_url(
+        tree,
+        final_url=page.final_url,
+    )
     raw: list[tuple[str, str, str, bool]] = []
     scripts = cast(
         Iterable[Any],
@@ -548,8 +641,9 @@ def _discover_catalogue_candidates_unchecked(
             usable_url = (
                 _same_origin_product_url(
                     url_value,
-                    base_url=page.final_url,
+                    base_url=document_base_url,
                     require_product_path=False,
+                    allow_relative=allow_relative_urls,
                 )
                 if isinstance(url_value, str)
                 else None
@@ -570,15 +664,28 @@ def _discover_catalogue_candidates_unchecked(
         href = anchor.get("href")  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
         label = _anchor_label(anchor)
         if isinstance(href, str) and label:
-            raw.append((href, label, _anchor_candidate_evidence(anchor, label), True))
+            raw.append(
+                (
+                    href,
+                    label,
+                    _anchor_candidate_evidence(
+                        anchor,
+                        label,
+                        base_url=document_base_url,
+                        allow_relative_urls=allow_relative_urls,
+                    ),
+                    True,
+                )
+            )
 
     candidates: list[CatalogueCandidate] = []
     positions: dict[str, int] = {}
     for value, label, evidence, require_product_path in raw:
         product_url = _same_origin_product_url(
             value,
-            base_url=page.final_url,
+            base_url=document_base_url,
             require_product_path=require_product_path,
+            allow_relative=allow_relative_urls,
         )
         if product_url is None:
             continue
