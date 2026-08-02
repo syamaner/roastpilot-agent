@@ -1676,6 +1676,50 @@ async def test_tls_fallback_closes_stream_and_propagates_cancellation(
 
 
 @pytest.mark.asyncio
+async def test_tls_fallback_propagates_cancellation_during_fallback_tcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation during a fallback dial re-raises after the prior stream closed."""
+    first_ip = "1.1.1.1"
+    second_ip = "93.184.216.34"
+    cancellation = asyncio.CancelledError("fallback TCP cancelled")
+    first_stream = _ScriptedAsyncNetworkStream(
+        tls_failure=httpcore.ConnectError("first TLS failed")
+    )
+    wrapped = _RecordingAsyncNetworkBackend(
+        streams=[first_stream],
+        failures={second_ip: cancellation},
+    )
+
+    async def two_address_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", two_address_getaddrinfo)
+    backend = bean_sourcing._SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+        wrapped
+    )
+    stream = await backend.connect_tcp("vendor.example", 443, timeout=10.0)
+
+    with pytest.raises(asyncio.CancelledError) as error:
+        await stream.start_tls(
+            ssl.create_default_context(),
+            server_hostname="vendor.example",
+            timeout=10.0,
+        )
+
+    assert error.value is cancellation
+    assert wrapped.hosts == [first_ip, second_ip]
+    assert first_stream.closed is True
+
+
+@pytest.mark.asyncio
 async def test_multi_address_plain_http_stream_delegates_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
