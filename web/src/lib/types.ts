@@ -329,6 +329,171 @@ export interface BeanProfileDraftResponse extends Omit<BeanProfileFields, "is_bl
   scouting_note: string;
 }
 
+// --- Catalogue recommendations (#573 phase 2, D121). ---
+
+/** Request body for `POST /api/beans/recommend-from-catalogue`. */
+export interface CatalogueRecommendationRequest {
+  url: string;
+}
+
+/** Server-owned, deterministic explanation codes for a catalogue candidate. */
+export type CatalogueReasonCode =
+  | "missing_country"
+  | "missing_processing"
+  | "novel_country_processing"
+  | "rated_pair_affinity";
+
+/** One read-only recommendation. Its URL is server-owned and is never inferred by the SPA. */
+export interface CatalogueRecommendation {
+  candidate_id: string;
+  product_url: string;
+  name: string;
+  country: string | null;
+  processing: ProcessingMethod | null;
+  score: number;
+  reason_codes: CatalogueReasonCode[];
+  reasons: string[];
+}
+
+/** Bounded response from `POST /api/beans/recommend-from-catalogue`. */
+export interface CatalogueRecommendationList {
+  recommendations: CatalogueRecommendation[];
+  discovered_count: number;
+  extracted_count: number;
+}
+
+const catalogueReasonCodes = new Set<CatalogueReasonCode>([
+  "missing_country",
+  "missing_processing",
+  "novel_country_processing",
+  "rated_pair_affinity",
+]);
+const processingMethods = new Set<ProcessingMethod>([
+  "washed",
+  "natural",
+  "honey",
+  "anaerobic",
+  "wet_hulled",
+  "other",
+]);
+const catalogueBidiControls = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
+function hasUnsafeCatalogueUrlCharacter(value: string): boolean {
+  return [...value].some((character) => {
+    const codePoint = character.codePointAt(0);
+    return character === "\\" || codePoint === undefined || codePoint <= 0x20 || codePoint === 0x7f;
+  });
+}
+
+function invalidCatalogueResponse(reason: string): never {
+  throw new Error(`Invalid catalogue recommendation response: ${reason}`);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function boundedInteger(value: unknown, field: string, max?: number): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0 || (max !== undefined && (value as number) > max)) {
+    return invalidCatalogueResponse(`${field} is out of bounds`);
+  }
+  return value as number;
+}
+
+function sanitizedText(value: unknown, field: string, max: number, min = 0): string {
+  if (typeof value !== "string") return invalidCatalogueResponse(`${field} is not text`);
+  // Bound work before the global replacement. A small allowance accepts a
+  // handful of formatting controls while preventing a bidi-heavy payload from
+  // allocating arbitrarily before the semantic post-strip contract is checked.
+  if (value.length > max + 64) {
+    return invalidCatalogueResponse(`${field} raw input is out of bounds`);
+  }
+  const sanitized = value.replace(catalogueBidiControls, "");
+  if (sanitized.length < min || sanitized.length > max) {
+    return invalidCatalogueResponse(`${field} is out of bounds`);
+  }
+  return sanitized;
+}
+
+function productUrl(value: unknown): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 4096) {
+    return invalidCatalogueResponse("product_url is out of bounds");
+  }
+  if (
+    /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(value) ||
+    hasUnsafeCatalogueUrlCharacter(value)
+  ) {
+    return invalidCatalogueResponse("product_url contains unsafe characters");
+  }
+  const url = value;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return invalidCatalogueResponse("product_url is not an absolute URL");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) {
+    return invalidCatalogueResponse("product_url is not a safe HTTP(S) URL");
+  }
+  return url;
+}
+
+function parseCatalogueRecommendation(value: unknown): CatalogueRecommendation {
+  if (!isRecord(value)) return invalidCatalogueResponse("recommendation is not an object");
+  if (typeof value.candidate_id !== "string" || !/^candidate-[0-9]{2}$/.test(value.candidate_id)) {
+    return invalidCatalogueResponse("candidate_id is invalid");
+  }
+  if (value.country !== null && typeof value.country !== "string") {
+    return invalidCatalogueResponse("country is invalid");
+  }
+  if (value.processing !== null && !processingMethods.has(value.processing as ProcessingMethod)) {
+    return invalidCatalogueResponse("processing is invalid");
+  }
+  if (!Array.isArray(value.reason_codes) || value.reason_codes.length > 5) {
+    return invalidCatalogueResponse("reason_codes is invalid");
+  }
+  if (!value.reason_codes.every((code) => catalogueReasonCodes.has(code as CatalogueReasonCode))) {
+    return invalidCatalogueResponse("reason_codes contains an unknown code");
+  }
+  if (!Array.isArray(value.reasons) || value.reasons.length > 5) {
+    return invalidCatalogueResponse("reasons is invalid");
+  }
+
+  return {
+    candidate_id: value.candidate_id,
+    product_url: productUrl(value.product_url),
+    name: sanitizedText(value.name, "name", 500, 1),
+    country: value.country === null ? null : sanitizedText(value.country, "country", 500),
+    processing: value.processing as ProcessingMethod | null,
+    score: boundedInteger(value.score, "score"),
+    reason_codes: [...value.reason_codes] as CatalogueReasonCode[],
+    reasons: value.reasons.map((reason, index) =>
+      sanitizedText(reason, `reasons[${index}]`, 600),
+    ),
+  };
+}
+
+/** Validate and sanitize the untrusted JSON boundary before UI code receives it. */
+export function parseCatalogueRecommendationList(value: unknown): CatalogueRecommendationList {
+  if (!isRecord(value) || !Array.isArray(value.recommendations) || value.recommendations.length > 3) {
+    return invalidCatalogueResponse("recommendations is invalid");
+  }
+  const recommendations = value.recommendations.map(parseCatalogueRecommendation);
+  if (new Set(recommendations.map((item) => item.candidate_id)).size !== recommendations.length) {
+    return invalidCatalogueResponse("candidate_id values are not unique");
+  }
+  const discoveredCount = boundedInteger(value.discovered_count, "discovered_count", 24);
+  const extractedCount = boundedInteger(value.extracted_count, "extracted_count", 12);
+  if (extractedCount > discoveredCount) {
+    return invalidCatalogueResponse("extracted_count exceeds discovered_count");
+  }
+  return {
+    recommendations,
+    discovered_count: discoveredCount,
+    extracted_count: extractedCount,
+  };
+}
+
 export interface LogManifest {
   log_dir: string;
   jsonl_path: string;

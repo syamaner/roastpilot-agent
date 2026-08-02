@@ -71,6 +71,106 @@ describe("api client", () => {
     expect(JSON.parse((init as RequestInit).body as string)).toEqual(input);
   });
 
+  it("POST /api/beans/recommend-from-catalogue sends the URL and validates its response", async () => {
+    mockFetch(200, {
+      recommendations: [
+        {
+          candidate_id: "candidate-01",
+          product_url: "https://vendor.example/products/kiambu",
+          name: "Kiambu \u202eLot",
+          country: "Ken\u2066ya",
+          processing: "washed",
+          score: 3,
+          reason_codes: ["missing_country"],
+          reasons: ["Adds Ken\u202eya to the active roster."],
+        },
+      ],
+      discovered_count: 4,
+      extracted_count: 2,
+    });
+
+    const result = await api.recommendBeansFromCatalogue(
+      "https://vendor.example/collections/green",
+    );
+
+    expect(result.recommendations[0]).toMatchObject({
+      name: "Kiambu Lot",
+      country: "Kenya",
+      reasons: ["Adds Kenya to the active roster."],
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/beans/recommend-from-catalogue",
+      expect.objectContaining({ method: "POST" }),
+    );
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+      url: "https://vendor.example/collections/green",
+    });
+  });
+
+  it.each([
+    ["more than three recommendations", { recommendations: Array(4).fill({}), discovered_count: 4, extracted_count: 4 }],
+    [
+      "an unknown reason code",
+      {
+        recommendations: [{
+          candidate_id: "candidate-01",
+          product_url: "https://vendor.example/products/a",
+          name: "A",
+          country: null,
+          processing: null,
+          score: 0,
+          reason_codes: ["invented"],
+          reasons: [],
+        }],
+        discovered_count: 1,
+        extracted_count: 1,
+      },
+    ],
+    [
+      "a browser-ambiguous product URL",
+      {
+        recommendations: [{
+          candidate_id: "candidate-01",
+          product_url: "https://vendor.example/\\evil.example/products/a",
+          name: "A",
+          country: null,
+          processing: null,
+          score: 0,
+          reason_codes: [],
+          reasons: [],
+        }],
+        discovered_count: 1,
+        extracted_count: 1,
+      },
+    ],
+    [
+      "an oversized bidi-heavy text field",
+      {
+        recommendations: [
+          {
+            candidate_id: "candidate-01",
+            product_url: "https://vendor.example/products/a",
+            name: `A${"\u202e".repeat(565)}`,
+            country: null,
+            processing: null,
+            score: 0,
+            reason_codes: [],
+            reasons: [],
+          },
+        ],
+        discovered_count: 1,
+        extracted_count: 1,
+      },
+    ],
+    ["inconsistent counts", { recommendations: [], discovered_count: 1, extracted_count: 2 }],
+  ])("rejects catalogue responses with %s", async (_case, body) => {
+    mockFetch(200, body);
+    await expect(
+      api.recommendBeansFromCatalogue("https://vendor.example/catalogue"),
+    ).rejects.toThrow("Invalid catalogue recommendation response");
+  });
+
   it("throws ApiError carrying the server detail on a non-ok response", async () => {
     mockFetch(409, { detail: "a roast is already active" });
     await expect(api.startRoast({} as never)).rejects.toMatchObject({

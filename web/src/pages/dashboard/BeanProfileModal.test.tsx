@@ -2,7 +2,12 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api, ApiError } from "@/lib/api";
-import type { BeanProfile, BeanProfileDraftResponse, BeanProfileInput } from "@/lib/types";
+import type {
+  BeanProfile,
+  BeanProfileDraftResponse,
+  BeanProfileInput,
+  CatalogueRecommendationList,
+} from "@/lib/types";
 import { BeanProfileModal } from "./BeanProfileModal";
 import * as beanProfileDraft from "./beanProfileDraft";
 import { FIXTURE_DRAFT_RESPONSE, FIXTURE_KOKE } from "./beanProfileFixture";
@@ -1340,5 +1345,222 @@ describe("BeanProfileModal draft-from-URL — stacks the URL/button row below `s
     const button = screen.getByTestId("bean-profile-draft-button");
     expect(button).toHaveClass("w-full");
     expect(button).toHaveClass("sm:w-auto");
+  });
+});
+
+describe("BeanProfileModal catalogue recommendations (#573 phase 2)", () => {
+  const catalogueUrl = "https://vendor.example/collections/green-coffee";
+  const productUrl = "https://vendor.example/products/ethiopia-guji?variant=green";
+  const recommendations: CatalogueRecommendationList = {
+    recommendations: [
+      {
+        candidate_id: "guji-1",
+        product_url: productUrl,
+        name: "Ethiopia Guji",
+        country: "Ethiopia",
+        processing: "natural",
+        score: 87,
+        reason_codes: ["missing_country", "rated_pair_affinity"],
+        reasons: ["Adds a missing origin", "Matches a well-rated roast"],
+      },
+    ],
+    discovered_count: 12,
+    extracted_count: 5,
+  };
+
+  function renderAdd(
+    onSave = vi.fn(async (input: BeanProfileInput, _draftAttemptId?: string) => savedFrom(input)),
+  ) {
+    return {
+      onSave,
+      ...render(
+        <BeanProfileModal mode="add" onSave={onSave} onSaved={vi.fn()} onClose={vi.fn()} />,
+      ),
+    };
+  }
+
+  function enterCatalogueUrl(value = catalogueUrl): void {
+    fireEvent.change(screen.getByTestId("bean-profile-catalogue-url"), {
+      target: { value },
+    });
+  }
+
+  it("renders explainable recommendations and an explicit empty result", async () => {
+    const recommend = vi
+      .spyOn(api, "recommendBeansFromCatalogue")
+      .mockResolvedValueOnce(recommendations)
+      .mockResolvedValueOnce({ recommendations: [], discovered_count: 9, extracted_count: 2 });
+    renderAdd();
+    enterCatalogueUrl();
+    fireEvent.click(screen.getByTestId("bean-profile-catalogue-button"));
+
+    expect(await screen.findByTestId("bean-profile-catalogue-card-guji-1")).toHaveTextContent(
+      "Adds a missing origin",
+    );
+    expect(screen.getByRole("list", { name: "Catalogue recommendations" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("bean-profile-catalogue-button"));
+    expect(await screen.findByTestId("bean-profile-catalogue-empty")).toHaveTextContent(
+      "2 extracted from 9 discovered",
+    );
+    expect(recommend).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    [422, "invalid catalogue https://vendor.example/list?token=secret", /couldn't recommend/i],
+    [503, "backend https://vendor.example/list?key=secret", /temporarily unavailable/i],
+    [500, "failed https://vendor.example/list?auth=secret", /failed https:\/\/vendor\.example\/list/i],
+  ])("maps a %s error without exposing URL query data", async (status, detail, message) => {
+    vi.spyOn(api, "recommendBeansFromCatalogue").mockRejectedValue(new ApiError(status, detail));
+    renderAdd();
+    enterCatalogueUrl();
+    fireEvent.click(screen.getByTestId("bean-profile-catalogue-button"));
+
+    const error = await screen.findByTestId("bean-profile-catalogue-error");
+    expect(error).toHaveTextContent(message);
+    expect(error).not.toHaveTextContent("secret");
+    expect(error).not.toHaveTextContent(/[?&](token|key|auth)=/);
+  });
+
+  it("uses Enter to recommend without submitting the profile form", async () => {
+    const recommend = vi
+      .spyOn(api, "recommendBeansFromCatalogue")
+      .mockResolvedValue(recommendations);
+    const { onSave } = renderAdd();
+    enterCatalogueUrl();
+    fireEvent.keyDown(screen.getByTestId("bean-profile-catalogue-url"), { key: "Enter" });
+
+    await waitFor(() => expect(recommend).toHaveBeenCalledWith(catalogueUrl));
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it("hands the exact server product URL to drafting and saves only after review", async () => {
+    vi.spyOn(api, "recommendBeansFromCatalogue").mockResolvedValue(recommendations);
+    const draft = vi.spyOn(api, "draftBeanFromUrl").mockResolvedValue(FIXTURE_DRAFT_RESPONSE);
+    const { onSave } = renderAdd();
+    enterCatalogueUrl();
+    fireEvent.click(screen.getByTestId("bean-profile-catalogue-button"));
+    fireEvent.click(await screen.findByRole("button", { name: "Draft and review Ethiopia Guji" }));
+
+    await waitFor(() => expect(draft).toHaveBeenCalledWith(productUrl));
+    await screen.findByText(/draft ready.*review and edit/i);
+    expect(screen.getByTestId("bean-profile-name")).toHaveFocus();
+    expect(onSave).not.toHaveBeenCalled();
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave.mock.calls[0][1]).toBe(FIXTURE_DRAFT_RESPONSE.draft_attempt_id);
+  });
+
+  it("shares one synchronous admission guard across catalogue and direct drafting", async () => {
+    const pendingRecommendation = deferred<CatalogueRecommendationList>();
+    const recommend = vi
+      .spyOn(api, "recommendBeansFromCatalogue")
+      .mockReturnValue(pendingRecommendation.promise);
+    const draft = vi.spyOn(api, "draftBeanFromUrl").mockResolvedValue(FIXTURE_DRAFT_RESPONSE);
+    renderAdd();
+    enterCatalogueUrl();
+    fireEvent.change(screen.getByTestId("bean-profile-draft-url"), {
+      target: { value: productUrl },
+    });
+    act(() => {
+      screen.getByTestId("bean-profile-catalogue-button").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      screen.getByTestId("bean-profile-draft-button").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+    expect(recommend).toHaveBeenCalledTimes(1);
+    expect(draft).not.toHaveBeenCalled();
+    await act(async () => pendingRecommendation.resolve(recommendations));
+  });
+
+  it("drops a response made stale by a URL edit", async () => {
+    const pending = deferred<CatalogueRecommendationList>();
+    vi.spyOn(api, "recommendBeansFromCatalogue").mockReturnValue(pending.promise);
+    renderAdd();
+    enterCatalogueUrl();
+    fireEvent.click(screen.getByTestId("bean-profile-catalogue-button"));
+    enterCatalogueUrl("https://vendor.example/collections/other");
+    await act(async () => pending.resolve(recommendations));
+    expect(screen.queryByTestId("bean-profile-catalogue-results")).not.toBeInTheDocument();
+  });
+
+  it("keeps an in-flight catalogue search valid across unrelated profile edits", async () => {
+    const pending = deferred<CatalogueRecommendationList>();
+    vi.spyOn(api, "recommendBeansFromCatalogue").mockReturnValue(pending.promise);
+    renderAdd();
+    enterCatalogueUrl();
+    fireEvent.click(screen.getByTestId("bean-profile-catalogue-button"));
+    fireEvent.change(screen.getByTestId("bean-profile-name"), {
+      target: { value: "Manual working name" },
+    });
+    await act(async () => pending.resolve(recommendations));
+    expect(await screen.findByTestId("bean-profile-catalogue-results")).toBeInTheDocument();
+  });
+
+  it("preserves successful results when a retry fails", async () => {
+    vi.spyOn(api, "recommendBeansFromCatalogue")
+      .mockResolvedValueOnce(recommendations)
+      .mockRejectedValueOnce(new ApiError(503, "down"));
+    renderAdd();
+    enterCatalogueUrl();
+    fireEvent.click(screen.getByTestId("bean-profile-catalogue-button"));
+    expect(await screen.findByTestId("bean-profile-catalogue-card-guji-1")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("bean-profile-catalogue-button"));
+    expect(await screen.findByTestId("bean-profile-catalogue-error")).toBeInTheDocument();
+    expect(screen.getByTestId("bean-profile-catalogue-card-guji-1")).toBeInTheDocument();
+  });
+
+  it("blocks catalogue sourcing while Save is in flight", async () => {
+    const pendingSave = deferred<BeanProfile>();
+    const onSave = vi.fn((_input: BeanProfileInput, _draftAttemptId?: string) => pendingSave.promise);
+    const recommend = vi.spyOn(api, "recommendBeansFromCatalogue").mockResolvedValue(recommendations);
+    renderAdd(onSave);
+    fireEvent.change(screen.getByTestId("bean-profile-name"), { target: { value: "Bean" } });
+    fireEvent.change(screen.getByTestId("bean-profile-bean_origin"), {
+      target: { value: "Ethiopia" },
+    });
+    enterCatalogueUrl();
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("bean-profile-catalogue-button")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("bean-profile-catalogue-button"));
+    expect(recommend).not.toHaveBeenCalled();
+    await act(async () => pendingSave.resolve(savedFrom(onSave.mock.calls[0][0])));
+  });
+
+  it("adopts an unmounted catalogue request and keeps the remount blocked until settlement", async () => {
+    const pending = deferred<CatalogueRecommendationList>();
+    const recommend = vi
+      .spyOn(api, "recommendBeansFromCatalogue")
+      .mockReturnValue(pending.promise);
+    const first = renderAdd();
+    enterCatalogueUrl();
+    fireEvent.click(screen.getByTestId("bean-profile-catalogue-button"));
+    first.unmount();
+
+    renderAdd();
+    enterCatalogueUrl();
+    await waitFor(() => expect(screen.getByTestId("bean-profile-catalogue-button")).toBeDisabled());
+    fireEvent.click(screen.getByTestId("bean-profile-catalogue-button"));
+    expect(recommend).toHaveBeenCalledTimes(1);
+    await act(async () => pending.resolve(recommendations));
+    await waitFor(() => expect(screen.getByTestId("bean-profile-catalogue-button")).toBeEnabled());
+  });
+
+  it("exposes labelled controls and live recommendation state", async () => {
+    const pending = deferred<CatalogueRecommendationList>();
+    vi.spyOn(api, "recommendBeansFromCatalogue").mockReturnValue(pending.promise);
+    renderAdd();
+    expect(screen.getByRole("dialog", { name: /add bean profile/i })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Vendor collection URL" })).toHaveAccessibleDescription(
+      /up to three explainable suggestions/i,
+    );
+    enterCatalogueUrl();
+    fireEvent.click(screen.getByTestId("bean-profile-catalogue-button"));
+    expect(screen.getByRole("status")).toHaveTextContent(/checking the catalogue/i);
+    await act(async () => pending.resolve(recommendations));
+    expect(await screen.findByRole("button", { name: "Draft and review Ethiopia Guji" })).toBeEnabled();
   });
 });

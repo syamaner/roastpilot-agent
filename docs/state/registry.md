@@ -33,10 +33,13 @@
 > latency and provenance counts, then atomically correlates at most one explicit
 > save to a bounded, server-held baseline without retaining URLs/evidence/error
 > text. The scoring/small-N bake-off harness already shipped as
-> `scripts/bakeoff_bean_sourcing.py`. **#573 / D121 catalogue recommendations is IN
-> PROGRESS:** backend slice PR #696 owns the bounded discovery, one-call extraction,
+> `scripts/bakeoff_bean_sourcing.py`. **#573 / D121 catalogue recommendations is
+> SHIPPED:** backend slice #696 provides bounded discovery, one-call extraction,
 > deterministic local ranking, roast-start pre-emption, and aggregate schema-v15
-> telemetry boundary; the UI/story-close slice follows only after that backend merges.
+> telemetry; the story-closing UI adds a collection-page form, explainable result
+> cards, and an exact server-owned product-URL handoff into the existing editable
+> draft flow. Recommendations never order or save a bean — the operator must select,
+> review, edit, and explicitly save the profile.
 > Other open follow-ups: **#591** (socket-level SSRF pinning), **#595**
 > (rate-limit/auth on the billable endpoint).
 >

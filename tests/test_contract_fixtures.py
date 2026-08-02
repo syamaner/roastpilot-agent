@@ -52,6 +52,8 @@ import pytest_asyncio
 
 from roastpilot_agent.config import AppConfig, ControllerConfig, PostFirstCrackControl
 from roastpilot_agent.models import (
+    CatalogueRecommendation,
+    CatalogueRecommendationList,
     MicStatus,
     RoastDetail,
     RoastEventKind,
@@ -612,11 +614,51 @@ def _build_rest_payload(
         "roast_detail": _normalize_rest_snapshot(detail.model_dump(mode="json")),
         "roast_summary": _normalize_rest_snapshot(summary.model_dump(mode="json")),
         "telemetry_series": _normalize_telemetry_series(series.model_dump(mode="json")),
+        "catalogue_recommendations": CatalogueRecommendationList(
+            recommendations=[
+                CatalogueRecommendation(
+                    candidate_id="candidate-01",
+                    product_url="https://vendor.example/products/kiambu-aa",
+                    name="Kiambu AA",
+                    country="Kenya",
+                    processing="washed",
+                    score=4,
+                    reason_codes=[
+                        "missing_country",
+                        "missing_processing",
+                        "novel_country_processing",
+                        "rated_pair_affinity",
+                    ],
+                    reasons=[
+                        "Adds a country missing from the active bean roster.",
+                        "Adds a processing method missing from the active bean roster.",
+                        "Adds a new country and processing-method pairing.",
+                        (
+                            "Matches a country and processing-method pairing rated at "
+                            "least four stars."
+                        ),
+                    ],
+                ),
+                CatalogueRecommendation(
+                    candidate_id="candidate-02",
+                    product_url="https://vendor.example/products/mystery-lot",
+                    name="Mystery Lot",
+                    country=None,
+                    processing=None,
+                    score=0,
+                    reason_codes=[],
+                    reasons=[],
+                ),
+            ],
+            discovered_count=4,
+            extracted_count=2,
+        ).model_dump(mode="json"),
     }
     # Re-validate against the real models so the fixture can't drift from them.
     RoastDetail.model_validate(payload["roast_detail"])
     RoastSummary.model_validate(payload["roast_summary"])
     TelemetrySeries.model_validate(payload["telemetry_series"])
+    CatalogueRecommendationList.model_validate(payload["catalogue_recommendations"])
     return payload
 
 

@@ -13,6 +13,8 @@ import type {
   BeanProfileDraftResponse,
   BeanProfileInput,
   BeanProfileList,
+  CatalogueRecommendationList,
+  CatalogueRecommendationRequest,
   ChargeWeightRequest,
   ClearStaleSessionRequest,
   ClearStaleSessionResult,
@@ -32,6 +34,7 @@ import type {
   TastingList,
   TelemetrySeries,
 } from "./types";
+import { parseCatalogueRecommendationList } from "./types";
 
 /** API base. Empty string in the browser: requests are same-origin and Vite
  *  proxies `/api` to the agent in dev. Overridable for tests/SSR. */
@@ -244,6 +247,22 @@ export const api = {
       body: JSON.stringify({ url }),
       signal,
     }),
+
+  /** `POST /api/beans/recommend-from-catalogue` — fetch-fresh, read-only
+   *  catalogue recommendations. The response is runtime-validated because
+   *  names, explanations, and server-owned product URLs cross an untrusted
+   *  vendor-content boundary. */
+  recommendBeansFromCatalogue: async (
+    url: string,
+    signal?: AbortSignal,
+  ): Promise<CatalogueRecommendationList> =>
+    parseCatalogueRecommendationList(
+      await request<unknown>("/api/beans/recommend-from-catalogue", {
+        method: "POST",
+        body: JSON.stringify({ url } satisfies CatalogueRecommendationRequest),
+        signal,
+      }),
+    ),
 
   // --- Config (#419, D78) ---
 
