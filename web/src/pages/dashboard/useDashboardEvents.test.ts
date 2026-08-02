@@ -29,6 +29,23 @@ const ADVISORY_DECISION = {
 };
 
 describe("dashboardReducer", () => {
+  function recoveringState() {
+    return dashboardReducer(
+      initialDashboardViewModel,
+      ev("telemetry", {
+        elapsed_seconds: 500,
+        charge_elapsed_seconds: 100,
+        bean_temp_c: 185,
+        env_temp_c: 205,
+        post_fc_recovery_enabled: true,
+        post_fc_heat_authority_state: "recovering",
+        post_fc_ror_setpoint_c_per_min: 6.4,
+        post_fc_smoothed_ror_c_per_min: 4.8,
+        post_fc_effective_heat_ceiling_percent: 75,
+      }),
+    );
+  }
+
   it("uses the restored charge clock to order D96 traces across restart", () => {
     let s = dashboardReducer(
       initialDashboardViewModel,
@@ -572,6 +589,49 @@ describe("dashboardReducer", () => {
     let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 1130, charge_elapsed_seconds: 630, bean_temp_c: 205, env_temp_c: 215 }));
     s = dashboardReducer(s, ev("phase_changed", { phase: "cooling", enabled_actions: ["stop_cooling"] }));
     expect(s.markers.find((m) => m.kind === "cooling")).toEqual({ kind: "cooling", t: 1130, label: "COOLING" });
+  });
+
+  it.each(["operator_recovery_required", "faulted"] as const)(
+    "clears stale D96 output on a telemetry-less %s transition",
+    (phase) => {
+      const s = dashboardReducer(recoveringState(), ev("phase_changed", { phase }));
+      expect(s.postFcControl).toEqual({
+        recoveryEnabled: true,
+        heatAuthorityState: null,
+        rorSetpointCPerMin: null,
+        smoothedRorCPerMin: null,
+        effectiveHeatCeilingPercent: null,
+        atChargeElapsedSeconds: 100,
+      });
+    },
+  );
+
+  it("adds the cooling marker while clearing stale D96 output", () => {
+    const s = dashboardReducer(recoveringState(), ev("phase_changed", { phase: "cooling" }));
+    expect(s.markers.find((marker) => marker.kind === "cooling")).toEqual({
+      kind: "cooling",
+      t: 500,
+      label: "COOLING",
+    });
+    expect(s.postFcControl).toMatchObject({
+      recoveryEnabled: true,
+      heatAuthorityState: null,
+      rorSetpointCPerMin: null,
+      smoothedRorCPerMin: null,
+      effectiveHeatCeilingPercent: null,
+      atChargeElapsedSeconds: 100,
+    });
+  });
+
+  it("preserves the active D96 trace on development and ignores unknown phases", () => {
+    const active = recoveringState();
+    const development = dashboardReducer(active, ev("phase_changed", { phase: "development" }));
+    const unknown = dashboardReducer(active, ev("phase_changed", { phase: "future_phase" }));
+    const missing = dashboardReducer(active, ev("phase_changed", {}));
+
+    expect(development.postFcControl).toEqual(active.postFcControl);
+    expect(unknown).toBe(active);
+    expect(missing).toBe(active);
   });
 
   it("places the cooling marker once — a re-fired cooling phase does not duplicate it (#309)", () => {

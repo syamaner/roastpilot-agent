@@ -428,6 +428,46 @@ function withPostFcTrace(
   return { ...state, postFcControl: incoming };
 }
 
+const ROAST_PHASES: ReadonlySet<string> = new Set<RoastPhase>([
+  "idle",
+  "starting",
+  "preheating",
+  "roasting_pre_first_crack",
+  "development",
+  "cooling",
+  "complete",
+  "faulted",
+  "operator_recovery_required",
+]);
+
+function isRoastPhase(value: unknown): value is RoastPhase {
+  return typeof value === "string" && ROAST_PHASES.has(value);
+}
+
+/** Clear output-derived diagnostics once the server leaves development. */
+function withoutPostFcOutput(state: DashboardViewModel): DashboardViewModel {
+  const trace = state.postFcControl;
+  if (trace === null) return state;
+  if (
+    trace.heatAuthorityState === null &&
+    trace.rorSetpointCPerMin === null &&
+    trace.smoothedRorCPerMin === null &&
+    trace.effectiveHeatCeilingPercent === null
+  ) {
+    return state;
+  }
+  return {
+    ...state,
+    postFcControl: {
+      ...trace,
+      heatAuthorityState: null,
+      rorSetpointCPerMin: null,
+      smoothedRorCPerMin: null,
+      effectiveHeatCeilingPercent: null,
+    },
+  };
+}
+
 export function dashboardReducer(
   state: DashboardViewModel,
   action: Action,
@@ -637,21 +677,24 @@ export function dashboardReducer(
       };
     }
     case "phase_changed": {
-      // The COOLING marker (#309). Phase is the SERVER's truth — owned by the
-      // shared reducer; we do NOT set it here and never infer it. We only READ the
-      // server-emitted phase value to place a display marker at the cooling
-      // transition (every drop lands in COOLING — controller.py — and explicit
-      // recovery cooling also transitions to COOLING, so phase_changed→cooling is
-      // the one signal that covers both paths). The marker sits at the latest
-      // plotted point's serve-elapsed (the same axis as T0/FC/drop, #326; the
-      // roast-time re-label is a display transform in LiveCurve), and dedupes via
-      // withMarker. Any other phase transition places no marker.
-      const data = event.data as { phase?: string };
-      if (data.phase !== "cooling") return state;
-      const at = state.points.length > 0 ? state.points[state.points.length - 1].t : 0;
+      // Phase is the SERVER's truth — owned by the shared reducer; we do NOT set
+      // or infer it here. Leaving development clears output-derived D96 values so
+      // a telemetry-less terminal/recovery tick cannot retain a stale authority
+      // label. Keep the configured flag and trace clock for operator context.
+      const data = event.data as { phase?: unknown };
+      if (!isRoastPhase(data.phase)) return state;
+      const phaseState = data.phase === "development" ? state : withoutPostFcOutput(state);
+      if (data.phase !== "cooling") return phaseState;
+
+      // Every drop and explicit recovery cooling transition lands in COOLING.
+      // Place the marker at the latest plotted serve-elapsed point and dedupe via
+      // withMarker (#309/#326).
+      const at = phaseState.points.length > 0
+        ? phaseState.points[phaseState.points.length - 1].t
+        : 0;
       return {
-        ...state,
-        markers: withMarker(state.markers, { kind: "cooling", t: at, label: "COOLING" }),
+        ...phaseState,
+        markers: withMarker(phaseState.markers, { kind: "cooling", t: at, label: "COOLING" }),
       };
     }
     default:
