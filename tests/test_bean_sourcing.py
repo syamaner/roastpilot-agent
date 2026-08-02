@@ -23,6 +23,7 @@ import gzip
 import ipaddress
 import logging
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -30,11 +31,12 @@ import time
 import unicodedata
 import unittest.mock
 import zlib
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Iterable
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import extruct  # type: ignore[import-untyped]
+import httpcore
 import httpx
 import pytest
 from openai import AsyncOpenAI
@@ -88,27 +90,133 @@ def _html_response(status_code: int, html: str) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
-#: A GENUINELY global address (example.com's real A record) the no-op
-#: destination stub below "resolves" every host to — not TEST-NET
-#: (``203.0.113.0/24`` and friends), which the ``is_global`` SSRF predicate
-#: (#587 CGNAT fix) now correctly rejects as non-public, since TEST-NET is a
-#: documentation/reserved range. Needs to be a real, syntactically valid
-#: public IP literal so the pinning code path (which needs a real
-#: ``ipaddress`` object to pin to) has something to pin to.
-_STUB_PUBLIC_IP = ipaddress.ip_address("93.184.216.34")
-
-
 async def _noop_assert_public_destination(
     url: str,
-) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
-    """Test double: skips the real DNS/IP validation (#587's SSRF guard),
-    "resolving" every host to :data:`_STUB_PUBLIC_IP` so client-lifecycle/
-    redirect-following tests can drive the (now pinning) fetch path without
-    depending on a real resolver. Tests that need to assert the ORIGINAL
-    hostname is preserved (Host header, SNI) still can — this only stubs the
-    validated CONNECTION target; destination validation itself, and the
-    real pinning mechanism, are covered separately."""
-    return [_STUB_PUBLIC_IP]
+) -> None:
+    """Skip DNS/IP validation for client-lifecycle and redirect unit tests.
+
+    Destination validation and socket-level IP pinning are covered separately.
+    """
+    del url
+    return None
+
+
+class _ManualClock:
+    """Deterministic monotonic clock for shared connect-budget tests."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _ScriptedAsyncNetworkStream(httpcore.AsyncNetworkStream):
+    """Minimal network-free HTTP/1.1 stream for transport contract tests."""
+
+    def __init__(
+        self,
+        response: bytes = b"",
+        *,
+        tls_failure: BaseException | None = None,
+        clock: _ManualClock | None = None,
+        tls_elapsed_seconds: float = 0.0,
+    ) -> None:
+        self._response = response
+        self._tls_failure = tls_failure
+        self._clock = clock
+        self._tls_elapsed_seconds = tls_elapsed_seconds
+        self.writes: list[bytes] = []
+        self.tls_server_names: list[str | None] = []
+        self.tls_contexts: list[ssl.SSLContext] = []
+        self.tls_timeouts: list[float | None] = []
+        self.closed = False
+
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        del max_bytes, timeout
+        response, self._response = self._response, b""
+        return response
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        del timeout
+        self.writes.append(buffer)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+    async def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        self.tls_contexts.append(ssl_context)
+        self.tls_server_names.append(server_hostname)
+        self.tls_timeouts.append(timeout)
+        if self._clock is not None:
+            self._clock.advance(self._tls_elapsed_seconds)
+        if self._tls_failure is not None:
+            raise self._tls_failure
+        return self
+
+
+class _RecordingAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
+    """Record low-level dial targets and optionally fail selected addresses."""
+
+    def __init__(
+        self,
+        *,
+        stream: httpcore.AsyncNetworkStream | None = None,
+        streams: list[httpcore.AsyncNetworkStream] | None = None,
+        failures: dict[str, BaseException] | None = None,
+        clock: _ManualClock | None = None,
+        connect_elapsed_seconds: dict[str, float] | None = None,
+    ) -> None:
+        self.stream = stream or _ScriptedAsyncNetworkStream()
+        self._streams = list(streams) if streams is not None else None
+        self.failures = failures or {}
+        self._clock = clock
+        self._connect_elapsed_seconds = connect_elapsed_seconds or {}
+        self.hosts: list[str] = []
+        self.timeouts: list[float | None] = []
+        self.sleeps: list[float] = []
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[Any] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        del port, local_address, socket_options
+        self.hosts.append(host)
+        self.timeouts.append(timeout)
+        if self._clock is not None:
+            self._clock.advance(self._connect_elapsed_seconds.get(host, 0.0))
+        failure = self.failures.get(host)
+        if failure is not None:
+            raise failure
+        if self._streams is not None:
+            if not self._streams:
+                raise AssertionError("No scripted stream remains for TCP connection")
+            return self._streams.pop(0)
+        return self.stream
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[Any] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        del path, timeout, socket_options
+        raise AssertionError("Unix socket was not expected")
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
 
 
 _SAMPLE_HTML = """
@@ -678,14 +786,11 @@ async def test_fetch_page_text_follows_redirects_on_internally_constructed_clien
     redirected_url = "https://www.vendor.example/products/kenya"
 
     def handler(request: httpx.Request) -> httpx.Response:
-        # The connection is now PINNED to the (stubbed) validated IP, so the
-        # request's URL host is no longer the original hostname — route by
-        # the preserved ``Host`` header instead (#587 fix 1b).
-        host_header = request.headers.get("host")
-        assert request.url.host == str(_STUB_PUBLIC_IP)
-        if host_header == "vendor.example":
+        if request.url.host == "vendor.example":
+            assert request.headers.get("host") == "vendor.example"
             return httpx.Response(302, headers={"Location": redirected_url})
-        assert host_header == "www.vendor.example"
+        assert request.url.host == "www.vendor.example"
+        assert request.headers.get("host") == "www.vendor.example"
         return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
 
     transport = httpx.MockTransport(handler)
@@ -694,6 +799,7 @@ async def test_fetch_page_text_follows_redirects_on_internally_constructed_clien
 
     def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
         captured_kwargs.update(kwargs)
+        kwargs.pop("transport", None)
         return real_async_client(transport=transport, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
@@ -709,6 +815,9 @@ async def test_fetch_page_text_follows_redirects_on_internally_constructed_clien
     ).prompt_text
     assert "Kenya Kiambu AA" in text
     assert captured_kwargs.get("follow_redirects") is False
+    protected = captured_kwargs.get("transport")
+    assert isinstance(protected, httpx.AsyncBaseTransport)
+    await protected.aclose()
 
 
 # --- #587 fix 1: SSRF destination guard ---
@@ -954,8 +1063,8 @@ async def test_fetch_page_text_redirect_public_to_public_succeeds(
 ) -> None:
     """A public->public redirect keeps working end-to-end (not just the
     ``follow_redirects=False`` kwarg check above) — the SSRF guard runs on
-    AND pins EACH hop independently, via a stubbed resolver that reports a
-    (different) public address per host."""
+    AND preserves the hostname URL for EACH hop, via a stubbed resolver that
+    reports a different public address per host."""
     original_host = "vendor.example"
     redirected_host = "www.vendor.example"
     original_url = f"https://{original_host}/products/kenya"
@@ -964,12 +1073,11 @@ async def test_fetch_page_text_redirect_public_to_public_succeeds(
     resolver_calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        host_header = request.headers.get("host")
-        if host_header == original_host:
-            assert request.url.host == host_ips[original_host]
+        if request.url.host == original_host:
+            assert request.headers.get("host") == original_host
             return httpx.Response(302, headers={"Location": redirected_url})
-        assert host_header == redirected_host
-        assert request.url.host == host_ips[redirected_host]
+        assert request.url.host == redirected_host
+        assert request.headers.get("host") == redirected_host
         return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
 
     transport = httpx.MockTransport(handler)
@@ -993,141 +1101,872 @@ async def test_fetch_page_text_redirect_public_to_public_succeeds(
         )
     ).prompt_text
     assert "Kenya Kiambu AA" in text
-    # Each hop was independently resolved (and thus independently validated
-    # + pinned) — exactly once per hop, no re-resolution.
+    # The test seam replaces the real socket transport, so this records the
+    # manual per-hop preflight only. Connect-time rebinding is proved below.
     assert resolver_calls == [original_host, redirected_host]
 
 
-# --- #587 fix 1b: DNS-rebinding TOCTOU close (connect-time IP pinning) ---
+# --- #591: hostname-preserving, socket-level DNS rebinding protection ---
 
 
 @pytest.mark.asyncio
-async def test_fetch_with_ssrf_guard_pins_connection_to_validated_ip(
+async def test_fetch_preserves_hostname_and_domain_cookie_across_redirect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The actual HTTP request must target the VALIDATED IP literal — not
-    the hostname — with the original hostname preserved via the ``Host``
-    header and the ``sni_hostname`` extension (TLS SNI / certificate
-    hostname identity). This is what closes the DNS-rebinding TOCTOU gap: a
-    rebinding domain gets exactly one resolution (the validation one), and
-    the connection never gives it a second chance to answer differently."""
-    origin_url = "https://example.test/products/kenya"
-    public_ip = "93.184.216.34"
-    resolver_calls: list[str] = []
-    captured_requests: list[httpx.Request] = []
+    """Domain cookies survive because HTTPX sees hostname URLs, not pinned IPs."""
+    redirected_url = "https://www.vendor.example/products/kenya"
+    seen: list[tuple[str | None, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.host, request.headers.get("cookie")))
+        if request.url.host == "vendor.example":
+            return httpx.Response(
+                302,
+                headers={
+                    "Location": redirected_url,
+                    "Set-Cookie": "consent=accepted; Domain=vendor.example; Path=/",
+                },
+            )
+        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/start", config=BeanSourcingConfig()
+        )
+    ).prompt_text
+    assert "Kenya Kiambu AA" in text
+    assert seen == [("vendor.example", None), ("www.vendor.example", "consent=accepted")]
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_private_dns_rebind_at_connect_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A public preflight followed by a private connect lookup fails closed."""
+    resolver_calls = 0
 
     async def fake_getaddrinfo(
         host: str, port: int, *, type: int
     ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
-        resolver_calls.append(host)
-        assert host == "example.test"
-        return [(None, None, None, "", (public_ip, port))]
+        nonlocal resolver_calls
+        del type
+        resolver_calls += 1
+        address = "93.184.216.34" if resolver_calls == 1 else "127.0.0.1"
+        return [(None, None, None, "", (address, port))]
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured_requests.append(request)
-        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
-
-    transport = httpx.MockTransport(handler)
-    real_async_client = httpx.AsyncClient
-
-    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
-        return real_async_client(transport=transport)
-
-    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-
-    text = (
+    with pytest.raises(BeanFetchError, match="non-public address"):
         await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            origin_url, config=BeanSourcingConfig()
+            "https://rebind.vendor.example/products/kenya",
+            config=BeanSourcingConfig(),
         )
-    ).prompt_text
-    assert "Kenya Kiambu AA" in text
-
-    # Resolved exactly once — no second resolution left for a rebinding
-    # domain to poison (the #587 rebind-defeated proof).
-    assert resolver_calls == ["example.test"]
-    assert len(captured_requests) == 1
-    sent = captured_requests[0]
-    # The actual connection target is the validated IP literal...
-    assert sent.url.host == public_ip
-    # ...while routing/TLS identity stay pinned to the ORIGINAL hostname.
-    assert sent.headers.get("host") == "example.test"
-    assert sent.extensions.get("sni_hostname") == "example.test"
+    assert resolver_calls == 2
 
 
 @pytest.mark.asyncio
-async def test_fetch_with_ssrf_guard_pins_ipv6_address_with_brackets(
+async def test_socket_backend_pins_ip_falls_back_and_redistributes_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """IPv6 pinning smoke test: ``httpx.URL.copy_with(host=...)`` must
-    bracket a raw (unbracketed) ``ipaddress.IPv6Address`` string
-    automatically for the pinned request URL. A real IPv6 socket connect
-    isn't exercised — ``MockTransport`` substitutes the whole transport, so
-    there is no real network stack anywhere in this test suite — this
-    validates the pinned URL/host reaching the mock handler is well-formed
-    and correctly bracketed, which is the httpx-integration risk unique to
-    IPv6 pinning."""
-    origin_url = "https://example.test/products/kenya"
-    public_ipv6 = "2606:2800:220:1:248:1893:25c8:1946"
-    captured_requests: list[httpx.Request] = []
+    """Only validated literals reach TCP; a fast failure releases its unused budget."""
+    first_ip = "2606:4700:4700::1111"
+    second_ip = "93.184.216.34"
 
     async def fake_getaddrinfo(
         host: str, port: int, *, type: int
-    ) -> list[tuple[object, object, object, object, tuple[str, int, int, int]]]:
-        return [(None, None, None, "", (public_ipv6, port, 0, 0))]
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+        ]
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured_requests.append(request)
-        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
-
-    transport = httpx.MockTransport(handler)
-    real_async_client = httpx.AsyncClient
-
-    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
-        return real_async_client(transport=transport)
-
-    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    wrapped = _RecordingAsyncNetworkBackend(
+        failures={first_ip: httpcore.ConnectTimeout("black-holed")}
+    )
+    backend = bean_sourcing._SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+        wrapped,
+        clock=lambda: 0.0,
+    )
+    stream = await backend.connect_tcp("vendor.example", 443, timeout=10.0)
+    assert isinstance(
+        stream,
+        bean_sourcing._TLSFallbackAsyncNetworkStream,  # pyright: ignore[reportPrivateUsage]
+    )
+    assert wrapped.hosts == [first_ip, second_ip]
+    assert wrapped.timeouts == [5.0, 10.0]
 
-    text = (
-        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            origin_url, config=BeanSourcingConfig()
-        )
-    ).prompt_text
-    assert "Kenya Kiambu AA" in text
-    assert len(captured_requests) == 1
-    sent = captured_requests[0]
-    assert sent.url.host == public_ipv6
-    assert str(sent.url).startswith(f"https://[{public_ipv6}]")
-    assert sent.headers.get("host") == "example.test"
 
+@pytest.mark.parametrize(
+    "first_error",
+    [httpcore.ConnectError("refused"), OSError("network down")],
+)
+@pytest.mark.asyncio
+async def test_socket_backend_falls_back_after_connect_error(
+    monkeypatch: pytest.MonkeyPatch,
+    first_error: BaseException,
+) -> None:
+    """Both httpcore and raw backend connection errors advance to the next IP."""
+    first_ip = "1.1.1.1"
+    second_ip = "93.184.216.34"
 
-# --- #587 P2: no keepalive pooling (TLS identity on a host-changing redirect) ---
+    async def fake_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    wrapped = _RecordingAsyncNetworkBackend(failures={first_ip: first_error})
+    backend = bean_sourcing._SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+        wrapped
+    )
+    assert isinstance(
+        await backend.connect_tcp("vendor.example", 443),
+        bean_sourcing._TLSFallbackAsyncNetworkStream,  # pyright: ignore[reportPrivateUsage]
+    )
+    assert wrapped.hosts == [first_ip, second_ip]
 
 
 @pytest.mark.asyncio
-async def test_fetch_page_text_constructs_client_with_no_keepalive_pooling(
+async def test_socket_backend_raises_last_error_when_all_addresses_fail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#587 P2: with connect-time IP pinning, two DIFFERENT hostnames that
-    happen to resolve to the SAME address would otherwise share one pooled
-    connection/origin — and ``sni_hostname`` only applies when a connection
-    is OPENED, not when a pooled one is reused, so a host-changing redirect
-    could silently skip re-validating the new host's TLS identity.
-    ``httpx.MockTransport`` never performs real connection pooling (it
-    substitutes the whole transport), so the strongest assertion available
-    at this layer is that the internally-constructed client is CONFIGURED
-    with no keepalive connections — mirrors the existing
-    ``follow_redirects`` kwarg-capture test above."""
-    transport = _html_response(200, _SAMPLE_HTML)
+    """Exhausting every validated address returns the final connect failure."""
+    first_ip = "1.1.1.1"
+    second_ip = "93.184.216.34"
+
+    async def fake_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    wrapped = _RecordingAsyncNetworkBackend(
+        failures={
+            first_ip: httpcore.ConnectError("first failed"),
+            second_ip: httpcore.ConnectError("second failed"),
+        }
+    )
+    backend = bean_sourcing._SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+        wrapped
+    )
+    with pytest.raises(httpcore.ConnectError, match="second failed"):
+        await backend.connect_tcp("vendor.example", 443)
+    assert wrapped.hosts == [first_ip, second_ip]
+
+
+@pytest.mark.asyncio
+async def test_socket_backend_dns_expiry_maps_timeout_without_dial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolver expiry is a typed connect timeout and never reaches the socket backend."""
+
+    async def blocked_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        await asyncio.sleep(0)
+        return [(None, None, None, "", ("93.184.216.34", port))]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", blocked_getaddrinfo)
+    wrapped = _RecordingAsyncNetworkBackend()
+    backend = bean_sourcing._SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+        wrapped
+    )
+
+    with pytest.raises(httpcore.ConnectTimeout, match="DNS resolution exceeded"):
+        await backend.connect_tcp("vendor.example", 443, timeout=0.0)
+    assert wrapped.hosts == []
+
+
+@pytest.mark.asyncio
+async def test_socket_backend_slow_dns_consumes_shared_budget_before_dial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DNS time is deducted from the absolute TCP+TLS deadline."""
+    ip = "93.184.216.34"
+    clock = _ManualClock()
+
+    async def slow_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        clock.advance(10.0)
+        return [(None, None, None, "", (ip, port))]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", slow_getaddrinfo)
+    wrapped = _RecordingAsyncNetworkBackend(clock=clock)
+    backend = bean_sourcing._SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+        wrapped,
+        clock=clock,
+    )
+
+    with pytest.raises(httpcore.ConnectTimeout, match="shared connect budget exhausted"):
+        await backend.connect_tcp("vendor.example", 443, timeout=10.0)
+    assert wrapped.hosts == []
+
+
+@pytest.mark.parametrize(
+    "tls_error_kind",
+    ["timeout", "oserror"],
+)
+@pytest.mark.parametrize(
+    "tcp_error_kind",
+    ["timeout", "oserror"],
+)
+@pytest.mark.asyncio
+async def test_transport_retries_next_validated_ip_after_tls_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tls_error_kind: Literal["timeout", "oserror"],
+    tcp_error_kind: Literal["timeout", "oserror"],
+) -> None:
+    """A TCP-success/TLS-failure candidate does not hide a healthy alternate."""
+    first_ip = "1.1.1.1"
+    second_ip = "8.8.8.8"
+    third_ip = "93.184.216.34"
+    body = _SAMPLE_HTML.encode()
+    response = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+        + body
+    )
+    tls_error: BaseException = (
+        httpcore.ConnectTimeout("TLS timed out")
+        if tls_error_kind == "timeout"
+        else OSError("TLS socket failed")
+    )
+    tcp_error: BaseException = (
+        httpcore.ConnectTimeout("second TCP timed out")
+        if tcp_error_kind == "timeout"
+        else OSError("second TCP socket failed")
+    )
+    first_stream = _ScriptedAsyncNetworkStream(tls_failure=tls_error)
+    third_stream = _ScriptedAsyncNetworkStream(response)
+    clock = _ManualClock()
+    wrapped = _RecordingAsyncNetworkBackend(
+        streams=[first_stream, third_stream],
+        failures={second_ip: tcp_error},
+    )
+
+    async def two_address_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+            (None, None, None, "", (third_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", two_address_getaddrinfo)
+    transport = bean_sourcing._SSRFProtectedAsyncHTTPTransport(  # pyright: ignore[reportPrivateUsage]
+        network_backend=wrapped,
+        clock=clock,
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        result = await client.get("https://vendor.example/products/kenya", timeout=10.0)
+
+    assert "Kenya Kiambu AA" in result.text
+    assert wrapped.hosts == [first_ip, second_ip, third_ip]
+    assert wrapped.timeouts == pytest.approx([10.0 / 3, 5.0, 10.0])
+    assert first_stream.tls_server_names == ["vendor.example"]
+    assert third_stream.tls_server_names == ["vendor.example"]
+    assert first_stream.tls_contexts[0] is third_stream.tls_contexts[0]
+    assert first_stream.tls_timeouts == pytest.approx([10.0 / 3])
+    assert third_stream.tls_timeouts == pytest.approx([10.0])
+    assert first_stream.closed is True
+    assert third_stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_tls_fallback_shares_one_candidate_budget_across_tcp_and_tls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slow TCP leaves only the unspent candidate slice for TLS."""
+    first_ip = "1.1.1.1"
+    second_ip = "93.184.216.34"
+    clock = _ManualClock()
+    first_stream = _ScriptedAsyncNetworkStream(
+        tls_failure=httpcore.ConnectTimeout("first TLS timed out"),
+        clock=clock,
+        tls_elapsed_seconds=1.0,
+    )
+    second_stream = _ScriptedAsyncNetworkStream(clock=clock)
+    wrapped = _RecordingAsyncNetworkBackend(
+        streams=[first_stream, second_stream],
+        clock=clock,
+        connect_elapsed_seconds={first_ip: 4.0},
+    )
+
+    async def two_address_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", two_address_getaddrinfo)
+    backend = bean_sourcing._SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+        wrapped,
+        clock=clock,
+    )
+    stream = await backend.connect_tcp("vendor.example", 443, timeout=10.0)
+    result = await stream.start_tls(
+        ssl.create_default_context(),
+        server_hostname="vendor.example",
+        timeout=10.0,
+    )
+
+    assert result is second_stream
+    assert wrapped.hosts == [first_ip, second_ip]
+    assert wrapped.timeouts == pytest.approx([5.0, 5.0])
+    assert first_stream.tls_timeouts == pytest.approx([1.0])
+    assert second_stream.tls_timeouts == pytest.approx([5.0])
+    assert first_stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_tls_fallback_redistributes_unused_budget_to_remaining_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fast failures enlarge later combined TCP+TLS candidate slices."""
+    first_ip = "1.1.1.1"
+    second_ip = "8.8.8.8"
+    third_ip = "93.184.216.34"
+    clock = _ManualClock()
+    second_stream = _ScriptedAsyncNetworkStream(
+        tls_failure=httpcore.ConnectError("second TLS failed"),
+        clock=clock,
+        tls_elapsed_seconds=1.0,
+    )
+    third_stream = _ScriptedAsyncNetworkStream(clock=clock)
+    wrapped = _RecordingAsyncNetworkBackend(
+        streams=[second_stream, third_stream],
+        failures={first_ip: httpcore.ConnectTimeout("first TCP failed")},
+        clock=clock,
+        connect_elapsed_seconds={first_ip: 1.0, second_ip: 1.0},
+    )
+
+    async def three_address_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+            (None, None, None, "", (third_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", three_address_getaddrinfo)
+    backend = bean_sourcing._SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+        wrapped,
+        clock=clock,
+    )
+    stream = await backend.connect_tcp("vendor.example", 443, timeout=9.0)
+    result = await stream.start_tls(
+        ssl.create_default_context(),
+        server_hostname="vendor.example",
+        timeout=9.0,
+    )
+
+    assert result is third_stream
+    assert wrapped.hosts == [first_ip, second_ip, third_ip]
+    assert wrapped.timeouts == pytest.approx([3.0, 4.0, 6.0])
+    assert second_stream.tls_timeouts == pytest.approx([3.0])
+    assert third_stream.tls_timeouts == pytest.approx([6.0])
+    assert second_stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_tls_fallback_exhausted_global_budget_closes_without_redial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exhausted deadline closes the live stream and attempts no fallback dial."""
+    first_ip = "1.1.1.1"
+    second_ip = "93.184.216.34"
+    clock = _ManualClock()
+    first_stream = _ScriptedAsyncNetworkStream(clock=clock)
+    wrapped = _RecordingAsyncNetworkBackend(stream=first_stream, clock=clock)
+
+    async def two_address_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", two_address_getaddrinfo)
+    backend = bean_sourcing._SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+        wrapped,
+        clock=clock,
+    )
+    stream = await backend.connect_tcp("vendor.example", 443, timeout=10.0)
+    clock.advance(10.0)
+
+    with pytest.raises(httpcore.ConnectTimeout, match="shared connect budget exhausted"):
+        await stream.start_tls(
+            ssl.create_default_context(),
+            server_hostname="vendor.example",
+            timeout=10.0,
+        )
+
+    assert wrapped.hosts == [first_ip]
+    assert first_stream.tls_timeouts == []
+    assert first_stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_tls_fallback_preserves_unbounded_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A None timeout stays unbounded across TCP and TLS."""
+    first_ip = "1.1.1.1"
+    second_ip = "93.184.216.34"
+    first_stream = _ScriptedAsyncNetworkStream(
+        tls_failure=httpcore.ConnectError("first TLS failed")
+    )
+    second_stream = _ScriptedAsyncNetworkStream()
+    wrapped = _RecordingAsyncNetworkBackend(streams=[first_stream, second_stream])
+
+    async def two_address_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", two_address_getaddrinfo)
+    backend = bean_sourcing._SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+        wrapped
+    )
+    fallback_stream = await backend.connect_tcp("vendor.example", 443, timeout=None)
+    assert (
+        await fallback_stream.start_tls(
+            ssl.create_default_context(),
+            server_hostname="vendor.example",
+            timeout=None,
+        )
+        is second_stream
+    )
+    assert wrapped.timeouts == [None, None]
+    assert first_stream.tls_timeouts == [None]
+    assert second_stream.tls_timeouts == [None]
+    assert first_stream.closed is True
+
+
+@pytest.mark.parametrize(
+    ("final_error_kind", "expected_error"),
+    [
+        ("timeout", httpx.ConnectTimeout),
+        ("oserror", httpx.ConnectError),
+    ],
+)
+@pytest.mark.asyncio
+async def test_transport_raises_last_tls_error_after_all_addresses_fail(
+    monkeypatch: pytest.MonkeyPatch,
+    final_error_kind: Literal["timeout", "oserror"],
+    expected_error: type[httpx.TransportError],
+) -> None:
+    """Exhausting TLS setup on every validated IP returns the final failure."""
+    first_ip = "1.1.1.1"
+    second_ip = "93.184.216.34"
+    first_stream = _ScriptedAsyncNetworkStream(
+        tls_failure=httpcore.ConnectError("first TLS failed")
+    )
+    final_error: BaseException = (
+        httpcore.ConnectTimeout("second TLS failed")
+        if final_error_kind == "timeout"
+        else OSError("second TLS failed")
+    )
+    second_stream = _ScriptedAsyncNetworkStream(tls_failure=final_error)
+    wrapped = _RecordingAsyncNetworkBackend(streams=[first_stream, second_stream])
+
+    async def two_address_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", two_address_getaddrinfo)
+    transport = bean_sourcing._SSRFProtectedAsyncHTTPTransport(  # pyright: ignore[reportPrivateUsage]
+        network_backend=wrapped
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(expected_error, match="second TLS failed"):
+            await client.get("https://vendor.example/products/kenya", timeout=10.0)
+
+    assert wrapped.hosts == [first_ip, second_ip]
+    assert first_stream.closed is True
+    assert second_stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_tls_fallback_closes_stream_and_propagates_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Roast-start preemption closes the raw socket and never dials a fallback."""
+    first_ip = "1.1.1.1"
+    second_ip = "93.184.216.34"
+    cancellation = asyncio.CancelledError("sourcing cancelled")
+    first_stream = _ScriptedAsyncNetworkStream(tls_failure=cancellation)
+    wrapped = _RecordingAsyncNetworkBackend(streams=[first_stream])
+
+    async def two_address_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", two_address_getaddrinfo)
+    transport = bean_sourcing._SSRFProtectedAsyncHTTPTransport(  # pyright: ignore[reportPrivateUsage]
+        network_backend=wrapped
+    )
+    client = httpx.AsyncClient(transport=transport)
+    try:
+        with pytest.raises(asyncio.CancelledError) as error:
+            await client.get("https://vendor.example/products/kenya", timeout=10.0)
+        assert error.value is cancellation
+        assert first_stream.closed is True
+        assert wrapped.hosts == [first_ip]
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tls_fallback_propagates_cancellation_during_fallback_tcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation during a fallback dial re-raises after the prior stream closed."""
+    first_ip = "1.1.1.1"
+    second_ip = "93.184.216.34"
+    cancellation = asyncio.CancelledError("fallback TCP cancelled")
+    first_stream = _ScriptedAsyncNetworkStream(
+        tls_failure=httpcore.ConnectError("first TLS failed")
+    )
+    wrapped = _RecordingAsyncNetworkBackend(
+        streams=[first_stream],
+        failures={second_ip: cancellation},
+    )
+
+    async def two_address_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", two_address_getaddrinfo)
+    backend = bean_sourcing._SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+        wrapped
+    )
+    stream = await backend.connect_tcp("vendor.example", 443, timeout=10.0)
+
+    with pytest.raises(asyncio.CancelledError) as error:
+        await stream.start_tls(
+            ssl.create_default_context(),
+            server_hostname="vendor.example",
+            timeout=10.0,
+        )
+
+    assert error.value is cancellation
+    assert wrapped.hosts == [first_ip, second_ip]
+    assert first_stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_multi_address_plain_http_stream_delegates_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The TLS-fallback wrapper remains a transparent stream for plain HTTP."""
+    first_ip = "1.1.1.1"
+    second_ip = "93.184.216.34"
+    scripted = _ScriptedAsyncNetworkStream(b"response")
+    wrapped = _RecordingAsyncNetworkBackend(stream=scripted)
+
+    async def two_address_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (first_ip, port)),
+            (None, None, None, "", (second_ip, port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", two_address_getaddrinfo)
+    backend = bean_sourcing._SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+        wrapped
+    )
+    stream = await backend.connect_tcp("vendor.example", 80, timeout=10.0)
+    assert isinstance(
+        stream,
+        bean_sourcing._TLSFallbackAsyncNetworkStream,  # pyright: ignore[reportPrivateUsage]
+    )
+    await stream.write(b"request", timeout=2.0)
+    assert await stream.read(1024, timeout=2.0) == b"response"
+    assert stream.get_extra_info("unknown") is None
+    await stream.aclose()
+    assert scripted.writes == [b"request"]
+    assert scripted.closed is True
+
+
+@pytest.mark.asyncio
+async def test_socket_backend_required_methods_fail_closed_and_delegate_sleep() -> None:
+    """The interface's Unix path is forbidden; retry sleep stays backend-native."""
+    wrapped = _RecordingAsyncNetworkBackend()
+    backend = bean_sourcing._SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+        wrapped
+    )
+    with pytest.raises(httpcore.ConnectError, match="Unix sockets"):
+        await backend.connect_unix_socket("/tmp/not-allowed.sock")
+    await backend.sleep(0.25)
+    assert wrapped.sleeps == [0.25]
+
+
+@pytest.mark.asyncio
+async def test_resolver_rejects_invalid_address_and_deduplicates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed resolver output fails typed; repeated public records are tried once."""
+    loop = asyncio.get_running_loop()
+
+    async def invalid_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [(None, None, None, "", ("not-an-ip", port))]
+
+    monkeypatch.setattr(loop, "getaddrinfo", invalid_getaddrinfo)
+    with pytest.raises(BeanFetchError, match="invalid address"):
+        await bean_sourcing._resolve_public_addresses(  # pyright: ignore[reportPrivateUsage]
+            "vendor.example", 443, destination="vendor.example"
+        )
+
+    async def duplicate_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", ("93.184.216.34", port)),
+            (None, None, None, "", ("93.184.216.34", port)),
+        ]
+
+    monkeypatch.setattr(loop, "getaddrinfo", duplicate_getaddrinfo)
+    addresses = await bean_sourcing._resolve_public_addresses(  # pyright: ignore[reportPrivateUsage]
+        "vendor.example", 443, destination="vendor.example"
+    )
+    assert addresses == [ipaddress.ip_address("93.184.216.34")]
+
+
+@pytest.mark.asyncio
+async def test_socket_backend_rejects_oversized_dns_answer_before_dial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hostile RRset cannot create an unbounded connection fallback loop."""
+    loop = asyncio.get_running_loop()
+
+    async def oversized_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [
+            (None, None, None, "", (f"8.8.8.{index}", port))
+            for index in range(1, bean_sourcing._MAX_RESOLVED_ADDRESSES + 2)  # pyright: ignore[reportPrivateUsage]
+        ]
+
+    monkeypatch.setattr(loop, "getaddrinfo", oversized_getaddrinfo)
+    wrapped = _RecordingAsyncNetworkBackend()
+    backend = bean_sourcing._SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+        wrapped
+    )
+    with pytest.raises(BeanFetchError, match="more than 8 unique addresses"):
+        await backend.connect_tcp("many.vendor.example", 443)
+    assert wrapped.hosts == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_one_hop_maps_connect_failure_to_typed_safe_error() -> None:
+    """Transport failures remain fail-soft and redact the source URL."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    sensitive_url = f"https://vendor.example/products/down?access_token={_ERROR_URL_SECRET}"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(
+            BeanFetchError, match="could not connect to any resolved address"
+        ) as error:
+            await bean_sourcing._fetch_one_hop(  # pyright: ignore[reportPrivateUsage]
+                client,
+                sensitive_url,
+                headers={"User-Agent": "test"},
+                timeout=httpx.Timeout(10.0),
+                config=BeanSourcingConfig(),
+            )
+    _assert_error_url_is_safe(error.value)
+
+
+@pytest.mark.asyncio
+async def test_transport_preserves_natural_host_and_tls_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TCP uses the IP while HTTP Host and TLS SNI use the original hostname."""
+    body = _SAMPLE_HTML.encode()
+    response = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+        + body
+    )
+    stream = _ScriptedAsyncNetworkStream(response)
+    wrapped = _RecordingAsyncNetworkBackend(stream=stream)
+
+    async def fake_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del host, type
+        return [(None, None, None, "", ("93.184.216.34", port))]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    transport = bean_sourcing._SSRFProtectedAsyncHTTPTransport(  # pyright: ignore[reportPrivateUsage]
+        network_backend=wrapped
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        result = await client.get("https://vendor.example/products/kenya")
+    assert "Kenya Kiambu AA" in result.text
+    assert wrapped.hosts == ["93.184.216.34"]
+    assert stream.tls_server_names == ["vendor.example"]
+    assert len(stream.tls_contexts) == 1
+    assert stream.tls_contexts[0].check_hostname is True
+    assert stream.tls_contexts[0].verify_mode == ssl.CERT_REQUIRED
+    request_bytes = b"".join(stream.writes).lower()
+    assert b"host: vendor.example\r\n" in request_bytes
+
+
+@pytest.mark.asyncio
+async def test_transport_keeps_same_ip_redirects_hostname_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cross-host redirect sharing one IP still gets a fresh safe origin."""
+    redirect_response = (
+        b"HTTP/1.1 302 Found\r\n"
+        b"Location: https://www.vendor.example/products/kenya\r\n"
+        b"Set-Cookie: consent=accepted; Domain=vendor.example; Path=/\r\n"
+        b"Content-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+    )
+    body = _SAMPLE_HTML.encode()
+    final_response = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+        + body
+    )
+    first_stream = _ScriptedAsyncNetworkStream(redirect_response)
+    second_stream = _ScriptedAsyncNetworkStream(final_response)
+    wrapped = _RecordingAsyncNetworkBackend(streams=[first_stream, second_stream])
+    resolver_hosts: list[str] = []
+
+    async def same_ip_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        del type
+        resolver_hosts.append(host)
+        return [(None, None, None, "", ("93.184.216.34", port))]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", same_ip_getaddrinfo)
+    transport = bean_sourcing._SSRFProtectedAsyncHTTPTransport(  # pyright: ignore[reportPrivateUsage]
+        network_backend=wrapped
+    )
+    async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
+        text, final_url = await bean_sourcing._fetch_with_ssrf_guard(  # pyright: ignore[reportPrivateUsage]
+            client,
+            "https://vendor.example/products/start",
+            headers={"User-Agent": "test"},
+            timeout=httpx.Timeout(10.0),
+            config=BeanSourcingConfig(),
+        )
+
+    assert "Kenya Kiambu AA" in text
+    assert final_url == "https://www.vendor.example/products/kenya"
+    assert resolver_hosts == [
+        "vendor.example",
+        "vendor.example",
+        "www.vendor.example",
+        "www.vendor.example",
+    ]
+    assert wrapped.hosts == ["93.184.216.34", "93.184.216.34"]
+    assert first_stream.tls_server_names == ["vendor.example"]
+    assert second_stream.tls_server_names == ["www.vendor.example"]
+    first_request = b"".join(first_stream.writes).lower()
+    second_request = b"".join(second_stream.writes).lower()
+    assert b"host: vendor.example\r\n" in first_request
+    assert b"host: www.vendor.example\r\n" in second_request
+    assert b"cookie: consent=accepted\r\n" in second_request
+
+
+@pytest.mark.asyncio
+async def test_fetch_constructs_socket_transport_without_keepalive_workaround(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production wires the protected transport and no longer disables pooling."""
+    mock_transport = _html_response(200, _SAMPLE_HTML)
     real_async_client = httpx.AsyncClient
     captured_kwargs: dict[str, object] = {}
+    protected_transport: httpx.AsyncBaseTransport | None = None
 
     def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        nonlocal protected_transport
         captured_kwargs.update(kwargs)
-        return real_async_client(transport=transport, **kwargs)  # type: ignore[arg-type]
+        candidate = kwargs.pop("transport", None)
+        assert isinstance(candidate, httpx.AsyncBaseTransport)
+        protected_transport = candidate
+        return real_async_client(transport=mock_transport, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
     monkeypatch.setattr(
@@ -1136,227 +1975,13 @@ async def test_fetch_page_text_constructs_client_with_no_keepalive_pooling(
     await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
         "https://vendor.example/products/kenya", config=BeanSourcingConfig()
     )
-    limits = captured_kwargs.get("limits")
-    assert isinstance(limits, httpx.Limits)
-    assert limits.max_keepalive_connections == 0
-
-
-@pytest.mark.asyncio
-async def test_fetch_page_text_redirect_public_to_public_tracks_sni_per_hop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Complements the no-keepalive-pooling config test above: even at the
-    ``MockTransport`` layer (no real connection reuse to observe), each
-    hop's request must carry the SNI (``sni_hostname`` extension) for THAT
-    hop's own host, never a stale one from a prior hop — the closest
-    behavioral proxy for "TLS identity tracks the new host each hop" this
-    test layer can assert."""
-    original_host = "vendor.example"
-    redirected_host = "www.vendor.example"
-    original_url = f"https://{original_host}/products/kenya"
-    redirected_url = f"https://{redirected_host}/products/kenya"
-    host_ips = {original_host: "93.184.216.34", redirected_host: "93.184.216.35"}
-    sni_per_request: list[str | None] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        sni_per_request.append(request.extensions.get("sni_hostname"))
-        host_header = request.headers.get("host")
-        if host_header == original_host:
-            return httpx.Response(302, headers={"Location": redirected_url})
-        assert host_header == redirected_host
-        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
-
-    transport = httpx.MockTransport(handler)
-    real_async_client = httpx.AsyncClient
-
-    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
-        return real_async_client(transport=transport)
-
-    async def fake_getaddrinfo(
-        host: str, port: int, *, type: int
-    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
-        return [(None, None, None, "", (host_ips[host], port))]
-
-    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
-    loop = asyncio.get_running_loop()
-    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    text = (
-        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            original_url, config=BeanSourcingConfig()
-        )
-    ).prompt_text
-    assert "Kenya Kiambu AA" in text
-    assert sni_per_request == [original_host, redirected_host]
-
-
-# --- #587 P2: try every validated address before giving up ---
-
-
-@pytest.mark.asyncio
-async def test_fetch_with_ssrf_guard_tries_next_address_after_connect_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A dual-stack host whose first resolved address is unreachable (a dead
-    route, or a transient CDN node) must still succeed via its SECOND
-    validated address, rather than failing the whole fetch."""
-    bad_ip = "1.1.1.1"
-    good_ip = "93.184.216.34"
-    attempted_hosts: list[str | None] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        attempted_hosts.append(request.url.host)
-        if request.url.host == bad_ip:
-            raise httpx.ConnectError("connection refused", request=request)
-        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
-
-    transport = httpx.MockTransport(handler)
-    real_async_client = httpx.AsyncClient
-
-    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
-        return real_async_client(transport=transport)
-
-    async def fake_getaddrinfo(
-        host: str, port: int, *, type: int
-    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
-        return [
-            (None, None, None, "", (bad_ip, port)),
-            (None, None, None, "", (good_ip, port)),
-        ]
-
-    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
-    loop = asyncio.get_running_loop()
-    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    text = (
-        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/products/kenya", config=BeanSourcingConfig()
-        )
-    ).prompt_text
-    assert "Kenya Kiambu AA" in text
-    assert attempted_hosts == [bad_ip, good_ip]
-
-
-@pytest.mark.asyncio
-async def test_fetch_with_ssrf_guard_raises_when_every_address_fails_to_connect(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When EVERY validated address fails to connect, the fetch must still
-    fail soft as a typed ``BeanFetchError``, not leak the raw
-    ``httpx.ConnectError``."""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection refused", request=request)
-
-    transport = httpx.MockTransport(handler)
-    real_async_client = httpx.AsyncClient
-
-    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
-        return real_async_client(transport=transport)
-
-    async def fake_getaddrinfo(
-        host: str, port: int, *, type: int
-    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
-        return [(None, None, None, "", ("93.184.216.34", port))]
-
-    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
-    loop = asyncio.get_running_loop()
-    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    sensitive_url = (
-        f"https://vendor.example/products/kenya?access_token={_ERROR_URL_SECRET}#fragment-secret"
+    assert isinstance(
+        protected_transport,
+        bean_sourcing._SSRFProtectedAsyncHTTPTransport,  # pyright: ignore[reportPrivateUsage]
     )
-    with pytest.raises(BeanFetchError, match="could not connect to any resolved address") as error:
-        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            sensitive_url, config=BeanSourcingConfig()
-        )
-    _assert_error_url_is_safe(error.value)
-
-
-@pytest.mark.asyncio
-async def test_fetch_with_ssrf_guard_tries_next_address_after_connect_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """#587 P2: ``httpx.ConnectTimeout`` (a "black-holed" address — a route
-    exists but nothing ever answers) is a SIBLING of ``httpx.ConnectError``
-    under ``httpx.TransportError``, not a subclass — a fallback loop that
-    only caught ``ConnectError`` would silently give up on a timed-out
-    first address instead of trying the next one."""
-    bad_ip = "1.1.1.1"
-    good_ip = "93.184.216.34"
-    attempted_hosts: list[str | None] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        attempted_hosts.append(request.url.host)
-        if request.url.host == bad_ip:
-            raise httpx.ConnectTimeout("connect timed out", request=request)
-        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
-
-    transport = httpx.MockTransport(handler)
-    real_async_client = httpx.AsyncClient
-
-    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
-        return real_async_client(transport=transport)
-
-    async def fake_getaddrinfo(
-        host: str, port: int, *, type: int
-    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
-        return [
-            (None, None, None, "", (bad_ip, port)),
-            (None, None, None, "", (good_ip, port)),
-        ]
-
-    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
-    loop = asyncio.get_running_loop()
-    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    text = (
-        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/products/kenya", config=BeanSourcingConfig()
-        )
-    ).prompt_text
-    assert "Kenya Kiambu AA" in text
-    assert attempted_hosts == [bad_ip, good_ip]
-
-
-@pytest.mark.asyncio
-async def test_fetch_one_hop_divides_connect_timeout_across_candidates(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """#587 P2: with more than one candidate address, each attempt's
-    CONNECT phase must be bounded to a FRACTION of the configured connect
-    timeout — otherwise one black-holed FIRST address could consume the
-    entire per-request connect budget, leaving the fallback loop no time to
-    even attempt a second address before the caller's outer end-to-end
-    deadline also expires."""
-    captured_timeouts: list[httpx.Timeout] = []
-    original_stream = httpx.AsyncClient.stream
-
-    def recording_stream(
-        self: httpx.AsyncClient, method: str, url: object, **kwargs: object
-    ) -> object:
-        captured_timeouts.append(kwargs.get("timeout"))  # type: ignore[arg-type]
-        return original_stream(self, method, url, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(httpx.AsyncClient, "stream", recording_stream)
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
-
-    candidate_addresses = [
-        ipaddress.ip_address("93.184.216.34"),
-        ipaddress.ip_address("1.1.1.1"),
-    ]
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        result, is_redirect = await bean_sourcing._fetch_one_hop(  # pyright: ignore[reportPrivateUsage]
-            client,
-            "https://vendor.example/products/kenya",
-            candidate_addresses,
-            headers={"User-Agent": "x"},
-            timeout=httpx.Timeout(10.0),
-            config=BeanSourcingConfig(),
-        )
-    assert is_redirect is False
-    assert "Kenya Kiambu AA" in result
-    assert len(captured_timeouts) == 1
-    assert captured_timeouts[0].connect == 5.0
-    assert captured_timeouts[0].read == 10.0
+    assert "limits" not in captured_kwargs
+    assert protected_transport is not None
+    await protected_transport.aclose()
 
 
 # --- #587 P2: decode using the response's declared charset ---
@@ -2787,18 +3412,14 @@ async def test_fetch_page_text_injected_client_rejects_nul_byte_in_path() -> Non
 async def test_fetch_page_text_constructs_client_with_trust_env_false(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#587 P2: with an env HTTPS_PROXY set, httpx's default
-    ``trust_env=True`` would route the fetch through a CONNECT-tunnelling
-    proxy that TLS-verifies against the pinned IP LITERAL (the
-    ``sni_hostname`` extension is not honored by the tunnel) — silently
-    defeating connect-time pinning. The internally-constructed client must
-    disable this; an injected client is untouched (the caller's to set)."""
+    """Env proxies must not add an alternate, unvalidated resolution path."""
     transport = _html_response(200, _SAMPLE_HTML)
     real_async_client = httpx.AsyncClient
     captured_kwargs: dict[str, object] = {}
 
     def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
         captured_kwargs.update(kwargs)
+        kwargs.pop("transport", None)
         return real_async_client(transport=transport, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
@@ -2809,6 +3430,9 @@ async def test_fetch_page_text_constructs_client_with_trust_env_false(
         "https://vendor.example/products/kenya", config=BeanSourcingConfig()
     )
     assert captured_kwargs.get("trust_env") is False
+    protected = captured_kwargs.get("transport")
+    assert isinstance(protected, httpx.AsyncBaseTransport)
+    await protected.aclose()
 
 
 # --- #587 fix 2: end-to-end fetch deadline ---

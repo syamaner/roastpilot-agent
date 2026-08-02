@@ -40,8 +40,11 @@
 > cards, and an exact server-owned product-URL handoff into the existing editable
 > draft flow. Recommendations never order or save a bean — the operator must select,
 > review, edit, and explicitly save the profile.
-> Other open follow-ups: **#591** (socket-level SSRF pinning), **#595**
-> (rate-limit/auth on the billable endpoint).
+> **#591 socket-level SSRF pinning is SHIPPED:** HTTPX now retains hostname URLs and
+> natural cookie/pooling/Host/TLS semantics while the httpcore TCP backend resolves,
+> validates, and dials only public IP literals at connect time; the URL-rewrite,
+> explicit Host/SNI, and disabled-keepalive workarounds are retired. Remaining open
+> follow-up: **#595** (rate-limit/auth on the billable endpoint).
 >
 > **Review + process.** PR size is a **reviewability guide, not a hard cap** (#661,
 > 26 Jul) — a cohesive single-slice story stays one PR. `security-reviewer` is now

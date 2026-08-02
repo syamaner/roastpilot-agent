@@ -48,7 +48,14 @@ dependencies = [
   # transitive-turned-direct precedent below).
   "anyio>=4.0,<5",
   "fastapi>=0.136,<1",
-  "httpx>=0.28,<1",
+  # #591's connect-time backend hook is verified against HTTPX 0.28's
+  # AsyncHTTPTransport pool surface; widen only with the transport tests.
+  "httpx>=0.28,<0.29",
+  # #591: bean sourcing wraps httpcore's public AsyncNetworkBackend so DNS
+  # validation and IP pinning happen at the actual TCP connect boundary while
+  # HTTPX retains hostname URL/cookie/SNI semantics. It was already transitive
+  # via httpx; direct runtime use makes the dependency explicit.
+  "httpcore>=1.0,<1.1",
   # D121 catalogue discovery imports lxml directly for bounded HTML parsing;
   # declare the runtime requirement instead of relying on sourcing transitive deps.
   "lxml>=5.0,<7",

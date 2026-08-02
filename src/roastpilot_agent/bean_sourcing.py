@@ -65,22 +65,16 @@ the hostname" version of that check has a DNS-rebinding TOCTOU gap: a
 short-TTL domain can answer a public address on the validation lookup and a
 private/metadata address on ``httpx``'s own connect-time re-resolution (the
 exact shape behind CVE-2026-27826 / GHSA-489g-7rxv-6c8q in other
-fetch-URL-for-LLM tools). This module closes that gap by connect-time IP
-pinning: :func:`_assert_public_destination` returns every validated address
-a hostname resolved to, and :func:`_fetch_with_ssrf_guard` issues the
-request against a literal IP from that list (``httpx.URL.copy_with(host=...)``,
-trying the next candidate address on a connect failure — a dual-stack host
-with a dead IPv6 route, or a transient CDN node, should not fail the whole
-fetch) so there is no second resolution left to poison, while an explicit
-``Host`` header and the ``sni_hostname`` request extension keep
-routing/TLS identity (virtual host, SNI, certificate hostname check) pinned
-to the ORIGINAL hostname. The internally-constructed client also disables
-keepalive pooling (``httpx.Limits(max_keepalive_connections=0)``): with IP
-pinning, two DIFFERENT hostnames that happen to resolve to the SAME address
-would otherwise share one pooled connection/origin, and ``sni_hostname``
-only applies when a connection is *opened* — a pooled reuse across a
-host-changing redirect would silently skip re-validating the new host's TLS
-identity. The only remaining residual is parser-differential risk — a
+fetch-URL-for-LLM tools). This module closes that gap at the socket boundary:
+:class:`_SSRFProtectedAsyncNetworkBackend` resolves and validates immediately
+before each new TCP connection, then passes only a validated IP literal to the
+wrapped network backend. HTTPX/httpcore retain the ORIGINAL hostname origin,
+so cookie scoping, pooling, virtual-host routing, TLS SNI, and certificate
+hostname verification work naturally — no URL rewrite, explicit ``Host``
+header, ``sni_hostname`` extension, or disabled-keepalive workaround. Every
+validated address is tried within one divided connect-time budget, so a dead
+IPv6 route or transient CDN node does not fail a host with a working alternate.
+The only remaining residual is parser-differential risk — a
 hostname the resolver and this module's own URL parsing could disagree on —
 mitigated by validating and pinning from the exact same parsed host on every
 hop. An operator-supplied URL with embedded credentials (``user:pass@host``)
@@ -89,10 +83,9 @@ redirect's ``#access_token=...``) is rejected up front, before any logging
 or outbound request — and even that rejection path aside, the source URL
 is only ever logged in a credential-and-fragment-redacted form
 (:func:`_redact_url_credentials`). The internally-constructed client sets
-``trust_env=False``: an operator/system ``HTTPS_PROXY`` would otherwise
-route the fetch through a CONNECT-tunnelling proxy that TLS-verifies
-against the pinned IP literal (the ``sni_hostname`` extension is not
-honored by the tunnel), silently defeating connect-time pinning. Response
+``trust_env=False`` and supplies the transport explicitly, so an
+operator/system proxy cannot interpose a second destination-resolution path.
+Response
 bodies are decompressed by THIS module, not ``httpx``: the fetch is
 streamed via ``response.aiter_raw()`` (the still-compressed wire bytes,
 capped to ``max_response_bytes`` before any decompression happens at all —
@@ -207,17 +200,21 @@ import ipaddress
 import logging
 import re
 import socket
+import ssl
 import threading
+import time
 import unicodedata
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from html import unescape
-from typing import Any, Final, Literal, TypeVar, cast
+from typing import Any, Final, Literal, Protocol, TypeVar, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import extruct  # type: ignore[import-untyped]
+import httpcore
 import httpx
 import lxml.etree  # type: ignore[import-untyped]
 import lxml.html  # type: ignore[import-untyped]
@@ -1282,6 +1279,10 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
 #: (#587 fix 1) before giving up — matches the prior ``httpx``
 #: ``max_redirects=5`` policy this replaces.
 _MAX_REDIRECTS = 5
+#: Bound attacker-controlled DNS cardinality before any TCP fallback loop. Eight
+#: candidates comfortably covers normal dual-stack/CDN answers without allowing
+#: a hostile RRset to turn fast connection failures into unbounded work (#591).
+_MAX_RESOLVED_ADDRESSES: Final[int] = 8
 
 #: NAT64 well-known prefix (RFC 6052) — an IPv6 address in this range embeds
 #: an IPv4 address in its low 32 bits (#587 P2, round 6).
@@ -1345,12 +1346,86 @@ def _extract_embedded_ipv4(
     return None
 
 
+async def _resolve_public_addresses(
+    host: str,
+    port: int,
+    *,
+    destination: str,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Resolve ``host`` and fail closed unless every address is public.
+
+    This is the shared address-policy primitive for both the per-hop URL
+    preflight and the socket-level connect backend (#591). The latter calls it
+    immediately before dialing and passes only one returned IP literal to the
+    wrapped network backend, closing the DNS-rebinding gap without rewriting
+    the HTTP request URL.
+
+    Args:
+        host: Parsed hostname or IP literal to resolve.
+        port: TCP port used to constrain ``getaddrinfo`` to stream results.
+        destination: Already-redacted display value for typed error messages.
+
+    Returns:
+        Every unique validated address, in resolver order.
+
+    Raises:
+        BeanFetchError: Resolution failed, produced no usable addresses, or
+            any resolved/embedded address is not publicly routable.
+    """
+    try:
+        addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [
+            ipaddress.ip_address(host)
+        ]
+    except ValueError:
+        loop = asyncio.get_running_loop()
+        try:
+            resolved = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except (OSError, UnicodeError) as exc:
+            raise BeanFetchError(
+                f"could not resolve host {host!r} for {destination!r}: {exc}"
+            ) from exc
+        addresses = []
+        for info in resolved:
+            try:
+                address = ipaddress.ip_address(info[4][0])
+            except ValueError as exc:
+                raise BeanFetchError(
+                    f"host {host!r} resolved to an invalid address for {destination!r}"
+                ) from exc
+            if address in addresses:
+                continue
+            if len(addresses) >= _MAX_RESOLVED_ADDRESSES:
+                raise BeanFetchError(
+                    f"host {host!r} resolved to more than "
+                    f"{_MAX_RESOLVED_ADDRESSES} unique addresses for {destination!r}"
+                ) from None
+            addresses.append(address)
+        if not addresses:
+            raise BeanFetchError(
+                f"host {host!r} resolved to no usable address for {destination!r}"
+            ) from None
+
+    for address in addresses:
+        if _is_non_public_address(address):
+            raise BeanFetchError(
+                f"fetch destination {destination!r} resolves to a non-public address "
+                f"({address}) — blocked by the SSRF guard (#587/#591)"
+            )
+        embedded_v4 = _extract_embedded_ipv4(address)
+        if embedded_v4 is not None and _is_non_public_address(embedded_v4):
+            raise BeanFetchError(
+                f"fetch destination {destination!r} resolves to {address}, which embeds "
+                f"a non-public IPv4 address ({embedded_v4}) — blocked by the "
+                "SSRF guard (#587/#591)"
+            )
+
+    return addresses
+
+
 async def _assert_public_destination(
     url: str,
-) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
-    """Reject a fetch destination that is not publicly routable, and return
-    EVERY validated address to try CONNECTING TO (#587 fix 1, SSRF guard +
-    DNS-rebinding fix; #587 P2, multi-address resilience).
+) -> None:
+    """Fail-fast unless a fetch destination currently resolves as public.
 
     Parses ``url``'s host. If it is an IP literal, validates that address
     directly; otherwise resolves it via the non-blocking asyncio resolver
@@ -1387,27 +1462,16 @@ async def _assert_public_destination(
     302 into a private address just as easily as an operator can paste one
     in directly (#587).
 
-    The caller MUST connect to one of the returned addresses rather than
-    letting ``httpx`` re-resolve the hostname itself (see
-    :func:`_fetch_with_ssrf_guard`) — a hostname resolved and validated
-    here, then handed to the HTTP client as a hostname, gives a short-TTL
-    DNS record a second chance to answer differently at connect time (a
-    "rebinding" race: public on this check, private/metadata on the real
-    connect). Returning the validated addresses and pinning the actual
-    connection to one of them closes that gap: there is no second
-    resolution left to poison. Returning ALL of them (not just the first)
-    lets the caller fall back to another address if the first one it tries
-    is unreachable (a dual-stack host with a dead IPv6 route, or a
-    transient CDN node) — a resolution race must not fail the whole fetch
-    when a perfectly good alternate address was also returned.
+    This is a preflight policy/error check, not the connection pin. The
+    socket backend deliberately resolves the same hostname again immediately
+    before each new TCP dial, validates that connect-time answer, and passes
+    only one of those validated IP literals to the wrapped dialer. A DNS
+    record that rebinds to a private address between the two checks is
+    therefore rejected at the connection boundary (#591).
 
     Args:
         url: The absolute URL about to be connected to (the origin URL, or a
             redirect hop's resolved ``Location``).
-
-    Returns:
-        Every validated address (the literal IP itself, in a single-element
-        list, or every ``getaddrinfo`` result for a hostname).
 
     Raises:
         BeanFetchError: The scheme is not ``http``/``https``, the URL has no
@@ -1442,49 +1506,261 @@ async def _assert_public_destination(
         ) from exc
     port = explicit_port or (443 if parsed.scheme == "https" else 80)
 
-    try:
-        addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [
-            ipaddress.ip_address(host)
+    await _resolve_public_addresses(
+        host,
+        port,
+        destination=redact_url_for_error(url),
+    )
+
+
+class _TLSFallbackAsyncNetworkStream(httpcore.AsyncNetworkStream):
+    """Retry validated alternate IPs when TLS setup fails after TCP connects."""
+
+    def __init__(
+        self,
+        stream: httpcore.AsyncNetworkStream,
+        *,
+        wrapped_backend: httpcore.AsyncNetworkBackend,
+        remaining_addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address],
+        port: int,
+        overall_deadline: float | None,
+        candidate_deadline: float | None,
+        local_address: str | None,
+        socket_options: tuple[Any, ...] | None,
+        clock: Callable[[], float],
+    ) -> None:
+        self._stream = stream
+        self._wrapped_backend = wrapped_backend
+        self._remaining_addresses = remaining_addresses
+        self._port = port
+        self._overall_deadline = overall_deadline
+        self._candidate_deadline = candidate_deadline
+        self._local_address = local_address
+        self._socket_options = socket_options
+        self._clock = clock
+
+    def _allocate_candidate_budget(self, candidates_left: int) -> tuple[float | None, float | None]:
+        """Divide the remaining global budget among untried candidates."""
+        if self._overall_deadline is None:
+            return None, None
+        now = self._clock()
+        remaining = max(0.0, self._overall_deadline - now)
+        timeout = remaining / candidates_left
+        return now + timeout, timeout
+
+    def _remaining_candidate_budget(self, deadline: float | None) -> float | None:
+        """Return the unspent TCP+TLS budget for one candidate."""
+        if deadline is None:
+            return None
+        return max(0.0, deadline - self._clock())
+
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        """Delegate reads for non-TLS HTTP connections."""
+        return await self._stream.read(max_bytes, timeout)
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        """Delegate writes for non-TLS HTTP connections."""
+        await self._stream.write(buffer, timeout)
+
+    async def aclose(self) -> None:
+        """Close the currently connected stream."""
+        await self._stream.aclose()
+
+    async def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        """Negotiate TLS, advancing through validated IPs on connect failures."""
+        candidate_stream: httpcore.AsyncNetworkStream | None = self._stream
+        last_error: httpcore.ConnectError | httpcore.ConnectTimeout | None = None
+        addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address | None] = [
+            None,
+            *self._remaining_addresses,
         ]
-    except ValueError:
-        loop = asyncio.get_running_loop()
+        for index, address in enumerate(addresses):
+            candidate_deadline = self._candidate_deadline
+            try:
+                if address is not None:
+                    candidate_deadline, connect_timeout = self._allocate_candidate_budget(
+                        len(addresses) - index
+                    )
+                    if connect_timeout == 0.0:
+                        raise httpcore.ConnectTimeout("shared connect budget exhausted")
+                    candidate_stream = await self._wrapped_backend.connect_tcp(
+                        str(address),
+                        self._port,
+                        timeout=connect_timeout,
+                        local_address=self._local_address,
+                        socket_options=self._socket_options,
+                    )
+                assert candidate_stream is not None
+                candidate_budget = self._remaining_candidate_budget(candidate_deadline)
+                if candidate_budget == 0.0:
+                    raise httpcore.ConnectTimeout("shared connect budget exhausted")
+                tls_timeout = timeout
+                if candidate_budget is not None and (
+                    tls_timeout is None or candidate_budget < tls_timeout
+                ):
+                    tls_timeout = candidate_budget
+                return await candidate_stream.start_tls(
+                    ssl_context,
+                    server_hostname=server_hostname,
+                    timeout=tls_timeout,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                last_error = exc
+            except OSError as exc:
+                last_error = httpcore.ConnectError(str(exc))
+            except BaseException:
+                if candidate_stream is not None:
+                    with suppress(BaseException):
+                        await candidate_stream.aclose()
+                raise
+            if candidate_stream is not None:
+                with suppress(Exception):
+                    await candidate_stream.aclose()
+                candidate_stream = None
+        if last_error is None:  # pragma: no cover - at least the initial stream is attempted
+            raise httpcore.ConnectError("TLS setup had no connection candidate")
+        raise last_error
+
+    def get_extra_info(self, info: str) -> Any:
+        """Delegate socket metadata for non-TLS HTTP connections."""
+        return self._stream.get_extra_info(info)
+
+
+class _SSRFProtectedAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
+    """Pin each TCP connection to an address validated at connect time.
+
+    HTTPX/httpcore retain the original request origin, so cookie scoping,
+    connection pooling, the ``Host`` header, TLS SNI, and certificate hostname
+    validation all use the vendor hostname naturally. Only the wrapped
+    backend's TCP dial receives an IP literal. A fresh connection performs a
+    fresh validation; reusing an established public connection is safe.
+    """
+
+    def __init__(
+        self,
+        wrapped: httpcore.AsyncNetworkBackend,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._wrapped = wrapped
+        self._clock = clock
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[Any] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        """Resolve, validate, and try public IPs within one timeout budget."""
+        overall_deadline = self._clock() + timeout if timeout is not None else None
         try:
-            resolved = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        except (OSError, UnicodeError) as exc:
-            # getaddrinfo() raises OSError for a genuine resolution
-            # failure, but UnicodeError (UnicodeDecodeError /
-            # UnicodeEncodeError — both ValueError subclasses, but NEITHER
-            # is an OSError) for a hostname it cannot even IDNA-encode in
-            # the first place — a label over 63 characters, or a lone
-            # UTF-16 surrogate, for instance. Left uncaught this escapes as
-            # an unhandled 500 instead of the typed fail-soft error every
-            # other malformed-host case here gets (#587 P2, round 6).
-            raise BeanFetchError(
-                f"could not resolve host {host!r} for {redact_url_for_error(url)!r}: {exc}"
-            ) from exc
-        addresses = [ipaddress.ip_address(info[4][0]) for info in resolved]
-        if not addresses:
-            raise BeanFetchError(
-                f"host {host!r} resolved to no usable address for {redact_url_for_error(url)!r}"
-            ) from None
+            if timeout is None:
+                addresses = await _resolve_public_addresses(
+                    host,
+                    port,
+                    destination=host,
+                )
+            else:
+                async with asyncio.timeout(timeout):
+                    addresses = await _resolve_public_addresses(
+                        host,
+                        port,
+                        destination=host,
+                    )
+        except TimeoutError as exc:
+            raise httpcore.ConnectTimeout("DNS resolution exceeded shared connect budget") from exc
+        socket_options_tuple = tuple(socket_options) if socket_options is not None else None
+        last_error: httpcore.ConnectError | httpcore.ConnectTimeout | None = None
+        for index, address in enumerate(addresses):
+            try:
+                candidate_deadline: float | None = None
+                candidate_timeout: float | None = None
+                if overall_deadline is not None:
+                    now = self._clock()
+                    remaining = max(0.0, overall_deadline - now)
+                    candidate_timeout = remaining / (len(addresses) - index)
+                    candidate_deadline = now + candidate_timeout
+                    if candidate_timeout == 0.0:
+                        raise httpcore.ConnectTimeout("shared connect budget exhausted")
+                stream = await self._wrapped.connect_tcp(
+                    str(address),
+                    port,
+                    timeout=candidate_timeout,
+                    local_address=local_address,
+                    socket_options=socket_options_tuple,
+                )
+                remaining_addresses = addresses[index + 1 :]
+                return _TLSFallbackAsyncNetworkStream(
+                    stream,
+                    wrapped_backend=self._wrapped,
+                    remaining_addresses=remaining_addresses,
+                    port=port,
+                    overall_deadline=overall_deadline,
+                    candidate_deadline=candidate_deadline,
+                    local_address=local_address,
+                    socket_options=socket_options_tuple,
+                    clock=self._clock,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                last_error = exc
+            except OSError as exc:
+                last_error = httpcore.ConnectError(str(exc))
+        if last_error is None:  # pragma: no cover - resolver guarantees non-empty
+            raise httpcore.ConnectError(f"no validated address available for {host!r}")
+        raise last_error
 
-    for address in addresses:
-        if _is_non_public_address(address):
-            raise BeanFetchError(
-                f"fetch destination {redact_url_for_error(url)!r} "
-                "resolves to a non-public address "
-                f"({address}) — blocked by the SSRF guard (#587)"
-            )
-        embedded_v4 = _extract_embedded_ipv4(address)
-        if embedded_v4 is not None and _is_non_public_address(embedded_v4):
-            raise BeanFetchError(
-                f"fetch destination {redact_url_for_error(url)!r} resolves to "
-                f"{address}, which embeds "
-                f"a non-public IPv4 address ({embedded_v4}) — blocked by the "
-                "SSRF guard (#587)"
-            )
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[Any] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        """Reject Unix sockets; bean sourcing supports public HTTP(S) only."""
+        del path, timeout, socket_options
+        raise httpcore.ConnectError("Unix sockets are not supported by bean sourcing")
 
-    return addresses
+    async def sleep(self, seconds: float) -> None:
+        """Delegate retry backoff to the selected async backend."""
+        await self._wrapped.sleep(seconds)
+
+
+class _AsyncPoolWithNetworkBackend(Protocol):
+    """Structural view of the httpcore pool hook HTTPX 0.28 exposes."""
+
+    _network_backend: httpcore.AsyncNetworkBackend
+
+
+class _SSRFProtectedAsyncHTTPTransport(httpx.AsyncHTTPTransport):
+    """HTTPX transport with connect-time public-address validation (#591)."""
+
+    def __init__(
+        self,
+        *,
+        network_backend: httpcore.AsyncNetworkBackend | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Build the transport, optionally around an injected test backend.
+
+        Args:
+            network_backend: Low-level backend override used by network-free
+                transport contract tests. Production leaves this unset.
+            clock: Monotonic clock override for deterministic timeout tests.
+        """
+        # Explicit transport construction means env proxies are never mounted;
+        # trust_env=False also keeps SSL-context loading independent of env.
+        super().__init__(trust_env=False)
+        pool = cast(_AsyncPoolWithNetworkBackend, self._pool)
+        pool._network_backend = _SSRFProtectedAsyncNetworkBackend(  # pyright: ignore[reportPrivateUsage]
+            network_backend if network_backend is not None else pool._network_backend,  # pyright: ignore[reportPrivateUsage]
+            clock=clock,
+        )
 
 
 def _append_within_cap(body: bytearray, chunk: bytes, *, max_bytes: int, url: str) -> None:
@@ -1997,46 +2273,25 @@ def _decode_response_body(body: bytes, response: httpx.Response) -> str:
 async def _fetch_one_hop(
     client: httpx.AsyncClient,
     current_url: str,
-    candidate_addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address],
     *,
     headers: dict[str, str],
     timeout: httpx.Timeout,
     config: BeanSourcingConfig,
 ) -> tuple[str, bool]:
-    """Fetch a single hop of ``current_url``, trying each of its validated
-    candidate addresses in turn until one connects (#587 P2: a dual-stack
-    host with a dead route on one family, or a transient CDN node, must not
-    fail the whole fetch when an alternate resolved address would work).
-    Catches both ``httpx.ConnectError`` (e.g. connection refused) AND
-    ``httpx.ConnectTimeout`` (a "black-holed" address — a route exists but
-    nothing ever answers) — the two are SIBLING exceptions under
-    ``httpx.TransportError``, not a subclass relationship, so a fallback
-    loop that only caught ``ConnectError`` would silently give up on a
-    timed-out address instead of trying the next one.
+    """Fetch one hostname-preserving, manually-followed redirect hop.
 
-    Every attempt is pinned to its candidate IP literal
-    (``httpx.URL.copy_with(host=...)``) with the original hostname preserved
-    via an explicit ``Host`` header and the ``sni_hostname`` extension (SNI +
-    certificate-hostname identity) — see :func:`_fetch_with_ssrf_guard`.
-
-    When there is more than one candidate, each attempt's CONNECT phase is
-    bounded to ``timeout.connect`` divided by the candidate count (#587 P2)
-    — read/write/pool stay at the full configured value. Without this, one
-    black-holed FIRST address could consume the entire per-request connect
-    budget, leaving no time for the fallback loop to even attempt a second
-    address before the caller's outer end-to-end deadline
-    (``asyncio.timeout`` in :func:`_fetch_page_text`) also expires — the
-    per-address bound is what actually gives the fallback a chance to run.
+    The client's :class:`_SSRFProtectedAsyncHTTPTransport` performs address
+    validation and IP pinning at TCP connect time, including bounded fallback
+    across every public A/AAAA result. This layer therefore keeps the original
+    URL untouched: HTTPX owns natural cookie, ``Host``, pooling, and TLS
+    identity semantics.
 
     Args:
         client: The internally-constructed ``httpx.AsyncClient``.
         current_url: This hop's (hostname-based) URL.
-        candidate_addresses: Every address :func:`_assert_public_destination`
-            validated for ``current_url``'s host, tried in order.
         headers: Request headers (the identifying User-Agent).
-        timeout: The per-request ``httpx.Timeout`` (its ``connect`` value is
-            subdivided across candidates; ``read``/``write``/``pool`` are
-            reused as-is).
+        timeout: The per-request ``httpx.Timeout``. Its connect component is
+            divided across candidate addresses by the socket backend.
         config: Response-size-cap settings.
 
     Returns:
@@ -2065,81 +2320,52 @@ async def _fetch_one_hop(
             f"not a well-formed http(s) URL: "
             f"{redact_url_for_error(current_url)!r} (invalid URL syntax)"
         ) from exc
-    pinned_headers = {**headers, "Host": original_url.netloc.decode("ascii")}
-    per_address_timeout = timeout
-    if len(candidate_addresses) > 1 and timeout.connect is not None:
-        per_address_timeout = httpx.Timeout(
-            connect=timeout.connect / len(candidate_addresses),
-            read=timeout.read,
-            write=timeout.write,
-            pool=timeout.pool,
-        )
-    last_connect_error: httpx.ConnectError | httpx.ConnectTimeout | None = None
-    for candidate_address in candidate_addresses:
-        pinned_url = original_url.copy_with(host=str(candidate_address))
-        try:
-            async with client.stream(
-                "GET",
-                pinned_url,
-                headers=pinned_headers,
-                timeout=per_address_timeout,
-                extensions={"sni_hostname": original_url.host},
-            ) as response:
-                if 300 <= response.status_code < 400:
-                    location = response.headers.get("location")
-                    if not location:
-                        raise BeanFetchError(
-                            f"vendor page redirected (HTTP {response.status_code}) with no "
-                            f"Location header for {redact_url_for_error(current_url)!r}"
-                        )
-                    try:
-                        # A malformed Location (e.g. an unclosed IPv6
-                        # bracket, "http://[::1") makes urljoin() raise
-                        # ValueError, which would otherwise escape as an
-                        # unhandled 500 (#587 P2).
-                        next_url = urljoin(current_url, location)
-                    except ValueError as exc:
-                        raise BeanFetchError(
-                            f"vendor page redirected to a malformed Location "
-                            f"{redact_url_for_error(location)!r} for "
-                            f"{redact_url_for_error(current_url)!r} "
-                            "(invalid redirect URL syntax)"
-                        ) from exc
-                    return next_url, True
-                if response.status_code >= 400:
+    try:
+        async with client.stream(
+            "GET",
+            original_url,
+            headers=headers,
+            timeout=timeout,
+        ) as response:
+            if 300 <= response.status_code < 400:
+                location = response.headers.get("location")
+                if not location:
                     raise BeanFetchError(
-                        f"vendor page fetch failed: HTTP {response.status_code} for "
-                        f"{redact_url_for_error(current_url)!r}"
+                        f"vendor page redirected (HTTP {response.status_code}) with no "
+                        f"Location header for {redact_url_for_error(current_url)!r}"
                     )
-                # aiter_raw(), never aiter_bytes() (#587 P1 round 2):
-                # aiter_bytes() runs httpx's OWN internal decompression per
-                # network chunk with no output-size bound at all, so a
-                # single (still small, still within our raw cap) chunk
-                # could already have been decompressed into something huge
-                # INSIDE httpx before _append_within_cap ever saw it.
-                # aiter_raw() yields the STILL-COMPRESSED bytes as received
-                # off the wire; we cap those, then decompress ourselves
-                # with an explicit output bound (_decompress_within_cap).
-                raw_body = bytearray()
-                async for chunk in response.aiter_raw():
-                    _append_within_cap(
-                        raw_body, chunk, max_bytes=config.max_response_bytes, url=current_url
-                    )
-                decoded = _decompress_within_cap(
-                    bytes(raw_body),
-                    response.headers.get("content-encoding", ""),
-                    max_bytes=config.max_response_bytes,
-                    url=current_url,
+                try:
+                    next_url = urljoin(current_url, location)
+                except ValueError as exc:
+                    raise BeanFetchError(
+                        f"vendor page redirected to a malformed Location "
+                        f"{redact_url_for_error(location)!r} for "
+                        f"{redact_url_for_error(current_url)!r} "
+                        "(invalid redirect URL syntax)"
+                    ) from exc
+                return next_url, True
+            if response.status_code >= 400:
+                raise BeanFetchError(
+                    f"vendor page fetch failed: HTTP {response.status_code} for "
+                    f"{redact_url_for_error(current_url)!r}"
                 )
-                return _decode_response_body(decoded, response), False
-        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-            last_connect_error = exc
-            continue
-    raise BeanFetchError(
-        f"could not connect to any resolved address for "
-        f"{redact_url_for_error(current_url)!r}: "
-        f"{type(last_connect_error).__name__}"
-    ) from last_connect_error
+            raw_body = bytearray()
+            async for chunk in response.aiter_raw():
+                _append_within_cap(
+                    raw_body, chunk, max_bytes=config.max_response_bytes, url=current_url
+                )
+            decoded = _decompress_within_cap(
+                bytes(raw_body),
+                response.headers.get("content-encoding", ""),
+                max_bytes=config.max_response_bytes,
+                url=current_url,
+            )
+            return _decode_response_body(decoded, response), False
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        raise BeanFetchError(
+            f"could not connect to any resolved address for "
+            f"{redact_url_for_error(current_url)!r}: {type(exc).__name__}"
+        ) from exc
 
 
 async def _fetch_with_ssrf_guard(
@@ -2150,35 +2376,21 @@ async def _fetch_with_ssrf_guard(
     timeout: httpx.Timeout,
     config: BeanSourcingConfig,
 ) -> tuple[str, str]:
-    """Fetch ``url`` on the internally-constructed client, following
-    redirects MANUALLY (#587 fix 1) with every hop's connection PINNED to
-    one of its validated addresses (#587 fix 1b, closes the DNS-rebinding
-    TOCTOU gap; #587 P2, tries every validated address before giving up).
+    """Fetch ``url`` while manually validating and following each redirect.
 
-    Per hop: :func:`_assert_public_destination` validates the CURRENT
-    (hostname-based) URL and returns every address to try;
-    :func:`_fetch_one_hop` issues the request against those addresses in
-    turn, literally (``httpx.URL.copy_with(host=...)``), so
-    ``httpx``/``httpcore`` never re-resolves the hostname themselves —
-    there is no second DNS lookup a rebinding attack could win. Routing and
-    TLS identity stay pinned to the ORIGINAL hostname: an explicit ``Host``
-    header (mirroring what ``httpx`` would have sent had it connected to
-    the hostname directly) preserves virtual-host routing, and the
-    ``sni_hostname`` request extension keeps the TLS ClientHello's SNI —
-    and therefore certificate hostname verification — targeting the real
-    host, not the IP. The next hop's ``Location`` is resolved against the
-    ORIGINAL (hostname) URL, never the IP-pinned one, so a relative
-    redirect stays correct.
+    Per hop, :func:`_assert_public_destination` performs the fail-fast URL
+    and address-policy check. The client's socket-level transport repeats
+    resolution at the actual connection boundary, validates every result,
+    and dials a validated IP directly. A rebind between these two lookups is
+    therefore rejected rather than connected. The HTTP request retains its
+    hostname URL throughout, including when resolving relative redirects.
 
     Only used for the client this module constructs itself (never an
     injected ``http_client`` — see :func:`_fetch_page_text`); that client is
-    built with ``follow_redirects=False`` (so ``httpx`` never follows a
-    redirect for us before we get a chance to validate/pin its destination)
-    and ``limits=httpx.Limits(max_keepalive_connections=0)`` (so a
-    host-changing redirect that happens to pin to the SAME address as a
-    prior hop can never reuse that hop's pooled connection — and therefore
-    its already-negotiated TLS identity — for the NEW host; ``sni_hostname``
-    only takes effect when a connection is opened, not when one is reused).
+    built with ``follow_redirects=False`` so HTTPX never follows a redirect
+    before this module validates its destination. Normal hostname-keyed
+    keepalive pooling is safe: a different hostname is a different origin,
+    while reusing an already-established public connection cannot rebind.
 
     Args:
         client: The internally-constructed ``httpx.AsyncClient``.
@@ -2201,11 +2413,10 @@ async def _fetch_with_ssrf_guard(
     """
     current_url = url
     for _ in range(_MAX_REDIRECTS + 1):
-        candidate_addresses = await _assert_public_destination(current_url)
+        await _assert_public_destination(current_url)
         result, is_redirect = await _fetch_one_hop(
             client,
             current_url,
-            candidate_addresses,
             headers=headers,
             timeout=timeout,
             config=config,
@@ -2687,22 +2898,11 @@ async def _fetch_and_extract(
         if http_client is not None
         else httpx.AsyncClient(
             follow_redirects=False,
-            # No keepalive pooling (#587 P2): with connect-time IP pinning,
-            # two DIFFERENT hostnames that happen to resolve to the SAME
-            # address would otherwise share one pooled connection/origin —
-            # and ``sni_hostname`` only applies when a connection is
-            # OPENED, not when a pooled one is reused, so a host-changing
-            # redirect could silently skip re-validating the new host's TLS
-            # identity. Forcing a fresh connection per request closes that.
-            limits=httpx.Limits(max_keepalive_connections=0),
-            # No env proxies (#587 P2, round 5): httpx defaults to
-            # trust_env=True, so an operator/system HTTPS_PROXY would route
-            # this fetch through a CONNECT-tunnelling proxy that TLS-
-            # verifies against the PINNED IP LITERAL, not the original
-            # hostname the sni_hostname extension names — silently
-            # bypassing the whole connect-time-pinning defense above. The
-            # injected client (test seam / future caller) is untouched;
-            # its proxy behavior is the caller's to set.
+            # The custom transport keeps the hostname request intact while
+            # validating and pinning only the TCP dial (#591). An explicit
+            # transport also prevents env-proxy mounting; keep trust_env=False
+            # for the SSL-context/environment side of HTTPX configuration.
+            transport=_SSRFProtectedAsyncHTTPTransport(),
             trust_env=False,
         )
     )
