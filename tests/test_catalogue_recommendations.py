@@ -653,13 +653,117 @@ def test_provider_text_redacts_url_forms_without_touching_product_words() -> Non
     assert redact("Fair &amp; Trade Caf&eacute; washed") == "Fair &amp; Trade Caf&eacute; washed"
     assert redact("products%2Fkenya%3Ftoken%3DSECRET washed") == "[link] washed"
     assert redact("products%252Fkenya%253Ftoken%253DSECRET washed") == "[link] washed"
+    assert redact("web+shop:products/kenya-washed natural") == "[link] natural"
+    assert redact("web%2Bshop%3Aproducts%2Fkenya-washed natural") == "[link] natural"
+    assert redact("Origin:web+shop:secret Kenya") == "Origin:[link] Kenya"
+    assert redact("Country%3Aweb%2Bshop%3Asecret Kenya") == "[link] Kenya"
+    assert redact("Country:vault:APIKEY Washed") == "Country:[link] Washed"
+    assert redact("custom:products/kenya-washed natural") == "[link] natural"
+    assert redact("vault:APIKEY Washed") == "[link] Washed"
+    assert redact("custom:secret natural") == "[link] natural"
+    assert redact("custom%3Asecret natural") == "[link] natural"
+    assert redact("custom%253Asecret natural") == "[link] natural"
+    assert redact("Origin:products/private Kenya") == "[link] Kenya"
+    assert redact("Origin:(products/private) Kenya") == "Origin:([link]) Kenya"
+    assert redact("Origin:[products/private] Kenya") == "Origin:[[link]] Kenya"
+    assert redact("Origin%253Aproducts%252Fprivate Kenya") == "[link] Kenya"
+    assert redact("Origin:(vault:APIKEY) Kenya") == "Origin:([link]) Kenya"
+    assert redact("Origin%3A%28vault%3AAPIKEY%29 Kenya") == "[link] Kenya"
+    assert redact("URL=custom:secret natural") == "URL=[link] natural"
+    assert redact("vault:)APIKEY natural") == "[link] natural"
+    assert redact("vault:'APIKEY natural") == "[link] natural"
+    assert redact("vault%3A%29APIKEY natural") == "[link] natural"
+    assert redact("vault:)APIKEY,www.vendor.example/x natural") == "[link] natural"
+    assert redact("vault%3A%29APIKEY%2Cwww.vendor.example%2Fx natural") == "[link] natural"
+    assert redact("www.vendor.example/x,vault:)APIKEY natural") == "[link] natural"
+    assert redact("https://vendor.example/x,vault:)APIKEY natural") == "[link] natural"
+    assert redact("https%3A%2F%2Fvendor.example%2Fx%2Cvault%3A%29APIKEY natural") == (
+        "[link] natural"
+    )
+    for separator in ("&", "+", ":", "~"):
+        assert redact(f"https://vendor.example/x{separator}vault:)APIKEY natural") == (
+            "[link] natural"
+        )
+    assert redact("https%3A%2F%2Fvendor.example%2Fx%26vault%3A%29APIKEY natural") == (
+        "[link] natural"
+    )
+    assert redact("https://vendor.example:8443,vault:)APIKEY natural") == "[link] natural"
+    assert redact("https://[2001:db8::1]:8443,vault:)APIKEY natural") == "[link] natural"
+    assert redact("https://vendor.example/products/code:ABC>Kenya washed") == (
+        "[link]>Kenya washed"
+    )
+    assert redact("https://vendor.example/products/123code:ABC>Kenya washed") == (
+        "[link]>Kenya washed"
+    )
+    assert redact("https://vendor.example/x/vault:]APIKEY natural") == "[link] natural"
+    assert redact("vault:A)APIKEY natural") == "[link] natural"
+    assert redact("(vault:APIKEY)Kenya washed") == "([link] washed"
+    assert redact('"vault:APIKEY"Kenya washed') == '"[link] washed'
+    assert redact("'vault:APIKEY'Kenya washed") == "'[link] washed"
+    assert redact('"Ethiopia:" Guji') == '"Ethiopia:" Guji'
+    assert redact('"Ethiopia:", Guji') == '"Ethiopia:", Guji'
+    assert redact('"Ethiopia:"Guji') == '"[link]'
+    assert redact('"products/private:" Kenya') == '"[link]:" Kenya'
+    assert redact('"products/private?token=SECRET:"') == '"[link]:"'
+    assert redact("(Ethiopia:) Guji") == "(Ethiopia:) Guji"
+    assert redact("(Ethiopia:)Guji") == "([link]"
+    assert redact("(vault:)Kenya washed") == "([link] washed"
+    assert redact("(vault:)_APIKEY washed") == "([link] washed"
+    assert redact("(vault:)-APIKEY washed") == "([link] washed"
+    assert redact("X=(vault:)Kenya washed") == "X=([link] washed"
+    assert redact("Origin:(vault:)Kenya washed") == "Origin:([link] washed"
+    assert redact("(products/private:) Kenya") == "([link]:) Kenya"
+    assert redact("[products/private:] Kenya") == "[[link]:] Kenya"
+    assert redact("{products/private:} Kenya") == "{[link]:} Kenya"
+    assert redact("((products/private:)) Kenya") == "(([link]:)) Kenya"
+    assert redact("[[products/private:]] Kenya") == "[[[link]:]] Kenya"
+    assert redact("{{products/private:}} Kenya") == "{{[link]:}} Kenya"
+    assert redact("([products/private:]) Kenya") == "([[link]:]) Kenya"
+    assert redact('"[products/private?token=SECRET:]" Kenya') == '"[[link]:]" Kenya'
+    assert redact('"(products/private:)" Kenya') == '"([link]:)" Kenya'
+    assert redact('"[products/SECRET?v=x:)]" Kenya') == '"[[link] Kenya'
+    assert redact('"(products/SECRET?v=x:])" Kenya') == '"([link] Kenya'
+    assert redact("Kenya,vault:APIKEY washed") == "Kenya,[link] washed"
+    assert redact("products/private?token=SECRET,vault:APIKEY") == "[link]"
+    assert redact("products/private?token=SECRET,web+shop:products/kenya") == "[link]"
+    assert redact("products/private,custom://host/private") == "[link]"
+    assert redact("products/private,https://host.example/private") == "[link]"
+    assert redact("Kenya>products/a?token=SECRET,vault:KEY washed") == ("Kenya>[link] washed")
+    assert redact("SL28/SL34>products/a?token=SECRET+vault:KEY washed") == (
+        "SL28/SL34>[link] washed"
+    )
+    assert redact("Kenya>products/a?token=SECRET washed") == "Kenya>[link] washed"
+    assert redact("x?token=SECRET,products/private") == "[link]"
+    assert redact("misc/path?token=SECRET,products/private") == "[link]"
+    assert redact("x#token=SECRET,products/private") == "[link]"
+    assert redact("@products/SECRET Kenya") == "@[link] Kenya"
+    assert redact("Kenya%3Eproducts%2Fprivate washed") == "[link] washed"
+    assert redact("Kenya%253Eproducts%252Fprivate washed") == "[link] washed"
+    assert redact("SL28%3ESL34%3Eproducts%2Fprivate washed") == "[link] washed"
+    assert redact("SL28/SL34[?token=SECRET]products/a?x=y!") == ("SL28/SL34[[link]][link]")
+    assert redact("Origin:(products/private)vault:APIKEY") == "Origin:([link])[link]"
+    assert redact("Origin:(products/private),vault:APIKEY") == "Origin:([link]),[link]"
+    assert redact("Farm:Gachatha,Producer:Kamau natural") == (
+        "Farm:Gachatha,Producer:Kamau natural"
+    )
+    assert redact("Country:Kenya) natural") == "Country:Kenya) natural"
     assert redact("1 /2 lb and 1/2 kg") == "1 /2 lb and 1/2 kg"
     assert redact("SL28/SL34 and Caturra/Castillo") == "SL28/SL34 and Caturra/Castillo"
     assert redact("washed/natural 12oz/340g AA/AB") == "washed/natural 12oz/340g AA/AB"
     assert redact("faq/shipping washed") == "faq/shipping washed"
     assert redact("Country: Kenya Process: washed") == "Country: Kenya Process: washed"
+    assert redact("Ethiopia: Guji Price: $12 Grade: AA") == ("Ethiopia: Guji Price: $12 Grade: AA")
     assert redact("Country:Kenya Process:Washed SKU:ABC123") == (
         "Country:Kenya Process:Washed SKU:ABC123"
+    )
+    assert redact("Region:Nyeri Producer:Kamau Farm:Gachatha") == (
+        "Region:Nyeri Producer:Kamau Farm:Gachatha"
+    )
+    assert redact("Region%3ANyeri Producer%3AKamau Farm%3AGachatha") == (
+        "Region%3ANyeri Producer%3AKamau Farm%3AGachatha"
+    )
+    assert redact("Variety:SL28/SL34 Processing:washed/natural") == (
+        "Variety:SL28/SL34 Processing:washed/natural"
     )
     assert redact("Country=Kenya;Process=Washed") == "Country=Kenya;Process=Washed"
     assert redact("Country=Kenya&Process=Washed") == "Country=Kenya&Process=Washed"
@@ -677,9 +781,10 @@ def test_json_ld_flattener_handles_graph_item_list_nested_item_and_noise() -> No
                 "@graph": [{"@type": ["Thing", "https://schema.org/Product"], "name": "A"}],
                 "itemListElement": [{"item": {"@type": "Product", "name": "B"}}],
             },
+            {"itemListElement": {"item": {"@type": "Product", "name": "C"}}},
         ]
     )
-    assert [block["name"] for block in blocks] == ["A", "B"]
+    assert [block["name"] for block in blocks] == ["A", "B", "C"]
     evidence = catalogue._json_ld_product_evidence(  # pyright: ignore[reportPrivateUsage]
         {"origin": {"name": 7}, "description": "Washed lot"}, "A"
     )
@@ -1568,7 +1673,8 @@ async def test_extraction_cannot_ground_metadata_in_redacted_url_tokens() -> Non
                 "Mystery Lot https://vendor.example/kenya/washed?token=secret "
                 "https%3A%2F%2Fvendor.example%2Fproducts%2Fa%3Fencoded_token%3Dsecret "
                 "https%253A%252F%252Fvendor.example%252Fa%253Fnested_token%253Dsecret "
-                "products%252Fkenya%253Frelative_token%253Dsecret"
+                "products%252Fkenya%253Frelative_token%253Dsecret "
+                "web+shop:products/kenya-washed"
             ),
             source_order=0,
         )
@@ -1583,6 +1689,7 @@ async def test_extraction_cannot_ground_metadata_in_redacted_url_tokens() -> Non
         assert "relative_token" not in rendered
         assert "https%3a" not in rendered.casefold()
         assert "https%253a" not in rendered.casefold()
+        assert "web+shop" not in rendered.casefold()
         return ModelResponse(
             parts=[
                 ToolCallPart(

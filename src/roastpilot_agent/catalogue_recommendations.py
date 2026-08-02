@@ -88,6 +88,41 @@ _URL_START = re.compile(
 _REFERENCE_TERMINATORS: Final = frozenset(")]}>\"'\u201d\u2019")
 _REFERENCE_LEADING_PUNCTUATION: Final = frozenset("([{<,:;\u201c\u2018")
 _REFERENCE_CONTINUATION_PREFIXES: Final = frozenset("&?#/;")
+_BODYLESS_LABEL_TRAILING_PUNCTUATION: Final = frozenset(",;.!?")
+_OPAQUE_URI = re.compile(r"(?P<scheme>[a-z][a-z0-9+.-]*):(?P<body>\S+)", re.IGNORECASE)
+_URI_SCHEME_PREFIX = re.compile(r"(?P<scheme>[a-z][a-z0-9+.-]*):", re.IGNORECASE)
+_URI_SEGMENT_PREFIX = re.compile(r"[a-z0-9+.-]+", re.IGNORECASE)
+_REFERENCE_WRAPPERS: Final = {
+    "(": ")",
+    "[": "]",
+    "{": "}",
+    "<": ">",
+    '"': '"',
+    "'": "'",
+    "\u201c": "\u201d",
+    "\u2018": "\u2019",
+}
+_CATALOGUE_METADATA_LABELS: Final = frozenset(
+    {
+        "altitude",
+        "country",
+        "cultivar",
+        "elevation",
+        "farm",
+        "flavor",
+        "flavour",
+        "lot",
+        "notes",
+        "origin",
+        "process",
+        "processing",
+        "producer",
+        "region",
+        "roast",
+        "sku",
+        "variety",
+    }
+)
 _KNOWN_RELATIVE_PATH_PREFIXES: Final = frozenset(
     {
         "bean",
@@ -390,6 +425,8 @@ def _json_ld_product_blocks(value: object) -> list[dict[str, object]]:
         items = block.get("itemListElement")
         if isinstance(items, list):
             pending.extend(cast(list[object], items)[:_MAX_DISCOVERED])
+        elif isinstance(items, dict):
+            pending.append(cast(dict[str, object], items))
         nested = block.get("item")
         if nested is not None:
             pending.append(nested)
@@ -914,6 +951,154 @@ def _is_relative_reference_token(token: str) -> bool:
     )
 
 
+def _relative_reference_start(token: str) -> int | None:
+    """Return the first boundary-aligned relative locator offset."""
+    candidates: list[int] = []
+    for marker in ("?", "#"):
+        marker_position = token.find(marker)
+        while marker_position >= 0:
+            if _has_parameter_assignment(token[marker_position:]):
+                start = marker_position
+                while start > 0:
+                    previous = token[start - 1]
+                    if not (previous.isalnum() or previous in "_@./%-"):
+                        break
+                    start -= 1
+                candidates.append(start)
+                break
+            marker_position = token.find(marker, marker_position + 1)
+    for position in range(len(token)):
+        character = token[position]
+        if not character.isalnum():
+            continue
+        if position > 0 and (token[position - 1].isalnum() or token[position - 1] in "_./"):
+            continue
+        first_segment, separator, _rest = token[position:].casefold().partition("/")
+        if bool(separator) and first_segment in _KNOWN_RELATIVE_PATH_PREFIXES:
+            candidates.append(position)
+    return min(candidates) if candidates else None
+
+
+def _opaque_uri_locator_start(token: str) -> int | None:
+    """Return the first locator-like opaque scheme offset, if present."""
+    remaining = token
+    offset = 0
+    while match := _OPAQUE_URI.search(remaining):
+        scheme = match.group("scheme").casefold()
+        body = match.group("body")
+        # A plain ``Label:Value`` token is indistinguishable from the simplest
+        # opaque URI and is common coffee metadata. Preserve only known
+        # catalogue labels; every other syntactic scheme is a locator. Continue
+        # into the strictly shorter body so wrapper punctuation and chained
+        # metadata labels cannot hide a nested locator.
+        scheme_start = offset + match.start("scheme")
+        if scheme not in _CATALOGUE_METADATA_LABELS or _is_relative_reference_token(body):
+            return scheme_start
+        offset += match.start("body")
+        remaining = body
+    return None
+
+
+def _standard_url_reference_ranges(token: str) -> tuple[tuple[int, int], ...]:
+    """Return precise legacy reference spans for standard URL starts."""
+    return tuple(
+        (match.start(), _reference_end(token, match.start()))
+        for match in _URL_START.finditer(token)
+    )
+
+
+def _independent_opaque_uri_start(token: str) -> int | None:
+    """Return an opaque scheme outside standard URL structural spans."""
+    standard_starts = frozenset(match.start() for match in _URL_START.finditer(token))
+    reference_ranges = _standard_url_reference_ranges(token)
+    for match in _URI_SCHEME_PREFIX.finditer(token):
+        start = match.start("scheme")
+        closes_bodyless_wrapper = (
+            match.end() < len(token)
+            and start > 0
+            and _REFERENCE_WRAPPERS.get(token[start - 1]) == token[match.end()]
+            and match.end() + 1 == len(token)
+        )
+        if start in standard_starts or match.end() >= len(token) or closes_bodyless_wrapper:
+            continue
+        containing_range = next(
+            (
+                (reference_start, reference_end)
+                for reference_start, reference_end in reference_ranges
+                if reference_start < start < reference_end
+            ),
+            None,
+        )
+        if containing_range is not None:
+            reference_start, reference_end = containing_range
+            ipv6_open = token.rfind("[", reference_start, start)
+            ipv6_close = token.find("]", start, reference_end)
+            if ipv6_open >= reference_start and ipv6_close >= 0:
+                continue
+            segment_start = token.rfind("/", reference_start, start) + 1
+            segment_prefix = token[segment_start:start]
+            follows_path_separator = token[start - 1] == "/" or (
+                bool(segment_prefix) and _URI_SEGMENT_PREFIX.fullmatch(segment_prefix) is not None
+            )
+            body_starts_with_uri_terminator = (
+                match.end() < len(token) and token[match.end()] in _REFERENCE_TERMINATORS
+            )
+            if follows_path_separator and not body_starts_with_uri_terminator:
+                continue
+        scheme = match.group("scheme").casefold()
+        if scheme not in _CATALOGUE_METADATA_LABELS:
+            return start
+        body_start = match.end()
+        has_wrapped_body = body_start < len(token) and token[body_start] in _REFERENCE_WRAPPERS
+        while body_start < len(token) and token[body_start] in _REFERENCE_WRAPPERS:
+            body_start += 1
+        body_end = _reference_end(token, body_start)
+        if has_wrapped_body and _is_relative_reference_token(token[body_start:body_end]):
+            return body_start
+        nested_start = _opaque_uri_locator_start(token[start:])
+        if nested_start is not None:
+            return start + nested_start
+    return None
+
+
+def _independent_opaque_uri_span(token: str) -> tuple[int, int] | None:
+    """Return the precise opaque locator span in one decoded token."""
+    start = _independent_opaque_uri_start(token)
+    if start is None:
+        return None
+    scheme = _URI_SCHEME_PREFIX.match(token, start)
+    if scheme is not None:
+        terminator = next(
+            (
+                position
+                for position in range(scheme.end(), len(token))
+                if token[position] in _REFERENCE_TERMINATORS
+            ),
+            None,
+        )
+        if terminator is not None:
+            opener = token[start - 1] if start > 0 else None
+            if (
+                opener is not None
+                and _REFERENCE_WRAPPERS.get(opener) == token[terminator]
+                and terminator + 1 == len(token)
+            ):
+                return start, terminator
+            return start, len(token)
+    return start, _reference_end(token, start)
+
+
+def _decode_reference_token(token: str) -> str:
+    """Decode bounded URL and HTML-reference layers for classification."""
+    decoded = token
+    for _ in range(len(token) // 2 + 1):
+        next_token = unescape_html(unquote(decoded))
+        if next_token == decoded:
+            break
+        decoded = next_token
+    return decoded
+
+
 def _token_reference_spans(text: str) -> list[tuple[int, int]]:
     """Find ambiguous relative references by bounded, linear token inspection.
 
@@ -925,36 +1110,100 @@ def _token_reference_spans(text: str) -> list[tuple[int, int]]:
     classifying it as a link would erase legitimate variety/process evidence.
     """
     spans: list[tuple[int, int]] = []
-    cursor = 0
+    cursor: int = 0
     while cursor < len(text):
-        while cursor < len(text) and (
-            text[cursor].isspace() or text[cursor] in _REFERENCE_TERMINATORS
-        ):
+        while cursor < len(text) and text[cursor].isspace():
             cursor += 1
-        token_start = cursor
-        candidate_start = token_start
+        token_start: int = cursor
+        quoted_token_end = token_start
+        while quoted_token_end < len(text) and not text[quoted_token_end].isspace():
+            quoted_token_end += 1
+        wrapped_content_start = token_start
+        wrapped_closers: list[str] = []
         while (
-            candidate_start < len(text) and text[candidate_start] in _REFERENCE_LEADING_PUNCTUATION
+            wrapped_content_start < quoted_token_end
+            and text[wrapped_content_start] in _REFERENCE_WRAPPERS
+        ):
+            opener = text[wrapped_content_start]
+            closer = _REFERENCE_WRAPPERS[opener]
+            wrapped_closers.append(closer)
+            wrapped_content_start += 1
+            next_is_nested_opener = (
+                wrapped_content_start < quoted_token_end
+                and text[wrapped_content_start] in _REFERENCE_WRAPPERS
+                and text[wrapped_content_start] != opener
+            )
+            if opener == closer and (len(wrapped_closers) > 1 or not next_is_nested_opener):
+                break
+        wrapped_scheme = (
+            _URI_SCHEME_PREFIX.search(text, wrapped_content_start, quoted_token_end)
+            if wrapped_closers
+            else None
+        )
+        expected_closers = "".join(reversed(wrapped_closers))
+        wrapped_close_end = (
+            wrapped_scheme.end() + len(expected_closers) if wrapped_scheme is not None else 0
+        )
+        closes_wrapped_colon = (
+            wrapped_scheme is not None
+            and wrapped_close_end <= quoted_token_end
+            and text[wrapped_scheme.end() : wrapped_close_end] == expected_closers
+        )
+        if closes_wrapped_colon:
+            assert wrapped_scheme is not None
+            wrapped_label_body = text[wrapped_content_start : wrapped_scheme.end() - 1]
+            starts_with_wrapped_label = wrapped_scheme.start() == wrapped_content_start
+            is_wrapped_relative_reference = _is_relative_reference_token(wrapped_label_body)
+            attached_suffix = text[wrapped_close_end:quoted_token_end]
+            has_attached_body = any(
+                character not in _BODYLESS_LABEL_TRAILING_PUNCTUATION
+                for character in attached_suffix
+            )
+            if is_wrapped_relative_reference:
+                spans.append((wrapped_content_start, wrapped_scheme.end() - 1))
+            if (
+                starts_with_wrapped_label or is_wrapped_relative_reference
+            ) and not has_attached_body:
+                cursor = wrapped_close_end
+                continue
+        candidate_start: int = token_start
+        while (
+            candidate_start < len(text)
+            and text[candidate_start] in _REFERENCE_LEADING_PUNCTUATION | _REFERENCE_TERMINATORS
         ):
             candidate_start += 1
+        opaque_end: int = token_start
+        while opaque_end < len(text) and not text[opaque_end].isspace():
+            opaque_end += 1
+        opaque_token = text[token_start:opaque_end]
+        decoded_opaque_token = _decode_reference_token(opaque_token)
+        opaque_span = _independent_opaque_uri_span(decoded_opaque_token)
+        if opaque_span is not None:
+            if decoded_opaque_token != opaque_token:
+                spans.append((token_start, opaque_end))
+                cursor = max(opaque_end, cursor + 1)
+                continue
+            opaque_start, opaque_reference_end = opaque_span
+            absolute_opaque_start = token_start + opaque_start
+            prefix_end = absolute_opaque_start
+            prefix = text[candidate_start:prefix_end]
+            relative_prefix_start = _relative_reference_start(prefix)
+            if relative_prefix_start is not None:
+                # A later opaque locator must not make an earlier relative
+                # locator in the same whitespace-delimited token invisible.
+                spans.append((candidate_start + relative_prefix_start, prefix_end))
+            spans.append((token_start + opaque_start, token_start + opaque_reference_end))
+            cursor = max(token_start + opaque_reference_end, cursor + 1)
+            continue
         token_end = _reference_end(text, candidate_start)
         cursor = max(token_end, cursor + 1)
         if candidate_start >= token_end:
             continue
         token = text[candidate_start:token_end]
-        decoded_token = token
-        # Decode both URL and HTML character-reference layers for
-        # classification while preserving the original offsets for redaction.
-        # The input-derived cap keeps malformed or alternating encodings
-        # bounded; candidate evidence is capped at 1,200 characters.
-        for _ in range(len(token) // 2 + 1):
-            next_token = unescape_html(unquote(decoded_token))
-            if next_token == decoded_token:
-                break
-            decoded_token = next_token
+        decoded_token = _decode_reference_token(token)
         if decoded_token != token and (
             _URL_START.search(decoded_token) is not None
-            or _is_relative_reference_token(decoded_token)
+            or _relative_reference_start(decoded_token) is not None
         ):
             # Redact the original encoded token as one span. Decoding only
             # for classification preserves source offsets while covering
@@ -964,10 +1213,28 @@ def _token_reference_spans(text: str) -> list[tuple[int, int]]:
         # An unambiguous absolute/domain/root/dot-relative match gets a more
         # precise span from ``_URL_START`` below; do not widen it to swallow a
         # legitimate product word glued immediately before the URL.
-        if _URL_START.search(token) is not None:
+        standard_url_match = _URL_START.search(token)
+        if standard_url_match is not None:
+            gap_start = 0
+            for reference_start, reference_end in _standard_url_reference_ranges(token):
+                relative_gap_start = _relative_reference_start(token[gap_start:reference_start])
+                if relative_gap_start is not None:
+                    spans.append(
+                        (
+                            candidate_start + gap_start + relative_gap_start,
+                            candidate_start + reference_start,
+                        )
+                    )
+                gap_start = max(gap_start, reference_end)
+            relative_gap_start = _relative_reference_start(token[gap_start:])
+            if relative_gap_start is not None:
+                spans.append(
+                    (candidate_start + gap_start + relative_gap_start, candidate_start + len(token))
+                )
             continue
-        if _is_relative_reference_token(token):
-            spans.append((candidate_start, token_end))
+        relative_start = _relative_reference_start(token)
+        if relative_start is not None:
+            spans.append((candidate_start + relative_start, token_end))
     return spans
 
 
