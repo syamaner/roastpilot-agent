@@ -1432,6 +1432,12 @@ class TelemetryPoint(BaseModel):
     fan_level_percent: int | None = None
     cooling_on: bool | None = None
     development_percent: float | None = None
+    post_fc_recovery_enabled: bool | None = None
+    """Resolved D96 flag for this persisted row; ``None`` for pre-v16 data."""
+    post_fc_heat_authority_state: PostFcHeatAuthorityState | None = None
+    post_fc_ror_setpoint_c_per_min: float | None = None
+    post_fc_smoothed_ror_c_per_min: float | None = None
+    post_fc_effective_heat_ceiling_percent: int | None = None
 
 
 class TelemetrySeries(BaseModel):
@@ -1961,6 +1967,14 @@ class TelemetryEventData(BaseModel):
     (consistent with the advisor's DTR, #219) — NOT the run/serve clock.
     ``None`` before first crack (or before charge). A live readout DISTINCT from
     ``development_elapsed_seconds``: one is a duration, the other a ratio."""
+    post_fc_recovery_enabled: bool = False
+    """Resolved D96 flag for this run, separate from the authority state so an
+    operator can distinguish feature OFF from ARMED-but-HOLDING."""
+    post_fc_heat_authority_state: PostFcHeatAuthorityState | None = None
+    """Controller-owned D96 authority state for the current DEVELOPMENT dwell."""
+    post_fc_ror_setpoint_c_per_min: float | None = None
+    post_fc_smoothed_ror_c_per_min: float | None = None
+    post_fc_effective_heat_ceiling_percent: int | None = None
     t0_detected: bool = False
     first_crack_detected: bool = False
     mic_status: MicStatus | None = None

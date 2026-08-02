@@ -15,6 +15,7 @@ import { AppFrame, ConnectionIndicator, LiveCurve, VerdictBadge } from "@/compon
 import type { ConnectionStatus } from "@/hooks/useRoastStream";
 import type { SafetyVerdict } from "@/lib/types";
 import type { CurveMarker, CurvePoint } from "@/components/shared/LiveCurve";
+import { PostFcRecoveryStatus } from "@/pages/dashboard/PostFcRecoveryStatus";
 
 // Deterministic synthetic curve — a short roast arc. Fixed numbers so snapshots
 // and chart-data assertions are reproducible.
@@ -91,6 +92,18 @@ export function ChartHarnessPage(): React.JSX.Element {
             highlightTime={highlight}
           />
         </div>
+
+        <PostFcRecoveryStatus
+          phase="development"
+          trace={{
+            recoveryEnabled: true,
+            heatAuthorityState: "recovering",
+            rorSetpointCPerMin: 6.4,
+            smoothedRorCPerMin: 4.8,
+            effectiveHeatCeilingPercent: 75,
+            atChargeElapsedSeconds: 510,
+          }}
+        />
       </div>
     </AppFrame>
   );

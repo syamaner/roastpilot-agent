@@ -19,7 +19,7 @@ import aiosqlite
 from pydantic import BaseModel, ConfigDict
 
 from roastpilot_agent.advisor import AdvisorContext, RoastDecision
-from roastpilot_agent.config import AppConfig
+from roastpilot_agent.config import AppConfig, ControllerConfig, SafetyLimits
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
     BeanProfile,
@@ -29,6 +29,7 @@ from roastpilot_agent.models import (
     CommandTraceSource,
     CommandTraceStatus,
     LogManifest,
+    PostFcHeatAuthorityState,
     ProcessingMethod,
     ReferenceCurveSample,
     ReferenceLandmarks,
@@ -520,6 +521,21 @@ ALTER TABLE bean_sourcing_attempts ADD COLUMN catalogue_extracted_count INTEGER
           catalogue_extracted_count <= catalogue_discovered_count));
 """
 
+SCHEMA_V16_D96_VALIDATION_TRACE = """
+-- #699 / D96: retain the controller-owned recovery-authority diagnostics used
+-- to validate the dormant post-FC recovery law during supervised roasts.
+ALTER TABLE telemetry_snapshots ADD COLUMN post_fc_recovery_enabled INTEGER
+  CHECK (post_fc_recovery_enabled IS NULL OR post_fc_recovery_enabled IN (0, 1));
+ALTER TABLE telemetry_snapshots ADD COLUMN post_fc_heat_authority_state TEXT
+  CHECK (post_fc_heat_authority_state IS NULL OR
+         post_fc_heat_authority_state IN ('holding', 'recovering', 'gliding'));
+ALTER TABLE telemetry_snapshots ADD COLUMN post_fc_ror_setpoint_c_per_min REAL;
+ALTER TABLE telemetry_snapshots ADD COLUMN post_fc_smoothed_ror_c_per_min REAL;
+ALTER TABLE telemetry_snapshots ADD COLUMN post_fc_effective_heat_ceiling_percent INTEGER
+  CHECK (post_fc_effective_heat_ceiling_percent IS NULL OR
+         post_fc_effective_heat_ceiling_percent BETWEEN 0 AND 100);
+"""
+
 _BEAN_SOURCING_LEASE_DURATION = timedelta(minutes=2)
 _BEAN_SOURCING_LEASE_CONFIRMATION = timedelta(seconds=60)
 
@@ -542,6 +558,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V13_EXCLUDED,
     SCHEMA_V14_BEAN_SOURCING_ATTEMPTS,
     SCHEMA_V15_CATALOGUE_ATTEMPT_COUNTS,
+    SCHEMA_V16_D96_VALIDATION_TRACE,
 )
 
 
@@ -590,6 +607,15 @@ class RunActivelyDrivenError(Exception):
     driven: verify the hardware / use emergency stop, do not clear)."""
 
 
+class FrozenRunConfig(BaseModel):
+    """Controller and safety configuration frozen when a roast starts."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    controller: ControllerConfig
+    safety: SafetyLimits
+
+
 class PersistedRun(BaseModel):
     """The recovery read (E6-S3): what restart classification needs —
     feeds controller.recover_from_restart and run resumption context.
@@ -603,6 +629,10 @@ class PersistedRun(BaseModel):
     started_at_utc: str
     completed_at_utc: str | None
     profile: RoastProfile
+    #: The run-generation controller and safety configuration. Recovery must
+    #: restore this pair rather than applying process-current next-roast edits
+    #: to a roast that is already in progress.
+    frozen_config: FrozenRunConfig | None = None
     #: Absolute UTC instant of the debounced charge/T0 transition (#235), or
     #: ``None`` when the run never charged or predates the v3 column. Recovery
     #: restores the advisory DTR clock from it; nothing safety-gating reads it.
@@ -631,6 +661,9 @@ class RoastStore:
         self._db_path = db_path
         self._connection: aiosqlite.Connection | None = None
         self._last_telemetry_elapsed: dict[str, float] = {}
+        self._last_telemetry_d96_state: dict[
+            str, tuple[bool | None, PostFcHeatAuthorityState | None, bool]
+        ] = {}
         self._bean_profile_write_lock = asyncio.Lock()
 
     @property
@@ -959,24 +992,51 @@ class RoastStore:
         fan_level_percent: int | None = None,
         development_percent: float | None = None,
         charge_elapsed_seconds: float | None = None,
+        post_fc_recovery_enabled: bool | None = None,
+        post_fc_heat_authority_state: PostFcHeatAuthorityState | None = None,
+        post_fc_ror_setpoint_c_per_min: float | None = None,
+        post_fc_smoothed_ror_c_per_min: float | None = None,
+        post_fc_effective_heat_ceiling_percent: int | None = None,
         raw_state_json: str | None = None,
     ) -> bool:
-        """Persist a telemetry row, throttled to ``interval_seconds``.
+        """Persist a periodic telemetry row or a D96 authority transition.
 
         The controller persists every tick; rows are only inserted every
-        ``telemetry_log_interval_seconds`` (plan §5, default 5 s). Returns
-        whether a row was written. The first row of a run always writes.
+        ``telemetry_log_interval_seconds`` (plan §5, default 5 s), except that
+        a change in the resolved D96 flag or authority state always writes so a
+        short recovery/glide cycle cannot disappear between periodic samples.
+        Returns whether a row was written. The first row of a run always writes.
         """
         last = self._last_telemetry_elapsed.get(run_id)
-        if last is not None and (elapsed_seconds - last) < interval_seconds:
+        # DEVELOPMENT owns live D96 authority. Persist entry/exit of that
+        # ownership domain even when a same-tick historical witness repeats the
+        # prior authority value; otherwise the periodic throttle can move the
+        # phase boundary a tick late and overstate validation durations.
+        d96_state = (
+            post_fc_recovery_enabled,
+            post_fc_heat_authority_state,
+            agent_phase is RoastPhase.DEVELOPMENT,
+        )
+        d96_state_changed = (
+            run_id in self._last_telemetry_d96_state
+            and self._last_telemetry_d96_state[run_id] != d96_state
+        )
+        if (
+            last is not None
+            and (elapsed_seconds - last) < interval_seconds
+            and not d96_state_changed
+        ):
             return False
         await self.connection.execute(
             "INSERT INTO telemetry_snapshots"
             " (run_id, tick, recorded_at_utc, elapsed_seconds, agent_phase, mcp_phase,"
             "  bean_temp_c, env_temp_c, bean_ror_c_per_min, env_ror_c_per_min,"
             "  heat_level_percent, fan_level_percent, cooling_on, development_percent,"
-            "  charge_elapsed_seconds, raw_state_json)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  charge_elapsed_seconds, post_fc_recovery_enabled,"
+            "  post_fc_heat_authority_state, post_fc_ror_setpoint_c_per_min,"
+            "  post_fc_smoothed_ror_c_per_min,"
+            "  post_fc_effective_heat_ceiling_percent, raw_state_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 tick,
@@ -993,11 +1053,21 @@ class RoastStore:
                 None if telemetry is None else int(telemetry.cooling_on),
                 development_percent,
                 charge_elapsed_seconds,
+                None if post_fc_recovery_enabled is None else int(post_fc_recovery_enabled),
+                (
+                    None
+                    if post_fc_heat_authority_state is None
+                    else post_fc_heat_authority_state.value
+                ),
+                post_fc_ror_setpoint_c_per_min,
+                post_fc_smoothed_ror_c_per_min,
+                post_fc_effective_heat_ceiling_percent,
                 raw_state_json,
             ),
         )
         await self.connection.commit()
         self._last_telemetry_elapsed[run_id] = elapsed_seconds
+        self._last_telemetry_d96_state[run_id] = d96_state
         return True
 
     async def record_safety_evaluation(
@@ -1146,7 +1216,8 @@ class RoastStore:
         fresh database."""
         async with self.connection.execute(
             "SELECT id, agent_phase, outcome, started_at_utc, completed_at_utc,"
-            " t0_detected_at_utc, ambient_captured, profile_json FROM roast_runs"
+            " t0_detected_at_utc, ambient_captured, profile_json, config_json"
+            " FROM roast_runs"
             " ORDER BY started_at_utc DESC, rowid DESC LIMIT 1"
         ) as cursor:
             row = await cursor.fetchone()
@@ -1167,6 +1238,7 @@ class RoastStore:
             # NULL`` — a captured-but-null reading must still latch.
             ambient_captured=bool(row["ambient_captured"]),
             profile=RoastProfile.model_validate_json(str(row["profile_json"])),
+            frozen_config=FrozenRunConfig.model_validate_json(str(row["config_json"])),
         )
 
     async def complete_run(
@@ -1884,18 +1956,22 @@ class RoastStore:
     async def read_telemetry_points(
         self, run_id: str, *, downsample: int = 1
     ) -> list[TelemetryPoint]:
-        """Tick-ordered telemetry snapshots, sampled every ``downsample`` rows.
+        """Insertion-ordered telemetry snapshots, sampled every ``downsample`` rows.
 
         ``downsample`` must be >= 1; ``1`` returns every snapshot. The stride
         is index-based and keeps the first row, so the series start is stable
-        regardless of stride."""
+        regardless of stride. The durable insertion id owns chronology because
+        the process-local tick counter restarts at zero after agent recovery."""
         if downsample < 1:
             raise ValueError("downsample must be >= 1")
         async with self.connection.execute(
             "SELECT tick, elapsed_seconds, agent_phase, bean_temp_c, env_temp_c,"
             " bean_ror_c_per_min, env_ror_c_per_min, heat_level_percent,"
             " fan_level_percent, cooling_on, development_percent, charge_elapsed_seconds"
-            " FROM telemetry_snapshots WHERE run_id = ? ORDER BY tick ASC, id ASC",
+            ", post_fc_recovery_enabled, post_fc_heat_authority_state,"
+            " post_fc_ror_setpoint_c_per_min, post_fc_smoothed_ror_c_per_min,"
+            " post_fc_effective_heat_ceiling_percent"
+            " FROM telemetry_snapshots WHERE run_id = ? ORDER BY id ASC",
             (run_id,),
         ) as cursor:
             rows = list(await cursor.fetchall())
@@ -1928,6 +2004,21 @@ class RoastStore:
                 charge_elapsed_seconds=None
                 if row["charge_elapsed_seconds"] is None
                 else float(row["charge_elapsed_seconds"]),
+                post_fc_recovery_enabled=None
+                if row["post_fc_recovery_enabled"] is None
+                else bool(row["post_fc_recovery_enabled"]),
+                post_fc_heat_authority_state=None
+                if row["post_fc_heat_authority_state"] is None
+                else PostFcHeatAuthorityState(str(row["post_fc_heat_authority_state"])),
+                post_fc_ror_setpoint_c_per_min=None
+                if row["post_fc_ror_setpoint_c_per_min"] is None
+                else float(row["post_fc_ror_setpoint_c_per_min"]),
+                post_fc_smoothed_ror_c_per_min=None
+                if row["post_fc_smoothed_ror_c_per_min"] is None
+                else float(row["post_fc_smoothed_ror_c_per_min"]),
+                post_fc_effective_heat_ceiling_percent=None
+                if row["post_fc_effective_heat_ceiling_percent"] is None
+                else int(row["post_fc_effective_heat_ceiling_percent"]),
             )
             for row in sampled
         ]

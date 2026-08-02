@@ -59,6 +59,16 @@ test("roast-detail — full-page snapshot of the detail page (canvas un-masked)"
   await expect(page.getByTestId("roast-conditions-temp")).toHaveText("29.7 °C");
   await expect(page.getByTestId("roast-conditions-humidity")).toHaveText("41 %");
   await expect(page.getByTestId("roast-conditions-pressure")).toHaveText("1008 hPa");
+  // #699: the deterministic fixture carries one complete D96 cycle. Guard every
+  // retained metric structurally as well as in the full-page baseline.
+  const recovery = page.getByTestId("post-fc-recovery-summary");
+  await expect(recovery).toContainText("Recovery armed");
+  await expect(recovery).toContainText("Cycles1");
+  await expect(recovery).toContainText("First recovery06:00");
+  await expect(recovery).toContainText("Max ceiling75 %");
+  await expect(recovery).toContainText("Recovering00:30");
+  await expect(recovery).toContainText("Exit glide00:30");
+  await expect(recovery).toContainText("Glide retriggers0");
   // #566: baseline regenerated — "Your rating" now renders the read-only
   // headline (stars + saved note, with an "Edit" affordance) instead of the
   // old always-editable star-picker form.

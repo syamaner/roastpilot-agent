@@ -231,6 +231,11 @@ describe("telemetry — every field the SPA renders is present", () => {
       "ambient_temp_c",
       "ambient_humidity_pct",
       "ambient_pressure_hpa",
+      "post_fc_recovery_enabled",
+      "post_fc_heat_authority_state",
+      "post_fc_ror_setpoint_c_per_min",
+      "post_fc_smoothed_ror_c_per_min",
+      "post_fc_effective_heat_ceiling_percent",
     ]);
     expect(typeof t.bean_temp_c).toBe("number");
     expect(PHASES).toContain(t.agent_phase);
@@ -536,6 +541,11 @@ describe("REST snapshot contract", () => {
       "fan_level_percent",
       "cooling_on",
       "development_percent",
+      "post_fc_recovery_enabled",
+      "post_fc_heat_authority_state",
+      "post_fc_ror_setpoint_c_per_min",
+      "post_fc_smoothed_ror_c_per_min",
+      "post_fc_effective_heat_ceiling_percent",
     ]);
     // Every point in the real series carries the key (pre-charge points hold null —
     // a real contract state the SPA drops from the curve — but the KEY is present).

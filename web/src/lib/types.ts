@@ -23,6 +23,9 @@ export type RoastPhase =
   | "faulted"
   | "operator_recovery_required";
 
+/** Controller-owned D96 post-first-crack heat-authority state. */
+export type PostFcHeatAuthorityState = "holding" | "recovering" | "gliding";
+
 /** Phases where the chart's preheat charge band is shown (preheating only). */
 export const CHARGE_BAND_PHASE: RoastPhase = "preheating";
 
@@ -126,6 +129,14 @@ export interface TelemetryEventData {
   // each other. The SPA renders these directly (no client-side derivation).
   development_elapsed_seconds: number | null;
   development_percent: number | null;
+  // D96 validation trace (#699). The resolved flag is separate from the state:
+  // a disabled loop can still compute HOLDING, so state alone cannot say whether
+  // recovery authority was armed. Optional keeps older recorded fixtures readable.
+  post_fc_recovery_enabled?: boolean;
+  post_fc_heat_authority_state?: PostFcHeatAuthorityState | null;
+  post_fc_ror_setpoint_c_per_min?: number | null;
+  post_fc_smoothed_ror_c_per_min?: number | null;
+  post_fc_effective_heat_ceiling_percent?: number | null;
   t0_detected: boolean;
   first_crack_detected: boolean;
   // Capture-alive mic / first-crack health (#197); nullable — null = no active
@@ -641,6 +652,12 @@ export interface TelemetryPoint {
   fan_level_percent: number | null;
   cooling_on: boolean | null;
   development_percent: number | null;
+  // Null/absent on telemetry persisted before schema v16.
+  post_fc_recovery_enabled?: boolean | null;
+  post_fc_heat_authority_state?: PostFcHeatAuthorityState | null;
+  post_fc_ror_setpoint_c_per_min?: number | null;
+  post_fc_smoothed_ror_c_per_min?: number | null;
+  post_fc_effective_heat_ceiling_percent?: number | null;
 }
 
 export interface TelemetrySeries {

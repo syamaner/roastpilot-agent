@@ -98,6 +98,12 @@ test("dashboard-live — preheating with the charge band, full-page snapshot (ca
   await expect(page.getByTestId("control-heat-readout-note")).toBeVisible();
   await expect(page.getByTestId("control-fan-readout-note")).toBeVisible();
 
+  // #699 structural guard: the D96 authority strip is unconditional, including
+  // pre-FC states where recovery is disabled. Keep this assertion alongside the
+  // pixel snapshot so a stale/regenerated baseline cannot normalize its removal.
+  await expect(page.getByTestId("post-fc-recovery-status")).toBeVisible();
+  await expect(page.getByTestId("post-fc-recovery-status")).toContainText("Recovery off");
+
   // #464 structural guard: the live "Room" ambient readout renders, hard-failing
   // on a missing/renamed element regardless of pixel tolerance. session-2's
   // recorded export predates #342 (no ambient probe captured), so `replay.py`'s

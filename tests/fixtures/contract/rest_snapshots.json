@@ -139,6 +139,11 @@
         "env_temp_c": 35.0,
         "fan_level_percent": 10,
         "heat_level_percent": 100,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 1
       },
       {
@@ -153,6 +158,11 @@
         "env_temp_c": 70.0,
         "fan_level_percent": 30,
         "heat_level_percent": 100,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 2
       },
       {
@@ -167,6 +177,11 @@
         "env_temp_c": 120.0,
         "fan_level_percent": 30,
         "heat_level_percent": 100,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 3
       },
       {
@@ -181,6 +196,11 @@
         "env_temp_c": 160.0,
         "fan_level_percent": 30,
         "heat_level_percent": 100,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 4
       },
       {
@@ -195,6 +215,11 @@
         "env_temp_c": 185.0,
         "fan_level_percent": 30,
         "heat_level_percent": 100,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 5
       },
       {
@@ -209,6 +234,11 @@
         "env_temp_c": 195.0,
         "fan_level_percent": 30,
         "heat_level_percent": 100,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 6
       },
       {
@@ -223,6 +253,11 @@
         "env_temp_c": 200.0,
         "fan_level_percent": 30,
         "heat_level_percent": 100,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 7
       },
       {
@@ -237,6 +272,11 @@
         "env_temp_c": 210.0,
         "fan_level_percent": 30,
         "heat_level_percent": 100,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 8
       },
       {
@@ -251,6 +291,11 @@
         "env_temp_c": 218.0,
         "fan_level_percent": 30,
         "heat_level_percent": 100,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 9
       },
       {
@@ -265,6 +310,11 @@
         "env_temp_c": 225.0,
         "fan_level_percent": 30,
         "heat_level_percent": 100,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 10
       },
       {
@@ -279,6 +329,11 @@
         "env_temp_c": 230.0,
         "fan_level_percent": 30,
         "heat_level_percent": 100,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 11
       },
       {
@@ -293,6 +348,11 @@
         "env_temp_c": 232.0,
         "fan_level_percent": 30,
         "heat_level_percent": 100,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 12
       },
       {
@@ -307,6 +367,11 @@
         "env_temp_c": 234.0,
         "fan_level_percent": 30,
         "heat_level_percent": 100,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 13
       },
       {
@@ -321,6 +386,11 @@
         "env_temp_c": 235.0,
         "fan_level_percent": 100,
         "heat_level_percent": 0,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 14
       },
       {
@@ -335,6 +405,11 @@
         "env_temp_c": 150.0,
         "fan_level_percent": 100,
         "heat_level_percent": 0,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 15
       },
       {
@@ -349,6 +424,11 @@
         "env_temp_c": 110.0,
         "fan_level_percent": 100,
         "heat_level_percent": 0,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 16
       },
       {
@@ -363,6 +443,11 @@
         "env_temp_c": 80.0,
         "fan_level_percent": 100,
         "heat_level_percent": 0,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 17
       },
       {
@@ -377,6 +462,11 @@
         "env_temp_c": 60.0,
         "fan_level_percent": 100,
         "heat_level_percent": 0,
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "tick": 18
       }
     ],

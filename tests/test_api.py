@@ -49,7 +49,14 @@ from roastpilot_agent.bean_sourcing import (
     BeanSourcingDiagnostics,
 )
 from roastpilot_agent.catalogue_recommendations import CATALOGUE_EXTRACTION_PROMPT_VERSION
-from roastpilot_agent.config import AppConfig, ControllerConfig, MCPDeviceConfig, ReferenceCurve
+from roastpilot_agent.config import (
+    AppConfig,
+    ControllerConfig,
+    MCPDeviceConfig,
+    PostFirstCrackControl,
+    ReferenceCurve,
+    SafetyLimits,
+)
 from roastpilot_agent.mcp_client import (
     AmbientStatus,
     FirstCrackStatus,
@@ -66,6 +73,7 @@ from roastpilot_agent.models import (
     MicHealth,
     OperatorAction,
     OperatorActionRequest,
+    PostFcHeatAuthorityState,
     ReferenceRoast,
     RoastCommand,
     RoastDetail,
@@ -2691,12 +2699,22 @@ def test_event_broadcaster_emits_typed_telemetry() -> None:
             env_temp_c=210.0,
             heat_percent=60,
             fan_percent=40,
+            post_fc_recovery_enabled=True,
+            post_fc_heat_authority_state=PostFcHeatAuthorityState.RECOVERING,
+            post_fc_ror_setpoint_c_per_min=6.4,
+            post_fc_smoothed_ror_c_per_min=4.8,
+            post_fc_effective_heat_ceiling_percent=75,
         )
     )
     event = queue.get_nowait()
     assert event.event is SseEventType.TELEMETRY
     assert event.data["agent_phase"] == "development"
     assert event.data["bean_temp_c"] == 200.0
+    assert event.data["post_fc_recovery_enabled"] is True
+    assert event.data["post_fc_heat_authority_state"] == "recovering"
+    assert event.data["post_fc_ror_setpoint_c_per_min"] == pytest.approx(6.4)
+    assert event.data["post_fc_smoothed_ror_c_per_min"] == pytest.approx(4.8)
+    assert event.data["post_fc_effective_heat_ceiling_percent"] == 75
 
 
 def test_event_broadcaster_wraps_non_dict_payload() -> None:
@@ -3469,6 +3487,66 @@ async def test_recover_on_start_active_roast_still_recovers_to_recovery_required
     assert OperatorAction.EMERGENCY_STOP in enabled_operator_actions(
         RoastPhase.OPERATOR_RECOVERY_REQUIRED
     )
+
+
+@pytest.mark.asyncio
+async def test_recover_on_start_restores_frozen_controller_and_safety_generation(
+    store: RoastStore,
+) -> None:
+    """A restart keeps the active roast's frozen config, not next-roast edits."""
+    frozen = AppConfig(
+        controller=ControllerConfig(
+            telemetry_log_interval_seconds=7.0,
+            post_first_crack_control=PostFirstCrackControl(recovery_enabled=False),
+        ),
+        safety=SafetyLimits(max_bean_temp_c=225.0),
+    )
+    await store.create_run(
+        run_id="run-frozen-generation",
+        profile=_profile(),
+        config=frozen,
+        agent_phase=RoastPhase.DEVELOPMENT,
+    )
+    process_current = AppConfig(
+        controller=ControllerConfig(
+            telemetry_log_interval_seconds=1.0,
+            post_first_crack_control=PostFirstCrackControl(recovery_enabled=True),
+        ),
+        safety=SafetyLimits(max_bean_temp_c=229.0),
+    )
+    mcp = FakeMCPClient()
+    service = RoastService(
+        store,
+        config=process_current,
+        roaster=mcp,
+        advisor=FakeAdvisor(),
+        run_loop=False,
+        clock=FakeClock(),
+    )
+
+    await service.recover_on_start()
+
+    assert service.runner is not None
+    snapshot = service.runner.controller_snapshot()
+    assert snapshot.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert snapshot.post_fc_recovery_enabled is False
+    assert service.runner._config.controller == frozen.controller  # pyright: ignore[reportPrivateUsage]
+    assert service.runner._config.safety == frozen.safety  # pyright: ignore[reportPrivateUsage]
+    assert service._safety.limits == frozen.safety  # pyright: ignore[reportPrivateUsage]
+    assert mcp.commands() == []
+
+    # Once that run is terminal, a fresh start returns to process-current
+    # apply-next-roast config even in an explicitly configured test service.
+    await store.complete_run(
+        run_id="run-frozen-generation",
+        outcome="aborted",
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await service.start_roast(_profile())
+    assert service.runner is not None
+    assert service.runner._config.controller == process_current.controller  # pyright: ignore[reportPrivateUsage]
+    assert service.runner._config.safety == process_current.safety  # pyright: ignore[reportPrivateUsage]
+    assert service._safety.limits == process_current.safety  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -7495,19 +7573,21 @@ async def test_resume_reretrieves_reference_when_flag_on(store: RoastStore) -> N
     await store.create_run(
         run_id="run-resume-ref-on",
         profile=profile,
-        config=AppConfig(),
+        config=AppConfig(
+            controller=ControllerConfig(
+                telemetry_log_interval_seconds=1.0,
+                reference_curve=ReferenceCurve(enabled=True),
+            )
+        ),
         agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
     )
 
     clock = FakeClock()
     mcp = FakeMCPClient()
     advisor = FakeAdvisor([], default_decision=_live_decision())
-    config = AppConfig(
-        controller=ControllerConfig(
-            telemetry_log_interval_seconds=1.0,
-            reference_curve=ReferenceCurve(enabled=True),
-        )
-    )
+    # Process-current config is the opposite: next-roast OFF must not alter the
+    # already-active run's frozen ON generation during restart recovery.
+    config = AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=9.0))
     service = RoastService(
         store, config=config, roaster=mcp, advisor=advisor, run_loop=False, clock=clock
     )
@@ -7553,14 +7633,21 @@ async def test_resume_does_not_retrieve_reference_when_flag_off(store: RoastStor
     await store.create_run(
         run_id="run-resume-ref-off",
         profile=profile,
-        config=AppConfig(),
+        config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
         agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
     )
 
     clock = FakeClock()
     mcp = FakeMCPClient()
     advisor = FakeAdvisor([], default_decision=_live_decision())
-    config = AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0))
+    # Process-current config is the opposite: next-roast ON must not alter the
+    # already-active run's frozen OFF generation during restart recovery.
+    config = AppConfig(
+        controller=ControllerConfig(
+            telemetry_log_interval_seconds=9.0,
+            reference_curve=ReferenceCurve(enabled=True),
+        )
+    )
     service = RoastService(
         store, config=config, roaster=mcp, advisor=advisor, run_loop=False, clock=clock
     )

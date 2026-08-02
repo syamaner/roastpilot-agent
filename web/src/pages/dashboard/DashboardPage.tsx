@@ -37,6 +37,7 @@ import { ControlRow } from "./ControlRow";
 import { FaultBanner } from "./FaultBanner";
 import { resolveMicStatus } from "./micStatus";
 import { OperatorActionBar, type OperatorActionResultView } from "./OperatorActionBar";
+import { PostFcRecoveryStatus } from "./PostFcRecoveryStatus";
 import { RecoveryModal } from "./RecoveryModal";
 import { RoastHeader } from "./RoastHeader";
 import { firstCrackFromTimeline } from "./events";
@@ -452,6 +453,8 @@ export function DashboardPage(): React.JSX.Element {
           targetHeatPercent={targetHeat}
           targetFanPercent={targetFan}
         />
+
+        <PostFcRecoveryStatus phase={phase} trace={view.postFcControl} />
 
         <AdvisoryPanel
           latest={view.latestAdvisory}

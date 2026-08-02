@@ -1,19 +1,21 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "@/lib/api";
-import type { RoastDetail } from "@/lib/types";
+import type { RoastDetail, TelemetrySeries } from "@/lib/types";
+import { roastKeys } from "@/hooks/queries";
 import { FIXTURE_DETAIL, FIXTURE_TELEMETRY, FIXTURE_TIMELINE } from "./fixture";
 import { DetailPage } from "./DetailPage";
 import { __resetPartialFailureLocksForTests } from "./useSaveRating";
 
-function renderAt(path: string) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderAt(path: string, client?: QueryClient) {
+  const queryClient =
+    client ?? new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const Wrapper = ({ children }: { children: ReactNode }) => (
-    <QueryClientProvider client={client}>
+    <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[path]}>
         <Routes>
           <Route path="/roasts/:runId" element={children} />
@@ -35,13 +37,14 @@ afterEach(() => {
 describe("DetailPage shell", () => {
   it("fetches by the route run id and renders the detail view", async () => {
     const detailSpy = vi.spyOn(api, "roast").mockResolvedValue(FIXTURE_DETAIL);
-    vi.spyOn(api, "telemetry").mockResolvedValue(FIXTURE_TELEMETRY);
+    const telemetrySpy = vi.spyOn(api, "telemetry").mockResolvedValue(FIXTURE_TELEMETRY);
     vi.spyOn(api, "timeline").mockResolvedValue(FIXTURE_TIMELINE);
 
     renderAt(`/roasts/${FIXTURE_DETAIL.id}`);
 
     await waitFor(() => expect(screen.getByTestId("detail-view")).toBeInTheDocument());
     expect(detailSpy).toHaveBeenCalledWith(FIXTURE_DETAIL.id);
+    expect(telemetrySpy).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("decision-trace-table")).toBeInTheDocument();
   });
 
@@ -57,6 +60,333 @@ describe("DetailPage shell", () => {
   it("shows a no-run message when there is no run id", () => {
     renderAt("/roasts");
     expect(screen.getByTestId("detail-no-run")).toBeInTheDocument();
+  });
+
+  it("refreshes cached live telemetry once the detail poll observes completion", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const liveDetail = { ...FIXTURE_DETAIL, completed_at_utc: null };
+    const finalTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      points: FIXTURE_TELEMETRY.points.map((point, index) =>
+        index >= 11 && index <= 12
+          ? {
+              ...point,
+              post_fc_recovery_enabled: true,
+              post_fc_heat_authority_state: "recovering",
+            }
+          : index === 13
+            ? {
+                ...point,
+                post_fc_recovery_enabled: true,
+                post_fc_heat_authority_state: "holding",
+              }
+            : point,
+      ),
+    };
+    const partialTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      point_count: 10,
+      points: FIXTURE_TELEMETRY.points.slice(0, 10),
+    };
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { refetchOnWindowFocus: false, retry: false, staleTime: 30_000 },
+      },
+    });
+    client.setQueryData(roastKeys.detail(FIXTURE_DETAIL.id), liveDetail);
+    client.setQueryData(roastKeys.telemetry(FIXTURE_DETAIL.id, 1), partialTelemetry);
+    const detailSpy = vi.spyOn(api, "roast").mockResolvedValue(FIXTURE_DETAIL);
+    const telemetrySpy = vi.spyOn(api, "telemetry").mockResolvedValue(finalTelemetry);
+    vi.spyOn(api, "timeline").mockResolvedValue(FIXTURE_TIMELINE);
+
+    renderAt(`/roasts/${FIXTURE_DETAIL.id}`, client);
+    expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
+      "No observed recovery",
+    );
+    expect(telemetrySpy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    await vi.waitFor(() => expect(detailSpy).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(telemetrySpy).toHaveBeenCalledWith(FIXTURE_DETAIL.id, 1));
+    await vi.waitFor(() =>
+      expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent("Recovery armed"),
+    );
+    expect(telemetrySpy).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent("Recovering01:00");
+  });
+
+  it("confirms a cold terminal read once when its concurrent telemetry is partial", async () => {
+    const partialTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      point_count: 13,
+      points: FIXTURE_TELEMETRY.points.slice(0, 13),
+    };
+    let resolveInitialTelemetry: ((series: TelemetrySeries) => void) | undefined;
+    const initialTelemetry = new Promise<TelemetrySeries>((resolve) => {
+      resolveInitialTelemetry = resolve;
+    });
+    vi.spyOn(api, "roast").mockResolvedValue(FIXTURE_DETAIL);
+    const telemetrySpy = vi
+      .spyOn(api, "telemetry")
+      .mockImplementationOnce(() => initialTelemetry)
+      .mockResolvedValueOnce(FIXTURE_TELEMETRY);
+    vi.spyOn(api, "timeline").mockResolvedValue(FIXTURE_TIMELINE);
+
+    renderAt(`/roasts/${FIXTURE_DETAIL.id}`);
+
+    await waitFor(() => expect(screen.getByTestId("detail-view")).toBeInTheDocument());
+    // The terminal detail response alone must not race a second telemetry GET
+    // against the first request that is still in flight.
+    expect(telemetrySpy).toHaveBeenCalledTimes(1);
+
+    resolveInitialTelemetry?.(partialTelemetry);
+    await waitFor(() => expect(telemetrySpy).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
+        "Recovery armed",
+      ),
+    );
+    expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
+      "Recovering00:30",
+    );
+    expect(telemetrySpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("confirms a cold faulted run until persisted telemetry reaches faulted", async () => {
+    const partialTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      point_count: 13,
+      points: FIXTURE_TELEMETRY.points.slice(0, 13),
+    };
+    const faultedTelemetry: TelemetrySeries = {
+      ...partialTelemetry,
+      point_count: 14,
+      points: [
+        ...partialTelemetry.points,
+        {
+          ...FIXTURE_TELEMETRY.points[13],
+          agent_phase: "faulted",
+          post_fc_heat_authority_state: null,
+        },
+      ],
+    };
+    let resolveInitialTelemetry: ((series: TelemetrySeries) => void) | undefined;
+    const initialTelemetry = new Promise<TelemetrySeries>((resolve) => {
+      resolveInitialTelemetry = resolve;
+    });
+    vi.spyOn(api, "roast").mockResolvedValue({
+      ...FIXTURE_DETAIL,
+      outcome: "faulted",
+    });
+    const telemetrySpy = vi
+      .spyOn(api, "telemetry")
+      .mockImplementationOnce(() => initialTelemetry)
+      .mockResolvedValueOnce(faultedTelemetry);
+    vi.spyOn(api, "timeline").mockResolvedValue(FIXTURE_TIMELINE);
+
+    renderAt(`/roasts/${FIXTURE_DETAIL.id}`);
+    await waitFor(() => expect(screen.getByTestId("detail-view")).toBeInTheDocument());
+    expect(telemetrySpy).toHaveBeenCalledTimes(1);
+
+    resolveInitialTelemetry?.(partialTelemetry);
+    await waitFor(() => expect(telemetrySpy).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(telemetrySpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes telemetry once after an administratively aborted outcome", async () => {
+    const partialTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      point_count: 10,
+      points: FIXTURE_TELEMETRY.points.slice(0, 10),
+    };
+    vi.spyOn(api, "roast").mockResolvedValue({
+      ...FIXTURE_DETAIL,
+      outcome: "aborted",
+    });
+    const telemetrySpy = vi.spyOn(api, "telemetry").mockResolvedValue(partialTelemetry);
+    vi.spyOn(api, "timeline").mockResolvedValue(FIXTURE_TIMELINE);
+
+    renderAt(`/roasts/${FIXTURE_DETAIL.id}`);
+    await waitFor(() => expect(screen.getByTestId("detail-view")).toBeInTheDocument());
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(telemetrySpy).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(telemetrySpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes a fresh cached telemetry series once after an administrative abort", async () => {
+    const partialTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      point_count: 10,
+      points: FIXTURE_TELEMETRY.points.slice(0, 10),
+    };
+    const finalTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      points: FIXTURE_TELEMETRY.points.map((point, index) =>
+        index >= 11 && index <= 12
+          ? {
+              ...point,
+              post_fc_recovery_enabled: true,
+              post_fc_heat_authority_state: "recovering",
+            }
+          : index === 13
+            ? {
+                ...point,
+                post_fc_recovery_enabled: true,
+                post_fc_heat_authority_state: "holding",
+              }
+            : point,
+      ),
+    };
+    const abortedDetail = {
+      ...FIXTURE_DETAIL,
+      outcome: "aborted" as const,
+    };
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { refetchOnWindowFocus: false, retry: false, staleTime: 30_000 },
+      },
+    });
+    client.setQueryData(roastKeys.detail(FIXTURE_DETAIL.id), abortedDetail);
+    client.setQueryData(roastKeys.telemetry(FIXTURE_DETAIL.id, 1), partialTelemetry);
+    vi.spyOn(api, "roast").mockResolvedValue(abortedDetail);
+    const telemetrySpy = vi.spyOn(api, "telemetry").mockResolvedValue(finalTelemetry);
+    vi.spyOn(api, "timeline").mockResolvedValue(FIXTURE_TIMELINE);
+
+    renderAt(`/roasts/${FIXTURE_DETAIL.id}`, client);
+    expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
+      "No observed recovery",
+    );
+
+    await waitFor(() => expect(telemetrySpy).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
+        "Recovery armed",
+      ),
+    );
+    expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
+      "Recovering01:00",
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(telemetrySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries one partial live-boundary refresh and then retains the final trace", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const liveDetail = { ...FIXTURE_DETAIL, completed_at_utc: null };
+    const partialTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      point_count: 13,
+      points: FIXTURE_TELEMETRY.points.slice(0, 13),
+    };
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { refetchOnWindowFocus: false, retry: false, staleTime: 30_000 },
+      },
+    });
+    client.setQueryData(roastKeys.detail(FIXTURE_DETAIL.id), liveDetail);
+    client.setQueryData(roastKeys.telemetry(FIXTURE_DETAIL.id, 1), partialTelemetry);
+    vi.spyOn(api, "roast").mockResolvedValue(FIXTURE_DETAIL);
+    const telemetrySpy = vi
+      .spyOn(api, "telemetry")
+      .mockResolvedValueOnce(partialTelemetry)
+      .mockResolvedValueOnce(FIXTURE_TELEMETRY);
+    vi.spyOn(api, "timeline").mockResolvedValue(FIXTURE_TIMELINE);
+
+    renderAt(`/roasts/${FIXTURE_DETAIL.id}`, client);
+    expect(telemetrySpy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    await vi.waitFor(() => expect(telemetrySpy).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() =>
+      expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
+        "Recovery armed",
+      ),
+    );
+    expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
+      "Recovering00:30",
+    );
+  });
+
+  it("uses its bounded confirmation retry after the first completion refresh errors", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const liveDetail = { ...FIXTURE_DETAIL, completed_at_utc: null };
+    const partialTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      point_count: 13,
+      points: FIXTURE_TELEMETRY.points.slice(0, 13),
+    };
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { refetchOnWindowFocus: false, retry: false, staleTime: 30_000 },
+      },
+    });
+    client.setQueryData(roastKeys.detail(FIXTURE_DETAIL.id), liveDetail);
+    client.setQueryData(roastKeys.telemetry(FIXTURE_DETAIL.id, 1), partialTelemetry);
+    vi.spyOn(api, "roast").mockResolvedValue(FIXTURE_DETAIL);
+    const telemetrySpy = vi
+      .spyOn(api, "telemetry")
+      .mockRejectedValueOnce(new Error("temporary telemetry failure"))
+      .mockResolvedValueOnce(FIXTURE_TELEMETRY);
+    vi.spyOn(api, "timeline").mockResolvedValue(FIXTURE_TIMELINE);
+
+    renderAt(`/roasts/${FIXTURE_DETAIL.id}`, client);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    await vi.waitFor(() => expect(telemetrySpy).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() =>
+      expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
+        "Recovery armed",
+      ),
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(telemetrySpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops after the bounded live-boundary confirmation retry", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const liveDetail = { ...FIXTURE_DETAIL, completed_at_utc: null };
+    const partialTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      point_count: 13,
+      points: FIXTURE_TELEMETRY.points.slice(0, 13),
+    };
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { refetchOnWindowFocus: false, retry: false, staleTime: 30_000 },
+      },
+    });
+    client.setQueryData(roastKeys.detail(FIXTURE_DETAIL.id), liveDetail);
+    client.setQueryData(roastKeys.telemetry(FIXTURE_DETAIL.id, 1), partialTelemetry);
+    vi.spyOn(api, "roast").mockResolvedValue(FIXTURE_DETAIL);
+    const telemetrySpy = vi.spyOn(api, "telemetry").mockResolvedValue(partialTelemetry);
+    vi.spyOn(api, "timeline").mockResolvedValue(FIXTURE_TIMELINE);
+
+    renderAt(`/roasts/${FIXTURE_DETAIL.id}`, client);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    await vi.waitFor(() => expect(telemetrySpy).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(telemetrySpy).toHaveBeenCalledTimes(2);
   });
 
   it("#568 Codex (PRRT_kwDOSzMG_c6Rdlk6 / PRRT_kwDOSzMG_c6RdxDQ): the read-only rating headline reflects a saved edit IMMEDIATELY, never a stale flash while the detail query re-settles", async () => {

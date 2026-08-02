@@ -223,6 +223,11 @@
           "reason": null,
           "total_overflow_count": 0
         },
+        "post_fc_effective_heat_ceiling_percent": null,
+        "post_fc_heat_authority_state": null,
+        "post_fc_recovery_enabled": false,
+        "post_fc_ror_setpoint_c_per_min": null,
+        "post_fc_smoothed_ror_c_per_min": null,
         "t0_detected": false
       },
       "event": "telemetry",

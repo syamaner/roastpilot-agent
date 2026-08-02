@@ -8022,8 +8022,70 @@ async def test_recovery_raises_heat_above_entry_end_to_end() -> None:
         harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=ror)]
         await harness.controller.tick()
 
-    assert harness.controller.snapshot().current_heat > entry_heat
-    assert harness.controller.snapshot().current_heat <= entry_heat + 15
+    snapshot = harness.controller.snapshot()
+    assert snapshot.current_heat > entry_heat
+    assert snapshot.current_heat <= entry_heat + 15
+    assert snapshot.post_fc_recovery_enabled is True
+    assert snapshot.post_fc_heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+    assert snapshot.post_fc_ror_setpoint_c_per_min is not None
+    assert snapshot.post_fc_smoothed_ror_c_per_min is not None
+    assert snapshot.post_fc_effective_heat_ceiling_percent == entry_heat + 15
+
+
+@pytest.mark.asyncio
+async def test_same_tick_advisor_drop_retains_the_accepted_recovery_trace() -> None:
+    """A recovery raise that lands before an advisor drop remains auditable."""
+    advisor = FakeAdvisor(
+        [decision(heat=50, fan=40, drop=False)],
+        default_decision=decision(heat=50, fan=40, drop=True),
+    )
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=220.0,
+        recovery_confirm_ticks=1,
+    )
+    harness = make_harness(
+        config=config,
+        advisor=advisor,
+        limits=_ISOLATED_CEILING_GUARD_LIMITS,
+    )
+    await _charge_through_fc_at_heat(
+        harness,
+        expected_pre_fc_heat=60,
+        fc_bean_temp_c=183.0,
+        fc_ror_c_per_min=7.0,
+    )
+
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+
+    snapshot = harness.controller.snapshot()
+    assert harness.controller.phase is RoastPhase.COOLING
+    assert harness.executor.targets == [(66, 40)]
+    # Live/current authority is phase-gated off after the drop.
+    assert snapshot.post_fc_heat_authority_state is None
+    assert snapshot.post_fc_ror_setpoint_c_per_min is None
+    # The output that genuinely reached hardware remains a tick-scoped
+    # persistence witness even though transition_to(COOLING) cleared current
+    # DEVELOPMENT authority later in the same tick.
+    accepted = snapshot.accepted_post_fc_output
+    assert accepted is not None
+    assert accepted.heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+    assert accepted.heat_percent == 66
+    assert accepted.effective_ceiling_percent == 75
+
+    # The witness belongs only to the tick that accepted the output.  A later
+    # cooling tick must clear it so persistence emits the durable null boundary
+    # instead of extending the final recovery interval indefinitely.
+    harness.clock.advance(1.0)
+    harness.reader.readings = [reading(bean=184.0, bean_ror_c_per_min=1.0)]
+    await harness.controller.tick()
+
+    next_snapshot = harness.controller.snapshot()
+    assert next_snapshot.accepted_post_fc_output is None
+    assert next_snapshot.post_fc_heat_authority_state is None
 
 
 @pytest.mark.asyncio
@@ -8043,7 +8105,11 @@ async def test_recovery_stays_inert_when_flag_off_default() -> None:
         harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=ror)]
         await harness.controller.tick()
 
-    assert harness.controller.snapshot().current_heat <= entry_heat
+    snapshot = harness.controller.snapshot()
+    assert snapshot.current_heat <= entry_heat
+    assert snapshot.post_fc_recovery_enabled is False
+    assert snapshot.post_fc_heat_authority_state is PostFcHeatAuthorityState.HOLDING
+    assert snapshot.post_fc_effective_heat_ceiling_percent == entry_heat
 
 
 @pytest.mark.asyncio
@@ -8962,6 +9028,9 @@ async def test_clamp_write_itself_failing_leaves_recovery_state_untouched() -> N
         and post_tick_state.recovery_ticks_within_exit == 0
     )
     assert not forced_exit_shape
+    # The corrective write did not land, so the elevated output remains the
+    # real tick witness and must not be erased by a forced exit that never ran.
+    assert harness.controller.snapshot().accepted_post_fc_output is not None
 
     # The NEXT tick: set_targets now succeeds normally (no longer armed), so
     # the clamp's write lands and the recovery state machine is forced to
@@ -9178,6 +9247,7 @@ async def test_clamp_clears_stale_advisor_context_on_forced_exit() -> None:
     # (if any) must not disagree with the context the advisor was actually
     # shown; this is the told==enforced proof for this field.
     assert harness.controller._last_post_fc_output is None  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller.snapshot().accepted_post_fc_output is None
 
 
 @pytest.mark.asyncio

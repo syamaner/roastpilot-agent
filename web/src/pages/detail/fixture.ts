@@ -61,6 +61,8 @@ export function fixtureTastings(runId: string): TastingList {
 const TELEMETRY_POINTS: TelemetryPoint[] = Array.from({ length: 16 }, (_, i) => {
   const elapsed = i * 30; // 30 s per sampled tick (downsampled view).
   const phase = i < 11 ? "roasting_pre_first_crack" : i < 15 ? "development" : "cooling";
+  const recoveryState =
+    i === 12 ? "recovering" : i === 13 ? "gliding" : i >= 11 && i < 15 ? "holding" : null;
   return {
     tick: i,
     elapsed_seconds: elapsed,
@@ -77,6 +79,16 @@ const TELEMETRY_POINTS: TelemetryPoint[] = Array.from({ length: 16 }, (_, i) => 
     fan_level_percent: i < 5 ? 40 : i < 10 ? 55 : i < 15 ? 70 : 100,
     cooling_on: i >= 15,
     development_percent: i >= 11 ? (i - 11) * 5 + 4 : null,
+    // #699: the deterministic detail harness carries one complete D96 cycle so
+    // Playwright guards the populated retained-summary layout, not only the
+    // pre-v16/empty state. The feature remains disabled in real replay fixtures.
+    post_fc_recovery_enabled: true,
+    post_fc_heat_authority_state: recoveryState,
+    post_fc_ror_setpoint_c_per_min: recoveryState === null ? null : 6.4,
+    post_fc_smoothed_ror_c_per_min:
+      recoveryState === "recovering" ? 4.8 : recoveryState === null ? null : 6.2,
+    post_fc_effective_heat_ceiling_percent:
+      recoveryState === "recovering" ? 75 : recoveryState === "gliding" ? 70 : recoveryState === "holding" ? 60 : null,
   };
 });
 

@@ -1,4 +1,4 @@
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ConnectionStatus } from "@/hooks/useRoastStream";
@@ -185,6 +185,144 @@ describe("useDashboardEvents (hook)", () => {
     expect(result.current.points[0]).toMatchObject({ t: 0, bean: 100, env: 120, heat: 70, fan: 40 });
   });
 
+  it("restores the latest persisted D96 trace on a cold reload", async () => {
+    const persisted = series([500, 505]);
+    persisted.points[0] = {
+      ...persisted.points[0],
+      charge_elapsed_seconds: 100,
+      post_fc_recovery_enabled: true,
+      post_fc_heat_authority_state: "recovering",
+      post_fc_ror_setpoint_c_per_min: 6.4,
+      post_fc_smoothed_ror_c_per_min: 4.8,
+      post_fc_effective_heat_ceiling_percent: 75,
+    };
+    persisted.points[1] = {
+      ...persisted.points[1],
+      charge_elapsed_seconds: 105,
+      post_fc_recovery_enabled: true,
+      post_fc_heat_authority_state: "gliding",
+      post_fc_ror_setpoint_c_per_min: 6.2,
+      post_fc_smoothed_ror_c_per_min: 6.3,
+      post_fc_effective_heat_ceiling_percent: 70,
+    };
+    const fetchTelemetry = vi.fn(() => Promise.resolve(persisted));
+    const { result } = renderHook(() =>
+      useDashboardEvents([], 0, "run-1", "live", { fetchTelemetry }),
+    );
+
+    await waitFor(() =>
+      expect(result.current.postFcControl).toMatchObject({
+        recoveryEnabled: true,
+        heatAuthorityState: "gliding",
+        effectiveHeatCeilingPercent: 70,
+        atChargeElapsedSeconds: 105,
+      }),
+    );
+  });
+
+  it("retains an armed D96 flag before the first authority output on cold reload", async () => {
+    const persisted = series([500]);
+    persisted.points[0] = {
+      ...persisted.points[0],
+      charge_elapsed_seconds: 100,
+      post_fc_recovery_enabled: true,
+      post_fc_heat_authority_state: null,
+      post_fc_ror_setpoint_c_per_min: null,
+      post_fc_smoothed_ror_c_per_min: null,
+      post_fc_effective_heat_ceiling_percent: null,
+    };
+    const fetchTelemetry = vi.fn(() => Promise.resolve(persisted));
+    const { result } = renderHook(() =>
+      useDashboardEvents([], 0, "run-1", "live", { fetchTelemetry }),
+    );
+
+    await waitFor(() =>
+      expect(result.current.postFcControl).toEqual({
+        recoveryEnabled: true,
+        heatAuthorityState: null,
+        rorSetpointCPerMin: null,
+        smoothedRorCPerMin: null,
+        effectiveHeatCeilingPercent: null,
+        atChargeElapsedSeconds: 100,
+      }),
+    );
+  });
+
+  it("does not let an equal-clock partial backfill restore authority after live cooling", async () => {
+    const persisted = series([500]);
+    persisted.points[0] = {
+      ...persisted.points[0],
+      charge_elapsed_seconds: 100,
+      post_fc_recovery_enabled: true,
+      post_fc_heat_authority_state: "recovering",
+      post_fc_ror_setpoint_c_per_min: 6.4,
+      post_fc_smoothed_ror_c_per_min: 4.8,
+      post_fc_effective_heat_ceiling_percent: 75,
+    };
+    let resolveSeed: ((series: TelemetrySeries) => void) | undefined;
+    const pendingSeed = new Promise<TelemetrySeries>((resolve) => {
+      resolveSeed = resolve;
+    });
+    const fetchTelemetry = vi.fn(() => pendingSeed);
+    const recovering: SseEvent = {
+      event: "telemetry",
+      data: {
+        elapsed_seconds: 500,
+        charge_elapsed_seconds: 100,
+        bean_temp_c: 195,
+        env_temp_c: 210,
+        post_fc_recovery_enabled: true,
+        post_fc_heat_authority_state: "recovering",
+        post_fc_ror_setpoint_c_per_min: 6.4,
+        post_fc_smoothed_ror_c_per_min: 4.8,
+        post_fc_effective_heat_ceiling_percent: 75,
+      },
+      id: 2100,
+    };
+    const cooling: SseEvent = {
+      event: "telemetry",
+      data: {
+        elapsed_seconds: 501,
+        charge_elapsed_seconds: 100,
+        bean_temp_c: 194,
+        env_temp_c: 209,
+        post_fc_recovery_enabled: true,
+        post_fc_heat_authority_state: null,
+        post_fc_ror_setpoint_c_per_min: null,
+        post_fc_smoothed_ror_c_per_min: null,
+        post_fc_effective_heat_ceiling_percent: null,
+      },
+      id: 2101,
+    };
+    const { result, rerender } = renderHook(
+      ({ frames, count }: { frames: readonly SseEvent[]; count: number }) =>
+        useDashboardEvents(frames, count, "run-1", "live", { fetchTelemetry }),
+      { initialProps: { frames: [] as readonly SseEvent[], count: 0 } },
+    );
+
+    rerender({ frames: [recovering, cooling], count: 2 });
+    expect(result.current.postFcControl).toMatchObject({
+      heatAuthorityState: null,
+      rorSetpointCPerMin: null,
+      smoothedRorCPerMin: null,
+      effectiveHeatCeilingPercent: null,
+      atChargeElapsedSeconds: 100,
+    });
+
+    resolveSeed?.(persisted);
+    await waitFor(() => expect(fetchTelemetry).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.postFcControl).toMatchObject({
+      heatAuthorityState: null,
+      rorSetpointCPerMin: null,
+      smoothedRorCPerMin: null,
+      effectiveHeatCeilingPercent: null,
+      atChargeElapsedSeconds: 100,
+    });
+  });
+
   it("backfills a PRE-charge snapshot row AND recovers the T0 origin on cold reload (#326)", async () => {
     // End-to-end through the real hook → pointFromSnapshot → seed path (the seed
     // action takes already-projected points, so this is the only test of the
@@ -219,6 +357,44 @@ describe("useDashboardEvents (hook)", () => {
     expect(result.current.markers.find((m) => m.kind === "t0")).toEqual({ kind: "t0", t: 540, label: "T0" });
   });
 
+  it("recovers the T0 origin from the latest serve-clock epoch after restart", async () => {
+    const fetchTelemetry = vi.fn(() =>
+      Promise.resolve(mixedSeries([
+        [100, 50],
+        [105, 55],
+        [0, 180],
+        [5, 185],
+      ])),
+    );
+    const { result, rerender } = renderHook(
+      ({ frames, count }: { frames: readonly SseEvent[]; count: number }) =>
+        useDashboardEvents(frames, count, "run-1", "live", { fetchTelemetry }),
+      { initialProps: { frames: [] as readonly SseEvent[], count: 0 } },
+    );
+
+    await waitFor(() => expect(result.current.t0ElapsedSeconds).toBe(-180));
+    expect(result.current.points.map((point) => point.t)).toEqual([0, 5]);
+    expect(result.current.markers.find((marker) => marker.kind === "t0")).toEqual({
+      kind: "t0",
+      t: -180,
+      label: "T0",
+    });
+
+    const current: SseEvent = {
+      event: "telemetry",
+      data: {
+        elapsed_seconds: 10,
+        charge_elapsed_seconds: 190,
+        bean_temp_c: 185,
+        env_temp_c: 205,
+      },
+      id: 2000,
+    };
+    rerender({ frames: [current], count: 1 });
+    expect(result.current.t0ElapsedSeconds).toBe(-180);
+    expect(result.current.points.map((point) => point.t)).toEqual([0, 5, 10]);
+  });
+
   it("re-seeds on reconnect WITHOUT duplicating points (reconnect catches up, #135)", async () => {
     const fetchTelemetry = vi.fn(() => Promise.resolve(series([0, 30, 60])));
     const { result, rerender } = renderHook(
@@ -235,6 +411,74 @@ describe("useDashboardEvents (hook)", () => {
     rerender({ status: "live" });
     await waitFor(() => expect(fetchTelemetry).toHaveBeenCalledTimes(2));
     expect(result.current.points.map((p) => p.t)).toEqual([0, 30, 60]); // deduped on t
+  });
+
+  it("rebases an already-mounted curve when reconnect discovers a new clock epoch", async () => {
+    const oldEpoch = mixedSeries([
+      [100, 50],
+      [105, 55],
+    ]);
+    const afterRestart = mixedSeries([
+      [100, 50],
+      [105, 55],
+      [0, 180],
+      [5, 185],
+    ]);
+    const laterBackfill = mixedSeries([
+      [100, 50],
+      [105, 55],
+      [0, 180],
+      [5, 185],
+      [10, 190],
+    ]);
+    const fetchTelemetry = vi
+      .fn<() => Promise<TelemetrySeries>>()
+      .mockResolvedValueOnce(oldEpoch)
+      .mockResolvedValueOnce(afterRestart)
+      .mockResolvedValueOnce(laterBackfill);
+    const { result, rerender } = renderHook(
+      ({ frames, count, status }: {
+        frames: readonly SseEvent[];
+        count: number;
+        status: ConnectionStatus;
+      }) => useDashboardEvents(frames, count, "run-1", status, { fetchTelemetry }),
+      {
+        initialProps: {
+          frames: [] as readonly SseEvent[],
+          count: 0,
+          status: "live" as ConnectionStatus,
+        },
+      },
+    );
+
+    await waitFor(() => expect(result.current.t0ElapsedSeconds).toBe(50));
+    expect(result.current.points.map((point) => point.t)).toEqual([100, 105]);
+
+    rerender({ frames: [], count: 0, status: "reconnecting" });
+    rerender({ frames: [], count: 0, status: "live" });
+    await waitFor(() => expect(result.current.t0ElapsedSeconds).toBe(-180));
+    expect(result.current.points.map((point) => point.t)).toEqual([-130, -125, 0, 5]);
+    expect(result.current.markers.find((marker) => marker.kind === "t0")?.t).toBe(-180);
+
+    const current: SseEvent = {
+      event: "telemetry",
+      data: {
+        elapsed_seconds: 10,
+        charge_elapsed_seconds: 190,
+        bean_temp_c: 185,
+        env_temp_c: 205,
+      },
+      id: 2001,
+    };
+    rerender({ frames: [current], count: 1, status: "live" });
+    expect(result.current.points.map((point) => point.t)).toEqual([-130, -125, 0, 5, 10]);
+
+    // Once this epoch is established, an ordinary later reconnect restores the
+    // live-wins rule: stale persisted t=10 must not replace the fresher SSE row.
+    rerender({ frames: [current], count: 1, status: "reconnecting" });
+    rerender({ frames: [current], count: 1, status: "live" });
+    await waitFor(() => expect(fetchTelemetry).toHaveBeenCalledTimes(3));
+    expect(result.current.points.find((point) => point.t === 10)?.bean).toBe(185);
   });
 
   it("appends live frames after the seed with no duplicate at the seam", async () => {

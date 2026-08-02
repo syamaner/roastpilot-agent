@@ -84,6 +84,18 @@ afterEach(() => {
 });
 
 describe("DetailView composition", () => {
+  it("renders the retained D96 recovery summary", () => {
+    renderView();
+    const summary = screen.getByTestId("post-fc-recovery-summary");
+    expect(summary).toHaveTextContent("Recovery armed");
+    expect(summary).toHaveTextContent("Cycles1");
+    expect(summary).toHaveTextContent("First recovery06:00");
+    expect(summary).toHaveTextContent("Max ceiling75 %");
+    expect(summary).toHaveTextContent("Recovering00:30");
+    expect(summary).toHaveTextContent("Exit glide00:30");
+    expect(summary).toHaveTextContent("Glide retriggers0");
+  });
+
   it("mounts ChargeWeight wired to the detail's frozen charge weight (#520) — the data-flows-to-the-render-tree check", () => {
     renderView();
     const frozen = screen.getByTestId("charge-weight-frozen");

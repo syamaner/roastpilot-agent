@@ -368,7 +368,7 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
     upgraded = RoastStore(db_path=db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 15 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 16 == len(MIGRATIONS)
         row = await fetch_one(upgraded, "SELECT excluded FROM roast_runs WHERE id = 'run-1'")
         assert row == (0,)
         detail = await upgraded.read_run("run-1")
@@ -384,11 +384,11 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
 
 
 @pytest.mark.asyncio
-async def test_fresh_store_is_v15(tmp_store: RoastStore) -> None:
-    """A brand-new store lands on the current (v15) schema version."""
+async def test_fresh_store_is_v16(tmp_store: RoastStore) -> None:
+    """A brand-new store lands on the current (v16) schema version."""
     await tmp_store.initialize()
     try:
-        assert await tmp_store.schema_version() == 15 == len(MIGRATIONS)
+        assert await tmp_store.schema_version() == 16 == len(MIGRATIONS)
     finally:
         await tmp_store.close()
 
@@ -412,7 +412,7 @@ async def test_v14_migration_upgrades_real_v13_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 15
+        assert await upgraded.schema_version() == 16
         assert await upgraded.read_run("run-1") is not None
         assert "bean_sourcing_attempts" in await fetch_names(upgraded, "table")
         assert "idx_bean_sourcing_attempt_expiry" in await fetch_names(upgraded, "index")
@@ -441,7 +441,7 @@ async def test_v15_migration_adds_catalogue_counts_to_real_v14_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 15 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 16 == len(MIGRATIONS)
         row = await fetch_one(
             upgraded,
             "SELECT catalogue_discovered_count, catalogue_extracted_count"
@@ -457,6 +457,54 @@ async def test_v15_migration_adds_catalogue_counts_to_real_v14_database(
                     (discovered_count, extracted_count, attempt_id),
                 )
             await upgraded.connection.rollback()
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_v16_migration_adds_nullable_d96_trace_to_real_v15_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#699: v15 telemetry survives the additive D96 trace migration."""
+    db_path = tmp_path / "v16upgrade.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:15])
+    old = RoastStore(db_path)
+    await old.initialize()
+    try:
+        assert await old.schema_version() == 15
+        await seeded_store(old)
+        # Use the actual v15 column set: the current write method quite
+        # correctly targets v16 and therefore cannot manufacture a pre-v16
+        # row after the migration list has been pinned back.
+        await old.connection.execute(
+            "INSERT INTO telemetry_snapshots"
+            " (run_id, tick, recorded_at_utc, elapsed_seconds, agent_phase,"
+            "  bean_temp_c, env_temp_c) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "run-1",
+                1,
+                datetime.now(UTC).isoformat(),
+                5.0,
+                RoastPhase.DEVELOPMENT.value,
+                184.0,
+                205.0,
+            ),
+        )
+        await old.connection.commit()
+    finally:
+        await old.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(db_path)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == 16 == len(MIGRATIONS)
+        [point] = await upgraded.read_telemetry_points("run-1")
+        assert point.post_fc_recovery_enabled is None
+        assert point.post_fc_heat_authority_state is None
+        assert point.post_fc_ror_setpoint_c_per_min is None
+        assert point.post_fc_smoothed_ror_c_per_min is None
+        assert point.post_fc_effective_heat_ceiling_percent is None
     finally:
         await upgraded.close()
 
@@ -705,6 +753,7 @@ async def test_migration_embedding_transaction_is_rejected(
 from roastpilot_agent.advisor import AdvisorContext, RoastDecision  # noqa: E402
 from roastpilot_agent.config import AppConfig  # noqa: E402
 from roastpilot_agent.models import (  # noqa: E402
+    PostFcHeatAuthorityState,
     RoastCommand,
     RoastEventKind,
     RoastEventSource,
@@ -925,6 +974,226 @@ async def test_telemetry_round_trips_charge_elapsed_seconds(tmp_store: RoastStor
 
 
 @pytest.mark.asyncio
+async def test_telemetry_read_preserves_insertion_order_across_tick_restart(
+    tmp_store: RoastStore,
+) -> None:
+    """A recovered process's reset tick counter must not reorder one run."""
+    await seeded_store(tmp_store)
+    restarted: RoastStore | None = None
+    try:
+        reading = RoastTelemetry(bean_temp_c=185.0, env_temp_c=205.0)
+        for tick, elapsed, charge in [(10, 100.0, 50.0), (11, 105.0, 55.0)]:
+            assert await tmp_store.record_telemetry(
+                run_id="run-1",
+                tick=tick,
+                agent_phase=RoastPhase.DEVELOPMENT,
+                elapsed_seconds=elapsed,
+                interval_seconds=5.0,
+                telemetry=reading,
+                charge_elapsed_seconds=charge,
+            )
+
+        # A real agent restart constructs a fresh store and tick counter. Its
+        # durable insertion ids continue, while process-local ticks restart at 0.
+        await tmp_store.close()
+        restarted = RoastStore(tmp_store.db_path)
+        await restarted.initialize()
+        for tick, elapsed, charge in [(0, 0.0, 180.0), (1, 5.0, 185.0)]:
+            assert await restarted.record_telemetry(
+                run_id="run-1",
+                tick=tick,
+                agent_phase=RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+                elapsed_seconds=elapsed,
+                interval_seconds=5.0,
+                telemetry=reading,
+                charge_elapsed_seconds=charge,
+            )
+
+        points = await restarted.read_telemetry_points("run-1")
+        assert [point.tick for point in points] == [10, 11, 0, 1]
+        sampled = await restarted.read_telemetry_points("run-1", downsample=2)
+        assert [point.tick for point in sampled] == [10, 0]
+    finally:
+        if restarted is not None:
+            await restarted.close()
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_telemetry_round_trips_d96_validation_trace(tmp_store: RoastStore) -> None:
+    """#699: retained telemetry preserves the controller-owned D96 trace."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.record_telemetry(
+            run_id="run-1",
+            tick=1,
+            agent_phase=RoastPhase.DEVELOPMENT,
+            elapsed_seconds=5.0,
+            interval_seconds=5.0,
+            telemetry=RoastTelemetry(bean_temp_c=184.0, env_temp_c=205.0),
+            post_fc_recovery_enabled=True,
+            post_fc_heat_authority_state=PostFcHeatAuthorityState.RECOVERING,
+            post_fc_ror_setpoint_c_per_min=6.4,
+            post_fc_smoothed_ror_c_per_min=4.8,
+            post_fc_effective_heat_ceiling_percent=75,
+        )
+        [point] = await tmp_store.read_telemetry_points("run-1")
+        assert point.post_fc_recovery_enabled is True
+        assert point.post_fc_heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+        assert point.post_fc_ror_setpoint_c_per_min == pytest.approx(6.4)
+        assert point.post_fc_smoothed_ror_c_per_min == pytest.approx(4.8)
+        assert point.post_fc_effective_heat_ceiling_percent == 75
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_d96_authority_transitions_bypass_periodic_telemetry_throttle(
+    tmp_store: RoastStore,
+) -> None:
+    """#699: short D96 cycles remain observable at a slower sample cadence."""
+    await seeded_store(tmp_store)
+    try:
+        reading = RoastTelemetry(bean_temp_c=185.0, env_temp_c=205.0)
+        states = [
+            PostFcHeatAuthorityState.HOLDING,
+            PostFcHeatAuthorityState.RECOVERING,
+            PostFcHeatAuthorityState.GLIDING,
+            PostFcHeatAuthorityState.RECOVERING,
+            PostFcHeatAuthorityState.HOLDING,
+        ]
+        outcomes: list[bool] = []
+        for tick, state in enumerate(states):
+            outcomes.append(
+                await tmp_store.record_telemetry(
+                    run_id="run-1",
+                    tick=tick,
+                    agent_phase=RoastPhase.DEVELOPMENT,
+                    elapsed_seconds=float(tick * 5),
+                    interval_seconds=60.0,
+                    telemetry=reading,
+                    charge_elapsed_seconds=float(100 + tick * 5),
+                    post_fc_recovery_enabled=True,
+                    post_fc_heat_authority_state=state,
+                    post_fc_ror_setpoint_c_per_min=6.4,
+                    post_fc_smoothed_ror_c_per_min=4.8,
+                    post_fc_effective_heat_ceiling_percent=75,
+                )
+            )
+
+        # Every authority transition is durable even though none reaches the
+        # ordinary 60-second sample boundary; an unchanged state still throttles.
+        outcomes.append(
+            await tmp_store.record_telemetry(
+                run_id="run-1",
+                tick=5,
+                agent_phase=RoastPhase.DEVELOPMENT,
+                elapsed_seconds=25.0,
+                interval_seconds=60.0,
+                telemetry=reading,
+                charge_elapsed_seconds=125.0,
+                post_fc_recovery_enabled=True,
+                post_fc_heat_authority_state=PostFcHeatAuthorityState.HOLDING,
+            )
+        )
+        # Leaving DEVELOPMENT clears the controller output; persist that
+        # non-null -> null boundary even inside the periodic interval.
+        outcomes.append(
+            await tmp_store.record_telemetry(
+                run_id="run-1",
+                tick=6,
+                agent_phase=RoastPhase.COOLING,
+                elapsed_seconds=30.0,
+                interval_seconds=60.0,
+                telemetry=reading,
+                charge_elapsed_seconds=130.0,
+                post_fc_recovery_enabled=True,
+                post_fc_heat_authority_state=None,
+            )
+        )
+
+        assert outcomes == [True, True, True, True, True, False, True]
+        points = await tmp_store.read_telemetry_points("run-1")
+        assert [point.post_fc_heat_authority_state for point in points] == [
+            *states,
+            None,
+        ]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_d96_development_exit_bypasses_throttle_with_same_historical_witness(
+    tmp_store: RoastStore,
+) -> None:
+    """A same-state historical witness must not hide its phase boundary."""
+    await seeded_store(tmp_store)
+    try:
+        reading = RoastTelemetry(bean_temp_c=196.0, env_temp_c=210.0)
+        outcomes = [
+            await tmp_store.record_telemetry(
+                run_id="run-1",
+                tick=1,
+                agent_phase=RoastPhase.DEVELOPMENT,
+                elapsed_seconds=100.0,
+                interval_seconds=60.0,
+                telemetry=reading,
+                charge_elapsed_seconds=50.0,
+                post_fc_recovery_enabled=True,
+                post_fc_heat_authority_state=PostFcHeatAuthorityState.RECOVERING,
+            ),
+            await tmp_store.record_telemetry(
+                run_id="run-1",
+                tick=2,
+                agent_phase=RoastPhase.COOLING,
+                elapsed_seconds=101.0,
+                interval_seconds=60.0,
+                telemetry=reading,
+                charge_elapsed_seconds=51.0,
+                post_fc_recovery_enabled=True,
+                post_fc_heat_authority_state=PostFcHeatAuthorityState.RECOVERING,
+            ),
+            await tmp_store.record_telemetry(
+                run_id="run-1",
+                tick=3,
+                agent_phase=RoastPhase.COOLING,
+                elapsed_seconds=102.0,
+                interval_seconds=60.0,
+                telemetry=reading,
+                charge_elapsed_seconds=51.0,
+                post_fc_recovery_enabled=True,
+                post_fc_heat_authority_state=PostFcHeatAuthorityState.RECOVERING,
+            ),
+            await tmp_store.record_telemetry(
+                run_id="run-1",
+                tick=4,
+                agent_phase=RoastPhase.COOLING,
+                elapsed_seconds=103.0,
+                interval_seconds=60.0,
+                telemetry=reading,
+                charge_elapsed_seconds=51.0,
+                post_fc_recovery_enabled=True,
+                post_fc_heat_authority_state=None,
+            ),
+        ]
+
+        assert outcomes == [True, True, False, True]
+        points = await tmp_store.read_telemetry_points("run-1")
+        assert [point.agent_phase for point in points] == [
+            RoastPhase.DEVELOPMENT,
+            RoastPhase.COOLING,
+            RoastPhase.COOLING,
+        ]
+        assert [point.post_fc_heat_authority_state for point in points] == [
+            PostFcHeatAuthorityState.RECOVERING,
+            PostFcHeatAuthorityState.RECOVERING,
+            None,
+        ]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_drying_end_event_round_trips_through_timeline(tmp_store: RoastStore) -> None:
     """#351: the v6 ``drying_end`` event kind is accepted by the rebuilt
     roast_events CHECK and surfaces on the persisted timeline (the detail page),
@@ -1073,6 +1342,9 @@ async def test_restart_scenario_recovers_persisted_phase(tmp_path: Path, phase: 
         assert persisted.agent_phase is phase
         assert persisted.outcome is None  # still active when the process died
         assert persisted.profile.name == "store-test"
+        assert persisted.frozen_config is not None
+        assert persisted.frozen_config.controller == AppConfig().controller
+        assert persisted.frozen_config.safety == AppConfig().safety
     finally:
         await restarted.close()
 
