@@ -154,6 +154,134 @@ describe("DetailPage shell", () => {
     expect(telemetrySpy).toHaveBeenCalledTimes(2);
   });
 
+  it("confirms a cold faulted run until persisted telemetry reaches faulted", async () => {
+    const partialTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      point_count: 13,
+      points: FIXTURE_TELEMETRY.points.slice(0, 13),
+    };
+    const faultedTelemetry: TelemetrySeries = {
+      ...partialTelemetry,
+      point_count: 14,
+      points: [
+        ...partialTelemetry.points,
+        {
+          ...FIXTURE_TELEMETRY.points[13],
+          agent_phase: "faulted",
+          post_fc_heat_authority_state: null,
+        },
+      ],
+    };
+    let resolveInitialTelemetry: ((series: TelemetrySeries) => void) | undefined;
+    const initialTelemetry = new Promise<TelemetrySeries>((resolve) => {
+      resolveInitialTelemetry = resolve;
+    });
+    vi.spyOn(api, "roast").mockResolvedValue({
+      ...FIXTURE_DETAIL,
+      outcome: "faulted",
+    });
+    const telemetrySpy = vi
+      .spyOn(api, "telemetry")
+      .mockImplementationOnce(() => initialTelemetry)
+      .mockResolvedValueOnce(faultedTelemetry);
+    vi.spyOn(api, "timeline").mockResolvedValue(FIXTURE_TIMELINE);
+
+    renderAt(`/roasts/${FIXTURE_DETAIL.id}`);
+    await waitFor(() => expect(screen.getByTestId("detail-view")).toBeInTheDocument());
+    expect(telemetrySpy).toHaveBeenCalledTimes(1);
+
+    resolveInitialTelemetry?.(partialTelemetry);
+    await waitFor(() => expect(telemetrySpy).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(telemetrySpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes telemetry once after an administratively aborted outcome", async () => {
+    const partialTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      point_count: 10,
+      points: FIXTURE_TELEMETRY.points.slice(0, 10),
+    };
+    vi.spyOn(api, "roast").mockResolvedValue({
+      ...FIXTURE_DETAIL,
+      outcome: "aborted",
+    });
+    const telemetrySpy = vi.spyOn(api, "telemetry").mockResolvedValue(partialTelemetry);
+    vi.spyOn(api, "timeline").mockResolvedValue(FIXTURE_TIMELINE);
+
+    renderAt(`/roasts/${FIXTURE_DETAIL.id}`);
+    await waitFor(() => expect(screen.getByTestId("detail-view")).toBeInTheDocument());
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(telemetrySpy).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(telemetrySpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes a fresh cached telemetry series once after an administrative abort", async () => {
+    const partialTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      point_count: 10,
+      points: FIXTURE_TELEMETRY.points.slice(0, 10),
+    };
+    const finalTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      points: FIXTURE_TELEMETRY.points.map((point, index) =>
+        index >= 11 && index <= 12
+          ? {
+              ...point,
+              post_fc_recovery_enabled: true,
+              post_fc_heat_authority_state: "recovering",
+            }
+          : index === 13
+            ? {
+                ...point,
+                post_fc_recovery_enabled: true,
+                post_fc_heat_authority_state: "holding",
+              }
+            : point,
+      ),
+    };
+    const abortedDetail = {
+      ...FIXTURE_DETAIL,
+      outcome: "aborted" as const,
+    };
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { refetchOnWindowFocus: false, retry: false, staleTime: 30_000 },
+      },
+    });
+    client.setQueryData(roastKeys.detail(FIXTURE_DETAIL.id), abortedDetail);
+    client.setQueryData(roastKeys.telemetry(FIXTURE_DETAIL.id, 1), partialTelemetry);
+    vi.spyOn(api, "roast").mockResolvedValue(abortedDetail);
+    const telemetrySpy = vi.spyOn(api, "telemetry").mockResolvedValue(finalTelemetry);
+    vi.spyOn(api, "timeline").mockResolvedValue(FIXTURE_TIMELINE);
+
+    renderAt(`/roasts/${FIXTURE_DETAIL.id}`, client);
+    expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
+      "No observed recovery",
+    );
+
+    await waitFor(() => expect(telemetrySpy).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
+        "Recovery armed",
+      ),
+    );
+    expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
+      "Recovering01:00",
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(telemetrySpy).toHaveBeenCalledTimes(1);
+  });
+
   it("retries one partial live-boundary refresh and then retains the final trace", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const liveDetail = { ...FIXTURE_DETAIL, completed_at_utc: null };
@@ -191,6 +319,44 @@ describe("DetailPage shell", () => {
     expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
       "Recovering00:30",
     );
+  });
+
+  it("uses its bounded confirmation retry after the first completion refresh errors", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const liveDetail = { ...FIXTURE_DETAIL, completed_at_utc: null };
+    const partialTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      point_count: 13,
+      points: FIXTURE_TELEMETRY.points.slice(0, 13),
+    };
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { refetchOnWindowFocus: false, retry: false, staleTime: 30_000 },
+      },
+    });
+    client.setQueryData(roastKeys.detail(FIXTURE_DETAIL.id), liveDetail);
+    client.setQueryData(roastKeys.telemetry(FIXTURE_DETAIL.id, 1), partialTelemetry);
+    vi.spyOn(api, "roast").mockResolvedValue(FIXTURE_DETAIL);
+    const telemetrySpy = vi
+      .spyOn(api, "telemetry")
+      .mockRejectedValueOnce(new Error("temporary telemetry failure"))
+      .mockResolvedValueOnce(FIXTURE_TELEMETRY);
+    vi.spyOn(api, "timeline").mockResolvedValue(FIXTURE_TIMELINE);
+
+    renderAt(`/roasts/${FIXTURE_DETAIL.id}`, client);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    await vi.waitFor(() => expect(telemetrySpy).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() =>
+      expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
+        "Recovery armed",
+      ),
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(telemetrySpy).toHaveBeenCalledTimes(2);
   });
 
   it("stops after the bounded live-boundary confirmation retry", async () => {

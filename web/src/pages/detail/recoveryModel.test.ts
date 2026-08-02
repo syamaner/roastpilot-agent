@@ -123,6 +123,35 @@ describe("postFcRecoverySummary", () => {
     expect(summary.recoveringDurationSeconds).toBe(5);
   });
 
+  it.each([
+    { nextElapsed: 0, nextCharge: 180 },
+    { nextElapsed: 200, nextCharge: 330 },
+  ])(
+    "does not treat a restored cooling row as a same-process boundary ($nextElapsed/$nextCharge)",
+    ({ nextElapsed, nextCharge }) => {
+      const summary = postFcRecoverySummary(
+        series([
+          {
+            elapsed_seconds: 50,
+            charge_elapsed_seconds: 50,
+            post_fc_recovery_enabled: true,
+            post_fc_heat_authority_state: "recovering",
+          },
+          {
+            elapsed_seconds: nextElapsed,
+            charge_elapsed_seconds: nextCharge,
+            agent_phase: "cooling",
+            cooling_on: true,
+            post_fc_recovery_enabled: true,
+            post_fc_heat_authority_state: null,
+          },
+        ]),
+      );
+
+      expect(summary.recoveringDurationSeconds).toBe(0);
+    },
+  );
+
   it("closes an authority interval at a same-process recovery boundary", () => {
     const summary = postFcRecoverySummary(
       series([
@@ -143,5 +172,51 @@ describe("postFcRecoverySummary", () => {
     );
 
     expect(summary.recoveringDurationSeconds).toBe(5);
+  });
+
+  it("does not accrue beyond a non-development historical exit witness", () => {
+    const summary = postFcRecoverySummary(
+      series([
+        {
+          elapsed_seconds: 100,
+          charge_elapsed_seconds: 50,
+          post_fc_recovery_enabled: true,
+          post_fc_heat_authority_state: "recovering",
+        },
+        {
+          elapsed_seconds: 105,
+          charge_elapsed_seconds: 55,
+          agent_phase: "operator_recovery_required",
+          post_fc_recovery_enabled: true,
+          post_fc_heat_authority_state: "recovering",
+        },
+        {
+          elapsed_seconds: 110,
+          charge_elapsed_seconds: 60,
+          agent_phase: "operator_recovery_required",
+          post_fc_recovery_enabled: true,
+          post_fc_heat_authority_state: null,
+        },
+      ]),
+    );
+
+    expect(summary.cycleCount).toBe(1);
+    expect(summary.recoveringDurationSeconds).toBe(5);
+  });
+
+  it("does not estimate an open trailing interval without a server boundary", () => {
+    const summary = postFcRecoverySummary(
+      series([
+        {
+          elapsed_seconds: 50,
+          charge_elapsed_seconds: 50,
+          post_fc_recovery_enabled: true,
+          post_fc_heat_authority_state: "recovering",
+        },
+      ]),
+    );
+
+    expect(summary.cycleCount).toBe(1);
+    expect(summary.recoveringDurationSeconds).toBe(0);
   });
 });

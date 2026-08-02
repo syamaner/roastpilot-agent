@@ -594,6 +594,12 @@ class ControllerSnapshot:
     #: reads ``True`` so a later restart→resume can restore the DTR clock. A
     #: pure read; advisory/display-only and never safety-gating.
     charge_detected: bool
+    #: The post-FC output accepted or kept by the controller during this tick,
+    #: retained even when a later same-tick drop/fault clears current
+    #: DEVELOPMENT authority.
+    #: Persistence uses this historical witness; live SSE uses the phase-gated
+    #: current-authority fields above.
+    accepted_post_fc_output: PostFcControlOutput | None = None
 
 
 class RoastController:
@@ -762,6 +768,12 @@ class RoastController:
         # different DEVELOPMENT dwell or an operator-resume (loop inert)
         # never reads a stale prior engagement's output.
         self._last_post_fc_output: PostFcControlOutput | None = None
+        # Historical witness for the one accepted/kept post-FC output this tick.
+        # It is reset at tick entry, set only where the output stands (executed
+        # or already held), and deliberately survives a later same-tick phase
+        # transition so the runner can retain a recovery entry that immediately
+        # ends in a drop.
+        self._accepted_post_fc_output: PostFcControlOutput | None = None
         # Safety-review fix (post-B2, Opus finding, MEDIUM): whether the post-FC
         # PI loop is ENGAGED for the current DEVELOPMENT dwell. ``DEVELOPMENT``
         # is reachable by two distinct edges — the true first-crack transition
@@ -917,6 +929,7 @@ class RoastController:
             telemetry=self._last_telemetry,
             advisory_paused=self._advisory_paused,
             charge_detected=self._charge_monotonic is not None,
+            accepted_post_fc_output=self._accepted_post_fc_output,
         )
 
     def _roast_elapsed_seconds(self) -> float:
@@ -1446,6 +1459,10 @@ class RoastController:
         separate, always-available methods, so the latch never reduces what the
         operator can do (#206 operable-faulted intact).
         """
+        # Tick-scoped historical witness. Operator actions are drained before
+        # this method, so clearing here also prevents a prior tick's accepted
+        # output leaking through a later operator drop/recovery transition.
+        self._accepted_post_fc_output = None
         if self._phase in TERMINAL_LATCH_PHASES:
             # If the fail-safe write did not confirm on entry (a transient MCP
             # write failure), re-attempt the heat-off write here — the latch must
@@ -2084,6 +2101,7 @@ class RoastController:
                 # restored) — stash it for `_build_advisor_context` (told ==
                 # enforced).
                 self._last_post_fc_output = output
+                self._accepted_post_fc_output = output
             # D96 slice 2 (#559), Codex round-1 finding #1 precedent applied
             # here too: on a suppressed tick `_last_post_fc_output` is left
             # exactly as `_force_recovery_exit`/the top-of-tick machinery
@@ -2140,6 +2158,7 @@ class RoastController:
             # D96 slice 2 (#559): this `output` stands (kept, not restored) —
             # stash it for `_build_advisor_context` (told == enforced).
             self._last_post_fc_output = output
+            self._accepted_post_fc_output = output
         elif not executed and not heat_suppressed_this_tick:
             # NOT executed — REJECTed (e.g. rate-limited) OR an actuator
             # failure: undo the tentative `compute` step entirely so the
@@ -2477,8 +2496,9 @@ class RoastController:
         heat needed to be at or below the base, which is exactly the
         condition the latch exists to remember.
 
-        **Also clears the stashed ``_last_post_fc_output``** (Codex round-1
-        finding #1): that field is copied VERBATIM into
+        **Also clears the stashed ``_last_post_fc_output`` and the tick-scoped
+        ``_accepted_post_fc_output`` witness** (Codex round-1 finding #1 / PR
+        #700 safety review): the former is copied VERBATIM into
         :meth:`_build_advisor_context` (told == enforced, D96 slice 2) —
         without this, a tick where a drop fails AFTER the loop already
         stashed a RECOVERING/GLIDING output earlier the SAME tick would let
@@ -2490,6 +2510,12 @@ class RoastController:
         of this field (``_build_advisor_context``'s two ``None``-mapped
         fields) already treats ``None`` as "the loop's state this tick is
         not meaningfully known", the correct posture for a forced reset.
+        The accepted witness is likewise no longer the tick's final
+        authoritative D96 state once the corrective clamp has landed and the
+        controller has forced authority back to HOLDING; retaining it would
+        make persistence report an elevated state the clamp superseded. A
+        failed corrective write never calls this method, so its still-real
+        elevated witness remains intact.
 
         Args:
             state: A snapshot taken in the same clamp call this re-arm
@@ -2513,6 +2539,7 @@ class RoastController:
         )
         self._post_fc_raise_suppressed_after_clamp = True
         self._last_post_fc_output = None
+        self._accepted_post_fc_output = None
 
     async def _maybe_ceiling_guard_drop(self, telemetry: RoastTelemetry | None) -> None:
         """Decoupled ceiling-guard drop: a bitter-line safety anchor, not a

@@ -94,6 +94,7 @@ export function ChartHarnessPage(): React.JSX.Element {
         </div>
 
         <PostFcRecoveryStatus
+          phase="development"
           trace={{
             recoveryEnabled: true,
             heatAuthorityState: "recovering",

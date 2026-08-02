@@ -34,7 +34,24 @@ function sameProcessInterval(
   );
 }
 
-/** Summarize only fields persisted by schema v16; no state is inferred from RoR. */
+/** Whether a cooling row can close an interval without crossing a restart. */
+function sameProcessCoolingBoundary(
+  currentElapsed: number | null,
+  nextElapsed: number | null,
+  currentCharge: number,
+  nextCharge: number,
+): boolean {
+  if (!finite(currentElapsed) || !finite(nextElapsed)) return false;
+  const serveDelta = nextElapsed - currentElapsed;
+  const chargeDelta = nextCharge - currentCharge;
+  // Charge time may advance less because it freezes at drop. It cannot advance
+  // more than the process-local serve clock unless the charge clock was restored
+  // across a restart.
+  return serveDelta >= 0 && chargeDelta >= 0 && chargeDelta <= serveDelta + 0.1;
+}
+
+/** Summarize only fields persisted by schema v16; no state is inferred from RoR.
+ *  Durations include only intervals closed by a later server snapshot. */
 export function postFcRecoverySummary(
   telemetry: TelemetrySeries | undefined,
 ): PostFcRecoverySummaryData {
@@ -76,21 +93,32 @@ export function postFcRecoverySummary(
       finite(point.charge_elapsed_seconds) &&
       finite(nextChargeElapsed) &&
       nextChargeElapsed >= point.charge_elapsed_seconds &&
-      (nextPoint.agent_phase === "cooling" ||
-        sameProcessInterval(
+      (sameProcessInterval(
           point.elapsed_seconds,
           nextPoint.elapsed_seconds,
           point.charge_elapsed_seconds,
           nextChargeElapsed,
-        ))
+        ) ||
+        (nextPoint.agent_phase === "cooling" &&
+          sameProcessCoolingBoundary(
+            point.elapsed_seconds,
+            nextPoint.elapsed_seconds,
+            point.charge_elapsed_seconds,
+            nextChargeElapsed,
+          )))
     ) {
-      // The charge clock freezes at drop, so the final DEVELOPMENT interval
-      // may end at a COOLING row. Otherwise both clocks must advance together:
-      // that closes an in-process fault/recovery boundary while excluding an
-      // agent restart, whose serve clock resets as its charge clock is restored.
+      // The charge clock freezes at drop, so it may advance less than the serve
+      // clock at a COOLING boundary. Otherwise both clocks must advance together.
+      // Both forms exclude a restart, where restored charge time can jump ahead
+      // of the new process-local serve clock.
       const duration = nextChargeElapsed - point.charge_elapsed_seconds;
-      if (state === "recovering") recoveringDurationSeconds += duration;
-      if (state === "gliding") glidingDurationSeconds += duration;
+      // A non-DEVELOPMENT row may retain the output accepted earlier in its
+      // transition tick as historical evidence. It does not own live authority
+      // after the phase exit, so it must never accrue the following interval.
+      if (point.agent_phase === "development") {
+        if (state === "recovering") recoveringDurationSeconds += duration;
+        if (state === "gliding") glidingDurationSeconds += duration;
+      }
     }
     previousState = state;
   }

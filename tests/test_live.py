@@ -10,6 +10,7 @@ synchronous ``TestClient`` over a temporary built-SPA tree.
 import asyncio
 import json
 from collections.abc import AsyncGenerator, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -47,6 +48,7 @@ from roastpilot_agent.models import (
     RoastProfile,
     RoastTelemetry,
 )
+from roastpilot_agent.post_fc_control import PostFcControlOutput
 from roastpilot_agent.store import RoastStore
 
 # Reuse the canned tool fixtures + fake-session doubles from the mcp_client tests.
@@ -648,6 +650,10 @@ class _SnapshotOnlyController:
     def snapshot(self) -> ControllerSnapshot:
         return self._snapshot
 
+    def set_snapshot(self, snapshot: ControllerSnapshot) -> None:
+        """Replace the snapshot returned by this test double."""
+        self._snapshot = snapshot
+
 
 class _RawStateStub:
     """A ``RawStateSource`` whose ``last_state`` carries a chosen MCP raw dev%."""
@@ -731,5 +737,101 @@ async def test_persisted_dev_percent_is_the_controller_value_not_mcp_raw(
         assert points[0].post_fc_ror_setpoint_c_per_min == pytest.approx(6.4)
         assert points[0].post_fc_smoothed_ror_c_per_min == pytest.approx(4.8)
         assert points[0].post_fc_effective_heat_ceiling_percent == 75
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_persists_same_tick_accepted_trace_but_emits_current_authority(
+    tmp_path: Path,
+) -> None:
+    """Historical recovery survives a same-tick drop without stale live SSE."""
+    store = RoastStore(tmp_path / "accepted-trace.sqlite3")
+    await store.initialize()
+    try:
+        run_id = "run-accepted-trace"
+        await store.create_run(
+            run_id=run_id,
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.COOLING,
+        )
+        accepted = PostFcControlOutput(
+            heat_percent=66,
+            setpoint_c_per_min=6.4,
+            error_c_per_min=1.6,
+            smoothed_ror_c_per_min=4.8,
+            integrator=8.0,
+            effective_ceiling_percent=75,
+            effective_floor_percent=1,
+            saturated=False,
+            heat_authority_state=PostFcHeatAuthorityState.RECOVERING,
+            recovery_active=True,
+        )
+        snapshot = ControllerSnapshot(
+            phase=RoastPhase.COOLING,
+            current_heat=0,
+            current_fan=100,
+            roast_elapsed_seconds=600.0,
+            charge_elapsed_seconds=480.0,
+            development_elapsed_seconds=75.0,
+            development_percent=15.625,
+            post_fc_recovery_enabled=True,
+            post_fc_heat_authority_state=None,
+            post_fc_ror_setpoint_c_per_min=None,
+            post_fc_smoothed_ror_c_per_min=None,
+            post_fc_effective_heat_ceiling_percent=None,
+            telemetry=RoastTelemetry.model_validate(
+                {"bean_temp_c": 196.0, "env_temp_c": 214.0, "cooling_on": True}
+            ),
+            advisory_paused=False,
+            charge_detected=True,
+            accepted_post_fc_output=accepted,
+        )
+        controller = _SnapshotOnlyController(snapshot)
+        broadcaster = EventBroadcaster()
+        subscriber = broadcaster.subscribe()
+        runner = RoastRunner(
+            controller=cast(RoastController, controller),
+            store=store,
+            emitter=BufferingEventEmitter(broadcaster, clock=lambda: 0.0),
+            operator_queue=asyncio.Queue[QueuedOperatorAction](),
+            counter=_TickCounter(),
+            config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=5.0)),
+            run_id=run_id,
+            clock=lambda: 0.0,
+            raw_state=None,
+        )
+
+        await runner._publish_and_persist_telemetry()  # pyright: ignore[reportPrivateUsage]
+        live = subscriber.get_nowait()
+        assert live.event.value == "telemetry"
+        assert live.data["agent_phase"] == "cooling"
+        assert live.data["post_fc_heat_authority_state"] is None
+        assert live.data["post_fc_ror_setpoint_c_per_min"] is None
+
+        points = await store.read_telemetry_points(run_id)
+        assert len(points) == 1
+        assert points[0].agent_phase is RoastPhase.COOLING
+        assert points[0].post_fc_heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+        assert points[0].post_fc_ror_setpoint_c_per_min == pytest.approx(6.4)
+
+        # The next cooling tick resets the tick-scoped witness. Its null state
+        # bypasses the 5 s periodic throttle because it closes the D96 trace.
+        controller.set_snapshot(
+            replace(
+                snapshot,
+                roast_elapsed_seconds=600.5,
+                accepted_post_fc_output=None,
+            )
+        )
+        await runner._publish_and_persist_telemetry()  # pyright: ignore[reportPrivateUsage]
+        next_live = subscriber.get_nowait()
+        assert next_live.data["post_fc_heat_authority_state"] is None
+        points = await store.read_telemetry_points(run_id)
+        assert [point.post_fc_heat_authority_state for point in points] == [
+            PostFcHeatAuthorityState.RECOVERING,
+            None,
+        ]
     finally:
         await store.close()

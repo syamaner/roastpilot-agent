@@ -76,17 +76,21 @@ export interface HeadlineStats {
 /**
  * Project telemetry snapshots into the shared `LiveCurve` point form.
  *
- * x is seconds since T0 (`elapsed_seconds`); points without an elapsed value are
+ * x is the server's process-local `elapsed_seconds`, stitched at detected agent
+ * restarts into one continuous coordinate. Points without an elapsed value are
  * dropped (they cannot be placed on the time axis). Heat/fan are the *executed*
  * control levels; a missing channel is a gap (`null`), not zero.
  */
 export function toCurvePoints(series: TelemetrySeries | undefined): CurvePoint[] {
   if (!series) return [];
+  const elapsed = projectedElapsedSeconds(series.points);
   const points: CurvePoint[] = [];
-  for (const p of series.points) {
-    if (p.elapsed_seconds === null) continue;
+  for (let index = 0; index < series.points.length; index += 1) {
+    const p = series.points[index];
+    const t = elapsed[index];
+    if (t === null) continue;
     points.push({
-      t: p.elapsed_seconds,
+      t,
       bean: p.bean_temp_c,
       env: p.env_temp_c,
       ror: p.bean_ror_c_per_min,
@@ -94,23 +98,20 @@ export function toCurvePoints(series: TelemetrySeries | undefined): CurvePoint[]
       fan: p.fan_level_percent,
     });
   }
-  // REST preserves durable insertion order because the D96 recovery summary
-  // needs the true row sequence across an agent restart. The process-local
-  // serve clock resets on that boundary, though, while uPlot and the display
-  // smoother require an ascending x column. Sort this detached projection only:
-  // recovery analysis keeps the source chronology and the chart stays valid.
-  return points.sort((left, right) => left.t - right.t);
+  return points;
 }
 
 /**
- * Build a tick → `elapsed_seconds` lookup so a trace row (keyed by tick) can be
- * placed on the curve's seconds axis. Latest value wins on duplicate ticks.
+ * Build a tick → stitched-elapsed lookup so a trace row (keyed by tick) can
+ * be placed on the curve's seconds axis. Latest value wins on duplicate ticks.
  */
 function tickElapsedIndex(series: TelemetrySeries | undefined): Map<number, number> {
   const index = new Map<number, number>();
   if (!series) return index;
-  for (const p of series.points) {
-    if (p.elapsed_seconds !== null) index.set(p.tick, p.elapsed_seconds);
+  const elapsed = projectedElapsedSeconds(series.points);
+  for (let pointIndex = 0; pointIndex < series.points.length; pointIndex += 1) {
+    const t = elapsed[pointIndex];
+    if (t !== null) index.set(series.points[pointIndex].tick, t);
   }
   return index;
 }
@@ -175,13 +176,15 @@ function turningPointSeconds(
   if (!event || !series) return null;
   const chargeElapsed = event.payload?.elapsed_since_charge_seconds;
   if (typeof chargeElapsed !== "number") return null;
-  for (const p of series.points) {
+  const elapsed = projectedElapsedSeconds(series.points);
+  for (let index = 0; index < series.points.length; index += 1) {
+    const p = series.points[index];
     if (
       p.charge_elapsed_seconds !== null &&
       p.charge_elapsed_seconds >= chargeElapsed &&
-      p.elapsed_seconds !== null
+      elapsed[index] !== null
     ) {
-      return p.elapsed_seconds;
+      return elapsed[index];
     }
   }
   return null;
@@ -209,9 +212,11 @@ function dryEndSeconds(
   if (!event || !series) return null;
   const threshold = event.payload?.threshold_c;
   if (typeof threshold !== "number") return null;
-  for (const p of series.points) {
-    if (p.bean_temp_c !== null && p.bean_temp_c >= threshold && p.elapsed_seconds !== null) {
-      return p.elapsed_seconds;
+  const elapsed = projectedElapsedSeconds(series.points);
+  for (let index = 0; index < series.points.length; index += 1) {
+    const p = series.points[index];
+    if (p.bean_temp_c !== null && p.bean_temp_c >= threshold && elapsed[index] !== null) {
+      return elapsed[index];
     }
   }
   return null;
@@ -223,8 +228,11 @@ function firstPhaseSeconds(
   phase: TelemetryPoint["agent_phase"],
 ): number | null {
   if (!series) return null;
-  for (const p of series.points) {
-    if (p.agent_phase === phase && p.elapsed_seconds !== null) return p.elapsed_seconds;
+  const elapsed = projectedElapsedSeconds(series.points);
+  for (let index = 0; index < series.points.length; index += 1) {
+    if (series.points[index].agent_phase === phase && elapsed[index] !== null) {
+      return elapsed[index];
+    }
   }
   return null;
 }
@@ -348,19 +356,40 @@ function numberOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-/** Sum insertion-ordered process-local serve-clock epochs across restarts. */
-function accumulatedElapsed(points: readonly TelemetryPoint[]): number | null {
+/** Stitch insertion-ordered process-local serve clocks into one monotonic axis. */
+function projectedElapsedSeconds(
+  points: readonly TelemetryPoint[],
+): Array<number | null> {
   let offset = 0;
-  let previous: number | null = null;
-  let total: number | null = null;
-  for (const point of points) {
+  let previousElapsed: number | null = null;
+  let previousProjected: number | null = null;
+  let previousTick: number | null = null;
+  return points.map((point) => {
     const elapsed = point.elapsed_seconds;
-    if (elapsed === null) continue;
-    if (previous !== null && elapsed < previous) offset += previous;
-    total = offset + elapsed;
-    previous = elapsed;
+    const restarted =
+      (previousElapsed !== null && elapsed !== null && elapsed < previousElapsed) ||
+      (previousTick !== null && point.tick < previousTick);
+    if (restarted && previousProjected !== null) {
+      // Each raw serve clock measures time within one agent process. Adding the
+      // prior projected endpoint preserves the elapsed duration of every epoch,
+      // including time before the first persisted sample after a late reload.
+      offset = previousProjected;
+    }
+    previousTick = point.tick;
+    if (elapsed === null) return null;
+    previousElapsed = elapsed;
+    previousProjected = offset + elapsed;
+    return previousProjected;
+  });
+}
+
+/** Total elapsed time on the shared stitched curve coordinate. */
+function accumulatedElapsed(points: readonly TelemetryPoint[]): number | null {
+  const elapsed = projectedElapsedSeconds(points);
+  for (let index = elapsed.length - 1; index >= 0; index -= 1) {
+    if (elapsed[index] !== null) return elapsed[index];
   }
-  return total;
+  return null;
 }
 
 function lastDevelopmentPercent(points: readonly TelemetryPoint[]): number | null {

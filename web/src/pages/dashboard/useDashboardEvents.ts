@@ -203,6 +203,8 @@ type Action =
        *  origin isn't already known. Null/omitted when the snapshot has no post-charge
        *  point. */
       origin?: number | null;
+      /** The persisted series contains a process-clock reset before this seed. */
+      startsNewEpoch?: boolean;
       postFcControl?: PostFcControlTrace | null;
     }
   | { kind: "reset" };
@@ -268,6 +270,44 @@ function originFromClocks(
   return Math.round(elapsedSeconds) - Math.round(chargeElapsedSeconds);
 }
 
+interface LatestClockEpoch {
+  origin: number | null;
+  startIndex: number;
+}
+
+/** Locate the latest process-local serve-clock epoch and its charge origin. */
+function latestClockEpoch(points: readonly TelemetryPoint[]): LatestClockEpoch {
+  let previousElapsed: number | null = null;
+  let previousTick: number | null = null;
+  let origin: number | null = null;
+  let startIndex = 0;
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index];
+    const elapsed = point.elapsed_seconds;
+    const restarted =
+      (elapsed !== null &&
+        Number.isFinite(elapsed) &&
+        previousElapsed !== null &&
+        elapsed < previousElapsed) ||
+      (previousTick !== null && point.tick < previousTick);
+    if (restarted) {
+      // Restart resets both the tick and serve clocks. Either signal invalidates
+      // an older origin, including a reload late enough that the new serve value
+      // has already overtaken the old epoch's last sampled value.
+      origin = null;
+      startIndex = index;
+    }
+    previousTick = point.tick;
+    if (elapsed !== null && Number.isFinite(elapsed)) {
+      previousElapsed = elapsed;
+    }
+    if (origin === null) {
+      origin = originFromClocks(elapsed, point.charge_elapsed_seconds);
+    }
+  }
+  return { origin, startIndex };
+}
+
 /** Fold a recovered T0 origin into the view-model iff it isn't already known —
  *  setting `t0ElapsedSeconds`, placing the T0 marker at that serve-elapsed, and
  *  flushing any deferred turning-point marker. This is the SOLE place the T0 marker
@@ -295,6 +335,46 @@ function withRecoveredOrigin(state: DashboardViewModel, origin: number | null): 
     t0ElapsedSeconds: origin,
     pendingTurningPointChargeSeconds: pending,
     markers,
+  };
+}
+
+/** Move an already-mounted dashboard onto the newest process-local clock epoch. */
+function withLatestClockEpoch(
+  state: DashboardViewModel,
+  origin: number | null,
+): DashboardViewModel {
+  if (origin === null) {
+    // Without origins the two raw serve-clock domains cannot be related safely.
+    return {
+      ...state,
+      t0ElapsedSeconds: null,
+      pendingTurningPointChargeSeconds: null,
+      markers: [],
+      points: [],
+    };
+  }
+  if (state.t0ElapsedSeconds === null) {
+    // There is no trustworthy transform for any old pre-origin points.
+    return withRecoveredOrigin(
+      {
+        ...state,
+        pendingTurningPointChargeSeconds: null,
+        markers: [],
+        points: [],
+      },
+      origin,
+    );
+  }
+  if (state.t0ElapsedSeconds === origin) return state;
+
+  // Preserve every charge-relative position while changing the raw clock domain:
+  // (old t + delta) - new origin == old t - old origin.
+  const delta = origin - state.t0ElapsedSeconds;
+  return {
+    ...state,
+    t0ElapsedSeconds: origin,
+    points: state.points.map((point) => ({ ...point, t: point.t + delta })),
+    markers: state.markers.map((marker) => ({ ...marker, t: marker.t + delta })),
   };
 }
 
@@ -407,6 +487,16 @@ function finiteTraceClock(value: number | null): value is number {
   return value !== null && Number.isFinite(value);
 }
 
+/** Whether a D96 trace carries output-derived controller diagnostics. */
+function hasPostFcOutput(trace: PostFcControlTrace): boolean {
+  return (
+    trace.heatAuthorityState !== null ||
+    trace.rorSetpointCPerMin !== null ||
+    trace.smoothedRorCPerMin !== null ||
+    trace.effectiveHeatCeilingPercent !== null
+  );
+}
+
 /** True when `incoming` is not older on the restart-stable charge clock. */
 function traceIsAtLeastAsRecent(
   current: PostFcControlTrace | null,
@@ -415,7 +505,13 @@ function traceIsAtLeastAsRecent(
   const currentAt = current?.atChargeElapsedSeconds ?? null;
   const incomingAt = incoming.atChargeElapsedSeconds;
   if (!finiteTraceClock(currentAt)) return true;
-  return finiteTraceClock(incomingAt) && incomingAt >= currentAt;
+  if (!finiteTraceClock(incomingAt) || incomingAt < currentAt) return false;
+  if (incomingAt > currentAt) return true;
+  // Charge time freezes at drop. A live cooling/null trace and an older partial
+  // persisted recovery boundary can therefore tie. Null/current phase-gated
+  // authority must dominate historical output on that tie; the inverse order
+  // remains allowed so a same-clock live null can clear visible diagnostics.
+  return current === null || hasPostFcOutput(current) || !hasPostFcOutput(incoming);
 }
 
 /** Accept a trace only when it is at least as recent as the one already shown. */
@@ -479,9 +575,19 @@ export function dashboardReducer(
     // late-join (#326), then merge the points. Origin recovery runs even when the
     // points themselves dedupe to a no-op (a reconnect re-seed of an already-present
     // window), so a reload still hydrates the axis origin.
-    const withOrigin = withRecoveredOrigin(state, action.origin ?? null);
+    const adoptingNewEpoch =
+      action.startsNewEpoch === true &&
+      (action.origin == null || action.origin !== state.t0ElapsedSeconds);
+    const withOrigin = adoptingNewEpoch
+      ? withLatestClockEpoch(state, action.origin ?? null)
+      : withRecoveredOrigin(state, action.origin ?? null);
     const withTrace = withPostFcTrace(withOrigin, action.postFcControl);
-    const merged = mergeSeed(withTrace.points, action.points);
+    // Across an epoch boundary the current snapshot wins any charge-relative
+    // collision with rebased old data. Normal reconnects retain the established
+    // live-wins merge rule.
+    const merged = adoptingNewEpoch
+      ? action.points.reduce(upsertPoint, withTrace.points)
+      : mergeSeed(withTrace.points, action.points);
     if (merged === withTrace.points) return withTrace;
     return { ...withTrace, points: merged };
   }
@@ -493,12 +599,26 @@ export function dashboardReducer(
       const point = pointFromTelemetry(data);
       const withTrace = withPostFcTrace(state, postFcTraceFromTelemetry(data));
       if (point === null) return withTrace;
+      const observedOrigin = originFromClocks(
+        data.elapsed_seconds,
+        data.charge_elapsed_seconds,
+      );
       // Recover the T0 origin from the live frame's server clocks if it isn't yet
       // known (#326): SSE doesn't replay `t0_detected`, so a reload/reconnect mid-
       // roast recovers the charge origin from the first post-charge telemetry frame
       // (charge_elapsed_seconds non-null) rather than waiting on an event that
-      // already fired. A no-op once the origin is set (the live `t0_detected` path).
-      const recovered = withRecoveredOrigin(withTrace, originFromClocks(data.elapsed_seconds, data.charge_elapsed_seconds));
+      // already fired. A materially EARLIER origin proves the serve clock restarted;
+      // adopt it before inserting this current-epoch frame so a delayed REST seed
+      // cannot later rebase the new point with the old epoch. The one-second margin
+      // tolerates independently rounded clocks. Never adopt a later origin here:
+      // charge time freezes at drop while serve time continues, so that expected
+      // post-drop divergence is not a process restart.
+      const recovered =
+        observedOrigin !== null &&
+        withTrace.t0ElapsedSeconds !== null &&
+        observedOrigin < withTrace.t0ElapsedSeconds - 1
+          ? withLatestClockEpoch(withTrace, observedOrigin)
+          : withRecoveredOrigin(withTrace, observedOrigin);
       return { ...recovered, points: upsertPoint(recovered.points, point) };
     }
     case "advisory": {
@@ -683,7 +803,11 @@ export function dashboardReducer(
       // label. Keep the configured flag and trace clock for operator context.
       const data = event.data as { phase?: unknown };
       if (!isRoastPhase(data.phase)) return state;
-      const phaseState = data.phase === "development" ? state : withoutPostFcOutput(state);
+      // A DEVELOPMENT transition may be an operator resume after restart, not a
+      // fresh first-crack edge. Clear on every recognized phase transition so a
+      // pre-restart backfill cannot masquerade as current authority after resume;
+      // valid same-tick telemetry immediately repopulates the controller fields.
+      const phaseState = withoutPostFcOutput(state);
       if (data.phase !== "cooling") return phaseState;
 
       // Every drop and explicit recovery cooling transition lands in COOLING.
@@ -804,19 +928,16 @@ export function useDashboardEvents(
       .then((series) => {
         if (cancelled) return;
         const seeded: CurvePoint[] = [];
-        // Recover the T0 origin from the FIRST post-charge snapshot point's server
-        // clocks (#326 cold-reload): SSE didn't replay `t0_detected`, so the snapshot
-        // is the only place the origin can be recovered on a fresh page load. Earliest
-        // post-charge point keeps the recovery deterministic regardless of order.
-        let origin: number | null = null;
+        // Recover from the latest process epoch. After an agent restart the REST
+        // series remains insertion-ordered and contains older serve-clock epochs;
+        // anchoring to their first post-charge row would permanently mislabel the
+        // current SSE clock because withRecoveredOrigin is first-wins.
+        const latestEpoch = latestClockEpoch(series.points);
         let postFcControl: PostFcControlTrace | null = null;
-        for (const p of series.points) {
+        for (let index = 0; index < series.points.length; index += 1) {
+          const p = series.points[index];
           const point = pointFromSnapshot(p);
-          if (point !== null) seeded.push(point);
-          if (origin === null) {
-            const o = originFromClocks(p.elapsed_seconds, p.charge_elapsed_seconds);
-            if (o !== null) origin = o;
-          }
+          if (index >= latestEpoch.startIndex && point !== null) seeded.push(point);
           const trace = postFcTraceFromSnapshot(p);
           if (
             trace !== null &&
@@ -825,7 +946,13 @@ export function useDashboardEvents(
             postFcControl = trace;
           }
         }
-        dispatch({ kind: "seed", points: seeded, origin, postFcControl });
+        dispatch({
+          kind: "seed",
+          points: seeded,
+          origin: latestEpoch.origin,
+          startsNewEpoch: latestEpoch.startIndex > 0,
+          postFcControl,
+        });
       })
       .catch(() => {
         // A failed backfill leaves the live frames as-is and re-arms so a later

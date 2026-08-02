@@ -24,8 +24,14 @@ import { DetailView } from "./DetailView";
 interface CompletionState {
   runId: string | null;
   wasLive: boolean;
-  phase: "idle" | "refreshing_after_live_transition" | "retrying_confirmation" | "done";
-  dataUpdatedAtBeforeFetch: number;
+  phase:
+    | "idle"
+    | "refreshing_after_live_transition"
+    | "refreshing_aborted"
+    | "retrying_confirmation"
+    | "done";
+  dataUpdateCountBeforeFetch: number;
+  errorUpdateCountBeforeFetch: number;
 }
 
 /** Whether persisted telemetry already proves the run's terminal D96 boundary. */
@@ -54,7 +60,8 @@ export function DetailPage(): React.JSX.Element {
     runId: null,
     wasLive: false,
     phase: "idle",
-    dataUpdatedAtBeforeFetch: 0,
+    dataUpdateCountBeforeFetch: 0,
+    errorUpdateCountBeforeFetch: 0,
   });
 
   // A detail route may be opened while its roast is still live. `useRoast`
@@ -67,7 +74,8 @@ export function DetailPage(): React.JSX.Element {
         runId,
         wasLive: false,
         phase: "idle",
-        dataUpdatedAtBeforeFetch: 0,
+        dataUpdateCountBeforeFetch: 0,
+        errorUpdateCountBeforeFetch: 0,
       };
     }
     const state = completionStateRef.current;
@@ -81,10 +89,13 @@ export function DetailPage(): React.JSX.Element {
     const refresh = (
       phase: CompletionState["phase"],
     ): void => {
+      const queryKey = roastKeys.telemetry(runId, 1);
+      const queryState = queryClient.getQueryState(queryKey);
       state.phase = phase;
-      state.dataUpdatedAtBeforeFetch = telemetry.dataUpdatedAt;
+      state.dataUpdateCountBeforeFetch = queryState?.dataUpdateCount ?? 0;
+      state.errorUpdateCountBeforeFetch = queryState?.errorUpdateCount ?? 0;
       void queryClient.invalidateQueries({
-        queryKey: roastKeys.telemetry(runId, 1),
+        queryKey,
         exact: true,
       });
     };
@@ -101,18 +112,27 @@ export function DetailPage(): React.JSX.Element {
     // to settle, then confirm from server-owned phase evidence; retry at most
     // once when the boundary row is absent. Query timestamps cannot prove
     // server SELECT order, so they are deliberately not used as freshness proof.
-    if (outcome === "aborted") {
-      state.phase = "done";
-      return;
-    }
-    if (outcome === undefined || telemetry.fetchStatus !== "idle") return;
-    if (telemetry.data === undefined) return;
+    if (outcome === undefined) return;
+    if (telemetry.fetchStatus !== "idle") return;
 
     if (state.phase !== "idle") {
-      // Wait until the request started by this state has actually replaced the
-      // prior query result. `fetchStatus` alone briefly remains idle between
-      // invalidation and the refetch starting.
-      if (telemetry.dataUpdatedAt <= state.dataUpdatedAtBeforeFetch) return;
+      // Query-core increments one of these generation counters on every settled
+      // request. Unlike timestamps/fetchStatus, this detects an exhausted error,
+      // a same-millisecond success, and a request that starts/settles in one batch.
+      const queryState = queryClient.getQueryState(roastKeys.telemetry(runId, 1));
+      const settled =
+        (queryState?.dataUpdateCount ?? 0) > state.dataUpdateCountBeforeFetch ||
+        (queryState?.errorUpdateCount ?? 0) > state.errorUpdateCountBeforeFetch;
+      if (!settled) return;
+      // An administrative abort has no runner left to append a terminal row,
+      // but the telemetry request that mounted beside the detail request may
+      // have completed before the abort became authoritative. One post-outcome
+      // refresh makes the persisted series current; there is no evidence row to
+      // wait for, so never schedule a confirmation retry after it settles.
+      if (state.phase === "refreshing_aborted") {
+        state.phase = "done";
+        return;
+      }
       if (hasTerminalTelemetryEvidence(outcome, telemetry.data)) {
         state.phase = "done";
         return;
@@ -128,7 +148,9 @@ export function DetailPage(): React.JSX.Element {
       return;
     }
 
-    if (hasTerminalTelemetryEvidence(outcome, telemetry.data)) {
+    if (outcome === "aborted") {
+      refresh("refreshing_aborted");
+    } else if (hasTerminalTelemetryEvidence(outcome, telemetry.data)) {
       state.phase = "done";
     } else {
       refresh("retrying_confirmation");
@@ -140,6 +162,7 @@ export function DetailPage(): React.JSX.Element {
     runId,
     telemetry.data,
     telemetry.dataUpdatedAt,
+    telemetry.errorUpdatedAt,
     telemetry.fetchStatus,
   ]);
 

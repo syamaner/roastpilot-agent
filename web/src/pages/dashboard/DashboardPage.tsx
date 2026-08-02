@@ -454,7 +454,7 @@ export function DashboardPage(): React.JSX.Element {
           targetFanPercent={targetFan}
         />
 
-        <PostFcRecoveryStatus trace={view.postFcControl} />
+        <PostFcRecoveryStatus phase={phase} trace={view.postFcControl} />
 
         <AdvisoryPanel
           latest={view.latestAdvisory}

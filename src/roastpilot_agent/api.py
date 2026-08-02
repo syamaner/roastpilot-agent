@@ -57,7 +57,7 @@ from roastpilot_agent.catalogue_recommendations import (
     CatalogueRankingContext,
     recommend_from_catalogue,
 )
-from roastpilot_agent.config import AppConfig, MCPDeviceConfig
+from roastpilot_agent.config import AppConfig, ControllerConfig, MCPDeviceConfig
 from roastpilot_agent.config_store import (
     AppConfigEdit,
     AppConfigSnapshot,
@@ -1268,6 +1268,7 @@ class RoastRunner:
         await self._persist_ambient_if_charged(snapshot)
         telemetry = snapshot.telemetry
         raw = None if self._raw_state is None else self._raw_state.last_state
+        accepted_post_fc = snapshot.accepted_post_fc_output
         if telemetry is not None:
             self._emitter.emit_telemetry(
                 TelemetryEventData(
@@ -1323,11 +1324,29 @@ class RoastRunner:
             # before charge; frozen at the drop value in cooling. Display-only.
             charge_elapsed_seconds=snapshot.charge_elapsed_seconds,
             post_fc_recovery_enabled=snapshot.post_fc_recovery_enabled,
-            post_fc_heat_authority_state=snapshot.post_fc_heat_authority_state,
-            post_fc_ror_setpoint_c_per_min=snapshot.post_fc_ror_setpoint_c_per_min,
-            post_fc_smoothed_ror_c_per_min=(snapshot.post_fc_smoothed_ror_c_per_min),
+            # Retain an output the controller accepted/kept this tick even when
+            # a later same-tick drop/fault cleared current DEVELOPMENT authority.
+            # SSE above remains phase-gated/current and therefore never re-arms
+            # stale live UI state after phase_changed; this fallback is history.
+            post_fc_heat_authority_state=(
+                snapshot.post_fc_heat_authority_state
+                if accepted_post_fc is None
+                else accepted_post_fc.heat_authority_state
+            ),
+            post_fc_ror_setpoint_c_per_min=(
+                snapshot.post_fc_ror_setpoint_c_per_min
+                if accepted_post_fc is None
+                else accepted_post_fc.setpoint_c_per_min
+            ),
+            post_fc_smoothed_ror_c_per_min=(
+                snapshot.post_fc_smoothed_ror_c_per_min
+                if accepted_post_fc is None
+                else accepted_post_fc.smoothed_ror_c_per_min
+            ),
             post_fc_effective_heat_ceiling_percent=(
                 snapshot.post_fc_effective_heat_ceiling_percent
+                if accepted_post_fc is None
+                else accepted_post_fc.effective_ceiling_percent
             ),
             raw_state_json=None if raw is None else raw.model_dump_json(),
         )
@@ -1711,6 +1730,10 @@ class RoastService:
                     or fresh_config.mcp_device != self._spawned_mcp_device
                 ):
                     await self._respawn_mcp_for_device_config(fresh_config.mcp_device)
+            # A recovered run temporarily installs its frozen safety generation
+            # so API prechecks and controller evaluation agree. A later fresh run
+            # must always return to the process-current, apply-next-roast config.
+            self._safety = SafetyPolicy(self._config.safety)
             run_id = uuid.uuid4().hex
             await self._store.create_run(
                 run_id=run_id,
@@ -1864,7 +1887,12 @@ class RoastService:
             return None
         return prior + 1
 
-    async def _retrieve_reference_for(self, profile: RoastProfile) -> ReferenceRoast | None:
+    async def _retrieve_reference_for(
+        self,
+        profile: RoastProfile,
+        *,
+        controller_config: ControllerConfig | None = None,
+    ) -> ReferenceRoast | None:
         """Fail-soft, flag-gated same-bean reference retrieval (#567 Slice B).
 
         Returns ``None`` immediately when ``reference_curve.enabled`` is
@@ -1887,13 +1915,17 @@ class RoastService:
             profile: The roast profile being started (fresh) or restored
                 (recovery) — its identity fields drive the same-bean match
                 and its charge weight drives the weight-tolerance filter.
+            controller_config: The run-generation controller configuration.
+                Recovery supplies the persisted frozen value; fresh starts use
+                the process-current configuration.
 
         Returns:
             The best usable :class:`~roastpilot_agent.models.ReferenceRoast`,
             or ``None`` when the flag is off, no qualifying reference
             exists, or the lookup failed.
         """
-        if not self._config.controller.reference_curve.enabled:
+        effective_controller = controller_config or self._config.controller
+        if not effective_controller.reference_curve.enabled:
             return None
         origin_slug = recording_origin_slug(profile)
         if origin_slug is None:
@@ -1915,7 +1947,14 @@ class RoastService:
             )
             return None
 
-    async def _build_runner(self, run_id: str, profile: RoastProfile) -> "RoastRunner | None":
+    async def _build_runner(
+        self,
+        run_id: str,
+        profile: RoastProfile,
+        *,
+        config: AppConfig | None = None,
+        safety: SafetyPolicy | None = None,
+    ) -> "RoastRunner | None":
         """Construct a controller + runner bound to ``run_id`` (shared by the
         fresh-start and restart-recovery paths). ``None`` in API-only mode.
 
@@ -1934,13 +1973,17 @@ class RoastService:
         roaster = self._roaster
         if roaster is None:  # pragma: no cover — guarded by the caller
             return None
-        reference_roast = await self._retrieve_reference_for(profile)
+        run_config = config or self._config
+        run_safety = safety or self._safety
+        reference_roast = await self._retrieve_reference_for(
+            profile, controller_config=run_config.controller
+        )
         counter = _TickCounter()
         sink = StoreSnapshotSink(self._store, run_id, lambda: counter.value)
         emitter = BufferingEventEmitter(self.events, clock=self._clock)
         controller = RoastController(
-            config=self._config.controller,
-            safety=self._safety,
+            config=run_config.controller,
+            safety=run_safety,
             state_reader=roaster,
             command_executor=roaster,
             snapshot_sink=sink,
@@ -1955,7 +1998,7 @@ class RoastService:
             emitter=emitter,
             operator_queue=self.operator_queue,
             counter=counter,
-            config=self._config,
+            config=run_config,
             run_id=run_id,
             clock=self._clock,
             exporter=self._exporter,
@@ -2017,7 +2060,28 @@ class RoastService:
             # cross-restart STALE fault.
             await self._store.finalize_stale_faulted_run(persisted.run_id)
             return
-        runner = await self._build_runner(persisted.run_id, persisted.profile)
+        if persisted.frozen_config is None:  # pragma: no cover - store read always supplies it
+            raise RuntimeError("active persisted run is missing its frozen config")
+        # Restore the active roast's controller/safety generation while retaining
+        # process-scoped sections (advisor, MCP, logging, bean sourcing). This
+        # preserves apply-next-roast semantics across a process restart: config
+        # edits made after this run started cannot alter its control, scheduling,
+        # reference lookup, API prechecks, or safety policy.
+        recovery_config = AppConfig.model_validate(
+            {
+                **self._config.model_dump(mode="python"),
+                "controller": persisted.frozen_config.controller,
+                "safety": persisted.frozen_config.safety,
+            }
+        )
+        recovery_safety = SafetyPolicy(recovery_config.safety)
+        self._safety = recovery_safety
+        runner = await self._build_runner(
+            persisted.run_id,
+            persisted.profile,
+            config=recovery_config,
+            safety=recovery_safety,
+        )
         if runner is None:  # pragma: no cover — guarded above
             return
         self.active_run_id = persisted.run_id

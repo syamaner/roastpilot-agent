@@ -1123,6 +1123,77 @@ async def test_d96_authority_transitions_bypass_periodic_telemetry_throttle(
 
 
 @pytest.mark.asyncio
+async def test_d96_development_exit_bypasses_throttle_with_same_historical_witness(
+    tmp_store: RoastStore,
+) -> None:
+    """A same-state historical witness must not hide its phase boundary."""
+    await seeded_store(tmp_store)
+    try:
+        reading = RoastTelemetry(bean_temp_c=196.0, env_temp_c=210.0)
+        outcomes = [
+            await tmp_store.record_telemetry(
+                run_id="run-1",
+                tick=1,
+                agent_phase=RoastPhase.DEVELOPMENT,
+                elapsed_seconds=100.0,
+                interval_seconds=60.0,
+                telemetry=reading,
+                charge_elapsed_seconds=50.0,
+                post_fc_recovery_enabled=True,
+                post_fc_heat_authority_state=PostFcHeatAuthorityState.RECOVERING,
+            ),
+            await tmp_store.record_telemetry(
+                run_id="run-1",
+                tick=2,
+                agent_phase=RoastPhase.COOLING,
+                elapsed_seconds=101.0,
+                interval_seconds=60.0,
+                telemetry=reading,
+                charge_elapsed_seconds=51.0,
+                post_fc_recovery_enabled=True,
+                post_fc_heat_authority_state=PostFcHeatAuthorityState.RECOVERING,
+            ),
+            await tmp_store.record_telemetry(
+                run_id="run-1",
+                tick=3,
+                agent_phase=RoastPhase.COOLING,
+                elapsed_seconds=102.0,
+                interval_seconds=60.0,
+                telemetry=reading,
+                charge_elapsed_seconds=51.0,
+                post_fc_recovery_enabled=True,
+                post_fc_heat_authority_state=PostFcHeatAuthorityState.RECOVERING,
+            ),
+            await tmp_store.record_telemetry(
+                run_id="run-1",
+                tick=4,
+                agent_phase=RoastPhase.COOLING,
+                elapsed_seconds=103.0,
+                interval_seconds=60.0,
+                telemetry=reading,
+                charge_elapsed_seconds=51.0,
+                post_fc_recovery_enabled=True,
+                post_fc_heat_authority_state=None,
+            ),
+        ]
+
+        assert outcomes == [True, True, False, True]
+        points = await tmp_store.read_telemetry_points("run-1")
+        assert [point.agent_phase for point in points] == [
+            RoastPhase.DEVELOPMENT,
+            RoastPhase.COOLING,
+            RoastPhase.COOLING,
+        ]
+        assert [point.post_fc_heat_authority_state for point in points] == [
+            PostFcHeatAuthorityState.RECOVERING,
+            PostFcHeatAuthorityState.RECOVERING,
+            None,
+        ]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_drying_end_event_round_trips_through_timeline(tmp_store: RoastStore) -> None:
     """#351: the v6 ``drying_end`` event kind is accepted by the rebuilt
     roast_events CHECK and surfaces on the persisted timeline (the detail page),
@@ -1271,6 +1342,9 @@ async def test_restart_scenario_recovers_persisted_phase(tmp_path: Path, phase: 
         assert persisted.agent_phase is phase
         assert persisted.outcome is None  # still active when the process died
         assert persisted.profile.name == "store-test"
+        assert persisted.frozen_config is not None
+        assert persisted.frozen_config.controller == AppConfig().controller
+        assert persisted.frozen_config.safety == AppConfig().safety
     finally:
         await restarted.close()
 

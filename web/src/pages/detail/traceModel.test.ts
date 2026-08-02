@@ -34,7 +34,7 @@ describe("toCurvePoints", () => {
     expect(toCurvePoints(series)).toHaveLength(1);
   });
 
-  it("sorts only the chart projection after a process-local clock reset", () => {
+  it("stitches a process-local clock reset without reordering the roast", () => {
     const elapsed = [100, 105, 0, 5];
     const series: TelemetrySeries = {
       run_id: "recovered-run",
@@ -48,12 +48,65 @@ describe("toCurvePoints", () => {
     };
 
     expect(toCurvePoints(series).map(({ t, bean }) => [t, bean])).toEqual([
-      [0, 152],
-      [5, 153],
       [100, 150],
       [105, 151],
+      [105, 152],
+      [110, 153],
     ]);
     expect(series.points.map((point) => point.elapsed_seconds)).toEqual(elapsed);
+  });
+
+  it("keeps post-restart markers, tick highlights, and stats on the stitched axis", () => {
+    const elapsed = [100, 105, 0, 5];
+    const phases = [
+      "development",
+      "development",
+      "operator_recovery_required",
+      "cooling",
+    ] as const;
+    const series: TelemetrySeries = {
+      run_id: "recovered-run",
+      downsample: 1,
+      point_count: elapsed.length,
+      points: elapsed.map((elapsedSeconds, index) => ({
+        ...FIXTURE_TELEMETRY.points[index],
+        tick: index < 2 ? index + 10 : index - 2,
+        elapsed_seconds: elapsedSeconds,
+        agent_phase: phases[index],
+      })),
+    };
+
+    const markers = toCurveMarkers(FIXTURE_TIMELINE, series);
+    expect(markers.find((marker) => marker.kind === "first_crack")?.t).toBe(100);
+    expect(markers.find((marker) => marker.kind === "drop")?.t).toBe(110);
+    expect(tickToSeconds(series, 1)).toBe(110);
+    expect(headlineStats(undefined, series)).toMatchObject({
+      totalSeconds: 110,
+      firstCrackSeconds: 100,
+      dropSeconds: 110,
+    });
+  });
+
+  it("uses the tick reset when a late new-process clock has overtaken the old epoch", () => {
+    const elapsed = [100, 105, 200, 205];
+    const series: TelemetrySeries = {
+      run_id: "late-recovered-run",
+      downsample: 1,
+      point_count: elapsed.length,
+      points: elapsed.map((elapsedSeconds, index) => ({
+        ...FIXTURE_TELEMETRY.points[index],
+        tick: index < 2 ? index + 10 : index - 2,
+        elapsed_seconds: elapsedSeconds,
+        bean_temp_c: 150 + index,
+      })),
+    };
+
+    expect(toCurvePoints(series).map(({ t, bean }) => [t, bean])).toEqual([
+      [100, 150],
+      [105, 151],
+      [305, 152],
+      [310, 153],
+    ]);
   });
 
   it("returns [] for undefined telemetry", () => {

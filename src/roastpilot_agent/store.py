@@ -19,7 +19,7 @@ import aiosqlite
 from pydantic import BaseModel, ConfigDict
 
 from roastpilot_agent.advisor import AdvisorContext, RoastDecision
-from roastpilot_agent.config import AppConfig
+from roastpilot_agent.config import AppConfig, ControllerConfig, SafetyLimits
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
     BeanProfile,
@@ -607,6 +607,15 @@ class RunActivelyDrivenError(Exception):
     driven: verify the hardware / use emergency stop, do not clear)."""
 
 
+class FrozenRunConfig(BaseModel):
+    """Controller and safety configuration frozen when a roast starts."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    controller: ControllerConfig
+    safety: SafetyLimits
+
+
 class PersistedRun(BaseModel):
     """The recovery read (E6-S3): what restart classification needs —
     feeds controller.recover_from_restart and run resumption context.
@@ -620,6 +629,10 @@ class PersistedRun(BaseModel):
     started_at_utc: str
     completed_at_utc: str | None
     profile: RoastProfile
+    #: The run-generation controller and safety configuration. Recovery must
+    #: restore this pair rather than applying process-current next-roast edits
+    #: to a roast that is already in progress.
+    frozen_config: FrozenRunConfig | None = None
     #: Absolute UTC instant of the debounced charge/T0 transition (#235), or
     #: ``None`` when the run never charged or predates the v3 column. Recovery
     #: restores the advisory DTR clock from it; nothing safety-gating reads it.
@@ -649,7 +662,7 @@ class RoastStore:
         self._connection: aiosqlite.Connection | None = None
         self._last_telemetry_elapsed: dict[str, float] = {}
         self._last_telemetry_d96_state: dict[
-            str, tuple[bool | None, PostFcHeatAuthorityState | None]
+            str, tuple[bool | None, PostFcHeatAuthorityState | None, bool]
         ] = {}
         self._bean_profile_write_lock = asyncio.Lock()
 
@@ -995,7 +1008,15 @@ class RoastStore:
         Returns whether a row was written. The first row of a run always writes.
         """
         last = self._last_telemetry_elapsed.get(run_id)
-        d96_state = (post_fc_recovery_enabled, post_fc_heat_authority_state)
+        # DEVELOPMENT owns live D96 authority. Persist entry/exit of that
+        # ownership domain even when a same-tick historical witness repeats the
+        # prior authority value; otherwise the periodic throttle can move the
+        # phase boundary a tick late and overstate validation durations.
+        d96_state = (
+            post_fc_recovery_enabled,
+            post_fc_heat_authority_state,
+            agent_phase is RoastPhase.DEVELOPMENT,
+        )
         d96_state_changed = (
             run_id in self._last_telemetry_d96_state
             and self._last_telemetry_d96_state[run_id] != d96_state
@@ -1195,7 +1216,8 @@ class RoastStore:
         fresh database."""
         async with self.connection.execute(
             "SELECT id, agent_phase, outcome, started_at_utc, completed_at_utc,"
-            " t0_detected_at_utc, ambient_captured, profile_json FROM roast_runs"
+            " t0_detected_at_utc, ambient_captured, profile_json, config_json"
+            " FROM roast_runs"
             " ORDER BY started_at_utc DESC, rowid DESC LIMIT 1"
         ) as cursor:
             row = await cursor.fetchone()
@@ -1216,6 +1238,7 @@ class RoastStore:
             # NULL`` — a captured-but-null reading must still latch.
             ambient_captured=bool(row["ambient_captured"]),
             profile=RoastProfile.model_validate_json(str(row["profile_json"])),
+            frozen_config=FrozenRunConfig.model_validate_json(str(row["config_json"])),
         )
 
     async def complete_run(

@@ -106,6 +106,46 @@ describe("dashboardReducer", () => {
     });
   });
 
+  it("adopts a restarted live clock before a delayed backfill seed", () => {
+    let s = dashboardReducer(initialDashboardViewModel, {
+      kind: "seed",
+      points: [
+        { t: 100, bean: 150, env: 160, ror: 5, heat: 60, fan: 40 },
+        { t: 105, bean: 151, env: 161, ror: 5, heat: 60, fan: 40 },
+      ],
+      origin: 50,
+    });
+
+    // SSE wins the race with the restarted-epoch REST request. Its server clocks
+    // establish the new origin before the point is inserted, so only old-epoch
+    // points are rebased.
+    s = dashboardReducer(
+      s,
+      ev("telemetry", {
+        elapsed_seconds: 10,
+        charge_elapsed_seconds: 190,
+        bean_temp_c: 185,
+        env_temp_c: 205,
+      }),
+    );
+    expect(s.t0ElapsedSeconds).toBe(-180);
+    expect(s.points.map((point) => point.t)).toEqual([-130, -125, 10]);
+
+    // The delayed seed now shares the established origin. It fills the missed
+    // persisted window without moving or replacing the fresher live point.
+    s = dashboardReducer(s, {
+      kind: "seed",
+      points: [
+        { t: 0, bean: 180, env: 200, ror: 5, heat: 0, fan: 0 },
+        { t: 5, bean: 182, env: 202, ror: 5, heat: 0, fan: 0 },
+      ],
+      origin: -180,
+      startsNewEpoch: true,
+    });
+    expect(s.points.map((point) => point.t)).toEqual([-130, -125, 0, 5, 10]);
+    expect(s.points.find((point) => point.t === 10)?.bean).toBe(185);
+  });
+
   it("appends a curve point per telemetry frame (x = SERVE-elapsed seconds, #326)", () => {
     let s = initialDashboardViewModel;
     // The curve buffer keys `t` on serve elapsed_seconds (#326), NOT
@@ -623,15 +663,68 @@ describe("dashboardReducer", () => {
     });
   });
 
-  it("preserves the active D96 trace on development and ignores unknown phases", () => {
+  it("clears stale D96 output on development resume and ignores unknown phases", () => {
     const active = recoveringState();
     const development = dashboardReducer(active, ev("phase_changed", { phase: "development" }));
     const unknown = dashboardReducer(active, ev("phase_changed", { phase: "future_phase" }));
     const missing = dashboardReducer(active, ev("phase_changed", {}));
 
-    expect(development.postFcControl).toEqual(active.postFcControl);
+    expect(development.postFcControl).toMatchObject({
+      recoveryEnabled: true,
+      heatAuthorityState: null,
+      rorSetpointCPerMin: null,
+      smoothedRorCPerMin: null,
+      effectiveHeatCeilingPercent: null,
+      atChargeElapsedSeconds: 100,
+    });
     expect(unknown).toBe(active);
     expect(missing).toBe(active);
+  });
+
+  it("keeps restart backfill stale until fresh post-resume telemetry arrives", () => {
+    let s = dashboardReducer(
+      recoveringState(),
+      ev("phase_changed", { phase: "operator_recovery_required" }),
+    );
+    expect(s.postFcControl?.heatAuthorityState).toBeNull();
+
+    // A late REST response may still carry the pre-restart controller output.
+    s = dashboardReducer(s, {
+      kind: "seed",
+      points: [],
+      postFcControl: {
+        recoveryEnabled: true,
+        heatAuthorityState: "recovering",
+        rorSetpointCPerMin: 6.4,
+        smoothedRorCPerMin: 4.8,
+        effectiveHeatCeilingPercent: 75,
+        atChargeElapsedSeconds: 101,
+      },
+    });
+    expect(s.postFcControl?.heatAuthorityState).toBe("recovering");
+
+    // Operator resume is a new controller generation. The phase edge clears
+    // the late seed; only a current-generation telemetry frame may repopulate.
+    s = dashboardReducer(s, ev("phase_changed", { phase: "development" }));
+    expect(s.postFcControl?.heatAuthorityState).toBeNull();
+    s = dashboardReducer(
+      s,
+      ev("telemetry", {
+        elapsed_seconds: 501,
+        charge_elapsed_seconds: 102,
+        bean_temp_c: 186,
+        env_temp_c: 206,
+        post_fc_recovery_enabled: true,
+        post_fc_heat_authority_state: "recovery_confirming",
+        post_fc_ror_setpoint_c_per_min: 6.3,
+        post_fc_smoothed_ror_c_per_min: 4.9,
+        post_fc_effective_heat_ceiling_percent: 75,
+      }),
+    );
+    expect(s.postFcControl).toMatchObject({
+      heatAuthorityState: "recovery_confirming",
+      atChargeElapsedSeconds: 102,
+    });
   });
 
   it("places the cooling marker once — a re-fired cooling phase does not duplicate it (#309)", () => {

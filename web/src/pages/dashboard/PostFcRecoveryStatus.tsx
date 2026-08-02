@@ -1,9 +1,11 @@
 /** Compact, read-only D96 recovery-authority status for a live roast (#699). */
 
 import { formatPercent, formatRoR } from "./format";
+import type { RoastPhase } from "@/lib/types";
 import type { PostFcControlTrace } from "./useDashboardEvents";
 
 export interface PostFcRecoveryStatusProps {
+  phase: RoastPhase | null;
   trace: PostFcControlTrace | null | undefined;
 }
 
@@ -14,27 +16,42 @@ const STATE_LABEL = {
 } as const;
 
 export function PostFcRecoveryStatus({
+  phase,
   trace,
 }: PostFcRecoveryStatusProps): React.JSX.Element {
+  // A persisted trace describes what the controller accepted historically. The
+  // hydrated server phase owns whether that authority is live now: after restart
+  // into recovery there may be no replayed phase-change or telemetry frame to
+  // clear the old output, so never present its diagnostics outside DEVELOPMENT.
+  const currentTrace =
+    phase === "development" || trace == null
+      ? trace
+      : {
+          ...trace,
+          heatAuthorityState: null,
+          rorSetpointCPerMin: null,
+          smoothedRorCPerMin: null,
+          effectiveHeatCeilingPercent: null,
+        };
   const label =
-    trace == null
+    currentTrace == null
       ? "No recovery trace"
-      : !trace.recoveryEnabled
+      : !currentTrace.recoveryEnabled
         ? "Recovery off"
-        : trace.heatAuthorityState === null
+        : currentTrace.heatAuthorityState === null
           ? "Recovery armed"
-          : STATE_LABEL[trace.heatAuthorityState];
+          : STATE_LABEL[currentTrace.heatAuthorityState];
   const active =
-    trace?.recoveryEnabled === true &&
-    (trace.heatAuthorityState === "recovering" ||
-      trace.heatAuthorityState === "gliding");
+    currentTrace?.recoveryEnabled === true &&
+    (currentTrace.heatAuthorityState === "recovering" ||
+      currentTrace.heatAuthorityState === "gliding");
 
   return (
     <section
       data-testid="post-fc-recovery-status"
       data-state={
-        trace?.recoveryEnabled === true
-          ? (trace.heatAuthorityState ?? "armed")
+        currentTrace?.recoveryEnabled === true
+          ? (currentTrace.heatAuthorityState ?? "armed")
           : "off"
       }
       className="rounded-lg border border-border bg-card px-4 py-3"
@@ -57,13 +74,13 @@ export function PostFcRecoveryStatus({
         </div>
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
           <span>
-            RoR <strong className="numeric text-foreground">{formatRoR(trace?.smoothedRorCPerMin)}</strong>
+            RoR <strong className="numeric text-foreground">{formatRoR(currentTrace?.smoothedRorCPerMin)}</strong>
           </span>
           <span>
-            Target <strong className="numeric text-foreground">{formatRoR(trace?.rorSetpointCPerMin)}</strong>
+            Target <strong className="numeric text-foreground">{formatRoR(currentTrace?.rorSetpointCPerMin)}</strong>
           </span>
           <span>
-            Heat ceiling <strong className="numeric text-foreground">{formatPercent(trace?.effectiveHeatCeilingPercent)}</strong>
+            Heat ceiling <strong className="numeric text-foreground">{formatPercent(currentTrace?.effectiveHeatCeilingPercent)}</strong>
           </span>
         </div>
       </div>
