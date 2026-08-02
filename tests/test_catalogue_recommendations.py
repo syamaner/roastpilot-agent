@@ -1077,6 +1077,40 @@ def test_discovery_falls_back_to_json_ld_id_when_url_is_unusable(unusable_url: s
     ]
 
 
+def test_discovery_uses_single_json_ld_offer_url_when_product_url_is_absent() -> None:
+    html = """
+    <script type="application/ld+json">
+      {"@type":"Product","name":"Kenya Kiambu",
+       "offers":{"@type":"Offer","url":"/products/kenya-kiambu"}}
+    </script>
+    """
+
+    candidates = discover_catalogue_candidates(_page(html))
+
+    assert [(item.label, item.product_url) for item in candidates] == [
+        ("Kenya Kiambu", "https://vendor.example/products/kenya-kiambu")
+    ]
+
+
+def test_discovery_uses_first_usable_url_from_json_ld_offer_list() -> None:
+    html = """
+    <script type="application/ld+json">
+      {"@type":"Product","name":"Rwanda Nyamasheke","url":"https://evil.example/x",
+       "offers":[
+         {"@type":"Offer","url":"https://evil.example/products/wrong-origin"},
+         {"@type":"Offer","url":"/products/rwanda-nyamasheke"},
+         {"@type":"Offer","url":"/products/later-variant"}
+       ]}
+    </script>
+    """
+
+    candidates = discover_catalogue_candidates(_page(html))
+
+    assert [(item.label, item.product_url) for item in candidates] == [
+        ("Rwanda Nyamasheke", "https://vendor.example/products/rwanda-nyamasheke")
+    ]
+
+
 def test_discovery_ignores_fragment_only_json_ld_product_identifier() -> None:
     html = """
     <script type="application/ld+json">

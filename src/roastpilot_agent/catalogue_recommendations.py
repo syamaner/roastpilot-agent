@@ -433,6 +433,31 @@ def _json_ld_product_blocks(value: object) -> list[dict[str, object]]:
     return products[:_MAX_DISCOVERED]
 
 
+def _json_ld_product_urls(block: dict[str, object]) -> list[str]:
+    """Return bounded URL candidates from a JSON-LD Product in priority order.
+
+    Schema.org permits ``offers`` to be either one Offer object or a list, and
+    client-rendered catalogues often keep the product locator only on the Offer.
+    The Product's own ``url`` remains authoritative when usable; Offer URLs are
+    bounded fallbacks. ``@id`` is handled separately because opaque entity ids
+    need the stricter product-path check used by discovery.
+    """
+    candidates: list[str] = []
+    product_url = block.get("url")
+    if isinstance(product_url, str):
+        candidates.append(product_url)
+
+    offers = block.get("offers")
+    offer_items = cast(list[object], offers) if isinstance(offers, list) else [offers]
+    for offer in offer_items[:_MAX_DISCOVERED]:
+        if not isinstance(offer, dict):
+            continue
+        offer_url = cast(dict[str, object], offer).get("url")
+        if isinstance(offer_url, str):
+            candidates.append(offer_url)
+    return candidates
+
+
 def _canonical_host(host: str) -> str:
     """Return the ASCII browser-equivalent host used for origin checks."""
     rendered = f"[{host}]" if ":" in host else host
@@ -734,17 +759,22 @@ def _discover_catalogue_candidates_unchecked(
             continue
         for block in _json_ld_product_blocks(decoded):
             name = _clean_text(block.get("name"))
-            url_value = block.get("url")
             identifier = block.get("@id")
-            usable_url = (
-                _same_origin_product_url(
-                    url_value,
-                    base_url=document_base_url,
-                    require_product_path=False,
-                    allow_relative=allow_relative_urls,
-                )
-                if isinstance(url_value, str)
-                else None
+            usable_url = next(
+                (
+                    normalized
+                    for url_value in _json_ld_product_urls(block)
+                    if (
+                        normalized := _same_origin_product_url(
+                            url_value,
+                            base_url=document_base_url,
+                            require_product_path=False,
+                            allow_relative=allow_relative_urls,
+                        )
+                    )
+                    is not None
+                ),
+                None,
             )
             if usable_url is not None and name:
                 raw.append((usable_url, name, _json_ld_product_evidence(block, name), False))
