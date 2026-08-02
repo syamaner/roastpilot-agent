@@ -94,4 +94,54 @@ describe("postFcRecoverySummary", () => {
     expect(summary.recoveringDurationSeconds).toBe(5);
     expect(summary.glidingDurationSeconds).toBe(3);
   });
+
+  it("does not attribute restart downtime to the last pre-restart authority state", () => {
+    const summary = postFcRecoverySummary(
+      series([
+        {
+          elapsed_seconds: 45,
+          charge_elapsed_seconds: 45,
+          post_fc_recovery_enabled: true,
+          post_fc_heat_authority_state: "recovering",
+        },
+        {
+          elapsed_seconds: 50,
+          charge_elapsed_seconds: 50,
+          post_fc_recovery_enabled: true,
+          post_fc_heat_authority_state: "recovering",
+        },
+        {
+          elapsed_seconds: 0,
+          charge_elapsed_seconds: 180,
+          agent_phase: "operator_recovery_required",
+          post_fc_recovery_enabled: true,
+          post_fc_heat_authority_state: null,
+        },
+      ]),
+    );
+
+    expect(summary.recoveringDurationSeconds).toBe(5);
+  });
+
+  it("closes an authority interval at a same-process recovery boundary", () => {
+    const summary = postFcRecoverySummary(
+      series([
+        {
+          elapsed_seconds: 100,
+          charge_elapsed_seconds: 50,
+          post_fc_recovery_enabled: true,
+          post_fc_heat_authority_state: "recovering",
+        },
+        {
+          elapsed_seconds: 105,
+          charge_elapsed_seconds: 55,
+          agent_phase: "operator_recovery_required",
+          post_fc_recovery_enabled: true,
+          post_fc_heat_authority_state: null,
+        },
+      ]),
+    );
+
+    expect(summary.recoveringDurationSeconds).toBe(5);
+  });
 });

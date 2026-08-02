@@ -1918,11 +1918,12 @@ class RoastStore:
     async def read_telemetry_points(
         self, run_id: str, *, downsample: int = 1
     ) -> list[TelemetryPoint]:
-        """Tick-ordered telemetry snapshots, sampled every ``downsample`` rows.
+        """Insertion-ordered telemetry snapshots, sampled every ``downsample`` rows.
 
         ``downsample`` must be >= 1; ``1`` returns every snapshot. The stride
         is index-based and keeps the first row, so the series start is stable
-        regardless of stride."""
+        regardless of stride. The durable insertion id owns chronology because
+        the process-local tick counter restarts at zero after agent recovery."""
         if downsample < 1:
             raise ValueError("downsample must be >= 1")
         async with self.connection.execute(
@@ -1932,7 +1933,7 @@ class RoastStore:
             ", post_fc_recovery_enabled, post_fc_heat_authority_state,"
             " post_fc_ror_setpoint_c_per_min, post_fc_smoothed_ror_c_per_min,"
             " post_fc_effective_heat_ceiling_percent"
-            " FROM telemetry_snapshots WHERE run_id = ? ORDER BY tick ASC, id ASC",
+            " FROM telemetry_snapshots WHERE run_id = ? ORDER BY id ASC",
             (run_id,),
         ) as cursor:
             rows = list(await cursor.fetchall())

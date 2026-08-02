@@ -12,10 +12,12 @@
  * the snapshot harness can feed it fixed data).
  */
 
+import { useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
 
 import { AppFrame } from "@/components/shared";
-import { useRoast, useTelemetry, useTimeline } from "@/hooks/queries";
+import { roastKeys, useRoast, useTelemetry, useTimeline } from "@/hooks/queries";
 import { DetailView } from "./DetailView";
 
 export function DetailPage(): React.JSX.Element {
@@ -24,6 +26,25 @@ export function DetailPage(): React.JSX.Element {
   const detail = useRoast(runId);
   const telemetry = useTelemetry(runId);
   const timeline = useTimeline(runId);
+  const queryClient = useQueryClient();
+  const completedAtUtc = detail.data?.completed_at_utc;
+
+  // A detail route may be opened while its roast is still live. `useRoast`
+  // observes completion on its slow poll, but telemetry has a separate cache
+  // key and otherwise remains the mid-roast series indefinitely. Refresh it
+  // once at the terminal boundary so the post-roast D96 summary is complete.
+  useEffect(() => {
+    if (
+      runId !== null &&
+      completedAtUtc !== undefined &&
+      completedAtUtc !== null
+    ) {
+      void queryClient.invalidateQueries({
+        queryKey: roastKeys.telemetry(runId, 1),
+        exact: true,
+      });
+    }
+  }, [completedAtUtc, queryClient, runId]);
 
   return (
     <AppFrame>

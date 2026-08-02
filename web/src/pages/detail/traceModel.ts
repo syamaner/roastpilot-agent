@@ -94,7 +94,12 @@ export function toCurvePoints(series: TelemetrySeries | undefined): CurvePoint[]
       fan: p.fan_level_percent,
     });
   }
-  return points;
+  // REST preserves durable insertion order because the D96 recovery summary
+  // needs the true row sequence across an agent restart. The process-local
+  // serve clock resets on that boundary, though, while uPlot and the display
+  // smoother require an ascending x column. Sort this detached projection only:
+  // recovery analysis keeps the source chronology and the chart stays valid.
+  return points.sort((left, right) => left.t - right.t);
 }
 
 /**

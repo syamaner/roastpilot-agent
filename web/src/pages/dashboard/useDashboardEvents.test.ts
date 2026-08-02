@@ -29,11 +29,11 @@ const ADVISORY_DECISION = {
 };
 
 describe("dashboardReducer", () => {
-  it("retains the latest D96 trace and rejects an older reconnect seed", () => {
+  it("uses the restored charge clock to order D96 traces across restart", () => {
     let s = dashboardReducer(
       initialDashboardViewModel,
       ev("telemetry", {
-        elapsed_seconds: 510,
+        elapsed_seconds: 500,
         charge_elapsed_seconds: 100,
         bean_temp_c: 185,
         env_temp_c: 205,
@@ -47,7 +47,27 @@ describe("dashboardReducer", () => {
     expect(s.postFcControl).toMatchObject({
       recoveryEnabled: true,
       heatAuthorityState: "recovering",
-      atElapsedSeconds: 510,
+      atChargeElapsedSeconds: 100,
+    });
+
+    // The serve clock resets with the process while the restored charge clock
+    // remains chronological. This newer recovery-required frame must replace
+    // the stale pre-restart RECOVERING trace despite its lower serve clock.
+    s = dashboardReducer(
+      s,
+      ev("telemetry", {
+        elapsed_seconds: 0,
+        charge_elapsed_seconds: 180,
+        bean_temp_c: 184,
+        env_temp_c: 204,
+        post_fc_recovery_enabled: true,
+        post_fc_heat_authority_state: null,
+      }),
+    );
+    expect(s.postFcControl).toMatchObject({
+      recoveryEnabled: true,
+      heatAuthorityState: null,
+      atChargeElapsedSeconds: 180,
     });
 
     s = dashboardReducer(s, {
@@ -59,13 +79,13 @@ describe("dashboardReducer", () => {
         rorSetpointCPerMin: 6,
         smoothedRorCPerMin: 6,
         effectiveHeatCeilingPercent: 60,
-        atElapsedSeconds: 500,
+        atChargeElapsedSeconds: 100,
       },
     });
     expect(s.postFcControl).toMatchObject({
       recoveryEnabled: true,
-      heatAuthorityState: "recovering",
-      atElapsedSeconds: 510,
+      heatAuthorityState: null,
+      atChargeElapsedSeconds: 180,
     });
   });
 

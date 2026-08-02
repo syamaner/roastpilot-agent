@@ -1,19 +1,21 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "@/lib/api";
-import type { RoastDetail } from "@/lib/types";
+import type { RoastDetail, TelemetrySeries } from "@/lib/types";
+import { roastKeys } from "@/hooks/queries";
 import { FIXTURE_DETAIL, FIXTURE_TELEMETRY, FIXTURE_TIMELINE } from "./fixture";
 import { DetailPage } from "./DetailPage";
 import { __resetPartialFailureLocksForTests } from "./useSaveRating";
 
-function renderAt(path: string) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderAt(path: string, client?: QueryClient) {
+  const queryClient =
+    client ?? new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const Wrapper = ({ children }: { children: ReactNode }) => (
-    <QueryClientProvider client={client}>
+    <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[path]}>
         <Routes>
           <Route path="/roasts/:runId" element={children} />
@@ -57,6 +59,60 @@ describe("DetailPage shell", () => {
   it("shows a no-run message when there is no run id", () => {
     renderAt("/roasts");
     expect(screen.getByTestId("detail-no-run")).toBeInTheDocument();
+  });
+
+  it("refreshes cached live telemetry once the detail poll observes completion", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const liveDetail = { ...FIXTURE_DETAIL, completed_at_utc: null };
+    const finalTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      points: FIXTURE_TELEMETRY.points.map((point, index) =>
+        index >= 11 && index <= 12
+          ? {
+              ...point,
+              post_fc_recovery_enabled: true,
+              post_fc_heat_authority_state: "recovering",
+            }
+          : index === 13
+            ? {
+                ...point,
+                post_fc_recovery_enabled: true,
+                post_fc_heat_authority_state: "holding",
+              }
+            : point,
+      ),
+    };
+    const partialTelemetry: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      point_count: 10,
+      points: FIXTURE_TELEMETRY.points.slice(0, 10),
+    };
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { refetchOnWindowFocus: false, retry: false, staleTime: 30_000 },
+      },
+    });
+    client.setQueryData(roastKeys.detail(FIXTURE_DETAIL.id), liveDetail);
+    client.setQueryData(roastKeys.telemetry(FIXTURE_DETAIL.id, 1), partialTelemetry);
+    const detailSpy = vi.spyOn(api, "roast").mockResolvedValue(FIXTURE_DETAIL);
+    const telemetrySpy = vi.spyOn(api, "telemetry").mockResolvedValue(finalTelemetry);
+    vi.spyOn(api, "timeline").mockResolvedValue(FIXTURE_TIMELINE);
+
+    renderAt(`/roasts/${FIXTURE_DETAIL.id}`, client);
+    expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent(
+      "No observed recovery",
+    );
+    expect(telemetrySpy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    await vi.waitFor(() => expect(detailSpy).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(telemetrySpy).toHaveBeenCalledWith(FIXTURE_DETAIL.id, 1));
+    await vi.waitFor(() =>
+      expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent("Recovery armed"),
+    );
+    expect(screen.getByTestId("post-fc-recovery-summary")).toHaveTextContent("Recovering01:00");
   });
 
   it("#568 Codex (PRRT_kwDOSzMG_c6Rdlk6 / PRRT_kwDOSzMG_c6RdxDQ): the read-only rating headline reflects a saved edit IMMEDIATELY, never a stale flash while the detail query re-settles", async () => {

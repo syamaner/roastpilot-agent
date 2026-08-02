@@ -34,6 +34,28 @@ describe("toCurvePoints", () => {
     expect(toCurvePoints(series)).toHaveLength(1);
   });
 
+  it("sorts only the chart projection after a process-local clock reset", () => {
+    const elapsed = [100, 105, 0, 5];
+    const series: TelemetrySeries = {
+      run_id: "recovered-run",
+      downsample: 1,
+      point_count: elapsed.length,
+      points: elapsed.map((elapsedSeconds, index) => ({
+        ...FIXTURE_TELEMETRY.points[index],
+        elapsed_seconds: elapsedSeconds,
+        bean_temp_c: 150 + index,
+      })),
+    };
+
+    expect(toCurvePoints(series).map(({ t, bean }) => [t, bean])).toEqual([
+      [0, 152],
+      [5, 153],
+      [100, 150],
+      [105, 151],
+    ]);
+    expect(series.points.map((point) => point.elapsed_seconds)).toEqual(elapsed);
+  });
+
   it("returns [] for undefined telemetry", () => {
     expect(toCurvePoints(undefined)).toEqual([]);
   });

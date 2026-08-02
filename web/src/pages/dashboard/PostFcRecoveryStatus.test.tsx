@@ -15,7 +15,7 @@ describe("PostFcRecoveryStatus", () => {
           rorSetpointCPerMin: 6,
           smoothedRorCPerMin: 6.2,
           effectiveHeatCeilingPercent: 60,
-          atElapsedSeconds: 500,
+          atChargeElapsedSeconds: 500,
         }}
       />,
     );
@@ -29,7 +29,7 @@ describe("PostFcRecoveryStatus", () => {
           rorSetpointCPerMin: 6,
           smoothedRorCPerMin: 6.2,
           effectiveHeatCeilingPercent: 60,
-          atElapsedSeconds: 501,
+          atChargeElapsedSeconds: 501,
         }}
       />,
     );
@@ -45,7 +45,7 @@ describe("PostFcRecoveryStatus", () => {
           rorSetpointCPerMin: 6.4,
           smoothedRorCPerMin: 4.8,
           effectiveHeatCeilingPercent: 75,
-          atElapsedSeconds: 510,
+          atChargeElapsedSeconds: 510,
         }}
       />,
     );
@@ -63,7 +63,7 @@ describe("PostFcRecoveryStatus", () => {
           rorSetpointCPerMin: 6,
           smoothedRorCPerMin: 6.1,
           effectiveHeatCeilingPercent: 70,
-          atElapsedSeconds: 515,
+          atChargeElapsedSeconds: 515,
         }}
       />,
     );

@@ -189,6 +189,7 @@ describe("useDashboardEvents (hook)", () => {
     const persisted = series([500, 505]);
     persisted.points[0] = {
       ...persisted.points[0],
+      charge_elapsed_seconds: 100,
       post_fc_recovery_enabled: true,
       post_fc_heat_authority_state: "recovering",
       post_fc_ror_setpoint_c_per_min: 6.4,
@@ -197,6 +198,7 @@ describe("useDashboardEvents (hook)", () => {
     };
     persisted.points[1] = {
       ...persisted.points[1],
+      charge_elapsed_seconds: 105,
       post_fc_recovery_enabled: true,
       post_fc_heat_authority_state: "gliding",
       post_fc_ror_setpoint_c_per_min: 6.2,
@@ -213,7 +215,7 @@ describe("useDashboardEvents (hook)", () => {
         recoveryEnabled: true,
         heatAuthorityState: "gliding",
         effectiveHeatCeilingPercent: 70,
-        atElapsedSeconds: 505,
+        atChargeElapsedSeconds: 105,
       }),
     );
   });

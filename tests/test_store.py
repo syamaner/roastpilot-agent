@@ -974,6 +974,52 @@ async def test_telemetry_round_trips_charge_elapsed_seconds(tmp_store: RoastStor
 
 
 @pytest.mark.asyncio
+async def test_telemetry_read_preserves_insertion_order_across_tick_restart(
+    tmp_store: RoastStore,
+) -> None:
+    """A recovered process's reset tick counter must not reorder one run."""
+    await seeded_store(tmp_store)
+    restarted: RoastStore | None = None
+    try:
+        reading = RoastTelemetry(bean_temp_c=185.0, env_temp_c=205.0)
+        for tick, elapsed, charge in [(10, 100.0, 50.0), (11, 105.0, 55.0)]:
+            assert await tmp_store.record_telemetry(
+                run_id="run-1",
+                tick=tick,
+                agent_phase=RoastPhase.DEVELOPMENT,
+                elapsed_seconds=elapsed,
+                interval_seconds=5.0,
+                telemetry=reading,
+                charge_elapsed_seconds=charge,
+            )
+
+        # A real agent restart constructs a fresh store and tick counter. Its
+        # durable insertion ids continue, while process-local ticks restart at 0.
+        await tmp_store.close()
+        restarted = RoastStore(tmp_store.db_path)
+        await restarted.initialize()
+        for tick, elapsed, charge in [(0, 0.0, 180.0), (1, 5.0, 185.0)]:
+            assert await restarted.record_telemetry(
+                run_id="run-1",
+                tick=tick,
+                agent_phase=RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+                elapsed_seconds=elapsed,
+                interval_seconds=5.0,
+                telemetry=reading,
+                charge_elapsed_seconds=charge,
+            )
+
+        points = await restarted.read_telemetry_points("run-1")
+        assert [point.tick for point in points] == [10, 11, 0, 1]
+        sampled = await restarted.read_telemetry_points("run-1", downsample=2)
+        assert [point.tick for point in sampled] == [10, 0]
+    finally:
+        if restarted is not None:
+            await restarted.close()
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_telemetry_round_trips_d96_validation_trace(tmp_store: RoastStore) -> None:
     """#699: retained telemetry preserves the controller-owned D96 trace."""
     await seeded_store(tmp_store)

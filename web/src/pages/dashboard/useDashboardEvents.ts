@@ -73,8 +73,8 @@ export interface PostFcControlTrace {
   rorSetpointCPerMin: number | null;
   smoothedRorCPerMin: number | null;
   effectiveHeatCeilingPercent: number | null;
-  /** Serve-elapsed ordering key; null only for a malformed/legacy live frame. */
-  atElapsedSeconds: number | null;
+  /** Restart-stable charge-clock ordering key; null on malformed/legacy data. */
+  atChargeElapsedSeconds: number | null;
 }
 
 export interface DashboardViewModel {
@@ -386,7 +386,7 @@ function postFcTraceFromTelemetry(data: TelemetryEventData): PostFcControlTrace 
     smoothedRorCPerMin: data.post_fc_smoothed_ror_c_per_min ?? null,
     effectiveHeatCeilingPercent:
       data.post_fc_effective_heat_ceiling_percent ?? null,
-    atElapsedSeconds: data.elapsed_seconds,
+    atChargeElapsedSeconds: data.charge_elapsed_seconds,
   };
 }
 
@@ -399,8 +399,23 @@ function postFcTraceFromSnapshot(point: TelemetryPoint): PostFcControlTrace | nu
     smoothedRorCPerMin: point.post_fc_smoothed_ror_c_per_min ?? null,
     effectiveHeatCeilingPercent:
       point.post_fc_effective_heat_ceiling_percent ?? null,
-    atElapsedSeconds: point.elapsed_seconds,
+    atChargeElapsedSeconds: point.charge_elapsed_seconds,
   };
+}
+
+function finiteTraceClock(value: number | null): value is number {
+  return value !== null && Number.isFinite(value);
+}
+
+/** True when `incoming` is not older on the restart-stable charge clock. */
+function traceIsAtLeastAsRecent(
+  current: PostFcControlTrace | null,
+  incoming: PostFcControlTrace,
+): boolean {
+  const currentAt = current?.atChargeElapsedSeconds ?? null;
+  const incomingAt = incoming.atChargeElapsedSeconds;
+  if (!finiteTraceClock(currentAt)) return true;
+  return finiteTraceClock(incomingAt) && incomingAt >= currentAt;
 }
 
 /** Accept a trace only when it is at least as recent as the one already shown. */
@@ -409,15 +424,7 @@ function withPostFcTrace(
   incoming: PostFcControlTrace | null | undefined,
 ): DashboardViewModel {
   if (incoming == null) return state;
-  const currentAt = state.postFcControl?.atElapsedSeconds;
-  const incomingAt = incoming.atElapsedSeconds;
-  if (
-    currentAt !== null &&
-    currentAt !== undefined &&
-    (incomingAt === null || incomingAt < currentAt)
-  ) {
-    return state;
-  }
+  if (!traceIsAtLeastAsRecent(state.postFcControl, incoming)) return state;
   return { ...state, postFcControl: incoming };
 }
 
@@ -770,9 +777,7 @@ export function useDashboardEvents(
           const trace = postFcTraceFromSnapshot(p);
           if (
             trace !== null &&
-            (postFcControl === null ||
-              (trace.atElapsedSeconds ?? -Infinity) >=
-                (postFcControl.atElapsedSeconds ?? -Infinity))
+            traceIsAtLeastAsRecent(postFcControl, trace)
           ) {
             postFcControl = trace;
           }
