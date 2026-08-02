@@ -64,4 +64,34 @@ describe("postFcRecoverySummary", () => {
       glideToRecoveryRetriggerCount: 1,
     });
   });
+
+  it("clips the final authority interval at drop instead of counting cooling time", () => {
+    const summary = postFcRecoverySummary(
+      series([
+        {
+          elapsed_seconds: 100,
+          charge_elapsed_seconds: 50,
+          post_fc_recovery_enabled: true,
+          post_fc_heat_authority_state: "recovering",
+        },
+        {
+          elapsed_seconds: 105,
+          charge_elapsed_seconds: 55,
+          post_fc_recovery_enabled: true,
+          post_fc_heat_authority_state: "gliding",
+        },
+        {
+          elapsed_seconds: 112,
+          charge_elapsed_seconds: 58,
+          agent_phase: "cooling",
+          cooling_on: true,
+          post_fc_recovery_enabled: true,
+          post_fc_heat_authority_state: null,
+        },
+      ]),
+    );
+
+    expect(summary.recoveringDurationSeconds).toBe(5);
+    expect(summary.glidingDurationSeconds).toBe(3);
+  });
 });

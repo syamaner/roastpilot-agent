@@ -53,9 +53,15 @@ export function postFcRecoverySummary(
       if (previousState === "gliding") glideToRecoveryRetriggerCount += 1;
     }
 
-    const nextElapsed = points[index + 1]?.elapsed_seconds;
-    if (finite(point.elapsed_seconds) && finite(nextElapsed) && nextElapsed >= point.elapsed_seconds) {
-      const duration = nextElapsed - point.elapsed_seconds;
+    const nextChargeElapsed = points[index + 1]?.charge_elapsed_seconds;
+    if (
+      finite(point.charge_elapsed_seconds) &&
+      finite(nextChargeElapsed) &&
+      nextChargeElapsed >= point.charge_elapsed_seconds
+    ) {
+      // The charge clock freezes at drop, so the final DEVELOPMENT interval
+      // excludes any cooling time before the next persisted row arrives.
+      const duration = nextChargeElapsed - point.charge_elapsed_seconds;
       if (state === "recovering") recoveringDurationSeconds += duration;
       if (state === "gliding") glidingDurationSeconds += duration;
     }
