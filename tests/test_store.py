@@ -368,7 +368,7 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
     upgraded = RoastStore(db_path=db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 14 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 15 == len(MIGRATIONS)
         row = await fetch_one(upgraded, "SELECT excluded FROM roast_runs WHERE id = 'run-1'")
         assert row == (0,)
         detail = await upgraded.read_run("run-1")
@@ -384,11 +384,11 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
 
 
 @pytest.mark.asyncio
-async def test_fresh_store_is_v14(tmp_store: RoastStore) -> None:
-    """A brand-new store lands on the current (v14) schema version."""
+async def test_fresh_store_is_v15(tmp_store: RoastStore) -> None:
+    """A brand-new store lands on the current (v15) schema version."""
     await tmp_store.initialize()
     try:
-        assert await tmp_store.schema_version() == 14 == len(MIGRATIONS)
+        assert await tmp_store.schema_version() == 15 == len(MIGRATIONS)
     finally:
         await tmp_store.close()
 
@@ -412,10 +412,51 @@ async def test_v14_migration_upgrades_real_v13_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 14
+        assert await upgraded.schema_version() == 15
         assert await upgraded.read_run("run-1") is not None
         assert "bean_sourcing_attempts" in await fetch_names(upgraded, "table")
         assert "idx_bean_sourcing_attempt_expiry" in await fetch_names(upgraded, "index")
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_v15_migration_adds_catalogue_counts_to_real_v14_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#573: v14 attempt rows survive the additive aggregate-count migration."""
+    db_path = tmp_path / "v15upgrade.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:14])
+    old = RoastStore(db_path)
+    await old.initialize()
+    try:
+        assert await old.schema_version() == 14
+        attempt_id = await old.start_bean_sourcing_attempt(
+            provider="provider", model_slug="model", prompt_version="v1"
+        )
+    finally:
+        await old.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(db_path)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == 15 == len(MIGRATIONS)
+        row = await fetch_one(
+            upgraded,
+            "SELECT catalogue_discovered_count, catalogue_extracted_count"
+            " FROM bean_sourcing_attempts WHERE id = ?",
+            (attempt_id,),
+        )
+        assert row == (None, None)
+        for discovered_count, extracted_count in ((25, 1), (1, 2)):
+            with pytest.raises(aiosqlite_module.IntegrityError):
+                await upgraded.connection.execute(
+                    "UPDATE bean_sourcing_attempts SET catalogue_discovered_count = ?,"
+                    " catalogue_extracted_count = ? WHERE id = ?",
+                    (discovered_count, extracted_count, attempt_id),
+                )
+            await upgraded.connection.rollback()
     finally:
         await upgraded.close()
 
@@ -696,8 +737,10 @@ async def seeded_store(store: RoastStore, run_id: str = "run-1") -> RoastStore:
     return store
 
 
-async def fetch_one(store: RoastStore, sql: str) -> tuple[object, ...]:
-    async with store.connection.execute(sql) as cursor:
+async def fetch_one(
+    store: RoastStore, sql: str, parameters: tuple[object, ...] = ()
+) -> tuple[object, ...]:
+    async with store.connection.execute(sql, parameters) as cursor:
         row = await cursor.fetchone()
     assert row is not None
     return tuple(row)

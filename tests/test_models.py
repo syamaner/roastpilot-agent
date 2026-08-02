@@ -17,6 +17,8 @@ from roastpilot_agent.models import (
     BeanProfile,
     BeanProfileDraft,
     BeanProfileInput,
+    CatalogueRecommendation,
+    CatalogueRecommendationList,
     MicHealth,
     MicStatus,
     RoastCommand,
@@ -980,6 +982,60 @@ def test_bean_profile_draft_field_evidence_round_trip() -> None:
     # field with no captured quote.
     assert "bean_species" not in restored.field_evidence
     assert "is_blend" not in restored.field_evidence
+
+
+def test_catalogue_recommendation_strips_bidi_controls_from_display_text() -> None:
+    recommendation = CatalogueRecommendation(
+        candidate_id="candidate-01",
+        product_url="https://vendor.example/products/kiambu",
+        name="Kiambu \u202eLot",
+        country="Ken\u2066ya",
+        processing="washed",
+        score=1,
+        reason_codes=["missing_country"],
+        reasons=["Adds Ken\u202eya to the active bean roster."],
+    )
+    assert recommendation.name == "Kiambu Lot"
+    assert recommendation.country == "Kenya"
+    assert recommendation.reasons == ["Adds Kenya to the active bean roster."]
+
+
+def test_catalogue_recommendation_rejects_bidi_controls_in_product_url() -> None:
+    with pytest.raises(pydantic.ValidationError, match="unsafe display characters"):
+        CatalogueRecommendation(
+            candidate_id="candidate-01",
+            product_url="https://vendor.example/products/\u202ekiambu",
+            name="Kiambu Lot",
+            country="Kenya",
+            processing="washed",
+            score=1,
+            reason_codes=["missing_country"],
+            reasons=["Adds Kenya to the active bean roster."],
+        )
+
+
+def test_catalogue_recommendation_rejects_unsafe_url_and_oversized_reason() -> None:
+    base = {
+        "candidate_id": "candidate-01",
+        "product_url": "https://vendor.example/products/kiambu",
+        "name": "Kiambu Lot",
+        "country": "Kenya",
+        "processing": "washed",
+        "score": 1,
+        "reason_codes": ["missing_country"],
+        "reasons": ["Adds Kenya to the active bean roster."],
+    }
+    with pytest.raises(pydantic.ValidationError, match="unsafe display characters"):
+        CatalogueRecommendation.model_validate(
+            base | {"product_url": r"https://vendor.example/\evil.example/products/a"}
+        )
+    with pytest.raises(pydantic.ValidationError, match="at most 600 characters"):
+        CatalogueRecommendation.model_validate(base | {"reasons": ["x" * 601]})
+
+
+def test_catalogue_recommendation_list_requires_extracted_subset() -> None:
+    with pytest.raises(pydantic.ValidationError, match="extracted_count cannot exceed"):
+        CatalogueRecommendationList(recommendations=[], discovered_count=1, extracted_count=2)
 
 
 @pytest.mark.parametrize(

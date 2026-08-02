@@ -13,7 +13,7 @@ import json
 import re
 from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, cast
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
@@ -826,7 +826,8 @@ precedent: this is bean metadata, not a safety verdict, so it stays OUT of
 the enum surface the safety-reviewer escalation routes on."""
 
 
-_BEAN_DRAFT_BIDI_CONTROLS = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+UNTRUSTED_TEXT_BIDI_CONTROLS = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+UNTRUSTED_URL_UNSAFE_CHARACTERS = re.compile(r"[\x00-\x20\\\x7f]")
 
 
 class BeanProfileDraft(_BeanProfileFieldsBase):
@@ -881,7 +882,7 @@ class BeanProfileDraft(_BeanProfileFieldsBase):
     def _strip_bidi_controls(cls, value: object) -> object:
         """Remove non-content bidi controls from untrusted drafted identity text."""
         if isinstance(value, str):
-            return _BEAN_DRAFT_BIDI_CONTROLS.sub("", value)
+            return UNTRUSTED_TEXT_BIDI_CONTROLS.sub("", value)
         return value
 
     draft_attempt_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
@@ -940,6 +941,67 @@ class BeanProfileDraft(_BeanProfileFieldsBase):
     """Operator-facing conservative-target framing text (#573): explains why
     the drafted targets are a de-risked first-roast starting point, not a
     fixed recipe."""
+
+
+CatalogueReasonCode = Literal[
+    "missing_country",
+    "missing_processing",
+    "novel_country_processing",
+    "rated_pair_affinity",
+]
+"""Deterministic local reason codes for a catalogue recommendation (D121)."""
+
+
+class CatalogueRecommendation(BaseModel):
+    """One read-only, explainable product recommendation from a catalogue."""
+
+    candidate_id: str = Field(pattern=r"^candidate-[0-9]{2}$")
+    product_url: str = Field(min_length=1, max_length=4096)
+    name: str = Field(min_length=1, max_length=500)
+    country: str | None = Field(default=None, max_length=500)
+    processing: ProcessingMethod | None = None
+    score: int = Field(ge=0)
+    reason_codes: list[CatalogueReasonCode] = Field(max_length=5)
+    reasons: list[Annotated[str, Field(max_length=600)]] = Field(max_length=5)
+
+    @field_validator("product_url", mode="before")
+    @classmethod
+    def _reject_bidi_controls_in_product_url(cls, value: object) -> object:
+        """Reject display-reordering and browser-ambiguous URL characters."""
+        if isinstance(value, str) and (
+            UNTRUSTED_TEXT_BIDI_CONTROLS.search(value)
+            or UNTRUSTED_URL_UNSAFE_CHARACTERS.search(value)
+        ):
+            raise ValueError("product URL contains unsafe display characters")
+        return value
+
+    @field_validator("name", "country", "reasons", mode="before")
+    @classmethod
+    def _strip_bidi_controls(cls, value: object) -> object:
+        """Remove display-reordering controls from untrusted recommendation text."""
+        if isinstance(value, str):
+            return UNTRUSTED_TEXT_BIDI_CONTROLS.sub("", value)
+        if isinstance(value, list):
+            return [
+                UNTRUSTED_TEXT_BIDI_CONTROLS.sub("", item) if isinstance(item, str) else item
+                for item in cast(list[object], value)
+            ]
+        return value
+
+
+class CatalogueRecommendationList(BaseModel):
+    """Bounded recommendations returned for one fetch-fresh catalogue page."""
+
+    recommendations: list[CatalogueRecommendation] = Field(max_length=3)
+    discovered_count: int = Field(ge=0, le=24)
+    extracted_count: int = Field(ge=0, le=12)
+
+    @model_validator(mode="after")
+    def _check_extracted_subset(self) -> "CatalogueRecommendationList":
+        """Extracted candidates cannot outnumber server discovery candidates."""
+        if self.extracted_count > self.discovered_count:
+            raise ValueError("extracted_count cannot exceed discovered_count")
+        return self
 
 
 # --- #567 Slice A: reference-curve retrieval + representation models ---

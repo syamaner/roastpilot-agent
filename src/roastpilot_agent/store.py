@@ -29,6 +29,7 @@ from roastpilot_agent.models import (
     CommandTraceSource,
     CommandTraceStatus,
     LogManifest,
+    ProcessingMethod,
     ReferenceCurveSample,
     ReferenceLandmarks,
     ReferenceRoast,
@@ -506,6 +507,19 @@ CREATE INDEX idx_bean_sourcing_attempt_expiry
   WHERE draft_snapshot_json IS NOT NULL AND saved_profile_id IS NULL;
 """
 
+SCHEMA_V15_CATALOGUE_ATTEMPT_COUNTS = """
+-- #573 / D121: successful catalogue attempts retain only bounded aggregate
+-- discovery/extraction counts, never URLs, HTML, provider output, or result text.
+ALTER TABLE bean_sourcing_attempts ADD COLUMN catalogue_discovered_count INTEGER
+  CHECK (catalogue_discovered_count IS NULL OR
+         catalogue_discovered_count BETWEEN 0 AND 24);
+ALTER TABLE bean_sourcing_attempts ADD COLUMN catalogue_extracted_count INTEGER
+  CHECK (catalogue_extracted_count IS NULL OR
+         (catalogue_extracted_count BETWEEN 0 AND 12 AND
+          catalogue_discovered_count IS NOT NULL AND
+          catalogue_extracted_count <= catalogue_discovered_count));
+"""
+
 _BEAN_SOURCING_LEASE_DURATION = timedelta(minutes=2)
 _BEAN_SOURCING_LEASE_CONFIRMATION = timedelta(seconds=60)
 
@@ -527,6 +541,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V12_CORRECTED_CHARGE,
     SCHEMA_V13_EXCLUDED,
     SCHEMA_V14_BEAN_SOURCING_ATTEMPTS,
+    SCHEMA_V15_CATALOGUE_ATTEMPT_COUNTS,
 )
 
 
@@ -2529,6 +2544,9 @@ class RoastStore:
         usage_evidence: Literal["exact", "partial", "unknown"],
         timed_out_runs: int,
         draft: BeanProfileDraft | None = None,
+        claimable_draft: bool = True,
+        catalogue_discovered_count: int | None = None,
+        catalogue_extracted_count: int | None = None,
         completed_at_utc: str | None = None,
     ) -> None:
         """Commit one terminal attempt outcome without retaining unsafe inputs."""
@@ -2537,9 +2555,26 @@ class RoastStore:
         expires: str | None = None
         on_page_count: int | None = None
         estimated_count: int | None = None
-        if outcome == "success":
-            if draft is None:
-                raise ValueError("a successful bean-sourcing attempt requires a draft")
+        if outcome == "success" and claimable_draft and draft is None:
+            raise ValueError("a successful bean-sourcing attempt requires a draft")
+        if outcome == "success" and not claimable_draft and draft is not None:
+            raise ValueError("a nonclaimable bean-sourcing success cannot carry a draft")
+        catalogue_counts = (catalogue_discovered_count, catalogue_extracted_count)
+        if outcome == "success" and not claimable_draft and None in catalogue_counts:
+            raise ValueError("a nonclaimable catalogue success requires aggregate counts")
+        if claimable_draft and any(value is not None for value in catalogue_counts):
+            raise ValueError("a claimable bean draft cannot carry catalogue counts")
+        if (
+            catalogue_discovered_count is not None
+            and catalogue_extracted_count is not None
+            and catalogue_extracted_count > catalogue_discovered_count
+        ):
+            raise ValueError("catalogue extracted count cannot exceed discovered count")
+        if outcome == "success" and draft is not None:
+            # Single-product success carries one claimable draft baseline.
+            # Catalogue success deliberately carries no draft: it records only
+            # aggregate attempt metrics and the distinct catalogue prompt version;
+            # choosing a result starts the existing single-product flow (D121).
             snapshot_fields = BeanProfileInput.model_fields.keys()
             snapshot_data = {
                 field: getattr(draft, field) for field in snapshot_fields if field != "source_url"
@@ -2558,7 +2593,8 @@ class RoastStore:
                 "UPDATE bean_sourcing_attempts SET completed_at_utc = ?, latency_ms = ?,"
                 " outcome = ?, request_tokens = ?, response_tokens = ?, usage_evidence = ?,"
                 " timed_out_runs = ?, on_page_field_count = ?,"
-                " origin_estimated_field_count = ?, draft_snapshot_json = ?,"
+                " origin_estimated_field_count = ?, catalogue_discovered_count = ?,"
+                " catalogue_extracted_count = ?, draft_snapshot_json = ?,"
                 " claim_expires_at_utc = ? WHERE id = ? AND outcome = 'in_progress'",
                 (
                     completed,
@@ -2570,6 +2606,8 @@ class RoastStore:
                     timed_out_runs,
                     on_page_count,
                     estimated_count,
+                    catalogue_discovered_count,
+                    catalogue_extracted_count,
                     snapshot,
                     expires,
                     attempt_id,
@@ -2707,6 +2745,57 @@ class RoastStore:
         ) as cursor:
             rows = await cursor.fetchall()
         return [BeanProfile.model_validate_json(str(row["profile_json"])) for row in rows]
+
+    async def catalogue_ranking_axes(
+        self,
+    ) -> tuple[
+        list[tuple[str | None, ProcessingMethod | None]],
+        list[tuple[str, ProcessingMethod]],
+    ]:
+        """Read only the distinct local facts used by catalogue ranking.
+
+        This deliberately avoids :meth:`list_runs`, whose history projection
+        materializes full profiles and correlated telemetry/advisor aggregates.
+        Catalogue ranking needs only active-profile country/process axes and
+        completed, non-excluded 4--5-star country/process pairs.
+
+        Returns:
+            ``(profile_axes, rated_pairs)``. Profile axes retain either nullable
+            component so missing-country and missing-processing sets can be
+            built independently; rated pairs require both components.
+        """
+        async with self.connection.execute(
+            "SELECT DISTINCT json_extract(profile_json, '$.country') AS country,"
+            " json_extract(profile_json, '$.processing') AS processing"
+            " FROM bean_profiles WHERE archived = 0"
+        ) as cursor:
+            profile_rows = await cursor.fetchall()
+        async with self.connection.execute(
+            "SELECT DISTINCT json_extract(profile_json, '$.country') AS country,"
+            " json_extract(profile_json, '$.processing') AS processing"
+            " FROM roast_runs WHERE excluded = 0 AND outcome = 'completed'"
+            " AND operator_rating >= 4"
+            " AND json_extract(profile_json, '$.country') IS NOT NULL"
+            " AND json_extract(profile_json, '$.processing') IS NOT NULL"
+        ) as cursor:
+            rated_rows = await cursor.fetchall()
+        profile_axes: list[tuple[str | None, ProcessingMethod | None]] = [
+            (
+                None if row["country"] is None else str(row["country"]),
+                None
+                if row["processing"] is None
+                else cast(ProcessingMethod, str(row["processing"])),
+            )
+            for row in profile_rows
+        ]
+        rated_pairs: list[tuple[str, ProcessingMethod]] = [
+            (
+                str(row["country"]),
+                cast(ProcessingMethod, str(row["processing"])),
+            )
+            for row in rated_rows
+        ]
+        return profile_axes, rated_pairs
 
     async def get_bean_profile(self, profile_id: str) -> BeanProfile | None:
         """One active saved profile by id, or ``None`` (unknown or archived)."""

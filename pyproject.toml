@@ -49,6 +49,9 @@ dependencies = [
   "anyio>=4.0,<5",
   "fastapi>=0.136,<1",
   "httpx>=0.28,<1",
+  # D121 catalogue discovery imports lxml directly for bounded HTML parsing;
+  # declare the runtime requirement instead of relying on sourcing transitive deps.
+  "lxml>=5.0,<7",
   "mcp>=1.0.0,<2",
   "pydantic>=2.10,<3",
   # D18: the lean core covers the default openai_compatible path (OpenRouter

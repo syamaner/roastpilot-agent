@@ -210,9 +210,11 @@ import socket
 import threading
 import unicodedata
 import zlib
+from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from html import unescape
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, Literal, TypeVar, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import extruct  # type: ignore[import-untyped]
@@ -249,6 +251,33 @@ from roastpilot_agent.models import (
 )
 
 _log = logging.getLogger(__name__)
+_catalogue_transport_logs_suppressed: ContextVar[bool] = ContextVar(
+    "catalogue_transport_logs_suppressed", default=False
+)
+_HTTP_TRANSPORT_LOGGER_NAMES: Final = (
+    "httpx",
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
+)
+
+
+class _CatalogueTransportLogFilter(logging.Filter):
+    """Suppress dependency request logs only in a catalogue-fetch task."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Return false while the current task owns a URL-free catalogue fetch.
+
+        Args:
+            record: The dependency log record being considered.
+
+        Returns:
+            Whether the record may be emitted.
+        """
+        del record
+        return not _catalogue_transport_logs_suppressed.get()
 
 
 class BeanSourcingError(Exception):
@@ -1112,17 +1141,21 @@ def _parse_wrapper_entry_seam() -> None:
     "dequeued, future RUNNING" and "reached the handshake"."""
 
 
-async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -> str | None:
-    """Run :func:`_extract_page_markdown` on the dedicated, bounded parse
-    pool, admission-controlled by actual worker availability (#607).
+_ParseResultT = TypeVar("_ParseResultT")
+
+
+async def run_untrusted_parse_bounded(
+    operation: Callable[[], _ParseResultT], *, timeout_seconds: float
+) -> _ParseResultT | None:
+    """Run bounded untrusted parsing on the dedicated parser pool (#607).
 
     Isolation: the parse runs via ``_get_parse_executor().submit(...)`` —
     a separately-owned pool, so an orphaned hung worker can only exhaust
     THIS pool's :data:`_MAX_CONCURRENT_PARSES` slots. Admission control:
     when :data:`_inflight_parse_count` already reports every worker busy,
-    a new call skips the markdown attempt immediately. The parse is
+    a new call skips the parse attempt immediately. The parse is
     submitted wrapped in a :class:`_ParseSlotToken`-owned closure, not the
-    bare :func:`_extract_page_markdown` call, so the slot rides WITH the
+    bare operation call, so the slot rides WITH the
     work item. Submission failure replaces the executor
     (:func:`_replace_poisoned_parse_executor`) then reclaims the slot only
     if the ``started``/``reclaimed`` handshake proves the item never ran
@@ -1137,23 +1170,20 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
     ``concurrent_future.cancelled()`` (still PENDING when cancelled) — a
     still-RUNNING item's own ``finally`` releases it instead.
 
-    Either branch returns exactly like the pre-#607 call site: ``None``
-    tells the caller to fall back to the linear-strip pass
-    (:func:`_extract_page_text`) — this module's never-worse-than-before,
-    never-an-unhandled-exception fail-soft contract is unchanged.
+    ``None`` tells the caller its operation was not completed because the
+    parser boundary was saturated, timed out, or could not submit work.
 
     Args:
-        html: The raw, already-fetched, already-capped page HTML.
+        operation: Synchronous parse over already-fetched, byte-capped input.
         timeout_seconds: The bound on this call's OWN wait (reuses
             ``config.fetch_timeout_seconds`` — see
             :func:`_fetch_and_extract`'s comment on the resulting
             draft-request latency bound).
 
     Returns:
-        The extracted markdown, or ``None`` on a timeout, a saturated
-        pool, a submission failure, or whatever
-        :func:`_extract_page_markdown` itself already returns
-        ``None``/raises for.
+        The operation result, or ``None`` on a timeout, saturated pool,
+        or submission failure. Exceptions raised by ``operation`` propagate
+        so its caller can map them to the appropriate typed fail-soft error.
     """
     global _inflight_parse_count
     with _parse_slot_lock:
@@ -1161,7 +1191,7 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
             _log.warning(
                 "bean_sourcing: dedicated parse pool saturated (%d/%d workers busy "
                 "— likely orphaned by prior timed-out parses, #607); skipping "
-                "markdown extraction, falling back to linear-strip",
+                "untrusted parse",
                 _inflight_parse_count,
                 _MAX_CONCURRENT_PARSES,
             )
@@ -1170,7 +1200,7 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
 
     token = _ParseSlotToken()
 
-    def _run_and_release() -> str | None:
+    def _run_and_release() -> _ParseResultT | None:
         # Runs once (and only if) actually dequeued and started; the
         # reclaimed check-then-set is the wrapper's half of the
         # handshake with the submission-failure path below (#607 fold 5).
@@ -1180,7 +1210,7 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
                 return None
             token.started = True
         try:
-            return _extract_page_markdown(html)
+            return operation()
         finally:
             _release_parse_slot_once(token)
 
@@ -1202,7 +1232,7 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
             _release_parse_slot_once(token)
         _log.warning(
             "bean_sourcing: dedicated parse pool submission failed; replaced the "
-            "poisoned executor; falling back to linear-strip (slot already_started=%s)",
+            "poisoned executor; parse unavailable (slot already_started=%s)",
             already_started,
             exc_info=True,
         )
@@ -1214,8 +1244,8 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
             return await asyncio.wrap_future(concurrent_future, loop=loop)
     except TimeoutError:
         _log.debug(
-            "bean_sourcing: trafilatura markdown extraction exceeded the %.3gs "
-            "deadline; falling back to linear-strip (the worker keeps running in "
+            "bean_sourcing: untrusted parse exceeded the %.3gs deadline; "
+            "falling back (the worker keeps running in "
             "the dedicated pool — contained to that pool alone, #607)",
             timeout_seconds,
         )
@@ -1236,9 +1266,16 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
         _log.debug(
             "bean_sourcing: dedicated parse pool item cancelled by a "
             "concurrent submission-failure replacement (#607 fold 3); "
-            "falling back to linear-strip"
+            "falling back"
         )
         return None
+
+
+async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -> str | None:
+    """Extract page markdown through the shared dedicated parser boundary."""
+    return await run_untrusted_parse_bounded(
+        lambda: _extract_page_markdown(html), timeout_seconds=timeout_seconds
+    )
 
 
 #: Redirect hops the internally-constructed client will follow manually
@@ -2552,7 +2589,8 @@ async def _fetch_and_extract(
     *,
     config: BeanSourcingConfig,
     http_client: httpx.AsyncClient | None = None,
-) -> tuple[str, _JsonLdProductFacts | None]:
+    extract_content: bool = True,
+) -> tuple[str, _JsonLdProductFacts | None, str, str]:
     """Respectfully fetch ``url`` and return its extracted plain text plus
     any identity-matched JSON-LD Product facts.
 
@@ -2605,6 +2643,9 @@ async def _fetch_and_extract(
         http_client: An injectable client (the fetch test seam — e.g. one
             built with ``httpx.MockTransport``). A real client is
             constructed, used, and closed when omitted.
+        extract_content: Whether to run the product-draft markdown and JSON-LD
+            identity passes after fetching. Catalogue discovery disables this
+            because it consumes the bounded raw HTML directly.
 
     Returns:
         A ``(extracted_text, facts)`` pair. ``extracted_text`` is the
@@ -2726,6 +2767,8 @@ async def _fetch_and_extract(
     finally:
         if owns_client:
             await client.aclose()
+    if not extract_content:
+        return "", None, html, final_url
     # #590 slice C: trafilatura's boilerplate-stripped markdown is the
     # PRIMARY page-body text; the linear-strip pass is only the fail-soft
     # fallback when trafilatura finds nothing usable or raises. Measured up
@@ -2784,11 +2827,11 @@ async def _fetch_and_extract(
     # final_url, not url (#590 P1 fix) — a redirect commonly canonicalises
     # the URL, and the fetched HTML's own JSON-LD reflects the FINAL one.
     facts = _match_json_ld_product_facts(html, final_url)
-    return extracted_text, facts
+    return extracted_text, facts, html, final_url
 
 
 @dataclass(frozen=True)
-class _FetchedPage:
+class FetchedVendorPage:
     """A fetched vendor page's text forms (#590 D1 fold 1; parts split
     #590 slice E1).
 
@@ -2810,6 +2853,8 @@ class _FetchedPage:
     extracted_text: str
     json_ld_values: str
     json_ld_name: str = ""
+    raw_html: str = ""
+    final_url: str = ""
 
     @property
     def verification_corpus(self) -> str:
@@ -2823,30 +2868,43 @@ class _FetchedPage:
         )
 
 
+# Compatibility alias for the focused private-contract tests written before
+# catalogue sourcing made the fetched page a public package-internal value.
+_FetchedPage = FetchedVendorPage
+
+
 async def _fetch_page_text(
     url: str,
     *,
     config: BeanSourcingConfig,
     http_client: httpx.AsyncClient | None = None,
-) -> _FetchedPage:
-    """Fetch ``url`` and return both of :class:`_FetchedPage`'s text
+    extract_content: bool = True,
+) -> FetchedVendorPage:
+    """Fetch ``url`` and return both of :class:`FetchedVendorPage`'s text
     forms (#590 D1 fold 1 — this function's return type changed from a
-    bare ``str`` to :class:`_FetchedPage`, so ``.prompt_text`` is the
+    bare ``str`` to :class:`FetchedVendorPage`, so ``.prompt_text`` is the
     pre-fold return value; ``.extracted_text``/``.json_ld_values`` are
     the #590 slice E1 split of what was one stored ``verification_corpus``
     field). See :func:`_fetch_and_extract` for the fetch/extraction
     behavior and failure modes."""
-    extracted_text, facts = await _fetch_and_extract(url, config=config, http_client=http_client)
+    extracted_text, facts, raw_html, final_url = await _fetch_and_extract(
+        url,
+        config=config,
+        http_client=http_client,
+        extract_content=extract_content,
+    )
     json_ld_context = _format_json_ld_context(facts) if facts is not None else None
     prompt_text = (
         extracted_text if json_ld_context is None else f"{json_ld_context}\n\n{extracted_text}"
     )
     fact_values = _json_ld_fact_values(facts)
-    return _FetchedPage(
+    return FetchedVendorPage(
         prompt_text=prompt_text,
         extracted_text=extracted_text,
         json_ld_values=fact_values,
         json_ld_name=(facts.name if facts is not None else None) or "",
+        raw_html=raw_html,
+        final_url=final_url,
     )
 
 
@@ -5693,6 +5751,100 @@ def _draft_from_identity(
         ) from exc
 
 
+async def fetch_vendor_page(
+    url: str,
+    *,
+    config: BeanSourcingConfig,
+    http_client: httpx.AsyncClient | None = None,
+    log_url: bool = True,
+    extract_content: bool = True,
+) -> FetchedVendorPage:
+    """Validate and fetch one vendor page through the hardened sourcing boundary.
+
+    This shared entry point keeps product drafting and catalogue recommendation
+    on the same credential, fragment, SSRF, redirect, decompression, deadline,
+    and off-loop parsing contract.
+
+    Args:
+        url: Operator-supplied vendor page URL.
+        config: Bean-sourcing resource and timeout limits.
+        http_client: Optional injected test client.
+        log_url: Whether operational logs may retain the redacted locator.
+            Catalogue recommendation calls disable this under D121, including
+            HTTPX/HTTPCore request logs; the existing single-product draft
+            behavior remains unchanged. Suppression is ContextVar-scoped so a
+            concurrent non-catalogue request keeps its normal dependency logs.
+        extract_content: Whether to run the product-draft text and JSON-LD
+            identity extraction passes. Catalogue discovery sets this false
+            and parses the bounded raw HTML through its own isolated stage.
+
+    Returns:
+        The bounded page representations and final redirect URL.
+
+    Raises:
+        BeanFetchError: The URL or fetched response violates the sourcing
+            boundary.
+    """
+    try:
+        parsed_url = urlsplit(url)
+    except ValueError as exc:
+        raise BeanFetchError(
+            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} (invalid URL syntax)"
+        ) from exc
+    if parsed_url.username is not None or parsed_url.password is not None:
+        if log_url:
+            _log.warning(
+                "bean_sourcing: rejected a URL with embedded credentials: %r",
+                _redact_url_credentials(url),
+            )
+        else:
+            _log.warning("bean_sourcing: rejected a catalogue URL with embedded credentials")
+        raise BeanFetchError(
+            "vendor URLs with embedded credentials (user:pass@host) are not "
+            "supported — remove the credentials from the URL and, if the "
+            "page needs authentication, save the profile manually instead"
+        )
+    if parsed_url.fragment:
+        if log_url:
+            _log.warning(
+                "bean_sourcing: rejected a URL with a fragment: %r",
+                _redact_url_credentials(url),
+            )
+        else:
+            _log.warning("bean_sourcing: rejected a catalogue URL with a fragment")
+        raise BeanFetchError(
+            "vendor URLs with a fragment (#...) are not supported — a "
+            "fragment can carry a sensitive token that must never be fetched, "
+            "logged, or stored; remove the fragment from the URL"
+        )
+    if log_url:
+        _log.info("bean_sourcing: fetching %r", _redact_url_credentials(url))
+        return await _fetch_page_text(
+            url,
+            config=config,
+            http_client=http_client,
+            extract_content=extract_content,
+        )
+
+    _log.info("bean_sourcing: fetching catalogue page")
+    transport_filter = _CatalogueTransportLogFilter()
+    transport_loggers = tuple(logging.getLogger(name) for name in _HTTP_TRANSPORT_LOGGER_NAMES)
+    token = _catalogue_transport_logs_suppressed.set(True)
+    for transport_logger in transport_loggers:
+        transport_logger.addFilter(transport_filter)
+    try:
+        return await _fetch_page_text(
+            url,
+            config=config,
+            http_client=http_client,
+            extract_content=extract_content,
+        )
+    finally:
+        for transport_logger in transport_loggers:
+            transport_logger.removeFilter(transport_filter)
+        _catalogue_transport_logs_suppressed.reset(token)
+
+
 async def draft_bean_profile_from_url(
     url: str,
     *,
@@ -5771,55 +5923,8 @@ async def draft_bean_profile_from_url(
             name/origin) to draft a profile from, or the assembled draft
             failed its own field validation — both client-actionable.
     """
-    # Credential-leak guard (#587 P1): checked before ANYTHING else — no
-    # logging, no fetch, no billable LLM call — so a URL with embedded
-    # basic-auth credentials is never sent over the wire (to the vendor OR
-    # to the LLM provider) and never appears in a log line even transiently.
-    # A malformed URL (e.g. an unclosed IPv6 bracket) makes urlsplit() raise
-    # ValueError eagerly (#587 P2) — this is the very first thing ANY url
-    # goes through, so it needs its own guard rather than relying on a
-    # later call site to catch it.
-    try:
-        parsed_url = urlsplit(url)
-    except ValueError as exc:
-        raise BeanFetchError(
-            f"not a well-formed http(s) URL: {redact_url_for_error(url)!r} (invalid URL syntax)"
-        ) from exc
-    if parsed_url.username is not None or parsed_url.password is not None:
-        _log.warning(
-            "draft_bean_profile_from_url: rejected a URL with embedded credentials: %r",
-            _redact_url_credentials(url),
-        )
-        raise BeanFetchError(
-            "vendor URLs with embedded credentials (user:pass@host) are not "
-            "supported — remove the credentials from the URL and, if the "
-            "page needs authentication, save the profile manually instead"
-        )
-    if parsed_url.fragment:
-        # A fragment (#587 P2, round 5) is never sent to the vendor over
-        # HTTP (fragments are client-side-only, per the URL spec) — the
-        # risk is entirely in what THIS module does with the raw ``url``
-        # value itself: it is logged (mirroring the credential leak above)
-        # and, worse, carried verbatim into the returned draft's
-        # ``source_url`` — so a URL an operator pasted straight out of an
-        # OAuth redirect (``#access_token=...``) or a hash-router page
-        # would leak that token into logs and into a saved bean profile.
-        # Mirrors the credential check exactly: rejected up front, logged
-        # only in fragment-and-credential-redacted form.
-        _log.warning(
-            "draft_bean_profile_from_url: rejected a URL with a fragment: %r",
-            _redact_url_credentials(url),
-        )
-        raise BeanFetchError(
-            "vendor URLs with a fragment (#...) are not supported — a "
-            "fragment can carry a sensitive token (e.g. an OAuth redirect's "
-            "#access_token=...) that must never be fetched, logged, or "
-            "stored; remove the fragment from the URL"
-        )
-
     config = sourcing_config if sourcing_config is not None else BeanSourcingConfig()
-    _log.info("draft_bean_profile_from_url: fetching %r", _redact_url_credentials(url))
-    page = await _fetch_page_text(url, config=config, http_client=http_client)
+    page = await fetch_vendor_page(url, config=config, http_client=http_client)
     # config (never sourcing_config directly) — the fetch's already-resolved
     # default, so the extraction step's model/timeout resolution stays
     # consistent with the fetch's, rather than re-deriving its own None
