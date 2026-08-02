@@ -25,7 +25,11 @@ import { useEffect, useRef, useState } from "react";
 
 import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/cn";
-import type { BeanProfile, BeanProfileInput } from "@/lib/types";
+import type {
+  BeanProfile,
+  BeanProfileInput,
+  CatalogueRecommendationList,
+} from "@/lib/types";
 import {
   DEFAULT_BEAN_PROFILE_DRAFT,
   draftFromBeanProfile,
@@ -51,7 +55,9 @@ import { BeanProfileFields } from "./beanProfileFields";
  * whether any instance) is still mounted to see it — a remounted instance
  * subscribes to it to adopt the busy state it can't otherwise see.
  */
-let draftInFlight: { settle: Promise<void> } | null = null;
+type SourcingKind = "draft" | "catalogue";
+
+let sourcingInFlight: { kind: SourcingKind; settle: Promise<void> } | null = null;
 
 /** The draft fields the server's `scouting_note` text actually summarizes
  *  (#654 final round): "...targets are a conservative, de-risked starting
@@ -110,19 +116,27 @@ export function BeanProfileModal({
   // fail-and-retry. `drafting` doubles as the retry affordance — the same
   // button re-fires the request with whatever URL is still in the field.
   const [draftUrl, setDraftUrl] = useState("");
-  const [drafting, setDrafting] = useState(false);
+  const [sourcingKind, setSourcingKind] = useState<SourcingKind | null>(null);
   const [draftErrorKind, setDraftErrorKind] = useState<"invalid" | "unavailable" | "other" | null>(
     null,
   );
   const [draftErrorDetail, setDraftErrorDetail] = useState<string | null>(null);
   const [scoutingNote, setScoutingNote] = useState<string | null>(null);
   const [draftAttemptId, setDraftAttemptId] = useState<string | undefined>(undefined);
+  const [catalogueUrl, setCatalogueUrl] = useState("");
+  const [catalogueResult, setCatalogueResult] = useState<CatalogueRecommendationList | null>(null);
+  const [catalogueErrorKind, setCatalogueErrorKind] = useState<
+    "invalid" | "unavailable" | "other" | null
+  >(null);
+  const [catalogueErrorDetail, setCatalogueErrorDetail] = useState<string | null>(null);
+  const [draftReadyStatus, setDraftReadyStatus] = useState<string | null>(null);
   // Race guard (#637, #654 round 2): the latest fired request "wins" — a token
   // bumped whenever the in-flight draft is invalidated (a newer request, or an
   // operator edit made while it was pending), captured at fire time, and
   // re-checked before EITHER branch of `handleDraftFromUrl` applies its result.
   // A response that no longer matches the current token is dropped outright.
   const draftRequestIdRef = useRef(0);
+  const catalogueRequestIdRef = useRef(0);
   // Whether THIS instance is still mounted (#654 final thread): every
   // setState past an `await` in `handleDraftFromUrl` is gated on this too, so
   // an instance that unmounted mid-request (Cancel) never touches state that
@@ -138,17 +152,28 @@ export function BeanProfileModal({
   // (#654 final thread): a remounted modal (e.g. reopened via Cancel while a
   // request was still running) must show itself as busy until that
   // abandoned request's `settle` resolves, not start fresh as idle while
-  // secretly blocked from firing by `draftInFlight` below. Gated to `add`
+  // secretly blocked from firing by `sourcingInFlight` below. Gated to `add`
   // mode only (one more #654 P2): edit mode renders no draft panel at all —
-  // its Save never depended on `draftInFlight` — so inheriting `drafting`
+  // its Save never depended on `sourcingInFlight` — so inheriting sourcing state
   // there would disable Save with no visible cause and no way to clear it.
   useEffect(() => {
-    if (mode !== "add" || draftInFlight === null) return;
-    setDrafting(true);
-    void draftInFlight.settle.then(() => {
-      if (mountedRef.current) setDrafting(false);
+    if (mode !== "add" || sourcingInFlight === null) return;
+    const adoptedKind = sourcingInFlight.kind;
+    setSourcingKind(adoptedKind);
+    void sourcingInFlight.settle.then(() => {
+      if (mountedRef.current) setSourcingKind(null);
     });
   }, [mode]);
+
+  const drafting = sourcingKind === "draft";
+  const recommending = sourcingKind === "catalogue";
+  const sourcingBusy = sourcingKind !== null;
+  // Drafting can replace the form fields when its response arrives, so Save
+  // must wait for it. Catalogue ranking is read-only with respect to the form:
+  // preserving the operator's work must not depend on that independent request
+  // settling. Include the module guard to cover the remount-before-effect gap.
+  const saveBlockedBySourcing =
+    mode === "add" && (sourcingInFlight?.kind ?? sourcingKind) === "draft";
 
   // Editing a field orphans any provenance/evidence it carried (#627): those
   // describe the value the SERVER extracted, not whatever the operator just
@@ -158,7 +183,7 @@ export function BeanProfileModal({
   // staleness check drop it.
   //
   // Invalidation is TOKEN-BUMP ONLY (#654 verdict round) — it deliberately
-  // does NOT abort the fetch or touch the single-flight guard (`draftInFlight`
+  // does NOT abort the fetch or touch the single-flight guard (`sourcingInFlight`
   // module state). An earlier version aborted the request, but
   // `AbortController.abort()` settles the fetch's promise IMMEDIATELY on the
   // client, while the backend has no disconnect check — so that abort was
@@ -172,9 +197,12 @@ export function BeanProfileModal({
   // correct. A true server-side cancel would need a disconnect check on the
   // backend; out of scope, and unnecessary for correctness once the guard
   // holds to the real response.
+  // Profile-field edits invalidate only a draft whose extracted fields they
+  // can supersede. Catalogue ranking is independent of the unsaved form and
+  // remains valid unless its own collection URL changes.
   const invalidateInFlightDraft = () => {
-    if (!drafting) return;
-    draftRequestIdRef.current += 1;
+    const activeKind = sourcingInFlight?.kind ?? sourcingKind;
+    if (activeKind === "draft") draftRequestIdRef.current += 1;
   };
   const onChange = (field: keyof BeanProfileDraft, value: string) => {
     invalidateInFlightDraft();
@@ -200,11 +228,13 @@ export function BeanProfileModal({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     // Guarded here (not just via the disabled Save button, #637): pressing Enter
-    // with focus in any OTHER form field submits natively regardless of the
-    // button's disabled attribute, so a draft in flight must block at the
-    // handler too — the simplest-correct pairing with the request-token guard
-    // in `handleDraftFromUrl` (latest-token-wins + Save blocked meanwhile).
-    if (submitting || drafting) return;
+    // with focus in any OTHER add-form field submits natively regardless of the
+    // button's disabled attribute. Only draft sourcing can later overwrite the
+    // form; catalogue ranking is independent and must not prevent preservation.
+    // The derived guard also closes the brief remount-before-effect window.
+    if (submitting || saveBlockedBySourcing) {
+      return;
+    }
     setSubmitError(null);
 
     const result = validateBeanProfile(draft);
@@ -261,23 +291,26 @@ export function BeanProfileModal({
     }
   };
 
-  const handleDraftFromUrl = async () => {
-    const url = draftUrl.trim();
+  const handleDraftFromUrl = async (urlOverride?: string, fromCatalogue = false) => {
+    const url = (urlOverride ?? draftUrl).trim();
     // Synchronous check-and-set against the MODULE-scope guard (#654 final
-    // thread) — see `draftInFlight` above. Also refused while a save is in
+    // thread) — see `sourcingInFlight` above. Also refused while a save is in
     // flight (#654 landing round): the modal may unmount on a successful
     // save, and no vendor/LLM call should ever start mid-save regardless.
-    if (draftInFlight !== null || submitting || url === "") return;
+    if (sourcingInFlight !== null || submitting || url === "") return;
     const requestId = ++draftRequestIdRef.current;
     let resolveSettle!: () => void;
-    draftInFlight = {
+    sourcingInFlight = {
+      kind: "draft",
       settle: new Promise<void>((resolve) => {
         resolveSettle = resolve;
       }),
     };
-    setDrafting(true);
+    setSourcingKind("draft");
+    if (urlOverride !== undefined) setDraftUrl(url);
     setDraftErrorKind(null);
     setDraftErrorDetail(null);
+    setDraftReadyStatus(null);
     try {
       const response = await api.draftBeanFromUrl(url);
       // Superseded (#637, #654 round 2), or this instance unmounted while the
@@ -296,6 +329,13 @@ export function BeanProfileModal({
       // explanation.
       setScoutingNote(note);
       setDraftAttemptId(response.draft_attempt_id);
+      if (fromCatalogue) {
+        setCatalogueResult(null);
+        setDraftReadyStatus("Draft ready — review and edit the fields below before saving.");
+        // Selecting a card removes the focused card button. Move focus into
+        // the editable review flow instead of leaving keyboard users at body.
+        document.getElementById("bean-profile-name")?.focus();
+      }
     } catch (err) {
       if (draftRequestIdRef.current !== requestId || !mountedRef.current) return;
       if (err instanceof ApiError && err.status === 422) {
@@ -320,11 +360,54 @@ export function BeanProfileModal({
       // match too (#654 landing round) — even a superseded request must
       // release Save once it settles; only mount state gates it, since a
       // setState on an unmounted instance is the one thing to avoid here.
-      draftInFlight = null;
+      sourcingInFlight = null;
       resolveSettle();
       if (mountedRef.current) {
-        setDrafting(false);
+        setSourcingKind(null);
       }
+    }
+  };
+
+  const handleRecommendFromCatalogue = async () => {
+    const url = catalogueUrl.trim();
+    if (sourcingInFlight !== null || submitting || url === "") return;
+    const requestId = ++catalogueRequestIdRef.current;
+    let resolveSettle!: () => void;
+    sourcingInFlight = {
+      kind: "catalogue",
+      settle: new Promise<void>((resolve) => {
+        resolveSettle = resolve;
+      }),
+    };
+    setSourcingKind("catalogue");
+    setCatalogueErrorKind(null);
+    setCatalogueErrorDetail(null);
+    setDraftReadyStatus(null);
+    try {
+      const response = await api.recommendBeansFromCatalogue(url);
+      if (catalogueRequestIdRef.current !== requestId || !mountedRef.current) return;
+      setCatalogueResult(response);
+      setCatalogueErrorKind(null);
+      setCatalogueErrorDetail(null);
+    } catch (err) {
+      if (catalogueRequestIdRef.current !== requestId || !mountedRef.current) return;
+      if (err instanceof ApiError && err.status === 422) {
+        setCatalogueErrorKind("invalid");
+        setCatalogueErrorDetail(err.detail);
+      } else if (err instanceof ApiError && err.status === 503) {
+        setCatalogueErrorKind("unavailable");
+        setCatalogueErrorDetail(null);
+      } else if (err instanceof ApiError) {
+        setCatalogueErrorKind("other");
+        setCatalogueErrorDetail(err.detail || `Request failed (${err.status}).`);
+      } else {
+        setCatalogueErrorKind("other");
+        setCatalogueErrorDetail(err instanceof Error ? err.message : "Request failed.");
+      }
+    } finally {
+      sourcingInFlight = null;
+      resolveSettle();
+      if (mountedRef.current) setSourcingKind(null);
     }
   };
 
@@ -367,7 +450,178 @@ export function BeanProfileModal({
         )}
 
         {mode === "add" && (
-          <div
+          <>
+            <section
+            data-testid="bean-profile-catalogue-panel"
+            aria-labelledby="bean-profile-catalogue-title"
+            aria-busy={recommending}
+            className="flex flex-col gap-3 rounded-md border border-roast-coffee/40 bg-roast-coffee/5 p-4"
+          >
+            <div className="space-y-1">
+              <h3
+                id="bean-profile-catalogue-title"
+                className="text-xs font-semibold uppercase tracking-wide text-roast-coffee"
+              >
+                Find beans from a catalogue
+              </h3>
+              <p id="bean-profile-catalogue-help" className="text-xs text-muted-foreground">
+                Paste a collection page to get up to three explainable suggestions based on
+                gaps in your local bean roster and well-rated roasts. Nothing is ordered or
+                saved.
+              </p>
+            </div>
+            <div className="flex flex-col gap-2 sm:flex-row">
+              <label htmlFor="bean-profile-catalogue-url" className="sr-only">
+                Vendor collection URL
+              </label>
+              <input
+                id="bean-profile-catalogue-url"
+                type="url"
+                data-testid="bean-profile-catalogue-url"
+                value={catalogueUrl}
+                aria-describedby="bean-profile-catalogue-help"
+                onChange={(e) => {
+                  if ((sourcingInFlight?.kind ?? sourcingKind) === "catalogue") {
+                    catalogueRequestIdRef.current += 1;
+                  }
+                  setCatalogueUrl(e.target.value);
+                  setCatalogueResult(null);
+                  setCatalogueErrorKind(null);
+                  setCatalogueErrorDetail(null);
+                  setDraftReadyStatus(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key !== "Enter") return;
+                  e.preventDefault();
+                  void handleRecommendFromCatalogue();
+                }}
+                placeholder="https://roaster.example.com/collections/green-coffee"
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus:ring-1 focus:ring-ring sm:flex-1"
+              />
+              <button
+                type="button"
+                onClick={() => void handleRecommendFromCatalogue()}
+                disabled={sourcingBusy || submitting || catalogueUrl.trim() === ""}
+                aria-disabled={sourcingBusy || submitting || catalogueUrl.trim() === ""}
+                data-testid="bean-profile-catalogue-button"
+                className={cn(
+                  "w-full shrink-0 rounded-md border border-roast-coffee/60 bg-roast-coffee/20 px-4 py-2 text-sm font-semibold uppercase tracking-wide text-roast-coffee transition-colors sm:w-auto",
+                  sourcingBusy || submitting || catalogueUrl.trim() === ""
+                    ? "cursor-not-allowed opacity-60"
+                    : "hover:bg-roast-coffee/30",
+                )}
+              >
+                {recommending ? "Finding…" : "Find beans"}
+              </button>
+            </div>
+
+            {recommending && (
+              <p data-testid="bean-profile-catalogue-status" role="status" className="text-xs">
+                Checking the catalogue and ranking suitable beans…
+              </p>
+            )}
+
+            {catalogueErrorKind !== null &&
+              (() => {
+                const safeDetail =
+                  catalogueErrorDetail !== null
+                    ? redactUrlQueryStrings(catalogueErrorDetail)
+                    : null;
+                return (
+                  <p
+                    data-testid="bean-profile-catalogue-error"
+                    role="alert"
+                    className="text-xs text-roast-fault"
+                  >
+                    {catalogueErrorKind === "invalid" &&
+                      `Couldn't recommend from that catalogue — check the URL, or the page may not expose product links. ${safeDetail ?? ""}`}
+                    {catalogueErrorKind === "unavailable" &&
+                      "Catalogue recommendations are temporarily unavailable — try again in a moment."}
+                    {catalogueErrorKind === "other" && (safeDetail ?? "Request failed.")}
+                  </p>
+                );
+              })()}
+
+            {catalogueResult !== null && catalogueResult.recommendations.length === 0 && (
+              <p
+                data-testid="bean-profile-catalogue-empty"
+                role="status"
+                className="text-xs text-muted-foreground"
+              >
+                No suitable products were found ({catalogueResult.extracted_count} extracted
+                from {catalogueResult.discovered_count} discovered).
+              </p>
+            )}
+
+            {catalogueResult !== null && catalogueResult.recommendations.length > 0 && (
+              <div data-testid="bean-profile-catalogue-results" className="space-y-3">
+                <p role="status" className="text-xs text-muted-foreground">
+                  {catalogueResult.recommendations.length} recommendation
+                  {catalogueResult.recommendations.length === 1 ? "" : "s"}. Choose one to
+                  draft and review below.
+                </p>
+                <ul className="space-y-3" aria-label="Catalogue recommendations">
+                  {catalogueResult.recommendations.map((recommendation) => (
+                    <li
+                      key={recommendation.candidate_id}
+                      data-testid={`bean-profile-catalogue-card-${recommendation.candidate_id}`}
+                      className="space-y-2 rounded-md border border-border bg-background/70 p-3"
+                    >
+                      <div className="flex flex-wrap items-start justify-between gap-2">
+                        <div>
+                          <h4 className="font-semibold">{recommendation.name}</h4>
+                          {(recommendation.country !== null ||
+                            recommendation.processing !== null) && (
+                            <p className="text-xs text-muted-foreground">
+                              {[recommendation.country, recommendation.processing?.replace("_", " ")]
+                                .filter((value): value is string => value !== null && value !== undefined)
+                                .join(" · ")}
+                            </p>
+                          )}
+                        </div>
+                        <span className="text-xs text-muted-foreground">
+                          Score {recommendation.score}
+                        </span>
+                      </div>
+                      {recommendation.reasons.length > 0 && (
+                        <div>
+                          <span className="text-xs font-semibold text-muted-foreground">
+                            Why this one
+                          </span>
+                          <ul className="list-disc space-y-1 pl-5 text-xs text-muted-foreground">
+                            {recommendation.reasons.map((reason, index) => (
+                              <li key={`${recommendation.candidate_id}-reason-${index}`}>
+                                {reason}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      <button
+                        type="button"
+                        data-testid={`bean-profile-catalogue-draft-${recommendation.candidate_id}`}
+                        aria-label={`Draft and review ${recommendation.name}`}
+                        disabled={sourcingBusy || submitting}
+                        onClick={() =>
+                          void handleDraftFromUrl(recommendation.product_url, true)
+                        }
+                        className={cn(
+                          "rounded-md border border-roast-coffee/60 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-roast-coffee transition-colors",
+                          sourcingBusy || submitting
+                            ? "cursor-not-allowed opacity-60"
+                            : "hover:bg-roast-coffee/20",
+                        )}
+                      >
+                        Draft this bean
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            </section>
+
+            <div
             data-testid="bean-profile-draft-panel"
             className="flex flex-col gap-2 rounded-md border border-border bg-muted/20 p-4"
           >
@@ -392,7 +646,9 @@ export function BeanProfileModal({
                   // in-flight request the SAME way a profile-field edit does —
                   // without this, a fresh Enter on the NEW url could still get
                   // clobbered by a stale response seeded from the OLD url.
-                  invalidateInFlightDraft();
+                  if ((sourcingInFlight?.kind ?? sourcingKind) === "draft") {
+                    draftRequestIdRef.current += 1;
+                  }
                   setDraftUrl(e.target.value);
                 }}
                 onKeyDown={(e) => {
@@ -412,12 +668,12 @@ export function BeanProfileModal({
               <button
                 type="button"
                 onClick={() => void handleDraftFromUrl()}
-                disabled={drafting || submitting || draftUrl.trim() === ""}
-                aria-disabled={drafting || submitting || draftUrl.trim() === ""}
+                disabled={sourcingBusy || submitting || draftUrl.trim() === ""}
+                aria-disabled={sourcingBusy || submitting || draftUrl.trim() === ""}
                 data-testid="bean-profile-draft-button"
                 className={cn(
                   "w-full shrink-0 rounded-md border border-roast-coffee/60 bg-roast-coffee/20 px-4 py-2 text-sm font-semibold uppercase tracking-wide text-roast-coffee transition-colors sm:w-auto",
-                  drafting || submitting || draftUrl.trim() === ""
+                  sourcingBusy || submitting || draftUrl.trim() === ""
                     ? "cursor-not-allowed opacity-60"
                     : "hover:bg-roast-coffee/30",
                 )}
@@ -461,7 +717,17 @@ export function BeanProfileModal({
                 {scoutingNote}
               </p>
             )}
-          </div>
+            </div>
+            {draftReadyStatus !== null && (
+              <p
+                data-testid="bean-profile-draft-ready-status"
+                role="status"
+                className="rounded-md border border-roast-caution/50 bg-roast-caution/10 px-4 py-2 text-xs text-roast-caution"
+              >
+                {draftReadyStatus}
+              </p>
+            )}
+          </>
         )}
 
         <BeanProfileFields
@@ -502,12 +768,14 @@ export function BeanProfileModal({
           )}
           <button
             type="submit"
-            disabled={submitting || drafting}
-            aria-disabled={submitting || drafting}
+            disabled={submitting || saveBlockedBySourcing}
+            aria-disabled={submitting || saveBlockedBySourcing}
             data-testid="bean-profile-save"
             className={cn(
               "inline-flex items-center justify-center rounded-md border border-roast-coffee/60 bg-roast-coffee/20 px-6 py-2 text-sm font-semibold uppercase tracking-wide text-roast-coffee transition-colors",
-              submitting || drafting ? "cursor-not-allowed opacity-60" : "hover:bg-roast-coffee/30",
+              submitting || saveBlockedBySourcing
+                ? "cursor-not-allowed opacity-60"
+                : "hover:bg-roast-coffee/30",
             )}
           >
             {submitting ? "Saving…" : "Save Profile"}

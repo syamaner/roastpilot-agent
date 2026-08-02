@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
+import { parseCatalogueRecommendationList } from "@/lib/types";
 import {
   applyEvent,
   hydrate,
@@ -41,6 +42,7 @@ import type {
   RoastDetail,
   RoastPhase,
   RoastSummary,
+  CatalogueRecommendationList,
   SseEvent,
   SseEventType,
   TelemetryEventData,
@@ -70,6 +72,7 @@ interface RestFixture {
   // The real `/telemetry` series the detail-page curve renders (#308 adds the
   // charge-referenced clock to each point); server-dumped, never hand-authored.
   telemetry_series: TelemetrySeries;
+  catalogue_recommendations: CatalogueRecommendationList;
 }
 
 const sse = JSON.parse(
@@ -120,6 +123,33 @@ const FC_STATUSES: readonly FcStatus[] = [
   "faulted",
   "unavailable",
 ];
+
+describe("catalogue recommendation REST contract", () => {
+  it("accepts the real server-dumped response and pins every reason code", () => {
+    const parsed = parseCatalogueRecommendationList(rest.catalogue_recommendations);
+    expect(parsed.recommendations).toHaveLength(2);
+    expect(parsed.recommendations[0]).toMatchObject({
+      candidate_id: "candidate-01",
+      product_url: "https://vendor.example/products/kiambu-aa",
+      country: "Kenya",
+      processing: "washed",
+      score: 4,
+    });
+    expect(parsed.recommendations[0]?.reason_codes).toEqual([
+      "missing_country",
+      "missing_processing",
+      "novel_country_processing",
+      "rated_pair_affinity",
+    ]);
+    expect(parsed.recommendations[1]).toMatchObject({
+      country: null,
+      processing: null,
+      reason_codes: [],
+      reasons: [],
+    });
+    expect(parsed).toMatchObject({ discovered_count: 4, extracted_count: 2 });
+  });
+});
 
 describe("SSE contract — every event type has a real frame", () => {
   // The Python dump pins the full SseEventType set; mirror that here so a server

@@ -6,7 +6,7 @@
  * agents (they always carry an active run), so this mirrors the `/__chart-harness`
  * + `/__detail-harness` route-harness convention.
  *
- * Three baselines:
+ * Four baselines:
  *   - start-roast                       → the idle form with the saved-profile dropdown
  *   - start-roast-add-modal             → the add-profile modal open (full page)
  *   - start-roast-add-modal-draft-panel → JUST the draft-from-URL panel (#637), scoped
@@ -20,6 +20,9 @@
  *     disappears, `toHaveScreenshot` on its locator fails outright (element not
  *     found / zero-size) before any pixel math runs, so this closes that gap
  *     without loosening or fighting the full-page tolerance.
+ *   - start-roast-add-modal-catalogue-results → JUST the populated catalogue
+ *     recommendation panel (#573), proving the result-card hierarchy without
+ *     diluting it into the full-page tolerance.
  *
  * The data-assert layer (per D24) is the dropdown options + the fields filling from
  * a selected profile + the modal opening — asserted alongside the pixels so a
@@ -92,6 +95,126 @@ test("start-roast-add-modal — the draft-from-URL panel, scoped snapshot (#637)
   await page.evaluate(() => document.fonts.ready);
 
   await expect(panel).toHaveScreenshot("start-roast-add-modal-draft-panel.png");
+});
+
+test("catalogue recommendations hand the selected server URL to draft-and-review (#573)", async ({
+  page,
+}) => {
+  const catalogueUrl = "https://vendor.example.com/collections/filter-coffee";
+  const selectedProductUrl = "https://vendor.example.com/products/kiambu-aa?lot=42";
+
+  await page.route("**/api/beans/recommend-from-catalogue", async (route) => {
+    expect(route.request().method()).toBe("POST");
+    expect(route.request().postDataJSON()).toEqual({ url: catalogueUrl });
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        recommendations: [
+          {
+            candidate_id: "candidate-01",
+            product_url: selectedProductUrl,
+            name: "Kenya Kiambu AA",
+            country: "Kenya",
+            processing: "washed",
+            score: 86,
+            reason_codes: ["novel_country_processing", "rated_pair_affinity"],
+            reasons: [
+              "Adds a country and process pairing that is new to the saved library.",
+              "Similar washed coffees have previously scored well.",
+            ],
+          },
+          {
+            candidate_id: "candidate-02",
+            product_url: "https://vendor.example.com/products/huila-decaf",
+            name: "Colombia Huila Decaf",
+            country: "Colombia",
+            processing: "washed",
+            score: 71,
+            reason_codes: ["rated_pair_affinity"],
+            reasons: ["Similar washed coffees have previously scored well."],
+          },
+        ],
+        discovered_count: 8,
+        extracted_count: 5,
+      }),
+    });
+  });
+
+  await page.route("**/api/beans/draft-from-url", async (route) => {
+    expect(route.request().method()).toBe("POST");
+    expect(route.request().postDataJSON()).toEqual({ url: selectedProductUrl });
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        draft_attempt_id: "attempt-catalogue-1",
+        name: "Kenya Kiambu AA",
+        bean_origin: "Kiambu",
+        bean_varietal: "SL28",
+        country: "Kenya",
+        farm: "Mikari Estate",
+        description: "Blackcurrant, grapefruit, and brown sugar",
+        bean_species: "arabica",
+        is_blend: false,
+        processing: "washed",
+        altitude_m: 1850,
+        source_url: selectedProductUrl,
+        charge_guidance_min_c: 175,
+        charge_guidance_max_c: 185,
+        initial_heat_percent: 80,
+        initial_fan_percent: 20,
+        target_drop_temp_c: 201,
+        target_development_percent: 16,
+        default_bean_weight_grams: 250,
+        field_sources: {
+          name: "on_page",
+          bean_origin: "on_page",
+          processing: "on_page",
+          altitude_m: "on_page",
+          target_drop_temp_c: "origin_estimated",
+        },
+        field_evidence: {
+          name: "Kenya Kiambu AA",
+          bean_origin: "Kiambu, Kenya",
+          processing: "Washed process",
+          altitude_m: "Grown at 1,850 metres",
+        },
+        scouting_note: "Conservative first-roast targets — review before saving.",
+      }),
+    });
+  });
+
+  await page.getByTestId("bean-profile-add-button").click();
+  await page.getByTestId("bean-profile-catalogue-url").fill(catalogueUrl);
+  await page.getByTestId("bean-profile-catalogue-button").click();
+
+  const panel = page.getByTestId("bean-profile-catalogue-panel");
+  await expect(page.getByTestId("bean-profile-catalogue-results")).toBeVisible();
+  await expect(panel).toContainText("Kenya Kiambu AA");
+  await expect(panel).toContainText("Colombia Huila Decaf");
+  await expect(panel).toContainText("Why this one");
+  await expect(panel).toContainText(
+    "Adds a country and process pairing that is new to the saved library.",
+  );
+  await page.evaluate(() => document.fonts.ready);
+  await expect(panel).toHaveScreenshot("start-roast-add-modal-catalogue-results.png");
+
+  await page.getByTestId("bean-profile-catalogue-draft-candidate-01").click();
+  await expect(page.getByTestId("bean-profile-draft-ready-status")).toContainText(
+    /draft ready/i,
+  );
+  await expect(page.getByTestId("bean-profile-name")).toHaveValue("Kenya Kiambu AA");
+  await expect(page.getByTestId("bean-profile-name")).toBeFocused();
+  await expect(page.getByTestId("bean-profile-bean_origin")).toHaveValue("Kiambu");
+  await expect(page.getByTestId("bean-profile-processing")).toHaveValue("washed");
+  await expect(page.getByTestId("bean-profile-target_drop_temp_c")).toHaveValue("201");
+
+  // Recommendation and drafting are read-only: the modal remains open and the
+  // operator must still explicitly submit the existing Save Profile action.
+  await expect(page.getByTestId("bean-profile-modal")).toBeVisible();
+  await expect(page.getByTestId("bean-profile-save")).toHaveText("Save Profile");
+  await expect(page.getByTestId("bean-profile-select")).not.toContainText("Kenya Kiambu AA");
 });
 
 test("the edit pencil opens the edit modal for the selected profile (data-assert)", async ({
