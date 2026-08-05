@@ -16,7 +16,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { AppConfigSnapshot, ConfigFieldMeta } from "@/lib/types";
-import { buildEditFromDirty, buildValuesFromSnapshot, valuesEqual } from "./configState";
+import { buildEditFromDirty, buildValuesFromSnapshot, setPath, valuesEqual } from "./configState";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -500,5 +500,54 @@ describe("buildEditFromDirty — #412 damping fields (#443)", () => {
       expect(lmt?.trim_depth_deadband_pp).toBeUndefined();
       expect(lmt?.trim_depth_slew_pp_per_tick).toBeUndefined();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — setPath prototype-pollution guard (#683 alert #10)
+// ---------------------------------------------------------------------------
+
+describe("setPath — prototype-pollution guard", () => {
+  it("writes a nested value at a dot-path, creating intermediate objects", () => {
+    const target: Record<string, unknown> = {};
+    setPath(target, "pre_first_crack_levers.late_maillard_trim.enabled", true);
+    expect(target).toEqual({
+      pre_first_crack_levers: { late_maillard_trim: { enabled: true } },
+    });
+  });
+
+  it("writes a single-segment path", () => {
+    const target: Record<string, unknown> = {};
+    setPath(target, "model_slug", "gpt-4o");
+    expect(target).toEqual({ model_slug: "gpt-4o" });
+  });
+
+  it("preserves sibling keys on an existing intermediate object", () => {
+    const target: Record<string, unknown> = { levers: { a: 1 } };
+    setPath(target, "levers.b", 2);
+    expect(target).toEqual({ levers: { a: 1, b: 2 } });
+  });
+
+  for (const forbidden of ["__proto__", "constructor", "prototype"]) {
+    it(`throws when a leaf segment is "${forbidden}"`, () => {
+      const target: Record<string, unknown> = {};
+      expect(() => setPath(target, forbidden, "x")).toThrow(
+        `forbidden key segment "${forbidden}"`,
+      );
+    });
+
+    it(`throws when an intermediate segment is "${forbidden}"`, () => {
+      const target: Record<string, unknown> = {};
+      expect(() => setPath(target, `${forbidden}.enabled`, true)).toThrow(
+        `forbidden key segment "${forbidden}"`,
+      );
+    });
+  }
+
+  it("never pollutes Object.prototype through a malicious path", () => {
+    const target: Record<string, unknown> = {};
+    expect(() => setPath(target, "__proto__.polluted", "yes")).toThrow();
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    expect(Object.prototype).not.toHaveProperty("polluted");
   });
 });
