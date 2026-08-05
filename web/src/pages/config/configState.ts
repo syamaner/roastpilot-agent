@@ -78,11 +78,6 @@ export function valuesEqual(a: unknown, b: unknown): boolean {
   return false;
 }
 
-// Segments that could mutate Object.prototype — never present in our hardcoded
-// editKeys, but guard explicitly so static-analysis tools (CodeQL) don't flag
-// the assignment pattern as a prototype-pollution sink.
-const FORBIDDEN_KEY_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
-
 /**
  * Set a value at a dot-path inside a mutable nested object, creating
  * intermediate objects as needed.
@@ -90,31 +85,42 @@ const FORBIDDEN_KEY_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]
  * e.g. setPath(obj, "pre_first_crack_levers.late_maillard_trim.enabled", true)
  * produces { pre_first_crack_levers: { late_maillard_trim: { enabled: true } } }
  *
- * Throws if any segment is a forbidden prototype key — all editKeys are
- * compile-time constants so this is unreachable in practice.
+ * Every segment is guarded against the three property names that can walk the
+ * prototype chain (`__proto__`, `constructor`, `prototype`); a forbidden
+ * segment throws. All editKeys are compile-time constants from
+ * `CONFIG_FIELD_MAP`, so this is unreachable in practice — the guard exists so
+ * the dynamic-key assignment can never become a prototype-pollution sink.
+ *
+ * The guard is written as explicit strict-equality comparisons rather than a
+ * `Set.has()` membership test. The two are equivalent at runtime, but CodeQL's
+ * `js/prototype-pollution-utility` query recognises an `EqualityTest` barrier
+ * and does not recognise the Set lookup, so the Set form left issue #683's
+ * alert #10 open despite the guard being correct. Exported for direct
+ * behaviour tests of the guard, which `buildEditFromDirty` cannot reach.
  */
-function setPath(
+export function setPath(
   target: Record<string, unknown>,
   path: string,
   value: unknown,
 ): void {
   const parts = path.split(".");
   let node: Record<string, unknown> = target;
-  for (let i = 0; i < parts.length - 1; i++) {
+  for (let i = 0; i < parts.length; i++) {
     const key = parts[i]!;
-    if (FORBIDDEN_KEY_SEGMENTS.has(key)) {
+    // Explicit `===` guard (not Set.has) so CodeQL can prove these dynamic-key
+    // assignments cannot reach Object.prototype (#683 alert #10).
+    if (key === "__proto__" || key === "constructor" || key === "prototype") {
       throw new Error(`setPath: forbidden key segment "${key}"`);
+    }
+    if (i === parts.length - 1) {
+      node[key] = value;
+      return;
     }
     if (typeof node[key] !== "object" || node[key] === null) {
       node[key] = {};
     }
     node = node[key] as Record<string, unknown>;
   }
-  const lastKey = parts[parts.length - 1]!;
-  if (FORBIDDEN_KEY_SEGMENTS.has(lastKey)) {
-    throw new Error(`setPath: forbidden key segment "${lastKey}"`);
-  }
-  node[lastKey] = value;
 }
 
 /**
