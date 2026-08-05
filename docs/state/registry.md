@@ -2,7 +2,7 @@
 
 ## Active Epic
 
-> **STATUS UPDATE — 27 Jul 2026 (supersedes every framing below).** Read this block
+> **STATUS UPDATE — 2 Aug 2026 (supersedes every framing below).** Read this block
 > first; everything under it is retained history, and several of its forward-looking
 > statements (June hardware target, "harness complete target: July 2026", #327 as the
 > open P1) are now spent. Nothing below this line should be treated as a live plan
@@ -14,7 +14,8 @@
 > control thread is **#559** (D96 recovery law): merged **dormant** and awaiting the
 > operator's flag-on hardware validation roast. It is the only control work that is
 > ready-but-unproven; the watch-list is on the issue, and an agent analyses the trace
-> after the operator runs it. **#699 adds the validation trace needed for that roast:**
+> after the operator runs it. **#699 / PR #700 shipped the validation trace needed
+> for that roast:**
 > the live dashboard exposes the resolved recovery flag, controller-owned authority
 > state, RoR target/measurement, and effective heat ceiling; schema v16 retains the
 > same fields for a deterministic post-roast summary (cycles, entry time, authority
@@ -59,7 +60,11 @@
 > PR-scoped Claude approval bridge and bounded solo-maintainer privileged override are
 > on `main`; live adversarial proofs passed; `main` now requires one stale-dismissing
 > approval. The temporary 25-Jul Claude outage exception is closed. The retired
-> SHA-scoped `review-gate` must not be restored.
+> SHA-scoped `review-gate` must not be restored. **#683 CodeQL triage is down from
+> 3,532 alerts to one open first-party alert** (`js/prototype-pollution-utility` in
+> `web/src/pages/config/configState.ts`); the fixture-provenance, workflow-permission,
+> Python logging, and digest batches are complete, but #683 stays open for that final
+> UI adjudication.
 >
 > **Milestone reality.** M1 build continues; the "July 2026 harness complete" and
 > "first supervised hardware session in June" targets below are historical. E11
@@ -71,7 +76,7 @@
 > scratch.)
 > Next free plan decision number: **D122** (D121 records catalogue recommendations).
 
-> **STATUS UPDATE — 21 Jun 2026 (superseded by the 27 Jul block above):** the D35 control work
+> **STATUS UPDATE — 21 Jun 2026 (superseded by the 2 Aug block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
 > deterministic floor (#222) + post-FC LLM loop (#223/#226/#276) + model pin (gpt-4o + c1, D43)
 > all SHIPPED. The floor shipped FLAT (heat 100 → FC); the §3 anticipatory **trim** was never
@@ -152,7 +157,7 @@
   conditions — E9 vertical slice green in CI, E10 dashboard usable for a live roast,
   and one supervised real-hardware roast end-to-end — and all three hold (roasts 3–15).
   The definition itself says E11/E12 polish may run into August, so their being
-  operator-gated is the milestone working as specified, not a miss. See the 27 Jul
+  operator-gated is the milestone working as specified, not a miss. See the 2 Aug
   status block at the top for the live position.
 - **July milestone (D17)** — "harness complete" = (1) E9 vertical slice
   green in CI + (2) E10 dashboard usable for a live roast + (3) one
