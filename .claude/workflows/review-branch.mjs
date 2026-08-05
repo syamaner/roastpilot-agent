@@ -200,23 +200,72 @@ const VERDICT_SCHEMA = {
 // nothing wrong with it and vote survives=false, silently restoring the fail-open the
 // synthetic finding exists to prevent. It bypasses Verify and lands straight in Triage.
 const lensFailures = allFindings.filter((f) => f.lensFailure)
+// A ui lens FAILURE is advisory exactly like a ui finding — D24 keeps direction-match
+// review off the merge gate — so it must never enter the triage payload (#680 P2).
+// Leaving it in `survivors` let the unconstrained triage agent return BLOCK on a
+// ui-only failure, and `forcedBlock` (which correctly excludes ui) could not veto that
+// verdict. Blocking (non-ui) lens failures DO stay in `survivors` so the triage report
+// lists them; they force BLOCK deterministically in code regardless.
+const blockingLensFailures = lensFailures.filter((f) => f.lens !== 'ui')
+const uiLensFailures = lensFailures.filter((f) => f.lens === 'ui')
 const claimFindings = allFindings.filter((f) => !f.lensFailure)
-if (lensFailures.length) {
-  log(`${lensFailures.length} lens(es) failed to return a result — bypassing Verify, blocking`)
+if (blockingLensFailures.length) {
+  log(`${blockingLensFailures.length} lens(es) failed to return a result — bypassing Verify, blocking`)
+}
+if (uiLensFailures.length) {
+  log(`${uiLensFailures.length} ui lens failure(s) — advisory (D24), reported but not blocking`)
 }
 const verified = await parallel(
   claimFindings.map((f) => () =>
     agent(
       `A reviewer raised this finding on ${diffScope}:\n\nTitle: ${f.title}\nSeverity: ${f.severity}\nFile: ${f.file}${f.line ? ':' + f.line : ''}\nDetail: ${f.detail}\n\nRun ${diffScope} and read the cited file for context first, then adversarially VERIFY it against the actual diff + code. Try to REFUTE it. Does it survive — a real, in-scope issue this change introduced? Default to survives=false if uncertain, already-handled, pre-existing, or out of scope.`,
       { label: `verify:${f.lens}`, phase: 'Verify', schema: VERDICT_SCHEMA },
-    ).then((v) => ({ ...f, survives: v ? v.survives : false, verifyReason: v ? v.reason : 'verifier failed' })),
+    ).then((v) => ({
+      ...f,
+      // A dead verifier is NOT a refutation (#680 P1). agent() returns null on a
+      // schema-validation failure, a terminal API error, or a user skip; treating
+      // that as survives=false would silently DROP a real finding — and if it were
+      // the only finding, triage would receive an empty set and return CLEAR TO
+      // MERGE. Keep the finding unrefuted (survives=true) so it escalates to triage
+      // instead. Failing closed here means at worst an unverified finding reaches
+      // triage, which is the safe direction — mirrors the lens-failure treatment.
+      survives: v ? v.survives : true,
+      // `verified` records whether the verifier actually RAN (vs. died). Kept alive
+      // above is only half the fix — the marker must reach triage + the report, or an
+      // unverified finding is indistinguishable from a verified survivor and can be
+      // silently rejected (#680 Codex P2). Propagated into the payload and used for a
+      // deterministic severity-gated block below.
+      verified: !!v,
+      verifyReason: v ? v.reason : 'verifier failed to run — kept unrefuted (fail closed)',
+    })),
   ),
 )
-const survivors = [...lensFailures, ...verified.filter(Boolean).filter((f) => f.survives)]
+const survivors = [...blockingLensFailures, ...verified.filter(Boolean).filter((f) => f.survives)]
 log(
-  `${survivors.length - lensFailures.length}/${claimFindings.length} findings survived adversarial verification` +
-    (lensFailures.length ? ` (+${lensFailures.length} lens failure(s), unrefutable)` : ''),
+  `${survivors.length - blockingLensFailures.length}/${claimFindings.length} findings survived adversarial verification` +
+    (blockingLensFailures.length ? ` (+${blockingLensFailures.length} blocking lens failure(s), unrefutable)` : ''),
 )
+
+// Nothing left to adjudicate: every claim finding was refuted and no blocking lens
+// failed. A ui-only lens failure lands here too — report it (advisory, D24) but do NOT
+// spin up triage, so a null/degraded triage result can never flip a ui-only failure to
+// BLOCK (#680 P2).
+if (survivors.length === 0) {
+  return {
+    verdict: scopeUnknown ? 'CLEAR TO MERGE (degraded — scope unknown)' : 'CLEAR TO MERGE',
+    scope: scope ? scope.summary : null,
+    scopeUnknown,
+    lenses: lenses.map((l) => l.key),
+    rawFindings: allFindings.length,
+    survivors: 0,
+    uiLensFailures: uiLensFailures.length
+      ? uiLensFailures.map((f) => `${f.lens} lens failed to run (advisory, D24 — not blocking)`)
+      : undefined,
+    note: uiLensFailures.length
+      ? 'all claim findings refuted; ui lens failed to run (advisory — reported, not blocking)'
+      : 'all findings refuted under adversarial verification',
+  }
+}
 
 // --- Phase 4: Triage — one consolidated verdict -------------------------------
 phase('Triage')
@@ -233,6 +282,22 @@ const TRIAGE_SCHEMA = {
     rejected: { type: 'array', items: { type: 'string' } },
   },
 }
+// A verifier that DIED (returned null) leaves the finding unrefuted, not confirmed.
+// Surface that to triage AND force a deterministic block for anything that would
+// actually gate merge — a must-fix/fix-now finding that was never adversarially
+// verified must not be silently rejected into CLEAR TO MERGE. A nit that couldn't be
+// verified is surfaced but left to triage (it can't block on its own anyway). This
+// mirrors the lens-failure treatment at the finding grain (#680 P1 + Codex P2).
+// EXCLUDE ui exactly as blockingLensFailures does: a ui direction-match/visual finding
+// is advisory under D24 and must never deterministically block, so an unverified ui
+// finding goes to triage (where the advisory-vs-SPA-invariant-violation call is made)
+// rather than force-blocking here solely because verification failed (#680 Codex P2 #2).
+const unverifiedBlockers = survivors.filter(
+  (f) =>
+    f.verified === false &&
+    f.lens !== 'ui' &&
+    (f.severity === 'must-fix' || f.severity === 'fix-now'),
+)
 const payload = survivors.map((f) => ({
   lens: f.lens,
   severity: f.severity,
@@ -240,24 +305,42 @@ const payload = survivors.map((f) => ({
   file: f.file,
   detail: f.detail,
   suggestion: f.suggestion,
+  // undefined for lens-failure synthetics (they force-block in code regardless).
+  verified: f.verified,
+  verifyReason: f.verified === false ? f.verifyReason : undefined,
 }))
 const triage = await agent(
-  `You are the pr-triage adjudicator. Consolidate these adversarially-verified findings on the current branch into a single triage report. Classify each: must-fix (correctness/safety/unmet acceptance/coverage regression — blocks merge), fix-now (cheap, clearly correct), defer (file a follow-up issue), rejected (with reason) — map any 'nit'-severity finding to defer or rejected. Then a single verdict: BLOCK if any must-fix OR any fix-now remains outstanding, else CLEAR TO MERGE. 'fix-now' means the fix has not been made yet, so it is not clear to merge — a security or safety finding of middling severity must not read as CLEAR TO MERGE just because it was cheap to fix. EXCEPTION, and read it precisely: a 'ui' finding is advisory ONLY when it is a direction-match or visual-judgement deviation — D24 keeps THAT off the merge gate, because the scripted Playwright snapshot suite is the gate. Classify those defer and never let one alone drive BLOCK. This does NOT extend to architecture invariants: a ui finding that the SPA infers roast phase locally, calls MCP directly, renders Fahrenheit, or otherwise breaks an AGENTS.md invariant is must-fix and DOES block, exactly like the same violation from any other lens. The ui lens is often the only one positioned to see those, so advisory-by-default must not swallow them. Be the skeptical second opinion — do not rubber-stamp.\n\nNOTE: any finding titled 'The <lens> lens returned no result' means that reviewer FAILED TO RUN. It is not a claim you can refute or defer — that lens simply did not review the diff. Classify it must-fix, with ONE exception: a failure of the 'ui' lens is advisory like its findings (D24), so classify that one defer and never let it drive BLOCK. (For every other lens the workflow also forces BLOCK in code, so a contrary verdict here would just be inconsistent.)\n\nFindings:\n${JSON.stringify(payload, null, 2)}`,
+  `You are the pr-triage adjudicator. Consolidate these adversarially-verified findings on the current branch into a single triage report. Classify each: must-fix (correctness/safety/unmet acceptance/coverage regression — blocks merge), fix-now (cheap, clearly correct), defer (file a follow-up issue), rejected (with reason) — map any 'nit'-severity finding to defer or rejected. Then a single verdict: BLOCK if any must-fix OR any fix-now remains outstanding, else CLEAR TO MERGE. 'fix-now' means the fix has not been made yet, so it is not clear to merge — a security or safety finding of middling severity must not read as CLEAR TO MERGE just because it was cheap to fix. EXCEPTION, and read it precisely: a 'ui' finding is advisory ONLY when it is a direction-match or visual-judgement deviation — D24 keeps THAT off the merge gate, because the scripted Playwright snapshot suite is the gate. Classify those defer and never let one alone drive BLOCK. This does NOT extend to architecture invariants: a ui finding that the SPA infers roast phase locally, calls MCP directly, renders Fahrenheit, or otherwise breaks an AGENTS.md invariant is must-fix and DOES block, exactly like the same violation from any other lens. The ui lens is often the only one positioned to see those, so advisory-by-default must not swallow them. Be the skeptical second opinion — do not rubber-stamp.\n\nNOTE: any finding titled 'The <lens> lens returned no result' means that reviewer FAILED TO RUN. It is not a claim you can refute or defer — that lens simply did not review the diff, so classify it must-fix. (A 'ui' lens failure is advisory under D24 and is filtered out upstream, so it never reaches you; every lens failure you DO see also forces BLOCK in code, so a contrary verdict here would just be inconsistent.)\n\nNOTE: a finding with \`verified: false\` was kept alive because its adversarial verifier DIED (its \`verifyReason\` says so), NOT because it was confirmed real. Do not treat that as low confidence and reject it as unfounded — treat it as unresolved. A non-ui unverified must-fix or fix-now finding forces BLOCK deterministically in code, so calling it CLEAR TO MERGE would just be inconsistent. A 'ui' unverified finding is the ONE exception: it still follows the ui rule above (advisory when a direction-match/visual deviation, must-fix only when it breaks an AGENTS.md SPA invariant) — being unverified does not upgrade it to a blocker.\n\nFindings:\n${JSON.stringify(payload, null, 2)}`,
   { label: 'triage', phase: 'Triage', schema: TRIAGE_SCHEMA, agentType: 'pr-triage' },
 )
 
-// A lens failure BLOCKS deterministically, in code — never at the triage agent's
-// discretion. pr-triage is an unconstrained LLM that could classify the synthetic
+// A failed component BLOCKS deterministically, in code — never at the triage agent's
+// discretion. pr-triage is an unconstrained LLM that could classify a "did not run"
 // finding as "defer" or "rejected" and hand back CLEAR TO MERGE, which would undo the
-// whole fail-closed chain at the last step. "A lens did not run" is not a judgement call.
+// whole fail-closed chain at the last step. Neither "a lens did not run" nor "a
+// must-fix/fix-now finding's verifier died" is a judgement call.
 // The ui lens is advisory by design (D24 keeps direction-match review off the merge
 // gate), so its FAILURE cannot block either — blocking on it would contradict the
 // triage rule that its findings never drive BLOCK. It is still reported.
-const blockingLensFailures = lensFailures.filter((f) => f.lens !== 'ui')
-const forcedBlock = blockingLensFailures.length > 0
+// Two deterministic block sources, neither at the triage agent's discretion: a
+// non-ui lens that failed to run, and a must-fix/fix-now finding whose verifier died
+// (unverifiedBlockers). Both are "a component did not run", the #678/#680 theme.
+const blockReasons = [
+  ...blockingLensFailures.map((f) => `${f.lens} lens failed to run`),
+  ...unverifiedBlockers.map((f) => `${f.severity} finding unverified (verifier failed): ${f.title}`),
+]
+const forcedBlock = blockReasons.length > 0
 return {
   verdict: forcedBlock ? 'BLOCK' : triage ? triage.verdict : 'BLOCK',
-  blockedBy: forcedBlock ? blockingLensFailures.map((f) => `${f.lens} lens failed to run`) : undefined,
+  blockedBy: forcedBlock ? blockReasons : undefined,
+  uiLensFailures: uiLensFailures.length
+    ? uiLensFailures.map((f) => `${f.lens} lens failed to run (advisory, D24 — not blocking)`)
+    : undefined,
+  // Every survivor whose verifier died, surfaced regardless of severity (the must-fix/
+  // fix-now ones also drive forcedBlock above; nits are reported but do not block).
+  verifierFailures: survivors
+    .filter((f) => f.verified === false)
+    .map((f) => `${f.severity} [${f.lens}] ${f.title} — ${f.verifyReason}`),
   scope: scope ? scope.summary : null,
   scopeUnknown,
   lenses: lenses.map((l) => l.key),
