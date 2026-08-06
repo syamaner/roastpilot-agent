@@ -19,23 +19,49 @@ The bundled web console renders entirely from server events and snapshots over
 SSE. It never infers the roast phase locally and never talks to the roaster
 directly.
 
-**Home.** Start a roast, or review and rate past roasts.
+**Live roast.** The live curve (bean, environment, rate-of-rise, heat, fan) with
+the run milestones marked (turning point, drying end, first crack, drop); the
+advisor's latest recommendation alongside its rationale and the safety verdict
+applied to it; the running decision history; the post-first-crack authority
+panel; and operator controls that stay available throughout (emergency stop,
+drop, mark first crack, cooling). Ambient temperature, humidity and pressure are
+shown as a per-roast covariate.
 
-![Home page](docs/screenshots/home.png)
+![Live roast console](docs/screenshots/live-console.png)
 
-**Start a roast.** Pick a saved bean profile or enter the bean by hand, set the
-roast targets (charge window, target drop temperature, target development) and
-the charge weight. Starting commands the roaster to preheat, which turns on real
-heat, so it is always an explicit operator action.
+**After the drop.** A per-roast summary once the roast completes: drop
+temperature, development percentage, total time and weight loss, with the
+finished curve and a link straight into the full detail view.
 
-![Start a roast](docs/screenshots/start-roast.png)
+![Completed roast summary](docs/screenshots/roast-complete.png)
 
-**Roast detail.** The live curve (bean, environment, rate-of-rise, heat, fan),
-every advisor decision with its rationale and the safety verdict applied to it,
-the run timeline (charge, drying end, first crack, drop), and per-roast rating,
-weight-loss and export.
+**History.** Every past roast, searchable and filterable, with the bean, the
+outcome, the advisor consult count (and how many recommendations the safety
+layer rejected), first-crack time, development percentage, weight loss, ambient
+conditions and your rating.
 
-![Roast detail](docs/screenshots/roast-detail.png)
+![Roast history](docs/screenshots/history.png)
+
+**Settings.** Configuration for the next roast: hardware, audio and first-crack
+detection, the advisor, pre-first-crack control and the late-Maillard trim.
+Safety limits are shown read-only. Nothing here touches the live loop; heat, fan
+and the in-roast controls stay on the roast page.
+
+![Settings](docs/screenshots/settings.png)
+
+**Bean sourcing (AI-assisted).** When adding a bean profile you can paste a
+supplier product URL and have the agent draft the profile for you. It fetches
+the page and proposes a conservative first-roast profile (de-risked targets, for
+example 13% development and a lower drop temperature, so a wrong guess cannot
+burn the batch). This is a second, human-gated LLM surface, kept well outside
+the roast safety envelope: nothing is fetched, ordered or saved automatically.
+Every drafted field is checked against the page and shown with its supporting
+`Page says:` quote; any field that could not be verified on the page is flagged
+for review, and you review, edit and explicitly save before it becomes a
+selectable profile. A sibling flow ranks recommendations from a supplier's whole
+collection page and hands the one you pick into the same editable draft.
+
+![Bean sourcing — draft a profile from a vendor page](docs/screenshots/bean-sourcing.png)
 
 ## What this is
 
