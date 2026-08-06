@@ -2,6 +2,30 @@
 
 ## Active Epic
 
+> **STATUS UPDATE — 6 Aug 2026 (updates the control-loop framing in the 2 Aug
+> block below).** The D96 recovery law (#559) has now had its flag-on hardware
+> validation: a paired Guatemala Conebosque (washed) A/B (baseline recovery-off
+> vs treatment recovery-on), run on `main` at `e3c67f0`; both arms are in the
+> trace DB, evidence on #559. **Structural/safety result: PASS** (the raise path
+> was genuinely exercised, `holding` to `recovering`, heat 60 to 67 within the
+> entry+15pp = 75 cap, the 196 C guard armed, every write ALLOW, zero
+> clamp/reject/fault). **Efficacy result: INSUFFICIENT on this bean** (baseline
+> dropped 188 C at 21% DTR, treatment 190 C at 24%; both temp-short and
+> DTR-over). Recovery fired too late (at the DTR target, no runway, because the
+> decaying measured-anchored setpoint chased the crashing RoR down) and too
+> weakly (67 of 75, 8 pp unused); the upstream cause is the advisor driving fan
+> to 85-100 and crashing RoR. First crack was heard to peter out and the roasted
+> beans came out under-expanded (about 75% jar fill, both arms similar, decent
+> dry aroma), the physical fingerprint of the RoR crash. **`recovery_enabled`
+> stays default-off; the cup is the final gate (tasting deferred).** Follow-up is
+> the joint-drop-objective tree **#707** (children: #708 recovery v2 runway-aware
+> trigger + fast-raise, #709 ambient-aware fan doctrine, #710 deterministic
+> joint-window drop planner, #711 joint-objective bake-off metric), all decisions
+> operator-ratified and recorded as **D122**; the advisor DTR-arithmetic finding
+> is **#705**; the catalogue-recommendation Shopify `products.json` fix is
+> documented but not being built (**#712**). Next hardware roast is one variable
+> at a time, RP-B before RP-A, per operator ruling.
+>
 > **STATUS UPDATE — 2 Aug 2026 (supersedes every framing below).** Read this block
 > first; everything under it is retained history, and several of its forward-looking
 > statements (June hardware target, "harness complete target: July 2026", #327 as the
@@ -74,7 +98,7 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D122** (D121 records catalogue recommendations).
+> Next free plan decision number: **D123** (D122 records the joint drop objective, #707).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 2 Aug block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
