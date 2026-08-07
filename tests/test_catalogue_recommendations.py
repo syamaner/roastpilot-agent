@@ -3058,6 +3058,29 @@ def test_products_json_tags_text_bounded_by_its_own_sub_budget() -> None:
     assert len(text) <= cap
 
 
+def test_products_json_tags_text_enforces_budget_at_tag_boundaries() -> None:
+    """The sub-budget is enforced at whole-tag boundaries, never mid-tag (#720).
+
+    ``['a'*195, 'washed']`` joined and sliced at 200 chars would yield
+    ``'a'*195 + ' washe'`` — a corrupted partial ``washe`` fragment. Accumulating
+    whole tags instead keeps the first tag whole and drops the second whole (it
+    does not fit), so the result is exactly the first tag with no partial second
+    tag appended."""
+    cap = catalogue._MAX_PRODUCTS_JSON_TAGS_CHARS  # pyright: ignore[reportPrivateUsage]
+    text = catalogue._products_json_tags_text(  # pyright: ignore[reportPrivateUsage]
+        ["a" * (cap - 5), "washed"]
+    )
+    assert text is not None
+    assert text == "a" * (cap - 5)
+    # No mid-tag fragment of the dropped canonical tag leaked in.
+    assert "washe" not in text
+    # A canonical tag that DOES fit whole is kept whole, not truncated.
+    kept = catalogue._products_json_tags_text(  # pyright: ignore[reportPrivateUsage]
+        ["Origin_Kenya", "Process_Washed", "x" * cap]
+    )
+    assert kept == "Origin_Kenya Process_Washed"
+
+
 def test_products_json_candidate_verbose_tags_do_not_crowd_out_body_facts() -> None:
     """#716: a product with many long tags must not drop ``body_html`` identity
     facts from the shared evidence budget. The bounded tags leave room for the

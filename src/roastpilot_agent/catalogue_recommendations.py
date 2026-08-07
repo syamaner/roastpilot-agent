@@ -1180,18 +1180,29 @@ def _validate_products_json_handle(value: object) -> str | None:
 def _products_json_tags_text(value: object) -> str | None:
     """Return bounded, space-joined tag text from an untrusted tag list.
 
-    Capped at :data:`_MAX_PRODUCTS_JSON_TAGS_CHARS` so verbose tags cannot crowd
+    Bounded at :data:`_MAX_PRODUCTS_JSON_TAGS_CHARS` so verbose tags cannot crowd
     ``body_html`` out of the shared evidence budget in
-    :func:`_products_json_candidate` (#716).
+    :func:`_products_json_candidate` (#716). The budget is enforced at TAG
+    BOUNDARIES — whole tags are accumulated until the next would exceed it, then
+    accumulation stops — never by slicing the joined text mid-tag, which would
+    corrupt an identity-bearing tag at the boundary (e.g. ``washed`` → ``washe``)
+    (#720, Codex P2).
     """
     if not isinstance(value, list):
         return None
     cleaned: list[str] = []
+    used = 0
     for tag in cast(list[object], value)[:_MAX_DISCOVERED]:
         text = _clean_text(tag, limit=_MAX_LABEL_CHARS)
-        if text:
-            cleaned.append(text)
-    return _clean_text(" ".join(cleaned), limit=_MAX_PRODUCTS_JSON_TAGS_CHARS) if cleaned else None
+        if not text:
+            continue
+        # +1 for the space that will join this tag to the previous one.
+        addition = len(text) + (1 if cleaned else 0)
+        if used + addition > _MAX_PRODUCTS_JSON_TAGS_CHARS:
+            break
+        cleaned.append(text)
+        used += addition
+    return " ".join(cleaned) if cleaned else None
 
 
 def _strip_products_json_body_html(value: object) -> str | None:
