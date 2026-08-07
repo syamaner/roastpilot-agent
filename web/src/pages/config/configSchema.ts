@@ -171,13 +171,15 @@ const PROVIDER_OPTIONS: FieldOption[] = [
   { value: "ollama",            label: "Ollama (local)" },
 ];
 
-// All nine c-series control-teaching prompts are real and selectable (c1–c9
+// All ten c-series control-teaching prompts are real and selectable (c1–c10
 // confirmed in advisor.py _CONTROL_TEACHING_PROMPTS). c3 is the live default.
 // c1/c2 are the original cuts (retained for A/B); c4/c5/c6 are experiment
 // selectors (#396); c7 is the #499 part-2 DTR-pace-mismatch experiment; c8 is
 // the D96 slice 2 (#559) pace/bottom-edge/fan-coupling experiment; c9 is the
 // #567 same-bean reference-roast teaching (the reference-taught bake-off arm —
-// pair it with the reference_curve flag enabled to feed the model a reference).
+// pair it with the reference_curve flag enabled to feed the model a reference);
+// c10 is the #705 read-the-provided-DTR teaching (use the deterministic
+// development_time_ratio, don't recompute it from the raw seconds).
 // Legacy v0/v1 prompts are internal only — not exposed here.
 const PROMPT_VERSION_OPTIONS: FieldOption[] = [
   { value: "c1", label: "c1 — original (v1 baseline)" },
@@ -189,6 +191,7 @@ const PROMPT_VERSION_OPTIONS: FieldOption[] = [
   { value: "c7", label: "c7 — experiment (#499 pt.2 DTR-pace A/B)" },
   { value: "c8", label: "c8 — experiment (#559 D96 pace/bottom-edge/fan A/B)" },
   { value: "c9", label: "c9 — experiment (#567 reference-roast A/B)" },
+  { value: "c10", label: "c10 — experiment (#705 read-provided-DTR A/B)" },
 ];
 
 // ---------------------------------------------------------------------------
