@@ -3140,6 +3140,52 @@ def test_products_json_candidate_returns_none_when_url_normalization_rejects_it(
 
 
 @pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        # Localized-market storefront prefix is preserved.
+        ("https://vendor.example/en-eu/collections/green/products.json", "/en-eu"),
+        ("https://vendor.example/fr-fr/collections/green-coffee/products.json", "/fr-fr"),
+        # No market prefix — collections at the root.
+        ("https://vendor.example/collections/green/products.json", ""),
+        # No /collections/ segment at all.
+        ("https://vendor.example/products.json", ""),
+        ("not-a-url", ""),
+        # Malformed URL (urlsplit raises) fails soft to no prefix.
+        ("http://[::1", ""),
+    ],
+)
+def test_market_path_prefix(base_url: str, expected: str) -> None:
+    assert (
+        catalogue._market_path_prefix(base_url)  # pyright: ignore[reportPrivateUsage]
+        == expected
+    )
+
+
+def test_products_json_candidate_preserves_localized_market_prefix() -> None:
+    """#717: a collection under a Shopify Markets locale prefix
+    (``/en-eu/collections/...``) must yield product URLs under the SAME market
+    (``/en-eu/products/<handle>``), not the default-market host root."""
+    candidate = catalogue._products_json_candidate(  # pyright: ignore[reportPrivateUsage]
+        {"handle": "kenya-kiambu", "title": "Kenya Kiambu"},
+        base_url="https://vendor.example/en-eu/collections/green/products.json",
+        source_order=0,
+    )
+    assert candidate is not None
+    assert candidate.product_url == "https://vendor.example/en-eu/products/kenya-kiambu"
+
+
+def test_products_json_candidate_no_prefix_stays_at_root() -> None:
+    """A collection with no market prefix keeps the bare root product route."""
+    candidate = catalogue._products_json_candidate(  # pyright: ignore[reportPrivateUsage]
+        {"handle": "kenya-kiambu", "title": "Kenya Kiambu"},
+        base_url="https://vendor.example/collections/green/products.json",
+        source_order=0,
+    )
+    assert candidate is not None
+    assert candidate.product_url == "https://vendor.example/products/kenya-kiambu"
+
+
+@pytest.mark.parametrize(
     ("value", "expected"),
     [
         ("kenya-kiambu-washed", "kenya-kiambu-washed"),
