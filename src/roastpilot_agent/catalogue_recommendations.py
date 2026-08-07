@@ -1182,27 +1182,41 @@ def _products_json_tags_text(value: object) -> str | None:
 
     Bounded at :data:`_MAX_PRODUCTS_JSON_TAGS_CHARS` so verbose tags cannot crowd
     ``body_html`` out of the shared evidence budget in
-    :func:`_products_json_candidate` (#716). The budget is enforced at TAG
-    BOUNDARIES — whole tags are accumulated until the next would exceed it, then
-    accumulation stops — never by slicing the joined text mid-tag, which would
-    corrupt an identity-bearing tag at the boundary (e.g. ``washed`` → ``washe``)
-    (#720, Codex P2).
+    :func:`_products_json_candidate` (#716). Two properties matter when the
+    budget cannot hold every tag (#720, Codex P2):
+
+    * **Whole tags only** — the budget is enforced at tag boundaries, never by
+      slicing the joined text mid-tag (which would corrupt an identity-bearing
+      tag, e.g. ``washed`` → ``washe``).
+    * **Shortest-first selection** — canonical identity keywords (``washed``,
+      ``natural``, an origin name) are short, while the long marketing tags are
+      the crowders. Selecting shortest-first means a long noise tag can never
+      starve a short identity tag out of the budget; the kept tags are then
+      emitted in their ORIGINAL order.
     """
     if not isinstance(value, list):
         return None
     cleaned: list[str] = []
-    used = 0
     for tag in cast(list[object], value)[:_MAX_DISCOVERED]:
         text = _clean_text(tag, limit=_MAX_LABEL_CHARS)
-        if not text:
-            continue
-        # +1 for the space that will join this tag to the previous one.
-        addition = len(text) + (1 if cleaned else 0)
+        if text:
+            cleaned.append(text)
+    if not cleaned:
+        return None
+    # Greedy shortest-first fill: each tag after the first adds one joining
+    # space, so total length == sum(kept lengths) + (count - 1) regardless of
+    # selection order — the accounting below is exact for the final join.
+    kept: set[int] = set()
+    used = 0
+    for index in sorted(range(len(cleaned)), key=lambda i: len(cleaned[i])):
+        addition = len(cleaned[index]) + (1 if kept else 0)
         if used + addition > _MAX_PRODUCTS_JSON_TAGS_CHARS:
             break
-        cleaned.append(text)
+        kept.add(index)
         used += addition
-    return " ".join(cleaned) if cleaned else None
+    if not kept:
+        return None
+    return " ".join(cleaned[index] for index in range(len(cleaned)) if index in kept)
 
 
 def _strip_products_json_body_html(value: object) -> str | None:

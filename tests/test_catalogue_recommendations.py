@@ -3062,23 +3062,48 @@ def test_products_json_tags_text_enforces_budget_at_tag_boundaries() -> None:
     """The sub-budget is enforced at whole-tag boundaries, never mid-tag (#720).
 
     ``['a'*195, 'washed']`` joined and sliced at 200 chars would yield
-    ``'a'*195 + ' washe'`` — a corrupted partial ``washe`` fragment. Accumulating
-    whole tags instead keeps the first tag whole and drops the second whole (it
-    does not fit), so the result is exactly the first tag with no partial second
-    tag appended."""
+    ``'a'*195 + ' washe'`` — a corrupted partial ``washe`` fragment. Selecting
+    whole tags shortest-first keeps the short canonical ``washed`` and drops the
+    long noise tag, and never emits a partial fragment."""
     cap = catalogue._MAX_PRODUCTS_JSON_TAGS_CHARS  # pyright: ignore[reportPrivateUsage]
     text = catalogue._products_json_tags_text(  # pyright: ignore[reportPrivateUsage]
         ["a" * (cap - 5), "washed"]
     )
     assert text is not None
-    assert text == "a" * (cap - 5)
-    # No mid-tag fragment of the dropped canonical tag leaked in.
-    assert "washe" not in text
-    # A canonical tag that DOES fit whole is kept whole, not truncated.
-    kept = catalogue._products_json_tags_text(  # pyright: ignore[reportPrivateUsage]
-        ["Origin_Kenya", "Process_Washed", "x" * cap]
+    # Shortest-first: the long noise tag never starves the short identity tag.
+    assert text == "washed"
+    # No mid-tag fragment of any tag ever leaked in.
+    assert "washe " not in text and not text.startswith("a")
+
+
+def test_products_json_tags_text_returns_none_when_nothing_survives() -> None:
+    """No usable tag text → ``None`` (#720): an all-blank list yields no cleaned
+    tags, and a single tag that alone exceeds the sub-budget is dropped whole."""
+    cap = catalogue._MAX_PRODUCTS_JSON_TAGS_CHARS  # pyright: ignore[reportPrivateUsage]
+    assert (
+        catalogue._products_json_tags_text(["", "   "])  # pyright: ignore[reportPrivateUsage]
+        is None
     )
-    assert kept == "Origin_Kenya Process_Washed"
+    assert (
+        catalogue._products_json_tags_text(["z" * (cap + 1)])  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
+
+
+def test_products_json_tags_text_shortest_first_preserves_identity_over_noise() -> None:
+    """A long noise tag before short identity tags must not starve them (#720).
+
+    Shortest-first selection keeps ``Origin_Kenya`` / ``Process_Washed`` (the
+    identity keywords) and drops the long marketing tag, and the kept tags are
+    emitted in their ORIGINAL order — regardless of where the noise tag sits."""
+    cap = catalogue._MAX_PRODUCTS_JSON_TAGS_CHARS  # pyright: ignore[reportPrivateUsage]
+    for tags in (
+        ["x" * cap, "Origin_Kenya", "Process_Washed"],
+        ["Origin_Kenya", "x" * cap, "Process_Washed"],
+        ["Origin_Kenya", "Process_Washed", "x" * cap],
+    ):
+        kept = catalogue._products_json_tags_text(tags)  # pyright: ignore[reportPrivateUsage]
+        assert kept == "Origin_Kenya Process_Washed", tags
 
 
 def test_products_json_candidate_verbose_tags_do_not_crowd_out_body_facts() -> None:
