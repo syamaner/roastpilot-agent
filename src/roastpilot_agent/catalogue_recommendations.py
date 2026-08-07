@@ -1246,6 +1246,28 @@ def _strip_products_json_body_html(value: object) -> str | None:
     return _clean_text(text, limit=_MAX_CANDIDATE_CONTEXT_CHARS)
 
 
+def _market_path_prefix(base_url: str) -> str:
+    """Return the storefront market/locale path prefix of a collection URL.
+
+    Shopify Markets serves a localized storefront under a path prefix, e.g.
+    ``https://vendor/en-eu/collections/green-coffee``. A product under that
+    market lives at ``/en-eu/products/<handle>``, so a bare root-relative
+    ``/products/<handle>`` would drop the prefix and open the DEFAULT market
+    (wrong language/currency/availability, or a 404 on prefix-required
+    storefronts). This returns everything before the first ``/collections/``
+    segment (``"/en-eu"``), or ``""`` when the path is not under a market
+    prefix (``/collections/...`` at the root, or no ``/collections/`` at all),
+    so the product route can be anchored to the same market (#717).
+    """
+    try:
+        path = urlsplit(base_url).path
+    except ValueError:
+        return ""
+    marker = "/collections/"
+    index = path.find(marker)
+    return path[:index] if index > 0 else ""
+
+
 def _products_json_candidate(
     product: object,
     *,
@@ -1268,8 +1290,12 @@ def _products_json_candidate(
     label = _clean_text(product_fields.get("title"))
     if label is None:
         return None
+    # Anchor the product route to the SAME storefront market as the collection
+    # (its path prefix before ``/collections/``), not the host root, so a
+    # localized-market collection does not generate default-market product URLs
+    # (#717). ``_same_origin_product_url`` re-validates the full result.
     product_url = _same_origin_product_url(
-        f"/products/{handle}",
+        f"{_market_path_prefix(base_url)}/products/{handle}",
         base_url=base_url,
         require_product_path=True,
         allow_relative=True,
