@@ -1616,7 +1616,7 @@ def test_c10_registered_selectable_and_not_the_live_default() -> None:
 # #559) is now the newest/most-spliced version and is added the same way.
 
 
-@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9"])
+@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9", "c10"])
 def test_assembled_prompt_carries_the_joint_objective_and_no_contradiction(
     version: str,
 ) -> None:
@@ -1637,7 +1637,7 @@ def test_assembled_prompt_carries_the_joint_objective_and_no_contradiction(
     assert "latest acceptable drop" not in lowered
 
 
-@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9"])
+@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9", "c10"])
 def test_assembled_prompt_joint_objective_precedes_every_later_section(
     version: str,
 ) -> None:
@@ -1655,6 +1655,7 @@ def test_assembled_prompt_joint_objective_precedes_every_later_section(
         "POST-FIRST-CRACK: A LARGE DTR OVERSHOOT",  # c7
         "POST-FIRST-CRACK: COMPARE PROGRESS RATES",  # c8
         "POST-FIRST-CRACK: A REFERENCE ROAST",  # c9
+        "POST-FIRST-CRACK: READ THE PROVIDED DEVELOPMENT RATIO",  # c10
     ):
         if marker in prompt:
             assert prompt.index(marker) > joint_index, (
