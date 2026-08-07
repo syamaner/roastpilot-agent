@@ -8144,6 +8144,30 @@ def test_draft_from_identity_scouting_note_does_not_claim_deferred_fields_absent
     assert "was not found on the vendor page" not in note
 
 
+def test_draft_from_identity_scouting_note_does_not_claim_a_safety_guarantee() -> None:
+    """#714: the note used to promise "a wrong guess cannot burn the batch" — a
+    false safety guarantee, since ``target_drop_temp_c`` is not deterministically
+    enforced (with ``ceiling_guard_drop_enabled`` off only the 230 °C e-stop is).
+    The copy must describe the conservative posture (risk reduction) without an
+    absolute guarantee, and keep it distinct from the enforced controls."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(processing="washed")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="This lot was fully washed and sun-dried on raised beds.",
+    )
+    note = draft.scouting_note.lower()
+    # The over-claim is gone.
+    assert "cannot burn the batch" not in note
+    # Risk-reduction framing is present, distinct from the enforced controls.
+    assert "under-development" in note
+    assert "over-roasting" in note
+    assert "not an enforced safety limit" in note
+    assert "ceiling guard" in note and "emergency stop" in note
+
+
 def test_draft_from_identity_bean_origin_falls_back_to_country_and_is_still_on_page() -> None:
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(bean_origin=None, country="Ethiopia")
