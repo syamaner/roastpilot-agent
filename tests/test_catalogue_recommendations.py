@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 import pytest
@@ -53,6 +55,14 @@ def _page(html: str) -> FetchedVendorPage:
         raw_html=html,
         final_url="https://vendor.example/collections/green-coffee",
     )
+
+
+_CATALOGUE_FIXTURES_DIR = Path(__file__).parent / "fixtures" / "catalogue"
+
+
+def _load_catalogue_fixture(name: str) -> str:
+    """Return one trimmed, real-shaped ``products.json`` fixture (#712)."""
+    return (_CATALOGUE_FIXTURES_DIR / name).read_text(encoding="utf-8")
 
 
 def test_discovery_prefers_json_ld_and_bounds_links_to_same_origin_products() -> None:
@@ -1597,7 +1607,10 @@ async def test_full_catalogue_pipeline_fetches_once_extracts_once_and_ranks_loca
             http_client=client,
             model=FunctionModel(respond),
         )
-    assert fetches == 1
+    # One fetch for the collection page, one for the (here, non-JSON)
+    # ``products.json`` discovery attempt, which fails soft to the
+    # page-anchor discovery already exercised below (#712).
+    assert fetches == 2
     assert model_calls == 1
     assert result.recommendations[0].candidate_id == "candidate-01"
     assert result.recommendations[0].score == 3
@@ -2737,7 +2750,10 @@ async def test_provider_owns_full_timeout_and_records_usage_after_preparation(
         model=FunctionModel(respond),
     )
     assert result.recommendations[0].candidate_id == "candidate-01"
-    assert timeout_budgets == [6.0, 2.0, 11.0]
+    # [preparation (fetch_timeout_seconds * 6), the products.json discovery
+    # parse, the page-anchor fallback parse (the mocked page has no
+    # ``products.json`` body, #712), then the extraction timeout.
+    assert timeout_budgets == [12.0, 2.0, 2.0, 11.0]
     assert provider_timeout_context == (11.0,)
     assert diagnostics.timed_out_runs == 0
     assert (diagnostics.request_tokens, diagnostics.response_tokens) == (5, 2)
@@ -2763,6 +2779,654 @@ async def test_full_pipeline_rejects_catalogue_without_product_links() -> None:
                 diagnostics=BeanSourcingDiagnostics(),
                 http_client=client,
                 model=FunctionModel(lambda messages, info: ModelResponse(parts=[])),
+            )
+
+
+def test_products_json_discovery_yields_candidates_from_redber_fixture() -> None:
+    """#712: real Redber "Origin Details" prose layout yields exact membership."""
+    raw_json = _load_catalogue_fixture("redber-products.json")
+    candidates = catalogue._discover_products_json_candidates(  # pyright: ignore[reportPrivateUsage]
+        raw_json, base_url="https://www.redber.co.uk/collections/green-coffee-beans"
+    )
+    assert candidates is not None
+    assert [candidate.product_url for candidate in candidates] == [
+        "https://www.redber.co.uk/products/ethiopia-natural-djimmah-green-coffee-beans",
+        "https://www.redber.co.uk/products/brazil-finca-cachoeira-natural-green-coffee-beans",
+        "https://www.redber.co.uk/products/peru-chanchamayo-green-coffee-beans",
+    ]
+    assert [candidate.candidate_id for candidate in candidates] == [
+        "candidate-01",
+        "candidate-02",
+        "candidate-03",
+    ]
+    brazil = candidates[1]
+    assert brazil.label == "BRAZIL FINCA CACHOEIRA NATURAL - Green Coffee Beans"
+    assert "Brazil" in brazil.evidence
+    assert "1,100 metres above sea level" in brazil.evidence
+    assert "Natural" in brazil.evidence
+
+
+def test_products_json_discovery_yields_candidates_from_pennine_fixture() -> None:
+    """#712: real Pennine table-layout ``body_html`` yields exact membership."""
+    raw_json = _load_catalogue_fixture("pennine-products.json")
+    candidates = catalogue._discover_products_json_candidates(  # pyright: ignore[reportPrivateUsage]
+        raw_json,
+        base_url="https://www.pennineteaandcoffee.co.uk/collections/green-coffee",
+    )
+    assert candidates is not None
+    assert [candidate.product_url for candidate in candidates] == [
+        "https://www.pennineteaandcoffee.co.uk/products/bolivia-arabica-green-coffee-beans-1kg",
+        "https://www.pennineteaandcoffee.co.uk/products/"
+        "brazil-screen-15-natural-fazenda-inhame-arabica-green-coffee-beans-1kg",
+        "https://www.pennineteaandcoffee.co.uk/products/burundi-a-arabica-green-coffee-beans-1kg",
+    ]
+    bolivia = candidates[0]
+    assert "Bolivia" in bolivia.evidence
+    assert "1650masl" in bolivia.evidence
+    assert "Washed" in bolivia.evidence
+    # The vendor's inline <style> block must not leak into the evidence text
+    # fed to the extraction provider (#712).
+    assert "background-color" not in bolivia.evidence
+    assert "ROW1" not in bolivia.evidence
+
+
+@pytest.mark.parametrize(
+    "raw_json",
+    [
+        "not json at all",
+        "{}",
+        '{"products": "not-a-list"}',
+        "null",
+        "[1, 2, 3]",
+        # A non-empty membership none of whose entries parse is unusable, not
+        # authoritatively empty — it must fall back to HTML (#715, Codex P2).
+        '{"products": [1, 2, 3]}',
+    ],
+)
+def test_products_json_candidates_fall_back_when_unusable(raw_json: str) -> None:
+    """Absent/non-JSON/wrong-typed/all-invalid membership signals HTML fallback."""
+    assert (
+        catalogue._discover_products_json_candidates(  # pyright: ignore[reportPrivateUsage]
+            raw_json, base_url="https://vendor.example/collections/green"
+        )
+        is None
+    )
+
+
+def test_products_json_candidates_authoritative_empty_membership() -> None:
+    """A well-formed empty ``products`` list is authoritative, not fallback (#712).
+
+    An empty Shopify collection (e.g. sold out) must NOT re-admit the collection
+    page's cross-sell chrome, so the empty membership survives as ``[]`` — the
+    caller then returns "no products" rather than falling back (#715, Codex P2).
+    """
+    assert (
+        catalogue._discover_products_json_candidates(  # pyright: ignore[reportPrivateUsage]
+            '{"products": []}', base_url="https://vendor.example/collections/green"
+        )
+        == []
+    )
+
+
+def test_products_json_candidates_skip_malformed_products_without_raising() -> None:
+    raw_json = json.dumps(
+        {
+            "products": [
+                "not-a-dict",
+                {"title": "Missing handle"},
+                {"handle": "has/slash", "title": "Slash handle"},
+                {"handle": "javascript:alert(1)", "title": "Scheme handle"},
+                {"handle": "  ", "title": "Blank handle"},
+                {"handle": 12345, "title": "Non-string handle"},
+                {"handle": "valid-handle-one", "title": 12345},
+                {
+                    "handle": "valid-handle-two",
+                    "title": "Valid Two",
+                    "tags": "not-a-list",
+                },
+                {
+                    "handle": "valid-handle-three",
+                    "title": "Valid Three",
+                    "product_type": None,
+                    "body_html": None,
+                },
+            ]
+        }
+    )
+    candidates = catalogue._discover_products_json_candidates(  # pyright: ignore[reportPrivateUsage]
+        raw_json, base_url="https://vendor.example/collections/green"
+    )
+    assert candidates is not None
+    assert [candidate.product_url for candidate in candidates] == [
+        "https://vendor.example/products/valid-handle-two",
+        "https://vendor.example/products/valid-handle-three",
+    ]
+
+
+def test_products_json_candidates_dedupe_by_product_url() -> None:
+    raw_json = json.dumps(
+        {
+            "products": [
+                {"handle": "kenya-kiambu", "title": "Kenya Kiambu (first)"},
+                {"handle": "kenya-kiambu", "title": "Kenya Kiambu (duplicate)"},
+            ]
+        }
+    )
+    candidates = catalogue._discover_products_json_candidates(  # pyright: ignore[reportPrivateUsage]
+        raw_json, base_url="https://vendor.example/collections/green"
+    )
+    assert candidates is not None
+    assert len(candidates) == 1
+    assert candidates[0].label == "Kenya Kiambu (first)"
+
+
+def test_products_json_candidates_cap_products_processed_before_per_item_work() -> None:
+    """The raw list is sliced at ``_MAX_DISCOVERED`` BEFORE per-item validation.
+
+    Six invalid handles occupy the first ``_MAX_DISCOVERED`` slots, with valid
+    products only AFTER the cap. A correct raw-slice-before-work implementation
+    never reaches them, so the six invalid early entries simply reduce the yield
+    (to 18). A filter-then-truncate regression — collecting the first
+    ``_MAX_DISCOVERED`` *valid* candidates by scanning past the cap — would
+    instead backfill from ``product-24``..``product-29`` and yield 24. Asserting
+    on both the count and the absence of the beyond-cap handles distinguishes
+    them (#712, #715 qa).
+    """
+    invalid_early = [{"handle": f"bad/{index}", "title": f"Invalid {index}"} for index in range(6)]
+    valid_after = [
+        {"handle": f"product-{index:02d}", "title": f"Product {index}"} for index in range(6, 30)
+    ]
+    raw_json = json.dumps({"products": [*invalid_early, *valid_after]})
+    candidates = catalogue._discover_products_json_candidates(  # pyright: ignore[reportPrivateUsage]
+        raw_json, base_url="https://vendor.example/collections/green"
+    )
+    assert candidates is not None
+    # Only raw indices 6..23 survive the pre-validation slice (18 valid entries);
+    # indices 24..29 are past the cap and must never be reached.
+    assert [candidate.product_url for candidate in candidates] == [
+        f"https://vendor.example/products/product-{index:02d}" for index in range(6, 24)
+    ]
+    assert all(
+        f"product-{index:02d}" not in candidate.product_url
+        for candidate in candidates
+        for index in range(24, 30)
+    )
+
+
+def test_products_json_discovery_fails_soft_on_unexpected_parser_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirrors the HTML discovery boundary's own adversarial-escape test."""
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("adversarial parser escape")
+
+    monkeypatch.setattr(catalogue, "_products_json_candidate", boom)
+    raw_json = json.dumps({"products": [{"handle": "kenya", "title": "Kenya"}]})
+    assert (
+        catalogue._discover_products_json_candidates(  # pyright: ignore[reportPrivateUsage]
+            raw_json, base_url="https://vendor.example/collections/green"
+        )
+        is None
+    )
+
+
+def test_strip_products_json_body_html_removes_style_and_script() -> None:
+    html = (
+        "<style>td{color:red}</style>"
+        "<table><tr><td>Origin</td><td>Bolivia</td></tr></table>"
+        "<script>evil()</script>"
+    )
+    text = catalogue._strip_products_json_body_html(html)  # pyright: ignore[reportPrivateUsage]
+    assert text == "Origin Bolivia"
+
+
+@pytest.mark.parametrize("value", [None, 123, "", []])
+def test_strip_products_json_body_html_fails_soft_on_non_string_and_empty(
+    value: object,
+) -> None:
+    assert (
+        catalogue._strip_products_json_body_html(value)  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
+
+
+def test_strip_products_json_body_html_fails_soft_on_parser_error() -> None:
+    """A whitespace-only fragment raises ``lxml.etree.ParserError`` — caught."""
+    assert (
+        catalogue._strip_products_json_body_html(" ")  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
+
+
+def test_strip_products_json_body_html_does_not_expand_xxe_entities(tmp_path: Path) -> None:
+    """HTML-mode ``no_network`` parsing must not expand DTD entities (XXE).
+
+    Internal-entity check: an internal DTD entity would expand to the secret
+    under an XML parser; the HTML-mode parser must leave it unexpanded.
+    External-entity check: a ``SYSTEM`` entity pointing at a real on-disk file
+    with a unique marker must NOT surface that marker in the output — proving the
+    file was never read — and must not raise (#712, #715 Codex P2).
+    """
+    internal = '<!DOCTYPE t [<!ENTITY xxe "LEAKED-SECRET">]><p>Origin Bolivia &xxe;</p>'
+    internal_text = catalogue._strip_products_json_body_html(internal)  # pyright: ignore[reportPrivateUsage]
+    assert internal_text is not None
+    assert "LEAKED-SECRET" not in internal_text
+    assert "Bolivia" in internal_text
+    secret = tmp_path / "xxe-secret.txt"
+    secret.write_text("XXE-FILE-MARKER-8f3a2b")
+    external = f'<!DOCTYPE t [<!ENTITY xxe SYSTEM "file://{secret}">]><p>Origin Peru &xxe;</p>'
+    external_text = catalogue._strip_products_json_body_html(external)  # pyright: ignore[reportPrivateUsage]
+    # The file contents must never appear — the external entity is never resolved.
+    assert external_text is None or "XXE-FILE-MARKER-8f3a2b" not in external_text
+
+
+def test_strip_products_json_body_html_truncates_oversized_input() -> None:
+    """Input is bounded to ``_MAX_PRODUCTS_JSON_BODY_HTML_INPUT_CHARS`` pre-parse.
+
+    The discriminating token sits AFTER a ``<script>`` filler longer than the
+    input cap. ``<script>`` text is stripped, so an UNBOUNDED parse would surface
+    the token within the separate 1,200-char output budget (the short prefix is
+    the only other text). Slicing the INPUT at the cap cuts the filler mid-way,
+    so the closing tag and the trailing marker never exist for the parser — its
+    absence therefore proves the pre-parse input bound, distinct from the output
+    cap. Removing the production input slice would make this token appear and
+    fail the test (#715 Codex P2).
+    """
+    cap = catalogue._MAX_PRODUCTS_JSON_BODY_HTML_INPUT_CHARS  # pyright: ignore[reportPrivateUsage]
+    html = f"<p>SHORT</p><script>{'x' * cap}</script><p>BEYOND-INPUT-CAP-MARKER</p>"
+    text = catalogue._strip_products_json_body_html(html)  # pyright: ignore[reportPrivateUsage]
+    assert text is not None
+    assert "SHORT" in text
+    assert "BEYOND-INPUT-CAP-MARKER" not in text
+
+
+def test_products_json_tags_text_skips_blank_entries() -> None:
+    text = catalogue._products_json_tags_text(  # pyright: ignore[reportPrivateUsage]
+        ["Kenya", "", "   ", "Washed"]
+    )
+    assert text == "Kenya Washed"
+
+
+def test_products_json_candidate_returns_none_when_url_normalization_rejects_it() -> None:
+    """A valid handle over a rejected base origin (e.g. a non-http(s) scheme)
+    still fails soft — the URL is never trusted without going through the
+    same normalizer every other discovered candidate URL uses."""
+    candidate = catalogue._products_json_candidate(  # pyright: ignore[reportPrivateUsage]
+        {"handle": "kenya-kiambu", "title": "Kenya Kiambu"},
+        base_url="ftp://vendor.example/collections/green",
+        source_order=0,
+    )
+    assert candidate is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("kenya-kiambu-washed", "kenya-kiambu-washed"),
+        ("Kenya_AA_2024", "Kenya_AA_2024"),
+        ("a", "a"),
+        ("../etc/passwd", None),
+        ("kenya/other", None),
+        ("javascript:alert(1)", None),
+        ("", None),
+        ("   ", None),
+        (".", None),
+        ("..", None),
+        (12345, None),
+        (None, None),
+        ("a" * 201, None),
+        ("a" * 200, "a" * 200),
+        # Unicode / bidi / whitespace: the ASCII allowlist rejects all of these
+        # by construction. Locked as explicit cases so a future regex loosening
+        # cannot silently admit a homoglyph, bidi-override, or newline handle.
+        ("café", None),  # non-ASCII (é)
+        ("kenya‮gnp", None),  # right-to-left override
+        ("kenya​hidden", None),  # zero-width space
+        ("kenya\n", None),  # trailing newline
+        ("kenya\ttab", None),  # tab
+        ("ke nya", None),  # internal space
+    ],
+)
+def test_validate_products_json_handle(value: object, expected: str | None) -> None:
+    assert (
+        catalogue._validate_products_json_handle(value)  # pyright: ignore[reportPrivateUsage]
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("collection_url", "expected"),
+    [
+        (
+            "https://vendor.example/collections/green-coffee",
+            "https://vendor.example/collections/green-coffee/products.json?limit=24",
+        ),
+        (
+            "https://vendor.example/collections/green-coffee/",
+            "https://vendor.example/collections/green-coffee/products.json?limit=24",
+        ),
+        (
+            "https://vendor.example/collections/green?existing=param#fragment",
+            "https://vendor.example/collections/green/products.json?limit=24",
+        ),
+        ("not-a-url", None),
+        ("ftp://vendor.example/collections/green", None),
+        ("http://[::1", None),
+    ],
+)
+def test_products_json_url(collection_url: str, expected: str | None) -> None:
+    assert (
+        catalogue._products_json_url(collection_url)  # pyright: ignore[reportPrivateUsage]
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("url_a", "url_b", "expected"),
+    [
+        ("https://x.example/a", "https://x.example/b/c", True),
+        ("https://X.Example/a", "https://x.example/b", True),  # host canonicalized
+        ("https://x.example:443/a", "https://x.example/b", True),  # https default port
+        ("https://x.example/a", "http://x.example/b", False),  # scheme mismatch
+        ("https://x.example/a", "https://y.example/b", False),  # host mismatch
+        ("ftp://x.example/a", "ftp://x.example/b", False),  # non-http(s) scheme
+        ("https://x.example:notaport/a", "https://x.example/b", False),  # invalid port
+    ],
+)
+def test_same_origin(url_a: str, url_b: str, expected: bool) -> None:
+    assert (
+        catalogue._same_origin(url_a, url_b)  # pyright: ignore[reportPrivateUsage]
+        is expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_discover_from_products_json_yields_server_owned_candidates() -> None:
+    """The full async path: fetch, off-loop parse, server-owned URLs (#712)."""
+    raw_json = _load_catalogue_fixture("pennine-products.json")
+
+    def fetch(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/collections/green-coffee/products.json"
+        assert request.url.params.get("limit") == "24"
+        return httpx.Response(200, stream=_BytesStream(raw_json.encode("utf-8")), request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fetch)) as client:
+        candidates = await catalogue._discover_from_products_json(  # pyright: ignore[reportPrivateUsage]
+            "https://www.pennineteaandcoffee.co.uk/collections/green-coffee",
+            config=BeanSourcingConfig(),
+            http_client=client,
+        )
+    assert candidates is not None
+    assert [candidate.product_url for candidate in candidates] == [
+        "https://www.pennineteaandcoffee.co.uk/products/bolivia-arabica-green-coffee-beans-1kg",
+        "https://www.pennineteaandcoffee.co.uk/products/"
+        "brazil-screen-15-natural-fazenda-inhame-arabica-green-coffee-beans-1kg",
+        "https://www.pennineteaandcoffee.co.uk/products/burundi-a-arabica-green-coffee-beans-1kg",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_discover_from_products_json_returns_none_for_non_json_response() -> None:
+    def fetch(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_BytesStream(b"<html>not json</html>"), request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fetch)) as client:
+        result = await catalogue._discover_from_products_json(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/collections/green",
+            config=BeanSourcingConfig(),
+            http_client=client,
+        )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_discover_from_products_json_returns_none_on_fetch_failure() -> None:
+    """A non-Shopify vendor (or any 404) fails soft to the caller's fallback."""
+
+    def fetch(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, stream=_BytesStream(b"not found"), request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fetch)) as client:
+        result = await catalogue._discover_from_products_json(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/collections/green",
+            config=BeanSourcingConfig(),
+            http_client=client,
+        )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_discover_from_products_json_authoritative_empty_membership() -> None:
+    """A well-formed empty collection resolves to ``[]`` (authoritative), not None.
+
+    The caller must honour this without falling back to the collection page's
+    cross-sell chrome — the exact bug #712 fixes (#715, Codex P2).
+    """
+
+    def fetch(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_BytesStream(b'{"products": []}'), request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fetch)) as client:
+        result = await catalogue._discover_from_products_json(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/collections/green",
+            config=BeanSourcingConfig(),
+            http_client=client,
+        )
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_discover_from_products_json_falls_back_on_cross_origin_redirect() -> None:
+    """An off-origin ``products.json`` redirect is rejected → caller falls back.
+
+    ``fetch_vendor_page`` follows cross-host redirects (each SSRF-vetted), so a
+    vendor could point ``products.json`` at another public origin. Anchoring
+    product URLs there would recommend a different store, so the endpoint's
+    final origin must match the requested collection origin (#715, Codex P2).
+    """
+    membership = json.dumps(
+        {"products": [{"handle": "kenya", "title": "Kenya Kiambu Washed"}]}
+    ).encode("utf-8")
+
+    def fetch(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "vendor.example":
+            return httpx.Response(
+                301, headers={"Location": "https://other.example/collections/green/products.json"}
+            )
+        return httpx.Response(200, stream=_BytesStream(membership), request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(fetch), follow_redirects=True
+    ) as client:
+        result = await catalogue._discover_from_products_json(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/collections/green",
+            config=BeanSourcingConfig(),
+            http_client=client,
+        )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_discover_from_products_json_returns_none_for_unparseable_collection_url() -> None:
+    result = await catalogue._discover_from_products_json(  # pyright: ignore[reportPrivateUsage]
+        "http://[::1", config=BeanSourcingConfig()
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_recommend_from_catalogue_prefers_products_json_membership_over_html_chrome() -> None:
+    """#712 regression: cross-sell HTML chrome can never crowd out real membership.
+
+    Reproduces the reported failure shape (D121/#573 fallout): the collection
+    page's anchors are entirely non-green cross-sell chrome, while the
+    same-origin ``products.json`` lists the actual green-coffee membership.
+    Discovery must use the JSON membership, so the chrome is never even seen
+    by the extraction provider.
+    """
+    html = b"""
+    <html><body>
+      <a href="/products/barista-instant-coffee">Barista Instant Coffee</a>
+      <a href="/products/barista-milk-powder">Barista Milk Powder</a>
+    </body></html>
+    """
+    products_json = json.dumps(
+        {
+            "products": [
+                {
+                    "title": "Kenya Kiambu Washed",
+                    "handle": "kenya-kiambu-washed",
+                    "product_type": "Green Coffee",
+                    "tags": ["Washed", "Origin_Kenya"],
+                    "body_html": "<p>Kenya, washed process, grown at altitude.</p>",
+                }
+            ]
+        }
+    ).encode("utf-8")
+
+    def fetch(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/products.json"):
+            return httpx.Response(200, stream=_BytesStream(products_json), request=request)
+        return httpx.Response(200, stream=_BytesStream(html), request=request)
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        rendered = str(messages)
+        assert "candidate-01" in rendered
+        assert "barista" not in rendered.lower()
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "candidates": [
+                            {
+                                "candidate_id": "candidate-01",
+                                "name": "Kenya Kiambu Washed",
+                                "country": "Kenya",
+                                "processing": "washed",
+                            }
+                        ]
+                    },
+                )
+            ],
+            usage=RequestUsage(input_tokens=5, output_tokens=2),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fetch)) as client:
+        result = await recommend_from_catalogue(
+            "https://vendor.example/collections/green-coffee",
+            context=CatalogueRankingContext(
+                roster_countries=frozenset(),
+                roster_processes=frozenset(),
+                roster_pairs=frozenset(),
+                rated_pairs=frozenset(),
+            ),
+            advisor_config=AdvisorConfig(),
+            sourcing_config=BeanSourcingConfig(),
+            diagnostics=BeanSourcingDiagnostics(),
+            http_client=client,
+            model=FunctionModel(respond),
+        )
+    assert result.discovered_count == 1
+    assert result.recommendations[0].product_url == (
+        "https://vendor.example/products/kenya-kiambu-washed"
+    )
+    assert result.recommendations[0].country == "Kenya"
+
+
+@pytest.mark.asyncio
+async def test_recommend_from_catalogue_falls_back_to_html_discovery_on_404() -> None:
+    """Non-Shopify vendors (no ``products.json``) keep working with no regression."""
+    html = b"""
+    <html><body>
+      <a href="/products/kenya">Kenya Kiambu Washed</a>
+    </body></html>
+    """
+
+    def fetch(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/products.json"):
+            return httpx.Response(404, stream=_BytesStream(b"not found"), request=request)
+        return httpx.Response(200, stream=_BytesStream(html), request=request)
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "candidates": [
+                            {
+                                "candidate_id": "candidate-01",
+                                "name": "Kenya Kiambu Washed",
+                            }
+                        ]
+                    },
+                )
+            ],
+            usage=RequestUsage(input_tokens=5, output_tokens=2),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fetch)) as client:
+        result = await recommend_from_catalogue(
+            "https://vendor.example/collections/green-coffee",
+            context=CatalogueRankingContext(
+                roster_countries=frozenset(),
+                roster_processes=frozenset(),
+                roster_pairs=frozenset(),
+                rated_pairs=frozenset(),
+            ),
+            advisor_config=AdvisorConfig(),
+            sourcing_config=BeanSourcingConfig(),
+            diagnostics=BeanSourcingDiagnostics(),
+            http_client=client,
+            model=FunctionModel(respond),
+        )
+    assert result.recommendations[0].product_url == "https://vendor.example/products/kenya"
+
+
+@pytest.mark.asyncio
+async def test_recommend_from_catalogue_empty_products_json_does_not_fall_back_to_chrome() -> None:
+    """#712 regression: an empty Shopify collection must not recommend cross-sell.
+
+    A well-formed ``{"products": []}`` is authoritative — the collection has no
+    members — so discovery must NOT fall back to the collection page's
+    cross-sell HTML chrome (which is exactly the crowding bug #712 fixes). The
+    endpoint returns "no products" rather than recommending instant coffee
+    (#715, Codex P2).
+    """
+    html = b"""
+    <html><body>
+      <a href="/products/barista-instant-coffee">Barista Instant Coffee</a>
+      <a href="/products/barista-milk-powder">Barista Milk Powder</a>
+    </body></html>
+    """
+
+    def fetch(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/products.json"):
+            return httpx.Response(200, stream=_BytesStream(b'{"products": []}'), request=request)
+        return httpx.Response(200, stream=_BytesStream(html), request=request)
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        raise AssertionError("extraction must not run for an authoritative empty collection")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fetch)) as client:
+        with pytest.raises(BeanExtractionError, match="no same-origin product links"):
+            await recommend_from_catalogue(
+                "https://vendor.example/collections/green-coffee",
+                context=CatalogueRankingContext(
+                    roster_countries=frozenset(),
+                    roster_processes=frozenset(),
+                    roster_pairs=frozenset(),
+                    rated_pairs=frozenset(),
+                ),
+                advisor_config=AdvisorConfig(),
+                sourcing_config=BeanSourcingConfig(),
+                diagnostics=BeanSourcingDiagnostics(),
+                http_client=client,
+                model=FunctionModel(respond),
             )
 
 

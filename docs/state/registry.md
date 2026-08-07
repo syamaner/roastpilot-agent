@@ -23,8 +23,13 @@
 > joint-window drop planner, #711 joint-objective bake-off metric), all decisions
 > operator-ratified and recorded as **D122**; the advisor DTR-arithmetic finding
 > is **#705**; the catalogue-recommendation Shopify `products.json` fix is
-> documented but not being built (**#712**). Next hardware roast is one variable
-> at a time, RP-B before RP-A, per operator ruling.
+> **being implemented in PR #715** (**#712**) — HTML anchor discovery was
+> grabbing site-wide cross-sell links and the D121 24/12 caps crowded the real
+> green-coffee products out, so discovery now reads the collection's exact
+> membership from the same-origin `products.json` endpoint first (via the
+> hardened `fetch_vendor_page`), falling back to HTML discovery for non-Shopify
+> vendors. Next hardware roast is one variable at a time, RP-B before RP-A, per
+> operator ruling.
 >
 > **STATUS UPDATE — 2 Aug 2026 (supersedes every framing below).** Read this block
 > first; everything under it is retained history, and several of its forward-looking
