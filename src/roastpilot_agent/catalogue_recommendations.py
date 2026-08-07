@@ -57,6 +57,13 @@ _MAX_EXTRACTED: Final = 12
 _MAX_RECOMMENDATIONS: Final = 3
 _MAX_LABEL_CHARS: Final = 300
 _MAX_CANDIDATE_CONTEXT_CHARS: Final = 1200
+#: Sub-budget for a product's joined ``tags`` text within the shared
+#: ``_MAX_CANDIDATE_CONTEXT_CHARS`` evidence budget. Without it, a product with
+#: many long tags (up to ``_MAX_DISCOVERED`` × ``_MAX_LABEL_CHARS``) could
+#: consume the whole budget before ``body_html``, dropping the origin/processing
+#: prose the extractor + ranker rely on. Tags are realistically a short keyword
+#: list, so this stays well under the shared cap (#716).
+_MAX_PRODUCTS_JSON_TAGS_CHARS: Final = 200
 _MAX_CONTEXT_ANCESTORS: Final = 4
 _MAX_CONTEXT_TEXT_NODES: Final = 64
 _MAX_CONTEXT_LINKS: Final = 8
@@ -1171,7 +1178,22 @@ def _validate_products_json_handle(value: object) -> str | None:
 
 
 def _products_json_tags_text(value: object) -> str | None:
-    """Return bounded, space-joined tag text from an untrusted tag list."""
+    """Return bounded, space-joined tag text from an untrusted tag list.
+
+    Bounded at :data:`_MAX_PRODUCTS_JSON_TAGS_CHARS` so verbose tags cannot crowd
+    ``body_html`` out of the shared evidence budget in
+    :func:`_products_json_candidate` (#716). Two properties matter when the
+    budget cannot hold every tag (#720, Codex P2):
+
+    * **Whole tags only** — the budget is enforced at tag boundaries, never by
+      slicing the joined text mid-tag (which would corrupt an identity-bearing
+      tag, e.g. ``washed`` → ``washe``).
+    * **Shortest-first selection** — canonical identity keywords (``washed``,
+      ``natural``, an origin name) are short, while the long marketing tags are
+      the crowders. Selecting shortest-first means a long noise tag can never
+      starve a short identity tag out of the budget; the kept tags are then
+      emitted in their ORIGINAL order.
+    """
     if not isinstance(value, list):
         return None
     cleaned: list[str] = []
@@ -1179,7 +1201,22 @@ def _products_json_tags_text(value: object) -> str | None:
         text = _clean_text(tag, limit=_MAX_LABEL_CHARS)
         if text:
             cleaned.append(text)
-    return " ".join(cleaned) if cleaned else None
+    if not cleaned:
+        return None
+    # Greedy shortest-first fill: each tag after the first adds one joining
+    # space, so total length == sum(kept lengths) + (count - 1) regardless of
+    # selection order — the accounting below is exact for the final join.
+    kept: set[int] = set()
+    used = 0
+    for index in sorted(range(len(cleaned)), key=lambda i: len(cleaned[i])):
+        addition = len(cleaned[index]) + (1 if kept else 0)
+        if used + addition > _MAX_PRODUCTS_JSON_TAGS_CHARS:
+            break
+        kept.add(index)
+        used += addition
+    if not kept:
+        return None
+    return " ".join(cleaned[index] for index in range(len(cleaned)) if index in kept)
 
 
 def _strip_products_json_body_html(value: object) -> str | None:

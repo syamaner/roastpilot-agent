@@ -3048,6 +3048,85 @@ def test_products_json_tags_text_skips_blank_entries() -> None:
     assert text == "Kenya Washed"
 
 
+def test_products_json_tags_text_bounded_by_its_own_sub_budget() -> None:
+    """Verbose tags are capped at ``_MAX_PRODUCTS_JSON_TAGS_CHARS`` (#716)."""
+    cap = catalogue._MAX_PRODUCTS_JSON_TAGS_CHARS  # pyright: ignore[reportPrivateUsage]
+    text = catalogue._products_json_tags_text(  # pyright: ignore[reportPrivateUsage]
+        [f"tag-{index}-{'x' * 40}" for index in range(catalogue._MAX_DISCOVERED)]  # pyright: ignore[reportPrivateUsage]
+    )
+    assert text is not None
+    assert len(text) <= cap
+
+
+def test_products_json_tags_text_enforces_budget_at_tag_boundaries() -> None:
+    """The sub-budget is enforced at whole-tag boundaries, never mid-tag (#720).
+
+    ``['a'*195, 'washed']`` joined and sliced at 200 chars would yield
+    ``'a'*195 + ' washe'`` — a corrupted partial ``washe`` fragment. Selecting
+    whole tags shortest-first keeps the short canonical ``washed`` and drops the
+    long noise tag, and never emits a partial fragment."""
+    cap = catalogue._MAX_PRODUCTS_JSON_TAGS_CHARS  # pyright: ignore[reportPrivateUsage]
+    text = catalogue._products_json_tags_text(  # pyright: ignore[reportPrivateUsage]
+        ["a" * (cap - 5), "washed"]
+    )
+    assert text is not None
+    # Shortest-first: the long noise tag never starves the short identity tag.
+    assert text == "washed"
+    # No mid-tag fragment of any tag ever leaked in.
+    assert "washe " not in text and not text.startswith("a")
+
+
+def test_products_json_tags_text_returns_none_when_nothing_survives() -> None:
+    """No usable tag text → ``None`` (#720): an all-blank list yields no cleaned
+    tags, and a single tag that alone exceeds the sub-budget is dropped whole."""
+    cap = catalogue._MAX_PRODUCTS_JSON_TAGS_CHARS  # pyright: ignore[reportPrivateUsage]
+    assert (
+        catalogue._products_json_tags_text(["", "   "])  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
+    assert (
+        catalogue._products_json_tags_text(["z" * (cap + 1)])  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
+
+
+def test_products_json_tags_text_shortest_first_preserves_identity_over_noise() -> None:
+    """A long noise tag before short identity tags must not starve them (#720).
+
+    Shortest-first selection keeps ``Origin_Kenya`` / ``Process_Washed`` (the
+    identity keywords) and drops the long marketing tag, and the kept tags are
+    emitted in their ORIGINAL order — regardless of where the noise tag sits."""
+    cap = catalogue._MAX_PRODUCTS_JSON_TAGS_CHARS  # pyright: ignore[reportPrivateUsage]
+    for tags in (
+        ["x" * cap, "Origin_Kenya", "Process_Washed"],
+        ["Origin_Kenya", "x" * cap, "Process_Washed"],
+        ["Origin_Kenya", "Process_Washed", "x" * cap],
+    ):
+        kept = catalogue._products_json_tags_text(tags)  # pyright: ignore[reportPrivateUsage]
+        assert kept == "Origin_Kenya Process_Washed", tags
+
+
+def test_products_json_candidate_verbose_tags_do_not_crowd_out_body_facts() -> None:
+    """#716: a product with many long tags must not drop ``body_html`` identity
+    facts from the shared evidence budget. The bounded tags leave room for the
+    origin/processing prose the extractor + ranker rely on."""
+    product = {
+        "handle": "kenya-kiambu",
+        "title": "Kenya Kiambu",
+        "tags": [f"marketing-tag-{index}-{'x' * 60}" for index in range(catalogue._MAX_DISCOVERED)],  # pyright: ignore[reportPrivateUsage]
+        "body_html": "<p>Origin Kenya, washed process, grown at 1800 masl.</p>",
+    }
+    candidate = catalogue._products_json_candidate(  # pyright: ignore[reportPrivateUsage]
+        product, base_url="https://vendor.example/collections/green", source_order=0
+    )
+    assert candidate is not None
+    assert candidate.grounding_evidence is not None
+    # The body_html identity facts survive despite the verbose tag list.
+    assert "Kenya" in candidate.grounding_evidence
+    assert "washed" in candidate.grounding_evidence
+    assert "1800 masl" in candidate.grounding_evidence
+
+
 def test_products_json_candidate_returns_none_when_url_normalization_rejects_it() -> None:
     """A valid handle over a rejected base origin (e.g. a non-http(s) scheme)
     still fails soft — the URL is never trusted without going through the
