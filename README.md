@@ -56,14 +56,14 @@ a lower drop temperature) that reduce the risk when the draft is off. Those
 targets are a conservative starting point, not a safety mechanism: the enforced
 limits are separate (the deterministic ceiling guard and the emergency-stop
 backstop). This is a second, human-gated LLM surface, kept well outside the
-roast safety envelope: nothing is fetched, ordered or saved automatically. The
-origin fields it can verify (processing, altitude, species, single-origin versus
-blend) carry a supporting `Page says:` quote; the free-text identity fields are
-checked for on-page presence; the roast targets are always estimated. Anything
-not confirmed on the page is flagged for review, and you review, edit and
-explicitly save before it becomes a selectable profile. A sibling flow ranks a
-bounded set of products discovered on one supplier collection page and hands the
-one you pick into the same editable draft.
+roast safety envelope: nothing is fetched, ordered or saved automatically. For
+some fields it shows the `Page says:` text it found, as a review aid only; that
+tells you the phrase appears on the page, not that it is correct or that it
+supports the value, and the roast targets are always estimated. Treat the whole
+draft as a starting point to check: you review, edit and explicitly save before
+it becomes a selectable profile. A sibling flow ranks a bounded set of products
+discovered on one supplier collection page and hands the one you pick into the
+same editable draft.
 
 ![Bean sourcing — draft a profile from a vendor page](docs/screenshots/bean-sourcing.png)
 
