@@ -8148,8 +8148,11 @@ def test_draft_from_identity_scouting_note_does_not_claim_a_safety_guarantee() -
     """#714: the note used to promise "a wrong guess cannot burn the batch" — a
     false safety guarantee, since ``target_drop_temp_c`` is not deterministically
     enforced (with ``ceiling_guard_drop_enabled`` off only the 230 °C e-stop is).
-    The copy must describe the conservative posture (risk reduction) without an
-    absolute guarantee, and keep it distinct from the enforced controls."""
+    The copy must describe the conservative posture WITHOUT an absolute guarantee,
+    WITHOUT promising the error direction (a wrong processing guess can point
+    either way — #714 Codex P2), and WITHOUT naming the ceiling guard as an
+    always-active protection (it is config-gated off in a supported baseline —
+    #714 Codex P2)."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(processing="washed")
     )
@@ -8159,13 +8162,16 @@ def test_draft_from_identity_scouting_note_does_not_claim_a_safety_guarantee() -
         corpus="This lot was fully washed and sun-dried on raised beds.",
     )
     note = draft.scouting_note.lower()
-    # The over-claim is gone.
+    # The original over-claim is gone.
     assert "cannot burn the batch" not in note
-    # Risk-reduction framing is present, distinct from the enforced controls.
-    assert "under-development" in note
-    assert "over-roasting" in note
-    assert "not an enforced safety limit" in note
-    assert "ceiling guard" in note and "emergency stop" in note
+    # No directional guarantee (the processing guess can be wrong either way).
+    assert "errs toward under-development" not in note
+    # No claim that a specific (config-gated) control protects the batch.
+    assert "ceiling guard" not in note
+    # Honest framing: a cautious guess, explicitly NOT a safety limit, that does
+    # not by itself prevent an over-roast.
+    assert "not a safety limit" in note
+    assert "does not by itself prevent an over-roast" in note
 
 
 def test_draft_from_identity_bean_origin_falls_back_to_country_and_is_still_on_page() -> None:
