@@ -34,6 +34,7 @@ from roastpilot_agent.bean_sourcing import (
     BEAN_EXTRACTION_PROMPT_VERSION,
     BeanExtractionError,
     BeanExtractionUnavailableError,
+    BeanFetchError,
     BeanSourcingDiagnostics,
     FetchedVendorPage,
     fetch_vendor_page,
@@ -152,6 +153,21 @@ _ENCODED_DOT = re.compile(r"%2e", re.IGNORECASE)
 _PRODUCT_QUERY_KEYS: Final = frozenset({"product", "product-id", "product_id", "productid"})
 _COUNTRY_PROPERTY_LABELS: Final = frozenset({"country", "country of origin", "origin"})
 _PROCESS_PROPERTY_LABELS: Final = frozenset({"process", "processing", "processing method"})
+# Shopify handles are the storefront's own URL-safe product slug (lowercase
+# ASCII, digits, hyphens; Shopify itself normalizes uppercase/underscore
+# input into this shape at product-creation time). An allowlist regex — not
+# a blacklist of unsafe characters — is the categorical fix for a single
+# path segment: it rejects "/", ":", "?", "#", whitespace, and control/bidi
+# characters by construction, so a crafted ``products.json`` handle can
+# never smuggle a path traversal, scheme, query, or fragment into the
+# server-owned product URL (#712).
+_PRODUCTS_JSON_HANDLE: Final = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,198}[A-Za-z0-9])?$")
+# Bound the HTML parse input for one product's ``body_html`` well above the
+# eventual ``_MAX_CANDIDATE_CONTEXT_CHARS`` text cap (so real vendor copy is
+# never truncated mid-sentence before the identity-bearing "Origin
+# Details"/"Location/Origin" section), while still capping worst-case parse
+# work per product independently of the overall response byte cap.
+_MAX_PRODUCTS_JSON_BODY_HTML_INPUT_CHARS: Final = 8_000
 _log = logging.getLogger(__name__)
 
 
@@ -617,6 +633,32 @@ def _canonical_host(host: str) -> str:
         return httpx.URL(f"https://{rendered}").raw_host.decode("ascii").lower()
     except (httpx.InvalidURL, UnicodeDecodeError):
         return ""
+
+
+def _same_origin(url_a: str, url_b: str) -> bool:
+    """Whether two http(s) URLs share an origin (scheme, host, effective port).
+
+    Uses the same host canonicalization and default-port rules as
+    :func:`_same_origin_product_url`, and fails soft (``False``) on any
+    malformed URL or invalid port literal.
+    """
+    try:
+        parts_a = urlsplit(url_a)
+        parts_b = urlsplit(url_b)
+        scheme_a = parts_a.scheme.lower()
+        scheme_b = parts_b.scheme.lower()
+        if scheme_a not in ("http", "https") or scheme_b != scheme_a:
+            return False
+        host_a = _canonical_host(parts_a.hostname or "")
+        host_b = _canonical_host(parts_b.hostname or "")
+        if not host_a or host_a != host_b:
+            return False
+        default_port = 443 if scheme_a == "https" else 80
+        port_a = parts_a.port if parts_a.port is not None else default_port
+        port_b = parts_b.port if parts_b.port is not None else default_port
+    except ValueError:
+        return False
+    return port_a == port_b
 
 
 def _has_encoded_dot_segment(path: str) -> bool:
@@ -1089,6 +1131,263 @@ def discover_catalogue_candidates(page: FetchedVendorPage) -> list[CatalogueCand
     except Exception:  # noqa: BLE001 - fail-soft boundary for adversarial parser input
         _log.warning("catalogue discovery failed soft", exc_info=True)
         return []
+
+
+def _products_json_url(collection_url: str) -> str | None:
+    """Return the same-origin Shopify ``products.json`` locator for a page.
+
+    Built entirely from the operator-supplied collection URL's own
+    scheme/host/path — never from anything fetched or decoded later — so
+    the request stays same-origin by construction (#712). Any existing
+    query or fragment is dropped; ``?limit=<_MAX_DISCOVERED>`` replaces it.
+    Only the first ``_MAX_DISCOVERED`` products are ever processed, so
+    requesting more would be discarded work that needlessly inflates the
+    response toward ``max_response_bytes`` — where an overflow would reject
+    the fetch and force the very HTML fallback this endpoint exists to
+    avoid (#715, Codex P2).
+
+    Args:
+        collection_url: The operator-supplied catalogue page URL.
+
+    Returns:
+        The constructed ``products.json`` URL, or ``None`` if
+        ``collection_url`` cannot be split into a usable http(s) origin.
+    """
+    try:
+        parts = urlsplit(collection_url)
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    path = f"{parts.path.rstrip('/')}/products.json"
+    return urlunsplit((parts.scheme, parts.netloc, path, f"limit={_MAX_DISCOVERED}", ""))
+
+
+def _validate_products_json_handle(value: object) -> str | None:
+    """Return ``value`` only if it is one safe Shopify product-handle segment."""
+    if not isinstance(value, str):
+        return None
+    return value if _PRODUCTS_JSON_HANDLE.fullmatch(value) else None
+
+
+def _products_json_tags_text(value: object) -> str | None:
+    """Return bounded, space-joined tag text from an untrusted tag list."""
+    if not isinstance(value, list):
+        return None
+    cleaned: list[str] = []
+    for tag in cast(list[object], value)[:_MAX_DISCOVERED]:
+        text = _clean_text(tag, limit=_MAX_LABEL_CHARS)
+        if text:
+            cleaned.append(text)
+    return " ".join(cleaned) if cleaned else None
+
+
+def _strip_products_json_body_html(value: object) -> str | None:
+    """Return bounded plain text from an untrusted ``body_html`` field.
+
+    Parses with the same XXE-safe ``no_network`` HTML-mode parser used
+    throughout this module, then discards ``<style>``/``<script>`` element
+    text (which ``itertext()`` would otherwise surface as page prose) before
+    collapsing to bounded single-spaced text.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parser = lxml.html.HTMLParser(encoding="utf-8", no_network=True)
+        fragment = lxml.html.fromstring(  # type: ignore[reportUnknownVariableType]
+            value[:_MAX_PRODUCTS_JSON_BODY_HTML_INPUT_CHARS], parser=parser
+        )
+    except (lxml.etree.LxmlError, ValueError):  # type: ignore[reportUnknownMemberType]
+        return None
+    lxml.etree.strip_elements(fragment, "style", "script", with_tail=False)  # type: ignore[reportUnknownMemberType]
+    text = " ".join(
+        islice(
+            cast(Iterable[str], fragment.itertext()),  # type: ignore[reportUnknownMemberType]
+            _MAX_CONTEXT_TEXT_NODES,
+        )
+    )
+    return _clean_text(text, limit=_MAX_CANDIDATE_CONTEXT_CHARS)
+
+
+def _products_json_candidate(
+    product: object,
+    *,
+    base_url: str,
+    source_order: int,
+) -> CatalogueCandidate | None:
+    """Return one server-owned candidate from an untrusted ``products.json`` entry.
+
+    Every dict/list access is guarded: a missing or wrong-typed field skips
+    just this product (returns ``None``) rather than raising, and the
+    product URL is always built from the validated ``handle`` alone, never
+    from any URL-shaped value in the JSON (#712).
+    """
+    if not isinstance(product, dict):
+        return None
+    product_fields = cast(dict[str, object], product)
+    handle = _validate_products_json_handle(product_fields.get("handle"))
+    if handle is None:
+        return None
+    label = _clean_text(product_fields.get("title"))
+    if label is None:
+        return None
+    product_url = _same_origin_product_url(
+        f"/products/{handle}",
+        base_url=base_url,
+        require_product_path=True,
+        allow_relative=True,
+    )
+    if product_url is None:
+        return None
+    product_type_text = _clean_text(product_fields.get("product_type"))
+    tags_text = _products_json_tags_text(product_fields.get("tags"))
+    body_text = _strip_products_json_body_html(product_fields.get("body_html"))
+    parts = [part for part in (label, product_type_text, tags_text, body_text) if part]
+    grounding_evidence = _clean_text(" ".join(parts), limit=_MAX_CANDIDATE_CONTEXT_CHARS) or label
+    evidence, country_fact_values, processing_fact_values = _compose_candidate_evidence(
+        label, grounding_evidence, (), ()
+    )
+    return CatalogueCandidate(
+        candidate_id=f"candidate-{source_order + 1:02d}",
+        product_url=product_url,
+        label=label,
+        evidence=evidence,
+        source_order=source_order,
+        name_label_keys=frozenset(key for key in (_candidate_name_label_key(label),) if key),
+        grounding_evidence=grounding_evidence,
+        country_fact_values=country_fact_values,
+        processing_fact_values=processing_fact_values,
+    )
+
+
+def _discover_products_json_candidates_unchecked(
+    raw_json: str,
+    *,
+    base_url: str,
+) -> list[CatalogueCandidate] | None:
+    """Implement bounded ``products.json`` discovery; see the checked wrapper.
+
+    Returns ``None`` when the document is not a usable Shopify
+    ``products.json`` — unparseable, not a JSON object, missing/non-list
+    ``products``, or a non-empty membership none of whose entries survive the
+    per-field guards — so the caller falls back to page-anchor discovery.
+    Returns an empty list ONLY for a well-formed but genuinely empty
+    membership (``{"products": []}``, e.g. a sold-out collection): that is
+    authoritative, and the caller must NOT then fall back to the collection
+    page's cross-sell chrome, which is the exact bug #712 fixes (#715, Codex P2).
+    """
+    try:
+        decoded: object = json.loads(raw_json)
+    except (json.JSONDecodeError, RecursionError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    products = cast(dict[str, object], decoded).get("products")
+    if not isinstance(products, list):
+        return None
+    if not products:
+        return []
+    candidates: list[CatalogueCandidate] = []
+    positions: set[str] = set()
+    # Cap the product count BEFORE any per-item work, ahead of the per-field
+    # guards inside ``_products_json_candidate`` (#712).
+    for product in cast(list[object], products)[:_MAX_DISCOVERED]:
+        candidate = _products_json_candidate(
+            product, base_url=base_url, source_order=len(candidates)
+        )
+        if candidate is None or candidate.product_url in positions:
+            continue
+        positions.add(candidate.product_url)
+        candidates.append(candidate)
+    # A non-empty membership that yields zero usable candidates is treated as
+    # unusable (fall back to HTML), NOT as an authoritative empty collection —
+    # our validators may simply have mis-parsed a real listing (#715, Codex P2).
+    return candidates or None
+
+
+def _discover_products_json_candidates(
+    raw_json: str, *, base_url: str
+) -> list[CatalogueCandidate] | None:
+    """Discover a Shopify collection's exact membership from ``products.json``.
+
+    Mirrors :func:`discover_catalogue_candidates`'s fail-soft boundary: any
+    parser/library escape over this untrusted JSON document returns ``None``
+    rather than propagating, so the caller falls back to page discovery
+    instead of failing the whole recommendation request. See the unchecked
+    implementation for the ``None`` (fall back) vs empty-list (authoritative
+    empty) contract.
+    """
+    try:
+        return _discover_products_json_candidates_unchecked(raw_json, base_url=base_url)
+    except Exception:  # noqa: BLE001 - fail-soft boundary for adversarial parser input
+        _log.warning("products.json discovery failed soft", exc_info=True)
+        return None
+
+
+async def _discover_from_products_json(
+    collection_url: str,
+    *,
+    config: BeanSourcingConfig,
+    http_client: httpx.AsyncClient | None = None,
+) -> list[CatalogueCandidate] | None:
+    """Discover a Shopify collection's exact product membership (#712).
+
+    Every Shopify storefront exposes ``<collection-url>/products.json`` —
+    the collection's exact membership, with no site-wide cross-sell chrome
+    to crowd the real green-coffee products out of the bounded discovery
+    cap. This fetches that same-origin endpoint through the same hardened
+    :func:`~roastpilot_agent.bean_sourcing.fetch_vendor_page` boundary used
+    for the collection page itself (SSRF pinning, redirect handling, byte
+    cap, deadline), then parses it off-loop on the dedicated untrusted-parse
+    pool.
+
+    Args:
+        collection_url: The operator-supplied catalogue page URL. Used only
+            to derive the same-origin ``products.json`` locator — never
+            forwarded as-is.
+        config: Bean-sourcing fetch/byte/timeout limits.
+        http_client: Optional injected test client.
+
+    Returns:
+        Server-owned candidates from the collection's exact membership; an
+        empty list when the collection is authoritatively empty (a
+        well-formed ``{"products": []}``), which the caller must honour
+        without falling back; or ``None`` when the endpoint is absent,
+        non-JSON, structurally unusable, redirects off-origin, or yields
+        zero valid products from a non-empty membership — telling the caller
+        to fall back to page-anchor discovery. Non-Shopify vendors always
+        take this path.
+    """
+    products_json_url = _products_json_url(collection_url)
+    if products_json_url is None:
+        return None
+    try:
+        page = await fetch_vendor_page(
+            products_json_url,
+            config=config,
+            http_client=http_client,
+            log_url=False,
+            extract_content=False,
+        )
+    except BeanFetchError:
+        return None
+    # ``fetch_vendor_page`` follows cross-host redirects (each hop SSRF-vetted,
+    # but not origin-pinned), so ``products.json`` could resolve to a different
+    # public origin than the operator's collection; anchoring product URLs to
+    # that origin would point recommendations at another store. Require the
+    # endpoint's FINAL origin to match the same-origin URL we requested. The
+    # collection's own canonical redirect is already reflected because
+    # ``collection_url`` is the collection page's resolved final URL, so a
+    # same-origin canonical hop still matches (#715, Codex P2).
+    if not _same_origin(page.final_url, products_json_url):
+        return None
+    # Pass the bounded parse result through verbatim: ``None`` (unusable, or
+    # the parser pool was saturated/timed out) → caller falls back; an empty
+    # list (authoritative empty collection) → caller must NOT fall back (#712).
+    return await run_untrusted_parse_bounded(
+        lambda: _discover_products_json_candidates(page.raw_html, base_url=page.final_url),
+        timeout_seconds=config.fetch_timeout_seconds,
+    )
 
 
 def _agent(
@@ -1750,9 +2049,16 @@ async def recommend_from_catalogue(
     model: Model | None = None,
 ) -> CatalogueRecommendationList:
     """Fetch, extract once, and deterministically rank one vendor catalogue."""
-    preparation_timeout = sourcing_config.fetch_timeout_seconds * 3
+    # Up to four bounded stages can now run in sequence: the collection-page
+    # fetch, the same-origin ``products.json`` fetch (#712), and — only when
+    # ``products.json`` is absent or unusable — the off-loop parse of
+    # whichever of those two already-fetched documents supplies candidates.
+    # Each stage is individually capped at ``fetch_timeout_seconds``; ``* 6``
+    # keeps the same ~1.5x aggregate headroom over that four-stage worst case
+    # the prior ``* 3`` gave the original two-stage (fetch + parse) pipeline.
+    preparation_timeout = sourcing_config.fetch_timeout_seconds * 6
     try:
-        # Bound the two fetch/vendor-page parsing stages plus catalogue
+        # Bound the fetch/vendor-page parsing stages plus catalogue
         # discovery here, then leave provider timing to ``_extract``. Wrapping
         # both in one aggregate deadline can steal time from the configured
         # extraction budget and bypass its timeout-usage accounting.
@@ -1764,10 +2070,27 @@ async def recommend_from_catalogue(
                 log_url=False,
                 extract_content=False,
             )
-            candidates = await run_untrusted_parse_bounded(
-                lambda: discover_catalogue_candidates(page),
-                timeout_seconds=sourcing_config.fetch_timeout_seconds,
+            candidates = await _discover_from_products_json(
+                # Start from the collection page's already-resolved final URL,
+                # so the ``products.json`` request shares the collection's own
+                # origin/redirect resolution rather than opening an independent
+                # redirect chain from the raw operator URL (#715, Codex P2).
+                page.final_url,
+                config=sourcing_config,
+                http_client=http_client,
             )
+            if candidates is None:
+                # Absent, non-JSON, off-origin, or otherwise-unusable
+                # ``products.json`` — every non-Shopify vendor, and any Shopify
+                # page whose endpoint is unusable — falls back to the existing
+                # page-anchor/JSON-LD discovery with no regression (#712). An
+                # authoritative empty membership (``[]``) deliberately does NOT
+                # fall back: it flows to the "no products" result below rather
+                # than re-admitting the collection page's cross-sell chrome.
+                candidates = await run_untrusted_parse_bounded(
+                    lambda: discover_catalogue_candidates(page),
+                    timeout_seconds=sourcing_config.fetch_timeout_seconds,
+                )
             if candidates is None:
                 raise BeanExtractionUnavailableError(
                     "catalogue product discovery is temporarily unavailable"
