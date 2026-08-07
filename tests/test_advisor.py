@@ -1540,6 +1540,64 @@ def test_c9_registered_selectable_and_not_the_live_default() -> None:
     assert control_teaching_prompt("c9") != control_teaching_prompt(CONTROL_TEACHING_PROMPT_VERSION)
 
 
+def test_c10_is_exactly_c9_plus_the_dtr_authority_section() -> None:
+    """c10 (#705) is c9 with the read-the-provided-DTR section spliced in exactly
+    before "THE OBJECTIVE" (the SAME splice advisor.py performs) — an
+    EXACT-SPLICE equality, so all of c1..c9 is preserved byte-for-byte and the
+    ONLY delta is the DTR-authority section. The teaching must not have leaked
+    into c9 or the live default c3."""
+    from roastpilot_agent.advisor import (
+        _C10_DTR_AUTHORITY_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    c9 = control_teaching_prompt("c9")
+    c10 = control_teaching_prompt("c10")
+    assert c10 == c9.replace(
+        "THE OBJECTIVE\n", _C10_DTR_AUTHORITY_SECTION + "THE OBJECTIVE\n", 1
+    ), "c10 must be EXACTLY c9 with the DTR-authority section spliced before THE OBJECTIVE"
+    assert "DO NOT RECOMPUTE" not in c9
+    assert "DO NOT RECOMPUTE" not in control_teaching_prompt("c3")
+
+
+def test_c10_dtr_section_teaches_use_the_field_not_recompute_and_names_no_numbers() -> None:
+    """#705: the DTR-authority section must (1) name the real
+    development_time_ratio context field as authoritative; (2) name the raw
+    development_elapsed_seconds / roast_elapsed_seconds and teach NOT to divide
+    them; (3) state the fraction-vs-percentage relationship so the model reads
+    the field correctly; and (4) name NO new numbers (the #218 two-copies
+    discipline) — every target still comes from context."""
+    from roastpilot_agent.advisor import (
+        _C10_DTR_AUTHORITY_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    section = _C10_DTR_AUTHORITY_SECTION
+    lowered = section.lower()
+    # (1) the authoritative context field.
+    assert "development_time_ratio" in section
+    assert "authoritative" in lowered
+    # (2) the raw durations, taught as NOT to be divided by hand.
+    assert "development_elapsed_seconds" in section
+    assert "roast_elapsed_seconds" in section
+    assert "do not" in lowered and "recompute" in lowered
+    # (3) fraction vs percentage, so the field is read correctly.
+    assert "fraction" in lowered and "percentage" in lowered
+    # (4) no baked numbers — every threshold/target comes from context.
+    assert not re.search(r"\d", section), "the DTR-authority section must name no hardcoded numbers"
+
+
+def test_c10_registered_selectable_and_not_the_live_default() -> None:
+    """c10 is a registered, selectable version wired the same as its siblings
+    (``instructions_for`` resolves it to the same text), and adding it does not
+    make it live — c3 stays the default (c10 is promoted only if the #705 part-2
+    math-reliability bake-off validates it, routed through #396)."""
+    assert instructions_for("c10") == control_teaching_prompt("c10")
+    assert control_teaching_prompt("c10")  # non-empty
+    assert CONTROL_TEACHING_PROMPT_VERSION == "c3"
+    assert control_teaching_prompt("c10") != control_teaching_prompt(
+        CONTROL_TEACHING_PROMPT_VERSION
+    )
+
+
 # --- Codex P2 follow-up (#499): assert on the FINAL ASSEMBLED prompt, not
 # just the c1 fragment. The splice chain (c1 -> c2 -> c3 -> c4 -> c5 -> c6)
 # means a section added to c1 can be directly contradicted by a LATER-spliced
@@ -1558,7 +1616,7 @@ def test_c9_registered_selectable_and_not_the_live_default() -> None:
 # #559) is now the newest/most-spliced version and is added the same way.
 
 
-@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9"])
+@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9", "c10"])
 def test_assembled_prompt_carries_the_joint_objective_and_no_contradiction(
     version: str,
 ) -> None:
@@ -1579,7 +1637,7 @@ def test_assembled_prompt_carries_the_joint_objective_and_no_contradiction(
     assert "latest acceptable drop" not in lowered
 
 
-@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9"])
+@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9", "c10"])
 def test_assembled_prompt_joint_objective_precedes_every_later_section(
     version: str,
 ) -> None:
@@ -1597,6 +1655,7 @@ def test_assembled_prompt_joint_objective_precedes_every_later_section(
         "POST-FIRST-CRACK: A LARGE DTR OVERSHOOT",  # c7
         "POST-FIRST-CRACK: COMPARE PROGRESS RATES",  # c8
         "POST-FIRST-CRACK: A REFERENCE ROAST",  # c9
+        "POST-FIRST-CRACK: READ THE PROVIDED DEVELOPMENT RATIO",  # c10
     ):
         if marker in prompt:
             assert prompt.index(marker) > joint_index, (
