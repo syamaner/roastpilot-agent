@@ -29,7 +29,8 @@
 > reads the collection's exact membership from the same-origin `products.json`
 > endpoint (hardened `fetch_vendor_page`, allowlisted handles, XXE-safe body-html
 > stripping, origin-correct fail-soft, ≤2 fetches), falling back to HTML for
-> non-Shopify vendors. A five-issue follow-up batch then landed on `main`:
+> non-Shopify vendors. A follow-up batch then closed five issues — four merged to
+> `main`, one closed won't-fix:
 > **#714** (#719) removed a false "a wrong guess cannot burn the batch" safety
 > claim from the bean-sourcing scouting note (advisory copy must not promise
 > outcomes the mechanism does not enforce); **#716** (#720) bounds a product's
@@ -40,9 +41,11 @@
 > 1 SHIPPED (#721):** the advisor DTR-arithmetic slip (it recomputed DTR from raw
 > seconds ~6 pp low) is addressed by new **selectable prompt `c10`** teaching the
 > model to use the deterministic `development_time_ratio` already in context; `c3`
-> stays the live default, and **c10's promotion is gated on the #705 part-2
-> math-reliability bake-off + re-pin (through #396) — paid, operator-gated, NOT yet
-> run.** **#718 closed won't-fix (D123):** honouring a filter/sort-scoped collection
+> stays the live default. **#705 is now CLOSED** (part 1 delivered c10); the
+> remaining math-reliability bake-off + re-pin work is **part 2, tracked under the
+> open #396 prompt/model A/B** (paid, operator-gated, NOT yet run), and c10's
+> promotion to default is gated on it. **#718 closed won't-fix (D123):** honouring a
+> filter/sort-scoped collection
 > URL by falling back to HTML discovery would reintroduce the #712 crowding bug, and
 > `products.json` is the correct membership source, so full membership stays.
 >
