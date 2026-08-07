@@ -5904,8 +5904,11 @@ def _draft_from_identity(
         "Scouting run — this is the FIRST roast on this bean. Targets are a "
         f"conservative, de-risked starting point ({dev_percent:g} % development, "
         f"drop {drop_temp_c:g} °C) based on the "
-        f"{identity.processing or 'unstated'} processing method, so a wrong guess "
-        "cannot burn the batch. Taste and step the development target up on the "
+        f"{identity.processing or 'unstated'} processing method — a cautious "
+        "first guess, not a safety limit, and it does not by itself prevent an "
+        "over-roast (the processing method may be wrong, and the drop target is "
+        "not always deterministically enforced). Watch the roast and taste, then "
+        "step the development target up on the "
         "next bag if it reads underdeveloped. Every field marked "
         '"origin_estimated" in field_sources is NOT verified against the vendor '
         "page — either the field was absent, its on-page citation check failed "
