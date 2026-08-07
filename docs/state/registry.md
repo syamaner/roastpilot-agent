@@ -21,15 +21,30 @@
 > the joint-drop-objective tree **#707** (children: #708 recovery v2 runway-aware
 > trigger + fast-raise, #709 ambient-aware fan doctrine, #710 deterministic
 > joint-window drop planner, #711 joint-objective bake-off metric), all decisions
-> operator-ratified and recorded as **D122**; the advisor DTR-arithmetic finding
-> is **#705**; the catalogue-recommendation Shopify `products.json` fix is
-> **being implemented in PR #715** (**#712**) — HTML anchor discovery was
-> grabbing site-wide cross-sell links and the D121 24/12 caps crowded the real
-> green-coffee products out, so discovery now reads the collection's exact
-> membership from the same-origin `products.json` endpoint first (via the
-> hardened `fetch_vendor_page`), falling back to HTML discovery for non-Shopify
-> vendors. Next hardware roast is one variable at a time, RP-B before RP-A, per
-> operator ruling.
+> operator-ratified and recorded as **D122**. Next hardware roast is one variable
+> at a time, RP-B before RP-A, per operator ruling.
+>
+> **STATUS UPDATE — 7 Aug 2026 (catalogue + advisor follow-up batch SHIPPED).**
+> The Shopify `products.json` catalogue fix **#712 shipped (#715)** — discovery now
+> reads the collection's exact membership from the same-origin `products.json`
+> endpoint (hardened `fetch_vendor_page`, allowlisted handles, XXE-safe body-html
+> stripping, origin-correct fail-soft, ≤2 fetches), falling back to HTML for
+> non-Shopify vendors. A five-issue follow-up batch then landed on `main`:
+> **#714** (#719) removed a false "a wrong guess cannot burn the batch" safety
+> claim from the bean-sourcing scouting note (advisory copy must not promise
+> outcomes the mechanism does not enforce); **#716** (#720) bounds a product's
+> `products.json` tags text with its own sub-budget, selected shortest-first so a
+> long marketing tag cannot starve a short identity tag out of `body_html`'s
+> evidence budget; **#717** (#722) preserves a Shopify Markets locale/market path
+> prefix in generated product URLs (no more default-market/404 links). **#705 part
+> 1 SHIPPED (#721):** the advisor DTR-arithmetic slip (it recomputed DTR from raw
+> seconds ~6 pp low) is addressed by new **selectable prompt `c10`** teaching the
+> model to use the deterministic `development_time_ratio` already in context; `c3`
+> stays the live default, and **c10's promotion is gated on the #705 part-2
+> math-reliability bake-off + re-pin (through #396) — paid, operator-gated, NOT yet
+> run.** **#718 closed won't-fix (D123):** honouring a filter/sort-scoped collection
+> URL by falling back to HTML discovery would reintroduce the #712 crowding bug, and
+> `products.json` is the correct membership source, so full membership stays.
 >
 > **STATUS UPDATE — 2 Aug 2026 (supersedes every framing below).** Read this block
 > first; everything under it is retained history, and several of its forward-looking
@@ -103,7 +118,8 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D123** (D122 records the joint drop objective, #707).
+> Next free plan decision number: **D124** (D123 records the #718 catalogue
+> query-scope won't-fix decision).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 2 Aug block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
