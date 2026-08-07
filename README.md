@@ -23,9 +23,9 @@ directly.
 the run milestones marked (turning point, drying end, first crack, drop); the
 advisor's latest recommendation alongside its rationale and the safety verdict
 applied to it; the running decision history; the post-first-crack authority
-panel; and operator controls that stay available throughout (emergency stop,
-drop, mark first crack, cooling). Ambient temperature, humidity and pressure are
-shown as a per-roast covariate.
+panel; and operator controls: emergency stop is always available, alongside the
+phase-appropriate drop, mark-first-crack and cooling controls. Ambient
+temperature, humidity and pressure are shown as a per-roast covariate.
 
 ![Live roast console](docs/screenshots/live-console.png)
 
@@ -35,7 +35,7 @@ finished curve and a link straight into the full detail view.
 
 ![Completed roast summary](docs/screenshots/roast-complete.png)
 
-**History.** Every past roast, searchable and filterable, with the bean, the
+**History.** Every retained (non-discarded) roast, searchable and filterable, with the bean, the
 outcome, the advisor consult count (and how many recommendations the safety
 layer rejected), first-crack time, development percentage, weight loss, ambient
 conditions and your rating.
@@ -51,15 +51,19 @@ and the in-roast controls stay on the roast page.
 
 **Bean sourcing (AI-assisted).** When adding a bean profile you can paste a
 supplier product URL and have the agent draft the profile for you. It fetches
-the page and proposes a conservative first-roast profile (de-risked targets, for
-example 13% development and a lower drop temperature, so a wrong guess cannot
-burn the batch). This is a second, human-gated LLM surface, kept well outside
-the roast safety envelope: nothing is fetched, ordered or saved automatically.
-Every drafted field is checked against the page and shown with its supporting
-`Page says:` quote; any field that could not be verified on the page is flagged
-for review, and you review, edit and explicitly save before it becomes a
-selectable profile. A sibling flow ranks recommendations from a supplier's whole
-collection page and hands the one you pick into the same editable draft.
+the page and proposes lower first-roast targets (for example 13% development and
+a lower drop temperature) that reduce the risk when the draft is off. Those
+targets are a conservative starting point, not a safety mechanism: the enforced
+limits are separate (the deterministic ceiling guard and the emergency-stop
+backstop). This is a second, human-gated LLM surface, kept well outside the
+roast safety envelope: nothing is fetched, ordered or saved automatically. The
+origin fields it can verify (processing, altitude, species, single-origin versus
+blend) carry a supporting `Page says:` quote; the free-text identity fields are
+checked for on-page presence; the roast targets are always estimated. Anything
+not confirmed on the page is flagged for review, and you review, edit and
+explicitly save before it becomes a selectable profile. A sibling flow ranks a
+bounded set of products discovered on one supplier collection page and hands the
+one you pick into the same editable draft.
 
 ![Bean sourcing — draft a profile from a vendor page](docs/screenshots/bean-sourcing.png)
 
