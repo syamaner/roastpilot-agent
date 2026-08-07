@@ -1006,9 +1006,14 @@ own best-rated past roast of the bean, carried in
 ``reference_curve``/``reference_landmarks``; deviations are information, not
 commands, and the reference never overrides the profile's targets) on top of
 ``c8`` — the "reference present AND taught" arm of the #567 three-arm bake-off.
-``c1`` / ``c2`` / ``c4`` / ``c5`` / ``c6`` / ``c7`` / ``c8`` / ``c9`` stay
-selectable for the #396 A/B; ``c3`` remains the live default until the A/B
-validates a successor (operator-gated).
+``c10`` (#705) adds the read-the-provided-DTR teaching (use the deterministic
+``development_time_ratio`` already in context; do not recompute the ratio from
+the raw ``development_elapsed_seconds`` / ``roast_elapsed_seconds`` — a #559
+baseline consult mis-stated a hand-computed percentage ~6 pp low) on top of
+``c9``. ``c1`` / ``c2`` / ``c4`` / ``c5`` / ``c6`` / ``c7`` / ``c8`` / ``c9`` /
+``c10`` stay selectable for the #396 A/B; ``c3`` remains the live default until
+the A/B validates a successor (operator-gated). ``c10``'s promotion is gated on
+the #705 part-2 math-reliability bake-off in particular.
 """
 
 _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
@@ -1683,6 +1688,49 @@ _C9_REFERENCE_CURVE_SECTION = (
 )
 _CONTROL_TEACHING_PROMPTS["c9"] = _CONTROL_TEACHING_PROMPTS["c8"].replace(
     "THE OBJECTIVE\n", _C9_REFERENCE_CURVE_SECTION + "THE OBJECTIVE\n", 1
+)
+
+# --- c10 (#705: use the provided DTR, don't recompute it) --------------------
+#
+# c10 is c9 PLUS one section, spliced just before THE OBJECTIVE so all of
+# c1..c9 is preserved byte-for-byte. Motivation (#559 baseline, run
+# 55f6a034, gpt-4o + c3): the advisor set the DTR ratio up correctly from the
+# raw seconds and then MIS-STATED the percentage (~6 pp low: "150.79 / 732.48"
+# read as 15.08 %, not the correct 20.6 %), concluding "behind target" on that
+# false premise when it was actually at the top of the band. The deterministic
+# DTR is ALREADY in context as ``development_time_ratio`` (a fraction, the same
+# value the operator readout shows as a percent) — the model just recomputed it
+# itself and slipped on the arithmetic. This section is the "feed, don't
+# recompute" / data-over-prose lesson made explicit: it names ONLY the existing
+# context field, adds NO new number, and teaches the model to read the provided
+# DTR rather than divide the raw durations. Imperative here is appropriate — this
+# is a fact about which input is authoritative, not a behavioural steer.
+# Selectable-only; c3 stays the live default. Promotion is gated on the #705
+# part-2 math-reliability bake-off (routed through #396) — operator-gated.
+_C10_DTR_AUTHORITY_SECTION = (
+    "POST-FIRST-CRACK: READ THE PROVIDED DEVELOPMENT RATIO - DO NOT RECOMPUTE "
+    "IT\n"
+    "- development_time_ratio in context is the authoritative development time "
+    "ratio (DTR), computed deterministically from the same charge-referenced "
+    "clock the operator's readout and the controller use. It is a FRACTION of "
+    "the whole roast on a zero-to-one scale; the profile's "
+    "target_development_percent and its window state the same quantity as a "
+    "percentage, so convert to that percentage scale before comparing them. "
+    "Read that value directly whenever you reason about development progress.\n"
+    "- development_elapsed_seconds and roast_elapsed_seconds are provided for "
+    "context, but do NOT divide them yourself to get the ratio: that hand "
+    "arithmetic is error-prone and a wrong percentage there quietly poisons "
+    "every DTR-based judgement above (the window-bottom and pace-mismatch "
+    "comparisons, and whether a drop is disqualified). When you state the "
+    "development ratio in your reasoning, state development_time_ratio (as a "
+    "percentage) - not a figure you recomputed from the seconds. If "
+    "development_time_ratio is absent (before first crack), development is not "
+    "yet defined; do not manufacture a ratio from the seconds in that case "
+    "either.\n"
+    "\n"
+)
+_CONTROL_TEACHING_PROMPTS["c10"] = _CONTROL_TEACHING_PROMPTS["c9"].replace(
+    "THE OBJECTIVE\n", _C10_DTR_AUTHORITY_SECTION + "THE OBJECTIVE\n", 1
 )
 
 
