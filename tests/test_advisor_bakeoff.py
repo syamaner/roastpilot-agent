@@ -12,6 +12,7 @@ text, no auto-pick).
 from __future__ import annotations
 
 import dataclasses
+import json
 import sys
 from pathlib import Path
 
@@ -36,6 +37,7 @@ from roastpilot_agent.advisor import (  # noqa: E402
     PydanticAIAdvisor,
     RoastDecision,
 )
+from roastpilot_agent.config import AmbientFanDoctrine  # noqa: E402
 from roastpilot_agent.models import (  # noqa: E402
     AdvisorHealth,
     AdvisorHealthStatus,
@@ -986,3 +988,157 @@ async def test_run_replay_bakeoff_drops_unavailable_then_scores(
     assert rows[0]["slug"] == _OK_SLUG
     assert rows[0]["scores"]
     assert rows[0]["samples"]
+
+
+# --- #709/#737: recorded ambient carried into replayed contexts -------------
+#
+# Every c11 bake-off arm depends on this. Without the carriage a replayed
+# context has no ambient at all, so a c11 arm exercises the doctrine's
+# ABSENT-ambient fallback and scores something that is not the doctrine — a
+# silent null result, not a visible failure. These tests pin all four paths.
+
+
+def _fixture_with_summary(tmp_path: Path, summary: dict[str, object] | None) -> Path:
+    """Copy a real replay roast into ``tmp_path``, rewriting its summary sidecar.
+
+    Uses genuine telemetry (never a synthetic stub) so the ticks under test are
+    the same ones the bake-off actually scores; only the sidecar varies.
+
+    Args:
+        tmp_path: The pytest temporary directory.
+        summary: The summary mapping to write, or ``None`` to omit the sidecar
+            entirely (the missing-summary path).
+
+    Returns:
+        The path to the copied ``roast.jsonl``.
+    """
+    source = bakeoff.REPLAY_ROASTS[0]
+    fixture = tmp_path / "roast.jsonl"
+    fixture.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    if summary is not None:
+        (tmp_path / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    return fixture
+
+
+def _recorded_summary(**overrides: object) -> dict[str, object]:
+    """The source roast's real summary, with ambient keys layered on top."""
+    source = json.loads(
+        (bakeoff.REPLAY_ROASTS[0].parent / "summary.json").read_text(encoding="utf-8")
+    )
+    assert isinstance(source, dict)
+    merged: dict[str, object] = dict(source)  # pyright: ignore[reportUnknownArgumentType]
+    merged.update(overrides)
+    return merged
+
+
+def test_build_ticks_carries_the_recorded_ambient_when_the_doctrine_is_enabled(
+    tmp_path: Path,
+) -> None:
+    """An enabled doctrine stamps the roast's RECORDED ambient onto every tick.
+
+    The doctrine's own two numbers ride along as well, because c11 compares the
+    reading against the threshold and paces by the step; a context carrying the
+    reading but not the boundary would leave the model no way to apply it.
+    """
+    doctrine = AmbientFanDoctrine(enabled=True)
+    fixture = _fixture_with_summary(
+        tmp_path, _recorded_summary(ambient_temp_c=29.4, ambient_humidity_pct=41.0)
+    )
+    ticks, _ = bakeoff.build_ticks(fixture, cadence_seconds=30.0, ambient_doctrine=doctrine)
+    assert ticks, "the fixture must yield ticks or this asserts nothing"
+    for tick in ticks:
+        assert tick.context.ambient_temp_c == pytest.approx(29.4)
+        assert tick.context.ambient_humidity_pct == pytest.approx(41.0)
+        assert tick.context.ambient_fan_threshold_c == pytest.approx(doctrine.threshold_c)
+        assert tick.context.ambient_fan_step_max_pp == pytest.approx(doctrine.step_max_pp)
+
+
+def test_build_ticks_omits_ambient_while_the_doctrine_is_disabled(tmp_path: Path) -> None:
+    """The inert default carries nothing, even from a roast that RECORDED ambient.
+
+    This is the replay-side half of #731's inert-by-default guarantee: the
+    reconstruction must mirror the live controller's gate, or a c3 arm would be
+    scored against a context the live c3 roast never sees.
+    """
+    fixture = _fixture_with_summary(
+        tmp_path, _recorded_summary(ambient_temp_c=29.4, ambient_humidity_pct=41.0)
+    )
+    for doctrine in (None, AmbientFanDoctrine(), AmbientFanDoctrine(enabled=False)):
+        ticks, _ = bakeoff.build_ticks(fixture, cadence_seconds=30.0, ambient_doctrine=doctrine)
+        assert ticks
+        for tick in ticks:
+            assert tick.context.ambient_temp_c is None
+            assert tick.context.ambient_humidity_pct is None
+            assert tick.context.ambient_fan_threshold_c is None
+            assert tick.context.ambient_fan_step_max_pp is None
+
+
+def test_build_ticks_leaves_ambient_absent_for_a_roast_that_recorded_none(
+    tmp_path: Path,
+) -> None:
+    """A pre-#342 store export or an ``.alog`` roast genuinely has no ambient.
+
+    Enabled doctrine, no reading: the two doctrine numbers still populate (they
+    describe the doctrine, not the room), and the reading stays absent so the
+    arm exercises c11's absent-ambient fallback HONESTLY rather than against a
+    fabricated room temperature.
+    """
+    doctrine = AmbientFanDoctrine(enabled=True)
+    for summary in (
+        _recorded_summary(),  # pre-#737 export: keys absent entirely
+        _recorded_summary(ambient_temp_c=None, ambient_humidity_pct=None),  # .alog: explicit nulls
+    ):
+        fixture = _fixture_with_summary(tmp_path, summary)
+        ticks, _ = bakeoff.build_ticks(fixture, cadence_seconds=30.0, ambient_doctrine=doctrine)
+        assert ticks
+        for tick in ticks:
+            assert tick.context.ambient_temp_c is None
+            assert tick.context.ambient_humidity_pct is None
+            assert tick.context.ambient_fan_threshold_c == pytest.approx(doctrine.threshold_c)
+
+
+def test_build_ticks_survives_a_missing_or_unparseable_summary(tmp_path: Path) -> None:
+    """No sidecar, a non-object sidecar, or a non-numeric value degrades to absent.
+
+    A malformed sidecar must not crash a bake-off run mid-corpus; it must read
+    as "this roast recorded no ambient", which is already a supported case.
+    """
+    doctrine = AmbientFanDoctrine(enabled=True)
+    fixture = _fixture_with_summary(tmp_path, None)
+    ticks, _ = bakeoff.build_ticks(fixture, cadence_seconds=30.0, ambient_doctrine=doctrine)
+    assert ticks
+    assert all(t.context.ambient_temp_c is None for t in ticks)
+
+    (tmp_path / "summary.json").write_text("[]", encoding="utf-8")
+    ticks, _ = bakeoff.build_ticks(fixture, cadence_seconds=30.0, ambient_doctrine=doctrine)
+    assert all(t.context.ambient_temp_c is None for t in ticks)
+
+    (tmp_path / "summary.json").write_text('{"ambient_temp_c": "warm"}', encoding="utf-8")
+    ticks, _ = bakeoff.build_ticks(fixture, cadence_seconds=30.0, ambient_doctrine=doctrine)
+    assert all(t.context.ambient_temp_c is None for t in ticks)
+
+    # A bool is an int in Python; it must not read as a temperature.
+    (tmp_path / "summary.json").write_text('{"ambient_temp_c": true}', encoding="utf-8")
+    ticks, _ = bakeoff.build_ticks(fixture, cadence_seconds=30.0, ambient_doctrine=doctrine)
+    assert all(t.context.ambient_temp_c is None for t in ticks)
+
+
+def test_build_control_ticks_threads_the_doctrine_through_to_the_contexts(
+    tmp_path: Path,
+) -> None:
+    """The bake-off's single reconstruction seam forwards the doctrine.
+
+    ``build_control_ticks`` is what every arm actually calls; a doctrine honored
+    by ``build_ticks`` but dropped here would leave the carriage unreachable
+    from the harness, which is precisely the #737 gap.
+    """
+    doctrine = AmbientFanDoctrine(enabled=True)
+    fixture = _fixture_with_summary(
+        tmp_path, _recorded_summary(ambient_temp_c=29.4, ambient_humidity_pct=41.0)
+    )
+    ticks, _ = bakeoff.build_control_ticks(fixture, cadence_seconds=30.0, ambient_doctrine=doctrine)
+    assert ticks, "development-scoped ticks expected"
+    assert all(t.context.ambient_temp_c == pytest.approx(29.4) for t in ticks)
+
+    plain, _ = bakeoff.build_control_ticks(fixture, cadence_seconds=30.0)
+    assert all(t.context.ambient_temp_c is None for t in plain)

@@ -135,7 +135,12 @@ from roastpilot_agent.advisor import (  # noqa: E402
     RoastDecision,
     control_teaching_prompt,
 )
-from roastpilot_agent.config import AdvisorConfig, ControllerConfig, SafetyLimits  # noqa: E402
+from roastpilot_agent.config import (  # noqa: E402
+    AdvisorConfig,
+    AmbientFanDoctrine,
+    ControllerConfig,
+    SafetyLimits,
+)
 from roastpilot_agent.control_policy import PhaseControlLimits, RoastControlPolicy  # noqa: E402
 from roastpilot_agent.models import AdvisorHealthStatus, RoastPhase  # noqa: E402
 from roastpilot_agent.roast_history import (  # noqa: E402
@@ -562,6 +567,7 @@ def build_control_ticks(
     enrich: bool = True,
     policy: RoastControlPolicy | None = None,
     include_pre_fc: bool = False,
+    ambient_doctrine: AmbientFanDoctrine | None = None,
 ) -> tuple[list[ReplayTick], GroundTruth]:
     """Build replay ticks and (by default) enrich + scope them to the advisor box.
 
@@ -584,11 +590,19 @@ def build_control_ticks(
         include_pre_fc: Keep the pre-first-crack ticks (preheat + drying/Maillard)
             for a one-off inspection of the gated-out path. Default ``False`` — the
             as-built D35 scope is development-only.
+        ambient_doctrine: The #709 doctrine config whose ``enabled`` flag decides
+            whether each replayed context carries the roast's RECORDED ambient
+            (#732/#737). Default ``None`` = absent ambient, which is the correct
+            reconstruction for every arm except a c11 one: a c11 arm run without
+            it scores the doctrine's absent-ambient FALLBACK rather than the
+            doctrine, which is the gap this parameter closes.
 
     Returns:
         ``(ticks, ground_truth)`` — development-only unless ``include_pre_fc``.
     """
-    ticks, ground = build_ticks(fixture, cadence_seconds=cadence_seconds)
+    ticks, ground = build_ticks(
+        fixture, cadence_seconds=cadence_seconds, ambient_doctrine=ambient_doctrine
+    )
     if enrich:
         ticks = enrich_ticks_with_control_context(ticks, ground, policy=policy)
     if not include_pre_fc:
