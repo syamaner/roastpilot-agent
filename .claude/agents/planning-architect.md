@@ -5,12 +5,6 @@ tools: Read, Grep, Glob, Bash
 model: claude-fable-5
 effort: high
 permissionMode: plan
-hooks:
-  PreToolUse:
-    - matcher: "Bash"
-      hooks:
-        - type: command
-          command: "\"$CLAUDE_PROJECT_DIR/.claude/hooks/readonly-bash-guard.sh\""
 ---
 
 Investigate and plan only. The Opus PM owns product authority, final scope,

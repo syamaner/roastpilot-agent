@@ -1,8 +1,8 @@
 # Claude Agent Topology Specification
 
 Status: Accepted; phased rollout in progress (revised 8 Aug 2026). Slice 1
-(additive: the read-only planning-architect, the operator output style, and the
-read-only Bash hook) has landed. Slice 2, which re-pins the ten existing role
+(additive: the read-only planning-architect and the operator output style) has
+landed. Slice 2, which re-pins the ten existing role
 definitions from `sonnet`/`opus` aliases to full model IDs and sets explicit
 effort per role, is deferred and gated on live model availability plus a
 mock-slice validation. Until Slice 2 lands, the acceptance criteria in §16 that
@@ -44,7 +44,7 @@ The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
 | Role | Exact model | Default effort | Authority | Default tools |
 |---|---|---:|---|---|
 | Product PM / orchestrator (main session) | `claude-opus-5` (pin via the `model` setting or `--model claude-opus-5`, never `default`) | `high` | Scope, routing, adjudication, integration, escalation | Repository and coordination tools required by the task |
-| Planning architect (named subagent) | `claude-fable-5` | `high` | Advisory only | Read, Grep, Glob, Bash (no Edit/Write; Bash read-only, see §7) |
+| Planning architect (named subagent) | `claude-fable-5` | `high` | Advisory only | Read, Grep, Glob, Bash (no Edit/Write; read-only by convention, §7) |
 | Backend/frontend implementer | `claude-sonnet-5` | `high` | Writes only inside assigned scope | Read, Grep, Glob, Bash, Edit, Write |
 | Mechanical contract/simulation checker | `claude-sonnet-5` | `medium` | Read-only verdict | Read, Grep, Glob, Bash |
 | QA/product/security reviewer | `claude-sonnet-5` | `high` | Read-only findings | Read, Grep, Glob, Bash |
@@ -93,7 +93,7 @@ Only one planning subagent SHOULD run for a single decision problem. Multiple pl
 
 The Fable planning architect MUST:
 
-- Work read-only. The tool list grants no `Edit` or `Write`; `permissionMode: plan` restricts `Bash` to read-only use, but it is discarded when the parent session runs in `acceptEdits`, `auto`, or `bypassPermissions`, so treat it as defence-in-depth. Where a hard technical guarantee is required, gate `Bash` with a read-only `PreToolUse` hook (the documented `db-reader` pattern). Bash is for inspection only, such as `git log` and read-only search.
+- Work read-only. Read-only is enforced by the tool list: the planner has no `Edit` or `Write` tool, the same posture as the repository's other read-only roles (`safety-reviewer`, `qa`, `pr-triage`), and it runs under `permissionMode: plan`. `Bash` is for inspection only (`git log`/`show`/`diff`/`blame`, ripgrep, file reads), never mutation. A hard OS-level guarantee against a determined `Bash` write is out of scope for this posture and would have to apply to every read-only role equally; the operational control is to run read-only roles under `default` or `plan` parent sessions, not `acceptEdits`, `auto`, or `bypassPermissions`. A pattern-matching Bash guard was evaluated and rejected: a denylist is bypassable (command wrappers, substitution, `git -C`) and a strict allowlist is disproportionate for an advisory role.
 - Read the authoritative repository instructions, specifications, current state, and relevant history.
 - Distinguish confirmed evidence from assumptions and unknowns.
 - Preserve decisions already made by the human or authoritative plan.
@@ -350,7 +350,7 @@ This topology is ready when:
 
 - Exact model IDs and explicit effort levels are used for every defined role.
 - No override in the documented precedence chain (`CLAUDE_CODE_SUBAGENT_MODEL`, the per-invocation `model` parameter, the frontmatter `model`, `availableModels` / `enforceAvailableModels`, an organisation default, or organisation restrictions) silently defeats role-level model selection.
-- The Fable planner is read-only by construction: no `Edit` or `Write` tool, `Bash` limited to read-only inspection (via `permissionMode: plan`, hardened with a read-only `PreToolUse` hook where the parent session may run in a permissive mode), and it runs only as a named subagent, never a fork.
+- The Fable planner is read-only by tool restriction: no `Edit` or `Write` tool (the same posture as the repository's other read-only roles), `permissionMode: plan`, and it runs only as a named subagent, never a fork. A hard guarantee against a determined `Bash` write is an operational control (do not run read-only roles under permissive parent modes), not a per-agent mechanism.
 - The Opus PM remains the sole agent authority for routing and plan adjudication.
 - Simple tasks demonstrably bypass Fable.
 - Complex plans use the required output contract.
