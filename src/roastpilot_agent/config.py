@@ -66,6 +66,16 @@ DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS: dict[RoastPhase, float | None] = {
 # is retained so a future re-run can flip a slot without a behavior change.
 DEFAULT_ADVISOR_MODEL = "openai/gpt-4o"
 
+# One Hottop fan level, in normalized percentage points (#709 / D126). The
+# roaster's fan is a 0-10 INTEGER scale and the driver quantises every command
+# with ``(value + 5) // 10``
+# (``coffee_roaster_mcp.drivers._percent_to_hottop_fan_scale``), so 10 pp is the
+# granularity at which a told fan number and the physical move can agree. The
+# same fact ``ControllerConfig.post_fc_deadband_threshold_percent`` (also 10)
+# already encodes; named here so the ambient doctrine's step bound can be
+# validated against it rather than re-deriving the constant.
+HOTTOP_FAN_LEVEL_PP = 10.0
+
 # Phase-keyed advisor MODEL selection (#173, operator 13 Jun): the model slug
 # the advisor uses, by agent phase. The MECHANISM only — every phase defaults to
 # ``DEFAULT_ADVISOR_MODEL`` (gpt-4o everywhere, #277 PIN). Under D35 the advisor
@@ -926,6 +936,126 @@ class PreFirstCrackLevers(BaseModel):
         return self
 
 
+class AmbientFanDoctrine(BaseModel):
+    """Ambient-aware fan doctrine inputs for the ``c11`` teaching (#709, RP-B).
+
+    The #707/D122 joint-drop-objective tree traced both Conebosque A/B arms'
+    temperature-short drops to advisor fan aggression crashing the rate of
+    rise, and the corpus put both crash roasts in the two coolest rooms
+    (23.1 / 23.5 °C) while fan 100 at 25-31 °C repeatedly cupped fine. So the
+    doctrine is CONDITIONAL on ambient, never a blanket softening: #498's full
+    fan capability (including fan 100) is unchanged.
+
+    Both numbers live here, as DATA, rather than as constants written into the
+    ``c11`` prose, which stays digit-free under test. Two reasons: the #218
+    two-copies discipline (a constant baked into a prose rule is the pattern
+    that misled the model in the #567/c9 and #563 told-ceiling arcs), and
+    because both values are HYPOTHESES the operator re-fits from RP-D (#711)
+    joint scores — a re-fit that must not require a prompt edit and a fresh
+    bake-off.
+
+    **Inert on its own, mirroring :class:`ReferenceCurve`'s posture.** With
+    ``enabled=False`` (the default) the controller populates none of the
+    doctrine's context fields, so ``AdvisorContext.ambient_temp_c`` /
+    ``ambient_humidity_pct`` / ``ambient_fan_threshold_c`` /
+    ``ambient_fan_step_max_pp`` stay ``None`` and the advisor's prompt JSON
+    gains only always-null keys — a context-SHAPE addition, not a behavioural
+    one, exactly as #567 reasoned for its own two fields.
+
+    That distinction is the whole point of the flag. An always-null key is
+    inert; a populated, meaningfully-named number is not. Without the gate,
+    every roast on the live default ``c3`` would carry real ambient values and
+    a named fan-step bound into a prompt that never teaches them — changing
+    the live advisor's input, and contaminating any c3 baseline the RP-B
+    comparison is measured against.
+
+    **Enabling is deliberately two acts:** select ``c11`` AND set
+    ``enabled=True``. Selecting ``c11`` alone leaves the doctrine inert (the
+    teaching's own absent-ambient branch applies and it falls back to the
+    unqualified fan-brake rule), which is the same pairing ``c9`` has with
+    ``reference_curve.enabled``. A bake-off arm that forgets the flag measures
+    the fallback, not the doctrine.
+
+    Advisory only, whatever the flag says: nothing in the controller or the
+    safety policy reads these values back, and no clamp, gate, or slew
+    enforces either number. This release is prompt-only by ratification (6 Aug);
+    the optional deterministic fan slew clamp stays out of it.
+    """
+
+    enabled: bool = False
+    """Whether the controller feeds the doctrine's ambient context to the
+    advisor. Default ``False`` — promotion is gated on the offline
+    decision-level bake-off plus a single-variable hardware roast scored by
+    RP-D (#711), both operator-gated."""
+
+    threshold_c: float = Field(default=26.0, gt=0.0, le=60.0)
+    """The boundary ``c11`` compares ``ambient_temp_c`` against, in Celsius.
+
+    Default 26.0 — the operator's ratified first cut (6 Aug), explicitly a
+    HYPOTHESIS to re-fit once several roasts span the ambient range with the
+    RP-D joint score attached. Ten corpus roasts (23.1-31.6 °C) show no clean
+    ambient-to-fan correlation, so this is a starting point, not a pin.
+
+    Bounded because it is re-fit BY HAND, which is where a typo lands: an
+    unbounded field accepts 260.0 for 26.0 and silently puts every roast in
+    the graduated regime. ``nan`` is quieter and worse, since it serialises to
+    ``null`` and the model would read the boundary as absent."""
+
+    step_max_pp: float = Field(default=10.0, gt=0.0, le=HOTTOP_FAN_LEVEL_PP * 2)
+    """The size of an ORDINARY below-threshold fan step, in percentage points.
+
+    Default 10.0 per D126, refining D124's ratified "about 15 pp" on hardware
+    grounds. The Hottop fan is a 0-10 INTEGER scale: the driver quantises every
+    command with ``(value + 5) // 10``
+    (``coffee_roaster_mcp.drivers._percent_to_hottop_fan_scale``). A 15 pp step
+    is therefore one physical level from some starting values and two from
+    others — from fan 30 it lands on level 5, a 20 pp move. Telling the model
+    15 while the machine moves 10 or 20 is a told-vs-enforced gap in exactly
+    the path this doctrine exists to protect. This is the same quantisation
+    fact ``post_fc_deadband_threshold_percent`` (also 10) already encodes.
+
+    Constrained twice, because each bound catches a different failure:
+
+    * a whole multiple of one level, so ANY accepted value maps to an exact
+      whole number of Hottop levels and told == physically-moved across a
+      re-fit (10 pp = one level, 20 pp = two). A re-fit to 15.0 would silently
+      reopen the gap D126 closed, so it is rejected at construction.
+    * at most TWO levels. Without this, a "whole multiple" alone accepts 100.0
+      — a full floor-to-ceiling move as an ORDINARY, non-emergency,
+      below-threshold step. That would make the docstring line above ("bounds
+      the STEP, never the destination") false, and with no deterministic slew
+      clamp in this release nothing downstream would catch it: it just moves
+      the fan slam this doctrine exists to prevent from the prose into the
+      config. Beyond two levels a step is not graduation in any meaningful
+      sense.
+
+    It bounds the STEP, never the destination: every fan value, including the
+    ceiling, stays reachable, and the teaching says so explicitly. It is also
+    subordinate to the fan-brake rule — when heat is at its floor and the bean
+    is still climbing, fan is the only brake left and graduation does not
+    apply."""
+
+    @model_validator(mode="after")
+    def _step_must_be_a_whole_number_of_hottop_levels(self) -> "AmbientFanDoctrine":
+        """Reject a step that is not a whole number of Hottop fan levels.
+
+        Returns:
+            The validated model.
+
+        Raises:
+            ValueError: If ``step_max_pp`` is not a multiple of 10.
+        """
+        if self.step_max_pp % HOTTOP_FAN_LEVEL_PP != 0:
+            raise ValueError(
+                "ambient_fan_doctrine.step_max_pp must be a whole multiple of "
+                f"{HOTTOP_FAN_LEVEL_PP:g} pp (one Hottop fan level), so the bound the "
+                "model is told maps to a whole number of physical fan levels under "
+                f"the driver's (value + 5) // 10 quantisation (D126). Got "
+                f"{self.step_max_pp:g}"
+            )
+        return self
+
+
 class ControllerConfig(BaseModel):
     """Controller timing and advisory-call thresholds.
 
@@ -1095,6 +1225,12 @@ class ControllerConfig(BaseModel):
     # was ~7-8 pp below the ~13 % target) is blocked. Config-overridable; a
     # literal-free named constant the controller's drop guard reads.
     drop_dev_margin_percent: float = Field(default=3.0, ge=0.0, le=100.0)
+
+    # #709 (RP-B): the ambient-aware fan doctrine's own config group. Mirrors
+    # ``reference_curve`` above — a selectable advisor teaching whose context
+    # inputs stay INERT until explicitly enabled, so selecting the prompt and
+    # feeding it data are one deliberate act rather than a default.
+    ambient_fan_doctrine: AmbientFanDoctrine = Field(default_factory=AmbientFanDoctrine)
 
     def advisory_interval_for(self, phase: RoastPhase) -> float | None:
         """Return the minimum-interval consult floor for ``phase`` in seconds.
