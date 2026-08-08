@@ -2,6 +2,41 @@
 
 ## Active Epic
 
+> **STATUS UPDATE — 8 Aug 2026 (RP-D shipped; RP-B is next). Read with the 6 Aug
+> block below.** The joint-drop-objective tree (**#707 / D122**) advanced: **RP-D
+> (#711) — the joint-objective bake-off metric — has SHIPPED its
+> code** across two PRs on `main`: **PR-D1 (#724)** the pure `joint_window_score` HIT+scalar core in
+> `scripts/bakeoff_replay.py`, and **PR-D2 (#725)** the standalone offline corpus
+> scorer `scripts/rpd_corpus_score.py`. The ratified metric (D124): HIT =
+> `|Δdrop| ≤ 3 °C` AND `DTR ∈ target ± 2 pp`; 50/50 scalar (window-edge 0.5);
+> fixed constants; abnormal termination fail-closed; D42 rating printed beside
+> every score. **Corpus result: 15 scored / 3 HITs** — the joint window IS
+> achievable (Sumatra `43c84c98`, El Durazno `edbe9a76` + `a4299aea`); the
+> Conebosque A/B both MISS 0.00 (baseline 188 °C/21%, treatment 190 °C/24%),
+> correcting the earlier "no joint-HIT yet" read. **Design:** RP-D scores achieved
+> OUTCOMES, so it is a standalone corpus scorer reading the frozen `profile_json`
+> targets, deliberately NOT wired into `advisor_bakeoff.py` (the replay context's
+> targets default to the achieved values = a self-comparison that always HITs);
+> D124 clarified in `roastpilot-plan`. **Follow-ups:** **#726** (shared
+> `RoastStore.read_drop_reading` + abnormal-termination classifier + snapshot/URI
+> helper; owns robust guard-drop classification — two review findings deferred
+> there, zero current-corpus impact as all 15 drops are advisor-sourced). **#711
+> itself stays OPEN by design** — its remaining item, registering the two
+> Conebosque roasts as labelled fixtures, is folded into RP-B's kickoff (they are
+> RP-B's replay-harness eval input, not needed by the store-reading scorer). No PR
+> used `Closes #711`, so file state (metric code shipped) and GitHub state (issue
+> open for the residual fixture item + the #726 follow-ups) agree — no drift.
+> **Next in the D122 sequence: RP-B (#709) — the c11 ambient-fan doctrine.**
+> **Eval-model correction (Codex catch on the docs PR, now D125):** RP-D scores a
+> roast's ACHIEVED outcome, which a replay cannot change, so an offline c3-vs-c11
+> replay yields the SAME RP-D score for both arms — RP-D cannot discriminate a
+> fan/heat-doctrine change offline. The offline RP-B comparison is DECISION-level
+> (fan-direction agreement at recorded ambient); RP-D is the acceptance gate on a
+> real single-variable HARDWARE roast (or a validated plant simulator, #580).
+> Plan design for the RP-D scorer + RP-B c11 doctrine is **D124**; the eval-model
+> correction is **D125** (roastpilot-plan); next free plan decision number:
+> **D126**.
+>
 > **STATUS UPDATE — 6 Aug 2026 (updates the control-loop framing in the 2 Aug
 > block below).** The D96 recovery law (#559) has now had its flag-on hardware
 > validation: a paired Guatemala Conebosque (washed) A/B (baseline recovery-off
@@ -121,9 +156,10 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D125** (D124 records the RP-D joint-objective
-> bake-off scorer + RP-B c11 ambient-fan doctrine design, roastpilot-agent#711/#709;
-> D123 records the #718 catalogue query-scope won't-fix decision).
+> Next free plan decision number: **D126** (D125 records the RP-D eval-model
+> correction — discriminates only on hardware/simulator, not replay; D124 records
+> the RP-D scorer + RP-B c11 design, roastpilot-agent#711/#709; D123 the #718
+> catalogue query-scope won't-fix).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 2 Aug block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
