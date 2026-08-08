@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import statistics
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -808,4 +809,203 @@ def score_to_json(score: RoastScore) -> dict[str, Any]:
         "heat": dataclasses.asdict(score.heat),
         "fan": dataclasses.asdict(score.fan),
         "phase_latency": [dataclasses.asdict(p) for p in score.phase_latency],
+    }
+
+
+# --- RP-D joint-objective metric (#711, plan D124) ---------------------------
+#
+# The operator-ratified "did the roast land BOTH targets" metric over a
+# completed roast trace. Unlike the agreement metrics above (which need a
+# model decision per tick), this is pure arithmetic over the roast's OUTCOME
+# — the achieved drop temperature and DTR vs the profile's targets — so it
+# scores a real, replayed, or historical roast with NO LLM call and NO store
+# or safety surface. It is the fixed yardstick the #707 joint-drop-objective
+# tree is measured against, and it feeds #396 (prompt/model A/B) and #705
+# (math-reliability) through the same report path.
+#
+# Tolerances and weights are the 6 Aug operator ratification (#711): HIT within
+# ±3 °C drop temp AND ±2 pp DTR; scalar weighted 50/50. The scalar's literal
+# ratified form carries both the 0.5 weights AND a final /2, so a roast sitting
+# exactly on the joint-window edge scores 0.5 and a perfect roast 1.0
+# (operator-confirmed, 7 Aug).
+#
+# This is the pure metric CORE (PR-D1): callers pass the authoritative numbers
+# and it applies the ratified rule. The DTR passed in MUST be the deterministic
+# #219/#220 ``development_percent`` value, never recomputed from raw seconds (the
+# #705/c10 lesson), and the targets MUST be the frozen ``profile_json`` targets,
+# never the achieved values (``build_ticks`` stamps the achieved outcome into the
+# reconstructed context by default, so a fixture context is NOT a safe target
+# source). Sourcing those authoritative inputs from the store (profile targets,
+# ``development_percent``, drop-event bean temp, and outcome → abnormal
+# termination for faulted/aborted/guard-drop roasts) and wiring the per-roast +
+# corpus report is PR-D2; this slice ships only the arithmetic.
+JOINT_DROP_TEMP_TOL_C = 3.0
+JOINT_DTR_TOL_PP = 2.0
+JOINT_WEIGHT_DROP_TEMP = 0.5
+JOINT_WEIGHT_DTR = 0.5
+
+
+@dataclasses.dataclass(frozen=True)
+class JointWindowScore:
+    """The RP-D joint-objective scorecard for one completed roast (#711).
+
+    Attributes:
+        hit: The binary primary result — ``True`` only when the roast dropped
+            within the drop-temp tolerance AND within the DTR band AND
+            terminated normally. An abnormal termination (guard-drop,
+            emergency stop, fault) is never a hit, even if the numbers
+            coincidentally fall in range: a hard-stop-forced drop did not
+            *land* the joint window under control (fail-closed).
+        scalar: The secondary [0, 1] score that ranks non-hits (1.0 perfect,
+            0.5 at the exact window edge), clamped at 0 and zeroed by an
+            abnormal termination. Do not read it without ``hit`` — a prompt
+            tuned to the scalar alone could learn to drop early-and-cool (the
+            #711 Goodhart risk); the binary HIT and the D42 operator rating
+            stay primary.
+        drop_temp_error_c: Signed achieved − target drop temperature (negative
+            = dropped short of target).
+        dtr_error_pp: Signed achieved − target DTR in percentage points
+            (positive = over-developed).
+        terminated_abnormally: Whether the roast ended in a guard-drop,
+            emergency stop, or fault (the termination penalty was applied).
+        drop_temp_c: The achieved drop bean temperature (°C), echoed for the
+            report.
+        target_drop_temp_c: The profile's target drop temperature (°C).
+        dtr_percent: The achieved DTR as a percentage.
+        target_dtr_percent: The profile's target DTR as a percentage.
+    """
+
+    hit: bool
+    scalar: float
+    drop_temp_error_c: float
+    dtr_error_pp: float
+    terminated_abnormally: bool
+    drop_temp_c: float
+    target_drop_temp_c: float
+    dtr_percent: float
+    target_dtr_percent: float
+
+
+def _within_tolerance(error: float, tol: float) -> bool:
+    """Inclusive ``|error| <= tol``, robust to binary-float rounding at the edge.
+
+    The ratified HIT boundary is inclusive (``±3 °C`` / ``±2 pp``), but a bare
+    ``<=`` can flip a true-edge roast to a miss when the subtraction carries
+    float noise (e.g. ``16.1 - 14.1 == 2.0000000000000018``). ``math.isclose``
+    rescues the exact-edge case without widening the window for a genuine miss.
+
+    Args:
+        error: The signed achieved − target difference.
+        tol: The inclusive tolerance.
+
+    Returns:
+        ``True`` when ``error`` is within (or float-equal to) ``tol``.
+    """
+    abs_err = abs(error)
+    return abs_err <= tol or math.isclose(abs_err, tol, rel_tol=1e-9, abs_tol=1e-9)
+
+
+def joint_window_score(
+    *,
+    drop_temp_c: float,
+    target_drop_temp_c: float,
+    dtr_percent: float,
+    target_dtr_percent: float,
+    terminated_abnormally: bool = False,
+) -> JointWindowScore:
+    """Score a roast's achieved outcome against its joint drop targets (#711).
+
+    Pure arithmetic — no LLM, no store, no safety surface. The caller passes the
+    achieved drop temperature and DTR (both read from the deterministic trace,
+    never recomputed here) and the profile's targets; this applies the
+    operator-ratified HIT rule and scalar.
+
+    The tolerances (``±3 °C`` / ``±2 pp``) and 50/50 weights are the fixed,
+    operator-ratified constants — this is a stable yardstick, deliberately NOT a
+    tunable knob: making them per-call parameters invites nonsensical inputs
+    (a huge tolerance or a zero weight-total that score every roast ``1.0``) and
+    inconsistent aggregates. A future sensitivity sweep, if ever wanted, would be
+    a separate explicit change, not a back door in the metric.
+
+    Args:
+        drop_temp_c: The achieved drop bean temperature in Celsius.
+        target_drop_temp_c: The profile's target drop temperature in Celsius.
+        dtr_percent: The achieved development-time ratio as a percentage (e.g.
+            ``21.0``), read from the deterministic #219/#220 clock — not
+            recomputed from raw seconds (the #705/c10 discipline).
+        target_dtr_percent: The profile's target development percentage.
+        terminated_abnormally: ``True`` when the roast ended in a guard-drop,
+            emergency stop, or fault; zeroes the scalar and blocks a HIT.
+
+    Returns:
+        The :class:`JointWindowScore`.
+
+    Raises:
+        ValueError: If the drop-temp or DTR error is not finite. A non-finite
+            achieved/target value (an ``inf``/``nan`` from a corrupt trace or
+            profile) OR an overflow in these subtractions (opposite-sign values
+            near the float limits) would otherwise score as an ordinary worst
+            roast and emit invalid ``Infinity``/``NaN`` JSON, silently biasing
+            the aggregate stats. Validating the computed errors subsumes an
+            input check and closes the overflow case too — fail closed instead.
+    """
+    drop_err = drop_temp_c - target_drop_temp_c
+    dtr_err = dtr_percent - target_dtr_percent
+    if not (math.isfinite(drop_err) and math.isfinite(dtr_err)):
+        raise ValueError(
+            "joint-window achieved/target values must yield finite drop-temp and DTR "
+            "errors (a non-finite or overflowing input)"
+        )
+    within_temp = _within_tolerance(drop_err, JOINT_DROP_TEMP_TOL_C)
+    within_dtr = _within_tolerance(dtr_err, JOINT_DTR_TOL_PP)
+    hit = within_temp and within_dtr and not terminated_abnormally
+    # Literal ratified form: 50/50 weights AND a final /2 (window edge → 0.5).
+    # Clamp at 0 so a large miss floors rather than going negative; an abnormal
+    # termination multiplies the whole thing to 0.
+    raw = (
+        1.0
+        - (
+            JOINT_WEIGHT_DROP_TEMP * abs(drop_err) / JOINT_DROP_TEMP_TOL_C
+            + JOINT_WEIGHT_DTR * abs(dtr_err) / JOINT_DTR_TOL_PP
+        )
+        / 2.0
+    )
+    penalty = 0.0 if terminated_abnormally else 1.0
+    scalar = max(0.0, raw) * penalty
+    return JointWindowScore(
+        hit=hit,
+        scalar=scalar,
+        drop_temp_error_c=drop_err,
+        dtr_error_pp=dtr_err,
+        terminated_abnormally=terminated_abnormally,
+        drop_temp_c=drop_temp_c,
+        target_drop_temp_c=target_drop_temp_c,
+        dtr_percent=dtr_percent,
+        target_dtr_percent=target_dtr_percent,
+    )
+
+
+def joint_score_to_json(score: JointWindowScore) -> dict[str, Any]:
+    """Serialize a :class:`JointWindowScore` to a JSON-ready dict.
+
+    Parallels :func:`score_to_json` for the agreement scorecard, so the RP-D
+    metric flows through the same per-roast report path (and into
+    ``advisor_significance.py``'s paired stats over any per-roast scalar).
+
+    Args:
+        score: The joint-window scorecard to serialize.
+
+    Returns:
+        A JSON-ready dict of the scorecard.
+    """
+    return {
+        "hit": score.hit,
+        "scalar": round(score.scalar, 4),
+        "drop_temp_c": score.drop_temp_c,
+        "target_drop_temp_c": score.target_drop_temp_c,
+        "drop_temp_error_c": round(score.drop_temp_error_c, 2),
+        "dtr_percent": round(score.dtr_percent, 2),
+        "target_dtr_percent": score.target_dtr_percent,
+        "dtr_error_pp": round(score.dtr_error_pp, 2),
+        "terminated_abnormally": score.terminated_abnormally,
     }
