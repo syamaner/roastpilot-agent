@@ -64,6 +64,11 @@ const SCOPE_SCHEMA = {
 // the stages that have no agent of their own, so they never silently inherit the
 // caller's model. Single source for all three.
 const REVIEW_MODEL = 'claude-sonnet-5'
+// Safety-lens findings come from the always-Opus safety-reviewer; verify them on
+// the same tier, so a lower-tier Sonnet verifier can't return survives=false and
+// silently discard a subtle safety finding before triage. Other lenses verify on
+// the review model.
+const SAFETY_VERIFY_MODEL = 'claude-opus-5'
 const scope = await agent(
   `Scope a code review of the current branch. Run \`git fetch origin -q\` first so the base ref is current, then \`git diff --name-only ${base}...HEAD\` and \`git diff --stat ${base}...HEAD\` in this repo. Report which areas changed: web/ (the SPA), Python (src/roastpilot_agent or tests/), and specifically safety.py / controller.py / a models.py enum (the safety-critical surface). List the changed files and a one-line summary.
 
@@ -232,7 +237,9 @@ const verified = await parallel(
   claimFindings.map((f) => () =>
     agent(
       `A reviewer raised this finding on ${diffScope}:\n\nTitle: ${f.title}\nSeverity: ${f.severity}\nFile: ${f.file}${f.line ? ':' + f.line : ''}\nDetail: ${f.detail}\n\nRun ${diffScope} and read the cited file for context first, then adversarially VERIFY it against the actual diff + code. Try to REFUTE it. Does it survive — a real, in-scope issue this change introduced? Default to survives=false if uncertain, already-handled, pre-existing, or out of scope.`,
-      { label: `verify:${f.lens}`, phase: 'Verify', schema: VERDICT_SCHEMA, model: REVIEW_MODEL, effort: 'high' },
+      f.lens === 'safety'
+        ? { label: `verify:${f.lens}`, phase: 'Verify', schema: VERDICT_SCHEMA, model: SAFETY_VERIFY_MODEL, effort: 'xhigh' }
+        : { label: `verify:${f.lens}`, phase: 'Verify', schema: VERDICT_SCHEMA, model: REVIEW_MODEL, effort: 'high' },
     ).then((v) => ({
       ...f,
       // A dead verifier is NOT a refutation (#680 P1). agent() returns null on a

@@ -65,7 +65,12 @@ def test_every_expected_agent_exists() -> None:
 @pytest.mark.parametrize("path", _agent_files(), ids=lambda p: p.stem)
 def test_agent_model_and_effort_match_the_map(path: Path) -> None:
     fm = _frontmatter(path)
-    name = fm.get("name", path.stem)
+    name = fm.get("name")
+    assert name == path.stem, (
+        f"{path.name}: frontmatter name {name!r} must equal the filename stem "
+        f"{path.stem!r} — workflows resolve agents by name, so a mismatch or a "
+        f"renamed role would silently pass the file-set check"
+    )
     assert name in _EXPECTED, f"{name} is not in the authoritative pin map"
     expected_model, expected_effort = _EXPECTED[name]
     assert fm.get("model") == expected_model, (
@@ -84,36 +89,67 @@ def test_no_agent_uses_a_floating_alias(path: Path) -> None:
 
 
 def test_agents_md_prose_names_the_full_ids() -> None:
-    """The AGENTS.md model-selection prose must agree with the pins, not aliases."""
+    """AGENTS.md prose must name the pinned IDs and the two special role associations."""
     agents_md = (_REPO / "AGENTS.md").read_text()
     for full_id in {m for m, _ in _EXPECTED.values()}:
         assert full_id in agents_md, f"AGENTS.md does not mention the pinned id {full_id}"
+    # Bind the two roles whose model/effort differ from the Sonnet-high default, so
+    # the prose can't drift from the pins for them.
+    assert re.search(r"claude-opus-5.{0,24}xhigh", agents_md, re.S), (
+        "AGENTS.md must document safety-reviewer as claude-opus-5 at xhigh effort"
+    )
+    assert "claude-fable-5" in agents_md and "planning-architect" in agents_md, (
+        "AGENTS.md must document the planning-architect claude-fable-5 pin"
+    )
+
+
+def test_workflow_review_model_is_a_full_id() -> None:
+    """The review-branch workflow's inline-stage pin must be a full ID, not an alias."""
+    mjs = (_REPO / ".claude" / "workflows" / "review-branch.mjs").read_text()
+    match = re.search(r"const REVIEW_MODEL = '([^']+)'", mjs)
+    assert match, "REVIEW_MODEL constant not found in review-branch.mjs"
+    value = match.group(1)
+    assert value not in _ALIASES, f"REVIEW_MODEL {value!r} is a floating alias; pin a full ID"
+    assert value == "claude-sonnet-5", f"REVIEW_MODEL {value!r} != claude-sonnet-5"
 
 
 def test_committed_settings_do_not_defeat_the_pins() -> None:
-    """Repo-side of the §5 override check: no committed setting silently re-routes.
+    """Repo-side of the §5 override check, on GIT-TRACKED settings only.
 
-    A committed ``availableModels`` that omits a pinned family, or a committed
-    ``CLAUDE_CODE_SUBAGENT_MODEL`` env override, would defeat the frontmatter
-    pins regardless of what the files say. This guards the repository config; the
+    A committed ``availableModels`` that excludes a pinned model, or a committed
+    ``CLAUDE_CODE_SUBAGENT_MODEL`` env override, would defeat the frontmatter pins.
+    Only tracked files are inspected: a developer's local (gitignored) override is
+    their own environment, not repository config, and must not fail the suite. The
     live-environment and organisation-policy side stays an operator verification.
     """
     import json
+    import subprocess
 
-    families = {m.rsplit("-", 1)[0] for m, _ in _EXPECTED.values()}  # claude-sonnet, ...
-    for name in ("settings.json", "settings.local.json"):
-        path = _REPO / ".claude" / name
-        if not path.exists():
+    tracked = set(
+        subprocess.run(
+            ["git", "ls-files", ".claude"],
+            cwd=_REPO,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+    )
+    pinned_ids = {m for m, _ in _EXPECTED.values()}
+    for rel in (".claude/settings.json", ".claude/settings.local.json"):
+        if rel not in tracked:
             continue
-        data = json.loads(path.read_text())
+        data = json.loads((_REPO / rel).read_text())
         env = data.get("env", {})
         assert "CLAUDE_CODE_SUBAGENT_MODEL" not in env, (
-            f"{name} commits a CLAUDE_CODE_SUBAGENT_MODEL override that defeats every pin"
+            f"{rel} commits a CLAUDE_CODE_SUBAGENT_MODEL override that defeats every pin"
         )
         allowed = data.get("availableModels")
-        if allowed:
-            joined = " ".join(allowed)
-            for family in families:
-                assert family in joined or family.split("-")[-1] in joined, (
-                    f"{name} availableModels {allowed} excludes pinned family {family}"
-                )
+        if not allowed:
+            continue
+        for pinned in pinned_ids:
+            # family alias (sonnet/opus/fable), exact id, or a prefix the id extends
+            family = pinned.rsplit("-", 1)[0].rsplit("-", 1)[-1]
+            permitted = family in allowed or any(
+                pinned == e or pinned.startswith(e + "-") for e in allowed
+            )
+            assert permitted, f"{rel} availableModels {allowed} does not permit pinned id {pinned}"
