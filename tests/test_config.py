@@ -448,19 +448,53 @@ def test_ambient_freshness_bound_must_outlive_the_poll_interval() -> None:
     The direction is fail-safe, but an RP-B hardware arm would then be recorded
     as "c11 with ambient" while the model saw the absent branch throughout: a
     green, meaningless result. Cross-section validation is the only place this
-    is catchable — neither config group can see the other."""
+    is catchable — neither config group can see the other.
+
+    The threshold is the CORRECTNESS line (bound >= cadence), not a preferred
+    margin. Post-open review showed a 2x rule failing a 90 s bound against a
+    60 s cadence, where the doctrine in fact works perfectly well — and, via
+    recovery, retiring a doctrine that was serving fresh readings."""
     doctrine = AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
 
     # 90 s against the default 30 s cadence is three polls — comfortably valid.
     assert AppConfig(controller=ControllerConfig(ambient_fan_doctrine=doctrine))
 
-    # The operator widens the poll interval past the bound: rejected at
-    # construction rather than silently voiding the doctrine at roast time.
+    # 90 s against a 60 s cadence is NOT rejected: a healthy reading is at its
+    # oldest just before the next poll, so 60 < 90 means it always arrives
+    # fresh. Rejecting this pair is the bug post-open review caught.
+    assert AppConfig(
+        controller=ControllerConfig(ambient_fan_doctrine=doctrine),
+        mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=60.0),
+    )
+
+    # A cadence that genuinely outruns the bound IS rejected at construction,
+    # rather than silently voiding the doctrine at roast time.
     with pytest.raises(pydantic.ValidationError, match="max_reading_age_seconds"):
         AppConfig(
             controller=ControllerConfig(ambient_fan_doctrine=doctrine),
-            mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=60.0),
+            mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=120.0),
         )
+
+
+def test_ambient_freshness_check_stands_down_when_the_cadence_is_unknown() -> None:
+    """#732, post-open Codex P2: ``None`` does not mean "the package default".
+
+    ``mcp_yaml`` renders ``ambient_poll_interval_seconds`` only when it is set,
+    so an unset value inherits whatever the hand-authored MCP yaml carries —
+    which this process cannot read. An earlier revision substituted the
+    mirrored 30 s default, which would let an inherited 300 s cadence pass
+    against a 90 s bound and silently void the doctrine: the exact failure this
+    validator exists to prevent, wearing its approval.
+
+    So an unknown cadence is not guessed at. The runtime decline warning covers
+    it instead, by observing the behaviour rather than predicting it."""
+    assert MCPDeviceConfig().ambient_poll_interval_seconds is None
+    assert AppConfig(
+        controller=ControllerConfig(
+            ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=1.0)
+        ),
+        mcp_device=MCPDeviceConfig(),
+    )
 
 
 def test_ambient_freshness_bound_is_unconstrained_while_the_doctrine_is_inert() -> None:

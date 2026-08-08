@@ -1916,9 +1916,31 @@ class AppConfig(BaseSettings):
         every tick — a green, meaningless result, which is precisely the class
         of outcome #709's two-act enablement already warns about.
 
-        Requires 2x rather than 1x because a reading is at its oldest just
-        before the next poll lands: at exactly 1x, ordinary cadence alone puts
-        healthy readings at the boundary and the doctrine flaps tick to tick.
+        **Enforces the property actually required, not a preferred margin.** A
+        healthy reading is at its oldest just before the next poll lands, so the
+        bound must be at least the cadence for the doctrine to function at all;
+        that is the correctness line and the only one worth making
+        unconstructible. An earlier revision demanded 2x for flap margin and was
+        wrong to: at a 90 s bound against a 60 s cadence the doctrine works
+        perfectly well, and rejecting that pair caused a *working* configuration
+        to be treated as broken — including, through the recovery path, retiring
+        a doctrine that was serving fresh readings. Two or more cadences remains
+        the sensible operating margin; it is advice, not a validation rule.
+
+        **Enforced only when the cadence is actually KNOWN.**
+        ``ambient_poll_interval_seconds`` is ``None`` by default, and ``None``
+        does not mean "the package default" — ``mcp_yaml`` renders the field
+        only when set, so an unset value inherits whatever the hand-authored MCP
+        yaml carries, which this process cannot see. Substituting the mirrored
+        default there would let an inherited 300 s cadence pass against a 90 s
+        bound and silently void the doctrine — the exact failure this validator
+        exists to prevent, wearing its approval. So when the cadence is unknown
+        the static check stands down and the *runtime* decline warning
+        (``RoastController._doctrine_ambient``) is what covers it, by observing
+        the behaviour instead of predicting it. That split is deliberate: this
+        validator guards the ``/config`` path, which always writes an explicit
+        value, and the warning guards everything neither this nor any config
+        can see.
 
         Only enforced while the doctrine is ENABLED, so the inert default can
         never make an otherwise-valid config unconstructible.
@@ -1936,25 +1958,21 @@ class AppConfig(BaseSettings):
             The validated application config.
 
         Raises:
-            ValueError: If the doctrine is enabled and its freshness bound is
-                below twice the effective ambient poll interval.
+            ValueError: If the doctrine is enabled, the ambient poll interval is
+                explicitly set, and the freshness bound is below it.
         """
         doctrine = self.controller.ambient_fan_doctrine
-        if not doctrine.enabled:
+        poll_seconds = self.mcp_device.ambient_poll_interval_seconds
+        if not doctrine.enabled or poll_seconds is None:
             return self
-        poll_seconds = (
-            self.mcp_device.ambient_poll_interval_seconds
-            if self.mcp_device.ambient_poll_interval_seconds is not None
-            else DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS
-        )
-        minimum = 2.0 * poll_seconds
-        if doctrine.max_reading_age_seconds < minimum:
+        if doctrine.max_reading_age_seconds < poll_seconds:
             raise ValueError(
                 "controller.ambient_fan_doctrine.max_reading_age_seconds must be at least "
-                f"twice mcp_device.ambient_poll_interval_seconds ({minimum:g}) while the "
-                f"doctrine is enabled, or every healthy reading is declined as stale and "
-                f"c11 silently runs its absent-ambient fallback for the whole roast. Got "
-                f"{doctrine.max_reading_age_seconds:g} against a poll interval of "
-                f"{poll_seconds:g}"
+                "mcp_device.ambient_poll_interval_seconds while the doctrine is enabled, or "
+                "every healthy reading ages past the bound before the next poll lands, is "
+                "declined as stale, and c11 silently runs its absent-ambient fallback for "
+                f"the whole roast. Got {doctrine.max_reading_age_seconds:g} against a poll "
+                f"interval of {poll_seconds:g}. Two or more poll intervals is the "
+                "recommended operating margin."
             )
         return self

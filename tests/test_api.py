@@ -3554,7 +3554,9 @@ async def test_recover_on_start_survives_a_frozen_doctrine_the_live_poll_interva
         ),
         agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
     )
-    live = AppConfig(mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=60.0))
+    # 120 s cadence against a 90 s bound: the reading genuinely cannot arrive
+    # fresh, so the doctrine truly is unusable and retiring it is correct.
+    live = AppConfig(mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=120.0))
     service = RoastService(
         store,
         roaster=FakeMCPClient(),
@@ -3575,6 +3577,54 @@ async def test_recover_on_start_survives_a_frozen_doctrine_the_live_poll_interva
     assert doctrine.enabled is False
     assert doctrine.max_reading_age_seconds == 90.0
     assert service.runner._config.controller.tick_interval_seconds == 1.0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_recover_on_start_preserves_a_frozen_doctrine_that_still_fits(
+    store: RoastStore,
+) -> None:
+    """#732, post-open Codex P2: recovery must not retire a WORKING doctrine.
+
+    An earlier revision demanded the bound be twice the cadence, and retired the
+    doctrine whenever that failed. But a 90 s bound against a 60 s cadence
+    works: a healthy reading is at its oldest just before the next poll, so it
+    always arrives inside the bound. Retiring there silently switched a
+    recovered run from ambient-aware advice to the absent-ambient branch for the
+    rest of the roast — the opposite of the fail-safe framing used to justify
+    it, since the run had been fine.
+
+    The rule is now the correctness line (bound >= cadence), so this pair no
+    longer clashes at all and the frozen doctrine survives the restart intact.
+    Pinned separately from the retirement case because these two differ only in
+    the cadence, and it was that single number that made the old behaviour look
+    reasonable."""
+    await store.create_run(
+        run_id="run-doctrine-still-fits",
+        profile=_profile(),
+        config=AppConfig(
+            controller=ControllerConfig(
+                ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
+            )
+        ),
+        agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    )
+    live = AppConfig(mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=60.0))
+    service = RoastService(
+        store,
+        roaster=FakeMCPClient(),
+        advisor=FakeAdvisor(),
+        run_loop=False,
+        clock=FakeClock(),
+        config=live,
+    )
+
+    await service.recover_on_start()
+
+    assert service.runner is not None
+    assert service.runner.controller_snapshot().phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    doctrine = service.runner._config.controller.ambient_fan_doctrine  # pyright: ignore[reportPrivateUsage]
+    assert doctrine.enabled is True
+    assert doctrine.max_reading_age_seconds == 90.0
 
 
 @pytest.mark.asyncio

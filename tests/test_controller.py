@@ -7,6 +7,7 @@ extend this suite.
 """
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -4658,6 +4659,40 @@ def test_advisor_context_declines_ambient_older_than_the_doctrine_bound(
 
     assert ctx.ambient_temp_c == expected_temp_c
     assert ctx.ambient_humidity_pct == (None if expected_temp_c is None else 36.0)
+
+
+def test_first_ambient_decline_warns_once_per_run(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#732, post-open Codex P2: the config validator cannot see every route to
+    a permanently-declined reading.
+
+    It guards the ``/config`` path, which always writes an explicit poll
+    interval. It cannot see a cadence inherited from the hand-authored MCP
+    yaml, a probe that wedges mid-roast, a doctrine retired by the recovery
+    path, or a future constructor of ``RoastTelemetry``. All of those produce
+    the same silent outcome — ambient declined every tick while the Room tile,
+    reading ungated telemetry, still shows a temperature — and an RP-B arm
+    recorded as ambient-aware while the model saw the absent branch throughout.
+
+    Observing the behaviour covers what predicting it cannot. Once per run,
+    because a 1 Hz log would bury the transition that matters."""
+    harness = make_harness(config=_doctrine_on())
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    stale = reading(ambient_temp_c=23.5, ambient_age_seconds=600.0)
+
+    with caplog.at_level(logging.WARNING, logger="roastpilot_agent.controller"):
+        for _ in range(4):
+            harness.controller._build_advisor_context(stale, limits)  # pyright: ignore[reportPrivateUsage]
+
+    declines = [r for r in caplog.records if "#732" in r.getMessage()]
+    assert len(declines) == 1
+    # The message has to name the two numbers an operator would compare.
+    assert "600.0 s" in declines[0].getMessage()
+    assert "90.0" in declines[0].getMessage()
 
 
 def test_declined_stale_ambient_is_the_same_shape_as_an_absent_probe() -> None:
