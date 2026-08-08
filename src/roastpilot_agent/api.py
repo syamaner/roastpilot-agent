@@ -2049,11 +2049,6 @@ class RoastService:
         except ValidationError:
             if not frozen.controller.ambient_fan_doctrine.enabled:
                 raise
-            _log.warning(
-                "Recovered run's ambient fan doctrine is inconsistent with the current "
-                "ambient poll interval; retiring the doctrine for this run (advisory "
-                "only — c11 falls back to its absent-ambient branch). #732"
-            )
             payload["controller"] = frozen.controller.model_copy(
                 update={
                     "ambient_fan_doctrine": frozen.controller.ambient_fan_doctrine.model_copy(
@@ -2061,7 +2056,18 @@ class RoastService:
                     )
                 }
             )
-            return AppConfig.model_validate(payload)
+            # The retry IS the hypothesis test: if the doctrine was not the
+            # cause, this re-raises unchanged and nothing is swallowed. Logging
+            # only AFTER it succeeds means the message can never claim a cause
+            # that was not the cause — the alternative, matching on the error
+            # text before retrying, would couple this to validator wording.
+            recovered = AppConfig.model_validate(payload)
+            _log.warning(
+                "Recovered run's ambient fan doctrine is inconsistent with the current "
+                "ambient poll interval; retiring the doctrine for this run (advisory "
+                "only — c11 falls back to its absent-ambient branch). #732"
+            )
+            return recovered
 
     async def recover_on_start(self) -> None:
         """Restart recovery (orchestration plan § Persistence; architecture

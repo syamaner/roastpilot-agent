@@ -25,6 +25,7 @@ import pytest_asyncio
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
 
 import roastpilot_agent.api as api_module
 from roastpilot_agent import __version__
@@ -89,7 +90,7 @@ from roastpilot_agent.models import (
     TelemetryEventData,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
-from roastpilot_agent.store import PersistedRun, RoastStore
+from roastpilot_agent.store import FrozenRunConfig, PersistedRun, RoastStore
 from tests.conftest import FakeClock, FakeMCPClient
 
 
@@ -3488,6 +3489,40 @@ async def test_recover_on_start_active_roast_still_recovers_to_recovery_required
     assert OperatorAction.EMERGENCY_STOP in enabled_operator_actions(
         RoastPhase.OPERATOR_RECOVERY_REQUIRED
     )
+
+
+def test_recovery_config_reraises_a_failure_the_doctrine_did_not_cause() -> None:
+    """#732: the degradation is scoped to the ambient clash and NOTHING else.
+
+    ``_build_recovery_config`` retires the advisory doctrine only when the
+    frozen doctrine is enabled; any other validation failure must propagate
+    unchanged. This is the safety-preserving half of that fix — the line that
+    guarantees a genuinely broken frozen config (here the safety-owned
+    ceiling-guard bound, D88 A1) is never silently absorbed by a recovery that
+    then proceeds as if nothing were wrong.
+
+    Independent pre-open triage found this branch uncovered suite-wide and
+    true only by code reading, which for a fail-closed guard is the state
+    worth fixing before it is the state relied on. ``FrozenRunConfig`` carries
+    no cross-section validator of its own, so the offending pair is
+    constructible exactly as a historical record could hold it."""
+    service = RoastService(
+        cast(RoastStore, None),
+        roaster=FakeMCPClient(),
+        advisor=FakeAdvisor(),
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    frozen = FrozenRunConfig(
+        controller=ControllerConfig(
+            post_first_crack_control=PostFirstCrackControl(ceiling_guard_temp_c=240.0)
+        ),
+        safety=SafetyLimits(),
+    )
+    assert frozen.controller.ambient_fan_doctrine.enabled is False
+
+    with pytest.raises(ValidationError, match="ceiling_guard_temp_c"):
+        service._build_recovery_config(frozen)  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
