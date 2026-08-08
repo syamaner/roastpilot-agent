@@ -12,6 +12,7 @@ import pytest
 
 from roastpilot_agent.config import (
     DEFAULT_ADVISOR_MODEL,
+    DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS,
     HOTTOP_FAN_LEVEL_PP,
     OPENROUTER_BASE_URL,
     AdvisorConfig,
@@ -19,6 +20,7 @@ from roastpilot_agent.config import (
     AppConfig,
     BeanSourcingConfig,
     ControllerConfig,
+    MCPDeviceConfig,
     PostFirstCrackControl,
     SafetyLimits,
 )
@@ -420,6 +422,60 @@ def test_ambient_freshness_bound_accepts_a_real_refit() -> None:
     # A whole roast's length is the reasoning behind the ceiling: past that it
     # is not a freshness bound at all.
     assert ceiling <= 600.0
+
+
+def test_mcp_ambient_poll_default_matches_the_installed_server() -> None:
+    """#732 drift guard: the mirrored MCP poll cadence must equal the real one.
+
+    ``DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS`` is a COPY of the server's own
+    default, used to validate the doctrine's freshness bound when the operator
+    has set no interval. A server bump that changed the cadence would silently
+    narrow (or invert) that margin — the bound would still validate while every
+    healthy reading aged past it. Assert against the installed package so the
+    bump fails here instead of on the roast."""
+    from coffee_roaster_mcp.config import AmbientConfig
+
+    assert AmbientConfig().poll_interval_seconds == DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS
+
+
+def test_ambient_freshness_bound_must_outlive_the_poll_interval() -> None:
+    """#732, the pre-open safety review's finding 1. The poll interval is
+    operator-editable from ``/config`` with no maximum; the freshness bound is
+    file-only. Set the interval above the bound and EVERY healthy reading is
+    declined on EVERY tick — for the whole roast, with no log, no event, and a
+    Room tile still showing a temperature the advisor never received.
+
+    The direction is fail-safe, but an RP-B hardware arm would then be recorded
+    as "c11 with ambient" while the model saw the absent branch throughout: a
+    green, meaningless result. Cross-section validation is the only place this
+    is catchable — neither config group can see the other."""
+    doctrine = AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
+
+    # 90 s against the default 30 s cadence is three polls — comfortably valid.
+    assert AppConfig(controller=ControllerConfig(ambient_fan_doctrine=doctrine))
+
+    # The operator widens the poll interval past the bound: rejected at
+    # construction rather than silently voiding the doctrine at roast time.
+    with pytest.raises(pydantic.ValidationError, match="max_reading_age_seconds"):
+        AppConfig(
+            controller=ControllerConfig(ambient_fan_doctrine=doctrine),
+            mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=60.0),
+        )
+
+
+def test_ambient_freshness_bound_is_unconstrained_while_the_doctrine_is_inert() -> None:
+    """#732: the cross-check binds only when the doctrine is ENABLED.
+
+    The doctrine ships inert, so a config that would be rejected with the flag
+    on must stay constructible with it off — otherwise #732 could make an
+    existing, working, doctrine-free deployment unbootable, which is exactly
+    the kind of blast radius an inert feature is supposed to preclude."""
+    assert AppConfig(
+        controller=ControllerConfig(
+            ambient_fan_doctrine=AmbientFanDoctrine(max_reading_age_seconds=10.0)
+        ),
+        mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=600.0),
+    )
 
 
 def test_ambient_fan_step_cannot_be_widened_into_a_slam() -> None:

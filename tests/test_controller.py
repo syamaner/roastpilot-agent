@@ -79,6 +79,12 @@ from tests.conftest import (
     ScriptedStateReader,
 )
 
+# #732: the ambient-freshness seam test drives a REAL RoasterControlAdapter into
+# a real controller, so it borrows that module's canned session-state payload
+# rather than re-deriving a second copy that could drift from the MCP contract.
+# Same cross-module pattern ``tests/test_live.py`` already uses against it.
+from tests.test_mcp_client import SESSION_STATE_PAYLOAD
+
 # --- harness ---
 
 
@@ -4616,6 +4622,11 @@ def test_advisor_context_ambient_tracks_each_tick_and_reads_a_configured_thresho
         (90.1, None),  # past it — declined
         (600.0, None),  # a reading wedged for ten minutes
         (None, None),  # age unknown — fail closed, never "assume fresh"
+        # Non-finite ages fail CLOSED. `nan > max` is False, so a naive
+        # `age > max` would admit nan as fresh — the one fail-OPEN this path
+        # could have hidden, since it is the only inequality in it.
+        (float("nan"), None),
+        (float("inf"), None),
     ],
 )
 def test_advisor_context_declines_ambient_older_than_the_doctrine_bound(
@@ -4693,6 +4704,53 @@ def test_ambient_freshness_bound_is_configurable() -> None:
         contexts.append(ctx.ambient_temp_c)
 
     assert contexts == [None, 23.5]
+
+
+@pytest.mark.asyncio
+async def test_healthy_adapter_read_reaches_the_doctrine_context_populated() -> None:
+    """#732, the pre-open safety review's finding 4: the two halves of this
+    change were tested separately and nothing joined them.
+
+    ``test_mcp_client`` proves the adapter derives an age; the tests above prove
+    a fresh age passes the gate. Neither proves the age the adapter ACTUALLY
+    produces satisfies the bound the controller ACTUALLY applies — and if they
+    ever disagree the failure is silent: ambient is declined every tick, the
+    roast looks normal, the Room tile still shows a temperature (it reads
+    ungated telemetry), and a c11 arm measures the absent-ambient fallback while
+    being recorded as ambient-aware.
+
+    So this drives the real seam — a live ``RoasterControlAdapter`` read feeding
+    a live ``_build_advisor_context`` — rather than a hand-built reading."""
+    elapsed = iter([100.0, 101.0])
+    now = 0.0
+
+    async def call_tool(tool: str, arguments: dict[str, object]) -> object:
+        return {**SESSION_STATE_PAYLOAD, "elapsed_monotonic_seconds": next(elapsed)}
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(call_tool), clock=lambda: now)
+    harness = make_harness(config=_doctrine_on())
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+
+    telemetry = await adapter.read_telemetry()
+    assert telemetry is not None
+    ctx = harness.controller._build_advisor_context(telemetry, limits)  # pyright: ignore[reportPrivateUsage]
+
+    assert ctx.ambient_temp_c == 28.49
+    assert ctx.ambient_humidity_pct == 38.6
+    assert ctx.ambient_fan_threshold_c == AmbientFanDoctrine().threshold_c
+
+    # And it KEEPS reaching the context as the reading ages within the bound. A
+    # gate that only admitted the first tick of each reading would pass the
+    # assertion above and still starve the doctrine for the rest of the roast.
+    now = AmbientFanDoctrine().max_reading_age_seconds - 1.0
+    later = await adapter.read_telemetry()
+    assert later is not None
+    assert later.ambient_age_seconds == now
+    aged = harness.controller._build_advisor_context(later, limits)  # pyright: ignore[reportPrivateUsage]
+    assert aged.ambient_temp_c == 28.49
 
 
 @pytest.mark.asyncio

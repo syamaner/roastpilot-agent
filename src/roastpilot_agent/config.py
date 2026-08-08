@@ -76,6 +76,18 @@ DEFAULT_ADVISOR_MODEL = "openai/gpt-4o"
 # validated against it rather than re-deriving the constant.
 HOTTOP_FAN_LEVEL_PP = 10.0
 
+# The MCP's OWN default ambient poll cadence, mirrored (#732). The agent never
+# sets ``mcp_device.ambient_poll_interval_seconds`` by default — it leaves the
+# field ``None`` and the MCP applies
+# ``coffee_roaster_mcp.config.AmbientConfig.poll_interval_seconds``. That number
+# is what decides how old a HEALTHY reading routinely gets, so the ambient
+# doctrine's freshness bound has to be validated against it even when the
+# operator has set nothing. Mirrored rather than imported to keep config
+# construction free of an MCP import; a contract test asserts the two agree, so
+# a bump that changes the cadence fails loudly here instead of silently
+# narrowing the freshness margin.
+DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS = 30.0
+
 # Phase-keyed advisor MODEL selection (#173, operator 13 Jun): the model slug
 # the advisor uses, by agent phase. The MECHANISM only — every phase defaults to
 # ``DEFAULT_ADVISOR_MODEL`` (gpt-4o everywhere, #277 PIN). Under D35 the advisor
@@ -1878,5 +1890,62 @@ class AppConfig(BaseSettings):
                 "controller.post_first_crack_control.ceiling_guard_temp_c must not exceed "
                 f"safety.bitter_ceiling_temp_c ({guard_temp_c} > "
                 f"{self.safety.bitter_ceiling_temp_c})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_ambient_freshness_bound_outlives_the_poll_interval(self) -> "AppConfig":
+        """The doctrine's freshness bound must exceed the ambient POLL interval (#732).
+
+        The second cross-SECTION validator, and for the same structural reason
+        as the first: ``max_reading_age_seconds`` lives on
+        ``controller.ambient_fan_doctrine`` while the cadence that decides how
+        old a *healthy* reading routinely gets lives on
+        ``mcp_device.ambient_poll_interval_seconds``. Neither section can see
+        the other, so the check can only run here.
+
+        **The failure it prevents is silent and total.** The poll interval is
+        operator-editable from ``/config`` with no maximum, while the freshness
+        bound is file-only. Set the interval above the bound and EVERY reading
+        is stale on EVERY tick, forever — the controller declines ambient for
+        the whole roast, the doctrine runs its absent-ambient fallback, and
+        nothing surfaces that: the dashboard's Room tile reads the ungated
+        telemetry, so it still shows a room temperature the advisor was never
+        given. The direction is fail-safe, but an RP-B hardware arm would be
+        recorded as "c11 with ambient" while the model saw the absent branch on
+        every tick — a green, meaningless result, which is precisely the class
+        of outcome #709's two-act enablement already warns about.
+
+        Requires 2x rather than 1x because a reading is at its oldest just
+        before the next poll lands: at exactly 1x, ordinary cadence alone puts
+        healthy readings at the boundary and the doctrine flaps tick to tick.
+
+        Only enforced while the doctrine is ENABLED, so the inert default can
+        never make an otherwise-valid config unconstructible.
+
+        Returns:
+            The validated application config.
+
+        Raises:
+            ValueError: If the doctrine is enabled and its freshness bound is
+                below twice the effective ambient poll interval.
+        """
+        doctrine = self.controller.ambient_fan_doctrine
+        if not doctrine.enabled:
+            return self
+        poll_seconds = (
+            self.mcp_device.ambient_poll_interval_seconds
+            if self.mcp_device.ambient_poll_interval_seconds is not None
+            else DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS
+        )
+        minimum = 2.0 * poll_seconds
+        if doctrine.max_reading_age_seconds < minimum:
+            raise ValueError(
+                "controller.ambient_fan_doctrine.max_reading_age_seconds must be at least "
+                f"twice mcp_device.ambient_poll_interval_seconds ({minimum:g}) while the "
+                f"doctrine is enabled, or every healthy reading is declined as stale and "
+                f"c11 silently runs its absent-ambient fallback for the whole roast. Got "
+                f"{doctrine.max_reading_age_seconds:g} against a poll interval of "
+                f"{poll_seconds:g}"
             )
         return self

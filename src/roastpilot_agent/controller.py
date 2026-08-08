@@ -4624,7 +4624,16 @@ class RoastController:
         if not doctrine.enabled:
             return None, None
         age_seconds = telemetry.ambient_age_seconds
-        if age_seconds is None or age_seconds > doctrine.max_reading_age_seconds:
+        # Written as ``not (age <= max)`` rather than ``age > max`` so the
+        # comparison fails CLOSED on a non-finite age: every comparison against
+        # ``nan`` is False, so ``nan > max`` would admit it as fresh. The live
+        # adapter cannot produce one (the age is a monotonic difference), but
+        # ``RoastTelemetry.ambient_age_seconds`` is a public float field with
+        # pydantic's default ``allow_inf_nan``, and other constructors exist
+        # (replay frames, the offline bake-off harness, tests). This is the only
+        # inequality in the doctrine path, so it is the only place the fail-open
+        # could hide.
+        if age_seconds is None or not (age_seconds <= doctrine.max_reading_age_seconds):
             return None, None
         return telemetry.ambient_temp_c, telemetry.ambient_humidity_pct
 
