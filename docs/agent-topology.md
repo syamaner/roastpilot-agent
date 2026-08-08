@@ -1,6 +1,14 @@
 # Claude Agent Topology Specification
 
-Status: Ready for adoption (revised 8 Aug 2026)  
+Status: Accepted; phased rollout in progress (revised 8 Aug 2026). Slice 1
+(additive: the read-only planning-architect, the operator output style, and the
+read-only Bash hook) has landed. Slice 2, which re-pins the ten existing role
+definitions from `sonnet`/`opus` aliases to full model IDs and sets explicit
+effort per role, is deferred and gated on live model availability plus a
+mock-slice validation. Until Slice 2 lands, the acceptance criteria in §16 that
+require exact model IDs and explicit effort for every role are NOT yet met for
+the existing roles, and this document is the design of record, not a description
+of the current fleet configuration.  
 Audience: Repository owners, Claude PM/orchestrator sessions, agent authors  
 Scope: Claude Code model selection, planning, delegation, review, and authority boundaries
 

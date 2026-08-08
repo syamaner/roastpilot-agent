@@ -10,7 +10,7 @@ hooks:
     - matcher: "Bash"
       hooks:
         - type: command
-          command: "./.claude/hooks/readonly-bash-guard.sh"
+          command: "\"$CLAUDE_PROJECT_DIR/.claude/hooks/readonly-bash-guard.sh\""
 ---
 
 Investigate and plan only. The Opus PM owns product authority, final scope,
