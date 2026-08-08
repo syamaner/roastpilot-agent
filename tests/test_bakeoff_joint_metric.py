@@ -117,6 +117,43 @@ def test_scalar_ranks_a_nearer_miss_above_a_farther_miss() -> None:
     assert far.scalar == pytest.approx(0.5833333)
 
 
+def test_negative_weight_raises_not_scalar_above_one() -> None:
+    # A negative weight override would flip its error term positive and push the
+    # scalar above the documented [0, 1] range (a miss outranking a HIT). Guard
+    # it fail-closed rather than emit a corrupt score (reviewer catch, PR-D1).
+    with pytest.raises(ValueError, match="non-negative"):
+        replay.joint_window_score(
+            drop_temp_c=200.0,  # 5 C over -> a genuine MISS
+            target_drop_temp_c=195.0,
+            dtr_percent=16.0,
+            target_dtr_percent=16.0,
+            weight_temp=-1.0,
+            weight_dtr=0.0,
+        )
+
+
+def test_non_finite_weight_raises() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        replay.joint_window_score(
+            drop_temp_c=195.0,
+            target_drop_temp_c=195.0,
+            dtr_percent=16.0,
+            target_dtr_percent=16.0,
+            weight_dtr=float("nan"),
+        )
+
+
+def test_non_finite_tolerance_raises() -> None:
+    with pytest.raises(ValueError, match="finite and strictly positive"):
+        replay.joint_window_score(
+            drop_temp_c=195.0,
+            target_drop_temp_c=195.0,
+            dtr_percent=16.0,
+            target_dtr_percent=16.0,
+            tol_temp_c=float("inf"),
+        )
+
+
 def test_scalar_weights_are_overridable() -> None:
     # Weighting drop-temp fully and DTR to zero makes the scalar ignore a large
     # DTR miss (mirrors the tolerance-override surface). HIT is unaffected by

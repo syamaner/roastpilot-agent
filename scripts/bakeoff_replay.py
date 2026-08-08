@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import statistics
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -923,11 +924,20 @@ def joint_window_score(
         The :class:`JointWindowScore`.
 
     Raises:
-        ValueError: If a tolerance is not strictly positive (a zero tolerance
-            would divide by zero in the scalar).
+        ValueError: If a tolerance is not finite and strictly positive (a zero
+            tolerance would divide by zero in the scalar), or if a weight is not
+            finite and non-negative (a negative weight flips its error term
+            positive and pushes the scalar above the documented [0, 1] range, so
+            a miss could outrank a hit and corrupt the aggregate stats).
     """
-    if tol_temp_c <= 0.0 or tol_dtr_pp <= 0.0:
-        raise ValueError("joint-window tolerances must be strictly positive")
+    if not (math.isfinite(tol_temp_c) and tol_temp_c > 0.0) or not (
+        math.isfinite(tol_dtr_pp) and tol_dtr_pp > 0.0
+    ):
+        raise ValueError("joint-window tolerances must be finite and strictly positive")
+    if not (math.isfinite(weight_temp) and weight_temp >= 0.0) or not (
+        math.isfinite(weight_dtr) and weight_dtr >= 0.0
+    ):
+        raise ValueError("joint-window weights must be finite and non-negative")
     drop_err = drop_temp_c - target_drop_temp_c
     dtr_err = dtr_percent - target_dtr_percent
     within_temp = abs(drop_err) <= tol_temp_c
