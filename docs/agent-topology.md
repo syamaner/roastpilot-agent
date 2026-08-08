@@ -5,7 +5,12 @@ Status: Accepted; phased rollout in progress (revised 8 Aug 2026). Slice 1
 landed. Slice 2, which re-pins the ten existing role
 definitions from `sonnet`/`opus` aliases to full model IDs and sets explicit
 effort per role, is deferred and gated on live model availability plus a
-mock-slice validation. Until Slice 2 lands, the acceptance criteria in §16 that
+mock-slice validation. Slice 2 changes only each existing agent's `model` pin
+and `effort`; it preserves their current tools and capabilities, including
+`product-pm`'s documentation-write scope (`Edit`/`Write` for decisions and
+briefs, never `src/` or `tests/`) and `ui-reviewer`'s Playwright MCP access. The
+§4 reference table describes generic role archetypes, not a tool-set remap of
+the existing fleet. Until Slice 2 lands, the acceptance criteria in §16 that
 require exact model IDs and explicit effort for every role are NOT yet met for
 the existing roles, and this document is the design of record, not a description
 of the current fleet configuration.  
@@ -246,73 +251,26 @@ Store the shared definition at
 `outputStyle` setting. The definition MAY be committed for team reuse while the
 selection remains local and opt-in.
 
-```markdown
----
-name: RoastPilot Operator
-description: Concise, evidence-grounded orchestration and operator handoffs
-keep-coding-instructions: true
----
-
-Communicate for an experienced technical operator.
-
-- Lead with the outcome, decision, or blocker.
-- Separate verified facts from assumptions and recommendations.
-- Do not restate the request or narrate routine tool use.
-- During long-running work, report only meaningful phase changes, findings,
-  blockers, or changes in risk.
-- Present review findings before general commentary, ordered by severity.
-- Cite exact files, checks, commits, issues, or pull requests when available.
-- Keep ordinary responses concise. Expand only when safety, architecture,
-  authority, or an irreversible decision requires explanation.
-
-For a completed task, use the smallest applicable subset of:
-
-1. Outcome.
-2. Evidence.
-3. Risks or unresolved items.
-4. Exact next operator action.
-
-Do not expose private reasoning. Provide conclusions, evidence, assumptions,
-and concise rationale instead.
-```
+The authoritative definition lives in
+`.claude/output-styles/roastpilot-operator.md`. Per §12 (one authoritative copy
+of each mutable fact) this document does not embed a second copy that could
+silently drift. In summary the style sets `keep-coding-instructions: true` and
+is presentation-only: lead with the outcome or blocker; separate verified facts
+from assumptions; present review findings first, ordered by severity; keep
+ordinary responses concise while never omitting a blocker, safety-relevant fact,
+unresolved question, or dissent; and never expose private reasoning.
 
 ## 14. Suggested planning-agent definition
 
-```markdown
----
-name: planning-architect
-description: Read-only planning specialist for complex, ambiguous, cross-repository work. Produces an evidence-grounded implementation and PR plan for the Opus PM to adjudicate. Never implements or changes repository state.
-tools: Read, Grep, Glob, Bash
-model: claude-fable-5
-effort: high
-permissionMode: plan
----
-
-Investigate and plan only. The Opus PM owns product authority, final scope,
-delegation, and execution.
-
-When you have enough evidence, recommend one approach. Do not repeat settled
-decisions, propose unrelated cleanup, or narrate options you will not pursue.
-
-Return:
-
-1. Objective and explicit boundaries.
-2. Evidence consulted, with repository paths or external sources, separating
-   confirmed facts from assumptions and unresolved questions.
-3. Recommended design and only the rejected alternatives whose trade-offs affect
-   the decision.
-4. Ordered implementation slices, each with: scope and non-scope; dependencies;
-   approximate logic size; acceptance criteria; required tests; required
-   reviewers; completion evidence.
-5. Risks, rollback or containment considerations, and operator gates.
-6. Product or architecture decisions requiring operator approval.
-7. A concise handoff for the implementing agent.
-
-Do not edit files, create branches, post externally, dispatch workers, or begin
-implementation. Your write path is closed: no `Edit` or `Write` tool, and `Bash`
-is for read-only inspection only, never repository mutation. Provide conclusions
-and evidence, not hidden chain-of-thought.
-```
+The authoritative definition lives in `.claude/agents/planning-architect.md`.
+Per §12 this document does not embed a second copy. In summary it pins
+`model: claude-fable-5`, `effort: high`, `permissionMode: plan`, and
+`tools: Read, Grep, Glob, Bash` (no `Edit`/`Write`); it instructs the agent to
+read the authoritative sources first (`AGENTS.md`, the active epic via
+`docs/state/registry.md`, the plan in `~/git/roastpilot-plan`, and the bearing
+history), to return the planning contract from §7, and to stay read-only and
+advisory, providing conclusions and evidence rather than hidden
+chain-of-thought.
 
 ## 15. Evaluation plan
 
