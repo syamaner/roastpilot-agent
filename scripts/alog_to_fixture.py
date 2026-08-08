@@ -284,6 +284,13 @@ def _summary(profile: dict[str, Any], marks: RoastMarks) -> dict[str, Any]:
         # Tasting corpus label (#522): an .alog has no tasting concept — empty
         # list, kept in the key set for parity with store_to_fixture.
         "tastings": [],
+        # #709: an .alog carries no ambient capture — null, kept in the key set
+        # for parity with store_to_fixture. A replay of an .alog roast
+        # therefore has no room reading, and the ambient fan doctrine's
+        # absent-ambient branch applies, which is correct: we genuinely do not
+        # know what room it ran in.
+        "ambient_temp_c": None,
+        "ambient_humidity_pct": None,
     }
 
 

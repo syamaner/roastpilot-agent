@@ -43,9 +43,10 @@ import math
 import statistics
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from roastpilot_agent.advisor import AdvisorContext, RoastDecision
+from roastpilot_agent.config import AmbientFanDoctrine
 from roastpilot_agent.models import RoastPhase
 
 # How far back to estimate rate-of-rise from the raw temperature series.
@@ -186,6 +187,35 @@ def _phase_at(mono: float, ground: GroundTruth) -> RoastPhase:
     return RoastPhase.DEVELOPMENT
 
 
+def _summary_value(fixture: Path, key: str) -> float | None:
+    """Read one optional numeric from a fixture's sibling ``summary.json``.
+
+    Args:
+        fixture: The ``roast.jsonl`` being replayed.
+        key: The summary key to read.
+
+    Returns:
+        The value as a float, or ``None`` when the summary is absent, the key
+        is missing, or the value is null — the three ways a fixture can
+        legitimately carry no ambient (a pre-#709 fixture, an ``.alog`` roast,
+        or a roast whose ambient probe was off).
+    """
+    summary = fixture.parent / "summary.json"
+    if not summary.is_file():
+        return None
+    try:
+        parsed: object = json.loads(summary.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):  # pragma: no cover - unreadable sidecar
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    data = cast(dict[str, Any], parsed)
+    value = data.get(key)
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 def build_ticks(
     fixture: Path,
     *,
@@ -193,6 +223,7 @@ def build_ticks(
     profile_name: str | None = None,
     target_drop_c_override: float | None = None,
     target_development_percent_override: float | None = None,
+    ambient_doctrine: AmbientFanDoctrine | None = None,
 ) -> tuple[list[ReplayTick], GroundTruth]:
     """Reconstruct the per-tick advisor contexts for a replayed roast.
 
@@ -221,6 +252,15 @@ def build_ticks(
             against the real drop in ``ground``.
         target_development_percent_override: Likewise for
             ``target_development_percent``.
+        ambient_doctrine: When set AND enabled, stamps the #709 ambient fan
+            doctrine's context into every replayed tick: the roast's OWN
+            recorded ambient (read from the fixture's ``summary.json``, never
+            synthesized) plus the doctrine's configured boundary and step
+            bound. ``None`` or disabled leaves all four fields ``None``, which
+            is the doctrine's absent-ambient branch — correct for an ``.alog``
+            roast or a pre-v10 store run that genuinely has no room reading,
+            and the reason a ``c11`` arm run WITHOUT this parameter measures
+            the fallback rather than the doctrine.
 
     Returns:
         ``(ticks, ground_truth)``.
@@ -243,6 +283,15 @@ def build_ticks(
             last_emitted = mono
     if drop_index not in selected:  # pragma: no cover — drop_index is always added in-loop
         selected.append(drop_index)
+
+    # #709: resolved ONCE — the recorded ambient is a per-roast constant (the
+    # #342 charge-time capture), not per-tick data, and the doctrine's two
+    # numbers are config. A disabled or absent doctrine leaves all four None.
+    doctrine = ambient_doctrine if (ambient_doctrine and ambient_doctrine.enabled) else None
+    ambient_temp_c = _summary_value(fixture, "ambient_temp_c") if doctrine else None
+    ambient_humidity_pct = _summary_value(fixture, "ambient_humidity_pct") if doctrine else None
+    ambient_threshold_c = doctrine.threshold_c if doctrine else None
+    ambient_step_max_pp = doctrine.step_max_pp if doctrine else None
 
     ticks: list[ReplayTick] = []
     prev_heat: int | None = None
@@ -291,6 +340,16 @@ def build_ticks(
             # here is either advisor-driven or the deterministic pre-FC lever.
             current_heat_percent=heat,
             current_fan_percent=fan,
+            # #709 (RP-B): the roast's OWN recorded ambient, from the fixture
+            # summary — never ``replay.py``'s synthesized constant, which sits
+            # below the default boundary and would score every roast as a cool
+            # room. Gated on the doctrine being enabled so a replayed context
+            # mirrors the live controller's gate exactly: an arm with the
+            # doctrine off sees the same ``None``s a live c3 roast sees.
+            ambient_temp_c=ambient_temp_c,
+            ambient_humidity_pct=ambient_humidity_pct,
+            ambient_fan_threshold_c=ambient_threshold_c,
+            ambient_fan_step_max_pp=ambient_step_max_pp,
         )
         ticks.append(
             ReplayTick(
