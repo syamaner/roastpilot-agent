@@ -121,8 +121,9 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D124** (D123 records the #718 catalogue
-> query-scope won't-fix decision).
+> Next free plan decision number: **D125** (D124 records the RP-D joint-objective
+> bake-off scorer + RP-B c11 ambient-fan doctrine design, roastpilot-agent#711/#709;
+> D123 records the #718 catalogue query-scope won't-fix decision).
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 2 Aug block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
