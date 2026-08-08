@@ -1,6 +1,8 @@
 # Claude Agent Topology Specification
 
-Status: Accepted; implemented, §15 evaluation pending (revised 8 Aug 2026).
+Status: Accepted; implemented for the subagent fleet; §15 evaluation,
+override-precedence verification, and the PM main-session pin still pending
+(revised 8 Aug 2026).
 Slice 1 (the read-only planning-architect and the operator output style) and
 Slice 2 (the ten existing roles re-pinned from `sonnet`/`opus` aliases to full
 model IDs with explicit effort, plus the matching `AGENTS.md` model-selection
