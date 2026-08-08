@@ -1818,7 +1818,7 @@ def test_c11_keeps_the_fan_crash_mechanism_unconditional() -> None:
     assert "crash the rate of rise in any room" in lowered
     # The at/above branch keeps the watch-the-response discipline too, so the
     # sanctioned decisive step is not an unwatched one.
-    above = lowered[lowered.index("at or above") : lowered.index("below ambient")]
+    above = _bullet_starting_with(section, "- AT OR ABOVE ambient_fan_threshold_c").lower()
     assert "watch the rate of rise after the step" in above
     # Humidity is named with an explicit non-rule rather than left as context
     # the model must silently ignore (finding 5).

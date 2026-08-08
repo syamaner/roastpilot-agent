@@ -14,6 +14,7 @@ from roastpilot_agent.config import (
     DEFAULT_ADVISOR_MODEL,
     OPENROUTER_BASE_URL,
     AdvisorConfig,
+    AmbientFanDoctrine,
     AppConfig,
     BeanSourcingConfig,
     ControllerConfig,
@@ -303,63 +304,71 @@ def test_bean_sourcing_config_rejects_nonsense(overrides: dict[str, object]) -> 
         BeanSourcingConfig.model_validate(overrides)
 
 
-@pytest.mark.parametrize(
-    "value",
-    [260.0, 0.0, -500.0, float("nan"), float("inf")],
-)
+@pytest.mark.parametrize("value", [260.0, 0.0, -500.0, float("nan"), float("inf")])
 def test_ambient_fan_threshold_rejects_out_of_range_and_non_finite(value: float) -> None:
-    """#709 safety review finding 3. This field exists to be RE-FIT BY HAND
-    from RP-D scores, so a typo at exactly that moment is the plausible
-    failure: unbounded, it accepts 260.0 for 26.0 and silently puts every roast
-    in the graduated regime.
+    """#709. This field exists to be RE-FIT BY HAND from RP-D scores, so a typo
+    at exactly that moment is the plausible failure: unbounded, it accepts
+    260.0 for 26.0 and silently puts every roast in the graduated regime.
 
     ``nan`` is quieter and worse — pydantic serialises it to ``null`` in
     ``model_dump_json``, so the advisor sees the field as ABSENT and takes the
-    no-ambient branch rather than any doctrine at all. Both must fail loudly at
-    construction instead."""
+    no-ambient branch rather than any doctrine at all."""
     with pytest.raises(pydantic.ValidationError):
-        ControllerConfig(ambient_fan_threshold_c=value)
-
-
-@pytest.mark.parametrize("value", [0.0, -5.0, 101.0, float("nan"), float("inf")])
-def test_ambient_fan_step_max_rejects_out_of_range_and_non_finite(value: float) -> None:
-    """#709 / D124's ~15 pp ordinary below-threshold step, bounded for the same
-    reasons as the threshold: it is hand-edited, and ``nan`` would serialise to
-    ``null`` so the advisor reads the bound as absent — which is exactly the
-    unbounded "graduated steps" the bound exists to replace."""
-    with pytest.raises(pydantic.ValidationError):
-        ControllerConfig(ambient_fan_step_max_pp=value)
-
-
-def test_ambient_fan_step_max_is_one_hottop_fan_level() -> None:
-    """D124 ratified about 15 pp; D126 refines it to 10.0 because the Hottop
-    fan is a 0-10 INTEGER scale quantised by ``(value + 5) // 10``, so 15 pp is
-    one level from some starting values and two from others.
-
-    Pinned as the QUANTISATION PROPERTY, not the bare number: a step of this
-    size must move the hardware exactly one level from every legal starting
-    fan value. That is what makes the told bound equal the physical move; a
-    future re-fit that breaks the property breaks this test."""
-
-    def hottop_level(percent: float) -> int:
-        # coffee_roaster_mcp.drivers._percent_to_hottop_fan_scale
-        return (int(percent) + 5) // 10
-
-    step = ControllerConfig().ambient_fan_step_max_pp
-    assert step == 10.0
-    for start in range(0, int(100 - step) + 1):
-        moved = hottop_level(start + step) - hottop_level(start)
-        assert moved == 1, f"fan {start} +{step:g} moved {moved} levels, not exactly one"
-    assert ControllerConfig(ambient_fan_step_max_pp=10.0).ambient_fan_step_max_pp == 10.0
+        AmbientFanDoctrine(threshold_c=value)
 
 
 def test_ambient_fan_threshold_accepts_a_real_refit() -> None:
     """The bounds must not obstruct a genuine re-fit across the corpus's real
-    ambient span (23.1–31.6 °C), which is the whole point of holding the
+    ambient span (23.1-31.6 °C), which is the whole point of holding the
     ratified ~26 °C value as config rather than prose."""
-    assert ControllerConfig().ambient_fan_threshold_c == 26.0
-    assert ControllerConfig(ambient_fan_threshold_c=23.5).ambient_fan_threshold_c == 23.5
-    assert ControllerConfig(ambient_fan_threshold_c=31.6).ambient_fan_threshold_c == 31.6
+    assert AmbientFanDoctrine().threshold_c == 26.0
+    assert AmbientFanDoctrine(threshold_c=23.5).threshold_c == 23.5
+    assert AmbientFanDoctrine(threshold_c=31.6).threshold_c == 31.6
+
+
+def test_ambient_fan_step_is_a_whole_number_of_real_hottop_levels() -> None:
+    """#709 / D126, pinned against the REAL driver rather than a copy of its
+    formula. The bound only means anything if a step of this size maps to a
+    whole number of physical Hottop fan levels; that mapping lives in the
+    pinned ``coffee-roaster-mcp`` dependency, so this imports and calls it. A
+    hand-copied formula would stay green in CI while silently ceasing to hold
+    on real hardware after a dependency bump — and `mcp-contract-checker`
+    audits the ``mcp_client`` mirrors, not a formula re-typed in a test body.
+
+    Pinned as the PROPERTY, not the number: the default step must move the
+    hardware exactly one level from every legal starting fan value."""
+    from coffee_roaster_mcp import drivers
+
+    hottop_level = drivers._percent_to_hottop_fan_scale  # pyright: ignore[reportPrivateUsage]
+
+    step = AmbientFanDoctrine().step_max_pp
+    assert step == 10.0
+    for start in range(0, int(100 - step) + 1):
+        moved = hottop_level(int(start + step)) - hottop_level(start)
+        assert moved == 1, f"fan {start} +{step:g} moved {moved} levels, not exactly one"
+
+
+@pytest.mark.parametrize("value", [15.0, 5.0, 12.5, 0.0, -10.0, 101.0, float("nan")])
+def test_ambient_fan_step_rejects_a_non_level_step(value: float) -> None:
+    """#709 / D126: a re-fit to 15.0 would silently reopen the told-vs-enforced
+    gap the field exists to close (from fan 30, a 15 pp step is a 20 pp
+    physical move), so a step that is not a whole number of Hottop levels is
+    rejected at construction rather than merely discouraged in a comment."""
+    with pytest.raises(pydantic.ValidationError):
+        AmbientFanDoctrine(step_max_pp=value)
+
+
+def test_ambient_fan_step_accepts_a_whole_level_refit() -> None:
+    """A re-fit stays possible — it just has to land on a representable step."""
+    assert AmbientFanDoctrine(step_max_pp=20.0).step_max_pp == 20.0
+
+
+def test_ambient_fan_doctrine_is_inert_by_default() -> None:
+    """#709: the doctrine mirrors ``reference_curve``'s inert-until-enabled
+    posture, so merging it changes no roast. Enabling is deliberately two acts
+    (select c11 AND set this flag), the same pairing c9 has with
+    ``reference_curve.enabled``."""
+    assert ControllerConfig().ambient_fan_doctrine.enabled is False
 
 
 def test_app_config_loads_nested_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -23,6 +23,7 @@ from roastpilot_agent.advisor import (
 )
 from roastpilot_agent.coherence import LeverDirection
 from roastpilot_agent.config import (
+    AmbientFanDoctrine,
     ControllerConfig,
     LateMaillardTrim,
     PostFirstCrackControl,
@@ -4446,6 +4447,58 @@ def test_advisor_context_reference_fields_populated_from_cached_reference_roast(
     assert second_ctx.reference_landmarks == reference.landmarks
 
 
+def _doctrine_on(**overrides: float) -> ControllerConfig:
+    """A config with the #709 ambient fan doctrine enabled.
+
+    The doctrine is inert by default (the ``reference_curve`` posture), so a
+    test that wants its context fields populated must opt in explicitly —
+    which is also the operator's real two-act enablement.
+
+    Built by copying ``_BASELINE_POST_FC_CONFIG`` rather than constructing a
+    bare ``ControllerConfig``: the baseline is what every other controller test
+    runs on, and a bare config would silently also flip the post-FC control
+    loop to its production default, changing which actor owns heat and making
+    an ambient assertion fail for an unrelated reason.
+
+    Args:
+        **overrides: Field overrides for the doctrine group.
+
+    Returns:
+        The controller config.
+    """
+    return _BASELINE_POST_FC_CONFIG.model_copy(
+        update={"ambient_fan_doctrine": AmbientFanDoctrine(enabled=True, **overrides)}
+    )
+
+
+def test_advisor_context_omits_the_ambient_doctrine_while_it_is_disabled() -> None:
+    """#709, the defect Codex found pre-merge. c11 is selectable-only and c3 is
+    the live default, so the doctrine's context must not reach the prompt of a
+    roast that never selected it.
+
+    An always-null key is a context-SHAPE addition and inert (#567 reasoned
+    exactly this for its own two fields). A POPULATED, meaningfully-named
+    number is not: ungated, every live c3 roast would carry a real room
+    temperature and a named fan-step bound into a prompt that never teaches
+    them — changing the live advisor's input, and contaminating the very c3
+    baseline the RP-B comparison is measured against.
+
+    So with the flag off, all four fields stay ``None`` EVEN WHEN the tick
+    carries a perfectly good ambient reading."""
+    harness = make_harness()  # default config — doctrine disabled
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
+        reading(ambient_temp_c=23.5, ambient_humidity_pct=36.0), limits
+    )
+    assert ctx.ambient_temp_c is None
+    assert ctx.ambient_humidity_pct is None
+    assert ctx.ambient_fan_threshold_c is None
+    assert ctx.ambient_fan_step_max_pp is None
+
+
 def test_advisor_context_mirrors_this_ticks_ambient_and_the_config_threshold() -> None:
     """#709 (RP-B): the ambient fields are mirrored VERBATIM from THIS tick's
     telemetry — the same live triad the MCP already projects (#464/D86) — and
@@ -4453,7 +4506,7 @@ def test_advisor_context_mirrors_this_ticks_ambient_and_the_config_threshold() -
     config field, never a second copy in the prompt prose (#218). The pressure
     leg is deliberately not carried: the doctrine drives off temperature with
     humidity as context."""
-    harness = make_harness()
+    harness = make_harness(config=_doctrine_on())
     harness.controller.load_profile(PROFILE)
     for step in NORMAL_PATH[:3]:
         harness.controller.transition_to(step)
@@ -4464,8 +4517,8 @@ def test_advisor_context_mirrors_this_ticks_ambient_and_the_config_threshold() -
     )
     assert ctx.ambient_temp_c == 23.5
     assert ctx.ambient_humidity_pct == 36.0
-    assert ctx.ambient_fan_threshold_c == ControllerConfig().ambient_fan_threshold_c
-    assert ctx.ambient_fan_step_max_pp == ControllerConfig().ambient_fan_step_max_pp
+    assert ctx.ambient_fan_threshold_c == AmbientFanDoctrine().threshold_c
+    assert ctx.ambient_fan_step_max_pp == AmbientFanDoctrine().step_max_pp
 
 
 def test_advisor_context_ambient_is_none_when_this_tick_has_no_ambient() -> None:
@@ -4474,7 +4527,7 @@ def test_advisor_context_ambient_is_none_when_this_tick_has_no_ambient() -> None
     or invented reading — the c11 teaching then has no room reading to
     condition on and says so explicitly. The boundary still comes through, so
     an absent ambient is distinguishable from an absent threshold."""
-    harness = make_harness()
+    harness = make_harness(config=_doctrine_on())
     harness.controller.load_profile(PROFILE)
     for step in NORMAL_PATH[:3]:
         harness.controller.transition_to(step)
@@ -4482,7 +4535,7 @@ def test_advisor_context_ambient_is_none_when_this_tick_has_no_ambient() -> None
     ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
     assert ctx.ambient_temp_c is None
     assert ctx.ambient_humidity_pct is None
-    assert ctx.ambient_fan_threshold_c == ControllerConfig().ambient_fan_threshold_c
+    assert ctx.ambient_fan_threshold_c == AmbientFanDoctrine().threshold_c
 
 
 def test_advisor_context_ambient_tracks_each_tick_and_reads_a_configured_threshold() -> None:
@@ -4491,7 +4544,7 @@ def test_advisor_context_ambient_tracks_each_tick_and_reads_a_configured_thresho
     And an operator-configured threshold flows through unchanged, which is the
     whole point of holding the ratified ~26 °C value as DATA: it re-fits from
     RP-D (#711) scores by changing config, with no prompt edit."""
-    harness = make_harness(config=ControllerConfig(ambient_fan_threshold_c=24.5))
+    harness = make_harness(config=_doctrine_on(threshold_c=24.5))
     harness.controller.load_profile(PROFILE)
     for step in NORMAL_PATH[:3]:
         harness.controller.transition_to(step)
@@ -4519,10 +4572,14 @@ async def test_ambient_fan_doctrine_is_advisory_only_and_actuates_no_lever() -> 
     untouched and no fan slew clamp ships with this release (6 Aug
     ratification: prompt-only, no clamp)."""
     cold = harness_in_development(
-        readings=[reading(ambient_temp_c=23.1)], advisor=FakeAdvisor([decision(heat=60, fan=100)])
+        readings=[reading(ambient_temp_c=23.1)],
+        advisor=FakeAdvisor([decision(heat=60, fan=100)]),
+        config=_doctrine_on(),
     )
     hot = harness_in_development(
-        readings=[reading(ambient_temp_c=31.6)], advisor=FakeAdvisor([decision(heat=60, fan=100)])
+        readings=[reading(ambient_temp_c=31.6)],
+        advisor=FakeAdvisor([decision(heat=60, fan=100)]),
+        config=_doctrine_on(),
     )
     for harness in (cold, hot):
         harness.controller.request_advisory()

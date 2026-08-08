@@ -178,16 +178,11 @@ class AdvisorContext(BaseModel):
     explicitly tells the model NOT to condition a fan decision on (ten noisy
     corpus roasts support a temperature-first reading and nothing more). They
     are
-    mirrored VERBATIM from the same per-tick
-    :class:`~roastpilot_agent.models.RoastTelemetry` triad the controller
-    already receives (#464, D86) — never re-read, re-derived, or averaged
-    here. Read-only context with no control authority: no lever is derived
-    from them, and neither the controller nor the safety policy ever reads
-    them back, so #498's full fan capability is untouched (the doctrine
-    changes what the model is TOLD, never what the box ENFORCES). Default
-    ``None`` so a context built where ambient is uncaptured, disabled, or
-    unavailable (and every older caller) stays valid — the doctrine then
-    simply has no ambient to condition on.
+    read-only, carry no control authority, and are populated only while
+    ``ControllerConfig.ambient_fan_doctrine`` is enabled — see the field
+    comments below for the sourcing and gating rules, and
+    :class:`~roastpilot_agent.config.AmbientFanDoctrine` for why the gate
+    exists.
     """
 
     phase: RoastPhase
@@ -390,9 +385,12 @@ class AdvisorContext(BaseModel):
     # then has no boundary to compare against and says so.
     ambient_fan_threshold_c: float | None = None
     # #709 (RP-B): the size of an ORDINARY below-threshold fan step, in
-    # percentage points, from ``ControllerConfig.ambient_fan_step_max_pp``
-    # (default 15.0, ratified with the threshold and recorded in D124). Data
-    # rather than prose for the same reason as the boundary above, and present
+    # percentage points, from ``ControllerConfig.ambient_fan_doctrine.step_max_pp``
+    # (default 10.0 — D124 ratified "about 15 pp"; D126 refined it to one
+    # Hottop fan level, since the driver quantises fan with ``(value + 5) //
+    # 10`` so 15 pp is one level from some starting values and two from
+    # others). Data rather than prose for the same reason as the boundary
+    # above, and present
     # at all because "graduated steps" with no bound is not a bound: with no
     # deterministic slew clamp in this release, an unbounded graduation still
     # permits the fan slam the doctrine exists to prevent.
