@@ -4711,14 +4711,6 @@ class RoastController:
             reference_landmarks=(
                 None if self._reference_roast is None else self._reference_roast.landmarks
             ),
-            # #709 (RP-B): mirrored VERBATIM from THIS tick's telemetry — the
-            # same live ambient triad the MCP already projects each tick
-            # (#464/D86) and the snapshot already surfaces. Not re-read from
-            # the MCP, not cached, not averaged: whatever this tick's
-            # telemetry carries (including ``None`` when ambient is
-            # uncaptured, disabled, or unavailable) is what the model is told.
-            # Read-only context for the c11 fan doctrine — no lever is derived
-            # from it and no control path reads it back.
             # #709 (RP-B): the ambient-aware fan doctrine's context, fed ONLY
             # when the doctrine is explicitly enabled — the ``reference_curve``
             # posture (#567 Slice B). Flag off (the default) leaves all four

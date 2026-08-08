@@ -1001,7 +1001,7 @@ class AmbientFanDoctrine(BaseModel):
     the graduated regime. ``nan`` is quieter and worse, since it serialises to
     ``null`` and the model would read the boundary as absent."""
 
-    step_max_pp: float = Field(default=10.0, gt=0.0, le=100.0)
+    step_max_pp: float = Field(default=10.0, gt=0.0, le=_HOTTOP_FAN_LEVEL_PP * 2)
     """The size of an ORDINARY below-threshold fan step, in percentage points.
 
     Default 10.0 per D126, refining D124's ratified "about 15 pp" on hardware
@@ -1014,11 +1014,20 @@ class AmbientFanDoctrine(BaseModel):
     the path this doctrine exists to protect. This is the same quantisation
     fact ``post_fc_deadband_threshold_percent`` (also 10) already encodes.
 
-    Constrained to whole multiples of 10 so that ANY accepted value maps to an
-    exact whole number of Hottop levels, keeping told == physically-moved
-    across a re-fit (10 pp = one level, 20 pp = two). A re-fit to 15.0 would
-    silently reopen the gap D126 closed, so it is rejected at construction
-    rather than merely discouraged in a comment.
+    Constrained twice, because each bound catches a different failure:
+
+    * a whole multiple of one level, so ANY accepted value maps to an exact
+      whole number of Hottop levels and told == physically-moved across a
+      re-fit (10 pp = one level, 20 pp = two). A re-fit to 15.0 would silently
+      reopen the gap D126 closed, so it is rejected at construction.
+    * at most TWO levels. Without this, a "whole multiple" alone accepts 100.0
+      — a full floor-to-ceiling move as an ORDINARY, non-emergency,
+      below-threshold step. That would make the docstring line above ("bounds
+      the STEP, never the destination") false, and with no deterministic slew
+      clamp in this release nothing downstream would catch it: it just moves
+      the fan slam this doctrine exists to prevent from the prose into the
+      config. Beyond two levels a step is not graduation in any meaningful
+      sense.
 
     It bounds the STEP, never the destination: every fan value, including the
     ceiling, stays reachable, and the teaching says so explicitly. It is also
@@ -1040,8 +1049,9 @@ class AmbientFanDoctrine(BaseModel):
             raise ValueError(
                 "ambient_fan_doctrine.step_max_pp must be a whole multiple of "
                 f"{_HOTTOP_FAN_LEVEL_PP:g} pp (one Hottop fan level), so the bound the "
-                "model is told equals the move the driver actually makes — its "
-                f"(value + 5) // 10 quantisation (D126). Got {self.step_max_pp:g}"
+                "model is told maps to a whole number of physical fan levels under "
+                f"the driver's (value + 5) // 10 quantisation (D126). Got "
+                f"{self.step_max_pp:g}"
             )
         return self
 

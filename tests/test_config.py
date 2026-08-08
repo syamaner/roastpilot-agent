@@ -348,7 +348,7 @@ def test_ambient_fan_step_is_a_whole_number_of_real_hottop_levels() -> None:
         assert moved == 1, f"fan {start} +{step:g} moved {moved} levels, not exactly one"
 
 
-@pytest.mark.parametrize("value", [15.0, 5.0, 12.5, 0.0, -10.0, 101.0, float("nan")])
+@pytest.mark.parametrize("value", [15.0, 5.0, 12.5, 0.0, -10.0, 30.0, 100.0, 101.0, float("nan")])
 def test_ambient_fan_step_rejects_a_non_level_step(value: float) -> None:
     """#709 / D126: a re-fit to 15.0 would silently reopen the told-vs-enforced
     gap the field exists to close (from fan 30, a 15 pp step is a 20 pp
@@ -359,8 +359,30 @@ def test_ambient_fan_step_rejects_a_non_level_step(value: float) -> None:
 
 
 def test_ambient_fan_step_accepts_a_whole_level_refit() -> None:
-    """A re-fit stays possible — it just has to land on a representable step."""
+    """A re-fit stays possible — it just has to land on a representable step,
+    and stay inside the two-level ceiling."""
     assert AmbientFanDoctrine(step_max_pp=20.0).step_max_pp == 20.0
+
+
+def test_ambient_fan_step_cannot_be_widened_into_a_slam() -> None:
+    """#709, independent-triage blocker. A whole-multiple rule ALONE accepts
+    100.0 — a full floor-to-ceiling move as an ORDINARY, non-emergency,
+    below-threshold step. That would falsify the doctrine's own "bounds the
+    STEP, never the destination" claim and, with no deterministic slew clamp in
+    this release, nothing downstream would catch it: the fan slam simply moves
+    from the prose into the config.
+
+    Pinned as the PROPERTY: whatever the field accepts, an ordinary step may
+    never span more than two Hottop fan levels."""
+    from coffee_roaster_mcp import drivers
+
+    hottop_level = drivers._percent_to_hottop_fan_scale  # pyright: ignore[reportPrivateUsage]
+    widest = AmbientFanDoctrine.model_fields["step_max_pp"].metadata
+    # Whatever the declared ceiling is, it must not exceed two levels of travel.
+    accepted_max = AmbientFanDoctrine(step_max_pp=20.0).step_max_pp
+    assert hottop_level(int(accepted_max)) - hottop_level(0) <= 2, widest
+    with pytest.raises(pydantic.ValidationError):
+        AmbientFanDoctrine(step_max_pp=100.0)
 
 
 def test_ambient_fan_doctrine_is_inert_by_default() -> None:

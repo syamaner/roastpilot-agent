@@ -168,21 +168,10 @@ class AdvisorContext(BaseModel):
     past roast, older callers, and every replay session, which pins live
     reference retrieval off).
 
-    ``ambient_temp_c`` / ``ambient_humidity_pct`` (#709, RP-B) carry the
-    roasting room's live conditions for the ambient-aware fan doctrine of
-    #707/D122: at higher ambient an aggressive fan is appropriate, while at
-    lower ambient a fan slam crashes the rate of rise into a
-    temperature-short drop. The doctrine conditions on ``ambient_temp_c``
-    ALONE — compared against ``ambient_fan_threshold_c`` below;
-    ``ambient_humidity_pct`` is background context that the ``c11`` teaching
-    explicitly tells the model NOT to condition a fan decision on (ten noisy
-    corpus roasts support a temperature-first reading and nothing more). They
-    are
-    read-only, carry no control authority, and are populated only while
-    ``ControllerConfig.ambient_fan_doctrine`` is enabled — see the field
-    comments below for the sourcing and gating rules, and
-    :class:`~roastpilot_agent.config.AmbientFanDoctrine` for why the gate
-    exists.
+    The four ``ambient_*`` fields (#709, RP-B) carry the ambient-aware fan
+    doctrine's inputs for the ``c11`` teaching. See
+    :class:`~roastpilot_agent.config.AmbientFanDoctrine` for the doctrine
+    itself and why it is gated, and the field comments below for sourcing.
     """
 
     phase: RoastPhase
@@ -371,7 +360,8 @@ class AdvisorContext(BaseModel):
     ambient_humidity_pct: float | None = None
     # #709 (RP-B): the doctrine BOUNDARY the c11 teaching compares
     # ``ambient_temp_c`` against — supplied as DATA from
-    # ``ControllerConfig.ambient_fan_threshold_c`` (default 26.0) rather than
+    # ``ControllerConfig.ambient_fan_doctrine.threshold_c`` (default 26.0)
+    # rather than
     # written into the prompt prose, so the operator's ratified ~26 °C
     # HYPOTHESIS can be re-fit from RP-D (#711) joint scores by changing config
     # alone, with no prompt edit and no fresh bake-off. Exactly the shape
