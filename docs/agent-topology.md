@@ -1,9 +1,10 @@
 # Claude Agent Topology Specification
 
-Status: Accepted and adopted (revised 8 Aug 2026). Slice 1 (the read-only
-planning-architect and the operator output style) and Slice 2 (the ten existing
-roles re-pinned from `sonnet`/`opus` aliases to full model IDs with explicit
-effort, plus the matching `AGENTS.md` model-selection guidance) have both landed.
+Status: Accepted; implemented, §15 evaluation pending (revised 8 Aug 2026).
+Slice 1 (the read-only planning-architect and the operator output style) and
+Slice 2 (the ten existing roles re-pinned from `sonnet`/`opus` aliases to full
+model IDs with explicit effort, plus the matching `AGENTS.md` model-selection
+guidance) have both landed.
 Slice 2 updated each existing agent's `model` pin and
 `effort`, and the corresponding model-selection guidance in `AGENTS.md` (so the
 prose and the pins agree rather than contradict); it preserves their current
@@ -14,9 +15,11 @@ role archetypes, not a tool-set remap of the existing fleet. Operator note:
 `claude-opus-5` and `claude-fable-5` availability was confirmed for this
 environment before Slice 1 shipped, so the planning-architect's Fable pin
 resolves; the Slice-2 model-availability gate covers the fleet re-pin
-validation. The §16 acceptance criteria (exact model IDs and explicit effort for
-every role) are now met; this document is the design of record and matches the
-current fleet configuration.  
+validation. The §16 criteria for exact model IDs and explicit effort on every
+role are now met and this document matches the current fleet configuration, but
+the §15 evaluation on the five representative cases (and the §16 evaluation-
+evidence criterion) remains outstanding: Slice-2 validation was limited to the
+mock-slice run, so the topology is in effect but not yet the validated default.  
 Audience: Repository owners, Claude PM/orchestrator sessions, agent authors  
 Scope: Claude Code model selection, planning, delegation, review, and authority boundaries
 
