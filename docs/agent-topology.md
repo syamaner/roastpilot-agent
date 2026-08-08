@@ -316,6 +316,35 @@ Measure:
 
 Model and effort changes MUST be evaluated against these cases rather than adopted solely from general guidance.
 
+Evidence is recorded in `docs/agent-topology-evaluation.md`, one entry per real
+story. Recorded so far: **RP-B (#709)**, covering the ambiguous-multi-slice and
+safety-sensitive archetypes. Still outstanding: a simple single-slice task that
+should bypass the planner, a cross-repository change, and a previously failed or
+heavily reworked task. The PM output-style measurements in this section remain
+unevaluated, because the `RoastPilot Operator` style was not selected for the
+RP-B session.
+
+Two findings from the RP-B entry bear on this specification directly rather than
+on the story:
+
+1. **§6's trigger list and skip list can both fire on one task**, and the text
+   does not say which dominates. RP-B hit multiple dependent slices, a safety
+   boundary, and extensive history to reconcile, while its design was
+   simultaneously already authoritative. The planner was skipped on that basis,
+   and every defect that later reached the PR lived in a *join* between two
+   individually-correct artifacts (a construction and an evaluation protocol
+   ratified separately). "The design is settled" should therefore NOT be
+   sufficient grounds to skip the planner when a story spans artifacts that were
+   ratified independently.
+2. **§7's read-only posture depends on an operational control that a reasonable
+   agent can breach.** A review role ran `git checkout origin/main -- .` in the
+   shared checkout as an ordinary-looking verification step, overwriting the
+   working tree. Nothing was lost and it self-reported, but the spec's
+   "don't run read-only roles under permissive parent modes" control does not
+   address a destructive command that looks like inspection. Read-only reviewers
+   SHOULD be directed to verify against a separate worktree rather than the
+   shared checkout.
+
 ## 16. Acceptance criteria
 
 This topology is ready when:
