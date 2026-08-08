@@ -1,8 +1,7 @@
 # Claude Agent Topology Specification
 
-Status: Accepted; implemented for the subagent fleet; §15 evaluation,
-override-precedence verification, and the PM main-session pin still pending
-(revised 8 Aug 2026).
+Status: Accepted; implemented for the subagent fleet; §15 evaluation and the PM
+main-session pin still pending (revised 8 Aug 2026).
 Slice 1 (the read-only planning-architect and the operator output style) and
 Slice 2 (the ten existing roles re-pinned from `sonnet`/`opus` aliases to full
 model IDs with explicit effort, plus the matching `AGENTS.md` model-selection
@@ -17,14 +16,17 @@ role archetypes, not a tool-set remap of the existing fleet. Operator note:
 `claude-opus-5` and `claude-fable-5` availability was confirmed for this
 environment before Slice 1 shipped, so the planning-architect's Fable pin
 resolves; the Slice-2 model-availability gate covers the fleet re-pin
-validation. This PR sets exact model IDs and explicit effort for every
-named-subagent role and aligns `AGENTS.md`. It does not by itself satisfy the
-remaining §16 adoption criteria, which stay outstanding: the §15 evaluation on
-the five representative cases (the §16 evaluation-evidence criterion); effective-
-model verification against the override surface in §5 (`CLAUDE_CODE_SUBAGENT_MODEL`,
-per-invocation parameters, `availableModels`, organisation restrictions); and the
-Product PM main-session pin, which is an operator setting (`model: claude-opus-5`
-or `--model`, never `default`), not repository config. The topology is in effect
+validation. Exact model IDs and explicit effort are set for every named-subagent
+role, `AGENTS.md` agrees, the inline workflow stages in `review-branch.mjs` are
+pinned, and a consistency test (`tests/test_agent_model_pins.py`) guards the pins
+against drift and against committed settings that would defeat them (the
+repository side of the §5 override surface). Two §16 adoption criteria remain
+outstanding: the §15 evaluation on the five representative cases (the §16
+evaluation-evidence criterion), and the Product PM main-session pin, which is an
+operator setting (`model: claude-opus-5` or `--model`, never `default`), not
+repository config. The live-environment and organisation side of the §5 override
+surface (`CLAUDE_CODE_SUBAGENT_MODEL`, `availableModels`, organisation
+restrictions) is likewise a standing operator check. The topology is in effect
 for the subagent fleet but not yet the validated default.  
 Audience: Repository owners, Claude PM/orchestrator sessions, agent authors  
 Scope: Claude Code model selection, planning, delegation, review, and authority boundaries

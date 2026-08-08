@@ -642,7 +642,10 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   judgment or subtle correctness triage. Why the pins matter: an agent with no `model:`
   inherits the PARENT, so a careless spawn from the Opus main loop silently runs Opus —
   the per-role defaults stop that. The Opus main loop conserves credits by delegating
-  execution to Sonnet.
+  execution to Sonnet. The `planning-architect` is the one Fable role: pinned
+  `model: claude-fable-5` at `effort: high`, read-only and advisory, invoked
+  selectively for complex, ambiguous, or cross-repository planning (see
+  `docs/agent-topology.md`).
 - **Skills** (`.claude/skills/`): `triage-pr` (→ `pr-triage`), `capture` (drive
   the replay harness + SPA, screenshot a named page state — E10+).
 - **Workflows** (`.claude/workflows/`): `review-branch` (cross-checked roster

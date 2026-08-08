@@ -58,6 +58,17 @@ const SCOPE_SCHEMA = {
     summary: { type: 'string' },
   },
 }
+// Model pin for the workflow's own inline stages (scope, the correctness lens,
+// and the finding verifiers). Lenses that name an agentType resolve their model
+// and effort from that (now full-ID) agent definition instead; this only pins
+// the stages that have no agent of their own, so they never silently inherit the
+// caller's model. Single source for all three.
+const REVIEW_MODEL = 'claude-sonnet-5'
+// Safety-lens findings come from the always-Opus safety-reviewer; verify them on
+// the same tier, so a lower-tier Sonnet verifier can't return survives=false and
+// silently discard a subtle safety finding before triage. Other lenses verify on
+// the review model.
+const SAFETY_VERIFY_MODEL = 'claude-opus-5'
 const scope = await agent(
   `Scope a code review of the current branch. Run \`git fetch origin -q\` first so the base ref is current, then \`git diff --name-only ${base}...HEAD\` and \`git diff --stat ${base}...HEAD\` in this repo. Report which areas changed: web/ (the SPA), Python (src/roastpilot_agent or tests/), and specifically safety.py / controller.py / a models.py enum (the safety-critical surface). List the changed files and a one-line summary.
 
@@ -71,7 +82,7 @@ Otherwise set it false — do not stretch the test to fit an unrelated diff.
 Finally, set \`addsProviderCallPath\` for the narrower CONTENTION case, which routes the safety lens. The test is capability to contend with the roast advisor, NOT whether the remote backend is byte-identical: a path to a *separate* model service still contends if it can consume the same host CPU, event loop, memory, network, or provider rate limit during an active roast (checklist class 6 explicitly covers bounding provider AND CPU contention). Set it true whenever the diff adds such a path, EVEN IF it already appears to carry an active-roast admission guard, a lock, or a queue — whether that mitigation is correct is precisely what the safety lens exists to verify, so a present-looking guard is a reason to route the review, never a reason to skip it. "New path" means new REACHABILITY, not a new call site: a diff adding an endpoint, route, job, or service method that reaches a provider through an EXISTING helper still counts. Set it FALSE when the diff only modifies an EXISTING provider path without creating a new way to reach one (tweaking the roast advisor's own integration is not a new path), and when it reaches no provider at all.
 
 Do NOT review the content yet.`,
-  { label: 'scope', phase: 'Scope', schema: SCOPE_SCHEMA },
+  { label: 'scope', phase: 'Scope', schema: SCOPE_SCHEMA, model: REVIEW_MODEL, effort: 'high' },
 )
 if (scope) log(scope.summary)
 
@@ -142,7 +153,14 @@ if (scopeUnknown || scope.touchesWeb) {
 const reviews = await parallel(
   lenses.map((l) => async () => {
     const opts = { label: `review:${l.key}`, phase: 'Review', schema: FINDINGS_SCHEMA }
+    // A lens with an agentType resolves its model + effort from that (now full-ID)
+    // agent definition; a lens without one (correctness) would inherit the caller,
+    // so pin it explicitly to the review model.
     if (l.agentType) opts.agentType = l.agentType
+    else {
+      opts.model = REVIEW_MODEL
+      opts.effort = 'high'
+    }
     const r = await agent(l.prompt, opts)
     // Fail CLOSED, same reasoning as the scope gate: a lens that returned nothing did
     // NOT pass — it failed to run. Flattening that to an empty findings list makes a
@@ -219,7 +237,9 @@ const verified = await parallel(
   claimFindings.map((f) => () =>
     agent(
       `A reviewer raised this finding on ${diffScope}:\n\nTitle: ${f.title}\nSeverity: ${f.severity}\nFile: ${f.file}${f.line ? ':' + f.line : ''}\nDetail: ${f.detail}\n\nRun ${diffScope} and read the cited file for context first, then adversarially VERIFY it against the actual diff + code. Try to REFUTE it. Does it survive — a real, in-scope issue this change introduced? Default to survives=false if uncertain, already-handled, pre-existing, or out of scope.`,
-      { label: `verify:${f.lens}`, phase: 'Verify', schema: VERDICT_SCHEMA },
+      f.lens === 'safety'
+        ? { label: `verify:${f.lens}`, phase: 'Verify', schema: VERDICT_SCHEMA, model: SAFETY_VERIFY_MODEL, effort: 'xhigh' }
+        : { label: `verify:${f.lens}`, phase: 'Verify', schema: VERDICT_SCHEMA, model: REVIEW_MODEL, effort: 'high' },
     ).then((v) => ({
       ...f,
       // A dead verifier is NOT a refutation (#680 P1). agent() returns null on a
