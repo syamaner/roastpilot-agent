@@ -389,6 +389,39 @@ def test_ambient_fan_step_accepts_a_whole_level_refit() -> None:
     assert AmbientFanDoctrine(step_max_pp=20.0).step_max_pp == 20.0
 
 
+@pytest.mark.parametrize("value", [900.0, 601.0, 0.0, -30.0, float("inf"), float("nan")])
+def test_ambient_freshness_bound_cannot_be_widened_into_no_bound(value: float) -> None:
+    """#732, and the SECOND occurrence of the shape independent triage blocked
+    on #709's ``step_max_pp``: a hand-refit knob whose ceiling sits far above
+    its intent lets a plausible typo validate.
+
+    ``900.0`` for ``90.0`` passes a ``gt=0.0``-only rule and silently disables
+    the staleness guard for most of a 12-20 minute roast — the guard is still
+    there, still tested, and no longer guarding anything. ``inf`` disables it
+    outright AND freezes a bare ``Infinity`` token into the per-run
+    ``config_json``, which is not valid strict JSON. ``nan`` is quieter still:
+    every comparison against it is ``False``, so the bound would never fire.
+
+    The whole point is a config-only re-fit, so nothing downstream would catch
+    any of these — validation is the only place they can be caught."""
+    with pytest.raises(pydantic.ValidationError):
+        AmbientFanDoctrine(max_reading_age_seconds=value)
+
+
+def test_ambient_freshness_bound_accepts_a_real_refit() -> None:
+    """#732: the operator can genuinely re-fit it — a slower ambient poll wants
+    a wider bound, and the tighter 60 s (two poll cycles) option must hold too.
+    Asserted against the field's own declared ceiling so the test tracks the
+    real bound rather than restating today's literal."""
+    ceiling = _declared_le(AmbientFanDoctrine, "max_reading_age_seconds")
+
+    assert AmbientFanDoctrine(max_reading_age_seconds=60.0).max_reading_age_seconds == 60.0
+    assert AmbientFanDoctrine(max_reading_age_seconds=ceiling).max_reading_age_seconds == ceiling
+    # A whole roast's length is the reasoning behind the ceiling: past that it
+    # is not a freshness bound at all.
+    assert ceiling <= 600.0
+
+
 def test_ambient_fan_step_cannot_be_widened_into_a_slam() -> None:
     """#709, independent-triage blocker. A whole-multiple rule ALONE accepts
     100.0 — a full floor-to-ceiling move as an ORDINARY, non-emergency,

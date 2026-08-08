@@ -4505,7 +4505,10 @@ def _fresh_ambient(
     )
 
 
-def test_advisor_context_omits_the_ambient_doctrine_while_it_is_disabled() -> None:
+@pytest.mark.parametrize("age_seconds", [2.0, 600.0, None])
+def test_advisor_context_omits_the_ambient_doctrine_while_it_is_disabled(
+    age_seconds: float | None,
+) -> None:
     """#709, the defect Codex found pre-merge. c11 is selectable-only and c3 is
     the live default, so the doctrine's context must not reach the prompt of a
     roast that never selected it.
@@ -4518,14 +4521,23 @@ def test_advisor_context_omits_the_ambient_doctrine_while_it_is_disabled() -> No
     baseline the RP-B comparison is measured against.
 
     So with the flag off, all four fields stay ``None`` EVEN WHEN the tick
-    carries a perfectly good ambient reading."""
+    carries a perfectly good ambient reading.
+
+    Parametrized over freshness (#732) to prove the staleness gate is
+    inert-CONSISTENT: the doctrine now has three knobs, and with ``enabled``
+    off, a fresh, a stale, and an unknown-age reading must all produce the
+    identical empty context. #732 has to stay as complete a no-op on a live
+    ``c3`` roast as #731 was — a freshness gate that changed anything while the
+    doctrine is disabled would be a behavioural change smuggled in behind an
+    off switch."""
     harness = make_harness()  # default config — doctrine disabled
     harness.controller.load_profile(PROFILE)
     for step in NORMAL_PATH[:3]:
         harness.controller.transition_to(step)
     limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
     ctx = harness.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
-        _fresh_ambient(ambient_temp_c=23.5, ambient_humidity_pct=36.0), limits
+        reading(ambient_temp_c=23.5, ambient_humidity_pct=36.0, ambient_age_seconds=age_seconds),
+        limits,
     )
     assert ctx.ambient_temp_c is None
     assert ctx.ambient_humidity_pct is None

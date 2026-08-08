@@ -1035,8 +1035,14 @@ class AmbientFanDoctrine(BaseModel):
     is still climbing, fan is the only brake left and graduation does not
     apply."""
 
-    max_reading_age_seconds: float = Field(default=90.0, gt=0.0)
+    max_reading_age_seconds: float = Field(default=90.0, gt=0.0, le=600.0)
     """How old a live ambient reading may be and still reach the advisor (#732).
+
+    Unlike the two fields above, this one is **controller-only**: it gates what
+    the controller populates and is never surfaced into ``AdvisorContext``, so
+    no prompt ever sees it. The group now holds knobs for two audiences —
+    ``threshold_c`` and ``step_max_pp`` are told to the model, this is not — and
+    a fourth field should say which it is.
 
     ``c11`` selects a fan regime by comparing ``ambient_temp_c`` against
     :attr:`threshold_c`, so a stale reading does not degrade gracefully — it
@@ -1058,7 +1064,18 @@ class AmbientFanDoctrine(BaseModel):
     (``coffee_roaster_mcp.config.AmbientConfig.poll_interval_seconds``), so
     ordinary poll jitter and a couple of missed cycles never flap the doctrine
     while a genuinely wedged reading is out within about a minute and a half —
-    well inside a roast's post-first-crack window, where the doctrine acts."""
+    well inside a roast's post-first-crack window, where the doctrine acts.
+    It is a BOUND, not a measurement: no corpus records reading age, so this is
+    picked off the MCP's own cadence. Being too tight merely falls back to the
+    absent-ambient branch; too loose is the failure being fixed.
+
+    Ceilinged at 600.0 for the reason ``step_max_pp``'s own ceiling exists — a
+    hand-refit knob whose ceiling sits far above its intent lets a plausible
+    typo validate. ``900.0`` for ``90.0`` would pass ``gt=0.0`` alone and
+    silently disable the guard for most of a 12-20 minute roast, and a bare
+    ``inf`` would disable it outright while freezing a non-standard
+    ``Infinity`` token into ``config_json``. Ten minutes exceeds any real
+    freshness bound: past a whole roast's length this is not a staleness gate."""
 
     @model_validator(mode="after")
     def _step_must_be_a_whole_number_of_hottop_levels(self) -> "AmbientFanDoctrine":
