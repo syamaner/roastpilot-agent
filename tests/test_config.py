@@ -321,6 +321,23 @@ def test_ambient_fan_threshold_rejects_out_of_range_and_non_finite(value: float)
         ControllerConfig(ambient_fan_threshold_c=value)
 
 
+@pytest.mark.parametrize("value", [0.0, -5.0, 101.0, float("nan"), float("inf")])
+def test_ambient_fan_step_max_rejects_out_of_range_and_non_finite(value: float) -> None:
+    """#709 / D124's ~15 pp ordinary below-threshold step, bounded for the same
+    reasons as the threshold: it is hand-edited, and ``nan`` would serialise to
+    ``null`` so the advisor reads the bound as absent — which is exactly the
+    unbounded "graduated steps" the bound exists to replace."""
+    with pytest.raises(pydantic.ValidationError):
+        ControllerConfig(ambient_fan_step_max_pp=value)
+
+
+def test_ambient_fan_step_max_defaults_to_the_ratified_step() -> None:
+    """D124 ratified about 15 pp. The value lives in config, not prompt prose,
+    so it re-fits from RP-D scores without a prompt edit."""
+    assert ControllerConfig().ambient_fan_step_max_pp == 15.0
+    assert ControllerConfig(ambient_fan_step_max_pp=10.0).ambient_fan_step_max_pp == 10.0
+
+
 def test_ambient_fan_threshold_accepts_a_real_refit() -> None:
     """The bounds must not obstruct a genuine re-fit across the corpus's real
     ambient span (23.1–31.6 °C), which is the whole point of holding the

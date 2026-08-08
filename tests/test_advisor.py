@@ -1635,6 +1635,7 @@ def test_c11_ambient_section_names_the_context_fields_and_no_numbers() -> None:
     assert "ambient_temp_c" in section
     assert "ambient_humidity_pct" in section
     assert "ambient_fan_threshold_c" in section
+    assert "ambient_fan_step_max_pp" in section
     # (2) both regimes are present and the boundary is an explicit comparison.
     assert "at or above" in lowered
     assert "below" in lowered
@@ -1670,6 +1671,14 @@ def test_c11_qualifies_the_fan_brake_and_does_not_regress_high_ambient_fan() -> 
     # (2) below the boundary the lever is NOT capped — only the pace changes.
     assert "the fan ceiling is unchanged" in lowered
     assert "every fan value stays available" in lowered
+    # (2b) the below-threshold bullet bounds the STEP by the context field
+    # (D124's ~15 pp, as data) while explicitly leaving the destination open.
+    # Without a bound, "graduated" permits a 30-to-85 jump and this release
+    # ships no deterministic slew clamp to stop it.
+    below = _bullet_starting_with(section, "- BELOW ambient_fan_threshold_c")
+    assert "ambient_fan_step_max_pp" in below
+    assert "bounds the STEP, not the destination" in below
+    assert "including the ceiling itself" in below.lower()
     # (3) the c3 brake teaching survives VERBATIM and, critically, appears
     # BEFORE the qualifier — "the fan-brake rule above" only resolves if the
     # rule really is above it in the assembled text (the #499 splice-ordering
@@ -1757,6 +1766,9 @@ def test_c11_never_rations_the_brake_when_fan_is_the_only_brake_left() -> None:
     # The carve-out is an override of the graduated default, and names it.
     assert "takes precedence" in carve_out
     assert "graduation" in carve_out
+    # The emergency must escape the STEP BOUND as well as the pacing advice —
+    # a bounded step is still a rationed brake.
+    assert "without regard to ambient_fan_step_max_pp" in carve_out
     # It is unconditional — never itself re-gated on the room or on ambient
     # being readable at all (the finding-2 failure mode, applied here).
     assert "in any room" in carve_out

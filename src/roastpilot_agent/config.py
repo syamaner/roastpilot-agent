@@ -1132,6 +1132,27 @@ class ControllerConfig(BaseModel):
     # reject both without constraining a real re-fit.
     ambient_fan_threshold_c: float = Field(default=26.0, gt=0.0, le=60.0)
 
+    # ``ambient_fan_step_max_pp`` — the size of an ORDINARY below-threshold fan
+    # step, in percentage points (#709, RP-B; ratified with the threshold on
+    # 6 Aug and recorded in D124 as "steps of about 15 pp or less").
+    #
+    # Carried here for the same reason as the threshold above: "graduated
+    # steps" with no bound is not actually a bound. Because this release ships
+    # NO deterministic fan slew clamp, the prompt is the only thing shaping fan
+    # pace, so an unbounded "graduate it" still permits a 30-to-85 jump — the
+    # very fan slam the doctrine exists to prevent.
+    #
+    # It bounds the STEP, never the destination: every fan value, including the
+    # ceiling, stays reachable, and the c11 teaching says so explicitly. It is
+    # also subordinate to the fan-brake rule — when heat is at its floor and
+    # the bean is still climbing, fan is the only brake left and graduation
+    # (this bound included) does not apply.
+    #
+    # Advisory only. Nothing clamps a fan command to it; a model that ignores
+    # it is not overridden, which is precisely why promotion is gated on the
+    # bake-off and a hardware roast rather than on this number being obeyed.
+    ambient_fan_step_max_pp: float = Field(default=15.0, gt=0.0, le=100.0)
+
     def advisory_interval_for(self, phase: RoastPhase) -> float | None:
         """Return the minimum-interval consult floor for ``phase`` in seconds.
 

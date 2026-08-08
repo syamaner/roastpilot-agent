@@ -384,6 +384,19 @@ class AdvisorContext(BaseModel):
     # controller (older callers, the drop-only bake-off) — the c11 teaching
     # then has no boundary to compare against and says so.
     ambient_fan_threshold_c: float | None = None
+    # #709 (RP-B): the size of an ORDINARY below-threshold fan step, in
+    # percentage points, from ``ControllerConfig.ambient_fan_step_max_pp``
+    # (default 15.0, ratified with the threshold and recorded in D124). Data
+    # rather than prose for the same reason as the boundary above, and present
+    # at all because "graduated steps" with no bound is not a bound: with no
+    # deterministic slew clamp in this release, an unbounded graduation still
+    # permits the fan slam the doctrine exists to prevent.
+    #
+    # Bounds the STEP, never the destination — the fan ceiling and every fan
+    # value stay reachable — and it is subordinate to the fan-brake rule, which
+    # takes precedence whenever fan is the only brake left. ``None`` for
+    # callers that build no controller.
+    ambient_fan_step_max_pp: float | None = None
 
 
 class RoastDecision(BaseModel):
@@ -1861,18 +1874,21 @@ _C11_AMBIENT_FAN_SECTION = (
     "be cautious is the very failure the fan-brake rule above exists to "
     "prevent - it buries the roast in smoke and scorches the bean surface.\n"
     "- BELOW ambient_fan_threshold_c: a cool room is already carrying heat "
-    "away, so the SAME fan number bites considerably harder. Prefer to reach "
-    "the higher regime in graduated steps rather than one slam, and watch what "
+    "away, so the SAME fan number bites considerably harder. Reach the higher "
+    "regime in graduated steps rather than one slam - an ordinary step here is "
+    "no larger than ambient_fan_step_max_pp percentage points - and watch what "
     "the rate of rise actually does after each step before taking the next "
-    "one. The fan ceiling is unchanged and every fan value stays available to "
-    "you - what changes is the PACE at which you get there, never the "
-    "destination.\n"
+    "one. This bounds the STEP, not the destination: the fan ceiling is "
+    "unchanged and every fan value stays available to you, including the "
+    "ceiling itself. What changes is the PACE at which you get there, never "
+    "where you can get to.\n"
     "- THIS PACE GUIDANCE GOVERNS THE ORDINARY APPROACH ONLY. If heat is "
     "already at its floor and the bean is still climbing toward the drop "
     "ceiling, the fan-brake rule above TAKES PRECEDENCE: raise the fan in one "
-    "decisive move to arrest the climb. Graduation NEVER applies when fan is "
-    "the only brake left - in any room, at any ambient reading, and whether or "
-    "not an ambient reading is available at all.\n"
+    "decisive move to arrest the climb, as far as it takes and without regard "
+    "to ambient_fan_step_max_pp. Graduation NEVER applies when fan is the only "
+    "brake left - in any room, at any ambient reading, and whether or not an "
+    "ambient reading is available at all.\n"
     "- WHY THIS MATTERS: a fan slam can crash the rate of rise in ANY room; a "
     "cool room only makes it bite harder. The bean then stalls short of its "
     "drop temperature while development time keeps running, so the roast lands "

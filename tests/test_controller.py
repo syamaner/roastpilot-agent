@@ -4465,6 +4465,7 @@ def test_advisor_context_mirrors_this_ticks_ambient_and_the_config_threshold() -
     assert ctx.ambient_temp_c == 23.5
     assert ctx.ambient_humidity_pct == 36.0
     assert ctx.ambient_fan_threshold_c == ControllerConfig().ambient_fan_threshold_c
+    assert ctx.ambient_fan_step_max_pp == ControllerConfig().ambient_fan_step_max_pp
 
 
 def test_advisor_context_ambient_is_none_when_this_tick_has_no_ambient() -> None:

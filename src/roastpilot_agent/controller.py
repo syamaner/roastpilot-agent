@@ -4727,6 +4727,7 @@ class RoastController:
             # context, never a second copy in the prompt prose, #218). Nothing
             # reads it back: it clamps and gates nothing.
             ambient_fan_threshold_c=self._config.ambient_fan_threshold_c,
+            ambient_fan_step_max_pp=self._config.ambient_fan_step_max_pp,
         )
 
     def _seconds_since_last_command(self) -> float | None:
