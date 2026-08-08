@@ -12,6 +12,7 @@ import pytest
 
 from roastpilot_agent.config import (
     DEFAULT_ADVISOR_MODEL,
+    HOTTOP_FAN_LEVEL_PP,
     OPENROUTER_BASE_URL,
     AdvisorConfig,
     AmbientFanDoctrine,
@@ -22,6 +23,30 @@ from roastpilot_agent.config import (
     SafetyLimits,
 )
 from roastpilot_agent.models import RoastPhase
+
+
+def _declared_le(model: type[pydantic.BaseModel], field: str) -> float:
+    """Return a field's declared ``le`` bound from its own constraint metadata.
+
+    Lets a test assert against the REAL bound rather than a copy of it, so
+    loosening the field breaks the test instead of silently leaving it
+    asserting a stale literal.
+
+    Args:
+        model: The pydantic model owning the field.
+        field: The field name.
+
+    Returns:
+        The declared ``le`` value.
+
+    Raises:
+        AssertionError: If the field declares no ``le`` constraint.
+    """
+    for meta in model.model_fields[field].metadata:
+        bound = getattr(meta, "le", None)
+        if bound is not None:
+            return float(bound)
+    raise AssertionError(f"{model.__name__}.{field} declares no le constraint")
 
 
 def test_controller_defaults_match_orchestration_plan() -> None:
@@ -372,17 +397,24 @@ def test_ambient_fan_step_cannot_be_widened_into_a_slam() -> None:
     this release, nothing downstream would catch it: the fan slam simply moves
     from the prose into the config.
 
-    Pinned as the PROPERTY: whatever the field accepts, an ordinary step may
-    never span more than two Hottop fan levels."""
+    Derives the ceiling from the FIELD'S OWN constraint rather than restating
+    today's value, so the test tracks the real bound. A literal would keep
+    passing if ``le`` were loosened part-way (say to 30.0) — still true of the
+    literal, no longer true of the field — which is precisely the regression
+    this test exists to catch."""
     from coffee_roaster_mcp import drivers
 
     hottop_level = drivers._percent_to_hottop_fan_scale  # pyright: ignore[reportPrivateUsage]
-    widest = AmbientFanDoctrine.model_fields["step_max_pp"].metadata
-    # Whatever the declared ceiling is, it must not exceed two levels of travel.
-    accepted_max = AmbientFanDoctrine(step_max_pp=20.0).step_max_pp
-    assert hottop_level(int(accepted_max)) - hottop_level(0) <= 2, widest
+    ceiling = _declared_le(AmbientFanDoctrine, "step_max_pp")
+
+    # The widest step the field will EVER accept must still be graduation:
+    # never more than two Hottop levels of travel.
+    assert hottop_level(int(ceiling)) - hottop_level(0) <= 2
+    # And it must genuinely BE the boundary — accepted at the ceiling, rejected
+    # one whole level above it.
+    assert AmbientFanDoctrine(step_max_pp=ceiling).step_max_pp == ceiling
     with pytest.raises(pydantic.ValidationError):
-        AmbientFanDoctrine(step_max_pp=100.0)
+        AmbientFanDoctrine(step_max_pp=ceiling + HOTTOP_FAN_LEVEL_PP)
 
 
 def test_ambient_fan_doctrine_is_inert_by_default() -> None:

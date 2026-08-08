@@ -74,7 +74,7 @@ DEFAULT_ADVISOR_MODEL = "openai/gpt-4o"
 # same fact ``ControllerConfig.post_fc_deadband_threshold_percent`` (also 10)
 # already encodes; named here so the ambient doctrine's step bound can be
 # validated against it rather than re-deriving the constant.
-_HOTTOP_FAN_LEVEL_PP = 10.0
+HOTTOP_FAN_LEVEL_PP = 10.0
 
 # Phase-keyed advisor MODEL selection (#173, operator 13 Jun): the model slug
 # the advisor uses, by agent phase. The MECHANISM only — every phase defaults to
@@ -1001,7 +1001,7 @@ class AmbientFanDoctrine(BaseModel):
     the graduated regime. ``nan`` is quieter and worse, since it serialises to
     ``null`` and the model would read the boundary as absent."""
 
-    step_max_pp: float = Field(default=10.0, gt=0.0, le=_HOTTOP_FAN_LEVEL_PP * 2)
+    step_max_pp: float = Field(default=10.0, gt=0.0, le=HOTTOP_FAN_LEVEL_PP * 2)
     """The size of an ORDINARY below-threshold fan step, in percentage points.
 
     Default 10.0 per D126, refining D124's ratified "about 15 pp" on hardware
@@ -1045,10 +1045,10 @@ class AmbientFanDoctrine(BaseModel):
         Raises:
             ValueError: If ``step_max_pp`` is not a multiple of 10.
         """
-        if self.step_max_pp % _HOTTOP_FAN_LEVEL_PP != 0:
+        if self.step_max_pp % HOTTOP_FAN_LEVEL_PP != 0:
             raise ValueError(
                 "ambient_fan_doctrine.step_max_pp must be a whole multiple of "
-                f"{_HOTTOP_FAN_LEVEL_PP:g} pp (one Hottop fan level), so the bound the "
+                f"{HOTTOP_FAN_LEVEL_PP:g} pp (one Hottop fan level), so the bound the "
                 "model is told maps to a whole number of physical fan levels under "
                 f"the driver's (value + 5) // 10 quantisation (D126). Got "
                 f"{self.step_max_pp:g}"
