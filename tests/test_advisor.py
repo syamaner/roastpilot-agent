@@ -1678,6 +1678,31 @@ def test_c11_qualifies_the_fan_brake_and_does_not_regress_high_ambient_fan() -> 
     assert assembled.index(_C3_FAN_BRAKE_SECTION) < assembled.index(section)
 
 
+def _bullet_starting_with(section: str, marker: str) -> str:
+    """Return the single ``- `` bullet of ``section`` that starts with ``marker``.
+
+    Prompt sections are one string of ``- ``-prefixed bullets. Asserting a
+    clause lands in the RIGHT bullet (rather than anywhere in the section)
+    matters whenever sibling bullets share vocabulary — c11's at/above and
+    below branches both discuss stepping the fan, so a whole-section check can
+    pass on the wrong bullet's text.
+
+    Args:
+        section: The prompt section text.
+        marker: The bullet's opening substring, including its leading ``- ``.
+
+    Returns:
+        The bullet text, from ``marker`` up to the next bullet or section end.
+
+    Raises:
+        AssertionError: If no bullet starts with ``marker``.
+    """
+    start = section.find(marker)
+    assert start != -1, f"no bullet starting {marker!r} in section"
+    nxt = section.find("\n- ", start)
+    return section[start:] if nxt == -1 else section[start:nxt]
+
+
 def test_c11_never_rations_the_brake_when_fan_is_the_only_brake_left() -> None:
     """#709 safety review finding 1. In post-first-crack loop mode the
     deterministic loop owns heat and FAN IS THE ADVISOR'S LEVER, while the
@@ -1691,21 +1716,51 @@ def test_c11_never_rations_the_brake_when_fan_is_the_only_brake_left() -> None:
     resolve the conflict itself — toward slower braking, in exactly the cool
     rooms this doctrine targets.
 
-    Pinned as ORDER, not just presence: the carve-out must come AFTER the
-    graduated-steps bullet it overrides, since a precedence clause that
-    precedes the rule it governs does not read as an override."""
+    Pinned three ways, none of which prose can satisfy by merely sounding
+    urgent:
+
+    (1) SLICE-SCOPED. The assertions run against the carve-out BULLET alone,
+        not the whole section — the at/above bullet also talks about decisive
+        stepping and would otherwise satisfy a loose whole-section check even
+        if the carve-out were missing or malformed.
+    (2) ANCHORED TO c3's OWN CONDITION. The carve-out must reuse c3's existing
+        trigger language verbatim rather than inventing a fresh synonym for it.
+        This is the #218 two-copies discipline applied to a CONDITION rather
+        than a number: if a later edit rewords either copy of "heat at its
+        floor and the bean still climbing toward the drop ceiling" without
+        updating the other, the two rules silently stop describing the same
+        state, and this test fails.
+    (3) ORDERED. A precedence clause that precedes the rule it governs does not
+        read as an override, so it must follow the graduated-steps bullet.
+
+    Scope limit, stated honestly: this pins the AUTHORED ARTIFACT, not model
+    behaviour at inference time. No unit test can show the model actually
+    treats the clause as an override — that is what the offline decision-level
+    bake-off and the hardware gate are for."""
     from roastpilot_agent.advisor import (
+        _C3_FAN_BRAKE_SECTION,  # pyright: ignore[reportPrivateUsage]
         _C11_AMBIENT_FAN_SECTION,  # pyright: ignore[reportPrivateUsage]
     )
 
     section = _C11_AMBIENT_FAN_SECTION
     lowered = section.lower()
-    assert "takes precedence" in lowered
-    # The carve-out names the heat-at-floor / still-climbing state explicitly.
-    assert "floor" in lowered and "climbing" in lowered
-    # It is unconditional — never itself re-gated on the room.
-    assert "in any room" in lowered
-    # And it OVERRIDES the graduated bullet, so it must follow it.
+    carve_out = _bullet_starting_with(section, "- THIS PACE GUIDANCE GOVERNS").lower()
+
+    # (2) c3's own trigger phrases, required to appear in BOTH copies — so a
+    # reword of either side breaks this rather than silently diverging.
+    for anchor in ("climbing toward the drop ceiling", "the only brake left"):
+        assert anchor in _C3_FAN_BRAKE_SECTION.lower(), (
+            f"{anchor!r} is the c3 anchor this carve-out cross-references; "
+            "if c3 was reworded, update the carve-out in the SAME commit"
+        )
+        assert anchor in carve_out
+    # The carve-out is an override of the graduated default, and names it.
+    assert "takes precedence" in carve_out
+    assert "graduation" in carve_out
+    # It is unconditional — never itself re-gated on the room or on ambient
+    # being readable at all (the finding-2 failure mode, applied here).
+    assert "in any room" in carve_out
+    # (3) and it must FOLLOW the bullet it overrides.
     assert lowered.index("takes precedence") > lowered.index("graduated steps")
 
 
