@@ -964,7 +964,7 @@ async def main() -> int:
 
     if json_out is not None:
         json_out.parent.mkdir(parents=True, exist_ok=True)
-        json_out.write_text(json.dumps(report_to_json(report), indent=2))
+        json_out.write_text(json.dumps(report_to_json(report), indent=2), encoding="utf-8")
         print(f"\nwrote JSON report -> {json_out}")
     return 0
 
