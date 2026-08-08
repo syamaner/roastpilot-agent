@@ -96,20 +96,68 @@ responding to the finding.
 
 ### Tokens and cost per model tier
 
-Measured from this session's subagent transcripts. Cache reads dominate raw
-input and are cheap, so the meaningful columns are cache-write and output.
+Measured from this session's transcripts, **deduplicated on `message.id`** — the
+transcripts repeat each assistant message roughly twice, so a straight sum
+inflates every figure by about 2×. Snapshot near session end; the session was
+still running, so treat these as magnitudes, not a final ledger.
 
-| Agent | Model | Cache write | Output | Messages |
-|---|---|---:|---:|---:|
-| `qa-b1` | `claude-sonnet-5` | 919,691 | 46,915 | 190 |
-| `safety-b1` | `claude-opus-5` | 358,238 | 40,379 | 92 |
+Costs are **list-price references**, not a bill: this is a subscription account.
+Rates used are Opus 5 $5/$25 per MTok, Sonnet 5 $2/$10 (the intro rate current
+until 31 Aug 2026), cache write 1.25× input, cache read 0.1× input.
 
-**The pin produced the intended cost shape.** The Opus reviewer consumed ~39% of
-the Sonnet reviewer's cache-write volume while carrying the harder judgement;
-the Sonnet agent absorbed the high-volume mechanical work (repeated pytest runs,
-coverage runs, independent mutation testing). This is the §4 allocation
-behaving as designed, and it is evidence for keeping `safety-reviewer` on Opus
-rather than "saving" it.
+| Agent | Tier | Cost | Msgs | Cache read | Output |
+|---|---|---:|---:|---:|---:|
+| PM main loop | opus | **$86.21** | 497 | 141,979,495 | 411,303 |
+| `eng-732` | sonnet | $13.09 | 221 | 52,853,889 | 11,918 |
+| `safety-b1` | opus | $2.90 | 43 | 3,824,664 | 6,258 |
+| `qa-b1` | sonnet | $2.67 | 83 | 9,435,244 | 2,925 |
+| `triage-731` | sonnet | $0.52 | 17 | 1,231,056 | 842 |
+| `triage-739` | sonnet | $0.36 | 14 | 818,550 | 636 |
+
+**Finding 1 — the orchestrating loop is the cost, not the reviewer tier.** The PM
+main loop is **81.5%** of the $105.75 total. Any cost analysis of this topology
+that omits it is not an analysis of the topology.
+
+**Finding 2 — within that loop, re-reading context outweighs generating it about
+7:1.** Cache reads cost $70.99 against $10.28 of output. The lever on a session
+like this is its **length and delegation depth**, both of which the topology
+controls directly, and neither of which is the model a reviewer runs on.
+
+**Finding 3 — the delegation pin does show a defensible saving, but not the one
+originally claimed here.** Work delegated to Sonnet totalled **$16.64**; pricing
+that *same observed token volume* at Opus rates gives ~$41.60, so the delegated
+work ran at roughly **40%** of its lead-tier cost. This is a valid counterfactual
+because it prices identical work at two rates. It is still an approximation: a
+different tier might have used a different volume to do the same job, which this
+does not model.
+
+**What this section deliberately does NOT claim.** An earlier draft argued that
+the Opus reviewer consumed ~39% of the Sonnet reviewer's cache-write volume and
+called that evidence for the `safety-reviewer` pin. That argument was wrong twice
+over, and both errors are worth recording because they are easy to repeat:
+
+1. **Cache-write volume is not cost.** Converted to cost, the two reviewers land
+   at 1.09× — a dead heat — because the Opus tokens cost ~2.5× more, which
+   cancels the volume gap the claim rested on. The direction also inverts once
+   Sonnet's intro pricing lapses. A conclusion that flips sign on a pricing date
+   cannot support a durable pin.
+2. **The comparison was invalid regardless of units.** `safety-b1` (43 messages)
+   and `qa-b1` (83 messages) are different roles doing different amounts of
+   different work. Comparing their totals measures the two TASKS, not the two
+   tiers. Replacing a wrong tier-cost claim with a tidy "cost-neutral" one would
+   repeat the same error with a friendlier number.
+
+**So the `safety-reviewer` Opus pin stands on VALUE, with no cost claim attached
+in either direction.** The Opus lens found the brake-rationing gap and the
+fail-soft defect in ten minutes (§ above), and at $2.90 the pin is close enough
+to free that cost is simply not the axis worth arguing about.
+
+**How both errors were caught: a second party recomputed the numbers from
+source.** Not by reviewing the prose — the surrounding argument was coherent, the
+magnitudes plausible, the units apparently right. This is a cheap, concrete
+control the topology can adopt: **any number heading into a decision record or a
+doc gets recomputed by someone who did not derive it.** It ran in both directions
+here, catching an error on each side.
 
 ### Unnecessary agent spawns
 
@@ -163,12 +211,19 @@ evidence.
 
 ### Net assessment
 
-The topology performed well where it was exercised: model pins produced the
-intended cost split, both review lenses found real defects the other missed
-(the safety lens found the brake-rationing and fail-soft-softening defects; the
-Codex lens found the two that changed ratified decisions), and independent
-review caught every one of the PM's own misses.
+The topology performed well where it was exercised: delegation moved real volume
+to Sonnet at roughly 40% of its lead-tier list cost, both review lenses found
+real defects the other missed (the safety lens found the brake-rationing and
+fail-soft-softening defects; the Codex lens found the two that changed ratified
+decisions), and independent review caught every one of the PM's own misses —
+including, twice, a number the PM had asserted without recomputing.
 
 Its weakest point in this case was **planning**, which is the part that was
 skipped. Every defect that reached the PR came from a join between artifacts,
 which is the failure mode the read-only planner exists to address.
+
+The cheapest control this case surfaced is not a model pin at all: **have a
+second party recompute any number before it becomes durable.** Two wrong figures
+survived ordinary review here — one in this document — because a wrong number
+reads exactly like a right one. Recomputation caught both; prose review caught
+neither.
