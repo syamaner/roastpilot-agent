@@ -22,7 +22,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import rpd_corpus_score as scorer  # noqa: E402
 
 from roastpilot_agent.config import AppConfig  # noqa: E402
-from roastpilot_agent.models import RoastPhase, RoastProfile, RoastTelemetry  # noqa: E402
+from roastpilot_agent.models import (  # noqa: E402
+    DropReason,
+    RoastCommand,
+    RoastEventKind,
+    RoastEventSource,
+    RoastPhase,
+    RoastProfile,
+    RoastTelemetry,
+)
+from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict  # noqa: E402
 from roastpilot_agent.store import RoastStore  # noqa: E402
 
 
@@ -81,6 +90,17 @@ async def _record_row(
     )
 
 
+async def _record_drop_event(store: RoastStore, run_id: str) -> None:
+    """Persist the executed ``drop_beans`` command event fix #1's drop-gate
+    requires (:func:`rpd_corpus_score._has_drop_command`)."""
+    await store.record_event(
+        run_id=run_id,
+        kind=RoastEventKind.COMMAND_EXECUTED,
+        source=RoastEventSource.CONTROLLER,
+        payload={"command": RoastCommand.DROP_BEANS.value, "source": "operator"},
+    )
+
+
 async def _seed_scoreable_run(
     store: RoastStore,
     run_id: str,
@@ -91,13 +111,17 @@ async def _seed_scoreable_run(
     outcome: Literal["completed", "aborted", "faulted"] = "completed",
     rating: Literal[1, 2, 3, 4, 5] | None = 4,
     add_cooling_tail: bool = False,
+    record_drop: bool = True,
 ) -> None:
     """Build a run with one development row (the drop) via the real write path.
 
     ``add_cooling_tail=True`` appends a post-drop COOLING row with a lower
     (physically falling) bean temperature and no ``development_percent`` — the
     scorer must ignore it and still read the drop off the LAST
-    ``development``-phase row.
+    ``development``-phase row. ``record_drop=False`` omits the executed
+    ``drop_beans`` command event (fix #1's drop-gate), simulating a run that
+    reached DEVELOPMENT and was cooled/ended WITHOUT ever dropping (e.g. an
+    operator ``start_cooling`` recovery).
     """
     await _create_run(store, run_id, profile=profile)
     await _record_row(store, run_id, 1, phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, bean_temp=180.0)
@@ -109,6 +133,8 @@ async def _seed_scoreable_run(
         bean_temp=drop_temp_c,
         dev_pct=dtr_percent,
     )
+    if record_drop:
+        await _record_drop_event(store, run_id)
     if add_cooling_tail:
         await _record_row(store, run_id, 3, phase=RoastPhase.COOLING, bean_temp=drop_temp_c - 20.0)
     await store.complete_run(run_id=run_id, outcome=outcome, agent_phase=RoastPhase.COMPLETE)
@@ -293,18 +319,23 @@ async def test_score_run_prefers_the_transition_tick_row_over_the_last_developme
             bean_temp=188.0,
             dev_pct=19.97,
         )
-        # The transition tick: phase already flipped to 'cooling', but the
-        # reading is the SAME (or higher) bean_temp_c and the just-frozen,
-        # slightly-higher development_percent — the true drop instant.
+        # The transition tick: phase already flipped to 'cooling', carrying the
+        # true drop instant — the just-frozen development_percent and the fresh
+        # bean_temp_c. The temps are made to DIFFER (189 vs the dev row's 188)
+        # so BOTH fields discriminate a revert to the naive last-development
+        # rule, not just the percentage.
         await _record_row(
-            tmp_store, "transition-run", 2, phase=RoastPhase.COOLING, bean_temp=188.0, dev_pct=21.0
+            tmp_store, "transition-run", 2, phase=RoastPhase.COOLING, bean_temp=189.0, dev_pct=21.0
         )
+        await _record_drop_event(tmp_store, "transition-run")
         await tmp_store.complete_run(
             run_id="transition-run", outcome="completed", agent_phase=RoastPhase.COMPLETE
         )
         result = await scorer.score_run(tmp_store, "transition-run")
         assert isinstance(result, scorer.ScoredRun)
-        assert result.score.drop_temp_c == pytest.approx(188.0)
+        # Both from the transition row; the naive last-development rule would
+        # give 188.0 / 19.97 and fail on either assertion.
+        assert result.score.drop_temp_c == pytest.approx(189.0)
         assert result.score.dtr_percent == pytest.approx(21.0)
     finally:
         await tmp_store.close()
@@ -367,16 +398,63 @@ async def test_score_run_development_row_missing_fields_is_skipped(
         profile = _profile()
         await _create_run(tmp_store, "null-dev-run", profile=profile)
         # A development row with no bean_temp_c reading (a failed/sessionless
-        # telemetry read that tick) and no development_percent.
+        # telemetry read that tick) and no development_percent. A drop event IS
+        # recorded so this run clears fix #1's drop-gate and reaches the
+        # missing-fields check this test targets.
         await _record_row(
             tmp_store, "null-dev-run", 1, phase=RoastPhase.DEVELOPMENT, bean_temp=None
         )
+        await _record_drop_event(tmp_store, "null-dev-run")
         await tmp_store.complete_run(
             run_id="null-dev-run", outcome="completed", agent_phase=RoastPhase.COMPLETE
         )
         result = await scorer.score_run(tmp_store, "null-dev-run")
         assert isinstance(result, scorer.SkippedRun)
         assert "missing bean_temp_c or development_percent" in result.reason
+    finally:
+        await tmp_store.close()
+
+
+# --- score_run: the drop-gate (fix #1, Codex P2) ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_score_run_without_drop_command_is_skipped(tmp_store: RoastStore) -> None:
+    """A run that reaches DEVELOPMENT and is then cooled/ended WITHOUT ever
+    dropping (e.g. an operator ``start_cooling`` recovery) has development
+    telemetry but no executed ``drop_beans`` command event — its
+    post-development rows must not be scored as a drop reading."""
+    await tmp_store.initialize()
+    try:
+        profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
+        await _seed_scoreable_run(
+            tmp_store,
+            "no-drop-run",
+            profile=profile,
+            drop_temp_c=195.0,
+            dtr_percent=16.0,
+            record_drop=False,
+        )
+        result = await scorer.score_run(tmp_store, "no-drop-run")
+        assert isinstance(result, scorer.SkippedRun)
+        assert "no drop_beans" in result.reason
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_score_run_with_drop_command_still_scores(tmp_store: RoastStore) -> None:
+    """A normally-seeded run (WITH the executed ``drop_beans`` event) still
+    scores — the drop-gate must not false-positive on a genuine drop."""
+    await tmp_store.initialize()
+    try:
+        profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
+        await _seed_scoreable_run(
+            tmp_store, "with-drop-run", profile=profile, drop_temp_c=195.0, dtr_percent=16.0
+        )
+        result = await scorer.score_run(tmp_store, "with-drop-run")
+        assert isinstance(result, scorer.ScoredRun)
+        assert result.score.hit is True
     finally:
         await tmp_store.close()
 
@@ -391,8 +469,6 @@ async def test_completed_run_with_emergency_stop_is_terminated_abnormally(
     """An in-run EMERGENCY_STOP verdict marks even a 'completed'-outcome run
     abnormal (D15: the typed SafetyVerdict, bound as a parameter, not a raw
     string literal)."""
-    from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
-
     await tmp_store.initialize()
     try:
         profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
@@ -423,8 +499,6 @@ async def test_completed_run_with_ceiling_guard_drop_is_terminated_abnormally(
 ) -> None:
     """A persisted ceiling-guard drop event (D88 amendment A1) marks even a
     'completed'-outcome run abnormal."""
-    from roastpilot_agent.models import DropReason, RoastEventKind, RoastEventSource
-
     await tmp_store.initialize()
     try:
         profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
@@ -455,8 +529,6 @@ async def test_completed_run_with_development_target_drop_stays_normal(
 ) -> None:
     """The OTHER deterministic drop reason (the ordinary dev%/temp anchor) must
     NOT be misread as an abnormal termination."""
-    from roastpilot_agent.models import DropReason, RoastEventKind, RoastEventSource
-
     await tmp_store.initialize()
     try:
         profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
@@ -474,6 +546,47 @@ async def test_completed_run_with_development_target_drop_stays_normal(
             },
         )
         result = await scorer.score_run(tmp_store, "normal-drop-run")
+        assert isinstance(result, scorer.ScoredRun)
+        assert result.score.terminated_abnormally is False
+        assert result.score.hit is True
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_run_with_non_emergency_verdicts_stays_normal(
+    tmp_store: RoastStore,
+) -> None:
+    """The ordinary per-tick ALLOW/CLAMP verdicts every real roast records must
+    NOT be misread as an abnormal termination.
+
+    A real corpus run has many ``safety_evaluations`` rows (api.py records one
+    per tick, mostly ALLOW). If the emergency-stop query ever lost its
+    ``verdict = ?`` filter, every scored run would be misclassified abnormal —
+    this pins the verdict-specific match (the mirror of the reason-specific
+    ceiling-guard guard test above)."""
+    await tmp_store.initialize()
+    try:
+        profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
+        await _seed_scoreable_run(
+            tmp_store, "allow-run", profile=profile, drop_temp_c=195.0, dtr_percent=16.0
+        )
+        per_tick = (
+            (10, SafetyVerdict.ALLOW),
+            (20, SafetyVerdict.ALLOW),
+            (30, SafetyVerdict.CLAMP),
+        )
+        for tick, verdict in per_tick:
+            await tmp_store.record_safety_evaluation(
+                run_id="allow-run",
+                tick=tick,
+                evaluation=SafetyEvaluation(
+                    rule="rate_limit" if verdict is SafetyVerdict.CLAMP else "nominal",
+                    verdict=verdict,
+                    reason="ordinary per-tick evaluation",
+                ),
+            )
+        result = await scorer.score_run(tmp_store, "allow-run")
         assert isinstance(result, scorer.ScoredRun)
         assert result.score.terminated_abnormally is False
         assert result.score.hit is True
@@ -537,6 +650,31 @@ async def test_score_corpus_explicit_run_ids_filters_excluded_and_unfinished(
         assert skip_reasons["run-excluded"] == "run is excluded (soft-discarded, #582)"
         assert skip_reasons["run-active"] == "run has not finished (outcome is null)"
         assert skip_reasons["ghost"] == "run not found"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_score_corpus_discovery_skips_one_bad_profile_without_aborting(
+    tmp_store: RoastStore,
+) -> None:
+    """A legacy/malformed frozen profile among the auto-discovered ids must
+    not abort the whole corpus (fix #2, Codex P2): id-only discovery defers
+    the profile parse to :func:`~rpd_corpus_score.score_run`, so the bad run
+    lands in ``skipped`` and the good one still scores."""
+    await tmp_store.initialize()
+    try:
+        profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
+        await _seed_scoreable_run(
+            tmp_store, "good-run", profile=profile, drop_temp_c=195.0, dtr_percent=16.0
+        )
+        await _insert_legacy_run_missing_targets(tmp_store, "legacy-run")
+
+        report = await scorer.score_corpus(tmp_store)  # run_ids=None: full auto-discovery
+
+        assert {run.run_id for run in report.scored} == {"good-run"}
+        skip_reasons = {skip.run_id: skip.reason for skip in report.skipped}
+        assert "could not parse frozen profile" in skip_reasons["legacy-run"]
     finally:
         await tmp_store.close()
 
@@ -725,3 +863,42 @@ async def test_main_without_json_flag_prints_table_only(
     captured = capsys.readouterr()
     assert "N scored: 1" in captured.out
     assert "wrote JSON report" not in captured.out
+
+
+@pytest.mark.asyncio
+async def test_main_rejects_json_path_equal_to_store_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--json`` pointing at the source store must be refused BEFORE any read
+    (fix #3, Codex P1, data loss): writing the JSON report there would
+    truncate and destroy the operator's SQLite database."""
+    real_path = tmp_path / "operator.sqlite3"
+    store = RoastStore(real_path)
+    await store.initialize()
+    try:
+        await _seed_scoreable_run(
+            store, "run-a", profile=_profile(), drop_temp_c=195.0, dtr_percent=16.0
+        )
+    finally:
+        await store.close()
+
+    original_bytes = real_path.read_bytes()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["rpd_corpus_score.py", "--store", str(real_path), "--json", str(real_path)],
+    )
+    with pytest.raises(SystemExit):
+        await scorer.main()
+
+    # The store file must be byte-for-byte untouched — not truncated, not
+    # partially overwritten — and still a valid, openable SQLite database.
+    assert real_path.read_bytes() == original_bytes
+    connection = sqlite3.connect(str(real_path))
+    try:
+        cursor = connection.execute("SELECT id FROM roast_runs")
+        rows = cursor.fetchall()
+    finally:
+        connection.close()
+    assert rows == [("run-a",)]

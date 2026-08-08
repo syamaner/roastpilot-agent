@@ -85,7 +85,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from bakeoff_replay import JointWindowScore, joint_score_to_json, joint_window_score  # noqa: E402
 
-from roastpilot_agent.models import DropReason, RoastEventKind, RoastPhase  # noqa: E402
+from roastpilot_agent.models import (  # noqa: E402
+    DropReason,
+    RoastCommand,
+    RoastEventKind,
+    RoastPhase,
+)
 from roastpilot_agent.safety import SafetyVerdict  # noqa: E402
 from roastpilot_agent.store import RoastStore  # noqa: E402
 
@@ -311,6 +316,36 @@ async def _terminated_abnormally(store: RoastStore, run_id: str, outcome: str | 
     return False
 
 
+async def _has_drop_command(store: RoastStore, run_id: str) -> bool:
+    """Whether ``run_id`` recorded an executed bean drop.
+
+    A drop is a ``command_executed`` :class:`~roastpilot_agent.models.RoastEventKind`
+    event whose payload ``command`` is
+    :attr:`~roastpilot_agent.models.RoastCommand.DROP_BEANS`'s value — emitted
+    for a policy, advisor, operator, OR ceiling-guard drop
+    (:meth:`RoastController._execute_drop` / ``_maybe_ceiling_guard_drop``), so
+    it is the single signal that the beans were actually dropped. A run that
+    reaches DEVELOPMENT and is then cooled/ended WITHOUT a drop (e.g. an operator
+    ``start_cooling`` recovery) has development telemetry but no drop event; its
+    post-development rows are not a drop reading and must not be scored as one.
+    The command value is bound as a query parameter (mirrors the typed-value
+    discipline of the guard/verdict queries).
+
+    Args:
+        store: The (snapshot-backed) store to read.
+        run_id: The run to check.
+
+    Returns:
+        ``True`` if an executed ``drop_beans`` command event exists.
+    """
+    async with store.connection.execute(
+        "SELECT 1 FROM roast_events WHERE run_id = ? AND kind = ?"
+        " AND json_extract(payload_json, '$.command') = ? LIMIT 1",
+        (run_id, RoastEventKind.COMMAND_EXECUTED.value, RoastCommand.DROP_BEANS.value),
+    ) as cursor:
+        return await cursor.fetchone() is not None
+
+
 async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
     """Score one run, or explain why it could not be scored.
 
@@ -321,9 +356,9 @@ async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
     Returns:
         A :class:`ScoredRun` on success, or a :class:`SkippedRun` naming the
         reason (run not found, an unparseable/legacy frozen profile missing
-        the required drop/DTR targets, no ``development``-phase telemetry row
-        at all, or a development-phase row missing ``bean_temp_c``/
-        ``development_percent``).
+        the required drop/DTR targets, no executed ``drop_beans`` command event,
+        no ``development``-phase telemetry row at all, or a development-phase row
+        missing ``bean_temp_c``/``development_percent``).
     """
     try:
         detail = await store.read_run(run_id)
@@ -335,6 +370,11 @@ async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
     development_indices = _development_row_indices(rows)
     if not development_indices:
         return SkippedRun(run_id=run_id, reason="no development-phase telemetry row")
+    if not await _has_drop_command(store, run_id):
+        return SkippedRun(
+            run_id=run_id,
+            reason="no drop_beans command event (run cooled/ended without a bean drop)",
+        )
     reading = _extract_drop_reading(rows, development_indices)
     if reading is None:
         return SkippedRun(
@@ -358,13 +398,37 @@ async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
     )
 
 
+async def _discover_finished_run_ids(store: RoastStore) -> list[str]:
+    """Discover every finished, non-excluded run id WITHOUT parsing profiles.
+
+    Reads ids directly from ``roast_runs`` (finished ``outcome IS NOT NULL``,
+    ``excluded = 0`` per #582) rather than :meth:`RoastStore.list_runs`, which
+    validates every run's frozen profile and would raise on the FIRST legacy or
+    malformed one — aborting the whole corpus instead of skipping that one run.
+    Deferring the profile read to :func:`score_run` keeps a single bad run a
+    per-run :class:`SkippedRun`, not a corpus-wide failure.
+
+    Args:
+        store: The (snapshot-backed) store to read.
+
+    Returns:
+        Finished, non-excluded run ids in ``started_at_utc`` order.
+    """
+    async with store.connection.execute(
+        "SELECT id FROM roast_runs WHERE outcome IS NOT NULL AND excluded = 0"
+        " ORDER BY started_at_utc, id"
+    ) as cursor:
+        return [str(row["id"]) for row in await cursor.fetchall()]
+
+
 async def score_corpus(store: RoastStore, run_ids: list[str] | None = None) -> CorpusReport:
     """Score every finished, non-excluded run in the store (or an explicit subset).
 
     With ``run_ids=None``, discovers every finished run (``outcome IS NOT
-    NULL``) via :meth:`~roastpilot_agent.store.RoastStore.list_runs`, which
-    already filters ``excluded = 0`` (#582) — a soft-discarded roast never
-    contributes to the corpus. With an explicit ``run_ids``, each id is
+    NULL``, ``excluded = 0``) via :func:`_discover_finished_run_ids` — an
+    id-only query that does NOT parse profiles, so one legacy/malformed frozen
+    profile is skipped per-run (#582 soft-discards never contribute) rather than
+    aborting the whole corpus. With an explicit ``run_ids``, each id is
     independently checked for existence, exclusion, and finished-ness (so an
     explicit request for an excluded or still-active run is skipped with a
     reason, not silently bypassed).
@@ -381,8 +445,7 @@ async def score_corpus(store: RoastStore, run_ids: list[str] | None = None) -> C
     skipped: list[SkippedRun] = []
     candidate_ids: list[str]
     if run_ids is None:
-        summaries = await store.list_runs()
-        candidate_ids = [summary.id for summary in summaries if summary.outcome is not None]
+        candidate_ids = await _discover_finished_run_ids(store)
     else:
         candidate_ids = []
         for run_id in run_ids:
@@ -556,12 +619,17 @@ async def main() -> int:
     )
     args = parser.parse_args()
 
-    report = await run_corpus_score(
-        cast("Path", args.store), cast("list[str] | None", args.run_ids)
-    )
+    store_path = cast("Path", args.store)
+    json_out = cast("Path | None", args.json_out)
+    # Refuse a --json path that resolves to the source store (directly or via a
+    # symlink): writing JSON there would truncate and destroy the operator's
+    # SQLite database. Check BEFORE any read so a fat-fingered path fails fast.
+    if json_out is not None and json_out.resolve() == store_path.resolve():
+        parser.error("--json must not point at the source store (it would overwrite the database)")
+
+    report = await run_corpus_score(store_path, cast("list[str] | None", args.run_ids))
     print(render_markdown_table(report))
 
-    json_out = cast("Path | None", args.json_out)
     if json_out is not None:
         json_out.parent.mkdir(parents=True, exist_ok=True)
         json_out.write_text(json.dumps(report_to_json(report), indent=2))
