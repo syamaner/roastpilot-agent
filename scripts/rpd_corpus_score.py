@@ -697,7 +697,24 @@ async def score_corpus(store: RoastStore, run_ids: list[str] | None = None) -> C
 
     scored: list[ScoredRun] = []
     for run_id in candidate_ids:
-        result = await score_run(store, run_id)
+        # Categorical resilience: one corrupt run must never abort the whole
+        # corpus. score_run already turns the expected failure modes into a
+        # SkippedRun, but a store row can carry data no typed accessor
+        # anticipates (a non-numeric REAL, malformed payload_json, an
+        # incompatible timestamp), and those surface as a raw ValueError /
+        # OperationalError / TypeError from deep in the read path. Rather than
+        # enumerate every such source at every call site, the corpus loop
+        # converts ANY per-run failure into a SkippedRun so the rest still
+        # scores. The pure metric core (bakeoff_replay.joint_window_score) is
+        # separately unit-tested; this catch guards the per-run I/O, not the
+        # arithmetic.
+        try:
+            result = await score_run(store, run_id)
+        except Exception as exc:  # noqa: BLE001 - deliberate per-run resilience backstop
+            skipped.append(
+                SkippedRun(run_id=run_id, reason=f"scoring failed ({type(exc).__name__}): {exc}")
+            )
+            continue
         if isinstance(result, ScoredRun):
             scored.append(result)
         else:

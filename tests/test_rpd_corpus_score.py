@@ -1201,6 +1201,43 @@ async def test_score_corpus_discovery_skips_one_bad_profile_without_aborting(
 
 
 @pytest.mark.asyncio
+async def test_score_corpus_survives_a_run_that_raises(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Categorical resilience backstop: ANY per-run failure — a non-numeric REAL,
+    malformed payload_json, an incompatible timestamp, anything a typed accessor
+    can't anticipate — must become a SkippedRun, never abort the whole corpus.
+    Simulated by making score_run raise for one run; the others still score."""
+    await tmp_store.initialize()
+    try:
+        profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
+        await _seed_scoreable_run(
+            tmp_store, "good-run", profile=profile, drop_temp_c=195.0, dtr_percent=16.0
+        )
+        await _seed_scoreable_run(
+            tmp_store, "corrupt-run", profile=profile, drop_temp_c=195.0, dtr_percent=16.0
+        )
+
+        real_score_run = scorer.score_run
+
+        async def flaky(store: RoastStore, run_id: str) -> object:
+            if run_id == "corrupt-run":
+                raise ValueError("simulated corrupt telemetry row")
+            return await real_score_run(store, run_id)
+
+        monkeypatch.setattr(scorer, "score_run", flaky)
+
+        report = await scorer.score_corpus(tmp_store)
+
+        assert {run.run_id for run in report.scored} == {"good-run"}
+        skip_reasons = {skip.run_id: skip.reason for skip in report.skipped}
+        assert "scoring failed" in skip_reasons["corrupt-run"]
+        assert "simulated corrupt telemetry row" in skip_reasons["corrupt-run"]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_score_corpus_explicit_run_ids_skips_malformed_profile_without_aborting(
     tmp_store: RoastStore,
 ) -> None:
