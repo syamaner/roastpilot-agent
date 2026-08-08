@@ -1133,8 +1133,20 @@ class ControllerConfig(BaseModel):
     ambient_fan_threshold_c: float = Field(default=26.0, gt=0.0, le=60.0)
 
     # ``ambient_fan_step_max_pp`` — the size of an ORDINARY below-threshold fan
-    # step, in percentage points (#709, RP-B; ratified with the threshold on
-    # 6 Aug and recorded in D124 as "steps of about 15 pp or less").
+    # step, in percentage points (#709, RP-B). D124 ratified "about 15 pp or
+    # less"; **D126 refines that to 10.0 on hardware grounds** (operator
+    # decision, 8 Aug).
+    #
+    # Why 10 and not 15: the Hottop fan is a 0-10 INTEGER scale, and the driver
+    # quantises with ``(value + 5) // 10``
+    # (``coffee_roaster_mcp.drivers._percent_to_hottop_fan_scale``). A 15 pp
+    # step is therefore not representable as a fixed number of physical levels
+    # — from fan 30 it lands on level 5 (a 20 pp move), from fan 35 on level 5
+    # (10 pp). Telling the model 15 while the machine does 10 or 20 is a quiet
+    # told-vs-enforced gap in the ONE path this doctrine exists to protect. A
+    # 10 pp step is exactly one level from ANY starting value, so the told
+    # bound equals the physical move. This is the same quantisation fact
+    # ``post_fc_deadband_threshold_percent`` (also 10) already encodes.
     #
     # Carried here for the same reason as the threshold above: "graduated
     # steps" with no bound is not actually a bound. Because this release ships
@@ -1151,7 +1163,7 @@ class ControllerConfig(BaseModel):
     # Advisory only. Nothing clamps a fan command to it; a model that ignores
     # it is not overridden, which is precisely why promotion is gated on the
     # bake-off and a hardware roast rather than on this number being obeyed.
-    ambient_fan_step_max_pp: float = Field(default=15.0, gt=0.0, le=100.0)
+    ambient_fan_step_max_pp: float = Field(default=10.0, gt=0.0, le=100.0)
 
     def advisory_interval_for(self, phase: RoastPhase) -> float | None:
         """Return the minimum-interval consult floor for ``phase`` in seconds.

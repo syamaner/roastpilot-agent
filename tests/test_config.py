@@ -331,10 +331,25 @@ def test_ambient_fan_step_max_rejects_out_of_range_and_non_finite(value: float) 
         ControllerConfig(ambient_fan_step_max_pp=value)
 
 
-def test_ambient_fan_step_max_defaults_to_the_ratified_step() -> None:
-    """D124 ratified about 15 pp. The value lives in config, not prompt prose,
-    so it re-fits from RP-D scores without a prompt edit."""
-    assert ControllerConfig().ambient_fan_step_max_pp == 15.0
+def test_ambient_fan_step_max_is_one_hottop_fan_level() -> None:
+    """D124 ratified about 15 pp; D126 refines it to 10.0 because the Hottop
+    fan is a 0-10 INTEGER scale quantised by ``(value + 5) // 10``, so 15 pp is
+    one level from some starting values and two from others.
+
+    Pinned as the QUANTISATION PROPERTY, not the bare number: a step of this
+    size must move the hardware exactly one level from every legal starting
+    fan value. That is what makes the told bound equal the physical move; a
+    future re-fit that breaks the property breaks this test."""
+
+    def hottop_level(percent: float) -> int:
+        # coffee_roaster_mcp.drivers._percent_to_hottop_fan_scale
+        return (int(percent) + 5) // 10
+
+    step = ControllerConfig().ambient_fan_step_max_pp
+    assert step == 10.0
+    for start in range(0, int(100 - step) + 1):
+        moved = hottop_level(start + step) - hottop_level(start)
+        assert moved == 1, f"fan {start} +{step:g} moved {moved} levels, not exactly one"
     assert ControllerConfig(ambient_fan_step_max_pp=10.0).ambient_fan_step_max_pp == 10.0
 
 
