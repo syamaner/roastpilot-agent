@@ -144,14 +144,17 @@ def test_abnormal_termination_zeroes_scalar_and_blocks_hit() -> None:
         (195.0, float("nan"), 16.0, 16.0),  # corrupt target drop temp
         (195.0, 195.0, float("inf"), 16.0),  # corrupt achieved DTR
         (195.0, 195.0, 16.0, float("nan")),  # corrupt target DTR
+        (1e308, -1e308, 16.0, 16.0),  # finite inputs, drop-temp error overflows
+        (195.0, 195.0, 1e308, -1e308),  # finite inputs, DTR error overflows
     ],
 )
-def test_non_finite_input_raises(
+def test_non_finite_or_overflowing_input_raises(
     drop: float, target_drop: float, dtr: float, target_dtr: float
 ) -> None:
     # A non-finite outcome/target (e.g. an inf MCP temperature in a corrupt
-    # trace) must fail closed, not score as an ordinary worst roast and emit
-    # invalid Infinity/NaN JSON that biases the aggregate stats.
+    # trace) OR a finite-but-overflowing pair must fail closed, not score as an
+    # ordinary worst roast and emit invalid Infinity/NaN JSON that biases the
+    # aggregate stats. Validating the computed errors catches both.
     with pytest.raises(ValueError, match="finite"):
         _score(drop, target_drop, dtr, target_dtr)
 

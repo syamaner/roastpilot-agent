@@ -922,17 +922,21 @@ def joint_window_score(
         The :class:`JointWindowScore`.
 
     Raises:
-        ValueError: If any of the four achieved/target inputs is not finite. A
-            non-finite value (an ``inf``/``nan`` from a corrupt trace or profile)
-            would otherwise score as an ordinary worst roast and emit invalid
-            ``Infinity``/``NaN`` JSON, silently biasing the aggregate stats —
-            fail closed instead.
+        ValueError: If the drop-temp or DTR error is not finite. A non-finite
+            achieved/target value (an ``inf``/``nan`` from a corrupt trace or
+            profile) OR an overflow in these subtractions (opposite-sign values
+            near the float limits) would otherwise score as an ordinary worst
+            roast and emit invalid ``Infinity``/``NaN`` JSON, silently biasing
+            the aggregate stats. Validating the computed errors subsumes an
+            input check and closes the overflow case too — fail closed instead.
     """
-    inputs = (drop_temp_c, target_drop_temp_c, dtr_percent, target_dtr_percent)
-    if not all(math.isfinite(v) for v in inputs):
-        raise ValueError("joint-window inputs (drop temp / DTR / targets) must all be finite")
     drop_err = drop_temp_c - target_drop_temp_c
     dtr_err = dtr_percent - target_dtr_percent
+    if not (math.isfinite(drop_err) and math.isfinite(dtr_err)):
+        raise ValueError(
+            "joint-window achieved/target values must yield finite drop-temp and DTR "
+            "errors (a non-finite or overflowing input)"
+        )
     within_temp = abs(drop_err) <= JOINT_DROP_TEMP_TOL_C
     within_dtr = abs(dtr_err) <= JOINT_DTR_TOL_PP
     hit = within_temp and within_dtr and not terminated_abnormally
