@@ -1123,6 +1123,49 @@ def test_build_ticks_survives_a_missing_or_unparseable_summary(tmp_path: Path) -
     assert all(t.context.ambient_temp_c is None for t in ticks)
 
 
+def test_build_ticks_rejects_a_non_finite_or_overflowing_ambient(tmp_path: Path) -> None:
+    """``NaN`` / ``Infinity`` / a float-overflowing int never reach a context.
+
+    ``json.loads`` accepts the non-standard ``NaN``/``Infinity`` tokens by
+    default, and a huge JSON integer raises ``OverflowError`` in ``float()``
+    rather than saturating. ``NaN`` is the dangerous one: it compares false
+    against the doctrine's threshold in BOTH directions, so it would seat the
+    model in the below-threshold branch while looking like a real reading, and
+    would never fail loudly.
+    """
+    doctrine = AmbientFanDoctrine(enabled=True)
+    fixture = _fixture_with_summary(tmp_path, _recorded_summary())
+    for raw in ("NaN", "Infinity", "-Infinity", "1" + "0" * 400):
+        (tmp_path / "summary.json").write_text(
+            f'{{"ambient_temp_c": {raw}, "ambient_humidity_pct": {raw}}}', encoding="utf-8"
+        )
+        ticks, _ = bakeoff.build_ticks(fixture, cadence_seconds=30.0, ambient_doctrine=doctrine)
+        assert ticks
+        assert all(t.context.ambient_temp_c is None for t in ticks), f"{raw} leaked as a temp"
+        assert all(t.context.ambient_humidity_pct is None for t in ticks), f"{raw} leaked as RH"
+
+
+def test_build_ticks_reads_the_summary_sidecar_once_per_fixture(tmp_path: Path) -> None:
+    """Both ambient keys come from ONE parse, not one parse per key."""
+    doctrine = AmbientFanDoctrine(enabled=True)
+    fixture = _fixture_with_summary(
+        tmp_path, _recorded_summary(ambient_temp_c=29.4, ambient_humidity_pct=41.0)
+    )
+    reads = 0
+    real_read_text = Path.read_text
+
+    def counting_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        nonlocal reads
+        if self.name == "summary.json":
+            reads += 1
+        return real_read_text(self, *args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Path, "read_text", counting_read_text)
+        bakeoff.build_ticks(fixture, cadence_seconds=30.0, ambient_doctrine=doctrine)
+    assert reads == 1, f"summary.json parsed {reads} times; the sidecar is read once per fixture"
+
+
 def test_build_control_ticks_threads_the_doctrine_through_to_the_contexts(
     tmp_path: Path,
 ) -> None:

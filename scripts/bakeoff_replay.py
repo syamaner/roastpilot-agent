@@ -187,33 +187,64 @@ def _phase_at(mono: float, ground: GroundTruth) -> RoastPhase:
     return RoastPhase.DEVELOPMENT
 
 
-def _summary_value(fixture: Path, key: str) -> float | None:
-    """Read one optional numeric from a fixture's sibling ``summary.json``.
+def _summary_numeric(data: dict[str, Any], key: str) -> float | None:
+    """Coerce one summary key to a real, finite float, or ``None``.
+
+    Rejects every way a JSON number can fail to be a usable temperature:
+
+    - absent, or an explicit ``null`` (the legitimate no-ambient cases);
+    - a non-numeric type. ``bool`` is checked FIRST because it is an ``int``
+      in Python, so ``true`` would otherwise read as 1.0 °C;
+    - ``NaN`` / ``Infinity`` / ``-Infinity``. ``json.loads`` accepts these
+      non-standard tokens by default, and a non-finite ambient reading would
+      propagate silently into every replayed context — ``NaN`` compares false
+      against the doctrine's threshold in BOTH directions, so it would not even
+      fail loudly;
+    - an integer too large to become a float, which raises ``OverflowError``
+      rather than returning ``inf``.
 
     Args:
-        fixture: The ``roast.jsonl`` being replayed.
+        data: The parsed ``summary.json`` mapping.
         key: The summary key to read.
 
     Returns:
-        The value as a float, or ``None`` when the summary is absent, the key
-        is missing, or the value is null — the three ways a fixture can
-        legitimately carry no ambient (a pre-#709 fixture, an ``.alog`` roast,
-        or a roast whose ambient probe was off).
+        The value as a finite float, or ``None`` when it is absent or unusable.
     """
-    summary = fixture.parent / "summary.json"
-    if not summary.is_file():
-        return None
-    try:
-        parsed: object = json.loads(summary.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):  # pragma: no cover - unreadable sidecar
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    data = cast(dict[str, Any], parsed)
     value = data.get(key)
     if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _summary_ambient(fixture: Path) -> tuple[float | None, float | None]:
+    """Read a fixture's recorded ambient pair from its sibling ``summary.json``.
+
+    Reads and parses the sidecar ONCE per fixture rather than once per key.
+
+    Args:
+        fixture: The ``roast.jsonl`` being replayed.
+
+    Returns:
+        The ``(ambient_temp_c, ambient_humidity_pct)`` pair, each ``None`` when
+        the summary is absent, unparseable, not an object, or carries no usable
+        value — the ways a fixture legitimately has no ambient (a pre-#709
+        fixture, an ``.alog`` roast, or a roast whose probe was off).
+    """
+    summary = fixture.parent / "summary.json"
+    if not summary.is_file():
+        return None, None
+    try:
+        parsed: object = json.loads(summary.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):  # pragma: no cover - unreadable
+        return None, None
+    if not isinstance(parsed, dict):
+        return None, None
+    data = cast(dict[str, Any], parsed)
+    return _summary_numeric(data, "ambient_temp_c"), _summary_numeric(data, "ambient_humidity_pct")
 
 
 def build_ticks(
@@ -288,8 +319,7 @@ def build_ticks(
     # #342 charge-time capture), not per-tick data, and the doctrine's two
     # numbers are config. A disabled or absent doctrine leaves all four None.
     doctrine = ambient_doctrine if (ambient_doctrine and ambient_doctrine.enabled) else None
-    ambient_temp_c = _summary_value(fixture, "ambient_temp_c") if doctrine else None
-    ambient_humidity_pct = _summary_value(fixture, "ambient_humidity_pct") if doctrine else None
+    ambient_temp_c, ambient_humidity_pct = _summary_ambient(fixture) if doctrine else (None, None)
     ambient_threshold_c = doctrine.threshold_c if doctrine else None
     ambient_step_max_pp = doctrine.step_max_pp if doctrine else None
 

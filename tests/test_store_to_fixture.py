@@ -1118,3 +1118,61 @@ def test_alog_and_store_summaries_share_their_key_set(tmp_path: Path) -> None:
     store_summary = json.loads((tmp_path / "store-out" / "summary.json").read_text())
 
     assert alog_summary.keys() == store_summary.keys()
+
+
+@pytest.mark.asyncio
+async def test_schema_v9_compat_ambient_columns_absent(tmp_path: Path) -> None:
+    """#709/#737: schema v9 stores predate the ambient triad (added in v10, #342/D85).
+
+    ``read_store_roast`` must not crash when the columns are absent; it falls
+    back to ``NULL AS ambient_temp_c`` / ``NULL AS ambient_humidity_pct``,
+    matching the v7/v12 guards beside it. A pre-v10 roast genuinely recorded no
+    ambient, so the resulting fixture drives c11's absent-ambient branch, which
+    is the honest reconstruction for it.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "v9store.sqlite3"
+    store = await _synthetic_store(db_path)
+    await store.close()
+    # Simulate schema v9 by dropping both columns added in v10.
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("ALTER TABLE roast_runs DROP COLUMN ambient_temp_c")
+    conn.execute("ALTER TABLE roast_runs DROP COLUMN ambient_humidity_pct")
+    conn.commit()
+    conn.close()
+
+    result = s2f.read_store_roast(db_path)
+    assert result.ambient_temp_c is None
+    assert result.ambient_humidity_pct is None
+    # The summary still carries both keys, so every fixture has one key set
+    # regardless of the source store's schema version.
+    summary = s2f.build_summary(result, s2f.build_fixture_rows(result))
+    assert summary["ambient_temp_c"] is None
+    assert summary["ambient_humidity_pct"] is None
+
+
+@pytest.mark.asyncio
+async def test_recorded_ambient_reaches_the_fixture_summary(tmp_path: Path) -> None:
+    """A v10+ store's recorded ambient is carried into the fixture summary.
+
+    This is the store-side half of the #737 carriage: without it the replayed
+    context has no ambient to stamp, and a c11 bake-off arm silently scores the
+    doctrine's absent-ambient fallback instead of the doctrine.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "v10store.sqlite3"
+    store = await _synthetic_store(db_path)
+    await store.close()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("UPDATE roast_runs SET ambient_temp_c = ?, ambient_humidity_pct = ?", (26.5, 44.2))
+    conn.commit()
+    conn.close()
+
+    result = s2f.read_store_roast(db_path)
+    assert result.ambient_temp_c == pytest.approx(26.5)
+    assert result.ambient_humidity_pct == pytest.approx(44.2)
+    summary = s2f.build_summary(result, s2f.build_fixture_rows(result))
+    assert summary["ambient_temp_c"] == pytest.approx(26.5)
+    assert summary["ambient_humidity_pct"] == pytest.approx(44.2)
