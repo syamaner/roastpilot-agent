@@ -169,10 +169,15 @@ class AdvisorContext(BaseModel):
     reference retrieval off).
 
     ``ambient_temp_c`` / ``ambient_humidity_pct`` (#709, RP-B) carry the
-    roasting room's live conditions so the ``c11`` fan doctrine can condition
-    its guidance on them (the ambient-aware fan doctrine of #707/D122: at
-    higher ambient an aggressive fan is appropriate; at lower ambient a fan
-    slam crashes the rate of rise into a temperature-short drop). They are
+    roasting room's live conditions for the ambient-aware fan doctrine of
+    #707/D122: at higher ambient an aggressive fan is appropriate, while at
+    lower ambient a fan slam crashes the rate of rise into a
+    temperature-short drop. The doctrine conditions on ``ambient_temp_c``
+    ALONE — compared against ``ambient_fan_threshold_c`` below;
+    ``ambient_humidity_pct`` is background context that the ``c11`` teaching
+    explicitly tells the model NOT to condition a fan decision on (ten noisy
+    corpus roasts support a temperature-first reading and nothing more). They
+    are
     mirrored VERBATIM from the same per-tick
     :class:`~roastpilot_agent.models.RoastTelemetry` triad the controller
     already receives (#464, D86) — never re-read, re-derived, or averaged
