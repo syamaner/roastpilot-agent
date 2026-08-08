@@ -103,14 +103,31 @@ def test_agents_md_prose_names_the_full_ids() -> None:
     )
 
 
-def test_workflow_review_model_is_a_full_id() -> None:
-    """The review-branch workflow's inline-stage pin must be a full ID, not an alias."""
+def test_workflow_model_pins_are_full_ids() -> None:
+    """The review-branch inline-stage pins must be full IDs, and the safety verifier
+    must stay on the Opus tier so it can't silently overrule the always-Opus safety
+    review by drifting to a lower tier."""
     mjs = (_REPO / ".claude" / "workflows" / "review-branch.mjs").read_text()
-    match = re.search(r"const REVIEW_MODEL = '([^']+)'", mjs)
-    assert match, "REVIEW_MODEL constant not found in review-branch.mjs"
-    value = match.group(1)
-    assert value not in _ALIASES, f"REVIEW_MODEL {value!r} is a floating alias; pin a full ID"
-    assert value == "claude-sonnet-5", f"REVIEW_MODEL {value!r} != claude-sonnet-5"
+
+    review = re.search(r"const REVIEW_MODEL = '([^']+)'", mjs)
+    assert review, "REVIEW_MODEL constant not found in review-branch.mjs"
+    assert review.group(1) not in _ALIASES, f"REVIEW_MODEL {review.group(1)!r} is a floating alias"
+    assert review.group(1) == "claude-sonnet-5", f"REVIEW_MODEL is {review.group(1)!r}"
+
+    safety = re.search(r"const SAFETY_VERIFY_MODEL = '([^']+)'", mjs)
+    assert safety, "SAFETY_VERIFY_MODEL constant not found in review-branch.mjs"
+    assert safety.group(1) not in _ALIASES, (
+        f"SAFETY_VERIFY_MODEL {safety.group(1)!r} is a floating alias"
+    )
+    assert safety.group(1) == "claude-opus-5", (
+        f"SAFETY_VERIFY_MODEL is {safety.group(1)!r}, expected claude-opus-5 — a lower "
+        f"tier lets the safety verifier discard an Opus safety finding"
+    )
+
+    assert "f.lens === 'safety'" in mjs, "verify stage no longer branches on the safety lens"
+    assert "model: SAFETY_VERIFY_MODEL, effort: 'xhigh'" in mjs, (
+        "the safety verify branch must use SAFETY_VERIFY_MODEL at effort xhigh"
+    )
 
 
 def test_committed_settings_do_not_defeat_the_pins() -> None:
