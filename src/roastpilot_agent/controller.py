@@ -4711,6 +4711,44 @@ class RoastController:
             reference_landmarks=(
                 None if self._reference_roast is None else self._reference_roast.landmarks
             ),
+            # #709 (RP-B): the ambient-aware fan doctrine's context, fed ONLY
+            # when the doctrine is explicitly enabled — the ``reference_curve``
+            # posture (#567 Slice B). Flag off (the default) leaves all four
+            # fields ``None``, so the advisor's prompt JSON gains only
+            # always-null keys: a context-SHAPE addition, not a behavioural
+            # one. That gate is load-bearing rather than tidy: an always-null
+            # key is inert, but a populated, meaningfully-named number is not,
+            # so without it every roast on the live default ``c3`` would carry
+            # real ambient values and a named fan-step bound into a prompt that
+            # never teaches them — changing the live advisor's input and
+            # contaminating the very c3 baseline RP-B is measured against.
+            #
+            # Enabled, the readings are mirrored VERBATIM from THIS tick's
+            # telemetry (the live triad the MCP already projects, #464/D86) —
+            # not re-read, not cached, not averaged; ``None`` propagates as
+            # ``None`` when ambient is uncaptured, disabled, or unavailable.
+            # The two doctrine numbers come from the single config group the
+            # operator re-fits from RP-D scores, never a second copy in the
+            # prompt prose (#218). Read-only throughout: nothing here clamps or
+            # gates a lever.
+            ambient_temp_c=(
+                telemetry.ambient_temp_c if self._config.ambient_fan_doctrine.enabled else None
+            ),
+            ambient_humidity_pct=(
+                telemetry.ambient_humidity_pct
+                if self._config.ambient_fan_doctrine.enabled
+                else None
+            ),
+            ambient_fan_threshold_c=(
+                self._config.ambient_fan_doctrine.threshold_c
+                if self._config.ambient_fan_doctrine.enabled
+                else None
+            ),
+            ambient_fan_step_max_pp=(
+                self._config.ambient_fan_doctrine.step_max_pp
+                if self._config.ambient_fan_doctrine.enabled
+                else None
+            ),
         )
 
     def _seconds_since_last_command(self) -> float | None:
