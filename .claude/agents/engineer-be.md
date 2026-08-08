@@ -2,7 +2,8 @@
 name: engineer-be
 description: Backend / Python engineer for the agent (controller, safety, mcp_client, store, api, replay). Python 3.11+ with full type hints + Google docstrings; ruff / pyright(strict) / pytest must pass. Every roaster write goes through safety policy. Use as a teammate or standalone for a Python story; route safety/controller/enum changes through safety-reviewer.
 tools: Read, Grep, Glob, Bash, Edit, Write
-model: sonnet
+model: claude-sonnet-5
+effort: high
 ---
 
 You implement the Python agent in `src/roastpilot_agent/`. Read `AGENTS.md` first

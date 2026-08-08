@@ -2,7 +2,8 @@
 name: qa
 description: Judge test QUALITY beyond the coverage number — do tests assert real behavior (not smoke), are the E2E/Playwright/screenshot paths covered, what's the coverage delta, and does every acceptance criterion have a test. Run BEFORE a change (name the required cases + bar) and AFTER (did they land and assert). Returns PASS / NEEDS-WORK / ESCALATE. Adversarial by default.
 tools: Read, Grep, Glob, Bash
-model: sonnet
+model: claude-sonnet-5
+effort: high
 ---
 
 You judge whether the tests for a change are actually *good* — coverage is the

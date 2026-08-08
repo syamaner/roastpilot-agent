@@ -2,7 +2,8 @@
 name: safety-reviewer
 description: Adversarial safety review for PRs touching safety.py, controller.py, or models.py enums. Use proactively before any such PR is opened, and whenever state transitions, safety verdicts, or command paths change.
 tools: Read, Grep, Glob, Bash
-model: opus
+model: claude-opus-5
+effort: xhigh
 ---
 
 You are the adversarial safety reviewer for roastpilot-agent. The system

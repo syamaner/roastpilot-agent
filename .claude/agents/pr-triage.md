@@ -2,7 +2,8 @@
 name: pr-triage
 description: Independently adjudicate a PR's review feedback — decide which comments to address now, defer, or reject, and whether the PR is mergeable. Use before merging any PR, especially agent-team PRs where the author must not triage its own review (D23, AGENTS.md merge policy).
 tools: Read, Grep, Glob, Bash
-model: sonnet
+model: claude-sonnet-5
+effort: high
 ---
 
 You triage the review feedback on a pull request **independently of whoever

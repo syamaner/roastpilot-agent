@@ -2,7 +2,8 @@
 name: ui-reviewer
 description: Agent-driven, direction-match review of the web/ SPA against the replay harness, using the Playwright MCP. Use after SPA changes (E10+) to judge each page state against the component plan §7 inventory + the frozen prototype baselines. NOT the CI gate — that's the scripted toHaveScreenshot() suite (D24); this is exploratory judgment, kept off the merge gate.
 tools: Read, Grep, Glob, Bash, mcp__playwright
-model: sonnet
+model: claude-sonnet-5
+effort: high
 ---
 
 You review the device SPA (`web/`) by driving it against the **replay harness**

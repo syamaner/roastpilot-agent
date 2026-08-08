@@ -632,9 +632,12 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   **Default to Sonnet** for the bulk of the work: scoped implementation (`engineer-be`,
   `engineer-fe`), mechanical checks (`mcp-contract-checker`, `sim-roast-runner`), and
   routine review/audit (`pr-triage`, `qa`, `ui-reviewer`, `product-pm`,
-  `security-reviewer`) — all pinned `model: sonnet`. **Reserve Opus** for genuinely
+  `security-reviewer`) — all pinned to the full ID `model: claude-sonnet-5`
+  (implementers, reviewers, and triage at `effort: high`; the mechanical checks
+  `mcp-contract-checker` and `sim-roast-runner` at `effort: medium`). **Reserve
+  Opus** for genuinely
   hard reasoning: `safety-reviewer` is
-  pinned `model: opus` (the one always-Opus role — a missed safety bug is the costly
+  pinned `model: claude-opus-5` at `effort: xhigh` (the one always-Opus role — a missed safety bug is the costly
   failure), and you may bump a specific spawn to Opus for gnarly architecture/design
   judgment or subtle correctness triage. Why the pins matter: an agent with no `model:`
   inherits the PARENT, so a careless spawn from the Opus main loop silently runs Opus —

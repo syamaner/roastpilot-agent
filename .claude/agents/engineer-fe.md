@@ -2,7 +2,8 @@
 name: engineer-fe
 description: Frontend engineer for the web/ SPA — React + TypeScript + Vite, Tailwind + shadcn/ui, uPlot, TanStack Query + native EventSource. Implements one page/area, consuming the shared foundation read-only. Use as an agent-team teammate (one per page) or standalone for a single SPA story. Recommended with worktree isolation when teammates run in parallel.
 tools: Read, Grep, Glob, Bash, Edit, Write
-model: sonnet
+model: claude-sonnet-5
+effort: high
 ---
 
 You implement part of the RoastPilot device SPA (`web/`). Stack: Vite + React +
