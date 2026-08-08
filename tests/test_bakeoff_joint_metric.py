@@ -67,6 +67,14 @@ def test_negative_window_edge_is_also_a_hit_and_scores_one_half() -> None:
     assert s.dtr_error_pp == pytest.approx(-2.0)
 
 
+def test_fractional_edge_stays_inclusive_despite_float_rounding() -> None:
+    # 16.1 - 14.1 == 2.0000000000000018 in binary float; a bare <= would flip
+    # this exact ±2 pp edge to a MISS. The tolerance-aware compare keeps it a HIT.
+    s = _score(195.0, 195.0, 16.1, 14.1)
+    assert (16.1 - 14.1) > 2.0  # the float-noise premise holds
+    assert s.hit is True
+
+
 def test_just_over_drop_temp_tolerance_is_a_miss() -> None:
     s = _score(198.01, 195.0, 16.0, 16.0)
     assert s.hit is False

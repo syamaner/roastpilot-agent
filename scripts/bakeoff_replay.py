@@ -886,6 +886,25 @@ class JointWindowScore:
     target_dtr_percent: float
 
 
+def _within_tolerance(error: float, tol: float) -> bool:
+    """Inclusive ``|error| <= tol``, robust to binary-float rounding at the edge.
+
+    The ratified HIT boundary is inclusive (``±3 °C`` / ``±2 pp``), but a bare
+    ``<=`` can flip a true-edge roast to a miss when the subtraction carries
+    float noise (e.g. ``16.1 - 14.1 == 2.0000000000000018``). ``math.isclose``
+    rescues the exact-edge case without widening the window for a genuine miss.
+
+    Args:
+        error: The signed achieved − target difference.
+        tol: The inclusive tolerance.
+
+    Returns:
+        ``True`` when ``error`` is within (or float-equal to) ``tol``.
+    """
+    abs_err = abs(error)
+    return abs_err <= tol or math.isclose(abs_err, tol, rel_tol=1e-9, abs_tol=1e-9)
+
+
 def joint_window_score(
     *,
     drop_temp_c: float,
@@ -937,8 +956,8 @@ def joint_window_score(
             "joint-window achieved/target values must yield finite drop-temp and DTR "
             "errors (a non-finite or overflowing input)"
         )
-    within_temp = abs(drop_err) <= JOINT_DROP_TEMP_TOL_C
-    within_dtr = abs(dtr_err) <= JOINT_DTR_TOL_PP
+    within_temp = _within_tolerance(drop_err, JOINT_DROP_TEMP_TOL_C)
+    within_dtr = _within_tolerance(dtr_err, JOINT_DTR_TOL_PP)
     hit = within_temp and within_dtr and not terminated_abnormally
     # Literal ratified form: 50/50 weights AND a final /2 (window edge → 0.5).
     # Clamp at 0 so a large miss floors rather than going negative; an abnormal
