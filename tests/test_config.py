@@ -303,6 +303,33 @@ def test_bean_sourcing_config_rejects_nonsense(overrides: dict[str, object]) -> 
         BeanSourcingConfig.model_validate(overrides)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [260.0, 0.0, -500.0, float("nan"), float("inf")],
+)
+def test_ambient_fan_threshold_rejects_out_of_range_and_non_finite(value: float) -> None:
+    """#709 safety review finding 3. This field exists to be RE-FIT BY HAND
+    from RP-D scores, so a typo at exactly that moment is the plausible
+    failure: unbounded, it accepts 260.0 for 26.0 and silently puts every roast
+    in the graduated regime.
+
+    ``nan`` is quieter and worse — pydantic serialises it to ``null`` in
+    ``model_dump_json``, so the advisor sees the field as ABSENT and takes the
+    no-ambient branch rather than any doctrine at all. Both must fail loudly at
+    construction instead."""
+    with pytest.raises(pydantic.ValidationError):
+        ControllerConfig(ambient_fan_threshold_c=value)
+
+
+def test_ambient_fan_threshold_accepts_a_real_refit() -> None:
+    """The bounds must not obstruct a genuine re-fit across the corpus's real
+    ambient span (23.1–31.6 °C), which is the whole point of holding the
+    ratified ~26 °C value as config rather than prose."""
+    assert ControllerConfig().ambient_fan_threshold_c == 26.0
+    assert ControllerConfig(ambient_fan_threshold_c=23.5).ambient_fan_threshold_c == 23.5
+    assert ControllerConfig(ambient_fan_threshold_c=31.6).ambient_fan_threshold_c == 31.6
+
+
 def test_app_config_loads_nested_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS", "0.5")
     monkeypatch.setenv("ROASTPILOT_ADVISOR__MODEL_SLUG", "anthropic/claude-sonnet-4.6")

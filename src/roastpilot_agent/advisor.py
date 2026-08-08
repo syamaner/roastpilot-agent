@@ -1063,10 +1063,16 @@ commands, and the reference never overrides the profile's targets) on top of
 ``development_time_ratio`` already in context; do not recompute the ratio from
 the raw ``development_elapsed_seconds`` / ``roast_elapsed_seconds`` — a #559
 baseline consult mis-stated a hand-computed percentage ~6 pp low) on top of
-``c9``. ``c1`` / ``c2`` / ``c4`` / ``c5`` / ``c6`` / ``c7`` / ``c8`` / ``c9`` /
-``c10`` stay selectable for the #396 A/B; ``c3`` remains the live default until
-the A/B validates a successor (operator-gated). ``c10``'s promotion is gated on
-the #705 part-2 math-reliability bake-off in particular.
+``c9``. ``c11`` (#709, RP-B) adds the ambient-aware fan doctrine (condition the
+PACE of a fan increase on the room: an aggressive regime is appropriate at or
+above ``ambient_fan_threshold_c``, graduated steps below it — the boundary
+arrives as context DATA so it re-fits from RP-D scores without a prompt edit)
+on top of ``c10``. ``c1`` / ``c2`` / ``c4`` / ``c5`` / ``c6`` / ``c7`` / ``c8``
+/ ``c9`` / ``c10`` / ``c11`` stay selectable for the #396 A/B; ``c3`` remains
+the live default until the A/B validates a successor (operator-gated).
+``c10``'s promotion is gated on the #705 part-2 math-reliability bake-off in
+particular, and ``c11``'s on the RP-B decision-level bake-off plus a
+single-variable hardware roast scored by RP-D (#711).
 """
 
 _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
@@ -1811,6 +1817,25 @@ _CONTROL_TEACHING_PROMPTS["c10"] = _CONTROL_TEACHING_PROMPTS["c9"].replace(
 # assembly order) and must never read as cancelling it: fan is still a primary
 # post-first-crack lever and still the only brake once heat is at its floor.
 #
+# Two safety-relevant clauses come from the pre-open safety review, and both
+# exist because in post-FC loop mode the deterministic loop owns heat and FAN
+# IS THE ADVISOR'S LEVER, while the safety gate clamps fan only to
+# [floor, ceiling] with no slew limit — so this prose is the ONLY thing shaping
+# fan pace, and it shapes an actuated value:
+#   (a) an explicit PRECEDENCE carve-out, because the graduated-steps
+#       preference would otherwise ration the brake in exactly the emergency
+#       the fan-brake rule exists to handle (heat at its floor, bean still
+#       climbing toward the ceiling). Graduation never applies when fan is the
+#       only brake left, in any room.
+#   (b) the crash mechanism is stated as UNCONDITIONAL ("in ANY room"), so this
+#       newer, more specific section cannot be read as narrowing the earlier
+#       unconditional fan->rate-of-rise coupling teaching to cool rooms only.
+#       Ten noisy corpus points do not establish that the crash mechanism is
+#       ambient-gated — only that a cool room makes it bite harder.
+# The absent-ambient fallback deliberately does NOT default to the gentler
+# regime: the ambient probe is optional and fail-soft, so a disabled or
+# dropped-out probe must never soften fan doctrine in a genuinely hot room.
+#
 # NO numbers here — not the boundary, not a step size (the #218 two-copies
 # discipline; the guard test asserts the section is digit-free). The boundary
 # arrives as DATA in ``ambient_fan_threshold_c``, so the operator's ratified
@@ -1821,19 +1846,20 @@ _CONTROL_TEACHING_PROMPTS["c10"] = _CONTROL_TEACHING_PROMPTS["c9"].replace(
 # single-variable hardware roast scored by RP-D — operator-gated.
 _C11_AMBIENT_FAN_SECTION = (
     "POST-FIRST-CRACK: MATCH FAN AGGRESSION TO THE ROOM\n"
-    "- ambient_temp_c and ambient_humidity_pct in context describe the room "
-    "the roaster is working in, and ambient_fan_threshold_c is the boundary "
-    "separating the two airflow regimes below. Compare ambient_temp_c against "
-    "ambient_fan_threshold_c before making a large fan move. This QUALIFIES "
-    "the fan-as-active-brake rule above - it never cancels it. Fan remains a "
-    "primary post-first-crack lever, and it remains the only brake left once "
-    "heat is already at its floor.\n"
+    "- ambient_temp_c in context is the roasting room's temperature, and "
+    "ambient_fan_threshold_c is the boundary separating the two airflow "
+    "regimes below; compare them before making a large fan move. "
+    "ambient_humidity_pct is background only - do NOT condition a fan decision "
+    "on it. This QUALIFIES the fan-as-active-brake rule above - it never "
+    "cancels it. Fan remains a primary post-first-crack lever, and it remains "
+    "the only brake left once heat is already at its floor.\n"
     "- AT OR ABOVE ambient_fan_threshold_c: a warm room works against the "
     "brake, so an aggressive airflow regime is appropriate, up to and "
     "including the fan ceiling given in context. Step decisively to the "
-    "regime you need. Holding the fan low in a hot room to be cautious is the "
-    "very failure the fan-brake rule above exists to prevent - it buries the "
-    "roast in smoke and scorches the bean surface.\n"
+    "regime you need, and watch the rate of rise after the step exactly as the "
+    "deliberate-fan rule above requires. Holding the fan low in a hot room to "
+    "be cautious is the very failure the fan-brake rule above exists to "
+    "prevent - it buries the roast in smoke and scorches the bean surface.\n"
     "- BELOW ambient_fan_threshold_c: a cool room is already carrying heat "
     "away, so the SAME fan number bites considerably harder. Prefer to reach "
     "the higher regime in graduated steps rather than one slam, and watch what "
@@ -1841,17 +1867,23 @@ _C11_AMBIENT_FAN_SECTION = (
     "one. The fan ceiling is unchanged and every fan value stays available to "
     "you - what changes is the PACE at which you get there, never the "
     "destination.\n"
-    "- WHY THIS MATTERS: a fan slam in a cool room crashes the rate of rise. "
-    "The bean then stalls short of its drop temperature while development time "
-    "keeps running, so the roast lands short on temperature AND over on "
-    "development ratio - missing BOTH halves of the joint objective at once. "
-    "If the rate of rise falls away sharply just after a fan increase, read "
-    "that as the signal to stop stepping the fan up and let it recover, not to "
-    "push further.\n"
+    "- THIS PACE GUIDANCE GOVERNS THE ORDINARY APPROACH ONLY. If heat is "
+    "already at its floor and the bean is still climbing toward the drop "
+    "ceiling, the fan-brake rule above TAKES PRECEDENCE: raise the fan in one "
+    "decisive move to arrest the climb. Graduation NEVER applies when fan is "
+    "the only brake left - in any room, at any ambient reading, and whether or "
+    "not an ambient reading is available at all.\n"
+    "- WHY THIS MATTERS: a fan slam can crash the rate of rise in ANY room; a "
+    "cool room only makes it bite harder. The bean then stalls short of its "
+    "drop temperature while development time keeps running, so the roast lands "
+    "short on temperature AND over on development ratio - missing BOTH halves "
+    "of the joint objective at once. If the rate of rise falls away sharply "
+    "just after a fan increase, read that as the signal to stop stepping the "
+    "fan up and let it recover, not to push further.\n"
     "- If ambient_temp_c or ambient_fan_threshold_c is absent from context, "
     "you have no room reading to condition on: apply the fan-brake rule above "
-    "exactly as written, and prefer the graduated approach when in doubt. Do "
-    "not guess at the room from any other value.\n"
+    "exactly as written. Do not guess at the room from any other value, and do "
+    "not treat a missing reading as a reason to be gentler with the fan.\n"
     "\n"
 )
 _CONTROL_TEACHING_PROMPTS["c11"] = _CONTROL_TEACHING_PROMPTS["c10"].replace(

@@ -1662,18 +1662,100 @@ def test_c11_qualifies_the_fan_brake_and_does_not_regress_high_ambient_fan() -> 
 
     section = _C11_AMBIENT_FAN_SECTION
     lowered = section.lower()
-    # (1) qualifies, never cancels, the brake rule above it.
-    assert "qualifies" in lowered
-    assert "never cancels it" in lowered
-    # (2) the high-ambient regime stays aggressive, and the #498 failure is named.
+    assembled = control_teaching_prompt("c11")
+    # (1) the high-ambient regime stays aggressive, and the #498 failure it
+    # exists to prevent is named rather than merely implied.
     assert "fan ceiling" in lowered
     assert "smoke" in lowered and "scorches" in lowered
-    # (3) below the boundary the lever is NOT capped — only the pace changes.
+    # (2) below the boundary the lever is NOT capped — only the pace changes.
     assert "the fan ceiling is unchanged" in lowered
     assert "every fan value stays available" in lowered
-    assert "never the destination" in lowered
-    # (4) the c3 brake teaching survives verbatim inside the assembled c11.
-    assert _C3_FAN_BRAKE_SECTION in control_teaching_prompt("c11")
+    # (3) the c3 brake teaching survives VERBATIM and, critically, appears
+    # BEFORE the qualifier — "the fan-brake rule above" only resolves if the
+    # rule really is above it in the assembled text (the #499 splice-ordering
+    # defect class: a later section silently overriding an earlier one).
+    assert _C3_FAN_BRAKE_SECTION in assembled
+    assert assembled.index(_C3_FAN_BRAKE_SECTION) < assembled.index(section)
+
+
+def test_c11_never_rations_the_brake_when_fan_is_the_only_brake_left() -> None:
+    """#709 safety review finding 1. In post-first-crack loop mode the
+    deterministic loop owns heat and FAN IS THE ADVISOR'S LEVER, while the
+    safety gate clamps fan only to [floor, ceiling] with NO slew limit — so
+    this prose is the only thing shaping fan pace, and it shapes an actuated
+    value.
+
+    The graduated-steps preference must therefore carry an explicit PRECEDENCE
+    carve-out for the state the c3 fan-brake rule exists to handle (heat at its
+    floor, bean still climbing toward the ceiling), or the model is left to
+    resolve the conflict itself — toward slower braking, in exactly the cool
+    rooms this doctrine targets.
+
+    Pinned as ORDER, not just presence: the carve-out must come AFTER the
+    graduated-steps bullet it overrides, since a precedence clause that
+    precedes the rule it governs does not read as an override."""
+    from roastpilot_agent.advisor import (
+        _C11_AMBIENT_FAN_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    section = _C11_AMBIENT_FAN_SECTION
+    lowered = section.lower()
+    assert "takes precedence" in lowered
+    # The carve-out names the heat-at-floor / still-climbing state explicitly.
+    assert "floor" in lowered and "climbing" in lowered
+    # It is unconditional — never itself re-gated on the room.
+    assert "in any room" in lowered
+    # And it OVERRIDES the graduated bullet, so it must follow it.
+    assert lowered.index("takes precedence") > lowered.index("graduated steps")
+
+
+def test_c11_does_not_soften_fan_doctrine_when_ambient_is_unavailable() -> None:
+    """#709 safety review finding 2. The ambient probe is OPTIONAL and
+    fail-soft — a disabled, unplugged, or mid-roast-dropped probe yields
+    ``None``. Sensor availability must never flip fan doctrine in the unsafe
+    direction, or every probe-less roast (including one in a genuinely hot
+    room, where the smoke/scorching failure #498 fixed is the live risk) is
+    quietly told to be gentler with the fan.
+
+    Regression pin: the earlier draft ended the fallback with "and prefer the
+    graduated approach when in doubt", which did exactly that."""
+    from roastpilot_agent.advisor import (
+        _C11_AMBIENT_FAN_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    lowered = _C11_AMBIENT_FAN_SECTION.lower()
+    assert "prefer the graduated approach when in doubt" not in lowered
+    # The fallback falls back to the UNQUALIFIED brake rule, and says so.
+    assert "apply the fan-brake rule above exactly as written" in lowered
+    assert "not treat a missing reading as a reason to be gentler" in lowered
+
+
+def test_c11_keeps_the_fan_crash_mechanism_unconditional() -> None:
+    """#709 safety review finding 8. The already-spliced c8 section teaches the
+    fan-to-rate-of-rise crash mechanism UNCONDITIONALLY. c11 is newer and more
+    specific, so if it attributes the crash to the room ("a fan slam in a cool
+    room crashes the rate of rise") it implicitly NARROWS c8 to the
+    below-threshold case — and the at/above branch would then sanction a
+    decisive step with no watch-the-response discipline at all.
+
+    Ten noisy corpus points establish only that a cool room makes the crash
+    bite harder, NOT that the mechanism is ambient-gated, so the prompt must
+    not imply it is."""
+    from roastpilot_agent.advisor import (
+        _C11_AMBIENT_FAN_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    section = _C11_AMBIENT_FAN_SECTION
+    lowered = section.lower()
+    # The crash is stated for ANY room; the room only changes how hard it bites.
+    assert "crash the rate of rise in any room" in lowered
+    # The at/above branch keeps the watch-the-response discipline too, so the
+    # sanctioned decisive step is not an unwatched one.
+    above = lowered[lowered.index("at or above") : lowered.index("below ambient")]
+    assert "watch the rate of rise after the step" in above
+    # Humidity is named with an explicit non-rule rather than left as context
+    # the model must silently ignore (finding 5).
+    assert "ambient_humidity_pct is background only" in lowered
 
 
 def test_c11_registered_selectable_and_not_the_live_default() -> None:

@@ -1120,7 +1120,17 @@ class ControllerConfig(BaseModel):
     # model is TOLD, never what the box ENFORCES. (The deterministic fan slew
     # clamp #709 raises as optional hardening is deliberately NOT part of this
     # release — prompt-only to start, per the 6 Aug ratification.)
-    ambient_fan_threshold_c: float = Field(default=26.0)
+    # Bounded like every sibling numeric here. The operator re-fits this value
+    # by hand (that is the whole point of holding it as config rather than
+    # prose), so the plausible failure is a typo at exactly that moment: an
+    # unbounded field accepts 260.0 for 26.0 silently and puts EVERY roast into
+    # the graduated regime, and accepts nan — which is quieter and worse, since
+    # ``model_dump_json`` serialises nan to ``null``, so the model sees the
+    # field as ABSENT and lands on the no-ambient branch rather than any
+    # doctrine at all. ``gt=0.0`` (a roasting room is above freezing on any
+    # scale we use) and ``le=60.0`` (well above any room this rig runs in)
+    # reject both without constraining a real re-fit.
+    ambient_fan_threshold_c: float = Field(default=26.0, gt=0.0, le=60.0)
 
     def advisory_interval_for(self, phase: RoastPhase) -> float | None:
         """Return the minimum-interval consult floor for ``phase`` in seconds.
