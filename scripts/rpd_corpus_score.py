@@ -27,15 +27,20 @@ LLM, no network, no store WRITE of any kind.
   run's final row, which can land deep in the post-drop COOLING tail with a
   falling, physically meaningless bean temperature (the trap: a bare
   ``MAX(tick WHERE development_percent IS NOT NULL)`` lands there because
-  ``development_percent`` freezes at drop and is echoed on every later row) —
-  or, when it has both fields populated, the row immediately FOLLOWING it (the
-  controller flips ``agent_phase`` to ``cooling`` synchronously within the
-  drop tick, so that row is one control-loop tick fresher than the last
-  ``development``-tagged one). The event-anchored primary read exists because,
-  for a HISTORICAL run recorded before phase-boundary telemetry was
-  force-persisted on every D96-state change, the immediate successor row can
-  be an ordinary PERIODIC cooling sample several seconds (and several degrees)
-  after the true drop — the event timestamp is not subject to that gap.
+  ``development_percent`` freezes at drop and is echoed on every later row).
+  The fallback returns that row's OWN reading directly (Codex P2, round 3) —
+  it deliberately does NOT try the row immediately following it, since
+  without a correlated timestamp that successor could be an ordinary
+  PERIODIC cooling sample several seconds (and several degrees) after the
+  true drop on exactly the HISTORICAL, pre-force-persist stores this
+  fallback exists for. **KNOWN LIMITATION** (Codex P1, round 3; documented,
+  not redesigned — see :func:`_extract_drop_reading`'s docstring for the
+  full analysis): the event-anchored PRIMARY read assumes the drop event's
+  timestamp is stamped at the true drop instant, verified true for every
+  advisor/policy/ceiling-guard drop in the real corpus (all 15 scored runs),
+  but an OPERATOR-initiated drop's event may be flush-stamped up to one
+  controller tick late — acceptable for this offline eval tool today; no
+  operator-drop run has entered the corpus yet.
   Telemetry rows are read in durable INSERTION-id order, never ``(tick, id)``
   — a restart resets the process-local tick counter to zero, so ordering by
   tick can interleave a post-restart run's low ticks ahead of a pre-restart
@@ -392,24 +397,44 @@ def _extract_drop_reading(
     event anchor, silently excluding every such guard-forced failure from
     the corpus instead of counting it as the abnormal 0.00 MISS it is.
 
-    **Fallback: last-development / immediate-successor heuristic.** Used only
-    when the drop event's timestamp is missing/unparseable, or no row near it
-    has both fields populated — e.g. a HISTORICAL run recorded before
-    phase-boundary telemetry was force-persisted on every D96-state change,
-    where the immediate successor row can be an ordinary periodic cooling
-    sample several seconds (and several degrees) after the true drop. Anchors
-    on the LAST ``development``-phase telemetry row — the same clock-safe
-    anchor :meth:`~roastpilot_agent.store.RoastStore._build_reference_roast`
-    uses (design note §6.4a): never the run's chronologically final row (a
-    post-drop COOLING-tail sample with a falling bean temperature), and never
-    a bare ``MAX(tick)`` over rows with a non-null ``development_percent`` (a
-    predicate cooling-tail rows also satisfy, since ``development_percent``
-    freezes at drop and is echoed on every later row). Prefers the row
-    immediately FOLLOWING the last ``development`` row when it has both
-    fields populated — the controller flips ``agent_phase`` to ``cooling``
-    synchronously within the drop tick, so that row is one control-loop tick
-    fresher than the last ``development``-tagged one — else falls back to the
-    last ``development`` row's own reading. Skipped entirely (returns
+    **KNOWN LIMITATION (Codex P1, round 3 — verified zero current corpus
+    impact, documented rather than redesigned again):** this primary path
+    assumes the drop event's ``recorded_at_utc`` is stamped at (or
+    immediately after) the true drop instant. Verified true for every
+    advisor/policy/ceiling-guard drop path
+    (:meth:`RoastController._execute_drop` /
+    ``_maybe_ceiling_guard_drop``) — confirmed against the real store: all
+    15 currently-scored corpus runs are advisor-driven, and every
+    event-anchored reading lands 0-2 °C AT OR ABOVE the last-development
+    row's own temperature, never on a fallen (post-drop-cooling) reading. An
+    OPERATOR-initiated drop's command event may be flush-stamped up to one
+    controller tick late (unverified either way — no operator-drop run is in
+    the corpus yet), which could pull the event-anchored read onto an
+    already-cooling sample a few degrees short. Reconstructing an exact
+    sub-sample drop instant from ~5 s telemetry is inherently approximate for
+    an offline yardstick; acceptable here, revisit if/when an operator-drop
+    run enters the corpus (a real trace, not a synthetic worry, would let
+    this be measured rather than argued).
+
+    **Fallback: last-development row's own reading.** Used only when the
+    drop event's timestamp is missing/unparseable, or no row near it has
+    both fields populated — e.g. a HISTORICAL run recorded before
+    phase-boundary telemetry was force-persisted on every D96-state change.
+    Returns the LAST ``development``-phase telemetry row's OWN reading
+    directly (Codex P2, round 3) — the same clock-safe anchor
+    :meth:`~roastpilot_agent.store.RoastStore._build_reference_roast` uses
+    (design note §6.4a): never the run's chronologically final row (a
+    post-drop COOLING-tail sample with a falling bean temperature), and
+    never a bare ``MAX(tick)`` over rows with a non-null
+    ``development_percent`` (a predicate cooling-tail rows also satisfy,
+    since ``development_percent`` freezes at drop and is echoed on every
+    later row). Deliberately does NOT try the row immediately following the
+    last ``development`` row: without a correlated timestamp to bound it,
+    that successor could be an ordinary PERIODIC cooling sample several
+    seconds (and several degrees) after the true drop, on exactly the
+    HISTORICAL pre-force-persist stores this fallback exists for — a
+    "blind" successor guess is less trustworthy than the last confirmed
+    development-phase measurement itself. Skipped entirely (returns
     ``None``) when ``development_indices`` is empty AND the event anchor
     already failed — there is nothing left to fall back to.
 
@@ -434,16 +459,7 @@ def _extract_drop_reading(
     if not development_indices:
         return None
 
-    last_dev_index = development_indices[-1]
-
-    if last_dev_index + 1 < len(rows):
-        transition_row = rows[last_dev_index + 1]
-        transition_temp = _optional_float(transition_row["bean_temp_c"])
-        transition_dtr = _optional_float(transition_row["development_percent"])
-        if transition_temp is not None and transition_dtr is not None:
-            return DropReading(bean_temp_c=transition_temp, development_percent=transition_dtr)
-
-    last_dev = rows[last_dev_index]
+    last_dev = rows[development_indices[-1]]
     last_dev_temp = _optional_float(last_dev["bean_temp_c"])
     last_dev_dtr = _optional_float(last_dev["development_percent"])
     if last_dev_temp is None or last_dev_dtr is None:
@@ -727,11 +743,13 @@ def _fmt_optional(value: float | None, *, precision: int = 1) -> str:
 def _escape_markdown_cell(text: str) -> str:
     """Escape a value for safe interpolation into a Markdown table cell.
 
-    A bean ``name`` (or a skip ``reason``, sourced from an exception message)
-    is uncontrolled operator/corpus text: an embedded ``|`` would be read as
-    an extra column delimiter, corrupting every column after it, and an
-    embedded newline would break the row out of the table entirely. Escapes
-    ``|`` and collapses any newline to a space.
+    A bean ``name``, a skip ``reason`` (sourced from an exception message),
+    or a ``run_id`` (an explicit ``--run-ids`` value need not exist in the
+    store, so a bogus/adversarial id reaches the skipped-row table verbatim,
+    Codex P3) is uncontrolled operator/corpus text: an embedded ``|`` would
+    be read as an extra column delimiter, corrupting every column after it,
+    and an embedded newline would break the row out of the table entirely.
+    Escapes ``|`` and collapses any newline to a space.
 
     Args:
         text: The raw cell text.
@@ -764,17 +782,19 @@ def render_markdown_table(report: CorpusReport) -> str:
     lines = [header, separator]
     for run in report.scored:
         score = run.score
+        run_id = _escape_markdown_cell(run.run_id[:8])
         bean_name = _escape_markdown_cell(run.bean_name)
         lines.append(
-            f"| {run.run_id[:8]} | {bean_name} | {_fmt_optional(run.ambient_temp_c)} "
+            f"| {run_id} | {bean_name} | {_fmt_optional(run.ambient_temp_c)} "
             f"| {score.target_drop_temp_c:.1f} °C / {score.target_dtr_percent:.1f}% "
             f"| {score.drop_temp_c:.1f} °C / {score.dtr_percent:.1f}% "
             f"| {'HIT' if score.hit else 'MISS'} | {score.scalar:.2f} "
             f"| {'—' if run.rating is None else f'{run.rating}★'} |"
         )
     for skip in report.skipped:
+        skip_run_id = _escape_markdown_cell(skip.run_id[:8])
         reason = _escape_markdown_cell(skip.reason)
-        lines.append(f"| {skip.run_id[:8]} | (skipped: {reason}) | | | | | | |")
+        lines.append(f"| {skip_run_id} | (skipped: {reason}) | | | | | | |")
     stats = aggregate_stats(report)
     aggregate_line = (
         f"\nN scored: {stats['n_scored']} (skipped: {stats['n_skipped']}) | "

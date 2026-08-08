@@ -681,13 +681,15 @@ def test_nearest_reading_to_timestamp_skips_row_with_unparseable_recorded_at() -
     assert reading.development_percent == 16.0
 
 
-def test_extract_drop_reading_falls_back_on_unparseable_event_timestamp() -> None:
-    """An unparseable ``drop_event_recorded_at_utc`` falls back to the
-    successor-row heuristic rather than raising."""
+def test_extract_drop_reading_falls_back_to_last_dev_row_on_unparseable_event_timestamp() -> None:
+    """An unparseable ``drop_event_recorded_at_utc`` falls back to the last
+    ``development`` row's OWN reading, not a following row — the successor
+    and the last-development row are made to DIFFER so this discriminates a
+    regression back to the (removed) successor-row heuristic."""
     rows = _make_telemetry_rows(
         [
             ("development", 195.0, 16.0, "2026-01-01T00:00:00+00:00"),
-            ("cooling", 195.0, 16.0, "2026-01-01T00:00:05+00:00"),
+            ("cooling", 180.0, 16.0, "2026-01-01T00:00:05+00:00"),
         ]
     )
     reading = scorer._extract_drop_reading(  # pyright: ignore[reportPrivateUsage]
@@ -723,22 +725,31 @@ def test_extract_drop_reading_skips_event_anchor_when_timestamp_is_none() -> Non
     assert reading.development_percent == 16.0
 
 
-def test_extract_drop_reading_fallback_skips_an_incomplete_successor_row() -> None:
-    """The fallback's successor row is missing a field (here,
-    ``development_percent``): it must be skipped, landing on the last
-    development row's own reading instead."""
+def test_extract_drop_reading_fallback_ignores_a_complete_but_fallen_successor_row() -> None:
+    """Regression test (Codex P2, round 3): a COMPLETE (both fields
+    populated) but genuinely fallen cooling successor row — the exact shape
+    a pre-force-persist historical run's periodic cadence can produce — must
+    still be ignored by the fallback in favor of the last ``development``
+    row's own reading. Without a correlated timestamp (the event anchor
+    already failed here), the fallback can no longer tell that successor
+    apart from a real several-seconds-later cooling sample, so it must never
+    be trusted, even when it is superficially "complete"."""
     rows = _make_telemetry_rows(
         [
             ("development", 195.0, 16.0, "2026-01-01T00:00:00+00:00"),
-            ("cooling", 180.0, None, "2026-01-01T00:00:05+00:00"),
+            # A LATER, fallen cooling sample: both fields present, but the
+            # temperature has genuinely dropped (real post-drop cooling).
+            ("cooling", 180.0, 16.0, "2026-01-01T00:00:25+00:00"),
         ]
     )
     reading = scorer._extract_drop_reading(  # pyright: ignore[reportPrivateUsage]
         rows, [0], "not-a-timestamp"
     )
     assert reading is not None
-    assert reading.bean_temp_c == 195.0
-    assert reading.development_percent == 16.0
+    # If the removed successor-row heuristic had been used, this would read
+    # 180.0 (the fallen temp) instead of the true 195.0.
+    assert reading.bean_temp_c == pytest.approx(195.0)
+    assert reading.development_percent == pytest.approx(16.0)
 
 
 def test_nearest_reading_to_timestamp_compares_naive_and_aware_timestamps_safely() -> None:
@@ -1330,6 +1341,31 @@ async def test_render_markdown_table_escapes_pipe_and_newline_in_bean_name(
         assert row_line.replace("\\|", "").count("|") == 9
         assert "\n" not in row_line
         assert "Evil \\| Bean Name" in table
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_render_markdown_table_escapes_pipe_in_a_bogus_run_id(
+    tmp_store: RoastStore,
+) -> None:
+    """An explicit ``--run-ids`` value need not exist in the store, so a
+    bogus/adversarial id reaches the skipped-row table verbatim (fix, Codex
+    P3, round 4): a ``|`` in its first 8 characters must not corrupt the
+    table any more than an unescaped bean name or skip reason would."""
+    await tmp_store.initialize()
+    try:
+        bogus_id = "bad|id-with-a-pipe"
+        report = await scorer.score_corpus(tmp_store, run_ids=[bogus_id])
+        assert report.scored == []
+        assert report.skipped == [scorer.SkippedRun(run_id=bogus_id, reason="run not found")]
+
+        table = scorer.render_markdown_table(report)
+        row_line = next(line for line in table.splitlines() if "run not found" in line)
+        # Exactly 8 columns (9 DELIMITING pipes) — count only pipes that are
+        # not part of an escaped "\|".
+        assert row_line.replace("\\|", "").count("|") == 9
+        assert "bad\\|id-w" in table
     finally:
         await tmp_store.close()
 
