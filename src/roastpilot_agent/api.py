@@ -135,6 +135,7 @@ from roastpilot_agent.store import (
     BeanDraftAttemptAlreadyClaimedError,
     BeanDraftAttemptClaimError,
     BeanProfileNotFoundError,
+    FrozenRunConfig,
     PhysicallyImpossibleWeightError,
     RoastStore,
     RunActivelyDrivenError,
@@ -2007,6 +2008,61 @@ class RoastService:
         self.runner = runner
         return runner
 
+    def _build_recovery_config(self, frozen: FrozenRunConfig) -> AppConfig:
+        """Recombine a run's FROZEN controller/safety with the CURRENT process config.
+
+        This preserves apply-next-roast semantics across a restart: config edits
+        made after the run started cannot alter its control, scheduling,
+        reference lookup, API prechecks, or safety policy.
+
+        It is also the ONE place a historical controller meets a current device
+        config, and #732's cross-section ambient check spans exactly that pair.
+        The two can legitimately disagree in a way no edit can now repair — a
+        run may have started with the fan doctrine on at a 90 s freshness bound
+        while the operator has since widened the ambient poll interval, a save
+        the live config accepted because the live controller had the doctrine
+        off. Letting that raise here would abort recovery and could strand an
+        operator with a possibly-active run and no route into
+        ``operator_recovery_required``, which the restart invariant forbids.
+
+        So a clash retires the doctrine for the recovered run and retries. That
+        is a strictly fail-safe degradation and not a control change: the
+        doctrine is advisory-only, and a disabled doctrine yields the same
+        empty ambient context the freshness gate already produces, which
+        ``c11`` handles as its absent-ambient branch (the unqualified fan-brake
+        rule — #498's full capability intact). Any OTHER validation failure is
+        re-raised unchanged, including the safety-owned ceiling-guard bound.
+
+        Args:
+            frozen: The run's frozen controller/safety generation.
+
+        Returns:
+            The recovery application config.
+        """
+        payload = {
+            **self._config.model_dump(mode="python"),
+            "controller": frozen.controller,
+            "safety": frozen.safety,
+        }
+        try:
+            return AppConfig.model_validate(payload)
+        except ValidationError:
+            if not frozen.controller.ambient_fan_doctrine.enabled:
+                raise
+            _log.warning(
+                "Recovered run's ambient fan doctrine is inconsistent with the current "
+                "ambient poll interval; retiring the doctrine for this run (advisory "
+                "only — c11 falls back to its absent-ambient branch). #732"
+            )
+            payload["controller"] = frozen.controller.model_copy(
+                update={
+                    "ambient_fan_doctrine": frozen.controller.ambient_fan_doctrine.model_copy(
+                        update={"enabled": False}
+                    )
+                }
+            )
+            return AppConfig.model_validate(payload)
+
     async def recover_on_start(self) -> None:
         """Restart recovery (orchestration plan § Persistence; architecture
         invariant): a possibly-active persisted run is brought back without ever
@@ -2067,13 +2123,7 @@ class RoastService:
         # preserves apply-next-roast semantics across a process restart: config
         # edits made after this run started cannot alter its control, scheduling,
         # reference lookup, API prechecks, or safety policy.
-        recovery_config = AppConfig.model_validate(
-            {
-                **self._config.model_dump(mode="python"),
-                "controller": persisted.frozen_config.controller,
-                "safety": persisted.frozen_config.safety,
-            }
-        )
+        recovery_config = self._build_recovery_config(persisted.frozen_config)
         recovery_safety = SafetyPolicy(recovery_config.safety)
         self._safety = recovery_safety
         runner = await self._build_runner(

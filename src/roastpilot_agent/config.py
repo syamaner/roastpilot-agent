@@ -1923,6 +1923,15 @@ class AppConfig(BaseSettings):
         Only enforced while the doctrine is ENABLED, so the inert default can
         never make an otherwise-valid config unconstructible.
 
+        **This compares a controller field against a device field, so it is
+        only meaningful when both come from the same generation.** Recovery
+        deliberately recombines a run's FROZEN controller with the CURRENT
+        device config, where they can legitimately disagree and the pair is
+        unrepairable because the run already happened; that ONE site handles
+        the clash itself (see ``RoastApp.recover_on_start``) rather than being
+        allowed to raise, because a guard against a silently-void advisory
+        input must never be able to block a recovery.
+
         Returns:
             The validated application config.
 

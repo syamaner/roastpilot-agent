@@ -50,6 +50,7 @@ from roastpilot_agent.bean_sourcing import (
 )
 from roastpilot_agent.catalogue_recommendations import CATALOGUE_EXTRACTION_PROMPT_VERSION
 from roastpilot_agent.config import (
+    AmbientFanDoctrine,
     AppConfig,
     ControllerConfig,
     MCPDeviceConfig,
@@ -3487,6 +3488,58 @@ async def test_recover_on_start_active_roast_still_recovers_to_recovery_required
     assert OperatorAction.EMERGENCY_STOP in enabled_operator_actions(
         RoastPhase.OPERATOR_RECOVERY_REQUIRED
     )
+
+
+@pytest.mark.asyncio
+async def test_recover_on_start_survives_a_frozen_doctrine_the_live_poll_interval_voids(
+    store: RoastStore,
+) -> None:
+    """#732: the ambient cross-section guard must never be able to abort a RECOVERY.
+
+    Recovery is the one place a run's FROZEN controller meets the CURRENT device
+    config, and #732's check spans exactly that pair. They can legitimately
+    disagree with no repair available, because the run already happened: here a
+    run started with the doctrine on at a 90 s bound, and the operator has since
+    widened the ambient poll interval to 60 s — a save the live config accepted,
+    because by then the live controller had the doctrine off.
+
+    Raising there would strand an operator with a possibly-active run and no
+    route into ``operator_recovery_required``. So the clash retires the doctrine
+    for the recovered run instead: fail-safe (advisory-only, and it lands on the
+    same absent-ambient branch the freshness gate already produces) and, above
+    all, recoverable. Asserted end to end rather than on the helper, because the
+    invariant at stake is the restart one."""
+    await store.create_run(
+        run_id="run-doctrine-voided",
+        profile=_profile(),
+        config=AppConfig(
+            controller=ControllerConfig(
+                ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
+            )
+        ),
+        agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    )
+    live = AppConfig(mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=60.0))
+    service = RoastService(
+        store,
+        roaster=FakeMCPClient(),
+        advisor=FakeAdvisor(),
+        run_loop=False,
+        clock=FakeClock(),
+        config=live,
+    )
+
+    await service.recover_on_start()
+
+    assert service.runner is not None
+    assert service.runner.controller_snapshot().phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    doctrine = service.runner._config.controller.ambient_fan_doctrine  # pyright: ignore[reportPrivateUsage]
+    # Only the advisory doctrine was retired, and only because it could not be
+    # satisfied — its other fields, and the rest of the frozen generation, are
+    # untouched.
+    assert doctrine.enabled is False
+    assert doctrine.max_reading_age_seconds == 90.0
+    assert service.runner._config.controller.tick_interval_seconds == 1.0  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
