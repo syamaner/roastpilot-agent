@@ -15,11 +15,15 @@ role archetypes, not a tool-set remap of the existing fleet. Operator note:
 `claude-opus-5` and `claude-fable-5` availability was confirmed for this
 environment before Slice 1 shipped, so the planning-architect's Fable pin
 resolves; the Slice-2 model-availability gate covers the fleet re-pin
-validation. The §16 criteria for exact model IDs and explicit effort on every
-role are now met and this document matches the current fleet configuration, but
-the §15 evaluation on the five representative cases (and the §16 evaluation-
-evidence criterion) remains outstanding: Slice-2 validation was limited to the
-mock-slice run, so the topology is in effect but not yet the validated default.  
+validation. Status of the §16 criteria: exact model IDs and explicit effort are
+now set for every named-subagent role, and `AGENTS.md` matches. Two items remain
+before full §16 adoption. (1) The Product PM main session is pinned by an
+operator setting (`model: claude-opus-5` or `--model`, never `default`), not by
+repository config, so that pin is an operator responsibility this PR does not
+enforce. (2) The §15 evaluation on the five representative cases (the §16
+evaluation-evidence criterion) is still outstanding: Slice-2 validation covered
+only the mock-slice run. The topology is in effect for the subagent fleet but
+not yet the validated default.  
 Audience: Repository owners, Claude PM/orchestrator sessions, agent authors  
 Scope: Claude Code model selection, planning, delegation, review, and authority boundaries
 
