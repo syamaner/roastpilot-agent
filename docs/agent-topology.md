@@ -1,11 +1,10 @@
 # Claude Agent Topology Specification
 
-Status: Accepted; phased rollout in progress (revised 8 Aug 2026). Slice 1
-(additive: the read-only planning-architect and the operator output style) has
-landed. Slice 2, which re-pins the ten existing role
-definitions from `sonnet`/`opus` aliases to full model IDs and sets explicit
-effort per role, is deferred and gated on live model availability plus a
-mock-slice validation. Slice 2 updates each existing agent's `model` pin and
+Status: Accepted and adopted (revised 8 Aug 2026). Slice 1 (the read-only
+planning-architect and the operator output style) and Slice 2 (the ten existing
+roles re-pinned from `sonnet`/`opus` aliases to full model IDs with explicit
+effort, plus the matching `AGENTS.md` model-selection guidance) have both landed.
+Slice 2 updated each existing agent's `model` pin and
 `effort`, and the corresponding model-selection guidance in `AGENTS.md` (so the
 prose and the pins agree rather than contradict); it preserves their current
 tools and capabilities, including `product-pm`'s documentation-write scope
@@ -15,10 +14,9 @@ role archetypes, not a tool-set remap of the existing fleet. Operator note:
 `claude-opus-5` and `claude-fable-5` availability was confirmed for this
 environment before Slice 1 shipped, so the planning-architect's Fable pin
 resolves; the Slice-2 model-availability gate covers the fleet re-pin
-validation. Until Slice 2 lands, the acceptance criteria in §16 that
-require exact model IDs and explicit effort for every role are NOT yet met for
-the existing roles, and this document is the design of record, not a description
-of the current fleet configuration.  
+validation. The §16 acceptance criteria (exact model IDs and explicit effort for
+every role) are now met; this document is the design of record and matches the
+current fleet configuration.  
 Audience: Repository owners, Claude PM/orchestrator sessions, agent authors  
 Scope: Claude Code model selection, planning, delegation, review, and authority boundaries
 

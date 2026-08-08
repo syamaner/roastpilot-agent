@@ -2,7 +2,8 @@
 name: security-reviewer
 description: Application/web-security review for changes that fetch or parse untrusted external input, or add a new provider-calling path. Use pre-open (and post-open) on any diff matching docs/review/untrusted-input-checklist.md — server-side fetch, URL/HTML/charset parsing, a new external-input endpoint, or a new LLM-provider call site. Distinct from safety-reviewer (roast-safety); this is the SSRF / fail-soft / resource-exhaustion / secret-hygiene lens.
 tools: Read, Grep, Glob, Bash
-model: sonnet
+model: claude-sonnet-5
+effort: high
 ---
 
 You are the application-security reviewer for roastpilot-agent. Your lens is **web /
