@@ -41,7 +41,16 @@ LLM, no network, no store WRITE of any kind.
   tick can interleave a post-restart run's low ticks ahead of a pre-restart
   run's high ticks (mirrors
   :meth:`~roastpilot_agent.store.RoastStore.read_telemetry_points`'s own
-  documented insertion-id rule).
+  documented insertion-id rule). Every timestamp compare normalizes a naive
+  (offset-less) ISO string to UTC before subtracting, so a legacy row's naive
+  ``recorded_at_utc`` never raises against the drop event's offset-aware one.
+  The event-anchored read is tried FIRST and unconditionally, even when the
+  run has NO ``development``-phase row at all: a same-tick ceiling-guard drop
+  (first crack detected at/above the ceiling guard temperature) transitions
+  DEVELOPMENT → COOLING within the SAME tick it fires the drop, so only a
+  single COOLING-tagged row is ever persisted — that guard-forced failure
+  must still be counted in the corpus as an abnormal 0.00 MISS, not silently
+  excluded.
 - ``terminated_abnormally`` is ``True`` whenever ``outcome != 'completed'``
   (aborted/faulted), OR — within an otherwise ``'completed'`` run — a
   cleanly-detectable guard/emergency termination: an ``emergency_stop``
@@ -79,12 +88,13 @@ import argparse
 import asyncio
 import dataclasses
 import json
+import math
 import os
 import sqlite3
 import statistics
 import sys
 import tempfile
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -220,6 +230,31 @@ def _optional_float(value: object) -> float | None:
     return None if value is None else float(cast("float", value))
 
 
+def _finite_or_none(value: float | None) -> float | None:
+    """Normalize a non-finite float to ``None`` (JSON ``null`` / "unknown" display).
+
+    A historical ``ambient_temp_c`` of SQLite ``+/-Infinity`` round-trips
+    faithfully as IEEE-754 (unlike ``NaN``, which SQLite silently stores as
+    ``NULL`` on write — verified round-trip), so it can reach this scorer as
+    a genuine non-finite float. ``json.dumps`` would then emit a literal
+    ``Infinity`` token — not valid JSON per RFC 8259 — which a strict
+    ``JSON.parse`` rejects for the WHOLE report over one display-only field
+    (Codex P2, round 3). Ambient is advisory/display-only (the score itself
+    never reads it), so treating a non-finite reading as "unknown" costs
+    nothing.
+
+    Args:
+        value: The raw optional float.
+
+    Returns:
+        ``value`` unchanged when it is ``None`` or finite; ``None`` when it
+        is ``inf``/``-inf`` (or, defensively, ``nan``).
+    """
+    if value is None or not math.isfinite(value):
+        return None
+    return value
+
+
 @dataclasses.dataclass(frozen=True)
 class DropReading:
     """The achieved drop bean temperature and DTR read off telemetry.
@@ -261,6 +296,34 @@ def _development_row_indices(rows: list[sqlite3.Row]) -> list[int]:
     ]
 
 
+def _parse_recorded_at(value: str) -> datetime | None:
+    """Parse an ISO-8601 ``recorded_at_utc`` string as a timezone-AWARE ``datetime``.
+
+    Every current write path stamps an offset-aware instant (``_utc_now()``
+    is ``datetime.now(UTC).isoformat()``), but ``datetime.fromisoformat``
+    faithfully parses a NAIVE timestamp too (no UTC offset) — e.g. a legacy
+    or hand-constructed row. Subtracting a naive ``datetime`` from an aware
+    one raises ``TypeError``, which a bare ``except ValueError`` around the
+    parse alone does NOT catch — one such row would otherwise raise
+    uncaught out of :func:`_nearest_reading_to_timestamp` and abort the
+    whole corpus (Codex P2, round 3). A naive result is assumed UTC (the
+    only timezone this store ever writes) and stamped accordingly, so every
+    returned value is always safely subtractable from another.
+
+    Args:
+        value: The ISO-8601 timestamp string to parse.
+
+    Returns:
+        A timezone-aware ``datetime``, or ``None`` if ``value`` does not
+        parse as ISO-8601 at all.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 def _nearest_reading_to_timestamp(
     rows: list[sqlite3.Row], target_recorded_at_utc: str
 ) -> DropReading | None:
@@ -270,7 +333,9 @@ def _nearest_reading_to_timestamp(
     populated and returns the one whose ``recorded_at_utc`` is closest in
     absolute time to ``target_recorded_at_utc`` — the drop-instant reading,
     independent of which phase label the controller happened to persist that
-    tick under.
+    tick under. Every timestamp is parsed via :func:`_parse_recorded_at`
+    (normalized to timezone-aware), so a naive-vs-aware pair compares safely
+    instead of raising.
 
     Args:
         rows: Every telemetry row for the run (see :func:`_fetch_telemetry_rows`).
@@ -280,11 +345,10 @@ def _nearest_reading_to_timestamp(
     Returns:
         The nearest :class:`DropReading`, or ``None`` when
         ``target_recorded_at_utc`` does not parse as ISO-8601, or no row has
-        both fields populated.
+        both fields populated with a parseable timestamp.
     """
-    try:
-        target = datetime.fromisoformat(target_recorded_at_utc)
-    except ValueError:
+    target = _parse_recorded_at(target_recorded_at_utc)
+    if target is None:
         return None
     best_diff_seconds: float | None = None
     best_reading: DropReading | None = None
@@ -293,9 +357,8 @@ def _nearest_reading_to_timestamp(
         dtr = _optional_float(row["development_percent"])
         if temp is None or dtr is None:
             continue
-        try:
-            row_time = datetime.fromisoformat(str(row["recorded_at_utc"]))
-        except ValueError:
+        row_time = _parse_recorded_at(str(row["recorded_at_utc"]))
+        if row_time is None:
             continue
         diff_seconds = abs((row_time - target).total_seconds())
         if best_diff_seconds is None or diff_seconds < best_diff_seconds:
@@ -318,7 +381,16 @@ def _extract_drop_reading(
     reading, regardless of which control-loop tick or phase label persisted
     it. Verified against the real store's ratified #559 Conebosque A/B: the
     drop event and the nearest telemetry row land within a millisecond of
-    each other for both arms.
+    each other for both arms. Tried FIRST and unconditionally (Codex P1,
+    round 3): it needs only the drop event and nearby telemetry, so it alone
+    can score a run with NO ``development``-phase row at all — a same-tick
+    ceiling-guard drop (first crack detected at/above the ceiling guard
+    temperature) has the controller transition DEVELOPMENT -> COOLING
+    within the SAME tick it fires the drop, so only a single
+    COOLING-tagged row is ever persisted. A prior version of this scorer
+    gated on ``development_indices`` being non-empty BEFORE ever trying the
+    event anchor, silently excluding every such guard-forced failure from
+    the corpus instead of counting it as the abnormal 0.00 MISS it is.
 
     **Fallback: last-development / immediate-successor heuristic.** Used only
     when the drop event's timestamp is missing/unparseable, or no row near it
@@ -337,13 +409,16 @@ def _extract_drop_reading(
     fields populated — the controller flips ``agent_phase`` to ``cooling``
     synchronously within the drop tick, so that row is one control-loop tick
     fresher than the last ``development``-tagged one — else falls back to the
-    last ``development`` row's own reading.
+    last ``development`` row's own reading. Skipped entirely (returns
+    ``None``) when ``development_indices`` is empty AND the event anchor
+    already failed — there is nothing left to fall back to.
 
     Args:
         rows: Every telemetry row for the run, in insertion-id order (see
             :func:`_fetch_telemetry_rows`).
         development_indices: Indices of every ``development``-phase row (see
-            :func:`_development_row_indices`); must be non-empty.
+            :func:`_development_row_indices`); MAY be empty (a same-tick
+            guard-drop run has none).
         drop_event_recorded_at_utc: The executed ``drop_beans`` command
             event's ``recorded_at_utc``, or ``None`` when unavailable.
 
@@ -355,6 +430,9 @@ def _extract_drop_reading(
         nearest = _nearest_reading_to_timestamp(rows, drop_event_recorded_at_utc)
         if nearest is not None:
             return nearest
+
+    if not development_indices:
+        return None
 
     last_dev_index = development_indices[-1]
 
@@ -463,10 +541,10 @@ async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
     Returns:
         A :class:`ScoredRun` on success, or a :class:`SkippedRun` naming the
         reason (run not found, an unparseable/legacy frozen profile missing
-        the required drop/DTR targets, no executed ``drop_beans`` command event,
-        no ``development``-phase telemetry row at all, a development-phase row
-        missing ``bean_temp_c``/``development_percent``, or a non-finite
-        achieved/target value the metric itself rejects).
+        the required drop/DTR targets, no executed ``drop_beans`` command
+        event, no usable drop reading from EITHER the event-anchored read or
+        the ``development``-phase fallback, or a non-finite achieved/target
+        value the metric itself rejects).
     """
     try:
         detail = await store.read_run(run_id)
@@ -475,20 +553,26 @@ async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
     if detail is None:
         return SkippedRun(run_id=run_id, reason="run not found")
     rows = await _fetch_telemetry_rows(store, run_id)
-    development_indices = _development_row_indices(rows)
-    if not development_indices:
-        return SkippedRun(run_id=run_id, reason="no development-phase telemetry row")
+    # The drop-gate is checked BEFORE the development-row check (Codex P1,
+    # round 3): a same-tick ceiling-guard drop has NO development-phase row
+    # at all (see _extract_drop_reading), so gating on development_indices
+    # first would silently exclude every such guard-forced failure from the
+    # corpus. Presence of an executed drop event is the correct, independent
+    # gate — a run that reached DEVELOPMENT and cooled/ended WITHOUT ever
+    # dropping (e.g. an operator start_cooling recovery) is still excluded.
     drop_event_recorded_at_utc = await _drop_event_recorded_at(store, run_id)
     if drop_event_recorded_at_utc is None:
         return SkippedRun(
             run_id=run_id,
             reason="no drop_beans command event (run cooled/ended without a bean drop)",
         )
+    development_indices = _development_row_indices(rows)
     reading = _extract_drop_reading(rows, development_indices, drop_event_recorded_at_utc)
     if reading is None:
         return SkippedRun(
             run_id=run_id,
-            reason="development-phase telemetry missing bean_temp_c or development_percent",
+            reason="no drop reading (no telemetry near the drop event and no usable "
+            "development-phase row to fall back on)",
         )
     terminated_abnormally = await _terminated_abnormally(store, run_id, detail.outcome)
     try:
@@ -508,7 +592,12 @@ async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
     return ScoredRun(
         run_id=run_id,
         bean_name=detail.profile.name,
-        ambient_temp_c=detail.ambient_temp_c,
+        # A historical +/-Infinity ambient reading (SQLite round-trips it,
+        # unlike NaN, which is silently stored as NULL) would otherwise reach
+        # report_to_json as a non-standard JSON "Infinity" token, rejected by
+        # a strict JSON.parse — normalized to None (display-only field; the
+        # score itself never reads it).
+        ambient_temp_c=_finite_or_none(detail.ambient_temp_c),
         rating=detail.rating,
         score=score,
     )

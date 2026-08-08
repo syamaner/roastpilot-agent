@@ -498,6 +498,136 @@ async def test_score_run_event_anchor_prefers_true_drop_over_a_gapped_cooling_sa
         await tmp_store.close()
 
 
+@pytest.mark.asyncio
+async def test_score_run_handles_naive_legacy_timestamp_without_aborting(
+    tmp_store: RoastStore,
+) -> None:
+    """Regression test (Codex P2, round 3): a legacy telemetry row with a
+    NAIVE ISO timestamp (no UTC offset) must not raise when compared against
+    the drop event's offset-aware timestamp — assumed UTC, not a
+    corpus-aborting ``TypeError``."""
+    await tmp_store.initialize()
+    try:
+        profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
+        await _create_run(tmp_store, "naive-run", profile=profile)
+        # A legacy row: NAIVE timestamp (no "+00:00" offset).
+        await _insert_telemetry_row_at(
+            tmp_store,
+            "naive-run",
+            1,
+            phase=RoastPhase.DEVELOPMENT,
+            bean_temp=195.0,
+            dev_pct=16.0,
+            recorded_at_utc="2026-01-01T00:00:00.000000",
+        )
+        await _record_drop_event(
+            tmp_store, "naive-run", recorded_at_utc="2026-01-01T00:00:00.500000+00:00"
+        )
+        await tmp_store.complete_run(
+            run_id="naive-run", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        result = await scorer.score_run(tmp_store, "naive-run")
+        assert isinstance(result, scorer.ScoredRun)
+        assert result.score.drop_temp_c == pytest.approx(195.0)
+        assert result.score.dtr_percent == pytest.approx(16.0)
+        assert result.score.hit is True
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_score_run_same_tick_ceiling_guard_drop_with_no_development_row(
+    tmp_store: RoastStore,
+) -> None:
+    """Regression test (Codex P1, round 3): first crack detected AT/ABOVE the
+    ceiling guard temperature makes the controller transition
+    DEVELOPMENT -> COOLING within the SAME tick it fires the drop, so only a
+    single COOLING-tagged telemetry row is ever persisted — no
+    ``development``-phase row exists at all. The event-anchored read must
+    still find it: a same-tick guard-drop now SCORES as an abnormal MISS
+    (scalar 0), not silently excluded from the corpus."""
+    await tmp_store.initialize()
+    try:
+        profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
+        await _create_run(tmp_store, "guard-only-run", profile=profile)
+        # The ONLY telemetry row for this run: tagged 'cooling' (the phase
+        # already flipped by the time it was persisted), at/above the
+        # ceiling guard.
+        await _insert_telemetry_row_at(
+            tmp_store,
+            "guard-only-run",
+            1,
+            phase=RoastPhase.COOLING,
+            bean_temp=198.0,
+            dev_pct=0.5,
+            recorded_at_utc="2026-01-01T00:00:00.100000+00:00",
+        )
+        # A single event carries BOTH the executed drop_beans command AND the
+        # ceiling-guard reason, exactly like the real controller
+        # (D88 amendment A1's _maybe_ceiling_guard_drop).
+        await tmp_store.record_event(
+            run_id="guard-only-run",
+            kind=RoastEventKind.COMMAND_EXECUTED,
+            source=RoastEventSource.CONTROLLER,
+            payload={
+                "command": RoastCommand.DROP_BEANS.value,
+                "source": "policy",
+                "reason": DropReason.CEILING_GUARD.value,
+            },
+            recorded_at_utc="2026-01-01T00:00:00.000000+00:00",
+        )
+        await tmp_store.complete_run(
+            run_id="guard-only-run", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        result = await scorer.score_run(tmp_store, "guard-only-run")
+        assert isinstance(result, scorer.ScoredRun)
+        assert result.score.drop_temp_c == pytest.approx(198.0)
+        assert result.score.terminated_abnormally is True
+        assert result.score.hit is False
+        assert result.score.scalar == pytest.approx(0.0)
+    finally:
+        await tmp_store.close()
+
+
+def test_finite_or_none() -> None:
+    assert scorer._finite_or_none(None) is None  # pyright: ignore[reportPrivateUsage]
+    assert scorer._finite_or_none(float("inf")) is None  # pyright: ignore[reportPrivateUsage]
+    assert scorer._finite_or_none(float("-inf")) is None  # pyright: ignore[reportPrivateUsage]
+    assert scorer._finite_or_none(23.5) == 23.5  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_score_run_normalizes_non_finite_ambient_to_none(tmp_store: RoastStore) -> None:
+    """Regression test (Codex P2, round 3): a non-finite ``ambient_temp_c``
+    (SQLite round-trips ``+/-Infinity`` faithfully, unlike ``NaN``, which it
+    silently stores as ``NULL``) must normalize to ``None`` — ``json.dumps``
+    would otherwise emit a non-standard ``Infinity`` token a strict
+    ``JSON.parse`` rejects for the whole report."""
+    await tmp_store.initialize()
+    try:
+        profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
+        await _seed_scoreable_run(
+            tmp_store, "hot-ambient-run", profile=profile, drop_temp_c=195.0, dtr_percent=16.0
+        )
+        await tmp_store.set_ambient(
+            "hot-ambient-run", temperature_c=float("inf"), humidity_percent=None, pressure_hpa=None
+        )
+        result = await scorer.score_run(tmp_store, "hot-ambient-run")
+        assert isinstance(result, scorer.ScoredRun)
+        assert result.ambient_temp_c is None
+
+        report = scorer.CorpusReport(scored=[result], skipped=[])
+        payload = scorer.report_to_json(report)
+        assert payload["runs"][0]["ambient_temp_c"] is None
+        # Must be valid, RFC-8259-strict JSON: no "Infinity" token anywhere.
+        assert "Infinity" not in json.dumps(payload)
+
+        table = scorer.render_markdown_table(report)
+        assert "inf" not in table.lower()
+    finally:
+        await tmp_store.close()
+
+
 # --- _extract_drop_reading / _nearest_reading_to_timestamp: direct unit tests --
 # (the fallback branches score_run's own drop-gate makes unreachable through
 # score_run itself — a valid drop_event_recorded_at_utc is guaranteed non-None
@@ -611,6 +741,50 @@ def test_extract_drop_reading_fallback_skips_an_incomplete_successor_row() -> No
     assert reading.development_percent == 16.0
 
 
+def test_nearest_reading_to_timestamp_compares_naive_and_aware_timestamps_safely() -> None:
+    """Regression test (Codex P2, round 3): a legacy row's NAIVE ISO
+    timestamp (no UTC offset) compared against the drop event's
+    offset-AWARE one must not raise ``TypeError`` — both are normalized to
+    UTC-aware before subtracting, so the naive row is still found and used."""
+    rows = _make_telemetry_rows(
+        [
+            # NAIVE: no "+00:00" offset.
+            ("development", 195.0, 16.0, "2026-01-01T00:00:00.000000"),
+        ]
+    )
+    reading = scorer._nearest_reading_to_timestamp(  # pyright: ignore[reportPrivateUsage]
+        rows, "2026-01-01T00:00:00.500000+00:00"
+    )
+    assert reading is not None
+    assert reading.bean_temp_c == 195.0
+    assert reading.development_percent == 16.0
+
+
+def test_extract_drop_reading_empty_development_indices_uses_event_anchor() -> None:
+    """``development_indices=[]`` (a same-tick ceiling-guard drop has NO
+    ``development``-phase row at all): the event anchor alone must still
+    find the reading — the fallback is never consulted, and must never index
+    an empty list."""
+    rows = _make_telemetry_rows([("cooling", 198.0, 0.5, "2026-01-01T00:00:00.100000+00:00")])
+    reading = scorer._extract_drop_reading(  # pyright: ignore[reportPrivateUsage]
+        rows, [], "2026-01-01T00:00:00.000000+00:00"
+    )
+    assert reading is not None
+    assert reading.bean_temp_c == 198.0
+    assert reading.development_percent == 0.5
+
+
+def test_extract_drop_reading_empty_development_indices_and_failed_anchor_returns_none() -> None:
+    """``development_indices=[]`` AND the event anchor also fails to find a
+    usable row: there is nothing left to fall back to, so the pure helper
+    must return ``None`` rather than raise on an empty-list index."""
+    rows = _make_telemetry_rows([])
+    reading = scorer._extract_drop_reading(  # pyright: ignore[reportPrivateUsage]
+        rows, [], "2026-01-01T00:00:00.000000+00:00"
+    )
+    assert reading is None
+
+
 @pytest.mark.asyncio
 async def test_score_run_missing_targets_is_skipped(tmp_store: RoastStore) -> None:
     await tmp_store.initialize()
@@ -639,9 +813,13 @@ async def test_score_run_not_found_is_skipped(tmp_store: RoastStore) -> None:
 
 
 @pytest.mark.asyncio
-async def test_score_run_without_development_telemetry_is_skipped(
+async def test_score_run_pre_first_crack_only_run_is_skipped_for_no_drop_event(
     tmp_store: RoastStore,
 ) -> None:
+    """A run that never reached DEVELOPMENT and never dropped is skipped on
+    the drop-gate (round 3: the drop-event check now runs BEFORE the
+    development-row check, so this hits "no drop_beans command event", not a
+    development-specific reason)."""
     await tmp_store.initialize()
     try:
         profile = _profile()
@@ -654,7 +832,7 @@ async def test_score_run_without_development_telemetry_is_skipped(
         )
         result = await scorer.score_run(tmp_store, "no-dev-run")
         assert isinstance(result, scorer.SkippedRun)
-        assert result.reason == "no development-phase telemetry row"
+        assert result.reason == "no drop_beans command event (run cooled/ended without a bean drop)"
     finally:
         await tmp_store.close()
 
@@ -669,8 +847,10 @@ async def test_score_run_development_row_missing_fields_is_skipped(
         await _create_run(tmp_store, "null-dev-run", profile=profile)
         # A development row with no bean_temp_c reading (a failed/sessionless
         # telemetry read that tick) and no development_percent. A drop event IS
-        # recorded so this run clears fix #1's drop-gate and reaches the
-        # missing-fields check this test targets.
+        # recorded so this run clears the drop-gate and reaches the "no
+        # usable reading" check this test targets — neither the event anchor
+        # (no row near it has both fields) nor the development fallback (the
+        # only development row itself is missing both fields) can produce one.
         await _record_row(
             tmp_store, "null-dev-run", 1, phase=RoastPhase.DEVELOPMENT, bean_temp=None
         )
@@ -680,7 +860,30 @@ async def test_score_run_development_row_missing_fields_is_skipped(
         )
         result = await scorer.score_run(tmp_store, "null-dev-run")
         assert isinstance(result, scorer.SkippedRun)
-        assert "missing bean_temp_c or development_percent" in result.reason
+        assert "no drop reading" in result.reason
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_score_run_no_development_row_and_no_event_match_is_skipped(
+    tmp_store: RoastStore,
+) -> None:
+    """A drop event exists but there is NO telemetry at all (so the event
+    anchor has nothing to match) and NO development-phase row to fall back
+    on — the unified terminal skip, exercising ``_extract_drop_reading``'s
+    empty-``development_indices`` guard directly through ``score_run``."""
+    await tmp_store.initialize()
+    try:
+        profile = _profile()
+        await _create_run(tmp_store, "empty-run", profile=profile)
+        await _record_drop_event(tmp_store, "empty-run")
+        await tmp_store.complete_run(
+            run_id="empty-run", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        result = await scorer.score_run(tmp_store, "empty-run")
+        assert isinstance(result, scorer.SkippedRun)
+        assert "no drop reading" in result.reason
     finally:
         await tmp_store.close()
 
@@ -1083,7 +1286,7 @@ async def test_aggregate_stats_and_rendering(tmp_store: RoastStore) -> None:
         assert "MISS" in table
         assert "5★" in table  # rated row
         assert "—" in table  # unrated row + skipped columns
-        assert "no development-phase telemetry row" in table
+        assert "no drop_beans command event" in table
         assert "N scored: 2 (skipped: 1)" in table
         assert "HIT: 1/2 (50.0%)" in table
         # The #711 Goodhart guard extends to the aggregate: the mean scalar
