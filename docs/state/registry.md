@@ -2,6 +2,32 @@
 
 ## Active Epic
 
+> **STATUS UPDATE — 8 Aug 2026 (RP-D shipped; RP-B is next). Read with the 6 Aug
+> block below.** The joint-drop-objective tree (**#707 / D122**) advanced: **RP-D
+> (#711) — the joint-objective bake-off metric — is SHIPPED** across two PRs on
+> `main`: **PR-D1 (#724)** the pure `joint_window_score` HIT+scalar core in
+> `scripts/bakeoff_replay.py`, and **PR-D2 (#725)** the standalone offline corpus
+> scorer `scripts/rpd_corpus_score.py`. The ratified metric (D124): HIT =
+> `|Δdrop| ≤ 3 °C` AND `DTR ∈ target ± 2 pp`; 50/50 scalar (window-edge 0.5);
+> fixed constants; abnormal termination fail-closed; D42 rating printed beside
+> every score. **Corpus result: 15 scored / 3 HITs** — the joint window IS
+> achievable (Sumatra `43c84c98`, El Durazno `edbe9a76` + `a4299aea`); the
+> Conebosque A/B both MISS 0.00 (baseline 188 °C/21%, treatment 190 °C/24%),
+> correcting the earlier "no joint-HIT yet" read. **Design:** RP-D scores achieved
+> OUTCOMES, so it is a standalone corpus scorer reading the frozen `profile_json`
+> targets, deliberately NOT wired into `advisor_bakeoff.py` (the replay context's
+> targets default to the achieved values = a self-comparison that always HITs);
+> D124 clarified in `roastpilot-plan`. **Follow-ups:** **#726** (shared
+> `RoastStore.read_drop_reading` + abnormal-termination classifier + snapshot/URI
+> helper; owns robust guard-drop classification — two review findings deferred
+> there, zero current-corpus impact as all 15 drops are advisor-sourced); the two
+> Conebosque **fixture-registrations are folded into RP-B's kickoff** (they are
+> RP-B's replay-harness eval input, not needed by the store-reading scorer).
+> **Next in the D122 sequence: RP-B (#709) — the c11 ambient-fan doctrine —
+> evaluated offline by the RP-D score.** Plan design for both the RP-D scorer and
+> the RP-B c11 doctrine is recorded as **D124** (roastpilot-plan); next free plan
+> decision number: **D125**.
+>
 > **STATUS UPDATE — 6 Aug 2026 (updates the control-loop framing in the 2 Aug
 > block below).** The D96 recovery law (#559) has now had its flag-on hardware
 > validation: a paired Guatemala Conebosque (washed) A/B (baseline recovery-off
