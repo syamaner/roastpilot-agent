@@ -11,31 +11,37 @@ LLM, no network, no store WRITE of any kind.
   frozen ``roast_runs.profile_json`` (the profile instantiated at roast start,
   immutable thereafter).
 - The achieved drop bean temperature and achieved DTR are read off
-  ``telemetry_snapshots``, anchored on the LAST row tagged ``agent_phase =
-  'development'`` for that run — the same clock-safe anchor
+  ``telemetry_snapshots``, **primarily anchored on the executed ``drop_beans``
+  command event's own ``recorded_at_utc``** (from ``roast_events``): the
+  telemetry row (whatever phase it happens to be tagged) whose
+  ``recorded_at_utc`` is NEAREST that instant is the true drop-instant
+  reading. Confirmed against the ratified #559 Conebosque A/B on the real
+  store: the drop event and the nearest telemetry row are within a
+  millisecond of each other for both arms (188.0 °C / 20.997 % baseline,
+  190.0 °C / 24.257 % treatment — matching the ratified 188/21 and 190/24 to
+  the nearest integer). **Fallback (drop event missing/unparseable, or no row
+  near it has both fields populated):** the LAST row tagged ``agent_phase =
+  'development'`` — the same clock-safe anchor
   :meth:`~roastpilot_agent.store.RoastStore._build_reference_roast` uses
   (design note §6.4a): development begins at first crack, so this is never the
   run's final row, which can land deep in the post-drop COOLING tail with a
   falling, physically meaningless bean temperature (the trap: a bare
   ``MAX(tick WHERE development_percent IS NOT NULL)`` lands there because
-  ``development_percent`` freezes at drop and is echoed on every later row).
-  **One refinement beyond a literal last-development-row read, verified
-  against the real store:** the controller flips ``agent_phase`` to
-  ``cooling`` SYNCHRONOUSLY within the same tick it executes the drop
-  (``api._publish_and_persist_telemetry`` persists ``snapshot.phase`` AFTER
-  the tick's transition), so the row immediately FOLLOWING the last
-  ``development`` row — not that row itself — carries the true drop-instant
-  ``bean_temp_c`` (one control-loop tick fresher) and the just-frozen
-  ``development_percent``. Confirmed against the ratified #559 Conebosque A/B
-  on the real store: the last-``development``-row read gives 188.0 °C / 19.97 %
-  (baseline) and 189.0 °C / 23.34 % (treatment) — both ~1 tick short of the
-  ratified 188/21 and 190/24 — while the immediately-following row gives
-  188.0 °C / 20.997 % and 190.0 °C / 24.257 %, matching to the nearest
-  integer. Used only when that following row has BOTH fields populated
-  (never a later, genuinely-cooled-down reading with a missing field); falls
-  back to the last ``development`` row's own reading otherwise (e.g. the run
-  ended abruptly with no further tick logged, or the following row failed to
-  record a temperature that tick).
+  ``development_percent`` freezes at drop and is echoed on every later row) —
+  or, when it has both fields populated, the row immediately FOLLOWING it (the
+  controller flips ``agent_phase`` to ``cooling`` synchronously within the
+  drop tick, so that row is one control-loop tick fresher than the last
+  ``development``-tagged one). The event-anchored primary read exists because,
+  for a HISTORICAL run recorded before phase-boundary telemetry was
+  force-persisted on every D96-state change, the immediate successor row can
+  be an ordinary PERIODIC cooling sample several seconds (and several degrees)
+  after the true drop — the event timestamp is not subject to that gap.
+  Telemetry rows are read in durable INSERTION-id order, never ``(tick, id)``
+  — a restart resets the process-local tick counter to zero, so ordering by
+  tick can interleave a post-restart run's low ticks ahead of a pre-restart
+  run's high ticks (mirrors
+  :meth:`~roastpilot_agent.store.RoastStore.read_telemetry_points`'s own
+  documented insertion-id rule).
 - ``terminated_abnormally`` is ``True`` whenever ``outcome != 'completed'``
   (aborted/faulted), OR — within an otherwise ``'completed'`` run — a
   cleanly-detectable guard/emergency termination: an ``emergency_stop``
@@ -73,10 +79,12 @@ import argparse
 import asyncio
 import dataclasses
 import json
+import os
 import sqlite3
 import statistics
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -96,6 +104,29 @@ from roastpilot_agent.store import RoastStore  # noqa: E402
 
 #: Default operator store path (mirrors every other offline bake-off script).
 DEFAULT_STORE = Path.home() / "roasts" / "roastpilot.sqlite3"
+
+
+def _read_only_sqlite_uri(path: Path) -> str:
+    """Build a percent-encoded, read-only ``sqlite3`` URI for ``path``.
+
+    A raw ``f"file:{path}?mode=ro"`` (the naive form) mis-parses a path
+    containing ``?`` or ``#``: SQLite's URI filenames follow RFC 3986, so an
+    unescaped ``?``/``#`` in the path is read as the query-string/fragment
+    delimiter, silently truncating or corrupting the path SQLite actually
+    opens — a store path containing either character could open the wrong
+    file (or fail) instead of opening the intended file read-only.
+    :meth:`~pathlib.Path.as_uri` percent-encodes the path per RFC 3986 before
+    the ``mode=ro`` query string is appended, so both characters (and any
+    other reserved/non-ASCII byte) round-trip correctly. Requires an absolute
+    path, hence the ``resolve()``.
+
+    Args:
+        path: The SQLite file path to open read-only.
+
+    Returns:
+        A ``file:...?mode=ro`` URI safe to pass to ``sqlite3.connect(uri=True)``.
+    """
+    return f"{path.resolve().as_uri()}?mode=ro"
 
 
 def snapshot_store_to_temp(store_path: Path, tmp_dir: Path) -> Path:
@@ -124,7 +155,7 @@ def snapshot_store_to_temp(store_path: Path, tmp_dir: Path) -> Path:
     if not store_path.exists():
         raise FileNotFoundError(f"no store at {store_path}")
     snapshot_path = tmp_dir / "store-snapshot.sqlite3"
-    source = sqlite3.connect(f"file:{store_path}?mode=ro", uri=True)
+    source = sqlite3.connect(_read_only_sqlite_uri(store_path), uri=True)
     try:
         target = sqlite3.connect(str(snapshot_path))
         try:
@@ -203,10 +234,19 @@ class DropReading:
 
 
 async def _fetch_telemetry_rows(store: RoastStore, run_id: str) -> list[sqlite3.Row]:
-    """Every telemetry row for ``run_id``, in persisted (tick, id) order."""
+    """Every telemetry row for ``run_id``, in durable INSERTION-id order.
+
+    Ordered by ``id`` alone, never ``(tick, id)``: a restart resets the
+    process-local tick counter to zero
+    (:meth:`~roastpilot_agent.store.RoastStore.read_telemetry_points`'s own
+    documented rule), so ordering by ``tick`` first can interleave a
+    post-restart run's low ticks ahead of a pre-restart run's high ticks —
+    the durable autoincrement ``id`` is the only column insertion order (and
+    therefore chronology) is guaranteed to track.
+    """
     async with store.connection.execute(
-        "SELECT agent_phase, bean_temp_c, development_percent FROM telemetry_snapshots"
-        " WHERE run_id = ? ORDER BY tick ASC, id ASC",
+        "SELECT agent_phase, bean_temp_c, development_percent, recorded_at_utc"
+        " FROM telemetry_snapshots WHERE run_id = ? ORDER BY id ASC",
         (run_id,),
     ) as cursor:
         return list(await cursor.fetchall())
@@ -221,41 +261,101 @@ def _development_row_indices(rows: list[sqlite3.Row]) -> list[int]:
     ]
 
 
-def _extract_drop_reading(
-    rows: list[sqlite3.Row], development_indices: list[int]
+def _nearest_reading_to_timestamp(
+    rows: list[sqlite3.Row], target_recorded_at_utc: str
 ) -> DropReading | None:
-    """The achieved drop reading given pre-fetched rows and their development indices.
+    """The telemetry row (any phase) whose ``recorded_at_utc`` is nearest ``target``.
 
-    Anchored on the LAST ``development``-phase telemetry row — the same
-    clock-safe anchor
-    :meth:`~roastpilot_agent.store.RoastStore._build_reference_roast` uses
-    (design note §6.4a): this is never the run's chronologically final row (a
+    Considers every row with BOTH ``bean_temp_c`` and ``development_percent``
+    populated and returns the one whose ``recorded_at_utc`` is closest in
+    absolute time to ``target_recorded_at_utc`` — the drop-instant reading,
+    independent of which phase label the controller happened to persist that
+    tick under.
+
+    Args:
+        rows: Every telemetry row for the run (see :func:`_fetch_telemetry_rows`).
+        target_recorded_at_utc: The anchor instant (ISO-8601 UTC), typically
+            the executed ``drop_beans`` command event's own ``recorded_at_utc``.
+
+    Returns:
+        The nearest :class:`DropReading`, or ``None`` when
+        ``target_recorded_at_utc`` does not parse as ISO-8601, or no row has
+        both fields populated.
+    """
+    try:
+        target = datetime.fromisoformat(target_recorded_at_utc)
+    except ValueError:
+        return None
+    best_diff_seconds: float | None = None
+    best_reading: DropReading | None = None
+    for row in rows:
+        temp = _optional_float(row["bean_temp_c"])
+        dtr = _optional_float(row["development_percent"])
+        if temp is None or dtr is None:
+            continue
+        try:
+            row_time = datetime.fromisoformat(str(row["recorded_at_utc"]))
+        except ValueError:
+            continue
+        diff_seconds = abs((row_time - target).total_seconds())
+        if best_diff_seconds is None or diff_seconds < best_diff_seconds:
+            best_diff_seconds = diff_seconds
+            best_reading = DropReading(bean_temp_c=temp, development_percent=dtr)
+    return best_reading
+
+
+def _extract_drop_reading(
+    rows: list[sqlite3.Row],
+    development_indices: list[int],
+    drop_event_recorded_at_utc: str | None,
+) -> DropReading | None:
+    """The achieved drop reading given pre-fetched rows and the drop event's timestamp.
+
+    **Primary: event-anchored (Codex P1).** When
+    ``drop_event_recorded_at_utc`` is available, :func:`_nearest_reading_to_timestamp`
+    picks the telemetry row (whatever phase it is tagged) closest in time to
+    the executed ``drop_beans`` command event — the true drop-instant
+    reading, regardless of which control-loop tick or phase label persisted
+    it. Verified against the real store's ratified #559 Conebosque A/B: the
+    drop event and the nearest telemetry row land within a millisecond of
+    each other for both arms.
+
+    **Fallback: last-development / immediate-successor heuristic.** Used only
+    when the drop event's timestamp is missing/unparseable, or no row near it
+    has both fields populated — e.g. a HISTORICAL run recorded before
+    phase-boundary telemetry was force-persisted on every D96-state change,
+    where the immediate successor row can be an ordinary periodic cooling
+    sample several seconds (and several degrees) after the true drop. Anchors
+    on the LAST ``development``-phase telemetry row — the same clock-safe
+    anchor :meth:`~roastpilot_agent.store.RoastStore._build_reference_roast`
+    uses (design note §6.4a): never the run's chronologically final row (a
     post-drop COOLING-tail sample with a falling bean temperature), and never
     a bare ``MAX(tick)`` over rows with a non-null ``development_percent`` (a
     predicate cooling-tail rows also satisfy, since ``development_percent``
-    freezes at drop and is echoed on every later row — that trap misreads the
-    drop far into the tail).
-
-    **Refinement, verified against the real store (module docstring):** the
-    row immediately FOLLOWING the last ``development`` row is preferred when
-    it has both fields populated — the controller flips ``agent_phase`` to
-    ``cooling`` synchronously within the drop tick, so that following row (not
-    the last ``development``-tagged one) carries the true drop-instant
-    ``bean_temp_c`` and the just-frozen ``development_percent``. Falls back to
-    the last ``development`` row's own reading when there is no following row,
-    or it is missing either field (e.g. a failed telemetry read that tick, or
-    a later, already-cooling reading with no fresh percentage).
+    freezes at drop and is echoed on every later row). Prefers the row
+    immediately FOLLOWING the last ``development`` row when it has both
+    fields populated — the controller flips ``agent_phase`` to ``cooling``
+    synchronously within the drop tick, so that row is one control-loop tick
+    fresher than the last ``development``-tagged one — else falls back to the
+    last ``development`` row's own reading.
 
     Args:
-        rows: Every telemetry row for the run, in ``(tick, id)`` order (see
+        rows: Every telemetry row for the run, in insertion-id order (see
             :func:`_fetch_telemetry_rows`).
         development_indices: Indices of every ``development``-phase row (see
             :func:`_development_row_indices`); must be non-empty.
+        drop_event_recorded_at_utc: The executed ``drop_beans`` command
+            event's ``recorded_at_utc``, or ``None`` when unavailable.
 
     Returns:
-        The :class:`DropReading`, or ``None`` when neither the last
-        ``development`` row nor its immediate successor has both fields.
+        The :class:`DropReading`, or ``None`` when neither the event-anchored
+        read nor the fallback heuristic can find a row with both fields.
     """
+    if drop_event_recorded_at_utc is not None:
+        nearest = _nearest_reading_to_timestamp(rows, drop_event_recorded_at_utc)
+        if nearest is not None:
+            return nearest
+
     last_dev_index = development_indices[-1]
 
     if last_dev_index + 1 < len(rows):
@@ -316,8 +416,8 @@ async def _terminated_abnormally(store: RoastStore, run_id: str, outcome: str | 
     return False
 
 
-async def _has_drop_command(store: RoastStore, run_id: str) -> bool:
-    """Whether ``run_id`` recorded an executed bean drop.
+async def _drop_event_recorded_at(store: RoastStore, run_id: str) -> str | None:
+    """The ``recorded_at_utc`` of ``run_id``'s executed ``drop_beans`` command event.
 
     A drop is a ``command_executed`` :class:`~roastpilot_agent.models.RoastEventKind`
     event whose payload ``command`` is
@@ -328,22 +428,29 @@ async def _has_drop_command(store: RoastStore, run_id: str) -> bool:
     reaches DEVELOPMENT and is then cooled/ended WITHOUT a drop (e.g. an operator
     ``start_cooling`` recovery) has development telemetry but no drop event; its
     post-development rows are not a drop reading and must not be scored as one.
-    The command value is bound as a query parameter (mirrors the typed-value
-    discipline of the guard/verdict queries).
+    One query serves both :func:`score_run`'s drop-gate (``None`` ⇒ no drop
+    ever happened) and :func:`_extract_drop_reading`'s event-anchored read
+    (a non-``None`` timestamp). The command value is bound as a query
+    parameter (mirrors the typed-value discipline of the guard/verdict
+    queries); ordered by ``id`` (insertion order) so the FIRST executed drop
+    wins on the (structurally unreachable today) chance more than one is ever
+    persisted.
 
     Args:
         store: The (snapshot-backed) store to read.
         run_id: The run to check.
 
     Returns:
-        ``True`` if an executed ``drop_beans`` command event exists.
+        The event's ``recorded_at_utc``, or ``None`` if no executed
+        ``drop_beans`` command event exists.
     """
     async with store.connection.execute(
-        "SELECT 1 FROM roast_events WHERE run_id = ? AND kind = ?"
-        " AND json_extract(payload_json, '$.command') = ? LIMIT 1",
+        "SELECT recorded_at_utc FROM roast_events WHERE run_id = ? AND kind = ?"
+        " AND json_extract(payload_json, '$.command') = ? ORDER BY id ASC LIMIT 1",
         (run_id, RoastEventKind.COMMAND_EXECUTED.value, RoastCommand.DROP_BEANS.value),
     ) as cursor:
-        return await cursor.fetchone() is not None
+        row = await cursor.fetchone()
+    return None if row is None else str(row["recorded_at_utc"])
 
 
 async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
@@ -357,8 +464,9 @@ async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
         A :class:`ScoredRun` on success, or a :class:`SkippedRun` naming the
         reason (run not found, an unparseable/legacy frozen profile missing
         the required drop/DTR targets, no executed ``drop_beans`` command event,
-        no ``development``-phase telemetry row at all, or a development-phase row
-        missing ``bean_temp_c``/``development_percent``).
+        no ``development``-phase telemetry row at all, a development-phase row
+        missing ``bean_temp_c``/``development_percent``, or a non-finite
+        achieved/target value the metric itself rejects).
     """
     try:
         detail = await store.read_run(run_id)
@@ -370,25 +478,33 @@ async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
     development_indices = _development_row_indices(rows)
     if not development_indices:
         return SkippedRun(run_id=run_id, reason="no development-phase telemetry row")
-    if not await _has_drop_command(store, run_id):
+    drop_event_recorded_at_utc = await _drop_event_recorded_at(store, run_id)
+    if drop_event_recorded_at_utc is None:
         return SkippedRun(
             run_id=run_id,
             reason="no drop_beans command event (run cooled/ended without a bean drop)",
         )
-    reading = _extract_drop_reading(rows, development_indices)
+    reading = _extract_drop_reading(rows, development_indices, drop_event_recorded_at_utc)
     if reading is None:
         return SkippedRun(
             run_id=run_id,
             reason="development-phase telemetry missing bean_temp_c or development_percent",
         )
     terminated_abnormally = await _terminated_abnormally(store, run_id, detail.outcome)
-    score = joint_window_score(
-        drop_temp_c=reading.bean_temp_c,
-        target_drop_temp_c=detail.profile.target_drop_temp_c,
-        dtr_percent=reading.development_percent,
-        target_dtr_percent=detail.profile.target_development_percent,
-        terminated_abnormally=terminated_abnormally,
-    )
+    try:
+        score = joint_window_score(
+            drop_temp_c=reading.bean_temp_c,
+            target_drop_temp_c=detail.profile.target_drop_temp_c,
+            dtr_percent=reading.development_percent,
+            target_dtr_percent=detail.profile.target_development_percent,
+            terminated_abnormally=terminated_abnormally,
+        )
+    except ValueError as exc:
+        # joint_window_score fails closed on a non-finite achieved/target value
+        # (an inf/nan from a corrupt historical trace or profile) — one corrupt
+        # run must not abort the whole corpus; skip it like every other
+        # per-run data problem.
+        return SkippedRun(run_id=run_id, reason=f"corrupt trace or profile: {exc}")
     return ScoredRun(
         run_id=run_id,
         bean_name=detail.profile.name,
@@ -428,10 +544,13 @@ async def score_corpus(store: RoastStore, run_ids: list[str] | None = None) -> C
     NULL``, ``excluded = 0``) via :func:`_discover_finished_run_ids` — an
     id-only query that does NOT parse profiles, so one legacy/malformed frozen
     profile is skipped per-run (#582 soft-discards never contribute) rather than
-    aborting the whole corpus. With an explicit ``run_ids``, each id is
-    independently checked for existence, exclusion, and finished-ness (so an
-    explicit request for an excluded or still-active run is skipped with a
-    reason, not silently bypassed).
+    aborting the whole corpus. With an explicit ``run_ids``, a repeated id is
+    de-duplicated (first occurrence kept — a duplicate would otherwise score
+    the same run twice and double-count it in the aggregate), and each
+    surviving id is independently checked for existence, exclusion,
+    finished-ness, and a parseable frozen profile (so an explicit request for
+    an excluded/still-active/malformed run is skipped with a reason, not
+    silently bypassed or allowed to abort the whole invocation).
 
     Args:
         store: The (snapshot-backed) store to read.
@@ -448,8 +567,14 @@ async def score_corpus(store: RoastStore, run_ids: list[str] | None = None) -> C
         candidate_ids = await _discover_finished_run_ids(store)
     else:
         candidate_ids = []
-        for run_id in run_ids:
-            detail = await store.read_run(run_id)
+        for run_id in dict.fromkeys(run_ids):  # de-dupe, preserve first occurrence
+            try:
+                detail = await store.read_run(run_id)
+            except ValueError as exc:
+                skipped.append(
+                    SkippedRun(run_id=run_id, reason=f"could not parse frozen profile: {exc}")
+                )
+                continue
             if detail is None:
                 skipped.append(SkippedRun(run_id=run_id, reason="run not found"))
                 continue
@@ -476,17 +601,24 @@ async def score_corpus(store: RoastStore, run_ids: list[str] | None = None) -> C
 
 
 def aggregate_stats(report: CorpusReport) -> dict[str, Any]:
-    """The corpus aggregate: N scored, HIT count/rate, mean scalar.
+    """The corpus aggregate: N scored, HIT count/rate, mean scalar, rating coverage.
 
     Args:
         report: The scored corpus.
 
     Returns:
-        A dict with ``n_scored``, ``n_skipped``, ``hits``, ``hit_rate``, and
-        ``mean_scalar`` (``0.0`` for both when nothing was scored).
+        A dict with ``n_scored``, ``n_skipped``, ``hits``, ``hit_rate``,
+        ``mean_scalar``, and ``rated`` — how many of the scored runs carry a
+        D42 operator rating (``0``/``0.0`` for the numeric fields when
+        nothing was scored). ``rated`` is the #711 Goodhart-guard evidence
+        for ``mean_scalar``: the module's own stated invariant is that the
+        scalar is never presented without the rating, so the aggregate must
+        say how much of it the mean scalar actually reflects, not just the
+        per-row table.
     """
     n_scored = len(report.scored)
     hits = sum(1 for run in report.scored if run.score.hit)
+    rated = sum(1 for run in report.scored if run.rating is not None)
     mean_scalar = statistics.fmean(run.score.scalar for run in report.scored) if n_scored else 0.0
     return {
         "n_scored": n_scored,
@@ -494,6 +626,7 @@ def aggregate_stats(report: CorpusReport) -> dict[str, Any]:
         "hits": hits,
         "hit_rate": (hits / n_scored) if n_scored else 0.0,
         "mean_scalar": mean_scalar,
+        "rated": rated,
     }
 
 
@@ -502,11 +635,31 @@ def _fmt_optional(value: float | None, *, precision: int = 1) -> str:
     return "—" if value is None else f"{value:.{precision}f}"
 
 
+def _escape_markdown_cell(text: str) -> str:
+    """Escape a value for safe interpolation into a Markdown table cell.
+
+    A bean ``name`` (or a skip ``reason``, sourced from an exception message)
+    is uncontrolled operator/corpus text: an embedded ``|`` would be read as
+    an extra column delimiter, corrupting every column after it, and an
+    embedded newline would break the row out of the table entirely. Escapes
+    ``|`` and collapses any newline to a space.
+
+    Args:
+        text: The raw cell text.
+
+    Returns:
+        The text, safe to place inside a single ``| ... |`` table cell.
+    """
+    return text.replace("|", "\\|").replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+
+
 def render_markdown_table(report: CorpusReport) -> str:
     """Render the per-roast markdown table + corpus aggregate line.
 
     Every row shows the D42 operator rating alongside the scalar (the #711
-    Goodhart guard: the scalar is never shown without the rating).
+    Goodhart guard: the scalar is never shown without the rating); the
+    aggregate line extends that guard to the corpus-level mean scalar by also
+    stating how many scored runs are rated.
 
     Args:
         report: The scored corpus.
@@ -522,20 +675,23 @@ def render_markdown_table(report: CorpusReport) -> str:
     lines = [header, separator]
     for run in report.scored:
         score = run.score
+        bean_name = _escape_markdown_cell(run.bean_name)
         lines.append(
-            f"| {run.run_id[:8]} | {run.bean_name} | {_fmt_optional(run.ambient_temp_c)} "
+            f"| {run.run_id[:8]} | {bean_name} | {_fmt_optional(run.ambient_temp_c)} "
             f"| {score.target_drop_temp_c:.1f} °C / {score.target_dtr_percent:.1f}% "
             f"| {score.drop_temp_c:.1f} °C / {score.dtr_percent:.1f}% "
             f"| {'HIT' if score.hit else 'MISS'} | {score.scalar:.2f} "
             f"| {'—' if run.rating is None else f'{run.rating}★'} |"
         )
     for skip in report.skipped:
-        lines.append(f"| {skip.run_id[:8]} | (skipped: {skip.reason}) | | | | | | |")
+        reason = _escape_markdown_cell(skip.reason)
+        lines.append(f"| {skip.run_id[:8]} | (skipped: {reason}) | | | | | | |")
     stats = aggregate_stats(report)
     aggregate_line = (
         f"\nN scored: {stats['n_scored']} (skipped: {stats['n_skipped']}) | "
         f"HIT: {stats['hits']}/{stats['n_scored']} "
-        f"({stats['hit_rate'] * 100:.1f}%) | mean scalar: {stats['mean_scalar']:.4f}"
+        f"({stats['hit_rate'] * 100:.1f}%) | mean scalar: {stats['mean_scalar']:.4f} "
+        f"(rated: {stats['rated']}/{stats['n_scored']})"
     )
     return "\n".join(lines) + "\n" + aggregate_line
 
@@ -564,6 +720,68 @@ def report_to_json(report: CorpusReport) -> dict[str, Any]:
         "skipped": [{"run_id": skip.run_id, "reason": skip.reason} for skip in report.skipped],
         "aggregate": aggregate_stats(report),
     }
+
+
+#: SQLite's live-WAL-mode sidecar filename suffixes (appended directly to the
+#: database filename, not a new extension): the write-ahead log, the shared
+#: memory index, and the legacy rollback journal. Each is as live/mutable as
+#: the database file itself while the operator's agent has the store open.
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+def _same_file_or_path(a: Path, b: Path) -> bool:
+    """Whether ``a`` and ``b`` name the same file.
+
+    Prefers inode identity (:func:`os.path.samefile`) when BOTH paths exist —
+    the only way to catch a hard link, which has a different path string but
+    the same inode, so a resolved-path string compare alone would miss it.
+    Falls back to a resolved-path compare (handles a symlink, and the common
+    case where ``a`` does not exist yet, e.g. a ``--json`` output path that
+    has never been written).
+
+    Args:
+        a: The first path.
+        b: The second path.
+
+    Returns:
+        ``True`` if the two paths refer to the same file.
+    """
+    if a.exists() and b.exists():
+        try:
+            return os.path.samefile(a, b)
+        except OSError:  # pragma: no cover - a TOCTOU race, not reachable in tests
+            return False
+    return a.resolve() == b.resolve()
+
+
+def _json_out_targets_store(json_out: Path, store_path: Path) -> bool:
+    """Whether writing ``json_out`` would touch the store or a live SQLite sidecar.
+
+    Blocks four cases (Codex P1, data loss): the store file itself; either of
+    its live WAL-mode sidecars (``-wal``/``-shm``) or the legacy rollback
+    journal (``-journal``) — each as mutable as the database while the
+    operator's agent holds the store open; a SYMLINK to any of those (caught
+    by :func:`_same_file_or_path`'s resolved-path fallback); and a HARD LINK
+    to any of those (caught by :func:`_same_file_or_path`'s
+    :func:`os.path.samefile` check — a hard link has a different path string
+    but the identical inode, so a resolved-path compare alone would miss it).
+
+    Args:
+        json_out: The proposed ``--json`` output path.
+        store_path: The ``--store`` path.
+
+    Returns:
+        ``True`` if ``json_out`` would write to the store or a sidecar.
+    """
+    resolved_store = store_path.resolve()
+    forbidden = [
+        store_path,
+        *(
+            resolved_store.with_name(resolved_store.name + suffix)
+            for suffix in _SQLITE_SIDECAR_SUFFIXES
+        ),
+    ]
+    return any(_same_file_or_path(json_out, candidate) for candidate in forbidden)
 
 
 async def run_corpus_score(store_path: Path, run_ids: list[str] | None) -> CorpusReport:
@@ -621,11 +839,16 @@ async def main() -> int:
 
     store_path = cast("Path", args.store)
     json_out = cast("Path | None", args.json_out)
-    # Refuse a --json path that resolves to the source store (directly or via a
-    # symlink): writing JSON there would truncate and destroy the operator's
-    # SQLite database. Check BEFORE any read so a fat-fingered path fails fast.
-    if json_out is not None and json_out.resolve() == store_path.resolve():
-        parser.error("--json must not point at the source store (it would overwrite the database)")
+    # Refuse a --json path that targets the source store, a live WAL-mode
+    # sidecar, or either via a symlink/hard link (see
+    # _json_out_targets_store): writing JSON there would truncate and destroy
+    # the operator's SQLite database. Check BEFORE any read so a
+    # fat-fingered path fails fast.
+    if json_out is not None and _json_out_targets_store(json_out, store_path):
+        parser.error(
+            "--json must not point at the source store or a live SQLite sidecar "
+            "(it would overwrite the database)"
+        )
 
     report = await run_corpus_score(store_path, cast("list[str] | None", args.run_ids))
     print(render_markdown_table(report))
