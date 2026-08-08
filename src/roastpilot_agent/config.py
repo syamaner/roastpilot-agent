@@ -1035,6 +1035,31 @@ class AmbientFanDoctrine(BaseModel):
     is still climbing, fan is the only brake left and graduation does not
     apply."""
 
+    max_reading_age_seconds: float = Field(default=90.0, gt=0.0)
+    """How old a live ambient reading may be and still reach the advisor (#732).
+
+    ``c11`` selects a fan regime by comparing ``ambient_temp_c`` against
+    :attr:`threshold_c`, so a stale reading does not degrade gracefully — it
+    puts the model confidently in the wrong regime, and a stale value is
+    indistinguishable from a fresh one at the prompt. The asymmetry that
+    matters is a stale LOW reading in a room that has since warmed: it holds
+    the graduated regime when aggressive airflow is right, which is the
+    direction #498 warns about.
+
+    Past this bound the controller declines to populate ``ambient_temp_c`` /
+    ``ambient_humidity_pct`` at all, so the doctrine degrades to the SAME
+    absent-ambient path an unplugged probe already takes — a branch ``c11``
+    handles deliberately (fall back to the unqualified fan-brake rule; do not
+    read a missing reading as licence to be gentler). No new teaching, no new
+    branch, and the failure direction is toward #498's full fan capability
+    rather than away from it.
+
+    Default 90.0 = three of the MCP's 30 s default ambient poll cycles
+    (``coffee_roaster_mcp.config.AmbientConfig.poll_interval_seconds``), so
+    ordinary poll jitter and a couple of missed cycles never flap the doctrine
+    while a genuinely wedged reading is out within about a minute and a half —
+    well inside a roast's post-first-crack window, where the doctrine acts."""
+
     @model_validator(mode="after")
     def _step_must_be_a_whole_number_of_hottop_levels(self) -> "AmbientFanDoctrine":
         """Reject a step that is not a whole number of Hottop fan levels.

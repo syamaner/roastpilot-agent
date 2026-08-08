@@ -454,15 +454,36 @@ def project_live_ambient(status: AmbientStatus) -> tuple[float | None, float | N
     :meth:`RoastStore.set_ambient` persists (#342, D85), which this function
     does not touch.
 
+    **``ambient_running`` is part of the gate (#732).** ``status == "ok"`` alone
+    is *not* sufficient to call a reading live, because the MCP's
+    ``AmbientSessionRuntime._stop_locked`` drops its reader (``ambient_running``
+    goes ``False``) while deliberately leaving ``status`` at ``"ok"`` and
+    *preserving the last reading* — after which
+    ``AmbientSessionRuntime.poll``'s ``self._reader is None`` early return means
+    that reading can never change again. Forwarding it would hand a permanently
+    frozen room temperature to every downstream consumer, indistinguishable from
+    a fresh one. This mattered little while ambient was observability-only, but
+    ``c11`` (#709) selects a fan regime on it, and a stale *low* reading holds
+    the model in the graduated regime after the room has warmed — the direction
+    #498 warns about. A stopped runtime therefore degrades to the all-``None``
+    absent-ambient triad, which ``c11`` already handles correctly.
+
+    This deliberately changes OBSERVABILITY too, not just the advisor path: the
+    dashboard's live "Room" readout (#464, D86) blanks when the runtime stops,
+    where it previously showed the frozen reading indefinitely. That is the
+    intended reading of the tile — it reports the current room, and once nothing
+    is measuring the room there is nothing current to report.
+
     Args:
         status: The MCP ambient status from ``RoastSessionState``.
 
     Returns:
         The ``(temperature_c, humidity_percent, pressure_hpa)`` triad when
-        ``status.status == "ok"``, else ``(None, None, None)`` — the MCP's own
-        fail-soft contract for a disabled/unavailable probe.
+        ``status.status == "ok"`` **and** ``status.ambient_running``, else
+        ``(None, None, None)`` — the MCP's own fail-soft contract for a
+        disabled/unavailable probe, extended to a stopped-but-``ok`` runtime.
     """
-    if status.status != "ok":
+    if status.status != "ok" or not status.ambient_running:
         return None, None, None
     return status.temperature_c, status.humidity_percent, status.pressure_hpa
 
@@ -617,7 +638,36 @@ def applied_state_from_event(event: EventSnapshot) -> AppliedRoasterState:
         ) from exc
 
 
-def project_session_state(state: RoastSessionState, *, age_seconds: float) -> RoastTelemetry | None:
+def ambient_reading_token(status: AmbientStatus) -> float | None:
+    """Return an opaque identity token for the MCP's current ambient reading.
+
+    The token is ``last_reading_monotonic_seconds`` — an absolute ``time.monotonic``
+    stamp from the **MCP child process** (D6). It is used **only for equality
+    comparison against a previously observed token**, never as a timestamp and
+    never in arithmetic against the agent's clock: cross-process monotonic
+    clocks are not comparable (the rule :meth:`RoastController._backdated_now`
+    states and this module's backdating deltas already observe). A change in the
+    token means "the MCP took a new reading"; the elapsed time since that change
+    is then measured entirely in the agent's own clock domain by
+    :meth:`RoasterControlAdapter.read_telemetry`.
+
+    Args:
+        status: The MCP ambient status from ``RoastSessionState``.
+
+    Returns:
+        The reading's identity token, or ``None`` when the runtime holds no
+        reading at all (its ``AmbientRuntimeSnapshot`` nulls the stamp and the
+        triad together, so an absent token means an absent reading).
+    """
+    return status.last_reading_monotonic_seconds
+
+
+def project_session_state(
+    state: RoastSessionState,
+    *,
+    age_seconds: float,
+    ambient_age_seconds: float | None = None,
+) -> RoastTelemetry | None:
     """Project an MCP ``RoastSessionState`` into the controller's ``RoastTelemetry``.
 
     Returns ``None`` when no usable reading exists — no device state, or bean/
@@ -632,7 +682,9 @@ def project_session_state(state: RoastSessionState, *, age_seconds: float) -> Ro
     as in-domain durations the controller subtracts from its receive-tick clock.
     Derived metrics (RoR) are passed through from MCP, never recomputed (plan §2).
     ``age_seconds`` is supplied by the caller — the session state carries no
-    per-reading wall-clock age."""
+    per-reading wall-clock age. ``ambient_age_seconds`` is likewise
+    caller-supplied (#732) for the same reason, and defaults to ``None`` =
+    "age unknown", the fail-closed value for callers that do not track it."""
     device = state.device_state
     if device is None or device.bean_temp_c is None or device.env_temp_c is None:
         return None
@@ -662,6 +714,7 @@ def project_session_state(state: RoastSessionState, *, age_seconds: float) -> Ro
         ambient_temp_c=ambient_temp_c,
         ambient_humidity_pct=ambient_humidity_pct,
         ambient_pressure_hpa=ambient_pressure_hpa,
+        ambient_age_seconds=None if ambient_temp_c is None else ambient_age_seconds,
     )
 
 
@@ -701,6 +754,8 @@ class RoasterControlAdapter:
         self._last_state: RoastSessionState | None = None
         self._last_elapsed: float | None = None
         self._last_change_monotonic: float | None = None
+        self._last_ambient_token: float | None = None
+        self._ambient_token_change_monotonic: float | None = None
 
     @property
     def last_state(self) -> RoastSessionState | None:
@@ -717,7 +772,61 @@ class RoasterControlAdapter:
             self._last_change_monotonic = now
         age = 0.0 if self._last_change_monotonic is None else now - self._last_change_monotonic
         self._last_state = state
-        return project_session_state(state, age_seconds=age)
+        return project_session_state(
+            state,
+            age_seconds=age,
+            ambient_age_seconds=self._observe_ambient_age(state.ambient_status, now=now),
+        )
+
+    def _observe_ambient_age(self, status: AmbientStatus, *, now: float) -> float | None:
+        """Track how long the MCP's current ambient reading has been current (#732).
+
+        Deliberately the same shape as the ``age_seconds`` derivation above, for
+        the same reason: the freshness signal must live in the **agent's** clock
+        domain. The MCP's ``last_reading_monotonic_seconds`` is used only as an
+        opaque identity token (see :func:`ambient_reading_token`) — compared for
+        *change*, never subtracted from anything — because cross-process
+        ``time.monotonic`` clocks are not comparable.
+
+        Freshness is tracked for the reading :func:`project_live_ambient`
+        actually FORWARDS, not for whatever stamp the status happens to carry —
+        one source of truth for "is there a live reading". That matters for the
+        stopped-runtime case in particular: the MCP keeps reporting the frozen
+        reading's stamp after ``ambient_running`` goes ``False``, so a
+        token-only tracker would go on ageing a reading nothing consumes, and a
+        runtime that resumed on that same preserved reading would inherit an
+        age from before the outage. An absent forwarded reading therefore resets
+        the tracker, and a probe that drops out and returns is aged from the
+        reading it comes back with.
+
+        Known and deliberate under-report: the age is measured from the agent's
+        *first observation* of a token, so a reading already old when first seen
+        reads as 0.0. That residue is bounded in the case this can actually
+        mislead: while the runtime is running, ``AmbientSessionRuntime.poll``
+        attempts a read every ``poll_interval_seconds`` and demotes ``status`` to
+        ``"unavailable"`` on failure, so an unchanging token means a live probe
+        returning the same instant. The unbounded case — a *stopped* runtime
+        holding a frozen reading forever — is caught structurally by
+        :func:`project_live_ambient`'s ``ambient_running`` gate, not by this age.
+
+        Args:
+            status: The MCP ambient status from this tick's session state.
+            now: The agent-clock instant of this read.
+
+        Returns:
+            Seconds since the current reading was first observed, or ``None``
+            when the MCP holds no reading — "age unknown", the fail-closed value.
+        """
+        forwarded_temp_c, _, _ = project_live_ambient(status)
+        token = None if forwarded_temp_c is None else ambient_reading_token(status)
+        if token is None:
+            self._last_ambient_token = None
+            self._ambient_token_change_monotonic = None
+            return None
+        if self._ambient_token_change_monotonic is None or token != self._last_ambient_token:
+            self._last_ambient_token = token
+            self._ambient_token_change_monotonic = now
+        return now - self._ambient_token_change_monotonic
 
     async def start_session(
         self, *, recording_origin: str | None = None, recording_roast_num: int | None = None

@@ -4471,6 +4471,40 @@ def _doctrine_on(**overrides: float) -> ControllerConfig:
     )
 
 
+def _fresh_ambient(
+    *,
+    ambient_temp_c: float | None = None,
+    ambient_humidity_pct: float | None = None,
+    ambient_pressure_hpa: float | None = None,
+    ambient_age_seconds: float = 2.0,
+) -> RoastTelemetry:
+    """A reading whose ambient triad is FRESH enough for the doctrine (#732).
+
+    Freshness is a precondition of ambient reaching the advisor at all: the
+    controller declines a reading older than
+    ``ambient_fan_doctrine.max_reading_age_seconds``, and an unknown age
+    (``None``, the model default) is declined too. So a doctrine test that wants
+    ambient in the context has to say the reading is current — without which the
+    assertion would pass, or fail, for the wrong reason.
+
+    Args:
+        ambient_temp_c: Live ambient temperature in Celsius.
+        ambient_humidity_pct: Live ambient relative humidity percentage.
+        ambient_pressure_hpa: Live ambient barometric pressure in hectopascals.
+        ambient_age_seconds: Age of the reading in the agent's clock; defaults
+            well inside the doctrine's bound.
+
+    Returns:
+        The telemetry reading.
+    """
+    return reading(
+        ambient_temp_c=ambient_temp_c,
+        ambient_humidity_pct=ambient_humidity_pct,
+        ambient_pressure_hpa=ambient_pressure_hpa,
+        ambient_age_seconds=ambient_age_seconds,
+    )
+
+
 def test_advisor_context_omits_the_ambient_doctrine_while_it_is_disabled() -> None:
     """#709, the defect Codex found pre-merge. c11 is selectable-only and c3 is
     the live default, so the doctrine's context must not reach the prompt of a
@@ -4491,7 +4525,7 @@ def test_advisor_context_omits_the_ambient_doctrine_while_it_is_disabled() -> No
         harness.controller.transition_to(step)
     limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
     ctx = harness.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
-        reading(ambient_temp_c=23.5, ambient_humidity_pct=36.0), limits
+        _fresh_ambient(ambient_temp_c=23.5, ambient_humidity_pct=36.0), limits
     )
     assert ctx.ambient_temp_c is None
     assert ctx.ambient_humidity_pct is None
@@ -4512,7 +4546,7 @@ def test_advisor_context_mirrors_this_ticks_ambient_and_the_config_threshold() -
         harness.controller.transition_to(step)
     limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
     ctx = harness.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
-        reading(ambient_temp_c=23.5, ambient_humidity_pct=36.0, ambient_pressure_hpa=1011.0),
+        _fresh_ambient(ambient_temp_c=23.5, ambient_humidity_pct=36.0, ambient_pressure_hpa=1011.0),
         limits,
     )
     assert ctx.ambient_temp_c == 23.5
@@ -4550,16 +4584,103 @@ def test_advisor_context_ambient_tracks_each_tick_and_reads_a_configured_thresho
         harness.controller.transition_to(step)
     limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
     first = harness.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
-        reading(ambient_temp_c=23.1), limits
+        _fresh_ambient(ambient_temp_c=23.1), limits
     )
     harness.clock.advance(5.0)
     second = harness.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
-        reading(ambient_temp_c=31.6), limits
+        _fresh_ambient(ambient_temp_c=31.6), limits
     )
     assert first.ambient_temp_c == 23.1
     assert second.ambient_temp_c == 31.6
     assert first.ambient_fan_threshold_c == 24.5
     assert second.ambient_fan_threshold_c == 24.5
+
+
+@pytest.mark.parametrize(
+    ("age_seconds", "expected_temp_c"),
+    [
+        (89.9, 23.5),  # inside the bound — reasoned on
+        (90.0, 23.5),  # exactly at the bound — still current, not yet stale
+        (90.1, None),  # past it — declined
+        (600.0, None),  # a reading wedged for ten minutes
+        (None, None),  # age unknown — fail closed, never "assume fresh"
+    ],
+)
+def test_advisor_context_declines_ambient_older_than_the_doctrine_bound(
+    age_seconds: float | None, expected_temp_c: float | None
+) -> None:
+    """#732: c11 picks a fan REGIME by comparing ambient against the boundary,
+    so a stale reading does not degrade gracefully — it seats the model
+    confidently in the wrong regime, and at the prompt a stale value is
+    indistinguishable from a fresh one.
+
+    The asymmetry that motivates the bound: a stale LOW reading in a room that
+    has since warmed holds the graduated regime when aggressive airflow is
+    right, which is the direction #498 warns about.
+
+    An unknown age is declined too. That is the load-bearing default — every
+    path that does not actively track freshness (a hand-built reading, a replay
+    frame's synthesized 21.0 °C constant) reaches the doctrine as ``None``, and
+    the safe reading of "I don't know how old this is" is not "assume fresh"."""
+    harness = make_harness(config=_doctrine_on())
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    telemetry = reading(
+        ambient_temp_c=23.5, ambient_humidity_pct=36.0, ambient_age_seconds=age_seconds
+    )
+
+    ctx = harness.controller._build_advisor_context(telemetry, limits)  # pyright: ignore[reportPrivateUsage]
+
+    assert ctx.ambient_temp_c == expected_temp_c
+    assert ctx.ambient_humidity_pct == (None if expected_temp_c is None else 36.0)
+
+
+def test_declined_stale_ambient_is_the_same_shape_as_an_absent_probe() -> None:
+    """#732: a stale reading degrades to the EXACT absent-ambient context an
+    unplugged probe produces — the branch c11 already handles deliberately
+    (fall back to the unqualified fan-brake rule, and do not read a missing
+    reading as licence to be gentler).
+
+    Asserted as whole-context equality rather than field-by-field, because the
+    claim is precisely that staleness introduces no new shape for the teaching
+    to meet: no new branch, no new prose, nothing to re-validate in a bake-off.
+    The doctrine's two numbers stay populated in both, since they describe the
+    doctrine rather than the room."""
+    harness = make_harness(config=_doctrine_on())
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+
+    stale = harness.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
+        reading(ambient_temp_c=23.5, ambient_humidity_pct=36.0, ambient_age_seconds=600.0), limits
+    )
+    absent = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
+
+    assert stale == absent
+    assert stale.ambient_fan_threshold_c == AmbientFanDoctrine().threshold_c
+    assert stale.ambient_fan_step_max_pp == AmbientFanDoctrine().step_max_pp
+
+
+def test_ambient_freshness_bound_is_configurable() -> None:
+    """#732: the bound is config, like the doctrine's other two numbers — an
+    operator running a slower ambient poll widens it without a code change, and
+    the same reading is reasoned on under the wider bound and declined under
+    the default."""
+    telemetry = reading(ambient_temp_c=23.5, ambient_age_seconds=150.0)
+    contexts: list[float | None] = []
+    for config in (_doctrine_on(), _doctrine_on(max_reading_age_seconds=300.0)):
+        harness = make_harness(config=config)
+        harness.controller.load_profile(PROFILE)
+        for step in NORMAL_PATH[:3]:
+            harness.controller.transition_to(step)
+        limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+        ctx = harness.controller._build_advisor_context(telemetry, limits)  # pyright: ignore[reportPrivateUsage]
+        contexts.append(ctx.ambient_temp_c)
+
+    assert contexts == [None, 23.5]
 
 
 @pytest.mark.asyncio
@@ -4572,12 +4693,12 @@ async def test_ambient_fan_doctrine_is_advisory_only_and_actuates_no_lever() -> 
     untouched and no fan slew clamp ships with this release (6 Aug
     ratification: prompt-only, no clamp)."""
     cold = harness_in_development(
-        readings=[reading(ambient_temp_c=23.1)],
+        readings=[_fresh_ambient(ambient_temp_c=23.1)],
         advisor=FakeAdvisor([decision(heat=60, fan=100)]),
         config=_doctrine_on(),
     )
     hot = harness_in_development(
-        readings=[reading(ambient_temp_c=31.6)],
+        readings=[_fresh_ambient(ambient_temp_c=31.6)],
         advisor=FakeAdvisor([decision(heat=60, fan=100)]),
         config=_doctrine_on(),
     )

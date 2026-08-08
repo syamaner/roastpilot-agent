@@ -4588,6 +4588,46 @@ class RoastController:
             and self._post_fc_engaged
         )
 
+    def _doctrine_ambient(self, telemetry: RoastTelemetry) -> tuple[float | None, float | None]:
+        """Resolve the ambient pair the #709 fan doctrine may reason on (#732).
+
+        Two gates, in order, both failing toward "absent":
+
+        1. **The doctrine's own flag.** Off (the default) yields ``(None, None)``
+           so a roast on the live ``c3`` carries only always-null keys.
+        2. **Freshness.** ``c11`` picks a fan regime by comparing the reading
+           against ``threshold_c``, so an old reading does not degrade
+           gracefully — it seats the model confidently in the wrong regime, and
+           at the prompt a stale value looks exactly like a fresh one. Past
+           ``max_reading_age_seconds`` (or with the age unknown) the reading is
+           declined.
+
+        Declining nulls exactly the two fields a genuinely absent probe already
+        nulls, so a stale reading takes the identical absent-ambient path
+        ``c11`` was written for — no new teaching, no new branch. The doctrine's
+        two numbers stay populated in that case, again exactly as they are for
+        an unplugged probe: they describe the doctrine, not the room.
+
+        Advisory-only in both directions: this narrows what the ADVISOR is told
+        and touches no lever, verdict, or transition.
+
+        Args:
+            telemetry: This tick's telemetry, carrying the live triad and the
+                agent-clock age of its ambient reading.
+
+        Returns:
+            The ``(ambient_temp_c, ambient_humidity_pct)`` pair to place in the
+            advisor context, or ``(None, None)`` when the doctrine is disabled
+            or the reading is not fresh enough to reason on.
+        """
+        doctrine = self._config.ambient_fan_doctrine
+        if not doctrine.enabled:
+            return None, None
+        age_seconds = telemetry.ambient_age_seconds
+        if age_seconds is None or age_seconds > doctrine.max_reading_age_seconds:
+            return None, None
+        return telemetry.ambient_temp_c, telemetry.ambient_humidity_pct
+
     def _build_advisor_context(
         self, telemetry: RoastTelemetry, limits: PhaseControlLimits
     ) -> AdvisorContext:
@@ -4605,6 +4645,7 @@ class RoastController:
             The populated :class:`AdvisorContext`.
         """
         assert self._profile is not None  # guarded by caller
+        doctrine_ambient_temp_c, doctrine_ambient_humidity_pct = self._doctrine_ambient(telemetry)
         return AdvisorContext(
             phase=self._phase,
             # Charge-referenced (#219): the DTR denominator the advisor reasons
@@ -4730,15 +4771,10 @@ class RoastController:
             # The two doctrine numbers come from the single config group the
             # operator re-fits from RP-D scores, never a second copy in the
             # prompt prose (#218). Read-only throughout: nothing here clamps or
-            # gates a lever.
-            ambient_temp_c=(
-                telemetry.ambient_temp_c if self._config.ambient_fan_doctrine.enabled else None
-            ),
-            ambient_humidity_pct=(
-                telemetry.ambient_humidity_pct
-                if self._config.ambient_fan_doctrine.enabled
-                else None
-            ),
+            # gates a lever. A reading too old to trust is declined by
+            # ``_doctrine_ambient`` (#732) rather than passed on.
+            ambient_temp_c=doctrine_ambient_temp_c,
+            ambient_humidity_pct=doctrine_ambient_humidity_pct,
             ambient_fan_threshold_c=(
                 self._config.ambient_fan_doctrine.threshold_c
                 if self._config.ambient_fan_doctrine.enabled
