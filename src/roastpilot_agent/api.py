@@ -2027,11 +2027,28 @@ class RoastService:
 
         So a clash retires the doctrine for the recovered run and retries. That
         is a strictly fail-safe degradation and not a control change: the
-        doctrine is advisory-only, and a disabled doctrine yields the same
-        empty ambient context the freshness gate already produces, which
-        ``c11`` handles as its absent-ambient branch (the unqualified fan-brake
-        rule — #498's full capability intact). Any OTHER validation failure is
-        re-raised unchanged, including the safety-owned ceiling-guard bound.
+        doctrine is advisory-only — ``ambient_fan_doctrine`` is read nowhere but
+        the two context fields — and ``c11`` takes its absent-ambient branch
+        either way (the unqualified fan-brake rule, #498's full capability
+        intact).
+
+        Precisely, because the shape is NOT identical: retiring also nulls
+        ``ambient_fan_threshold_c`` and ``ambient_fan_step_max_pp``, which the
+        freshness gate deliberately leaves populated. The resulting context is
+        #731's DISABLED shape, not the freshness-declined shape. ``c11``'s
+        branch condition treats them the same, so behaviour is unchanged — but
+        #732 asserts whole-context equality for the freshness path exactly
+        because shape parity is that argument, and this path does not have it.
+
+        What makes the retirement safe is narrower and stronger than shape
+        parity: in the clash state the doctrine was ALREADY effectively inert,
+        since a bound below twice the poll cadence means healthy readings
+        routinely age past it and get declined tick by tick. Retiring converts
+        a flapping, mostly-declined doctrine into a deterministically declined
+        one — not an enabled doctrine into a disabled one.
+
+        Any OTHER validation failure is re-raised unchanged, including the
+        safety-owned ceiling-guard bound.
 
         Args:
             frozen: The run's frozen controller/safety generation.

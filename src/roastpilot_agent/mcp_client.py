@@ -801,13 +801,29 @@ class RoasterControlAdapter:
 
         Known and deliberate under-report: the age is measured from the agent's
         *first observation* of a token, so a reading already old when first seen
-        reads as 0.0. That residue is bounded in the case this can actually
-        mislead: while the runtime is running, ``AmbientSessionRuntime.poll``
-        attempts a read every ``poll_interval_seconds`` and demotes ``status`` to
-        ``"unavailable"`` on failure, so an unchanging token means a live probe
-        returning the same instant. The unbounded case — a *stopped* runtime
-        holding a frozen reading forever — is caught structurally by
-        :func:`project_live_ambient`'s ``ambient_running`` gate, not by this age.
+        reads as 0.0. Two distinct freeze paths bound that residue, and they are
+        caught by different mechanisms — worth stating precisely, because the
+        obvious reading (that ``ambient_running`` covers freezing generally) is
+        wrong:
+
+        * **Runtime stopped** — ``_stop_locked`` drops the reader while leaving
+          ``status`` at ``"ok"``. Caught structurally by
+          :func:`project_live_ambient`'s ``ambient_running`` gate; the age never
+          has to notice.
+        * **Runtime running but not polled** — the MCP polls ambient only for an
+          active, id-matched session, so with no active session ``poll`` is
+          skipped while the reader stays non-``None`` and ``status`` stays
+          ``"ok"``. ``ambient_running`` is ``True`` here, so **only the age gate
+          catches this one.** Unreachable on today's live path (the agent omits
+          the session id, and the adapter is constructed once over a freshly
+          spawned child, so first observation cannot predate the session), but
+          it is the case that makes the age gate load-bearing rather than
+          belt-and-braces.
+
+        While a session IS being polled, an unchanging token means a live probe
+        returning the same instant: ``poll`` attempts a read every
+        ``poll_interval_seconds`` and demotes ``status`` to ``"unavailable"`` on
+        failure.
 
         Args:
             status: The MCP ambient status from this tick's session state.
