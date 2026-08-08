@@ -1598,6 +1598,98 @@ def test_c10_registered_selectable_and_not_the_live_default() -> None:
     )
 
 
+def test_c11_is_exactly_c10_plus_the_ambient_fan_section() -> None:
+    """c11 (#709 / RP-B) is c10 with the ambient-fan section spliced in exactly
+    before "THE OBJECTIVE" (the SAME splice advisor.py performs) — an
+    EXACT-SPLICE equality, so all of c1..c10 is preserved byte-for-byte and the
+    ONLY delta is the ambient-fan section. The doctrine must not have leaked
+    into c10 or the live default c3."""
+    from roastpilot_agent.advisor import (
+        _C11_AMBIENT_FAN_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    c10 = control_teaching_prompt("c10")
+    c11 = control_teaching_prompt("c11")
+    assert c11 == c10.replace("THE OBJECTIVE\n", _C11_AMBIENT_FAN_SECTION + "THE OBJECTIVE\n", 1), (
+        "c11 must be EXACTLY c10 with the ambient-fan section spliced before THE OBJECTIVE"
+    )
+    assert "MATCH FAN AGGRESSION TO THE ROOM" not in c10
+    assert "MATCH FAN AGGRESSION TO THE ROOM" not in control_teaching_prompt("c3")
+
+
+def test_c11_ambient_section_names_the_context_fields_and_no_numbers() -> None:
+    """#709 / RP-B: the ambient-fan section must (1) name the real
+    ambient_temp_c / ambient_humidity_pct context fields and the
+    ambient_fan_threshold_c boundary it compares against; (2) carry BOTH
+    regimes — aggressive airflow at/above the boundary, graduated steps below
+    it; (3) name NO numbers, so the operator's ratified ~26 °C hypothesis
+    re-fits from RP-D scores by changing config alone rather than by editing
+    the prompt (the #218 two-copies discipline)."""
+    from roastpilot_agent.advisor import (
+        _C11_AMBIENT_FAN_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    section = _C11_AMBIENT_FAN_SECTION
+    lowered = section.lower()
+    # (1) the real context fields, including the boundary supplied as data.
+    assert "ambient_temp_c" in section
+    assert "ambient_humidity_pct" in section
+    assert "ambient_fan_threshold_c" in section
+    # (2) both regimes are present and the boundary is an explicit comparison.
+    assert "at or above" in lowered
+    assert "below" in lowered
+    assert "graduated steps" in lowered
+    # (3) NO baked numbers — the boundary is data, never prose.
+    assert not re.search(r"\d", section), "the ambient-fan section must name no hardcoded numbers"
+
+
+def test_c11_qualifies_the_fan_brake_and_does_not_regress_high_ambient_fan() -> None:
+    """#709 risk control (#498 must NOT regress). The doctrine is CONDITIONAL:
+    it may never read as a blanket fan softening, because a soft fan in a
+    genuinely hot room reproduces the smoke/scorching failure #498 fixed.
+
+    So the section must (1) explicitly QUALIFY rather than cancel the
+    fan-as-active-brake teaching spliced above it; (2) sanction an aggressive
+    regime up to the context fan ceiling when at/above the boundary, and name
+    the hot-room failure mode; (3) leave the fan ceiling and every fan value
+    available below the boundary too — changing the PACE, never capping the
+    lever; and (4) keep the c3 brake teaching itself byte-for-byte intact in
+    the assembled c11 (the qualification is additive, not a rewrite)."""
+    from roastpilot_agent.advisor import (
+        _C3_FAN_BRAKE_SECTION,  # pyright: ignore[reportPrivateUsage]
+        _C11_AMBIENT_FAN_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    section = _C11_AMBIENT_FAN_SECTION
+    lowered = section.lower()
+    # (1) qualifies, never cancels, the brake rule above it.
+    assert "qualifies" in lowered
+    assert "never cancels it" in lowered
+    # (2) the high-ambient regime stays aggressive, and the #498 failure is named.
+    assert "fan ceiling" in lowered
+    assert "smoke" in lowered and "scorches" in lowered
+    # (3) below the boundary the lever is NOT capped — only the pace changes.
+    assert "the fan ceiling is unchanged" in lowered
+    assert "every fan value stays available" in lowered
+    assert "never the destination" in lowered
+    # (4) the c3 brake teaching survives verbatim inside the assembled c11.
+    assert _C3_FAN_BRAKE_SECTION in control_teaching_prompt("c11")
+
+
+def test_c11_registered_selectable_and_not_the_live_default() -> None:
+    """c11 is a registered, selectable version wired the same as its siblings
+    (``instructions_for`` resolves it to the same text), and adding it does not
+    make it live — c3 stays the default. c11 is promoted only if the offline
+    decision-level bake-off and a single-variable hardware roast scored by RP-D
+    (#711) validate it, which is an operator-gated decision (#707/D122)."""
+    assert instructions_for("c11") == control_teaching_prompt("c11")
+    assert control_teaching_prompt("c11")  # non-empty
+    assert CONTROL_TEACHING_PROMPT_VERSION == "c3"
+    assert control_teaching_prompt("c11") != control_teaching_prompt(
+        CONTROL_TEACHING_PROMPT_VERSION
+    )
+
+
 # --- Codex P2 follow-up (#499): assert on the FINAL ASSEMBLED prompt, not
 # just the c1 fragment. The splice chain (c1 -> c2 -> c3 -> c4 -> c5 -> c6)
 # means a section added to c1 can be directly contradicted by a LATER-spliced
@@ -1616,7 +1708,7 @@ def test_c10_registered_selectable_and_not_the_live_default() -> None:
 # #559) is now the newest/most-spliced version and is added the same way.
 
 
-@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9", "c10"])
+@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9", "c10", "c11"])
 def test_assembled_prompt_carries_the_joint_objective_and_no_contradiction(
     version: str,
 ) -> None:
@@ -1637,7 +1729,7 @@ def test_assembled_prompt_carries_the_joint_objective_and_no_contradiction(
     assert "latest acceptable drop" not in lowered
 
 
-@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9", "c10"])
+@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9", "c10", "c11"])
 def test_assembled_prompt_joint_objective_precedes_every_later_section(
     version: str,
 ) -> None:
@@ -1656,6 +1748,7 @@ def test_assembled_prompt_joint_objective_precedes_every_later_section(
         "POST-FIRST-CRACK: COMPARE PROGRESS RATES",  # c8
         "POST-FIRST-CRACK: A REFERENCE ROAST",  # c9
         "POST-FIRST-CRACK: READ THE PROVIDED DEVELOPMENT RATIO",  # c10
+        "POST-FIRST-CRACK: MATCH FAN AGGRESSION TO THE ROOM",  # c11
     ):
         if marker in prompt:
             assert prompt.index(marker) > joint_index, (

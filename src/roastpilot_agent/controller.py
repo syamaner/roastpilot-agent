@@ -4711,6 +4711,22 @@ class RoastController:
             reference_landmarks=(
                 None if self._reference_roast is None else self._reference_roast.landmarks
             ),
+            # #709 (RP-B): mirrored VERBATIM from THIS tick's telemetry — the
+            # same live ambient triad the MCP already projects each tick
+            # (#464/D86) and the snapshot already surfaces. Not re-read from
+            # the MCP, not cached, not averaged: whatever this tick's
+            # telemetry carries (including ``None`` when ambient is
+            # uncaptured, disabled, or unavailable) is what the model is told.
+            # Read-only context for the c11 fan doctrine — no lever is derived
+            # from it and no control path reads it back.
+            ambient_temp_c=telemetry.ambient_temp_c,
+            ambient_humidity_pct=telemetry.ambient_humidity_pct,
+            # #709 (RP-B): the doctrine boundary as DATA, read from the SAME
+            # single config field the operator re-fits from RP-D scores — the
+            # ``drop_dev_margin_percent`` pattern (one owner, surfaced into
+            # context, never a second copy in the prompt prose, #218). Nothing
+            # reads it back: it clamps and gates nothing.
+            ambient_fan_threshold_c=self._config.ambient_fan_threshold_c,
         )
 
     def _seconds_since_last_command(self) -> float | None:

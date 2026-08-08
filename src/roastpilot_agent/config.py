@@ -1096,6 +1096,32 @@ class ControllerConfig(BaseModel):
     # literal-free named constant the controller's drop guard reads.
     drop_dev_margin_percent: float = Field(default=3.0, ge=0.0, le=100.0)
 
+    # ``ambient_fan_threshold_c`` — the AMBIENT-AWARE FAN DOCTRINE boundary
+    # (#709, RP-B; the #707/D122 joint-drop-objective tree). The Conebosque A/B
+    # (#559) showed advisor fan aggression crashing the rate of rise into a
+    # temperature-short drop, and both crash roasts were the two coolest rooms
+    # in the corpus (23.1 / 23.5 °C) — while fan 100 at 25-31 °C repeatedly
+    # cupped fine. So the doctrine is CONDITIONAL on ambient, never a blanket
+    # softening: #498's full fan capability (including 100) is unchanged.
+    #
+    # This is the value the ``c11`` teaching compares the live
+    # ``AdvisorContext.ambient_temp_c`` against. It lives here, as DATA, rather
+    # than as a number written into the prompt prose, for two reasons: the #218
+    # two-copies discipline (a constant baked into a prose rule is the pattern
+    # that misled the model in the #567/c9 and #563 told-ceiling arcs), and
+    # because the operator ratified 26.0 explicitly as a HYPOTHESIS to be
+    # re-fit from RP-D (#711) joint scores once several roasts span the ambient
+    # range — a re-fit that must not require a prompt edit and a fresh
+    # bake-off. Same shape as ``drop_dev_margin_percent`` above: a config-owned
+    # named constant surfaced into the advisor context, never a second copy.
+    #
+    # Advisory ONLY. Nothing in the controller or the safety policy reads this
+    # back: it never clamps, gates, or slews a fan command. It changes what the
+    # model is TOLD, never what the box ENFORCES. (The deterministic fan slew
+    # clamp #709 raises as optional hardening is deliberately NOT part of this
+    # release — prompt-only to start, per the 6 Aug ratification.)
+    ambient_fan_threshold_c: float = Field(default=26.0)
+
     def advisory_interval_for(self, phase: RoastPhase) -> float | None:
         """Return the minimum-interval consult floor for ``phase`` in seconds.
 

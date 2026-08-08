@@ -4446,6 +4446,91 @@ def test_advisor_context_reference_fields_populated_from_cached_reference_roast(
     assert second_ctx.reference_landmarks == reference.landmarks
 
 
+def test_advisor_context_mirrors_this_ticks_ambient_and_the_config_threshold() -> None:
+    """#709 (RP-B): the ambient fields are mirrored VERBATIM from THIS tick's
+    telemetry — the same live triad the MCP already projects (#464/D86) — and
+    the doctrine boundary comes from the single ``ambient_fan_threshold_c``
+    config field, never a second copy in the prompt prose (#218). The pressure
+    leg is deliberately not carried: the doctrine drives off temperature with
+    humidity as context."""
+    harness = make_harness()
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
+        reading(ambient_temp_c=23.5, ambient_humidity_pct=36.0, ambient_pressure_hpa=1011.0),
+        limits,
+    )
+    assert ctx.ambient_temp_c == 23.5
+    assert ctx.ambient_humidity_pct == 36.0
+    assert ctx.ambient_fan_threshold_c == ControllerConfig().ambient_fan_threshold_c
+
+
+def test_advisor_context_ambient_is_none_when_this_tick_has_no_ambient() -> None:
+    """#709: ambient is optional at the source (uncaptured, disabled, or
+    unavailable this tick), so the context reports ``None`` rather than a stale
+    or invented reading — the c11 teaching then has no room reading to
+    condition on and says so explicitly. The boundary still comes through, so
+    an absent ambient is distinguishable from an absent threshold."""
+    harness = make_harness()
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
+    assert ctx.ambient_temp_c is None
+    assert ctx.ambient_humidity_pct is None
+    assert ctx.ambient_fan_threshold_c == ControllerConfig().ambient_fan_threshold_c
+
+
+def test_advisor_context_ambient_tracks_each_tick_and_reads_a_configured_threshold() -> None:
+    """#709: ambient is per-tick live data, NOT retrieved-once-and-cached like
+    the #567 reference roast — a second build reports the second tick's reading.
+    And an operator-configured threshold flows through unchanged, which is the
+    whole point of holding the ratified ~26 °C value as DATA: it re-fits from
+    RP-D (#711) scores by changing config, with no prompt edit."""
+    harness = make_harness(config=ControllerConfig(ambient_fan_threshold_c=24.5))
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    first = harness.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
+        reading(ambient_temp_c=23.1), limits
+    )
+    harness.clock.advance(5.0)
+    second = harness.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
+        reading(ambient_temp_c=31.6), limits
+    )
+    assert first.ambient_temp_c == 23.1
+    assert second.ambient_temp_c == 31.6
+    assert first.ambient_fan_threshold_c == 24.5
+    assert second.ambient_fan_threshold_c == 24.5
+
+
+@pytest.mark.asyncio
+async def test_ambient_fan_doctrine_is_advisory_only_and_actuates_no_lever() -> None:
+    """#709 invariant (the reason ``safety-reviewer`` gates this PR): the
+    ambient doctrine is prompt-only. Two ticks whose ONLY difference is the
+    ambient reading — one far below the boundary, one far above — must actuate
+    IDENTICAL heat/fan for the same advisor decision. Nothing in the controller
+    or the safety policy reads ambient back, so #498's fan capability is
+    untouched and no fan slew clamp ships with this release (6 Aug
+    ratification: prompt-only, no clamp)."""
+    cold = harness_in_development(
+        readings=[reading(ambient_temp_c=23.1)], advisor=FakeAdvisor([decision(heat=60, fan=100)])
+    )
+    hot = harness_in_development(
+        readings=[reading(ambient_temp_c=31.6)], advisor=FakeAdvisor([decision(heat=60, fan=100)])
+    )
+    for harness in (cold, hot):
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+    assert cold.controller.snapshot().current_heat == hot.controller.snapshot().current_heat == 60
+    # Fan 100 lands in BOTH rooms — the doctrine never restrains the lever.
+    assert cold.controller.snapshot().current_fan == hot.controller.snapshot().current_fan == 100
+
+
 def test_advisor_context_roast_style_forwards_the_profiles_style_name() -> None:
     """#499: when a profile carries a ``roast_style``, the context forwards
     the STYLE NAME as qualitative intent — never the style's own reference

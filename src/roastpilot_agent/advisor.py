@@ -167,6 +167,22 @@ class AdvisorContext(BaseModel):
     ``reference_curve.enabled`` config flag off, a bean with no qualifying
     past roast, older callers, and every replay session, which pins live
     reference retrieval off).
+
+    ``ambient_temp_c`` / ``ambient_humidity_pct`` (#709, RP-B) carry the
+    roasting room's live conditions so the ``c11`` fan doctrine can condition
+    its guidance on them (the ambient-aware fan doctrine of #707/D122: at
+    higher ambient an aggressive fan is appropriate; at lower ambient a fan
+    slam crashes the rate of rise into a temperature-short drop). They are
+    mirrored VERBATIM from the same per-tick
+    :class:`~roastpilot_agent.models.RoastTelemetry` triad the controller
+    already receives (#464, D86) — never re-read, re-derived, or averaged
+    here. Read-only context with no control authority: no lever is derived
+    from them, and neither the controller nor the safety policy ever reads
+    them back, so #498's full fan capability is untouched (the doctrine
+    changes what the model is TOLD, never what the box ENFORCES). Default
+    ``None`` so a context built where ambient is uncaptured, disabled, or
+    unavailable (and every older caller) stays valid — the doctrine then
+    simply has no ambient to condition on.
     """
 
     phase: RoastPhase
@@ -331,6 +347,43 @@ class AdvisorContext(BaseModel):
     # qualifying past roast, older callers, and the drop-only bake-off.
     reference_curve: list[ReferenceCurveSample] = Field(default_factory=list[ReferenceCurveSample])
     reference_landmarks: ReferenceLandmarks | None = None
+    # #709 (RP-B, the ambient-aware fan doctrine of #707/D122): the roasting
+    # room's live conditions, mirrored VERBATIM from the SAME per-tick
+    # RoastTelemetry triad the controller already receives (#464/D86) — never
+    # re-read from the MCP, re-derived, or averaged here. The c11 doctrine
+    # conditions its fan guidance on ambient_temp_c; the THRESHOLD itself is
+    # deliberately NOT in the prompt prose (the #218 two-copies discipline), so
+    # it can be re-fit from RP-D scores without a prompt edit.
+    #
+    # Read-only context with no control authority — no lever is derived from
+    # these, and neither the controller nor safety.evaluate_command reads them
+    # back. #498's fan capability (including fan 100) is untouched: this
+    # changes what the model is TOLD, never the box that is ENFORCED. The
+    # pressure leg of the triad is deliberately omitted: the doctrine drives
+    # off temperature first with humidity as context, and an unused third
+    # field would be context the model must ignore.
+    #
+    # Default ``None`` for the uncaptured / disabled / unavailable cases and
+    # every older caller (the drop-only bake-off, replayed contexts that
+    # predate the fixture ambient carriage) — the doctrine then simply has no
+    # ambient to condition on, exactly as ``None`` reads today.
+    ambient_temp_c: float | None = None
+    ambient_humidity_pct: float | None = None
+    # #709 (RP-B): the doctrine BOUNDARY the c11 teaching compares
+    # ``ambient_temp_c`` against — supplied as DATA from
+    # ``ControllerConfig.ambient_fan_threshold_c`` (default 26.0) rather than
+    # written into the prompt prose, so the operator's ratified ~26 °C
+    # HYPOTHESIS can be re-fit from RP-D (#711) joint scores by changing config
+    # alone, with no prompt edit and no fresh bake-off. Exactly the shape
+    # ``target_development_percent_min``/``_max`` already use for
+    # ``drop_dev_margin_percent``: one config-owned constant surfaced into
+    # context, never a second copy in prose (#218).
+    #
+    # Advisory only, like every field above: no lever is derived from it and no
+    # control path reads it back. ``None`` when the context is built without a
+    # controller (older callers, the drop-only bake-off) — the c11 teaching
+    # then has no boundary to compare against and says so.
+    ambient_fan_threshold_c: float | None = None
 
 
 class RoastDecision(BaseModel):
@@ -1731,6 +1784,78 @@ _C10_DTR_AUTHORITY_SECTION = (
 )
 _CONTROL_TEACHING_PROMPTS["c10"] = _CONTROL_TEACHING_PROMPTS["c9"].replace(
     "THE OBJECTIVE\n", _C10_DTR_AUTHORITY_SECTION + "THE OBJECTIVE\n", 1
+)
+
+# --- c11 (#709 / RP-B: the ambient-aware fan doctrine) -----------------------
+#
+# c11 is c10 PLUS one section, spliced just before THE OBJECTIVE so all of
+# c1..c10 is preserved byte-for-byte. Motivation (#707/D122, the paired
+# Conebosque A/B on #559): both arms missed BOTH halves of the joint objective
+# — temperature-short (188 / 190 against a 195 target) and development-ratio
+# over (21 % / 24 % against 16 %) — and the upstream cause was advisor fan
+# aggression (85-100) crashing the rate of rise, after which the decaying
+# setpoint chased the crash down and recovery had no runway left.
+#
+# The corpus says the fix is CONDITIONAL, not a blanket softening. Across the
+# ten ambient-labelled completed roasts (23.1-31.6 °C), the only two
+# rate-of-rise-crash roasts were the two COOLEST rooms, while fan 100 at
+# 23.9 °C cupped a 4 and fan 85-100 at 25-31 °C repeatedly cupped fine. There
+# is no clean ambient-to-fan correlation in ten noisy points, and that has a
+# design consequence: below the boundary the teaching steers the PROCESS
+# (graduate the steps, read the rate-of-rise response) and never caps the fan.
+# #498's capability — including fan 100 — is untouched, and a soft fan in a
+# genuinely hot room (the smoke/scorching failure #498 fixed) stays explicitly
+# warned against.
+#
+# This section QUALIFIES the fan-as-active-brake teaching (spliced above it in
+# assembly order) and must never read as cancelling it: fan is still a primary
+# post-first-crack lever and still the only brake once heat is at its floor.
+#
+# NO numbers here — not the boundary, not a step size (the #218 two-copies
+# discipline; the guard test asserts the section is digit-free). The boundary
+# arrives as DATA in ``ambient_fan_threshold_c``, so the operator's ratified
+# ~26 °C HYPOTHESIS re-fits from RP-D (#711) joint scores by changing config
+# alone. Prompt-only doctrine: no deterministic fan slew clamp ships with this
+# (6 Aug ratification). Selectable-only; c3 stays the live default, and
+# promotion is gated on the offline decision-level bake-off plus a
+# single-variable hardware roast scored by RP-D — operator-gated.
+_C11_AMBIENT_FAN_SECTION = (
+    "POST-FIRST-CRACK: MATCH FAN AGGRESSION TO THE ROOM\n"
+    "- ambient_temp_c and ambient_humidity_pct in context describe the room "
+    "the roaster is working in, and ambient_fan_threshold_c is the boundary "
+    "separating the two airflow regimes below. Compare ambient_temp_c against "
+    "ambient_fan_threshold_c before making a large fan move. This QUALIFIES "
+    "the fan-as-active-brake rule above - it never cancels it. Fan remains a "
+    "primary post-first-crack lever, and it remains the only brake left once "
+    "heat is already at its floor.\n"
+    "- AT OR ABOVE ambient_fan_threshold_c: a warm room works against the "
+    "brake, so an aggressive airflow regime is appropriate, up to and "
+    "including the fan ceiling given in context. Step decisively to the "
+    "regime you need. Holding the fan low in a hot room to be cautious is the "
+    "very failure the fan-brake rule above exists to prevent - it buries the "
+    "roast in smoke and scorches the bean surface.\n"
+    "- BELOW ambient_fan_threshold_c: a cool room is already carrying heat "
+    "away, so the SAME fan number bites considerably harder. Prefer to reach "
+    "the higher regime in graduated steps rather than one slam, and watch what "
+    "the rate of rise actually does after each step before taking the next "
+    "one. The fan ceiling is unchanged and every fan value stays available to "
+    "you - what changes is the PACE at which you get there, never the "
+    "destination.\n"
+    "- WHY THIS MATTERS: a fan slam in a cool room crashes the rate of rise. "
+    "The bean then stalls short of its drop temperature while development time "
+    "keeps running, so the roast lands short on temperature AND over on "
+    "development ratio - missing BOTH halves of the joint objective at once. "
+    "If the rate of rise falls away sharply just after a fan increase, read "
+    "that as the signal to stop stepping the fan up and let it recover, not to "
+    "push further.\n"
+    "- If ambient_temp_c or ambient_fan_threshold_c is absent from context, "
+    "you have no room reading to condition on: apply the fan-brake rule above "
+    "exactly as written, and prefer the graduated approach when in doubt. Do "
+    "not guess at the room from any other value.\n"
+    "\n"
+)
+_CONTROL_TEACHING_PROMPTS["c11"] = _CONTROL_TEACHING_PROMPTS["c10"].replace(
+    "THE OBJECTIVE\n", _C11_AMBIENT_FAN_SECTION + "THE OBJECTIVE\n", 1
 )
 
 
