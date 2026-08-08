@@ -4,8 +4,8 @@
 
 > **STATUS UPDATE — 8 Aug 2026 (RP-D shipped; RP-B is next). Read with the 6 Aug
 > block below.** The joint-drop-objective tree (**#707 / D122**) advanced: **RP-D
-> (#711) — the joint-objective bake-off metric — is SHIPPED** across two PRs on
-> `main`: **PR-D1 (#724)** the pure `joint_window_score` HIT+scalar core in
+> (#711) — the joint-objective bake-off metric — has SHIPPED its
+> code** across two PRs on `main`: **PR-D1 (#724)** the pure `joint_window_score` HIT+scalar core in
 > `scripts/bakeoff_replay.py`, and **PR-D2 (#725)** the standalone offline corpus
 > scorer `scripts/rpd_corpus_score.py`. The ratified metric (D124): HIT =
 > `|Δdrop| ≤ 3 °C` AND `DTR ∈ target ± 2 pp`; 50/50 scalar (window-edge 0.5);
@@ -20,9 +20,12 @@
 > D124 clarified in `roastpilot-plan`. **Follow-ups:** **#726** (shared
 > `RoastStore.read_drop_reading` + abnormal-termination classifier + snapshot/URI
 > helper; owns robust guard-drop classification — two review findings deferred
-> there, zero current-corpus impact as all 15 drops are advisor-sourced); the two
-> Conebosque **fixture-registrations are folded into RP-B's kickoff** (they are
-> RP-B's replay-harness eval input, not needed by the store-reading scorer).
+> there, zero current-corpus impact as all 15 drops are advisor-sourced). **#711
+> itself stays OPEN by design** — its remaining item, registering the two
+> Conebosque roasts as labelled fixtures, is folded into RP-B's kickoff (they are
+> RP-B's replay-harness eval input, not needed by the store-reading scorer). No PR
+> used `Closes #711`, so file state (metric code shipped) and GitHub state (issue
+> open for the residual fixture item + the #726 follow-ups) agree — no drift.
 > **Next in the D122 sequence: RP-B (#709) — the c11 ambient-fan doctrine —
 > evaluated offline by the RP-D score.** Plan design for both the RP-D scorer and
 > the RP-B c11 doctrine is recorded as **D124** (roastpilot-plan); next free plan
