@@ -1,10 +1,11 @@
 """Tests for the RP-D joint-objective bake-off metric core (#711, plan D124).
 
 Covers the pure :func:`joint_window_score` arithmetic (HIT boundaries, the
-ratified scalar shape, the termination penalty, clamping, custom tolerances /
-weights) and :func:`joint_score_to_json` serialization. No LLM, no store — the
-metric is a pure function of a roast's achieved outcome vs its targets. The
-store/trace adapter that sources authoritative targets and DTR is PR-D2.
+ratified scalar shape, the termination penalty, clamping, non-finite-input
+rejection) and :func:`joint_score_to_json` serialization. No LLM, no store — the
+metric is a pure function of a roast's achieved outcome vs its targets, applying
+the fixed ratified tolerances/weights. The store/trace adapter that sources
+authoritative targets and DTR is PR-D2.
 """
 
 from __future__ import annotations
@@ -117,61 +118,6 @@ def test_scalar_ranks_a_nearer_miss_above_a_farther_miss() -> None:
     assert far.scalar == pytest.approx(0.5833333)
 
 
-def test_negative_weight_raises_not_scalar_above_one() -> None:
-    # A negative weight override would flip its error term positive and push the
-    # scalar above the documented [0, 1] range (a miss outranking a HIT). Guard
-    # it fail-closed rather than emit a corrupt score (reviewer catch, PR-D1).
-    with pytest.raises(ValueError, match="non-negative"):
-        replay.joint_window_score(
-            drop_temp_c=200.0,  # 5 C over -> a genuine MISS
-            target_drop_temp_c=195.0,
-            dtr_percent=16.0,
-            target_dtr_percent=16.0,
-            weight_temp=-1.0,
-            weight_dtr=0.0,
-        )
-
-
-def test_non_finite_weight_raises() -> None:
-    with pytest.raises(ValueError, match="non-negative"):
-        replay.joint_window_score(
-            drop_temp_c=195.0,
-            target_drop_temp_c=195.0,
-            dtr_percent=16.0,
-            target_dtr_percent=16.0,
-            weight_dtr=float("nan"),
-        )
-
-
-def test_non_finite_tolerance_raises() -> None:
-    with pytest.raises(ValueError, match="finite and strictly positive"):
-        replay.joint_window_score(
-            drop_temp_c=195.0,
-            target_drop_temp_c=195.0,
-            dtr_percent=16.0,
-            target_dtr_percent=16.0,
-            tol_temp_c=float("inf"),
-        )
-
-
-def test_scalar_weights_are_overridable() -> None:
-    # Weighting drop-temp fully and DTR to zero makes the scalar ignore a large
-    # DTR miss (mirrors the tolerance-override surface). HIT is unaffected by
-    # weights: 10 pp over is still outside the ±2 pp band.
-    s = replay.joint_window_score(
-        drop_temp_c=197.0,  # 2 C over
-        target_drop_temp_c=195.0,
-        dtr_percent=26.0,  # 10 pp over
-        target_dtr_percent=16.0,
-        weight_temp=1.0,
-        weight_dtr=0.0,
-    )
-    assert s.hit is False
-    assert s.scalar == pytest.approx(0.6666667)
-    # With the default 50/50 weights the same roast floors at 0 (DTR dominates).
-    assert _score(197.0, 195.0, 26.0, 16.0).scalar == pytest.approx(0.0)
-
-
 def test_large_miss_clamps_scalar_at_zero_not_negative() -> None:
     s = _score(150.0, 195.0, 40.0, 16.0)
     assert s.scalar == 0.0
@@ -188,56 +134,26 @@ def test_abnormal_termination_zeroes_scalar_and_blocks_hit() -> None:
     assert s.terminated_abnormally is True
 
 
-# --- joint_window_score: guards + custom tolerances -------------------------
+# --- joint_window_score: input validation -----------------------------------
 
 
-def test_zero_temp_tolerance_raises() -> None:
-    with pytest.raises(ValueError, match="strictly positive"):
-        replay.joint_window_score(
-            drop_temp_c=195.0,
-            target_drop_temp_c=195.0,
-            dtr_percent=16.0,
-            target_dtr_percent=16.0,
-            tol_temp_c=0.0,
-        )
-
-
-def test_zero_dtr_tolerance_raises() -> None:
-    # The other arm of the guard (would divide by zero in the scalar otherwise).
-    with pytest.raises(ValueError, match="strictly positive"):
-        replay.joint_window_score(
-            drop_temp_c=195.0,
-            target_drop_temp_c=195.0,
-            dtr_percent=16.0,
-            target_dtr_percent=16.0,
-            tol_dtr_pp=0.0,
-        )
-
-
-def test_negative_tolerance_raises() -> None:
-    # "not strictly positive" covers negatives, not just zero.
-    with pytest.raises(ValueError, match="strictly positive"):
-        replay.joint_window_score(
-            drop_temp_c=195.0,
-            target_drop_temp_c=195.0,
-            dtr_percent=16.0,
-            target_dtr_percent=16.0,
-            tol_temp_c=-1.0,
-        )
-
-
-def test_custom_tolerances_widen_the_window() -> None:
-    # 5 C short is a MISS at the default 3 C tolerance...
-    assert _score(190.0, 195.0, 16.0, 16.0).hit is False
-    # ...but a HIT if the operator later widened the drop-temp tolerance to 6 C.
-    wide = replay.joint_window_score(
-        drop_temp_c=190.0,
-        target_drop_temp_c=195.0,
-        dtr_percent=16.0,
-        target_dtr_percent=16.0,
-        tol_temp_c=6.0,
-    )
-    assert wide.hit is True
+@pytest.mark.parametrize(
+    ("drop", "target_drop", "dtr", "target_dtr"),
+    [
+        (float("inf"), 195.0, 16.0, 16.0),  # corrupt achieved drop temp
+        (195.0, float("nan"), 16.0, 16.0),  # corrupt target drop temp
+        (195.0, 195.0, float("inf"), 16.0),  # corrupt achieved DTR
+        (195.0, 195.0, 16.0, float("nan")),  # corrupt target DTR
+    ],
+)
+def test_non_finite_input_raises(
+    drop: float, target_drop: float, dtr: float, target_dtr: float
+) -> None:
+    # A non-finite outcome/target (e.g. an inf MCP temperature in a corrupt
+    # trace) must fail closed, not score as an ordinary worst roast and emit
+    # invalid Infinity/NaN JSON that biases the aggregate stats.
+    with pytest.raises(ValueError, match="finite"):
+        _score(drop, target_drop, dtr, target_dtr)
 
 
 # --- joint_score_to_json ----------------------------------------------------

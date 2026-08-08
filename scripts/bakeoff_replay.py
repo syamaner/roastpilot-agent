@@ -893,10 +893,6 @@ def joint_window_score(
     dtr_percent: float,
     target_dtr_percent: float,
     terminated_abnormally: bool = False,
-    tol_temp_c: float = JOINT_DROP_TEMP_TOL_C,
-    tol_dtr_pp: float = JOINT_DTR_TOL_PP,
-    weight_temp: float = JOINT_WEIGHT_DROP_TEMP,
-    weight_dtr: float = JOINT_WEIGHT_DTR,
 ) -> JointWindowScore:
     """Score a roast's achieved outcome against its joint drop targets (#711).
 
@@ -904,6 +900,13 @@ def joint_window_score(
     achieved drop temperature and DTR (both read from the deterministic trace,
     never recomputed here) and the profile's targets; this applies the
     operator-ratified HIT rule and scalar.
+
+    The tolerances (``±3 °C`` / ``±2 pp``) and 50/50 weights are the fixed,
+    operator-ratified constants — this is a stable yardstick, deliberately NOT a
+    tunable knob: making them per-call parameters invites nonsensical inputs
+    (a huge tolerance or a zero weight-total that score every roast ``1.0``) and
+    inconsistent aggregates. A future sensitivity sweep, if ever wanted, would be
+    a separate explicit change, not a back door in the metric.
 
     Args:
         drop_temp_c: The achieved drop bean temperature in Celsius.
@@ -914,41 +917,35 @@ def joint_window_score(
         target_dtr_percent: The profile's target development percentage.
         terminated_abnormally: ``True`` when the roast ended in a guard-drop,
             emergency stop, or fault; zeroes the scalar and blocks a HIT.
-        tol_temp_c: The drop-temp HIT tolerance (default 3 °C, ratified).
-        tol_dtr_pp: The DTR HIT tolerance in percentage points (default 2 pp,
-            ratified).
-        weight_temp: The drop-temp scalar weight (default 0.5, ratified).
-        weight_dtr: The DTR scalar weight (default 0.5, ratified).
 
     Returns:
         The :class:`JointWindowScore`.
 
     Raises:
-        ValueError: If a tolerance is not finite and strictly positive (a zero
-            tolerance would divide by zero in the scalar), or if a weight is not
-            finite and non-negative (a negative weight flips its error term
-            positive and pushes the scalar above the documented [0, 1] range, so
-            a miss could outrank a hit and corrupt the aggregate stats).
+        ValueError: If any of the four achieved/target inputs is not finite. A
+            non-finite value (an ``inf``/``nan`` from a corrupt trace or profile)
+            would otherwise score as an ordinary worst roast and emit invalid
+            ``Infinity``/``NaN`` JSON, silently biasing the aggregate stats —
+            fail closed instead.
     """
-    if not (math.isfinite(tol_temp_c) and tol_temp_c > 0.0) or not (
-        math.isfinite(tol_dtr_pp) and tol_dtr_pp > 0.0
-    ):
-        raise ValueError("joint-window tolerances must be finite and strictly positive")
-    if not (math.isfinite(weight_temp) and weight_temp >= 0.0) or not (
-        math.isfinite(weight_dtr) and weight_dtr >= 0.0
-    ):
-        raise ValueError("joint-window weights must be finite and non-negative")
+    inputs = (drop_temp_c, target_drop_temp_c, dtr_percent, target_dtr_percent)
+    if not all(math.isfinite(v) for v in inputs):
+        raise ValueError("joint-window inputs (drop temp / DTR / targets) must all be finite")
     drop_err = drop_temp_c - target_drop_temp_c
     dtr_err = dtr_percent - target_dtr_percent
-    within_temp = abs(drop_err) <= tol_temp_c
-    within_dtr = abs(dtr_err) <= tol_dtr_pp
+    within_temp = abs(drop_err) <= JOINT_DROP_TEMP_TOL_C
+    within_dtr = abs(dtr_err) <= JOINT_DTR_TOL_PP
     hit = within_temp and within_dtr and not terminated_abnormally
-    # Literal ratified form: weights AND a final /2 (window edge → 0.5). Clamp at
-    # 0 so a large miss floors rather than going negative; an abnormal
+    # Literal ratified form: 50/50 weights AND a final /2 (window edge → 0.5).
+    # Clamp at 0 so a large miss floors rather than going negative; an abnormal
     # termination multiplies the whole thing to 0.
     raw = (
         1.0
-        - (weight_temp * abs(drop_err) / tol_temp_c + weight_dtr * abs(dtr_err) / tol_dtr_pp) / 2.0
+        - (
+            JOINT_WEIGHT_DROP_TEMP * abs(drop_err) / JOINT_DROP_TEMP_TOL_C
+            + JOINT_WEIGHT_DTR * abs(dtr_err) / JOINT_DTR_TOL_PP
+        )
+        / 2.0
     )
     penalty = 0.0 if terminated_abnormally else 1.0
     scalar = max(0.0, raw) * penalty
