@@ -324,20 +324,24 @@ def test_a_padded_slug_still_matches_its_screen() -> None:
     assert "no FC-latency screen on record" in _advisor_line_for(model_slug="  ")
 
 
-def test_a_thinking_variant_of_a_buster_is_still_reported_as_busted() -> None:
-    """An OpenRouter `:variant` suffix keeps its base slug's BUSTED verdict.
+def test_a_suffixed_variant_is_unscreened_in_both_directions() -> None:
+    """An OpenRouter `:variant` inherits NOTHING — it is not the measured model.
 
-    `anthropic/claude-sonnet-4.6:thinking` is strictly slower than the base
-    model D40/D41 measured busting the gate, yet exact-matching alone gave it
-    the weakest message. The asymmetry is deliberate: a variant inherits a
-    BUSTED result, never a CLEARING one, since a thinking variant of a fast
-    model can itself be slow.
+    An earlier draft let a variant inherit its base slug's BUSTED verdict, on
+    the reasoning that `:thinking` is slower still. `:nitro` selects FASTER
+    routing and `:free` a different provider entirely, so that inheritance
+    presented an unmeasured arm as measured evidence — overstating the record
+    in the name of caution (local Codex P2, folded pre-open). Unmeasured is
+    unmeasured; the operator still gets a warning, just a true one.
     """
-    assert "BUSTED" in _advisor_line_for(model_slug="anthropic/claude-sonnet-4.6:thinking")
-    # The other direction: a variant of a CLEARED model does not inherit the pass.
-    assert "no FC-latency screen on record" in _advisor_line_for(
-        model_slug="openai/gpt-4o:extended"
-    )
+    for slug in (
+        "anthropic/claude-sonnet-4.6:thinking",
+        "anthropic/claude-sonnet-4.6:nitro",
+        "openai/gpt-4o:extended",
+    ):
+        line = _advisor_line_for(model_slug=slug)
+        assert f"no FC-latency screen on record for {slug}" in line
+        assert "BUSTED" not in line
 
 
 def test_reasoning_off_does_not_invert_a_measured_passing_arm() -> None:

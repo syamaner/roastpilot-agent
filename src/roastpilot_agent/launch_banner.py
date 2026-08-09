@@ -114,29 +114,6 @@ def _arm_matches(slug: str, effort: str | None, known: frozenset[tuple[str, str 
     return (slug.strip().lower(), effort) in known
 
 
-def _matches_busted(slug: str, effort: str | None) -> bool:
-    """Whether this arm was MEASURED as busting the FC-latency gate.
-
-    Also matches an OpenRouter ``:variant`` suffix (``…-4.6:thinking``) against
-    its base slug, because every such variant of a busting model is slower
-    still. Deliberately NOT applied to the screened table: a variant must never
-    inherit a CLEARING measurement it did not earn (a thinking variant of a fast
-    model can itself be slow), so the asymmetry is the safe direction in both
-    cases.
-
-    Args:
-        slug: A resolved advisor model slug.
-        effort: The configured ``reasoning_effort`` (``None`` = provider default).
-
-    Returns:
-        ``True`` when this arm, or its pre-``:`` base at the same effort, busts.
-    """
-    if _arm_matches(slug, effort, FC_LATENCY_BUSTED_ADVISOR_ARMS):
-        return True
-    base = slug.strip().split(":", 1)[0]
-    return base != slug.strip() and _arm_matches(base, effort, FC_LATENCY_BUSTED_ADVISOR_ARMS)
-
-
 def _latency_screen_note(
     advisor: AdvisorConfig, resolved: set[str], advisory_timeout_seconds: float
 ) -> str:
@@ -193,14 +170,26 @@ def _latency_screen_note(
     voided = (
         advisor.provider != "openai_compatible" or advisor.provider_base_url != OPENROUTER_BASE_URL
     )
-    busted = sorted(m for m in resolved if not voided and _matches_busted(m, effort))
+    # Exact arm matching only, so an OpenRouter ``:variant`` suffix inherits
+    # NOTHING in either direction (local Codex P2, folded pre-open). An earlier
+    # draft let a variant inherit its base slug's BUSTED verdict, reasoning that
+    # ``:thinking`` is slower still — but ``:nitro`` selects FASTER routing and
+    # ``:free`` a different provider, so that inheritance presented an unmeasured
+    # arm as measured evidence, overstating the record in the name of caution.
+    # Unmeasured is unmeasured; a suffixed slug lands in ``unscreened``, which is
+    # still a warning, just a true one. Add an explicit row if one is screened.
+    busted = sorted(
+        m
+        for m in resolved
+        if not voided and _arm_matches(m, effort, FC_LATENCY_BUSTED_ADVISOR_ARMS)
+    )
     unscreened = sorted(
         m
         for m in resolved
         if voided
         or (
             not _arm_matches(m, effort, FC_LATENCY_SCREENED_ADVISOR_ARMS)
-            and not _matches_busted(m, effort)
+            and not _arm_matches(m, effort, FC_LATENCY_BUSTED_ADVISOR_ARMS)
         )
     )
     notes: list[str] = []

@@ -141,6 +141,24 @@ DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS = 30.0
 # via ``provider="openai_compatible"``, so any other provider or base URL voids
 # the whole table rather than matching a row.
 #
+# PROMPT VERSION is deliberately NOT a key dimension, and this is the scope
+# boundary — the dimensions stop here (local Codex P1, considered and declined
+# with reasons, so a later round does not relitigate it). Prompt size IS a
+# latency input: 8 Jun measured v1 -> v2 (~1,100 -> ~1,800 chars) adding ~1-2 s
+# and pushing borderline frontier models over the gate. But that finding is
+# about moving from a TOY prompt to a production-representative one, and it
+# predates this table: D40/D41 ran at ``v4`` and #396 at ``c3``, both
+# production-weight, as is every live ``c``-series prompt the operator selects.
+# Keying on the prompt anyway would leave the table matching nothing, so the
+# banner would warn on the proven baseline arm of every ordinary roast — the
+# cry-wolf failure that costs exactly the case this warning exists for, and the
+# reason a hard guard was rejected in the first place. What IS true and worth
+# knowing: these are MODEL-level indicators measured under a production-weight
+# prompt, not a certification of the operator's exact configuration, and a
+# materially heavier future prompt would move them — most of all for
+# ``claude-haiku-4.5``, the one entry with no margin (~4.1 s against ~5 s, and
+# 4.3-5.5 s straddling the gate on 8 Jun's heavier prompt).
+#
 # Sources — numbers live in the reports, not here, so this table cannot drift
 # into a stale citation: ``docs/advisor/bakeoff-summary-2026-06-16.md`` (D40/D41,
 # 8 models x 28 roasts, median/max against the ~5 s gate — the authoritative
