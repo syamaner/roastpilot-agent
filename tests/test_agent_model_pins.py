@@ -99,8 +99,10 @@ def test_agents_md_prose_names_the_full_ids() -> None:
     assert re.search(r"claude-opus-5.{0,24}xhigh", agents_md, re.S), (
         "AGENTS.md must document safety-reviewer as claude-opus-5 at xhigh effort"
     )
-    assert "claude-fable-5" in agents_md and "planning-architect" in agents_md, (
-        "AGENTS.md must document the planning-architect claude-fable-5 pin"
+    assert re.search(r"claude-fable-5(?:(?!claude-)[\s\S]){0,400}planning-architect", agents_md), (
+        "AGENTS.md must associate planning-architect with the claude-fable-5 pin "
+        "with no other model ID intervening — a bare mention check is satisfiable "
+        "by the other Fable role's text"
     )
     # Bind story-planner to the Fable pin the same way: the two-Fable-roles
     # sentence must associate the full ID with the role, not merely mention both
