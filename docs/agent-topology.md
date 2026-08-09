@@ -21,8 +21,11 @@ role, `AGENTS.md` agrees, the inline workflow stages in `review-branch.mjs` are
 pinned, and a consistency test (`tests/test_agent_model_pins.py`) guards the pins
 against drift and against committed settings that would defeat them (the
 repository side of the §5 override surface). Two §16 adoption criteria remain
-outstanding: the §15 evaluation on the five representative cases (the §16
-evaluation-evidence criterion), and the Product PM main-session pin, which is an
+outstanding: the §15 evaluation across all five archetypes — not a five-case
+count, since a single story may cover more than one, and RP-B (#709) already
+covers two (ambiguous multi-slice, safety-sensitive) with three
+archetype-defining stories still needed (§15; the §16 evaluation-evidence
+criterion) — and the Product PM main-session pin, which is an
 operator setting (`model: claude-opus-5` or `--model`, never `default`), not
 repository config. The live-environment and organisation side of the §5 override
 surface (`CLAUDE_CODE_SUBAGENT_MODEL`, `availableModels`, organisation

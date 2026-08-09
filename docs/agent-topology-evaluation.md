@@ -106,6 +106,17 @@ responding to the finding.
 - **Healthy (found before the PR opened, folded into the first push):** 6
   safety findings, 1 qa test-design improvement, 2 local Codex findings. None
   of these became post-open rework, which is the shift-left target working.
+  Two of the six are the safety findings the cost section below cites by name:
+  graduated fan-brake steps that would have rationed c3's own heat-at-floor
+  emergency brake (PR #731 pre-open findings table, finding 1 — "Graduated
+  steps rationed the brake in the heat-at-floor emergency c3 exists to
+  handle", fixed with an explicit precedence carve-out), and an absent-ambient
+  fallback that defaulted the step bound *soft* — silently weakening the
+  doctrine in a hot room whenever the ambient reading was missing, the
+  opposite of fail-safe (PR #731 finding 2 — "Absent-ambient fallback
+  defaulted *soft*, so a fail-soft probe softened doctrine in a hot room",
+  fixed by removing the soft default and pinning a regression test). Full
+  findings table: PR #731 body.
 - **Preventable (post-open, should have been caught earlier):** the c3
   contamination and the stale `15.0` doc comment. The doc comment is the
   sharper miss: the PR violated the two-copies discipline it repeatedly
@@ -171,8 +182,9 @@ over, and both errors are worth recording because they are easy to repeat:
 
 **So the `safety-reviewer` Opus pin stands on VALUE, with no cost claim attached
 in either direction.** The Opus lens found the brake-rationing gap and the
-fail-soft defect in ten minutes (§ above), and at $2.90 the pin is close enough
-to free that cost is simply not the axis worth arguing about.
+fail-soft defect named under "Preventable rework vs healthy review catches"
+above (PR #731 findings 1 and 2), and at $2.90 the pin is close enough to free
+that cost is simply not the axis worth arguing about.
 
 **How both errors were caught: a second party recomputed the numbers from
 source.** Not by reviewing the prose — the surrounding argument was coherent, the
@@ -180,6 +192,13 @@ magnitudes plausible, the units apparently right. This is a cheap, concrete
 control the topology can adopt: **any number heading into a decision record or a
 doc gets recomputed by someone who did not derive it.** It ran in both directions
 here, catching an error on each side.
+
+**Latency: not evaluated.** §15 asks for total tokens, latency, and model cost
+together; this section covers the first and third. The transcripts it draws
+from carry message counts and token volumes but no per-call wall-clock
+timestamps, so no latency figure can be recomputed from source the way the
+token and cost numbers above were — recording the gap explicitly rather than
+letting the token/cost detail read as if it covered all three.
 
 ### Unnecessary agent spawns
 
@@ -214,8 +233,12 @@ so.
 tree-mutating git commands. The control exists; it was never routed to the
 Bash-capable roles that keep re-entering it — `.claude/agents/qa.md` contains
 nothing about worktrees, checkout, or mutation. So the actionable gap is
-DELIVERY into the agent definitions, not another runbook note, and #733 is
-re-scoped accordingly.
+DELIVERY into the agent definitions, not another runbook note. **A re-scope to
+that effect is proposed in a comment on #733** (route the snapshot-by-`cp` and
+worktree/basetemp controls into the agent definitions for `qa`,
+`safety-reviewer`, `pr-triage`, and the engineer roles); as of this writing
+#733's own title and body are unchanged — the re-scope exists as a comment,
+not yet as an edit to the issue itself.
 
 Two further data points arrived the same night, both on #741, and both matter
 because they show the control failing in ways a prohibition alone cannot fix.
@@ -259,10 +282,11 @@ evidence.
 
 The topology performed well where it was exercised: delegation moved real volume
 to Sonnet at roughly 40% of its lead-tier list cost, both review lenses found
-real defects the other missed (the safety lens found the brake-rationing and
-fail-soft-softening defects; the Codex lens found the two that changed ratified
-decisions), and independent review caught every one of the PM's own misses —
-including, twice, a number the PM had asserted without recomputing.
+real defects the other missed (the safety lens found the two defects named
+under "Preventable rework vs healthy review catches" above; the Codex lens
+found the two that changed ratified decisions), and independent review caught
+every one of the PM's own misses — including, twice, a number the PM had
+asserted without recomputing.
 
 Its weakest point in this case was **planning**, which is the part that was
 skipped. Every defect that reached the PR came from a join between artifacts,

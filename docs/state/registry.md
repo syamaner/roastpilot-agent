@@ -3,7 +3,9 @@
 ## Active Epic
 
 > **STATUS UPDATE — 8 Aug 2026 (RP-D shipped; RP-B is next). Read with the 6 Aug
-> block below.** The joint-drop-objective tree (**#707 / D122**) advanced: **RP-D
+> block below.** [Corrected 9 Aug: RP-B is now IN FLIGHT, not next — PR #731
+> merged 8 Aug, PR #741 open; see the next free decision number below.] The
+> joint-drop-objective tree (**#707 / D122**) advanced: **RP-D
 > (#711) — the joint-objective bake-off metric — has SHIPPED its
 > code** across two PRs on `main`: **PR-D1 (#724)** the pure `joint_window_score` HIT+scalar core in
 > `scripts/bakeoff_replay.py`, and **PR-D2 (#725)** the standalone offline corpus
@@ -27,6 +29,7 @@
 > used `Closes #711`, so file state (metric code shipped) and GitHub state (issue
 > open for the residual fixture item + the #726 follow-ups) agree — no drift.
 > **Next in the D122 sequence: RP-B (#709) — the c11 ambient-fan doctrine.**
+> [Corrected 9 Aug: RP-B is in flight — PR #731 merged, PR #741 open.]
 > **Eval-model correction (Codex catch on the docs PR, now D125):** RP-D scores a
 > roast's ACHIEVED outcome, which a replay cannot change, so an offline c3-vs-c11
 > replay yields the SAME RP-D score for both arms — RP-D cannot discriminate a
@@ -156,7 +159,15 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D126** (D125 records the RP-D eval-model
+> Next free plan decision number: **D150** (corrected 9 Aug — verified against
+> `roastpilot-plan`: decision numbers run contiguously through D149, i.e. D126-D149
+> are also consumed. **The number space is SHARED across programmes, so it does not
+> advance at this repository's pace:** D126-D129 are RP-B's
+> (`roastpilot-agent/plan.md`), and D130-D149 are the roastpilot-cloud factory
+> ledger's (`roastpilot-cloud/factory.md`) — which is why 8 Aug's "D126" went stale
+> within a day without RP-B consuming anything like that many. Always re-derive this
+> from `roastpilot-plan` rather than trusting this line; it is current only as of its
+> own correction date. D125 records the RP-D eval-model
 > correction — discriminates only on hardware/simulator, not replay; D124 records
 > the RP-D scorer + RP-B c11 design, roastpilot-agent#711/#709; D123 the #718
 > catalogue query-scope won't-fix).
