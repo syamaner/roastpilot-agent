@@ -150,7 +150,14 @@ def _print_decision(decision: RoastDecision) -> None:
 
 
 async def run(iterations: int, fixture: Path, row_offset_seconds: float) -> int:
-    config = AppConfig().advisor
+    app_config = AppConfig()
+    config = app_config.advisor
+    # The LIVE budget a roast actually enforces (D151 dropped it to 5.0 s).
+    # Not AdvisorConfig.timeout_seconds, which has no runtime consumer in the
+    # agent: bounding the harness by that knob let a candidate returning
+    # between the two numbers pass here while every production call timed out
+    # (local Codex P2, folded pre-open).
+    live_budget = app_config.controller.advisory_timeout_seconds
     # The model this run will genuinely call, resolved the way the advisor
     # resolves it (#747): this fixture is a DEVELOPMENT-phase context, and
     # ``PydanticAIAdvisor`` picks its agent with ``model_for(context.phase)``.
@@ -167,7 +174,7 @@ async def run(iterations: int, fixture: Path, row_offset_seconds: float) -> int:
         f"model_slug={config.model_slug!r}{shadowed} "
         f"base_url={config.provider_base_url!r} "
         f"prompt_version={config.prompt_version} temperature={config.temperature} "
-        f"timeout_seconds={config.timeout_seconds}"
+        f"live_advisory_budget={live_budget:g}s"
     )
     # Report whether the key is PRESENT rather than echoing ``api_key_env``.
     # CodeQL flags printing that field as clear-text logging of sensitive data:
@@ -197,23 +204,22 @@ async def run(iterations: int, fixture: Path, row_offset_seconds: float) -> int:
         print(f"\n--- iteration {i}/{iterations} ---")
         started = time.perf_counter()
         try:
-            # Bound the call like the controller does (it wraps the advisory
-            # call in wait_for). This uses AdvisorConfig.timeout_seconds
-            # (ROASTPILOT_ADVISOR__TIMEOUT_SECONDS) — a separate knob from the
-            # controller's ControllerConfig.advisory_timeout_seconds, but the
-            # same 10 s default, so it reproduces the production budget while
-            # letting a characterisation run extend it without touching the
-            # controller's live budget. A reasoning model that runs long
-            # surfaces here as TimeoutError, not as silently slow advice.
+            # Bound the call by the budget a ROAST enforces —
+            # ControllerConfig.advisory_timeout_seconds, the value the
+            # controller wraps the advisory call in. A characterisation run
+            # that wants longer sets ROASTPILOT_CONTROLLER__ADVISORY_TIMEOUT_
+            # SECONDS, which moves both together. A model that runs long
+            # surfaces here as TimeoutError, exactly as it would live, rather
+            # than as silently slow advice.
             decision = await asyncio.wait_for(
-                advisor.get_recommendation(context), timeout=config.timeout_seconds
+                advisor.get_recommendation(context), timeout=live_budget
             )
         except TimeoutError:
             elapsed = time.perf_counter() - started
             failures += 1
             print(
                 f"  TimeoutError after {elapsed:.2f}s "
-                f"(exceeded configured timeout_seconds={config.timeout_seconds})"
+                f"(exceeded the live advisory budget of {live_budget:g}s)"
             )
             continue
         except AdvisorError as exc:

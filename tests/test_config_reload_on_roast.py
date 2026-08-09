@@ -30,7 +30,12 @@ from roastpilot_agent.config_store import (
     PreFirstCrackLeversEdit,
     persist_config_edit,
 )
-from roastpilot_agent.models import AdvisorHealth, AdvisorHealthStatus, RoastProfile
+from roastpilot_agent.models import (
+    AdvisorHealth,
+    AdvisorHealthStatus,
+    RoastPhase,
+    RoastProfile,
+)
 from roastpilot_agent.store import RoastStore
 
 # ---------------------------------------------------------------------------
@@ -209,6 +214,50 @@ async def test_an_endpoint_change_alone_invalidates_the_probe(
 
     persist_config_edit(
         AppConfigEdit(advisor=AdvisorConfigEdit(provider_base_url="http://proxy.local/v1"))
+    )
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert (await svc.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_base_slug_change_invalidates_even_with_a_pinned_phase_slot(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """The PROBED model is the base slug, so it belongs in the identity.
+
+    `healthcheck` probes `model_slug`, while advice dispatches the
+    phase-RESOLVED model. With a DEVELOPMENT slot pinned, the base slug can
+    change while the advice model does not — and comparing only the advice
+    models left `/api/health` describing a probe of the previous base model
+    (local Codex P2, folded pre-open).
+    """
+    svc = RoastService(store, live_serve_mode=True)
+    svc._config = svc._config.model_copy(  # pyright: ignore[reportPrivateUsage]
+        update={
+            "advisor": svc._config.advisor.model_copy(  # pyright: ignore[reportPrivateUsage]
+                update={"model_slug_by_phase": {RoastPhase.DEVELOPMENT: "openai/gpt-4o-mini"}}
+            )
+        }
+    )
+    svc.set_advisor_health(
+        AdvisorHealth(
+            status=AdvisorHealthStatus.REACHABLE,
+            provider="openai_compatible",
+            model_slug="openai/gpt-4o",
+        )
+    )
+
+    # The pinned DEVELOPMENT slot means the ADVICE model is unchanged; only the
+    # probed base slug moves.
+    persist_config_edit(
+        AppConfigEdit(
+            advisor=AdvisorConfigEdit(
+                model_slug="openai/gpt-4.1-mini",
+                model_slug_by_phase={RoastPhase.DEVELOPMENT: "openai/gpt-4o-mini"},
+            )
+        )
     )
     await svc.start_roast(RoastProfile(**_profile()))
 

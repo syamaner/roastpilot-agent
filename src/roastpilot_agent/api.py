@@ -1775,10 +1775,22 @@ class RoastService:
                     # prevent. Comparing the PREVIOUS config against the fresh
                     # one catches every axis without enumerating them here.
                     was, now = previous_advisor, fresh_config.advisor
-                    if (was.provider, was.provider_base_url, was.api_key_env) != (
+                    # ``healthcheck`` probes the BASE ``model_slug``, while
+                    # advice dispatches the phase-RESOLVED model, so both belong
+                    # in the identity: with a DEVELOPMENT slot pinned, the base
+                    # slug can change while the advice model does not, and the
+                    # probe on record would still describe the old base model
+                    # (local Codex P2, folded pre-open).
+                    if (
+                        was.provider,
+                        was.provider_base_url,
+                        was.api_key_env,
+                        was.model_slug,
+                    ) != (
                         now.provider,
                         now.provider_base_url,
                         now.api_key_env,
+                        now.model_slug,
                     ) or advice_models(was) != advice_models(now):
                         self._advisor_health = None
                 # MCP device respawn (#431): when the reloaded mcp_device differs
