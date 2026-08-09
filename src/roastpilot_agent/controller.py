@@ -72,6 +72,7 @@ from roastpilot_agent.safety import (
 )
 
 __all__ = [
+    "AUTO_ADVICE_PHASES",
     "TRANSITION_TABLE",
     "UNIVERSAL_TARGETS",
     "AdvisoryCallPolicy",
@@ -397,7 +398,11 @@ _ADVICE_PHASES: frozenset[RoastPhase] = COMMAND_PHASE_MATRIX[RoastCommand.SET_HE
 # deterministic pre-FC phases (preheat AND charge→FC) are excluded — pre-FC is
 # deterministic and the advisor is not consulted there. With only DEVELOPMENT
 # left, post-FC is where the LLM advises (#223).
-_AUTO_ADVICE_PHASES: frozenset[RoastPhase] = _ADVICE_PHASES - _DETERMINISTIC_PRE_FC_PHASES
+# PUBLIC (#746): the roast-live launcher's banner reads this to report the model
+# the advisor will ACTUALLY be asked for, so a per-phase model in a phase that
+# never consults cannot be announced as the arm being run. Read-only — the
+# gating itself stays owned by ``_maybe_run_advisory`` below.
+AUTO_ADVICE_PHASES: frozenset[RoastPhase] = _ADVICE_PHASES - _DETERMINISTIC_PRE_FC_PHASES
 
 
 class AdvisoryCallPolicy:
@@ -456,7 +461,7 @@ class AdvisoryCallPolicy:
         """
         if manual_request:
             return AdvisoryTrigger.MANUAL
-        if phase not in _AUTO_ADVICE_PHASES:
+        if phase not in AUTO_ADVICE_PHASES:
             return None
         # First consult in an advice phase, or any phase transition since the
         # last call: ``_last_phase`` starts None, so the first eligible tick
@@ -3477,7 +3482,7 @@ class RoastController:
             drop = self._safety.evaluate_drop_recommendation(phase=self._phase)
             await self._snapshots.persist_evaluation(drop)
             # The advisor advice path is reached only in DEVELOPMENT (the sole
-            # post-FC advice phase, _AUTO_ADVICE_PHASES), and
+            # post-FC advice phase, AUTO_ADVICE_PHASES), and
             # evaluate_drop_recommendation ALLOWs unconditionally in DEVELOPMENT —
             # so the REJECT/false branch here is unreachable today. Kept (not
             # collapsed) because it is the safety boundary if a future phase becomes

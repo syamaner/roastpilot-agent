@@ -637,3 +637,65 @@ Format: one entry per anti-pattern.
   `docs/agent-team-worktrees.md` (§ "Branch freeze on PR-open") and the
   codex-wait rule's "signal must postdate the final-commit trigger" clause in
   AGENTS.md.
+
+## An operator-facing readout must resolve config through `load_app_config()`, never a bare `AppConfig()`
+
+*(fixed by #746, 9 Aug 2026)*
+
+- **Signature:** `grep -rn "AppConfig()" scripts/ src/` — any site that
+  CONSTRUCTS `AppConfig()` and then PRINTS/renders one of its values for the
+  operator. Especially `python -c` heredocs inside `scripts/*.sh`.
+- **Wrong:** `AppConfig` is a pydantic `BaseSettings` with
+  `env_prefix="ROASTPILOT_"` and **no YAML source**, so a bare `AppConfig()`
+  sees environment variables and schema defaults only. It never reads the
+  operator's saved `~/.roastpilot/config.yaml`. The serving agent resolves
+  through `config_store.load_app_config()` (env ?? saved file ?? default), so
+  the two views diverge for every value the operator set in the `/config` UI.
+  `scripts/roast-live.sh` printed `prompt c3` on its pre-charge banner while
+  the agent genuinely ran the saved `c10`, and its "non-default" tag never
+  fired because the env-only view matched the defaults. A readout that
+  disagrees with runtime is worse than no readout: it is trusted at exactly
+  the moment (pre-charge) when the roast cannot be re-run.
+- **Right:** resolve through `load_app_config()` and compare against the SCHEMA
+  defaults when deciding whether to tag a value as non-default. Put the
+  resolution in an importable seam (`roastpilot_agent/launch_banner.py`) with
+  unit tests, not in a shell heredoc, and fail LOUD on a malformed saved config
+  — print an explicit "unresolved" rather than a plausible-looking default.
+  Note the two legitimate exceptions found in the same sweep, which must stay
+  as they are: `config_store.load_app_config` itself, and
+  `replay.create_replay_app`'s `config or AppConfig()` fallback (deliberate —
+  a replay must reproduce a fixed recorded trajectory regardless of live
+  config; see the replay entry above). `scripts/advisor_smoke.py` is also
+  fine: the bare config it prints is the same object it then runs on, so its
+  readout is honest.
+- **Also:** resolving the right config is only half of it — the readout must
+  report the value the code path actually *consumes*, and it must know WHICH
+  code path consumes it. Four related traps in this same banner, all caught by
+  the local Codex pass pre-open, over two rounds:
+  (a) `advisor.model_slug` is shadowed by `model_slug_by_phase` (the advisor
+  calls `model_for(phase)`, and that map ships populated and is not editable
+  from `/config`), so the banner must print the phase-resolved model — the
+  runtime bug is #747; (b) but the base slug is NOT unused: `healthcheck()`
+  probes reachability with it, so an invalid one still drives the startup
+  advisor status — say "gives no roast advice", not "unused"; (c) only
+  `AUTO_ADVICE_PHASES` (DEVELOPMENT alone, under D35) consults the advisor at
+  all, so deriving the readout from the per-phase model MAP would advertise a
+  pre-FC model no advisory call can reach — import the controller's own gate;
+  (d) `late_maillard_trim.enabled=False` makes `_trim_engaged` always false, so
+  a depth or adaptive band left in the saved config is dead and must not be
+  announced. Before printing a config value, follow it to its consumer, and
+  check whether that consumer runs at all.
+- **And the symmetric half:** a warning that fires on inert config is as bad as
+  a missing one — it trains the operator to ignore the tag. Comparing the whole
+  `LateMaillardTrim` section against defaults tagged `base_trim`/`k_ror` on a
+  roast running the proven fixed 65 % cut, because those are read only in
+  adaptive mode. The fix that scales is a `ClassVar` group declared BESIDE the
+  fields (`LateMaillardTrim.ADAPTIVE_ONLY_FIELDS`), subtracted from a
+  whole-section scan: drift-proof both ways, because a new coefficient joins the
+  group in the same edit that adds it. Also note `FieldInfo.default` is
+  `PydanticUndefined` for a `default_factory` field, so a naive
+  value-vs-default scan would report it permanently non-default.
+- **Guarded by:** `tests/test_launch_banner.py` — a saved-only `prompt_version`
+  must reach the banner, a saved-only non-default must be tagged, a shadowed
+  `model_slug` must be reported as shadowed, and a disabled trim must report
+  the flat floor rather than its leftover depth.
