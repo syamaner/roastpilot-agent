@@ -3549,7 +3549,88 @@ async def test_start_roast_refuses_an_enabled_doctrine_with_an_unknown_cadence(
             clock=FakeClock(),
             config=config,
         )
-        ok._require_explicit_ambient_cadence()  # pyright: ignore[reportPrivateUsage]
+        ok._require_explicit_ambient_cadence(config)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_start_roast_checks_the_cadence_of_the_RELOADED_config_not_the_stale_one(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#732, post-open round 6 (Claude and Codex found this independently).
+
+    In live-serve mode `start_roast` reloads config from disk (D76/D78
+    apply-next-roast) partway through. The cadence gate ran ABOVE that reload,
+    so it judged the config from before the operator's last `PUT /api/config`
+    rather than the one the roast actually runs under. This test pins the
+    admit direction; its sibling below pins the lockout direction.
+    """
+    enabled = ControllerConfig(
+        ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
+    )
+    with_cadence = AppConfig(
+        controller=enabled, mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=30.0)
+    )
+    without_cadence = AppConfig(controller=enabled, mcp_device=MCPDeviceConfig())
+
+    def _service(initial: AppConfig, on_disk: AppConfig) -> RoastService:
+        def _load() -> tuple[AppConfig, frozenset[str]]:
+            return on_disk, frozenset()
+
+        monkeypatch.setattr("roastpilot_agent.api.load_app_config", _load)
+        return RoastService(
+            store, config=initial, run_loop=False, clock=FakeClock(), live_serve_mode=True
+        )
+
+    # The stale value must not ADMIT a roast the live config forbids: a cadence
+    # that was explicit last time does not vouch for one that is now unset.
+    with pytest.raises(RoastConfigError, match="ambient_poll_interval_seconds"):
+        await _service(with_cadence, without_cadence).start_roast(_profile())
+    assert await store.active_run() is None
+
+
+@pytest.mark.asyncio
+async def test_start_roast_cannot_lock_itself_out_on_a_config_already_corrected(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#732, post-open round 6: the operator-facing half, pinned on its own.
+
+    Deliberately a SEPARATE test from its sibling above rather than a second
+    assertion inside it: sharing one test meant the first `pytest.raises` aborted
+    the run before this half executed, so a mutation restoring the original
+    ordering was killed only by the other direction and this one was never
+    actually exercised.
+
+    The scenario is an operator at a preheated roaster. The running config has
+    the doctrine enabled with no cadence, so a start is refused; the operator
+    corrects the file and tries again. Because the reload sits BELOW the gate, the
+    old ordering never re-read the file: `self._config` stayed stale and every
+    retry reproduced the identical refusal until the agent was restarted.
+    """
+    enabled = ControllerConfig(
+        ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
+    )
+    corrected_on_disk = AppConfig(
+        controller=enabled, mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=30.0)
+    )
+
+    def _load() -> tuple[AppConfig, frozenset[str]]:
+        return corrected_on_disk, frozenset()
+
+    monkeypatch.setattr("roastpilot_agent.api.load_app_config", _load)
+    service = RoastService(
+        store,
+        config=AppConfig(controller=enabled, mcp_device=MCPDeviceConfig()),  # stale + bad
+        run_loop=False,
+        clock=FakeClock(),
+        live_serve_mode=True,
+    )
+
+    detail = await service.start_roast(_profile())
+
+    active = await store.active_run()
+    assert active is not None and active.run_id == detail.id
 
 
 def test_recovery_config_reraises_a_failure_the_doctrine_did_not_cause() -> None:

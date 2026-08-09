@@ -1665,7 +1665,6 @@ class RoastService:
                     f"a roast is already active (run {active.run_id}, phase "
                     f"{active.agent_phase.value}); end it before starting another"
                 )
-            self._require_explicit_ambient_cadence()
             if self._mcp is not None and self._mcp.stop_unconfirmed:
                 raise RoastRunConflictError(
                     "MCP child teardown was unconfirmed; verify the roaster and old MCP "
@@ -1693,6 +1692,17 @@ class RoastService:
                     "start_roast: reloaded config (advisor_model_slug=%r)",
                     fresh_config.advisor.model_slug,
                 )
+                # Validate the config this roast will ACTUALLY run with, which is
+                # the reloaded one — and validate it BEFORE any of it is committed
+                # or the MCP child is respawned for it. Checking the pre-reload
+                # snapshot instead was wrong twice over: a stale-but-explicit
+                # cadence let an unset reloaded cadence through (the silent void
+                # this whole guard exists to prevent), and a stale-and-invalid one
+                # refused the start before the reload could run — so `_config` never
+                # refreshed and EVERY later attempt reproduced the same refusal even
+                # after the operator had corrected the file, clearable only by
+                # restarting the agent.
+                self._require_explicit_ambient_cadence(fresh_config)
                 # Safety is always env-resolved; rebuild so self._safety matches
                 # self._config (the file injector skips ROASTPILOT_SAFETY__ so the
                 # SafetyLimits field values are identical to the startup values,
@@ -1739,6 +1749,10 @@ class RoastService:
                     or fresh_config.mcp_device != self._spawned_mcp_device
                 ):
                     await self._respawn_mcp_for_device_config(fresh_config.mcp_device)
+            else:
+                # No reload here (test doubles, API-only mode, the replay harness):
+                # the caller's explicit config IS the one the roast runs with.
+                self._require_explicit_ambient_cadence(self._config)
             # A recovered run temporarily installs its frozen safety generation
             # so API prechecks and controller evaluation agree. A later fresh run
             # must always return to the process-current, apply-next-roast config.
@@ -2016,7 +2030,7 @@ class RoastService:
         self.runner = runner
         return runner
 
-    def _require_explicit_ambient_cadence(self) -> None:
+    def _require_explicit_ambient_cadence(self, config: AppConfig) -> None:
         """Refuse to START a roast on an enabled doctrine with an unknown cadence (#732).
 
         ``mcp_yaml`` renders ``ambient_poll_interval_seconds`` only when it is
@@ -2041,20 +2055,35 @@ class RoastService:
         The runtime freshness gate remains the backstop for everything this
         cannot see, including a cadence that is stated but wrong.
 
+        **Takes the config explicitly rather than reading ``self._config``**, so
+        the caller can only pass the config the roast will actually run with. In
+        live-serve mode that is the RELOADED one, and an earlier revision that
+        read ``self._config`` from above the D76/D78 reload was wrong in both
+        directions: a stale-but-explicit cadence admitted an unset reloaded one,
+        and a stale-and-invalid cadence refused the start *before* the reload
+        could run, so ``self._config`` never refreshed and every later attempt
+        reproduced the identical refusal even after the operator had corrected
+        the file. Only an agent restart cleared that. Making the config a
+        parameter is what stops the check drifting away from its subject again.
+
+        Args:
+            config: The configuration this roast will run under, already
+                reloaded in live-serve mode.
+
         Raises:
             RoastConfigError: If the ambient fan doctrine is enabled while
                 ``mcp_device.ambient_poll_interval_seconds`` is unset.
         """
-        if not self._config.controller.ambient_fan_doctrine.enabled:
+        if not config.controller.ambient_fan_doctrine.enabled:
             return
-        if self._config.mcp_device.ambient_poll_interval_seconds is not None:
+        if config.mcp_device.ambient_poll_interval_seconds is not None:
             return
         raise RoastConfigError(
             "controller.ambient_fan_doctrine.enabled requires "
             "mcp_device.ambient_poll_interval_seconds to be set explicitly before a roast "
             "can start. Left unset, the effective cadence comes from the hand-authored MCP "
             "yaml, which this process does not read — and a cadence wider than "
-            f"{self._config.controller.ambient_fan_doctrine.max_reading_age_seconds:g} s "
+            f"{config.controller.ambient_fan_doctrine.max_reading_age_seconds:g} s "
             "declines every healthy reading, so c11 would run its absent-ambient fallback "
             "for the whole roast. Set the interval to the yaml's "
             "ambient.poll_interval_seconds, or disable the doctrine."
