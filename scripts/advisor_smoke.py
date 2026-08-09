@@ -161,21 +161,22 @@ async def run(iterations: int, fixture: Path, row_offset_seconds: float) -> int:
     called = config.model_for(RoastPhase.DEVELOPMENT)
     shadowed = "" if called == config.model_slug else " (SHADOWED by model_slug_by_phase)"
     print("=== advisor smoke / bake-off ===")
-    # codeql[py/clear-text-logging-sensitive-data]: ``api_key_env`` is the NAME
-    # of the environment variable holding the key ("OPENROUTER_API_KEY"), never
-    # the key itself — the secret is read from ``os.environ`` at call time and
-    # is not in this config object at all. CodeQL's heuristic matches the
-    # "api_key" identifier and classifies the name as a password. Printing the
-    # variable name is the point: it tells the operator which env var to set
-    # when the smoke run cannot authenticate. The line is unchanged from main;
-    # editing the same statement re-attributed the pre-existing alert to #747.
     print(
         f"provider={config.provider} model={called!r} "
         f"model_slug={config.model_slug!r}{shadowed} "
-        f"base_url={config.provider_base_url!r} api_key_env={config.api_key_env} "
+        f"base_url={config.provider_base_url!r} "
         f"prompt_version={config.prompt_version} temperature={config.temperature} "
         f"timeout_seconds={config.timeout_seconds}"
     )
+    # Split onto its own line so the suppression can attach to it — CodeQL
+    # applies an inline suppression to the line it sits on, and this statement
+    # used to span five. The alert is a false positive: ``api_key_env`` is the
+    # NAME of the env var holding the key ("OPENROUTER_API_KEY"), never the key
+    # itself, which is read from ``os.environ`` at call time and is not in this
+    # config object at all. CodeQL matches the "api_key" identifier and
+    # classifies the name as a password. Printing the name is the whole point —
+    # it tells the operator which var to set when the run cannot authenticate.
+    print(f"api_key_env={config.api_key_env}")  # codeql[py/clear-text-logging-sensitive-data]
 
     context, source_row = build_context(fixture, row_offset_seconds)
     print(
