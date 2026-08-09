@@ -85,6 +85,7 @@ from roastpilot_agent.mcp_client import (
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
     AdvisorHealth,
+    AdvisorHealthStatus,
     AdvisorTraceStatus,
     BeanProfile,
     BeanProfileDraft,
@@ -1744,16 +1745,22 @@ class RoastService:
                 # keeps a network call out of the roast-start path. Re-probing
                 # between roasts is issue-sized, not a side effect of starting
                 # a roast.
-                # ``model_slug is None`` means the probe never named a model —
-                # the NOT_CONFIGURED (advisory-paused, no API key) result. That
-                # is a statement about the ADVISOR being absent, not about which
-                # model was reached, so a model change cannot stale it; clearing
-                # it would regress an explicit "advisory-paused" readout to the
-                # ambiguous "not probed" on the first roast (local Codex P2).
+                # Keyed on the STATUS, not on whether a model was named (two
+                # successive local Codex P2s, both folded pre-open).
+                # NOT_CONFIGURED says the ADVISOR is absent — advisory-paused,
+                # no API key — which no model change can stale, so clearing it
+                # would regress an explicit readout to the ambiguous "not
+                # probed". But a model-less result does NOT imply that state:
+                # ``probe_advisor_health`` also returns UNREACHABLE with no
+                # slug when the probe times out or raises, and preserving THAT
+                # would report the old advisor offline forever after a model
+                # change the probe never saw. Anything other than
+                # NOT_CONFIGURED is a claim about a specific model, so it is
+                # stale unless it names the one now configured.
                 probed = self._advisor_health
                 if (
                     probed is not None
-                    and probed.model_slug is not None
+                    and probed.status is not AdvisorHealthStatus.NOT_CONFIGURED
                     and probed.model_slug != fresh_config.advisor.model_slug
                 ):
                     self._advisor_health = None

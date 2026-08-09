@@ -161,6 +161,31 @@ async def test_an_advisory_paused_readout_survives_a_model_change(
 
 
 @pytest.mark.asyncio
+async def test_a_model_less_UNREACHABLE_does_not_survive_a_model_change(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """A failed probe names no model either — and it MUST still go stale.
+
+    `probe_advisor_health` returns UNREACHABLE with `model_slug=None` when the
+    probe times out or raises, so "named no model" does not imply
+    NOT_CONFIGURED. Keying the preservation on the missing slug pinned that
+    failure forever, reporting the old advisor offline after a model change the
+    probe never saw — the defect the NOT_CONFIGURED fix introduced (local Codex
+    P2, folded pre-open). The invalidation keys on the STATUS instead.
+    """
+    svc = RoastService(store, live_serve_mode=True)
+    svc.set_advisor_health(
+        AdvisorHealth(status=AdvisorHealthStatus.UNREACHABLE, error="probe timed out")
+    )
+
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4.1-mini")))
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert (await svc.health()).advisor is None
+
+
+@pytest.mark.asyncio
 async def test_an_unchanged_model_keeps_its_reachability_probe(
     store: RoastStore,
     config_file: Path,
