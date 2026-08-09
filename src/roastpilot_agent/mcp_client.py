@@ -444,18 +444,25 @@ def project_mic_status(status: FirstCrackStatus) -> MicStatus:
 
 
 def ambient_reading_is_live(status: AmbientStatus) -> bool:
-    """Whether the MCP currently HOLDS a live ambient reading (#732, #741).
+    """Whether the MCP's ambient RUNTIME is live (#732, #741).
 
-    The liveness half of :func:`project_live_ambient`'s gate, named separately
-    because two different questions are asked of an ambient status and #752
-    made the difference load-bearing:
+    Deliberately says nothing about whether a reading exists or is usable: it
+    inspects neither the triad nor the stamp, so a runtime that is up but has
+    never read anything is "live" here (:func:`ambient_reading_token` returns
+    ``None`` for it, and :func:`project_live_ambient` returns an all-``None``
+    triad — the composite is what callers should reason about, not this
+    predicate alone).
 
-    * **Liveness** — is there a reading, and is anything still refreshing it?
-      That is a property of the *runtime*: a stopped or unavailable probe holds
-      no live reading, and the one it preserved will never change again.
-    * **Usability** — are the values it published representable? That is a
-      property of *this poll's payload*, and a bad one says nothing about
-      whether the runtime is alive.
+    This is the liveness half of :func:`project_live_ambient`'s gate, named
+    separately because two different questions are asked of an ambient status
+    and #752 made the difference load-bearing:
+
+    * **Liveness** — is anything still refreshing the reading? A property of the
+      *runtime*: a stopped or unavailable probe holds no live reading, and the
+      one it preserved will never change again.
+    * **Usability** — are the values it published representable? A property of
+      *this poll's payload*, and a bad one says nothing about whether the
+      runtime is alive.
 
     :meth:`RoasterControlAdapter._observe_ambient_age` keys its freshness clock
     on liveness alone, deliberately: a malformed payload must not reset the
@@ -508,9 +515,21 @@ def project_live_ambient(status: AmbientStatus) -> tuple[float | None, float | N
 
     **A non-finite MEMBER voids the whole triad (#752).** #745 gave the reading's
     identity *stamp* this treatment (:func:`ambient_reading_token`); the measured
-    values themselves had no such guard, so a ``NaN``/``±inf`` ``temperature_c``
-    reached :class:`RoastTelemetry`, the ``c11`` doctrine, and the corpus column
-    unchanged. The failure is quiet rather than loud — ``NaN`` compares ``False``
+    values themselves had no such guard, so **on any transport that delivers a
+    non-finite float intact** a ``NaN``/``±inf`` ``temperature_c`` reached
+    :class:`RoastTelemetry`, the ``c11`` doctrine, and the corpus column
+    unchanged. That qualifier is load-bearing and is spelled out at the end of
+    this docstring: today's live child replies on ``structuredContent``, which
+    launders a non-finite member to ``null`` before this function ever sees it,
+    so on the current live path this guard is **defence in depth** rather than
+    the thing standing between the doctrine and a bad value. It is still worth
+    having — the text-content path does deliver one intact, and the hazard is
+    real at the source: the MCP's ``YoctoMeteoAmbientReader._current_value``
+    rejects only the Yoctopuce ``CURRENTVALUE_INVALID`` sentinel, with ``==``,
+    which ``NaN`` defeats. A ``NaN`` member is producible at the probe; it is
+    the transport that currently launders it.
+
+    The failure is quiet rather than loud — ``NaN`` compares ``False``
     against the doctrine's ``threshold_c`` in BOTH directions, so it does not
     raise, it seats the model in whichever fan regime the comparison falls
     through to. The advisor path appears harmless today only by accident:
@@ -568,19 +587,27 @@ def project_live_ambient(status: AmbientStatus) -> tuple[float | None, float | N
     * ``structuredContent`` — the MCP serialises it with pydantic, so a
       non-finite member is already ``null`` by the time
       :func:`parse_tool_result` reads it. The guard is a no-op there, and the
-      triad arrives partially populated instead of malformed.
+      triad arrives partially populated instead of malformed. **This is the
+      live path today**: the child's ``get_roast_state`` is a FastMCP
+      ``@mcp.tool()`` returning a dataclass, so its reply carries
+      ``structuredContent``, and :func:`parse_tool_result` prefers that
+      whenever it is a multi-key dict and never reaches the text block.
     * the text content block — parsed with :func:`json.loads`, whose default
       ``parse_constant`` accepts the bare ``Infinity``/``NaN`` tokens, so the
       value does arrive non-finite. This is the path the guard is load-bearing
-      on.
+      on, and it is what an older or non-FastMCP server, or the scalar-wrapper
+      shape, would use.
 
-    So a *partially populated* triad is reachable regardless, and this function
+    So a *partially populated* triad is reachable regardless — and on the live
+    transport it is the ONLY reachable shape of this fault — and this function
     deliberately still forwards one. Whether an incomplete triad should itself
     be voided is a separate decision that turns on whether any supported ambient
-    probe legitimately reports fewer than three members (the ``AmbientStatus``
-    mirror allows it; the Yocto-Meteo does not need it) — filed rather than
-    guessed at here, because guessing wrong silently disables ambient for that
-    hardware.
+    probe legitimately reports fewer than three members. The evidence points at
+    "no" (the MCP's ``AmbientReading`` requires all three floats, and
+    ``AmbientRuntimeSnapshot`` nulls them together), but the ``AmbientStatus``
+    mirror allows it and that evidence is one MCP version deep, so it is filed
+    rather than guessed at here: guessing wrong silently disables ambient for
+    that hardware.
 
     Guarding here rather than at each call site follows #745's shape: this is the
     boundary every consumer already goes through, so

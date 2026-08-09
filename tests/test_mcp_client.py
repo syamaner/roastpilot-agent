@@ -2901,7 +2901,8 @@ def test_which_mcp_transport_path_preserves_a_non_finite_ambient_member() -> Non
     * ``structuredContent`` is serialised by pydantic, which nulls non-finite
       floats. The value is already ``None`` before the guard sees it, so the
       triad arrives partially populated rather than malformed and the guard is
-      a no-op on that path.
+      a no-op on that path — which is the LIVE path today, since the child's
+      ``get_roast_state`` is a FastMCP tool returning a dataclass.
     * The text content block is parsed with :func:`json.loads`, whose default
       ``parse_constant`` accepts the bare ``Infinity``/``NaN`` tokens. The value
       arrives non-finite, and this is the path the guard actually catches.
@@ -2949,7 +2950,14 @@ def test_ambient_reading_is_live_asks_only_the_runtime_question() -> None:
     assert ambient_reading_is_live(_ambient_status_with(temperature_c=float("nan"))) is True
     # A stopped or non-ok runtime is not live, whatever it preserved.
     assert ambient_reading_is_live(_ambient_status_with(ambient_running=False)) is False
+    # BOTH non-"ok" members of AmbientRuntimeStatus, and note the helper leaves
+    # ambient_running True — so the status half is genuinely what is under test.
+    # Every other test in this file pairs "disabled" with ambient_running=False,
+    # which cannot distinguish `== "ok"` from `!= "unavailable"`: a real
+    # surviving mutation (safety-reviewer finding 3, second pass, folded
+    # pre-open).
     assert ambient_reading_is_live(_ambient_status_with(status="unavailable")) is False
+    assert ambient_reading_is_live(_ambient_status_with(status="disabled")) is False
 
 
 def test_project_live_ambient_non_ok_status_is_none() -> None:
