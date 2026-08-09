@@ -380,15 +380,16 @@ This topology is ready when:
 - Evaluation evidence supports the selected models and effort levels.
 - **The §7 worktree, copy-restore and committed-tree rules are delivered into the
   role definitions they bind**, not only stated here. Tracked by **#733**.
-  §7 binds EVERY read-only role, so the criterion is satisfied only when ALL
-  Bash-capable definitions carry the controls — currently `engineer-be`,
-  `engineer-fe`, `mcp-contract-checker`, `planning-architect`, `pr-triage`,
-  `product-pm`, `qa`, `safety-reviewer`, `security-reviewer`, `sim-roast-runner`
-  and `ui-reviewer`, or whatever that set becomes. Enumerated rather than
-  sampled because an earlier draft named four and a repository sweep found
-  eleven, of which only `engineer-fe` mentioned the controls at all: a
-  partial list can be fully satisfied while most bound roles remain able to
-  repeat the incident. Added because §7 declares those rules normative while
+  §7 binds every **read-only** role, so the criterion is satisfied only when all
+  eight carry the controls: `mcp-contract-checker`, `planning-architect`,
+  `pr-triage`, `qa`, `safety-reviewer`, `security-reviewer`, `sim-roast-runner`
+  and `ui-reviewer`. **Currently none of them does.** The three Bash-capable
+  WRITING roles (`engineer-be`, `engineer-fe`, `product-pm`) fall outside §7 as
+  written, but the mutate-then-restore hazard is identical for them — an
+  implementer runs mutation tests as readily as a reviewer — so #733 should
+  cover all eleven even though only the eight gate this criterion. Enumerated
+  rather than sampled because an earlier draft named four: a partial list can be
+  fully satisfied while most bound roles remain able to repeat the incident. Added because §7 declares those rules normative while
   the roles it binds are silent on them, so without this criterion the topology
   could become the validated default with a safety control documented but not
   in force — the exact gap §7's own text names.
