@@ -123,44 +123,73 @@ DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS = 30.0
 # ``model_slug`` effective is what puts a 6-10 s model within operator reach,
 # which is precisely why the banner names the bound.
 #
-# Sources — numbers live in the reports, not here, so this list cannot drift
-# into a stale citation: ``docs/advisor/bakeoff-summary-2026-06-16.md`` (D40/D41,
-# 8 models x 28 roasts, median/max FC latency against the ~5 s gate) and #396's
-# 16 Jul screens (gpt-5.6-luna, gpt-4.1-mini).
+# An ARM, not a slug, is the unit of measurement — ``(model_slug,
+# reasoning_effort)`` (local Codex P2 + safety-reviewer, both folded pre-open).
+# Keying on the slug alone INVERTS recorded evidence in at least one real case:
+# ``openai/gpt-5.5`` busts the gate at the provider default (10.8 s on 8 Jun,
+# 7.17/8.58 s in D40/D41) but was measured at **2.9 s, passing**, with
+# ``reasoning_effort="off"`` — a configuration
+# ``docs/advisor-bakeoff-2026-06-08.md`` explicitly documents as a speed/cost
+# alternative. A slug-keyed set would print "BUSTED" over the operator's own
+# measured-passing arm, which is worse than silence: it teaches them the warning
+# is noise. The effort key is the raw ``AdvisorConfig.reasoning_effort`` value,
+# ``None`` meaning the provider default (itself a measured condition, not an
+# absence).
 #
-# Both sets are lower-cased at definition and asserted disjoint by test:
-# ``launch_banner._slug_matches`` compares against them lower-case, so a
-# mixed-case entry added later would silently fall through to "no screen on
-# record" — a false NEGATIVE, the one direction that matters here.
-FC_LATENCY_SCREENED_ADVISOR_MODELS: frozenset[str] = frozenset(
-    slug.lower()
-    for slug in {
-        # D40/D41 (16 Jun): cleared comfortably.
-        "google/gemini-3.1-flash-lite",
-        "openai/gpt-4o-mini",
-        "openai/gpt-4o",
+# The ENDPOINT is the third dimension and is handled in ``launch_banner``
+# instead of being repeated on every row: every screen below ran on OpenRouter
+# via ``provider="openai_compatible"``, so any other provider or base URL voids
+# the whole table rather than matching a row.
+#
+# Sources — numbers live in the reports, not here, so this table cannot drift
+# into a stale citation: ``docs/advisor/bakeoff-summary-2026-06-16.md`` (D40/D41,
+# 8 models x 28 roasts, median/max against the ~5 s gate — the authoritative
+# screen for this gate), #396's 16 Jul screens (gpt-5.6-luna, gpt-4.1-mini), and
+# ``docs/advisor-bakeoff-2026-06-08.md`` for the reasoning-off arms. Note the
+# 8 Jun run scored against a LOOSER gate (it passes sonnet at 9.1 s and opus at
+# 6.2 s), so only its reasoning-off arms are carried here; the ~5 s
+# classification is D40/D41's.
+#
+# Slugs are lower-cased at definition and the two tables are asserted disjoint
+# by test: ``launch_banner`` matches them lower-case, so a mixed-case entry
+# added later would silently fall through to "no screen on record" — a false
+# NEGATIVE, the one direction that matters here.
+FC_LATENCY_SCREENED_ADVISOR_ARMS: frozenset[tuple[str, str | None]] = frozenset(
+    (slug.lower(), effort)
+    for slug, effort in {
+        # D40/D41 (16 Jun), provider-default reasoning: cleared comfortably.
+        ("google/gemini-3.1-flash-lite", None),
+        ("openai/gpt-4o-mini", None),
+        ("openai/gpt-4o", None),
         # D40/D41: cleared, but TIGHT (~4.1 s median against a ~5 s gate).
-        "anthropic/claude-haiku-4.5",
+        ("anthropic/claude-haiku-4.5", None),
         # #396 (16 Jul): dedicated screens, both cleared. Recorded honestly —
         # over 28 roasts gpt-4.1-mini's MAX grazed the gate while its median
         # stayed well inside it, so it is screened rather than busted.
-        "openai/gpt-5.6-luna",
-        "openai/gpt-4.1-mini",
+        ("openai/gpt-5.6-luna", None),
+        ("openai/gpt-4.1-mini", None),
+        # 8 Jun: reasoning OFF turns the same model from 10.8 s into 2.9 s.
+        # The one arm on this table whose base slug busts at the default.
+        ("openai/gpt-5.5", "off"),
     }
 )
 
-#: Slugs whose recorded screen BUSTED the gate — the reasoning / frontier models
+#: Arms whose recorded screen BUSTED the gate — the reasoning / frontier models
 #: that think past the wall (D40/D41). Named explicitly so the banner can say
 #: "measured, and it busts" instead of the much weaker "no screen on record".
-FC_LATENCY_BUSTED_ADVISOR_MODELS: frozenset[str] = frozenset(
-    slug.lower()
-    for slug in {
-        # Measured AT ``reasoning=low``; the banner voids the whole screen when
-        # a non-default reasoning effort is configured, precisely because of it.
-        "openai/gpt-5-mini",
-        "anthropic/claude-opus-4.8",
-        "openai/gpt-5.5",
-        "anthropic/claude-sonnet-4.6",
+FC_LATENCY_BUSTED_ADVISOR_ARMS: frozenset[tuple[str, str | None]] = frozenset(
+    (slug.lower(), effort)
+    for slug, effort in {
+        # The #277 brief pins this one to ``low``; that is the arm measured, and
+        # 8 Jun found reasoning cannot be disabled on it at all (a 400 from the
+        # endpoint), so no reasoning-off escape exists for it.
+        ("openai/gpt-5-mini", "low"),
+        ("anthropic/claude-opus-4.8", None),
+        ("openai/gpt-5.5", None),
+        # Structural generation latency, not reasoning: 8 Jun found Anthropic
+        # models emit zero reasoning tokens, so reasoning-off is a no-op here
+        # and there is no faster arm of this model to record.
+        ("anthropic/claude-sonnet-4.6", None),
     }
 )
 

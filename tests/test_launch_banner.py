@@ -22,8 +22,8 @@ from pydantic import ValidationError
 
 from roastpilot_agent import config_store
 from roastpilot_agent.config import (
-    FC_LATENCY_BUSTED_ADVISOR_MODELS,
-    FC_LATENCY_SCREENED_ADVISOR_MODELS,
+    FC_LATENCY_BUSTED_ADVISOR_ARMS,
+    FC_LATENCY_SCREENED_ADVISOR_ARMS,
     AdvisorConfig,
     AppConfig,
     ControllerConfig,
@@ -292,17 +292,21 @@ def test_latency_warning_follows_the_resolved_model_not_the_base_slug() -> None:
     assert "openai/gpt-4o BUSTED" not in line
 
 
-def test_native_provider_model_name_matches_its_screened_slug() -> None:
-    """A bare native-provider name inherits its screened slug's result.
+def test_a_native_provider_model_does_not_inherit_the_openrouter_screen() -> None:
+    """Running a screened model on its native provider is a different arm.
 
-    `AdvisorConfig` supports running a model on its native provider (D18),
-    where gpt-4o is configured as `gpt-4o` rather than `openai/gpt-4o`. Warning
-    there would be a false alarm on a legitimate config.
+    An earlier version of this test asserted the opposite — that bare `gpt-4o`
+    on `provider="openai"` should inherit `openai/gpt-4o`'s result, to avoid a
+    false alarm. That was wrong on the evidence: every screen ran on OpenRouter,
+    nobody has measured the direct-provider path, and the honest report is the
+    mild "no screen on record at this endpoint", not silence. It is also what
+    kills the whole bare-name matching class, which could otherwise let an
+    unrelated vendor's suffix inherit a measurement.
     """
-    line = _advisor_line_for(provider="openai", model_slug="gpt-4o")
-
-    assert "no FC-latency screen" not in line
-    assert "BUSTED" not in line
+    assert "no FC-latency screen on record" in _advisor_line_for(
+        provider="openai", model_slug="gpt-4o"
+    )
+    assert "BUSTED" not in _advisor_line_for(provider="openai", model_slug="gpt-4o")
 
 
 def test_a_padded_slug_still_matches_its_screen() -> None:
@@ -336,55 +340,66 @@ def test_a_thinking_variant_of_a_buster_is_still_reported_as_busted() -> None:
     )
 
 
-def test_a_non_default_reasoning_effort_voids_the_screen() -> None:
-    """The screen measures (endpoint, slug, effort) — effort is part of the key.
+def test_reasoning_off_does_not_invert_a_measured_passing_arm() -> None:
+    """`gpt-5.5` busts at the provider default but PASSES with reasoning off.
 
-    The busted set's own provenance is effort-qualified (`gpt-5-mini` busts *at
-    reasoning=low*), so honouring the slug alone would clear
-    `gpt-4o@reasoning=high`, a configuration nothing has ever measured and one
-    that is reachable from `ROASTPILOT_ADVISOR__REASONING_EFFORT`.
+    The sharpest case for keying on the arm rather than the slug (local Codex
+    P2, folded pre-open). `docs/advisor-bakeoff-2026-06-08.md` records
+    `gpt-5.5 + reasoning_effort="off"` at 2.9 s — passing — and documents it as
+    a deliberate speed/cost alternative. A slug-keyed set printed "BUSTED" over
+    the operator's own measured-passing configuration, which is worse than
+    silence: it teaches them the warning is noise.
+    """
+    assert "BUSTED" in _advisor_line_for(model_slug="openai/gpt-5.5")
+    assert "BUSTED" not in _advisor_line_for(model_slug="openai/gpt-5.5", reasoning_effort="off")
+    assert "no FC-latency screen" not in _advisor_line_for(
+        model_slug="openai/gpt-5.5", reasoning_effort="off"
+    )
+
+
+def test_an_unmeasured_reasoning_effort_is_reported_as_unscreened() -> None:
+    """A cleared model at an effort nobody ran is unmeasured, and says so.
+
+    `gpt-4o` cleared at the provider default; `gpt-4o@reasoning=high` is a
+    different arm that no report covers, and it is reachable from
+    `ROASTPILOT_ADVISOR__REASONING_EFFORT`. The message names the dimension so
+    the operator can tell "never screened this model" from "screened, but not
+    like this".
     """
     line = _advisor_line_for(model_slug="openai/gpt-4o", reasoning_effort="high")
 
-    assert "no FC-latency screen on record for openai/gpt-4o" in line
-    assert "endpoint/reasoning effort" in line
-    # "off" is the measured condition, so it must NOT void the screen.
-    assert "no FC-latency screen" not in _advisor_line_for(
-        model_slug="openai/gpt-4o", reasoning_effort="off"
-    )
+    assert "no FC-latency screen on record for openai/gpt-4o at reasoning_effort=high" in line
 
 
-def test_a_different_endpoint_voids_the_screen() -> None:
+def test_another_endpoint_voids_the_whole_table() -> None:
     """A screened slug behind some other endpoint is not the screened thing.
 
-    `provider_base_url` is operator-editable (a local proxy, LiteLLM, Ollama),
-    and the latency of `openai/gpt-4o` through an unknown hop is unmeasured.
-    Clearing it on the strength of the slug string would be a false negative.
+    Both halves matter. `provider_base_url` is operator-editable (a local
+    proxy, LiteLLM), and `provider` can move the endpoint while the base URL
+    sits unchanged at its inert default — a native-provider config. Keying on
+    the URL alone let that second case inherit an OpenRouter measurement
+    (safety-reviewer + local Codex, folded pre-open).
     """
-    line = _advisor_line_for(
+    assert "no FC-latency screen on record for openai/gpt-4o at this endpoint" in _advisor_line_for(
         model_slug="openai/gpt-4o", provider_base_url="http://some-proxy.local/v1"
     )
+    assert "no FC-latency screen on record for gpt-4o at this endpoint" in _advisor_line_for(
+        provider="openai", model_slug="gpt-4o"
+    )
 
-    assert "no FC-latency screen on record for openai/gpt-4o" in line
 
-
-def test_the_screen_sets_are_lower_case_and_disjoint() -> None:
-    """The invariants `_slug_matches` silently depends on.
+def test_the_screen_tables_are_lower_case_and_disjoint() -> None:
+    """The invariants `_arm_matches` silently depends on.
 
     It compares lower-case, so a mixed-case entry added later would fall
-    through to "no screen on record" — a false negative. And a slug in both
-    sets, or two entries sharing a bare name, would make the classification
-    order-dependent for the native-provider match.
+    through to "no screen on record" — a false negative. And the same ARM in
+    both tables would make the verdict order-dependent. Note a SLUG may legally
+    appear in both (`gpt-5.5` busts at the default and clears with reasoning
+    off); it is the arm that must be unique.
     """
-    assert all(slug == slug.lower() for slug in FC_LATENCY_SCREENED_ADVISOR_MODELS)
-    assert all(slug == slug.lower() for slug in FC_LATENCY_BUSTED_ADVISOR_MODELS)
-    assert not (FC_LATENCY_SCREENED_ADVISOR_MODELS & FC_LATENCY_BUSTED_ADVISOR_MODELS)
-
-    bare = [
-        slug.rsplit("/", 1)[-1]
-        for slug in FC_LATENCY_SCREENED_ADVISOR_MODELS | FC_LATENCY_BUSTED_ADVISOR_MODELS
-    ]
-    assert len(bare) == len(set(bare))
+    both = FC_LATENCY_SCREENED_ADVISOR_ARMS | FC_LATENCY_BUSTED_ADVISOR_ARMS
+    assert all(slug == slug.lower() for slug, _ in both)
+    assert not (FC_LATENCY_SCREENED_ADVISOR_ARMS & FC_LATENCY_BUSTED_ADVISOR_ARMS)
 
 
 def test_a_lookalike_vendor_prefix_does_not_inherit_a_screen() -> None:

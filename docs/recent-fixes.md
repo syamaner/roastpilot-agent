@@ -698,7 +698,13 @@ Format: one entry per anti-pattern.
   a replay must reproduce a fixed recorded trajectory regardless of live
   config; see the replay entry above). `scripts/advisor_smoke.py` is also
   fine: the bare config it prints is the same object it then runs on, so its
-  readout is honest.
+  readout is honest. **WRONG, corrected by #747 — and wrong in a way that
+  illustrates this very entry.** Same OBJECT, but not the same FIELD: it
+  printed `config.model_slug` while `PydanticAIAdvisor` resolves
+  `model_for(phase)`, so an env-set slug was printed and never called. Object
+  identity is not the check; following the field to its CONSUMER is. Fixed in
+  the #747 branch, which prints the phase-resolved model and names a shadowed
+  slug.
 - **Also:** resolving the right config is only half of it — the readout must
   report the value the code path actually *consumes*, and it must know WHICH
   code path consumes it. Four related traps in this same banner, all caught by

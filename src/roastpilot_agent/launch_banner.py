@@ -30,8 +30,8 @@ from dataclasses import dataclass
 from pydantic import BaseModel, ValidationError
 
 from roastpilot_agent.config import (
-    FC_LATENCY_BUSTED_ADVISOR_MODELS,
-    FC_LATENCY_SCREENED_ADVISOR_MODELS,
+    FC_LATENCY_BUSTED_ADVISOR_ARMS,
+    FC_LATENCY_SCREENED_ADVISOR_ARMS,
     OPENROUTER_BASE_URL,
     AdvisorConfig,
     AppConfig,
@@ -90,55 +90,51 @@ def _changed_fields(model: BaseModel) -> set[str]:
     }
 
 
-def _slug_matches(slug: str, known: frozenset[str]) -> bool:
-    """Whether *slug* names a model in *known*.
+def _arm_matches(slug: str, effort: str | None, known: frozenset[tuple[str, str | None]]) -> bool:
+    """Whether the ``(slug, effort)`` ARM appears in *known*.
 
-    Matching is case-insensitive.  A slug carrying a vendor prefix must match a
-    known slug in full, so ``someone-else/gpt-4o`` never inherits OpenRouter
-    ``openai/gpt-4o``'s screen.  A BARE name (no ``/``) is matched against the
-    known slugs' bare names instead, because :class:`AdvisorConfig` supports
-    running a model on its native provider (D18), where the same model is
-    configured as ``gpt-4o`` rather than ``openai/gpt-4o`` — warning there would
-    be a false alarm on a legitimate config, and a false alarm is how a soft
-    warning gets ignored.
+    Matching is exact on the lower-cased slug: every screen ran on OpenRouter,
+    where slugs carry a vendor prefix, so ``someone-else/gpt-4o`` never inherits
+    ``openai/gpt-4o``'s measurement. (Callers void the whole table for a
+    non-OpenRouter endpoint, which is why no bare native-provider name is
+    matched here — an unmeasured endpoint is unmeasured whatever it is called.)
 
     Surrounding whitespace is stripped: a hand-edited saved config can hold
-    ``" openai/gpt-5.5 "``, and without the strip a measured-busting model would
+    ``" openai/gpt-5.5 "``, and without the strip a measured-busting arm would
     silently downgrade to the weaker "no screen on record" wording.
 
     Args:
         slug: A resolved advisor model slug.
-        known: Lower-case slugs to match against.
+        effort: The configured ``reasoning_effort`` (``None`` = provider default).
+        known: Lower-case ``(slug, effort)`` arms to match against.
 
     Returns:
-        ``True`` when *slug* names one of *known*.
+        ``True`` when the arm was measured.
     """
-    candidate = slug.strip().lower()
-    if "/" in candidate:
-        return candidate in known
-    return any(entry.rsplit("/", 1)[-1] == candidate for entry in known)
+    return (slug.strip().lower(), effort) in known
 
 
-def _matches_busted(slug: str) -> bool:
-    """Whether *slug* names a model measured as BUSTING the FC-latency gate.
+def _matches_busted(slug: str, effort: str | None) -> bool:
+    """Whether this arm was MEASURED as busting the FC-latency gate.
 
     Also matches an OpenRouter ``:variant`` suffix (``…-4.6:thinking``) against
     its base slug, because every such variant of a busting model is slower
-    still. Deliberately NOT applied to the screened set: a variant must never
-    inherit a CLEARING measurement it did not earn (a thinking variant of a
-    fast model can be slow), so the asymmetry is the safe direction in both
+    still. Deliberately NOT applied to the screened table: a variant must never
+    inherit a CLEARING measurement it did not earn (a thinking variant of a fast
+    model can itself be slow), so the asymmetry is the safe direction in both
     cases.
 
     Args:
         slug: A resolved advisor model slug.
+        effort: The configured ``reasoning_effort`` (``None`` = provider default).
 
     Returns:
-        ``True`` when *slug*, or its pre-``:`` base, is a known buster.
+        ``True`` when this arm, or its pre-``:`` base at the same effort, busts.
     """
-    if _slug_matches(slug, FC_LATENCY_BUSTED_ADVISOR_MODELS):
+    if _arm_matches(slug, effort, FC_LATENCY_BUSTED_ADVISOR_ARMS):
         return True
     base = slug.strip().split(":", 1)[0]
-    return base != slug.strip() and _slug_matches(base, FC_LATENCY_BUSTED_ADVISOR_MODELS)
+    return base != slug.strip() and _arm_matches(base, effort, FC_LATENCY_BUSTED_ADVISOR_ARMS)
 
 
 def _latency_screen_note(
@@ -162,13 +158,18 @@ def _latency_screen_note(
     * neither — named as unverified, which is a prompt to screen it, not a
       verdict against it.
 
-    A screen measures a ``(endpoint, slug, reasoning effort)`` triple, not a
-    slug, so a non-default ``reasoning_effort`` or a non-OpenRouter
-    ``provider_base_url`` voids it and every resolved model falls to the
-    unscreened class (safety-reviewer finding, folded pre-open). The busted
-    set's own provenance is effort-qualified — ``gpt-5-mini`` busts *at
-    reasoning=low* — so honouring only the slug would clear
-    ``gpt-4o@reasoning=high``, which nothing has ever measured.
+    A screen measures an ``(endpoint, slug, reasoning effort)`` triple, not a
+    slug (local Codex P2 + safety-reviewer, both folded pre-open). Slug and
+    effort are matched together as an ARM; the ENDPOINT is checked here, once,
+    because every screen ran on OpenRouter via ``openai_compatible`` — any other
+    provider or base URL voids the whole table rather than matching a row.
+
+    Keying on the slug alone is not merely imprecise, it INVERTS the evidence in
+    a real case: ``gpt-5.5`` busts at the provider default but was measured
+    passing at 2.9 s with ``reasoning_effort="off"``, an arm the 8 Jun report
+    documents as a deliberate speed/cost option. Printing "BUSTED" over the
+    operator's own measured-passing configuration is worse than silence — it
+    teaches them the warning is noise.
 
     Args:
         advisor: The resolved advisor config, for the endpoint/effort qualifier.
@@ -183,17 +184,24 @@ def _latency_screen_note(
         The note to append to the advisor line, or ``""`` when every resolved
         model has an applicable screen on record that cleared.
     """
-    # ``reasoning_effort="off"`` is the measured condition (the screens ran with
-    # reasoning disabled or absent); any positive effort is a different model.
-    voided = (advisor.reasoning_effort not in (None, "off")) or (
-        advisor.provider_base_url != OPENROUTER_BASE_URL
+    # The endpoint qualifier. ``provider`` alone can move the endpoint while
+    # ``provider_base_url`` sits unchanged at its default (a native-provider
+    # config leaves the OpenRouter URL inert but unused), so BOTH are checked —
+    # keying on the URL alone let a native provider inherit an OpenRouter
+    # measurement.
+    effort = advisor.reasoning_effort
+    voided = (
+        advisor.provider != "openai_compatible" or advisor.provider_base_url != OPENROUTER_BASE_URL
     )
-    busted = sorted(m for m in resolved if not voided and _matches_busted(m))
+    busted = sorted(m for m in resolved if not voided and _matches_busted(m, effort))
     unscreened = sorted(
         m
         for m in resolved
         if voided
-        or (not _slug_matches(m, FC_LATENCY_SCREENED_ADVISOR_MODELS) and not _matches_busted(m))
+        or (
+            not _arm_matches(m, effort, FC_LATENCY_SCREENED_ADVISOR_ARMS)
+            and not _matches_busted(m, effort)
+        )
     )
     notes: list[str] = []
     if busted:
@@ -204,11 +212,15 @@ def _latency_screen_note(
             f"long as it runs, bounded at {advisory_timeout_seconds:g} s"
         )
     if unscreened:
-        why = (
-            " at this endpoint/reasoning effort (a screen measures the whole triple)"
-            if voided
-            else ""
-        )
+        # Name the dimension that made it unmeasured, so the operator can tell
+        # "we never screened this model" from "we screened it, but not HERE" —
+        # different problems with different fixes.
+        if voided:
+            why = " at this endpoint (screens ran on OpenRouter)"
+        elif effort is not None:
+            why = f" at reasoning_effort={effort}"
+        else:
+            why = ""
         notes.append(
             f"⚠ no FC-latency screen on record for {', '.join(unscreened)}{why} — "
             "the ~5 s post-FC advice slot (D40/D41) is unverified for it"
