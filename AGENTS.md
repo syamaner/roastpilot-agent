@@ -136,9 +136,11 @@ docs/epics/
 
 ## Key Design Decisions
 
-Authoritative sources: `roastpilot-plan/roastpilot-agent/plan.md` (D5–D9),
+Authoritative sources: `roastpilot-plan/roastpilot-agent/plan.md` (D5–D8, then
+the bulk of the series from D15), `roastpilot-plan/roastpilot-agent/README.md`
+(**D9** — it is not in `plan.md`),
 `roastpilot-plan/roastpilot-agent-orchestration-plan.md` (architecture),
-`roastpilot-plan/00-repository-structure.md` (D1–D14).
+`roastpilot-plan/00-repository-structure.md` (D1–D4, D14, D150).
 
 - D5: advisor provider is OpenRouter via PydanticAI; model slug is config;
   tests always use a deterministic fake.
