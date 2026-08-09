@@ -34,6 +34,7 @@ from roastpilot_agent.api import (
     _DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     EventBroadcaster,
     QueuedOperatorAction,
+    RoastConfigError,
     RoastRunConflictError,
     RoastRunGoneError,
     RoastRunner,
@@ -3489,6 +3490,66 @@ async def test_recover_on_start_active_roast_still_recovers_to_recovery_required
     assert OperatorAction.EMERGENCY_STOP in enabled_operator_actions(
         RoastPhase.OPERATOR_RECOVERY_REQUIRED
     )
+
+
+@pytest.mark.asyncio
+async def test_start_roast_refuses_an_enabled_doctrine_with_an_unknown_cadence(
+    store: RoastStore,
+) -> None:
+    """#732, post-open Codex round 4: the explicit-cadence requirement lives at
+    the START boundary, and is enforced there rather than at construction.
+
+    Unset means the cadence comes from a hand-authored MCP yaml this process
+    does not read — including one merely sitting in the working directory,
+    which `resolve_mcp_yaml_source_path` honours. A cadence wider than the
+    freshness bound declines every healthy reading, so c11 would run its
+    absent-ambient fallback for the entire roast: green, and meaningless.
+
+    Refusing at start costs a config edit. The earlier placement, as a
+    construction rule, cost a running roast instead — recovery rebuilds a
+    config for a run already in progress, so a resume silently retired the
+    doctrine. Both halves are asserted here: the refusal, and that stating the
+    cadence is the way through."""
+    service = RoastService(
+        store,
+        roaster=FakeMCPClient(),
+        advisor=FakeAdvisor(),
+        run_loop=False,
+        clock=FakeClock(),
+        config=AppConfig(
+            controller=ControllerConfig(
+                ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
+            ),
+            mcp_device=MCPDeviceConfig(),
+        ),
+    )
+
+    # Driven through the REAL entry point, not the helper: a test that called
+    # the helper directly would still pass with the call site deleted from
+    # start_roast, which is the wiring that actually has to hold.
+    with pytest.raises(RoastConfigError, match="ambient_poll_interval_seconds"):
+        await service.start_roast(_profile())
+    assert await store.active_run() is None  # refused before any run was persisted
+
+    # Stating it is the way through; and with the doctrine off it never binds.
+    for config in (
+        AppConfig(
+            controller=ControllerConfig(
+                ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
+            ),
+            mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=30.0),
+        ),
+        AppConfig(mcp_device=MCPDeviceConfig()),
+    ):
+        ok = RoastService(
+            store,
+            roaster=FakeMCPClient(),
+            advisor=FakeAdvisor(),
+            run_loop=False,
+            clock=FakeClock(),
+            config=config,
+        )
+        ok._require_explicit_ambient_cadence()  # pyright: ignore[reportPrivateUsage]
 
 
 def test_recovery_config_reraises_a_failure_the_doctrine_did_not_cause() -> None:

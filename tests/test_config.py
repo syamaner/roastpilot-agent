@@ -6,7 +6,6 @@ nesting), validation rejections, and the guidance-vs-safety-bound link.
 """
 
 import os
-from pathlib import Path
 
 import pydantic
 import pytest
@@ -480,44 +479,22 @@ def test_ambient_freshness_bound_must_outlive_the_poll_interval() -> None:
         )
 
 
-def test_enabling_the_doctrine_requires_an_explicit_poll_cadence() -> None:
-    """#732, post-open Codex rounds 1-3: enabling the doctrine demands the
-    cadence outright rather than inferring it.
+def test_an_unset_cadence_does_not_block_config_construction() -> None:
+    """#732, post-open Codex round 4: an unset cadence is UNKNOWN, not incompatible.
 
-    ``mcp_yaml`` renders ``ambient_poll_interval_seconds`` only when set, so
-    unset means "inherit" from a file config construction will not read
-    (``AppConfig`` is built in tests, replay and recovery; it must not depend on
-    the filesystem).
-
-    Three earlier revisions each closed an instance and left the class:
-    substituting the MCP default let an inherited 300 s cadence pass against a
-    90 s bound; standing down when unset stripped the guard from the DEFAULT
-    deployment shape; enumerating the yaml routes still missed
-    ``resolve_mcp_yaml_source_path``'s working-directory fallback, which the
-    spawn honours. Requiring the value has no residual left to miss.
-
-    The cost is one field the operator effectively has to know anyway before
-    running a scored arm on a doctrine whose whole behaviour turns on it."""
-    tight = ControllerConfig(
-        ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
-    )
+    Requiring the value is a start-a-roast precondition
+    (``RoastService._require_explicit_ambient_cadence``), deliberately not a
+    construction one. As a construction rule it also fired during recovery,
+    which rebuilds a config for a run already in progress — so an operator
+    resume retired the doctrine merely because the CURRENT cadence was unset,
+    silently changing the fan advice mid-run. An in-flight run's own
+    configuration is not the place to enforce an authoring rule."""
     assert MCPDeviceConfig().ambient_poll_interval_seconds is None
-
-    # No route configured is STILL rejected: a working-directory yaml is
-    # invisible from here, so "no route" cannot be told apart from it.
-    with pytest.raises(pydantic.ValidationError, match="ambient_poll_interval_seconds"):
-        AppConfig(controller=tight, mcp_device=MCPDeviceConfig())
-
-    # An explicit path route, likewise.
-    with pytest.raises(pydantic.ValidationError, match="ambient_poll_interval_seconds"):
-        AppConfig(
-            controller=tight,
-            mcp_device=MCPDeviceConfig(mcp_yaml_source_path=Path("/tmp/coffee-roaster-mcp.yaml")),
-        )
-
-    # Stating the cadence is the way through.
     assert AppConfig(
-        controller=tight, mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=30.0)
+        controller=ControllerConfig(
+            ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
+        ),
+        mcp_device=MCPDeviceConfig(),
     )
 
 

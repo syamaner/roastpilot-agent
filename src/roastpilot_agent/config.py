@@ -1982,17 +1982,15 @@ class AppConfig(BaseSettings):
             return self
         poll_seconds = self.mcp_device.ambient_poll_interval_seconds
         if poll_seconds is None:
-            raise ValueError(
-                "controller.ambient_fan_doctrine.enabled requires "
-                "mcp_device.ambient_poll_interval_seconds to be set explicitly. Left unset, "
-                "the effective cadence is whatever a hand-authored MCP yaml carries — and "
-                f"{DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS:g} s is only the fallback when "
-                "no yaml supplies one. The doctrine's freshness bound is meaningless against "
-                "a cadence this process cannot see, and getting it wrong silently voids the "
-                "doctrine for a whole roast. Set the interval to the yaml's "
-                "ambient.poll_interval_seconds (or to the MCP default if no yaml sets it), "
-                "or disable the doctrine."
-            )
+            # Unknown, not incompatible. Requiring the value is a START-A-ROAST
+            # precondition (``RoastService._require_explicit_ambient_cadence``),
+            # deliberately NOT a construction one: making it a second way for
+            # this validator to raise meant recovery — which rebuilds an
+            # ``AppConfig`` for a run already in progress — retired the doctrine
+            # merely because the live cadence was unset, silently changing the
+            # fan advice an operator resumed into. An in-flight run's own
+            # configuration is not the place to enforce an authoring rule.
+            return self
         if doctrine.max_reading_age_seconds < poll_seconds:
             raise ValueError(
                 "controller.ambient_fan_doctrine.max_reading_age_seconds must be at least "

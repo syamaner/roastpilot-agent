@@ -426,6 +426,13 @@ class RoastRunConflictError(Exception):
     starting a roast while one is active, or rating an in-progress run."""
 
 
+class RoastConfigError(Exception):
+    """A roast cannot start because the configuration is internally incoherent
+    (maps to HTTP 409). Distinct from a pydantic ``ValidationError``: the config
+    is CONSTRUCTIBLE and a running roast keeps using it, but starting a NEW roast
+    on it would produce a silently meaningless result (#732)."""
+
+
 class OperatorActionRateLimitError(Exception):
     """A safety-relevant operator mutation exceeded its admission bound."""
 
@@ -1658,6 +1665,7 @@ class RoastService:
                     f"a roast is already active (run {active.run_id}, phase "
                     f"{active.agent_phase.value}); end it before starting another"
                 )
+            self._require_explicit_ambient_cadence()
             if self._mcp is not None and self._mcp.stop_unconfirmed:
                 raise RoastRunConflictError(
                     "MCP child teardown was unconfirmed; verify the roaster and old MCP "
@@ -2007,6 +2015,50 @@ class RoastService:
         )
         self.runner = runner
         return runner
+
+    def _require_explicit_ambient_cadence(self) -> None:
+        """Refuse to START a roast on an enabled doctrine with an unknown cadence (#732).
+
+        ``mcp_yaml`` renders ``ambient_poll_interval_seconds`` only when it is
+        set, so leaving it unset means the effective cadence comes from a
+        hand-authored MCP yaml — including, via
+        ``resolve_mcp_yaml_source_path``'s fourth route, a
+        ``coffee-roaster-mcp.yaml`` merely sitting in the working directory.
+        ``c11`` compares ambient against a freshness bound, so a cadence wider
+        than that bound declines every healthy reading and runs the doctrine's
+        absent-ambient fallback for the whole roast — green, and meaningless,
+        which is the outcome an RP-B arm must not be able to record.
+
+        **Enforced here rather than in ``AppConfig``**, and that placement is
+        the finding rather than an implementation detail. As a construction-time
+        rule it also fired during recovery, which rebuilds a config for a run
+        already in progress: an operator resume then retired the doctrine
+        because the *current* cadence was unset, silently changing the fan
+        advice mid-run. Starting a roast is the authoring boundary — the moment
+        an operator commits to a configuration — so the requirement belongs
+        here, where refusing costs a config edit rather than a run.
+
+        The runtime freshness gate remains the backstop for everything this
+        cannot see, including a cadence that is stated but wrong.
+
+        Raises:
+            RoastConfigError: If the ambient fan doctrine is enabled while
+                ``mcp_device.ambient_poll_interval_seconds`` is unset.
+        """
+        if not self._config.controller.ambient_fan_doctrine.enabled:
+            return
+        if self._config.mcp_device.ambient_poll_interval_seconds is not None:
+            return
+        raise RoastConfigError(
+            "controller.ambient_fan_doctrine.enabled requires "
+            "mcp_device.ambient_poll_interval_seconds to be set explicitly before a roast "
+            "can start. Left unset, the effective cadence comes from the hand-authored MCP "
+            "yaml, which this process does not read — and a cadence wider than "
+            f"{self._config.controller.ambient_fan_doctrine.max_reading_age_seconds:g} s "
+            "declines every healthy reading, so c11 would run its absent-ambient fallback "
+            "for the whole roast. Set the interval to the yaml's "
+            "ambient.poll_interval_seconds, or disable the doctrine."
+        )
 
     def _build_recovery_config(self, frozen: FrozenRunConfig) -> AppConfig:
         """Recombine a run's FROZEN controller/safety with the CURRENT process config.
@@ -3669,7 +3721,7 @@ async def start_roast(profile: RoastProfile, service: ServiceDep) -> RoastDetail
     """``POST /api/roasts`` — start a roast (409 if one is active)."""
     try:
         return await service.start_roast(profile)
-    except RoastRunConflictError as exc:
+    except (RoastRunConflictError, RoastConfigError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
