@@ -443,6 +443,38 @@ def project_mic_status(status: FirstCrackStatus) -> MicStatus:
     )
 
 
+def ambient_reading_is_live(status: AmbientStatus) -> bool:
+    """Whether the MCP currently HOLDS a live ambient reading (#732, #741).
+
+    The liveness half of :func:`project_live_ambient`'s gate, named separately
+    because two different questions are asked of an ambient status and #752
+    made the difference load-bearing:
+
+    * **Liveness** — is there a reading, and is anything still refreshing it?
+      That is a property of the *runtime*: a stopped or unavailable probe holds
+      no live reading, and the one it preserved will never change again.
+    * **Usability** — are the values it published representable? That is a
+      property of *this poll's payload*, and a bad one says nothing about
+      whether the runtime is alive.
+
+    :meth:`RoasterControlAdapter._observe_ambient_age` keys its freshness clock
+    on liveness alone, deliberately: a malformed payload must not reset the
+    clock, because resetting it would re-base a demonstrably unrefreshed
+    reading to age ``0.0`` and hand a stale value back as fresh — the exact
+    laundering #732/#741/#745 exist to prevent (local Codex pass, pre-open).
+    A runtime that genuinely stops still resets it, which is #732's own
+    deliberate trade and is unchanged here.
+
+    Args:
+        status: The MCP ambient status from ``RoastSessionState``.
+
+    Returns:
+        ``True`` when the MCP reports ``"ok"`` **and** its ambient runtime is
+        still running.
+    """
+    return status.status == "ok" and status.ambient_running
+
+
 def project_live_ambient(status: AmbientStatus) -> tuple[float | None, float | None, float | None]:
     """Project an MCP ``AmbientStatus`` into the live ambient triad (#464, D86).
 
@@ -540,7 +572,7 @@ def project_live_ambient(status: AmbientStatus) -> tuple[float | None, float | N
         fail-soft contract for a disabled/unavailable probe, extended to a
         stopped-but-``ok`` runtime and to a malformed reading.
     """
-    if status.status != "ok" or not status.ambient_running:
+    if not ambient_reading_is_live(status):
         return None, None, None
     triad = (status.temperature_c, status.humidity_percent, status.pressure_hpa)
     if any(value is not None and not math.isfinite(value) for value in triad):
@@ -935,16 +967,28 @@ class RoasterControlAdapter:
         *change*, never subtracted from anything — because cross-process
         ``time.monotonic`` clocks are not comparable.
 
-        Freshness is tracked for the reading :func:`project_live_ambient`
-        actually FORWARDS, not for whatever stamp the status happens to carry —
-        one source of truth for "is there a live reading". That matters for the
-        stopped-runtime case in particular: the MCP keeps reporting the frozen
-        reading's stamp after ``ambient_running`` goes ``False``, so a
-        token-only tracker would go on ageing a reading nothing consumes, and a
-        runtime that resumed on that same preserved reading would inherit an
-        age from before the outage. An absent forwarded reading therefore resets
-        the tracker, and a probe that drops out and returns is aged from the
-        reading it comes back with.
+        Freshness is tracked for a reading the MCP still HOLDS LIVE
+        (:func:`ambient_reading_is_live`), not for whatever stamp the status
+        happens to carry — one source of truth for "is there a live reading".
+        That matters for the stopped-runtime case in particular: the MCP keeps
+        reporting the frozen reading's stamp after ``ambient_running`` goes
+        ``False``, so a token-only tracker would go on ageing a reading nothing
+        consumes, and a runtime that resumed on that same preserved reading
+        would inherit an age from before the outage. A reading that is no longer
+        live therefore resets the tracker, and a probe that drops out and
+        returns is aged from the reading it comes back with.
+
+        **Liveness, NOT usability (#752).** The gate here is deliberately the
+        liveness half only, where the projection this feeds applies both halves.
+        A live runtime that publishes a non-finite value on one poll has not
+        stopped holding its reading — the stamp still identifies the same
+        reading — so the clock keeps running against it. Resetting on a
+        malformed payload instead would re-base a demonstrably unrefreshed
+        reading to ``0.0``, so a single bad tick would launder a stale value
+        back into the doctrine's freshness bound and could re-enter the
+        graduated fan regime. The age returned during such a tick is never
+        consumed: :func:`project_session_state` nulls it along with the triad,
+        because that projection applies the usability half too.
 
         Known and deliberate under-report: the age is measured from the agent's
         *first observation* of a token, so a reading already old when first seen
@@ -978,10 +1022,10 @@ class RoasterControlAdapter:
 
         Returns:
             Seconds since the current reading was first observed, or ``None``
-            when the MCP holds no reading — "age unknown", the fail-closed value.
+            when the MCP holds no live, dateable reading — "age unknown", the
+            fail-closed value.
         """
-        forwarded_temp_c, _, _ = project_live_ambient(status)
-        token = None if forwarded_temp_c is None else ambient_reading_token(status)
+        token = ambient_reading_token(status) if ambient_reading_is_live(status) else None
         if token is None:
             self._last_ambient_token = None
             self._ambient_token_change_monotonic = None

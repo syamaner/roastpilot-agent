@@ -2829,6 +2829,57 @@ async def test_adapter_ambient_age_is_unknown_for_a_non_finite_reading() -> None
     assert second is not None and second.ambient_age_seconds is None
 
 
+@pytest.mark.asyncio
+async def test_a_malformed_ambient_tick_does_not_relaunder_a_wedged_reading_as_fresh() -> None:
+    """#752, the local Codex pass: declining must not RESET the freshness clock.
+
+    The trap the obvious implementation walks into. If the freshness tracker
+    keyed on the projection's whole gate, a single non-finite tick would clear
+    its token — and the very next tick, carrying finite values but the SAME
+    unchanged stamp, would be re-based to ``0.0`` and read as brand new. A
+    reading the doctrine had already declined as too old would be handed back
+    inside the bound, able to re-enter the graduated fan regime: exactly the
+    laundering of a frozen reading that #732/#741/#745 exist to prevent, and
+    the #498 direction the doctrine must never take on stale data.
+
+    So the tracker keys on LIVENESS (:func:`ambient_reading_is_live`) while the
+    projection applies liveness AND usability. The stamp is deliberately
+    IDENTICAL in all three reads — the running-but-not-polled freeze path, the
+    one ``ambient_running`` cannot catch — so a tracker that reset would report
+    ``0.0`` on the third read and prove nothing if the stamp changed.
+    """
+    clock = _StepClock()
+    ok_ambient = dict(SESSION_STATE_PAYLOAD["ambient_status"])  # type: ignore[call-overload]
+    malformed = {**ok_ambient, "temperature_c": float("nan")}
+    adapter = RoasterControlAdapter(
+        RoasterMCPClient(
+            _SequenceCaller(
+                [
+                    _state_payload(100.0),
+                    _state_payload(101.0, ambient_status=malformed),
+                    _state_payload(102.0),
+                ]
+            )
+        ),
+        clock=clock,
+    )
+
+    first = await adapter.read_telemetry()
+    clock.now = 45.0
+    bad = await adapter.read_telemetry()
+    clock.now = 90.0
+    recovered = await adapter.read_telemetry()
+
+    assert first is not None and first.ambient_age_seconds == 0.0
+    # The malformed tick itself is declined outright, age and all.
+    assert bad is not None and bad.ambient_temp_c is None
+    assert bad.ambient_age_seconds is None
+    # And the reading that comes back is the SAME one, aged from first sight —
+    # not a fresh 0.0.
+    assert recovered is not None and recovered.ambient_temp_c == 28.49
+    assert recovered.ambient_age_seconds == 90.0
+
+
 def test_project_live_ambient_non_ok_status_is_none() -> None:
     """#464 (D86): disabled/unavailable ambient degrades to an all-None triad,
     mirroring the MCP's own fail-soft contract (#342, D85) — never a fault."""
