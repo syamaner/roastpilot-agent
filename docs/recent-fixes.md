@@ -668,5 +668,18 @@ Format: one entry per anti-pattern.
   config; see the replay entry above). `scripts/advisor_smoke.py` is also
   fine: the bare config it prints is the same object it then runs on, so its
   readout is honest.
+- **Also:** resolving the right config is only half of it — the readout must
+  report the value the code path actually *consumes*, which is not always the
+  field the operator set. Two shadowing traps in this same banner, both caught
+  by the local Codex pass pre-open:
+  `advisor.model_slug` is shadowed by `model_slug_by_phase` for every
+  advisor-consulted phase (the advisor calls `model_for(phase)`, and that map
+  is not editable from `/config`), so the banner must print the phase-resolved
+  model and name a shadowed slug — tracked as its own runtime bug, #747; and
+  `late_maillard_trim.enabled=False` makes `_trim_engaged` always false, so a
+  depth or adaptive band left in the saved config is dead and must not be
+  announced. Before printing a config value, follow it to its consumer.
 - **Guarded by:** `tests/test_launch_banner.py` — a saved-only `prompt_version`
-  must reach the banner, and a saved-only non-default must be tagged.
+  must reach the banner, a saved-only non-default must be tagged, a shadowed
+  `model_slug` must be reported as shadowed, and a disabled trim must report
+  the flat floor rather than its leftover depth.

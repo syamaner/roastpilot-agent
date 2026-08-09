@@ -35,17 +35,22 @@
 #            boundary reverts to the advisor's own judgment alone, e.g.
 #            POST_FC_LOOP=0 CEILING_GUARD=0 ./scripts/roast-live.sh for the
 #            full pre-promotion baseline
-#          ROASTPILOT_ADVISOR__MODEL_SLUG / …__PROMPT_VERSION override the
-#            advisor model + control-teaching prompt (schema defaults
-#            openai/gpt-4o + c3). The banner prints the RESOLVED pair — env over
-#            the saved ~/.roastpilot/config.yaml over the schema defaults, the
-#            same order the agent uses — and tags it ⚠ EXPERIMENT when either
-#            differs from the schema default, e.g. roast 8:
-#              ROASTPILOT_ADVISOR__MODEL_SLUG=openai/gpt-4.1-mini ./scripts/roast-live.sh
-#            ⚠ Setting either PINS that value for every roast in the session:
-#            env beats the saved file, so the /config UI selector becomes a
-#            silent no-op. Never use them to switch arms in a prompt A/B —
+#          ROASTPILOT_ADVISOR__MODEL_SLUG / …__PROMPT_VERSION set the advisor
+#            model + control-teaching prompt (schema defaults openai/gpt-4o +
+#            c3). The banner prints the RESOLVED values — env over the saved
+#            ~/.roastpilot/config.yaml over the schema defaults, the same order
+#            the agent uses — and tags them ⚠ EXPERIMENT when non-default.
+#            ⚠ Two traps the banner now surfaces rather than hides (#746):
+#            (1) setting either PINS that value for every roast in the session,
+#            because env beats the saved file — the /config UI selector becomes
+#            a silent no-op. Never use them to switch arms in a prompt A/B;
 #            switch in /config between roasts and read the banner to confirm.
+#            (2) the model slug has NO EFFECT on its own: the advisor calls
+#            AdvisorConfig.model_for(phase), and model_slug_by_phase ships
+#            populated with gpt-4o for every advisor phase and is not editable
+#            from /config, so a model_slug set here or in /config is shadowed.
+#            The banner names the phase-resolved model and flags a shadowed
+#            slug explicitly; changing the model for real is issue #747.
 #
 set -euo pipefail
 

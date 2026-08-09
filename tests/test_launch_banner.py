@@ -32,6 +32,7 @@ from roastpilot_agent.config_store import (
     persist_config_edit,
 )
 from roastpilot_agent.launch_banner import (
+    ADVISOR_PHASES,
     EXPERIMENT_TAG,
     LaunchBannerLines,
     _one_line,  # pyright: ignore[reportPrivateUsage]
@@ -39,6 +40,7 @@ from roastpilot_agent.launch_banner import (
     main,
     resolve_banner_lines,
 )
+from roastpilot_agent.models import RoastPhase
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -101,13 +103,62 @@ def test_defaults_are_not_tagged_experiment(config_file: Path) -> None:
     assert EXPERIMENT_TAG not in lines.advisor_cfg
 
 
-def test_saved_only_non_default_model_is_tagged_experiment(config_file: Path) -> None:
-    """A file-only non-default MODEL is tagged too (the other half of the pair)."""
+def test_shadowed_model_slug_reports_the_model_the_advisor_actually_uses(
+    config_file: Path,
+) -> None:
+    """A saved model_slug that model_for() shadows is named as shadowed, not announced.
+
+    `model_slug_by_phase` ships populated for every advisor-consulted phase and
+    is not editable from /config, so `PydanticAIAdvisor`'s
+    `model_for(context.phase)` keeps returning gpt-4o after a `model_slug` edit.
+    Printing the base slug would announce an arm the roast is not running — the
+    #746 lie in the other direction (local Codex P1, folded pre-open).
+    """
     persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4.1-mini")))
+    config, _ = config_store.load_app_config()
+    # Guard the premise: the advisor genuinely still calls gpt-4o in every phase.
+    assert {config.advisor.model_for(p) for p in ADVISOR_PHASES} == {"openai/gpt-4o"}
 
     lines = load_banner_lines()
 
-    assert lines.advisor_cfg.startswith("openai/gpt-4.1-mini  ·  prompt c3")
+    assert lines.advisor_cfg.startswith("openai/gpt-4o ")
+    assert "config model_slug openai/gpt-4.1-mini is shadowed per-phase, unused" in (
+        lines.advisor_cfg
+    )
+    # The RESOLVED pair is the untouched baseline, so this is not an experiment.
+    assert EXPERIMENT_TAG not in lines.advisor_cfg
+
+
+def test_effective_non_default_model_is_tagged_experiment() -> None:
+    """A per-phase override that actually takes effect IS tagged."""
+    config = AppConfig(
+        advisor=AdvisorConfig(
+            model_slug_by_phase=dict.fromkeys(ADVISOR_PHASES, "openai/gpt-4.1-mini")
+        ),
+        controller=ControllerConfig(),
+    )
+
+    lines = resolve_banner_lines(config)
+
+    assert lines.advisor_cfg == "openai/gpt-4.1-mini  ·  prompt c3" + EXPERIMENT_TAG
+    # The base slug is the schema default here, so it is shadowed silently —
+    # the warning is reserved for a slug the operator actually set.
+    assert "shadowed" not in lines.advisor_cfg
+
+
+def test_per_phase_split_is_reported_phase_by_phase() -> None:
+    """When phases resolve to different models, every phase is named."""
+    by_phase = dict.fromkeys(ADVISOR_PHASES, "openai/gpt-4o")
+    by_phase[RoastPhase.DEVELOPMENT] = "openai/gpt-4.1-mini"
+    config = AppConfig(
+        advisor=AdvisorConfig(model_slug_by_phase=by_phase), controller=ControllerConfig()
+    )
+
+    lines = resolve_banner_lines(config)
+
+    assert lines.advisor_cfg.startswith("per phase ")
+    assert "development=openai/gpt-4.1-mini" in lines.advisor_cfg
+    assert "preheating=openai/gpt-4o" in lines.advisor_cfg
     assert EXPERIMENT_TAG in lines.advisor_cfg
 
 
@@ -160,6 +211,34 @@ def test_trim_line_reports_saved_non_default_depth(config_file: Path) -> None:
 def test_trim_line_default_depth_is_untagged(config_file: Path) -> None:
     """The proven 65 % default keeps its plain, untagged wording."""
     assert load_banner_lines().trim == "fixed 65% (proven roast-6 default)"
+
+
+def test_disabled_trim_is_reported_as_disabled_not_as_its_dead_depth(
+    config_file: Path,
+) -> None:
+    """`enabled: false` reports the flat floor, never the leftover depth or band.
+
+    `RoastControlPolicy._trim_engaged` returns False whenever the trim is
+    disabled, so the controller holds the flat pre-FC floor. A saved depth or
+    adaptive band left behind is dead config; announcing it would name the
+    treatment arm while the roast runs the baseline (local Codex P1, folded
+    pre-open).
+    """
+    config_file.write_text(
+        "controller:\n"
+        "  pre_first_crack_levers:\n"
+        "    late_maillard_trim:\n"
+        "      enabled: false\n"
+        "      trim_heat_percent: 60\n"
+        "      adaptive_depth_enabled: true\n"
+    )
+
+    trim = load_banner_lines().trim
+
+    assert trim.startswith("DISABLED — no trim window; flat 100% pre-FC floor")
+    assert EXPERIMENT_TAG in trim
+    assert "ADAPTIVE" not in trim
+    assert "60%" not in trim
 
 
 def test_trim_line_reports_saved_adaptive_state(config_file: Path) -> None:
@@ -306,7 +385,7 @@ def test_multiline_value_cannot_split_the_two_line_contract(
 
     out = capsys.readouterr().out.splitlines()
     assert len(out) == 2
-    assert out[0].startswith("bad slug  ·  prompt c3")
+    assert "bad slug" in out[0] and "\n" not in out[0]
     assert out[1] == "fixed 65% (proven roast-6 default)"
 
 

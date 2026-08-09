@@ -29,11 +29,16 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from roastpilot_agent.config import AppConfig
+from roastpilot_agent.config import DEFAULT_ADVISOR_MODEL_BY_PHASE, AppConfig
 
 #: Appended to a banner line whose RESOLVED value differs from the schema
 #: default, so a non-default arm can never be mistaken for the proven baseline.
 EXPERIMENT_TAG = "   ⚠ EXPERIMENT — non-default, watch it"
+
+#: The phases the advisor is consulted in, in roast order. Single-sourced from
+#: the per-phase model map's own default so the banner cannot drift from the
+#: set of phases ``AdvisorConfig.model_for`` is called with.
+ADVISOR_PHASES = tuple(DEFAULT_ADVISOR_MODEL_BY_PHASE)
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,15 @@ def _advisor_line(config: AppConfig) -> str:
     *schema* defaults, so a value that reached the agent from the saved-config
     file is tagged exactly like one exported into the environment.
 
+    The model reported is the PHASE-RESOLVED one — what
+    :meth:`AdvisorConfig.model_for` returns for each advisor-consulted phase,
+    which is what ``PydanticAIAdvisor`` actually calls. It is NOT
+    ``advisor.model_slug``: ``model_slug_by_phase`` ships populated for every
+    advisor phase and is not editable from ``/config``, so a ``model_slug``
+    saved there (or exported) is silently shadowed and never used. Printing the
+    base slug would announce an arm the roast is not running — the same lie in
+    the other direction, so the line names the shadowed value explicitly.
+
     Args:
         config: The resolved application config (env over saved file over
             schema defaults).
@@ -68,12 +82,27 @@ def _advisor_line(config: AppConfig) -> str:
     """
     advisor = config.advisor
     fields = type(advisor).model_fields
-    is_default = (
-        advisor.model_slug == fields["model_slug"].default
-        and advisor.prompt_version == fields["prompt_version"].default
+    default_model = fields["model_slug"].default
+    by_phase = {phase: advisor.model_for(phase) for phase in ADVISOR_PHASES}
+    resolved = set(by_phase.values())
+
+    if len(resolved) == 1:
+        model_text = next(iter(resolved))
+    else:
+        model_text = "per phase " + ", ".join(
+            f"{phase.value}={by_phase[phase]}" for phase in ADVISOR_PHASES
+        )
+    # Warn only when the operator SET a base slug that then has no effect. A
+    # base slug left at the schema default is shadowed too, but silently and
+    # harmlessly — saying so on every per-phase roast would be noise.
+    if advisor.model_slug != default_model and advisor.model_slug not in resolved:
+        model_text += f" (config model_slug {advisor.model_slug} is shadowed per-phase, unused)"
+
+    is_default = resolved == {default_model} and (
+        advisor.prompt_version == fields["prompt_version"].default
     )
     tag = "" if is_default else EXPERIMENT_TAG
-    return f"{advisor.model_slug}  ·  prompt {advisor.prompt_version}{tag}"
+    return f"{model_text}  ·  prompt {advisor.prompt_version}{tag}"
 
 
 def _trim_line(config: AppConfig) -> str:
@@ -84,15 +113,28 @@ def _trim_line(config: AppConfig) -> str:
     validation recipe), and the banner claiming 65 % there is the same class of
     lie as the advisor line printing the schema-default prompt.
 
+    ``enabled`` is checked FIRST and reported on its own. With the trim
+    disabled, ``RoastControlPolicy._trim_engaged`` always returns ``False`` and
+    the controller holds the flat #222 pre-FC floor, so a depth or an ADAPTIVE
+    band left in the saved config is dead configuration — announcing it would
+    name the treatment arm while the roast runs the baseline.
+
     Args:
         config: The resolved application config.
 
     Returns:
-        The adaptive-depth line when ``adaptive_depth_enabled``, otherwise the
-        fixed-depth line, tagged when the depth is non-default.
+        The disabled line when the trim is off, the adaptive-depth line when
+        ``adaptive_depth_enabled``, otherwise the fixed-depth line, tagged when
+        the resolved state is non-default.
     """
     trim = config.controller.pre_first_crack_levers.late_maillard_trim
     fields = type(trim).model_fields
+    heat_target = config.controller.pre_first_crack_levers.heat_target_percent
+    if not trim.enabled:
+        return (
+            f"DISABLED — no trim window; flat {heat_target}% pre-FC floor "
+            f"holds to first crack{EXPERIMENT_TAG}"
+        )
     if trim.adaptive_depth_enabled:
         return (
             f"ADAPTIVE — #386 RoR-keyed depth, base {trim.base_trim}% "
