@@ -2,7 +2,7 @@
 
 The topology (``docs/agent-topology.md``) pins each named subagent to a full
 model ID with an explicit effort, and §12 requires a consistency mechanism when
-that fact is duplicated across the ten frontmatters, ``AGENTS.md``, and the §4
+that fact is duplicated across the agent frontmatters, ``AGENTS.md``, and the §4
 table. This test is that mechanism: a single authoritative mapping that fails if
 any agent frontmatter drifts (an alias creeps back, a model/effort changes
 without updating the map, or a role is added/removed), plus a repo-side guard
@@ -33,6 +33,7 @@ _EXPECTED: dict[str, tuple[str, str]] = {
     "ui-reviewer": ("claude-sonnet-5", "high"),
     "safety-reviewer": ("claude-opus-5", "xhigh"),
     "planning-architect": ("claude-fable-5", "high"),
+    "story-planner": ("claude-fable-5", "high"),
 }
 _ALIASES = {"sonnet", "opus", "fable", "haiku", "best", "default"}
 

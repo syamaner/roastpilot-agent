@@ -630,7 +630,9 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   workflow stage): `product-pm` (product reviewer — audit vs plan, record
   decisions, write the next brief; never edits src/tests), `qa` (test quality
   beyond coverage), `pr-triage` (independent PR-feedback triage — also the
-  `triage-pr` skill), `engineer-fe` (web/ SPA), `engineer-be` (Python agent). The
+  `triage-pr` skill), `engineer-fe` (web/ SPA), `engineer-be` (Python agent),
+  `story-planner` (implementation contracts before any code — required before any
+  Codex-MCP delegation, D152; read-only, no shell). The
   human is the lead + domain expert/architect, consulted on escalations.
 - **Model selection — decide it WITH the topology, every time.** When you pick a
   primitive (sub-agent / agent team / workflow), pick the model in the same breath.
@@ -648,11 +650,37 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   inherits the PARENT, so a careless spawn from the Opus main loop silently runs Opus —
   the per-role defaults stop that. The Opus main loop conserves credits by delegating
   execution to Sonnet. Default concurrency cap: 3 parallel workers; prefer one
-  capable worker over several redundant ones (`docs/agent-topology.md` §10). The
-  `planning-architect` is the one Fable role: pinned
-  `model: claude-fable-5` at `effort: high`, read-only and advisory, invoked
-  selectively for complex, ambiguous, or cross-repository planning (see
-  `docs/agent-topology.md`).
+  capable worker over several redundant ones (`docs/agent-topology.md` §10).
+  Two Fable roles exist, both pinned
+  `model: claude-fable-5` at `effort: high`, read-only and advisory:
+  `planning-architect`, invoked selectively for complex, ambiguous, or
+  cross-repository planning (see `docs/agent-topology.md`), and
+  `story-planner`, invoked on every story headed for Codex-MCP delegation to
+  write the implementation contract (D152).
+- **Implementation delegation — Codex-MCP by DEFAULT for specced slices (D152,
+  9 Aug 2026; mirrors roastpilot-cloud's D145 credit pivot, adopted on the cloud
+  repo's results).** Once a `story-planner` contract exists, delegate
+  implementation via `mcp__codex__codex`, continuing the same session with
+  `mcp__codex__codex-reply` to fold review findings; `engineer-be` /
+  `engineer-fe` are the FALLBACK (Codex unavailable, or its weekly quota below
+  the budget stop). The rule is **fail-closed: no contract, no Codex
+  delegation** — the contract (spec, test list with mutation checks, class
+  sweeps, PR plan, routing, delegation-prompt notes, risk profile) is what
+  "specced" means. Safety-critical slices are INCLUDED in the default: the
+  mandatory `safety-reviewer` (Opus, xhigh) floor is unchanged and is the
+  cross-family adversarial lens over Codex-authored code — never cut it for
+  credits. On a Codex-authored branch the local `codex review` lens is
+  same-family, so the Claude domain reviewers carry the diverse-lens duty
+  there (see `pr-preflight`). Budget: one weekly-capped Codex subscription
+  shared across repos — both repos' every-PR pre-open review floors are
+  protected first, implementation delegation flexes, and below roughly 20%
+  remaining allowance implementation delegation stops entirely. The MCP
+  binding is operator-level (`codex mcp-server` in `~/.claude.json`),
+  deliberately outside the repo's review surface. The delegation prompt must
+  carry the repo traps verbatim: explicit worktree path with per-command
+  self-location, the #738 fresh-venv-in-worktree rule, `.venv/bin/python -m
+  ...` invocation, and the full gates before handback. D23 is unchanged:
+  Codex-as-author never adjudicates review feedback on its own PR.
 - **Skills** (`.claude/skills/`): `triage-pr` (→ `pr-triage`), `capture` (drive
   the replay harness + SPA, screenshot a named page state — E10+).
 - **Workflows** (`.claude/workflows/`): `review-branch` (cross-checked roster

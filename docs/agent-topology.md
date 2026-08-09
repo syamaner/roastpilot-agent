@@ -80,7 +80,8 @@ The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
 |---|---|---:|---|---|
 | Product PM / orchestrator (main session) | `claude-opus-5` recommended (the main-session model is a deliberate per-terminal operator choice — operator decision, 9 Aug 2026, see §5; set via the `model` setting or `--model claude-opus-5`; `default` is an alias, not a pin) | `high` | Scope, routing, adjudication, integration, escalation | Repository and coordination tools required by the task |
 | Planning architect (named subagent) | `claude-fable-5` | `high` | Advisory only | Read, Grep, Glob, Bash (no Edit/Write; read-only by convention, §7) |
-| Backend/frontend implementer | `claude-sonnet-5` | `high` | Writes only inside assigned scope | Read, Grep, Glob, Bash, Edit, Write |
+| Story planner / contract writer (named subagent) | `claude-fable-5` | `high` | Advisory only — writes the implementation contract required before any Codex-MCP delegation (D152) | Read, Grep, Glob (no shell, no Edit/Write; read-only by construction) |
+| Backend/frontend implementer | Codex-MCP by DEFAULT for contracted slices (D152 — external family, own subscription); `claude-sonnet-5` (`engineer-be`/`engineer-fe`) as the FALLBACK | `high` (fallback) | Writes only inside assigned scope | Read, Grep, Glob, Bash, Edit, Write (Codex: its own MCP-side toolset) |
 | Mechanical contract/simulation checker | `claude-sonnet-5` | `medium` | Read-only verdict | Read, Grep, Glob, Bash |
 | QA/product/security reviewer | `claude-sonnet-5` | `high` | Read-only findings | Read, Grep, Glob, Bash |
 | Safety/critical architecture reviewer | `claude-opus-5` | `xhigh` | Read-only findings | Read, Grep, Glob, Bash |
@@ -233,6 +234,8 @@ Agent teams SHOULD be reserved for independent work that benefits from peer comm
 - Independent safety, security, QA, and author-independent triage are deliberate control layers and are not considered redundant self-verification.
 - Fresh verifier agents SHOULD receive findings in bounded batches rather than one new agent per minor finding.
 - Effort SHOULD be lowered before weakening acceptance criteria or removing independent review.
+- Implementation delegation defaults to Codex-MCP for contracted slices (D152, 9 Aug 2026; adopted from roastpilot-cloud's D145 on its results). Delegation without a `story-planner` contract is forbidden (fail-closed). The Codex subscription is one weekly-capped pool shared across repositories: both repositories' every-PR pre-open review floors are protected first, implementation delegation flexes, and below roughly 20% remaining allowance implementation delegation stops entirely (the Claude fallback implementers take over; the orchestrator still never implements).
+- The Claude safety floor is NOT cut for credits: a Codex-authored diff gets the same mandatory domain reviewers, and on such a diff the Claude reviewers are the cross-family adversarial lens (the local `codex review` is then same-family).
 
 ## 11. Refusal and failure handling
 
@@ -394,7 +397,10 @@ This topology is ready when:
   §7 binds every **read-only** role, so the criterion is satisfied only when all
   eight carry the controls: `mcp-contract-checker`, `planning-architect`,
   `pr-triage`, `qa`, `safety-reviewer`, `security-reviewer`, `sim-roast-runner`
-  and `ui-reviewer`. **Currently none of them does.** Carrying the rule in all
+  and `ui-reviewer`. (`story-planner`, added by D152, is read-only but carries
+  no shell at all — no Bash, no Edit/Write — so the §7 mutate-then-restore
+  hazard cannot arise for it and it neither gates nor extends this criterion.)
+  **Currently none of them does.** Carrying the rule in all
   eight prompts does not on its own satisfy this criterion: because a read-only
   role cannot create its own worktree, the lead-side provisioning and
   `git worktree list` verification required by §8 item 6 must be in force too,
