@@ -33,6 +33,7 @@ Date: 8 Aug 2026. PR: #731. Plan decisions produced: D126, D127.
 > itself a finding about the handoff, and the same gap will recur on the next
 > multi-session story unless the registry is updated as decisions are consumed
 > rather than at story end.
+
 Archetypes covered: **ambiguous multi-slice feature** and **safety-sensitive
 design**, simultaneously.
 
@@ -54,9 +55,13 @@ offline eval path would carry ambient — took exactly the "handful of repositor
 reads" §6 gives as the skip criterion (five tool calls).
 
 **Finding for §6:** the trigger list and the skip list can both fire on the same
-task, and when they do, the skip list should win where the *design* is settled
-and only *mechanism* is open. The current text does not say which dominates. A
-one-line precedence rule would remove the judgement call.
+task, and the text as written does not say which dominates — which is the defect,
+because it leaves the call to whoever is reading. This case supplies the answer:
+**the trigger list has to win.** A settled design is exactly what the skip list
+was reaching for here, and it still produced three plan corrections, because a
+settled design says nothing about whether the separately-ratified artifacts agree
+with each other. The precedence rule added to §6 in this PR is that answer written
+down.
 
 ### Did plans need material rewrite?
 
