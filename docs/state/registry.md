@@ -163,8 +163,11 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D150** — one past the highest number defined
-> ANYWHERE in `roastpilot-plan` (9 Aug 2026). Take D150 because it is the only
+> Next free plan decision number: **D150** — one past **D149**, the highest number
+> defined anywhere in `roastpilot-plan` as of 9 Aug 2026 (`factory.md`'s
+> `## D149:` heading; `roastpilot-agent/plan.md`'s own maximum is D129).
+> Ratified as **D150** in `00-repository-structure.md`: one shared series for the
+> whole repo. Take D150 because it is the only
 > answer that is safe under both readings of an unresolved ambiguity, described
 > next; do not "optimise" it down.
 >
@@ -178,8 +181,9 @@
 > name the file whenever a reader could be in either programme.**
 >
 > The collision is DRIFT, not design. Up to D102 the repo demonstrably ran ONE
-> shared series across files: D1-D4 are cross-repo, `plan.md` never defines
-> D9-D14 or D97-D101 (those are in `roastpilot-cloud/plan.md`), and D2 is
+> shared series across files: D1-D4 are cross-repo, `plan.md` defines neither
+> D10-D13 nor D97-D101 (those are in `roastpilot-cloud/plan.md`; D9 and D14 are
+> defined nowhere at all — see the gaps noted below), and D2 is
 > superseded by D97 from a different file — D5-D99 interleave with zero
 > collisions. Both files then began incrementing independently from D103.
 >

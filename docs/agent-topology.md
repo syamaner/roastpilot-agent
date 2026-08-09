@@ -334,10 +334,12 @@ Measure:
 Model and effort changes MUST be evaluated against these cases rather than adopted solely from general guidance.
 
 Evidence is recorded in `docs/agent-topology-evaluation.md`, one entry per real
-story. Recorded so far: **RP-B (#709)**, covering the ambiguous-multi-slice and
-safety-sensitive archetypes. Still outstanding: a simple single-slice task that
-should bypass the planner, a cross-repository change, and a previously failed or
-heavily reworked task. The PM output-style measurements in this section remain
+story. Recorded so far: **RP-B (#709)**, which supplies FAILURE evidence on the
+ambiguous-multi-slice and safety-sensitive archetypes — no planner ran on it, so
+both remain **provisional** until a later story exercises them under the
+trigger-wins rule in §6. Still outstanding: those two re-validations, plus a
+simple single-slice task that should bypass the planner, a cross-repository
+change, and a previously failed or heavily reworked task. The PM output-style measurements in this section remain
 unevaluated, because the `RoastPilot Operator` style was not selected for the
 RP-B session.
 

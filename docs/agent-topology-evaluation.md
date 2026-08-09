@@ -16,6 +16,14 @@ Archetypes still needed after the entries below: a simple single-slice task that
 should bypass the planner, a cross-repository change, and a previously failed or
 heavily reworked task.
 
+**Plus a re-validation of the two RP-B already touches.** Case 1 exercises the
+ambiguous-multi-slice and safety-sensitive archetypes but is FAILURE evidence —
+no planner ran on it, so it tests neither the trigger-wins rule §6 now carries
+nor the Fable planner itself. Those two are **provisional, not cleared**: a later
+story must exercise them UNDER the revised rule. Listing only the three above
+would let §16 signal readiness after three more stories without Fable ever having
+been run on an ambiguous or safety-sensitive case.
+
 ---
 
 ## Case 1 — RP-B (#709), the ambient-aware fan doctrine
@@ -138,9 +146,11 @@ responding to the finding.
   defaulted *soft*, so a fail-soft probe softened doctrine in a hot room",
   fixed by removing the soft default and pinning a regression test). Full
   findings table: PR #731 body.
-- **Preventable (post-open, should have been caught earlier): four, not the two
-  an earlier revision of this line reported.** Understating this understated the
-  case's headline measurement, so the full list, from #731's merged history:
+- **Preventable (post-open, should have been caught earlier): four on #731, and
+  a further six ROUNDS on #741** — an earlier revision of this line reported two,
+  and counted #731 alone even after the header widened every measurement to the
+  whole story. Both omissions understated the case's headline measurement. From
+  #731's merged history:
   1. the **c3 contamination** (Codex P1) — the doctrine's context was populated
      on every roast including the live default, so any c3 baseline the RP-B
      comparison is measured against was contaminated;
@@ -160,6 +170,20 @@ responding to the finding.
   post-open, and then its guard did too. Item 4 is the neatest, though — the PR
   violated the two-copies discipline it repeatedly invokes as its own design
   principle.
+
+  **#741 (ambient freshness) then ran six post-open rounds, and this is the
+  sharper number of the two.** Every finding was real, but rounds 4, 5 and 6 were
+  each fixing a defect introduced by the PR's OWN previous fix: an explicit-cadence
+  rule added at construction time also fired during recovery and silently retired
+  the doctrine on an operator resume; moving it to the start-a-roast boundary then
+  left it validating the config from ABOVE the config reload, which could both
+  admit an unvalidated cadence and lock an operator out of starting a roast until
+  the agent was restarted. A `Raises:` clause corrected in round 3 was re-broken in
+  the opposite direction by round 5's own change. Two residuals were recorded as
+  #745 rather than folded. **The lesson is not the count but the shape:
+  instance-by-instance folding of a class re-enters the class**, which is also why
+  the entry you are reading needed seven rounds. Fixing a claim without sweeping
+  the document for its downstream copies is the same error in prose.
 - **Avoidable churn:** one self-inflicted CI failure. Editing the PR body while
   a review run was in flight cancelled the legitimate `synchronize` run and
   started an `edited` run that fails by design, leaving the head with no valid
@@ -350,9 +374,12 @@ The topology performed well where it was exercised: delegation moved real volume
 to Sonnet at roughly 40% of its lead-tier list cost, both review lenses found
 real defects the other missed (the safety lens found the two defects named
 under "Preventable rework vs healthy review catches" above; the Codex lens
-found the two that changed ratified decisions), and independent review caught
-every one of the PM's own misses — including, twice, a number the PM had
-asserted without recomputing.
+found the two that changed ratified decisions), and of the PM's three plan
+defects **two were caught by independent review and one the PM caught itself** at
+implementation time — plus, twice, a number the PM had asserted without
+recomputing, which recomputation caught. An earlier revision of this sentence
+said review caught every PM miss; that contradicted the corrected tally above and
+overstated the independent-review result.
 
 Its weakest point in this case was **planning**, which is the part that was
 skipped. Every defect that reached the PR came from a join between artifacts,
