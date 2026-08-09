@@ -34,7 +34,7 @@ from collections.abc import Iterable
 from roastpilot_agent.config import (
     FC_LATENCY_BUSTED_ADVISOR_ARMS,
     FC_LATENCY_SCREENED_ADVISOR_ARMS,
-    FC_LATENCY_TIGHT_ADVISOR_ARMS,
+    FC_LATENCY_TIGHT_HEADROOM_FRACTION,
     OPENROUTER_BASE_URL,
     AdvisorConfig,
 )
@@ -91,7 +91,9 @@ def advice_models(advisor: AdvisorConfig) -> set[str]:
     return {advisor.model_for(phase) for phase in phases}
 
 
-def classify(advisor: AdvisorConfig, slug: str) -> AdvisorScreenVerdict:
+def classify(
+    advisor: AdvisorConfig, slug: str, advisory_timeout_seconds: float
+) -> AdvisorScreenVerdict:
     """Classify one resolved slug under *advisor*'s endpoint and reasoning effort.
 
     The unit of measurement is an ARM — ``(endpoint, slug, reasoning_effort)`` —
@@ -110,6 +112,11 @@ def classify(advisor: AdvisorConfig, slug: str) -> AdvisorScreenVerdict:
     Args:
         advisor: The resolved advisor config (supplies endpoint + effort).
         slug: One model slug from :func:`advice_models`.
+        advisory_timeout_seconds: The CONFIGURED controller bound. Tightness is
+            a relation between a recorded measurement and this number, not a
+            property of the model, so it is derived here rather than baked into
+            the table — a static partition is silently wrong the moment an
+            operator moves the bound.
 
     Returns:
         The verdict for that arm.
@@ -121,9 +128,11 @@ def classify(advisor: AdvisorConfig, slug: str) -> AdvisorScreenVerdict:
     if advisor.provider != "openai_compatible" or advisor.provider_base_url != OPENROUTER_BASE_URL:
         return AdvisorScreenVerdict.NO_SCREEN
     arm = (slug, advisor.reasoning_effort)
-    if arm in FC_LATENCY_TIGHT_ADVISOR_ARMS:
-        return AdvisorScreenVerdict.CLEARED_TIGHT
-    if arm in FC_LATENCY_SCREENED_ADVISOR_ARMS:
+    recorded_max = FC_LATENCY_SCREENED_ADVISOR_ARMS.get(arm)
+    if recorded_max is not None:
+        headroom = advisory_timeout_seconds - recorded_max
+        if headroom < advisory_timeout_seconds * FC_LATENCY_TIGHT_HEADROOM_FRACTION:
+            return AdvisorScreenVerdict.CLEARED_TIGHT
         return AdvisorScreenVerdict.CLEARED
     if arm in FC_LATENCY_BUSTED_ADVISOR_ARMS:
         return AdvisorScreenVerdict.BUSTED
@@ -154,16 +163,13 @@ def screen_warning(advisor: AdvisorConfig, advisory_timeout_seconds: float) -> s
         The warning text, or ``None`` when there is nothing to warn about.
     """
     resolved = advice_models(advisor)
-    busted = sorted(m for m in resolved if classify(advisor, m) is AdvisorScreenVerdict.BUSTED)
-    unscreened = sorted(
-        m for m in resolved if classify(advisor, m) is AdvisorScreenVerdict.NO_SCREEN
-    )
-    tight = sorted(
-        m for m in resolved if classify(advisor, m) is AdvisorScreenVerdict.CLEARED_TIGHT
-    )
+    verdicts = {m: classify(advisor, m, advisory_timeout_seconds) for m in resolved}
+    busted = sorted(m for m, v in verdicts.items() if v is AdvisorScreenVerdict.BUSTED)
+    unscreened = sorted(m for m, v in verdicts.items() if v is AdvisorScreenVerdict.NO_SCREEN)
+    tight = sorted(m for m, v in verdicts.items() if v is AdvisorScreenVerdict.CLEARED_TIGHT)
     notes: list[str] = []
     for slug in tight:
-        recorded_max = FC_LATENCY_TIGHT_ADVISOR_ARMS[(slug, advisor.reasoning_effort)]
+        recorded_max = FC_LATENCY_SCREENED_ADVISOR_ARMS[(slug, advisor.reasoning_effort)]
         # Quote the recorded max AGAINST the configured bound rather than
         # asserting "it will time out": the two numbers are what the operator
         # needs to judge it, and the bound is theirs to change.

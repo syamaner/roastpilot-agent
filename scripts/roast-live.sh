@@ -67,7 +67,7 @@
 #            the next telemetry read, the next safety evaluation, and the next
 #            drain of the operator queue — which is where the in-UI EMERGENCY
 #            STOP is consumed. N is bounded by controller.advisory_timeout_
-#            seconds (default 10 s), and any failure falls back fail-closed to
+#            seconds (default 5 s, D151), and any failure falls back fail-closed to
 #            holding current targets, so it cannot hang forever and cannot
 #            actuate anything. Ctrl-C here is unaffected: it calls the
 #            controller directly and does not go through the queue. With the

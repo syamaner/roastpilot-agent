@@ -43,6 +43,10 @@ def test_advice_models_is_the_controllers_own_gate() -> None:
     [
         # D40/D41, provider-default reasoning.
         ("openai/gpt-4o", None, AdvisorScreenVerdict.CLEARED),
+        # Recorded max 5.05 s against the 5 s bound — cleared the roster
+        # screen, but has no room under the hard per-call cutoff.
+        ("openai/gpt-4.1-mini", None, AdvisorScreenVerdict.CLEARED_TIGHT),
+        ("anthropic/claude-haiku-4.5", None, AdvisorScreenVerdict.CLEARED_TIGHT),
         ("google/gemini-3.1-flash-lite", None, AdvisorScreenVerdict.CLEARED),
         ("openai/gpt-5.5", None, AdvisorScreenVerdict.BUSTED),
         ("anthropic/claude-sonnet-4.6", None, AdvisorScreenVerdict.BUSTED),
@@ -67,7 +71,7 @@ def test_classify_keys_on_the_arm(
     """The unit of measurement is ``(endpoint, slug, reasoning_effort)``."""
     config = AdvisorConfig(model_slug=slug, reasoning_effort=effort)  # pyright: ignore[reportArgumentType]
 
-    assert classify(config, slug) is expected
+    assert classify(config, slug, TIMEOUT) is expected
 
 
 def test_a_non_openrouter_endpoint_voids_the_table() -> None:
@@ -81,8 +85,8 @@ def test_a_non_openrouter_endpoint_voids_the_table() -> None:
     proxied = AdvisorConfig(model_slug="openai/gpt-4o", provider_base_url="http://proxy.local/v1")
     native = AdvisorConfig(provider="openai", model_slug="gpt-4o")
 
-    assert classify(proxied, "openai/gpt-4o") is AdvisorScreenVerdict.NO_SCREEN
-    assert classify(native, "gpt-4o") is AdvisorScreenVerdict.NO_SCREEN
+    assert classify(proxied, "openai/gpt-4o", TIMEOUT) is AdvisorScreenVerdict.NO_SCREEN
+    assert classify(native, "gpt-4o", TIMEOUT) is AdvisorScreenVerdict.NO_SCREEN
 
 
 def test_the_pinned_baseline_produces_no_warning() -> None:
@@ -125,3 +129,26 @@ def test_the_unscreened_warning_names_the_dimension_that_made_it_unmeasured() ->
     assert never is not None and "no FC-latency screen on record" in never
     assert effort is not None and "at reasoning_effort=high" in effort
     assert endpoint is not None and "at this endpoint" in endpoint
+
+
+def test_tightness_is_relative_to_the_configured_bound() -> None:
+    """Tightness is a relation to the bound, not a property of the model.
+
+    A static tight/cleared partition was silently wrong the moment an operator
+    moved ``ROASTPILOT_CONTROLLER__ADVISORY_TIMEOUT_SECONDS`` (local Codex P2,
+    folded pre-open): it stayed quiet about gpt-4o under a 1 s bound, and still
+    cried timeout for gpt-4.1-mini under a 10 s one, which its 5.05 s worst
+    call comfortably fits.
+    """
+    gpt4o = AdvisorConfig(model_slug="openai/gpt-4o")
+    mini = AdvisorConfig(model_slug="openai/gpt-4.1-mini")
+
+    # gpt-4o (3.73 s worst) is comfortable at 5 s and hopeless at 1 s.
+    assert classify(gpt4o, "openai/gpt-4o", 5.0) is AdvisorScreenVerdict.CLEARED
+    assert classify(gpt4o, "openai/gpt-4o", 1.0) is AdvisorScreenVerdict.CLEARED_TIGHT
+    # gpt-4.1-mini (5.05 s worst) is tight at 5 s and comfortable at 10 s.
+    assert classify(mini, "openai/gpt-4.1-mini", 5.0) is AdvisorScreenVerdict.CLEARED_TIGHT
+    assert classify(mini, "openai/gpt-4.1-mini", 10.0) is AdvisorScreenVerdict.CLEARED
+    # And the warning follows the verdict, not a hardcoded list.
+    assert screen_warning(mini, 10.0) is None
+    assert screen_warning(mini, 5.0) is not None

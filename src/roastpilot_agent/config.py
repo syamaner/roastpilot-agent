@@ -172,47 +172,39 @@ DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS = 30.0
 # by test: ``launch_banner`` matches them lower-case, so a mixed-case entry
 # added later would silently fall through to "no screen on record" — a false
 # NEGATIVE, the one direction that matters here.
-FC_LATENCY_SCREENED_ADVISOR_ARMS: frozenset[tuple[str, str | None]] = frozenset(
-    (slug.lower(), effort)
-    for slug, effort in {
-        # D40/D41 (16 Jun), provider-default reasoning: cleared comfortably.
-        ("google/gemini-3.1-flash-lite", None),
-        ("openai/gpt-4o-mini", None),
-        ("openai/gpt-4o", None),
-        # 8 Jun: reasoning OFF turns the same model from 10.8 s into 2.9 s.
-        # The one arm on this table whose base slug busts at the default.
-        ("openai/gpt-5.5", "off"),
-    }
-)
-
-#: Arms that CLEARED the ~5 s roster screen but whose recorded WORST call leaves
-#: little or no room under ``ControllerConfig.advisory_timeout_seconds`` — the
-#: value in seconds is that recorded max (safety-reviewer finding, folded
-#: pre-open).
-#:
-#: This distinction exists because the two "5 s" numbers are not the same kind
-#: of thing. The screen's ~5 s was a SOFT roster-selection threshold applied to
-#: a median; ``advisory_timeout_seconds`` is a HARD per-call cutoff. While the
-#: timeout sat at 10 s (2x the screen) the difference was free, and an arm whose
-#: max grazed 5 s still always answered. D151 dropped the timeout to 5.0, so
-#: "cleared the screen" no longer implies "will not time out" — and these arms
-#: are the ones where it does not. ``gpt-4.1-mini`` is the sharp case: its
-#: recorded max (5.05 s) is ABOVE the configured bound, so leaving it silently
-#: "cleared" would have promised the operator a model that cannot reliably
-#: answer inside the loop's own budget.
-#:
-#: Timing out is fail-closed (one REJECT with hold-current-targets; D30 needs
-#: three CONSECUTIVE failures), so this is a quality warning, not a hazard.
-FC_LATENCY_TIGHT_ADVISOR_ARMS: dict[tuple[str, str | None], float] = {
-    # D40/D41 (16 Jun): 4.10 s median / 4.59 s max — "✅ (tight)" in the report.
+FC_LATENCY_SCREENED_ADVISOR_ARMS: dict[tuple[str, str | None], float] = {
+    # D40/D41 (16 Jun), provider-default reasoning: cleared comfortably.
+    # Values are the recorded WORST call (max), not the median — the median is
+    # what the roster screen selected on, the max is what a hard per-call
+    # timeout actually meets.
+    ("google/gemini-3.1-flash-lite", None): 1.44,
+    ("openai/gpt-4o-mini", None): 2.39,
+    ("openai/gpt-4o", None): 3.73,
+    # D40/D41: "✅ (tight)" in the report — 4.10 s median / 4.59 s max.
     ("anthropic/claude-haiku-4.5", None): 4.59,
-    # #396 (16 Jul): 1.89/2.46 s on the dedicated screen, but 3.76/4.52 s over
-    # the 28-roast run. Still usable, with ~0.5 s of headroom.
+    # #396 (16 Jul): 1.89/2.46 s on the dedicated screen, 3.76/4.52 s over the
+    # 28-roast run.
     ("openai/gpt-5.6-luna", None): 4.52,
     # #396 (16 Jul): 2.62/4.39 s on the dedicated screen, 2.94/5.05 s over 28
-    # roasts. The median sits well inside the bound; the max does not.
+    # roasts. The median sits well inside a 5 s bound; the max does not.
     ("openai/gpt-4.1-mini", None): 5.05,
+    # 8 Jun: reasoning OFF turns the same model from 10.8 s into 2.9 s.
+    # The one arm on this table whose base slug busts at the default.
+    ("openai/gpt-5.5", "off"): 2.9,
 }
+
+#: The headroom an arm needs under ``ControllerConfig.advisory_timeout_seconds``
+#: before the banner stays silent about it. An arm whose recorded worst call
+#: leaves less than this fraction of the bound spare is reported as tight rather
+#: than cleared.
+#:
+#: Derived rather than hardcoded (local Codex P2, folded pre-open): tightness is
+#: a relation between a measurement and the CONFIGURED bound, not a property of
+#: the model. A static partition was silently wrong the moment an operator moved
+#: ``ROASTPILOT_CONTROLLER__ADVISORY_TIMEOUT_SECONDS`` — it stayed quiet about
+#: gpt-4o under a 1 s bound, and still cried timeout for gpt-4.1-mini under a
+#: 10 s one, which its 5.05 s worst call comfortably fits.
+FC_LATENCY_TIGHT_HEADROOM_FRACTION = 0.2
 
 #: Arms whose recorded screen BUSTED the gate — the reasoning / frontier models
 #: that think past the wall (D40/D41). Named explicitly so the banner can say

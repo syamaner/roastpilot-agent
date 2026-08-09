@@ -401,9 +401,13 @@ def test_the_screen_tables_are_lower_case_and_disjoint() -> None:
     appear in both (`gpt-5.5` busts at the default and clears with reasoning
     off); it is the arm that must be unique.
     """
-    both = FC_LATENCY_SCREENED_ADVISOR_ARMS | FC_LATENCY_BUSTED_ADVISOR_ARMS
+    screened = frozenset(FC_LATENCY_SCREENED_ADVISOR_ARMS)
+    both = screened | FC_LATENCY_BUSTED_ADVISOR_ARMS
     assert all(slug == slug.lower() for slug, _ in both)
-    assert not (FC_LATENCY_SCREENED_ADVISOR_ARMS & FC_LATENCY_BUSTED_ADVISOR_ARMS)
+    assert not (screened & FC_LATENCY_BUSTED_ADVISOR_ARMS)
+    # Every recorded max is a positive number of seconds — a zero or negative
+    # entry would silently classify an arm as comfortably cleared at any bound.
+    assert all(m > 0 for m in FC_LATENCY_SCREENED_ADVISOR_ARMS.values())
 
 
 def test_a_lookalike_vendor_prefix_does_not_inherit_a_screen() -> None:
