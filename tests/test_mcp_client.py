@@ -2717,6 +2717,118 @@ def test_project_recordable_ambient_is_strictly_narrower_than_live() -> None:
     assert project_recordable_ambient(absent) == nulls
 
 
+@pytest.mark.parametrize("member", ["temperature_c", "humidity_percent", "pressure_hpa"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_project_live_ambient_voids_the_whole_triad_on_a_non_finite_member(
+    member: str, bad: float
+) -> None:
+    """#752: a malformed MEASURED value reads as an absent reading, like the stamp.
+
+    #745 guarded the reading's identity stamp; the values themselves went
+    through unchanged, so a ``NaN`` room temperature reached ``RoastTelemetry``,
+    the c11 doctrine and the corpus column. The failure is quiet rather than
+    loud — ``NaN`` compares ``False`` against ``threshold_c`` in BOTH
+    directions, so the model is seated in whichever fan regime the comparison
+    falls through to.
+
+    The unit under test is the **triad**, not the member: all three values are
+    one poll of one device published under one stamp, so a member that came back
+    unrepresentable is evidence the reading is malformed rather than that one
+    channel is. Each member is driven independently here to prove the whole
+    triad is voided whichever one is bad — including ``pressure_hpa``, which no
+    advisor path reads but which lands in the same corpus row.
+    """
+    status = _ambient_status_with(**{member: bad})
+    # Only the named member is malformed: the other two must still be present,
+    # or the assertion below would pass for the wrong reason.
+    intact = [
+        getattr(status, name)
+        for name in ("temperature_c", "humidity_percent", "pressure_hpa")
+        if name != member
+    ]
+    assert all(value is not None for value in intact)
+    assert status.status == "ok" and status.ambient_running
+    assert status.last_reading_monotonic_seconds is not None
+
+    assert project_live_ambient(status) == (None, None, None)
+    # And the recordable predicate stays a pure narrowing of it (#745).
+    assert project_recordable_ambient(status) == (None, None, None)
+
+
+def test_project_live_ambient_keeps_absent_members_and_finite_zeroes() -> None:
+    """#752: the guard rejects MALFORMED, never merely absent or zero.
+
+    ``None`` is a legitimate member state and must not be conflated with
+    non-finite, and ``0.0`` is a real reading (0 °C, 0 %RH) that
+    ``math.isfinite`` accepts — the same distinction :func:`ambient_reading_token`
+    already draws for a ``0.0`` stamp.
+    """
+    partial = _ambient_status_with(humidity_percent=None)
+    assert project_live_ambient(partial) == (28.49, None, 1008.56)
+
+    zeroed = _ambient_status_with(temperature_c=0.0, humidity_percent=0.0)
+    assert project_live_ambient(zeroed) == (0.0, 0.0, 1008.56)
+
+
+def test_project_session_state_declines_a_non_finite_ambient_reading() -> None:
+    """#752 end-to-end on the telemetry projection: a malformed reading arrives
+    at the controller as an ABSENT one, age and all.
+
+    The age going with it matters as much as the triad: the doctrine's range
+    check is what declines the reading, and it declines on an unknown age. This
+    is the #498-safe direction — the absent branch can only leave the graduated
+    fan regime, never enter it.
+    """
+    state = RoastSessionState.model_validate(
+        _state_payload(
+            100.0,
+            ambient_status={
+                **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[dict-item]
+                "temperature_c": float("inf"),
+            },
+        )
+    )
+    telemetry = project_session_state(state, age_seconds=0.0, ambient_age_seconds=1.0)
+    assert telemetry is not None
+    assert telemetry.ambient_temp_c is None
+    assert telemetry.ambient_humidity_pct is None
+    assert telemetry.ambient_pressure_hpa is None
+    assert telemetry.ambient_age_seconds is None
+
+
+@pytest.mark.asyncio
+async def test_adapter_ambient_age_is_unknown_for_a_non_finite_reading() -> None:
+    """#752: the freshness tracker inherits the guard rather than re-deriving it.
+
+    ``_observe_ambient_age`` tokenises only a reading the live projection
+    forwards, so a malformed triad never starts a freshness clock — two reads a
+    second apart both report an unknown age, exactly as they do for a probe that
+    has never reported.
+    """
+    clock = _StepClock()
+    nan_reading = {
+        **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[dict-item]
+        "temperature_c": float("nan"),
+    }
+    adapter = RoasterControlAdapter(
+        RoasterMCPClient(
+            _SequenceCaller(
+                [
+                    _state_payload(100.0, ambient_status=nan_reading),
+                    _state_payload(101.0, ambient_status=nan_reading),
+                ]
+            )
+        ),
+        clock=clock,
+    )
+    first = await adapter.read_telemetry()
+    clock.now = 1.0
+    second = await adapter.read_telemetry()
+
+    assert first is not None and first.ambient_age_seconds is None
+    assert second is not None and second.ambient_age_seconds is None
+
+
 def test_project_live_ambient_non_ok_status_is_none() -> None:
     """#464 (D86): disabled/unavailable ambient degrades to an all-None triad,
     mirroring the MCP's own fail-soft contract (#342, D85) — never a fault."""

@@ -474,18 +474,78 @@ def project_live_ambient(status: AmbientStatus) -> tuple[float | None, float | N
     intended reading of the tile — it reports the current room, and once nothing
     is measuring the room there is nothing current to report.
 
+    **A non-finite MEMBER voids the whole triad (#752).** #745 gave the reading's
+    identity *stamp* this treatment (:func:`ambient_reading_token`); the measured
+    values themselves had no such guard, so a ``NaN``/``±inf`` ``temperature_c``
+    reached :class:`RoastTelemetry`, the ``c11`` doctrine, and the corpus column
+    unchanged. That is not hypothetical: ``scripts/rpd_corpus_score.py`` carries a
+    ``_finite_or_none`` normalisation precisely because a historical
+    ``+/-Infinity`` ``ambient_temp_c`` has already reached that corpus. The
+    failure is quiet rather than loud — ``NaN`` compares ``False`` against the
+    doctrine's ``threshold_c`` in BOTH directions, so it does not raise, it seats
+    the model in whichever fan regime the comparison falls through to. It appears
+    harmless today only by accident: ``AdvisorContext.model_dump_json()`` emits
+    ``null`` for non-finite floats under pydantic v2's default
+    ``ser_json_inf_nan="null"`` (verified). That is implicit, version-dependent
+    protection which ``model_dump()`` (python mode) already does not provide, on
+    a path whose whole thesis is that non-finite values defeat gates.
+
+    Three choices worth stating rather than assuming:
+
+    * **The unit is the TRIAD, not the member.** The three values are one poll of
+      one device, published with one stamp, and the MCP's own
+      ``AmbientRuntimeSnapshot`` nulls them together — a member that came back
+      unrepresentable is evidence the *reading* is malformed, not that one
+      channel is. A partially-populated triad would also be a shape no consumer
+      has ever seen: a temperature-less reading that still renders humidity on
+      the Room tile, or a corpus row claiming "a real, dateable reading of the
+      room" for a reading whose room temperature is missing. Over-rejecting costs
+      one run's breadcrumb and one tick's graduated-regime eligibility; under-
+      rejecting costs a mislabelled RP-B arm (#709).
+    * **``humidity_percent`` is included on its own merits**, not just by
+      atomicity: it reaches the advisor context through
+      :meth:`RoastController._doctrine_ambient` exactly as the temperature does.
+      ``c11`` tells the model humidity is background only, but "background" text
+      in a prompt is still text in the prompt.
+    * **``pressure_hpa`` is included even though it is corpus-only**, and that is
+      not over-reach: it lands in the same ``roast_runs`` columns and carries the
+      same hazard the temperature does — SQLite round-trips ``±inf`` faithfully
+      (unlike ``NaN``, which it silently stores as ``NULL``), and ``json.dumps``
+      then emits a bare ``Infinity`` token that a strict ``JSON.parse`` rejects
+      for a whole report. Guarding the reading at its boundary is cheaper than
+      one downstream normalisation per consumer.
+
+    No type guard is needed alongside ``math.isfinite`` (unlike
+    :func:`_payload_float`, which reads an untyped payload mapping): these are
+    pydantic-validated ``float | None`` fields, so the only way a value survives
+    validation and is still unusable is by being non-finite (pydantic's
+    ``allow_inf_nan`` default). ``None`` members are untouched — absent is a
+    legitimate state and must not be conflated with malformed.
+
+    Guarding here rather than at each call site follows #745's shape: this is the
+    boundary every consumer already goes through, so
+    :func:`project_recordable_ambient`, :func:`project_session_state` and the
+    freshness tracker inherit it and cannot disagree. A non-finite reading then
+    reads as an ABSENT reading — the branch ``c11`` already handles, and the
+    #498-safe direction, since declining can only leave the graduated fan regime
+    and never enter it.
+
     Args:
         status: The MCP ambient status from ``RoastSessionState``.
 
     Returns:
         The ``(temperature_c, humidity_percent, pressure_hpa)`` triad when
-        ``status.status == "ok"`` **and** ``status.ambient_running``, else
-        ``(None, None, None)`` — the MCP's own fail-soft contract for a
-        disabled/unavailable probe, extended to a stopped-but-``ok`` runtime.
+        ``status.status == "ok"``, ``status.ambient_running``, **and** every
+        present member is finite; else ``(None, None, None)`` — the MCP's own
+        fail-soft contract for a disabled/unavailable probe, extended to a
+        stopped-but-``ok`` runtime and to a malformed reading.
     """
     if status.status != "ok" or not status.ambient_running:
         return None, None, None
-    return status.temperature_c, status.humidity_percent, status.pressure_hpa
+    triad = (status.temperature_c, status.humidity_percent, status.pressure_hpa)
+    if any(value is not None and not math.isfinite(value) for value in triad):
+        return None, None, None
+    return triad
 
 
 def _payload_float(payload: dict[str, EventPayloadValue], key: str) -> float | None:
@@ -696,7 +756,10 @@ def project_recordable_ambient(
 
     Strictly narrower than :func:`project_live_ambient`: it additionally
     requires a usable :func:`ambient_reading_token`, i.e. a reading whose
-    freshness can even be established. Without that extra clause the two
+    freshness can even be established. Everything the live projection rejects is
+    rejected here too — including a triad with a non-finite member (#752), which
+    is guarded there rather than here precisely so this predicate stays a pure
+    narrowing. Without that extra clause the two
     #745 fixes leave a hole between them — a ``NaN`` stamp on an otherwise
     ``ok``/running status makes the live advisor DECLINE the reading (the age
     is unknown, and the controller fails closed on that), while the
