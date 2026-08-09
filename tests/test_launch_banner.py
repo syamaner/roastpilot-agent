@@ -170,6 +170,28 @@ def test_effective_non_default_model_is_tagged_experiment() -> None:
     assert "no roast advice" not in lines.advisor_cfg
 
 
+def test_a_base_slug_that_matches_the_override_is_not_called_advice_less() -> None:
+    """An operator-set slug that IS what DEVELOPMENT resolves to gets no warning.
+
+    Both clauses of the shadow guard matter: without the second, a model the
+    operator set AND that genuinely answers every advisory call would still be
+    reported as giving no roast advice — telling them their live choice is
+    inert. Mutation-proven gap (qa re-review, folded pre-ready).
+    """
+    config = AppConfig(
+        advisor=AdvisorConfig(
+            model_slug="openai/gpt-4.1-mini",
+            model_slug_by_phase={RoastPhase.DEVELOPMENT: "openai/gpt-4.1-mini"},
+        ),
+        controller=ControllerConfig(),
+    )
+
+    lines = resolve_banner_lines(config)
+
+    assert lines.advisor_cfg == "openai/gpt-4.1-mini  ·  prompt c3" + EXPERIMENT_TAG
+    assert "no roast advice" not in lines.advisor_cfg
+
+
 def test_pre_fc_only_model_override_is_not_advertised() -> None:
     """A model set ONLY for a pre-FC phase never reaches an advisory call.
 
@@ -286,16 +308,31 @@ def test_inert_adaptive_coefficients_do_not_tag_a_default_fixed_arm() -> None:
     assert EXPERIMENT_TAG not in lines.trim
 
 
-def test_adaptive_only_fields_all_exist_on_the_model() -> None:
-    """Every name in the declared adaptive-only group is a real field.
+def test_adaptive_only_fields_is_exactly_the_non_fixed_mode_field_set() -> None:
+    """The adaptive-only group is COMPLETE, not merely well-formed.
 
-    The group is subtracted from the non-default scan, so a typo or a rename
-    would silently stop excluding a field (or silently exclude nothing).
+    Membership and disjointness alone leave the dangerous direction open: a
+    genuinely adaptive-only field OMITTED from the group is silently tagged
+    ⚠ EXPERIMENT on the proven baseline arm, and a test exercising only three
+    of the nine members cannot see it (mutation-proven: dropping `k_eta` from
+    the group left every test green — qa re-review, folded pre-ready).
+
+    Pinning the COMPLEMENT is the stable way round. The fixed-mode set below is
+    small and settled — the three window/depth knobs plus the two switches — so
+    a new adaptive coefficient fails here until it is classified, while adding a
+    fixed-mode field is a deliberate one-line edit rather than silent drift.
     """
-    assert set(LateMaillardTrim.model_fields) >= LateMaillardTrim.ADAPTIVE_ONLY_FIELDS
-    # And the group must not swallow the fields fixed mode DOES consume.
-    assert LateMaillardTrim.ADAPTIVE_ONLY_FIELDS.isdisjoint(
-        {"enabled", "trim_heat_percent", "window_fc_eta_seconds", "min_bean_temp_c"}
+    fixed_mode_fields = {
+        "enabled",
+        "adaptive_depth_enabled",
+        "trim_heat_percent",
+        "window_fc_eta_seconds",
+        "min_bean_temp_c",
+    }
+
+    assert (
+        set(LateMaillardTrim.model_fields) - fixed_mode_fields
+        == LateMaillardTrim.ADAPTIVE_ONLY_FIELDS
     )
 
 
