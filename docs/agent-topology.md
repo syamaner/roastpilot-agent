@@ -49,7 +49,9 @@ Scope: Claude Code model selection, planning, delegation, review, and authority 
 
 This specification defines a cost-aware Claude agent topology in which:
 
-- Claude Opus 5 owns product orchestration, scope, authority, and integration.
+- Claude Opus 5 owns product orchestration, scope, authority, and integration
+  (recommended model for the role; the main-session model itself is a
+  per-terminal operator decision — see §5).
 - Claude Fable 5 is invoked selectively as a read-only planning specialist.
 - Claude Sonnet 5 performs bounded implementation and routine review work.
 - High-consequence safety or architecture review remains an independent Opus 5 responsibility.
@@ -63,7 +65,7 @@ The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
 ## 3. Core principles
 
 1. **The human owns product authority.** The human approves material scope, architecture, safety, cost, and irreversible decisions.
-2. **Opus owns orchestration.** The Opus PM maintains intent, chooses the execution primitive, adjudicates plans, assigns work, integrates results, and escalates genuine forks.
+2. **Opus owns orchestration** (Opus 5 recommended; see §5 for the per-terminal operator decision on the main-session model). The Opus PM maintains intent, chooses the execution primitive, adjudicates plans, assigns work, integrates results, and escalates genuine forks.
 3. **Fable advises on plans.** The Fable planner investigates and recommends. It does not implement, mutate repositories, contact external systems, or manage workers.
 4. **Workers receive bounded tasks.** Implementation agents receive one coherent responsibility, explicit boundaries, acceptance criteria, and relevant evidence.
 5. **Authors do not adjudicate their own work.** Review and triage remain independent from implementation.
