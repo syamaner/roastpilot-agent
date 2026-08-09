@@ -168,13 +168,22 @@
 > that settled this very question, recorded in `00-repository-structure.md` on
 > 9 Aug 2026: **one shared D-number series for the whole `roastpilot-plan` repo,
 > next free being one past the highest defined anywhere in it.** D149
-> (`factory.md`'s `## D149:` heading) was the previous maximum;
-> `roastpilot-agent/plan.md`'s own maximum is D129. Take **D151**; D150 is spent.
+> (`factory.md`'s `## D149:` heading) was the previous maximum. Take **D151**;
+> D150 is spent. Do **not** derive the number from any one file's own maximum:
+> that per-file reading is exactly what produced the collisions described below,
+> and it produced another on 9 Aug (see the operator flag there).
 >
 > **There is a live decision-number COLLISION in the plan repo, and it is not yet
 > resolved.** `roastpilot-agent/plan.md` (this programme's file, in the SEPARATE `~/git/roastpilot-plan` repository — not a path inside this one) and
 > `roastpilot-cloud/factory.md` (the cloud programme) **both independently define
-> D103-D129** — 27 numbers meaning entirely different things in each file.
+> D103-D130** — 28 numbers meaning entirely different things in each file.
+> **Operator flag (9 Aug 2026):** D130 is the newest of those and it postdates
+> D150 — `plan.md`'s D130 (advisor model pin, recorded 18:24 on 9 Aug) collides
+> with `factory.md`'s D130 (27 Jul 2026), which is precisely the collision D150
+> ratified at 13:59 the same day to prevent. It is left in place and NOT
+> renumbered here: D-numbers appear in commit messages and issues, so the
+> resolution is the operator's call, and it belongs to a separate thread. Cite
+> D130 with its file until then.
 > `plan.md` D108 is the PR-scoped Claude approval bridge `AGENTS.md` cites;
 > `factory.md` D108 is an unrelated cloud slice decision. The same holds for
 > D122, D124 and D127, all of which RP-B cites. **So a bare "D127" is ambiguous:

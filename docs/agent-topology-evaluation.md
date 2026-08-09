@@ -8,8 +8,9 @@ transcripts, not impressions.
 
 Every D-number in this log is defined in `roastpilot-plan/roastpilot-agent/plan.md`
 unless stated otherwise. The qualifier matters because `roastpilot-cloud/factory.md`
-independently defines the same D103-D129 range for unrelated decisions, so a bare
-number in that range resolves two ways; see `docs/state/registry.md`.
+independently defines the same range for unrelated decisions, so a bare number in
+it resolves two ways. The range itself is deliberately not restated here — it has
+already moved once; `docs/state/registry.md` holds the current one.
 
 The requirement is archetype COVERAGE, not a case count, and a single story may
 cover more than one — Case 1 below covers two. Stated explicitly because the two
@@ -420,8 +421,11 @@ said review caught every PM miss; that contradicted the corrected tally above an
 overstated the independent-review result.
 
 Its weakest point in this case was **planning**, which is the part that was
-skipped. Every defect that reached the PR came from a join between artifacts,
-which is the failure mode the read-only planner exists to address.
+skipped. Every *plan* defect that reached the PR came from a join between
+artifacts, which is the failure mode the read-only planner exists to address.
+The class matters: the case's implementation and test defects did not come from
+a join, and a pre-implementation read-only planner could not have caught them,
+so they are not evidence for planning.
 
 The cheapest control this case surfaced is not a model pin at all: **have a
 second party recompute any number before it becomes durable.** Two wrong figures
