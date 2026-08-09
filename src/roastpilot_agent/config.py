@@ -1974,8 +1974,8 @@ class AppConfig(BaseSettings):
             The validated application config.
 
         Raises:
-            ValueError: If the doctrine is enabled, the ambient poll interval is
-                explicitly set, and the freshness bound is below it.
+            ValueError: If the doctrine is enabled and either the ambient poll
+                interval is unset, or the freshness bound is below it.
         """
         doctrine = self.controller.ambient_fan_doctrine
         if not doctrine.enabled:
