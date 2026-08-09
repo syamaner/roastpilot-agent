@@ -218,8 +218,9 @@
 > recorded D9 and D14 as never defined — they are defined, and that claim was
 > wrong** (corrected 9 Aug 2026, roastpilot-agent#750). The only real gap is
 > D144, deliberately renumbered to D145; it is not a number to reclaim. Re-derived
-> across all five formats, the highest number defined anywhere is still D150, so
-> the free number above is unchanged.
+> across all five formats on 9 Aug 2026 the highest number defined anywhere was
+> D150; D151 and D152 have been spent since (see above), so the highest defined
+> anywhere is now D152 and the free number above (**D153**) follows from it.
 >
 > D125 records the RP-D eval-model
 > correction — discriminates only on hardware/simulator, not replay; D124 records

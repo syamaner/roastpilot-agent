@@ -102,6 +102,13 @@ def test_agents_md_prose_names_the_full_ids() -> None:
     assert "claude-fable-5" in agents_md and "planning-architect" in agents_md, (
         "AGENTS.md must document the planning-architect claude-fable-5 pin"
     )
+    # Bind story-planner to the Fable pin the same way: the two-Fable-roles
+    # sentence must associate the full ID with the role, not merely mention both
+    # somewhere — otherwise re-pinning story-planner alone in prose stays green
+    # because planning-architect already satisfies the mention checks.
+    assert re.search(r"claude-fable-5.{0,400}story-planner", agents_md, re.S), (
+        "AGENTS.md must document the story-planner claude-fable-5 pin (D152)"
+    )
 
 
 def test_workflow_model_pins_are_full_ids() -> None:
