@@ -579,35 +579,38 @@ def project_live_ambient(status: AmbientStatus) -> tuple[float | None, float | N
     ``allow_inf_nan`` default). ``None`` members are untouched — absent is a
     legitimate state and must not be conflated with malformed.
 
-    **What this does NOT close, stated so the atomicity claim above is not read
-    wider than it is.** Which of the two MCP transport paths a reading arrives
-    on decides whether this guard ever sees a non-finite value at all
+    **An INCOMPLETE triad is voided too, and the transport is why.** Which of
+    the two paths :func:`parse_tool_result` supports a reading arrives on
+    decides whether a non-finite value survives to be seen at all
     (``tests/test_mcp_client.py`` pins both):
 
     * ``structuredContent`` — the MCP serialises it with pydantic, so a
       non-finite member is already ``null`` by the time
-      :func:`parse_tool_result` reads it. The guard is a no-op there, and the
-      triad arrives partially populated instead of malformed. **This is the
-      live path today**: the child's ``get_roast_state`` is a FastMCP
-      ``@mcp.tool()`` returning a dataclass, so its reply carries
-      ``structuredContent``, and :func:`parse_tool_result` prefers that
-      whenever it is a multi-key dict and never reaches the text block.
+      :func:`parse_tool_result` reads it. **This is the live path today**: the
+      child's ``get_roast_state`` is a FastMCP ``@mcp.tool()`` returning a
+      dataclass, so its reply carries ``structuredContent``, and
+      :func:`parse_tool_result` prefers that whenever it is a multi-key dict and
+      never reaches the text block.
     * the text content block — parsed with :func:`json.loads`, whose default
       ``parse_constant`` accepts the bare ``Infinity``/``NaN`` tokens, so the
-      value does arrive non-finite. This is the path the guard is load-bearing
-      on, and it is what an older or non-FastMCP server, or the scalar-wrapper
-      shape, would use.
+      value does arrive non-finite. It is what an older or non-FastMCP server,
+      or the scalar-wrapper shape, would use.
 
-    So a *partially populated* triad is reachable regardless — and on the live
-    transport it is the ONLY reachable shape of this fault — and this function
-    deliberately still forwards one. Whether an incomplete triad should itself
-    be voided is a separate decision that turns on whether any supported ambient
-    probe legitimately reports fewer than three members. The evidence points at
-    "no" (the MCP's ``AmbientReading`` requires all three floats, and
-    ``AmbientRuntimeSnapshot`` nulls them together), but the ``AmbientStatus``
-    mirror allows it and that evidence is one MCP version deep, so it is filed
-    rather than guessed at here: guessing wrong silently disables ambient for
-    that hardware.
+    Guarding non-finite members alone would therefore be a **no-op on the live
+    path**, forwarding a partial triad where the finiteness clause was meant to
+    void the whole reading. The completeness clause closes that, and it is safe
+    to require completeness because a partial triad is not something the pinned
+    probe can produce: ``coffee-roaster-mcp`` is pinned ``==0.1.13``, whose
+    ``build_configured_ambient_reader`` supports exactly one mode, whose
+    ``YoctoMeteoAmbientReader.read`` raises for the WHOLE read if any one sensor
+    fails, whose ``AmbientReading`` declares all three members as required
+    (non-optional) ``float``, and whose ``AmbientRuntimeSnapshot`` nulls the
+    triad and the stamp together. All-or-nothing at the source, so a mixed
+    present/absent triad can only be the serialisation artifact above — exactly
+    what should read as malformed.
+
+    The all-``None`` triad is of course untouched: that is a probe with no
+    reading yet, not an incomplete one.
 
     Guarding here rather than at each call site follows #745's shape: this is the
     boundary every consumer already goes through, so
@@ -622,15 +625,19 @@ def project_live_ambient(status: AmbientStatus) -> tuple[float | None, float | N
 
     Returns:
         The ``(temperature_c, humidity_percent, pressure_hpa)`` triad when
-        ``status.status == "ok"``, ``status.ambient_running``, **and** every
-        present member is finite; else ``(None, None, None)`` — the MCP's own
-        fail-soft contract for a disabled/unavailable probe, extended to a
+        ``status.status == "ok"``, ``status.ambient_running``, and the reading
+        is well formed — every member finite, and the three either all present
+        or all absent. Else ``(None, None, None)`` — the MCP's own fail-soft
+        contract for a disabled/unavailable probe, extended to a
         stopped-but-``ok`` runtime and to a malformed reading.
     """
     if not ambient_reading_is_live(status):
         return None, None, None
     triad = (status.temperature_c, status.humidity_percent, status.pressure_hpa)
     if any(value is not None and not math.isfinite(value) for value in triad):
+        return None, None, None
+    present = [value is not None for value in triad]
+    if any(present) and not all(present):
         return None, None, None
     return triad
 

@@ -2756,19 +2756,54 @@ def test_project_live_ambient_voids_the_whole_triad_on_a_non_finite_member(
     assert project_recordable_ambient(status) == (None, None, None)
 
 
-def test_project_live_ambient_keeps_absent_members_and_finite_zeroes() -> None:
-    """#752: the guard rejects MALFORMED, never merely absent or zero.
+def test_project_live_ambient_keeps_finite_zeroes_and_the_wholly_absent_triad() -> None:
+    """#752: the guard rejects MALFORMED, never merely zero or wholly absent.
 
-    ``None`` is a legitimate member state and must not be conflated with
-    non-finite, and ``0.0`` is a real reading (0 °C, 0 %RH) that
-    ``math.isfinite`` accepts — the same distinction :func:`ambient_reading_token`
-    already draws for a ``0.0`` stamp.
+    ``0.0`` is a real reading (0 °C, 0 %RH) that ``math.isfinite`` accepts — the
+    same distinction :func:`ambient_reading_token` already draws for a ``0.0``
+    stamp. An all-``None`` triad is a live runtime that has not read yet, which
+    is absent rather than incomplete, and must survive the completeness clause
+    that voids a *mixed* triad.
     """
-    partial = _ambient_status_with(humidity_percent=None)
-    assert project_live_ambient(partial) == (28.49, None, 1008.56)
-
     zeroed = _ambient_status_with(temperature_c=0.0, humidity_percent=0.0)
     assert project_live_ambient(zeroed) == (0.0, 0.0, 1008.56)
+
+    not_read_yet = _ambient_status_with(
+        temperature_c=None, humidity_percent=None, pressure_hpa=None
+    )
+    assert project_live_ambient(not_read_yet) == (None, None, None)
+
+
+@pytest.mark.parametrize("absent", ["temperature_c", "humidity_percent", "pressure_hpa"])
+def test_project_live_ambient_voids_a_partially_populated_triad(absent: str) -> None:
+    """#752 / #758(b), post-open Codex P2: a MIXED triad is malformed too.
+
+    An earlier revision of this PR forwarded a partial triad and deferred this
+    case, on the grounds that some ambient probe might legitimately report fewer
+    than three members. It cannot: ``coffee-roaster-mcp`` is pinned ``==0.1.13``,
+    whose ``build_configured_ambient_reader`` supports exactly one mode, whose
+    ``YoctoMeteoAmbientReader.read`` raises for the WHOLE read if any one sensor
+    fails, whose ``AmbientReading`` declares all three members as required
+    ``float``, and whose ``AmbientRuntimeSnapshot`` nulls the triad together.
+
+    So a mixed present/absent triad can only be the serialisation artifact on
+    the live transport — pydantic nulling a **non-finite** member during
+    ``structuredContent`` serialisation, before this function ever sees it (see
+    ``test_which_mcp_transport_path_preserves_a_non_finite_ambient_member``).
+    Without this clause the finiteness guard is a no-op on the live path, which
+    is precisely the reading it exists to void.
+    """
+    status = _ambient_status_with(**{absent: None})
+    intact = [
+        getattr(status, name)
+        for name in ("temperature_c", "humidity_percent", "pressure_hpa")
+        if name != absent
+    ]
+    assert all(value is not None for value in intact), "only the named member is absent"
+    assert status.status == "ok" and status.ambient_running
+
+    assert project_live_ambient(status) == (None, None, None)
+    assert project_recordable_ambient(status) == (None, None, None)
 
 
 def test_project_session_state_declines_a_non_finite_ambient_reading() -> None:
@@ -2929,7 +2964,9 @@ def test_which_mcp_transport_path_preserves_a_non_finite_ambient_member() -> Non
     via_structured = cast("dict[str, object]", parse_tool_result(structured))
     laundered = AmbientStatus.model_validate(via_structured["ambient_status"])
     assert laundered.humidity_percent is None  # nulled by the transport, not by us
-    assert project_live_ambient(laundered) == (28.49, None, 1008.56)
+    # The finiteness clause cannot see it — the COMPLETENESS clause is what
+    # voids this reading, which is why the guard is not a live-path no-op.
+    assert project_live_ambient(laundered) == (None, None, None)
 
     via_text = cast("dict[str, object]", parse_tool_result(text_only))
     malformed = AmbientStatus.model_validate(via_text["ambient_status"])
