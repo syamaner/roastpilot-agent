@@ -2795,6 +2795,44 @@ async def test_adapter_ambient_age_grows_while_the_reading_does_not_change() -> 
 
 
 @pytest.mark.asyncio
+async def test_adapter_ambient_age_resets_on_a_new_session() -> None:
+    """#732, post-open Codex P2: the ambient tracker is per-SESSION state.
+
+    ``start_session`` resets the telemetry-age trackers; the ambient ones were
+    added beside them and initially were not. That leaks across back-to-back
+    roasts through one adapter, and the MCP makes the leak reachable rather
+    than theoretical: its stop path deliberately PRESERVES the last reading and
+    its stamp, and a stop/start pair need not have an intervening telemetry
+    read. So the new session's first state can carry the previous roast's
+    token — which either ages the new run's first reading from the old run's
+    clock (passing a stale reading as fresh) or declines it at once and burns
+    the new run's one-shot decline warning on a phantom.
+
+    The stamp is deliberately IDENTICAL either side of the restart; a test that
+    changed it would pass without the reset and prove nothing."""
+    clock = _StepClock()
+
+    async def call_tool(tool: str, arguments: dict[str, object]) -> object:
+        # The restart itself goes through the real ``start_roast_session`` path,
+        # so the reset under test is exercised where it actually lives.
+        return CANNED[tool] if tool == "start_roast_session" else _state_payload(100.0)
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(call_tool), clock=clock)
+
+    first = await adapter.read_telemetry()
+    assert first is not None and first.ambient_age_seconds == 0.0
+
+    # Time passes within the first roast, so a leaked tracker would report it.
+    clock.now = 300.0
+    await adapter.start_session()
+    after_restart = await adapter.read_telemetry()
+
+    assert after_restart is not None
+    assert after_restart.ambient_temp_c == 28.49
+    assert after_restart.ambient_age_seconds == 0.0
+
+
+@pytest.mark.asyncio
 async def test_adapter_ambient_age_resets_across_an_outage_on_the_same_reading() -> None:
     """#732: freshness is tracked for the reading the projection FORWARDS, not
     for whatever stamp the status carries.

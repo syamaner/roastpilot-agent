@@ -4638,16 +4638,26 @@ class RoastController:
         if not doctrine.enabled:
             return None, None
         age_seconds = telemetry.ambient_age_seconds
-        # Written as ``not (age <= max)`` rather than ``age > max`` so the
-        # comparison fails CLOSED on a non-finite age: every comparison against
-        # ``nan`` is False, so ``nan > max`` would admit it as fresh. The live
-        # adapter cannot produce one (the age is a monotonic difference), but
-        # ``RoastTelemetry.ambient_age_seconds`` is a public float field with
-        # pydantic's default ``allow_inf_nan``, and other constructors exist
-        # (replay frames, the offline bake-off harness, tests). This is the only
+        # A RANGE check, not an upper bound, and written as ``not (lo <= x <=
+        # hi)`` so every way of being invalid fails CLOSED:
+        #
+        # * ``nan`` — every comparison against it is False, so a bare
+        #   ``age > max`` would admit it as fresh.
+        # * ``-inf`` and any negative — these satisfy ``x <= max`` and so slip
+        #   through an upper bound alone, forwarding an arbitrarily stale
+        #   reading. An earlier revision's comment claimed non-finite ages
+        #   failed closed; that was true of ``+inf`` and ``nan`` and false of
+        #   ``-inf``, which is exactly the kind of half-true claim worth not
+        #   leaving in a safety-adjacent comment.
+        #
+        # The live adapter cannot produce any of them (the age is a difference
+        # of one monotonic clock), but ``RoastTelemetry.ambient_age_seconds`` is
+        # a public float field with pydantic's default ``allow_inf_nan`` and the
+        # code deliberately supports other constructors — replay frames, the
+        # offline bake-off harness, a custom ``StateReader``. This is the only
         # inequality in the doctrine path, so it is the only place the fail-open
         # could hide.
-        if age_seconds is None or not (age_seconds <= doctrine.max_reading_age_seconds):
+        if age_seconds is None or not (0.0 <= age_seconds <= doctrine.max_reading_age_seconds):
             self._warn_once_on_ambient_decline(age_seconds)
             return None, None
         return telemetry.ambient_temp_c, telemetry.ambient_humidity_pct

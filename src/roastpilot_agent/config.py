@@ -7,6 +7,7 @@ deliberately conservative software ceilings pending supervised hardware
 validation at E12 (E12-S1).
 """
 
+import os
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -1927,20 +1928,36 @@ class AppConfig(BaseSettings):
         a doctrine that was serving fresh readings. Two or more cadences remains
         the sensible operating margin; it is advice, not a validation rule.
 
-        **Enforced only when the cadence is actually KNOWN.**
-        ``ambient_poll_interval_seconds`` is ``None`` by default, and ``None``
-        does not mean "the package default" — ``mcp_yaml`` renders the field
-        only when set, so an unset value inherits whatever the hand-authored MCP
-        yaml carries, which this process cannot see. Substituting the mirrored
-        default there would let an inherited 300 s cadence pass against a 90 s
-        bound and silently void the doctrine — the exact failure this validator
-        exists to prevent, wearing its approval. So when the cadence is unknown
-        the static check stands down and the *runtime* decline warning
-        (``RoastController._doctrine_ambient``) is what covers it, by observing
-        the behaviour instead of predicting it. That split is deliberate: this
-        validator guards the ``/config`` path, which always writes an explicit
-        value, and the warning guards everything neither this nor any config
-        can see.
+        **Enforced only when the cadence is actually KNOWN — and an unset field
+        does not automatically mean unknown.** ``mcp_yaml`` renders
+        ``ambient_poll_interval_seconds`` only when it is set, so ``None`` means
+        "inherit", and what it inherits from splits into two cases that must not
+        be collapsed:
+
+        * **No hand-authored yaml route configured** — nothing to inherit from,
+          so the operative cadence really is the MCP's own default, mirrored
+          here as ``DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS``. This is the
+          common deployment shape and it IS checkable; standing down here would
+          remove the guard from the default path, which is the opposite of the
+          intent.
+        * **A yaml route IS configured** — the inherited value lives in a file
+          this validator will not read (config construction must not depend on
+          the filesystem; ``AppConfig`` is built in tests, replay and recovery).
+          Enabling the doctrine is then **rejected**, asking the operator to
+          state the cadence explicitly.
+
+        Rejecting rather than standing down is the point independent triage and
+        Codex reached separately: a runtime warning is fresh evidence, not a
+        guard, because it fires only once the roast is already running and does
+        not stop a scored hardware arm continuing with ambient populated for
+        part of each cycle and absent for the rest. Requiring one explicit field
+        before enabling an experimental doctrine whose whole behaviour depends
+        on that cadence is proportionate — and it is the operator's own
+        ``/config`` field, not a new concept.
+
+        The runtime decline warning stays as defence in depth for what no config
+        can predict: a wedged probe, a doctrine retired by recovery, a future
+        constructor of ``RoastTelemetry``.
 
         Only enforced while the doctrine is ENABLED, so the inert default can
         never make an otherwise-valid config unconstructible.
@@ -1962,9 +1979,24 @@ class AppConfig(BaseSettings):
                 explicitly set, and the freshness bound is below it.
         """
         doctrine = self.controller.ambient_fan_doctrine
-        poll_seconds = self.mcp_device.ambient_poll_interval_seconds
-        if not doctrine.enabled or poll_seconds is None:
+        if not doctrine.enabled:
             return self
+        poll_seconds = self.mcp_device.ambient_poll_interval_seconds
+        if poll_seconds is None:
+            if self.mcp_device.mcp_yaml_source_path is not None or bool(
+                (self.mcp.env or {}).get("COFFEE_ROASTER_MCP_CONFIG")
+                or os.environ.get("COFFEE_ROASTER_MCP_CONFIG")
+            ):
+                raise ValueError(
+                    "controller.ambient_fan_doctrine.enabled requires "
+                    "mcp_device.ambient_poll_interval_seconds to be set explicitly while a "
+                    "hand-authored MCP yaml is in use: the doctrine's freshness bound is "
+                    "meaningless against a cadence inherited from a file this process does "
+                    "not read, and getting it wrong silently voids the doctrine for a whole "
+                    "roast. Set the interval to the yaml's ambient.poll_interval_seconds, or "
+                    "disable the doctrine."
+                )
+            poll_seconds = DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS
         if doctrine.max_reading_age_seconds < poll_seconds:
             raise ValueError(
                 "controller.ambient_fan_doctrine.max_reading_age_seconds must be at least "

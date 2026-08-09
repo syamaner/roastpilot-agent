@@ -6,6 +6,7 @@ nesting), validation rejections, and the guidance-vs-safety-bound link.
 """
 
 import os
+from pathlib import Path
 
 import pydantic
 import pytest
@@ -20,6 +21,7 @@ from roastpilot_agent.config import (
     AppConfig,
     BeanSourcingConfig,
     ControllerConfig,
+    MCPConfig,
     MCPDeviceConfig,
     PostFirstCrackControl,
     SafetyLimits,
@@ -487,13 +489,52 @@ def test_ambient_freshness_check_stands_down_when_the_cadence_is_unknown() -> No
     validator exists to prevent, wearing its approval.
 
     So an unknown cadence is not guessed at. The runtime decline warning covers
-    it instead, by observing the behaviour rather than predicting it."""
+    it instead, by observing the behaviour rather than predicting it.
+
+    But "unset" is NOT the same as "unknown", and collapsing the two was the
+    over-correction independent triage caught: with no yaml route configured
+    there is nothing to inherit FROM, so the MCP's own default really is
+    operative and the guard must still apply. Standing down for both cases
+    would have stripped the guard from the DEFAULT deployment shape — widening
+    the silent-void hole rather than closing it."""
+    tight = ControllerConfig(
+        ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=1.0)
+    )
     assert MCPDeviceConfig().ambient_poll_interval_seconds is None
+
+    # No yaml route: the cadence IS known (the mirrored MCP default), so a 1 s
+    # bound against it is still rejected.
+    with pytest.raises(pydantic.ValidationError, match="max_reading_age_seconds"):
+        AppConfig(controller=tight, mcp_device=MCPDeviceConfig())
+
+    # An explicit yaml route: the inherited cadence is genuinely unreadable
+    # from here, so enabling the doctrine is REJECTED rather than guessed at.
+    # A runtime warning is evidence, not a guard — it fires once the roast is
+    # already running and cannot stop a scored arm continuing on a doctrine
+    # that is void for most of every cycle.
+    with pytest.raises(pydantic.ValidationError, match="ambient_poll_interval_seconds"):
+        AppConfig(
+            controller=tight,
+            mcp_device=MCPDeviceConfig(mcp_yaml_source_path=Path("/tmp/coffee-roaster-mcp.yaml")),
+        )
+
+    # Same for the env-var route the MCP spawn actually honours.
+    with pytest.raises(pydantic.ValidationError, match="ambient_poll_interval_seconds"):
+        AppConfig(
+            controller=tight,
+            mcp=MCPConfig(env={"COFFEE_ROASTER_MCP_CONFIG": "/tmp/coffee-roaster-mcp.yaml"}),
+        )
+
+    # Stating the cadence explicitly is the documented way through, and it is
+    # the operator's own /config field rather than a new concept.
     assert AppConfig(
         controller=ControllerConfig(
-            ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=1.0)
+            ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
         ),
-        mcp_device=MCPDeviceConfig(),
+        mcp_device=MCPDeviceConfig(
+            mcp_yaml_source_path=Path("/tmp/coffee-roaster-mcp.yaml"),
+            ambient_poll_interval_seconds=30.0,
+        ),
     )
 
 

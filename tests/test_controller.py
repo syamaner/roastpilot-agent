@@ -4628,6 +4628,10 @@ def test_advisor_context_ambient_tracks_each_tick_and_reads_a_configured_thresho
         # could have hidden, since it is the only inequality in it.
         (float("nan"), None),
         (float("inf"), None),
+        # Negative and -inf satisfy `x <= bound`, so an upper bound ALONE would
+        # admit them and forward an arbitrarily stale reading. Codex P3.
+        (-1.0, None),
+        (float("-inf"), None),
     ],
 )
 def test_advisor_context_declines_ambient_older_than_the_doctrine_bound(

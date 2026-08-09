@@ -2042,7 +2042,7 @@ class RoastService:
 
         What makes the retirement safe is narrower and stronger than shape
         parity: in the clash state the doctrine was ALREADY effectively inert,
-        since a bound below twice the poll cadence means healthy readings
+        since a bound below the poll cadence means healthy readings
         routinely age past it and get declined tick by tick. Retiring converts
         a flapping, mostly-declined doctrine into a deterministically declined
         one — not an enabled doctrine into a disabled one.

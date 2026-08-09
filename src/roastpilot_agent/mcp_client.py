@@ -871,6 +871,17 @@ class RoasterControlAdapter:
         self._last_state = None
         self._last_elapsed = None
         self._last_change_monotonic = None
+        # #732: the ambient tracker is age-tracking state exactly like the two
+        # above and must reset with them. The MCP's stop path deliberately
+        # PRESERVES the last ambient reading and its stamp, and a stop/start
+        # pair need not have an intervening telemetry read — so on back-to-back
+        # roasts through one adapter the first state of the new session can
+        # carry the previous roast's token. Left unreset, that either ages the
+        # new run's first reading from the old run's clock (passing a stale
+        # reading as fresh) or declines it immediately and burns the new run's
+        # one-shot decline warning on a phantom.
+        self._last_ambient_token = None
+        self._ambient_token_change_monotonic = None
         if recording_origin is not None and recording_roast_num is not None:
             try:
                 await self._client.set_recording_metadata(recording_origin, recording_roast_num)
