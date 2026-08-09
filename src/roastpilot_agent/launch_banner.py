@@ -27,7 +27,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from roastpilot_agent.config import AppConfig
 from roastpilot_agent.controller import AUTO_ADVICE_PHASES
@@ -58,6 +58,30 @@ class LaunchBannerLines:
 
     advisor_cfg: str
     trim: str
+
+
+def _changed_fields(model: BaseModel) -> set[str]:
+    """Return the names of *model*'s fields whose value differs from the default.
+
+    A field declared with ``default_factory`` has ``FieldInfo.default`` set to
+    ``PydanticUndefined``, which never equals the instance value. Comparing
+    against it would mark such a field permanently non-default and tag every
+    roast, so those fields are skipped rather than guessed at — no field in the
+    sections this module reads uses a factory today, and the guard keeps it that
+    way if one is added.
+
+    Args:
+        model: Any Pydantic model instance.
+
+    Returns:
+        The set of field names whose resolved value differs from the schema
+        default, excluding ``default_factory`` fields.
+    """
+    return {
+        name
+        for name, spec in type(model).model_fields.items()
+        if spec.default_factory is None and getattr(model, name) != spec.default
+    }
 
 
 def _advisor_line(config: AppConfig) -> str:
@@ -133,24 +157,25 @@ def _trim_line(config: AppConfig) -> str:
         the resolved state is non-default.
     """
     trim = config.controller.pre_first_crack_levers.late_maillard_trim
-    fields = type(trim).model_fields
     heat_target = config.controller.pre_first_crack_levers.heat_target_percent
     if not trim.enabled:
         return (
-            f"DISABLED — no trim window; flat {heat_target}% pre-FC floor "
-            f"holds to first crack{EXPERIMENT_TAG}"
+            f"DISABLED — no trim window; flat pre-FC floor {heat_target}% "
+            f"(config; a bean's pre_fc_heat overrides){EXPERIMENT_TAG}"
         )
     if trim.adaptive_depth_enabled:
         return (
             f"ADAPTIVE — #386 RoR-keyed depth, base {trim.base_trim}% "
             f"within {trim.min_trim}–{trim.max_trim}% (experiment, watch the cut)"
         )
-    # "proven roast-6 default" is a claim about the WHOLE fixed-mode trim, not
-    # just its depth: changing the window or the bean-temp threshold changes
-    # when the cut engages and so changes the roast. Compare the section
-    # field-by-field rather than naming the fields that matter — an enumerated
-    # list drifts silently the next time a field is added.
-    changed = sorted(name for name, spec in fields.items() if getattr(trim, name) != spec.default)
+    # "proven roast-6 default" is a claim about the whole ACTIVE fixed-mode
+    # trim, not just its depth: moving the window or the bean-temp threshold
+    # changes when the cut engages and so changes the roast. Compare the section
+    # field-by-field rather than naming the fields that matter (an enumerated
+    # list drifts the next time a field is added), minus the adaptive-only group
+    # the model itself declares — those are inert with adaptive mode off, and a
+    # tag that fires on the proven baseline arm teaches the operator to ignore it.
+    changed = sorted(_changed_fields(trim) - type(trim).ADAPTIVE_ONLY_FIELDS)
     if not changed:
         return f"fixed {trim.trim_heat_percent}% (proven roast-6 default)"
     return f"fixed {trim.trim_heat_percent}% (non-default: {', '.join(changed)}){EXPERIMENT_TAG}"

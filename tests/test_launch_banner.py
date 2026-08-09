@@ -42,6 +42,7 @@ from roastpilot_agent.launch_banner import (
     ADVISOR_PHASES,
     EXPERIMENT_TAG,
     LaunchBannerLines,
+    _changed_fields,  # pyright: ignore[reportPrivateUsage]
     _one_line,  # pyright: ignore[reportPrivateUsage]
     load_banner_lines,
     main,
@@ -262,6 +263,57 @@ def test_trim_line_flags_a_non_default_window_at_the_proven_depth() -> None:
     assert "proven" not in lines.trim
 
 
+def test_inert_adaptive_coefficients_do_not_tag_a_default_fixed_arm() -> None:
+    """With adaptive OFF, a non-default adaptive coefficient changes nothing.
+
+    `depth_for` returns `trim_heat_percent` immediately when adaptive mode is
+    off and the controller's damping is never called, so tagging this roast
+    would fire ⚠ EXPERIMENT on the proven baseline arm and teach the operator
+    to ignore the tag (local Codex P2 + safety-reviewer, folded pre-open).
+    """
+    config = AppConfig(
+        advisor=AdvisorConfig(),
+        controller=ControllerConfig(
+            pre_first_crack_levers=PreFirstCrackLevers(
+                late_maillard_trim=LateMaillardTrim(base_trim=60, k_ror=1.7, min_trim=40)
+            )
+        ),
+    )
+
+    lines = resolve_banner_lines(config)
+
+    assert lines.trim == "fixed 65% (proven roast-6 default)"
+    assert EXPERIMENT_TAG not in lines.trim
+
+
+def test_adaptive_only_fields_all_exist_on_the_model() -> None:
+    """Every name in the declared adaptive-only group is a real field.
+
+    The group is subtracted from the non-default scan, so a typo or a rename
+    would silently stop excluding a field (or silently exclude nothing).
+    """
+    assert set(LateMaillardTrim.model_fields) >= LateMaillardTrim.ADAPTIVE_ONLY_FIELDS
+    # And the group must not swallow the fields fixed mode DOES consume.
+    assert LateMaillardTrim.ADAPTIVE_ONLY_FIELDS.isdisjoint(
+        {"enabled", "trim_heat_percent", "window_fc_eta_seconds", "min_bean_temp_c"}
+    )
+
+
+def test_changed_fields_skips_default_factory_fields() -> None:
+    """A default_factory field is never reported as changed.
+
+    `FieldInfo.default` is `PydanticUndefined` for such a field, so a naive
+    comparison would mark it permanently non-default and tag every roast
+    (safety-reviewer note, folded pre-open). `AdvisorConfig.model_slug_by_phase`
+    is the live example.
+    """
+    assert "model_slug_by_phase" not in _changed_fields(AdvisorConfig())
+    assert "model_slug_by_phase" not in _changed_fields(
+        AdvisorConfig(model_slug_by_phase={RoastPhase.DEVELOPMENT: "openai/gpt-4.1-mini"})
+    )
+    assert _changed_fields(AdvisorConfig(prompt_version="c11")) == {"prompt_version"}
+
+
 def test_trim_line_default_depth_is_untagged(config_file: Path) -> None:
     """The proven 65 % default keeps its plain, untagged wording."""
     assert load_banner_lines().trim == "fixed 65% (proven roast-6 default)"
@@ -289,7 +341,9 @@ def test_disabled_trim_is_reported_as_disabled_not_as_its_dead_depth(
 
     trim = load_banner_lines().trim
 
-    assert trim.startswith("DISABLED — no trim window; flat 100% pre-FC floor")
+    assert trim.startswith(
+        "DISABLED — no trim window; flat pre-FC floor 100% (config; a bean's pre_fc_heat overrides)"
+    )
     assert EXPERIMENT_TAG in trim
     assert "ADAPTIVE" not in trim
     assert "60%" not in trim

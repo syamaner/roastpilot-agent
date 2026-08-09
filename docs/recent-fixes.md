@@ -685,6 +685,16 @@ Format: one entry per anti-pattern.
   a depth or adaptive band left in the saved config is dead and must not be
   announced. Before printing a config value, follow it to its consumer, and
   check whether that consumer runs at all.
+- **And the symmetric half:** a warning that fires on inert config is as bad as
+  a missing one — it trains the operator to ignore the tag. Comparing the whole
+  `LateMaillardTrim` section against defaults tagged `base_trim`/`k_ror` on a
+  roast running the proven fixed 65 % cut, because those are read only in
+  adaptive mode. The fix that scales is a `ClassVar` group declared BESIDE the
+  fields (`LateMaillardTrim.ADAPTIVE_ONLY_FIELDS`), subtracted from a
+  whole-section scan: drift-proof both ways, because a new coefficient joins the
+  group in the same edit that adds it. Also note `FieldInfo.default` is
+  `PydanticUndefined` for a `default_factory` field, so a naive
+  value-vs-default scan would report it permanently non-default.
 - **Guarded by:** `tests/test_launch_banner.py` — a saved-only `prompt_version`
   must reach the banner, a saved-only non-default must be tagged, a shadowed
   `model_slug` must be reported as shadowed, and a disabled trim must report

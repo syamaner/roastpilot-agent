@@ -212,8 +212,12 @@ ADV="advisor configured"
 # dashboard — not by re-reading this banner, which still shows roast 1's arm.
 BANNER_UNRESOLVED='unresolved (config read failed — see the error above)'
 BANNER_LINES="$(python -m roastpilot_agent.launch_banner)" || BANNER_LINES=""
-ADVISOR_CFG="$(printf '%s\n' "$BANNER_LINES" | sed -n '1p')"
-TRIM="$(printf '%s\n' "$BANNER_LINES" | sed -n '2p')"
+# `|| true` so a missing/broken sed degrades to the "unresolved" banner below
+# rather than aborting the launcher under `set -e` with no diagnosis — the same
+# fail-soft direction the rest of this block takes (a banner is never a reason
+# to refuse to roast; the port guard is, and keeps its hard failure).
+ADVISOR_CFG="$(printf '%s\n' "$BANNER_LINES" | sed -n '1p' || true)"
+TRIM="$(printf '%s\n' "$BANNER_LINES" | sed -n '2p' || true)"
 [ -n "$ADVISOR_CFG" ] || ADVISOR_CFG="$BANNER_UNRESOLVED"
 [ -n "$TRIM" ] || TRIM="$BANNER_UNRESOLVED"
 

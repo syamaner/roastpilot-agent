@@ -72,6 +72,7 @@ from roastpilot_agent.safety import (
 )
 
 __all__ = [
+    "AUTO_ADVICE_PHASES",
     "TRANSITION_TABLE",
     "UNIVERSAL_TARGETS",
     "AdvisoryCallPolicy",

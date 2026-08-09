@@ -8,7 +8,7 @@ validation at E12 (E12-S1).
 """
 
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, ClassVar, Literal
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -267,6 +267,30 @@ class LateMaillardTrim(BaseModel):
     #: fast enough to track the genuine pre-FC acceleration and slow enough
     #: to suppress the ~12 pp/tick thrash observed on roast 7.
     trim_depth_slew_pp_per_tick: int = Field(default=3, ge=1, le=20)
+
+    #: The fields consumed ONLY while :attr:`adaptive_depth_enabled` is ``True``
+    #: — the #386 formula's inputs plus the #412 damping coefficients. With
+    #: adaptive mode off, :meth:`depth_for` returns ``trim_heat_percent``
+    #: immediately and the controller's damping is never called, so a
+    #: non-default value in this group changes nothing about the roast.
+    #: Declared HERE, beside the fields, so a new coefficient joins the group in
+    #: the same edit that adds it. Consumer: the roast-live banner (#746)
+    #: subtracts this group before calling a fixed-mode trim non-default —
+    #: tagging an inert value ⚠ EXPERIMENT would fire the warning on the proven
+    #: baseline arm and train the operator to ignore it.
+    ADAPTIVE_ONLY_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "base_trim",
+            "k_ror",
+            "k_eta",
+            "ror_ref",
+            "eta_ref",
+            "min_trim",
+            "max_trim",
+            "trim_depth_deadband_pp",
+            "trim_depth_slew_pp_per_tick",
+        }
+    )
 
     @model_validator(mode="after")
     def _check_adaptive_range(self) -> "LateMaillardTrim":
