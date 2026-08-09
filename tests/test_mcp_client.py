@@ -50,6 +50,7 @@ from roastpilot_agent.mcp_client import (
     parse_tool_result,
     project_live_ambient,
     project_mic_status,
+    project_recordable_ambient,
     project_session_state,
     resolve_mcp_command,
 )
@@ -2659,6 +2660,55 @@ def test_project_live_ambient_ok_status_passes_through_triad() -> None:
     """#464 (D86): an ``"ok"`` ambient status yields the live triad verbatim."""
     state = RoastSessionState.model_validate(SESSION_STATE_PAYLOAD)
     assert project_live_ambient(state.ambient_status) == (28.49, 38.6, 1008.56)
+
+
+def test_project_recordable_ambient_is_strictly_narrower_than_live() -> None:
+    """#745: the recordable predicate adds a dateability clause to the live one.
+
+    "Strictly narrower" is the load-bearing property — it is what closes the hole
+    between #745's two fixes, where a reading the live advisor declines could
+    still be persisted as the run's corpus breadcrumb. Asserted directly here
+    rather than only through the two api-level capture tests, so the relationship
+    between the two predicates is pinned rather than inferred (safety-reviewer
+    finding 1, folded pre-open).
+
+    The four cases are the full cross-product that matters: the healthy one, and
+    each way a reading can be unusable.
+    """
+
+    def _status(**overrides: object) -> AmbientStatus:
+        payload = {
+            **SESSION_STATE_PAYLOAD,
+            "ambient_status": {
+                **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[dict-item]
+                **overrides,
+            },
+        }
+        return RoastSessionState.model_validate(payload).ambient_status
+
+    triad = (28.49, 38.6, 1008.56)
+    nulls = (None, None, None)
+
+    # ok + running + a finite stamp: both predicates agree on the triad.
+    healthy = _status()
+    assert project_live_ambient(healthy) == triad
+    assert project_recordable_ambient(healthy) == triad
+
+    # ok + running but UNDATEABLE: this is the narrowing. The live projection
+    # still forwards it (the controller declines it on the age instead); the
+    # recordable one must not persist it.
+    undateable = _status(last_reading_monotonic_seconds=float("nan"))
+    assert project_live_ambient(undateable) == triad
+    assert project_recordable_ambient(undateable) == nulls
+
+    # Stopped-but-"ok" runtime: both reject, inherited from project_live_ambient.
+    stopped = _status(ambient_running=False)
+    assert project_live_ambient(stopped) == nulls
+    assert project_recordable_ambient(stopped) == nulls
+
+    # No reading at all: the MCP nulls the stamp and the triad together.
+    absent = _status(last_reading_monotonic_seconds=None)
+    assert project_recordable_ambient(absent) == nulls
 
 
 def test_project_live_ambient_non_ok_status_is_none() -> None:

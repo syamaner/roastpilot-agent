@@ -704,7 +704,21 @@ def project_recordable_ambient(
     run would read back as "had ambient", and #737's offline eval would stamp
     that value into every replayed context — reasoning on a reading the live
     advisor rejected, which is precisely the mislabelled RP-B arm (#709) that
-    #745 exists to remove. One predicate, so the two cannot disagree.
+    #745 exists to remove. One predicate, so the two cannot disagree **about
+    whether a real, dateable reading existed at charge**.
+
+    That is deliberately narrower than "the advisor reasoned on ambient", and
+    the difference is worth stating precisely rather than leaving a half-true
+    claim in a safety-adjacent docstring. The doctrine applies two further
+    clauses this predicate does not (see below), so a run CAN carry a recorded
+    triad while every advisory tick declined the reading: a running-but-not-
+    polled probe holding a finite, unchanging stamp — the one freeze path
+    ``ambient_running`` cannot catch, documented on
+    :meth:`RoasterControlAdapter._observe_ambient_age` — or a runtime that stops
+    AFTER charge. Today the only signal for that is a run-id-less process log,
+    which is the same gap #742 raises for doctrine retirement and is tracked
+    there. **A populated ambient column is therefore not evidence that the
+    doctrine saw ambient**; scoring a c11 arm needs #742's per-run record.
 
     It deliberately does **not** apply the doctrine's
     ``max_reading_age_seconds`` bound, and is not gated on the doctrine being

@@ -1223,7 +1223,13 @@ class RoastRunner:
         as "had ambient" and the offline eval (#737) then stamps that value into
         every replayed context, comparing arms on a reading the doctrine would
         never have reasoned on. Sharing one predicate means the two cannot
-        disagree.
+        disagree about whether a real, dateable reading existed at charge.
+
+        That is narrower than "the advisor reasoned on ambient", and the column
+        must not be read as evidence of it: the doctrine also gates on its
+        enable flag and ``max_reading_age_seconds``, neither of which belongs to
+        this corpus question. See :func:`project_recordable_ambient` for the two
+        concrete cases, tracked under #742.
 
         A ``"disabled"``/``"unavailable"`` MCP ambient config, and now a
         stopped-but-``"ok"`` runtime or an undateable reading, persist nulls
