@@ -2662,6 +2662,22 @@ def test_project_live_ambient_ok_status_passes_through_triad() -> None:
     assert project_live_ambient(state.ambient_status) == (28.49, 38.6, 1008.56)
 
 
+def _ambient_status_with(**overrides: object) -> AmbientStatus:
+    """The fixture ambient status with ``overrides`` applied to its fields.
+
+    Shared by the #745 predicate/token tests so the merge-into-SESSION_STATE_
+    PAYLOAD pattern lives once (claude-review low, folded pre-ready).
+    """
+    payload = {
+        **SESSION_STATE_PAYLOAD,
+        "ambient_status": {
+            **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[dict-item]
+            **overrides,
+        },
+    }
+    return RoastSessionState.model_validate(payload).ambient_status
+
+
 def test_project_recordable_ambient_is_strictly_narrower_than_live() -> None:
     """#745: the recordable predicate adds a dateability clause to the live one.
 
@@ -2676,38 +2692,28 @@ def test_project_recordable_ambient_is_strictly_narrower_than_live() -> None:
     each way a reading can be unusable.
     """
 
-    def _status(**overrides: object) -> AmbientStatus:
-        payload = {
-            **SESSION_STATE_PAYLOAD,
-            "ambient_status": {
-                **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[dict-item]
-                **overrides,
-            },
-        }
-        return RoastSessionState.model_validate(payload).ambient_status
-
     triad = (28.49, 38.6, 1008.56)
     nulls = (None, None, None)
 
     # ok + running + a finite stamp: both predicates agree on the triad.
-    healthy = _status()
+    healthy = _ambient_status_with()
     assert project_live_ambient(healthy) == triad
     assert project_recordable_ambient(healthy) == triad
 
     # ok + running but UNDATEABLE: this is the narrowing. The live projection
     # still forwards it (the controller declines it on the age instead); the
     # recordable one must not persist it.
-    undateable = _status(last_reading_monotonic_seconds=float("nan"))
+    undateable = _ambient_status_with(last_reading_monotonic_seconds=float("nan"))
     assert project_live_ambient(undateable) == triad
     assert project_recordable_ambient(undateable) == nulls
 
     # Stopped-but-"ok" runtime: both reject, inherited from project_live_ambient.
-    stopped = _status(ambient_running=False)
+    stopped = _ambient_status_with(ambient_running=False)
     assert project_live_ambient(stopped) == nulls
     assert project_recordable_ambient(stopped) == nulls
 
     # No reading at all: the MCP nulls the stamp and the triad together.
-    absent = _status(last_reading_monotonic_seconds=None)
+    absent = _ambient_status_with(last_reading_monotonic_seconds=None)
     assert project_recordable_ambient(absent) == nulls
 
 
@@ -2898,23 +2904,24 @@ def test_ambient_reading_token_rejects_non_finite_stamps() -> None:
     which must not be confused with absent — passes through unchanged.
     """
 
-    def _status(stamp: float | None) -> AmbientStatus:
-        payload = {
-            **SESSION_STATE_PAYLOAD,
-            "ambient_status": {
-                **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[dict-item]
-                "last_reading_monotonic_seconds": stamp,
-            },
-        }
-        return RoastSessionState.model_validate(payload).ambient_status
-
-    assert ambient_reading_token(_status(float("nan"))) is None
-    assert ambient_reading_token(_status(float("inf"))) is None
-    assert ambient_reading_token(_status(float("-inf"))) is None
-    assert ambient_reading_token(_status(None)) is None
+    assert (
+        ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=float("nan")))
+        is None
+    )
+    assert (
+        ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=float("inf")))
+        is None
+    )
+    assert (
+        ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=float("-inf")))
+        is None
+    )
+    assert ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=None)) is None
     # 0.0 is a legitimate stamp and must not be confused with absent.
-    assert ambient_reading_token(_status(0.0)) == 0.0
-    assert ambient_reading_token(_status(1230.0)) == 1230.0
+    assert ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=0.0)) == 0.0
+    assert (
+        ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=1230.0)) == 1230.0
+    )
 
 
 @pytest.mark.asyncio

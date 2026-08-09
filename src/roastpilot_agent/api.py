@@ -1207,29 +1207,13 @@ class RoastRunner:
         run's ambient triad reading back ``None``.
 
         The triad comes from :func:`project_recordable_ambient` rather than a
-        second hand-rolled ``status == "ok"`` test (#745a). That is not a
-        ``status``-only question on either clause:
-
-        * ``ambient_running`` — the MCP's ``AmbientSessionRuntime._stop_locked``
-          drops its reader while deliberately leaving ``status`` at ``"ok"``
-          over the preserved last reading, so a ``status``-only test records a
-          frozen reading from a stopped probe as this run's corpus breadcrumb,
-          while the live paths correctly saw ambient as absent;
-        * a usable reading token — a reading whose freshness cannot be
-          established is one the live advisor declines (#745b), so recording it
-          would reintroduce the same disagreement one layer down.
-
-        Either way the cost is a mislabelled RP-B arm (#709): the run reads back
-        as "had ambient" and the offline eval (#737) then stamps that value into
-        every replayed context, comparing arms on a reading the doctrine would
-        never have reasoned on. Sharing one predicate means the two cannot
-        disagree about whether a real, dateable reading existed at charge.
-
-        That is narrower than "the advisor reasoned on ambient", and the column
-        must not be read as evidence of it: the doctrine also gates on its
-        enable flag and ``max_reading_age_seconds``, neither of which belongs to
-        this corpus question. See :func:`project_recordable_ambient` for the two
-        concrete cases, tracked under #742.
+        second hand-rolled ``status == "ok"`` test (#745): a ``status``-only
+        check records a frozen reading from a stopped probe, or one nothing can
+        date, as this run's corpus breadcrumb while the live paths correctly saw
+        ambient as absent — a mislabelled RP-B arm (#709). That predicate's own
+        docstring carries the full rationale, including why a populated column
+        is NOT evidence that the doctrine reasoned on ambient (#742); it is not
+        repeated here.
 
         A ``"disabled"``/``"unavailable"`` MCP ambient config, and now a
         stopped-but-``"ok"`` runtime or an undateable reading, persist nulls
