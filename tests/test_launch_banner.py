@@ -143,11 +143,11 @@ def test_shadowed_model_slug_reports_the_model_the_advisor_actually_uses(
     lines = load_banner_lines()
 
     assert lines.advisor_cfg.startswith("openai/gpt-4o ")
-    # Named as advice-less, NOT as unused: healthcheck() probes with the base
-    # slug, so an invalid one still drives the startup advisor status.
+    # Named as not-the-advice-model, NOT as unused: healthcheck() probes with
+    # the base slug and bean-sourcing extraction falls back to it off
+    # OpenRouter, so an "unused"/"only" claim would be false.
     assert (
-        "config model_slug openai/gpt-4.1-mini gives no roast advice;"
-        " startup reachability probe only"
+        "config model_slug openai/gpt-4.1-mini is NOT the roast-advice model"
     ) in lines.advisor_cfg
     # The RESOLVED pair is the untouched baseline, so this is not an experiment.
     assert EXPERIMENT_TAG not in lines.advisor_cfg
@@ -167,7 +167,7 @@ def test_effective_non_default_model_is_tagged_experiment() -> None:
     assert lines.advisor_cfg == "openai/gpt-4.1-mini  ·  prompt c3" + EXPERIMENT_TAG
     # The base slug is the schema default here, so it is shadowed silently —
     # the warning is reserved for a slug the operator actually set.
-    assert "no roast advice" not in lines.advisor_cfg
+    assert "NOT the roast-advice model" not in lines.advisor_cfg
 
 
 def test_a_base_slug_that_matches_the_override_is_not_called_advice_less() -> None:
@@ -189,7 +189,7 @@ def test_a_base_slug_that_matches_the_override_is_not_called_advice_less() -> No
     lines = resolve_banner_lines(config)
 
     assert lines.advisor_cfg == "openai/gpt-4.1-mini  ·  prompt c3" + EXPERIMENT_TAG
-    assert "no roast advice" not in lines.advisor_cfg
+    assert "NOT the roast-advice model" not in lines.advisor_cfg
 
 
 def test_pre_fc_only_model_override_is_not_advertised() -> None:

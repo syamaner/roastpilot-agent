@@ -99,8 +99,11 @@ def _advisor_line(config: AppConfig) -> str:
     saved there (or exported) is shadowed for roast advice. Printing the base
     slug would announce an arm the roast is not running — the same lie in the
     other direction — so the line names an operator-set shadowed slug and says
-    what it does still do: ``healthcheck`` probes reachability with the BASE
-    slug, so a changed or invalid one still shapes the startup advisor status.
+    only what the operator needs at pre-charge: it is not the advice model. It
+    deliberately does NOT enumerate what the base slug IS still used for —
+    ``healthcheck`` probes reachability with it, and bean-sourcing extraction
+    falls back to it off OpenRouter — because any such list is an "only" claim
+    that goes stale the next time a consumer is added.
 
     Args:
         config: The resolved application config (env over saved file over
@@ -122,10 +125,7 @@ def _advisor_line(config: AppConfig) -> str:
     # base slug left at the schema default is shadowed too, but silently and
     # harmlessly — saying so on an ordinary roast would be noise.
     if advisor.model_slug != default_model and advisor.model_slug not in resolved:
-        model_text += (
-            f" (config model_slug {advisor.model_slug} gives no roast advice;"
-            " startup reachability probe only)"
-        )
+        model_text += f" (config model_slug {advisor.model_slug} is NOT the roast-advice model)"
 
     is_default = resolved == {default_model} and (
         advisor.prompt_version == fields["prompt_version"].default
