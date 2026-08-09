@@ -20,8 +20,10 @@ validation. Exact model IDs and explicit effort are set for every named-subagent
 role, `AGENTS.md` agrees, the inline workflow stages in `review-branch.mjs` are
 pinned, and a consistency test (`tests/test_agent_model_pins.py`) guards the pins
 against drift and against committed settings that would defeat them (the
-repository side of the §5 override surface). Two §16 adoption criteria remain
-outstanding: the §15 evaluation across all five archetypes — not a five-case
+repository side of the §5 override surface). Three §16 adoption criteria remain
+outstanding. First, delivery of §7's worktree and copy-restore rules into the
+role definitions that carry none of them (#733) — the control is stated but not
+in force. Second, the §15 evaluation across all five archetypes — not a five-case
 count, since a single story may cover more than one. RP-B (#709) supplies
 evidence on two (ambiguous multi-slice, safety-sensitive), but **as a FAILURE
 case, which does not yet validate them**: no planner was invoked on it, so it
@@ -30,7 +32,7 @@ model and contract on either archetype. Counting those two as validated would
 let the topology be marked ready on the strength of an entry that records the
 rule being broken. They need a subsequent applicable story run UNDER the
 revised rule; three further archetype-defining stories are needed regardless
-(§15; the §16 evaluation-evidence criterion) — and the Product PM main-session
+(§15; the §16 evaluation-evidence criterion). Third, the Product PM main-session
 pin, which is an
 operator setting (`model: claude-opus-5` or `--model`, never `default`), not
 repository config. The live-environment and organisation side of the §5 override
@@ -376,6 +378,13 @@ This topology is ready when:
 - Named subagents retain explicit role-specific output contracts.
 - Automated consumers use schema validation rather than relying on prose style.
 - Evaluation evidence supports the selected models and effort levels.
+- **The §7 worktree, copy-restore and committed-tree rules are delivered into the
+  role definitions they bind** (`qa`, `safety-reviewer`, `pr-triage`, the
+  engineer roles), not only stated here. Tracked by **#733**. Added because §7
+  currently declares those rules normative while every role it binds is silent
+  on them: without this criterion the topology could become the validated
+  default with a safety control documented but not in force, which is the exact
+  gap §7's own text names.
 
 ## 17. Non-goals
 

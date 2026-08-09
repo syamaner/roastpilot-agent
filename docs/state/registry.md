@@ -169,9 +169,7 @@
 > 9 Aug 2026: **one shared D-number series for the whole `roastpilot-plan` repo,
 > next free being one past the highest defined anywhere in it.** D149
 > (`factory.md`'s `## D149:` heading) was the previous maximum;
-> `roastpilot-agent/plan.md`'s own maximum is D129. Take D150 because it is the only
-> answer that is safe under both readings of an unresolved ambiguity, described
-> next; do not "optimise" it down.
+> `roastpilot-agent/plan.md`'s own maximum is D129. Take **D151**; D150 is spent.
 >
 > **There is a live decision-number COLLISION in the plan repo, and it is not yet
 > resolved.** `roastpilot-agent/plan.md` (this repo) and

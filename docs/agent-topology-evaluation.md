@@ -271,15 +271,20 @@ category, not a mid-flight one.
 
 ### Unnecessary agent spawns
 
-None — but the count is **four for this case**, not the two an earlier draft of
-this section asserted. The usage table above records five delegated agents
-because it is measured over the whole session, which also covered the sibling PR
-#739; `triage-739` is therefore listed for completeness of the cost figures but
-sits outside this entry's #731 scope. **Five spawned, four in this entry's scope:**
+None — and the in-scope count is **three**, where an earlier draft of this
+section said two and a later one said four. Both were wrong, in opposite
+directions, and the second is the more instructive: after narrowing this entry to
+#731 I reconciled every textual `#739`/`#741` mention but never re-audited the
+AGENT ROSTER, where the scope is buried in a name. **`eng-732` is named for issue
+#732, which PR #741 closes** — it implemented the freshness slice, not #731. The
+usage table above spans the whole session and therefore prices #739 and #741 work
+too; it is retained for cost completeness, not as this case's inventory.
+
+**Five spawned across the session, three in this entry's #731 scope:**
 
 | Agent | Why it was spawned | Redundant? |
 |---|---|---|
-| `eng-732` | Implementer for the freshness slice | No — the work itself |
+| `eng-732` | Implementer for the freshness slice | No — but **out of this entry's scope**: that slice is #741, not #731 |
 | `safety-b1` | Required lens (controller/safety diff) | No — §10 names it a control layer |
 | `qa-b1` | Required lens (test quality) | No — same |
 | `triage-731` | Author-independent triage of PR #731 | No — D23 forbids self-triage |
@@ -287,8 +292,8 @@ sits outside this entry's #731 scope. **Five spawned, four in this entry's scope
 
 §10 rules out subagents spawned "merely to re-check work the active model already
 verifies", and names independent safety, QA and author-independent triage as
-deliberate control layers rather than redundancy; each of the four review spawns
-is one of those. Note also that **§10's "three" is a CONCURRENCY cap, not a
+deliberate control layers rather than redundancy; each of the three in-scope
+spawns is one of those. Note also that **§10's "three" is a CONCURRENCY cap, not a
 budget for total spawns** — the earlier draft cited it against a total, which
 would have read as a ceiling this case was near when in fact it does not bound
 totals at all.
