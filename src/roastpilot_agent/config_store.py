@@ -58,6 +58,7 @@ from typing import Any, Literal, cast
 import yaml
 from pydantic import BaseModel, Field
 
+from roastpilot_agent.advisor_screen import screen_warning
 from roastpilot_agent.config import (
     AdvisorConfig,
     AppConfig,
@@ -224,6 +225,15 @@ class ConfigFieldMeta(BaseModel, frozen=True):
     #: the key is simply absent from it (fails soft — see
     #: :func:`~roastpilot_agent.mcp_yaml.read_yaml_value`).
     yaml_value: Any = None
+    #: An operator-facing warning about the EFFECTIVE value, or ``None`` when
+    #: there is nothing to say (#754). Distinct from :attr:`description`, which
+    #: explains what the field is and never changes: this reacts to the value.
+    #: Populated today only for ``advisor.model_slug``, carrying the FC-latency
+    #: screen verdict from :mod:`~roastpilot_agent.advisor_screen` — the same
+    #: text the pre-charge launcher banner prints, so the two cannot drift.
+    #: ``None`` on the pinned baseline, so an ordinary config shows no warning
+    #: and the warning keeps its meaning.
+    advisory: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +551,7 @@ def _make_field_meta(
     description: str,
     injected_keys: frozenset[str] | None = None,
     yaml_value: Any = None,
+    advisory: str | None = None,
 ) -> ConfigFieldMeta:
     """Construct a :class:`ConfigFieldMeta` for one managed field.
 
@@ -562,6 +573,8 @@ def _make_field_meta(
         yaml_value: The value currently in the hand-authored MCP yaml for this
             field (#482), or ``None`` for non-``mcp_device`` fields and fields
             where no yaml value is resolvable.
+        advisory: An operator-facing warning about the effective value (#754),
+            or ``None`` when there is nothing to say.
 
     Returns:
         A frozen :class:`ConfigFieldMeta` instance.
@@ -666,6 +679,7 @@ def build_config_snapshot(
         read_only: bool = False,
         description: str = "",
         yaml_value: Any = None,
+        advisory: str | None = None,
     ) -> ConfigFieldMeta:
         return _make_field_meta(
             saved_value=saved,
@@ -676,6 +690,7 @@ def build_config_snapshot(
             description=description,
             injected_keys=injected_keys,
             yaml_value=yaml_value,
+            advisory=advisory,
         )
 
     # --- controller section ------------------------------------------------
@@ -890,6 +905,13 @@ def build_config_snapshot(
                 "The advisor model slug (provider/model-id via OpenRouter)."
                 " Default 'openai/gpt-4o' (#277 bake-off pin)."
             ),
+            # The FC-latency screen verdict for the model this config would
+            # actually run (#754). The launcher banner carries the same text
+            # from the same function, but it is a LAUNCH-TIME snapshot and
+            # /config is where an operator switches arms BETWEEN roasts (D78
+            # applies next-roast), so a warning living only in the banner
+            # missed the path the A/B workflow actually uses.
+            advisory=screen_warning(adv, effective.controller.advisory_timeout_seconds),
         ),
         prompt_version=_meta(
             adv_saved.get("prompt_version"),

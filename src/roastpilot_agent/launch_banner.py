@@ -29,13 +29,8 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, ValidationError
 
-from roastpilot_agent.config import (
-    FC_LATENCY_BUSTED_ADVISOR_ARMS,
-    FC_LATENCY_SCREENED_ADVISOR_ARMS,
-    OPENROUTER_BASE_URL,
-    AdvisorConfig,
-    AppConfig,
-)
+from roastpilot_agent.advisor_screen import screen_warning
+from roastpilot_agent.config import AppConfig
 from roastpilot_agent.controller import AUTO_ADVICE_PHASES
 
 #: Appended to a banner line whose RESOLVED value differs from the schema
@@ -90,139 +85,6 @@ def _changed_fields(model: BaseModel) -> set[str]:
     }
 
 
-def _arm_matches(slug: str, effort: str | None, known: frozenset[tuple[str, str | None]]) -> bool:
-    """Whether the ``(slug, effort)`` ARM appears in *known*.
-
-    Matching is EXACT on the slug as configured — no stripping, no case folding
-    (local Codex P2, folded pre-open). The rule is: report on the string that
-    will actually be DISPATCHED. ``AdvisorConfig`` and ``build_model`` send the
-    slug verbatim, so a normalisation here that the dispatch path does not share
-    lets the banner clear one identifier while the provider is sent another. A
-    hand-edited ``" openai/gpt-4o "`` is not the measured arm — it is a string
-    the provider may well reject — and the honest report is "no screen on
-    record", the same answer a ``:variant`` suffix gets, for the same reason.
-    Erring toward the warning is also the safe direction.
-
-    Every screen ran on OpenRouter, where slugs carry a vendor prefix, so
-    ``someone-else/gpt-4o`` never inherits ``openai/gpt-4o``'s measurement.
-    (Callers void the whole table for a non-OpenRouter endpoint, which is why no
-    bare native-provider name is matched here — an unmeasured endpoint is
-    unmeasured whatever it is called.)
-
-    Args:
-        slug: A resolved advisor model slug, exactly as it will be dispatched.
-        effort: The configured ``reasoning_effort`` (``None`` = provider default).
-        known: The canonical lower-case ``(slug, effort)`` arms to match against.
-
-    Returns:
-        ``True`` when the arm was measured.
-    """
-    return (slug, effort) in known
-
-
-def _latency_screen_note(
-    advisor: AdvisorConfig, resolved: set[str], advisory_timeout_seconds: float
-) -> str:
-    """The FC-latency soft warning for the models that will give advice (D151).
-
-    Advisory only — nothing here rejects or substitutes a model.  Making
-    ``model_slug`` effective (#747) removed the accidental protection that had
-    made a tick-busting model unreachable, and the operator chose a warning over
-    a hard guard: an allow-list would be stale the day a model ships and would
-    reject far from the roast, whereas this fires at the pre-charge moment the
-    operator can still act on it.
-
-    Three classes, because "measured, and it busts" is a much stronger thing to
-    say than "nothing on record" and the two must not be collapsed:
-
-    * screened as clearing the gate — silent, so an ordinary roast stays quiet
-      and the warning keeps its meaning;
-    * screened and BUSTED — named, with what that costs;
-    * neither — named as unverified, which is a prompt to screen it, not a
-      verdict against it.
-
-    A screen measures an ``(endpoint, slug, reasoning effort)`` triple, not a
-    slug (local Codex P2 + safety-reviewer, both folded pre-open). Slug and
-    effort are matched together as an ARM; the ENDPOINT is checked here, once,
-    because every screen ran on OpenRouter via ``openai_compatible`` — any other
-    provider or base URL voids the whole table rather than matching a row.
-
-    Keying on the slug alone is not merely imprecise, it INVERTS the evidence in
-    a real case: ``gpt-5.5`` busts at the provider default but was measured
-    passing at 2.9 s with ``reasoning_effort="off"``, an arm the 8 Jun report
-    documents as a deliberate speed/cost option. Printing "BUSTED" over the
-    operator's own measured-passing configuration is worse than silence — it
-    teaches them the warning is noise.
-
-    Args:
-        advisor: The resolved advisor config, for the endpoint/effort qualifier.
-        resolved: The distinct model slugs :data:`ADVISOR_PHASES` resolves to.
-        advisory_timeout_seconds: ``ControllerConfig.advisory_timeout_seconds``
-            — the bound the CONTROLLER puts on the advisory await, which is what
-            caps how long a slow call holds the loop. Not
-            ``AdvisorConfig.timeout_seconds`` (the provider request timeout);
-            the controller's is the one that actually fires.
-
-    Returns:
-        The note to append to the advisor line, or ``""`` when every resolved
-        model has an applicable screen on record that cleared.
-    """
-    # The endpoint qualifier. ``provider`` alone can move the endpoint while
-    # ``provider_base_url`` sits unchanged at its default (a native-provider
-    # config leaves the OpenRouter URL inert but unused), so BOTH are checked —
-    # keying on the URL alone let a native provider inherit an OpenRouter
-    # measurement.
-    effort = advisor.reasoning_effort
-    voided = (
-        advisor.provider != "openai_compatible" or advisor.provider_base_url != OPENROUTER_BASE_URL
-    )
-    # Exact arm matching only, so an OpenRouter ``:variant`` suffix inherits
-    # NOTHING in either direction (local Codex P2, folded pre-open). An earlier
-    # draft let a variant inherit its base slug's BUSTED verdict, reasoning that
-    # ``:thinking`` is slower still — but ``:nitro`` selects FASTER routing and
-    # ``:free`` a different provider, so that inheritance presented an unmeasured
-    # arm as measured evidence, overstating the record in the name of caution.
-    # Unmeasured is unmeasured; a suffixed slug lands in ``unscreened``, which is
-    # still a warning, just a true one. Add an explicit row if one is screened.
-    busted = sorted(
-        m
-        for m in resolved
-        if not voided and _arm_matches(m, effort, FC_LATENCY_BUSTED_ADVISOR_ARMS)
-    )
-    unscreened = sorted(
-        m
-        for m in resolved
-        if voided
-        or (
-            not _arm_matches(m, effort, FC_LATENCY_SCREENED_ADVISOR_ARMS)
-            and not _arm_matches(m, effort, FC_LATENCY_BUSTED_ADVISOR_ARMS)
-        )
-    )
-    notes: list[str] = []
-    if busted:
-        notes.append(
-            f"⚠ {', '.join(busted)} BUSTED the ~5 s post-FC latency screen "
-            "(D40/D41) — advice lands late at the drop, and each late call "
-            "holds the control loop (next safety check + queued e-stop) for as "
-            f"long as it runs, bounded at {advisory_timeout_seconds:g} s"
-        )
-    if unscreened:
-        # Name the dimension that made it unmeasured, so the operator can tell
-        # "we never screened this model" from "we screened it, but not HERE" —
-        # different problems with different fixes.
-        if voided:
-            why = " at this endpoint (screens ran on OpenRouter)"
-        elif effort is not None:
-            why = f" at reasoning_effort={effort}"
-        else:
-            why = ""
-        notes.append(
-            f"⚠ no FC-latency screen on record for {', '.join(unscreened)}{why} — "
-            "the ~5 s post-FC advice slot (D40/D41) is unverified for it"
-        )
-    return "".join(f"   {note}" for note in notes)
-
-
 def _advisor_line(config: AppConfig) -> str:
     """Format the ``Advisor cfg:`` line from a fully-resolved config.
 
@@ -246,9 +108,10 @@ def _advisor_line(config: AppConfig) -> str:
     extraction falls back to it off OpenRouter — because any such list is an
     "only" claim that goes stale the next time a consumer is added.
 
-    The FC-latency note (:func:`_latency_screen_note`) rides on the same
-    resolved set, so the warning can never describe a model other than the one
-    about to give advice.
+    The FC-latency note comes from :func:`advisor_screen.screen_warning`, which
+    resolves the same phase gate, so the warning can never describe a model
+    other than the one about to give advice — and is the SAME text ``GET
+    /api/config`` carries, so the launcher and the UI cannot drift (#754).
 
     Args:
         config: The resolved application config (env over saved file over
@@ -277,7 +140,8 @@ def _advisor_line(config: AppConfig) -> str:
         advisor.prompt_version == fields["prompt_version"].default
     )
     tag = "" if is_default else EXPERIMENT_TAG
-    latency = _latency_screen_note(advisor, resolved, config.controller.advisory_timeout_seconds)
+    warning = screen_warning(advisor, config.controller.advisory_timeout_seconds)
+    latency = "" if warning is None else f"   ⚠ {warning}"
     return f"{model_text}  ·  prompt {advisor.prompt_version}{tag}{latency}"
 
 

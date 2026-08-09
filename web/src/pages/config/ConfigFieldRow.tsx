@@ -510,6 +510,22 @@ export function ConfigFieldRow({
           </p>
         )}
 
+        {/* Value-reactive warning (#754) — rendered ONLY when the server sends
+            one, so the pinned baseline stays quiet and the warning keeps its
+            meaning. The text is server-side (advisor_screen.screen_warning),
+            the same source the pre-charge launcher banner uses, so the UI
+            cannot drift from the launcher. Advisory only: it never disables
+            the input or blocks a save — the operator's choice stands (D151). */}
+        {meta.advisory && (
+          <p
+            data-testid={`advisory-${fieldDef.key}`}
+            role="status"
+            className="rounded-[9px] border border-roast-caution/50 bg-roast-caution/10 px-3 py-2 text-xs text-roast-caution"
+          >
+            ⚠ {meta.advisory}
+          </p>
+        )}
+
         {/* Default + reset-to-default (suppressed for action-only field types) */}
         <div className="flex items-center justify-between">
           {fieldDef.type === "masked" ? (

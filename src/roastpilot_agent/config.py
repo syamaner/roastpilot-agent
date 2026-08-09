@@ -1288,7 +1288,26 @@ class ControllerConfig(BaseModel):
     # no pre-FC advice at all there is nothing to suppress.
     advisory_post_charge_settle_max_seconds: float = Field(default=90.0, gt=0)
     advisory_post_charge_turning_point_ror_c_per_min: float = Field(default=0.0)
-    advisory_timeout_seconds: float = Field(default=10.0, gt=0)
+    # The bound on the advisory await, and therefore on how long a slow model
+    # DELAYS the control loop (operator decision, 9 Aug 2026, #747 / D151).
+    # Lowered 10.0 -> 5.0 to match the ~5 s FC-slot latency screen the advisor
+    # roster is chosen against: the call is awaited inline at the end of
+    # ``tick()`` and the serve loop is drain-operator-queue -> tick, so this
+    # number is exactly how long a stalled provider can hold off the next
+    # telemetry read, the next ``_evaluate_safety``, and the next drain of the
+    # operator queue (where the in-UI EMERGENCY STOP is consumed). Holding it at
+    # 2x the screen meant an unscreened model could hold the loop for twice as
+    # long as any model we would knowingly run.
+    #
+    # Margin against a FALSE timeout on the pinned model: gpt-4o measured
+    # 2.41/3.73 s median/max over 28 roasts (D40/D41) and 2.54/3.59 s (#396,
+    # 16 Jul), so 5.0 leaves >1 s over the worst observed call. An isolated
+    # overrun is already tolerated — it becomes one REJECT with the
+    # hold-current-targets fallback, and D30's stop needs THREE CONSECUTIVE
+    # failures (``_consecutive_advisor_failures`` resets on any good call), so a
+    # single slow tick cannot push a roast into recovery. A model that times out
+    # three times running is one that should not be driving the roast anyway.
+    advisory_timeout_seconds: float = Field(default=5.0, gt=0)
     t0_debounce_ticks: int = Field(default=3, ge=1)
     telemetry_log_interval_seconds: float = Field(default=5.0, gt=0)
     max_stale_telemetry_seconds: float = Field(default=3.0, gt=0)

@@ -79,7 +79,14 @@ def test_controller_defaults_match_orchestration_plan() -> None:
     # threshold 0.0 (RoR crosses zero).
     assert config.advisory_post_charge_settle_max_seconds == 90.0
     assert config.advisory_post_charge_turning_point_ror_c_per_min == 0.0
-    assert config.advisory_timeout_seconds == 10.0
+    # Lowered 10.0 -> 5.0 (operator, 9 Aug 2026, #747 / D151) to match the ~5 s
+    # FC-slot screen the advisor roster is chosen against. This is the bound on
+    # how long a slow model can hold the control loop off its next safety
+    # evaluation and its next drain of the operator queue (where the in-UI
+    # emergency stop is consumed), so holding it at 2x the screen let an
+    # unscreened model delay the loop for twice as long as any model we would
+    # knowingly run.
+    assert config.advisory_timeout_seconds == 5.0
     assert config.t0_debounce_ticks == 3
     assert config.telemetry_log_interval_seconds == 5.0
     assert config.max_stale_telemetry_seconds == 3.0
