@@ -22,6 +22,20 @@ from roastpilot_agent.models import RoastPhase
 TIMEOUT = ControllerConfig().advisory_timeout_seconds
 
 
+@pytest.fixture(autouse=True)
+def advisor_key_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Wire an API key, because ``screen_warning`` is silent without one.
+
+    No key means ``build_advisor`` returns ``None`` and nothing calls a model,
+    so a latency warning would be describing a call that cannot happen. These
+    tests are about the classification, so they assert the key-present world
+    EXPLICITLY rather than inheriting whatever the developer's shell exports —
+    the ambient value masked this until a key-less run exposed it, which is the
+    CI environment.
+    """
+    monkeypatch.setenv(AdvisorConfig().api_key_env, "test-key")
+
+
 def test_advice_models_is_the_controllers_own_gate() -> None:
     """Only phases the controller actually consults can produce a warning.
 
@@ -152,3 +166,20 @@ def test_tightness_is_relative_to_the_configured_bound() -> None:
     # And the warning follows the verdict, not a hardcoded list.
     assert screen_warning(mini, 10.0) is None
     assert screen_warning(mini, 5.0) is not None
+
+
+def test_no_warning_at_all_when_the_agent_runs_advisory_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A key-less agent wires no advisor, so no model can delay anything.
+
+    The launcher documents running key-less on purpose ("omit the key to run
+    advisory-paused"), and the controller treats a missing advisor as no advice.
+    Warning that a model will hold the control loop when nothing will call it is
+    the cry-wolf failure this design exists to avoid (local Codex P2, folded
+    pre-open).
+    """
+    busted = AdvisorConfig(model_slug="openai/gpt-5.5")
+    monkeypatch.delenv(busted.api_key_env, raising=False)
+
+    assert screen_warning(busted, TIMEOUT) is None

@@ -29,6 +29,7 @@ workflow uses.
 from __future__ import annotations
 
 import enum
+import os
 from collections.abc import Iterable
 
 from roastpilot_agent.config import (
@@ -160,8 +161,18 @@ def screen_warning(advisor: AdvisorConfig, advisory_timeout_seconds: float) -> s
             the controller's is the one that actually fires.
 
     Returns:
-        The warning text, or ``None`` when there is nothing to warn about.
+        The warning text, or ``None`` when there is nothing to warn about —
+        every resolved arm cleared with headroom, or no advisor is wired at all.
     """
+    # Advisory-paused: no key, so ``build_advisor`` returns ``None`` and NO
+    # advisory call happens at all (the controller treats a missing advisor as
+    # no advice, never as an unsafe write). Warning that a model will delay the
+    # loop when nothing will call it is the cry-wolf failure this whole design
+    # avoids — and the launcher documents running key-less on purpose (local
+    # Codex P2, folded pre-open). The configured model is still reported; only
+    # the latency claim, which presumes a call, is withheld.
+    if not os.environ.get(advisor.api_key_env):
+        return None
     resolved = advice_models(advisor)
     verdicts = {m: classify(advisor, m, advisory_timeout_seconds) for m in resolved}
     busted = sorted(m for m, v in verdicts.items() if v is AdvisorScreenVerdict.BUSTED)

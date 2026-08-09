@@ -220,6 +220,19 @@ def test_a_base_slug_that_matches_the_override_is_not_called_advice_less() -> No
     assert "NOT the roast-advice model" not in lines.advisor_cfg
 
 
+@pytest.fixture(autouse=True)
+def advisor_key_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Wire an API key so the latency note is reachable at all.
+
+    `screen_warning` is silent with no key, because a key-less agent wires no
+    advisor and nothing can call a model. The banner's OTHER assertions are
+    unaffected either way; the latency ones need the key-present world stated
+    EXPLICITLY rather than inherited from the developer's shell, which is what
+    hid this until a key-less run (i.e. CI) exposed it.
+    """
+    monkeypatch.setenv(AdvisorConfig().api_key_env, "test-key")
+
+
 def _advisor_line_for(**advisor_kwargs: object) -> str:
     """Render the advisor banner line for an ad-hoc advisor config.
 

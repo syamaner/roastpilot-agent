@@ -1974,10 +1974,16 @@ def no_roastpilot_env(monkeypatch: pytest.MonkeyPatch) -> None:
     the other direction — a real ``ROASTPILOT_ADVISOR__*`` exported in the
     developer's own shell, which would otherwise decide which arm is
     classified. Same rationale as ``test_launch_banner``'s ``config_file``.
+
+    It also WIRES an API key, because ``screen_warning`` is silent without one
+    (a key-less agent builds no advisor, so nothing can call a model). Stated
+    explicitly rather than inherited: a key-less run — which is exactly CI —
+    is what exposed the ambient dependency.
     """
     for key in list(os.environ):
         if key.startswith("ROASTPILOT_"):
             monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv(AdvisorConfig().api_key_env, "test-key")
 
 
 def test_model_slug_advisory_is_none_on_the_pinned_baseline(no_roastpilot_env: None) -> None:
