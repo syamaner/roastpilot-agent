@@ -366,6 +366,7 @@ describe("ConfigFieldRow — value-reactive advisory (#754)", () => {
     renderRow(
       NUMBER_FIELD,
       makeFieldMeta({
+        effective_value: 100,
         advisory: "openai/gpt-5.5 BUSTED the ~5 s post-FC latency screen (D40/D41)",
       }),
     );
@@ -387,9 +388,30 @@ describe("ConfigFieldRow — value-reactive advisory (#754)", () => {
     // lock. A warning that blocked the edit would quietly re-impose the lock.
     renderRow(
       NUMBER_FIELD,
-      makeFieldMeta({ advisory: "no FC-latency screen on record for openai/gpt-6" }),
+      makeFieldMeta({
+        effective_value: 100,
+        advisory: "no FC-latency screen on record for openai/gpt-6",
+      }),
     );
 
     expect(screen.getByLabelText(NUMBER_FIELD.label)).not.toBeDisabled();
+  });
+});
+
+describe("ConfigFieldRow — advisory follows the SAVED value (#754)", () => {
+  it("hides the advisory while the input differs from what the server classified", () => {
+    // `meta.advisory` describes the saved model. Leaving it up under a
+    // half-typed slug shows the previous model's verdict against a value it
+    // was never about (local Codex P2, folded pre-open).
+    renderRow(
+      NUMBER_FIELD,
+      makeFieldMeta({
+        effective_value: 100,
+        advisory: "openai/gpt-5.5 BUSTED the ~5 s post-FC latency screen",
+      }),
+      55,
+    );
+
+    expect(screen.queryByTestId(`advisory-${NUMBER_FIELD.key}`)).toBeNull();
   });
 });

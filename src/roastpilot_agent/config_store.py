@@ -971,7 +971,8 @@ def build_config_snapshot(
             description=(
                 "Advisor request timeout (seconds), for tooling that reads it."
                 " NOT the control-loop bound: the controller cuts an advisory"
-                " call at its own advisory_timeout_seconds (5.0 s, D151)."
+                " call at its own advisory_timeout_seconds (default 5.0 s,"
+                " D151)."
                 " Default 10.0 s."
             ),
         ),
