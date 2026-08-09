@@ -651,15 +651,99 @@ def ambient_reading_token(status: AmbientStatus) -> float | None:
     is then measured entirely in the agent's own clock domain by
     :meth:`RoasterControlAdapter.read_telemetry`.
 
+    **A non-finite stamp is not a token (#745b).** Equality is the whole
+    mechanism here, and ``NaN`` is unequal to itself under IEEE-754, so a
+    malformed MCP or child response carrying ``NaN`` makes every tick look like
+    a *new* reading: the derived age is re-based to ``now`` every tick, never
+    advances past ``0.0``, and the controller's range check upstream — which is
+    written to fail closed on ``NaN``/negative *ages* — never sees anything but
+    a perfectly fresh one. A frozen value stays permanently "fresh", which is
+    the one thing the freshness clock exists to prevent. ``±inf`` is rejected
+    with it: it compares equal to itself and so would not defeat the clock, but
+    a non-finite stamp is malformed either way and there is no reason to carry
+    one. No type guard is needed alongside it, unlike :func:`_payload_float`:
+    that reads an untyped ``EventPayloadValue`` mapping, whereas
+    ``AmbientStatus.last_reading_monotonic_seconds`` is a pydantic-validated
+    ``float | None``, so the only way a value survives validation and is still
+    unusable is by being non-finite (pydantic's ``allow_inf_nan`` default).
+
+    Rejecting here rather than at the call site is deliberate: the token's
+    identity semantics are what ``NaN`` breaks, so the guard belongs at the
+    boundary every consumer already goes through. An unusable stamp reads as
+    "no reading", which the age tracker already treats as age-unknown and the
+    controller already fails closed on — the reading is declined and ``c11``
+    takes its absent-ambient path, the #498-safe direction.
+
     Args:
         status: The MCP ambient status from ``RoastSessionState``.
 
     Returns:
         The reading's identity token, or ``None`` when the runtime holds no
         reading at all (its ``AmbientRuntimeSnapshot`` nulls the stamp and the
-        triad together, so an absent token means an absent reading).
+        triad together, so an absent token means an absent reading) or when the
+        stamp is not a finite number.
     """
-    return status.last_reading_monotonic_seconds
+    stamp = status.last_reading_monotonic_seconds
+    if stamp is None or not math.isfinite(stamp):
+        return None
+    return stamp
+
+
+def project_recordable_ambient(
+    status: AmbientStatus,
+) -> tuple[float | None, float | None, float | None]:
+    """The ambient triad, but only when it is worth RECORDING (#745).
+
+    Strictly narrower than :func:`project_live_ambient`: it additionally
+    requires a usable :func:`ambient_reading_token`, i.e. a reading whose
+    freshness can even be established. Without that extra clause the two
+    #745 fixes leave a hole between them — a ``NaN`` stamp on an otherwise
+    ``ok``/running status makes the live advisor DECLINE the reading (the age
+    is unknown, and the controller fails closed on that), while the
+    charge-instant capture would still have persisted the numeric triad. The
+    run would read back as "had ambient", and #737's offline eval would stamp
+    that value into every replayed context — reasoning on a reading the live
+    advisor rejected, which is precisely the mislabelled RP-B arm (#709) that
+    #745 exists to remove. One predicate, so the two cannot disagree **about
+    whether a real, dateable reading existed at charge**.
+
+    That is deliberately narrower than "the advisor reasoned on ambient", and
+    the difference is worth stating precisely rather than leaving a half-true
+    claim in a safety-adjacent docstring. The doctrine applies two further
+    clauses this predicate does not (see below), so a run CAN carry a recorded
+    triad while every advisory tick declined the reading: a running-but-not-
+    polled probe holding a finite, unchanging stamp — the one freeze path
+    ``ambient_running`` cannot catch, documented on
+    :meth:`RoasterControlAdapter._observe_ambient_age` — or a runtime that stops
+    AFTER charge. Today the only signal for that is a run-id-less process log,
+    which is the same gap #742 raises for doctrine retirement and is tracked
+    there. **A populated ambient column is therefore not evidence that the
+    doctrine saw ambient**; scoring a c11 arm needs #742's per-run record.
+
+    It deliberately does **not** apply the doctrine's
+    ``max_reading_age_seconds`` bound, and is not gated on the doctrine being
+    enabled. Those are c11 policy about what may be REASONED on this tick; this
+    answers the different and older question (#342/D85) of whether there is a
+    real, dateable reading of the room to record at charge. A corpus that only
+    captured ambient while c11 happened to be enabled would be useless for the
+    analysis the column was added for.
+
+    :func:`project_live_ambient` is deliberately left alone. The dashboard's
+    Room tile reports what the probe last said and #741 already settled when it
+    blanks; this column reports the room at charge for later analysis and must
+    not carry a reading nothing can date. Different questions, so a stricter
+    predicate rather than a change to the shared one.
+
+    Args:
+        status: The MCP ambient status from ``RoastSessionState``.
+
+    Returns:
+        The ``(temperature_c, humidity_percent, pressure_hpa)`` triad when the
+        reading is both live and dateable, else ``(None, None, None)``.
+    """
+    if ambient_reading_token(status) is None:
+        return None, None, None
+    return project_live_ambient(status)
 
 
 def project_session_state(

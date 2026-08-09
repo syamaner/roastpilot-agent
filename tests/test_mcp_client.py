@@ -24,6 +24,7 @@ from pydantic import ValidationError
 
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig
 from roastpilot_agent.mcp_client import (
+    AmbientStatus,
     ControlCommandResult,
     EventCommandResult,
     EventSnapshot,
@@ -42,12 +43,14 @@ from roastpilot_agent.mcp_client import (
     ServerInfo,
     SetRecordingMetadataResult,
     StartRoastSessionResult,
+    ambient_reading_token,
     applied_state_from_event,
     event_backdate_seconds,
     force_terminate_process_group,
     parse_tool_result,
     project_live_ambient,
     project_mic_status,
+    project_recordable_ambient,
     project_session_state,
     resolve_mcp_command,
 )
@@ -2659,6 +2662,61 @@ def test_project_live_ambient_ok_status_passes_through_triad() -> None:
     assert project_live_ambient(state.ambient_status) == (28.49, 38.6, 1008.56)
 
 
+def _ambient_status_with(**overrides: object) -> AmbientStatus:
+    """The fixture ambient status with ``overrides`` applied to its fields.
+
+    Shared by the #745 predicate/token tests so the merge-into-SESSION_STATE_
+    PAYLOAD pattern lives once (claude-review low, folded pre-ready).
+    """
+    payload = {
+        **SESSION_STATE_PAYLOAD,
+        "ambient_status": {
+            **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[dict-item]
+            **overrides,
+        },
+    }
+    return RoastSessionState.model_validate(payload).ambient_status
+
+
+def test_project_recordable_ambient_is_strictly_narrower_than_live() -> None:
+    """#745: the recordable predicate adds a dateability clause to the live one.
+
+    "Strictly narrower" is the load-bearing property — it is what closes the hole
+    between #745's two fixes, where a reading the live advisor declines could
+    still be persisted as the run's corpus breadcrumb. Asserted directly here
+    rather than only through the two api-level capture tests, so the relationship
+    between the two predicates is pinned rather than inferred (safety-reviewer
+    finding 1, folded pre-open).
+
+    The four cases are the full cross-product that matters: the healthy one, and
+    each way a reading can be unusable.
+    """
+
+    triad = (28.49, 38.6, 1008.56)
+    nulls = (None, None, None)
+
+    # ok + running + a finite stamp: both predicates agree on the triad.
+    healthy = _ambient_status_with()
+    assert project_live_ambient(healthy) == triad
+    assert project_recordable_ambient(healthy) == triad
+
+    # ok + running but UNDATEABLE: this is the narrowing. The live projection
+    # still forwards it (the controller declines it on the age instead); the
+    # recordable one must not persist it.
+    undateable = _ambient_status_with(last_reading_monotonic_seconds=float("nan"))
+    assert project_live_ambient(undateable) == triad
+    assert project_recordable_ambient(undateable) == nulls
+
+    # Stopped-but-"ok" runtime: both reject, inherited from project_live_ambient.
+    stopped = _ambient_status_with(ambient_running=False)
+    assert project_live_ambient(stopped) == nulls
+    assert project_recordable_ambient(stopped) == nulls
+
+    # No reading at all: the MCP nulls the stamp and the triad together.
+    absent = _ambient_status_with(last_reading_monotonic_seconds=None)
+    assert project_recordable_ambient(absent) == nulls
+
+
 def test_project_live_ambient_non_ok_status_is_none() -> None:
     """#464 (D86): disabled/unavailable ambient degrades to an all-None triad,
     mirroring the MCP's own fail-soft contract (#342, D85) — never a fault."""
@@ -2792,6 +2850,78 @@ async def test_adapter_ambient_age_grows_while_the_reading_does_not_change() -> 
     # A genuinely new reading resets the age, and carries the new value.
     assert third is not None and third.ambient_age_seconds == 0.0
     assert third.ambient_temp_c == 24.0
+
+
+@pytest.mark.asyncio
+async def test_adapter_ambient_age_is_unknown_for_a_nan_reading_stamp() -> None:
+    """#745b: a NaN stamp must not read as a permanently-fresh reading.
+
+    The stamp is an opaque IDENTITY token compared with ``!=``, and NaN is
+    unequal to itself under IEEE-754 — so an unguarded token makes every tick
+    look like a brand-new reading: the age is re-based to ``now`` each tick and
+    never leaves 0.0. The controller's range check is written to fail closed on
+    a NaN *age*, but it never sees one; a frozen value stays "fresh" forever,
+    which is the single thing the freshness clock exists to prevent.
+
+    Rejecting the stamp makes it read as "no reading", so the age is ``None``
+    (age-unknown) and the controller declines — ``c11`` takes its absent-ambient
+    path, the #498-safe direction.
+
+    Two reads with the SAME NaN stamp: an unguarded token would report 0.0 twice
+    (each read looking new); a token-with-guard reports unknown twice.
+    """
+    clock = _StepClock()
+    nan_stamp = {
+        **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[dict-item]
+        "last_reading_monotonic_seconds": float("nan"),
+    }
+    adapter = RoasterControlAdapter(
+        RoasterMCPClient(
+            _SequenceCaller(
+                [
+                    _state_payload(100.0, ambient_status=nan_stamp),
+                    _state_payload(101.0, ambient_status=nan_stamp),
+                ]
+            )
+        ),
+        clock=clock,
+    )
+
+    first = await adapter.read_telemetry()
+    clock.now = 1.0
+    second = await adapter.read_telemetry()
+
+    assert first is not None and first.ambient_age_seconds is None
+    assert second is not None and second.ambient_age_seconds is None
+
+
+def test_ambient_reading_token_rejects_non_finite_stamps() -> None:
+    """#745b at the boundary every consumer goes through.
+
+    NaN is the one that defeats the equality mechanism; ``±inf`` compares equal
+    to itself and so would not, but a non-finite stamp is malformed either way
+    and there is no reason to carry one. A finite stamp — including ``0.0``,
+    which must not be confused with absent — passes through unchanged.
+    """
+
+    assert (
+        ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=float("nan")))
+        is None
+    )
+    assert (
+        ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=float("inf")))
+        is None
+    )
+    assert (
+        ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=float("-inf")))
+        is None
+    )
+    assert ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=None)) is None
+    # 0.0 is a legitimate stamp and must not be confused with absent.
+    assert ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=0.0)) == 0.0
+    assert (
+        ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=1230.0)) == 1230.0
+    )
 
 
 @pytest.mark.asyncio
