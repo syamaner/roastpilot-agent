@@ -573,6 +573,9 @@ resolved (branch protection). So calibrate where findings go:
   **low** (optional but worth it). Resolving the thread is the conscious triage.
 - **Summary comment (non-blocking): nits, praise, questions, observations.** Never
   clog the merge gate with trivia — a nitpick posted inline blocks the merge.
+- **Severity picks the channel, never whether to report.** Find and report
+  everything; the inline / summary split above governs which channel a finding is
+  posted to, never whether it is reported.
 - **Don't duplicate CI.** `ruff` / `pyright` (strict) / `pytest` / `codecov/patch`
   already gate; review for what they can't see, not what they catch.
 - **Be concrete:** `file:line` + the specific fix.
@@ -644,7 +647,9 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   judgment or subtle correctness triage. Why the pins matter: an agent with no `model:`
   inherits the PARENT, so a careless spawn from the Opus main loop silently runs Opus —
   the per-role defaults stop that. The Opus main loop conserves credits by delegating
-  execution to Sonnet. The `planning-architect` is the one Fable role: pinned
+  execution to Sonnet. Default concurrency cap: 3 parallel workers; prefer one
+  capable worker over several redundant ones (`docs/agent-topology.md` §10). The
+  `planning-architect` is the one Fable role: pinned
   `model: claude-fable-5` at `effort: high`, read-only and advisory, invoked
   selectively for complex, ambiguous, or cross-repository planning (see
   `docs/agent-topology.md`).

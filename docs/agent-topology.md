@@ -1,7 +1,7 @@
 # Claude Agent Topology Specification
 
-Status: Accepted; implemented for the subagent fleet; §15 evaluation and the PM
-main-session pin still pending (revised 8 Aug 2026).
+Status: Accepted; implemented for the subagent fleet; §15 evaluation still
+pending (revised 9 Aug 2026).
 Slice 1 (the read-only planning-architect and the operator output style) and
 Slice 2 (the ten existing roles re-pinned from `sonnet`/`opus` aliases to full
 model IDs with explicit effort, plus the matching `AGENTS.md` model-selection
@@ -20,7 +20,7 @@ validation. Exact model IDs and explicit effort are set for every named-subagent
 role, `AGENTS.md` agrees, the inline workflow stages in `review-branch.mjs` are
 pinned, and a consistency test (`tests/test_agent_model_pins.py`) guards the pins
 against drift and against committed settings that would defeat them (the
-repository side of the §5 override surface). Three §16 adoption criteria remain
+repository side of the §5 override surface). Two §16 adoption criteria remain
 outstanding. First, delivery of §7's worktree and copy-restore rules into the
 role definitions that carry none of them (#733) — the control is stated but not
 in force. Second, the §15 evaluation across all five archetypes — not a five-case
@@ -32,10 +32,13 @@ model and contract on either archetype. Counting those two as validated would
 let the topology be marked ready on the strength of an entry that records the
 rule being broken. They need a subsequent applicable story run UNDER the
 revised rule; three archetypes remain unexercised regardless
-(§15; the §16 evaluation-evidence criterion). Third, the Product PM main-session
-pin, which is an
-operator setting (`model: claude-opus-5` or `--model`, never `default`), not
-repository config. The live-environment and organisation side of the §5 override
+(§15; the §16 evaluation-evidence criterion). The formerly-third item, the
+Product PM main-session pin, was resolved by operator decision on 9 Aug 2026:
+the main-session model is chosen deliberately per fresh terminal (an operator
+setting, `model: claude-opus-5` or `--model`; `default` remains an alias, not a
+pin), and the guard-tested subagent pins are the reproducibility mechanism, so
+the fleet's model assignments do not depend on the main-loop choice (§5). The
+live-environment and organisation side of the §5 override
 surface (`CLAUDE_CODE_SUBAGENT_MODEL`, `availableModels`, organisation
 restrictions) is likewise a standing operator check. The topology is in effect
 for the subagent fleet but not yet the validated default.  
@@ -73,7 +76,7 @@ The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
 
 | Role | Exact model | Default effort | Authority | Default tools |
 |---|---|---:|---|---|
-| Product PM / orchestrator (main session) | `claude-opus-5` (pin via the `model` setting or `--model claude-opus-5`, never `default`) | `high` | Scope, routing, adjudication, integration, escalation | Repository and coordination tools required by the task |
+| Product PM / orchestrator (main session) | `claude-opus-5` (set via the `model` setting or `--model claude-opus-5`; chosen deliberately per fresh terminal — operator decision, 9 Aug 2026, see §5; `default` is an alias, not a pin) | `high` | Scope, routing, adjudication, integration, escalation | Repository and coordination tools required by the task |
 | Planning architect (named subagent) | `claude-fable-5` | `high` | Advisory only | Read, Grep, Glob, Bash (no Edit/Write; read-only by convention, §7) |
 | Backend/frontend implementer | `claude-sonnet-5` | `high` | Writes only inside assigned scope | Read, Grep, Glob, Bash, Edit, Write |
 | Mechanical contract/simulation checker | `claude-sonnet-5` | `medium` | Read-only verdict | Read, Grep, Glob, Bash |
@@ -89,9 +92,14 @@ The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
    - `claude-opus-5`
    - `claude-fable-5`
    - `claude-sonnet-5`
-   The Opus PM is the main session, not a subagent, so it is pinned through the
-   `model` setting or `--model claude-opus-5`, never through `default`, which
-   resolves to Sonnet 5 on Pro, Team Standard, and Enterprise seat accounts.
+   The Opus PM is the main session, not a subagent, so its model is set through
+   the `model` setting or `--model claude-opus-5`. Operator decision (9 Aug
+   2026): the main-session model is chosen deliberately per fresh terminal
+   rather than mandated here; the guard-tested subagent pins are the
+   reproducibility mechanism, so the fleet's model assignments do not depend on
+   the main-loop choice. `default` remains an alias, not a pin — it resolves to
+   Sonnet 5 on Pro, Team Standard, and Enterprise seat accounts, so it is never
+   a way to obtain Opus deliberately.
 2. Family aliases such as `opus`, `fable`, and `sonnet` MUST be described as aliases, not pins.
 3. Before relying on per-agent model selection, the orchestrator MUST account for the whole override surface, in Claude Code's documented precedence order: (1) `CLAUDE_CODE_SUBAGENT_MODEL`, (2) the per-invocation `model` parameter passed with the Agent tool, (3) the agent-frontmatter `model`, then (4) the main conversation's model. Separately, `availableModels` / `enforceAvailableModels`, an organisation default model, or organisation model restrictions can silently substitute a pinned ID for a different permitted version, or fall back to the inherited model. A pin holds only in the absence of all of these.
 4. The effective model SHOULD be verified through Claude Code status/telemetry or provider logs when audit-grade proof is required. A model's self-report is not proof.
