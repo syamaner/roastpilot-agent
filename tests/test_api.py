@@ -25,6 +25,7 @@ import pytest_asyncio
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
 
 import roastpilot_agent.api as api_module
 from roastpilot_agent import __version__
@@ -33,6 +34,7 @@ from roastpilot_agent.api import (
     _DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     EventBroadcaster,
     QueuedOperatorAction,
+    RoastConfigError,
     RoastRunConflictError,
     RoastRunGoneError,
     RoastRunner,
@@ -50,6 +52,7 @@ from roastpilot_agent.bean_sourcing import (
 )
 from roastpilot_agent.catalogue_recommendations import CATALOGUE_EXTRACTION_PROMPT_VERSION
 from roastpilot_agent.config import (
+    AmbientFanDoctrine,
     AppConfig,
     ControllerConfig,
     MCPDeviceConfig,
@@ -88,7 +91,7 @@ from roastpilot_agent.models import (
     TelemetryEventData,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
-from roastpilot_agent.store import PersistedRun, RoastStore
+from roastpilot_agent.store import FrozenRunConfig, PersistedRun, RoastStore
 from tests.conftest import FakeClock, FakeMCPClient
 
 
@@ -3487,6 +3490,289 @@ async def test_recover_on_start_active_roast_still_recovers_to_recovery_required
     assert OperatorAction.EMERGENCY_STOP in enabled_operator_actions(
         RoastPhase.OPERATOR_RECOVERY_REQUIRED
     )
+
+
+@pytest.mark.asyncio
+async def test_start_roast_refuses_an_enabled_doctrine_with_an_unknown_cadence(
+    store: RoastStore,
+) -> None:
+    """#732, post-open Codex round 4: the explicit-cadence requirement lives at
+    the START boundary, and is enforced there rather than at construction.
+
+    Unset means the cadence comes from a hand-authored MCP yaml this process
+    does not read — including one merely sitting in the working directory,
+    which `resolve_mcp_yaml_source_path` honours. A cadence wider than the
+    freshness bound declines every healthy reading, so c11 would run its
+    absent-ambient fallback for the entire roast: green, and meaningless.
+
+    Refusing at start costs a config edit. The earlier placement, as a
+    construction rule, cost a running roast instead — recovery rebuilds a
+    config for a run already in progress, so a resume silently retired the
+    doctrine. Both halves are asserted here: the refusal, and that stating the
+    cadence is the way through."""
+    service = RoastService(
+        store,
+        roaster=FakeMCPClient(),
+        advisor=FakeAdvisor(),
+        run_loop=False,
+        clock=FakeClock(),
+        config=AppConfig(
+            controller=ControllerConfig(
+                ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
+            ),
+            mcp_device=MCPDeviceConfig(),
+        ),
+    )
+
+    # Driven through the REAL entry point, not the helper: a test that called
+    # the helper directly would still pass with the call site deleted from
+    # start_roast, which is the wiring that actually has to hold.
+    with pytest.raises(RoastConfigError, match="ambient_poll_interval_seconds"):
+        await service.start_roast(_profile())
+    assert await store.active_run() is None  # refused before any run was persisted
+
+    # Stating it is the way through; and with the doctrine off it never binds.
+    for config in (
+        AppConfig(
+            controller=ControllerConfig(
+                ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
+            ),
+            mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=30.0),
+        ),
+        AppConfig(mcp_device=MCPDeviceConfig()),
+    ):
+        ok = RoastService(
+            store,
+            roaster=FakeMCPClient(),
+            advisor=FakeAdvisor(),
+            run_loop=False,
+            clock=FakeClock(),
+            config=config,
+        )
+        ok._require_explicit_ambient_cadence(config)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_start_roast_checks_the_cadence_of_the_RELOADED_config_not_the_stale_one(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#732, post-open round 6 (Claude and Codex found this independently).
+
+    In live-serve mode `start_roast` reloads config from disk (D76/D78
+    apply-next-roast) partway through. The cadence gate ran ABOVE that reload,
+    so it judged the config from before the operator's last `PUT /api/config`
+    rather than the one the roast actually runs under. This test pins the
+    admit direction; its sibling below pins the lockout direction.
+    """
+    enabled = ControllerConfig(
+        ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
+    )
+    with_cadence = AppConfig(
+        controller=enabled, mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=30.0)
+    )
+    without_cadence = AppConfig(controller=enabled, mcp_device=MCPDeviceConfig())
+
+    def _service(initial: AppConfig, on_disk: AppConfig) -> RoastService:
+        def _load() -> tuple[AppConfig, frozenset[str]]:
+            return on_disk, frozenset()
+
+        monkeypatch.setattr("roastpilot_agent.api.load_app_config", _load)
+        return RoastService(
+            store, config=initial, run_loop=False, clock=FakeClock(), live_serve_mode=True
+        )
+
+    # The stale value must not ADMIT a roast the live config forbids: a cadence
+    # that was explicit last time does not vouch for one that is now unset.
+    with pytest.raises(RoastConfigError, match="ambient_poll_interval_seconds"):
+        await _service(with_cadence, without_cadence).start_roast(_profile())
+    assert await store.active_run() is None
+
+
+@pytest.mark.asyncio
+async def test_start_roast_cannot_lock_itself_out_on_a_config_already_corrected(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#732, post-open round 6: the operator-facing half, pinned on its own.
+
+    Deliberately a SEPARATE test from its sibling above rather than a second
+    assertion inside it: sharing one test meant the first `pytest.raises` aborted
+    the run before this half executed, so a mutation restoring the original
+    ordering was killed only by the other direction and this one was never
+    actually exercised.
+
+    The scenario is an operator at a preheated roaster. The running config has
+    the doctrine enabled with no cadence, so a start is refused; the operator
+    corrects the file and tries again. Because the reload sits BELOW the gate, the
+    old ordering never re-read the file: `self._config` stayed stale and every
+    retry reproduced the identical refusal until the agent was restarted.
+    """
+    enabled = ControllerConfig(
+        ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
+    )
+    corrected_on_disk = AppConfig(
+        controller=enabled, mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=30.0)
+    )
+
+    def _load() -> tuple[AppConfig, frozenset[str]]:
+        return corrected_on_disk, frozenset()
+
+    monkeypatch.setattr("roastpilot_agent.api.load_app_config", _load)
+    service = RoastService(
+        store,
+        config=AppConfig(controller=enabled, mcp_device=MCPDeviceConfig()),  # stale + bad
+        run_loop=False,
+        clock=FakeClock(),
+        live_serve_mode=True,
+    )
+
+    detail = await service.start_roast(_profile())
+
+    active = await store.active_run()
+    assert active is not None and active.run_id == detail.id
+
+
+def test_recovery_config_reraises_a_failure_the_doctrine_did_not_cause() -> None:
+    """#732: the degradation is scoped to the ambient clash and NOTHING else.
+
+    ``_build_recovery_config`` retires the advisory doctrine only when the
+    frozen doctrine is enabled; any other validation failure must propagate
+    unchanged. This is the safety-preserving half of that fix — the line that
+    guarantees a genuinely broken frozen config (here the safety-owned
+    ceiling-guard bound, D88 A1) is never silently absorbed by a recovery that
+    then proceeds as if nothing were wrong.
+
+    Independent pre-open triage found this branch uncovered suite-wide and
+    true only by code reading, which for a fail-closed guard is the state
+    worth fixing before it is the state relied on. ``FrozenRunConfig`` carries
+    no cross-section validator of its own, so the offending pair is
+    constructible exactly as a historical record could hold it."""
+    service = RoastService(
+        cast(RoastStore, None),
+        roaster=FakeMCPClient(),
+        advisor=FakeAdvisor(),
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    frozen = FrozenRunConfig(
+        controller=ControllerConfig(
+            post_first_crack_control=PostFirstCrackControl(ceiling_guard_temp_c=240.0)
+        ),
+        safety=SafetyLimits(),
+    )
+    assert frozen.controller.ambient_fan_doctrine.enabled is False
+
+    with pytest.raises(ValidationError, match="ceiling_guard_temp_c"):
+        service._build_recovery_config(frozen)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_recover_on_start_survives_a_frozen_doctrine_the_live_poll_interval_voids(
+    store: RoastStore,
+) -> None:
+    """#732: the ambient cross-section guard must never be able to abort a RECOVERY.
+
+    Recovery is the one place a run's FROZEN controller meets the CURRENT device
+    config, and #732's check spans exactly that pair. They can legitimately
+    disagree with no repair available, because the run already happened: here a
+    run started with the doctrine on at a 90 s bound, and the operator has since
+    widened the ambient poll interval to 60 s — a save the live config accepted,
+    because by then the live controller had the doctrine off.
+
+    Raising there would strand an operator with a possibly-active run and no
+    route into ``operator_recovery_required``. So the clash retires the doctrine
+    for the recovered run instead: fail-safe (advisory-only, and it lands on the
+    same absent-ambient branch the freshness gate already produces) and, above
+    all, recoverable. Asserted end to end rather than on the helper, because the
+    invariant at stake is the restart one."""
+    await store.create_run(
+        run_id="run-doctrine-voided",
+        profile=_profile(),
+        config=AppConfig(
+            controller=ControllerConfig(
+                ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
+            ),
+            # The run's OWN generation was self-consistent when it started; the
+            # clash under test is against the CURRENT device config below.
+            mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=60.0),
+        ),
+        agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    )
+    # 120 s cadence against a 90 s bound: the reading genuinely cannot arrive
+    # fresh, so the doctrine truly is unusable and retiring it is correct.
+    live = AppConfig(mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=120.0))
+    service = RoastService(
+        store,
+        roaster=FakeMCPClient(),
+        advisor=FakeAdvisor(),
+        run_loop=False,
+        clock=FakeClock(),
+        config=live,
+    )
+
+    await service.recover_on_start()
+
+    assert service.runner is not None
+    assert service.runner.controller_snapshot().phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    doctrine = service.runner._config.controller.ambient_fan_doctrine  # pyright: ignore[reportPrivateUsage]
+    # Only the advisory doctrine was retired, and only because it could not be
+    # satisfied — its other fields, and the rest of the frozen generation, are
+    # untouched.
+    assert doctrine.enabled is False
+    assert doctrine.max_reading_age_seconds == 90.0
+    assert service.runner._config.controller.tick_interval_seconds == 1.0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_recover_on_start_preserves_a_frozen_doctrine_that_still_fits(
+    store: RoastStore,
+) -> None:
+    """#732, post-open Codex P2: recovery must not retire a WORKING doctrine.
+
+    An earlier revision demanded the bound be twice the cadence, and retired the
+    doctrine whenever that failed. But a 90 s bound against a 60 s cadence
+    works: a healthy reading is at its oldest just before the next poll, so it
+    always arrives inside the bound. Retiring there silently switched a
+    recovered run from ambient-aware advice to the absent-ambient branch for the
+    rest of the roast — the opposite of the fail-safe framing used to justify
+    it, since the run had been fine.
+
+    The rule is now the correctness line (bound >= cadence), so this pair no
+    longer clashes at all and the frozen doctrine survives the restart intact.
+    Pinned separately from the retirement case because these two differ only in
+    the cadence, and it was that single number that made the old behaviour look
+    reasonable."""
+    await store.create_run(
+        run_id="run-doctrine-still-fits",
+        profile=_profile(),
+        config=AppConfig(
+            controller=ControllerConfig(
+                ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
+            ),
+            # The run's OWN generation was self-consistent when it started; the
+            # clash under test is against the CURRENT device config below.
+            mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=60.0),
+        ),
+        agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    )
+    live = AppConfig(mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=60.0))
+    service = RoastService(
+        store,
+        roaster=FakeMCPClient(),
+        advisor=FakeAdvisor(),
+        run_loop=False,
+        clock=FakeClock(),
+        config=live,
+    )
+
+    await service.recover_on_start()
+
+    assert service.runner is not None
+    assert service.runner.controller_snapshot().phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    doctrine = service.runner._config.controller.ambient_fan_doctrine  # pyright: ignore[reportPrivateUsage]
+    assert doctrine.enabled is True
+    assert doctrine.max_reading_age_seconds == 90.0
 
 
 @pytest.mark.asyncio

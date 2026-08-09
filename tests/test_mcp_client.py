@@ -2718,6 +2718,162 @@ def test_project_session_state_ambient_none_when_disabled() -> None:
     assert telemetry.ambient_pressure_hpa is None
 
 
+def test_project_live_ambient_none_when_the_runtime_has_stopped() -> None:
+    """#732: ``status == "ok"`` alone does NOT mean the reading is live.
+
+    The MCP's ``AmbientSessionRuntime._stop_locked`` drops its reader
+    (``ambient_running`` -> ``False``) while deliberately leaving ``status`` at
+    ``"ok"`` and preserving the last reading — and ``poll``'s
+    ``self._reader is None`` early return then means that reading can never
+    change again. The old status-only gate forwarded that frozen room
+    temperature for the rest of the roast, indistinguishable from a fresh one.
+
+    Bounded while ambient was observability-only; not bounded once c11 (#709)
+    selects a fan regime on it."""
+    payload = _state_payload(
+        100.0,
+        ambient_status={
+            "mode": "yoctopuce",
+            "status": "ok",
+            "reason": "Ambient sensing stopped: session ended.",
+            "ambient_running": False,
+            "temperature_c": 23.1,
+            "humidity_percent": 35.0,
+            "pressure_hpa": 1011.0,
+            "last_reading_monotonic_seconds": 1200.0,
+        },
+    )
+    state = RoastSessionState.model_validate(payload)
+
+    assert project_live_ambient(state.ambient_status) == (None, None, None)
+
+    telemetry = project_session_state(state, age_seconds=0.0, ambient_age_seconds=1.0)
+    assert telemetry is not None
+    assert telemetry.ambient_temp_c is None
+    # The age goes with the reading: no reading, no age to report.
+    assert telemetry.ambient_age_seconds is None
+
+
+@pytest.mark.asyncio
+async def test_adapter_ambient_age_grows_while_the_reading_does_not_change() -> None:
+    """#732: the adapter derives ambient freshness the same way it already
+    derives ``age_seconds`` — and for the same reason.
+
+    The MCP's ``last_reading_monotonic_seconds`` is an absolute stamp from
+    ANOTHER PROCESS, so it is compared for CHANGE only and never subtracted
+    from anything; the elapsed time is measured in the agent's own clock. Three
+    reads: the first observes a reading, the second sees the same stamp (the
+    probe has not refreshed — age grows), the third sees a new stamp (age
+    resets)."""
+    clock = _StepClock()
+    unchanged = _state_payload(101.0)
+    refreshed = _state_payload(
+        102.0,
+        ambient_status={
+            **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[dict-item]
+            "temperature_c": 24.0,
+            "last_reading_monotonic_seconds": 1230.0,
+        },
+    )
+    adapter = RoasterControlAdapter(
+        RoasterMCPClient(_SequenceCaller([_state_payload(100.0), unchanged, refreshed])),
+        clock=clock,
+    )
+
+    first = await adapter.read_telemetry()
+    clock.now = 1.0
+    second = await adapter.read_telemetry()
+    clock.now = 2.0
+    third = await adapter.read_telemetry()
+
+    assert first is not None and first.ambient_age_seconds == 0.0
+    # Same reading on the second read: it has now been current for one step.
+    assert second is not None and second.ambient_age_seconds == 1.0
+    # A genuinely new reading resets the age, and carries the new value.
+    assert third is not None and third.ambient_age_seconds == 0.0
+    assert third.ambient_temp_c == 24.0
+
+
+@pytest.mark.asyncio
+async def test_adapter_ambient_age_resets_on_a_new_session() -> None:
+    """#732, post-open Codex P2: the ambient tracker is per-SESSION state.
+
+    ``start_session`` resets the telemetry-age trackers; the ambient ones were
+    added beside them and initially were not. That leaks across back-to-back
+    roasts through one adapter, and the MCP makes the leak reachable rather
+    than theoretical: its stop path deliberately PRESERVES the last reading and
+    its stamp, and a stop/start pair need not have an intervening telemetry
+    read. So the new session's first state can carry the previous roast's
+    token — which either ages the new run's first reading from the old run's
+    clock (passing a stale reading as fresh) or declines it at once and burns
+    the new run's one-shot decline warning on a phantom.
+
+    The stamp is deliberately IDENTICAL either side of the restart; a test that
+    changed it would pass without the reset and prove nothing."""
+    clock = _StepClock()
+
+    async def call_tool(tool: str, arguments: dict[str, object]) -> object:
+        # The restart itself goes through the real ``start_roast_session`` path,
+        # so the reset under test is exercised where it actually lives.
+        return CANNED[tool] if tool == "start_roast_session" else _state_payload(100.0)
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(call_tool), clock=clock)
+
+    first = await adapter.read_telemetry()
+    assert first is not None and first.ambient_age_seconds == 0.0
+
+    # Time passes within the first roast, so a leaked tracker would report it.
+    clock.now = 300.0
+    await adapter.start_session()
+    after_restart = await adapter.read_telemetry()
+
+    assert after_restart is not None
+    assert after_restart.ambient_temp_c == 28.49
+    assert after_restart.ambient_age_seconds == 0.0
+
+
+@pytest.mark.asyncio
+async def test_adapter_ambient_age_resets_across_an_outage_on_the_same_reading() -> None:
+    """#732: freshness is tracked for the reading the projection FORWARDS, not
+    for whatever stamp the status carries.
+
+    The sharp case is the stopped runtime, because ``_stop_locked`` PRESERVES
+    the last reading: the MCP reports the same ``last_reading_monotonic_seconds``
+    right through the outage. A tracker keyed on the stamp alone would keep
+    ageing a reading nothing consumes, and on resume would hand back an age
+    measured from before the outage — so a probe reporting a perfectly good
+    reading would be declined by the controller's bound for as long as the gap
+    lasted. Keyed on the forwarded reading, the outage resets it.
+
+    The stamp is deliberately IDENTICAL in all three reads; a test that changed
+    it would pass without the reset and prove nothing."""
+    clock = _StepClock()
+    running = dict(SESSION_STATE_PAYLOAD["ambient_status"])  # type: ignore[call-overload]
+    stopped = _state_payload(
+        101.0,
+        ambient_status={
+            **running,
+            "ambient_running": False,
+            "reason": "Ambient sensing stopped: session ended.",
+        },
+    )
+    adapter = RoasterControlAdapter(
+        RoasterMCPClient(_SequenceCaller([_state_payload(100.0), stopped, _state_payload(102.0)])),
+        clock=clock,
+    )
+
+    await adapter.read_telemetry()
+    clock.now = 45.0
+    outage = await adapter.read_telemetry()
+    clock.now = 90.0
+    back = await adapter.read_telemetry()
+
+    assert outage is not None and outage.ambient_temp_c is None
+    assert outage.ambient_age_seconds is None
+    assert back is not None and back.ambient_temp_c == 28.49
+    assert back.ambient_age_seconds == 0.0
+
+
 @pytest.mark.asyncio
 async def test_adapter_age_resets_on_advance_grows_on_stall() -> None:
     """The stale-telemetry safety fault depends on a real age: it stays ~0 while

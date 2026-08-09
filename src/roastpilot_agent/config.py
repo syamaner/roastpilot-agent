@@ -76,6 +76,18 @@ DEFAULT_ADVISOR_MODEL = "openai/gpt-4o"
 # validated against it rather than re-deriving the constant.
 HOTTOP_FAN_LEVEL_PP = 10.0
 
+# The MCP's OWN default ambient poll cadence, mirrored (#732). The agent never
+# sets ``mcp_device.ambient_poll_interval_seconds`` by default — it leaves the
+# field ``None`` and the MCP applies
+# ``coffee_roaster_mcp.config.AmbientConfig.poll_interval_seconds``. That number
+# is what decides how old a HEALTHY reading routinely gets, so the ambient
+# doctrine's freshness bound has to be validated against it even when the
+# operator has set nothing. Mirrored rather than imported to keep config
+# construction free of an MCP import; a contract test asserts the two agree, so
+# a bump that changes the cadence fails loudly here instead of silently
+# narrowing the freshness margin.
+DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS = 30.0
+
 # Phase-keyed advisor MODEL selection (#173, operator 13 Jun): the model slug
 # the advisor uses, by agent phase. The MECHANISM only — every phase defaults to
 # ``DEFAULT_ADVISOR_MODEL`` (gpt-4o everywhere, #277 PIN). Under D35 the advisor
@@ -1035,6 +1047,48 @@ class AmbientFanDoctrine(BaseModel):
     is still climbing, fan is the only brake left and graduation does not
     apply."""
 
+    max_reading_age_seconds: float = Field(default=90.0, gt=0.0, le=600.0)
+    """How old a live ambient reading may be and still reach the advisor (#732).
+
+    Unlike the two fields above, this one is **controller-only**: it gates what
+    the controller populates and is never surfaced into ``AdvisorContext``, so
+    no prompt ever sees it. The group now holds knobs for two audiences —
+    ``threshold_c`` and ``step_max_pp`` are told to the model, this is not — and
+    a fourth field should say which it is.
+
+    ``c11`` selects a fan regime by comparing ``ambient_temp_c`` against
+    :attr:`threshold_c`, so a stale reading does not degrade gracefully — it
+    puts the model confidently in the wrong regime, and a stale value is
+    indistinguishable from a fresh one at the prompt. The asymmetry that
+    matters is a stale LOW reading in a room that has since warmed: it holds
+    the graduated regime when aggressive airflow is right, which is the
+    direction #498 warns about.
+
+    Past this bound the controller declines to populate ``ambient_temp_c`` /
+    ``ambient_humidity_pct`` at all, so the doctrine degrades to the SAME
+    absent-ambient path an unplugged probe already takes — a branch ``c11``
+    handles deliberately (fall back to the unqualified fan-brake rule; do not
+    read a missing reading as licence to be gentler). No new teaching, no new
+    branch, and the failure direction is toward #498's full fan capability
+    rather than away from it.
+
+    Default 90.0 = three of the MCP's 30 s default ambient poll cycles
+    (``coffee_roaster_mcp.config.AmbientConfig.poll_interval_seconds``), so
+    ordinary poll jitter and a couple of missed cycles never flap the doctrine
+    while a genuinely wedged reading is out within about a minute and a half —
+    well inside a roast's post-first-crack window, where the doctrine acts.
+    It is a BOUND, not a measurement: no corpus records reading age, so this is
+    picked off the MCP's own cadence. Being too tight merely falls back to the
+    absent-ambient branch; too loose is the failure being fixed.
+
+    Ceilinged at 600.0 for the reason ``step_max_pp``'s own ceiling exists — a
+    hand-refit knob whose ceiling sits far above its intent lets a plausible
+    typo validate. ``900.0`` for ``90.0`` would pass ``gt=0.0`` alone and
+    silently disable the guard for most of a 12-20 minute roast, and a bare
+    ``inf`` would disable it outright while freezing a non-standard
+    ``Infinity`` token into ``config_json``. Ten minutes exceeds any real
+    freshness bound: past a whole roast's length this is not a staleness gate."""
+
     @model_validator(mode="after")
     def _step_must_be_a_whole_number_of_hottop_levels(self) -> "AmbientFanDoctrine":
         """Reject a step that is not a whole number of Hottop fan levels.
@@ -1836,5 +1890,96 @@ class AppConfig(BaseSettings):
                 "controller.post_first_crack_control.ceiling_guard_temp_c must not exceed "
                 f"safety.bitter_ceiling_temp_c ({guard_temp_c} > "
                 f"{self.safety.bitter_ceiling_temp_c})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_ambient_freshness_bound_outlives_the_poll_interval(self) -> "AppConfig":
+        """The doctrine's freshness bound must exceed the ambient POLL interval (#732).
+
+        The second cross-SECTION validator, and for the same structural reason
+        as the first: ``max_reading_age_seconds`` lives on
+        ``controller.ambient_fan_doctrine`` while the cadence that decides how
+        old a *healthy* reading routinely gets lives on
+        ``mcp_device.ambient_poll_interval_seconds``. Neither section can see
+        the other, so the check can only run here.
+
+        **The failure it prevents is silent and total.** The poll interval is
+        operator-editable from ``/config`` with no maximum, while the freshness
+        bound is file-only. Set the interval above the bound and EVERY reading
+        is stale on EVERY tick, forever — the controller declines ambient for
+        the whole roast, the doctrine runs its absent-ambient fallback, and
+        nothing surfaces that: the dashboard's Room tile reads the ungated
+        telemetry, so it still shows a room temperature the advisor was never
+        given. The direction is fail-safe, but an RP-B hardware arm would be
+        recorded as "c11 with ambient" while the model saw the absent branch on
+        every tick — a green, meaningless result, which is precisely the class
+        of outcome #709's two-act enablement already warns about.
+
+        **Enforces the property actually required, not a preferred margin.** A
+        healthy reading is at its oldest just before the next poll lands, so the
+        bound must be at least the cadence for the doctrine to function at all;
+        that is the correctness line and the only one worth making
+        unconstructible. An earlier revision demanded 2x for flap margin and was
+        wrong to: at a 90 s bound against a 60 s cadence the doctrine works
+        perfectly well, and rejecting that pair caused a *working* configuration
+        to be treated as broken — including, through the recovery path, retiring
+        a doctrine that was serving fresh readings. Two or more cadences remains
+        the sensible operating margin; it is advice, not a validation rule.
+
+        **An UNSET cadence is unknown, not incompatible, and this validator
+        does not judge it.** ``mcp_yaml`` renders
+        ``ambient_poll_interval_seconds`` only when it is set, so ``None`` means
+        "inherit" from a file this validator will not read — config
+        construction must not depend on the filesystem, since ``AppConfig`` is
+        built in tests, replay and recovery. Requiring the value is therefore a
+        START-A-ROAST precondition
+        (``RoastService._require_explicit_ambient_cadence``, which also carries
+        the rationale) rather than a construction one; see the inline note on
+        the early return below for why that placement is load-bearing.
+
+        Only enforced while the doctrine is ENABLED, so the inert default can
+        never make an otherwise-valid config unconstructible.
+
+        **This compares a controller field against a device field, so it is
+        only meaningful when both come from the same generation.** Recovery
+        deliberately recombines a run's FROZEN controller with the CURRENT
+        device config, where they can legitimately disagree and the pair is
+        unrepairable because the run already happened; that ONE site handles
+        the clash itself (see ``RoastApp.recover_on_start``) rather than being
+        allowed to raise, because a guard against a silently-void advisory
+        input must never be able to block a recovery.
+
+        Returns:
+            The validated application config.
+
+        Raises:
+            ValueError: If the doctrine is enabled, the ambient poll interval is
+                KNOWN (explicitly set), and the freshness bound is below it. An
+                unset poll interval is not a rejection here — see above.
+        """
+        doctrine = self.controller.ambient_fan_doctrine
+        if not doctrine.enabled:
+            return self
+        poll_seconds = self.mcp_device.ambient_poll_interval_seconds
+        if poll_seconds is None:
+            # Unknown, not incompatible. Requiring the value is a START-A-ROAST
+            # precondition (``RoastService._require_explicit_ambient_cadence``),
+            # deliberately NOT a construction one: making it a second way for
+            # this validator to raise meant recovery — which rebuilds an
+            # ``AppConfig`` for a run already in progress — retired the doctrine
+            # merely because the live cadence was unset, silently changing the
+            # fan advice an operator resumed into. An in-flight run's own
+            # configuration is not the place to enforce an authoring rule.
+            return self
+        if doctrine.max_reading_age_seconds < poll_seconds:
+            raise ValueError(
+                "controller.ambient_fan_doctrine.max_reading_age_seconds must be at least "
+                "mcp_device.ambient_poll_interval_seconds while the doctrine is enabled, or "
+                "every healthy reading ages past the bound before the next poll lands, is "
+                "declined as stale, and c11 silently runs its absent-ambient fallback for "
+                f"the whole roast. Got {doctrine.max_reading_age_seconds:g} against a poll "
+                f"interval of {poll_seconds:g}. Two or more poll intervals is the "
+                "recommended operating margin."
             )
         return self

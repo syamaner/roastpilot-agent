@@ -135,6 +135,7 @@ from roastpilot_agent.store import (
     BeanDraftAttemptAlreadyClaimedError,
     BeanDraftAttemptClaimError,
     BeanProfileNotFoundError,
+    FrozenRunConfig,
     PhysicallyImpossibleWeightError,
     RoastStore,
     RunActivelyDrivenError,
@@ -423,6 +424,13 @@ _HARDWARE_CLEAR_MIN_INTERVAL_SECONDS = 1.0
 class RoastRunConflictError(Exception):
     """A request conflicts with the current run state (maps to HTTP 409):
     starting a roast while one is active, or rating an in-progress run."""
+
+
+class RoastConfigError(Exception):
+    """A roast cannot start because the configuration is internally incoherent
+    (maps to HTTP 409). Distinct from a pydantic ``ValidationError``: the config
+    is CONSTRUCTIBLE and a running roast keeps using it, but starting a NEW roast
+    on it would produce a silently meaningless result (#732)."""
 
 
 class OperatorActionRateLimitError(Exception):
@@ -1684,6 +1692,17 @@ class RoastService:
                     "start_roast: reloaded config (advisor_model_slug=%r)",
                     fresh_config.advisor.model_slug,
                 )
+                # Validate the config this roast will ACTUALLY run with, which is
+                # the reloaded one — and validate it BEFORE any of it is committed
+                # or the MCP child is respawned for it. Checking the pre-reload
+                # snapshot instead was wrong twice over: a stale-but-explicit
+                # cadence let an unset reloaded cadence through (the silent void
+                # this whole guard exists to prevent), and a stale-and-invalid one
+                # refused the start before the reload could run — so `_config` never
+                # refreshed and EVERY later attempt reproduced the same refusal even
+                # after the operator had corrected the file, clearable only by
+                # restarting the agent.
+                self._require_explicit_ambient_cadence(fresh_config)
                 # Safety is always env-resolved; rebuild so self._safety matches
                 # self._config (the file injector skips ROASTPILOT_SAFETY__ so the
                 # SafetyLimits field values are identical to the startup values,
@@ -1730,6 +1749,10 @@ class RoastService:
                     or fresh_config.mcp_device != self._spawned_mcp_device
                 ):
                     await self._respawn_mcp_for_device_config(fresh_config.mcp_device)
+            else:
+                # No reload here (test doubles, API-only mode, the replay harness):
+                # the caller's explicit config IS the one the roast runs with.
+                self._require_explicit_ambient_cadence(self._config)
             # A recovered run temporarily installs its frozen safety generation
             # so API prechecks and controller evaluation agree. A later fresh run
             # must always return to the process-current, apply-next-roast config.
@@ -2007,6 +2030,143 @@ class RoastService:
         self.runner = runner
         return runner
 
+    def _require_explicit_ambient_cadence(self, config: AppConfig) -> None:
+        """Refuse to START a roast on an enabled doctrine with an unknown cadence (#732).
+
+        ``mcp_yaml`` renders ``ambient_poll_interval_seconds`` only when it is
+        set, so leaving it unset means the effective cadence comes from a
+        hand-authored MCP yaml — including, via
+        ``resolve_mcp_yaml_source_path``'s fourth route, a
+        ``coffee-roaster-mcp.yaml`` merely sitting in the working directory.
+        ``c11`` compares ambient against a freshness bound, so a cadence wider
+        than that bound declines every healthy reading and runs the doctrine's
+        absent-ambient fallback for the whole roast — green, and meaningless,
+        which is the outcome an RP-B arm must not be able to record.
+
+        **Enforced here rather than in ``AppConfig``**, and that placement is
+        the finding rather than an implementation detail. As a construction-time
+        rule it also fired during recovery, which rebuilds a config for a run
+        already in progress: an operator resume then retired the doctrine
+        because the *current* cadence was unset, silently changing the fan
+        advice mid-run. Starting a roast is the authoring boundary — the moment
+        an operator commits to a configuration — so the requirement belongs
+        here, where refusing costs a config edit rather than a run.
+
+        The runtime freshness gate remains the backstop for everything this
+        cannot see, including a cadence that is stated but wrong.
+
+        **Takes the config explicitly rather than reading ``self._config``**, so
+        the caller can only pass the config the roast will actually run with. In
+        live-serve mode that is the RELOADED one, and an earlier revision that
+        read ``self._config`` from above the D76/D78 reload was wrong in both
+        directions: a stale-but-explicit cadence admitted an unset reloaded one,
+        and a stale-and-invalid cadence refused the start *before* the reload
+        could run, so ``self._config`` never refreshed and every later attempt
+        reproduced the identical refusal even after the operator had corrected
+        the file. Only an agent restart cleared that. Making the config a
+        parameter is what stops the check drifting away from its subject again.
+
+        Args:
+            config: The configuration this roast will run under, already
+                reloaded in live-serve mode.
+
+        Raises:
+            RoastConfigError: If the ambient fan doctrine is enabled while
+                ``mcp_device.ambient_poll_interval_seconds`` is unset.
+        """
+        if not config.controller.ambient_fan_doctrine.enabled:
+            return
+        if config.mcp_device.ambient_poll_interval_seconds is not None:
+            return
+        raise RoastConfigError(
+            "controller.ambient_fan_doctrine.enabled requires "
+            "mcp_device.ambient_poll_interval_seconds to be set explicitly before a roast "
+            "can start. Left unset, the effective cadence comes from the hand-authored MCP "
+            "yaml, which this process does not read — and a cadence wider than "
+            f"{config.controller.ambient_fan_doctrine.max_reading_age_seconds:g} s "
+            "declines every healthy reading, so c11 would run its absent-ambient fallback "
+            "for the whole roast. Set the interval to the yaml's "
+            "ambient.poll_interval_seconds, or disable the doctrine."
+        )
+
+    def _build_recovery_config(self, frozen: FrozenRunConfig) -> AppConfig:
+        """Recombine a run's FROZEN controller/safety with the CURRENT process config.
+
+        This preserves apply-next-roast semantics across a restart: config edits
+        made after the run started cannot alter its control, scheduling,
+        reference lookup, API prechecks, or safety policy.
+
+        It is also the ONE place a historical controller meets a current device
+        config, and #732's cross-section ambient check spans exactly that pair.
+        The two can legitimately disagree in a way no edit can now repair — a
+        run may have started with the fan doctrine on at a 90 s freshness bound
+        while the operator has since widened the ambient poll interval, a save
+        the live config accepted because the live controller had the doctrine
+        off. Letting that raise here would abort recovery and could strand an
+        operator with a possibly-active run and no route into
+        ``operator_recovery_required``, which the restart invariant forbids.
+
+        So a clash retires the doctrine for the recovered run and retries. That
+        is a strictly fail-safe degradation and not a control change: the
+        doctrine is advisory-only — ``ambient_fan_doctrine`` is read nowhere but
+        the two context fields — and ``c11`` takes its absent-ambient branch
+        either way (the unqualified fan-brake rule, #498's full capability
+        intact).
+
+        Precisely, because the shape is NOT identical: retiring also nulls
+        ``ambient_fan_threshold_c`` and ``ambient_fan_step_max_pp``, which the
+        freshness gate deliberately leaves populated. The resulting context is
+        #731's DISABLED shape, not the freshness-declined shape. ``c11``'s
+        branch condition treats them the same, so behaviour is unchanged — but
+        #732 asserts whole-context equality for the freshness path exactly
+        because shape parity is that argument, and this path does not have it.
+
+        What makes the retirement safe is narrower and stronger than shape
+        parity: in the clash state the doctrine was ALREADY effectively inert,
+        since a bound below the poll cadence means healthy readings
+        routinely age past it and get declined tick by tick. Retiring converts
+        a flapping, mostly-declined doctrine into a deterministically declined
+        one — not an enabled doctrine into a disabled one.
+
+        Any OTHER validation failure is re-raised unchanged, including the
+        safety-owned ceiling-guard bound.
+
+        Args:
+            frozen: The run's frozen controller/safety generation.
+
+        Returns:
+            The recovery application config.
+        """
+        payload = {
+            **self._config.model_dump(mode="python"),
+            "controller": frozen.controller,
+            "safety": frozen.safety,
+        }
+        try:
+            return AppConfig.model_validate(payload)
+        except ValidationError:
+            if not frozen.controller.ambient_fan_doctrine.enabled:
+                raise
+            payload["controller"] = frozen.controller.model_copy(
+                update={
+                    "ambient_fan_doctrine": frozen.controller.ambient_fan_doctrine.model_copy(
+                        update={"enabled": False}
+                    )
+                }
+            )
+            # The retry IS the hypothesis test: if the doctrine was not the
+            # cause, this re-raises unchanged and nothing is swallowed. Logging
+            # only AFTER it succeeds means the message can never claim a cause
+            # that was not the cause — the alternative, matching on the error
+            # text before retrying, would couple this to validator wording.
+            recovered = AppConfig.model_validate(payload)
+            _log.warning(
+                "Recovered run's ambient fan doctrine is inconsistent with the current "
+                "ambient poll interval; retiring the doctrine for this run (advisory "
+                "only — c11 falls back to its absent-ambient branch). #732"
+            )
+            return recovered
+
     async def recover_on_start(self) -> None:
         """Restart recovery (orchestration plan § Persistence; architecture
         invariant): a possibly-active persisted run is brought back without ever
@@ -2067,13 +2227,7 @@ class RoastService:
         # preserves apply-next-roast semantics across a process restart: config
         # edits made after this run started cannot alter its control, scheduling,
         # reference lookup, API prechecks, or safety policy.
-        recovery_config = AppConfig.model_validate(
-            {
-                **self._config.model_dump(mode="python"),
-                "controller": persisted.frozen_config.controller,
-                "safety": persisted.frozen_config.safety,
-            }
-        )
+        recovery_config = self._build_recovery_config(persisted.frozen_config)
         recovery_safety = SafetyPolicy(recovery_config.safety)
         self._safety = recovery_safety
         runner = await self._build_runner(
@@ -3596,7 +3750,7 @@ async def start_roast(profile: RoastProfile, service: ServiceDep) -> RoastDetail
     """``POST /api/roasts`` — start a roast (409 if one is active)."""
     try:
         return await service.start_roast(profile)
-    except RoastRunConflictError as exc:
+    except (RoastRunConflictError, RoastConfigError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
