@@ -145,12 +145,15 @@ def _trim_line(config: AppConfig) -> str:
             f"ADAPTIVE — #386 RoR-keyed depth, base {trim.base_trim}% "
             f"within {trim.min_trim}–{trim.max_trim}% (experiment, watch the cut)"
         )
-    if trim.trim_heat_percent == fields["trim_heat_percent"].default:
+    # "proven roast-6 default" is a claim about the WHOLE fixed-mode trim, not
+    # just its depth: changing the window or the bean-temp threshold changes
+    # when the cut engages and so changes the roast. Compare the section
+    # field-by-field rather than naming the fields that matter — an enumerated
+    # list drifts silently the next time a field is added.
+    changed = sorted(name for name, spec in fields.items() if getattr(trim, name) != spec.default)
+    if not changed:
         return f"fixed {trim.trim_heat_percent}% (proven roast-6 default)"
-    return (
-        f"fixed {trim.trim_heat_percent}% "
-        f"(schema default {fields['trim_heat_percent'].default}%){EXPERIMENT_TAG}"
-    )
+    return f"fixed {trim.trim_heat_percent}% (non-default: {', '.join(changed)}){EXPERIMENT_TAG}"
 
 
 def resolve_banner_lines(config: AppConfig) -> LaunchBannerLines:

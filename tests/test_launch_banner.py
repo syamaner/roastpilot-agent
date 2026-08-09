@@ -21,7 +21,13 @@ import pytest
 from pydantic import ValidationError
 
 from roastpilot_agent import config_store
-from roastpilot_agent.config import AdvisorConfig, AppConfig, ControllerConfig
+from roastpilot_agent.config import (
+    AdvisorConfig,
+    AppConfig,
+    ControllerConfig,
+    LateMaillardTrim,
+    PreFirstCrackLevers,
+)
 from roastpilot_agent.config_store import (
     AdvisorConfigEdit,
     AppConfigEdit,
@@ -231,7 +237,29 @@ def test_trim_line_reports_saved_non_default_depth(config_file: Path) -> None:
 
     lines = load_banner_lines()
 
-    assert lines.trim == f"fixed 60% (schema default 65%){EXPERIMENT_TAG}"
+    assert lines.trim == f"fixed 60% (non-default: trim_heat_percent){EXPERIMENT_TAG}"
+
+
+def test_trim_line_flags_a_non_default_window_at_the_proven_depth() -> None:
+    """A default 65 % depth is NOT "proven roast-6" if the window moved.
+
+    `window_fc_eta_seconds` / `min_bean_temp_c` decide WHEN the cut engages, so
+    the proven-default claim is about the whole fixed-mode section, not just the
+    depth (local Codex P2, folded pre-open).
+    """
+    config = AppConfig(
+        advisor=AdvisorConfig(),
+        controller=ControllerConfig(
+            pre_first_crack_levers=PreFirstCrackLevers(
+                late_maillard_trim=LateMaillardTrim(window_fc_eta_seconds=30.0)
+            )
+        ),
+    )
+
+    lines = resolve_banner_lines(config)
+
+    assert lines.trim == f"fixed 65% (non-default: window_fc_eta_seconds){EXPERIMENT_TAG}"
+    assert "proven" not in lines.trim
 
 
 def test_trim_line_default_depth_is_untagged(config_file: Path) -> None:

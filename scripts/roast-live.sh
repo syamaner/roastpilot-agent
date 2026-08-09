@@ -44,7 +44,9 @@
 #            (1) setting either PINS that value for every roast in the session,
 #            because env beats the saved file — the /config UI selector becomes
 #            a silent no-op. Never use them to switch arms in a prompt A/B;
-#            switch in /config between roasts and read the banner to confirm.
+#            switch in /config between roasts and confirm the arm at GET
+#            /api/config (see the banner note below — it is a LAUNCH-TIME
+#            snapshot and does NOT re-print between roasts).
 #            (2) the model slug does NOT change the advice model: the advisor
 #            calls AdvisorConfig.model_for(phase), and model_slug_by_phase
 #            ships populated with gpt-4o for every phase and is not editable
@@ -202,6 +204,12 @@ ADV="advisor configured"
 # Line 1 = the "Advisor cfg:" text, line 2 = the "Pre-FC trim:" text. A
 # malformed/unreadable saved config fails LOUD (reason on stderr, non-zero
 # exit) and both lines read "unresolved" — never a plausible-but-wrong version.
+#
+# ⚠ SCOPE: this is a LAUNCH-TIME snapshot, printed once. `start_roast` re-reads
+# the saved config per roast, so an arm switched in /config AFTER launch is live
+# for the next roast but is NOT reflected here. For roast 2 of an A/B, confirm
+# the arm at GET /api/config (saved vs effective per field) or on the live
+# dashboard — not by re-reading this banner, which still shows roast 1's arm.
 BANNER_UNRESOLVED='unresolved (config read failed — see the error above)'
 BANNER_LINES="$(python -m roastpilot_agent.launch_banner)" || BANNER_LINES=""
 ADVISOR_CFG="$(printf '%s\n' "$BANNER_LINES" | sed -n '1p')"
