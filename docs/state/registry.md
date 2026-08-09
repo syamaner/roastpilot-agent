@@ -163,22 +163,43 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number for THIS repository: **D130** (corrected 9 Aug;
-> this line previously said D126, then briefly and wrongly said D150).
+> Next free plan decision number: **D150** — one past the highest number defined
+> ANYWHERE in `roastpilot-plan` (9 Aug 2026). Take D150 because it is the only
+> answer that is safe under both readings of an unresolved ambiguity, described
+> next; do not "optimise" it down.
 >
-> **Derive it from `roastpilot-plan/roastpilot-agent/plan.md` ALONE. The
-> D-numbers are scoped PER PLAN FILE, not globally**, and a whole-repo grep of
-> `roastpilot-plan` gives the wrong answer — which is exactly how the D150 above
-> was produced. `roastpilot-agent/plan.md` (this repo) and
-> `roastpilot-cloud/factory.md` (the cloud programme) each run their own series
-> and **both independently define D103-D129**, 27 numbers that mean entirely
-> different things in each file. `plan.md` D108 is the PR-scoped Claude approval
-> bridge that `AGENTS.md` cites; `factory.md` D108 is an unrelated cloud slice
-> decision. Same for D122, D124 and D127, all of which RP-B cites. So a bare
-> "D127" is ambiguous across the two files: cite the file when the reader could be
-> in either programme.
+> **There is a live decision-number COLLISION in the plan repo, and it is not yet
+> resolved.** `roastpilot-agent/plan.md` (this repo) and
+> `roastpilot-cloud/factory.md` (the cloud programme) **both independently define
+> D103-D129** — 27 numbers meaning entirely different things in each file.
+> `plan.md` D108 is the PR-scoped Claude approval bridge `AGENTS.md` cites;
+> `factory.md` D108 is an unrelated cloud slice decision. The same holds for
+> D122, D124 and D127, all of which RP-B cites. **So a bare "D127" is ambiguous:
+> name the file whenever a reader could be in either programme.**
 >
-> `plan.md` currently runs to D129, hence D130. D125 records the RP-D eval-model
+> The collision is DRIFT, not design. Up to D102 the repo demonstrably ran ONE
+> shared series across files: D1-D4 are cross-repo, `plan.md` never defines
+> D9-D14 or D97-D101 (those are in `roastpilot-cloud/plan.md`), and D2 is
+> superseded by D97 from a different file — D5-D99 interleave with zero
+> collisions. Both files then began incrementing independently from D103.
+>
+> **Which convention now applies is an open question for the operator** (resume
+> one shared series, or formally namespace per programme). Until it is decided,
+> D150 is correct either way: next-in-sequence if the series is shared, and a
+> harmless skip if it is per-file. Continuing `plan.md`'s own count at D130 would
+> manufacture the 28th collision, so do not do that.
+>
+> **Deriving this number is a known trap; three separate attempts got it wrong on
+> 9 Aug alone** (D126 stale, then D150 by correct-answer-wrong-reasoning, then
+> D130 from a per-file assumption the history contradicts). Decisions are defined
+> in THREE formats and no single grep catches them all: `| D<n> |` table rows
+> (`roastpilot-agent/plan.md`, `roastpilot-cloud/plan.md`,
+> `00-repository-structure.md`), `**D<n> (date) — ...**` paragraphs
+> (`factory.md` up to D143), and `## D<n>: ...` headings (`factory.md` D145
+> onward). Note also that D9, D14 are never defined, and D144 was deliberately
+> renumbered to D145 — real gaps, not numbers to reclaim.
+>
+> D125 records the RP-D eval-model
 > correction — discriminates only on hardware/simulator, not replay; D124 records
 > the RP-D scorer + RP-B c11 design, roastpilot-agent#711/#709; D123 the #718
 > catalogue query-scope won't-fix.
