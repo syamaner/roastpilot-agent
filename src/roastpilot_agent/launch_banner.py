@@ -140,6 +140,20 @@ def load_banner_lines() -> LaunchBannerLines:
     return resolve_banner_lines(config)
 
 
+def _one_line(text: str) -> str:
+    """Fold any newline in *text* to a space so one value stays one output line.
+
+    Args:
+        text: A rendered banner line.
+
+    Returns:
+        The same text with every line break replaced by a single space.  Other
+        whitespace is left alone — the banner's alignment relies on the double
+        spaces around ``·`` and the tag's leading run.
+    """
+    return " ".join(text.splitlines())
+
+
 def main() -> int:
     """Print the two banner lines on stdout for ``scripts/roast-live.sh``.
 
@@ -147,6 +161,11 @@ def main() -> int:
     launcher reads them positionally.  A config failure prints the reason on
     stderr and returns non-zero so the launcher falls back to ``unresolved``
     instead of showing a plausible but wrong prompt version.
+
+    Any newline inside a resolved value (a hand-edited saved config can hold a
+    multi-line ``model_slug``) is folded to a space, so a value can never split
+    the positional two-line contract and shift the trim text onto the advisor
+    line.
 
     Returns:
         ``0`` on success, ``1`` when the saved config could not be resolved.
@@ -164,8 +183,8 @@ def main() -> int:
     except OSError as exc:
         print(f"error: saved-config file is unreadable — {exc}", file=sys.stderr)
         return 1
-    print(lines.advisor_cfg)
-    print(lines.trim)
+    print(_one_line(lines.advisor_cfg))
+    print(_one_line(lines.trim))
     return 0
 
 

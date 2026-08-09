@@ -34,6 +34,7 @@ from roastpilot_agent.config_store import (
 from roastpilot_agent.launch_banner import (
     EXPERIMENT_TAG,
     LaunchBannerLines,
+    _one_line,  # pyright: ignore[reportPrivateUsage]
     load_banner_lines,
     main,
     resolve_banner_lines,
@@ -287,6 +288,32 @@ def test_main_prints_advisor_then_trim(
     assert len(out) == 2
     assert out[0] == "openai/gpt-4o  ·  prompt c10" + EXPERIMENT_TAG
     assert out[1] == "fixed 65% (proven roast-6 default)"
+
+
+def test_multiline_value_cannot_split_the_two_line_contract(
+    config_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A newline inside a resolved value is folded, so the trim text stays on line 2.
+
+    The launcher reads the two lines positionally (``sed -n '1p'`` / ``'2p'``).
+    A hand-edited saved config can hold a multi-line scalar; without folding it
+    the trim text would slide onto the advisor line and the banner would lie
+    again — the exact failure mode this seam exists to remove.
+    """
+    config_file.write_text('advisor:\n  model_slug: "bad\\nslug"\n')
+
+    assert main() == 0
+
+    out = capsys.readouterr().out.splitlines()
+    assert len(out) == 2
+    assert out[0].startswith("bad slug  ·  prompt c3")
+    assert out[1] == "fixed 65% (proven roast-6 default)"
+
+
+def test_one_line_preserves_deliberate_spacing() -> None:
+    """Folding must not collapse the banner's alignment runs."""
+    assert _one_line("a  ·  b   tag") == "a  ·  b   tag"
+    assert _one_line("a\nb") == "a b"
 
 
 # ---------------------------------------------------------------------------
