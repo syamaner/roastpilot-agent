@@ -4658,7 +4658,15 @@ class RoastController:
         # inequality in the doctrine path, so it is the only place the fail-open
         # could hide.
         if age_seconds is None or not (0.0 <= age_seconds <= doctrine.max_reading_age_seconds):
-            self._warn_once_on_ambient_decline(age_seconds)
+            # The latch is spent only on a reading that EXISTS and is untrustworthy.
+            # A disabled, unplugged or not-yet-sampled probe also arrives here with
+            # ``age_seconds is None``, but nothing went stale — warning there would
+            # both mislead (a cadence complaint about a probe that never reported)
+            # and, worse, burn the run's one warning so a probe that starts fine and
+            # genuinely wedges later goes unreported. That is the case the warning
+            # exists for.
+            if telemetry.ambient_temp_c is not None:
+                self._warn_once_on_ambient_decline(age_seconds)
             return None, None
         return telemetry.ambient_temp_c, telemetry.ambient_humidity_pct
 

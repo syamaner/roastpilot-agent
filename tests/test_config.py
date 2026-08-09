@@ -21,7 +21,6 @@ from roastpilot_agent.config import (
     AppConfig,
     BeanSourcingConfig,
     ControllerConfig,
-    MCPConfig,
     MCPDeviceConfig,
     PostFirstCrackControl,
     SafetyLimits,
@@ -458,8 +457,11 @@ def test_ambient_freshness_bound_must_outlive_the_poll_interval() -> None:
     recovery, retiring a doctrine that was serving fresh readings."""
     doctrine = AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
 
-    # 90 s against the default 30 s cadence is three polls — comfortably valid.
-    assert AppConfig(controller=ControllerConfig(ambient_fan_doctrine=doctrine))
+    # 90 s against a 30 s cadence is three polls — comfortably valid.
+    assert AppConfig(
+        controller=ControllerConfig(ambient_fan_doctrine=doctrine),
+        mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=30.0),
+    )
 
     # 90 s against a 60 s cadence is NOT rejected: a healthy reading is at its
     # oldest just before the next poll, so 60 < 90 means it always arrives
@@ -478,63 +480,44 @@ def test_ambient_freshness_bound_must_outlive_the_poll_interval() -> None:
         )
 
 
-def test_ambient_freshness_check_stands_down_when_the_cadence_is_unknown() -> None:
-    """#732, post-open Codex P2: ``None`` does not mean "the package default".
+def test_enabling_the_doctrine_requires_an_explicit_poll_cadence() -> None:
+    """#732, post-open Codex rounds 1-3: enabling the doctrine demands the
+    cadence outright rather than inferring it.
 
-    ``mcp_yaml`` renders ``ambient_poll_interval_seconds`` only when it is set,
-    so an unset value inherits whatever the hand-authored MCP yaml carries —
-    which this process cannot read. An earlier revision substituted the
-    mirrored 30 s default, which would let an inherited 300 s cadence pass
-    against a 90 s bound and silently void the doctrine: the exact failure this
-    validator exists to prevent, wearing its approval.
+    ``mcp_yaml`` renders ``ambient_poll_interval_seconds`` only when set, so
+    unset means "inherit" from a file config construction will not read
+    (``AppConfig`` is built in tests, replay and recovery; it must not depend on
+    the filesystem).
 
-    So an unknown cadence is not guessed at. The runtime decline warning covers
-    it instead, by observing the behaviour rather than predicting it.
+    Three earlier revisions each closed an instance and left the class:
+    substituting the MCP default let an inherited 300 s cadence pass against a
+    90 s bound; standing down when unset stripped the guard from the DEFAULT
+    deployment shape; enumerating the yaml routes still missed
+    ``resolve_mcp_yaml_source_path``'s working-directory fallback, which the
+    spawn honours. Requiring the value has no residual left to miss.
 
-    But "unset" is NOT the same as "unknown", and collapsing the two was the
-    over-correction independent triage caught: with no yaml route configured
-    there is nothing to inherit FROM, so the MCP's own default really is
-    operative and the guard must still apply. Standing down for both cases
-    would have stripped the guard from the DEFAULT deployment shape — widening
-    the silent-void hole rather than closing it."""
+    The cost is one field the operator effectively has to know anyway before
+    running a scored arm on a doctrine whose whole behaviour turns on it."""
     tight = ControllerConfig(
-        ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=1.0)
+        ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
     )
     assert MCPDeviceConfig().ambient_poll_interval_seconds is None
 
-    # No yaml route: the cadence IS known (the mirrored MCP default), so a 1 s
-    # bound against it is still rejected.
-    with pytest.raises(pydantic.ValidationError, match="max_reading_age_seconds"):
+    # No route configured is STILL rejected: a working-directory yaml is
+    # invisible from here, so "no route" cannot be told apart from it.
+    with pytest.raises(pydantic.ValidationError, match="ambient_poll_interval_seconds"):
         AppConfig(controller=tight, mcp_device=MCPDeviceConfig())
 
-    # An explicit yaml route: the inherited cadence is genuinely unreadable
-    # from here, so enabling the doctrine is REJECTED rather than guessed at.
-    # A runtime warning is evidence, not a guard — it fires once the roast is
-    # already running and cannot stop a scored arm continuing on a doctrine
-    # that is void for most of every cycle.
+    # An explicit path route, likewise.
     with pytest.raises(pydantic.ValidationError, match="ambient_poll_interval_seconds"):
         AppConfig(
             controller=tight,
             mcp_device=MCPDeviceConfig(mcp_yaml_source_path=Path("/tmp/coffee-roaster-mcp.yaml")),
         )
 
-    # Same for the env-var route the MCP spawn actually honours.
-    with pytest.raises(pydantic.ValidationError, match="ambient_poll_interval_seconds"):
-        AppConfig(
-            controller=tight,
-            mcp=MCPConfig(env={"COFFEE_ROASTER_MCP_CONFIG": "/tmp/coffee-roaster-mcp.yaml"}),
-        )
-
-    # Stating the cadence explicitly is the documented way through, and it is
-    # the operator's own /config field rather than a new concept.
+    # Stating the cadence is the way through.
     assert AppConfig(
-        controller=ControllerConfig(
-            ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
-        ),
-        mcp_device=MCPDeviceConfig(
-            mcp_yaml_source_path=Path("/tmp/coffee-roaster-mcp.yaml"),
-            ambient_poll_interval_seconds=30.0,
-        ),
+        controller=tight, mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=30.0)
     )
 
 

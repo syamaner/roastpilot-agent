@@ -4699,6 +4699,38 @@ def test_first_ambient_decline_warns_once_per_run(
     assert "90.0" in declines[0].getMessage()
 
 
+def test_an_absent_probe_does_not_consume_the_stale_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#732, post-open Codex P3: the warning latch is spent only on a reading
+    that EXISTS and is untrustworthy.
+
+    A disabled, unplugged or not-yet-sampled probe also reaches the decline
+    branch with no age, but nothing went stale. Warning there would mislead —
+    a cadence complaint about a probe that never reported — and, worse, would
+    burn the run's single warning, so a probe that starts healthy and then
+    genuinely wedges later goes unreported. That wedge is the case the warning
+    exists for, which makes suppressing it the expensive half of the bug."""
+    harness = make_harness(config=_doctrine_on())
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+
+    with caplog.at_level(logging.WARNING, logger="roastpilot_agent.controller"):
+        # No ambient at all: silent.
+        for _ in range(3):
+            harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
+        assert [r for r in caplog.records if "#732" in r.getMessage()] == []
+
+        # The probe then starts, runs, and wedges — the warning is still available.
+        harness.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
+            reading(ambient_temp_c=23.5, ambient_age_seconds=600.0), limits
+        )
+
+    assert len([r for r in caplog.records if "#732" in r.getMessage()]) == 1
+
+
 def test_declined_stale_ambient_is_the_same_shape_as_an_absent_probe() -> None:
     """#732: a stale reading degrades to the EXACT absent-ambient context an
     unplugged probe produces — the branch c11 already handles deliberately

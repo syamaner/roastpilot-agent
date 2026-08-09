@@ -3550,7 +3550,10 @@ async def test_recover_on_start_survives_a_frozen_doctrine_the_live_poll_interva
         config=AppConfig(
             controller=ControllerConfig(
                 ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
-            )
+            ),
+            # The run's OWN generation was self-consistent when it started; the
+            # clash under test is against the CURRENT device config below.
+            mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=60.0),
         ),
         agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
     )
@@ -3604,7 +3607,10 @@ async def test_recover_on_start_preserves_a_frozen_doctrine_that_still_fits(
         config=AppConfig(
             controller=ControllerConfig(
                 ambient_fan_doctrine=AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
-            )
+            ),
+            # The run's OWN generation was self-consistent when it started; the
+            # clash under test is against the CURRENT device config below.
+            mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=60.0),
         ),
         agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
     )
