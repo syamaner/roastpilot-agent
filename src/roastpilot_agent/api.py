@@ -1751,48 +1751,37 @@ class RoastService:
                 # between roasts is issue-sized, not a side effect of starting
                 # a roast.
                 # Keyed on the STATUS, not on whether a model was named (two
-                # successive local Codex P2s, both folded pre-open).
-                # NOT_CONFIGURED says the ADVISOR is absent — advisory-paused,
-                # no API key — which no model change can stale, so clearing it
-                # would regress an explicit readout to the ambiguous "not
-                # probed". But a model-less result does NOT imply that state:
-                # ``probe_advisor_health`` also returns UNREACHABLE with no
-                # slug when the probe times out or raises, and preserving THAT
-                # would report the old advisor offline forever after a model
-                # change the probe never saw. Anything other than
-                # NOT_CONFIGURED is a claim about a specific model, so it is
-                # stale unless it names the one now configured.
+                # successive local Codex P2s). NOT_CONFIGURED says the ADVISOR
+                # is absent — advisory-paused, no API key — which no model
+                # change can stale, so clearing it would regress an explicit
+                # readout to the ambiguous "not probed". But a model-less
+                # result does NOT imply that state: ``probe_advisor_health``
+                # also returns UNREACHABLE with no slug when the probe times
+                # out or raises, and preserving THAT would report the old
+                # advisor offline forever after a model change the probe never
+                # saw. Anything other than NOT_CONFIGURED is a claim about a
+                # specific model, so it is stale unless it still describes the
+                # current one.
+                #
+                # ``dispatch_identity`` names what a probe CONTACTED (provider,
+                # NORMALISED endpoint, key env var, base slug, reasoning effort
+                # — ``build_model`` bakes the effort into every cached agent,
+                # including the one ``healthcheck`` probes with).
+                # ``advice_models`` is compared alongside it because a pinned
+                # phase slot changes which model gives ADVICE without changing
+                # what the probe contacted. Both together are the #134 "advisor
+                # configured" false comfort this probe exists to prevent.
                 probed = self._advisor_health
-                if probed is not None and probed.status is not AdvisorHealthStatus.NOT_CONFIGURED:
-                    # Compare the whole DISPATCH identity, not just the slug
-                    # (Claude review, folded pre-open). What a probe reached is
-                    # decided by provider + base URL + key env var + the model,
-                    # including a phase override, so a slug-only check let a
-                    # REACHABLE result survive an endpoint swap (same slug,
-                    # different server) or a pinned DEVELOPMENT slot — vouching
-                    # for something nothing has contacted, which is the #134
-                    # "advisor configured" false comfort this probe exists to
-                    # prevent. Comparing the PREVIOUS config against the fresh
-                    # one catches every axis without enumerating them here.
-                    was, now = previous_advisor, fresh_config.advisor
-                    # ``healthcheck`` probes the BASE ``model_slug``, while
-                    # advice dispatches the phase-RESOLVED model, so both belong
-                    # in the identity: with a DEVELOPMENT slot pinned, the base
-                    # slug can change while the advice model does not, and the
-                    # probe on record would still describe the old base model
-                    # (local Codex P2, folded pre-open).
-                    if (
-                        was.provider,
-                        was.provider_base_url,
-                        was.api_key_env,
-                        was.model_slug,
-                    ) != (
-                        now.provider,
-                        now.provider_base_url,
-                        now.api_key_env,
-                        now.model_slug,
-                    ) or advice_models(was) != advice_models(now):
-                        self._advisor_health = None
+                if (
+                    probed is not None
+                    and probed.status is not AdvisorHealthStatus.NOT_CONFIGURED
+                    and (
+                        previous_advisor.dispatch_identity()
+                        != fresh_config.advisor.dispatch_identity()
+                        or advice_models(previous_advisor) != advice_models(fresh_config.advisor)
+                    )
+                ):
+                    self._advisor_health = None
                 # MCP device respawn (#431): when the reloaded mcp_device differs
                 # from what the child was spawned with, stop and restart the child
                 # so hardware changes (serial port, driver, audio input, FC mode,

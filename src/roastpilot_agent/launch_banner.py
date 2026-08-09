@@ -29,7 +29,7 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, ValidationError
 
-from roastpilot_agent.advisor_screen import screen_warning
+from roastpilot_agent.advisor_screen import advice_models, screen_warning
 from roastpilot_agent.config import AppConfig
 from roastpilot_agent.controller import AUTO_ADVICE_PHASES
 
@@ -125,10 +125,12 @@ def _advisor_line(config: AppConfig) -> str:
     advisor = config.advisor
     fields = type(advisor).model_fields
     default_model = fields["model_slug"].default
-    # Distinct slugs rather than a per-phase listing: today ADVISOR_PHASES is a
-    # single phase, so a phase-by-phase branch would be dead code. Joining the
-    # distinct slugs stays correct if a second advice phase is ever added.
-    resolved = {advisor.model_for(phase) for phase in ADVISOR_PHASES}
+    # Shared with ``advisor_screen`` rather than recomputed (Claude review,
+    # folded pre-open): that module calls itself the single source for "which
+    # models can answer", and a second inline copy is the drift this PR exists
+    # to remove. Joining the distinct slugs stays correct if a second advice
+    # phase is ever added.
+    resolved = advice_models(advisor)
     model_text = " / ".join(sorted(resolved))
     # Warn only when the operator SET a base slug that then gives no advice. A
     # base slug left at the schema default is shadowed too, but silently and

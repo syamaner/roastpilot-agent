@@ -14,6 +14,7 @@ persists the run record and reloads config but does not start the tick loop).
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -75,7 +76,18 @@ async def store(tmp_path: Path) -> AsyncIterator[RoastStore]:
 
 @pytest_asyncio.fixture
 async def config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Isolated config file path; point load_app_config at it via env var."""
+    """Isolated config file path; point load_app_config at it via env var.
+
+    Also clears inherited ``ROASTPILOT_*`` (qa finding, folded pre-open). These
+    tests assert on specific resolved model identities, and env beats the saved
+    file, so a real ``ROASTPILOT_ADVISOR__MODEL_SLUG`` exported in a developer's
+    shell reddens six of them. Same guard ``test_launch_banner``'s own
+    ``config_file`` already carries; the sibling class was fixed in
+    ``test_config_store`` and simply had not been propagated here.
+    """
+    for key in list(os.environ):
+        if key.startswith("ROASTPILOT_"):
+            monkeypatch.delenv(key, raising=False)
     path = tmp_path / "roastpilot-config.yaml"
     monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(path))
     return path

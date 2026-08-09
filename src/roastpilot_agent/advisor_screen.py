@@ -186,11 +186,22 @@ def screen_warning(advisor: AdvisorConfig, advisory_timeout_seconds: float) -> s
         # Quote the recorded max AGAINST the configured bound rather than
         # asserting "it will time out": the two numbers are what the operator
         # needs to judge it, and the bound is theirs to change.
-        over = "above" if recorded_max >= advisory_timeout_seconds else "close to"
+        # "Occasional" is only true near the bound. When the recorded worst
+        # call is at or past it — and the headroom check has no lower bound, so
+        # a low configured timeout can put it far past — saying "occasional"
+        # understates a configuration that would time out on most or every call
+        # (Claude review, folded pre-open).
+        if recorded_max < advisory_timeout_seconds:
+            cost = "expect occasional timeouts"
+        elif recorded_max < advisory_timeout_seconds * 1.5:
+            cost = "expect frequent timeouts"
+        else:
+            cost = "expect MOST calls to time out"
         notes.append(
             f"{slug} cleared the ~5 s screen but its recorded worst call "
-            f"({recorded_max:g} s) is {over} the {advisory_timeout_seconds:g} s advisory "
-            "timeout — expect occasional timeouts, each one REJECT + hold (fail-closed)"
+            f"({recorded_max:g} s) leaves no room under the "
+            f"{advisory_timeout_seconds:g} s advisory timeout — {cost}, each one "
+            "REJECT + hold (fail-closed)"
         )
     if busted:
         notes.append(

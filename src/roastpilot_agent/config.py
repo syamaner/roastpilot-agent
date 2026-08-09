@@ -1580,41 +1580,29 @@ class AdvisorConfig(BaseModel):
     # provider default; ``"off"`` disables reasoning; the effort levels set
     # ``reasoning.effort``. Native anthropic/google providers ignore this.
     # Default ``None`` preserves provider behavior; the advisor's interest is
-    # fast structured advice inside the 10 s tick budget, so the bake-off
+    # fast structured advice inside the controller's advisory budget
+    # (``ControllerConfig.advisory_timeout_seconds``, 5.0 s since D151), so the
+    # bake-off
     # measures reasoning on-vs-off (E8-S4 cost/reasoning eval).
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None
 
     @field_validator("model_slug")
     @classmethod
     def _strip_model_slug(cls, value: str) -> str:
-        """Normalise the slug at the boundary, and reject a blank one.
+        """Normalise the base slug; see :func:`normalize_model_slug`.
 
         ``min_length=1`` admits ``"  "``, which before D151 was inert — the
-        always-populated phase map shadowed it. This PR is what makes it live:
-        a blank-looking slug saved through ``/config`` would now reload, pass
-        validation, and ship a garbage identifier to the provider on every
-        DEVELOPMENT call, burning D30's consecutive-failure budget with no
-        signal at save time (local Codex P2, folded pre-open).
-
-        Stripping rather than merely rejecting also closes a divergence the
-        review chased earlier: ``build_model`` dispatches the slug verbatim, so
-        a padded value used to be dispatched padded while the FC-latency screen
-        matched on the raw string. Normalising here means the classifier and
-        the provider always see the same identifier.
+        always-populated phase map shadowed it. This change is what makes it
+        live, so a blank-looking slug would now ship a garbage identifier to the
+        provider on every DEVELOPMENT call.
 
         Args:
             value: The configured slug.
 
         Returns:
             The stripped slug.
-
-        Raises:
-            ValueError: If the slug is blank once stripped.
         """
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("model_slug must not be blank")
-        return stripped
+        return normalize_model_slug(value, "model_slug")
 
     @field_validator("model_slug_by_phase")
     @classmethod
@@ -1629,17 +1617,42 @@ class AdvisorConfig(BaseModel):
 
         Returns:
             The map with every slug stripped.
-
-        Raises:
-            ValueError: If any override is blank once stripped.
         """
-        cleaned: dict[RoastPhase, str] = {}
-        for phase, slug in value.items():
-            stripped = slug.strip()
-            if not stripped:
-                raise ValueError(f"model_slug_by_phase[{phase.value}] must not be blank")
-            cleaned[phase] = stripped
-        return cleaned
+        return {
+            phase: normalize_model_slug(slug, f"model_slug_by_phase[{phase.value}]")
+            for phase, slug in value.items()
+        }
+
+    def dispatch_identity(self) -> tuple[str, str, str, str, str | None]:
+        """What a probe or an advice call actually CONTACTS (#747 review fold).
+
+        Named and returned as a unit because "does this probe still describe the
+        current config" has already taken three rounds of review-discovered
+        subtlety, all of it previously living as comments at one call site — and
+        the dimension that kept getting missed (``reasoning_effort``) is exactly
+        what an unnamed inline tuple invites. ``build_model`` bakes the reasoning
+        effort into the model settings every cached agent uses, including the one
+        ``healthcheck`` probes with, so it is part of the identity.
+
+        The base URL is compared NORMALISED, using the same helper the endpoint
+        screen uses: a trailing slash or host-case edit is cosmetic, and treating
+        it as a different endpoint would needlessly discard a valid probe.
+
+        The per-phase override map is deliberately NOT here — it changes which
+        model gives ADVICE, not what the base-slug probe contacted, and callers
+        that care compare :func:`advisor_screen.advice_models` alongside this.
+
+        Returns:
+            ``(provider, normalised base URL, api_key_env, model_slug,
+            reasoning_effort)``.
+        """
+        return (
+            self.provider,
+            normalize_base_url(self.provider_base_url),
+            self.api_key_env,
+            self.model_slug,
+            self.reasoning_effort,
+        )
 
     def model_for(self, phase: RoastPhase) -> str:
         """Return the advisor model slug to use for ``phase`` (#173).
@@ -1673,6 +1686,34 @@ class AdvisorConfig(BaseModel):
 # because this module already owns ``OPENROUTER_BASE_URL``, and because a
 # second, less tolerant copy is exactly the drift Claude's review caught.
 _DEFAULT_PORT_BY_SCHEME: dict[str, int] = {"http": 80, "https": 443}
+
+
+def normalize_model_slug(value: str, field_name: str) -> str:
+    """Strip a model slug and reject it if blank (#747 review fold).
+
+    One implementation for all three boundaries — ``AdvisorConfig.model_slug``,
+    its per-phase overrides, and ``AdvisorConfigEdit.model_slug`` — because
+    three hand-rolled copies of "strip, raise if empty" is the same drift this
+    PR is elsewhere fixing.
+
+    Stripping matters beyond tidiness: ``build_model`` dispatches the slug
+    verbatim, so a padded value would otherwise be dispatched padded while the
+    FC-latency screen matched on the raw string.
+
+    Args:
+        value: The configured slug.
+        field_name: Field name, for the error message.
+
+    Returns:
+        The stripped slug.
+
+    Raises:
+        ValueError: If the slug is blank once stripped.
+    """
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError(f"{field_name} must not be blank")
+    return stripped
 
 
 def normalize_base_url(url: str) -> str:
@@ -1794,11 +1835,12 @@ class BeanSourcingConfig(BaseModel):
     extraction_timeout_seconds: float = Field(default=45.0, gt=0)
     """Bound on the bean-identity extraction LLM call
     (``bean_sourcing._extract_bean_identity``'s ``agent.run()``) —
-    deliberately a SEPARATE, LONGER budget than
-    :attr:`AdvisorConfig.timeout_seconds` (10 s), which bounds the
-    *per-tick roast-advice* call the live control loop makes once a second.
+    deliberately a SEPARATE, LONGER budget than the *per-tick roast-advice*
+    call the live control loop makes once a second, which is bounded by
+    :attr:`ControllerConfig.advisory_timeout_seconds` (5.0 s since D151 —
+    :attr:`AdvisorConfig.timeout_seconds` has no runtime consumer in the agent).
     A bean draft is a one-shot request the operator explicitly triggers by
-    pasting a vendor URL and can wait ~30 s for; the 10 s advice budget
+    pasting a vendor URL and can wait ~30 s for; the far tighter advice budget
     starved every call for the reasoning models tested in the bean-sourcing
     bake-off (``gpt-5-nano``/``gpt-5-mini`` both scored 0/81 on the first
     pass — see ``docs/advisor/bean-sourcing-bakeoff-2026-07-19.md``,
