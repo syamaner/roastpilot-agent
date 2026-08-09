@@ -62,8 +62,10 @@ DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS: dict[RoastPhase, float | None] = {
 # ``google/gemini-3.1-flash-lite`` (faster + ~5x cheaper) lost on heat-magnitude
 # fidelity; ``google/gemini-3-flash-preview`` was rejected (best drop but steers
 # heat the wrong way). See ``docs/advisor/bakeoff-results-2026-06-21.md``. This is
-# the base slug AND the default for every phase; the per-phase mechanism (#173)
-# is retained so a future re-run can flip a slot without a behavior change.
+# the base slug, and — with ``model_slug_by_phase`` empty by default (D130) — the
+# model every advice call resolves to until the operator changes it. The pin is a
+# DEFAULT, not a lock: D43/D73 and the #396 A/B both schedule hardware arms on
+# other models, which a lock would forbid.
 DEFAULT_ADVISOR_MODEL = "openai/gpt-4o"
 
 # One Hottop fan level, in normalized percentage points (#709 / D126). The
@@ -88,19 +90,56 @@ HOTTOP_FAN_LEVEL_PP = 10.0
 # narrowing the freshness margin.
 DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS = 30.0
 
-# Phase-keyed advisor MODEL selection (#173, operator 13 Jun): the model slug
-# the advisor uses, by agent phase. The MECHANISM only — every phase defaults to
-# ``DEFAULT_ADVISOR_MODEL`` (gpt-4o everywhere, #277 PIN). Under D35 the advisor
-# is consulted only in DEVELOPMENT (post-FC), so DEVELOPMENT is the phase the PIN
-# actually governs; preheat / pre-FC are deterministic and never consult. The map
-# is kept so a future re-run can flip a slot (e.g. a faster/cheaper development
-# model once the cloud feedback loop learns heat trims) and record it as a new
-# D-number. A phase absent from the map falls back to ``model_slug``.
-DEFAULT_ADVISOR_MODEL_BY_PHASE: dict[RoastPhase, str] = {
-    RoastPhase.PREHEATING: DEFAULT_ADVISOR_MODEL,
-    RoastPhase.ROASTING_PRE_FIRST_CRACK: DEFAULT_ADVISOR_MODEL,
-    RoastPhase.DEVELOPMENT: DEFAULT_ADVISOR_MODEL,
-}
+# Advisor slugs whose post-FC advice latency has been MEASURED against the ~5 s
+# first-crack-slot gate, split by what the measurement said (D130, #747). Both
+# sets are ADVISORY DISPLAY DATA for the pre-charge banner and carry no runtime
+# authority whatsoever: nothing rejects, clamps, or substitutes a model on the
+# strength of them. A slug in neither set has no screen on record — which the
+# banner says, rather than implying it is either safe or bad.
+#
+# Why a warning and not a gate (the D130 sub-decision): until #747 the fully
+# populated per-phase map made a tick-busting model unreachable by accident, and
+# making ``model_slug`` effective removes that. A runtime allow-list was
+# rejected — it would go stale the day a model ships (gpt-5.6-luna would have
+# needed a code change before it could be tried), rejects at config-save time
+# far from the roast, and implies a June latency screen on one OpenRouter
+# account still holds. The load-bearing protection is elsewhere and unchanged:
+# ``_maybe_run_advisory`` is timeout-bounded and never blocks the tick, a
+# failure becomes a REJECT with the deterministic hold-current-targets
+# fallback, and D30's consecutive-failure stop arms on a sustained outage. A
+# slow model therefore degrades the ADVICE, it does not stall the loop.
+#
+# Sources — numbers live in the reports, not here, so this list cannot drift
+# into a stale citation: ``docs/advisor/bakeoff-summary-2026-06-16.md`` (D40/D41,
+# 8 models x 28 roasts, median/max FC latency against the ~5 s gate) and #396's
+# 16 Jul screens (gpt-5.6-luna, gpt-4.1-mini).
+FC_LATENCY_SCREENED_ADVISOR_MODELS: frozenset[str] = frozenset(
+    {
+        # D40/D41 (16 Jun): cleared comfortably.
+        "google/gemini-3.1-flash-lite",
+        "openai/gpt-4o-mini",
+        "openai/gpt-4o",
+        # D40/D41: cleared, but TIGHT (~4.1 s median against a ~5 s gate).
+        "anthropic/claude-haiku-4.5",
+        # #396 (16 Jul): dedicated screens, both cleared. Recorded honestly —
+        # over 28 roasts gpt-4.1-mini's MAX grazed the gate while its median
+        # stayed well inside it, so it is screened rather than busted.
+        "openai/gpt-5.6-luna",
+        "openai/gpt-4.1-mini",
+    }
+)
+
+#: Slugs whose recorded screen BUSTED the gate — the reasoning / frontier models
+#: that think past the wall (D40/D41). Named explicitly so the banner can say
+#: "measured, and it busts" instead of the much weaker "no screen on record".
+FC_LATENCY_BUSTED_ADVISOR_MODELS: frozenset[str] = frozenset(
+    {
+        "openai/gpt-5-mini",
+        "anthropic/claude-opus-4.8",
+        "openai/gpt-5.5",
+        "anthropic/claude-sonnet-4.6",
+    }
+)
 
 #: The canonical OpenRouter API base URL — :attr:`AdvisorConfig.provider_base_url`'s
 #: own default, and the single source of truth
@@ -1368,15 +1407,23 @@ class AdvisorConfig(BaseModel):
     ``provider`` + the matching ``api_key_env``. ``OPENROUTER_API_KEY`` must be
     set in the environment at runtime; ``FakeAdvisor`` stays the test/CI default.
 
-    Per-phase model selection (#173): ``model_slug`` is the base/default slug
-    (the identity in the decision-trace descriptor and the reachability probe),
-    and ``model_slug_by_phase`` is an optional per-phase override map resolved
-    by :meth:`model_for`. By default every phase resolves to
-    ``DEFAULT_ADVISOR_MODEL`` — gpt-4o everywhere (#277 PIN); under D35 only the
-    post-FC DEVELOPMENT phase actually consults the advisor — so the map is
-    retained additive plumbing with zero behavior change; a future re-run could
-    flip a phase slot to a different model. A phase absent from the
-    override map falls back to ``model_slug``.
+    Per-phase model selection (#173): ``model_slug`` is the model, and
+    ``model_slug_by_phase`` is an EMPTY-by-default per-phase override map
+    resolved by :meth:`model_for`. With no override, every phase resolves to
+    ``model_slug`` — so a slug set in ``/config``, in the saved config file, or
+    via ``ROASTPILOT_ADVISOR__MODEL_SLUG`` is the model that answers.
+
+    That empty default is D130 (#747), and it is a bug fix, not a re-pin. The
+    map used to ship populated with ``DEFAULT_ADVISOR_MODEL`` for every phase
+    and is absent from ``AdvisorConfigEdit``, so it silently SHADOWED every
+    operator-set ``model_slug``: roast 8 (28 Jun 2026) was launched as a
+    ``gpt-4.1-mini`` arm, ran gpt-4o for all 19 decisions, and was written up
+    as a mini hardware result in D73/D74 and #396. The pin itself (#277/D43)
+    is unchanged — it is the FIELD DEFAULT, which the operator may now change.
+
+    The mechanism is retained (an override still wins) so a future re-run can
+    pin one phase to a different model; under D35 only post-FC DEVELOPMENT
+    consults the advisor, so that map has exactly one live slot today.
     """
 
     provider: Literal["openai", "anthropic", "google", "ollama", "openai_compatible"] = (
@@ -1385,17 +1432,18 @@ class AdvisorConfig(BaseModel):
     provider_base_url: str = OPENROUTER_BASE_URL
     api_key_env: str = Field(default="OPENROUTER_API_KEY", min_length=1)
     model_slug: str = Field(default=DEFAULT_ADVISOR_MODEL, min_length=1)
-    # Phase-keyed model override map (#173). The MECHANISM for phase-dependent
-    # model selection — defaults to ``DEFAULT_ADVISOR_MODEL`` for preheat /
-    # pre-FC / development (gemini-3.1-flash-lite everywhere, D33), so
-    # :meth:`model_for` resolves to the single pinned model in every phase. The
-    # map is retained so a future re-run could flip a phase slot to a different
-    # model. A phase absent from this map falls back to ``model_slug``. Each slug
-    # is ``min_length=1``
-    # (an empty model slug is meaningless). Parameterized factory, not a bare
-    # ``dict`` default, per the repo's pyright-strict typed-default idiom.
+    # Phase-keyed model override map (#173) — EMPTY by default (D130, #747), so
+    # :meth:`model_for` falls back to ``model_slug`` in every phase and the
+    # configured model is the model that answers. Populating a slot overrides
+    # that phase only; a phase absent from the map falls back to ``model_slug``.
+    # Deliberately NOT in ``AdvisorConfigEdit``: a per-phase UI would expose
+    # three inputs for one live slot (D35 — only DEVELOPMENT consults), and it
+    # was that unreachable-from-the-UI map, shipped populated, that shadowed
+    # ``model_slug`` for six weeks. Each slug is ``min_length=1`` (an empty
+    # model slug is meaningless). Parameterized factory, not a bare ``dict``
+    # default, per the repo's pyright-strict typed-default idiom.
     model_slug_by_phase: dict[RoastPhase, Annotated[str, Field(min_length=1)]] = Field(
-        default_factory=lambda: dict(DEFAULT_ADVISOR_MODEL_BY_PHASE)
+        default_factory=dict[RoastPhase, str]
     )
     timeout_seconds: float = Field(default=10.0, gt=0)
     # Bound on the startup reachability probe (issue #168). Deliberately short
@@ -1435,11 +1483,18 @@ class AdvisorConfig(BaseModel):
     def model_for(self, phase: RoastPhase) -> str:
         """Return the advisor model slug to use for ``phase`` (#173).
 
-        Looks ``phase`` up in :attr:`model_slug_by_phase`, falling back to the
-        base :attr:`model_slug` when the phase carries no override. With the
-        default map (gpt-4o for every phase, #277 PIN) this always resolves to
-        :attr:`model_slug`, so per-phase selection is a behavioral no-op until a
-        future re-run populates the map with a different per-phase model.
+        Looks ``phase`` up in :attr:`model_slug_by_phase`, falling back to
+        :attr:`model_slug` when the phase carries no override. The map is empty
+        by default (D130, #747), so this resolves to the configured
+        :attr:`model_slug` in every phase — including the one phase that
+        consults the advisor under D35 — until a future re-run populates a slot.
+
+        This is the ONLY correct way to ask which model will answer. Reading
+        :attr:`model_slug` directly is right only when the question really is
+        about the base slug (the reachability probe, the off-OpenRouter
+        bean-sourcing extraction fallback); anything reporting or dispatching
+        roast advice must come through here, or it will name the wrong model
+        the moment an override exists.
 
         Args:
             phase: The agent phase the controller is currently in.

@@ -150,9 +150,20 @@ def _print_decision(decision: RoastDecision) -> None:
 
 async def run(iterations: int, fixture: Path, row_offset_seconds: float) -> int:
     config = AppConfig().advisor
+    # The model this run will genuinely call, resolved the way the advisor
+    # resolves it (#747): this fixture is a DEVELOPMENT-phase context, and
+    # ``PydanticAIAdvisor`` picks its agent with ``model_for(context.phase)``.
+    # Printing the base ``model_slug`` here reported an arm the run was not
+    # measuring whenever a phase override existed — the same trap that put a
+    # gpt-4o hardware roast on record as a gpt-4.1-mini one. Both are printed,
+    # and the shadowing is named, because the base slug still drives the
+    # reachability probe and so is not merely noise.
+    called = config.model_for(RoastPhase.DEVELOPMENT)
+    shadowed = "" if called == config.model_slug else " (SHADOWED by model_slug_by_phase)"
     print("=== advisor smoke / bake-off ===")
     print(
-        f"provider={config.provider} model_slug={config.model_slug!r} "
+        f"provider={config.provider} model={called!r} "
+        f"model_slug={config.model_slug!r}{shadowed} "
         f"base_url={config.provider_base_url!r} api_key_env={config.api_key_env} "
         f"prompt_version={config.prompt_version} temperature={config.temperature} "
         f"timeout_seconds={config.timeout_seconds}"

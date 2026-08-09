@@ -18,6 +18,37 @@ Format: one entry per anti-pattern.
 
 ---
 
+## A config field the operator can edit must not be shadowed by a resolver default they cannot reach
+*(fixed by #747 / D130, 9 Aug 2026)*
+
+- **Signature:** a settings field paired with a `*_by_<something>` override map (or
+  any second-level resolver) where the MAP ships fully populated AND is absent from
+  the `*ConfigEdit` model. Grep for `default_factory=lambda: dict(DEFAULT_` in
+  `config.py`, and cross-check every `Field` in `AdvisorConfigEdit` /
+  `ControllerConfigEdit` / `MCPDeviceConfigEdit` against whatever actually reads it
+  at runtime.
+- **Wrong:** `model_slug_by_phase` defaulted to the pinned model for EVERY phase, so
+  `model_for(phase)` never reached its `model_slug` fallback. `/config` rendered an
+  editable Model box, `GET /api/config` reported the saved value `effective`, and the
+  roast ran gpt-4o regardless. Roast 8 (28 Jun 2026) was launched as a `gpt-4.1-mini`
+  arm, ran gpt-4o for all 19 decisions, and was written up as a mini hardware result
+  in D73/D74 and #396. Six weeks, no signal.
+- **Right:** ship the override map EMPTY so the resolver falls back to the editable
+  field; keep the mechanism for a real override. If a value genuinely must not be
+  operator-changeable, do not render an editable control for it — the defect is then
+  the OFFER, not the resolution.
+- **The tell that generalises:** "editable + reported effective + no observable
+  effect". When a field claims to be effective, assert it end-to-end against the
+  thing that CONSUMES it (`model_for(DEVELOPMENT)`), never against the field's own
+  round-trip through the config store. A read-back test passes happily while the
+  value does nothing.
+- **Guarded by:** `test_config.test_configured_model_slug_governs_the_phase_that_consults`
+  (both the constructed and the `ROASTPILOT_ADVISOR__MODEL_SLUG` route) and
+  `test_launch_banner.test_saved_model_slug_is_the_model_the_advisor_actually_uses`
+  (saved file → resolved config → the model the advisor picks).
+
+---
+
 ## The MCP stdio session's cancel scopes must enter AND exit in ONE owning task; stop/respawn is a request to that task
 *(fixed by #484, 9 Jul 2026)*
 

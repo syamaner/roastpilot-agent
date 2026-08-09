@@ -40,21 +40,30 @@
 #            c3). The banner prints the RESOLVED values — env over the saved
 #            ~/.roastpilot/config.yaml over the schema defaults, the same order
 #            the agent uses — and tags them ⚠ EXPERIMENT when non-default.
-#            ⚠ Two traps the banner now surfaces rather than hides (#746):
-#            (1) setting either PINS that value for every roast in the session,
+#            ⚠ The env trap the banner surfaces rather than hides (#746):
+#            setting either PINS that value for every roast in the session,
 #            because env beats the saved file — the /config UI selector becomes
 #            a silent no-op. Never use them to switch arms in a prompt A/B;
 #            switch in /config between roasts and confirm the arm at GET
 #            /api/config (see the banner note below — it is a LAUNCH-TIME
 #            snapshot and does NOT re-print between roasts).
-#            (2) the model slug does NOT change the advice model: the advisor
-#            calls AdvisorConfig.model_for(phase), and model_slug_by_phase
-#            ships populated with gpt-4o for every phase and is not editable
-#            from /config, so a model_slug set here or in /config is shadowed
-#            for advice (it still drives the startup reachability probe). The
-#            banner reports the model DEVELOPMENT resolves to — post-FC is the
-#            only phase that consults, pre-FC being deterministic (D35) — and
-#            flags a shadowed slug; changing the model for real is issue #747.
+#            The model slug now DOES change the advice model (#747 / D130,
+#            9 Aug 2026): model_slug_by_phase ships EMPTY, so model_for(phase)
+#            falls back to model_slug in the one phase that consults the
+#            advisor (DEVELOPMENT; pre-FC is deterministic under D35). Before
+#            that fix the map shipped populated with gpt-4o and shadowed every
+#            operator-set slug — roast 8 was launched as a gpt-4.1-mini arm and
+#            ran gpt-4o for all 19 decisions. The banner still reports the model
+#            DEVELOPMENT RESOLVES to and still flags a shadowed slug, because a
+#            hand-pinned phase slot can shadow it again.
+#            ⚠ It also warns when that model has no clean FC-latency screen on
+#            record (D130). That is a WARNING, not a gate: nothing rejects a
+#            model. D40/D41 measured sonnet-4.6 / gpt-5.5 / opus-4.8 /
+#            gpt-5-mini@low busting the ~5 s post-FC slot, and until #747 the
+#            populated map made such a model unreachable by accident. A slow
+#            model degrades the ADVICE (late at the drop); it cannot stall the
+#            loop — the advisory step is timeout-bounded and falls back to
+#            holding current targets. Read the line before you charge.
 #
 set -euo pipefail
 

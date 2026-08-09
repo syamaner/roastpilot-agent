@@ -29,7 +29,11 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, ValidationError
 
-from roastpilot_agent.config import AppConfig
+from roastpilot_agent.config import (
+    FC_LATENCY_BUSTED_ADVISOR_MODELS,
+    FC_LATENCY_SCREENED_ADVISOR_MODELS,
+    AppConfig,
+)
 from roastpilot_agent.controller import AUTO_ADVICE_PHASES
 
 #: Appended to a banner line whose RESOLVED value differs from the schema
@@ -84,6 +88,78 @@ def _changed_fields(model: BaseModel) -> set[str]:
     }
 
 
+def _slug_matches(slug: str, known: frozenset[str]) -> bool:
+    """Whether *slug* names a model in *known*.
+
+    Matching is case-insensitive.  A slug carrying a vendor prefix must match a
+    known slug in full, so ``someone-else/gpt-4o`` never inherits OpenRouter
+    ``openai/gpt-4o``'s screen.  A BARE name (no ``/``) is matched against the
+    known slugs' bare names instead, because :class:`AdvisorConfig` supports
+    running a model on its native provider (D18), where the same model is
+    configured as ``gpt-4o`` rather than ``openai/gpt-4o`` — warning there would
+    be a false alarm on a legitimate config, and a false alarm is how a soft
+    warning gets ignored.
+
+    Args:
+        slug: A resolved advisor model slug.
+        known: Lower-case slugs to match against.
+
+    Returns:
+        ``True`` when *slug* names one of *known*.
+    """
+    candidate = slug.strip().lower()
+    if "/" in candidate:
+        return candidate in known
+    return any(entry.rsplit("/", 1)[-1] == candidate for entry in known)
+
+
+def _latency_screen_note(resolved: set[str]) -> str:
+    """The FC-latency soft warning for the models that will give advice (D130).
+
+    Advisory only — nothing here rejects or substitutes a model.  Making
+    ``model_slug`` effective (#747) removed the accidental protection that had
+    made a tick-busting model unreachable, and the operator chose a warning over
+    a hard guard: an allow-list would be stale the day a model ships and would
+    reject far from the roast, whereas this fires at the pre-charge moment the
+    operator can still act on it.
+
+    Three classes, because "measured, and it busts" is a much stronger thing to
+    say than "nothing on record" and the two must not be collapsed:
+
+    * screened as clearing the gate — silent, so an ordinary roast stays quiet
+      and the warning keeps its meaning;
+    * screened and BUSTED — named, with what that costs;
+    * neither — named as unverified, which is a prompt to screen it, not a
+      verdict against it.
+
+    Args:
+        resolved: The distinct model slugs :data:`ADVISOR_PHASES` resolves to.
+
+    Returns:
+        The note to append to the advisor line, or ``""`` when every resolved
+        model has a screen on record that cleared.
+    """
+    busted = sorted(m for m in resolved if _slug_matches(m, FC_LATENCY_BUSTED_ADVISOR_MODELS))
+    unscreened = sorted(
+        m
+        for m in resolved
+        if not _slug_matches(m, FC_LATENCY_SCREENED_ADVISOR_MODELS)
+        and not _slug_matches(m, FC_LATENCY_BUSTED_ADVISOR_MODELS)
+    )
+    notes: list[str] = []
+    if busted:
+        notes.append(
+            f"⚠ {', '.join(busted)} BUSTED the ~5 s post-FC latency screen "
+            "(D40/D41) — advice will land late at the drop"
+        )
+    if unscreened:
+        notes.append(
+            f"⚠ no FC-latency screen on record for {', '.join(unscreened)} — "
+            "the ~5 s post-FC tick budget is unverified for it"
+        )
+    return "".join(f"   {note}" for note in notes)
+
+
 def _advisor_line(config: AppConfig) -> str:
     """Format the ``Advisor cfg:`` line from a fully-resolved config.
 
@@ -94,16 +170,22 @@ def _advisor_line(config: AppConfig) -> str:
     The model reported is the PHASE-RESOLVED one — what
     :meth:`AdvisorConfig.model_for` returns for each phase in
     :data:`ADVISOR_PHASES`, which is what ``PydanticAIAdvisor`` actually calls.
-    It is NOT ``advisor.model_slug``: ``model_slug_by_phase`` ships populated
-    for every phase and is not editable from ``/config``, so a ``model_slug``
-    saved there (or exported) is shadowed for roast advice. Printing the base
-    slug would announce an arm the roast is not running — the same lie in the
-    other direction — so the line names an operator-set shadowed slug and says
-    only what the operator needs at pre-charge: it is not the advice model. It
-    deliberately does NOT enumerate what the base slug IS still used for —
-    ``healthcheck`` probes reachability with it, and bean-sourcing extraction
-    falls back to it off OpenRouter — because any such list is an "only" claim
-    that goes stale the next time a consumer is added.
+    It is NOT ``advisor.model_slug``. Since D130 (#747) the override map ships
+    empty, so the two normally agree; they part company the moment a phase slot
+    is pinned (a hand-edited saved config, or a
+    ``ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE`` JSON blob), which is exactly the
+    shape that shadowed ``model_slug`` for six weeks and put a gpt-4o roast on
+    record as a gpt-4.1-mini arm. Printing the base slug would announce an arm
+    the roast is not running, so the line names an operator-set shadowed slug
+    and says only what the operator needs at pre-charge: it is not the advice
+    model. It deliberately does NOT enumerate what the base slug IS still used
+    for — ``healthcheck`` probes reachability with it, and bean-sourcing
+    extraction falls back to it off OpenRouter — because any such list is an
+    "only" claim that goes stale the next time a consumer is added.
+
+    The FC-latency note (:func:`_latency_screen_note`) rides on the same
+    resolved set, so the warning can never describe a model other than the one
+    about to give advice.
 
     Args:
         config: The resolved application config (env over saved file over
@@ -111,7 +193,8 @@ def _advisor_line(config: AppConfig) -> str:
 
     Returns:
         ``"<model>  ·  prompt <version>"``, plus :data:`EXPERIMENT_TAG` when
-        either value is non-default.
+        either value is non-default, plus the FC-latency note when a resolved
+        model busts the gate or has no screen on record.
     """
     advisor = config.advisor
     fields = type(advisor).model_fields
@@ -131,7 +214,8 @@ def _advisor_line(config: AppConfig) -> str:
         advisor.prompt_version == fields["prompt_version"].default
     )
     tag = "" if is_default else EXPERIMENT_TAG
-    return f"{model_text}  ·  prompt {advisor.prompt_version}{tag}"
+    latency = _latency_screen_note(resolved)
+    return f"{model_text}  ·  prompt {advisor.prompt_version}{tag}{latency}"
 
 
 def _trim_line(config: AppConfig) -> str:

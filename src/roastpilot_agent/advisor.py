@@ -2160,9 +2160,9 @@ class PydanticAIAdvisor(RoastAdvisor):
         self._instructions = instructions_for(config.prompt_version)
         #: Per-slug agent cache (#173). One agent per distinct model slug —
         #: instructions and settings are slug-independent, only the underlying
-        #: ``Model`` varies. With the single-model default (gpt-4o everywhere,
-        #: #277) every phase resolves to the same slug, so exactly one agent is
-        #: built: a clean behavioral no-op. Keyed by slug; ``_injected_model``
+        #: ``Model`` varies. With the empty override map (D130) every phase
+        #: resolves to ``model_slug``, so exactly one agent is built unless the
+        #: operator pins a slot. Keyed by slug; ``_injected_model``
         #: short-circuits the cache for the test seam.
         #: ``descriptor``/``healthcheck`` warm the
         #: base ``model_slug`` entry eagerly so the prior single-agent eager
@@ -2207,10 +2207,12 @@ class PydanticAIAdvisor(RoastAdvisor):
 
         The ``model`` is the base :attr:`AdvisorConfig.model_slug`. Per-phase
         selection (#173) varies which model actually runs a given call; the
-        descriptor stays the stable advisor-level identity (every phase
-        resolves to this slug under the Opus-everywhere default, so it is
-        accurate today, and it remains the advisor's configured-model identity
-        once the FC slot is flipped).
+        descriptor stays the stable advisor-level identity (with the empty
+        override map, D130, every phase resolves to this slug, and it remains
+        the advisor's configured-model identity once a slot is pinned).
+
+        Use :meth:`descriptor_for` for anything that must name the model that
+        ANSWERED — this one is the configured identity, not the resolved one.
         """
         return AdvisorDescriptor(
             provider=self._config.provider,
@@ -2222,10 +2224,14 @@ class PydanticAIAdvisor(RoastAdvisor):
         """The trace identity with the PHASE-RESOLVED model slug (#189).
 
         Records the model that actually answered this phase's call
-        (``model_for(phase)``), not the base ``model_slug`` — so once the
-        FC/development slot is flipped to a faster model the ``advisor_decisions``
-        rows report the model truly called. Same provider + prompt version as
-        :attr:`descriptor`; identical to it under a single-model default.
+        (``model_for(phase)``), not the base ``model_slug`` — so the
+        ``advisor_decisions`` rows report the model truly called whether the
+        operator changed ``model_slug`` or pinned a phase slot. Same provider +
+        prompt version as :attr:`descriptor`; identical to it with no override.
+
+        This is what made #747 provable after the fact: through six weeks of
+        shadowed ``model_slug`` these rows named gpt-4o, which is what really
+        ran, while the launch line, D73/D74 and #396 all said gpt-4.1-mini.
         """
         return AdvisorDescriptor(
             provider=self._config.provider,
@@ -2237,11 +2243,10 @@ class PydanticAIAdvisor(RoastAdvisor):
         """Run the phase-resolved model and return a validated recommendation.
 
         The model slug is selected by ``context.phase`` via
-        :meth:`AdvisorConfig.model_for` (#173) — with the Opus-everywhere
-        default this is the single configured model in every phase. The
-        per-phase agent is cached, so flipping the FC/development slot to a
-        faster model after the bake-off changes only which agent runs, not the
-        call path.
+        :meth:`AdvisorConfig.model_for` (#173) — with the empty override map
+        (D130) this is the configured ``model_slug`` in every phase. The
+        per-phase agent is cached, so pinning a slot to a faster model changes
+        only which agent runs, not the call path.
         """
         model_slug = self._config.model_for(context.phase)
         agent = self._agent_for(model_slug)

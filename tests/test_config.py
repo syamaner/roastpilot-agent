@@ -163,28 +163,47 @@ def test_advisor_defaults_match_d5_d18_and_bakeoff() -> None:
     assert config.reasoning_effort is None  # provider default until measured
 
 
-def test_advisor_per_phase_model_default_is_pinned_model_everywhere() -> None:
-    """#173 MECHANISM: per-phase model selection defaults to the single pinned
-    model (gpt-4o, #277 PIN) for every phase — the map is retained so a future
-    re-run could flip a phase slot to a different model."""
+def test_advisor_per_phase_model_map_ships_empty() -> None:
+    """D130 (#747): the per-phase override map is EMPTY by default.
+
+    It used to ship populated with the pinned model for every phase, which —
+    since the map is absent from ``AdvisorConfigEdit`` and so unreachable from
+    ``/config`` — silently shadowed every operator-set ``model_slug``. The pin
+    itself is unchanged; it is now the FIELD DEFAULT rather than an override
+    the operator cannot see or reach.
+    """
     config = AdvisorConfig()
     assert DEFAULT_ADVISOR_MODEL == "openai/gpt-4o"
-    # The base slug and every phase override are the same single model today.
     assert config.model_slug == DEFAULT_ADVISOR_MODEL
-    assert config.model_slug_by_phase == {
-        RoastPhase.PREHEATING: DEFAULT_ADVISOR_MODEL,
-        RoastPhase.ROASTING_PRE_FIRST_CRACK: DEFAULT_ADVISOR_MODEL,
-        RoastPhase.DEVELOPMENT: DEFAULT_ADVISOR_MODEL,
-    }
+    assert config.model_slug_by_phase == {}
 
 
 def test_model_for_resolves_pinned_model_for_every_phase_by_default() -> None:
-    """The resolver returns the pinned model in every phase (including phases
-    absent from the map, which fall back to ``model_slug``) — the default
-    no-op."""
+    """The resolver returns the pinned model in every phase — now by FALLING
+    BACK to ``model_slug`` for every phase rather than by reading an override,
+    so the default behaviour is unchanged while the field becomes effective."""
     config = AdvisorConfig()
     for phase in RoastPhase:
         assert config.model_for(phase) == DEFAULT_ADVISOR_MODEL
+
+
+def test_configured_model_slug_governs_the_phase_that_consults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The #747 regression: a set ``model_slug`` IS the model that answers.
+
+    Guards both routes the operator actually uses — a constructed/saved value
+    and the documented ``ROASTPILOT_ADVISOR__MODEL_SLUG`` env var — against the
+    exact failure that ran roast 8 on gpt-4o while its launch line, D73/D74 and
+    #396 all recorded a gpt-4.1-mini arm. DEVELOPMENT is the phase under D35
+    that consults the advisor at all, so it is the one that has to be right.
+    """
+    assert AdvisorConfig(model_slug="openai/gpt-4.1-mini").model_for(RoastPhase.DEVELOPMENT) == (
+        "openai/gpt-4.1-mini"
+    )
+
+    monkeypatch.setenv("ROASTPILOT_ADVISOR__MODEL_SLUG", "openai/gpt-4.1-mini")
+    assert AppConfig().advisor.model_for(RoastPhase.DEVELOPMENT) == "openai/gpt-4.1-mini"
 
 
 def test_model_for_resolves_per_phase_override() -> None:
