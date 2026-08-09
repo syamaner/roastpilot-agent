@@ -106,9 +106,15 @@ The Opus PM SHOULD NOT invoke Fable when:
 - The principal work is mechanical execution rather than judgment.
 - Fable would merely restate an existing approved brief.
 
+**When both lists fire, the trigger list wins.** The two lists above are not mutually exclusive and a real story can satisfy both at once — an authoritative, complete design whose story nevertheless spans multiple dependent slices, a safety boundary, or artifacts ratified separately from one another. In that case the PM SHOULD invoke Fable. In particular, "the design is settled" **MUST NOT** on its own be sufficient grounds to skip the planner when a story spans a *construction* and an *evaluation protocol* that were ratified independently: a settled design says nothing about whether the artifacts agree with each other, and the join between two individually-correct artifacts is precisely what a read-only reconciliation pass exists to inspect. Evidence: Case 1 in the evaluation log, where every defect that reached the PR lived in such a join.
+
 Only one planning subagent SHOULD run for a single decision problem. Multiple planners MAY be used only for genuinely independent competing hypotheses, with an explicit cap set before spawning.
 
 ## 7. Planning architect contract
+
+**Every read-only role MUST verify against its own `git worktree`, never the shared checkout**, and MUST NOT run tree-mutating git commands (`git checkout --`, `git restore`, `git stash`, `git clean`) in a tree it does not own. Where a role needs to mutate a file and restore it — mutation testing is the normal case — it MUST snapshot and restore **by file copy**, never by git, because `git checkout --` silently discards uncommitted neighbouring edits along with the mutation. A prohibition without that alternative is not an operable control: the restore step is required, so the forbidden command keeps being reinvented. Claims about what a commit contains MUST be verified against the committed tree (`git show HEAD:path`), not the working tree.
+
+This is a requirement on the role definitions themselves, not only on this document: a control recorded in a runbook that no agent definition carries has not been delivered. Evidence, including three occurrences: Case 1's governance finding in the evaluation log.
 
 The Fable planning architect MUST:
 
@@ -325,25 +331,18 @@ unevaluated, because the `RoastPilot Operator` style was not selected for the
 RP-B session.
 
 Two findings from the RP-B entry bear on this specification directly rather than
-on the story:
+on the story. Both are now **normative text in the sections they govern** — §6's
+precedence rule and §7's worktree requirement — with the evidence, the reasoning
+and the numbers left in the evaluation log. Restating them here would be a
+second copy of a mutable fact, which is what §12 forbids and what splitting the
+log out was meant to avoid.
 
-1. **§6's trigger list and skip list can both fire on one task**, and the text
-   does not say which dominates. RP-B hit multiple dependent slices, a safety
-   boundary, and extensive history to reconcile, while its design was
-   simultaneously already authoritative. The planner was skipped on that basis,
-   and every defect that later reached the PR lived in a *join* between two
-   individually-correct artifacts (a construction and an evaluation protocol
-   ratified separately). "The design is settled" should therefore NOT be
-   sufficient grounds to skip the planner when a story spans artifacts that were
-   ratified independently.
-2. **§7's read-only posture depends on an operational control that a reasonable
-   agent can breach.** A review role ran `git checkout origin/main -- .` in the
-   shared checkout as an ordinary-looking verification step, overwriting the
-   working tree. Nothing was lost and it self-reported, but the spec's
-   "don't run read-only roles under permissive parent modes" control does not
-   address a destructive command that looks like inspection. Read-only reviewers
-   SHOULD be directed to verify against a separate worktree rather than the
-   shared checkout.
+1. §6's trigger list and skip list can both fire on one task; see the precedence
+   rule now stated in §6, and Case 1's §6 finding in the evaluation log for the
+   evidence behind it.
+2. §7's read-only posture depends on an operational control a reasonable agent
+   can breach; see the worktree requirement now stated in §7, and Case 1's
+   governance finding in the evaluation log.
 
 ## 16. Acceptance criteria
 

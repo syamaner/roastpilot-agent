@@ -1,10 +1,16 @@
 # Agent Topology Evaluation Log
 
 Evidence for `docs/agent-topology.md` §15, which requires the topology to be
-evaluated on five representative cases before it becomes the validated default
-(the §16 evaluation-evidence criterion). One entry per real story; no synthetic
-cases. Measurements come from tool results and session transcripts, not
-impressions.
+evaluated across five representative **archetypes** before it becomes the
+validated default (the §16 evaluation-evidence criterion). One entry per real
+story; no synthetic cases. Measurements come from tool results and session
+transcripts, not impressions.
+
+The requirement is archetype COVERAGE, not a case count, and a single story may
+cover more than one — Case 1 below covers two. Stated explicitly because the two
+readings diverge: counting entries, five archetypes across four stories would
+look like the bar was cleared a case early. What has to be true is that every
+archetype has been exercised by a real story, not that five rows exist.
 
 Archetypes still needed after the entries below: a simple single-slice task that
 should bypass the planner, a cross-repository change, and a previously failed or
@@ -15,13 +21,28 @@ heavily reworked task.
 ## Case 1 — RP-B (#709), the ambient-aware fan doctrine
 
 Date: 8 Aug 2026. PR: #731. Plan decisions produced: D126, D127.
+
+> **Reading this later: `docs/state/registry.md` lagged this entry.** AGENTS.md
+> sends every session to the registry first, and at the time this case was
+> written it still read "RP-B is next" with "next free plan decision number:
+> **D126**" — while D126 and D127 were already spent. That is not a hypothetical
+> drift: a cold-start session on 9 Aug followed the documented kickoff order,
+> read the registry, and was handed a spent decision number; it only avoided
+> reusing D126 because #709's comments corrected it. Recorded here as evidence
+> rather than silently fixed, because the registry going stale mid-story is
+> itself a finding about the handoff, and the same gap will recur on the next
+> multi-session story unless the registry is updated as decisions are consumed
+> rather than at story end.
 Archetypes covered: **ambiguous multi-slice feature** and **safety-sensitive
 design**, simultaneously.
 
 ### Was the planner invoked only when the §6 triggers applied?
 
-**No planner was invoked, and that was the right call**, though it is worth
-recording that the §6 triggers nominally fired: multiple dependent PR slices, a
+**No planner was invoked. That followed §6 as currently written, and the
+outcome shows §6 is wrong** — those are the two halves of one finding, and this
+entry is evidence for changing the rule rather than for the decision it
+produced. A later reader resolving the §6 trigger/skip conflict should take the
+revised guidance below, not the skip. The §6 triggers nominally fired: multiple dependent PR slices, a
 privilege/safety boundary on `AdvisorContext`, and extensive decision history to
 reconcile (#707/#709/#711/#498/#342/#726/#705/#580 plus D122/D124/D125).
 
@@ -58,7 +79,8 @@ test guard, context field vs comparison boundary. None was visible from either
 side alone. This is the strongest argument the evaluation has produced *for*
 invoking the planner on the next comparable story: a read-only pass whose whole
 job is reconciling artifacts is aimed exactly at join defects, and the PM
-skipped it on the reasonable-but-wrong basis that the design was settled.
+skipped it on grounds §6 explicitly sanctions — which is the point. The rule,
+not the judgement applying it, is what failed here.
 
 **Revised guidance for the next case:** treat "the design is settled" as
 insufficient grounds to skip the planner when the story spans a *construction*
@@ -184,7 +206,31 @@ pre-existing on `main`), not misuse.
 **Recommendation:** §7's operational control is necessary but not sufficient.
 Read-only reviewers should be given an explicit instruction to verify against a
 separate worktree rather than the shared checkout, and the runbook should say
-so. Filed as #733.
+so.
+
+**Corrected after review (the recommendation above misdiagnosed the gap).**
+`docs/agent-team-worktrees.md:83-98` ALREADY records a 9 Jul reviewer
+`git checkout --` incident and already forbids reviewers from running
+tree-mutating git commands. The control exists; it was never routed to the
+Bash-capable roles that keep re-entering it — `.claude/agents/qa.md` contains
+nothing about worktrees, checkout, or mutation. So the actionable gap is
+DELIVERY into the agent definitions, not another runbook note, and #733 is
+re-scoped accordingly.
+
+Two further data points arrived the same night, both on #741, and both matter
+because they show the control failing in ways a prohibition alone cannot fix.
+First, the concurrent-pytest basetemp collision produced a failure that a
+reviewer correctly escalated as a P1 flake; the cost of that class is not the
+phantom failure but the real investigation it justifies each time. Second, the
+same `git checkout --` destruction recurred — this time self-inflicted by the
+PM, as the restore step of a mutation-testing cycle, silently discarding a
+review-requested edit whose commit message then claimed it. That is the
+sharpest form of the finding: **mutation testing REQUIRES a restore step, and
+`git checkout --` is the obvious way to write one**, so a prohibition with no
+stated alternative will keep being re-entered. The alternative that belongs in
+the agent definitions is snapshot-and-restore by file copy, plus verifying
+record-level claims against the committed tree (`git show HEAD:path`) rather
+than the working tree.
 
 ### Contradictions introduced between plan, prompt, and repository
 
