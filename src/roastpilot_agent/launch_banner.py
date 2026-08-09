@@ -29,16 +29,20 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from roastpilot_agent.config import DEFAULT_ADVISOR_MODEL_BY_PHASE, AppConfig
+from roastpilot_agent.config import AppConfig
+from roastpilot_agent.controller import AUTO_ADVICE_PHASES
 
 #: Appended to a banner line whose RESOLVED value differs from the schema
 #: default, so a non-default arm can never be mistaken for the proven baseline.
 EXPERIMENT_TAG = "   ⚠ EXPERIMENT — non-default, watch it"
 
-#: The phases the advisor is consulted in, in roast order. Single-sourced from
-#: the per-phase model map's own default so the banner cannot drift from the
-#: set of phases ``AdvisorConfig.model_for`` is called with.
-ADVISOR_PHASES = tuple(DEFAULT_ADVISOR_MODEL_BY_PHASE)
+#: The phases that actually consult the advisor, single-sourced from the
+#: controller's own gate so the banner cannot drift from it.  Under D35 this is
+#: DEVELOPMENT alone — pre-FC is deterministic and ``_maybe_run_advisory``
+#: returns before consulting there, even on a manual request.  Deriving the
+#: banner from the per-phase model MAP instead would advertise (and tag) a
+#: pre-FC model no advisory call can ever reach.
+ADVISOR_PHASES = frozenset(AUTO_ADVICE_PHASES)
 
 
 @dataclass(frozen=True)
@@ -64,13 +68,15 @@ def _advisor_line(config: AppConfig) -> str:
     file is tagged exactly like one exported into the environment.
 
     The model reported is the PHASE-RESOLVED one — what
-    :meth:`AdvisorConfig.model_for` returns for each advisor-consulted phase,
-    which is what ``PydanticAIAdvisor`` actually calls. It is NOT
-    ``advisor.model_slug``: ``model_slug_by_phase`` ships populated for every
-    advisor phase and is not editable from ``/config``, so a ``model_slug``
-    saved there (or exported) is silently shadowed and never used. Printing the
-    base slug would announce an arm the roast is not running — the same lie in
-    the other direction, so the line names the shadowed value explicitly.
+    :meth:`AdvisorConfig.model_for` returns for each phase in
+    :data:`ADVISOR_PHASES`, which is what ``PydanticAIAdvisor`` actually calls.
+    It is NOT ``advisor.model_slug``: ``model_slug_by_phase`` ships populated
+    for every phase and is not editable from ``/config``, so a ``model_slug``
+    saved there (or exported) is shadowed for roast advice. Printing the base
+    slug would announce an arm the roast is not running — the same lie in the
+    other direction — so the line names an operator-set shadowed slug and says
+    what it does still do: ``healthcheck`` probes reachability with the BASE
+    slug, so a changed or invalid one still shapes the startup advisor status.
 
     Args:
         config: The resolved application config (env over saved file over
@@ -83,20 +89,19 @@ def _advisor_line(config: AppConfig) -> str:
     advisor = config.advisor
     fields = type(advisor).model_fields
     default_model = fields["model_slug"].default
-    by_phase = {phase: advisor.model_for(phase) for phase in ADVISOR_PHASES}
-    resolved = set(by_phase.values())
-
-    if len(resolved) == 1:
-        model_text = next(iter(resolved))
-    else:
-        model_text = "per phase " + ", ".join(
-            f"{phase.value}={by_phase[phase]}" for phase in ADVISOR_PHASES
-        )
-    # Warn only when the operator SET a base slug that then has no effect. A
+    # Distinct slugs rather than a per-phase listing: today ADVISOR_PHASES is a
+    # single phase, so a phase-by-phase branch would be dead code. Joining the
+    # distinct slugs stays correct if a second advice phase is ever added.
+    resolved = {advisor.model_for(phase) for phase in ADVISOR_PHASES}
+    model_text = " / ".join(sorted(resolved))
+    # Warn only when the operator SET a base slug that then gives no advice. A
     # base slug left at the schema default is shadowed too, but silently and
-    # harmlessly — saying so on every per-phase roast would be noise.
+    # harmlessly — saying so on an ordinary roast would be noise.
     if advisor.model_slug != default_model and advisor.model_slug not in resolved:
-        model_text += f" (config model_slug {advisor.model_slug} is shadowed per-phase, unused)"
+        model_text += (
+            f" (config model_slug {advisor.model_slug} gives no roast advice;"
+            " startup reachability probe only)"
+        )
 
     is_default = resolved == {default_model} and (
         advisor.prompt_version == fields["prompt_version"].default

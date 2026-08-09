@@ -31,6 +31,7 @@ from roastpilot_agent.config_store import (
     PreFirstCrackLeversEdit,
     persist_config_edit,
 )
+from roastpilot_agent.controller import AUTO_ADVICE_PHASES
 from roastpilot_agent.launch_banner import (
     ADVISOR_PHASES,
     EXPERIMENT_TAG,
@@ -103,28 +104,44 @@ def test_defaults_are_not_tagged_experiment(config_file: Path) -> None:
     assert EXPERIMENT_TAG not in lines.advisor_cfg
 
 
+def test_advisor_phases_is_the_controllers_own_gate() -> None:
+    """The banner's phase set IS the controller's, and is post-FC only under D35.
+
+    Pins the premise the rest of the model reporting rests on: pre-FC is
+    deterministic (`_maybe_run_advisory` returns before consulting there, even
+    on a manual request), so a per-phase model set for preheating or
+    pre-first-crack can never answer an advisory call and must not be
+    advertised as the arm being run (local Codex P2, folded pre-open).
+    """
+    assert frozenset(AUTO_ADVICE_PHASES) == ADVISOR_PHASES
+    assert frozenset({RoastPhase.DEVELOPMENT}) == ADVISOR_PHASES
+
+
 def test_shadowed_model_slug_reports_the_model_the_advisor_actually_uses(
     config_file: Path,
 ) -> None:
-    """A saved model_slug that model_for() shadows is named as shadowed, not announced.
+    """A saved model_slug that model_for() shadows is named, not announced.
 
-    `model_slug_by_phase` ships populated for every advisor-consulted phase and
-    is not editable from /config, so `PydanticAIAdvisor`'s
-    `model_for(context.phase)` keeps returning gpt-4o after a `model_slug` edit.
-    Printing the base slug would announce an arm the roast is not running — the
-    #746 lie in the other direction (local Codex P1, folded pre-open).
+    `model_slug_by_phase` ships populated for every phase and is not editable
+    from /config, so `PydanticAIAdvisor`'s `model_for(context.phase)` keeps
+    returning gpt-4o after a `model_slug` edit. Printing the base slug would
+    announce an arm the roast is not running — the #746 lie in the other
+    direction (local Codex P1, folded pre-open).
     """
     persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4.1-mini")))
     config, _ = config_store.load_app_config()
-    # Guard the premise: the advisor genuinely still calls gpt-4o in every phase.
+    # Guard the premise: the advisor genuinely still calls gpt-4o when consulted.
     assert {config.advisor.model_for(p) for p in ADVISOR_PHASES} == {"openai/gpt-4o"}
 
     lines = load_banner_lines()
 
     assert lines.advisor_cfg.startswith("openai/gpt-4o ")
-    assert "config model_slug openai/gpt-4.1-mini is shadowed per-phase, unused" in (
-        lines.advisor_cfg
-    )
+    # Named as advice-less, NOT as unused: healthcheck() probes with the base
+    # slug, so an invalid one still drives the startup advisor status.
+    assert (
+        "config model_slug openai/gpt-4.1-mini gives no roast advice;"
+        " startup reachability probe only"
+    ) in lines.advisor_cfg
     # The RESOLVED pair is the untouched baseline, so this is not an experiment.
     assert EXPERIMENT_TAG not in lines.advisor_cfg
 
@@ -143,23 +160,32 @@ def test_effective_non_default_model_is_tagged_experiment() -> None:
     assert lines.advisor_cfg == "openai/gpt-4.1-mini  ·  prompt c3" + EXPERIMENT_TAG
     # The base slug is the schema default here, so it is shadowed silently —
     # the warning is reserved for a slug the operator actually set.
-    assert "shadowed" not in lines.advisor_cfg
+    assert "no roast advice" not in lines.advisor_cfg
 
 
-def test_per_phase_split_is_reported_phase_by_phase() -> None:
-    """When phases resolve to different models, every phase is named."""
-    by_phase = dict.fromkeys(ADVISOR_PHASES, "openai/gpt-4o")
-    by_phase[RoastPhase.DEVELOPMENT] = "openai/gpt-4.1-mini"
+def test_pre_fc_only_model_override_is_not_advertised() -> None:
+    """A model set ONLY for a pre-FC phase never reaches an advisory call.
+
+    Pre-FC is deterministic, so this override cannot answer anything. The
+    banner must keep reporting the model DEVELOPMENT resolves to and must not
+    tag the roast as an experiment on the strength of it.
+    """
     config = AppConfig(
-        advisor=AdvisorConfig(model_slug_by_phase=by_phase), controller=ControllerConfig()
+        advisor=AdvisorConfig(
+            model_slug_by_phase={
+                RoastPhase.PREHEATING: "openai/gpt-4.1-mini",
+                RoastPhase.ROASTING_PRE_FIRST_CRACK: "openai/gpt-4.1-mini",
+                RoastPhase.DEVELOPMENT: "openai/gpt-4o",
+            }
+        ),
+        controller=ControllerConfig(),
     )
 
     lines = resolve_banner_lines(config)
 
-    assert lines.advisor_cfg.startswith("per phase ")
-    assert "development=openai/gpt-4.1-mini" in lines.advisor_cfg
-    assert "preheating=openai/gpt-4o" in lines.advisor_cfg
-    assert EXPERIMENT_TAG in lines.advisor_cfg
+    assert lines.advisor_cfg == "openai/gpt-4o  ·  prompt c3"
+    assert "gpt-4.1-mini" not in lines.advisor_cfg
+    assert EXPERIMENT_TAG not in lines.advisor_cfg
 
 
 # ---------------------------------------------------------------------------

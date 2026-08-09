@@ -19,7 +19,7 @@ from .models import RoastPhase
 # proximity (D32 / #191, refining #171). The advisor is consulted where it adds
 # optimization judgment, which ramps toward FC:
 #   - preheating: OFF — preheat is NOT an automatic-advice phase (see
-#     ``_AUTO_ADVICE_PHASES`` in controller.py). Reaching the charge band is a
+#     ``AUTO_ADVICE_PHASES`` in controller.py). Reaching the charge band is a
 #     deterministic ramp; charge is an operator action; charge-guidance is
 #     already emitted. (Also removes the #134 preheat error-spam surface.) A
 #     manual operator request still works — it bypasses phase scoping.

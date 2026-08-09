@@ -45,12 +45,14 @@
 #            because env beats the saved file — the /config UI selector becomes
 #            a silent no-op. Never use them to switch arms in a prompt A/B;
 #            switch in /config between roasts and read the banner to confirm.
-#            (2) the model slug has NO EFFECT on its own: the advisor calls
-#            AdvisorConfig.model_for(phase), and model_slug_by_phase ships
-#            populated with gpt-4o for every advisor phase and is not editable
-#            from /config, so a model_slug set here or in /config is shadowed.
-#            The banner names the phase-resolved model and flags a shadowed
-#            slug explicitly; changing the model for real is issue #747.
+#            (2) the model slug does NOT change the advice model: the advisor
+#            calls AdvisorConfig.model_for(phase), and model_slug_by_phase
+#            ships populated with gpt-4o for every phase and is not editable
+#            from /config, so a model_slug set here or in /config is shadowed
+#            for advice (it still drives the startup reachability probe). The
+#            banner reports the model DEVELOPMENT resolves to — post-FC is the
+#            only phase that consults, pre-FC being deterministic (D35) — and
+#            flags a shadowed slug; changing the model for real is issue #747.
 #
 set -euo pipefail
 
