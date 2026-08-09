@@ -364,7 +364,7 @@ describe("buildEditFromDirty — tri-state null = inherit for mcp_device", () =>
       read_only: false,
       description: "",
       yaml_value: null,
-    advisory: null,
+      advisory: null,
     };
     const saved = buildValuesFromSnapshot(snapshot);
     // Operator cleared it back to null (inherit).

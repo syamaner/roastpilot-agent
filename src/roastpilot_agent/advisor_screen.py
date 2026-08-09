@@ -36,8 +36,8 @@ from roastpilot_agent.config import (
     FC_LATENCY_BUSTED_ADVISOR_ARMS,
     FC_LATENCY_SCREENED_ADVISOR_ARMS,
     FC_LATENCY_TIGHT_HEADROOM_FRACTION,
-    OPENROUTER_BASE_URL,
     AdvisorConfig,
+    is_openrouter_endpoint,
 )
 from roastpilot_agent.models import RoastPhase
 
@@ -122,11 +122,13 @@ def classify(
     Returns:
         The verdict for that arm.
     """
-    # Every screen ran on OpenRouter via ``openai_compatible``. ``provider``
-    # alone can move the endpoint while ``provider_base_url`` sits unchanged at
-    # its inert default (a native-provider config), so BOTH are checked — a
-    # URL-only check let a native provider inherit an OpenRouter measurement.
-    if advisor.provider != "openai_compatible" or advisor.provider_base_url != OPENROUTER_BASE_URL:
+    # Every screen ran on OpenRouter via ``openai_compatible``. Shared with
+    # ``bean_sourcing`` rather than re-derived (Claude review, folded pre-open):
+    # it checks provider AND base URL — ``provider`` alone can move the endpoint
+    # while the URL sits unchanged at its inert default — and it normalises the
+    # URL, so a trailing slash or host case does not call a genuinely-OpenRouter
+    # config unmeasured and warn on the proven baseline arm.
+    if not is_openrouter_endpoint(advisor):
         return AdvisorScreenVerdict.NO_SCREEN
     arm = (slug, advisor.reasoning_effort)
     recorded_max = FC_LATENCY_SCREENED_ADVISOR_ARMS.get(arm)
@@ -200,9 +202,7 @@ def screen_warning(advisor: AdvisorConfig, advisory_timeout_seconds: float) -> s
     if unscreened:
         # Name the dimension that made it unmeasured, so "we never screened this
         # model" reads differently from "we screened it, but not HERE".
-        if advisor.provider != "openai_compatible" or (
-            advisor.provider_base_url != OPENROUTER_BASE_URL
-        ):
+        if not is_openrouter_endpoint(advisor):
             why = " at this endpoint (screens ran on OpenRouter)"
         elif advisor.reasoning_effort is not None:
             why = f" at reasoning_effort={advisor.reasoning_effort}"

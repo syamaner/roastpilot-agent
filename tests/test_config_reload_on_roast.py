@@ -186,6 +186,36 @@ async def test_a_model_less_UNREACHABLE_does_not_survive_a_model_change(
 
 
 @pytest.mark.asyncio
+async def test_an_endpoint_change_alone_invalidates_the_probe(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """Changing WHERE the model is reached stales the probe too.
+
+    A probe describes what it CONTACTED, and that is decided by provider +
+    base URL + key env var + the resolved model, not by the slug alone. Keying
+    invalidation on the slug let a REACHABLE result survive an endpoint swap —
+    same slug, different server — vouching for something nothing had contacted
+    (Claude review, folded pre-open).
+    """
+    svc = RoastService(store, live_serve_mode=True)
+    svc.set_advisor_health(
+        AdvisorHealth(
+            status=AdvisorHealthStatus.REACHABLE,
+            provider="openai_compatible",
+            model_slug=svc._config.advisor.model_slug,  # pyright: ignore[reportPrivateUsage]
+        )
+    )
+
+    persist_config_edit(
+        AppConfigEdit(advisor=AdvisorConfigEdit(provider_base_url="http://proxy.local/v1"))
+    )
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert (await svc.health()).advisor is None
+
+
+@pytest.mark.asyncio
 async def test_an_unchanged_model_keeps_its_reachability_probe(
     store: RoastStore,
     config_file: Path,

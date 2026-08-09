@@ -9,6 +9,7 @@ validation at E12 (E12-S1).
 
 from pathlib import Path
 from typing import Annotated, ClassVar, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -1607,6 +1608,90 @@ class AdvisorConfig(BaseModel):
             base ``model_slug``.
         """
         return self.model_slug_by_phase.get(phase, self.model_slug)
+
+
+# Tolerant provider-endpoint matching, shared by ``bean_sourcing`` (which
+# routes extraction off OpenRouter) and ``advisor_screen`` (which applies the
+# FC-latency screen only to the endpoint it was measured on). Lives here
+# because this module already owns ``OPENROUTER_BASE_URL``, and because a
+# second, less tolerant copy is exactly the drift Claude's review caught.
+_DEFAULT_PORT_BY_SCHEME: dict[str, int] = {"http": 80, "https": 443}
+
+
+def normalize_base_url(url: str) -> str:
+    """Normalise a provider base URL for tolerant comparison (#590 P2 fix).
+
+    Strips a trailing ``/``, lower-cases the host (scheme/path stay
+    case-sensitive, matching URL semantics — only the host is defined to be
+    case-insensitive), AND drops an explicit port that merely restates the
+    scheme's implicit default (:data:`_DEFAULT_PORT_BY_SCHEME`) — so
+    ``"https://openrouter.ai/api/v1"``, ``"https://openrouter.ai/api/v1/"``,
+    ``"https://OpenRouter.ai/api/v1"``, and
+    ``"https://openrouter.ai:443/api/v1"`` all normalise identically. A
+    NON-default explicit port (e.g. a LAN reverse-proxy on ``:8443``) is
+    preserved — dropping it would be the exact false-positive this
+    tolerant match must NOT introduce. Never raises: most non-URL strings
+    degrade to a mostly-empty ``SplitResult``; eager malformed-bracket errors
+    and malformed/non-numeric ports are caught explicitly. Either way, a
+    malformed ``provider_base_url`` here just
+    fails the equality check harmlessly (falls through to the
+    native-provider branch) rather than crashing model resolution.
+
+    Args:
+        url: The base URL to normalise.
+
+    Returns:
+        The normalised URL for ``==`` comparison.
+    """
+    stripped = url.strip().rstrip("/")
+    try:
+        parsed = urlsplit(stripped)
+    except ValueError:
+        # Malformed bracketed hosts raise eagerly. Treat them like every other
+        # non-matching provider URL so attempt admission can still be recorded.
+        return stripped
+    netloc = parsed.netloc.lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        # A non-numeric/out-of-range port -- can't be a default-port match
+        # either way, so leave netloc as-is and let the equality check
+        # fail harmlessly (this function must never raise).
+        port = None
+    default_port = _DEFAULT_PORT_BY_SCHEME.get(parsed.scheme.lower())
+    if port is not None and port == default_port:
+        # ``SplitResult.port`` is parsed directly off netloc's trailing
+        # ``:<port>`` segment, so whenever it returns a value, ``netloc``
+        # (already lower-cased above, and port digits are case-invariant)
+        # is GUARANTEED to end with exactly that suffix -- no ``.endswith``
+        # guard needed (would be an unreachable branch under coverage).
+        netloc = netloc[: -len(f":{port}")]
+    return urlunsplit(parsed._replace(netloc=netloc))
+
+
+def is_openrouter_endpoint(advisor_config: AdvisorConfig) -> bool:
+    """Whether ``advisor_config`` is ACTUALLY pointed at OpenRouter (#590 P2 fix).
+
+    ``advisor_config.provider == "openai_compatible"`` alone is NOT
+    sufficient: that provider setting is the generic OpenAI-compatible-API
+    path, which also covers a local server, LiteLLM, or any other
+    OpenAI-compatible endpoint reachable via a custom ``provider_base_url``
+    — none of which necessarily serve the OpenRouter-specific
+    :data:`_DEFAULT_EXTRACTION_MODEL_SLUG`. This additionally requires
+    ``provider_base_url`` to match :data:`~roastpilot_agent.config.OPENROUTER_BASE_URL`
+    (tolerant of a trailing-slash / host-case / explicit-default-port
+    variant — see :func:`normalize_base_url`).
+
+    Args:
+        advisor_config: The operator's advisor provider/key/model config.
+
+    Returns:
+        ``True`` only when the provider is ``"openai_compatible"`` AND its
+        base URL resolves to OpenRouter's.
+    """
+    return advisor_config.provider == "openai_compatible" and normalize_base_url(
+        advisor_config.provider_base_url
+    ) == normalize_base_url(OPENROUTER_BASE_URL)
 
 
 class BeanSourcingConfig(BaseModel):

@@ -27,6 +27,7 @@ for the E8-S4 bake-off — same script, no code change (D18).
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -168,15 +169,16 @@ async def run(iterations: int, fixture: Path, row_offset_seconds: float) -> int:
         f"prompt_version={config.prompt_version} temperature={config.temperature} "
         f"timeout_seconds={config.timeout_seconds}"
     )
-    # Split onto its own line so the suppression can attach to it — CodeQL
-    # applies an inline suppression to the line it sits on, and this statement
-    # used to span five. The alert is a false positive: ``api_key_env`` is the
-    # NAME of the env var holding the key ("OPENROUTER_API_KEY"), never the key
-    # itself, which is read from ``os.environ`` at call time and is not in this
-    # config object at all. CodeQL matches the "api_key" identifier and
-    # classifies the name as a password. Printing the name is the whole point —
-    # it tells the operator which var to set when the run cannot authenticate.
-    print(f"api_key_env={config.api_key_env}")  # codeql[py/clear-text-logging-sensitive-data]
+    # Report whether the key is PRESENT rather than echoing ``api_key_env``.
+    # CodeQL flags printing that field as clear-text logging of sensitive data:
+    # a false positive on its face (the field holds the env var's NAME, never
+    # the key, which is read from ``os.environ`` at call time), but GitHub code
+    # scanning does not honour inline CodeQL suppressions, so the choice was
+    # between a standing high-severity alert and removing the taint. Removing it
+    # costs little and arguably reads better: "cannot authenticate" is answered
+    # by whether the key is set, and the var's NAME is already on the /config
+    # page and the launcher banner.
+    print(f"api_key_present={bool(os.environ.get(config.api_key_env))}")
 
     context, source_row = build_context(fixture, row_offset_seconds)
     print(

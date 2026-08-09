@@ -183,3 +183,27 @@ def test_no_warning_at_all_when_the_agent_runs_advisory_paused(
     monkeypatch.delenv(busted.api_key_env, raising=False)
 
     assert screen_warning(busted, TIMEOUT) is None
+
+
+def test_a_tolerantly_equal_openrouter_url_still_counts_as_screened() -> None:
+    """A trailing slash or host case must not unscreen the baseline arm.
+
+    The endpoint check is shared with ``bean_sourcing`` rather than re-derived
+    (Claude review, folded pre-open). A raw ``!=`` called
+    ``https://openrouter.ai/api/v1/`` "not OpenRouter", so the PROVEN pinned arm
+    would have carried a spurious "no screen on record" warning — the
+    cry-wolf failure this design exists to avoid, on the one path that must stay
+    silent.
+    """
+    for url in (
+        "https://openrouter.ai/api/v1/",
+        "https://OpenRouter.ai/api/v1",
+        "https://openrouter.ai:443/api/v1",
+    ):
+        config = AdvisorConfig(provider_base_url=url)
+        assert classify(config, config.model_slug, TIMEOUT) is AdvisorScreenVerdict.CLEARED
+
+    # A genuinely different endpoint is still unmeasured, including a
+    # non-default port (a LAN proxy), which must NOT be normalised away.
+    other = AdvisorConfig(provider_base_url="https://openrouter.ai:8443/api/v1")
+    assert classify(other, other.model_slug, TIMEOUT) is AdvisorScreenVerdict.NO_SCREEN

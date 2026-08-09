@@ -42,6 +42,7 @@ from roastpilot_agent.advisor import (
     RoastAdvisor,
     RoastDecision,
 )
+from roastpilot_agent.advisor_screen import advice_models
 from roastpilot_agent.bean_sourcing import (
     BEAN_EXTRACTION_PROMPT_VERSION,
     BeanExtractionError,
@@ -1726,6 +1727,10 @@ class RoastService:
                 )
 
                 fresh_advisor = build_advisor(fresh_config)
+                # Captured BEFORE the commit below overwrites it — the probe
+                # invalidation compares the outgoing advisor config against the
+                # incoming one.
+                previous_advisor = self._config.advisor
                 # Commit all three atomically so the trio is always consistent
                 # (guards against a future raising build_advisor leaving _config
                 # ahead of _advisor).
@@ -1758,12 +1763,24 @@ class RoastService:
                 # NOT_CONFIGURED is a claim about a specific model, so it is
                 # stale unless it names the one now configured.
                 probed = self._advisor_health
-                if (
-                    probed is not None
-                    and probed.status is not AdvisorHealthStatus.NOT_CONFIGURED
-                    and probed.model_slug != fresh_config.advisor.model_slug
-                ):
-                    self._advisor_health = None
+                if probed is not None and probed.status is not AdvisorHealthStatus.NOT_CONFIGURED:
+                    # Compare the whole DISPATCH identity, not just the slug
+                    # (Claude review, folded pre-open). What a probe reached is
+                    # decided by provider + base URL + key env var + the model,
+                    # including a phase override, so a slug-only check let a
+                    # REACHABLE result survive an endpoint swap (same slug,
+                    # different server) or a pinned DEVELOPMENT slot — vouching
+                    # for something nothing has contacted, which is the #134
+                    # "advisor configured" false comfort this probe exists to
+                    # prevent. Comparing the PREVIOUS config against the fresh
+                    # one catches every axis without enumerating them here.
+                    was, now = previous_advisor, fresh_config.advisor
+                    if (was.provider, was.provider_base_url, was.api_key_env) != (
+                        now.provider,
+                        now.provider_base_url,
+                        now.api_key_env,
+                    ) or advice_models(was) != advice_models(now):
+                        self._advisor_health = None
                 # MCP device respawn (#431): when the reloaded mcp_device differs
                 # from what the child was spawned with, stop and restart the child
                 # so hardware changes (serial port, driver, audio input, FC mode,
