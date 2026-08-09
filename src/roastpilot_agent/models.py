@@ -401,8 +401,11 @@ class RoastTelemetry(BaseModel):
     MCP's ``ambient_status`` (mode/status + the ~30 s-cached triad), refreshed
     every tick. ``None`` when the MCP ambient status is not ``"ok"``, when its
     ambient runtime is no longer running (#732 — a stopped runtime keeps
-    reporting ``"ok"`` over a frozen reading), or when the source state carries
-    no ambient status at all (an older MCP / replay export). Distinct from the
+    reporting ``"ok"`` over a frozen reading), when any member of the reading is
+    non-finite (#752 — the triad is voided as a unit; see
+    :func:`~roastpilot_agent.mcp_client.project_live_ambient`), or when the
+    source state carries no ambient status at all (an older MCP / replay
+    export). Distinct from the
     ONE-TIME charge-instant value :meth:`RoastStore.set_ambient` persists onto
     ``roast_runs`` (#342, D85) — that capture path is untouched.
 

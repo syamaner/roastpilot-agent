@@ -3994,6 +3994,50 @@ async def test_charge_capture_persists_nulls_for_an_undateable_reading(
 
 
 @pytest.mark.asyncio
+async def test_charge_capture_persists_nulls_for_a_non_finite_reading(
+    store: RoastStore,
+) -> None:
+    """#752: a malformed reading must not become the run's corpus breadcrumb.
+
+    SQLite round-trips ``±inf`` faithfully (unlike ``NaN``, which it silently
+    stores as ``NULL``), so a non-finite reading survives the write and comes
+    back out — which is why ``scripts/rpd_corpus_score.py`` carries a
+    ``_finite_or_none`` normalisation on read. That shim guards a reachable
+    shape rather than recording an observed row, and reachable is enough: the
+    value must be stopped at the reading boundary instead, so the column keeps
+    meaning "a real reading of the room at charge" (#342, D85) rather than
+    "whatever the probe last emitted".
+
+    Asserted through the whole live path — MCP state, charge detection, store —
+    rather than on the predicate alone, because the predicate being right is
+    only half the claim; the other half is that this capture path goes through
+    it (#745).
+    """
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    malformed = _ambient_status(status="ok", temperature_c=float("inf"))
+    assert malformed.ambient_running is True, "only the READING is malformed here"
+    assert malformed.humidity_percent is not None, "the other members are intact"
+    assert malformed.last_reading_monotonic_seconds is not None, "the stamp is usable (#745)"
+    raw_state = _FakeRawState(
+        _session_state(fc_status="pending", audio_running=False, ambient_status=malformed)
+    )
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+    mcp.frames = [_reading(bean=178.0, env=185.0, t0_detected=True)]
+    for _ in range(ControllerConfig().t0_debounce_ticks + 1):
+        await _tick(service, clock)
+
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.agent_phase is RoastPhase.ROASTING_PRE_FIRST_CRACK  # roast unaffected
+    # NULL in the column, not a non-finite float: the whole triad is voided,
+    # including the intact members from the same poll.
+    assert detail.ambient_temp_c is None
+    assert detail.ambient_humidity_pct is None
+    assert detail.ambient_pressure_hpa is None
+
+
+@pytest.mark.asyncio
 async def test_ambient_capture_is_fail_soft_on_store_error(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
