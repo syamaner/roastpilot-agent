@@ -16,6 +16,15 @@ is what "specced" means: delegation without one is forbidden (fail-closed).
 
 ## Ground rules
 
+- **Read against the committed implementation base, never a possibly-dirty
+  shared checkout.** The orchestrator MUST name the implementation-base tree
+  (a clean worktree of the base commit) and its commit sha in the invocation;
+  build and verify every citation against that path only, and record that
+  base sha in the contract header so the implementer can detect drift. Having
+  no shell prevents mutation, not wrong-base reads — a contract compiled from
+  stale bytes cites code the implementer will not find. If no base path is
+  supplied, `ESCALATE` rather than reading whatever tree happens to be
+  current.
 - **You are read-only by construction: no shell, no write tools.** Your sole
   output is the returned contract, which the orchestrator posts. This closes
   the execution and mutation channels deliberately — a tool list is not a
@@ -50,18 +59,22 @@ is what "specced" means: delegation without one is forbidden (fail-closed).
 
 ## The contract (all sections mandatory)
 
-1. **Spec** — inputs/outputs, closed grammar for any parsed surface, explicit
+1. **Acceptance criteria** — restated source-faithfully from the story issue
+   (quote, do not paraphrase away testability), each numbered so the test
+   list below can map to them. Criteria you had to infer rather than quote
+   are marked as inferred.
+2. **Spec** — inputs/outputs, closed grammar for any parsed surface, explicit
    fail-closed behaviour for every unknown, with `file:line` citations for
    each claim about existing code.
-2. **Test list** — behavioural and negative cases per acceptance criterion,
-   and for every guard the change adds or moves, one mutation-style check
-   named as "removing/inverting guard X must fail test Y". A guard without
-   such a check is unproven. Name which tests run hardware-free (fake MCP /
+3. **Test list** — behavioural and negative cases per acceptance criterion,
+   and for every guard the change adds, changes, moves, or otherwise touches,
+   one mutation-style check named as "removing/inverting guard X must fail
+   test Y". A guard without such a check is unproven. Name which tests run hardware-free (fake MCP /
    mock driver) and which need the E12 manual-validation path.
-3. **Class sweep** — if any change fixes an instance of a class, name the
+4. **Class sweep** — if any change fixes an instance of a class, name the
    class, the exact `grep` that enumerates every sibling in the repo, and the
    expected match set (see `docs/recent-fixes.md` for known classes).
-4. **PR plan (PR-Hygiene bar)** — ordered coherent review units of about 400
+5. **PR plan (PR-Hygiene bar)** — ordered coherent review units of about 400
    changed logic lines each (tests and separated data excluded), dependencies
    named, branch names per `feature/{issue-number}-{slug}-{slice}` (or plain
    `feature/{issue-number}-{slug}` when the plan is genuinely a single slice),
@@ -69,18 +82,18 @@ is what "specced" means: delegation without one is forbidden (fail-closed).
    routing. For a Codex-delegated story this section IS the story-brief PR
    plan: the lead adopts it into the brief rather than writing a competing
    one (AGENTS.md PR-Hygiene).
-5. **Routing** — which implementer (Codex-MCP by DEFAULT per D152, including
+6. **Routing** — which implementer (Codex-MCP by DEFAULT per D152, including
    safety-critical slices; `engineer-be` / `engineer-fe` only as the FALLBACK
    when Codex is unavailable or its weekly quota is below the budget stop),
    and which reviewers fire pre-open. A safety-critical slice always names
    `safety-reviewer`; an external-input capability always names
    `security-reviewer`.
-6. **Delegation prompt notes** — the repo-specific traps the orchestrator's
+7. **Delegation prompt notes** — the repo-specific traps the orchestrator's
    Codex prompt must carry verbatim for this slice: the explicit worktree
    path with per-command self-location, the #738 fresh-venv-in-worktree rule,
    `.venv/bin/python -m ...` invocation, the full gates before handback, and
    any slice-specific fixtures or contract tests that must be regenerated.
-7. **Risk profile** — blast radius (roaster hardware consequence; data
+8. **Risk profile** — blast radius (roaster hardware consequence; data
    sensitivity; principal scope and capability), and what a reviewer should
    try to break first.
 

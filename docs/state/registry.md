@@ -164,12 +164,14 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D151**. D150 is SPENT — it is the decision
+> Next free plan decision number: **D153**. D150 is SPENT — it is the decision
 > that settled this very question, recorded in `00-repository-structure.md` on
 > 9 Aug 2026: **one shared D-number series for the whole `roastpilot-plan` repo,
-> next free being one past the highest defined anywhere in it.** D149
-> (`factory.md`'s `## D149:` heading) was the previous maximum. Take **D151**;
-> D150 is spent. Do **not** derive the number from any one file's own maximum:
+> next free being one past the highest defined anywhere in it.** D151 is SPENT
+> (the advisor `model_slug` shadowing fix, #747/#755, 9 Aug) and D152 is SPENT
+> (Codex-MCP default-implementer adoption, #764, 9 Aug), both in
+> `roastpilot-agent/plan.md`. Take **D153**.
+> Do **not** derive the number from any one file's own maximum:
 > that per-file reading is exactly what produced the collisions described below,
 > and it produced another on 9 Aug (see the operator flag there).
 >

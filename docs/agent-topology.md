@@ -52,8 +52,12 @@ This specification defines a cost-aware Claude agent topology in which:
 - Claude Opus 5 owns product orchestration, scope, authority, and integration
   (recommended model for the role; the main-session model itself is a
   per-terminal operator decision — see §5).
-- Claude Fable 5 is invoked selectively as a read-only planning specialist.
-- Claude Sonnet 5 performs bounded implementation and routine review work.
+- Claude Fable 5 is invoked selectively as a read-only planning specialist —
+  and, as the `story-planner` contract writer, on every story delegated to
+  Codex-MCP (D152, §6).
+- Implementation defaults to Codex-MCP for contracted slices (D152, §4/§10);
+  Claude Sonnet 5 performs fallback and uncontracted implementation and the
+  routine review work.
 - High-consequence safety or architecture review remains an independent Opus 5 responsibility.
 
 The design uses Fable where long-context planning and ambiguity resolution provide material value without making it the default model for every task.
@@ -415,7 +419,11 @@ This topology is ready when:
   `pr-triage`, `qa`, `safety-reviewer`, `security-reviewer`, `sim-roast-runner`
   and `ui-reviewer`. (`story-planner`, added by D152, is read-only but carries
   no shell at all — no Bash, no Edit/Write — so the §7 mutate-then-restore
-  hazard cannot arise for it and it neither gates nor extends this criterion.)
+  hazard cannot arise for it and it does not gate this criterion. The §7
+  own-worktree requirement still binds its READS: its agent definition
+  requires the orchestrator to name the committed implementation-base tree
+  and sha, and to `ESCALATE` when none is supplied, so a contract cannot be
+  compiled from a stale or dirty checkout.)
   **Currently none of them does.** Carrying the rule in all
   eight prompts does not on its own satisfy this criterion: because a read-only
   role cannot create its own worktree, the lead-side provisioning and
