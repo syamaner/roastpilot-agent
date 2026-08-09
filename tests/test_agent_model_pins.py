@@ -106,8 +106,9 @@ def test_agents_md_prose_names_the_full_ids() -> None:
     # sentence must associate the full ID with the role, not merely mention both
     # somewhere — otherwise re-pinning story-planner alone in prose stays green
     # because planning-architect already satisfies the mention checks.
-    assert re.search(r"claude-fable-5.{0,400}story-planner", agents_md, re.S), (
-        "AGENTS.md must document the story-planner claude-fable-5 pin (D152)"
+    assert re.search(r"claude-fable-5(?:(?!claude-)[\s\S]){0,400}story-planner", agents_md), (
+        "AGENTS.md must associate story-planner with the claude-fable-5 pin (D152) "
+        "with no other model ID intervening"
     )
 
 
