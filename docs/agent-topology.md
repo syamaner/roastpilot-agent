@@ -22,10 +22,16 @@ pinned, and a consistency test (`tests/test_agent_model_pins.py`) guards the pin
 against drift and against committed settings that would defeat them (the
 repository side of the §5 override surface). Two §16 adoption criteria remain
 outstanding: the §15 evaluation across all five archetypes — not a five-case
-count, since a single story may cover more than one, and RP-B (#709) already
-covers two (ambiguous multi-slice, safety-sensitive) with three
-archetype-defining stories still needed (§15; the §16 evaluation-evidence
-criterion) — and the Product PM main-session pin, which is an
+count, since a single story may cover more than one. RP-B (#709) supplies
+evidence on two (ambiguous multi-slice, safety-sensitive), but **as a FAILURE
+case, which does not yet validate them**: no planner was invoked on it, so it
+tests neither the trigger-wins rule added to §6 above nor the Fable planner's
+model and contract on either archetype. Counting those two as validated would
+let the topology be marked ready on the strength of an entry that records the
+rule being broken. They need a subsequent applicable story run UNDER the
+revised rule; three further archetype-defining stories are needed regardless
+(§15; the §16 evaluation-evidence criterion) — and the Product PM main-session
+pin, which is an
 operator setting (`model: claude-opus-5` or `--model`, never `default`), not
 repository config. The live-environment and organisation side of the §5 override
 surface (`CLAUDE_CODE_SUBAGENT_MODEL`, `availableModels`, organisation

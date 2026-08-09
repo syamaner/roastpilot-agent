@@ -181,7 +181,7 @@
 > `plan.md` currently runs to D129, hence D130. D125 records the RP-D eval-model
 > correction — discriminates only on hardware/simulator, not replay; D124 records
 > the RP-D scorer + RP-B c11 design, roastpilot-agent#711/#709; D123 the #718
-> catalogue query-scope won't-fix).
+> catalogue query-scope won't-fix.
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 2 Aug block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC

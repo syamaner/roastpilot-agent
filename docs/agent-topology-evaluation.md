@@ -20,7 +20,17 @@ heavily reworked task.
 
 ## Case 1 — RP-B (#709), the ambient-aware fan doctrine
 
-Date: 8 Aug 2026. PR: #731. Plan decisions produced: D126, D127.
+Dates: 8-9 Aug 2026. PRs: **#731** (the doctrine), **#739** (the eval set),
+**#741** (ambient freshness). Plan decisions produced: **D126, D127, D128, D129**
+(`roastpilot-agent/plan.md` — see the registry on why a bare D-number is
+ambiguous across plan files).
+
+**Scope note, because the measurements below are wider than a single PR.** An
+earlier revision of this header named only 8 Aug / #731 / D126-D127 while the
+usage table, rework tally and spawn list already drew on #739 and #741 as well —
+so a reader could not reproduce which slices fed which number. The entry covers
+the RP-B *story*, not one pull request; every measurement below is over all
+three PRs unless it names one.
 
 > **Reading this later: `docs/state/registry.md` lagged this entry.** AGENTS.md
 > sends every session to the registry first, and at the time this case was
@@ -66,7 +76,13 @@ down.
 ### Did plans need material rewrite?
 
 Not applicable (no planner). But the **PM-authored plan needed material
-correction three times**, all caught by review rather than by planning:
+correction three times** — **two** caught by review, **one** self-caught at
+implementation time (item 1 below). The distinction matters and an earlier
+revision blurred it by calling all three review catches: that inflates the
+review-catch count, and it makes the later "independent review caught every one
+of the PM's own misses" claim untrue as stated. What the evidence supports is
+narrower and still useful: *no* plan defect survived to merge, and the two that
+the PM did not notice were both caught by the Codex lens.
 
 1. The ratified design said the doctrine's threshold "comes from the
    `ambient_temp_c` context field". That field is the *measurement*; no boundary
@@ -122,10 +138,28 @@ responding to the finding.
   defaulted *soft*, so a fail-soft probe softened doctrine in a hot room",
   fixed by removing the soft default and pinning a regression test). Full
   findings table: PR #731 body.
-- **Preventable (post-open, should have been caught earlier):** the c3
-  contamination and the stale `15.0` doc comment. The doc comment is the
-  sharper miss: the PR violated the two-copies discipline it repeatedly
-  invokes as its own design principle.
+- **Preventable (post-open, should have been caught earlier): four, not the two
+  an earlier revision of this line reported.** Understating this understated the
+  case's headline measurement, so the full list, from #731's merged history:
+  1. the **c3 contamination** (Codex P1) — the doctrine's context was populated
+     on every roast including the live default, so any c3 baseline the RP-B
+     comparison is measured against was contaminated;
+  2. **`pr-triage` returned NOT-MERGEABLE** on a blocker: `step_max_pp` was
+     `le=100.0`, so the whole-multiple rule alone accepted a 100 pp *ordinary*
+     step — a full floor-to-ceiling fan slam, precisely what the doctrine
+     exists to prevent, moved out of the prose and into the config. The same
+     pass caught three claimed-but-not-delivered edits by diffing the commit
+     message against the file;
+  3. a later **Claude round on the guard for that blocker**: the ceiling test
+     read the field's constraint metadata but asserted against a hardcoded
+     `20.0`, so a partial loosening to 30.0 would have passed. The test for the
+     blocking issue did not actually guard the declared constraint;
+  4. the stale **`15.0` doc comment**.
+
+  Items 2 and 3 are the sharper misses, and they compound: a blocker reached
+  post-open, and then its guard did too. Item 4 is the neatest, though — the PR
+  violated the two-copies discipline it repeatedly invokes as its own design
+  principle.
 - **Avoidable churn:** one self-inflicted CI failure. Editing the PR body while
   a review run was in flight cancelled the legitimate `synchronize` run and
   started an `edited` run that fails by design, leaving the head with no valid
