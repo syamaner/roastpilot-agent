@@ -374,7 +374,7 @@ log out was meant to avoid.
 
 This topology is ready when:
 
-- Exact model IDs and explicit effort levels are used for every defined role.
+- Exact model IDs and explicit effort levels are used for every defined subagent role (the main-session model is a deliberate per-terminal operator choice — operator decision, 9 Aug 2026, see §5).
 - No override in the documented precedence chain (`CLAUDE_CODE_SUBAGENT_MODEL`, the per-invocation `model` parameter, the frontmatter `model`, `availableModels` / `enforceAvailableModels`, an organisation default, or organisation restrictions) silently defeats role-level model selection.
 - The Fable planner is read-only by tool restriction: no `Edit` or `Write` tool (the same posture as the repository's other read-only roles), `permissionMode: plan`, and it runs only as a named subagent, never a fork. A hard guarantee against a determined `Bash` write is an operational control (do not run read-only roles under permissive parent modes), not a per-agent mechanism.
 - The Opus PM remains the sole agent authority for routing and plan adjudication.
