@@ -7,6 +7,7 @@ All tests are hardware-free and use temporary directories for the config file.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -204,6 +205,38 @@ def test_load_saved_config_invalid_yaml_raises_config_file_error(tmp_path: Path)
     path.write_text("advisor:\n  model_slug: [unclosed\n")
     with pytest.raises(ConfigFileError, match=str(path)):
         _load_saved_config(path)
+
+
+# ---------------------------------------------------------------------------
+# Module-wide env hygiene
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def restore_roastpilot_env() -> Iterator[None]:
+    """Restore ``ROASTPILOT_*`` exactly as it was around EVERY test here.
+
+    ``_inject_saved_as_env`` writes ``os.environ`` directly — that is its job —
+    so a test calling it leaves the injected vars set for the rest of the
+    session. Harmless while nothing downstream read them; it stopped being
+    harmless once tests in this file began asserting on an EFFECTIVE config,
+    because a leaked ``ROASTPILOT_ADVISOR__MODEL_SLUG`` wins over the saved file
+    and silently changes what is under test (it reddened four tests in
+    ``test_config_reload_on_roast.py`` under one valid file ordering — local
+    Codex P2, folded pre-open).
+
+    Fixed here at the source rather than defended against per-test: an autouse
+    snapshot/restore makes every test in this module order-independent,
+    including the ones that do the injecting.
+    """
+    before = {k: v for k, v in os.environ.items() if k.startswith("ROASTPILOT_")}
+    try:
+        yield
+    finally:
+        for key in [k for k in os.environ if k.startswith("ROASTPILOT_")]:
+            if key not in before:
+                del os.environ[key]
+        os.environ.update(before)
 
 
 # ---------------------------------------------------------------------------
@@ -1936,9 +1969,11 @@ def test_snapshot_yaml_value_degrades_safely_when_only_mcp_env_carries_the_sourc
 def no_roastpilot_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Clear inherited ``ROASTPILOT_*`` env for the advisory tests.
 
-    These assert on the EFFECTIVE model, and env beats everything, so a leaked
-    ``ROASTPILOT_ADVISOR__MODEL_SLUG`` from a sibling test (the suite runs under
-    ``pytest-randomly``) would silently change which arm is classified.
+    These assert on the EFFECTIVE model, and env beats everything. In-module
+    leaks are now fixed at source by ``restore_roastpilot_env``; this guards
+    the other direction — a real ``ROASTPILOT_ADVISOR__*`` exported in the
+    developer's own shell, which would otherwise decide which arm is
+    classified. Same rationale as ``test_launch_banner``'s ``config_file``.
     """
     for key in list(os.environ):
         if key.startswith("ROASTPILOT_"):
