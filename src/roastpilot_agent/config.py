@@ -1927,36 +1927,16 @@ class AppConfig(BaseSettings):
         a doctrine that was serving fresh readings. Two or more cadences remains
         the sensible operating margin; it is advice, not a validation rule.
 
-        **Enabling the doctrine requires an EXPLICIT cadence.** ``mcp_yaml``
-        renders ``ambient_poll_interval_seconds`` only when it is set, so
-        ``None`` means "inherit", and what it inherits from is a file this
-        validator will not read — config construction must not depend on the
-        filesystem, since ``AppConfig`` is built in tests, replay and recovery.
-
-        Two earlier revisions tried to be cleverer and each left a hole. The
-        first substituted the mirrored MCP default, which let an inherited 300 s
-        cadence pass against a 90 s bound. The second stood down whenever the
-        field was unset, which stripped the guard from the default deployment
-        shape. The third enumerated the yaml routes — explicit path, ``mcp.env``,
-        ``os.environ`` — and still missed
-        ``resolve_mcp_yaml_source_path``'s fourth: a ``coffee-roaster-mcp.yaml``
-        sitting in the working directory, which the spawn really does honour.
-
-        Enumerating routes is the wrong shape of fix: each pass closes the
-        instance and leaves the class. Requiring the value outright has no
-        residual to miss, needs no filesystem access, and costs the operator one
-        field they effectively have to know anyway before running a scored arm
-        on a doctrine whose entire behaviour turns on that cadence. If no yaml
-        supplies a cadence, the correct value to type is the MCP's own default,
-        which the error message names.
-
-        Rejecting rather than warning is the point independent triage and Codex
-        reached separately: a runtime warning is fresh evidence, not a guard,
-        because it fires only once the roast is already running and cannot stop
-        a scored hardware arm continuing on a doctrine that is void for most of
-        each cycle. The runtime decline warning stays as defence in depth for
-        what no config can predict — a wedged probe, a doctrine retired by
-        recovery, a future constructor of ``RoastTelemetry``.
+        **An UNSET cadence is unknown, not incompatible, and this validator
+        does not judge it.** ``mcp_yaml`` renders
+        ``ambient_poll_interval_seconds`` only when it is set, so ``None`` means
+        "inherit" from a file this validator will not read — config
+        construction must not depend on the filesystem, since ``AppConfig`` is
+        built in tests, replay and recovery. Requiring the value is therefore a
+        START-A-ROAST precondition
+        (``RoastService._require_explicit_ambient_cadence``, which also carries
+        the rationale) rather than a construction one; see the inline note on
+        the early return below for why that placement is load-bearing.
 
         Only enforced while the doctrine is ENABLED, so the inert default can
         never make an otherwise-valid config unconstructible.
@@ -1974,8 +1954,9 @@ class AppConfig(BaseSettings):
             The validated application config.
 
         Raises:
-            ValueError: If the doctrine is enabled and either the ambient poll
-                interval is unset, or the freshness bound is below it.
+            ValueError: If the doctrine is enabled, the ambient poll interval is
+                KNOWN (explicitly set), and the freshness bound is below it. An
+                unset poll interval is not a rejection here — see above.
         """
         doctrine = self.controller.ambient_fan_doctrine
         if not doctrine.enabled:
