@@ -3116,18 +3116,25 @@ def _ambient_status(
     humidity_percent: float | None = 38.6,
     pressure_hpa: float | None = 1008.56,
     reason: str | None = None,
+    ambient_running: bool | None = None,
 ) -> AmbientStatus:
     """An ``AmbientStatus`` mirror instance (#342, D85).
 
     Defaults to an ``"ok"`` reading matching the hardware-validated live read
     (28.49 C / 38.6% / 1008.56 hPa). Pass ``status="unavailable"`` (or
     ``"disabled"``) with the numeric fields left ``None`` to exercise the
-    fail-soft no-reading case."""
+    fail-soft no-reading case.
+
+    ``ambient_running`` defaults to ``status == "ok"`` — the healthy pairing —
+    but is overridable so the STOPPED-BUT-``"ok"`` runtime is expressible
+    (#732/#745a): ``_stop_locked`` drops the reader while leaving ``status`` at
+    ``"ok"`` over the preserved last reading, which is the one shape a
+    ``status``-only gate gets wrong."""
     return AmbientStatus(
         mode="yoctopuce",
         status=status,  # type: ignore[arg-type]  # parametrized over the Literal
         reason=reason,
-        ambient_running=status == "ok",
+        ambient_running=(status == "ok") if ambient_running is None else ambient_running,
         temperature_c=temperature_c,
         humidity_percent=humidity_percent,
         pressure_hpa=pressure_hpa,
@@ -3903,6 +3910,45 @@ async def test_live_run_persists_null_ambient_when_unavailable(store: RoastStore
     mcp.frames = [_reading(bean=178.0, env=185.0, t0_detected=True)]
     for _ in range(ControllerConfig().t0_debounce_ticks + 1):
         await _tick(service, clock)
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.agent_phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert detail.ambient_temp_c is None
+    assert detail.ambient_humidity_pct is None
+    assert detail.ambient_pressure_hpa is None
+
+
+@pytest.mark.asyncio
+async def test_charge_capture_persists_nulls_for_a_stopped_but_ok_runtime(
+    store: RoastStore,
+) -> None:
+    """#745a: a stopped runtime's preserved reading is NOT recorded as the run's ambient.
+
+    ``AmbientSessionRuntime._stop_locked`` drops the reader (``ambient_running``
+    goes ``False``) while deliberately leaving ``status`` at ``"ok"`` over the
+    last reading, which can then never change. #741 gave the live advisor and
+    dashboard paths the ``ambient_running`` gate; the charge-instant corpus
+    capture kept its own ``status``-only test and so recorded that frozen
+    reading as the run's breadcrumb — the run reads back as "had ambient" while
+    every live path correctly saw none.
+
+    That is a mislabelled RP-B arm (#709): the offline eval (#737) reads exactly
+    this column and stamps it into every replayed context, so the comparison
+    would run on a reading the doctrine never reasoned on.
+    """
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    # status "ok" with the full triad intact — only the reader has stopped.
+    stopped = _ambient_status(status="ok", ambient_running=False)
+    assert stopped.temperature_c is not None, "the frozen reading must still be present"
+    raw_state = _FakeRawState(
+        _session_state(fc_status="pending", audio_running=False, ambient_status=stopped)
+    )
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+    mcp.frames = [_reading(bean=178.0, env=185.0, t0_detected=True)]
+    for _ in range(ControllerConfig().t0_debounce_ticks + 1):
+        await _tick(service, clock)
+
     detail = await store.read_run(run_id)
     assert detail is not None
     assert detail.agent_phase is RoastPhase.ROASTING_PRE_FIRST_CRACK

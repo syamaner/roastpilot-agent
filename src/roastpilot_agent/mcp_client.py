@@ -651,15 +651,42 @@ def ambient_reading_token(status: AmbientStatus) -> float | None:
     is then measured entirely in the agent's own clock domain by
     :meth:`RoasterControlAdapter.read_telemetry`.
 
+    **A non-finite stamp is not a token (#745b).** Equality is the whole
+    mechanism here, and ``NaN`` is unequal to itself under IEEE-754, so a
+    malformed MCP or child response carrying ``NaN`` makes every tick look like
+    a *new* reading: the derived age is re-based to ``now`` every tick, never
+    advances past ``0.0``, and the controller's range check upstream — which is
+    written to fail closed on ``NaN``/negative *ages* — never sees anything but
+    a perfectly fresh one. A frozen value stays permanently "fresh", which is
+    the one thing the freshness clock exists to prevent. ``±inf`` is rejected
+    with it: it compares equal to itself and so would not defeat the clock, but
+    a non-finite stamp is malformed either way and there is no reason to carry
+    one. No type guard is needed alongside it, unlike :func:`_payload_float`:
+    that reads an untyped ``EventPayloadValue`` mapping, whereas
+    ``AmbientStatus.last_reading_monotonic_seconds`` is a pydantic-validated
+    ``float | None``, so the only way a value survives validation and is still
+    unusable is by being non-finite (pydantic's ``allow_inf_nan`` default).
+
+    Rejecting here rather than at the call site is deliberate: the token's
+    identity semantics are what ``NaN`` breaks, so the guard belongs at the
+    boundary every consumer already goes through. An unusable stamp reads as
+    "no reading", which the age tracker already treats as age-unknown and the
+    controller already fails closed on — the reading is declined and ``c11``
+    takes its absent-ambient path, the #498-safe direction.
+
     Args:
         status: The MCP ambient status from ``RoastSessionState``.
 
     Returns:
         The reading's identity token, or ``None`` when the runtime holds no
         reading at all (its ``AmbientRuntimeSnapshot`` nulls the stamp and the
-        triad together, so an absent token means an absent reading).
+        triad together, so an absent token means an absent reading) or when the
+        stamp is not a finite number.
     """
-    return status.last_reading_monotonic_seconds
+    stamp = status.last_reading_monotonic_seconds
+    if stamp is None or not math.isfinite(stamp):
+        return None
+    return stamp
 
 
 def project_session_state(

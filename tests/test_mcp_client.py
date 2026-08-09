@@ -24,6 +24,7 @@ from pydantic import ValidationError
 
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig
 from roastpilot_agent.mcp_client import (
+    AmbientStatus,
     ControlCommandResult,
     EventCommandResult,
     EventSnapshot,
@@ -42,6 +43,7 @@ from roastpilot_agent.mcp_client import (
     ServerInfo,
     SetRecordingMetadataResult,
     StartRoastSessionResult,
+    ambient_reading_token,
     applied_state_from_event,
     event_backdate_seconds,
     force_terminate_process_group,
@@ -2792,6 +2794,77 @@ async def test_adapter_ambient_age_grows_while_the_reading_does_not_change() -> 
     # A genuinely new reading resets the age, and carries the new value.
     assert third is not None and third.ambient_age_seconds == 0.0
     assert third.ambient_temp_c == 24.0
+
+
+@pytest.mark.asyncio
+async def test_adapter_ambient_age_is_unknown_for_a_nan_reading_stamp() -> None:
+    """#745b: a NaN stamp must not read as a permanently-fresh reading.
+
+    The stamp is an opaque IDENTITY token compared with ``!=``, and NaN is
+    unequal to itself under IEEE-754 — so an unguarded token makes every tick
+    look like a brand-new reading: the age is re-based to ``now`` each tick and
+    never leaves 0.0. The controller's range check is written to fail closed on
+    a NaN *age*, but it never sees one; a frozen value stays "fresh" forever,
+    which is the single thing the freshness clock exists to prevent.
+
+    Rejecting the stamp makes it read as "no reading", so the age is ``None``
+    (age-unknown) and the controller declines — ``c11`` takes its absent-ambient
+    path, the #498-safe direction.
+
+    Two reads with the SAME NaN stamp: an unguarded token would report 0.0 twice
+    (each read looking new); a token-with-guard reports unknown twice.
+    """
+    clock = _StepClock()
+    nan_stamp = {
+        **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[dict-item]
+        "last_reading_monotonic_seconds": float("nan"),
+    }
+    adapter = RoasterControlAdapter(
+        RoasterMCPClient(
+            _SequenceCaller(
+                [
+                    _state_payload(100.0, ambient_status=nan_stamp),
+                    _state_payload(101.0, ambient_status=nan_stamp),
+                ]
+            )
+        ),
+        clock=clock,
+    )
+
+    first = await adapter.read_telemetry()
+    clock.now = 1.0
+    second = await adapter.read_telemetry()
+
+    assert first is not None and first.ambient_age_seconds is None
+    assert second is not None and second.ambient_age_seconds is None
+
+
+def test_ambient_reading_token_rejects_non_finite_stamps() -> None:
+    """#745b at the boundary every consumer goes through.
+
+    NaN is the one that defeats the equality mechanism; ``±inf`` compares equal
+    to itself and so would not, but a non-finite stamp is malformed either way
+    and there is no reason to carry one. A finite stamp — including ``0.0``,
+    which must not be confused with absent — passes through unchanged.
+    """
+
+    def _status(stamp: float | None) -> AmbientStatus:
+        payload = {
+            **SESSION_STATE_PAYLOAD,
+            "ambient_status": {
+                **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[dict-item]
+                "last_reading_monotonic_seconds": stamp,
+            },
+        }
+        return RoastSessionState.model_validate(payload).ambient_status
+
+    assert ambient_reading_token(_status(float("nan"))) is None
+    assert ambient_reading_token(_status(float("inf"))) is None
+    assert ambient_reading_token(_status(float("-inf"))) is None
+    assert ambient_reading_token(_status(None)) is None
+    # 0.0 is a legitimate stamp and must not be confused with absent.
+    assert ambient_reading_token(_status(0.0)) == 0.0
+    assert ambient_reading_token(_status(1230.0)) == 1230.0
 
 
 @pytest.mark.asyncio
