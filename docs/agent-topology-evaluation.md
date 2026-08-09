@@ -275,7 +275,7 @@ None — but the count is **four for this case**, not the two an earlier draft o
 this section asserted. The usage table above records five delegated agents
 because it is measured over the whole session, which also covered the sibling PR
 #739; `triage-739` is therefore listed for completeness of the cost figures but
-sits outside this entry's #731 scope. The four in scope:
+sits outside this entry's #731 scope. **Five spawned, four in this entry's scope:**
 
 | Agent | Why it was spawned | Redundant? |
 |---|---|---|

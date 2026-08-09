@@ -42,7 +42,8 @@
 > the claim is removed rather than corrected in place: a dated status block is
 > not the right home for a fast-moving fact, and two authoritative-looking
 > answers in one file is what caused the reuse incident in the first place. The
-> free number is stated ONCE, at the end of this registry.)*
+> free number is stated ONCE, at the end of this status block — not at the end of
+> the file, which continues for well over a thousand lines of historical status.)*
 >
 > **STATUS UPDATE — 6 Aug 2026 (updates the control-loop framing in the 2 Aug
 > block below).** The D96 recovery law (#559) has now had its flag-on hardware
