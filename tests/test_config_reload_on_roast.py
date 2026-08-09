@@ -224,6 +224,7 @@ async def test_an_endpoint_change_alone_invalidates_the_probe(
 async def test_a_base_slug_change_invalidates_even_with_a_pinned_phase_slot(
     store: RoastStore,
     config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The PROBED model is the base slug, so it belongs in the identity.
 
@@ -232,35 +233,33 @@ async def test_a_base_slug_change_invalidates_even_with_a_pinned_phase_slot(
     change while the advice model does not — and comparing only the advice
     models left `/api/health` describing a probe of the previous base model
     (local Codex P2, folded pre-open).
+
+    The slot is pinned via the env blob because `model_slug_by_phase` is
+    deliberately absent from `AdvisorConfigEdit` (D151) — env and a hand-edited
+    saved file are the supported ways to reach it, which is exactly why the
+    shadowing path still has to be handled.
     """
-    svc = RoastService(store, live_serve_mode=True)
-    svc._config = svc._config.model_copy(  # pyright: ignore[reportPrivateUsage]
-        update={
-            "advisor": svc._config.advisor.model_copy(  # pyright: ignore[reportPrivateUsage]
-                update={"model_slug_by_phase": {RoastPhase.DEVELOPMENT: "openai/gpt-4o-mini"}}
-            )
-        }
+    monkeypatch.setenv(
+        "ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE", '{"development": "openai/gpt-4o-mini"}'
     )
+    svc = RoastService(store, live_serve_mode=True)
+    probed_base = svc._config.advisor.model_slug  # pyright: ignore[reportPrivateUsage]
     svc.set_advisor_health(
         AdvisorHealth(
             status=AdvisorHealthStatus.REACHABLE,
             provider="openai_compatible",
-            model_slug="openai/gpt-4o",
+            model_slug=probed_base,
         )
     )
 
-    # The pinned DEVELOPMENT slot means the ADVICE model is unchanged; only the
-    # probed base slug moves.
-    persist_config_edit(
-        AppConfigEdit(
-            advisor=AdvisorConfigEdit(
-                model_slug="openai/gpt-4.1-mini",
-                model_slug_by_phase={RoastPhase.DEVELOPMENT: "openai/gpt-4o-mini"},
-            )
-        )
-    )
+    # Only the probed BASE slug moves; the pinned slot keeps the advice model
+    # identical across the reload.
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4.1-mini")))
     await svc.start_roast(RoastProfile(**_profile()))
 
+    reloaded = svc._config.advisor  # pyright: ignore[reportPrivateUsage]
+    assert reloaded.model_for(RoastPhase.DEVELOPMENT) == "openai/gpt-4o-mini"
+    assert reloaded.model_slug != probed_base
     assert (await svc.health()).advisor is None
 
 
