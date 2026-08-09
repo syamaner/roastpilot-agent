@@ -264,7 +264,9 @@ checklist before you open.
   with its scope, rough size, dependencies, and which reviewers it triggers
   (safety / security / qa). You should know the planned review units and why each is
   coherent *before* PR1 opens. This lives in the story brief (a lead / `product-pm`
-  activity). Reactively discovering unrelated responsibilities in a large diff is the
+  activity); for a story delegated to Codex-MCP, the `story-planner` contract
+  carries the PR plan (D152) and the lead adopts it into the brief — one plan,
+  not two competing ones. Reactively discovering unrelated responsibilities in a large diff is the
   failure mode this prevents (#587's ~800-line module and #600's ~2,000-line harness
   combined concerns that should have been identified at kickoff); line count is the
   prompt to inspect the design, not the design itself.
@@ -636,8 +638,10 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   human is the lead + domain expert/architect, consulted on escalations.
 - **Model selection — decide it WITH the topology, every time.** When you pick a
   primitive (sub-agent / agent team / workflow), pick the model in the same breath.
-  **Default to Sonnet** for the bulk of the work: scoped implementation (`engineer-be`,
-  `engineer-fe`), mechanical checks (`mcp-contract-checker`, `sim-roast-runner`), and
+  **Default to Sonnet** for the bulk of the Claude-side work: fallback implementation
+  (`engineer-be`, `engineer-fe` — Codex-MCP is the default implementer for contracted
+  slices, D152; see the delegation bullet below), mechanical checks
+  (`mcp-contract-checker`, `sim-roast-runner`), and
   routine review/audit (`pr-triage`, `qa`, `ui-reviewer`, `product-pm`,
   `security-reviewer`) — all pinned to the full ID `model: claude-sonnet-5`
   (implementers, reviewers, and triage at `effort: high`; the mechanical checks
@@ -649,9 +653,10 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   judgment or subtle correctness triage. Why the pins matter: an agent with no `model:`
   inherits the PARENT, so a careless spawn from the Opus main loop silently runs Opus —
   the per-role defaults stop that. The Opus main loop conserves credits by delegating
-  execution to Sonnet. Default concurrency cap: 3 parallel workers; prefer one
-  capable worker over several redundant ones (`docs/agent-topology.md` §10).
-  Two Fable roles exist, both pinned
+  execution — to Codex-MCP for contracted slices (D152), and to Sonnet as the
+  fallback and for uncontracted work. Default concurrency cap: 3 parallel
+  workers; prefer one capable worker over several redundant ones
+  (`docs/agent-topology.md` §10). Two Fable roles exist, both pinned
   `model: claude-fable-5` at `effort: high`, read-only and advisory:
   `planning-architect`, invoked selectively for complex, ambiguous, or
   cross-repository planning (see `docs/agent-topology.md`), and

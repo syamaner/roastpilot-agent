@@ -89,6 +89,8 @@ The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
 
 `xhigh` MAY be used for the Fable planner when the task is genuinely long-horizon, cross-repository, safety-sensitive, or architecture-defining. It SHOULD NOT be the default for ordinary planning.
 
+The implementer row's Codex-MCP default (D152) is an external-family harness, not a Claude model pin: the exact-ID discipline of §5 and §16 binds the Claude roles — including the Claude fallback implementer pins — and `tests/test_agent_model_pins.py` asserts exactly those. Codex delegation is bound by D152's contract rule instead.
+
 ## 5. Model pinning
 
 1. Agent definitions MUST use full model IDs when reproducibility is intended:
@@ -110,6 +112,15 @@ The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
 5. Effort MUST be selected separately from response verbosity. Prompts SHOULD state the desired output length directly.
 
 ## 6. When to invoke the Fable planner
+
+This section governs the `planning-architect`. The `story-planner` contract
+writer (D152) is a distinct, mandatory step for every story delegated to
+Codex-MCP: compiling the implementation contract is not the deep planning this
+section rations, so it is exempt from the bypass rules below and does not count
+against the one-planning-subagent rule at the end of this section. On a complex
+story the two compose in sequence — `planning-architect` (when triggered) plans,
+the Opus PM adjudicates, then `story-planner` compiles the adjudicated plan into
+the contract.
 
 The Opus PM SHOULD invoke Fable when one or more of these conditions hold:
 
@@ -202,7 +213,8 @@ Human request
     v
 Opus PM: orient, identify authority and complexity
     |
-    +-- simple and settled --> bounded Sonnet implementation
+    +-- simple and settled --> story-planner contract --> bounded implementation
+    |                          (Codex-MCP default, D152; Sonnet fallback)
     |
     +-- complex/ambiguous --> read-only Fable plan
                               |
@@ -210,7 +222,11 @@ Opus PM: orient, identify authority and complexity
                          Opus adjudication
                               |
                               v
-                    bounded Sonnet implementation
+                     story-planner contract
+                              |
+                              v
+                     bounded implementation
+              (Codex-MCP default, D152; Sonnet fallback)
                               |
                               v
                  independent domain review and QA
@@ -377,11 +393,11 @@ log out was meant to avoid.
 
 This topology is ready when:
 
-- Exact model IDs and explicit effort levels are used for every defined subagent role (the main-session model is a deliberate per-terminal operator choice — operator decision, 9 Aug 2026, see §5).
+- Exact model IDs and explicit effort levels are used for every defined Claude subagent role (the main-session model is a deliberate per-terminal operator choice — operator decision, 9 Aug 2026, see §5; the Codex-MCP default implementer is an external-family harness bound by D152's contract rule, not by a Claude pin — see the note under the §4 table).
 - No override in the documented precedence chain (`CLAUDE_CODE_SUBAGENT_MODEL`, the per-invocation `model` parameter, the frontmatter `model`, `availableModels` / `enforceAvailableModels`, an organisation default, or organisation restrictions) silently defeats role-level model selection.
-- The Fable planner is read-only by tool restriction: no `Edit` or `Write` tool (the same posture as the repository's other read-only roles), `permissionMode: plan`, and it runs only as a named subagent, never a fork. A hard guarantee against a determined `Bash` write is an operational control (do not run read-only roles under permissive parent modes), not a per-agent mechanism.
+- The Fable planner is read-only by tool restriction: no `Edit` or `Write` tool (the same posture as the repository's other read-only roles), `permissionMode: plan`, and it runs only as a named subagent, never a fork. A hard guarantee against a determined `Bash` write is an operational control (do not run read-only roles under permissive parent modes), not a per-agent mechanism. The `story-planner` (D152) holds the same posture with no `Bash` tool at all, so its read-only guarantee is stronger than `permissionMode` alone provides.
 - The Opus PM remains the sole agent authority for routing and plan adjudication.
-- Simple tasks demonstrably bypass Fable.
+- Simple tasks demonstrably bypass the `planning-architect` (the D152 `story-planner` contract still applies to Codex-delegated stories — §6).
 - Complex plans use the required output contract.
 - Planning refusals and unusable results fail closed with a documented fallback or escalation.
 - Writing agents have bounded, non-overlapping ownership.

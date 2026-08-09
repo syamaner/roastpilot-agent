@@ -4,6 +4,7 @@ description: Turn a story into an implementation contract before any code is wri
 tools: Read, Grep, Glob
 model: claude-fable-5
 effort: high
+permissionMode: plan
 ---
 
 You are the story planner for `roastpilot-agent`. You produce the contract the
@@ -62,8 +63,12 @@ is what "specced" means: delegation without one is forbidden (fail-closed).
    expected match set (see `docs/recent-fixes.md` for known classes).
 4. **PR plan (PR-Hygiene bar)** — ordered coherent review units of about 400
    changed logic lines each (tests and separated data excluded), dependencies
-   named, branch names per `feature/{issue-number}-{slug}-{slice}`, and the
-   domain reviewer each diff triggers per the Code Review Rubric routing.
+   named, branch names per `feature/{issue-number}-{slug}-{slice}` (or plain
+   `feature/{issue-number}-{slug}` when the plan is genuinely a single slice),
+   and the domain reviewer each diff triggers per the Code Review Rubric
+   routing. For a Codex-delegated story this section IS the story-brief PR
+   plan: the lead adopts it into the brief rather than writing a competing
+   one (AGENTS.md PR-Hygiene).
 5. **Routing** — which implementer (Codex-MCP by DEFAULT per D152, including
    safety-critical slices; `engineer-be` / `engineer-fe` only as the FALLBACK
    when Codex is unavailable or its weekly quota is below the budget stop),
