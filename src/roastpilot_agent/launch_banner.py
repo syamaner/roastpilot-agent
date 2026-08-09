@@ -93,25 +93,31 @@ def _changed_fields(model: BaseModel) -> set[str]:
 def _arm_matches(slug: str, effort: str | None, known: frozenset[tuple[str, str | None]]) -> bool:
     """Whether the ``(slug, effort)`` ARM appears in *known*.
 
-    Matching is exact on the lower-cased slug: every screen ran on OpenRouter,
-    where slugs carry a vendor prefix, so ``someone-else/gpt-4o`` never inherits
-    ``openai/gpt-4o``'s measurement. (Callers void the whole table for a
-    non-OpenRouter endpoint, which is why no bare native-provider name is
-    matched here — an unmeasured endpoint is unmeasured whatever it is called.)
+    Matching is EXACT on the slug as configured — no stripping, no case folding
+    (local Codex P2, folded pre-open). The rule is: report on the string that
+    will actually be DISPATCHED. ``AdvisorConfig`` and ``build_model`` send the
+    slug verbatim, so a normalisation here that the dispatch path does not share
+    lets the banner clear one identifier while the provider is sent another. A
+    hand-edited ``" openai/gpt-4o "`` is not the measured arm — it is a string
+    the provider may well reject — and the honest report is "no screen on
+    record", the same answer a ``:variant`` suffix gets, for the same reason.
+    Erring toward the warning is also the safe direction.
 
-    Surrounding whitespace is stripped: a hand-edited saved config can hold
-    ``" openai/gpt-5.5 "``, and without the strip a measured-busting arm would
-    silently downgrade to the weaker "no screen on record" wording.
+    Every screen ran on OpenRouter, where slugs carry a vendor prefix, so
+    ``someone-else/gpt-4o`` never inherits ``openai/gpt-4o``'s measurement.
+    (Callers void the whole table for a non-OpenRouter endpoint, which is why no
+    bare native-provider name is matched here — an unmeasured endpoint is
+    unmeasured whatever it is called.)
 
     Args:
-        slug: A resolved advisor model slug.
+        slug: A resolved advisor model slug, exactly as it will be dispatched.
         effort: The configured ``reasoning_effort`` (``None`` = provider default).
-        known: Lower-case ``(slug, effort)`` arms to match against.
+        known: The canonical lower-case ``(slug, effort)`` arms to match against.
 
     Returns:
         ``True`` when the arm was measured.
     """
-    return (slug.strip().lower(), effort) in known
+    return (slug, effort) in known
 
 
 def _latency_screen_note(

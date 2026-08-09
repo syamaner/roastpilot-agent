@@ -309,18 +309,18 @@ def test_a_native_provider_model_does_not_inherit_the_openrouter_screen() -> Non
     assert "BUSTED" not in _advisor_line_for(provider="openai", model_slug="gpt-4o")
 
 
-def test_a_padded_slug_still_matches_its_screen() -> None:
-    """Surrounding whitespace does not downgrade a BUSTED verdict.
+def test_a_padded_slug_is_reported_on_as_the_string_that_will_be_dispatched() -> None:
+    """Matching is exact, because the provider is sent the slug verbatim.
 
-    A hand-edited saved config can hold `" openai/gpt-5.5 "`. Without the strip
-    in `_slug_matches` that lands in the "no screen on record" class — the
-    WEAKEST of the three messages for a model we measured busting the gate,
-    which is the unsafe direction. (The earlier version of this test used a
-    whitespace-only slug, which passes with or without the strip and so guarded
-    nothing — safety-reviewer catch, folded pre-open.)
+    An earlier draft stripped whitespace before matching, so `" openai/gpt-4o "`
+    cleared the screen — while `build_model` sent the padded string to the
+    provider. The banner would have vouched for one identifier while another
+    was dispatched (local Codex P2, folded pre-open). Exact matching keeps the
+    report about the thing that actually runs, and errs toward warning.
     """
-    assert "BUSTED" in _advisor_line_for(model_slug=" openai/gpt-5.5 ")
-    # And a degenerate slug still fails closed rather than matching nothing quietly.
+    assert "no FC-latency screen on record" in _advisor_line_for(model_slug=" openai/gpt-4o ")
+    assert "no FC-latency screen on record" in _advisor_line_for(model_slug=" openai/gpt-5.5 ")
+    # A degenerate slug likewise fails closed rather than matching nothing quietly.
     assert "no FC-latency screen on record" in _advisor_line_for(model_slug="  ")
 
 

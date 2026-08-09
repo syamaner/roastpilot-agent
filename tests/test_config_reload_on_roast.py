@@ -138,6 +138,29 @@ async def test_changing_the_model_invalidates_the_startup_reachability_probe(
 
 
 @pytest.mark.asyncio
+async def test_an_advisory_paused_readout_survives_a_model_change(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """NOT_CONFIGURED is about the ADVISOR being absent, not about a model.
+
+    With no API key, `probe_advisor_health(None)` returns NOT_CONFIGURED and
+    names no model. Keying invalidation on "the slug differs" therefore wiped
+    it on the first roast, regressing an explicit advisory-paused readout to
+    the ambiguous `advisor: null` — a defect introduced by the invalidation fix
+    itself (local Codex P2, folded pre-open).
+    """
+    svc = RoastService(store, live_serve_mode=True)
+    paused = AdvisorHealth(status=AdvisorHealthStatus.NOT_CONFIGURED)
+    svc.set_advisor_health(paused)
+
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4.1-mini")))
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert (await svc.health()).advisor == paused
+
+
+@pytest.mark.asyncio
 async def test_an_unchanged_model_keeps_its_reachability_probe(
     store: RoastStore,
     config_file: Path,

@@ -1744,8 +1744,18 @@ class RoastService:
                 # keeps a network call out of the roast-start path. Re-probing
                 # between roasts is issue-sized, not a side effect of starting
                 # a roast.
+                # ``model_slug is None`` means the probe never named a model —
+                # the NOT_CONFIGURED (advisory-paused, no API key) result. That
+                # is a statement about the ADVISOR being absent, not about which
+                # model was reached, so a model change cannot stale it; clearing
+                # it would regress an explicit "advisory-paused" readout to the
+                # ambiguous "not probed" on the first roast (local Codex P2).
                 probed = self._advisor_health
-                if probed is not None and probed.model_slug != fresh_config.advisor.model_slug:
+                if (
+                    probed is not None
+                    and probed.model_slug is not None
+                    and probed.model_slug != fresh_config.advisor.model_slug
+                ):
                     self._advisor_health = None
                 # MCP device respawn (#431): when the reloaded mcp_device differs
                 # from what the child was spawned with, stop and restart the child
