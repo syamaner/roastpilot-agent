@@ -35,12 +35,17 @@
 #            boundary reverts to the advisor's own judgment alone, e.g.
 #            POST_FC_LOOP=0 CEILING_GUARD=0 ./scripts/roast-live.sh for the
 #            full pre-promotion baseline
-#          ROASTPILOT_ADVISOR__MODEL_SLUG / ROASTPILOT_ADVISOR__PROMPT_VERSION
-#            override the advisor model + control-teaching prompt (defaults
-#            openai/gpt-4o + c3). The banner prints the resolved pair and tags it
-#            ⚠ EXPERIMENT when non-default, e.g. roast 8:
-#              ROASTPILOT_ADVISOR__MODEL_SLUG=openai/gpt-4.1-mini \
-#              ROASTPILOT_ADVISOR__PROMPT_VERSION=c6 ./scripts/roast-live.sh
+#          ROASTPILOT_ADVISOR__MODEL_SLUG / …__PROMPT_VERSION override the
+#            advisor model + control-teaching prompt (schema defaults
+#            openai/gpt-4o + c3). The banner prints the RESOLVED pair — env over
+#            the saved ~/.roastpilot/config.yaml over the schema defaults, the
+#            same order the agent uses — and tags it ⚠ EXPERIMENT when either
+#            differs from the schema default, e.g. roast 8:
+#              ROASTPILOT_ADVISOR__MODEL_SLUG=openai/gpt-4.1-mini ./scripts/roast-live.sh
+#            ⚠ Setting either PINS that value for every roast in the session:
+#            env beats the saved file, so the /config UI selector becomes a
+#            silent no-op. Never use them to switch arms in a prompt A/B —
+#            switch in /config between roasts and read the banner to confirm.
 #
 set -euo pipefail
 
@@ -176,27 +181,26 @@ ADV="advisor configured"
 [ -n "${OPENROUTER_API_KEY:-}" ] || ADV="ADVISORY-PAUSED (no OPENROUTER_API_KEY)"
 
 # Derive the banner from the agent's OWN resolved config (the .venv is active by
-# now), so it can never drift from runtime: this covers ADAPTIVE_TRIM=1, a directly
-# exported var, AND pydantic's full truthy set (1/true/yes/on/…) identically, using
-# the same parser the serving agent used (Augment #402).
-TRIM="fixed 65% (proven roast-6 default)"
-if python -c "import sys; from roastpilot_agent.config import AppConfig as A; sys.exit(0 if A().controller.pre_first_crack_levers.late_maillard_trim.adaptive_depth_enabled else 1)" 2>/dev/null; then
-  TRIM="ADAPTIVE — #386 RoR-keyed depth (experiment, watch the cut)"
-fi
-
-# Drift-proof read of the resolved advisor model + prompt, tagged when non-default (e.g. roast 8 = mini+c6); rationale in the PR.
-ADVISOR_CFG="$(python -c '
-from roastpilot_agent.config import AppConfig
-
-adv = AppConfig().advisor
-fields = type(adv).model_fields
-default = (
-    adv.model_slug == fields["model_slug"].default
-    and adv.prompt_version == fields["prompt_version"].default
-)
-tag = "" if default else "   ⚠ EXPERIMENT — non-default, watch it"
-print(f"{adv.model_slug}  ·  prompt {adv.prompt_version}{tag}")
-' 2>/dev/null || echo 'unresolved (config read failed — check the agent output above)')"
+# now), so it can never drift from runtime. The seam is
+# roastpilot_agent.launch_banner, which resolves through the SAME
+# config_store.load_app_config the serving agent uses — env over the operator's
+# saved ~/.roastpilot/config.yaml over the schema defaults (#746). A bare
+# AppConfig() reads the environment ONLY (BaseSettings, no YAML source), so it
+# used to print the schema-default prompt while the agent genuinely ran the
+# version saved from the /config UI — the wrong arm shown at the one moment a
+# roast cannot be re-run. This also covers ADAPTIVE_TRIM=1, a directly exported
+# var, AND pydantic's full truthy set (1/true/yes/on/…) identically, because it
+# is the agent's own parser (Augment #402).
+#
+# Line 1 = the "Advisor cfg:" text, line 2 = the "Pre-FC trim:" text. A
+# malformed/unreadable saved config fails LOUD (reason on stderr, non-zero
+# exit) and both lines read "unresolved" — never a plausible-but-wrong version.
+BANNER_UNRESOLVED='unresolved (config read failed — see the error above)'
+BANNER_LINES="$(python -m roastpilot_agent.launch_banner)" || BANNER_LINES=""
+ADVISOR_CFG="$(printf '%s\n' "$BANNER_LINES" | sed -n '1p')"
+TRIM="$(printf '%s\n' "$BANNER_LINES" | sed -n '2p')"
+[ -n "$ADVISOR_CFG" ] || ADVISOR_CFG="$BANNER_UNRESOLVED"
+[ -n "$TRIM" ] || TRIM="$BANNER_UNRESOLVED"
 
 echo "→ starting agent + spawning MCP child (takes a few seconds — don't Ctrl-C yet)…"
 echo "  MCP config: ${COFFEE_ROASTER_MCP_CONFIG}"
