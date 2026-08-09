@@ -76,7 +76,7 @@ The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
 
 | Role | Exact model | Default effort | Authority | Default tools |
 |---|---|---:|---|---|
-| Product PM / orchestrator (main session) | `claude-opus-5` (set via the `model` setting or `--model claude-opus-5`; chosen deliberately per fresh terminal — operator decision, 9 Aug 2026, see §5; `default` is an alias, not a pin) | `high` | Scope, routing, adjudication, integration, escalation | Repository and coordination tools required by the task |
+| Product PM / orchestrator (main session) | `claude-opus-5` recommended (the main-session model is a deliberate per-terminal operator choice — operator decision, 9 Aug 2026, see §5; set via the `model` setting or `--model claude-opus-5`; `default` is an alias, not a pin) | `high` | Scope, routing, adjudication, integration, escalation | Repository and coordination tools required by the task |
 | Planning architect (named subagent) | `claude-fable-5` | `high` | Advisory only | Read, Grep, Glob, Bash (no Edit/Write; read-only by convention, §7) |
 | Backend/frontend implementer | `claude-sonnet-5` | `high` | Writes only inside assigned scope | Read, Grep, Glob, Bash, Edit, Write |
 | Mechanical contract/simulation checker | `claude-sonnet-5` | `medium` | Read-only verdict | Read, Grep, Glob, Bash |
@@ -95,9 +95,10 @@ The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
    The Opus PM is the main session, not a subagent, so its model is set through
    the `model` setting or `--model claude-opus-5`. Operator decision (9 Aug
    2026): the main-session model is chosen deliberately per fresh terminal
-   rather than mandated here; the guard-tested subagent pins are the
-   reproducibility mechanism, so the fleet's model assignments do not depend on
-   the main-loop choice. `default` remains an alias, not a pin — it resolves to
+   rather than mandated here — Opus 5 remains the recommended PM model (§1,
+   §4), and a deliberately chosen non-Opus main session is compliant; the
+   guard-tested subagent pins are the reproducibility mechanism, so the fleet's
+   model assignments do not depend on the main-loop choice. `default` remains an alias, not a pin — it resolves to
    Sonnet 5 on Pro, Team Standard, and Enterprise seat accounts, so it is never
    a way to obtain Opus deliberately.
 2. Family aliases such as `opus`, `fable`, and `sonnet` MUST be described as aliases, not pins.
