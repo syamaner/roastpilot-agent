@@ -34,6 +34,7 @@ from collections.abc import Iterable
 from roastpilot_agent.config import (
     FC_LATENCY_BUSTED_ADVISOR_ARMS,
     FC_LATENCY_SCREENED_ADVISOR_ARMS,
+    FC_LATENCY_TIGHT_ADVISOR_ARMS,
     OPENROUTER_BASE_URL,
     AdvisorConfig,
 )
@@ -48,13 +49,19 @@ class AdvisorScreenVerdict(enum.Enum):
     stringly-typed accident.
 
     Attributes:
-        CLEARED: Measured against the ~5 s slot and inside it.
+        CLEARED: Measured against the ~5 s slot and comfortably inside it.
+        CLEARED_TIGHT: Cleared the roster screen, but its recorded WORST call
+            leaves little or no room under the configured hard timeout. A
+            distinct state because the screen's ~5 s was a soft threshold on a
+            median while ``advisory_timeout_seconds`` is a hard per-call cutoff
+            — equal numbers, different meanings.
         BUSTED: Measured and over it.
         NO_SCREEN: Not measured — in this configuration. Not a verdict against
             the model; a statement that the record does not cover it.
     """
 
     CLEARED = "cleared"
+    CLEARED_TIGHT = "cleared_tight"
     BUSTED = "busted"
     NO_SCREEN = "no_screen"
 
@@ -114,6 +121,8 @@ def classify(advisor: AdvisorConfig, slug: str) -> AdvisorScreenVerdict:
     if advisor.provider != "openai_compatible" or advisor.provider_base_url != OPENROUTER_BASE_URL:
         return AdvisorScreenVerdict.NO_SCREEN
     arm = (slug, advisor.reasoning_effort)
+    if arm in FC_LATENCY_TIGHT_ADVISOR_ARMS:
+        return AdvisorScreenVerdict.CLEARED_TIGHT
     if arm in FC_LATENCY_SCREENED_ADVISOR_ARMS:
         return AdvisorScreenVerdict.CLEARED
     if arm in FC_LATENCY_BUSTED_ADVISOR_ARMS:
@@ -149,7 +158,21 @@ def screen_warning(advisor: AdvisorConfig, advisory_timeout_seconds: float) -> s
     unscreened = sorted(
         m for m in resolved if classify(advisor, m) is AdvisorScreenVerdict.NO_SCREEN
     )
+    tight = sorted(
+        m for m in resolved if classify(advisor, m) is AdvisorScreenVerdict.CLEARED_TIGHT
+    )
     notes: list[str] = []
+    for slug in tight:
+        recorded_max = FC_LATENCY_TIGHT_ADVISOR_ARMS[(slug, advisor.reasoning_effort)]
+        # Quote the recorded max AGAINST the configured bound rather than
+        # asserting "it will time out": the two numbers are what the operator
+        # needs to judge it, and the bound is theirs to change.
+        over = "above" if recorded_max >= advisory_timeout_seconds else "close to"
+        notes.append(
+            f"{slug} cleared the ~5 s screen but its recorded worst call "
+            f"({recorded_max:g} s) is {over} the {advisory_timeout_seconds:g} s advisory "
+            "timeout — expect occasional timeouts, each one REJECT + hold (fail-closed)"
+        )
     if busted:
         notes.append(
             f"{', '.join(busted)} BUSTED the ~5 s post-FC latency screen (D40/D41) — "

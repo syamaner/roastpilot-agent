@@ -179,18 +179,40 @@ FC_LATENCY_SCREENED_ADVISOR_ARMS: frozenset[tuple[str, str | None]] = frozenset(
         ("google/gemini-3.1-flash-lite", None),
         ("openai/gpt-4o-mini", None),
         ("openai/gpt-4o", None),
-        # D40/D41: cleared, but TIGHT (~4.1 s median against a ~5 s gate).
-        ("anthropic/claude-haiku-4.5", None),
-        # #396 (16 Jul): dedicated screens, both cleared. Recorded honestly —
-        # over 28 roasts gpt-4.1-mini's MAX grazed the gate while its median
-        # stayed well inside it, so it is screened rather than busted.
-        ("openai/gpt-5.6-luna", None),
-        ("openai/gpt-4.1-mini", None),
         # 8 Jun: reasoning OFF turns the same model from 10.8 s into 2.9 s.
         # The one arm on this table whose base slug busts at the default.
         ("openai/gpt-5.5", "off"),
     }
 )
+
+#: Arms that CLEARED the ~5 s roster screen but whose recorded WORST call leaves
+#: little or no room under ``ControllerConfig.advisory_timeout_seconds`` — the
+#: value in seconds is that recorded max (safety-reviewer finding, folded
+#: pre-open).
+#:
+#: This distinction exists because the two "5 s" numbers are not the same kind
+#: of thing. The screen's ~5 s was a SOFT roster-selection threshold applied to
+#: a median; ``advisory_timeout_seconds`` is a HARD per-call cutoff. While the
+#: timeout sat at 10 s (2x the screen) the difference was free, and an arm whose
+#: max grazed 5 s still always answered. D151 dropped the timeout to 5.0, so
+#: "cleared the screen" no longer implies "will not time out" — and these arms
+#: are the ones where it does not. ``gpt-4.1-mini`` is the sharp case: its
+#: recorded max (5.05 s) is ABOVE the configured bound, so leaving it silently
+#: "cleared" would have promised the operator a model that cannot reliably
+#: answer inside the loop's own budget.
+#:
+#: Timing out is fail-closed (one REJECT with hold-current-targets; D30 needs
+#: three CONSECUTIVE failures), so this is a quality warning, not a hazard.
+FC_LATENCY_TIGHT_ADVISOR_ARMS: dict[tuple[str, str | None], float] = {
+    # D40/D41 (16 Jun): 4.10 s median / 4.59 s max — "✅ (tight)" in the report.
+    ("anthropic/claude-haiku-4.5", None): 4.59,
+    # #396 (16 Jul): 1.89/2.46 s on the dedicated screen, but 3.76/4.52 s over
+    # the 28-roast run. Still usable, with ~0.5 s of headroom.
+    ("openai/gpt-5.6-luna", None): 4.52,
+    # #396 (16 Jul): 2.62/4.39 s on the dedicated screen, 2.94/5.05 s over 28
+    # roasts. The median sits well inside the bound; the max does not.
+    ("openai/gpt-4.1-mini", None): 5.05,
+}
 
 #: Arms whose recorded screen BUSTED the gate — the reasoning / frontier models
 #: that think past the wall (D40/D41). Named explicitly so the banner can say

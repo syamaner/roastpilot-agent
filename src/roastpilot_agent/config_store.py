@@ -620,6 +620,7 @@ def _make_field_meta(
         read_only=read_only,
         description=description,
         yaml_value=yaml_value,
+        advisory=advisory,
     )
 
 
@@ -959,9 +960,19 @@ def build_config_snapshot(
             adv.timeout_seconds,
             adv_def.timeout_seconds,
             "ROASTPILOT_ADVISOR__TIMEOUT_SECONDS",
+            # NOT the bound on the control loop (safety-reviewer finding,
+            # folded pre-open). The controller enforces its OWN
+            # ``advisory_timeout_seconds`` (5.0 s since D151) around the
+            # advisory await; this field has no runtime consumer in the agent
+            # today — ``build_model`` passes no timeout to the client. While
+            # both numbers were 10.0 the confusion was harmless; once the
+            # controller's dropped to 5.0 the old wording sent an operator
+            # hitting timeouts to raise a knob that changes nothing.
             description=(
-                "Per-call advisor timeout (seconds). The controller must not block"
-                " the tick loop past this; Default 10.0 s."
+                "Advisor request timeout (seconds), for tooling that reads it."
+                " NOT the control-loop bound: the controller cuts an advisory"
+                " call at its own advisory_timeout_seconds (5.0 s, D151)."
+                " Default 10.0 s."
             ),
         ),
         temperature=_meta(

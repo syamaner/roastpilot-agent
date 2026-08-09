@@ -15,7 +15,7 @@ no-network guardrail stays; CI keeps using `FakeAdvisor`).
 | api_key_env | `LMSTUDIO_API_KEY` (`lm-studio`) |
 | prompt_version | `v0` |
 | temperature | `0.0` |
-| timeout_seconds | `10.0` (`AdvisorConfig.timeout_seconds`; same default as the controller's `ControllerConfig.advisory_timeout_seconds`) |
+| timeout_seconds | `10.0` (`AdvisorConfig.timeout_seconds`; then the same default as the controller's `ControllerConfig.advisory_timeout_seconds` — **superseded by D151, 9 Aug 2026: the controller's bound is now 5.0 s**) |
 
 Command:
 
@@ -65,7 +65,7 @@ prior ~60 s; target = the roast's actual achieved drop temp):
 **At the production budget (`AdvisorConfig.timeout_seconds=10`, the harness
 default): TimeoutError.** The advisory call does not return within 10 s, so
 in a live roast the controller — which applies its own
-`ControllerConfig.advisory_timeout_seconds` (also 10 s) — would REJECT it and
+`ControllerConfig.advisory_timeout_seconds` (10 s at the time; 5.0 s since D151) — would REJECT it and
 hold current targets, correct fail-safe behavior but no advice delivered.
 Root cause is thinking mode (below), not the network or the model's
 competence.

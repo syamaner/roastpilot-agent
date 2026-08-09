@@ -185,14 +185,14 @@ def test_effective_non_default_model_is_tagged_experiment() -> None:
     """A per-phase override that actually takes effect IS tagged."""
     config = AppConfig(
         advisor=AdvisorConfig(
-            model_slug_by_phase=dict.fromkeys(ADVISOR_PHASES, "openai/gpt-4.1-mini")
+            model_slug_by_phase=dict.fromkeys(ADVISOR_PHASES, "openai/gpt-4o-mini")
         ),
         controller=ControllerConfig(),
     )
 
     lines = resolve_banner_lines(config)
 
-    assert lines.advisor_cfg == "openai/gpt-4.1-mini  ·  prompt c3" + EXPERIMENT_TAG
+    assert lines.advisor_cfg == "openai/gpt-4o-mini  ·  prompt c3" + EXPERIMENT_TAG
     # The base slug is the schema default here, so it is shadowed silently —
     # the warning is reserved for a slug the operator actually set.
     assert "NOT the roast-advice model" not in lines.advisor_cfg
@@ -208,15 +208,15 @@ def test_a_base_slug_that_matches_the_override_is_not_called_advice_less() -> No
     """
     config = AppConfig(
         advisor=AdvisorConfig(
-            model_slug="openai/gpt-4.1-mini",
-            model_slug_by_phase={RoastPhase.DEVELOPMENT: "openai/gpt-4.1-mini"},
+            model_slug="openai/gpt-4o-mini",
+            model_slug_by_phase={RoastPhase.DEVELOPMENT: "openai/gpt-4o-mini"},
         ),
         controller=ControllerConfig(),
     )
 
     lines = resolve_banner_lines(config)
 
-    assert lines.advisor_cfg == "openai/gpt-4.1-mini  ·  prompt c3" + EXPERIMENT_TAG
+    assert lines.advisor_cfg == "openai/gpt-4o-mini  ·  prompt c3" + EXPERIMENT_TAG
     assert "NOT the roast-advice model" not in lines.advisor_cfg
 
 
