@@ -207,3 +207,25 @@ def test_a_tolerantly_equal_openrouter_url_still_counts_as_screened() -> None:
     # non-default port (a LAN proxy), which must NOT be normalised away.
     other = AdvisorConfig(provider_base_url="https://openrouter.ai:8443/api/v1")
     assert classify(other, other.model_slug, TIMEOUT) is AdvisorScreenVerdict.NO_SCREEN
+
+
+def test_the_tight_warning_scales_with_how_far_past_the_bound_it_is() -> None:
+    """ "Occasional" is only true near the bound (Claude review, folded pre-open).
+
+    The headroom check has no lower bound, so a low configured timeout puts a
+    recorded max far past it — and telling the operator to "expect occasional
+    timeouts" for a configuration that would time out on essentially every call
+    understates it in the direction that costs a roast.
+    """
+    gpt4o = AdvisorConfig(model_slug="openai/gpt-4o")  # recorded worst call 3.73 s
+
+    near = screen_warning(gpt4o, 4.0)
+    past = screen_warning(gpt4o, 3.5)
+    far = screen_warning(gpt4o, 2.0)
+
+    assert near is not None and "expect occasional timeouts" in near
+    assert past is not None and "expect frequent timeouts" in past
+    assert far is not None and "expect MOST calls to time out" in far
+    # And the recorded max is always quoted against the configured bound, so the
+    # operator can judge it rather than take the adjective on trust.
+    assert far is not None and "3.73 s" in far and "2 s advisory timeout" in far
