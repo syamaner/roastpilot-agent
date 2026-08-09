@@ -28,17 +28,29 @@ been run on an ambiguous or safety-sensitive case.
 
 ## Case 1 — RP-B (#709), the ambient-aware fan doctrine
 
-Dates: 8-9 Aug 2026. PRs: **#731** (the doctrine), **#739** (the eval set),
-**#741** (ambient freshness). Plan decisions produced: **D126, D127, D128, D129**
-(`roastpilot-agent/plan.md` — see the registry on why a bare D-number is
-ambiguous across plan files).
+Date: 8 Aug 2026. PR: **#731** (the doctrine). Plan decisions produced:
+**D126, D127** (`roastpilot-agent/plan.md` — see the registry on why a bare
+D-number is ambiguous across plan files).
 
-**Scope note, because the measurements below are wider than a single PR.** An
-earlier revision of this header named only 8 Aug / #731 / D126-D127 while the
-usage table, rework tally and spawn list already drew on #739 and #741 as well —
-so a reader could not reproduce which slices fed which number. The entry covers
-the RP-B *story*, not one pull request; every measurement below is over all
-three PRs unless it names one.
+**Scope: this entry measures PR #731 ONLY**, and the boundary is deliberate. RP-B
+also shipped #739 (the eval set, D129) and #741 (ambient freshness, D128), and an
+earlier revision widened this entry to cover all three. That was a mistake worth
+recording, because it is a measurement lesson rather than a clerical one: widening
+the declared scope silently obliges every count below it — rework, spawns, review
+lenses, decisions — to be re-derived over the wider set, and four consecutive
+review rounds each found another place where the wider claim implied content that
+was not there. **A case entry should cover the unit whose evidence was actually
+gathered.** #741 in particular deserves its own entry rather than being folded in:
+six post-open rounds, three of them fixing defects introduced by its own previous
+fixes, and the first use of an operator stopping rule.
+
+One measurement is deliberately carried across the boundary, because suppressing
+it would flatter the case: **#741 merged without the `qa` pass its diff mandated**
+(837 test lines against AGENTS.md's 600-line threshold). It had its mandatory
+pre-open `safety-reviewer` pass, but not the test-quality lens. Not opened as an
+issue — the tests were mutation-verified in-session and CI plus codecov were green
+— but recorded here so the story is not read as fully compliant on #731's reviews
+alone.
 
 > **Reading this later: `docs/state/registry.md` lagged this entry.** AGENTS.md
 > sends every session to the registry first, and at the time this case was
@@ -146,11 +158,9 @@ responding to the finding.
   defaulted *soft*, so a fail-soft probe softened doctrine in a hot room",
   fixed by removing the soft default and pinning a regression test). Full
   findings table: PR #731 body.
-- **Preventable (post-open, should have been caught earlier): four on #731, and
-  a further six ROUNDS on #741** — an earlier revision of this line reported two,
-  and counted #731 alone even after the header widened every measurement to the
-  whole story. Both omissions understated the case's headline measurement. From
-  #731's merged history:
+- **Preventable (post-open, should have been caught earlier): four**, where an
+  earlier revision of this line reported two. Understating this understated the
+  case's headline measurement. From #731's merged history:
   1. the **c3 contamination** (Codex P1) — the doctrine's context was populated
      on every roast including the live default, so any c3 baseline the RP-B
      comparison is measured against was contaminated;
@@ -170,20 +180,6 @@ responding to the finding.
   post-open, and then its guard did too. Item 4 is the neatest, though — the PR
   violated the two-copies discipline it repeatedly invokes as its own design
   principle.
-
-  **#741 (ambient freshness) then ran six post-open rounds, and this is the
-  sharper number of the two.** Every finding was real, but rounds 4, 5 and 6 were
-  each fixing a defect introduced by the PR's OWN previous fix: an explicit-cadence
-  rule added at construction time also fired during recovery and silently retired
-  the doctrine on an operator resume; moving it to the start-a-roast boundary then
-  left it validating the config from ABOVE the config reload, which could both
-  admit an unvalidated cadence and lock an operator out of starting a roast until
-  the agent was restarted. A `Raises:` clause corrected in round 3 was re-broken in
-  the opposite direction by round 5's own change. Two residuals were recorded as
-  #745 rather than folded. **The lesson is not the count but the shape:
-  instance-by-instance folding of a class re-enters the class**, which is also why
-  the entry you are reading needed seven rounds. Fixing a claim without sweeping
-  the document for its downstream copies is the same error in prose.
 - **Avoidable churn:** one self-inflicted CI failure. Editing the PR body while
   a review run was in flight cancelled the legitimate `synchronize` run and
   started an `edited` run that fails by design, leaving the head with no valid
@@ -275,10 +271,11 @@ category, not a mid-flight one.
 
 ### Unnecessary agent spawns
 
-None — but the count is **five**, not the two an earlier draft of this section
-asserted. The usage table above records five delegated agents, and a spawn
-assessment that silently counted only the review lenses was not supported by its
-own evidence. All five are RP-B work:
+None — but the count is **four for this case**, not the two an earlier draft of
+this section asserted. The usage table above records five delegated agents
+because it is measured over the whole session, which also covered the sibling PR
+#739; `triage-739` is therefore listed for completeness of the cost figures but
+sits outside this entry's #731 scope. The four in scope:
 
 | Agent | Why it was spawned | Redundant? |
 |---|---|---|
@@ -286,7 +283,7 @@ own evidence. All five are RP-B work:
 | `safety-b1` | Required lens (controller/safety diff) | No — §10 names it a control layer |
 | `qa-b1` | Required lens (test quality) | No — same |
 | `triage-731` | Author-independent triage of PR #731 | No — D23 forbids self-triage |
-| `triage-739` | Author-independent triage of PR #739 | No — same |
+| `triage-739` | Author-independent triage of PR #739 | No — same, but **out of this entry's scope** (sibling PR; included in the cost table only) |
 
 §10 rules out subagents spawned "merely to re-check work the active model already
 verifies", and names independent safety, QA and author-independent triage as
@@ -330,8 +327,10 @@ worktree/basetemp controls into the agent definitions for `qa`,
 #733's own title and body are unchanged — the re-scope exists as a comment,
 not yet as an edit to the issue itself.
 
-Two further data points arrived the same night, both on #741, and both matter
-because they show the control failing in ways a prohibition alone cannot fix.
+Two further data points arrived the same night on the sibling PR #741. They sit
+outside this entry's measured scope and are recorded here anyway, because the
+control they bear on is repo-wide rather than per-case, and both show it failing
+in ways a prohibition alone cannot fix.
 First, the concurrent-pytest basetemp collision produced a failure that a
 reviewer correctly escalated as a P1 flake; the cost of that class is not the
 phantom failure but the real investigation it justifies each time. Second, the

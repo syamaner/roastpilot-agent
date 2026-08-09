@@ -163,11 +163,12 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D150** — one past **D149**, the highest number
-> defined anywhere in `roastpilot-plan` as of 9 Aug 2026 (`factory.md`'s
-> `## D149:` heading; `roastpilot-agent/plan.md`'s own maximum is D129).
-> Ratified as **D150** in `00-repository-structure.md`: one shared series for the
-> whole repo. Take D150 because it is the only
+> Next free plan decision number: **D151**. D150 is SPENT — it is the decision
+> that settled this very question, recorded in `00-repository-structure.md` on
+> 9 Aug 2026: **one shared D-number series for the whole `roastpilot-plan` repo,
+> next free being one past the highest defined anywhere in it.** D149
+> (`factory.md`'s `## D149:` heading) was the previous maximum;
+> `roastpilot-agent/plan.md`'s own maximum is D129. Take D150 because it is the only
 > answer that is safe under both readings of an unresolved ambiguity, described
 > next; do not "optimise" it down.
 >
@@ -187,11 +188,11 @@
 > superseded by D97 from a different file — D5-D99 interleave with zero
 > collisions. Both files then began incrementing independently from D103.
 >
-> **Which convention now applies is an open question for the operator** (resume
-> one shared series, or formally namespace per programme). Until it is decided,
-> D150 is correct either way: next-in-sequence if the series is shared, and a
-> harmless skip if it is per-file. Continuing `plan.md`'s own count at D130 would
-> manufacture the 28th collision, so do not do that.
+> **The convention is SETTLED as of D150: one shared series.** Renumbering was
+> rejected (D-numbers appear in merged commits, closed issues and `AGENTS.md`,
+> none rewritable) and per-programme prefixes were rejected as a second
+> convention alongside the bare historical numbers. Continuing `plan.md`'s own
+> count at D130 would manufacture the 28th collision, so do not do that.
 >
 > **Deriving this number is a known trap; three separate attempts got it wrong on
 > 9 Aug alone** (D126 stale, then D150 by correct-answer-wrong-reasoning, then
