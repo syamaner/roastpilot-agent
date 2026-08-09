@@ -44,6 +44,25 @@ gathered.** #741 in particular deserves its own entry rather than being folded i
 six post-open rounds, three of them fixing defects introduced by its own previous
 fixes, and the first use of an operator stopping rule.
 
+**Measurement granularity, stated once so §16 can consume this entry safely.**
+Not every number here shares the same unit, and the mismatch is a property of the
+telemetry rather than a loose end:
+
+| Measurement | Unit | Why |
+|---|---|---|
+| Preventable/healthy rework | **#731** | Derived from that PR's own merged history |
+| Agent spawns | **#731** (three) | Attributable per PR from the roster |
+| Plan corrections, missed boundaries | **#731** | Traceable to specific findings |
+| **Tokens and cost** | **The whole 8-9 Aug session** | Transcripts are session-scoped and carry no per-PR attribution, so these figures also price #739 and #741 work |
+
+Splitting the cost figures per PR is not possible from the available data, and
+inventing an apportionment would be worse than declaring the boundary. §16 should
+therefore read the rework and spawn results as #731 evidence and the tier-cost
+comparison as session evidence. The two review lenses disagreed about which unit
+this entry should use — one proposed narrowing to #731 and then argued the
+opposite once it was narrowed — and the operator settled it: **hold the narrowing,
+state the limitation.**
+
 One measurement is deliberately carried across the boundary, because suppressing
 it would flatter the case: **#741 merged without the `qa` pass its diff mandated**
 (837 test lines against AGENTS.md's 600-line threshold). It had its mandatory
@@ -180,11 +199,19 @@ responding to the finding.
   post-open, and then its guard did too. Item 4 is the neatest, though — the PR
   violated the two-copies discipline it repeatedly invokes as its own design
   principle.
-- **Avoidable churn:** one self-inflicted CI failure. Editing the PR body while
-  a review run was in flight cancelled the legitimate `synchronize` run and
-  started an `edited` run that fails by design, leaving the head with no valid
-  approval until the cancelled run was re-run. **Operational rule earned: do
-  not edit PR metadata while a review run is in flight.**
+- **Avoidable churn:** one self-inflicted CI failure — editing the PR body while
+  a review run was in flight. **The mechanism, corrected after review, is
+  cancellation and not a doomed run.** `claude-code-review.yml` subscribes to
+  `edited` and its job condition excludes only Dependabot, so the replacement is
+  a valid same-identity review; what bites is `concurrency` with
+  `cancel-in-progress: true`, scoped per PR, which kills the in-flight
+  `synchronize` run. The head is then briefly without valid approval until the
+  replacement finishes. An earlier revision of this line said the `edited` run
+  "fails by design", conflating this with the genuine by-design failure on PRs
+  that edit a workflow file. **Operational rule, restated accurately: do not edit
+  PR metadata while a review run is in flight — not because the new run is
+  invalid, but because it discards a run that was already most of the way
+  through.**
 
 ### Tokens and cost per model tier
 

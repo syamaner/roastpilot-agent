@@ -172,7 +172,7 @@
 > `roastpilot-agent/plan.md`'s own maximum is D129. Take **D151**; D150 is spent.
 >
 > **There is a live decision-number COLLISION in the plan repo, and it is not yet
-> resolved.** `roastpilot-agent/plan.md` (this repo) and
+> resolved.** `roastpilot-agent/plan.md` (this programme's file, in the SEPARATE `~/git/roastpilot-plan` repository — not a path inside this one) and
 > `roastpilot-cloud/factory.md` (the cloud programme) **both independently define
 > D103-D129** — 27 numbers meaning entirely different things in each file.
 > `plan.md` D108 is the PR-scoped Claude approval bridge `AGENTS.md` cites;

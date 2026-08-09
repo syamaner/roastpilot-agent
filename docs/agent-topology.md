@@ -379,12 +379,19 @@ This topology is ready when:
 - Automated consumers use schema validation rather than relying on prose style.
 - Evaluation evidence supports the selected models and effort levels.
 - **The §7 worktree, copy-restore and committed-tree rules are delivered into the
-  role definitions they bind** (`qa`, `safety-reviewer`, `pr-triage`, the
-  engineer roles), not only stated here. Tracked by **#733**. Added because §7
-  currently declares those rules normative while every role it binds is silent
-  on them: without this criterion the topology could become the validated
-  default with a safety control documented but not in force, which is the exact
-  gap §7's own text names.
+  role definitions they bind**, not only stated here. Tracked by **#733**.
+  §7 binds EVERY read-only role, so the criterion is satisfied only when ALL
+  Bash-capable definitions carry the controls — currently `engineer-be`,
+  `engineer-fe`, `mcp-contract-checker`, `planning-architect`, `pr-triage`,
+  `product-pm`, `qa`, `safety-reviewer`, `security-reviewer`, `sim-roast-runner`
+  and `ui-reviewer`, or whatever that set becomes. Enumerated rather than
+  sampled because an earlier draft named four and a repository sweep found
+  eleven, of which only `engineer-fe` mentioned the controls at all: a
+  partial list can be fully satisfied while most bound roles remain able to
+  repeat the incident. Added because §7 declares those rules normative while
+  the roles it binds are silent on them, so without this criterion the topology
+  could become the validated default with a safety control documented but not
+  in force — the exact gap §7's own text names.
 
 ## 17. Non-goals
 
