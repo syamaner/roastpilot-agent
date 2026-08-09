@@ -20,9 +20,20 @@ validation. Exact model IDs and explicit effort are set for every named-subagent
 role, `AGENTS.md` agrees, the inline workflow stages in `review-branch.mjs` are
 pinned, and a consistency test (`tests/test_agent_model_pins.py`) guards the pins
 against drift and against committed settings that would defeat them (the
-repository side of the §5 override surface). Two §16 adoption criteria remain
-outstanding: the §15 evaluation on the five representative cases (the §16
-evaluation-evidence criterion), and the Product PM main-session pin, which is an
+repository side of the §5 override surface). Three §16 adoption criteria remain
+outstanding. First, delivery of §7's worktree and copy-restore rules into the
+role definitions that carry none of them (#733) — the control is stated but not
+in force. Second, the §15 evaluation across all five archetypes — not a five-case
+count, since a single story may cover more than one. RP-B (#709) supplies
+evidence on two (ambiguous multi-slice, safety-sensitive), but **as a FAILURE
+case, which does not yet validate them**: no planner was invoked on it, so it
+tests neither the trigger-wins rule added to §6 above nor the Fable planner's
+model and contract on either archetype. Counting those two as validated would
+let the topology be marked ready on the strength of an entry that records the
+rule being broken. They need a subsequent applicable story run UNDER the
+revised rule; three further archetype-defining stories are needed regardless
+(§15; the §16 evaluation-evidence criterion). Third, the Product PM main-session
+pin, which is an
 operator setting (`model: claude-opus-5` or `--model`, never `default`), not
 repository config. The live-environment and organisation side of the §5 override
 surface (`CLAUDE_CODE_SUBAGENT_MODEL`, `availableModels`, organisation
@@ -106,9 +117,17 @@ The Opus PM SHOULD NOT invoke Fable when:
 - The principal work is mechanical execution rather than judgment.
 - Fable would merely restate an existing approved brief.
 
+**When both lists fire, the trigger list wins.** The two lists above are not mutually exclusive and a real story can satisfy both at once — an authoritative, complete design whose story nevertheless spans multiple dependent slices, a safety boundary, or artifacts ratified separately from one another. In that case the PM SHOULD invoke Fable. In particular, "the design is settled" **MUST NOT** on its own be sufficient grounds to skip the planner when a story spans a *construction* and an *evaluation protocol* that were ratified independently: a settled design says nothing about whether the artifacts agree with each other, and the join between two individually-correct artifacts is precisely what a read-only reconciliation pass exists to inspect. Evidence: Case 1 in the evaluation log, where every defect that reached the PR lived in such a join.
+
 Only one planning subagent SHOULD run for a single decision problem. Multiple planners MAY be used only for genuinely independent competing hypotheses, with an explicit cap set before spawning.
 
 ## 7. Planning architect contract
+
+**Every read-only role MUST verify against its own `git worktree`, never the shared checkout**, and MUST NOT run tree-mutating git commands (`git checkout --`, `git restore`, `git stash`, `git clean`) in a tree it does not own. Where a role needs to mutate a file and restore it — mutation testing is the normal case — it MUST snapshot and restore **by file copy**, never by git, because `git checkout --` silently discards uncommitted neighbouring edits along with the mutation. A prohibition without that alternative is not an operable control: the restore step is required, so the forbidden command keeps being reinvented. Claims about what a commit contains MUST be verified against the committed tree (`git show HEAD:path`), not the working tree.
+
+This is a requirement on the role definitions themselves, not only on this document: a control recorded in a runbook that no agent definition carries has not been delivered. Evidence, including three occurrences: Case 1's governance finding in the evaluation log.
+
+**Not yet delivered, as of this writing.** None of `.claude/agents/qa.md`, `safety-reviewer.md`, `pr-triage.md` or the engineer roles carries any of the above, so the rule is stated here and is **not** in force where it would actually bite. Delivery is tracked by **#733**, and the commit that closes it should delete this paragraph. Recorded explicitly rather than left to be inferred, because a specification declaring a control normative while the roles it binds stay silent is precisely the gap the paragraph above names: writing a rule down is not the same act as routing it.
 
 The Fable planning architect MUST:
 
@@ -316,6 +335,30 @@ Measure:
 
 Model and effort changes MUST be evaluated against these cases rather than adopted solely from general guidance.
 
+Evidence is recorded in `docs/agent-topology-evaluation.md`, one entry per real
+story. Recorded so far: **RP-B (#709)**, which supplies FAILURE evidence on the
+ambiguous-multi-slice and safety-sensitive archetypes — no planner ran on it, so
+both remain **provisional** until a later story exercises them under the
+trigger-wins rule in §6. Still outstanding: those two re-validations, plus a
+simple single-slice task that should bypass the planner, a cross-repository
+change, and a previously failed or heavily reworked task. The PM output-style measurements in this section remain
+unevaluated, because the `RoastPilot Operator` style was not selected for the
+RP-B session.
+
+Two findings from the RP-B entry bear on this specification directly rather than
+on the story. Both are now **normative text in the sections they govern** — §6's
+precedence rule and §7's worktree requirement — with the evidence, the reasoning
+and the numbers left in the evaluation log. Restating them here would be a
+second copy of a mutable fact, which is what §12 forbids and what splitting the
+log out was meant to avoid.
+
+1. §6's trigger list and skip list can both fire on one task; see the precedence
+   rule now stated in §6, and Case 1's §6 finding in the evaluation log for the
+   evidence behind it.
+2. §7's read-only posture depends on an operational control a reasonable agent
+   can breach; see the worktree requirement now stated in §7, and Case 1's
+   governance finding in the evaluation log.
+
 ## 16. Acceptance criteria
 
 This topology is ready when:
@@ -335,6 +378,21 @@ This topology is ready when:
 - Named subagents retain explicit role-specific output contracts.
 - Automated consumers use schema validation rather than relying on prose style.
 - Evaluation evidence supports the selected models and effort levels.
+- **The §7 worktree, copy-restore and committed-tree rules are delivered into the
+  role definitions they bind**, not only stated here. Tracked by **#733**.
+  §7 binds every **read-only** role, so the criterion is satisfied only when all
+  eight carry the controls: `mcp-contract-checker`, `planning-architect`,
+  `pr-triage`, `qa`, `safety-reviewer`, `security-reviewer`, `sim-roast-runner`
+  and `ui-reviewer`. **Currently none of them does.** The three Bash-capable
+  WRITING roles (`engineer-be`, `engineer-fe`, `product-pm`) fall outside §7 as
+  written, but the mutate-then-restore hazard is identical for them — an
+  implementer runs mutation tests as readily as a reviewer — so #733 should
+  cover all eleven even though only the eight gate this criterion. Enumerated
+  rather than sampled because an earlier draft named four: a partial list can be
+  fully satisfied while most bound roles remain able to repeat the incident. Added because §7 declares those rules normative while
+  the roles it binds are silent on them, so without this criterion the topology
+  could become the validated default with a safety control documented but not
+  in force — the exact gap §7's own text names.
 
 ## 17. Non-goals
 
