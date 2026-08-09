@@ -31,7 +31,7 @@ tests neither the trigger-wins rule added to §6 above nor the Fable planner's
 model and contract on either archetype. Counting those two as validated would
 let the topology be marked ready on the strength of an entry that records the
 rule being broken. They need a subsequent applicable story run UNDER the
-revised rule; three further archetype-defining stories are needed regardless
+revised rule; three archetypes remain unexercised regardless
 (§15; the §16 evaluation-evidence criterion). Third, the Product PM main-session
 pin, which is an
 operator setting (`model: claude-opus-5` or `--model`, never `default`), not
@@ -117,7 +117,7 @@ The Opus PM SHOULD NOT invoke Fable when:
 - The principal work is mechanical execution rather than judgment.
 - Fable would merely restate an existing approved brief.
 
-**When both lists fire, the trigger list wins.** The two lists above are not mutually exclusive and a real story can satisfy both at once — an authoritative, complete design whose story nevertheless spans multiple dependent slices, a safety boundary, or artifacts ratified separately from one another. In that case the PM SHOULD invoke Fable. In particular, "the design is settled" **MUST NOT** on its own be sufficient grounds to skip the planner when a story spans a *construction* and an *evaluation protocol* that were ratified independently: a settled design says nothing about whether the artifacts agree with each other, and the join between two individually-correct artifacts is precisely what a read-only reconciliation pass exists to inspect. Evidence: Case 1 in the evaluation log, where every defect that reached the PR lived in such a join.
+**When both lists fire, the trigger list wins.** The two lists above are not mutually exclusive and a real story can satisfy both at once — an authoritative, complete design whose story nevertheless spans multiple dependent slices, a safety boundary, or artifacts ratified separately from one another. In that case the PM SHOULD invoke Fable. In particular, "the design is settled" **MUST NOT** on its own be sufficient grounds to skip the planner when a story spans a *construction* and an *evaluation protocol* that were ratified independently: a settled design says nothing about whether the artifacts agree with each other, and the join between two individually-correct artifacts is precisely what a read-only reconciliation pass exists to inspect. Evidence: Case 1 in the evaluation log, where all three *plan* defects that reached the PR lived in such a join. The claim is deliberately limited to that class: the same case also produced implementation and test defects (the evaluation log's "Preventable" list), which a pre-implementation read-only planner could not have caught, so they are not evidence for this rule.
 
 Only one planning subagent SHOULD run for a single decision problem. Multiple planners MAY be used only for genuinely independent competing hypotheses, with an explicit cap set before spawning.
 
@@ -176,7 +176,7 @@ The Opus PM MUST:
 3. Review the plan against authoritative sources rather than accepting it automatically.
 4. Resolve conflicts and escalate only decisions that materially alter scope, architecture, safety, cost, or irreversible state.
 5. Approve a bounded implementation brief before spawning writing agents.
-6. Keep concurrent writing agents on disjoint file surfaces, preferably in isolated worktrees. Do not assume `isolation: worktree` engaged: it has silently no-op'd for background agent-team teammates in this repository, so verify with `git worktree list`, create an explicit `git worktree` per teammate per `docs/agent-team-worktrees.md` when isolation is needed, and serialise on any shared surface as the fallback.
+6. Keep concurrent writing agents on disjoint file surfaces, preferably in isolated worktrees. Do not assume `isolation: worktree` engaged: it has silently no-op'd for background agent-team teammates in this repository, so verify with `git worktree list`, create an explicit `git worktree` per teammate per `docs/agent-team-worktrees.md` when isolation is needed, and serialise on any shared surface as the fallback. The same provisioning duty extends to **read-only** roles even though they write nothing: §7 requires each to verify against its own worktree, and creating that worktree is itself a repository mutation the role is forbidden to perform, so the PM MUST create it before invoking the role and confirm it with `git worktree list`. A role prompt that carries the §7 rule is therefore necessary but not sufficient — unprovisioned, the role can only start in the shared checkout.
 7. Ensure independent review and triage before declaring completion.
 8. Report the outcome first and ground claims in current evidence.
 
@@ -383,7 +383,12 @@ This topology is ready when:
   §7 binds every **read-only** role, so the criterion is satisfied only when all
   eight carry the controls: `mcp-contract-checker`, `planning-architect`,
   `pr-triage`, `qa`, `safety-reviewer`, `security-reviewer`, `sim-roast-runner`
-  and `ui-reviewer`. **Currently none of them does.** The three Bash-capable
+  and `ui-reviewer`. **Currently none of them does.** Carrying the rule in all
+  eight prompts does not on its own satisfy this criterion: because a read-only
+  role cannot create its own worktree, the lead-side provisioning and
+  `git worktree list` verification required by §8 item 6 must be in force too,
+  or every invocation still starts in the shared checkout with eight compliant
+  prompts. The three Bash-capable
   WRITING roles (`engineer-be`, `engineer-fe`, `product-pm`) fall outside §7 as
   written, but the mutate-then-restore hazard is identical for them — an
   implementer runs mutation tests as readily as a reviewer — so #733 should

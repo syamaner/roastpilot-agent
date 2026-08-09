@@ -182,9 +182,9 @@
 >
 > The collision is DRIFT, not design. Up to D102 the repo demonstrably ran ONE
 > shared series across files: D1-D4 are cross-repo, `plan.md` defines neither
-> D10-D13 nor D97-D101 (those are in `roastpilot-cloud/plan.md`; D9 and D14 are
-> defined nowhere at all — see the gaps noted below), and D2 is
-> superseded by D97 from a different file — D5-D99 interleave with zero
+> D10-D13 nor D97-D101 (those are in `roastpilot-cloud/plan.md`), D9 is defined
+> in `roastpilot-agent/README.md` and D14 in `00-repository-structure.md`, and
+> D2 is superseded by D97 from a different file — D5-D99 interleave with zero
 > collisions. Both files then began incrementing independently from D103.
 >
 > **The convention is SETTLED as of D150: one shared series.** Renumbering was
@@ -196,12 +196,19 @@
 > **Deriving this number is a known trap; three separate attempts got it wrong on
 > 9 Aug alone** (D126 stale, then D150 by correct-answer-wrong-reasoning, then
 > D130 from a per-file assumption the history contradicts). Decisions are defined
-> in THREE formats and no single grep catches them all: `| D<n> |` table rows
+> in FIVE formats and no single grep catches them all: `| D<n> |` table rows
 > (`roastpilot-agent/plan.md`, `roastpilot-cloud/plan.md`,
 > `00-repository-structure.md`), `**D<n> (date) — ...**` paragraphs
-> (`factory.md` up to D143), and `## D<n>: ...` headings (`factory.md` D145
-> onward). Note also that D9, D14 are never defined, and D144 was deliberately
-> renumbered to D145 — real gaps, not numbers to reclaim.
+> (`factory.md` up to D143), `## D<n>: ...` headings (`factory.md` D145
+> onward), `**D<n> — ...**` bold paragraphs carrying the date inside the
+> sentence (`00-repository-structure.md`, where D14 lives), and
+> `- **D<n>** (date): ...` bullets (`roastpilot-agent/README.md`, where D9
+> lives). **Those last two formats are why an earlier revision of this audit
+> recorded D9 and D14 as never defined — they are defined, and that claim was
+> wrong** (corrected 9 Aug 2026, roastpilot-agent#750). The only real gap is
+> D144, deliberately renumbered to D145; it is not a number to reclaim. Re-derived
+> across all five formats, the highest number defined anywhere is still D150, so
+> the free number above is unchanged.
 >
 > D125 records the RP-D eval-model
 > correction — discriminates only on hardware/simulator, not replay; D124 records

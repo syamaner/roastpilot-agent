@@ -6,6 +6,11 @@ validated default (the §16 evaluation-evidence criterion). One entry per real
 story; no synthetic cases. Measurements come from tool results and session
 transcripts, not impressions.
 
+Every D-number in this log is defined in `roastpilot-plan/roastpilot-agent/plan.md`
+unless stated otherwise. The qualifier matters because `roastpilot-cloud/factory.md`
+independently defines the same D103-D129 range for unrelated decisions, so a bare
+number in that range resolves two ways; see `docs/state/registry.md`.
+
 The requirement is archetype COVERAGE, not a case count, and a single story may
 cover more than one — Case 1 below covers two. Stated explicitly because the two
 readings diverge: counting entries, five archetypes across four stories would
@@ -94,7 +99,8 @@ entry is evidence for changing the rule rather than for the decision it
 produced. A later reader resolving the §6 trigger/skip conflict should take the
 revised guidance below, not the skip. The §6 triggers nominally fired: multiple dependent PR slices, a
 privilege/safety boundary on `AdvisorContext`, and extensive decision history to
-reconcile (#707/#709/#711/#498/#342/#726/#705/#580 plus D122/D124/D125).
+reconcile (#707/#709/#711/#498/#342/#726/#705/#580 plus D122/D124/D125, all
+`roastpilot-agent/plan.md`).
 
 The §6 *SHOULD NOT* conditions bit harder. The design was already authoritative
 and complete: ratified on 6 Aug, with the c11 design posted on #709 on 7 Aug and
@@ -378,7 +384,8 @@ than the working tree.
 
 ### Contradictions introduced between plan, prompt, and repository
 
-Three found, all resolved and recorded rather than left latent:
+Three found, all resolved and recorded rather than left latent. Every D-number in
+this list is `roastpilot-agent/plan.md`'s:
 
 - Plan vs repo: D124's "threshold comes from `ambient_temp_c`" was not
   implementable as written (D126).
