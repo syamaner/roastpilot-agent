@@ -62,7 +62,7 @@ DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS: dict[RoastPhase, float | None] = {
 # ``google/gemini-3.1-flash-lite`` (faster + ~5x cheaper) lost on heat-magnitude
 # fidelity; ``google/gemini-3-flash-preview`` was rejected (best drop but steers
 # heat the wrong way). See ``docs/advisor/bakeoff-results-2026-06-21.md``. This is
-# the base slug, and — with ``model_slug_by_phase`` empty by default (D130) — the
+# the base slug, and — with ``model_slug_by_phase`` empty by default (D151) — the
 # model every advice call resolves to until the operator changes it. The pin is a
 # DEFAULT, not a lock: D43/D73 and the #396 A/B both schedule hardware arms on
 # other models, which a lock would forbid.
@@ -91,30 +91,50 @@ HOTTOP_FAN_LEVEL_PP = 10.0
 DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS = 30.0
 
 # Advisor slugs whose post-FC advice latency has been MEASURED against the ~5 s
-# first-crack-slot gate, split by what the measurement said (D130, #747). Both
+# first-crack-slot gate, split by what the measurement said (D151, #747). Both
 # sets are ADVISORY DISPLAY DATA for the pre-charge banner and carry no runtime
 # authority whatsoever: nothing rejects, clamps, or substitutes a model on the
 # strength of them. A slug in neither set has no screen on record — which the
 # banner says, rather than implying it is either safe or bad.
 #
-# Why a warning and not a gate (the D130 sub-decision): until #747 the fully
+# Why a warning and not a gate (the D151 sub-decision): until #747 the fully
 # populated per-phase map made a tick-busting model unreachable by accident, and
 # making ``model_slug`` effective removes that. A runtime allow-list was
 # rejected — it would go stale the day a model ships (gpt-5.6-luna would have
 # needed a code change before it could be tried), rejects at config-save time
 # far from the roast, and implies a June latency screen on one OpenRouter
-# account still holds. The load-bearing protection is elsewhere and unchanged:
-# ``_maybe_run_advisory`` is timeout-bounded and never blocks the tick, a
-# failure becomes a REJECT with the deterministic hold-current-targets
-# fallback, and D30's consecutive-failure stop arms on a sustained outage. A
-# slow model therefore degrades the ADVICE, it does not stall the loop.
+# account still holds.
+#
+# What a slow model actually costs, stated precisely (safety-reviewer finding,
+# folded pre-open — an earlier draft of this note claimed a slow model "cannot
+# stall the loop", which is FALSE and was the sentence the reader would rely
+# on). ``controller.tick`` awaits ``_maybe_run_advisory`` INLINE as its last
+# statement, and the serve loop is drain-operator-queue -> tick, so a call that
+# takes N seconds delays the next telemetry read, the next ``_evaluate_safety``
+# (including the hard bean-temp ceiling), and the next drain of the operator
+# queue — which is where the in-UI EMERGENCY STOP is consumed. N is bounded by
+# ``ControllerConfig.advisory_timeout_seconds``, not unbounded, and any failure
+# still falls back fail-closed to hold-current-targets with D30's
+# consecutive-failure stop behind it. So the true statement is: a slow model
+# DELAYS the control loop by up to that bound and degrades advice at the drop;
+# it cannot hang it forever and it cannot actuate anything. Ctrl-C at the
+# launcher is unaffected (it calls the controller directly). This exposure is
+# pre-existing — it was ~2 s while the accidental pin held gpt-4o — and making
+# ``model_slug`` effective is what puts a 6-10 s model within operator reach,
+# which is precisely why the banner names the bound.
 #
 # Sources — numbers live in the reports, not here, so this list cannot drift
 # into a stale citation: ``docs/advisor/bakeoff-summary-2026-06-16.md`` (D40/D41,
 # 8 models x 28 roasts, median/max FC latency against the ~5 s gate) and #396's
 # 16 Jul screens (gpt-5.6-luna, gpt-4.1-mini).
+#
+# Both sets are lower-cased at definition and asserted disjoint by test:
+# ``launch_banner._slug_matches`` compares against them lower-case, so a
+# mixed-case entry added later would silently fall through to "no screen on
+# record" — a false NEGATIVE, the one direction that matters here.
 FC_LATENCY_SCREENED_ADVISOR_MODELS: frozenset[str] = frozenset(
-    {
+    slug.lower()
+    for slug in {
         # D40/D41 (16 Jun): cleared comfortably.
         "google/gemini-3.1-flash-lite",
         "openai/gpt-4o-mini",
@@ -133,7 +153,10 @@ FC_LATENCY_SCREENED_ADVISOR_MODELS: frozenset[str] = frozenset(
 #: that think past the wall (D40/D41). Named explicitly so the banner can say
 #: "measured, and it busts" instead of the much weaker "no screen on record".
 FC_LATENCY_BUSTED_ADVISOR_MODELS: frozenset[str] = frozenset(
-    {
+    slug.lower()
+    for slug in {
+        # Measured AT ``reasoning=low``; the banner voids the whole screen when
+        # a non-default reasoning effort is configured, precisely because of it.
         "openai/gpt-5-mini",
         "anthropic/claude-opus-4.8",
         "openai/gpt-5.5",
@@ -1413,7 +1436,7 @@ class AdvisorConfig(BaseModel):
     ``model_slug`` — so a slug set in ``/config``, in the saved config file, or
     via ``ROASTPILOT_ADVISOR__MODEL_SLUG`` is the model that answers.
 
-    That empty default is D130 (#747), and it is a bug fix, not a re-pin. The
+    That empty default is D151 (#747), and it is a bug fix, not a re-pin. The
     map used to ship populated with ``DEFAULT_ADVISOR_MODEL`` for every phase
     and is absent from ``AdvisorConfigEdit``, so it silently SHADOWED every
     operator-set ``model_slug``: roast 8 (28 Jun 2026) was launched as a
@@ -1432,7 +1455,7 @@ class AdvisorConfig(BaseModel):
     provider_base_url: str = OPENROUTER_BASE_URL
     api_key_env: str = Field(default="OPENROUTER_API_KEY", min_length=1)
     model_slug: str = Field(default=DEFAULT_ADVISOR_MODEL, min_length=1)
-    # Phase-keyed model override map (#173) — EMPTY by default (D130, #747), so
+    # Phase-keyed model override map (#173) — EMPTY by default (D151, #747), so
     # :meth:`model_for` falls back to ``model_slug`` in every phase and the
     # configured model is the model that answers. Populating a slot overrides
     # that phase only; a phase absent from the map falls back to ``model_slug``.
@@ -1485,7 +1508,7 @@ class AdvisorConfig(BaseModel):
 
         Looks ``phase`` up in :attr:`model_slug_by_phase`, falling back to
         :attr:`model_slug` when the phase carries no override. The map is empty
-        by default (D130, #747), so this resolves to the configured
+        by default (D151, #747), so this resolves to the configured
         :attr:`model_slug` in every phase — including the one phase that
         consults the advisor under D35 — until a future re-run populates a slot.
 

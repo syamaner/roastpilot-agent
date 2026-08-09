@@ -19,6 +19,7 @@ Three layers:
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -320,10 +321,16 @@ async def test_failure_holds_previously_applied_targets() -> None:
 
 
 @pytest.mark.asyncio
-async def test_real_timeout_path_never_blocks_the_tick() -> None:
+async def test_real_timeout_path_bounds_the_tick_and_holds_current_targets() -> None:
     """The elapsed-time timeout (not the scripted shortcut): an advisor that
     never resolves is bounded by ``advisory_timeout_seconds`` and the tick
-    still completes with the hold fallback."""
+    still completes with the hold fallback.
+
+    Named "bounds", not "never blocks" (safety-reviewer finding, #747): the
+    advisory call is awaited INLINE at the end of ``tick()``, so it genuinely
+    delays the tick — it just cannot delay it forever. The companion
+    ``test_a_slow_advisor_delays_the_tick_it_does_not_run_beside_it`` pins the
+    delay itself, which this test's short timeout deliberately hides."""
 
     class NeverAdvisor(RoastAdvisor):
         @property
@@ -353,6 +360,60 @@ async def test_real_timeout_path_never_blocks_the_tick() -> None:
     assert harness.sink.evaluations[-1].rule == "advisor_unavailable_tolerated"
     assert harness.sink.evaluations[-1].verdict is SafetyVerdict.REJECT
     assert harness.executor.targets == []
+
+
+@pytest.mark.asyncio
+async def test_a_slow_advisor_delays_the_tick_it_does_not_run_beside_it() -> None:
+    """A slow advisor holds the tick for as long as it runs (#747 / D151).
+
+    Written down because the opposite was believed and published: the #747
+    rationale first claimed a slow model "cannot stall the loop". It can delay
+    it. ``tick()`` awaits ``_maybe_run_advisory`` inline as its last statement,
+    and ``RoastRunner`` runs drain-operator-queue → tick, so a call taking N
+    seconds pushes out the next telemetry read, the next safety evaluation, and
+    the next drain of the operator queue — which is where the in-UI EMERGENCY
+    STOP is consumed. It is bounded (the test above) and fail-closed, and that
+    bound is exactly why the FC-latency screen matters enough to warn about.
+
+    Asserts the delay TRACKS advisor latency rather than asserting a wall-clock
+    number, so it states the coupling without being a timing flake: the floor is
+    the advisor's own sleep, and the ceiling is loose enough for a busy runner.
+    """
+    delay = 0.3
+
+    class SlowAdvisor(RoastAdvisor):
+        @property
+        def descriptor(self) -> AdvisorDescriptor:
+            return AdvisorDescriptor(provider="test", model="slow", prompt_version="t")
+
+        async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
+            await asyncio.sleep(delay)
+            return RoastDecision(
+                target_heat=55, target_fan=45, should_drop=False, confidence=0.9, rationale="slow"
+            )
+
+        async def healthcheck(self) -> AdvisorHealth:
+            return AdvisorHealth(status=AdvisorHealthStatus.REACHABLE)
+
+    harness = harness_in_development(
+        advisor=SlowAdvisor(),
+        config=ControllerConfig(
+            advisory_timeout_seconds=10.0,
+            post_first_crack_control=PostFirstCrackControl(
+                enabled=False, ceiling_guard_drop_enabled=False
+            ),
+        ),
+    )
+    harness.controller.request_advisory()
+    started = time.perf_counter()
+    await harness.controller.tick()
+    elapsed = time.perf_counter() - started
+
+    # The tick cannot have finished before the advisor did: the await is inline.
+    assert elapsed >= delay
+    assert elapsed < delay + 2.0
+    # And the advice DID land — this is the healthy path, not a timeout.
+    assert harness.executor.targets == [(55, 45)]
 
 
 # --- PydanticAIAdvisor + build_model factory (E8-S2 / D18) ---

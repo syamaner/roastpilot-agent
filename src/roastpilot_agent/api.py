@@ -1518,6 +1518,12 @@ class RoastService:
         runs, so ``GET /api/health`` can surface whether the advisor answered
         before charge. Pure observability — the advisor is advisory-only.
 
+        Not re-set per roast, but INVALIDATED by :meth:`start_roast` when the
+        reloaded config names a different ``model_slug`` (#747 / D151): a probe
+        describes the model it probed, and since D151 that model is the one
+        that answers, so a stale REACHABLE would vouch for a slug nothing has
+        contacted.
+
         Args:
             health: The reachability probe result to surface on ``/api/health``.
         """
@@ -1725,6 +1731,22 @@ class RoastService:
                 self._config = fresh_config
                 self._safety = fresh_safety
                 self._advisor = fresh_advisor
+                # Invalidate a probe that no longer describes the advisor we
+                # just built (#747 / D151, safety-reviewer finding). The probe
+                # runs ONCE, at serve startup (``live.probe_advisor_health``),
+                # against ``advisor.model_slug``. Before D151 a changed
+                # ``model_slug`` could not reach a roast, so a stale REACHABLE
+                # was harmless; now the model the operator typed in /config IS
+                # the model that answers, and the first contact with it would
+                # otherwise be the post-FC advisory call while /api/health still
+                # vouched for the previous slug. Clearing (not re-probing) is
+                # deliberate: ``None`` renders as "not probed" — honest, and it
+                # keeps a network call out of the roast-start path. Re-probing
+                # between roasts is issue-sized, not a side effect of starting
+                # a roast.
+                probed = self._advisor_health
+                if probed is not None and probed.model_slug != fresh_config.advisor.model_slug:
+                    self._advisor_health = None
                 # MCP device respawn (#431): when the reloaded mcp_device differs
                 # from what the child was spawned with, stop and restart the child
                 # so hardware changes (serial port, driver, audio input, FC mode,

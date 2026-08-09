@@ -47,7 +47,7 @@
 #            switch in /config between roasts and confirm the arm at GET
 #            /api/config (see the banner note below — it is a LAUNCH-TIME
 #            snapshot and does NOT re-print between roasts).
-#            The model slug now DOES change the advice model (#747 / D130,
+#            The model slug now DOES change the advice model (#747 / D151,
 #            9 Aug 2026): model_slug_by_phase ships EMPTY, so model_for(phase)
 #            falls back to model_slug in the one phase that consults the
 #            advisor (DEVELOPMENT; pre-FC is deterministic under D35). Before
@@ -57,13 +57,22 @@
 #            DEVELOPMENT RESOLVES to and still flags a shadowed slug, because a
 #            hand-pinned phase slot can shadow it again.
 #            ⚠ It also warns when that model has no clean FC-latency screen on
-#            record (D130). That is a WARNING, not a gate: nothing rejects a
+#            record (D151). That is a WARNING, not a gate: nothing rejects a
 #            model. D40/D41 measured sonnet-4.6 / gpt-5.5 / opus-4.8 /
 #            gpt-5-mini@low busting the ~5 s post-FC slot, and until #747 the
-#            populated map made such a model unreachable by accident. A slow
-#            model degrades the ADVICE (late at the drop); it cannot stall the
-#            loop — the advisory step is timeout-bounded and falls back to
-#            holding current targets. Read the line before you charge.
+#            populated map made such a model unreachable by accident.
+#            ⚠ What a slow model COSTS, precisely: the controller awaits the
+#            advisory call inline at the end of its tick, and the serve loop is
+#            drain-operator-queue -> tick. So a call taking N seconds DELAYS
+#            the next telemetry read, the next safety evaluation, and the next
+#            drain of the operator queue — which is where the in-UI EMERGENCY
+#            STOP is consumed. N is bounded by controller.advisory_timeout_
+#            seconds (default 10 s), and any failure falls back fail-closed to
+#            holding current targets, so it cannot hang forever and cannot
+#            actuate anything. Ctrl-C here is unaffected: it calls the
+#            controller directly and does not go through the queue. With the
+#            gpt-4o pin (~2 s) that delay is small; a busting model makes it
+#            seconds. Read the banner line before you charge.
 #
 set -euo pipefail
 

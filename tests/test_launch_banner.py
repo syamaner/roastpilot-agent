@@ -22,6 +22,8 @@ from pydantic import ValidationError
 
 from roastpilot_agent import config_store
 from roastpilot_agent.config import (
+    FC_LATENCY_BUSTED_ADVISOR_MODELS,
+    FC_LATENCY_SCREENED_ADVISOR_MODELS,
     AdvisorConfig,
     AppConfig,
     ControllerConfig,
@@ -127,11 +129,11 @@ def test_advisor_phases_is_the_controllers_own_gate() -> None:
 def test_saved_model_slug_is_the_model_the_advisor_actually_uses(
     config_file: Path,
 ) -> None:
-    """D130 (#747): a model saved through /config now answers the roast.
+    """D151 (#747): a model saved through /config now answers the roast.
 
     This is the end-to-end shape of the defect — saved file → resolved config →
     the model `PydanticAIAdvisor` picks with `model_for(context.phase)`. Before
-    D130 the populated override map won and the banner correctly reported
+    D151 the populated override map won and the banner correctly reported
     gpt-4o against a saved gpt-4.1-mini; now the saved value IS the arm, so the
     banner names it and tags it as the experiment it is.
     """
@@ -149,7 +151,7 @@ def test_saved_model_slug_is_the_model_the_advisor_actually_uses(
 def test_a_pinned_phase_slot_still_shadows_an_operator_set_slug(
     config_file: Path,
 ) -> None:
-    """The shadow warning survives D130 — the map can still be populated.
+    """The shadow warning survives D151 — the map can still be populated.
 
     Emptying the DEFAULT does not remove the mechanism: a hand-edited saved
     config or a `ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE` JSON blob can still
@@ -248,7 +250,7 @@ def test_screened_model_gets_no_latency_warning() -> None:
 
 
 def test_model_measured_as_busting_the_gate_is_named_as_such() -> None:
-    """A model D40/D41 MEASURED as busting the ~5 s gate says so (D130).
+    """A model D40/D41 MEASURED as busting the ~5 s gate says so (D151).
 
     Distinct from the unscreened wording on purpose: "we measured it and it
     busts" is a far stronger claim than "nothing on record", and collapsing the
@@ -303,17 +305,86 @@ def test_native_provider_model_name_matches_its_screened_slug() -> None:
     assert "BUSTED" not in line
 
 
-def test_a_whitespace_only_slug_warns_rather_than_matching_nothing_quietly() -> None:
-    """A degenerate slug is unscreened, not silently cleared.
+def test_a_padded_slug_still_matches_its_screen() -> None:
+    """Surrounding whitespace does not downgrade a BUSTED verdict.
 
-    `min_length=1` rejects an empty slug but admits `" "` from a hand-edited
-    saved config, which strips to nothing. Matching must fail CLOSED there —
-    a slug that matches no known model is unverified, and the operator hears
-    about it.
+    A hand-edited saved config can hold `" openai/gpt-5.5 "`. Without the strip
+    in `_slug_matches` that lands in the "no screen on record" class — the
+    WEAKEST of the three messages for a model we measured busting the gate,
+    which is the unsafe direction. (The earlier version of this test used a
+    whitespace-only slug, which passes with or without the strip and so guarded
+    nothing — safety-reviewer catch, folded pre-open.)
     """
-    line = _advisor_line_for(model_slug="  ")
+    assert "BUSTED" in _advisor_line_for(model_slug=" openai/gpt-5.5 ")
+    # And a degenerate slug still fails closed rather than matching nothing quietly.
+    assert "no FC-latency screen on record" in _advisor_line_for(model_slug="  ")
 
-    assert "no FC-latency screen on record" in line
+
+def test_a_thinking_variant_of_a_buster_is_still_reported_as_busted() -> None:
+    """An OpenRouter `:variant` suffix keeps its base slug's BUSTED verdict.
+
+    `anthropic/claude-sonnet-4.6:thinking` is strictly slower than the base
+    model D40/D41 measured busting the gate, yet exact-matching alone gave it
+    the weakest message. The asymmetry is deliberate: a variant inherits a
+    BUSTED result, never a CLEARING one, since a thinking variant of a fast
+    model can itself be slow.
+    """
+    assert "BUSTED" in _advisor_line_for(model_slug="anthropic/claude-sonnet-4.6:thinking")
+    # The other direction: a variant of a CLEARED model does not inherit the pass.
+    assert "no FC-latency screen on record" in _advisor_line_for(
+        model_slug="openai/gpt-4o:extended"
+    )
+
+
+def test_a_non_default_reasoning_effort_voids_the_screen() -> None:
+    """The screen measures (endpoint, slug, effort) — effort is part of the key.
+
+    The busted set's own provenance is effort-qualified (`gpt-5-mini` busts *at
+    reasoning=low*), so honouring the slug alone would clear
+    `gpt-4o@reasoning=high`, a configuration nothing has ever measured and one
+    that is reachable from `ROASTPILOT_ADVISOR__REASONING_EFFORT`.
+    """
+    line = _advisor_line_for(model_slug="openai/gpt-4o", reasoning_effort="high")
+
+    assert "no FC-latency screen on record for openai/gpt-4o" in line
+    assert "endpoint/reasoning effort" in line
+    # "off" is the measured condition, so it must NOT void the screen.
+    assert "no FC-latency screen" not in _advisor_line_for(
+        model_slug="openai/gpt-4o", reasoning_effort="off"
+    )
+
+
+def test_a_different_endpoint_voids_the_screen() -> None:
+    """A screened slug behind some other endpoint is not the screened thing.
+
+    `provider_base_url` is operator-editable (a local proxy, LiteLLM, Ollama),
+    and the latency of `openai/gpt-4o` through an unknown hop is unmeasured.
+    Clearing it on the strength of the slug string would be a false negative.
+    """
+    line = _advisor_line_for(
+        model_slug="openai/gpt-4o", provider_base_url="http://some-proxy.local/v1"
+    )
+
+    assert "no FC-latency screen on record for openai/gpt-4o" in line
+
+
+def test_the_screen_sets_are_lower_case_and_disjoint() -> None:
+    """The invariants `_slug_matches` silently depends on.
+
+    It compares lower-case, so a mixed-case entry added later would fall
+    through to "no screen on record" — a false negative. And a slug in both
+    sets, or two entries sharing a bare name, would make the classification
+    order-dependent for the native-provider match.
+    """
+    assert all(slug == slug.lower() for slug in FC_LATENCY_SCREENED_ADVISOR_MODELS)
+    assert all(slug == slug.lower() for slug in FC_LATENCY_BUSTED_ADVISOR_MODELS)
+    assert not (FC_LATENCY_SCREENED_ADVISOR_MODELS & FC_LATENCY_BUSTED_ADVISOR_MODELS)
+
+    bare = [
+        slug.rsplit("/", 1)[-1]
+        for slug in FC_LATENCY_SCREENED_ADVISOR_MODELS | FC_LATENCY_BUSTED_ADVISOR_MODELS
+    ]
+    assert len(bare) == len(set(bare))
 
 
 def test_a_lookalike_vendor_prefix_does_not_inherit_a_screen() -> None:

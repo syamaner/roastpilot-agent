@@ -19,7 +19,7 @@ Format: one entry per anti-pattern.
 ---
 
 ## A config field the operator can edit must not be shadowed by a resolver default they cannot reach
-*(fixed by #747 / D130, 9 Aug 2026)*
+*(fixed by #747 / D151, 9 Aug 2026)*
 
 - **Signature:** a settings field paired with a `*_by_<something>` override map (or
   any second-level resolver) where the MAP ships fully populated AND is absent from
@@ -704,9 +704,11 @@ Format: one entry per anti-pattern.
   code path consumes it. Four related traps in this same banner, all caught by
   the local Codex pass pre-open, over two rounds:
   (a) `advisor.model_slug` is shadowed by `model_slug_by_phase` (the advisor
-  calls `model_for(phase)`, and that map ships populated and is not editable
-  from `/config`), so the banner must print the phase-resolved model — the
-  runtime bug is #747; (b) but the base slug is NOT unused: `healthcheck()`
+  calls `model_for(phase)`) — **the "ships populated" half of this is SUPERSEDED
+  by the #747 entry at the top of this file: since D151 the map ships EMPTY, so
+  the base slug normally IS the advice model. The banner must still print the
+  phase-resolved model, because a hand-pinned slot can shadow it again**;
+  (b) the base slug is NOT unused: `healthcheck()`
   probes reachability with it, so an invalid one still drives the startup
   advisor status — say "gives no roast advice", not "unused"; (c) only
   `AUTO_ADVICE_PHASES` (DEVELOPMENT alone, under D35) consults the advisor at

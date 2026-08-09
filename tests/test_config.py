@@ -164,7 +164,7 @@ def test_advisor_defaults_match_d5_d18_and_bakeoff() -> None:
 
 
 def test_advisor_per_phase_model_map_ships_empty() -> None:
-    """D130 (#747): the per-phase override map is EMPTY by default.
+    """D151 (#747): the per-phase override map is EMPTY by default.
 
     It used to ship populated with the pinned model for every phase, which —
     since the map is absent from ``AdvisorConfigEdit`` and so unreachable from

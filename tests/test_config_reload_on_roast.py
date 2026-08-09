@@ -30,7 +30,7 @@ from roastpilot_agent.config_store import (
     PreFirstCrackLeversEdit,
     persist_config_edit,
 )
-from roastpilot_agent.models import RoastProfile
+from roastpilot_agent.models import AdvisorHealth, AdvisorHealthStatus, RoastProfile
 from roastpilot_agent.store import RoastStore
 
 # ---------------------------------------------------------------------------
@@ -107,6 +107,60 @@ async def test_saved_advisor_model_reflected_in_next_roast_service_config(
     reloaded_model = svc._config.advisor.model_slug  # pyright: ignore[reportPrivateUsage]
     assert reloaded_model == "openai/gpt-4-turbo-preview"
     assert reloaded_model != initial_model
+
+
+@pytest.mark.asyncio
+async def test_changing_the_model_invalidates_the_startup_reachability_probe(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """A model change clears the stale REACHABLE on ``GET /api/health`` (#747).
+
+    The probe runs once, at serve startup, against ``advisor.model_slug``.
+    Before D151 a changed slug could not reach a roast, so a stale probe result
+    was harmless. Now it IS the model that answers, and the operator checks
+    health before charging — so health must not vouch for a slug nothing has
+    contacted. ``None`` renders as "not probed", which is the honest state.
+    """
+    svc = RoastService(store, live_serve_mode=True)
+    svc.set_advisor_health(
+        AdvisorHealth(
+            status=AdvisorHealthStatus.REACHABLE,
+            provider="openai_compatible",
+            model_slug=svc._config.advisor.model_slug,  # pyright: ignore[reportPrivateUsage]
+        )
+    )
+
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4.1-mini")))
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert (await svc.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_model_keeps_its_reachability_probe(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """Starting a roast does NOT wipe a probe that still describes the advisor.
+
+    The invalidation must be keyed on the model actually changing. Clearing
+    unconditionally would blank the advisor readout on every ordinary roast —
+    trading a stale-but-usually-right signal for no signal at all, which is the
+    worse failure for a check the operator runs before every charge.
+    """
+    svc = RoastService(store, live_serve_mode=True)
+    probed = AdvisorHealth(
+        status=AdvisorHealthStatus.REACHABLE,
+        provider="openai_compatible",
+        model_slug=svc._config.advisor.model_slug,  # pyright: ignore[reportPrivateUsage]
+    )
+    svc.set_advisor_health(probed)
+
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(prompt_version="c11")))
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert (await svc.health()).advisor == probed
 
 
 @pytest.mark.asyncio

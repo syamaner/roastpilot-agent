@@ -32,6 +32,8 @@ from pydantic import BaseModel, ValidationError
 from roastpilot_agent.config import (
     FC_LATENCY_BUSTED_ADVISOR_MODELS,
     FC_LATENCY_SCREENED_ADVISOR_MODELS,
+    OPENROUTER_BASE_URL,
+    AdvisorConfig,
     AppConfig,
 )
 from roastpilot_agent.controller import AUTO_ADVICE_PHASES
@@ -100,6 +102,10 @@ def _slug_matches(slug: str, known: frozenset[str]) -> bool:
     be a false alarm on a legitimate config, and a false alarm is how a soft
     warning gets ignored.
 
+    Surrounding whitespace is stripped: a hand-edited saved config can hold
+    ``" openai/gpt-5.5 "``, and without the strip a measured-busting model would
+    silently downgrade to the weaker "no screen on record" wording.
+
     Args:
         slug: A resolved advisor model slug.
         known: Lower-case slugs to match against.
@@ -113,8 +119,32 @@ def _slug_matches(slug: str, known: frozenset[str]) -> bool:
     return any(entry.rsplit("/", 1)[-1] == candidate for entry in known)
 
 
-def _latency_screen_note(resolved: set[str]) -> str:
-    """The FC-latency soft warning for the models that will give advice (D130).
+def _matches_busted(slug: str) -> bool:
+    """Whether *slug* names a model measured as BUSTING the FC-latency gate.
+
+    Also matches an OpenRouter ``:variant`` suffix (``…-4.6:thinking``) against
+    its base slug, because every such variant of a busting model is slower
+    still. Deliberately NOT applied to the screened set: a variant must never
+    inherit a CLEARING measurement it did not earn (a thinking variant of a
+    fast model can be slow), so the asymmetry is the safe direction in both
+    cases.
+
+    Args:
+        slug: A resolved advisor model slug.
+
+    Returns:
+        ``True`` when *slug*, or its pre-``:`` base, is a known buster.
+    """
+    if _slug_matches(slug, FC_LATENCY_BUSTED_ADVISOR_MODELS):
+        return True
+    base = slug.strip().split(":", 1)[0]
+    return base != slug.strip() and _slug_matches(base, FC_LATENCY_BUSTED_ADVISOR_MODELS)
+
+
+def _latency_screen_note(
+    advisor: AdvisorConfig, resolved: set[str], advisory_timeout_seconds: float
+) -> str:
+    """The FC-latency soft warning for the models that will give advice (D151).
 
     Advisory only — nothing here rejects or substitutes a model.  Making
     ``model_slug`` effective (#747) removed the accidental protection that had
@@ -132,30 +162,56 @@ def _latency_screen_note(resolved: set[str]) -> str:
     * neither — named as unverified, which is a prompt to screen it, not a
       verdict against it.
 
+    A screen measures a ``(endpoint, slug, reasoning effort)`` triple, not a
+    slug, so a non-default ``reasoning_effort`` or a non-OpenRouter
+    ``provider_base_url`` voids it and every resolved model falls to the
+    unscreened class (safety-reviewer finding, folded pre-open). The busted
+    set's own provenance is effort-qualified — ``gpt-5-mini`` busts *at
+    reasoning=low* — so honouring only the slug would clear
+    ``gpt-4o@reasoning=high``, which nothing has ever measured.
+
     Args:
+        advisor: The resolved advisor config, for the endpoint/effort qualifier.
         resolved: The distinct model slugs :data:`ADVISOR_PHASES` resolves to.
+        advisory_timeout_seconds: ``ControllerConfig.advisory_timeout_seconds``
+            — the bound the CONTROLLER puts on the advisory await, which is what
+            caps how long a slow call holds the loop. Not
+            ``AdvisorConfig.timeout_seconds`` (the provider request timeout);
+            the controller's is the one that actually fires.
 
     Returns:
         The note to append to the advisor line, or ``""`` when every resolved
-        model has a screen on record that cleared.
+        model has an applicable screen on record that cleared.
     """
-    busted = sorted(m for m in resolved if _slug_matches(m, FC_LATENCY_BUSTED_ADVISOR_MODELS))
+    # ``reasoning_effort="off"`` is the measured condition (the screens ran with
+    # reasoning disabled or absent); any positive effort is a different model.
+    voided = (advisor.reasoning_effort not in (None, "off")) or (
+        advisor.provider_base_url != OPENROUTER_BASE_URL
+    )
+    busted = sorted(m for m in resolved if not voided and _matches_busted(m))
     unscreened = sorted(
         m
         for m in resolved
-        if not _slug_matches(m, FC_LATENCY_SCREENED_ADVISOR_MODELS)
-        and not _slug_matches(m, FC_LATENCY_BUSTED_ADVISOR_MODELS)
+        if voided
+        or (not _slug_matches(m, FC_LATENCY_SCREENED_ADVISOR_MODELS) and not _matches_busted(m))
     )
     notes: list[str] = []
     if busted:
         notes.append(
             f"⚠ {', '.join(busted)} BUSTED the ~5 s post-FC latency screen "
-            "(D40/D41) — advice will land late at the drop"
+            "(D40/D41) — advice lands late at the drop, and each late call "
+            "holds the control loop (next safety check + queued e-stop) for as "
+            f"long as it runs, bounded at {advisory_timeout_seconds:g} s"
         )
     if unscreened:
+        why = (
+            " at this endpoint/reasoning effort (a screen measures the whole triple)"
+            if voided
+            else ""
+        )
         notes.append(
-            f"⚠ no FC-latency screen on record for {', '.join(unscreened)} — "
-            "the ~5 s post-FC tick budget is unverified for it"
+            f"⚠ no FC-latency screen on record for {', '.join(unscreened)}{why} — "
+            "the ~5 s post-FC advice slot (D40/D41) is unverified for it"
         )
     return "".join(f"   {note}" for note in notes)
 
@@ -170,7 +226,7 @@ def _advisor_line(config: AppConfig) -> str:
     The model reported is the PHASE-RESOLVED one — what
     :meth:`AdvisorConfig.model_for` returns for each phase in
     :data:`ADVISOR_PHASES`, which is what ``PydanticAIAdvisor`` actually calls.
-    It is NOT ``advisor.model_slug``. Since D130 (#747) the override map ships
+    It is NOT ``advisor.model_slug``. Since D151 (#747) the override map ships
     empty, so the two normally agree; they part company the moment a phase slot
     is pinned (a hand-edited saved config, or a
     ``ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE`` JSON blob), which is exactly the
@@ -214,7 +270,7 @@ def _advisor_line(config: AppConfig) -> str:
         advisor.prompt_version == fields["prompt_version"].default
     )
     tag = "" if is_default else EXPERIMENT_TAG
-    latency = _latency_screen_note(resolved)
+    latency = _latency_screen_note(advisor, resolved, config.controller.advisory_timeout_seconds)
     return f"{model_text}  ·  prompt {advisor.prompt_version}{tag}{latency}"
 
 
