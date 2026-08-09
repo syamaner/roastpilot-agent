@@ -3999,12 +3999,14 @@ async def test_charge_capture_persists_nulls_for_a_non_finite_reading(
 ) -> None:
     """#752: a malformed reading must not become the run's corpus breadcrumb.
 
-    ``scripts/rpd_corpus_score.py`` carries a ``_finite_or_none`` normalisation
-    precisely because a historical ``+/-Infinity`` ``ambient_temp_c`` already
-    reached this corpus — SQLite round-trips ``±inf`` faithfully, so it survives
-    the write and comes back out. The value must be stopped at the reading
-    boundary instead, so the column keeps meaning "a real reading of the room at
-    charge" (#342, D85) rather than "whatever the probe last emitted".
+    SQLite round-trips ``±inf`` faithfully (unlike ``NaN``, which it silently
+    stores as ``NULL``), so a non-finite reading survives the write and comes
+    back out — which is why ``scripts/rpd_corpus_score.py`` carries a
+    ``_finite_or_none`` normalisation on read. That shim guards a reachable
+    shape rather than recording an observed row, and reachable is enough: the
+    value must be stopped at the reading boundary instead, so the column keeps
+    meaning "a real reading of the room at charge" (#342, D85) rather than
+    "whatever the probe last emitted".
 
     Asserted through the whole live path — MCP state, charge detection, store —
     rather than on the predicate alone, because the predicate being right is

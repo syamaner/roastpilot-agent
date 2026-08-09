@@ -43,6 +43,7 @@ from roastpilot_agent.mcp_client import (
     ServerInfo,
     SetRecordingMetadataResult,
     StartRoastSessionResult,
+    ambient_reading_is_live,
     ambient_reading_token,
     applied_state_from_event,
     event_backdate_seconds,
@@ -2798,12 +2799,20 @@ def test_project_session_state_declines_a_non_finite_ambient_reading() -> None:
 
 @pytest.mark.asyncio
 async def test_adapter_ambient_age_is_unknown_for_a_non_finite_reading() -> None:
-    """#752: the freshness tracker inherits the guard rather than re-deriving it.
+    """#752: a malformed reading reaches the controller with NO age to reason on.
 
-    ``_observe_ambient_age`` tokenises only a reading the live projection
-    forwards, so a malformed triad never starts a freshness clock — two reads a
-    second apart both report an unknown age, exactly as they do for a probe that
-    has never reported.
+    Deliberately an assertion about the PROJECTION, not the tracker: the tracker
+    keeps its clock running against a live-but-malformed reading on purpose (see
+    ``test_a_malformed_ambient_tick_does_not_relaunder_a_wedged_reading_as_fresh``,
+    which is where that behaviour is pinned), and
+    :func:`project_session_state` is what nulls the age alongside the triad. The
+    controller fails closed on an unknown age, so this is the assertion that
+    matters at the seam: two reads a second apart both arrive age-unknown,
+    exactly as they do for a probe that has never reported.
+
+    An earlier revision claimed this test proved the *tracker* declined the
+    reading. It never could: the age is doubly determined here, and a tracker
+    mutation leaves it green (safety-reviewer finding 4, folded pre-open).
     """
     clock = _StepClock()
     nan_reading = {
@@ -2878,6 +2887,69 @@ async def test_a_malformed_ambient_tick_does_not_relaunder_a_wedged_reading_as_f
     # not a fresh 0.0.
     assert recovered is not None and recovered.ambient_temp_c == 28.49
     assert recovered.ambient_age_seconds == 90.0
+
+
+def test_which_mcp_transport_path_preserves_a_non_finite_ambient_member() -> None:
+    """#752, the local Codex pass: pin WHERE the guard is load-bearing.
+
+    The guard reads a pydantic-validated ``AmbientStatus``, so what reaches it
+    depends on how the child's reply crossed the wire — and the two paths
+    :func:`parse_tool_result` supports disagree. Asserted against a real
+    ``CallToolResult`` round-trip rather than a dict fake, because a dict fake
+    cannot show the disagreement at all.
+
+    * ``structuredContent`` is serialised by pydantic, which nulls non-finite
+      floats. The value is already ``None`` before the guard sees it, so the
+      triad arrives partially populated rather than malformed and the guard is
+      a no-op on that path.
+    * The text content block is parsed with :func:`json.loads`, whose default
+      ``parse_constant`` accepts the bare ``Infinity``/``NaN`` tokens. The value
+      arrives non-finite, and this is the path the guard actually catches.
+
+    Both halves are pinned so a future MCP or pydantic change that flips either
+    one reddens here rather than silently turning the guard into dead code (or,
+    worse, silently re-opening the malformed path).
+    """
+    mcp_types = pytest.importorskip("mcp.types")
+    ambient = {
+        **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[call-overload]
+        "humidity_percent": float("inf"),
+    }
+    body = {"ambient_status": ambient}
+    text_block = mcp_types.TextContent(type="text", text=json.dumps(body))
+
+    structured = mcp_types.CallToolResult.model_validate_json(
+        mcp_types.CallToolResult(content=[text_block], structuredContent=body).model_dump_json()
+    )
+    text_only = mcp_types.CallToolResult.model_validate_json(
+        mcp_types.CallToolResult(content=[text_block]).model_dump_json()
+    )
+
+    via_structured = cast("dict[str, object]", parse_tool_result(structured))
+    laundered = AmbientStatus.model_validate(via_structured["ambient_status"])
+    assert laundered.humidity_percent is None  # nulled by the transport, not by us
+    assert project_live_ambient(laundered) == (28.49, None, 1008.56)
+
+    via_text = cast("dict[str, object]", parse_tool_result(text_only))
+    malformed = AmbientStatus.model_validate(via_text["ambient_status"])
+    assert malformed.humidity_percent == float("inf")  # survives the wire intact
+    assert project_live_ambient(malformed) == (None, None, None)
+
+
+def test_ambient_reading_is_live_asks_only_the_runtime_question() -> None:
+    """#752: liveness is a property of the RUNTIME, usability of the PAYLOAD.
+
+    Split out because the freshness tracker keys on liveness alone while
+    :func:`project_live_ambient` applies both halves — if this predicate ever
+    grew a value clause, a malformed tick would start resetting the freshness
+    clock again and could re-launder a wedged reading as fresh.
+    """
+    assert ambient_reading_is_live(_ambient_status_with()) is True
+    # A malformed VALUE says nothing about whether the runtime is alive.
+    assert ambient_reading_is_live(_ambient_status_with(temperature_c=float("nan"))) is True
+    # A stopped or non-ok runtime is not live, whatever it preserved.
+    assert ambient_reading_is_live(_ambient_status_with(ambient_running=False)) is False
+    assert ambient_reading_is_live(_ambient_status_with(status="unavailable")) is False
 
 
 def test_project_live_ambient_non_ok_status_is_none() -> None:

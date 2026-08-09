@@ -510,30 +510,38 @@ def project_live_ambient(status: AmbientStatus) -> tuple[float | None, float | N
     identity *stamp* this treatment (:func:`ambient_reading_token`); the measured
     values themselves had no such guard, so a ``NaN``/``±inf`` ``temperature_c``
     reached :class:`RoastTelemetry`, the ``c11`` doctrine, and the corpus column
-    unchanged. That is not hypothetical: ``scripts/rpd_corpus_score.py`` carries a
-    ``_finite_or_none`` normalisation precisely because a historical
-    ``+/-Infinity`` ``ambient_temp_c`` has already reached that corpus. The
-    failure is quiet rather than loud — ``NaN`` compares ``False`` against the
-    doctrine's ``threshold_c`` in BOTH directions, so it does not raise, it seats
-    the model in whichever fan regime the comparison falls through to. It appears
-    harmless today only by accident: ``AdvisorContext.model_dump_json()`` emits
-    ``null`` for non-finite floats under pydantic v2's default
-    ``ser_json_inf_nan="null"`` (verified). That is implicit, version-dependent
-    protection which ``model_dump()`` (python mode) already does not provide, on
-    a path whose whole thesis is that non-finite values defeat gates.
+    unchanged. The failure is quiet rather than loud — ``NaN`` compares ``False``
+    against the doctrine's ``threshold_c`` in BOTH directions, so it does not
+    raise, it seats the model in whichever fan regime the comparison falls
+    through to. The advisor path appears harmless today only by accident:
+    ``AdvisorContext.model_dump_json()`` emits ``null`` for non-finite floats
+    under pydantic v2's default ``ser_json_inf_nan="null"`` (verified), implicit
+    version-dependent protection which ``model_dump()`` in python mode already
+    does not provide. The *other* consumers of the same value have no such
+    accident: :meth:`SseEvent.render` dumps with ``json.dumps``, which emits a
+    bare ``NaN``/``Infinity`` token that a strict ``JSON.parse`` rejects for the
+    whole frame (verified), and SQLite round-trips ``±inf`` into the corpus
+    column faithfully — which is what ``scripts/rpd_corpus_score.py``'s
+    ``_finite_or_none`` normalises. That shim is a reachability guard rather
+    than a record of an observed row (it arrived with the scorer itself, from a
+    reviewer's reachability argument), so the claim here is capability, not
+    history; the capability is enough.
 
     Three choices worth stating rather than assuming:
 
     * **The unit is the TRIAD, not the member.** The three values are one poll of
       one device, published with one stamp, and the MCP's own
-      ``AmbientRuntimeSnapshot`` nulls them together — a member that came back
-      unrepresentable is evidence the *reading* is malformed, not that one
-      channel is. A partially-populated triad would also be a shape no consumer
-      has ever seen: a temperature-less reading that still renders humidity on
-      the Room tile, or a corpus row claiming "a real, dateable reading of the
-      room" for a reading whose room temperature is missing. Over-rejecting costs
-      one run's breadcrumb and one tick's graduated-regime eligibility; under-
-      rejecting costs a mislabelled RP-B arm (#709).
+      ``AmbientRuntimeSnapshot`` nulls them together, so *from the live producer*
+      a partially-populated triad is not a shape any consumer has had to
+      interpret: a temperature-less reading still rendering humidity on the Room
+      tile, or a corpus row claiming "a real, dateable reading of the room" for a
+      reading whose room temperature is missing. A member that came back
+      unrepresentable is therefore evidence the *reading* is malformed, not that
+      one channel is. The cost of over-rejecting is concrete and worth owning:
+      the charge capture is once-only and never retried, so a non-finite
+      ``pressure_hpa`` on the charge tick discards a perfectly good
+      ``temperature_c`` for the whole run. Under-rejecting costs a mislabelled
+      RP-B arm (#709), which is worse.
     * **``humidity_percent`` is included on its own merits**, not just by
       atomicity: it reaches the advisor context through
       :meth:`RoastController._doctrine_ambient` exactly as the temperature does.
@@ -541,11 +549,9 @@ def project_live_ambient(status: AmbientStatus) -> tuple[float | None, float | N
       in a prompt is still text in the prompt.
     * **``pressure_hpa`` is included even though it is corpus-only**, and that is
       not over-reach: it lands in the same ``roast_runs`` columns and carries the
-      same hazard the temperature does — SQLite round-trips ``±inf`` faithfully
-      (unlike ``NaN``, which it silently stores as ``NULL``), and ``json.dumps``
-      then emits a bare ``Infinity`` token that a strict ``JSON.parse`` rejects
-      for a whole report. Guarding the reading at its boundary is cheaper than
-      one downstream normalisation per consumer.
+      same non-finite-through-SQLite / bare-``Infinity``-in-JSON hazard the
+      temperature does. Guarding the reading at its boundary is cheaper than one
+      downstream normalisation per consumer.
 
     No type guard is needed alongside ``math.isfinite`` (unlike
     :func:`_payload_float`, which reads an untyped payload mapping): these are
@@ -553,6 +559,28 @@ def project_live_ambient(status: AmbientStatus) -> tuple[float | None, float | N
     validation and is still unusable is by being non-finite (pydantic's
     ``allow_inf_nan`` default). ``None`` members are untouched — absent is a
     legitimate state and must not be conflated with malformed.
+
+    **What this does NOT close, stated so the atomicity claim above is not read
+    wider than it is.** Which of the two MCP transport paths a reading arrives
+    on decides whether this guard ever sees a non-finite value at all
+    (``tests/test_mcp_client.py`` pins both):
+
+    * ``structuredContent`` — the MCP serialises it with pydantic, so a
+      non-finite member is already ``null`` by the time
+      :func:`parse_tool_result` reads it. The guard is a no-op there, and the
+      triad arrives partially populated instead of malformed.
+    * the text content block — parsed with :func:`json.loads`, whose default
+      ``parse_constant`` accepts the bare ``Infinity``/``NaN`` tokens, so the
+      value does arrive non-finite. This is the path the guard is load-bearing
+      on.
+
+    So a *partially populated* triad is reachable regardless, and this function
+    deliberately still forwards one. Whether an incomplete triad should itself
+    be voided is a separate decision that turns on whether any supported ambient
+    probe legitimately reports fewer than three members (the ``AmbientStatus``
+    mirror allows it; the Yocto-Meteo does not need it) — filed rather than
+    guessed at here, because guessing wrong silently disables ambient for that
+    hardware.
 
     Guarding here rather than at each call site follows #745's shape: this is the
     boundary every consumer already goes through, so
