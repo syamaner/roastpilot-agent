@@ -2051,3 +2051,20 @@ def test_config_advisory_is_the_same_text_the_launch_banner_prints(
             assert "⚠ " not in banner.replace(EXPERIMENT_TAG, "")
         else:
             assert advisory in banner
+
+
+def test_a_blank_model_slug_is_rejected_at_the_edit_boundary() -> None:
+    """A PUT saving a whitespace-only slug fails at save time, not mid-roast.
+
+    `min_length=1` admits `"  "`. Before D151 that was inert — the populated
+    phase map shadowed it — so this PR is what makes it live: the value would
+    reload on the next roast and ship a garbage identifier to the provider on
+    every DEVELOPMENT call, burning D30's consecutive-failure budget with no
+    signal at save time (local Codex P2, folded pre-open).
+    """
+    with pytest.raises(pydantic.ValidationError):
+        AdvisorConfigEdit(model_slug="   ")
+
+    # Padding alone is normalised rather than rejected, so the value the
+    # operator meant still saves — and saves in the form that gets dispatched.
+    assert AdvisorConfigEdit(model_slug=" openai/gpt-4o ").model_slug == "openai/gpt-4o"

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Annotated, ClassVar, Literal
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .models import RoastPhase
@@ -1583,6 +1583,63 @@ class AdvisorConfig(BaseModel):
     # fast structured advice inside the 10 s tick budget, so the bake-off
     # measures reasoning on-vs-off (E8-S4 cost/reasoning eval).
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None
+
+    @field_validator("model_slug")
+    @classmethod
+    def _strip_model_slug(cls, value: str) -> str:
+        """Normalise the slug at the boundary, and reject a blank one.
+
+        ``min_length=1`` admits ``"  "``, which before D151 was inert — the
+        always-populated phase map shadowed it. This PR is what makes it live:
+        a blank-looking slug saved through ``/config`` would now reload, pass
+        validation, and ship a garbage identifier to the provider on every
+        DEVELOPMENT call, burning D30's consecutive-failure budget with no
+        signal at save time (local Codex P2, folded pre-open).
+
+        Stripping rather than merely rejecting also closes a divergence the
+        review chased earlier: ``build_model`` dispatches the slug verbatim, so
+        a padded value used to be dispatched padded while the FC-latency screen
+        matched on the raw string. Normalising here means the classifier and
+        the provider always see the same identifier.
+
+        Args:
+            value: The configured slug.
+
+        Returns:
+            The stripped slug.
+
+        Raises:
+            ValueError: If the slug is blank once stripped.
+        """
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("model_slug must not be blank")
+        return stripped
+
+    @field_validator("model_slug_by_phase")
+    @classmethod
+    def _strip_phase_slugs(cls, value: dict[RoastPhase, str]) -> dict[RoastPhase, str]:
+        """Apply the same normalisation to every per-phase override.
+
+        A phase override is dispatched by the same code path, so it carries the
+        same blank/padded hazard as the base slug.
+
+        Args:
+            value: The per-phase override map.
+
+        Returns:
+            The map with every slug stripped.
+
+        Raises:
+            ValueError: If any override is blank once stripped.
+        """
+        cleaned: dict[RoastPhase, str] = {}
+        for phase, slug in value.items():
+            stripped = slug.strip()
+            if not stripped:
+                raise ValueError(f"model_slug_by_phase[{phase.value}] must not be blank")
+            cleaned[phase] = stripped
+        return cleaned
 
     def model_for(self, phase: RoastPhase) -> str:
         """Return the advisor model slug to use for ``phase`` (#173).

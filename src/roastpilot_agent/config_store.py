@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from roastpilot_agent.advisor_screen import screen_warning
 from roastpilot_agent.config import (
@@ -392,6 +392,34 @@ class AdvisorConfigEdit(BaseModel):
 
     model_slug: str | None = Field(default=None, min_length=1)
     prompt_version: str | None = Field(default=None, min_length=1)
+
+    @field_validator("model_slug")
+    @classmethod
+    def _strip_model_slug(cls, value: str | None) -> str | None:
+        """Reject a blank slug at the EDIT boundary, before it is persisted.
+
+        ``AdvisorConfig`` normalises too, but a PUT that saves ``"  "`` and only
+        fails when the next roast reloads it is a bad trade: the operator gets a
+        200, the file holds garbage, and the failure surfaces mid-roast as
+        provider errors. Fail at save time instead (local Codex P2, folded
+        pre-open).
+
+        Args:
+            value: The submitted slug, or ``None`` when the field is absent.
+
+        Returns:
+            The stripped slug, or ``None``.
+
+        Raises:
+            ValueError: If the slug is blank once stripped.
+        """
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("model_slug must not be blank")
+        return stripped
+
     provider: Literal["openai", "anthropic", "google", "ollama", "openai_compatible"] | None = None
     provider_base_url: str | None = None
     timeout_seconds: float | None = Field(default=None, gt=0)

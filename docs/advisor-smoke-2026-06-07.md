@@ -70,8 +70,11 @@ hold current targets, correct fail-safe behavior but no advice delivered.
 Root cause is thinking mode (below), not the network or the model's
 competence.
 
-**With headroom (`ROASTPILOT_ADVISOR__TIMEOUT_SECONDS=180`, characterization
-only — extends the harness budget, not the controller's live budget):**
+**With headroom (`ROASTPILOT_CONTROLLER__ADVISORY_TIMEOUT_SECONDS=180`,
+characterization only — this was `ROASTPILOT_ADVISOR__TIMEOUT_SECONDS` when the
+run was made, but since #747/D151 the harness bounds itself by the CONTROLLER's
+live budget, and the advisor knob has no runtime consumer, so following the old
+line would silently fail to extend anything):**
 
 - latency **21.55 s**
 - raw model output: a clean `final_result` tool call (no JSON parse issues),

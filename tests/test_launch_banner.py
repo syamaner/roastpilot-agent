@@ -322,19 +322,21 @@ def test_a_native_provider_model_does_not_inherit_the_openrouter_screen() -> Non
     assert "BUSTED" not in _advisor_line_for(provider="openai", model_slug="gpt-4o")
 
 
-def test_a_padded_slug_is_reported_on_as_the_string_that_will_be_dispatched() -> None:
-    """Matching is exact, because the provider is sent the slug verbatim.
+def test_a_padded_slug_is_normalised_before_it_can_diverge() -> None:
+    """Padding is stripped at the config boundary, so nothing can disagree.
 
-    An earlier draft stripped whitespace before matching, so `" openai/gpt-4o "`
-    cleared the screen — while `build_model` sent the padded string to the
-    provider. The banner would have vouched for one identifier while another
-    was dispatched (local Codex P2, folded pre-open). Exact matching keeps the
-    report about the thing that actually runs, and errs toward warning.
+    An earlier round made the classifier match the raw string, on the rule
+    "report on what will be dispatched" — correct, but it left the padded slug
+    reaching the provider padded. Normalising in `AdvisorConfig` removes the
+    divergence class instead of reporting on it: the classifier and
+    `build_model` now always see the same identifier (local Codex P2, folded
+    pre-open). A blank-once-stripped slug is rejected outright.
     """
-    assert "no FC-latency screen on record" in _advisor_line_for(model_slug=" openai/gpt-4o ")
-    assert "no FC-latency screen on record" in _advisor_line_for(model_slug=" openai/gpt-5.5 ")
-    # A degenerate slug likewise fails closed rather than matching nothing quietly.
-    assert "no FC-latency screen on record" in _advisor_line_for(model_slug="  ")
+    assert "no FC-latency screen" not in _advisor_line_for(model_slug=" openai/gpt-4o ")
+    assert "BUSTED" in _advisor_line_for(model_slug=" openai/gpt-5.5 ")
+
+    with pytest.raises(ValidationError):
+        AdvisorConfig(model_slug="  ")
 
 
 def test_a_suffixed_variant_is_unscreened_in_both_directions() -> None:
