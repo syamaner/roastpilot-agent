@@ -37,8 +37,12 @@
 > (fan-direction agreement at recorded ambient); RP-D is the acceptance gate on a
 > real single-variable HARDWARE roast (or a validated plant simulator, #580).
 > Plan design for the RP-D scorer + RP-B c11 doctrine is **D124**; the eval-model
-> correction is **D125** (roastpilot-plan); next free plan decision number:
-> **D126**.
+> correction is **D125** (roastpilot-plan). *(This block said "next free plan
+> decision number: D126" when it was written on 8 Aug. That number is spent, and
+> the claim is removed rather than corrected in place: a dated status block is
+> not the right home for a fast-moving fact, and two authoritative-looking
+> answers in one file is what caused the reuse incident in the first place. The
+> free number is stated ONCE, at the end of this registry.)*
 >
 > **STATUS UPDATE — 6 Aug 2026 (updates the control-loop framing in the 2 Aug
 > block below).** The D96 recovery law (#559) has now had its flag-on hardware

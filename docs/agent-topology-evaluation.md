@@ -198,18 +198,45 @@ control the topology can adopt: **any number heading into a decision record or a
 doc gets recomputed by someone who did not derive it.** It ran in both directions
 here, catching an error on each side.
 
-**Latency: not evaluated.** §15 asks for total tokens, latency, and model cost
-together; this section covers the first and third. The transcripts it draws
-from carry message counts and token volumes but no per-call wall-clock
-timestamps, so no latency figure can be recomputed from source the way the
-token and cost numbers above were — recording the gap explicitly rather than
-letting the token/cost detail read as if it covered all three.
+**What §15's three measurement axes actually got, stated per axis** — because a
+detailed table on one axis reads as coverage of all three, and this section had
+claimed more than its own data supports:
+
+| §15 axis | Status | Why |
+|---|---|---|
+| Model cost | **Measured** (list-price reference, not a bill) | Per-agent, recomputed from source by a second party |
+| Total tokens | **Partial — not a complete ledger** | The table carries cache-read and output only; **cache-write and uncached-input columns are absent**, and the snapshot was taken while the session was still running |
+| Latency | **Not evaluated** | The transcripts carry message counts and token volumes but no per-call wall-clock timestamps, so no figure could be recomputed from source |
+
+The cost column is the more trustworthy of the two numeric axes because it was
+derived per agent and independently recomputed; the token figures are magnitudes
+for comparing tiers against each other, and should not be quoted as this case's
+total token consumption. A future case wanting to satisfy the total-token
+criterion properly needs a final end-of-session snapshot with every input
+category, not a mid-flight one.
 
 ### Unnecessary agent spawns
 
-None. Two subagents for a safety-sensitive cross-boundary change, both required
-lenses under the Code Review Rubric, well inside the §10 cap of three. No agent
-was spawned to re-check work the active model already verified.
+None — but the count is **five**, not the two an earlier draft of this section
+asserted. The usage table above records five delegated agents, and a spawn
+assessment that silently counted only the review lenses was not supported by its
+own evidence. All five are RP-B work:
+
+| Agent | Why it was spawned | Redundant? |
+|---|---|---|
+| `eng-732` | Implementer for the freshness slice | No — the work itself |
+| `safety-b1` | Required lens (controller/safety diff) | No — §10 names it a control layer |
+| `qa-b1` | Required lens (test quality) | No — same |
+| `triage-731` | Author-independent triage of PR #731 | No — D23 forbids self-triage |
+| `triage-739` | Author-independent triage of PR #739 | No — same |
+
+§10 rules out subagents spawned "merely to re-check work the active model already
+verifies", and names independent safety, QA and author-independent triage as
+deliberate control layers rather than redundancy; each of the four review spawns
+is one of those. Note also that **§10's "three" is a CONCURRENCY cap, not a
+budget for total spawns** — the earlier draft cited it against a total, which
+would have read as a ceiling this case was near when in fact it does not bound
+totals at all.
 
 ### Unauthorized mutations by a planning or review role
 
