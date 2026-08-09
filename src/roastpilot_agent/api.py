@@ -80,8 +80,8 @@ from roastpilot_agent.mcp_client import (
     MCPConnectionError,
     MCPServerProcess,
     RoastSessionState,
-    project_live_ambient,
     project_mic_status,
+    project_recordable_ambient,
 )
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
@@ -1206,28 +1206,36 @@ class RoastRunner:
         reads the persisted columns, so the only cost of a failure here is a
         run's ambient triad reading back ``None``.
 
-        The triad comes from :func:`project_live_ambient`, the SAME projection
-        the live advisor and dashboard paths read, rather than a second
-        hand-rolled ``status == "ok"`` test (#745a). That gate is not
-        ``status``-only: the MCP's ``AmbientSessionRuntime._stop_locked`` drops
-        its reader while deliberately leaving ``status`` at ``"ok"`` over the
-        preserved last reading, so a ``status``-only test records a frozen
-        reading from a stopped probe as this run's corpus breadcrumb — while
-        the live paths, correctly, saw ambient as absent. That mislabels an
-        RP-B arm (#709): the run reads back as "had ambient" and the offline
-        eval (#737) then stamps that frozen value into every replayed context,
-        comparing arms on a reading the doctrine would never have reasoned on.
-        Sharing the projection means the two can no longer disagree.
+        The triad comes from :func:`project_recordable_ambient` rather than a
+        second hand-rolled ``status == "ok"`` test (#745a). That is not a
+        ``status``-only question on either clause:
+
+        * ``ambient_running`` — the MCP's ``AmbientSessionRuntime._stop_locked``
+          drops its reader while deliberately leaving ``status`` at ``"ok"``
+          over the preserved last reading, so a ``status``-only test records a
+          frozen reading from a stopped probe as this run's corpus breadcrumb,
+          while the live paths correctly saw ambient as absent;
+        * a usable reading token — a reading whose freshness cannot be
+          established is one the live advisor declines (#745b), so recording it
+          would reintroduce the same disagreement one layer down.
+
+        Either way the cost is a mislabelled RP-B arm (#709): the run reads back
+        as "had ambient" and the offline eval (#737) then stamps that value into
+        every replayed context, comparing arms on a reading the doctrine would
+        never have reasoned on. Sharing one predicate means the two cannot
+        disagree.
 
         A ``"disabled"``/``"unavailable"`` MCP ambient config, and now a
-        stopped-but-``"ok"`` runtime, persist nulls (the MCP's own fail-soft
-        contract — never a fault or a recovery)."""
+        stopped-but-``"ok"`` runtime or an undateable reading, persist nulls
+        (the MCP's own fail-soft contract — never a fault or a recovery)."""
         if self._ambient_persisted or not snapshot.charge_detected:
             return
         state = None if self._raw_state is None else self._raw_state.last_state
         if state is None:
             return
-        temperature_c, humidity_percent, pressure_hpa = project_live_ambient(state.ambient_status)
+        temperature_c, humidity_percent, pressure_hpa = project_recordable_ambient(
+            state.ambient_status
+        )
         try:
             await self._store.set_ambient(
                 self._run_id,

@@ -3958,6 +3958,42 @@ async def test_charge_capture_persists_nulls_for_a_stopped_but_ok_runtime(
 
 
 @pytest.mark.asyncio
+async def test_charge_capture_persists_nulls_for_an_undateable_reading(
+    store: RoastStore,
+) -> None:
+    """#745, third-round fold: the corpus must not record what the advisor declines.
+
+    A NaN reading stamp on an otherwise ok/running status makes the live path
+    decline the reading — the freshness clock cannot date it, so the age is
+    unknown and the controller fails closed. Persisting the numeric triad anyway
+    would leave the run reading back as "had ambient" while no advisory call
+    ever saw it, and #737's offline eval would then stamp that value into every
+    replayed context. The capture and the live path share one predicate so the
+    hole between the two #745 fixes cannot open.
+    """
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    undateable = _ambient_status(status="ok").model_copy(
+        update={"last_reading_monotonic_seconds": float("nan")}
+    )
+    assert undateable.temperature_c is not None, "the reading itself must still be present"
+    assert undateable.ambient_running is True, "only the STAMP is unusable here"
+    raw_state = _FakeRawState(
+        _session_state(fc_status="pending", audio_running=False, ambient_status=undateable)
+    )
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+    mcp.frames = [_reading(bean=178.0, env=185.0, t0_detected=True)]
+    for _ in range(ControllerConfig().t0_debounce_ticks + 1):
+        await _tick(service, clock)
+
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.ambient_temp_c is None
+    assert detail.ambient_humidity_pct is None
+    assert detail.ambient_pressure_hpa is None
+
+
+@pytest.mark.asyncio
 async def test_ambient_capture_is_fail_soft_on_store_error(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

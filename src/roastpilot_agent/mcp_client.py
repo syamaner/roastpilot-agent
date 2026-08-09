@@ -689,6 +689,49 @@ def ambient_reading_token(status: AmbientStatus) -> float | None:
     return stamp
 
 
+def project_recordable_ambient(
+    status: AmbientStatus,
+) -> tuple[float | None, float | None, float | None]:
+    """The ambient triad, but only when it is worth RECORDING (#745).
+
+    Strictly narrower than :func:`project_live_ambient`: it additionally
+    requires a usable :func:`ambient_reading_token`, i.e. a reading whose
+    freshness can even be established. Without that extra clause the two
+    #745 fixes leave a hole between them — a ``NaN`` stamp on an otherwise
+    ``ok``/running status makes the live advisor DECLINE the reading (the age
+    is unknown, and the controller fails closed on that), while the
+    charge-instant capture would still have persisted the numeric triad. The
+    run would read back as "had ambient", and #737's offline eval would stamp
+    that value into every replayed context — reasoning on a reading the live
+    advisor rejected, which is precisely the mislabelled RP-B arm (#709) that
+    #745 exists to remove. One predicate, so the two cannot disagree.
+
+    It deliberately does **not** apply the doctrine's
+    ``max_reading_age_seconds`` bound, and is not gated on the doctrine being
+    enabled. Those are c11 policy about what may be REASONED on this tick; this
+    answers the different and older question (#342/D85) of whether there is a
+    real, dateable reading of the room to record at charge. A corpus that only
+    captured ambient while c11 happened to be enabled would be useless for the
+    analysis the column was added for.
+
+    :func:`project_live_ambient` is deliberately left alone. The dashboard's
+    Room tile reports what the probe last said and #741 already settled when it
+    blanks; this column reports the room at charge for later analysis and must
+    not carry a reading nothing can date. Different questions, so a stricter
+    predicate rather than a change to the shared one.
+
+    Args:
+        status: The MCP ambient status from ``RoastSessionState``.
+
+    Returns:
+        The ``(temperature_c, humidity_percent, pressure_hpa)`` triad when the
+        reading is both live and dateable, else ``(None, None, None)``.
+    """
+    if ambient_reading_token(status) is None:
+        return None, None, None
+    return project_live_ambient(status)
+
+
 def project_session_state(
     state: RoastSessionState,
     *,
