@@ -521,9 +521,12 @@ def project_live_ambient(status: AmbientStatus) -> tuple[float | None, float | N
     unchanged. That qualifier is load-bearing and is spelled out at the end of
     this docstring: today's live child replies on ``structuredContent``, which
     launders a non-finite member to ``null`` before this function ever sees it,
-    so on the current live path this guard is **defence in depth** rather than
-    the thing standing between the doctrine and a bad value. It is still worth
-    having — the text-content path does deliver one intact, and the hazard is
+    so on the current live path **this clause alone** is defence in depth rather
+    than the thing standing between the doctrine and a bad value — the
+    completeness clause below is what catches the laundered form, and the two
+    together are what make the guard bite live. The finiteness clause is still
+    load-bearing in its own right — the text-content path does deliver a
+    non-finite value intact, and the hazard is
     real at the source: the MCP's ``YoctoMeteoAmbientReader._current_value``
     rejects only the Yoctopuce ``CURRENTVALUE_INVALID`` sentinel, with ``==``,
     which ``NaN`` defeats. A ``NaN`` member is producible at the probe; it is
@@ -608,6 +611,13 @@ def project_live_ambient(status: AmbientStatus) -> tuple[float | None, float | N
     triad and the stamp together. All-or-nothing at the source, so a mixed
     present/absent triad can only be the serialisation artifact above — exactly
     what should read as malformed.
+
+    That pin describes the SUPPORTED configuration rather than an enforced one:
+    ``MCPConfig.command`` spawns an explicit override verbatim and nothing gates
+    ambient on ``ServerInfo.version``. It does not weaken the clause — a foreign
+    server that did report a partial triad degrades to absent, which is the
+    fail-soft and #498-safe direction — but the premise is worth stating at its
+    real strength.
 
     The all-``None`` triad is of course untouched: that is a probe with no
     reading yet, not an incomplete one.

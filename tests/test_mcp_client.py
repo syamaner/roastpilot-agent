@@ -2762,8 +2762,14 @@ def test_project_live_ambient_keeps_finite_zeroes_and_the_wholly_absent_triad() 
     ``0.0`` is a real reading (0 °C, 0 %RH) that ``math.isfinite`` accepts — the
     same distinction :func:`ambient_reading_token` already draws for a ``0.0``
     stamp. An all-``None`` triad is a live runtime that has not read yet, which
-    is absent rather than incomplete, and must survive the completeness clause
-    that voids a *mixed* triad.
+    is absent rather than incomplete.
+
+    Note the all-``None`` half documents intent rather than guarding a
+    reachable regression: that triad IS ``(None, None, None)``, so the
+    completeness clause returns the same value whether or not its ``any(present)``
+    conjunct is there (safety-reviewer finding 2 on the fold commit — the
+    conjunct is kept because it states what the clause is FOR, not because
+    dropping it would change behaviour). The ``0.0`` half is load-bearing.
     """
     zeroed = _ambient_status_with(temperature_c=0.0, humidity_percent=0.0)
     assert project_live_ambient(zeroed) == (0.0, 0.0, 1008.56)
@@ -2873,14 +2879,23 @@ async def test_adapter_ambient_age_is_unknown_for_a_non_finite_reading() -> None
     assert second is not None and second.ambient_age_seconds is None
 
 
+@pytest.mark.parametrize(
+    "bad_member",
+    [
+        pytest.param({"temperature_c": float("nan")}, id="non-finite"),
+        pytest.param({"humidity_percent": None}, id="incomplete"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_a_malformed_ambient_tick_does_not_relaunder_a_wedged_reading_as_fresh() -> None:
+async def test_a_malformed_ambient_tick_does_not_relaunder_a_wedged_reading_as_fresh(
+    bad_member: dict[str, object],
+) -> None:
     """#752, the local Codex pass: declining must not RESET the freshness clock.
 
     The trap the obvious implementation walks into. If the freshness tracker
-    keyed on the projection's whole gate, a single non-finite tick would clear
-    its token — and the very next tick, carrying finite values but the SAME
-    unchanged stamp, would be re-based to ``0.0`` and read as brand new. A
+    keyed on the projection's whole gate, a single malformed tick would clear
+    its token — and the very next tick, carrying a well-formed reading but the
+    SAME unchanged stamp, would be re-based to ``0.0`` and read as brand new. A
     reading the doctrine had already declined as too old would be handed back
     inside the bound, able to re-enter the graduated fan regime: exactly the
     laundering of a frozen reading that #732/#741/#745 exist to prevent, and
@@ -2891,10 +2906,19 @@ async def test_a_malformed_ambient_tick_does_not_relaunder_a_wedged_reading_as_f
     IDENTICAL in all three reads — the running-but-not-polled freeze path, the
     one ``ambient_running`` cannot catch — so a tracker that reset would report
     ``0.0`` on the third read and prove nothing if the stamp changed.
+
+    **Parametrised over BOTH malformed shapes**, which is what keeps this
+    invariant pinned where it matters: the non-finite shape only occurs on the
+    text transport, while the *incomplete* shape is the one the live
+    ``structuredContent`` path produces. With the non-finite case alone,
+    relocating the completeness clause into :func:`ambient_reading_is_live`
+    leaves ``project_live_ambient`` behaviourally identical, passes the entire
+    suite, and silently re-opens the laundering this test exists to prevent
+    (safety-reviewer finding 1 on the fold commit, verified as a real kill).
     """
     clock = _StepClock()
     ok_ambient = dict(SESSION_STATE_PAYLOAD["ambient_status"])  # type: ignore[call-overload]
-    malformed = {**ok_ambient, "temperature_c": float("nan")}
+    malformed = {**ok_ambient, **bad_member}
     adapter = RoasterControlAdapter(
         RoasterMCPClient(
             _SequenceCaller(
