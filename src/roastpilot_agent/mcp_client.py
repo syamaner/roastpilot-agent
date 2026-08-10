@@ -56,6 +56,11 @@ from roastpilot_agent.models import AppliedRoasterState, MicStatus, RoastTelemet
 
 _log = logging.getLogger(__name__)
 
+#: Dedicated one-shot diagnostics for malformed controller telemetry. This is
+#: intentionally separate from every adapter freshness/decline latch: warning
+#: suppression must never change whether a reading is accepted or how old it is.
+_WARNED_NON_FINITE_TELEMETRY_FIELDS: set[str] = set()
+
 #: Grace added to ``startup_timeout_seconds`` for the outer ``await ready`` bound
 #: in :meth:`MCPServerProcess.start` (#484). The owner task's own
 #: ``initialize()`` already carries ``startup_timeout_seconds``, so this outer
@@ -925,27 +930,40 @@ def project_session_state(
     environment temperature absent or non-finite (the mock driver reports
     ``connected`` with null temperatures during pre-roast). ``RoastTelemetry``
     requires both usable temperatures, so a partial or malformed reading is
-    "no telemetry", not a zero reading.
+    "no telemetry", not a zero reading. Non-finite derived rates are instead
+    projected as ``None`` individually: valid temperatures remain usable while
+    existing missing-rate gates decline rate-dependent control for that tick.
 
     Detection booleans come from the contract-checked Literal status fields
     (``t0_status.status`` / ``first_crack_status.status``), not the latched
     ``*_at_utc`` timestamps. The backdating deltas (#337) come from the matching
     ``beans_added`` / ``first_crack_detected`` event payloads (v0.1.7), surfaced
     as in-domain durations the controller subtracts from its receive-tick clock.
-    Derived metrics (RoR) are passed through from MCP, never recomputed (plan §2).
+    Finite derived metrics (RoR) are passed through from MCP, never recomputed
+    (plan §2).
     ``age_seconds`` is supplied by the caller — the session state carries no
     per-reading wall-clock age. ``ambient_age_seconds`` is likewise
     caller-supplied (#732) for the same reason, and defaults to ``None`` =
     "age unknown", the fail-closed value for callers that do not track it."""
     device = state.device_state
-    if (
-        device is None
-        or device.bean_temp_c is None
-        or device.env_temp_c is None
-        or not math.isfinite(device.bean_temp_c)
-        or not math.isfinite(device.env_temp_c)
-    ):
+    if device is None or device.bean_temp_c is None or device.env_temp_c is None:
         return None
+    malformed_temperatures = [
+        field_name
+        for field_name, value in (
+            ("bean_temp_c", device.bean_temp_c),
+            ("env_temp_c", device.env_temp_c),
+        )
+        if not math.isfinite(value)
+    ]
+    for field_name in malformed_temperatures:
+        _warn_non_finite_telemetry_field(field_name)
+    if malformed_temperatures:
+        return None
+    bean_ror_c_per_min = _finite_derived_metric_or_none(
+        "bean_ror_c_per_min", state.bean_ror_c_per_min
+    )
+    env_ror_c_per_min = _finite_derived_metric_or_none("env_ror_c_per_min", state.env_ror_c_per_min)
     ambient_temp_c, ambient_humidity_pct, ambient_pressure_hpa = project_live_ambient(
         state.ambient_status
     )
@@ -953,8 +971,8 @@ def project_session_state(
         bean_temp_c=device.bean_temp_c,
         env_temp_c=device.env_temp_c,
         age_seconds=age_seconds,
-        bean_ror_c_per_min=state.bean_ror_c_per_min,
-        env_ror_c_per_min=state.env_ror_c_per_min,
+        bean_ror_c_per_min=bean_ror_c_per_min,
+        env_ror_c_per_min=env_ror_c_per_min,
         t0_detected=state.t0_status.status == "detected",
         first_crack_detected=state.first_crack_status.status == "detected",
         cooling_on=state.cooling_on,
@@ -973,6 +991,25 @@ def project_session_state(
         ambient_humidity_pct=ambient_humidity_pct,
         ambient_pressure_hpa=ambient_pressure_hpa,
         ambient_age_seconds=None if ambient_temp_c is None else ambient_age_seconds,
+    )
+
+
+def _finite_derived_metric_or_none(field_name: str, value: float | None) -> float | None:
+    """Return a finite derived metric, warning once before voiding garbage."""
+    if value is None or math.isfinite(value):
+        return value
+    _warn_non_finite_telemetry_field(field_name)
+    return None
+
+
+def _warn_non_finite_telemetry_field(field_name: str) -> None:
+    """Log a field-only warning once, without echoing untrusted wire values."""
+    if field_name in _WARNED_NON_FINITE_TELEMETRY_FIELDS:
+        return
+    _WARNED_NON_FINITE_TELEMETRY_FIELDS.add(field_name)
+    _log.warning(
+        "MCP telemetry field %s is non-finite; treating the field as absent",
+        field_name,
     )
 
 

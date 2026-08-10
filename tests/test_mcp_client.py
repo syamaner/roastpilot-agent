@@ -23,6 +23,7 @@ import pytest
 from anyio import BrokenResourceError, ClosedResourceError
 from pydantic import ValidationError
 
+import roastpilot_agent.mcp_client as mcp_client_module
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig
 from roastpilot_agent.mcp_client import (
     AmbientStatus,
@@ -2186,6 +2187,50 @@ def test_project_session_state_voids_non_finite_temperature(member: str, non_fin
     state = RoastSessionState.model_validate({**SESSION_STATE_PAYLOAD, "device_state": device})
 
     assert project_session_state(state, age_seconds=0.0) is None
+
+
+@pytest.mark.parametrize("non_finite", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("member", ["bean_ror_c_per_min", "env_ror_c_per_min"])
+def test_project_session_state_voids_only_non_finite_ror(member: str, non_finite: float) -> None:
+    """A malformed derived rate is absent while valid temperatures survive."""
+    state = RoastSessionState.model_validate({**SESSION_STATE_PAYLOAD, member: non_finite})
+
+    telemetry = project_session_state(state, age_seconds=0.0)
+
+    assert telemetry is not None
+    assert getattr(telemetry, member) is None
+    assert telemetry.bean_temp_c == 196.0
+    assert telemetry.env_temp_c == 214.0
+
+
+@pytest.mark.parametrize(
+    "member",
+    ["bean_temp_c", "env_temp_c", "bean_ror_c_per_min", "env_ror_c_per_min"],
+)
+def test_non_finite_telemetry_warning_is_field_only_and_one_shot(
+    member: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Malformed telemetry names its field once without logging its value."""
+    monkeypatch.setattr(mcp_client_module, "_WARNED_NON_FINITE_TELEMETRY_FIELDS", set[str]())
+    caplog.set_level(logging.WARNING, logger="roastpilot_agent.mcp_client")
+    if member in {"bean_temp_c", "env_temp_c"}:
+        device = {
+            **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+            member: float("inf"),
+        }
+        payload = {**SESSION_STATE_PAYLOAD, "device_state": device}
+    else:
+        payload = {**SESSION_STATE_PAYLOAD, member: float("inf")}
+    state = RoastSessionState.model_validate(payload)
+
+    project_session_state(state, age_seconds=0.0)
+    project_session_state(state, age_seconds=0.0)
+
+    records = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(records) == 1
+    assert member in records[0].getMessage()
+    assert "Infinity" not in records[0].getMessage()
+    assert records[0].args == (member,)
 
 
 def test_temperature_transport_preserves_then_projection_voids_nan() -> None:

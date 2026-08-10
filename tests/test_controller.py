@@ -8,6 +8,7 @@ extend this suite.
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -397,9 +398,30 @@ def _session_payload_with_temperatures(
     return {**SESSION_STATE_PAYLOAD, "device_state": device}
 
 
+def _session_payload_with_ror(
+    *,
+    bean_ror_c_per_min: float | None,
+    elapsed_monotonic_seconds: float,
+    first_crack_detected: bool,
+) -> dict[str, object]:
+    """Return a fresh contract payload with selected RoR and FC status."""
+    first_crack_status = {
+        **cast("dict[str, object]", SESSION_STATE_PAYLOAD["first_crack_status"]),
+        "status": "detected" if first_crack_detected else "pending",
+    }
+    return {
+        **SESSION_STATE_PAYLOAD,
+        "elapsed_monotonic_seconds": elapsed_monotonic_seconds,
+        "bean_ror_c_per_min": bean_ror_c_per_min,
+        "first_crack_status": first_crack_status,
+    }
+
+
 def _controller_with_live_adapter(
     payloads: list[dict[str, object]],
-) -> tuple[RoastController, RecordingExecutor, RecordingSnapshotSink, EventSink]:
+    *,
+    config: ControllerConfig = _BASELINE_POST_FC_CONFIG,
+) -> tuple[RoastController, RecordingExecutor, RecordingSnapshotSink, EventSink, FakeClock]:
     """Build a controller whose fake transport runs through the live adapter."""
     call_count = 0
 
@@ -416,7 +438,7 @@ def _controller_with_live_adapter(
     sink = RecordingSnapshotSink(log)
     events = EventSink(log)
     controller = RoastController(
-        config=_BASELINE_POST_FC_CONFIG,
+        config=config,
         safety=SafetyPolicy(SafetyLimits()),
         state_reader=adapter,
         command_executor=executor,
@@ -424,7 +446,7 @@ def _controller_with_live_adapter(
         event_emitter=events,
         clock=clock,
     )
-    return controller, executor, sink, events
+    return controller, executor, sink, events, clock
 
 
 @pytest.mark.asyncio
@@ -1846,7 +1868,7 @@ async def test_safety_evaluated_before_advisory_and_blocks_it() -> None:
 @pytest.mark.asyncio
 async def test_non_finite_live_reading_faults_as_missing_telemetry() -> None:
     """Both guards removed recreates the pre-fix all-clear runaway mutant."""
-    controller, executor, sink, events = _controller_with_live_adapter(
+    controller, executor, sink, events, _ = _controller_with_live_adapter(
         [_session_payload_with_temperatures(bean_temp_c=float("nan"))]
     )
     controller.load_profile(PROFILE)
@@ -1870,7 +1892,7 @@ async def test_non_finite_live_reading_faults_as_missing_telemetry() -> None:
 @pytest.mark.asyncio
 async def test_idle_non_finite_live_reading_is_inert() -> None:
     """Outside active phases, voided telemetry causes no actuation or fault."""
-    controller, executor, sink, events = _controller_with_live_adapter(
+    controller, executor, sink, events, _ = _controller_with_live_adapter(
         [_session_payload_with_temperatures(bean_temp_c=float("nan"))]
     )
 
@@ -1882,6 +1904,64 @@ async def test_idle_non_finite_live_reading_is_inert() -> None:
     assert executor.targets == []
     assert executor.estop_reasons == []
     assert RoastEventKind.FAULT not in events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_non_finite_live_ror_cannot_raise_heat_and_next_finite_frame_recovers() -> None:
+    """A malformed mid-development RoR neither maximises nor poisons heat.
+
+    This drives the real MCP projection and post-FC controller together. If the
+    boundary RoR guard is removed, the NaN enters the clamp as its ceiling,
+    writes 100 % heat, poisons the EMA, and the subsequent finite frames remain
+    pinned there.
+    """
+    rors = [14.0, 14.0, 14.0, 14.0, float("nan"), 14.0, 14.0]
+    payloads = [
+        _session_payload_with_ror(
+            bean_ror_c_per_min=14.0,
+            elapsed_monotonic_seconds=1200.0,
+            first_crack_detected=False,
+        ),
+        *[
+            _session_payload_with_ror(
+                bean_ror_c_per_min=ror,
+                elapsed_monotonic_seconds=1205.0 + index * 5.0,
+                first_crack_detected=True,
+            )
+            for index, ror in enumerate(rors)
+        ],
+    ]
+    controller, executor, _, _, clock = _controller_with_live_adapter(
+        payloads,
+        config=_post_fc_config(control_interval_seconds=5.0),
+    )
+    controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:  # …→ ROASTING_PRE_FIRST_CRACK
+        controller.transition_to(step)
+
+    await controller.tick()  # establish the real pre-FC 100 % heat command
+    assert controller.snapshot().current_heat == 100
+    for _ in range(4):
+        clock.advance(5.0)
+        await controller.tick()
+
+    heat_before_bad_frame = controller.snapshot().current_heat
+    writes_before_bad_frame = len(executor.targets)
+    clock.advance(5.0)
+    await controller.tick()
+
+    assert controller.snapshot().current_heat == heat_before_bad_frame
+    assert len(executor.targets) == writes_before_bad_frame
+
+    for _ in range(2):
+        clock.advance(5.0)
+        await controller.tick()
+
+    snapshot = controller.snapshot()
+    assert snapshot.current_heat <= heat_before_bad_frame
+    assert snapshot.post_fc_smoothed_ror_c_per_min is not None
+    assert math.isfinite(snapshot.post_fc_smoothed_ror_c_per_min)
+    assert len(executor.targets) > writes_before_bad_frame
 
 
 @pytest.mark.asyncio
@@ -2436,7 +2516,7 @@ async def test_latch_does_not_escalate_on_a_same_or_lesser_verdict() -> None:
 @pytest.mark.asyncio
 async def test_fault_latch_holds_silently_on_non_finite_live_reading() -> None:
     """The live boundary turns latched non-finite telemetry into a silent None."""
-    controller, executor, sink, events = _controller_with_live_adapter(
+    controller, executor, sink, events, _ = _controller_with_live_adapter(
         [
             _session_payload_with_temperatures(bean_temp_c=None),
             _session_payload_with_temperatures(bean_temp_c=float("nan")),

@@ -70,10 +70,15 @@ def test_non_finite_temperature_faults_closed(
     assert evaluation.adjusted_fan == policy.limits.overrun_safe_fan_percent
 
 
-def test_non_finite_rule_precedes_pre_t0_and_finite_ceiling_still_estops(
+def test_non_finite_pre_t0_fault_and_finite_ceiling_estop(
     policy: SafetyPolicy,
 ) -> None:
-    """Invalid telemetry wins before pre-T0, while a finite breach still e-stops."""
+    """Pin both outcomes without claiming this NaN case proves rule ordering.
+
+    The ``inf`` cells in ``test_non_finite_temperature_faults_closed`` pin the
+    finiteness rule ahead of both ceiling rules: moving it below them changes
+    those cells from the required FAULT into an EMERGENCY_STOP.
+    """
     invalid = policy.evaluate_telemetry(
         phase=RoastPhase.PREHEATING,
         bean_temp_c=float("nan"),

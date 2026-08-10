@@ -270,11 +270,21 @@ def test_temperature_safety_ceilings_reject_non_finite_values(
     with pytest.raises(pydantic.ValidationError):
         SafetyLimits.model_validate({field: non_finite})
 
-    assert SafetyLimits() == SafetyLimits(
-        max_bean_temp_c=230.0,
-        max_env_temp_c=240.0,
-        pre_t0_max_bean_temp_c=200.0,
-    )
+
+@pytest.mark.parametrize("non_finite", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    ("model", "field"),
+    [
+        (ControllerConfig, "max_stale_telemetry_seconds"),
+        (SafetyLimits, "min_seconds_between_commands"),
+    ],
+)
+def test_control_safety_intervals_reject_non_finite_values(
+    model: type[ControllerConfig] | type[SafetyLimits], field: str, non_finite: float
+) -> None:
+    """Timing bounds must not disable stale detection or command delivery."""
+    with pytest.raises(pydantic.ValidationError):
+        model.model_validate({field: non_finite})
 
 
 @pytest.mark.parametrize(
