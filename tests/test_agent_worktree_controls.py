@@ -175,6 +175,10 @@ def _normalize_section_separator(text: str) -> str:
 
 def _canonical_block_mismatch(text: str, expected: str, source: str) -> str | None:
     """Return an actionable unified diff when a routed control block has drifted."""
+    heading_count = len(_DISCIPLINE_HEADING.findall(text))
+    if heading_count != 1:
+        return f"{source}: expected exactly one worktree discipline heading, found {heading_count}"
+
     actual = _discipline_section(text)
     normalized_expected = _normalize_section_separator(expected)
     normalized_actual = _normalize_section_separator(actual) if actual is not None else None
@@ -236,23 +240,143 @@ def test_following_section_separator_preserves_canonical_match() -> None:
     assert mismatch is None, mismatch
 
 
-def test_review_workflow_directs_a_no_mutation_shared_checkout_review() -> None:
-    """The roster workflow must explicitly activate the safe shared-tree exception."""
+def test_duplicate_discipline_heading_is_rejected() -> None:
+    """A later duplicate cannot sit outside the exact-matched control section."""
+    prompt = f"{_READ_ONLY_DISCIPLINE_BLOCK}\n## Worktree Discipline\n\nStray copy.\n"
+    mismatch = _canonical_block_mismatch(prompt, _READ_ONLY_DISCIPLINE_BLOCK, "duplicate")
+    assert mismatch is not None
+    assert "expected exactly one worktree discipline heading, found 2" in mismatch
+
+
+def _shared_checkout_direction(workflow: str) -> str:
+    """Extract the workflow's single authoritative shared-checkout direction."""
+    match = re.search(r"const SHARED_CHECKOUT_DIRECTION = `(.*?)`\n", workflow, re.DOTALL)
+    assert match, "SHARED_CHECKOUT_DIRECTION not found in review-branch.mjs"
+    return match.group(1)
+
+
+def _javascript_agent_calls(source: str) -> list[str]:
+    """Extract real ``agent(...)`` calls while ignoring comments and strings."""
+    calls: list[str] = []
+    index = 0
+    while index < len(source):
+        if source.startswith("//", index):
+            newline = source.find("\n", index + 2)
+            index = len(source) if newline == -1 else newline + 1
+            continue
+        if source.startswith("/*", index):
+            end_comment = source.find("*/", index + 2)
+            index = len(source) if end_comment == -1 else end_comment + 2
+            continue
+        if source[index] in "'\"`":
+            quote = source[index]
+            index += 1
+            while index < len(source):
+                if source[index] == "\\":
+                    index += 2
+                elif source[index] == quote:
+                    index += 1
+                    break
+                else:
+                    index += 1
+            continue
+        if source.startswith("agent", index):
+            before = source[index - 1] if index else ""
+            after_name = index + len("agent")
+            after = source[after_name] if after_name < len(source) else ""
+            if not (before.isalnum() or before in "_$") and not (after.isalnum() or after in "_$"):
+                open_paren = after_name
+                while open_paren < len(source) and source[open_paren].isspace():
+                    open_paren += 1
+                if open_paren < len(source) and source[open_paren] == "(":
+                    depth = 1
+                    cursor = open_paren + 1
+                    quote: str | None = None
+                    while cursor < len(source) and depth:
+                        char = source[cursor]
+                        if quote is not None:
+                            if char == "\\":
+                                cursor += 2
+                                continue
+                            if char == quote:
+                                quote = None
+                        elif source.startswith("//", cursor):
+                            newline = source.find("\n", cursor + 2)
+                            cursor = len(source) if newline == -1 else newline
+                            continue
+                        elif source.startswith("/*", cursor):
+                            end_comment = source.find("*/", cursor + 2)
+                            cursor = len(source) if end_comment == -1 else end_comment + 2
+                            continue
+                        elif char in "'\"`":
+                            quote = char
+                        elif char == "(":
+                            depth += 1
+                        elif char == ")":
+                            depth -= 1
+                        cursor += 1
+                    assert depth == 0, "unterminated agent() call in review-branch.mjs"
+                    calls.append(source[index:cursor])
+                    index = cursor
+                    continue
+        index += 1
+    return calls
+
+
+def _role_backed_agent_calls(workflow: str) -> list[str]:
+    """Select calls whose inline or variable options can carry ``agentType``."""
+    typed_option_variables = set(
+        re.findall(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\.agentType\s*=", workflow)
+    )
+    role_calls: list[str] = []
+    for call in _javascript_agent_calls(workflow):
+        inline_agent_type = re.search(r"\bagentType\s*:", call) is not None
+        variable_options = any(
+            re.search(rf",\s*{re.escape(name)}\s*,?\s*\)$", call, re.DOTALL)
+            for name in typed_option_variables
+        )
+        if inline_agent_type or variable_options:
+            role_calls.append(call)
+    return role_calls
+
+
+def test_shared_checkout_direction_is_narrow_and_routed() -> None:
+    """Every role-backed workflow call and the triage skill receive the direction."""
     workflow = (_REPO / ".claude" / "workflows" / "review-branch.mjs").read_text()
-    review_base = re.search(r"const reviewBase = `(.*?)`\n", workflow, re.DOTALL)
-    assert review_base, "reviewBase prompt not found in review-branch.mjs"
-    prompt = review_base.group(1)
+    direction = _shared_checkout_direction(workflow)
     required = (
         "SHARED-CHECKOUT REVIEW — EXPLICIT LEAD DIRECTION",
-        "fail-closed no-provisioned-worktree rule",
-        "Do not mutate any file",
-        "no mutation testing",
+        "If your role definition carries the fail-closed no-provisioned-worktree rule",
+        "Do not edit repository files",
         "no hypothesis edits",
-        "read and reason only",
+        "no mutation testing",
+        "nothing written into the tree under review",
+        "Read-only test execution",
+        "incidental caches or coverage artifacts",
         "cannot perform the shared-tree protocol's lead safety-commit",
+        "not the full shared-tree protocol",
     )
-    missing = [phrase for phrase in required if phrase not in prompt]
-    assert not missing, f"reviewBase is missing shared-checkout controls: {missing}"
+    missing = [phrase for phrase in required if phrase not in direction]
+    assert not missing, f"shared-checkout direction is missing controls: {missing}"
+    assert "Do not mutate any file" not in direction
+
+    role_calls = _role_backed_agent_calls(workflow)
+    assert role_calls, "review-branch.mjs has no role-backed agent() calls"
+    uncovered: list[str] = []
+    for call in role_calls:
+        if "${SHARED_CHECKOUT_DIRECTION}" not in call:
+            uncovered.append(call.splitlines()[0])
+    assert not uncovered, (
+        "every agentType-bearing agent() call must receive "
+        f"SHARED_CHECKOUT_DIRECTION; uncovered calls: {uncovered}"
+    )
+
+    skill = (_REPO / ".claude" / "skills" / "triage-pr" / "SKILL.md").read_text()
+    normalized_skill = " ".join(skill.split())
+    skill_missing = [phrase for phrase in required if phrase not in normalized_skill]
+    assert not skill_missing, (
+        f"triage-pr skill is missing shared-checkout controls: {skill_missing}"
+    )
 
 
 def test_story_planner_remains_shell_and_write_closed() -> None:
@@ -290,8 +414,7 @@ def test_runbook_citations_never_use_line_anchors() -> None:
     """Runbook citations use durable section names, never line numbers."""
     guarded = [
         *_agent_files(),
-        _REPO / "docs" / "agent-topology.md",
-        _REPO / "docs" / "state" / "registry.md",
+        *sorted((_REPO / "docs").rglob("*.md")),
         _REPO / "AGENTS.md",
     ]
     offenders = [
