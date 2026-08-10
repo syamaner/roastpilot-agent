@@ -132,6 +132,9 @@ def test_topology_reference_table_rows_match_the_map() -> None:
         (r"\| Story planner" + cells("claude-fable-5", "high"), "story-planner"),
         (r"\| Safety/critical" + cells("claude-opus-5", "xhigh"), "safety reviewer"),
         (r"Claude fallback" + cells("claude-sonnet-5", "high"), "fallback implementer"),
+        (r"\| Mechanical contract" + cells("claude-sonnet-5", "medium"), "mechanical checker"),
+        (r"\| QA/product/security" + cells("claude-sonnet-5", "high"), "qa/product/security"),
+        (r"\| Independent PR triage" + cells("claude-sonnet-5", "high"), "pr triage"),
     ]
     for row_re, role in rows:
         assert re.search(row_re, topo), (
