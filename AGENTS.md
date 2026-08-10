@@ -688,7 +688,8 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   binding is operator-level (`codex mcp-server` in `~/.claude.json`),
   deliberately outside the repo's review surface. The delegation prompt must
   carry the repo traps verbatim: the implementation worktree (a FRESH
-  `git worktree add` at the base sha, `git status --porcelain --ignored`
+  `git worktree add -b <planned-branch>` at the base sha,
+  `git status --porcelain --ignored`
   verified empty before delegation — Codex is an external-family provider,
   so no ignored secret may reach its context) with per-command
   self-location, the #738 fresh-venv-in-worktree rule, `.venv/bin/python -m
@@ -700,7 +701,13 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   re-imports the stripped bytes) — no raw untrusted bytes enter the
   write-capable implementer's context; it receives only the
   maintainer-ratified paraphrase, and source links live in the human
-  ratification copy. The implementation worktree is provisioned
+  ratification copy. The ratified contract is the implementer's ONLY
+  specification: the delegation prompt forbids Codex from fetching the
+  story issue, its comments, or any other GitHub discussion content —
+  `gh issue view --comments` would re-import the raw public bytes without
+  following any stripped link; the read-the-issue kickoff duty is the
+  lead's, already discharged into the ratified contract. The
+  implementation worktree is provisioned
   `git worktree add -b <planned-branch> <path> <base-sha>` (without `-b`,
   detached HEAD leaves the handback commit on no branch). Three named
   checks run immediately before every

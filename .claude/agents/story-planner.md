@@ -180,8 +180,9 @@ is what "specced" means: delegation without one is forbidden (fail-closed).
 7. **Delegation prompt notes** — the repo-specific traps the orchestrator's
    Codex prompt must carry verbatim for this slice: the implementation
    worktree as an explicit `{IMPL_WORKTREE}` placeholder with per-command
-   self-location (the orchestrator provisions a FRESH `git worktree add` at
-   the base sha, verifies `git status --porcelain --ignored` is empty there
+   self-location (the orchestrator provisions a FRESH
+   `git worktree add -b <planned-branch>` at the base sha, verifies
+   `git status --porcelain --ignored` is empty there
    — Codex is an external-family provider, so no ignored secret may reach
    its context — and substitutes the real path immediately before
    delegation; never name the read-only planning base as the implementation
@@ -189,7 +190,13 @@ is what "specced" means: delegation without one is forbidden (fail-closed).
    the contract's numbered sections and every nonce-delimited
    `UNTRUSTED-QUOTE` block AND non-maintainer URL is stripped before
    delegation (Codex receives the ratified paraphrase only — its tools can
-   fetch a link, which would re-import the stripped bytes), the worktree
+   fetch a link, which would re-import the stripped bytes), the rule that
+   the ratified contract is the implementer's ONLY specification — the
+   delegation prompt forbids fetching the story issue, its comments, or any
+   other GitHub discussion content (`gh issue view --comments` re-imports
+   the raw public bytes without any link; the kickoff read-the-issue duty
+   is the LEAD's, already discharged into the ratified contract), the
+   worktree
    provisioning command `git worktree add -b <planned-branch> <path>
    <base-sha>` (without `-b` Git creates a detached HEAD and the handback
    commit lands on no branch), the #738 fresh-venv-in-worktree rule,
