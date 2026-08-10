@@ -1,13 +1,15 @@
-"""Guard the worktree controls in every Bash-capable role prompt.
+"""Guard the ratified worktree controls in every Bash-capable role prompt.
 
-This proves forbidden-command presence inside a prohibition context within the
-discipline section, plus required-anchor presence in that section—not comprehension or
-compliance; the lead-side provisioning duty (§8 item 6) remains the unguardable other
-half.
+This proves each Bash-capable role carries its ratified control text verbatim, not
+comprehension or compliance; the lead-side provisioning duty (§8 item 6) remains the
+unguardable other half. Faithful rewording deliberately fails: each block is a routed
+control with one authoritative copy here, so a change is made once in this test and
+routed to every applicable role in the same commit instead of drifting file by file.
 """
 
 from __future__ import annotations
 
+import difflib
 import re
 from pathlib import Path
 
@@ -15,20 +17,105 @@ import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
 _AGENTS_DIR = _REPO / ".claude" / "agents"
-_FORBIDDEN_COMMANDS = (
-    "git checkout --",
-    "git restore",
-    "git stash",
-    "git reset",
-    "git clean",
-)
 _DISCIPLINE_HEADING = re.compile(
     r"^## [^\n]*worktree discipline[^\n]*$", re.IGNORECASE | re.MULTILINE
 )
 _NEXT_LEVEL_TWO_HEADING = re.compile(r"^## ", re.MULTILINE)
-_NEGATION_CUE = re.compile(
-    r"\b(?:never|not|forbidden|prohibited|must\s+not|do\s+not|cannot|can't)\b",
-    re.IGNORECASE,
+
+# These are the two authoritative routed-control variants copied byte-for-byte from
+# the ratified role prompts. Intentional edits update the relevant constant and every
+# role that consumes it in the same commit.
+_READ_ONLY_DISCIPLINE_BLOCK = """## Worktree discipline (topology §7 — binding)
+
+- Verify the worktree provisioned by the lead for this task at the sha under
+  review, never the shared checkout; self-locate every command against its
+  absolute path because cwd resets between Bash calls.
+  **Fail closed when no provisioned worktree is named:** stop and ask the lead
+  to provision one; a read-only role cannot create its own worktree. Use a
+  shared tree only on explicit lead
+  direction under **"Reviewers in a shared worktree"** in
+  **`docs/agent-team-worktrees.md`**, with its safety commit in place, and state
+  in the verdict which tree you reviewed and on whose direction.
+- Never run tree-mutating git commands — **`git checkout --`**, **`git restore`**,
+  **`git stash`**, **`git reset`**, **`git clean`**, or anything else that rewrites
+  a working tree or index — in a tree you do not own.
+- For mutation testing, snapshot the target to the scratchpad by file copy (`cp`)
+  before editing and restore by copying the snapshot back — never by git.
+- Verify committed-tree claims with **`git show`** `HEAD:path`, never against the
+  working tree.
+- Run Python gates with the provisioned worktree's `.venv/bin/python -m …` and a
+  per-run `--basetemp`, following **"Per-worktree gate environment (venv,
+  pyright, pytest) — added Aug 2026 (#738, #733)"** in the runbook above. The
+  full recipe and fail-closed assertions live there.
+"""
+
+_WRITING_DISCIPLINE_BLOCK = """## Worktree discipline (topology §7 — binding)
+
+- Your assigned worktree is the **only** tree you write in; the main checkout
+  and sibling worktrees are read-only (`git -C` peeks are fine, never a write).
+  Self-locate every command against the assigned worktree because cwd resets
+  between Bash calls.
+- Never run tree-mutating git commands — **`git checkout --`**, **`git restore`**,
+  **`git stash`**, **`git reset`**, **`git clean`**, or anything else that rewrites
+  a working tree or index — in a tree you do not own.
+- For mutation testing, snapshot the target to the scratchpad by file copy (`cp`)
+  before editing and restore by copying the snapshot back — never by git.
+- Verify committed-tree claims with **`git show`** `HEAD:path`, never against the
+  working tree.
+- Run Python gates with the assigned worktree's `.venv/bin/python -m …` and a
+  per-run `--basetemp`, following **"Per-worktree gate environment (venv,
+  pyright, pytest) — added Aug 2026 (#738, #733)"** in
+  **`docs/agent-team-worktrees.md`**. The full recipe and fail-closed assertions
+  live there.
+"""
+
+_ADVERSARIAL_BLOCKS = (
+    (
+        "round-1-inverted-permission",
+        """## Worktree discipline (topology §7 — binding)
+
+- `git checkout --`, `git restore`, `git stash`, `git reset`, and `git clean`
+  are all fine to use whenever convenient.
+- Inspect committed state with `git show` and read `docs/agent-team-worktrees.md`.
+""",
+    ),
+    (
+        "not-forbidden",
+        """## Worktree discipline (topology §7 — binding)
+
+- `git checkout --`, `git restore`, `git stash`, `git reset`, and `git clean` are
+  not forbidden and may be used whenever convenient.
+- Inspect committed state with `git show` and read `docs/agent-team-worktrees.md`.
+""",
+    ),
+    (
+        "cross-bullet-contradiction",
+        """## Worktree discipline (topology §7 — binding)
+
+- Never run `git checkout --`, `git restore`, `git stash`, `git reset`, or `git clean`.
+- Despite the previous bullet, all of those commands are permitted whenever useful.
+- Inspect committed state with `git show` and read `docs/agent-team-worktrees.md`.
+""",
+    ),
+    (
+        "single-sentence-scope",
+        """## Worktree discipline (topology §7 — binding)
+
+- Never run `git checkout --`; `git restore`, `git stash`, `git reset`, and `git clean`
+  are permitted whenever convenient.
+- Inspect committed state with `git show` and read `docs/agent-team-worktrees.md`.
+""",
+    ),
+    (
+        "numbered-bullet-gap",
+        """## Worktree discipline (topology §7 — binding)
+
+- Never mutate an unowned tree without first considering the command.
+1) `git checkout --`, `git restore`, `git stash`, `git reset`, and `git clean` are
+   permitted whenever convenient.
+- Inspect committed state with `git show` and read `docs/agent-team-worktrees.md`.
+""",
+    ),
 )
 
 
@@ -71,105 +158,58 @@ def _discipline_section(text: str) -> str | None:
     return text[heading.start() : end]
 
 
-def _control_chunks(section: str) -> list[str]:
-    """Split a discipline section into Markdown bullets or prose paragraphs."""
-    chunks: list[str] = []
-    current: list[str] = []
-    for line in section.splitlines()[1:]:
-        starts_bullet = re.match(r"^(?:[-*+] |\d+\. )", line) is not None
-        if starts_bullet or (not line.strip() and current):
-            chunks.append("\n".join(current))
-            current = []
-        if line.strip():
-            current.append(line)
-    if current:
-        chunks.append("\n".join(current))
-    return chunks
+def _canonical_block_mismatch(text: str, expected: str, source: str) -> str | None:
+    """Return an actionable unified diff when a routed control block has drifted."""
+    actual = _discipline_section(text)
+    if actual == expected:
+        return None
+
+    actual_for_diff = actual if actual is not None else "<missing discipline section>\n"
+    difference = "\n".join(
+        difflib.unified_diff(
+            expected.splitlines(),
+            actual_for_diff.splitlines(),
+            fromfile="expected canonical discipline block",
+            tofile=f"actual discipline block in {source}",
+            lineterm="",
+        )
+    )
+    return (
+        f"{source}: worktree discipline block differs from its canonical variant. "
+        "This discipline block is a routed control with one authoritative copy in "
+        "tests/test_agent_worktree_controls.py; an intentional change means updating "
+        "the constant there and every routed role in the same commit.\n"
+        f"{difference}"
+    )
 
 
-def _has_negation_cue(text: str) -> bool:
-    """Return whether text contains a categorical negation as a complete word."""
-    return _NEGATION_CUE.search(text) is not None
-
-
-def _worktree_control_errors(text: str) -> list[str]:
-    """Return discipline-section control violations found in an agent prompt."""
-    section = _discipline_section(text)
-    if section is None:
-        return ["missing Worktree discipline section"]
-
-    errors = [
-        f"missing discipline-section anchor {anchor!r}"
-        for anchor in ("docs/agent-team-worktrees.md", "git show")
-        if anchor not in section
-    ]
-    chunks = _control_chunks(section)
-    for command in _FORBIDDEN_COMMANDS:
-        command_chunks = [chunk for chunk in chunks if command in chunk]
-        if not command_chunks:
-            errors.append(f"missing discipline-section command {command!r}")
-        elif not any(_has_negation_cue(chunk) for chunk in command_chunks):
-            errors.append(f"command {command!r} is not in a prohibition context")
-    return errors
+def _expected_variant(tools: set[str]) -> str:
+    """Select the canonical block from write capability, never from a role list."""
+    if tools.intersection({"Edit", "Write"}):
+        return _WRITING_DISCIPLINE_BLOCK
+    return _READ_ONLY_DISCIPLINE_BLOCK
 
 
 @pytest.mark.parametrize("path", _agent_files(), ids=lambda path: path.stem)
 def test_bash_capable_roles_carry_worktree_controls(path: Path) -> None:
-    """Every shell-capable role must carry the scoped operational controls."""
-    if "Bash" not in _tools(path):
+    """Every shell-capable role must carry its canonical routed-control variant."""
+    tools = _tools(path)
+    if "Bash" not in tools:
         return
 
-    errors = _worktree_control_errors(path.read_text())
-    assert not errors, f"{path.name}: invalid worktree controls: {errors}"
+    mismatch = _canonical_block_mismatch(path.read_text(), _expected_variant(tools), path.name)
+    assert mismatch is None, mismatch
 
 
-def test_inverted_permission_is_rejected() -> None:
-    """Literal anchors cannot satisfy the guard when the prompt permits them."""
-    inverted = """## Worktree discipline (topology §7 — binding)
-
-- `git checkout --`, `git restore`, `git stash`, `git reset`, and `git clean`
-  are all fine to use whenever convenient.
-- Inspect committed state with `git show` and read `docs/agent-team-worktrees.md`.
-"""
-    errors = _worktree_control_errors(inverted)
-    prohibition_errors = [error for error in errors if "prohibition context" in error]
-    assert len(prohibition_errors) == len(_FORBIDDEN_COMMANDS), errors
-
-
-def test_negation_cues_use_word_boundaries() -> None:
-    """The substring ``never`` inside ``whenever`` is not a negation cue."""
-    assert not _has_negation_cue("These commands are fine whenever convenient.")
-    assert _has_negation_cue("Never run these commands.")
-    assert _has_negation_cue("These commands are forbidden.")
-
-
-def test_discipline_heading_is_case_insensitive() -> None:
-    """Stylistic heading capitalization does not disable the control guard."""
-    prompt = """## Worktree Discipline
-
-- Never run `git checkout --`, `git restore`, `git stash`, `git reset`, or `git clean`.
-- Verify commits with `git show`; read `docs/agent-team-worktrees.md`.
-"""
-    assert not _worktree_control_errors(prompt)
-
-
-def test_anchors_outside_discipline_section_do_not_satisfy_guard() -> None:
-    """Required anchors before or after the section cannot satisfy the guard."""
-    prompt = """`git show` appears before the section.
-
-## Worktree discipline
-
-- Never run `git checkout --`, `git restore`, `git stash`, `git reset`, or `git clean`.
-
-## Other instructions
-
-Read `docs/agent-team-worktrees.md` after the section.
-"""
-    errors = _worktree_control_errors(prompt)
-    assert errors == [
-        "missing discipline-section anchor 'docs/agent-team-worktrees.md'",
-        "missing discipline-section anchor 'git show'",
-    ]
+@pytest.mark.parametrize(
+    ("case_name", "block"),
+    _ADVERSARIAL_BLOCKS,
+    ids=[case_name for case_name, _ in _ADVERSARIAL_BLOCKS],
+)
+def test_inverted_permission_is_rejected(case_name: str, block: str) -> None:
+    """Known lexical bypasses cannot equal the canonical routed control."""
+    mismatch = _canonical_block_mismatch(block, _READ_ONLY_DISCIPLINE_BLOCK, case_name)
+    assert mismatch is not None
 
 
 def test_story_planner_remains_shell_and_write_closed() -> None:
