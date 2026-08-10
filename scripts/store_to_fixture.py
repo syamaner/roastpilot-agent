@@ -103,6 +103,15 @@ class StoreRoast:
 
     Attributes:
         run_id: The ``roast_runs.id`` (uuid4 hex).
+        ambient_temp_c: The roast's charge-time ambient temperature in Celsius
+            (#342 / D85), or ``None`` when ambient was never captured or the
+            store predates schema v10. Carried into the fixture so a replay can
+            reconstruct the room the roast actually ran in — required by the
+            #709 ambient fan doctrine's offline comparison, which is otherwise
+            blind to ambient and would score every tick on the doctrine's
+            absent-ambient fallback branch.
+        ambient_humidity_pct: The matching charge-time relative humidity, same
+            capture and back-compat rules.
         operator_rating: The operator's 1–5 self-rating, or ``None`` if unrated.
         operator_notes: The operator's free-text notes, or ``None``.
         charge_weight_grams: The EFFECTIVE green/charge weight (#520): the
@@ -149,6 +158,8 @@ class StoreRoast:
     """
 
     run_id: str
+    ambient_temp_c: float | None
+    ambient_humidity_pct: float | None
     operator_rating: int | None
     operator_notes: str | None
     charge_weight_grams: float | None
@@ -342,9 +353,21 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
             if "corrected_charge_grams" in _store_cols
             else "NULL AS corrected_charge_grams"
         )
+        # Guard: the ambient triad landed in store schema v10 (#342/D85), so a
+        # store from an earlier roast has no such columns — same shape as the
+        # v7/v12 guards above, treated as NULL rather than crashing.
+        _ambient_temp_col = (
+            "ambient_temp_c" if "ambient_temp_c" in _store_cols else "NULL AS ambient_temp_c"
+        )
+        _ambient_humidity_col = (
+            "ambient_humidity_pct"
+            if "ambient_humidity_pct" in _store_cols
+            else "NULL AS ambient_humidity_pct"
+        )
         run_row = connection.execute(
             f"SELECT operator_rating, operator_notes, {_weight_col},"
-            f" {_corrected_charge_col}, profile_json, completed_at_utc"
+            f" {_corrected_charge_col}, profile_json, completed_at_utc,"
+            f" {_ambient_temp_col}, {_ambient_humidity_col}"
             " FROM roast_runs WHERE id = ?",
             (resolved,),
         ).fetchone()
@@ -431,6 +454,12 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
         effective_charge_weight_grams = corrected_charge_grams or frozen_charge_weight_grams
         return StoreRoast(
             run_id=resolved,
+            ambient_temp_c=None
+            if run_row is None or run_row["ambient_temp_c"] is None
+            else float(run_row["ambient_temp_c"]),
+            ambient_humidity_pct=None
+            if run_row is None or run_row["ambient_humidity_pct"] is None
+            else float(run_row["ambient_humidity_pct"]),
             operator_rating=None
             if run_row is None or run_row["operator_rating"] is None
             else int(run_row["operator_rating"]),
@@ -620,6 +649,15 @@ def build_summary(roast: StoreRoast, rows: list[dict[str, Any]]) -> dict[str, An
         "total_roast_seconds": round(span, 1),
         # Outcome label (#300 / D42): the operator's per-roast rating + notes are
         # the corpus labels; degree is the shared drop-temperature rule.
+        # #709 (RP-B): the room the roast actually ran in. The ambient fan
+        # doctrine's offline comparison must replay each roast AT ITS RECORDED
+        # AMBIENT; without these keys every replayed tick takes the doctrine's
+        # absent-ambient fallback and the arms are indistinguishable for the
+        # wrong reason. ``None`` for an uncaptured roast or a pre-v10 store —
+        # and always ``None`` from the .alog adapter, which has no ambient
+        # concept (key-set parity, like corrected_charge_grams).
+        "ambient_temp_c": roast.ambient_temp_c,
+        "ambient_humidity_pct": roast.ambient_humidity_pct,
         "operator_rating": roast.operator_rating,
         "operator_notes": roast.operator_notes,
         "degree": classify_degree(drop_temp_c),
