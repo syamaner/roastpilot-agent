@@ -173,6 +173,14 @@ different model family and catches exactly that class**, and the measured gap is
 security keystone two Opus safety passes called clean — all post-open). Get Codex in
 **before the branch is pushed**, so its finds fold instead of becoming post-ready rework:
 
+> **Diverse-lens inversion on a Codex-authored branch (D152).** When the diff was
+> implemented by Codex-MCP (the D152 default for contracted slices), the family roles
+> swap: this step's local `codex review` is then the SAME-family lens, and the Claude
+> domain reviewers in step 4 are the cross-family adversarial lens — so on such a
+> branch step 4 is the one that must never be skipped or thinned, and a clean local
+> Codex pass carries correspondingly less independent weight. Run both regardless;
+> only the rationale shifts, not the checklist.
+
 1. **Run `codex review --base origin/main` LOCALLY, before pushing anything — and COMMIT your
    implementation work before that first pass, not merely the folds that follow it** (Codex P2,
    #682, caught on this fold). `--base` reviews the committed branch diff, so entering preflight

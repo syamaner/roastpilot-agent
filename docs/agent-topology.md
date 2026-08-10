@@ -52,8 +52,12 @@ This specification defines a cost-aware Claude agent topology in which:
 - Claude Opus 5 owns product orchestration, scope, authority, and integration
   (recommended model for the role; the main-session model itself is a
   per-terminal operator decision — see §5).
-- Claude Fable 5 is invoked selectively as a read-only planning specialist.
-- Claude Sonnet 5 performs bounded implementation and routine review work.
+- Claude Fable 5 is invoked selectively as a read-only planning specialist —
+  and, as the `story-planner` contract writer, on every story delegated to
+  Codex-MCP (D152, §6).
+- Implementation defaults to Codex-MCP for contracted slices (D152, §4/§10);
+  Claude Sonnet 5 performs fallback and uncontracted implementation and the
+  routine review work.
 - High-consequence safety or architecture review remains an independent Opus 5 responsibility.
 
 The design uses Fable where long-context planning and ambiguity resolution provide material value without making it the default model for every task.
@@ -80,13 +84,17 @@ The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
 |---|---|---:|---|---|
 | Product PM / orchestrator (main session) | `claude-opus-5` recommended (the main-session model is a deliberate per-terminal operator choice — operator decision, 9 Aug 2026, see §5; set via the `model` setting or `--model claude-opus-5`; `default` is an alias, not a pin) | `high` | Scope, routing, adjudication, integration, escalation | Repository and coordination tools required by the task |
 | Planning architect (named subagent) | `claude-fable-5` | `high` | Advisory only | Read, Grep, Glob, Bash (no Edit/Write; read-only by convention, §7) |
-| Backend/frontend implementer | `claude-sonnet-5` | `high` | Writes only inside assigned scope | Read, Grep, Glob, Bash, Edit, Write |
+| Story planner / contract writer (named subagent) | `claude-fable-5` | `high` | Advisory only — writes the implementation contract required before any Codex-MCP delegation (D152) | Read, Grep, Glob (no shell, no Edit/Write; read-only by construction) |
+| Backend/frontend implementer — default (contracted slices) | Codex-MCP (D152 — external family, own subscription; not a Claude pin) | n/a (Codex-side) | Writes only inside assigned scope | Codex's own MCP-side toolset |
+| Backend/frontend implementer — Claude fallback | `claude-sonnet-5` (`engineer-be`/`engineer-fe`) | `high` | Writes only inside assigned scope | Read, Grep, Glob, Bash, Edit, Write |
 | Mechanical contract/simulation checker | `claude-sonnet-5` | `medium` | Read-only verdict | Read, Grep, Glob, Bash |
 | QA/product/security reviewer | `claude-sonnet-5` | `high` | Read-only findings | Read, Grep, Glob, Bash |
 | Safety/critical architecture reviewer | `claude-opus-5` | `xhigh` | Read-only findings | Read, Grep, Glob, Bash |
 | Independent PR triage | `claude-sonnet-5` | `high` | Adjudicates findings; does not author fixes | Read, Grep, Glob, Bash |
 
 `xhigh` MAY be used for the Fable planner when the task is genuinely long-horizon, cross-repository, safety-sensitive, or architecture-defining. It SHOULD NOT be the default for ordinary planning.
+
+The implementer row's Codex-MCP default (D152) is an external-family harness, not a Claude model pin: the exact-ID discipline of §5 and §16 binds the Claude roles — including the Claude fallback implementer pins — and `tests/test_agent_model_pins.py` asserts exactly those. Codex delegation is bound by D152's contract rule instead.
 
 ## 5. Model pinning
 
@@ -109,6 +117,15 @@ The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
 5. Effort MUST be selected separately from response verbosity. Prompts SHOULD state the desired output length directly.
 
 ## 6. When to invoke the Fable planner
+
+This section governs the `planning-architect`. The `story-planner` contract
+writer (D152) is a distinct, mandatory step for every story delegated to
+Codex-MCP: compiling the implementation contract is not the deep planning this
+section rations, so it is exempt from the bypass rules below and does not count
+against the one-planning-subagent rule at the end of this section. On a complex
+story the two compose in sequence — `planning-architect` (when triggered) plans,
+the Opus PM adjudicates, then `story-planner` compiles the adjudicated plan into
+the contract.
 
 The Opus PM SHOULD invoke Fable when one or more of these conditions hold:
 
@@ -201,7 +218,8 @@ Human request
     v
 Opus PM: orient, identify authority and complexity
     |
-    +-- simple and settled --> bounded Sonnet implementation
+    +-- simple and settled --> story-planner contract --> bounded implementation
+    |                          (Codex-MCP default, D152; Sonnet fallback)
     |
     +-- complex/ambiguous --> read-only Fable plan
                               |
@@ -209,7 +227,11 @@ Opus PM: orient, identify authority and complexity
                          Opus adjudication
                               |
                               v
-                    bounded Sonnet implementation
+                     story-planner contract
+                              |
+                              v
+                     bounded implementation
+              (Codex-MCP default, D152; Sonnet fallback)
                               |
                               v
                  independent domain review and QA
@@ -233,6 +255,8 @@ Agent teams SHOULD be reserved for independent work that benefits from peer comm
 - Independent safety, security, QA, and author-independent triage are deliberate control layers and are not considered redundant self-verification.
 - Fresh verifier agents SHOULD receive findings in bounded batches rather than one new agent per minor finding.
 - Effort SHOULD be lowered before weakening acceptance criteria or removing independent review.
+- Implementation delegation defaults to Codex-MCP for contracted slices (D152, 9 Aug 2026; adopted from roastpilot-cloud's D145 on its results). Delegation without a `story-planner` contract is forbidden (fail-closed). The Codex subscription is one weekly-capped pool shared across repositories: both repositories' every-PR pre-open review floors are protected first, implementation delegation flexes, and below the budget-stop threshold implementation delegation stops entirely (the Claude fallback implementers take over; the orchestrator still never implements). The threshold's authoritative statement (roughly 20% remaining allowance) lives in the AGENTS.md implementation-delegation bullet; this section defers to it so the two copies cannot silently diverge.
+- The Claude safety floor is NOT cut for credits: a Codex-authored diff gets the same mandatory domain reviewers, and on such a diff the Claude reviewers are the cross-family adversarial lens (the local `codex review` is then same-family).
 
 ## 11. Refusal and failure handling
 
@@ -320,7 +344,7 @@ chain-of-thought.
 
 Before adopting this topology as the default, evaluate it on a representative set:
 
-- one simple single-slice task that should bypass Fable;
+- one simple single-slice task that should bypass the `planning-architect` (the D152 `story-planner` contract still runs when the slice is Codex-delegated, and its doing so is compliant, not a planning-trigger violation);
 - one ambiguous multi-slice feature;
 - one cross-repository change;
 - one safety- or security-sensitive design;
@@ -328,7 +352,7 @@ Before adopting this topology as the default, evaluate it on a representative se
 
 Measure:
 
-- whether Fable was invoked only when the trigger criteria applied;
+- whether the `planning-architect` was invoked only when the trigger criteria applied (a `story-planner` run on a Codex-delegated slice is the mandatory D152 contract step, not a Fable-trigger event, and never counts against this metric);
 - plan acceptance without material Opus rewrite;
 - requirements or boundaries missed;
 - preventable implementation rework;
@@ -351,7 +375,7 @@ story. Recorded so far: **RP-B (#709)**, which supplies FAILURE evidence on the
 ambiguous-multi-slice and safety-sensitive archetypes — no planner ran on it, so
 both remain **provisional** until a later story exercises them under the
 trigger-wins rule in §6. Still outstanding: those two re-validations, plus a
-simple single-slice task that should bypass the planner, a cross-repository
+simple single-slice task that should bypass the `planning-architect`, a cross-repository
 change, and a previously failed or heavily reworked task. The PM output-style measurements in this section remain
 unevaluated, because the `RoastPilot Operator` style was not selected for the
 RP-B session.
@@ -374,11 +398,11 @@ log out was meant to avoid.
 
 This topology is ready when:
 
-- Exact model IDs and explicit effort levels are used for every defined subagent role (the main-session model is a deliberate per-terminal operator choice — operator decision, 9 Aug 2026, see §5).
+- Exact model IDs and explicit effort levels are used for every defined Claude subagent role (the main-session model is a deliberate per-terminal operator choice — operator decision, 9 Aug 2026, see §5; the Codex-MCP default implementer is an external-family harness bound by D152's contract rule, not by a Claude pin — see the note under the §4 table).
 - No override in the documented precedence chain (`CLAUDE_CODE_SUBAGENT_MODEL`, the per-invocation `model` parameter, the frontmatter `model`, `availableModels` / `enforceAvailableModels`, an organisation default, or organisation restrictions) silently defeats role-level model selection.
-- The Fable planner is read-only by tool restriction: no `Edit` or `Write` tool (the same posture as the repository's other read-only roles), `permissionMode: plan`, and it runs only as a named subagent, never a fork. A hard guarantee against a determined `Bash` write is an operational control (do not run read-only roles under permissive parent modes), not a per-agent mechanism.
+- The Fable planner is read-only by tool restriction: no `Edit` or `Write` tool (the same posture as the repository's other read-only roles), `permissionMode: plan`, and it runs only as a named subagent, never a fork. A hard guarantee against a determined `Bash` write is an operational control (do not run read-only roles under permissive parent modes), not a per-agent mechanism. The `story-planner` (D152) holds the same posture with no `Bash` tool at all, so its read-only guarantee is stronger than `permissionMode` alone provides.
 - The Opus PM remains the sole agent authority for routing and plan adjudication.
-- Simple tasks demonstrably bypass Fable.
+- Simple tasks demonstrably bypass the `planning-architect` (the D152 `story-planner` contract still applies to Codex-delegated stories — §6).
 - Complex plans use the required output contract.
 - Planning refusals and unusable results fail closed with a documented fallback or escalation.
 - Writing agents have bounded, non-overlapping ownership.
@@ -394,7 +418,14 @@ This topology is ready when:
   §7 binds every **read-only** role, so the criterion is satisfied only when all
   eight carry the controls: `mcp-contract-checker`, `planning-architect`,
   `pr-triage`, `qa`, `safety-reviewer`, `security-reviewer`, `sim-roast-runner`
-  and `ui-reviewer`. **Currently none of them does.** Carrying the rule in all
+  and `ui-reviewer`. (`story-planner`, added by D152, is read-only but carries
+  no shell at all — no Bash, no Edit/Write — so the §7 mutate-then-restore
+  hazard cannot arise for it and it does not gate this criterion. The §7
+  own-worktree requirement still binds its READS: its agent definition
+  requires the orchestrator to name the committed implementation-base tree
+  and sha, and to `ESCALATE` when none is supplied, so a contract cannot be
+  compiled from a stale or dirty checkout.)
+  **Currently none of them does.** Carrying the rule in all
   eight prompts does not on its own satisfy this criterion: because a read-only
   role cannot create its own worktree, the lead-side provisioning and
   `git worktree list` verification required by §8 item 6 must be in force too,

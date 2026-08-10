@@ -164,12 +164,14 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D151**. D150 is SPENT — it is the decision
+> Next free plan decision number: **D153**. D150 is SPENT — it is the decision
 > that settled this very question, recorded in `00-repository-structure.md` on
 > 9 Aug 2026: **one shared D-number series for the whole `roastpilot-plan` repo,
-> next free being one past the highest defined anywhere in it.** D149
-> (`factory.md`'s `## D149:` heading) was the previous maximum. Take **D151**;
-> D150 is spent. Do **not** derive the number from any one file's own maximum:
+> next free being one past the highest defined anywhere in it.** D151 is SPENT
+> (the advisor `model_slug` shadowing fix, #747/#755, 9 Aug) and D152 is SPENT
+> (Codex-MCP default-implementer adoption, #764, 9 Aug), both in
+> `roastpilot-agent/plan.md`. Take **D153**.
+> Do **not** derive the number from any one file's own maximum:
 > that per-file reading is exactly what produced the collisions described below,
 > and it produced another on 9 Aug (see the operator flag there).
 >
@@ -216,8 +218,9 @@
 > recorded D9 and D14 as never defined — they are defined, and that claim was
 > wrong** (corrected 9 Aug 2026, roastpilot-agent#750). The only real gap is
 > D144, deliberately renumbered to D145; it is not a number to reclaim. Re-derived
-> across all five formats, the highest number defined anywhere is still D150, so
-> the free number above is unchanged.
+> across all five formats on 9 Aug 2026 the highest number defined anywhere was
+> D150; D151 and D152 have been spent since (see above), so the highest defined
+> anywhere is now D152 and the free number above (**D153**) follows from it.
 >
 > D125 records the RP-D eval-model
 > correction — discriminates only on hardware/simulator, not replay; D124 records
