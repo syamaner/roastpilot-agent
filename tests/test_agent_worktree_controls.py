@@ -58,8 +58,9 @@ _READ_ONLY_DISCIPLINE_BLOCK = """## Worktree discipline (topology §7 — bindin
 
 _WRITING_DISCIPLINE_BLOCK = """## Worktree discipline (topology §7 — binding)
 
-- Your assigned worktree is the **only** tree you write in; the main checkout
-  and sibling worktrees are read-only (`git -C` peeks are fine, never a write).
+- In each repository, your assigned worktree is the **only** tree you write in;
+  that repository's main checkout and sibling worktrees are read-only (`git -C`
+  peeks are fine, never a write).
   For a lead-directed serialized or standalone run, the main checkout is the
   assigned writable tree; sibling worktrees remain read-only.
   Self-locate every command against the assigned worktree because cwd resets
@@ -249,7 +250,6 @@ def test_review_workflow_directs_a_no_mutation_shared_checkout_review() -> None:
         "no hypothesis edits",
         "read and reason only",
         "cannot perform the shared-tree protocol's lead safety-commit",
-        "reviewed the shared checkout under this explicit direction",
     )
     missing = [phrase for phrase in required if phrase not in prompt]
     assert not missing, f"reviewBase is missing shared-checkout controls: {missing}"

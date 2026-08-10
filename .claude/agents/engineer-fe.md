@@ -37,8 +37,9 @@ TS, Tailwind + shadcn/ui, **uPlot** for curves, TanStack Query (REST) + native
 
 ## Worktree discipline (topology §7 — binding)
 
-- Your assigned worktree is the **only** tree you write in; the main checkout
-  and sibling worktrees are read-only (`git -C` peeks are fine, never a write).
+- In each repository, your assigned worktree is the **only** tree you write in;
+  that repository's main checkout and sibling worktrees are read-only (`git -C`
+  peeks are fine, never a write).
   For a lead-directed serialized or standalone run, the main checkout is the
   assigned writable tree; sibling worktrees remain read-only.
   Self-locate every command against the assigned worktree because cwd resets
