@@ -354,7 +354,7 @@ separate worktree rather than the shared checkout, and the runbook should say
 so.
 
 **Corrected after review (the recommendation above misdiagnosed the gap).**
-`docs/agent-team-worktrees.md:83-98` ALREADY records a 9 Jul reviewer
+The "Reviewers in a shared worktree" section of `docs/agent-team-worktrees.md` ALREADY records a 9 Jul reviewer
 `git checkout --` incident and already forbids reviewers from running
 tree-mutating git commands. The control exists; it was never routed to the
 Bash-capable roles that keep re-entering it — `.claude/agents/qa.md` contains
