@@ -258,6 +258,25 @@ def test_safety_limit_defaults_are_conservative() -> None:
     assert limits.emergency_drop_temp_c < limits.max_bean_temp_c
 
 
+@pytest.mark.parametrize("non_finite", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "field",
+    ["max_bean_temp_c", "max_env_temp_c", "pre_t0_max_bean_temp_c"],
+)
+def test_temperature_safety_ceilings_reject_non_finite_values(
+    field: str, non_finite: float
+) -> None:
+    """A non-finite configured bound must not disable a hard safety guard."""
+    with pytest.raises(pydantic.ValidationError):
+        SafetyLimits.model_validate({field: non_finite})
+
+    assert SafetyLimits() == SafetyLimits(
+        max_bean_temp_c=230.0,
+        max_env_temp_c=240.0,
+        pre_t0_max_bean_temp_c=200.0,
+    )
+
+
 @pytest.mark.parametrize(
     ("model", "overrides"),
     [

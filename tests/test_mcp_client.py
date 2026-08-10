@@ -8,6 +8,7 @@ source and validated here against the 7 Jun 2026 live-roast exports.
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -2161,6 +2162,7 @@ def test_project_session_state_maps_detection_and_passthrough() -> None:
 
 
 def test_project_session_state_none_without_usable_reading() -> None:
+    """A genuinely absent temperature remains an absent reading, not malformed."""
     no_device = RoastSessionState.model_validate({**SESSION_STATE_PAYLOAD, "device_state": None})
     assert project_session_state(no_device, age_seconds=0.0) is None
     null_temp_device = {
@@ -2171,6 +2173,47 @@ def test_project_session_state_none_without_usable_reading() -> None:
         {**SESSION_STATE_PAYLOAD, "device_state": null_temp_device}
     )
     assert project_session_state(null_temp, age_seconds=0.0) is None
+
+
+@pytest.mark.parametrize("non_finite", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("member", ["bean_temp_c", "env_temp_c"])
+def test_project_session_state_voids_non_finite_temperature(member: str, non_finite: float) -> None:
+    """The shared reading boundary declines every non-finite temperature."""
+    device = {
+        **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+        member: non_finite,
+    }
+    state = RoastSessionState.model_validate({**SESSION_STATE_PAYLOAD, "device_state": device})
+
+    assert project_session_state(state, age_seconds=0.0) is None
+
+
+def test_temperature_transport_preserves_then_projection_voids_nan() -> None:
+    """Text preserves bare NaN; structured content nulls it before projection."""
+    mcp_types = pytest.importorskip("mcp.types")
+    device = {
+        **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+        "bean_temp_c": float("nan"),
+    }
+    body = {**SESSION_STATE_PAYLOAD, "device_state": device}
+    text_block = mcp_types.TextContent(type="text", text=json.dumps(body))
+    structured = mcp_types.CallToolResult.model_validate_json(
+        mcp_types.CallToolResult(content=[text_block], structuredContent=body).model_dump_json()
+    )
+    text_only = mcp_types.CallToolResult.model_validate_json(
+        mcp_types.CallToolResult(content=[text_block]).model_dump_json()
+    )
+
+    structured_state = RoastSessionState.model_validate(parse_tool_result(structured))
+    assert structured_state.device_state is not None
+    assert structured_state.device_state.bean_temp_c is None
+    assert project_session_state(structured_state, age_seconds=0.0) is None
+
+    text_state = RoastSessionState.model_validate(parse_tool_result(text_only))
+    assert text_state.device_state is not None
+    assert text_state.device_state.bean_temp_c is not None
+    assert math.isnan(text_state.device_state.bean_temp_c)
+    assert project_session_state(text_state, age_seconds=0.0) is None
 
 
 def test_project_session_state_pending_detection_is_false() -> None:

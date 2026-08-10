@@ -922,9 +922,10 @@ def project_session_state(
     """Project an MCP ``RoastSessionState`` into the controller's ``RoastTelemetry``.
 
     Returns ``None`` when no usable reading exists — no device state, or bean/
-    environment temperature absent (the mock driver reports ``connected`` with
-    null temperatures during pre-roast). ``RoastTelemetry`` requires both
-    temperatures, so a partial reading is "no telemetry", not a zero reading.
+    environment temperature absent or non-finite (the mock driver reports
+    ``connected`` with null temperatures during pre-roast). ``RoastTelemetry``
+    requires both usable temperatures, so a partial or malformed reading is
+    "no telemetry", not a zero reading.
 
     Detection booleans come from the contract-checked Literal status fields
     (``t0_status.status`` / ``first_crack_status.status``), not the latched
@@ -937,7 +938,13 @@ def project_session_state(
     caller-supplied (#732) for the same reason, and defaults to ``None`` =
     "age unknown", the fail-closed value for callers that do not track it."""
     device = state.device_state
-    if device is None or device.bean_temp_c is None or device.env_temp_c is None:
+    if (
+        device is None
+        or device.bean_temp_c is None
+        or device.env_temp_c is None
+        or not math.isfinite(device.bean_temp_c)
+        or not math.isfinite(device.env_temp_c)
+    ):
         return None
     ambient_temp_c, ambient_humidity_pct, ambient_pressure_hpa = project_live_ambient(
         state.ambient_status

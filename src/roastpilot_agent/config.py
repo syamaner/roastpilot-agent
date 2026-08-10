@@ -7,6 +7,7 @@ deliberately conservative software ceilings pending supervised hardware
 validation at E12 (E12-S1).
 """
 
+import math
 from pathlib import Path
 from typing import Annotated, ClassVar, Literal
 from urllib.parse import urlsplit, urlunsplit
@@ -1958,6 +1959,14 @@ class SafetyLimits(BaseModel):
     # is the *target* ceiling, the emergency-drop bound is the last-resort one.
     bitter_ceiling_temp_c: float = Field(default=196.0, gt=0)
     emergency_drop_temp_c: float = Field(default=198.0, gt=0)
+
+    @field_validator("max_bean_temp_c", "max_env_temp_c", "pre_t0_max_bean_temp_c")
+    @classmethod
+    def _check_finite_temperature_ceiling(cls, value: float) -> float:
+        """Reject a non-finite bound that would disable a temperature guard."""
+        if not math.isfinite(value):
+            raise ValueError("temperature safety ceilings must be finite")
+        return value
 
     @model_validator(mode="after")
     def _check_drop_ceiling_order(self) -> "SafetyLimits":

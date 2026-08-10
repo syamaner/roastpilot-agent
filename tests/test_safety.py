@@ -43,6 +43,56 @@ def test_all_clear_within_limits(policy: SafetyPolicy) -> None:
     assert evaluation.adjusted_fan is None
 
 
+@pytest.mark.parametrize("non_finite", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("member", ["bean", "env"])
+def test_non_finite_temperature_faults_closed(
+    policy: SafetyPolicy, non_finite: float, member: Literal["bean", "env"]
+) -> None:
+    """Every non-finite direction faults before comparison-based rules.
+
+    In particular, a rewrite such as ``not (value <= ceiling)`` is not an
+    adequate guard: ``-inf <= ceiling`` is true, so negative infinity would
+    fall through to ``all_clear``. Explicit finiteness is the required fence.
+    """
+    bean = non_finite if member == "bean" else 195.0
+    env = non_finite if member == "env" else 215.0
+
+    evaluation = policy.evaluate_telemetry(
+        phase=RoastPhase.DEVELOPMENT,
+        bean_temp_c=bean,
+        env_temp_c=env,
+        t0_confirmed=True,
+    )
+
+    assert evaluation.verdict is SafetyVerdict.FAULT
+    assert evaluation.rule == "non_finite_telemetry"
+    assert evaluation.adjusted_heat == 0
+    assert evaluation.adjusted_fan == policy.limits.overrun_safe_fan_percent
+
+
+def test_non_finite_rule_precedes_pre_t0_and_finite_ceiling_still_estops(
+    policy: SafetyPolicy,
+) -> None:
+    """Invalid telemetry wins before pre-T0, while a finite breach still e-stops."""
+    invalid = policy.evaluate_telemetry(
+        phase=RoastPhase.PREHEATING,
+        bean_temp_c=float("nan"),
+        env_temp_c=210.0,
+        t0_confirmed=False,
+    )
+    finite_breach = policy.evaluate_telemetry(
+        phase=RoastPhase.DEVELOPMENT,
+        bean_temp_c=231.0,
+        env_temp_c=220.0,
+        t0_confirmed=True,
+    )
+
+    assert invalid.verdict is SafetyVerdict.FAULT
+    assert invalid.rule == "non_finite_telemetry"
+    assert finite_breach.verdict is SafetyVerdict.EMERGENCY_STOP
+    assert finite_breach.rule == "max_bean_temp"
+
+
 def test_max_bean_temp_triggers_emergency_stop(policy: SafetyPolicy) -> None:
     evaluation = policy.evaluate_telemetry(
         phase=RoastPhase.DEVELOPMENT, bean_temp_c=230.1, env_temp_c=220.0, t0_confirmed=True
