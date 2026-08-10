@@ -18,7 +18,10 @@ from roastpilot_agent.advisor import (
     FakeAdvisor,
     RoastDecision,
 )
-from roastpilot_agent.mcp_client import ExportRoastLogResult
+from roastpilot_agent.mcp_client import (
+    ExportRoastLogResult,
+    reset_non_finite_telemetry_warnings,
+)
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
     AppliedRoasterState,
@@ -43,6 +46,12 @@ DEFAULT_DROP_APPLIED_STATE = AppliedRoasterState(
 DEFAULT_EMERGENCY_STOP_APPLIED_STATE = AppliedRoasterState(
     heat_level_percent=0, fan_level_percent=100, cooling_on=True
 )
+
+
+@pytest.fixture(autouse=True)
+def reset_non_finite_warning_budget() -> None:
+    """Give every test an independent per-run telemetry warning budget."""
+    reset_non_finite_telemetry_warnings()
 
 
 class FakeClock:

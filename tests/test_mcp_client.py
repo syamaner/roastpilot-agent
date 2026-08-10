@@ -2233,6 +2233,33 @@ def test_non_finite_telemetry_warning_is_field_only_and_one_shot(
     assert records[0].args == (member,)
 
 
+def test_non_finite_telemetry_warnings_remain_one_shot_per_field(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One malformed field must not silence a different field in the same run."""
+    mcp_client_module.reset_non_finite_telemetry_warnings()
+    caplog.set_level(logging.WARNING, logger="roastpilot_agent.mcp_client")
+    bad_device = {
+        **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+        "bean_temp_c": float("inf"),
+    }
+    bad_temperature = RoastSessionState.model_validate(
+        {**SESSION_STATE_PAYLOAD, "device_state": bad_device}
+    )
+    bad_ror = RoastSessionState.model_validate(
+        {**SESSION_STATE_PAYLOAD, "bean_ror_c_per_min": float("inf")}
+    )
+
+    project_session_state(bad_temperature, age_seconds=0.0)
+    project_session_state(bad_ror, age_seconds=0.0)
+
+    records = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert [record.args for record in records] == [
+        ("bean_temp_c",),
+        ("bean_ror_c_per_min",),
+    ]
+
+
 def test_temperature_transport_preserves_then_projection_voids_nan() -> None:
     """Text preserves bare NaN; structured content nulls it before projection."""
     mcp_types = pytest.importorskip("mcp.types")

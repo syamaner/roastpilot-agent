@@ -61,6 +61,12 @@ _log = logging.getLogger(__name__)
 #: suppression must never change whether a reading is accepted or how old it is.
 _WARNED_NON_FINITE_TELEMETRY_FIELDS: set[str] = set()
 
+
+def reset_non_finite_telemetry_warnings() -> None:
+    """Restore the per-run warning budget for malformed telemetry fields."""
+    _WARNED_NON_FINITE_TELEMETRY_FIELDS.clear()
+
+
 #: Grace added to ``startup_timeout_seconds`` for the outer ``await ready`` bound
 #: in :meth:`MCPServerProcess.start` (#484). The owner task's own
 #: ``initialize()`` already carries ``startup_timeout_seconds``, so this outer

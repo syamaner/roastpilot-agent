@@ -243,6 +243,7 @@ def test_model_for_falls_back_to_base_slug_for_unmapped_phase() -> None:
 def test_safety_limit_defaults_are_conservative() -> None:
     limits = SafetyLimits()
     assert limits.pre_t0_max_bean_temp_c == 200.0
+    assert limits.max_env_temp_c == 240.0
     # Software ceilings stay below hardware territory and above any
     # legitimate roast target.
     assert limits.pre_t0_max_bean_temp_c < limits.max_bean_temp_c
@@ -271,7 +272,15 @@ def test_temperature_safety_ceilings_reject_non_finite_values(
         SafetyLimits.model_validate({field: non_finite})
 
 
-@pytest.mark.parametrize("non_finite", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    ("value", "is_valid"),
+    [
+        (float("nan"), False),
+        (float("inf"), False),
+        (float("-inf"), False),
+        (30.0, True),
+    ],
+)
 @pytest.mark.parametrize(
     ("model", "field"),
     [
@@ -279,12 +288,16 @@ def test_temperature_safety_ceilings_reject_non_finite_values(
         (SafetyLimits, "min_seconds_between_commands"),
     ],
 )
-def test_control_safety_intervals_reject_non_finite_values(
-    model: type[ControllerConfig] | type[SafetyLimits], field: str, non_finite: float
+def test_control_safety_intervals_require_finite_values(
+    model: type[ControllerConfig] | type[SafetyLimits], field: str, value: float, is_valid: bool
 ) -> None:
-    """Timing bounds must not disable stale detection or command delivery."""
-    with pytest.raises(pydantic.ValidationError):
-        model.model_validate({field: non_finite})
+    """Timing bounds reject non-finite values without rejecting valid ones."""
+    if is_valid:
+        validated = model.model_validate({field: value})
+        assert getattr(validated, field) == value
+    else:
+        with pytest.raises(pydantic.ValidationError):
+            model.model_validate({field: value})
 
 
 @pytest.mark.parametrize(

@@ -83,6 +83,7 @@ from roastpilot_agent.mcp_client import (
     RoastSessionState,
     project_mic_status,
     project_recordable_ambient,
+    reset_non_finite_telemetry_warnings,
 )
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
@@ -2070,6 +2071,7 @@ class RoastService:
         counter = _TickCounter()
         sink = StoreSnapshotSink(self._store, run_id, lambda: counter.value)
         emitter = BufferingEventEmitter(self.events, clock=self._clock)
+        reset_non_finite_telemetry_warnings()
         controller = RoastController(
             config=run_config.controller,
             safety=run_safety,
