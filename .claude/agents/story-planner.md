@@ -208,14 +208,15 @@ the `<!-- story-planner-contract:` prefix and MUST also verify the posting
 comment's author is a maintainer (`author_association` `OWNER`/`MEMBER`
 from the API) matching `ratified-by` — the marker string alone is
 copyable by any public commenter and is never sufficient. The ratified
-post also records the issue-revision watermark — the body's `updated_at`
-plus every PRE-CONTRACT comment's `(id, updated_at)` pair, or equivalently
-a hash of that normalised snapshot; the latest comment id alone misses
-in-place comment edits, and the watermark is defined over the snapshot as
-it stood BEFORE the contract post, with the verified contract comment
-itself excluded from revalidation (the post is a new comment, so a
-watermark claiming to cover "every comment" would self-invalidate on
-posting) — that the pre-delegation check revalidates, so a posted contract can neither launder into
+post also records the issue-revision watermark — a hash of the normalised
+issue BODY plus every PRE-CONTRACT comment's `(id, updated_at)` pair; a
+body hash, not the issue-level `updated_at`, because GitHub advances that
+aggregate timestamp on any comment activity (including the contract post
+itself), and comment objects carry their own `updated_at` so in-place
+comment edits are caught per pair. The watermark is defined over the
+snapshot as it stood BEFORE the contract post, with the verified contract
+comment itself excluded from revalidation — that the pre-delegation check
+revalidates, so a posted contract can neither launder into
 maintainer-authored criteria under the trust rule above nor delegate from
 a stale issue. If the story cannot
 be contracted — acceptance criteria untestable, a scope trip, or a decision

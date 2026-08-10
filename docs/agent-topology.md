@@ -344,7 +344,7 @@ chain-of-thought.
 
 Before adopting this topology as the default, evaluate it on a representative set:
 
-- one simple single-slice task that should bypass Fable;
+- one simple single-slice task that should bypass the `planning-architect` (the D152 `story-planner` contract still runs when the slice is Codex-delegated, and its doing so is compliant, not a planning-trigger violation);
 - one ambiguous multi-slice feature;
 - one cross-repository change;
 - one safety- or security-sensitive design;
@@ -375,7 +375,7 @@ story. Recorded so far: **RP-B (#709)**, which supplies FAILURE evidence on the
 ambiguous-multi-slice and safety-sensitive archetypes — no planner ran on it, so
 both remain **provisional** until a later story exercises them under the
 trigger-wins rule in §6. Still outstanding: those two re-validations, plus a
-simple single-slice task that should bypass the planner, a cross-repository
+simple single-slice task that should bypass the `planning-architect`, a cross-repository
 change, and a previously failed or heavily reworked task. The PM output-style measurements in this section remain
 unevaluated, because the `RoastPilot Operator` style was not selected for the
 RP-B session.

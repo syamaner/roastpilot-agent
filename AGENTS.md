@@ -704,10 +704,12 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   posting author is a verified maintainer (`author_association`
   `OWNER`/`MEMBER` from the API) matching the marker's `ratified-by` login
   — the marker string alone is copyable by any public commenter and never
-  sufficient; (2) the contract's issue-revision watermark (defined over the
-  pre-contract snapshot) still matches the live issue with the verified
-  contract comment itself excluded — any other drift means replan, not
-  delegate; (3) the remaining weekly
+  sufficient; (2) the contract's issue-revision watermark (a hash of the
+  normalised issue body plus each pre-contract comment's id + updated_at —
+  never the issue-level updated_at, which any comment activity advances)
+  still matches the live issue with the verified contract comment itself
+  excluded, AND the contract's recorded plan-repo sha still describes the
+  cited plan files — issue or plan drift means replan, not delegate; (3) the remaining weekly
   allowance is at or above the 20% budget stop. D23 is unchanged:
   Codex-as-author never adjudicates review feedback on its own PR.
 - **Skills** (`.claude/skills/`): `triage-pr` (→ `pr-triage`), `capture` (drive
