@@ -7,14 +7,19 @@
 > arm that #709 was waiting for is DONE, on Guatemala Conebosque (Washed),
 > target 195 °C / 16 %, back to back, identical config apart from the prompt.
 > **Result: c11 binds as written, and as written it does not fix the problem.**
-> Baseline `eaafde88` (c10): first crack 179, drop **183**, DTR 15.2 %, weight
+> Baseline `eaafde88` (c10): first crack 179, drop **183**, DTR **16.27 %**, weight
 > loss 10.4 %. Treatment `0dcb58ec` (c11): first crack 184, drop **188**, DTR
-> 15.4 %, weight loss 12.3 %. **Both arms gained exactly +4 °C across
+> **16.44 %**, weight loss 12.3 %. **Both arms gained exactly +4 °C across
 > development**, so the treatment's 5 °C better drop is inherited from its higher
 > first-crack temperature (a warm-machine effect from roasting back to back,
 > flagged contemporaneously BEFORE the crack), NOT from the doctrine. Both still
 > MISS the joint window (|Δdrop| 12 and 7 against a 3 °C HIT criterion), so RP-D
-> scores 0.00 for both, as on 6 Aug. **What c11 did:** every fan step after the
+> scores 0.00 for both, as on 6 Aug. **DTR was a HIT in both arms** (+0.27 and
+> +0.44 pp against a ±2 pp window), so the joint failure is ENTIRELY temperature,
+> not development time. Read DTR from the FROZEN `development_percent`, not from
+> the last development-phase row (~8 s early), and never take temperature off the
+> same trailing row: on `0dcb58ec` the last row carrying `development_percent` is a
+> COOLING row whose `bean_temp_c` reads 195.0, which is NOT the 188 drop. **What c11 did:** every fan step after the
 > first was exactly `ambient_fan_step_max_pp` (10 pp), which the baseline never
 > showed, so the doctrine demonstrably takes effect. **What it did not do:** bound
 > the destination. The advisor walked fan to **90** in disciplined steps, HIGHER
@@ -42,7 +47,7 @@
 > **#779 (new) — a #337 residual that corrupts every store-sourced fixture.**
 > `store_to_fixture` anchors first crack on the agent's receive time rather than
 > the MCP's backdated instant (25.5 s apart on `eaafde88`), so fixture DTR reads
-> ~2 pp LOW and `first_crack_temp_c` 1-2 °C high. `rpd_corpus_score.py` is NOT
+> ~3 pp LOW (13.2 % against a true 16.27 %) and `first_crack_temp_c` 1-2 °C high. `rpd_corpus_score.py` is NOT
 > affected (it reads `telemetry_snapshots.development_percent`, controller-computed),
 > so the shipped 15-scored/3-HITs corpus result stands. Affected: `bakeoff_replay`
 > arms, the #739 RP-B eval set, and the unbuilt #749 harness, which would compare
