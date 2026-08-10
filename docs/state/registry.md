@@ -50,8 +50,13 @@
 > on the treatment it entered at development 11.1 %, i.e. 4.9 pp of runway, which
 > SATISFIES #708's own proposed acceptance bar, lifted the ceiling 60 to 75 and
 > heat to 70 (5 pp unused), and improved bean climb only 2.8 to 3.75 °C/min. Net
-> +4 °C, identical to the baseline arm that had no recovery at all, so entry
-> timing is not the binding constraint and v2 should be re-scoped with #781 in view.
+> +4 °C, identical to the baseline arm that had no recovery at all. **Keep that
+> conditional** (Codex P2 on PR #782): the treatment also ran c11 and drove fan to 90
+> against the baseline's 65, so this establishes that 4.9 pp of runway was
+> insufficient UNDER THAT AIRFLOW — it cannot show entry timing is non-binding
+> independently of the changed fan behaviour. Do not drop timing from a v2 scope on
+> this evidence; it argues for #781 being addressed ALONGSIDE recovery timing, not
+> instead of it.
 >
 > **#779 (new) — a #337 residual that corrupts every store-sourced fixture.**
 > `store_to_fixture` anchors first crack on the agent's event row, which carries the
