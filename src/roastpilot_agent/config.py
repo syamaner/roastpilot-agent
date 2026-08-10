@@ -7,6 +7,7 @@ deliberately conservative software ceilings pending supervised hardware
 validation at E12 (E12-S1).
 """
 
+import math
 from pathlib import Path
 from typing import Annotated, ClassVar, Literal
 from urllib.parse import urlsplit, urlunsplit
@@ -1453,6 +1454,14 @@ class ControllerConfig(BaseModel):
     # feeding it data are one deliberate act rather than a default.
     ambient_fan_doctrine: AmbientFanDoctrine = Field(default_factory=AmbientFanDoctrine)
 
+    @field_validator("max_stale_telemetry_seconds")
+    @classmethod
+    def _check_finite_staleness_bound(cls, value: float) -> float:
+        """Reject a non-finite bound that would disable stale-read detection."""
+        if not math.isfinite(value):
+            raise ValueError("max_stale_telemetry_seconds must be finite")
+        return value
+
     def advisory_interval_for(self, phase: RoastPhase) -> float | None:
         """Return the minimum-interval consult floor for ``phase`` in seconds.
 
@@ -1958,6 +1967,22 @@ class SafetyLimits(BaseModel):
     # is the *target* ceiling, the emergency-drop bound is the last-resort one.
     bitter_ceiling_temp_c: float = Field(default=196.0, gt=0)
     emergency_drop_temp_c: float = Field(default=198.0, gt=0)
+
+    @field_validator("max_bean_temp_c", "max_env_temp_c", "pre_t0_max_bean_temp_c")
+    @classmethod
+    def _check_finite_temperature_ceiling(cls, value: float) -> float:
+        """Reject a non-finite bound that would disable a temperature guard."""
+        if not math.isfinite(value):
+            raise ValueError("temperature safety ceilings must be finite")
+        return value
+
+    @field_validator("min_seconds_between_commands")
+    @classmethod
+    def _check_finite_command_interval(cls, value: float) -> float:
+        """Reject a non-finite interval that would suppress every command."""
+        if not math.isfinite(value):
+            raise ValueError("min_seconds_between_commands must be finite")
+        return value
 
     @model_validator(mode="after")
     def _check_drop_ceiling_order(self) -> "SafetyLimits":

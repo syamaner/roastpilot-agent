@@ -7,6 +7,7 @@ telemetry validity (E3-S2), command validation (E3-S3), e-stop plumbing
 (E3-S4), and phase/source validity (E3-S5, D16) follow.
 """
 
+import math
 from enum import Enum
 from typing import Literal
 
@@ -231,15 +232,27 @@ class SafetyPolicy:
     ) -> SafetyEvaluation:
         """Apply the temperature rule set to a telemetry reading (E3-S1).
 
-        Severity order: hard ceilings first (bean, then environment —
-        breaching either is an emergency stop), then the pre-T0 overrun
-        rule, which applies only while ``preheating`` with no confirmed T0
-        (orchestration plan § Safety Policy): heat is forced to 0 %, fan to
-        the configured safe value, and the verdict is RECOVERY or FAULT per
-        ``pre_t0_overrun_severity``. Limits are strict: a reading exactly
-        at a ceiling does not trip it.
+        Severity order: invalid non-finite telemetry first (FAULT), hard
+        ceilings next (bean, then environment — breaching either is an
+        emergency stop), then the pre-T0 overrun rule, which applies only
+        while ``preheating`` with no confirmed T0 (orchestration plan § Safety
+        Policy): heat is forced to 0 %, fan to the configured safe value, and
+        the verdict is RECOVERY or FAULT per ``pre_t0_overrun_severity``.
+        Limits are strict: a finite reading exactly at a ceiling does not trip
+        it.
         """
         limits = self._limits
+        if not math.isfinite(bean_temp_c) or not math.isfinite(env_temp_c):
+            return SafetyEvaluation(
+                rule="non_finite_telemetry",
+                verdict=SafetyVerdict.FAULT,
+                adjusted_heat=0,
+                adjusted_fan=limits.overrun_safe_fan_percent,
+                reason=(
+                    "non-finite bean or environment temperature: failing closed "
+                    f"— heat 0 %, fan {limits.overrun_safe_fan_percent} %"
+                ),
+            )
         if bean_temp_c > limits.max_bean_temp_c:
             return SafetyEvaluation(
                 rule="max_bean_temp",

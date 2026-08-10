@@ -15,11 +15,12 @@
 > fail-closed without one; three pre-delegation gates and the
 > stripped-untrusted-bytes rules live in AGENTS.md's implementation-delegation
 > bullet. Follow-ups: #762 (verify-stage batching), #766 (planner read
-> confinement), #767 (four deferred watermark/guard P2s). Unchanged and top of
-> the week's plan: **#756 — an open SAFETY gate on any hardware roast (a
-> `NaN`/`-inf` temperature slips past the 230 °C bean and 240 °C environment
-> hard ceilings; fix before charging beans)** with #757/#758 completing that
-> family, and #742 as the remaining scoring blocker for the c11 hardware arm.
+> confinement), #767 (four deferred watermark/guard P2s). **#756 is FIXED in
+> this slice:** non-finite bean/environment temperatures and RoR values are
+> voided at the MCP reading boundary; the policy independently faults
+> non-finite temperatures closed; temperature ceilings and the telemetry
+> staleness bound must be finite. #757/#758 complete that family, and #742
+> remains the scoring blocker for the c11 hardware arm.
 >
 > **STATUS UPDATE — 8 Aug 2026 (RP-D shipped; RP-B is next). Read with the 6 Aug
 > block below.** [Corrected 9 Aug: RP-B is now IN FLIGHT, not next — PR #731
@@ -49,7 +50,7 @@
 > open for the residual fixture item + the #726 follow-ups) agree — no drift.
 > **Next in the D122 sequence: RP-B (#709) — the c11 ambient-fan doctrine.**
 > [Corrected 9 Aug: RP-B is in flight — PR #731 and PR #741 both merged; the c11 doctrine still ships DISABLED and #742/#745 gate scoring a hardware arm.]
-> [Corrected 10 Aug: #745 closed 9 Aug via PR #753, and #759 closed the non-finite triad half (#752); **#742 is now the remaining SCORING blocker** for a c11 hardware arm. **Open safety issue #756 separately gates RUNNING one at all** — a `NaN` or `-inf` bean/environment temperature slips past the hard ceilings (bare `>` at `safety.py:243`/`252`; bean ceiling 230 °C, environment ceiling 240 °C; `+inf` does trip them), so do not charge beans while it is open; #757/#758 complete that non-finite family.]
+> [Corrected 10 Aug: #745 closed 9 Aug via PR #753, and #759 closed the non-finite triad half (#752); **#742 is now the remaining SCORING blocker** for a c11 hardware arm. **The #756 safety gate is fixed in this slice:** the live projection voids non-finite bean/environment temperatures and RoR values, the policy independently faults non-finite temperatures closed, and the temperature ceilings plus telemetry-staleness bound must be finite. #757/#758 complete that non-finite family.]
 > **Eval-model correction (Codex catch on the docs PR, now D125):** RP-D scores a
 > roast's ACHIEVED outcome, which a replay cannot change, so an offline c3-vs-c11
 > replay yields the SAME RP-D score for both arms — RP-D cannot discriminate a

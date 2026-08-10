@@ -8,6 +8,7 @@ source and validated here against the 7 Jun 2026 live-roast exports.
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -22,6 +23,7 @@ import pytest
 from anyio import BrokenResourceError, ClosedResourceError
 from pydantic import ValidationError
 
+import roastpilot_agent.mcp_client as mcp_client_module
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig
 from roastpilot_agent.mcp_client import (
     AmbientStatus,
@@ -2161,6 +2163,7 @@ def test_project_session_state_maps_detection_and_passthrough() -> None:
 
 
 def test_project_session_state_none_without_usable_reading() -> None:
+    """A genuinely absent temperature remains an absent reading, not malformed."""
     no_device = RoastSessionState.model_validate({**SESSION_STATE_PAYLOAD, "device_state": None})
     assert project_session_state(no_device, age_seconds=0.0) is None
     null_temp_device = {
@@ -2171,6 +2174,118 @@ def test_project_session_state_none_without_usable_reading() -> None:
         {**SESSION_STATE_PAYLOAD, "device_state": null_temp_device}
     )
     assert project_session_state(null_temp, age_seconds=0.0) is None
+
+
+@pytest.mark.parametrize("non_finite", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("member", ["bean_temp_c", "env_temp_c"])
+def test_project_session_state_voids_non_finite_temperature(member: str, non_finite: float) -> None:
+    """The shared reading boundary declines every non-finite temperature."""
+    device = {
+        **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+        member: non_finite,
+    }
+    state = RoastSessionState.model_validate({**SESSION_STATE_PAYLOAD, "device_state": device})
+
+    assert project_session_state(state, age_seconds=0.0) is None
+
+
+@pytest.mark.parametrize("non_finite", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("member", ["bean_ror_c_per_min", "env_ror_c_per_min"])
+def test_project_session_state_voids_only_non_finite_ror(member: str, non_finite: float) -> None:
+    """A malformed derived rate is absent while valid temperatures survive."""
+    state = RoastSessionState.model_validate({**SESSION_STATE_PAYLOAD, member: non_finite})
+
+    telemetry = project_session_state(state, age_seconds=0.0)
+
+    assert telemetry is not None
+    assert getattr(telemetry, member) is None
+    assert telemetry.bean_temp_c == 196.0
+    assert telemetry.env_temp_c == 214.0
+
+
+@pytest.mark.parametrize(
+    "member",
+    ["bean_temp_c", "env_temp_c", "bean_ror_c_per_min", "env_ror_c_per_min"],
+)
+def test_non_finite_telemetry_warning_is_field_only_and_one_shot(
+    member: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Malformed telemetry names its field once without logging its value."""
+    monkeypatch.setattr(mcp_client_module, "_WARNED_NON_FINITE_TELEMETRY_FIELDS", set[str]())
+    caplog.set_level(logging.WARNING, logger="roastpilot_agent.mcp_client")
+    if member in {"bean_temp_c", "env_temp_c"}:
+        device = {
+            **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+            member: float("inf"),
+        }
+        payload = {**SESSION_STATE_PAYLOAD, "device_state": device}
+    else:
+        payload = {**SESSION_STATE_PAYLOAD, member: float("inf")}
+    state = RoastSessionState.model_validate(payload)
+
+    project_session_state(state, age_seconds=0.0)
+    project_session_state(state, age_seconds=0.0)
+
+    records = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(records) == 1
+    assert member in records[0].getMessage()
+    assert "Infinity" not in records[0].getMessage()
+    assert records[0].args == (member,)
+
+
+def test_non_finite_telemetry_warnings_remain_one_shot_per_field(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One malformed field must not silence a different field in the same run."""
+    mcp_client_module.reset_non_finite_telemetry_warnings()
+    caplog.set_level(logging.WARNING, logger="roastpilot_agent.mcp_client")
+    bad_device = {
+        **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+        "bean_temp_c": float("inf"),
+    }
+    bad_temperature = RoastSessionState.model_validate(
+        {**SESSION_STATE_PAYLOAD, "device_state": bad_device}
+    )
+    bad_ror = RoastSessionState.model_validate(
+        {**SESSION_STATE_PAYLOAD, "bean_ror_c_per_min": float("inf")}
+    )
+
+    project_session_state(bad_temperature, age_seconds=0.0)
+    project_session_state(bad_ror, age_seconds=0.0)
+
+    records = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert [record.args for record in records] == [
+        ("bean_temp_c",),
+        ("bean_ror_c_per_min",),
+    ]
+
+
+def test_temperature_transport_preserves_then_projection_voids_nan() -> None:
+    """Text preserves bare NaN; structured content nulls it before projection."""
+    mcp_types = pytest.importorskip("mcp.types")
+    device = {
+        **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+        "bean_temp_c": float("nan"),
+    }
+    body = {**SESSION_STATE_PAYLOAD, "device_state": device}
+    text_block = mcp_types.TextContent(type="text", text=json.dumps(body))
+    structured = mcp_types.CallToolResult.model_validate_json(
+        mcp_types.CallToolResult(content=[text_block], structuredContent=body).model_dump_json()
+    )
+    text_only = mcp_types.CallToolResult.model_validate_json(
+        mcp_types.CallToolResult(content=[text_block]).model_dump_json()
+    )
+
+    structured_state = RoastSessionState.model_validate(parse_tool_result(structured))
+    assert structured_state.device_state is not None
+    assert structured_state.device_state.bean_temp_c is None
+    assert project_session_state(structured_state, age_seconds=0.0) is None
+
+    text_state = RoastSessionState.model_validate(parse_tool_result(text_only))
+    assert text_state.device_state is not None
+    assert text_state.device_state.bean_temp_c is not None
+    assert math.isnan(text_state.device_state.bean_temp_c)
+    assert project_session_state(text_state, age_seconds=0.0) is None
 
 
 def test_project_session_state_pending_detection_is_false() -> None:

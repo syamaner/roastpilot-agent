@@ -3138,11 +3138,12 @@ class RoastController:
           counted toward a new fault and emits nothing (the dead-MCP anti-spam
           guarantee: still exactly one FAULT event ever).
         * **Same or lesser verdict** — do nothing: no re-emit, no re-fire.
-        * **Strictly more severe** (the only actionable case today: FAULT or
-          RECOVERY → EMERGENCY_STOP) — fire the hardware emergency stop ONCE,
-          emit ONE escalation FAULT event, and re-latch at the higher verdict.
-          Already at EMERGENCY_STOP (max severity) ⇒ nothing can out-rank it, so
-          it never re-fires.
+        * **Strictly more severe** — fire the hardware emergency stop ONCE,
+          emit ONE escalation FAULT event, and re-latch at EMERGENCY_STOP. A
+          direct foreign-reader non-finite FAULT can out-rank RECOVERY; a hard
+          ceiling EMERGENCY_STOP can out-rank FAULT or RECOVERY. Already at
+          EMERGENCY_STOP (max severity) ⇒ nothing can out-rank it, so it never
+          re-fires.
         """
         latched = self._latched_verdict
         if latched is None:  # pragma: no cover — only entered while latched
@@ -3178,8 +3179,9 @@ class RoastController:
             # ALLOW/CLAMP/REJECT, or a same/lesser terminal verdict: hold, no
             # re-emit, no re-fire — the latch stays at its current level.
             return
-        # Strictly more severe → escalate. The only path that reaches here is an
-        # EMERGENCY_STOP out-ranking a FAULT/RECOVERY latch.
+        # Strictly more severe → escalate. A foreign reader can supply a
+        # non-finite-telemetry FAULT that out-ranks RECOVERY; the live adapter
+        # voids that reading to None. Hard-ceiling EMERGENCY_STOP out-ranks both.
         await self._snapshots.persist_evaluation(evaluation)
         await self._escalate_to_emergency_stop(evaluation)
 

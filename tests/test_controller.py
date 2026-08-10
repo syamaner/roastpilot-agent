@@ -8,6 +8,7 @@ extend this suite.
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -383,6 +384,69 @@ def harness_in_development(
     harness.log.clear()
     harness.events.events.clear()
     return harness
+
+
+def _session_payload_with_temperatures(
+    *, bean_temp_c: float | None, env_temp_c: float | None = 214.0
+) -> dict[str, object]:
+    """Return the contract payload with selected device temperatures."""
+    device = {
+        **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+        "bean_temp_c": bean_temp_c,
+        "env_temp_c": env_temp_c,
+    }
+    return {**SESSION_STATE_PAYLOAD, "device_state": device}
+
+
+def _session_payload_with_ror(
+    *,
+    bean_ror_c_per_min: float | None,
+    elapsed_monotonic_seconds: float,
+    first_crack_detected: bool,
+) -> dict[str, object]:
+    """Return a fresh contract payload with selected RoR and FC status."""
+    first_crack_status = {
+        **cast("dict[str, object]", SESSION_STATE_PAYLOAD["first_crack_status"]),
+        "status": "detected" if first_crack_detected else "pending",
+    }
+    return {
+        **SESSION_STATE_PAYLOAD,
+        "elapsed_monotonic_seconds": elapsed_monotonic_seconds,
+        "bean_ror_c_per_min": bean_ror_c_per_min,
+        "first_crack_status": first_crack_status,
+    }
+
+
+def _controller_with_live_adapter(
+    payloads: list[dict[str, object]],
+    *,
+    config: ControllerConfig = _BASELINE_POST_FC_CONFIG,
+) -> tuple[RoastController, RecordingExecutor, RecordingSnapshotSink, EventSink, FakeClock]:
+    """Build a controller whose fake transport runs through the live adapter."""
+    call_count = 0
+
+    async def call_tool(tool: str, arguments: dict[str, object]) -> object:
+        nonlocal call_count
+        payload = payloads[min(call_count, len(payloads) - 1)]
+        call_count += 1
+        return payload
+
+    log: list[str] = []
+    clock = FakeClock()
+    adapter = RoasterControlAdapter(RoasterMCPClient(call_tool), clock=clock)
+    executor = RecordingExecutor(log)
+    sink = RecordingSnapshotSink(log)
+    events = EventSink(log)
+    controller = RoastController(
+        config=config,
+        safety=SafetyPolicy(SafetyLimits()),
+        state_reader=adapter,
+        command_executor=executor,
+        snapshot_sink=sink,
+        event_emitter=events,
+        clock=clock,
+    )
+    return controller, executor, sink, events, clock
 
 
 @pytest.mark.asyncio
@@ -1802,6 +1866,105 @@ async def test_safety_evaluated_before_advisory_and_blocks_it() -> None:
 
 
 @pytest.mark.asyncio
+async def test_non_finite_live_reading_faults_as_missing_telemetry() -> None:
+    """Both guards removed recreates the pre-fix all-clear runaway mutant."""
+    controller, executor, sink, events, _ = _controller_with_live_adapter(
+        [_session_payload_with_temperatures(bean_temp_c=float("nan"))]
+    )
+    controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:
+        controller.transition_to(step)
+    events.events.clear()
+
+    await controller.tick()
+
+    evaluation = sink.evaluations[-1]
+    assert evaluation.rule == "missing_telemetry"
+    assert evaluation.verdict is SafetyVerdict.FAULT
+    assert evaluation.adjusted_heat == 0
+    assert evaluation.adjusted_fan == SafetyLimits().overrun_safe_fan_percent
+    assert executor.targets == [(0, SafetyLimits().overrun_safe_fan_percent)]
+    assert executor.estop_reasons == []
+    assert controller.phase is RoastPhase.FAULTED
+    assert events.kinds().count(RoastEventKind.FAULT) == 1
+
+
+@pytest.mark.asyncio
+async def test_idle_non_finite_live_reading_is_inert() -> None:
+    """Outside active phases, voided telemetry causes no actuation or fault."""
+    controller, executor, sink, events, _ = _controller_with_live_adapter(
+        [_session_payload_with_temperatures(bean_temp_c=float("nan"))]
+    )
+
+    await controller.tick()
+
+    assert controller.phase is RoastPhase.IDLE
+    assert sink.evaluations[-1].verdict is SafetyVerdict.ALLOW
+    assert sink.evaluations[-1].rule == "all_clear"
+    assert executor.targets == []
+    assert executor.estop_reasons == []
+    assert RoastEventKind.FAULT not in events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_non_finite_live_ror_cannot_raise_heat_and_next_finite_frame_recovers() -> None:
+    """A malformed mid-development RoR neither maximises nor poisons heat.
+
+    This drives the real MCP projection and post-FC controller together. If the
+    boundary RoR guard is removed, the NaN enters the clamp as its ceiling,
+    writes 100 % heat, poisons the EMA, and the subsequent finite frames remain
+    pinned there.
+    """
+    rors = [14.0, 14.0, 14.0, 14.0, float("nan"), 14.0, 14.0]
+    payloads = [
+        _session_payload_with_ror(
+            bean_ror_c_per_min=14.0,
+            elapsed_monotonic_seconds=1200.0,
+            first_crack_detected=False,
+        ),
+        *[
+            _session_payload_with_ror(
+                bean_ror_c_per_min=ror,
+                elapsed_monotonic_seconds=1205.0 + index * 5.0,
+                first_crack_detected=True,
+            )
+            for index, ror in enumerate(rors)
+        ],
+    ]
+    controller, executor, _, _, clock = _controller_with_live_adapter(
+        payloads,
+        config=_post_fc_config(control_interval_seconds=5.0),
+    )
+    controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:  # …→ ROASTING_PRE_FIRST_CRACK
+        controller.transition_to(step)
+
+    await controller.tick()  # establish the real pre-FC 100 % heat command
+    assert controller.snapshot().current_heat == 100
+    for _ in range(4):
+        clock.advance(5.0)
+        await controller.tick()
+
+    heat_before_bad_frame = controller.snapshot().current_heat
+    writes_before_bad_frame = len(executor.targets)
+    clock.advance(5.0)
+    await controller.tick()
+
+    assert controller.snapshot().current_heat == heat_before_bad_frame
+    assert len(executor.targets) == writes_before_bad_frame
+
+    for _ in range(2):
+        clock.advance(5.0)
+        await controller.tick()
+
+    snapshot = controller.snapshot()
+    assert snapshot.current_heat <= heat_before_bad_frame
+    assert snapshot.post_fc_smoothed_ror_c_per_min is not None
+    assert math.isfinite(snapshot.post_fc_smoothed_ror_c_per_min)
+    assert len(executor.targets) > writes_before_bad_frame
+
+
+@pytest.mark.asyncio
 async def test_slow_advisor_never_blocks_the_tick() -> None:
     """An advisor that never resolves times out; the tick completes with a
     rejected recommendation and the deterministic hold fallback."""
@@ -2351,6 +2514,33 @@ async def test_latch_does_not_escalate_on_a_same_or_lesser_verdict() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fault_latch_holds_silently_on_non_finite_live_reading() -> None:
+    """The live boundary turns latched non-finite telemetry into a silent None."""
+    controller, executor, sink, events, _ = _controller_with_live_adapter(
+        [
+            _session_payload_with_temperatures(bean_temp_c=None),
+            _session_payload_with_temperatures(bean_temp_c=float("nan")),
+        ]
+    )
+    controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:
+        controller.transition_to(step)
+    events.events.clear()
+
+    await controller.tick()
+    assert controller.phase is RoastPhase.FAULTED
+    evaluations_at_latch = len(sink.evaluations)
+    assert events.kinds().count(RoastEventKind.FAULT) == 1
+
+    await controller.tick()
+
+    assert controller.phase is RoastPhase.FAULTED
+    assert len(sink.evaluations) == evaluations_at_latch
+    assert events.kinds().count(RoastEventKind.FAULT) == 1
+    assert executor.estop_reasons == []
+
+
+@pytest.mark.asyncio
 async def test_latch_skips_escalation_read_after_fault_acknowledged() -> None:
     """#332: once the operator acknowledges the fault (``note_fault_acknowledged``),
     the latched tick SKIPS the upward-escalation re-read — the run is finalising and
@@ -2408,6 +2598,37 @@ async def test_latch_escalates_recovery_to_emergency_stop_and_faults() -> None:
     for _ in range(5):
         await harness.controller.tick()
     assert len(harness.executor.estop_reasons) == 1
+
+
+@pytest.mark.asyncio
+async def test_foreign_non_finite_reader_escalates_recovery_latch_fail_safe() -> None:
+    """A foreign direct NaN FAULT escalates RECOVERY fail-safe to e-stop.
+
+    This upward-only direction is documented for foreign ``RoastTelemetry``
+    constructors and is unreachable from the live adapter, which voids the
+    non-finite reading to ``None`` before it reaches the controller.
+    """
+    pre_t0_overrun = reading(bean=205.0, env=200.0)
+    direct_non_finite = reading(bean=float("nan"), env=200.0)
+    harness = make_harness(readings=[pre_t0_overrun, direct_non_finite])
+    for step in NORMAL_PATH[:2]:
+        harness.controller.transition_to(step)
+    harness.events.events.clear()
+
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+
+    await harness.controller.tick()
+
+    assert harness.sink.evaluations[-1].rule == "non_finite_telemetry"
+    assert harness.sink.evaluations[-1].verdict is SafetyVerdict.FAULT
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert len(harness.executor.estop_reasons) == 1
+    assert harness.events.kinds().count(RoastEventKind.FAULT) == 1
+    assert (
+        harness.controller._latched_verdict  # pyright: ignore[reportPrivateUsage]
+        is SafetyVerdict.EMERGENCY_STOP
+    )
 
 
 @pytest.mark.asyncio
