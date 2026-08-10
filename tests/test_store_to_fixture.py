@@ -432,6 +432,12 @@ def test_utc_mapping_handles_iso_variants_bad_rows_and_ties(tmp_path: Path) -> N
     )
     assert (
         s2f._utc_to_run_seconds(  # pyright: ignore[reportPrivateUsage]
+            connection, "r", "2026-08-10T21:00:05+01:00"
+        )
+        == 5.0
+    )
+    assert (
+        s2f._utc_to_run_seconds(  # pyright: ignore[reportPrivateUsage]
             connection, "r", "not-a-date"
         )
         is None
@@ -471,6 +477,7 @@ async def test_t0_source_absent_falls_back_with_direction_warning(
     warning = capsys.readouterr().err
 
     assert entry["charge_anchor"] == "event_row"
+    assert entry["development_time_percent"] == pytest.approx(21.97, abs=0.05)
     assert "backdated-run" in warning
     assert "charge" in warning
     assert "source absent" in warning
@@ -478,7 +485,9 @@ async def test_t0_source_absent_falls_back_with_direction_warning(
 
 
 @pytest.mark.asyncio
-async def test_unparseable_first_crack_onset_falls_back(tmp_path: Path) -> None:
+async def test_unparseable_first_crack_onset_falls_back(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     """T7: an unparseable FC timestamp warns and uses the event row."""
     db_path = tmp_path / "fc-unparseable.sqlite3"
     store = await _backdated_store(db_path)
@@ -492,8 +501,10 @@ async def test_unparseable_first_crack_onset_falls_back(tmp_path: Path) -> None:
     await store.close()
 
     entry = s2f.convert(db_path, tmp_path / "fixture")
+    warning = capsys.readouterr().err
 
     assert entry["first_crack_anchor"] == "event_row"
+    assert "source unparseable" in warning
 
 
 @pytest.mark.asyncio
@@ -595,7 +606,9 @@ async def test_pre_schema_v3_store_falls_back_for_charge(
 
 
 @pytest.mark.asyncio
-async def test_unmappable_utc_anchors_fall_back(tmp_path: Path) -> None:
+async def test_unmappable_utc_anchors_fall_back(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     """T12: preferred UTC sources fall back when telemetry has no elapsed clock."""
     db_path = tmp_path / "unmappable.sqlite3"
     store = await _backdated_store(db_path)
@@ -607,9 +620,35 @@ async def test_unmappable_utc_anchors_fall_back(tmp_path: Path) -> None:
     await store.close()
 
     entry = s2f.convert(db_path, tmp_path / "fixture")
+    warning = capsys.readouterr().err
 
     assert entry["charge_anchor"] == "event_row"
     assert entry["first_crack_anchor"] == "event_row"
+    assert warning.count("source unmappable") == 2
+
+
+@pytest.mark.asyncio
+async def test_both_absent_utc_sources_fall_back_independently(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Both absent preferred sources retain their own event-row fallback warning."""
+    db_path = tmp_path / "both-fallbacks.sqlite3"
+    store = await _backdated_store(
+        db_path,
+        include_t0_anchor=False,
+        include_first_crack_anchor=False,
+    )
+    await store.close()
+
+    entry = s2f.convert(db_path, tmp_path / "fixture")
+    warning = capsys.readouterr().err
+
+    assert entry["charge_anchor"] == "event_row"
+    assert entry["first_crack_anchor"] == "event_row"
+    assert "charge uses event_row" in warning
+    assert "DTR overstated" in warning
+    assert "first crack uses event_row" in warning
+    assert "DTR understated" in warning
 
 
 @pytest.mark.asyncio
@@ -626,8 +665,13 @@ async def test_corrupt_backdated_onset_inverting_marks_fails_closed(tmp_path: Pa
     await store.connection.commit()
     await store.close()
 
-    with pytest.raises(s2f.FixtureConversionError, match="mark order invalid"):
+    with pytest.raises(s2f.FixtureConversionError) as exc_info:
         s2f.convert(db_path, tmp_path / "fixture")
+    message = str(exc_info.value)
+    assert "mark order invalid" in message
+    assert "charge 49.0" in message
+    assert "fc 30.0" in message
+    assert "drop 720.0" in message
 
 
 @pytest.mark.asyncio
@@ -646,6 +690,34 @@ async def test_frozen_dtr_mismatch_emits_cross_check_warning(
     assert "development_time_percent" in warning
     assert "17.9" in warning
     assert f"{_BACKDATED_FROZEN_DTR}" in warning
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("frozen_development_percent", "should_warn"),
+    [(22.1, False), (22.1001, True)],
+)
+async def test_frozen_dtr_cross_check_boundary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    frozen_development_percent: float,
+    should_warn: bool,
+) -> None:
+    """The frozen-DTR warning threshold is strictly greater than 0.5 pp."""
+    db_path = tmp_path / "dtr-boundary.sqlite3"
+    store = await _backdated_store(db_path)
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET development_percent = ?"
+        " WHERE run_id = ? AND development_percent IS NOT NULL",
+        (frozen_development_percent, "backdated-run"),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    s2f.convert(db_path, tmp_path / "fixture")
+    warning = capsys.readouterr().err
+
+    assert ("development_time_percent cross-check differs" in warning) is should_warn
 
 
 @pytest.mark.asyncio
