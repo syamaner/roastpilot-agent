@@ -112,6 +112,19 @@ def test_agents_md_prose_names_the_full_ids() -> None:
         "AGENTS.md must associate story-planner with the claude-fable-5 pin (D152) "
         "with no other model ID intervening"
     )
+    # Converse guard: the association checks above pass on the shared
+    # two-Fable-roles sentence even if a LATER clause re-pins one role (e.g.
+    # "story-planner (model: claude-opus-5)"). Forbid any non-Fable model ID
+    # in the window straight after either role's name, anywhere in the prose.
+    for role in ("planning-architect", "story-planner"):
+        drift = re.search(
+            rf"{role}(?:(?!claude-)[\s\S]){{0,80}}claude-(?!fable-5)[a-z0-9.-]+",
+            agents_md,
+        )
+        found = drift.group(0) if drift else ""
+        assert drift is None, (
+            f"{role} appears re-associated with a non-Fable model in AGENTS.md prose: {found!r}"
+        )
 
 
 def test_topology_reference_table_rows_match_the_map() -> None:
