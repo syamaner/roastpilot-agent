@@ -276,6 +276,64 @@ async def test_a_base_slug_change_invalidates_even_with_a_pinned_phase_slot(
 
 
 @pytest.mark.asyncio
+async def test_a_reasoning_effort_change_alone_invalidates_the_probe(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reasoning effort is part of what the probe contacted.
+
+    `build_model` bakes `reasoning_effort` into the model settings every cached
+    agent uses, including the one `healthcheck` probes with — so an effort-only
+    change makes the recorded probe describe a different call (Claude review,
+    folded pre-open). Set via env because `reasoning_effort` is not in
+    `AdvisorConfigEdit`.
+    """
+    svc = RoastService(store, live_serve_mode=True)
+    svc.set_advisor_health(
+        AdvisorHealth(
+            status=AdvisorHealthStatus.REACHABLE,
+            provider="openai_compatible",
+            model_slug=svc._config.advisor.model_slug,  # pyright: ignore[reportPrivateUsage]
+        )
+    )
+
+    monkeypatch.setenv("ROASTPILOT_ADVISOR__REASONING_EFFORT", "high")
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert svc._config.advisor.reasoning_effort == "high"  # pyright: ignore[reportPrivateUsage]
+    assert (await svc.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_cosmetic_base_url_edit_keeps_the_probe(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """A trailing slash is the same endpoint, so the probe still describes it.
+
+    The identity compares the NORMALISED base URL, using the same helper the
+    FC-latency screen uses. Comparing raw strings would discard a valid probe on
+    a purely cosmetic edit and report the advisor "not probed" for no reason
+    (Claude review, folded pre-open).
+    """
+    svc = RoastService(store, live_serve_mode=True)
+    probed = AdvisorHealth(
+        status=AdvisorHealthStatus.REACHABLE,
+        provider="openai_compatible",
+        model_slug=svc._config.advisor.model_slug,  # pyright: ignore[reportPrivateUsage]
+    )
+    svc.set_advisor_health(probed)
+
+    persist_config_edit(
+        AppConfigEdit(advisor=AdvisorConfigEdit(provider_base_url="https://openrouter.ai/api/v1/"))
+    )
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert (await svc.health()).advisor == probed
+
+
+@pytest.mark.asyncio
 async def test_an_unchanged_model_keeps_its_reachability_probe(
     store: RoastStore,
     config_file: Path,
