@@ -42,6 +42,7 @@ from roastpilot_agent.advisor import (
     RoastAdvisor,
     RoastDecision,
 )
+from roastpilot_agent.advisor_screen import advice_models
 from roastpilot_agent.bean_sourcing import (
     BEAN_EXTRACTION_PROMPT_VERSION,
     BeanExtractionError,
@@ -86,6 +87,7 @@ from roastpilot_agent.mcp_client import (
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
     AdvisorHealth,
+    AdvisorHealthStatus,
     AdvisorTraceStatus,
     BeanProfile,
     BeanProfileDraft,
@@ -1527,6 +1529,12 @@ class RoastService:
         runs, so ``GET /api/health`` can surface whether the advisor answered
         before charge. Pure observability — the advisor is advisory-only.
 
+        Not re-set per roast, but INVALIDATED by :meth:`start_roast` when the
+        reloaded config names a different ``model_slug`` (#747 / D151): a probe
+        describes the model it probed, and since D151 that model is the one
+        that answers, so a stale REACHABLE would vouch for a slug nothing has
+        contacted.
+
         Args:
             health: The reachability probe result to surface on ``/api/health``.
         """
@@ -1728,12 +1736,61 @@ class RoastService:
                 )
 
                 fresh_advisor = build_advisor(fresh_config)
+                # Captured BEFORE the commit below overwrites it — the probe
+                # invalidation compares the outgoing advisor config against the
+                # incoming one.
+                previous_advisor = self._config.advisor
                 # Commit all three atomically so the trio is always consistent
                 # (guards against a future raising build_advisor leaving _config
                 # ahead of _advisor).
                 self._config = fresh_config
                 self._safety = fresh_safety
                 self._advisor = fresh_advisor
+                # Invalidate a probe that no longer describes the advisor we
+                # just built (#747 / D151, safety-reviewer finding). The probe
+                # runs ONCE, at serve startup (``live.probe_advisor_health``),
+                # against ``advisor.model_slug``. Before D151 a changed
+                # ``model_slug`` could not reach a roast, so a stale REACHABLE
+                # was harmless; now the model the operator typed in /config IS
+                # the model that answers, and the first contact with it would
+                # otherwise be the post-FC advisory call while /api/health still
+                # vouched for the previous slug. Clearing (not re-probing) is
+                # deliberate: ``None`` renders as "not probed" — honest, and it
+                # keeps a network call out of the roast-start path. Re-probing
+                # between roasts is issue-sized, not a side effect of starting
+                # a roast.
+                # Keyed on the STATUS, not on whether a model was named (two
+                # successive local Codex P2s). NOT_CONFIGURED says the ADVISOR
+                # is absent — advisory-paused, no API key — which no model
+                # change can stale, so clearing it would regress an explicit
+                # readout to the ambiguous "not probed". But a model-less
+                # result does NOT imply that state: ``probe_advisor_health``
+                # also returns UNREACHABLE with no slug when the probe times
+                # out or raises, and preserving THAT would report the old
+                # advisor offline forever after a model change the probe never
+                # saw. Anything other than NOT_CONFIGURED is a claim about a
+                # specific model, so it is stale unless it still describes the
+                # current one.
+                #
+                # ``dispatch_identity`` names what a probe CONTACTED (provider,
+                # NORMALISED endpoint, key env var, base slug, reasoning effort
+                # — ``build_model`` bakes the effort into every cached agent,
+                # including the one ``healthcheck`` probes with).
+                # ``advice_models`` is compared alongside it because a pinned
+                # phase slot changes which model gives ADVICE without changing
+                # what the probe contacted. Both together are the #134 "advisor
+                # configured" false comfort this probe exists to prevent.
+                probed = self._advisor_health
+                if (
+                    probed is not None
+                    and probed.status is not AdvisorHealthStatus.NOT_CONFIGURED
+                    and (
+                        previous_advisor.dispatch_identity()
+                        != fresh_config.advisor.dispatch_identity()
+                        or advice_models(previous_advisor) != advice_models(fresh_config.advisor)
+                    )
+                ):
+                    self._advisor_health = None
                 # MCP device respawn (#431): when the reloaded mcp_device differs
                 # from what the child was spawned with, stop and restart the child
                 # so hardware changes (serial port, driver, audio input, FC mode,

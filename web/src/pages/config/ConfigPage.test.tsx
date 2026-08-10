@@ -35,6 +35,7 @@ function makeFieldMeta(overrides?: Partial<ConfigFieldMeta>): ConfigFieldMeta {
     read_only: false,
     description: "",
     yaml_value: null,
+    advisory: null,
     ...overrides,
   };
 }
@@ -949,6 +950,7 @@ describe("ConfigPage — #482 inherit-state rendering (fc_mode select)", () => {
       effective_value: null,
       default: null,
       yaml_value: null,
+      advisory: null,
     });
     configMock.mockResolvedValue(snapshot);
     renderPage();
@@ -1428,6 +1430,7 @@ describe("ConfigPage — recording_devices array dirty detection", () => {
           read_only: false,
           description: "",
           yaml_value: null,
+          advisory: null,
         };
         return snap;
       })(),
@@ -1472,6 +1475,7 @@ describe("ConfigPage — recording_devices array dirty detection", () => {
           read_only: false,
           description: "",
           yaml_value: null,
+          advisory: null,
         };
         return snap;
       })(),

@@ -22,6 +22,8 @@ from pydantic import ValidationError
 
 from roastpilot_agent import config_store
 from roastpilot_agent.config import (
+    FC_LATENCY_BUSTED_ADVISOR_ARMS,
+    FC_LATENCY_SCREENED_ADVISOR_ARMS,
     AdvisorConfig,
     AppConfig,
     ControllerConfig,
@@ -124,23 +126,49 @@ def test_advisor_phases_is_the_controllers_own_gate() -> None:
     assert frozenset({RoastPhase.DEVELOPMENT}) == ADVISOR_PHASES
 
 
-def test_shadowed_model_slug_reports_the_model_the_advisor_actually_uses(
+def test_saved_model_slug_is_the_model_the_advisor_actually_uses(
     config_file: Path,
 ) -> None:
-    """A saved model_slug that model_for() shadows is named, not announced.
+    """D151 (#747): a model saved through /config now answers the roast.
 
-    `model_slug_by_phase` ships populated for every phase and is not editable
-    from /config, so `PydanticAIAdvisor`'s `model_for(context.phase)` keeps
-    returning gpt-4o after a `model_slug` edit. Printing the base slug would
-    announce an arm the roast is not running — the #746 lie in the other
-    direction (local Codex P1, folded pre-open).
+    This is the end-to-end shape of the defect — saved file → resolved config →
+    the model `PydanticAIAdvisor` picks with `model_for(context.phase)`. Before
+    D151 the populated override map won and the banner correctly reported
+    gpt-4o against a saved gpt-4.1-mini; now the saved value IS the arm, so the
+    banner names it and tags it as the experiment it is.
     """
     persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4.1-mini")))
     config, _ = config_store.load_app_config()
-    # Guard the premise: the advisor genuinely still calls gpt-4o when consulted.
-    assert {config.advisor.model_for(p) for p in ADVISOR_PHASES} == {"openai/gpt-4o"}
+    assert {config.advisor.model_for(p) for p in ADVISOR_PHASES} == {"openai/gpt-4.1-mini"}
 
     lines = load_banner_lines()
+
+    assert lines.advisor_cfg.startswith("openai/gpt-4.1-mini ")
+    assert "NOT the roast-advice model" not in lines.advisor_cfg
+    assert EXPERIMENT_TAG in lines.advisor_cfg
+
+
+def test_a_pinned_phase_slot_still_shadows_an_operator_set_slug(
+    config_file: Path,
+) -> None:
+    """The shadow warning survives D151 — the map can still be populated.
+
+    Emptying the DEFAULT does not remove the mechanism: a hand-edited saved
+    config or a `ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE` JSON blob can still
+    pin a slot, and then a `model_slug` the operator set gives no roast advice
+    exactly as before. Printing the base slug there would announce an arm the
+    roast is not running, so the warning must stay live rather than becoming
+    dead code the day the default changed.
+    """
+    config = AppConfig(
+        advisor=AdvisorConfig(
+            model_slug="openai/gpt-4.1-mini",
+            model_slug_by_phase={RoastPhase.DEVELOPMENT: "openai/gpt-4o"},
+        ),
+        controller=ControllerConfig(),
+    )
+
+    lines = resolve_banner_lines(config)
 
     assert lines.advisor_cfg.startswith("openai/gpt-4o ")
     # Named as not-the-advice-model, NOT as unused: healthcheck() probes with
@@ -157,14 +185,14 @@ def test_effective_non_default_model_is_tagged_experiment() -> None:
     """A per-phase override that actually takes effect IS tagged."""
     config = AppConfig(
         advisor=AdvisorConfig(
-            model_slug_by_phase=dict.fromkeys(ADVISOR_PHASES, "openai/gpt-4.1-mini")
+            model_slug_by_phase=dict.fromkeys(ADVISOR_PHASES, "openai/gpt-4o-mini")
         ),
         controller=ControllerConfig(),
     )
 
     lines = resolve_banner_lines(config)
 
-    assert lines.advisor_cfg == "openai/gpt-4.1-mini  ·  prompt c3" + EXPERIMENT_TAG
+    assert lines.advisor_cfg == "openai/gpt-4o-mini  ·  prompt c3" + EXPERIMENT_TAG
     # The base slug is the schema default here, so it is shadowed silently —
     # the warning is reserved for a slug the operator actually set.
     assert "NOT the roast-advice model" not in lines.advisor_cfg
@@ -180,16 +208,233 @@ def test_a_base_slug_that_matches_the_override_is_not_called_advice_less() -> No
     """
     config = AppConfig(
         advisor=AdvisorConfig(
-            model_slug="openai/gpt-4.1-mini",
-            model_slug_by_phase={RoastPhase.DEVELOPMENT: "openai/gpt-4.1-mini"},
+            model_slug="openai/gpt-4o-mini",
+            model_slug_by_phase={RoastPhase.DEVELOPMENT: "openai/gpt-4o-mini"},
         ),
         controller=ControllerConfig(),
     )
 
     lines = resolve_banner_lines(config)
 
-    assert lines.advisor_cfg == "openai/gpt-4.1-mini  ·  prompt c3" + EXPERIMENT_TAG
+    assert lines.advisor_cfg == "openai/gpt-4o-mini  ·  prompt c3" + EXPERIMENT_TAG
     assert "NOT the roast-advice model" not in lines.advisor_cfg
+
+
+@pytest.fixture(autouse=True)
+def advisor_key_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Wire an API key so the latency note is reachable at all.
+
+    `screen_warning` is silent with no key, because a key-less agent wires no
+    advisor and nothing can call a model. The banner's OTHER assertions are
+    unaffected either way; the latency ones need the key-present world stated
+    EXPLICITLY rather than inherited from the developer's shell, which is what
+    hid this until a key-less run (i.e. CI) exposed it.
+    """
+    monkeypatch.setenv(AdvisorConfig().api_key_env, "test-key")
+
+
+def _advisor_line_for(**advisor_kwargs: object) -> str:
+    """Render the advisor banner line for an ad-hoc advisor config.
+
+    Args:
+        **advisor_kwargs: Field overrides for :class:`AdvisorConfig`.
+
+    Returns:
+        The rendered ``Advisor cfg:`` text.
+    """
+    config = AppConfig(
+        advisor=AdvisorConfig(**advisor_kwargs),  # pyright: ignore[reportArgumentType]
+        controller=ControllerConfig(),
+    )
+    return resolve_banner_lines(config).advisor_cfg
+
+
+def test_screened_model_gets_no_latency_warning() -> None:
+    """The pinned default is silent — an ordinary roast must stay quiet.
+
+    A warning that fires on the proven baseline is a warning the operator
+    learns to scroll past, which would cost exactly the case it exists for.
+    """
+    line = _advisor_line_for()
+
+    assert line == "openai/gpt-4o  ·  prompt c3"
+    assert "⚠ no FC-latency screen" not in line
+    assert "BUSTED" not in line
+
+
+def test_model_measured_as_busting_the_gate_is_named_as_such() -> None:
+    """A model D40/D41 MEASURED as busting the ~5 s gate says so (D151).
+
+    Distinct from the unscreened wording on purpose: "we measured it and it
+    busts" is a far stronger claim than "nothing on record", and collapsing the
+    two would either overstate an unknown model or understate this one.
+    """
+    line = _advisor_line_for(model_slug="openai/gpt-5.5")
+
+    assert "openai/gpt-5.5 BUSTED the ~5 s post-FC latency screen" in line
+    assert "no FC-latency screen on record" not in line
+    assert EXPERIMENT_TAG in line
+
+
+def test_model_with_no_screen_on_record_is_named_as_unverified() -> None:
+    """An unknown slug is reported as unscreened, not as bad.
+
+    The soft warning replaces the accidental protection the populated map used
+    to give (#747). It is a prompt to screen the model, not a verdict — the
+    operator's call stays the operator's.
+    """
+    line = _advisor_line_for(model_slug="openai/gpt-6-hypothetical")
+
+    assert "no FC-latency screen on record for openai/gpt-6-hypothetical" in line
+    assert "BUSTED" not in line
+
+
+def test_latency_warning_follows_the_resolved_model_not_the_base_slug() -> None:
+    """The warning describes the model that will ANSWER, not the configured one.
+
+    With a phase slot pinned, `model_slug` is inert for advice. A warning read
+    off the base slug would clear a busting model (and smear an innocent one) —
+    the same class of error as the banner printing a shadowed slug.
+    """
+    line = _advisor_line_for(
+        model_slug="openai/gpt-4o",
+        model_slug_by_phase={RoastPhase.DEVELOPMENT: "anthropic/claude-sonnet-4.6"},
+    )
+
+    assert "anthropic/claude-sonnet-4.6 BUSTED" in line
+    assert "openai/gpt-4o BUSTED" not in line
+
+
+def test_a_native_provider_model_does_not_inherit_the_openrouter_screen() -> None:
+    """Running a screened model on its native provider is a different arm.
+
+    An earlier version of this test asserted the opposite — that bare `gpt-4o`
+    on `provider="openai"` should inherit `openai/gpt-4o`'s result, to avoid a
+    false alarm. That was wrong on the evidence: every screen ran on OpenRouter,
+    nobody has measured the direct-provider path, and the honest report is the
+    mild "no screen on record at this endpoint", not silence. It is also what
+    kills the whole bare-name matching class, which could otherwise let an
+    unrelated vendor's suffix inherit a measurement.
+    """
+    assert "no FC-latency screen on record" in _advisor_line_for(
+        provider="openai", model_slug="gpt-4o"
+    )
+    assert "BUSTED" not in _advisor_line_for(provider="openai", model_slug="gpt-4o")
+
+
+def test_a_padded_slug_is_normalised_before_it_can_diverge() -> None:
+    """Padding is stripped at the config boundary, so nothing can disagree.
+
+    An earlier round made the classifier match the raw string, on the rule
+    "report on what will be dispatched" — correct, but it left the padded slug
+    reaching the provider padded. Normalising in `AdvisorConfig` removes the
+    divergence class instead of reporting on it: the classifier and
+    `build_model` now always see the same identifier (local Codex P2, folded
+    pre-open). A blank-once-stripped slug is rejected outright.
+    """
+    assert "no FC-latency screen" not in _advisor_line_for(model_slug=" openai/gpt-4o ")
+    assert "BUSTED" in _advisor_line_for(model_slug=" openai/gpt-5.5 ")
+
+    with pytest.raises(ValidationError):
+        AdvisorConfig(model_slug="  ")
+
+
+def test_a_suffixed_variant_is_unscreened_in_both_directions() -> None:
+    """An OpenRouter `:variant` inherits NOTHING — it is not the measured model.
+
+    An earlier draft let a variant inherit its base slug's BUSTED verdict, on
+    the reasoning that `:thinking` is slower still. `:nitro` selects FASTER
+    routing and `:free` a different provider entirely, so that inheritance
+    presented an unmeasured arm as measured evidence — overstating the record
+    in the name of caution (local Codex P2, folded pre-open). Unmeasured is
+    unmeasured; the operator still gets a warning, just a true one.
+    """
+    for slug in (
+        "anthropic/claude-sonnet-4.6:thinking",
+        "anthropic/claude-sonnet-4.6:nitro",
+        "openai/gpt-4o:extended",
+    ):
+        line = _advisor_line_for(model_slug=slug)
+        assert f"no FC-latency screen on record for {slug}" in line
+        assert "BUSTED" not in line
+
+
+def test_reasoning_off_does_not_invert_a_measured_passing_arm() -> None:
+    """`gpt-5.5` busts at the provider default but PASSES with reasoning off.
+
+    The sharpest case for keying on the arm rather than the slug (local Codex
+    P2, folded pre-open). `docs/advisor-bakeoff-2026-06-08.md` records
+    `gpt-5.5 + reasoning_effort="off"` at 2.9 s — passing — and documents it as
+    a deliberate speed/cost alternative. A slug-keyed set printed "BUSTED" over
+    the operator's own measured-passing configuration, which is worse than
+    silence: it teaches them the warning is noise.
+    """
+    assert "BUSTED" in _advisor_line_for(model_slug="openai/gpt-5.5")
+    assert "BUSTED" not in _advisor_line_for(model_slug="openai/gpt-5.5", reasoning_effort="off")
+    assert "no FC-latency screen" not in _advisor_line_for(
+        model_slug="openai/gpt-5.5", reasoning_effort="off"
+    )
+
+
+def test_an_unmeasured_reasoning_effort_is_reported_as_unscreened() -> None:
+    """A cleared model at an effort nobody ran is unmeasured, and says so.
+
+    `gpt-4o` cleared at the provider default; `gpt-4o@reasoning=high` is a
+    different arm that no report covers, and it is reachable from
+    `ROASTPILOT_ADVISOR__REASONING_EFFORT`. The message names the dimension so
+    the operator can tell "never screened this model" from "screened, but not
+    like this".
+    """
+    line = _advisor_line_for(model_slug="openai/gpt-4o", reasoning_effort="high")
+
+    assert "no FC-latency screen on record for openai/gpt-4o at reasoning_effort=high" in line
+
+
+def test_another_endpoint_voids_the_whole_table() -> None:
+    """A screened slug behind some other endpoint is not the screened thing.
+
+    Both halves matter. `provider_base_url` is operator-editable (a local
+    proxy, LiteLLM), and `provider` can move the endpoint while the base URL
+    sits unchanged at its inert default — a native-provider config. Keying on
+    the URL alone let that second case inherit an OpenRouter measurement
+    (safety-reviewer + local Codex, folded pre-open).
+    """
+    assert "no FC-latency screen on record for openai/gpt-4o at this endpoint" in _advisor_line_for(
+        model_slug="openai/gpt-4o", provider_base_url="http://some-proxy.local/v1"
+    )
+    assert "no FC-latency screen on record for gpt-4o at this endpoint" in _advisor_line_for(
+        provider="openai", model_slug="gpt-4o"
+    )
+
+
+def test_the_screen_tables_are_lower_case_and_disjoint() -> None:
+    """The invariants `_arm_matches` silently depends on.
+
+    It compares lower-case, so a mixed-case entry added later would fall
+    through to "no screen on record" — a false negative. And the same ARM in
+    both tables would make the verdict order-dependent. Note a SLUG may legally
+    appear in both (`gpt-5.5` busts at the default and clears with reasoning
+    off); it is the arm that must be unique.
+    """
+    screened = frozenset(FC_LATENCY_SCREENED_ADVISOR_ARMS)
+    both = screened | FC_LATENCY_BUSTED_ADVISOR_ARMS
+    assert all(slug == slug.lower() for slug, _ in both)
+    assert not (screened & FC_LATENCY_BUSTED_ADVISOR_ARMS)
+    # Every recorded max is a positive number of seconds — a zero or negative
+    # entry would silently classify an arm as comfortably cleared at any bound.
+    assert all(m > 0 for m in FC_LATENCY_SCREENED_ADVISOR_ARMS.values())
+
+
+def test_a_lookalike_vendor_prefix_does_not_inherit_a_screen() -> None:
+    """Only an exact prefixed slug inherits a prefixed slug's screen.
+
+    Suffix-matching a slug that carries its OWN vendor prefix would let any
+    third-party `<vendor>/gpt-4o` claim OpenRouter gpt-4o's measurement, and
+    that failure is silent in the unsafe direction — it SUPPRESSES the warning.
+    """
+    line = _advisor_line_for(model_slug="not-openai/gpt-4o")
+
+    assert "no FC-latency screen on record for not-openai/gpt-4o" in line
 
 
 def test_pre_fc_only_model_override_is_not_advertised() -> None:

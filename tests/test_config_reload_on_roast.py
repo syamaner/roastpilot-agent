@@ -14,6 +14,7 @@ persists the run record and reloads config but does not start the tick loop).
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,12 @@ from roastpilot_agent.config_store import (
     PreFirstCrackLeversEdit,
     persist_config_edit,
 )
-from roastpilot_agent.models import RoastProfile
+from roastpilot_agent.models import (
+    AdvisorHealth,
+    AdvisorHealthStatus,
+    RoastPhase,
+    RoastProfile,
+)
 from roastpilot_agent.store import RoastStore
 
 # ---------------------------------------------------------------------------
@@ -70,7 +76,18 @@ async def store(tmp_path: Path) -> AsyncIterator[RoastStore]:
 
 @pytest_asyncio.fixture
 async def config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Isolated config file path; point load_app_config at it via env var."""
+    """Isolated config file path; point load_app_config at it via env var.
+
+    Also clears inherited ``ROASTPILOT_*`` (qa finding, folded pre-open). These
+    tests assert on specific resolved model identities, and env beats the saved
+    file, so a real ``ROASTPILOT_ADVISOR__MODEL_SLUG`` exported in a developer's
+    shell reddens six of them. Same guard ``test_launch_banner``'s own
+    ``config_file`` already carries; the sibling class was fixed in
+    ``test_config_store`` and simply had not been propagated here.
+    """
+    for key in list(os.environ):
+        if key.startswith("ROASTPILOT_"):
+            monkeypatch.delenv(key, raising=False)
     path = tmp_path / "roastpilot-config.yaml"
     monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(path))
     return path
@@ -107,6 +124,239 @@ async def test_saved_advisor_model_reflected_in_next_roast_service_config(
     reloaded_model = svc._config.advisor.model_slug  # pyright: ignore[reportPrivateUsage]
     assert reloaded_model == "openai/gpt-4-turbo-preview"
     assert reloaded_model != initial_model
+
+
+@pytest.mark.asyncio
+async def test_changing_the_model_invalidates_the_startup_reachability_probe(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """A model change clears the stale REACHABLE on ``GET /api/health`` (#747).
+
+    The probe runs once, at serve startup, against ``advisor.model_slug``.
+    Before D151 a changed slug could not reach a roast, so a stale probe result
+    was harmless. Now it IS the model that answers, and the operator checks
+    health before charging — so health must not vouch for a slug nothing has
+    contacted. ``None`` renders as "not probed", which is the honest state.
+    """
+    svc = RoastService(store, live_serve_mode=True)
+    svc.set_advisor_health(
+        AdvisorHealth(
+            status=AdvisorHealthStatus.REACHABLE,
+            provider="openai_compatible",
+            model_slug=svc._config.advisor.model_slug,  # pyright: ignore[reportPrivateUsage]
+        )
+    )
+
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4.1-mini")))
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert (await svc.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_an_advisory_paused_readout_survives_a_model_change(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """NOT_CONFIGURED is about the ADVISOR being absent, not about a model.
+
+    With no API key, `probe_advisor_health(None)` returns NOT_CONFIGURED and
+    names no model. Keying invalidation on "the slug differs" therefore wiped
+    it on the first roast, regressing an explicit advisory-paused readout to
+    the ambiguous `advisor: null` — a defect introduced by the invalidation fix
+    itself (local Codex P2, folded pre-open).
+    """
+    svc = RoastService(store, live_serve_mode=True)
+    paused = AdvisorHealth(status=AdvisorHealthStatus.NOT_CONFIGURED)
+    svc.set_advisor_health(paused)
+
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4.1-mini")))
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert (await svc.health()).advisor == paused
+
+
+@pytest.mark.asyncio
+async def test_a_model_less_UNREACHABLE_does_not_survive_a_model_change(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """A failed probe names no model either — and it MUST still go stale.
+
+    `probe_advisor_health` returns UNREACHABLE with `model_slug=None` when the
+    probe times out or raises, so "named no model" does not imply
+    NOT_CONFIGURED. Keying the preservation on the missing slug pinned that
+    failure forever, reporting the old advisor offline after a model change the
+    probe never saw — the defect the NOT_CONFIGURED fix introduced (local Codex
+    P2, folded pre-open). The invalidation keys on the STATUS instead.
+    """
+    svc = RoastService(store, live_serve_mode=True)
+    svc.set_advisor_health(
+        AdvisorHealth(status=AdvisorHealthStatus.UNREACHABLE, error="probe timed out")
+    )
+
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4.1-mini")))
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert (await svc.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_an_endpoint_change_alone_invalidates_the_probe(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """Changing WHERE the model is reached stales the probe too.
+
+    A probe describes what it CONTACTED, and that is decided by provider +
+    base URL + key env var + the resolved model, not by the slug alone. Keying
+    invalidation on the slug let a REACHABLE result survive an endpoint swap —
+    same slug, different server — vouching for something nothing had contacted
+    (Claude review, folded pre-open).
+    """
+    svc = RoastService(store, live_serve_mode=True)
+    svc.set_advisor_health(
+        AdvisorHealth(
+            status=AdvisorHealthStatus.REACHABLE,
+            provider="openai_compatible",
+            model_slug=svc._config.advisor.model_slug,  # pyright: ignore[reportPrivateUsage]
+        )
+    )
+
+    persist_config_edit(
+        AppConfigEdit(advisor=AdvisorConfigEdit(provider_base_url="http://proxy.local/v1"))
+    )
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert (await svc.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_base_slug_change_invalidates_even_with_a_pinned_phase_slot(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The PROBED model is the base slug, so it belongs in the identity.
+
+    `healthcheck` probes `model_slug`, while advice dispatches the
+    phase-RESOLVED model. With a DEVELOPMENT slot pinned, the base slug can
+    change while the advice model does not — and comparing only the advice
+    models left `/api/health` describing a probe of the previous base model
+    (local Codex P2, folded pre-open).
+
+    The slot is pinned via the env blob because `model_slug_by_phase` is
+    deliberately absent from `AdvisorConfigEdit` (D151) — env and a hand-edited
+    saved file are the supported ways to reach it, which is exactly why the
+    shadowing path still has to be handled.
+    """
+    monkeypatch.setenv(
+        "ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE", '{"development": "openai/gpt-4o-mini"}'
+    )
+    svc = RoastService(store, live_serve_mode=True)
+    probed_base = svc._config.advisor.model_slug  # pyright: ignore[reportPrivateUsage]
+    svc.set_advisor_health(
+        AdvisorHealth(
+            status=AdvisorHealthStatus.REACHABLE,
+            provider="openai_compatible",
+            model_slug=probed_base,
+        )
+    )
+
+    # Only the probed BASE slug moves; the pinned slot keeps the advice model
+    # identical across the reload.
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4.1-mini")))
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    reloaded = svc._config.advisor  # pyright: ignore[reportPrivateUsage]
+    assert reloaded.model_for(RoastPhase.DEVELOPMENT) == "openai/gpt-4o-mini"
+    assert reloaded.model_slug != probed_base
+    assert (await svc.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_reasoning_effort_change_alone_invalidates_the_probe(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reasoning effort is part of what the probe contacted.
+
+    `build_model` bakes `reasoning_effort` into the model settings every cached
+    agent uses, including the one `healthcheck` probes with — so an effort-only
+    change makes the recorded probe describe a different call (Claude review,
+    folded pre-open). Set via env because `reasoning_effort` is not in
+    `AdvisorConfigEdit`.
+    """
+    svc = RoastService(store, live_serve_mode=True)
+    svc.set_advisor_health(
+        AdvisorHealth(
+            status=AdvisorHealthStatus.REACHABLE,
+            provider="openai_compatible",
+            model_slug=svc._config.advisor.model_slug,  # pyright: ignore[reportPrivateUsage]
+        )
+    )
+
+    monkeypatch.setenv("ROASTPILOT_ADVISOR__REASONING_EFFORT", "high")
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert svc._config.advisor.reasoning_effort == "high"  # pyright: ignore[reportPrivateUsage]
+    assert (await svc.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_cosmetic_base_url_edit_keeps_the_probe(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """A trailing slash is the same endpoint, so the probe still describes it.
+
+    The identity compares the NORMALISED base URL, using the same helper the
+    FC-latency screen uses. Comparing raw strings would discard a valid probe on
+    a purely cosmetic edit and report the advisor "not probed" for no reason
+    (Claude review, folded pre-open).
+    """
+    svc = RoastService(store, live_serve_mode=True)
+    probed = AdvisorHealth(
+        status=AdvisorHealthStatus.REACHABLE,
+        provider="openai_compatible",
+        model_slug=svc._config.advisor.model_slug,  # pyright: ignore[reportPrivateUsage]
+    )
+    svc.set_advisor_health(probed)
+
+    persist_config_edit(
+        AppConfigEdit(advisor=AdvisorConfigEdit(provider_base_url="https://openrouter.ai/api/v1/"))
+    )
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert (await svc.health()).advisor == probed
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_model_keeps_its_reachability_probe(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """Starting a roast does NOT wipe a probe that still describes the advisor.
+
+    The invalidation must be keyed on the model actually changing. Clearing
+    unconditionally would blank the advisor readout on every ordinary roast —
+    trading a stale-but-usually-right signal for no signal at all, which is the
+    worse failure for a check the operator runs before every charge.
+    """
+    svc = RoastService(store, live_serve_mode=True)
+    probed = AdvisorHealth(
+        status=AdvisorHealthStatus.REACHABLE,
+        provider="openai_compatible",
+        model_slug=svc._config.advisor.model_slug,  # pyright: ignore[reportPrivateUsage]
+    )
+    svc.set_advisor_health(probed)
+
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(prompt_version="c11")))
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert (await svc.health()).advisor == probed
 
 
 @pytest.mark.asyncio

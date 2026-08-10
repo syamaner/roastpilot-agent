@@ -925,6 +925,22 @@ export interface ConfigFieldMeta {
    * reason for GET /api/config to 500).
    */
   yaml_value: unknown;
+  /**
+   * An operator-facing warning about the EFFECTIVE value (#754), or `null`
+   * when there is nothing to say. Distinct from `description`, which explains
+   * what the field is and never changes: this reacts to the current value.
+   *
+   * Today only `advisor.model_slug` carries one — the FC-latency screen
+   * verdict for the model that would actually answer a roast, the same text
+   * the pre-charge launcher banner prints (one server-side source, so the
+   * launcher and the UI cannot drift). `null` on the pinned baseline, so an
+   * ordinary config shows no warning and the warning keeps its meaning.
+   *
+   * Advisory only: nothing rejects a model on the strength of it. The operator
+   * may run whatever they choose (D151) — this is what the record says about
+   * the choice.
+   */
+  advisory: string | null;
 }
 
 export interface ControllerConfigSnapshot {

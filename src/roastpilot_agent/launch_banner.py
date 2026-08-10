@@ -29,6 +29,7 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, ValidationError
 
+from roastpilot_agent.advisor_screen import advice_models, screen_warning
 from roastpilot_agent.config import AppConfig
 from roastpilot_agent.controller import AUTO_ADVICE_PHASES
 
@@ -94,16 +95,23 @@ def _advisor_line(config: AppConfig) -> str:
     The model reported is the PHASE-RESOLVED one — what
     :meth:`AdvisorConfig.model_for` returns for each phase in
     :data:`ADVISOR_PHASES`, which is what ``PydanticAIAdvisor`` actually calls.
-    It is NOT ``advisor.model_slug``: ``model_slug_by_phase`` ships populated
-    for every phase and is not editable from ``/config``, so a ``model_slug``
-    saved there (or exported) is shadowed for roast advice. Printing the base
-    slug would announce an arm the roast is not running — the same lie in the
-    other direction — so the line names an operator-set shadowed slug and says
-    only what the operator needs at pre-charge: it is not the advice model. It
-    deliberately does NOT enumerate what the base slug IS still used for —
-    ``healthcheck`` probes reachability with it, and bean-sourcing extraction
-    falls back to it off OpenRouter — because any such list is an "only" claim
-    that goes stale the next time a consumer is added.
+    It is NOT ``advisor.model_slug``. Since D151 (#747) the override map ships
+    empty, so the two normally agree; they part company the moment a phase slot
+    is pinned (a hand-edited saved config, or a
+    ``ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE`` JSON blob), which is exactly the
+    shape that shadowed ``model_slug`` for six weeks and put a gpt-4o roast on
+    record as a gpt-4.1-mini arm. Printing the base slug would announce an arm
+    the roast is not running, so the line names an operator-set shadowed slug
+    and says only what the operator needs at pre-charge: it is not the advice
+    model. It deliberately does NOT enumerate what the base slug IS still used
+    for — ``healthcheck`` probes reachability with it, and bean-sourcing
+    extraction falls back to it off OpenRouter — because any such list is an
+    "only" claim that goes stale the next time a consumer is added.
+
+    The FC-latency note comes from :func:`advisor_screen.screen_warning`, which
+    resolves the same phase gate, so the warning can never describe a model
+    other than the one about to give advice — and is the SAME text ``GET
+    /api/config`` carries, so the launcher and the UI cannot drift (#754).
 
     Args:
         config: The resolved application config (env over saved file over
@@ -111,15 +119,18 @@ def _advisor_line(config: AppConfig) -> str:
 
     Returns:
         ``"<model>  ·  prompt <version>"``, plus :data:`EXPERIMENT_TAG` when
-        either value is non-default.
+        either value is non-default, plus the FC-latency note when a resolved
+        model busts the gate or has no screen on record.
     """
     advisor = config.advisor
     fields = type(advisor).model_fields
     default_model = fields["model_slug"].default
-    # Distinct slugs rather than a per-phase listing: today ADVISOR_PHASES is a
-    # single phase, so a phase-by-phase branch would be dead code. Joining the
-    # distinct slugs stays correct if a second advice phase is ever added.
-    resolved = {advisor.model_for(phase) for phase in ADVISOR_PHASES}
+    # Shared with ``advisor_screen`` rather than recomputed (Claude review,
+    # folded pre-open): that module calls itself the single source for "which
+    # models can answer", and a second inline copy is the drift this PR exists
+    # to remove. Joining the distinct slugs stays correct if a second advice
+    # phase is ever added.
+    resolved = advice_models(advisor)
     model_text = " / ".join(sorted(resolved))
     # Warn only when the operator SET a base slug that then gives no advice. A
     # base slug left at the schema default is shadowed too, but silently and
@@ -131,7 +142,9 @@ def _advisor_line(config: AppConfig) -> str:
         advisor.prompt_version == fields["prompt_version"].default
     )
     tag = "" if is_default else EXPERIMENT_TAG
-    return f"{model_text}  ·  prompt {advisor.prompt_version}{tag}"
+    warning = screen_warning(advisor, config.controller.advisory_timeout_seconds)
+    latency = "" if warning is None else f"   ⚠ {warning}"
+    return f"{model_text}  ·  prompt {advisor.prompt_version}{tag}{latency}"
 
 
 def _trim_line(config: AppConfig) -> str:
