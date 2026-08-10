@@ -352,7 +352,7 @@ Before adopting this topology as the default, evaluate it on a representative se
 
 Measure:
 
-- whether Fable was invoked only when the trigger criteria applied;
+- whether the `planning-architect` was invoked only when the trigger criteria applied (a `story-planner` run on a Codex-delegated slice is the mandatory D152 contract step, not a Fable-trigger event, and never counts against this metric);
 - plan acceptance without material Opus rewrite;
 - requirements or boundaries missed;
 - preventable implementation rework;
