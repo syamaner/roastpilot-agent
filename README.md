@@ -89,8 +89,14 @@ A local Python service that drives a roast through
 
 First-crack detection comes from an audio model
 ([dataset, model, and live demo on Hugging Face](https://huggingface.co/syamaner/coffee-first-crack-detection))
-running inside the MCP server on a Raspberry Pi 5. Temperatures are Celsius
-throughout: models, schema, API, console, and tests.
+integrated through the local MCP server. The model has been benchmarked on a
+Raspberry Pi 5, but the full RoastPilot appliance has not yet been deployed or
+validated there. Temperatures are Celsius throughout: models, schema, API,
+console, and tests.
+
+A compact derived [Roast 3 authority-conflict fixture](tests/fixtures/evidence/roast-3-authority-conflict.json)
+publishes the decision and safety sequence behind the 203 °C guard-conflict
+case. The full operator trace remains local to avoid committing bulk logs.
 
 ## How the advisor model is chosen (the eval)
 
