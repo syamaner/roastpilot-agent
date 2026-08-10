@@ -2,6 +2,62 @@
 
 ## Active Epic
 
+> **STATUS UPDATE — 10 Aug 2026, EVENING (the RP-B hardware arm RAN; read before
+> the merge-status block below).** The paired single-variable c10-vs-c11 hardware
+> arm that #709 was waiting for is DONE, on Guatemala Conebosque (Washed),
+> target 195 °C / 16 %, back to back, identical config apart from the prompt.
+> **Result: c11 binds as written, and as written it does not fix the problem.**
+> Baseline `eaafde88` (c10): first crack 179, drop **183**, DTR 15.2 %, weight
+> loss 10.4 %. Treatment `0dcb58ec` (c11): first crack 184, drop **188**, DTR
+> 15.4 %, weight loss 12.3 %. **Both arms gained exactly +4 °C across
+> development**, so the treatment's 5 °C better drop is inherited from its higher
+> first-crack temperature (a warm-machine effect from roasting back to back,
+> flagged contemporaneously BEFORE the crack), NOT from the doctrine. Both still
+> MISS the joint window (|Δdrop| 12 and 7 against a 3 °C HIT criterion), so RP-D
+> scores 0.00 for both, as on 6 Aug. **What c11 did:** every fan step after the
+> first was exactly `ambient_fan_step_max_pp` (10 pp), which the baseline never
+> showed, so the doctrine demonstrably takes effect. **What it did not do:** bound
+> the destination. The advisor walked fan to **90** in disciplined steps, HIGHER
+> than the baseline's 65, and the rate of rise still collapsed 6.0 to 3.0. The arm
+> is VALID: `raw_state_json.ambient_status` proves a live, sub-boundary probe
+> (23.36-23.48 °C, advancing poll stamp) across all 11 development ticks, which is
+> the evidence #742 says the run record cannot give you.
+> **c11 is NOT promoted; c3 remains the live default and RP-B (#709) stays open
+> and inert.** The cup gate is still open: both roasts are unrated (D42 labels due).
+>
+> **The blocker moved, and it is not a prompt.** **#781 (new)**: post-FC lever
+> authority is asymmetric. At the drop the controller held heat 70 while the
+> advisor held fan 90; heat is capped at `heat_engage + 15` over an engage value
+> the pre-FC trim had already pinned at 60, while fan is uncapped to 100 with no
+> slew limit. Every temp-short drop in this corpus has that shape. A sub-finding
+> worth splitting if judged separable: the late-Maillard trim silently sets the
+> post-FC heat ceiling, and nothing in `/config`, the banner, or the trim docs
+> says so. **D96 recovery ALSO ran for the first time on hardware** (#708 comment):
+> on the treatment it entered at development 11.1 %, i.e. 4.9 pp of runway, which
+> SATISFIES #708's own proposed acceptance bar, lifted the ceiling 60 to 75 and
+> heat to 70 (5 pp unused), and improved bean climb only 2.8 to 3.75 °C/min. Net
+> +4 °C, identical to the baseline arm that had no recovery at all, so entry
+> timing is not the binding constraint and v2 should be re-scoped with #781 in view.
+>
+> **#779 (new) — a #337 residual that corrupts every store-sourced fixture.**
+> `store_to_fixture` anchors first crack on the agent's receive time rather than
+> the MCP's backdated instant (25.5 s apart on `eaafde88`), so fixture DTR reads
+> ~2 pp LOW and `first_crack_temp_c` 1-2 °C high. `rpd_corpus_score.py` is NOT
+> affected (it reads `telemetry_snapshots.development_percent`, controller-computed),
+> so the shipped 15-scored/3-HITs corpus result stands. Affected: `bakeoff_replay`
+> arms, the #739 RP-B eval set, and the unbuilt #749 harness, which would compare
+> c10 against c11 on fixtures whose DTR is wrong while c10 is precisely the prompt
+> that teaches the model to trust the deterministic DTR. Fixtures need regenerating
+> once it lands. Diagnosed by the operator live during the roast.
+>
+> Evidence for both roasts (fixtures, MCP session logs, READMEs) is preserved
+> OUTSIDE the repo at `~/roasts/evidence/rp-b-roast{1,2}-*/`, per the no-roast-logs
+> rule. Baseline `eaafde88` carries `outcome = 'faulted'` from an ACCIDENTAL
+> post-drop emergency stop (operator error, 2 m 43 s after the drop, beans already
+> out); the safety record was deliberately left unedited and an `operator_notes`
+> entry explains it. Score it from the `drop_beans` event, not from
+> `outcome = 'completed'`.
+
 > **STATUS UPDATE — 10 Aug 2026 (weekend merges; D152 changes the execution
 > model). Read with the 8/9 Aug blocks below.** Five PRs landed 9-10 Aug:
 > **#753** (ambient freshness-gate bypasses, closed #745), **#759** (non-finite
