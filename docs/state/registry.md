@@ -11,10 +11,17 @@
 > loss 10.4 %. Treatment `0dcb58ec` (c11): first crack 184, drop **188**, DTR
 > **16.44 %**, weight loss 12.3 %. **Both arms gained exactly +4 °C across
 > development**, so the treatment's 5 °C better drop is inherited from its higher
-> first-crack temperature (a warm-machine effect from roasting back to back,
-> flagged contemporaneously BEFORE the crack), NOT from the doctrine. Both still
-> MISS the joint window (|Δdrop| 12 and 7 against a 3 °C HIT criterion), so RP-D
-> scores 0.00 for both, as on 6 Aug. **DTR was a HIT in both arms** (+0.27 and
+> first-crack temperature. c11 is a POST-first-crack doctrine, so it cannot have caused
+> a pre-crack offset; but the treatment was always SECOND in a fixed-order pair, so
+> warm-machine and run order are confounded and these two roasts cannot separate them.
+> The offset was flagged contemporaneously BEFORE the crack, not fitted afterwards.
+> An order-swapped repeat would be needed to attribute it. Both still
+> MISS the joint window (|Δdrop| 12 and 7 against a 3 °C HIT criterion). Scored with
+> the shipped `scripts/rpd_corpus_score.py`: HIT **0/2**, baseline scalar **0.00**,
+> treatment scalar **0.36**. The baseline's 0.00 is NOT the metric's verdict on its
+> numbers — it is `_terminated_abnormally` zeroing the scalar because
+> `outcome != 'completed'` after the accidental e-stop; the treatment's 0.36 is the
+> real joint score. **DTR was a HIT in both arms** (+0.27 and
 > +0.44 pp against a ±2 pp window), so the joint failure is ENTIRELY temperature,
 > not development time. Read DTR from the FROZEN `development_percent`, not from
 > the last development-phase row (~8 s early), and never take temperature off the
@@ -37,7 +44,9 @@
 > slew limit. Every temp-short drop in this corpus has that shape. A sub-finding
 > worth splitting if judged separable: the late-Maillard trim silently sets the
 > post-FC heat ceiling, and nothing in `/config`, the banner, or the trim docs
-> says so. **D96 recovery ALSO ran for the first time on hardware** (#708 comment):
+> says so. **D96 recovery fired again** (#708 comment; the 6 Aug treatment in the block below
+> already entered `recovering` and raised heat 60 to 67, so this is the SECOND hardware
+> firing, not the first). What is new is WHEN:
 > on the treatment it entered at development 11.1 %, i.e. 4.9 pp of runway, which
 > SATISFIES #708's own proposed acceptance bar, lifted the ceiling 60 to 75 and
 > heat to 70 (5 pp unused), and improved bean climb only 2.8 to 3.75 °C/min. Net
@@ -45,8 +54,10 @@
 > timing is not the binding constraint and v2 should be re-scoped with #781 in view.
 >
 > **#779 (new) — a #337 residual that corrupts every store-sourced fixture.**
-> `store_to_fixture` anchors first crack on the agent's receive time rather than
-> the MCP's backdated instant (25.5 s apart on `eaafde88`), so fixture DTR reads
+> `store_to_fixture` anchors first crack on the agent's event row, which carries the
+> detector's CONFIRMATION rather than the MCP's backdated onset (25.5 s apart on
+> `eaafde88`). `charge_seconds` has the same defect via the `t0_detected` event row,
+> 11 s the other way, so the DTR DENOMINATOR is affected too. Net: fixture DTR reads
 > ~3 pp LOW (13.2 % against a true 16.27 %) and `first_crack_temp_c` 1-2 °C high. `rpd_corpus_score.py` is NOT
 > affected (it reads `telemetry_snapshots.development_percent`, controller-computed),
 > so the shipped 15-scored/3-HITs corpus result stands. Affected: `bakeoff_replay`
