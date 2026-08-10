@@ -33,3 +33,22 @@ You implement the Python agent in `src/roastpilot_agent/`. Read `AGENTS.md` firs
 - One PR per story; the completing PR updates the epic status table + registry.
   Follow the AGENTS.md merge policy (independent triage — you fix, you don't
   self-dismiss your own PR's review comments).
+
+## Worktree discipline (topology §7 — binding)
+
+- Your assigned worktree is the **only** tree you write in; the main checkout
+  and sibling worktrees are read-only (`git -C` peeks are fine, never a write).
+  Self-locate every command against the assigned worktree because cwd resets
+  between Bash calls.
+- Never run tree-mutating git commands — **`git checkout --`**, **`git restore`**,
+  **`git stash`**, **`git reset`**, **`git clean`**, or anything else that rewrites
+  a working tree or index — in a tree you do not own.
+- For mutation testing, snapshot the target to the scratchpad by file copy (`cp`)
+  before editing and restore by copying the snapshot back — never by git.
+- Verify committed-tree claims with **`git show`** `HEAD:path`, never against the
+  working tree.
+- Run Python gates with the assigned worktree's `.venv/bin/python -m …` and a
+  per-run `--basetemp`, following **"Per-worktree gate environment (venv,
+  pyright, pytest) — added Aug 2026 (#738, #733)"** in
+  **`docs/agent-team-worktrees.md`**. The full recipe and fail-closed assertions
+  live there.

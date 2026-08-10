@@ -20,11 +20,11 @@ validation. Exact model IDs and explicit effort are set for every named-subagent
 role, `AGENTS.md` agrees, the inline workflow stages in `review-branch.mjs` are
 pinned, and a consistency test (`tests/test_agent_model_pins.py`) guards the pins
 against drift and against committed settings that would defeat them (the
-repository side of the §5 override surface). Two §16 adoption criteria remain
-outstanding. First, delivery of §7's worktree and copy-restore rules into the
-role definitions that carry none of them (#733) — the control is stated but not
-in force. Second, the §15 evaluation across all five archetypes — not a five-case
-count, since a single story may cover more than one. RP-B (#709) supplies
+repository side of the §5 override surface). The §7 worktree and copy-restore
+rules are now delivered by #733 into all eleven Bash-capable role definitions
+and guarded for presence. One §16 adoption criterion remains outstanding: the
+§15 evaluation across all five archetypes — not a five-case count, since a
+single story may cover more than one. RP-B (#709) supplies
 evidence on two (ambiguous multi-slice, safety-sensitive), but **as a FAILURE
 case, which does not yet validate them**: no planner was invoked on it, so it
 tests neither the trigger-wins rule added to §6 above nor the Fable planner's
@@ -151,11 +151,9 @@ Only one planning subagent SHOULD run for a single decision problem. Multiple pl
 
 ## 7. Planning architect contract
 
-**Every read-only role MUST verify against its own `git worktree`, never the shared checkout**, and MUST NOT run tree-mutating git commands (`git checkout --`, `git restore`, `git stash`, `git clean`) in a tree it does not own. Where a role needs to mutate a file and restore it — mutation testing is the normal case — it MUST snapshot and restore **by file copy**, never by git, because `git checkout --` silently discards uncommitted neighbouring edits along with the mutation. A prohibition without that alternative is not an operable control: the restore step is required, so the forbidden command keeps being reinvented. Claims about what a commit contains MUST be verified against the committed tree (`git show HEAD:path`), not the working tree.
+**Every read-only role MUST verify against its own `git worktree`, never the shared checkout**, and MUST NOT run tree-mutating git commands (`git checkout --`, `git restore`, `git stash`, `git reset`, `git clean`) in a tree it does not own. Where a role needs to mutate a file and restore it — mutation testing is the normal case — it MUST snapshot and restore **by file copy**, never by git, because `git checkout --` silently discards uncommitted neighbouring edits along with the mutation. A prohibition without that alternative is not an operable control: the restore step is required, so the forbidden command keeps being reinvented. Claims about what a commit contains MUST be verified against the committed tree (`git show HEAD:path`), not the working tree.
 
 This is a requirement on the role definitions themselves, not only on this document: a control recorded in a runbook that no agent definition carries has not been delivered. Evidence, including three occurrences: Case 1's governance finding in the evaluation log.
-
-**Not yet delivered, as of this writing.** None of `.claude/agents/qa.md`, `safety-reviewer.md`, `pr-triage.md` or the engineer roles carries any of the above, so the rule is stated here and is **not** in force where it would actually bite. Delivery is tracked by **#733**, and the commit that closes it should delete this paragraph. Recorded explicitly rather than left to be inferred, because a specification declaring a control normative while the roles it binds stay silent is precisely the gap the paragraph above names: writing a rule down is not the same act as routing it.
 
 The Fable planning architect MUST:
 
@@ -414,7 +412,8 @@ This topology is ready when:
 - Automated consumers use schema validation rather than relying on prose style.
 - Evaluation evidence supports the selected models and effort levels.
 - **The §7 worktree, copy-restore and committed-tree rules are delivered into the
-  role definitions they bind**, not only stated here. Tracked by **#733**.
+  role definitions they bind**, not only stated here. Delivered by **#733**
+  (Aug 2026).
   §7 binds every **read-only** role, so the criterion is satisfied only when all
   eight carry the controls: `mcp-contract-checker`, `planning-architect`,
   `pr-triage`, `qa`, `safety-reviewer`, `security-reviewer`, `sim-roast-runner`
@@ -425,7 +424,9 @@ This topology is ready when:
   requires the orchestrator to name the committed implementation-base tree
   and sha, and to `ESCALATE` when none is supplied, so a contract cannot be
   compiled from a stale or dirty checkout.)
-  **Currently none of them does.** Carrying the rule in all
+  All eleven Bash-capable role definitions carry the controls, and
+  `tests/test_agent_worktree_controls.py` guards their **presence**, not
+  comprehension. Carrying the rule in all
   eight prompts does not on its own satisfy this criterion: because a read-only
   role cannot create its own worktree, the lead-side provisioning and
   `git worktree list` verification required by §8 item 6 must be in force too,
@@ -433,8 +434,8 @@ This topology is ready when:
   prompts. The three Bash-capable
   WRITING roles (`engineer-be`, `engineer-fe`, `product-pm`) fall outside §7 as
   written, but the mutate-then-restore hazard is identical for them — an
-  implementer runs mutation tests as readily as a reviewer — so #733 should
-  cover all eleven even though only the eight gate this criterion. Enumerated
+  implementer runs mutation tests as readily as a reviewer — so #733 covered
+  all eleven even though only the eight gate this criterion. Enumerated
   rather than sampled because an earlier draft named four: a partial list can be
   fully satisfied while most bound roles remain able to repeat the incident. Added because §7 declares those rules normative while
   the roles it binds are silent on them, so without this criterion the topology
