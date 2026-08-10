@@ -20,9 +20,9 @@
 > the shipped `scripts/rpd_corpus_score.py`: HIT **0/2**, baseline scalar **0.00**,
 > treatment scalar **0.36**. **The baseline's 0.00 is the metric's genuine verdict on
 > its numbers**, not an artefact of the accidental e-stop: `joint_window_score`
-> computes `raw = -0.034` for a 12 °C drop miss (which alone contributes 2.0 against
-> a total budget of 1.0) and `scalar = max(0.0, raw) * penalty` clamps BEFORE the
-> abnormal-termination penalty multiplies, so a non-faulted rerun of the same
+> computes `raw = -0.034` for this pair, and `scalar = max(0.0, raw) * penalty`
+> clamps BEFORE the abnormal-termination penalty multiplies, so a non-faulted
+> rerun of the same
 > 183 °C / 16.27 % would also score 0.00. What the abnormal termination WOULD have
 > suppressed is the `hit` flag, which is False here on the numbers anyway. **DTR was a HIT in both arms** (+0.27 and
 > +0.44 pp against a ±2 pp window), so the joint failure is ENTIRELY temperature,
