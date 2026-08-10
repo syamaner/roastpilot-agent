@@ -21,6 +21,13 @@ _DISCIPLINE_HEADING = re.compile(
     r"^## [^\n]*worktree discipline[^\n]*$", re.IGNORECASE | re.MULTILINE
 )
 _NEXT_LEVEL_TWO_HEADING = re.compile(r"^## ", re.MULTILINE)
+# This intentionally catches common mechanical citations plus one bounded prose form;
+# it is not an exhaustive detector for every way a human could describe a line range.
+_RUNBOOK_LINE_CITATIONS = (
+    re.compile(r"agent-team-worktrees\.md:[0-9]+"),
+    re.compile(r"agent-team-worktrees\.md#L[0-9]+(?:-L[0-9]+)?", re.IGNORECASE),
+    re.compile(r"agent-team-worktrees\.md[^\n]{0,48}\blines?\s+[0-9]+", re.IGNORECASE),
+)
 
 # These are the two authoritative routed-control variants copied byte-for-byte from
 # the ratified role prompts. Intentional edits update the relevant constant and every
@@ -53,6 +60,8 @@ _WRITING_DISCIPLINE_BLOCK = """## Worktree discipline (topology §7 — binding)
 
 - Your assigned worktree is the **only** tree you write in; the main checkout
   and sibling worktrees are read-only (`git -C` peeks are fine, never a write).
+  For a lead-directed serialized or standalone run, the main checkout is the
+  assigned writable tree; sibling worktrees remain read-only.
   Self-locate every command against the assigned worktree because cwd resets
   between Bash calls.
 - Never run tree-mutating git commands — **`git checkout --`**, **`git restore`**,
@@ -158,16 +167,23 @@ def _discipline_section(text: str) -> str | None:
     return text[heading.start() : end]
 
 
+def _normalize_section_separator(text: str) -> str:
+    """Normalize only trailing whitespace at a discipline-section boundary."""
+    return text.rstrip(" \t\r\n") + "\n"
+
+
 def _canonical_block_mismatch(text: str, expected: str, source: str) -> str | None:
     """Return an actionable unified diff when a routed control block has drifted."""
     actual = _discipline_section(text)
-    if actual == expected:
+    normalized_expected = _normalize_section_separator(expected)
+    normalized_actual = _normalize_section_separator(actual) if actual is not None else None
+    if normalized_actual == normalized_expected:
         return None
 
-    actual_for_diff = actual if actual is not None else "<missing discipline section>\n"
+    actual_for_diff = normalized_actual or "<missing discipline section>\n"
     difference = "\n".join(
         difflib.unified_diff(
-            expected.splitlines(),
+            normalized_expected.splitlines(),
             actual_for_diff.splitlines(),
             fromfile="expected canonical discipline block",
             tofile=f"actual discipline block in {source}",
@@ -212,6 +228,33 @@ def test_inverted_permission_is_rejected(case_name: str, block: str) -> None:
     assert mismatch is not None
 
 
+def test_following_section_separator_preserves_canonical_match() -> None:
+    """A later level-two section changes only the separator, not control bytes."""
+    prompt = f"{_READ_ONLY_DISCIPLINE_BLOCK}\n## Later instructions\n\nUnrelated text.\n"
+    mismatch = _canonical_block_mismatch(prompt, _READ_ONLY_DISCIPLINE_BLOCK, "later-section")
+    assert mismatch is None, mismatch
+
+
+def test_review_workflow_directs_a_no_mutation_shared_checkout_review() -> None:
+    """The roster workflow must explicitly activate the safe shared-tree exception."""
+    workflow = (_REPO / ".claude" / "workflows" / "review-branch.mjs").read_text()
+    review_base = re.search(r"const reviewBase = `(.*?)`\n", workflow, re.DOTALL)
+    assert review_base, "reviewBase prompt not found in review-branch.mjs"
+    prompt = review_base.group(1)
+    required = (
+        "SHARED-CHECKOUT REVIEW — EXPLICIT LEAD DIRECTION",
+        "fail-closed no-provisioned-worktree rule",
+        "Do not mutate any file",
+        "no mutation testing",
+        "no hypothesis edits",
+        "read and reason only",
+        "cannot perform the shared-tree protocol's lead safety-commit",
+        "reviewed the shared checkout under this explicit direction",
+    )
+    missing = [phrase for phrase in required if phrase not in prompt]
+    assert not missing, f"reviewBase is missing shared-checkout controls: {missing}"
+
+
 def test_story_planner_remains_shell_and_write_closed() -> None:
     """A shell addition must force a conscious discipline-block decision."""
     tools = _tools(_AGENTS_DIR / "story-planner.md")
@@ -222,6 +265,27 @@ def test_story_planner_remains_shell_and_write_closed() -> None:
     )
 
 
+def _has_runbook_line_citation(text: str) -> bool:
+    """Return whether text contains a supported runbook line-citation form."""
+    return any(pattern.search(text) is not None for pattern in _RUNBOOK_LINE_CITATIONS)
+
+
+@pytest.mark.parametrize(
+    "citation",
+    (
+        "docs/agent-team-worktrees.md:99",
+        "docs/agent-team-worktrees.md#L99",
+        "docs/agent-team-worktrees.md#L99-L140",
+        "docs/agent-team-worktrees.md, line 99",
+        "docs/agent-team-worktrees.md — see lines 99-140",
+    ),
+    ids=("colon", "fragment", "fragment-range", "prose-line", "prose-lines"),
+)
+def test_runbook_line_citation_forms_are_detected(citation: str) -> None:
+    """Each supported mechanical or bounded-prose form is rejected."""
+    assert _has_runbook_line_citation(citation)
+
+
 def test_runbook_citations_never_use_line_anchors() -> None:
     """Runbook citations use durable section names, never line numbers."""
     guarded = [
@@ -230,6 +294,7 @@ def test_runbook_citations_never_use_line_anchors() -> None:
         _REPO / "docs" / "state" / "registry.md",
         _REPO / "AGENTS.md",
     ]
-    pattern = re.compile(r"agent-team-worktrees\.md:[0-9]")
-    offenders = [path.relative_to(_REPO) for path in guarded if pattern.search(path.read_text())]
+    offenders = [
+        path.relative_to(_REPO) for path in guarded if _has_runbook_line_citation(path.read_text())
+    ]
     assert not offenders, f"line-anchored runbook citations found in: {offenders}"
