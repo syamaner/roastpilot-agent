@@ -29,19 +29,30 @@ were completely untouched.
    substrate (the single-owned foundation) must already be merged. Parallelize
    only genuinely-disjoint work (separate page directories), never a shared
    file surface.
-2. **One worktree per teammate** — its own directory *and* branch:
-   ```bash
-   git worktree add /Users/<you>/git/rp-<slug> -b feature/<n>-<slug> origin/main
-   ```
+2. **One worktree per occupant** — its own directory and intended revision:
+   - **Implementer / teammate doing new work:** create its branch from
+     `origin/main`:
+     ```bash
+     git worktree add /Users/<you>/git/rp-<slug> -b feature/<n>-<slug> origin/main
+     ```
+   - **Read-only occupant (reviewer, triage, QA):** detach at the exact commit
+     under review:
+     ```bash
+     git worktree add --detach <path> <reviewed-sha>
+     ```
+     `<reviewed-sha>` must be the reviewed commit, not `origin/main` and not a
+     branch tip that has moved since the review was requested. A reviewer in a
+     base-branch worktree renders a verdict about bytes nobody asked it to
+     review; see `docs/agent-topology.md` §8 item 6.
    Each worktree has its own index and HEAD, so git operations (branch, commit —
    the things that actually collided) never cross even though they share one
    `.git`.
    Provisioning also includes the gate environment described below, created by
    the teammate as its first act or by the lead for a read-only occupant that
-   cannot mutate the tree; see `docs/agent-topology.md` §8 item 6.
-3. **Verify before trusting:** `git worktree list` shows each teammate on its
-   own dir + branch. The flag failed *silently*; manual creation + this check
-   fails *loud*.
+   cannot mutate the tree.
+3. **Verify before trusting:** `git worktree list` shows each occupant on its
+   own directory and intended branch or detached reviewed SHA. The flag failed
+   *silently*; manual creation + this check fails *loud*.
 4. **Spawn each teammate** (background, team) with its **absolute** worktree path
    as its sole workdir, plus the teammate rules below.
 5. **Verify isolation on the FIRST teammate** before relying on all of them —
@@ -116,7 +127,7 @@ and validate the environment before trusting any gate:
 
 ```bash
 cd <abs worktree> && python3.11 -m venv .venv
-cd <abs worktree> && .venv/bin/python -c 'import os, sys; print(os.path.realpath(sys.prefix))'
+cd <abs worktree> && .venv/bin/python -c 'import sys; from pathlib import Path; p = Path(sys.prefix).resolve(); print(p); print(p.is_relative_to(Path("<abs worktree>").resolve()))'
 cd <abs worktree> && grep -Fx 'include-system-site-packages = false' .venv/pyvenv.cfg
 cd <abs worktree> && .venv/bin/python -m pip list
 cd <abs worktree> && .venv/bin/python -m pip install --upgrade pip
@@ -126,14 +137,14 @@ cd <abs worktree> && .venv/bin/python -c 'import numpy, sys; from pathlib import
 cd <abs worktree> && env -u PYTHONPATH .venv/bin/python -m ruff check .
 cd <abs worktree> && env -u PYTHONPATH .venv/bin/python -m ruff format --check .
 cd <abs worktree> && env -u PYTHONPATH .venv/bin/python -m pyright
-cd <abs worktree> && env -u PYTHONPATH -u OPENROUTER_API_KEY .venv/bin/python -m pytest --basetemp "$(mktemp -d)"
+cd <abs worktree> && env -u PYTHONPATH -u OPENROUTER_API_KEY .venv/bin/python -m pytest --basetemp "$(mktemp -d)" --cov=roastpilot_agent --cov-branch --cov-report=term-missing
 ```
 
 **Never create this venv with `--system-site-packages`.** Immediately after venv
-creation, the realpath command must print a prefix inside
-`<abs worktree>/.venv`, `pyvenv.cfg` must contain the exact false setting above,
-and the first, pre-install `pip list` should be short. A prefix that resolves
-outside the worktree identifies a borrowed or symlinked venv and means this is
+creation, the prefix command must print the resolved path and then `True`, proving
+component-aware containment within `<abs worktree>`; `pyvenv.cfg` must contain
+the exact false setting above, and the first, pre-install `pip list` should be
+short. `False` identifies a borrowed or symlinked venv and means this is
 **not a valid gate environment — discard the gate result and rebuild the venv**.
 The prefix realpath assertion catches whole-venv borrowing — a `.venv` that is
 itself a symlink or resolves outside the worktree — but cannot detect a symlinked
@@ -172,7 +183,9 @@ tests that fail in CI. Pytest's default basetemp, `/tmp/pytest-of-$USER/`, is
 shared across worktrees; concurrent runs collide there and produce phantom
 failures that have twice triggered real P1 investigations. Every worktree run
 therefore passes its own `--basetemp "$(mktemp -d)"`. It is unique per run,
-leaves nothing in the tree, and needs no `.gitignore` change.
+leaves nothing in the tree, and needs no `.gitignore` change. Every changed line
+and branch arm must be covered before opening, because `codecov/patch` counts
+partial branches.
 
 ### Manual pyright isolation verification
 
