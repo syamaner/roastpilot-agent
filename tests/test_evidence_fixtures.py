@@ -1,6 +1,8 @@
 """Integrity checks for compact evidence fixtures derived from hardware traces."""
 
 import json
+import math
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -18,16 +20,27 @@ def test_roast_three_authority_conflict_fixture_pins_recorded_sequence() -> None
     assert source["first_crack_bean_temp_c"] == 188.0
     assert source["profile_target_drop_temp_c"] == 195.0
     assert [sample["tick"] for sample in samples] == [918, 928, 936, 944, 952, 959, 966, 974, 981]
-    assert [sample["seconds_since_first_crack"] for sample in samples] == [
-        7.6,
-        15.1,
-        23.6,
-        31.6,
-        38.4,
-        45.5,
-        53.9,
-        60.5,
-        67.5,
+    assert [sample["controller_charge_elapsed_seconds"] for sample in samples] == [
+        523.4,
+        530.85,
+        539.39,
+        547.37,
+        554.12,
+        561.3,
+        569.64,
+        576.28,
+        583.22,
+    ]
+    assert [sample["controller_development_elapsed_seconds"] for sample in samples] == [
+        3.39,
+        10.84,
+        19.37,
+        27.35,
+        34.1,
+        41.28,
+        49.62,
+        56.26,
+        63.2,
     ]
     assert [sample["advisor_heat_target_percent"] for sample in samples] == [
         50,
@@ -56,3 +69,20 @@ def test_roast_three_authority_conflict_fixture_pins_recorded_sequence() -> None
     assert drop_requests[-1]["bean_temp_c"] == 203.0
     assert all(sample["telemetry_verdict"] == "allow" for sample in samples)
     assert all(sample["command_verdict"] == "allow" for sample in samples)
+
+    charge_elapsed = [sample["controller_charge_elapsed_seconds"] for sample in samples]
+    development_elapsed = [sample["controller_development_elapsed_seconds"] for sample in samples]
+    assert all(later > earlier for earlier, later in pairwise(charge_elapsed))
+    assert all(later > earlier for earlier, later in pairwise(development_elapsed))
+
+    for sample in samples:
+        derived_percent = (
+            sample["controller_development_elapsed_seconds"]
+            / sample["controller_charge_elapsed_seconds"]
+            * 100.0
+        )
+        assert math.isclose(
+            derived_percent,
+            sample["controller_development_percent"],
+            abs_tol=0.01,
+        )
