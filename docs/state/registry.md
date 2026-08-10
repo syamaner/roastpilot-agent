@@ -78,7 +78,20 @@
 > out); the safety record was deliberately left unedited and an `operator_notes`
 > entry explains it. Score it from the `drop_beans` event, not from
 > `outcome = 'completed'`.
-
+>
+> **STATUS UPDATE — 10 Aug 2026 (#738 gate environment; #733 role controls).**
+> **#738 closed via PR #772 (`6514d22`)**, adding the
+> **"Per-worktree gate environment (venv, pyright, pytest) — added Aug 2026
+> (#738, #733)"** section to `docs/agent-team-worktrees.md`; that section is the
+> citation target for this slice. **#773 was filed with the three P2s deferred
+> from #772's review under its declared stopping rule**, and **#767 gained two
+> D152 delegation frictions** on 10 Aug. This slice closes **#733** by routing
+> the worktree, copy-restore, and committed-tree controls into every
+> Bash-capable role prompt. The orchestrator ruled that **no new plan D-number
+> is warranted** for the reviewer-worktree-at-the-reviewed-sha rule: topology
+> §8 item 6 already makes it normative, and another D-number would create a
+> second authoritative-looking copy of the operational control.
+>
 > **STATUS UPDATE — 10 Aug 2026 (weekend merges; D152 changes the execution
 > model). Read with the 8/9 Aug blocks below.** Five PRs landed 9-10 Aug:
 > **#753** (ambient freshness-gate bypasses, closed #745), **#759** (non-finite

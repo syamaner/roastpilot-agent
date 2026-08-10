@@ -66,3 +66,25 @@ not make it yourself.
 A grounded verdict: **what shipped vs what was specified**, invariants held/at-risk,
 any plan/registry drift (with the fix), the decisions recorded (D-#), and the next
 brief — or an escalation to the human with options.
+
+## Worktree discipline (topology §7 — binding)
+
+- In each repository, your assigned worktree is the **only** tree you write in;
+  that repository's main checkout and sibling worktrees are read-only (`git -C`
+  peeks are fine, never a write).
+  For a lead-directed serialized or standalone run, the main checkout is the
+  assigned writable tree; sibling worktrees remain read-only.
+  Self-locate every command against the assigned worktree because cwd resets
+  between Bash calls.
+- Never run tree-mutating git commands — **`git checkout --`**, **`git restore`**,
+  **`git stash`**, **`git reset`**, **`git clean`**, or anything else that rewrites
+  a working tree or index — in a tree you do not own.
+- For mutation testing, snapshot the target to the scratchpad by file copy (`cp`)
+  before editing and restore by copying the snapshot back — never by git.
+- Verify committed-tree claims with **`git show`** `HEAD:path`, never against the
+  working tree.
+- Run Python gates with the assigned worktree's `.venv/bin/python -m …` and a
+  per-run `--basetemp`, following **"Per-worktree gate environment (venv,
+  pyright, pytest) — added Aug 2026 (#738, #733)"** in
+  **`docs/agent-team-worktrees.md`**. The full recipe and fail-closed assertions
+  live there.
