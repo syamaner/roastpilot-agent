@@ -2,6 +2,23 @@
 
 ## Active Epic
 
+> **STATUS UPDATE — 10 Aug 2026 (weekend merges; D152 changes the execution
+> model). Read with the 8/9 Aug blocks below.** Five PRs landed 9-10 Aug:
+> **#753** (ambient freshness-gate bypasses, closed #745), **#759** (non-finite
+> ambient triad voiding, closed #752), **#755** (D151 — `model_slug` shadowing
+> fix; #747 held open deliberately as its evidence record; #754 narrowed to
+> the `PUT /api/config` invalidation question), **#763** (reviewer-prompt
+> recall + delegation cap + main-session operator decision, closed #761), and
+> **#765 (D152, closed #764): Codex-MCP is now the DEFAULT implementer for
+> contracted slices, safety-critical included.** The new read-only
+> `story-planner` role writes the implementation contract and delegation is
+> fail-closed without one; three pre-delegation gates and the
+> stripped-untrusted-bytes rules live in AGENTS.md's implementation-delegation
+> bullet. Follow-ups: #762 (verify-stage batching), #766 (planner read
+> confinement), #767 (four deferred watermark/guard P2s). The #742 gate on
+> scoring a c11 hardware arm and the #756/#757/#758 non-finite family are
+> unchanged and remain the top of the week's plan.
+>
 > **STATUS UPDATE — 8 Aug 2026 (RP-D shipped; RP-B is next). Read with the 6 Aug
 > block below.** [Corrected 9 Aug: RP-B is now IN FLIGHT, not next — PR #731
 > merged 8 Aug, PR #741 (ambient freshness) merged 9 Aug; see the next free decision number below.] The
@@ -30,6 +47,7 @@
 > open for the residual fixture item + the #726 follow-ups) agree — no drift.
 > **Next in the D122 sequence: RP-B (#709) — the c11 ambient-fan doctrine.**
 > [Corrected 9 Aug: RP-B is in flight — PR #731 and PR #741 both merged; the c11 doctrine still ships DISABLED and #742/#745 gate scoring a hardware arm.]
+> [Corrected 10 Aug: #745 closed 9 Aug via PR #753, and #759 closed the non-finite triad half (#752); **#742 is now the single named blocker** for scoring a c11 hardware arm, with the #756/#757/#758 non-finite family still open alongside it.]
 > **Eval-model correction (Codex catch on the docs PR, now D125):** RP-D scores a
 > roast's ACHIEVED outcome, which a replay cannot change, so an offline c3-vs-c11
 > replay yields the SAME RP-D score for both arms — RP-D cannot discriminate a
@@ -186,6 +204,11 @@
 > renumbered here: D-numbers appear in commit messages and issues, so the
 > resolution is the operator's call, and it belongs to a separate thread. Cite
 > D130 with its file until then.
+> [Resolved 10 Aug for the D130 pair specifically: `plan.md` no longer defines
+> any D130 — the advisor-pin decision was recorded as **D151** (plan-repo
+> commit 784fc53, PR #755), so `factory.md`'s D130 (27 Jul, ordered context
+> evidence) is now the only D130. The historical D103-D129 dual definitions
+> remain, so a bare citation in that range still needs its file named.]
 > `plan.md` D108 is the PR-scoped Claude approval bridge `AGENTS.md` cites;
 > `factory.md` D108 is an unrelated cloud slice decision. The same holds for
 > D122, D124 and D127, all of which RP-B cites. **So a bare "D127" is ambiguous:
