@@ -31,6 +31,7 @@ function makeFieldMeta(overrides?: Partial<ConfigFieldMeta>): ConfigFieldMeta {
     read_only: false,
     description: "",
     yaml_value: null,
+    advisory: null,
     ...overrides,
   };
 }
@@ -363,6 +364,7 @@ describe("buildEditFromDirty — tri-state null = inherit for mcp_device", () =>
       read_only: false,
       description: "",
       yaml_value: null,
+      advisory: null,
     };
     const saved = buildValuesFromSnapshot(snapshot);
     // Operator cleared it back to null (inherit).

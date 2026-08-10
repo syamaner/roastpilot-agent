@@ -9,8 +9,9 @@ validation at E12 (E12-S1).
 
 from pathlib import Path
 from typing import Annotated, ClassVar, Literal
+from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .models import RoastPhase
@@ -62,8 +63,10 @@ DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS: dict[RoastPhase, float | None] = {
 # ``google/gemini-3.1-flash-lite`` (faster + ~5x cheaper) lost on heat-magnitude
 # fidelity; ``google/gemini-3-flash-preview`` was rejected (best drop but steers
 # heat the wrong way). See ``docs/advisor/bakeoff-results-2026-06-21.md``. This is
-# the base slug AND the default for every phase; the per-phase mechanism (#173)
-# is retained so a future re-run can flip a slot without a behavior change.
+# the base slug, and — with ``model_slug_by_phase`` empty by default (D151) — the
+# model every advice call resolves to until the operator changes it. The pin is a
+# DEFAULT, not a lock: D43/D73 and the #396 A/B both schedule hardware arms on
+# other models, which a lock would forbid.
 DEFAULT_ADVISOR_MODEL = "openai/gpt-4o"
 
 # One Hottop fan level, in normalized percentage points (#709 / D126). The
@@ -88,19 +91,140 @@ HOTTOP_FAN_LEVEL_PP = 10.0
 # narrowing the freshness margin.
 DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS = 30.0
 
-# Phase-keyed advisor MODEL selection (#173, operator 13 Jun): the model slug
-# the advisor uses, by agent phase. The MECHANISM only — every phase defaults to
-# ``DEFAULT_ADVISOR_MODEL`` (gpt-4o everywhere, #277 PIN). Under D35 the advisor
-# is consulted only in DEVELOPMENT (post-FC), so DEVELOPMENT is the phase the PIN
-# actually governs; preheat / pre-FC are deterministic and never consult. The map
-# is kept so a future re-run can flip a slot (e.g. a faster/cheaper development
-# model once the cloud feedback loop learns heat trims) and record it as a new
-# D-number. A phase absent from the map falls back to ``model_slug``.
-DEFAULT_ADVISOR_MODEL_BY_PHASE: dict[RoastPhase, str] = {
-    RoastPhase.PREHEATING: DEFAULT_ADVISOR_MODEL,
-    RoastPhase.ROASTING_PRE_FIRST_CRACK: DEFAULT_ADVISOR_MODEL,
-    RoastPhase.DEVELOPMENT: DEFAULT_ADVISOR_MODEL,
+# Advisor slugs whose post-FC advice latency has been MEASURED against the ~5 s
+# first-crack-slot gate, split by what the measurement said (D151, #747). Both
+# sets are ADVISORY DISPLAY DATA for the pre-charge banner and carry no runtime
+# authority whatsoever: nothing rejects, clamps, or substitutes a model on the
+# strength of them. A slug in neither set has no screen on record — which the
+# banner says, rather than implying it is either safe or bad.
+#
+# Why a warning and not a gate (the D151 sub-decision): until #747 the fully
+# populated per-phase map made a tick-busting model unreachable by accident, and
+# making ``model_slug`` effective removes that. A runtime allow-list was
+# rejected — it would go stale the day a model ships (gpt-5.6-luna would have
+# needed a code change before it could be tried), rejects at config-save time
+# far from the roast, and implies a June latency screen on one OpenRouter
+# account still holds.
+#
+# What a slow model actually costs, stated precisely (safety-reviewer finding,
+# folded pre-open — an earlier draft of this note claimed a slow model "cannot
+# stall the loop", which is FALSE and was the sentence the reader would rely
+# on). ``controller.tick`` awaits ``_maybe_run_advisory`` INLINE as its last
+# statement, and the serve loop is drain-operator-queue -> tick, so a call that
+# takes N seconds delays the next telemetry read, the next ``_evaluate_safety``
+# (including the hard bean-temp ceiling), and the next drain of the operator
+# queue — which is where the in-UI EMERGENCY STOP is consumed. N is bounded by
+# ``ControllerConfig.advisory_timeout_seconds``, not unbounded, and any failure
+# still falls back fail-closed to hold-current-targets with D30's
+# consecutive-failure stop behind it. So the true statement is: a slow model
+# DELAYS the control loop by up to that bound and degrades advice at the drop;
+# it cannot hang it forever and it cannot actuate anything. Ctrl-C at the
+# launcher is unaffected (it calls the controller directly). This exposure is
+# pre-existing — it was ~2 s while the accidental pin held gpt-4o — and making
+# ``model_slug`` effective is what puts a 6-10 s model within operator reach,
+# which is precisely why the banner names the bound.
+#
+# An ARM, not a slug, is the unit of measurement — ``(model_slug,
+# reasoning_effort)`` (local Codex P2 + safety-reviewer, both folded pre-open).
+# Keying on the slug alone INVERTS recorded evidence in at least one real case:
+# ``openai/gpt-5.5`` busts the gate at the provider default (10.8 s on 8 Jun,
+# 7.17/8.58 s in D40/D41) but was measured at **2.9 s, passing**, with
+# ``reasoning_effort="off"`` — a configuration
+# ``docs/advisor-bakeoff-2026-06-08.md`` explicitly documents as a speed/cost
+# alternative. A slug-keyed set would print "BUSTED" over the operator's own
+# measured-passing arm, which is worse than silence: it teaches them the warning
+# is noise. The effort key is the raw ``AdvisorConfig.reasoning_effort`` value,
+# ``None`` meaning the provider default (itself a measured condition, not an
+# absence).
+#
+# The ENDPOINT is the third dimension and is handled in ``launch_banner``
+# instead of being repeated on every row: every screen below ran on OpenRouter
+# via ``provider="openai_compatible"``, so any other provider or base URL voids
+# the whole table rather than matching a row.
+#
+# PROMPT VERSION is deliberately NOT a key dimension, and this is the scope
+# boundary — the dimensions stop here (local Codex P1, considered and declined
+# with reasons, so a later round does not relitigate it). Prompt size IS a
+# latency input: 8 Jun measured v1 -> v2 (~1,100 -> ~1,800 chars) adding ~1-2 s
+# and pushing borderline frontier models over the gate. But that finding is
+# about moving from a TOY prompt to a production-representative one, and it
+# predates this table: D40/D41 ran at ``v4`` and #396 at ``c3``, both
+# production-weight, as is every live ``c``-series prompt the operator selects.
+# Keying on the prompt anyway would leave the table matching nothing, so the
+# banner would warn on the proven baseline arm of every ordinary roast — the
+# cry-wolf failure that costs exactly the case this warning exists for, and the
+# reason a hard guard was rejected in the first place. What IS true and worth
+# knowing: these are MODEL-level indicators measured under a production-weight
+# prompt, not a certification of the operator's exact configuration, and a
+# materially heavier future prompt would move them — most of all for
+# ``claude-haiku-4.5``, the one entry with no margin (~4.1 s against ~5 s, and
+# 4.3-5.5 s straddling the gate on 8 Jun's heavier prompt).
+#
+# Sources — numbers live in the reports, not here, so this table cannot drift
+# into a stale citation: ``docs/advisor/bakeoff-summary-2026-06-16.md`` (D40/D41,
+# 8 models x 28 roasts, median/max against the ~5 s gate — the authoritative
+# screen for this gate), #396's 16 Jul screens (gpt-5.6-luna, gpt-4.1-mini), and
+# ``docs/advisor-bakeoff-2026-06-08.md`` for the reasoning-off arms. Note the
+# 8 Jun run scored against a LOOSER gate (it passes sonnet at 9.1 s and opus at
+# 6.2 s), so only its reasoning-off arms are carried here; the ~5 s
+# classification is D40/D41's.
+#
+# Slugs are lower-cased at definition and the two tables are asserted disjoint
+# by test: ``launch_banner`` matches them lower-case, so a mixed-case entry
+# added later would silently fall through to "no screen on record" — a false
+# NEGATIVE, the one direction that matters here.
+FC_LATENCY_SCREENED_ADVISOR_ARMS: dict[tuple[str, str | None], float] = {
+    # D40/D41 (16 Jun), provider-default reasoning: cleared comfortably.
+    # Values are the recorded WORST call (max), not the median — the median is
+    # what the roster screen selected on, the max is what a hard per-call
+    # timeout actually meets.
+    ("google/gemini-3.1-flash-lite", None): 1.44,
+    ("openai/gpt-4o-mini", None): 2.39,
+    ("openai/gpt-4o", None): 3.73,
+    # D40/D41: "✅ (tight)" in the report — 4.10 s median / 4.59 s max.
+    ("anthropic/claude-haiku-4.5", None): 4.59,
+    # #396 (16 Jul): 1.89/2.46 s on the dedicated screen, 3.76/4.52 s over the
+    # 28-roast run.
+    ("openai/gpt-5.6-luna", None): 4.52,
+    # #396 (16 Jul): 2.62/4.39 s on the dedicated screen, 2.94/5.05 s over 28
+    # roasts. The median sits well inside a 5 s bound; the max does not.
+    ("openai/gpt-4.1-mini", None): 5.05,
+    # 8 Jun: reasoning OFF turns the same model from 10.8 s into 2.9 s.
+    # The one arm on this table whose base slug busts at the default.
+    ("openai/gpt-5.5", "off"): 2.9,
 }
+
+#: The headroom an arm needs under ``ControllerConfig.advisory_timeout_seconds``
+#: before the banner stays silent about it. An arm whose recorded worst call
+#: leaves less than this fraction of the bound spare is reported as tight rather
+#: than cleared.
+#:
+#: Derived rather than hardcoded (local Codex P2, folded pre-open): tightness is
+#: a relation between a measurement and the CONFIGURED bound, not a property of
+#: the model. A static partition was silently wrong the moment an operator moved
+#: ``ROASTPILOT_CONTROLLER__ADVISORY_TIMEOUT_SECONDS`` — it stayed quiet about
+#: gpt-4o under a 1 s bound, and still cried timeout for gpt-4.1-mini under a
+#: 10 s one, which its 5.05 s worst call comfortably fits.
+FC_LATENCY_TIGHT_HEADROOM_FRACTION = 0.2
+
+#: Arms whose recorded screen BUSTED the gate — the reasoning / frontier models
+#: that think past the wall (D40/D41). Named explicitly so the banner can say
+#: "measured, and it busts" instead of the much weaker "no screen on record".
+FC_LATENCY_BUSTED_ADVISOR_ARMS: frozenset[tuple[str, str | None]] = frozenset(
+    (slug.lower(), effort)
+    for slug, effort in {
+        # The #277 brief pins this one to ``low``; that is the arm measured, and
+        # 8 Jun found reasoning cannot be disabled on it at all (a 400 from the
+        # endpoint), so no reasoning-off escape exists for it.
+        ("openai/gpt-5-mini", "low"),
+        ("anthropic/claude-opus-4.8", None),
+        ("openai/gpt-5.5", None),
+        # Structural generation latency, not reasoning: 8 Jun found Anthropic
+        # models emit zero reasoning tokens, so reasoning-off is a no-op here
+        # and there is no faster arm of this model to record.
+        ("anthropic/claude-sonnet-4.6", None),
+    }
+)
 
 #: The canonical OpenRouter API base URL — :attr:`AdvisorConfig.provider_base_url`'s
 #: own default, and the single source of truth
@@ -1179,7 +1303,26 @@ class ControllerConfig(BaseModel):
     # no pre-FC advice at all there is nothing to suppress.
     advisory_post_charge_settle_max_seconds: float = Field(default=90.0, gt=0)
     advisory_post_charge_turning_point_ror_c_per_min: float = Field(default=0.0)
-    advisory_timeout_seconds: float = Field(default=10.0, gt=0)
+    # The bound on the advisory await, and therefore on how long a slow model
+    # DELAYS the control loop (operator decision, 9 Aug 2026, #747 / D151).
+    # Lowered 10.0 -> 5.0 to match the ~5 s FC-slot latency screen the advisor
+    # roster is chosen against: the call is awaited inline at the end of
+    # ``tick()`` and the serve loop is drain-operator-queue -> tick, so this
+    # number is exactly how long a stalled provider can hold off the next
+    # telemetry read, the next ``_evaluate_safety``, and the next drain of the
+    # operator queue (where the in-UI EMERGENCY STOP is consumed). Holding it at
+    # 2x the screen meant an unscreened model could hold the loop for twice as
+    # long as any model we would knowingly run.
+    #
+    # Margin against a FALSE timeout on the pinned model: gpt-4o measured
+    # 2.41/3.73 s median/max over 28 roasts (D40/D41) and 2.54/3.59 s (#396,
+    # 16 Jul), so 5.0 leaves >1 s over the worst observed call. An isolated
+    # overrun is already tolerated — it becomes one REJECT with the
+    # hold-current-targets fallback, and D30's stop needs THREE CONSECUTIVE
+    # failures (``_consecutive_advisor_failures`` resets on any good call), so a
+    # single slow tick cannot push a roast into recovery. A model that times out
+    # three times running is one that should not be driving the roast anyway.
+    advisory_timeout_seconds: float = Field(default=5.0, gt=0)
     t0_debounce_ticks: int = Field(default=3, ge=1)
     telemetry_log_interval_seconds: float = Field(default=5.0, gt=0)
     max_stale_telemetry_seconds: float = Field(default=3.0, gt=0)
@@ -1368,15 +1511,23 @@ class AdvisorConfig(BaseModel):
     ``provider`` + the matching ``api_key_env``. ``OPENROUTER_API_KEY`` must be
     set in the environment at runtime; ``FakeAdvisor`` stays the test/CI default.
 
-    Per-phase model selection (#173): ``model_slug`` is the base/default slug
-    (the identity in the decision-trace descriptor and the reachability probe),
-    and ``model_slug_by_phase`` is an optional per-phase override map resolved
-    by :meth:`model_for`. By default every phase resolves to
-    ``DEFAULT_ADVISOR_MODEL`` — gpt-4o everywhere (#277 PIN); under D35 only the
-    post-FC DEVELOPMENT phase actually consults the advisor — so the map is
-    retained additive plumbing with zero behavior change; a future re-run could
-    flip a phase slot to a different model. A phase absent from the
-    override map falls back to ``model_slug``.
+    Per-phase model selection (#173): ``model_slug`` is the model, and
+    ``model_slug_by_phase`` is an EMPTY-by-default per-phase override map
+    resolved by :meth:`model_for`. With no override, every phase resolves to
+    ``model_slug`` — so a slug set in ``/config``, in the saved config file, or
+    via ``ROASTPILOT_ADVISOR__MODEL_SLUG`` is the model that answers.
+
+    That empty default is D151 (#747), and it is a bug fix, not a re-pin. The
+    map used to ship populated with ``DEFAULT_ADVISOR_MODEL`` for every phase
+    and is absent from ``AdvisorConfigEdit``, so it silently SHADOWED every
+    operator-set ``model_slug``: roast 8 (28 Jun 2026) was launched as a
+    ``gpt-4.1-mini`` arm, ran gpt-4o for all 19 decisions, and was written up
+    as a mini hardware result in D73/D74 and #396. The pin itself (#277/D43)
+    is unchanged — it is the FIELD DEFAULT, which the operator may now change.
+
+    The mechanism is retained (an override still wins) so a future re-run can
+    pin one phase to a different model; under D35 only post-FC DEVELOPMENT
+    consults the advisor, so that map has exactly one live slot today.
     """
 
     provider: Literal["openai", "anthropic", "google", "ollama", "openai_compatible"] = (
@@ -1385,17 +1536,18 @@ class AdvisorConfig(BaseModel):
     provider_base_url: str = OPENROUTER_BASE_URL
     api_key_env: str = Field(default="OPENROUTER_API_KEY", min_length=1)
     model_slug: str = Field(default=DEFAULT_ADVISOR_MODEL, min_length=1)
-    # Phase-keyed model override map (#173). The MECHANISM for phase-dependent
-    # model selection — defaults to ``DEFAULT_ADVISOR_MODEL`` for preheat /
-    # pre-FC / development (gemini-3.1-flash-lite everywhere, D33), so
-    # :meth:`model_for` resolves to the single pinned model in every phase. The
-    # map is retained so a future re-run could flip a phase slot to a different
-    # model. A phase absent from this map falls back to ``model_slug``. Each slug
-    # is ``min_length=1``
-    # (an empty model slug is meaningless). Parameterized factory, not a bare
-    # ``dict`` default, per the repo's pyright-strict typed-default idiom.
+    # Phase-keyed model override map (#173) — EMPTY by default (D151, #747), so
+    # :meth:`model_for` falls back to ``model_slug`` in every phase and the
+    # configured model is the model that answers. Populating a slot overrides
+    # that phase only; a phase absent from the map falls back to ``model_slug``.
+    # Deliberately NOT in ``AdvisorConfigEdit``: a per-phase UI would expose
+    # three inputs for one live slot (D35 — only DEVELOPMENT consults), and it
+    # was that unreachable-from-the-UI map, shipped populated, that shadowed
+    # ``model_slug`` for six weeks. Each slug is ``min_length=1`` (an empty
+    # model slug is meaningless). Parameterized factory, not a bare ``dict``
+    # default, per the repo's pyright-strict typed-default idiom.
     model_slug_by_phase: dict[RoastPhase, Annotated[str, Field(min_length=1)]] = Field(
-        default_factory=lambda: dict(DEFAULT_ADVISOR_MODEL_BY_PHASE)
+        default_factory=dict[RoastPhase, str]
     )
     timeout_seconds: float = Field(default=10.0, gt=0)
     # Bound on the startup reachability probe (issue #168). Deliberately short
@@ -1428,18 +1580,95 @@ class AdvisorConfig(BaseModel):
     # provider default; ``"off"`` disables reasoning; the effort levels set
     # ``reasoning.effort``. Native anthropic/google providers ignore this.
     # Default ``None`` preserves provider behavior; the advisor's interest is
-    # fast structured advice inside the 10 s tick budget, so the bake-off
+    # fast structured advice inside the controller's advisory budget
+    # (``ControllerConfig.advisory_timeout_seconds``, 5.0 s since D151), so the
+    # bake-off
     # measures reasoning on-vs-off (E8-S4 cost/reasoning eval).
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None
+
+    @field_validator("model_slug")
+    @classmethod
+    def _strip_model_slug(cls, value: str) -> str:
+        """Normalise the base slug; see :func:`normalize_model_slug`.
+
+        ``min_length=1`` admits ``"  "``, which before D151 was inert — the
+        always-populated phase map shadowed it. This change is what makes it
+        live, so a blank-looking slug would now ship a garbage identifier to the
+        provider on every DEVELOPMENT call.
+
+        Args:
+            value: The configured slug.
+
+        Returns:
+            The stripped slug.
+        """
+        return normalize_model_slug(value, "model_slug")
+
+    @field_validator("model_slug_by_phase")
+    @classmethod
+    def _strip_phase_slugs(cls, value: dict[RoastPhase, str]) -> dict[RoastPhase, str]:
+        """Apply the same normalisation to every per-phase override.
+
+        A phase override is dispatched by the same code path, so it carries the
+        same blank/padded hazard as the base slug.
+
+        Args:
+            value: The per-phase override map.
+
+        Returns:
+            The map with every slug stripped.
+        """
+        return {
+            phase: normalize_model_slug(slug, f"model_slug_by_phase[{phase.value}]")
+            for phase, slug in value.items()
+        }
+
+    def dispatch_identity(self) -> tuple[str, str, str, str, str | None]:
+        """What a probe or an advice call actually CONTACTS (#747 review fold).
+
+        Named and returned as a unit because "does this probe still describe the
+        current config" has already taken three rounds of review-discovered
+        subtlety, all of it previously living as comments at one call site — and
+        the dimension that kept getting missed (``reasoning_effort``) is exactly
+        what an unnamed inline tuple invites. ``build_model`` bakes the reasoning
+        effort into the model settings every cached agent uses, including the one
+        ``healthcheck`` probes with, so it is part of the identity.
+
+        The base URL is compared NORMALISED, using the same helper the endpoint
+        screen uses: a trailing slash or host-case edit is cosmetic, and treating
+        it as a different endpoint would needlessly discard a valid probe.
+
+        The per-phase override map is deliberately NOT here — it changes which
+        model gives ADVICE, not what the base-slug probe contacted, and callers
+        that care compare :func:`advisor_screen.advice_models` alongside this.
+
+        Returns:
+            ``(provider, normalised base URL, api_key_env, model_slug,
+            reasoning_effort)``.
+        """
+        return (
+            self.provider,
+            normalize_base_url(self.provider_base_url),
+            self.api_key_env,
+            self.model_slug,
+            self.reasoning_effort,
+        )
 
     def model_for(self, phase: RoastPhase) -> str:
         """Return the advisor model slug to use for ``phase`` (#173).
 
-        Looks ``phase`` up in :attr:`model_slug_by_phase`, falling back to the
-        base :attr:`model_slug` when the phase carries no override. With the
-        default map (gpt-4o for every phase, #277 PIN) this always resolves to
-        :attr:`model_slug`, so per-phase selection is a behavioral no-op until a
-        future re-run populates the map with a different per-phase model.
+        Looks ``phase`` up in :attr:`model_slug_by_phase`, falling back to
+        :attr:`model_slug` when the phase carries no override. The map is empty
+        by default (D151, #747), so this resolves to the configured
+        :attr:`model_slug` in every phase — including the one phase that
+        consults the advisor under D35 — until a future re-run populates a slot.
+
+        This is the ONLY correct way to ask which model will answer. Reading
+        :attr:`model_slug` directly is right only when the question really is
+        about the base slug (the reachability probe, the off-OpenRouter
+        bean-sourcing extraction fallback); anything reporting or dispatching
+        roast advice must come through here, or it will name the wrong model
+        the moment an override exists.
 
         Args:
             phase: The agent phase the controller is currently in.
@@ -1449,6 +1678,118 @@ class AdvisorConfig(BaseModel):
             base ``model_slug``.
         """
         return self.model_slug_by_phase.get(phase, self.model_slug)
+
+
+# Tolerant provider-endpoint matching, shared by ``bean_sourcing`` (which
+# routes extraction off OpenRouter) and ``advisor_screen`` (which applies the
+# FC-latency screen only to the endpoint it was measured on). Lives here
+# because this module already owns ``OPENROUTER_BASE_URL``, and because a
+# second, less tolerant copy is exactly the drift Claude's review caught.
+_DEFAULT_PORT_BY_SCHEME: dict[str, int] = {"http": 80, "https": 443}
+
+
+def normalize_model_slug(value: str, field_name: str) -> str:
+    """Strip a model slug and reject it if blank (#747 review fold).
+
+    One implementation for all three boundaries — ``AdvisorConfig.model_slug``,
+    its per-phase overrides, and ``AdvisorConfigEdit.model_slug`` — because
+    three hand-rolled copies of "strip, raise if empty" is the same drift this
+    PR is elsewhere fixing.
+
+    Stripping matters beyond tidiness: ``build_model`` dispatches the slug
+    verbatim, so a padded value would otherwise be dispatched padded while the
+    FC-latency screen matched on the raw string.
+
+    Args:
+        value: The configured slug.
+        field_name: Field name, for the error message.
+
+    Returns:
+        The stripped slug.
+
+    Raises:
+        ValueError: If the slug is blank once stripped.
+    """
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError(f"{field_name} must not be blank")
+    return stripped
+
+
+def normalize_base_url(url: str) -> str:
+    """Normalise a provider base URL for tolerant comparison (#590 P2 fix).
+
+    Strips a trailing ``/``, lower-cases the host (scheme/path stay
+    case-sensitive, matching URL semantics — only the host is defined to be
+    case-insensitive), AND drops an explicit port that merely restates the
+    scheme's implicit default (:data:`_DEFAULT_PORT_BY_SCHEME`) — so
+    ``"https://openrouter.ai/api/v1"``, ``"https://openrouter.ai/api/v1/"``,
+    ``"https://OpenRouter.ai/api/v1"``, and
+    ``"https://openrouter.ai:443/api/v1"`` all normalise identically. A
+    NON-default explicit port (e.g. a LAN reverse-proxy on ``:8443``) is
+    preserved — dropping it would be the exact false-positive this
+    tolerant match must NOT introduce. Never raises: most non-URL strings
+    degrade to a mostly-empty ``SplitResult``; eager malformed-bracket errors
+    and malformed/non-numeric ports are caught explicitly. Either way, a
+    malformed ``provider_base_url`` here just
+    fails the equality check harmlessly (falls through to the
+    native-provider branch) rather than crashing model resolution.
+
+    Args:
+        url: The base URL to normalise.
+
+    Returns:
+        The normalised URL for ``==`` comparison.
+    """
+    stripped = url.strip().rstrip("/")
+    try:
+        parsed = urlsplit(stripped)
+    except ValueError:
+        # Malformed bracketed hosts raise eagerly. Treat them like every other
+        # non-matching provider URL so attempt admission can still be recorded.
+        return stripped
+    netloc = parsed.netloc.lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        # A non-numeric/out-of-range port -- can't be a default-port match
+        # either way, so leave netloc as-is and let the equality check
+        # fail harmlessly (this function must never raise).
+        port = None
+    default_port = _DEFAULT_PORT_BY_SCHEME.get(parsed.scheme.lower())
+    if port is not None and port == default_port:
+        # ``SplitResult.port`` is parsed directly off netloc's trailing
+        # ``:<port>`` segment, so whenever it returns a value, ``netloc``
+        # (already lower-cased above, and port digits are case-invariant)
+        # is GUARANTEED to end with exactly that suffix -- no ``.endswith``
+        # guard needed (would be an unreachable branch under coverage).
+        netloc = netloc[: -len(f":{port}")]
+    return urlunsplit(parsed._replace(netloc=netloc))
+
+
+def is_openrouter_endpoint(advisor_config: AdvisorConfig) -> bool:
+    """Whether ``advisor_config`` is ACTUALLY pointed at OpenRouter (#590 P2 fix).
+
+    ``advisor_config.provider == "openai_compatible"`` alone is NOT
+    sufficient: that provider setting is the generic OpenAI-compatible-API
+    path, which also covers a local server, LiteLLM, or any other
+    OpenAI-compatible endpoint reachable via a custom ``provider_base_url``
+    — none of which necessarily serve the OpenRouter-specific
+    :data:`_DEFAULT_EXTRACTION_MODEL_SLUG`. This additionally requires
+    ``provider_base_url`` to match :data:`~roastpilot_agent.config.OPENROUTER_BASE_URL`
+    (tolerant of a trailing-slash / host-case / explicit-default-port
+    variant — see :func:`normalize_base_url`).
+
+    Args:
+        advisor_config: The operator's advisor provider/key/model config.
+
+    Returns:
+        ``True`` only when the provider is ``"openai_compatible"`` AND its
+        base URL resolves to OpenRouter's.
+    """
+    return advisor_config.provider == "openai_compatible" and normalize_base_url(
+        advisor_config.provider_base_url
+    ) == normalize_base_url(OPENROUTER_BASE_URL)
 
 
 class BeanSourcingConfig(BaseModel):
@@ -1494,11 +1835,12 @@ class BeanSourcingConfig(BaseModel):
     extraction_timeout_seconds: float = Field(default=45.0, gt=0)
     """Bound on the bean-identity extraction LLM call
     (``bean_sourcing._extract_bean_identity``'s ``agent.run()``) —
-    deliberately a SEPARATE, LONGER budget than
-    :attr:`AdvisorConfig.timeout_seconds` (10 s), which bounds the
-    *per-tick roast-advice* call the live control loop makes once a second.
+    deliberately a SEPARATE, LONGER budget than the *per-tick roast-advice*
+    call the live control loop makes once a second, which is bounded by
+    :attr:`ControllerConfig.advisory_timeout_seconds` (5.0 s since D151 —
+    :attr:`AdvisorConfig.timeout_seconds` has no runtime consumer in the agent).
     A bean draft is a one-shot request the operator explicitly triggers by
-    pasting a vendor URL and can wait ~30 s for; the 10 s advice budget
+    pasting a vendor URL and can wait ~30 s for; the far tighter advice budget
     starved every call for the reasoning models tested in the bean-sourcing
     bake-off (``gpt-5-nano``/``gpt-5-mini`` both scored 0/81 on the first
     pass — see ``docs/advisor/bean-sourcing-bakeoff-2026-07-19.md``,

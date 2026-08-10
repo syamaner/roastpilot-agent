@@ -18,6 +18,37 @@ Format: one entry per anti-pattern.
 
 ---
 
+## A config field the operator can edit must not be shadowed by a resolver default they cannot reach
+*(fixed by #747 / D151, 9 Aug 2026)*
+
+- **Signature:** a settings field paired with a `*_by_<something>` override map (or
+  any second-level resolver) where the MAP ships fully populated AND is absent from
+  the `*ConfigEdit` model. Grep for `default_factory=lambda: dict(DEFAULT_` in
+  `config.py`, and cross-check every `Field` in `AdvisorConfigEdit` /
+  `ControllerConfigEdit` / `MCPDeviceConfigEdit` against whatever actually reads it
+  at runtime.
+- **Wrong:** `model_slug_by_phase` defaulted to the pinned model for EVERY phase, so
+  `model_for(phase)` never reached its `model_slug` fallback. `/config` rendered an
+  editable Model box, `GET /api/config` reported the saved value `effective`, and the
+  roast ran gpt-4o regardless. Roast 8 (28 Jun 2026) was launched as a `gpt-4.1-mini`
+  arm, ran gpt-4o for all 19 decisions, and was written up as a mini hardware result
+  in D73/D74 and #396. Six weeks, no signal.
+- **Right:** ship the override map EMPTY so the resolver falls back to the editable
+  field; keep the mechanism for a real override. If a value genuinely must not be
+  operator-changeable, do not render an editable control for it — the defect is then
+  the OFFER, not the resolution.
+- **The tell that generalises:** "editable + reported effective + no observable
+  effect". When a field claims to be effective, assert it end-to-end against the
+  thing that CONSUMES it (`model_for(DEVELOPMENT)`), never against the field's own
+  round-trip through the config store. A read-back test passes happily while the
+  value does nothing.
+- **Guarded by:** `test_config.test_configured_model_slug_governs_the_phase_that_consults`
+  (both the constructed and the `ROASTPILOT_ADVISOR__MODEL_SLUG` route) and
+  `test_launch_banner.test_saved_model_slug_is_the_model_the_advisor_actually_uses`
+  (saved file → resolved config → the model the advisor picks).
+
+---
+
 ## The MCP stdio session's cancel scopes must enter AND exit in ONE owning task; stop/respawn is a request to that task
 *(fixed by #484, 9 Jul 2026)*
 
@@ -667,15 +698,23 @@ Format: one entry per anti-pattern.
   a replay must reproduce a fixed recorded trajectory regardless of live
   config; see the replay entry above). `scripts/advisor_smoke.py` is also
   fine: the bare config it prints is the same object it then runs on, so its
-  readout is honest.
+  readout is honest. **WRONG, corrected by #747 — and wrong in a way that
+  illustrates this very entry.** Same OBJECT, but not the same FIELD: it
+  printed `config.model_slug` while `PydanticAIAdvisor` resolves
+  `model_for(phase)`, so an env-set slug was printed and never called. Object
+  identity is not the check; following the field to its CONSUMER is. Fixed in
+  the #747 branch, which prints the phase-resolved model and names a shadowed
+  slug.
 - **Also:** resolving the right config is only half of it — the readout must
   report the value the code path actually *consumes*, and it must know WHICH
   code path consumes it. Four related traps in this same banner, all caught by
   the local Codex pass pre-open, over two rounds:
   (a) `advisor.model_slug` is shadowed by `model_slug_by_phase` (the advisor
-  calls `model_for(phase)`, and that map ships populated and is not editable
-  from `/config`), so the banner must print the phase-resolved model — the
-  runtime bug is #747; (b) but the base slug is NOT unused: `healthcheck()`
+  calls `model_for(phase)`) — **the "ships populated" half of this is SUPERSEDED
+  by the #747 entry at the top of this file: since D151 the map ships EMPTY, so
+  the base slug normally IS the advice model. The banner must still print the
+  phase-resolved model, because a hand-pinned slot can shadow it again**;
+  (b) the base slug is NOT unused: `healthcheck()`
   probes reachability with it, so an invalid one still drives the startup
   advisor status — say "gives no roast advice", not "unused"; (c) only
   `AUTO_ADVICE_PHASES` (DEVELOPMENT alone, under D35) consults the advisor at

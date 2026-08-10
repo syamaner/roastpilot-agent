@@ -57,6 +57,7 @@ function makeFieldMeta(overrides?: Partial<ConfigFieldMeta>): ConfigFieldMeta {
     read_only: false,
     description: "Test field description",
     yaml_value: null,
+    advisory: null,
     ...overrides,
   };
 }
@@ -353,5 +354,64 @@ describe("ConfigFieldRow — deviceSelect allowClear → onChange(null) (#439)",
     fireEvent.click(inheritOption);
     expect(onChange).toHaveBeenCalledWith(null);
     expect(onChange).not.toHaveBeenCalledWith("");
+  });
+});
+
+describe("ConfigFieldRow — value-reactive advisory (#754)", () => {
+  it("renders the server's advisory when one is present", () => {
+    // The #754 gap: /config is where the operator switches model arms BETWEEN
+    // roasts (D78 applies next-roast), but the FC-latency warning lived only in
+    // the launch-time banner. The text is server-side so the launcher and the
+    // UI cannot drift; the row's job is only to show it.
+    renderRow(
+      NUMBER_FIELD,
+      makeFieldMeta({
+        effective_value: 100,
+        advisory: "openai/gpt-5.5 BUSTED the ~5 s post-FC latency screen (D40/D41)",
+      }),
+    );
+
+    const advisory = screen.getByTestId(`advisory-${NUMBER_FIELD.key}`);
+    expect(advisory).toHaveTextContent("BUSTED the ~5 s post-FC latency screen");
+  });
+
+  it("renders nothing when the advisory is null, so the baseline stays quiet", () => {
+    // A warning that fires on the proven pinned arm is one the operator learns
+    // to scroll past — which would cost exactly the case it exists for.
+    renderRow(NUMBER_FIELD, makeFieldMeta({ advisory: null }));
+
+    expect(screen.queryByTestId(`advisory-${NUMBER_FIELD.key}`)).toBeNull();
+  });
+
+  it("never disables the input — the advisory is advice, not a gate (D151)", () => {
+    // The operator decided the model pin is a DEFAULT they may override, not a
+    // lock. A warning that blocked the edit would quietly re-impose the lock.
+    renderRow(
+      NUMBER_FIELD,
+      makeFieldMeta({
+        effective_value: 100,
+        advisory: "no FC-latency screen on record for openai/gpt-6",
+      }),
+    );
+
+    expect(screen.getByLabelText(NUMBER_FIELD.label)).not.toBeDisabled();
+  });
+});
+
+describe("ConfigFieldRow — advisory follows the SAVED value (#754)", () => {
+  it("hides the advisory while the input differs from what the server classified", () => {
+    // `meta.advisory` describes the saved model. Leaving it up under a
+    // half-typed slug shows the previous model's verdict against a value it
+    // was never about (local Codex P2, folded pre-open).
+    renderRow(
+      NUMBER_FIELD,
+      makeFieldMeta({
+        effective_value: 100,
+        advisory: "openai/gpt-5.5 BUSTED the ~5 s post-FC latency screen",
+      }),
+      55,
+    );
+
+    expect(screen.queryByTestId(`advisory-${NUMBER_FIELD.key}`)).toBeNull();
   });
 });

@@ -265,7 +265,12 @@ const ADVISOR_FIELDS: ConfigFieldDef[] = [
   {
     key:            "advisor.timeout_seconds",
     label:          "Timeout",
-    hint:           "Per-call advisor timeout (seconds). The controller tick blocks no longer than this.",
+    // NOT the control-loop bound (#747): the controller enforces its own
+    // advisory_timeout_seconds (5.0 s, D151) around the advisory await, and
+    // this field has no runtime consumer in the agent. Saying "the tick blocks
+    // no longer than this" sent an operator hitting timeouts to a knob that
+    // changes nothing — harmless while both were 10.0 s, wrong once they parted.
+    hint:           "Advisor request timeout (seconds), for tooling that reads it. NOT the control-loop bound — the controller cuts an advisory call at its own advisory_timeout_seconds (default 5.0 s, D151).",
     type:           "number",
     unit:           "s",
     min:            0.1,  // gt=0 (exclusive) in AdvisorConfigEdit
