@@ -114,6 +114,31 @@ def test_agents_md_prose_names_the_full_ids() -> None:
     )
 
 
+def test_topology_reference_table_rows_match_the_map() -> None:
+    """Light regex guard over the §4 reference table's Claude rows.
+
+    The module docstring has always claimed the §4 table as a guarded surface,
+    but until D152 added rows there nothing actually read the file — a drifted
+    table row (wrong model or effort text) stayed green. Cell-level regexes are
+    deliberately loose about prose and strict about the pinned ID + effort.
+    """
+    topo = (_REPO / "docs" / "agent-topology.md").read_text()
+
+    def cells(model: str, effort: str) -> str:
+        return rf"[^\n|]*\|[^\n|]*`{model}`[^\n|]*\|[^\n|]*`{effort}`"
+
+    rows = [
+        (r"\| Planning architect" + cells("claude-fable-5", "high"), "planning-architect"),
+        (r"\| Story planner" + cells("claude-fable-5", "high"), "story-planner"),
+        (r"\| Safety/critical" + cells("claude-opus-5", "xhigh"), "safety reviewer"),
+        (r"Claude fallback" + cells("claude-sonnet-5", "high"), "fallback implementer"),
+    ]
+    for row_re, role in rows:
+        assert re.search(row_re, topo), (
+            f"§4 reference-table row for {role} drifted from the authoritative pin map"
+        )
+
+
 def test_workflow_model_pins_are_full_ids() -> None:
     """The review-branch inline-stage pins must be full IDs, and the safety verifier
     must stay on the Opus tier so it can't silently overrule the always-Opus safety

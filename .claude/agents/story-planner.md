@@ -108,7 +108,8 @@ is what "specced" means: delegation without one is forbidden (fail-closed).
    and for every guard the change adds, changes, moves, or otherwise touches,
    one mutation-style check named as "removing/inverting guard X must fail
    test Y". A guard without such a check is unproven. Name which tests run hardware-free (fake MCP /
-   mock driver) and which need the E12 manual-validation path.
+   mock driver) and which need the E12 supervised hardware-validation
+   stories (AGENTS.md Hardware Safety Notes).
 4. **Class sweep** — if any change fixes an instance of a class, name the
    class, the exact `grep` that enumerates every sibling in the repo, and the
    expected match set (see `docs/recent-fixes.md` for known classes).
