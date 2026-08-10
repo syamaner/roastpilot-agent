@@ -4825,6 +4825,64 @@ async def test_healthy_adapter_read_reaches_the_doctrine_context_populated() -> 
 
 
 @pytest.mark.asyncio
+async def test_non_finite_adapter_ambient_reaches_the_doctrine_as_an_absent_reading() -> None:
+    """#752, the joined seam: a malformed reading must be DECLINED, not compared.
+
+    The mirror of the healthy-seam test above, and the reason it is worth having
+    both: ``NaN`` compares ``False`` against ``ambient_fan_threshold_c`` in both
+    directions, so nothing raises — the doctrine would simply seat the model in
+    whichever fan regime the comparison falls through to, with a plausible
+    ``Infinity``/``NaN`` room temperature in the prompt. Today the only thing
+    stopping that is pydantic's ``ser_json_inf_nan="null"`` default turning it
+    into ``null`` at serialisation time, which is implicit, version-dependent,
+    and not what ``model_dump()`` does.
+
+    Driven through a REAL ``RoasterControlAdapter`` into a REAL
+    ``_build_advisor_context`` with the doctrine ENABLED, because the failure is
+    otherwise silent at every individual layer. The assertion is whole-context
+    equality against the SAME session state with the probe unavailable instead:
+    the claim is that a malformed reading introduces no new shape for c11 to
+    meet — the same branch, the same prose, the #498-safe direction (the absent
+    branch can only leave the graduated fan regime, never enter it).
+    """
+
+    def _adapter(ambient_status: dict[str, object]) -> RoasterControlAdapter:
+        async def call_tool(tool: str, arguments: dict[str, object]) -> object:
+            return {**SESSION_STATE_PAYLOAD, "ambient_status": ambient_status}
+
+        return RoasterControlAdapter(RoasterMCPClient(call_tool), clock=lambda: 0.0)
+
+    ok_ambient: dict[str, object] = dict(SESSION_STATE_PAYLOAD["ambient_status"])  # type: ignore[arg-type]
+    malformed = await _adapter({**ok_ambient, "temperature_c": float("nan")}).read_telemetry()
+    unplugged = await _adapter(
+        {
+            "mode": "yoctopuce",
+            "status": "unavailable",
+            "reason": "Yoctopuce probe not detected.",
+            "ambient_running": False,
+        }
+    ).read_telemetry()
+
+    harness = make_harness(config=_doctrine_on())
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+
+    assert malformed is not None and unplugged is not None
+    assert malformed.ambient_temp_c is None  # voided at the reading boundary
+    ctx = harness.controller._build_advisor_context(malformed, limits)  # pyright: ignore[reportPrivateUsage]
+    absent = harness.controller._build_advisor_context(unplugged, limits)  # pyright: ignore[reportPrivateUsage]
+
+    assert ctx == absent
+    assert ctx.ambient_temp_c is None
+    assert ctx.ambient_humidity_pct is None
+    # The doctrine's own two numbers still describe the doctrine, not the room.
+    assert ctx.ambient_fan_threshold_c == AmbientFanDoctrine().threshold_c
+    assert ctx.ambient_fan_step_max_pp == AmbientFanDoctrine().step_max_pp
+
+
+@pytest.mark.asyncio
 async def test_ambient_fan_doctrine_is_advisory_only_and_actuates_no_lever() -> None:
     """#709 invariant (the reason ``safety-reviewer`` gates this PR): the
     ambient doctrine is prompt-only. Two ticks whose ONLY difference is the

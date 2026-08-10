@@ -24,6 +24,7 @@ from pydantic import ValidationError
 
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig
 from roastpilot_agent.mcp_client import (
+    AmbientStatus,
     ControlCommandResult,
     EventCommandResult,
     EventSnapshot,
@@ -42,12 +43,15 @@ from roastpilot_agent.mcp_client import (
     ServerInfo,
     SetRecordingMetadataResult,
     StartRoastSessionResult,
+    ambient_reading_is_live,
+    ambient_reading_token,
     applied_state_from_event,
     event_backdate_seconds,
     force_terminate_process_group,
     parse_tool_result,
     project_live_ambient,
     project_mic_status,
+    project_recordable_ambient,
     project_session_state,
     resolve_mcp_command,
 )
@@ -2659,6 +2663,364 @@ def test_project_live_ambient_ok_status_passes_through_triad() -> None:
     assert project_live_ambient(state.ambient_status) == (28.49, 38.6, 1008.56)
 
 
+def _ambient_status_with(**overrides: object) -> AmbientStatus:
+    """The fixture ambient status with ``overrides`` applied to its fields.
+
+    Shared by the #745 predicate/token tests so the merge-into-SESSION_STATE_
+    PAYLOAD pattern lives once (claude-review low, folded pre-ready).
+    """
+    payload = {
+        **SESSION_STATE_PAYLOAD,
+        "ambient_status": {
+            **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[dict-item]
+            **overrides,
+        },
+    }
+    return RoastSessionState.model_validate(payload).ambient_status
+
+
+def test_project_recordable_ambient_is_strictly_narrower_than_live() -> None:
+    """#745: the recordable predicate adds a dateability clause to the live one.
+
+    "Strictly narrower" is the load-bearing property — it is what closes the hole
+    between #745's two fixes, where a reading the live advisor declines could
+    still be persisted as the run's corpus breadcrumb. Asserted directly here
+    rather than only through the two api-level capture tests, so the relationship
+    between the two predicates is pinned rather than inferred (safety-reviewer
+    finding 1, folded pre-open).
+
+    The four cases are the full cross-product that matters: the healthy one, and
+    each way a reading can be unusable.
+    """
+
+    triad = (28.49, 38.6, 1008.56)
+    nulls = (None, None, None)
+
+    # ok + running + a finite stamp: both predicates agree on the triad.
+    healthy = _ambient_status_with()
+    assert project_live_ambient(healthy) == triad
+    assert project_recordable_ambient(healthy) == triad
+
+    # ok + running but UNDATEABLE: this is the narrowing. The live projection
+    # still forwards it (the controller declines it on the age instead); the
+    # recordable one must not persist it.
+    undateable = _ambient_status_with(last_reading_monotonic_seconds=float("nan"))
+    assert project_live_ambient(undateable) == triad
+    assert project_recordable_ambient(undateable) == nulls
+
+    # Stopped-but-"ok" runtime: both reject, inherited from project_live_ambient.
+    stopped = _ambient_status_with(ambient_running=False)
+    assert project_live_ambient(stopped) == nulls
+    assert project_recordable_ambient(stopped) == nulls
+
+    # No reading at all: the MCP nulls the stamp and the triad together.
+    absent = _ambient_status_with(last_reading_monotonic_seconds=None)
+    assert project_recordable_ambient(absent) == nulls
+
+
+@pytest.mark.parametrize("member", ["temperature_c", "humidity_percent", "pressure_hpa"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_project_live_ambient_voids_the_whole_triad_on_a_non_finite_member(
+    member: str, bad: float
+) -> None:
+    """#752: a malformed MEASURED value reads as an absent reading, like the stamp.
+
+    #745 guarded the reading's identity stamp; the values themselves went
+    through unchanged, so a ``NaN`` room temperature reached ``RoastTelemetry``,
+    the c11 doctrine and the corpus column. The failure is quiet rather than
+    loud — ``NaN`` compares ``False`` against ``threshold_c`` in BOTH
+    directions, so the model is seated in whichever fan regime the comparison
+    falls through to.
+
+    The unit under test is the **triad**, not the member: all three values are
+    one poll of one device published under one stamp, so a member that came back
+    unrepresentable is evidence the reading is malformed rather than that one
+    channel is. Each member is driven independently here to prove the whole
+    triad is voided whichever one is bad — including ``pressure_hpa``, which no
+    advisor path reads but which lands in the same corpus row.
+    """
+    status = _ambient_status_with(**{member: bad})
+    # Only the named member is malformed: the other two must still be present,
+    # or the assertion below would pass for the wrong reason.
+    intact = [
+        getattr(status, name)
+        for name in ("temperature_c", "humidity_percent", "pressure_hpa")
+        if name != member
+    ]
+    assert all(value is not None for value in intact)
+    assert status.status == "ok" and status.ambient_running
+    assert status.last_reading_monotonic_seconds is not None
+
+    assert project_live_ambient(status) == (None, None, None)
+    # And the recordable predicate stays a pure narrowing of it (#745).
+    assert project_recordable_ambient(status) == (None, None, None)
+
+
+def test_project_live_ambient_keeps_finite_zeroes_and_the_wholly_absent_triad() -> None:
+    """#752: the guard rejects MALFORMED, never merely zero or wholly absent.
+
+    ``0.0`` is a real reading (0 °C, 0 %RH) that ``math.isfinite`` accepts — the
+    same distinction :func:`ambient_reading_token` already draws for a ``0.0``
+    stamp. An all-``None`` triad is a live runtime that has not read yet, which
+    is absent rather than incomplete.
+
+    Note the all-``None`` half documents intent rather than guarding a
+    reachable regression: that triad IS ``(None, None, None)``, so the
+    completeness clause returns the same value whether or not its ``any(present)``
+    conjunct is there (safety-reviewer finding 2 on the fold commit — the
+    conjunct is kept because it states what the clause is FOR, not because
+    dropping it would change behaviour). The ``0.0`` half is load-bearing.
+    """
+    zeroed = _ambient_status_with(temperature_c=0.0, humidity_percent=0.0)
+    assert project_live_ambient(zeroed) == (0.0, 0.0, 1008.56)
+
+    not_read_yet = _ambient_status_with(
+        temperature_c=None, humidity_percent=None, pressure_hpa=None
+    )
+    assert project_live_ambient(not_read_yet) == (None, None, None)
+
+
+@pytest.mark.parametrize("absent", ["temperature_c", "humidity_percent", "pressure_hpa"])
+def test_project_live_ambient_voids_a_partially_populated_triad(absent: str) -> None:
+    """#752 / #758(b), post-open Codex P2: a MIXED triad is malformed too.
+
+    An earlier revision of this PR forwarded a partial triad and deferred this
+    case, on the grounds that some ambient probe might legitimately report fewer
+    than three members. It cannot: ``coffee-roaster-mcp`` is pinned ``==0.1.13``,
+    whose ``build_configured_ambient_reader`` supports exactly one mode, whose
+    ``YoctoMeteoAmbientReader.read`` raises for the WHOLE read if any one sensor
+    fails, whose ``AmbientReading`` declares all three members as required
+    ``float``, and whose ``AmbientRuntimeSnapshot`` nulls the triad together.
+
+    So a mixed present/absent triad can only be the serialisation artifact on
+    the live transport — pydantic nulling a **non-finite** member during
+    ``structuredContent`` serialisation, before this function ever sees it (see
+    ``test_which_mcp_transport_path_preserves_a_non_finite_ambient_member``).
+    Without this clause the finiteness guard is a no-op on the live path, which
+    is precisely the reading it exists to void.
+    """
+    status = _ambient_status_with(**{absent: None})
+    intact = [
+        getattr(status, name)
+        for name in ("temperature_c", "humidity_percent", "pressure_hpa")
+        if name != absent
+    ]
+    assert all(value is not None for value in intact), "only the named member is absent"
+    assert status.status == "ok" and status.ambient_running
+
+    assert project_live_ambient(status) == (None, None, None)
+    assert project_recordable_ambient(status) == (None, None, None)
+
+
+def test_project_session_state_declines_a_non_finite_ambient_reading() -> None:
+    """#752 end-to-end on the telemetry projection: a malformed reading arrives
+    at the controller as an ABSENT one, age and all.
+
+    The age going with it matters as much as the triad: the doctrine's range
+    check is what declines the reading, and it declines on an unknown age. This
+    is the #498-safe direction — the absent branch can only leave the graduated
+    fan regime, never enter it.
+    """
+    state = RoastSessionState.model_validate(
+        _state_payload(
+            100.0,
+            ambient_status={
+                **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[dict-item]
+                "temperature_c": float("inf"),
+            },
+        )
+    )
+    telemetry = project_session_state(state, age_seconds=0.0, ambient_age_seconds=1.0)
+    assert telemetry is not None
+    assert telemetry.ambient_temp_c is None
+    assert telemetry.ambient_humidity_pct is None
+    assert telemetry.ambient_pressure_hpa is None
+    assert telemetry.ambient_age_seconds is None
+
+
+@pytest.mark.asyncio
+async def test_adapter_ambient_age_is_unknown_for_a_non_finite_reading() -> None:
+    """#752: a malformed reading reaches the controller with NO age to reason on.
+
+    Deliberately an assertion about the PROJECTION, not the tracker: the tracker
+    keeps its clock running against a live-but-malformed reading on purpose (see
+    ``test_a_malformed_ambient_tick_does_not_relaunder_a_wedged_reading_as_fresh``,
+    which is where that behaviour is pinned), and
+    :func:`project_session_state` is what nulls the age alongside the triad. The
+    controller fails closed on an unknown age, so this is the assertion that
+    matters at the seam: two reads a second apart both arrive age-unknown,
+    exactly as they do for a probe that has never reported.
+
+    An earlier revision claimed this test proved the *tracker* declined the
+    reading. It never could: the age is doubly determined here, and a tracker
+    mutation leaves it green (safety-reviewer finding 4, folded pre-open).
+    """
+    clock = _StepClock()
+    nan_reading = {
+        **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[dict-item]
+        "temperature_c": float("nan"),
+    }
+    adapter = RoasterControlAdapter(
+        RoasterMCPClient(
+            _SequenceCaller(
+                [
+                    _state_payload(100.0, ambient_status=nan_reading),
+                    _state_payload(101.0, ambient_status=nan_reading),
+                ]
+            )
+        ),
+        clock=clock,
+    )
+    first = await adapter.read_telemetry()
+    clock.now = 1.0
+    second = await adapter.read_telemetry()
+
+    assert first is not None and first.ambient_age_seconds is None
+    assert second is not None and second.ambient_age_seconds is None
+
+
+@pytest.mark.parametrize(
+    "bad_member",
+    [
+        pytest.param({"temperature_c": float("nan")}, id="non-finite"),
+        pytest.param({"humidity_percent": None}, id="incomplete"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_malformed_ambient_tick_does_not_relaunder_a_wedged_reading_as_fresh(
+    bad_member: dict[str, object],
+) -> None:
+    """#752, the local Codex pass: declining must not RESET the freshness clock.
+
+    The trap the obvious implementation walks into. If the freshness tracker
+    keyed on the projection's whole gate, a single malformed tick would clear
+    its token — and the very next tick, carrying a well-formed reading but the
+    SAME unchanged stamp, would be re-based to ``0.0`` and read as brand new. A
+    reading the doctrine had already declined as too old would be handed back
+    inside the bound, able to re-enter the graduated fan regime: exactly the
+    laundering of a frozen reading that #732/#741/#745 exist to prevent, and
+    the #498 direction the doctrine must never take on stale data.
+
+    So the tracker keys on LIVENESS (:func:`ambient_reading_is_live`) while the
+    projection applies liveness AND usability. The stamp is deliberately
+    IDENTICAL in all three reads — the running-but-not-polled freeze path, the
+    one ``ambient_running`` cannot catch — so a tracker that reset would report
+    ``0.0`` on the third read and prove nothing if the stamp changed.
+
+    **Parametrised over BOTH malformed shapes**, which is what keeps this
+    invariant pinned where it matters: the non-finite shape only occurs on the
+    text transport, while the *incomplete* shape is the one the live
+    ``structuredContent`` path produces. With the non-finite case alone,
+    relocating the completeness clause into :func:`ambient_reading_is_live`
+    leaves ``project_live_ambient`` behaviourally identical, passes the entire
+    suite, and silently re-opens the laundering this test exists to prevent
+    (safety-reviewer finding 1 on the fold commit, verified as a real kill).
+    """
+    clock = _StepClock()
+    ok_ambient = dict(SESSION_STATE_PAYLOAD["ambient_status"])  # type: ignore[call-overload]
+    malformed = {**ok_ambient, **bad_member}
+    adapter = RoasterControlAdapter(
+        RoasterMCPClient(
+            _SequenceCaller(
+                [
+                    _state_payload(100.0),
+                    _state_payload(101.0, ambient_status=malformed),
+                    _state_payload(102.0),
+                ]
+            )
+        ),
+        clock=clock,
+    )
+
+    first = await adapter.read_telemetry()
+    clock.now = 45.0
+    bad = await adapter.read_telemetry()
+    clock.now = 90.0
+    recovered = await adapter.read_telemetry()
+
+    assert first is not None and first.ambient_age_seconds == 0.0
+    # The malformed tick itself is declined outright, age and all.
+    assert bad is not None and bad.ambient_temp_c is None
+    assert bad.ambient_age_seconds is None
+    # And the reading that comes back is the SAME one, aged from first sight —
+    # not a fresh 0.0.
+    assert recovered is not None and recovered.ambient_temp_c == 28.49
+    assert recovered.ambient_age_seconds == 90.0
+
+
+def test_which_mcp_transport_path_preserves_a_non_finite_ambient_member() -> None:
+    """#752, the local Codex pass: pin WHERE the guard is load-bearing.
+
+    The guard reads a pydantic-validated ``AmbientStatus``, so what reaches it
+    depends on how the child's reply crossed the wire — and the two paths
+    :func:`parse_tool_result` supports disagree. Asserted against a real
+    ``CallToolResult`` round-trip rather than a dict fake, because a dict fake
+    cannot show the disagreement at all.
+
+    * ``structuredContent`` is serialised by pydantic, which nulls non-finite
+      floats. The value is already ``None`` before the guard sees it, so the
+      triad arrives partially populated rather than malformed and the guard is
+      a no-op on that path — which is the LIVE path today, since the child's
+      ``get_roast_state`` is a FastMCP tool returning a dataclass.
+    * The text content block is parsed with :func:`json.loads`, whose default
+      ``parse_constant`` accepts the bare ``Infinity``/``NaN`` tokens. The value
+      arrives non-finite, and this is the path the guard actually catches.
+
+    Both halves are pinned so a future MCP or pydantic change that flips either
+    one reddens here rather than silently turning the guard into dead code (or,
+    worse, silently re-opening the malformed path).
+    """
+    mcp_types = pytest.importorskip("mcp.types")
+    ambient = {
+        **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[call-overload]
+        "humidity_percent": float("inf"),
+    }
+    body = {"ambient_status": ambient}
+    text_block = mcp_types.TextContent(type="text", text=json.dumps(body))
+
+    structured = mcp_types.CallToolResult.model_validate_json(
+        mcp_types.CallToolResult(content=[text_block], structuredContent=body).model_dump_json()
+    )
+    text_only = mcp_types.CallToolResult.model_validate_json(
+        mcp_types.CallToolResult(content=[text_block]).model_dump_json()
+    )
+
+    via_structured = cast("dict[str, object]", parse_tool_result(structured))
+    laundered = AmbientStatus.model_validate(via_structured["ambient_status"])
+    assert laundered.humidity_percent is None  # nulled by the transport, not by us
+    # The finiteness clause cannot see it — the COMPLETENESS clause is what
+    # voids this reading, which is why the guard is not a live-path no-op.
+    assert project_live_ambient(laundered) == (None, None, None)
+
+    via_text = cast("dict[str, object]", parse_tool_result(text_only))
+    malformed = AmbientStatus.model_validate(via_text["ambient_status"])
+    assert malformed.humidity_percent == float("inf")  # survives the wire intact
+    assert project_live_ambient(malformed) == (None, None, None)
+
+
+def test_ambient_reading_is_live_asks_only_the_runtime_question() -> None:
+    """#752: liveness is a property of the RUNTIME, usability of the PAYLOAD.
+
+    Split out because the freshness tracker keys on liveness alone while
+    :func:`project_live_ambient` applies both halves — if this predicate ever
+    grew a value clause, a malformed tick would start resetting the freshness
+    clock again and could re-launder a wedged reading as fresh.
+    """
+    assert ambient_reading_is_live(_ambient_status_with()) is True
+    # A malformed VALUE says nothing about whether the runtime is alive.
+    assert ambient_reading_is_live(_ambient_status_with(temperature_c=float("nan"))) is True
+    # A stopped or non-ok runtime is not live, whatever it preserved.
+    assert ambient_reading_is_live(_ambient_status_with(ambient_running=False)) is False
+    # BOTH non-"ok" members of AmbientRuntimeStatus, and note the helper leaves
+    # ambient_running True — so the status half is genuinely what is under test.
+    # Every other test in this file pairs "disabled" with ambient_running=False,
+    # which cannot distinguish `== "ok"` from `!= "unavailable"`: a real
+    # surviving mutation (safety-reviewer finding 3, second pass, folded
+    # pre-open).
+    assert ambient_reading_is_live(_ambient_status_with(status="unavailable")) is False
+    assert ambient_reading_is_live(_ambient_status_with(status="disabled")) is False
+
+
 def test_project_live_ambient_non_ok_status_is_none() -> None:
     """#464 (D86): disabled/unavailable ambient degrades to an all-None triad,
     mirroring the MCP's own fail-soft contract (#342, D85) — never a fault."""
@@ -2792,6 +3154,78 @@ async def test_adapter_ambient_age_grows_while_the_reading_does_not_change() -> 
     # A genuinely new reading resets the age, and carries the new value.
     assert third is not None and third.ambient_age_seconds == 0.0
     assert third.ambient_temp_c == 24.0
+
+
+@pytest.mark.asyncio
+async def test_adapter_ambient_age_is_unknown_for_a_nan_reading_stamp() -> None:
+    """#745b: a NaN stamp must not read as a permanently-fresh reading.
+
+    The stamp is an opaque IDENTITY token compared with ``!=``, and NaN is
+    unequal to itself under IEEE-754 — so an unguarded token makes every tick
+    look like a brand-new reading: the age is re-based to ``now`` each tick and
+    never leaves 0.0. The controller's range check is written to fail closed on
+    a NaN *age*, but it never sees one; a frozen value stays "fresh" forever,
+    which is the single thing the freshness clock exists to prevent.
+
+    Rejecting the stamp makes it read as "no reading", so the age is ``None``
+    (age-unknown) and the controller declines — ``c11`` takes its absent-ambient
+    path, the #498-safe direction.
+
+    Two reads with the SAME NaN stamp: an unguarded token would report 0.0 twice
+    (each read looking new); a token-with-guard reports unknown twice.
+    """
+    clock = _StepClock()
+    nan_stamp = {
+        **dict(SESSION_STATE_PAYLOAD["ambient_status"]),  # type: ignore[dict-item]
+        "last_reading_monotonic_seconds": float("nan"),
+    }
+    adapter = RoasterControlAdapter(
+        RoasterMCPClient(
+            _SequenceCaller(
+                [
+                    _state_payload(100.0, ambient_status=nan_stamp),
+                    _state_payload(101.0, ambient_status=nan_stamp),
+                ]
+            )
+        ),
+        clock=clock,
+    )
+
+    first = await adapter.read_telemetry()
+    clock.now = 1.0
+    second = await adapter.read_telemetry()
+
+    assert first is not None and first.ambient_age_seconds is None
+    assert second is not None and second.ambient_age_seconds is None
+
+
+def test_ambient_reading_token_rejects_non_finite_stamps() -> None:
+    """#745b at the boundary every consumer goes through.
+
+    NaN is the one that defeats the equality mechanism; ``±inf`` compares equal
+    to itself and so would not, but a non-finite stamp is malformed either way
+    and there is no reason to carry one. A finite stamp — including ``0.0``,
+    which must not be confused with absent — passes through unchanged.
+    """
+
+    assert (
+        ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=float("nan")))
+        is None
+    )
+    assert (
+        ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=float("inf")))
+        is None
+    )
+    assert (
+        ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=float("-inf")))
+        is None
+    )
+    assert ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=None)) is None
+    # 0.0 is a legitimate stamp and must not be confused with absent.
+    assert ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=0.0)) == 0.0
+    assert (
+        ambient_reading_token(_ambient_status_with(last_reading_monotonic_seconds=1230.0)) == 1230.0
+    )
 
 
 @pytest.mark.asyncio

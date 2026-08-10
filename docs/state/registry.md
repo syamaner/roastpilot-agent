@@ -3,7 +3,9 @@
 ## Active Epic
 
 > **STATUS UPDATE — 8 Aug 2026 (RP-D shipped; RP-B is next). Read with the 6 Aug
-> block below.** The joint-drop-objective tree (**#707 / D122**) advanced: **RP-D
+> block below.** [Corrected 9 Aug: RP-B is now IN FLIGHT, not next — PR #731
+> merged 8 Aug, PR #741 (ambient freshness) merged 9 Aug; see the next free decision number below.] The
+> joint-drop-objective tree (**#707 / D122**) advanced: **RP-D
 > (#711) — the joint-objective bake-off metric — has SHIPPED its
 > code** across two PRs on `main`: **PR-D1 (#724)** the pure `joint_window_score` HIT+scalar core in
 > `scripts/bakeoff_replay.py`, and **PR-D2 (#725)** the standalone offline corpus
@@ -27,6 +29,7 @@
 > used `Closes #711`, so file state (metric code shipped) and GitHub state (issue
 > open for the residual fixture item + the #726 follow-ups) agree — no drift.
 > **Next in the D122 sequence: RP-B (#709) — the c11 ambient-fan doctrine.**
+> [Corrected 9 Aug: RP-B is in flight — PR #731 and PR #741 both merged; the c11 doctrine still ships DISABLED and #742/#745 gate scoring a hardware arm.]
 > **Eval-model correction (Codex catch on the docs PR, now D125):** RP-D scores a
 > roast's ACHIEVED outcome, which a replay cannot change, so an offline c3-vs-c11
 > replay yields the SAME RP-D score for both arms — RP-D cannot discriminate a
@@ -34,8 +37,13 @@
 > (fan-direction agreement at recorded ambient); RP-D is the acceptance gate on a
 > real single-variable HARDWARE roast (or a validated plant simulator, #580).
 > Plan design for the RP-D scorer + RP-B c11 doctrine is **D124**; the eval-model
-> correction is **D125** (roastpilot-plan); next free plan decision number:
-> **D126**.
+> correction is **D125** (roastpilot-plan). *(This block said "next free plan
+> decision number: D126" when it was written on 8 Aug. That number is spent, and
+> the claim is removed rather than corrected in place: a dated status block is
+> not the right home for a fast-moving fact, and two authoritative-looking
+> answers in one file is what caused the reuse incident in the first place. The
+> free number is stated ONCE, at the end of this status block — not at the end of
+> the file, which continues for well over a thousand lines of historical status.)*
 >
 > **STATUS UPDATE — 6 Aug 2026 (updates the control-loop framing in the 2 Aug
 > block below).** The D96 recovery law (#559) has now had its flag-on hardware
@@ -156,10 +164,65 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> Next free plan decision number: **D126** (D125 records the RP-D eval-model
+> Next free plan decision number: **D151**. D150 is SPENT — it is the decision
+> that settled this very question, recorded in `00-repository-structure.md` on
+> 9 Aug 2026: **one shared D-number series for the whole `roastpilot-plan` repo,
+> next free being one past the highest defined anywhere in it.** D149
+> (`factory.md`'s `## D149:` heading) was the previous maximum. Take **D151**;
+> D150 is spent. Do **not** derive the number from any one file's own maximum:
+> that per-file reading is exactly what produced the collisions described below,
+> and it produced another on 9 Aug (see the operator flag there).
+>
+> **There is a live decision-number COLLISION in the plan repo, and it is not yet
+> resolved.** `roastpilot-agent/plan.md` (this programme's file, in the SEPARATE `~/git/roastpilot-plan` repository — not a path inside this one) and
+> `roastpilot-cloud/factory.md` (the cloud programme) **both independently define
+> D103-D130** — 28 numbers meaning entirely different things in each file.
+> **Operator flag (9 Aug 2026):** D130 is the newest of those and it postdates
+> D150 — `plan.md`'s D130 (advisor model pin, recorded 18:24 on 9 Aug) collides
+> with `factory.md`'s D130 (27 Jul 2026), which is precisely the collision D150
+> ratified at 13:59 the same day to prevent. It is left in place and NOT
+> renumbered here: D-numbers appear in commit messages and issues, so the
+> resolution is the operator's call, and it belongs to a separate thread. Cite
+> D130 with its file until then.
+> `plan.md` D108 is the PR-scoped Claude approval bridge `AGENTS.md` cites;
+> `factory.md` D108 is an unrelated cloud slice decision. The same holds for
+> D122, D124 and D127, all of which RP-B cites. **So a bare "D127" is ambiguous:
+> name the file whenever a reader could be in either programme.**
+>
+> The collision is DRIFT, not design. Up to D102 the repo demonstrably ran ONE
+> shared series across files: D1-D4 are cross-repo, `plan.md` defines neither
+> D10-D13 nor D97-D101 (those are in `roastpilot-cloud/plan.md`), D9 is defined
+> in `roastpilot-agent/README.md` and D14 in `00-repository-structure.md`, and
+> D2 is superseded by D97 from a different file — D5-D99 interleave with zero
+> collisions. Both files then began incrementing independently from D103.
+>
+> **The convention is SETTLED as of D150: one shared series.** Renumbering was
+> rejected (D-numbers appear in merged commits, closed issues and `AGENTS.md`,
+> none rewritable) and per-programme prefixes were rejected as a second
+> convention alongside the bare historical numbers. Continuing `plan.md`'s own
+> count at D130 would manufacture the 28th collision, so do not do that.
+>
+> **Deriving this number is a known trap; three separate attempts got it wrong on
+> 9 Aug alone** (D126 stale, then D150 by correct-answer-wrong-reasoning, then
+> D130 from a per-file assumption the history contradicts). Decisions are defined
+> in FIVE formats and no single grep catches them all: `| D<n> |` table rows
+> (`roastpilot-agent/plan.md`, `roastpilot-cloud/plan.md`,
+> `00-repository-structure.md`), `**D<n> (date) — ...**` paragraphs
+> (`factory.md` up to D143), `## D<n>: ...` headings (`factory.md` D145
+> onward), `**D<n> — ...**` bold paragraphs carrying the date inside the
+> sentence (`00-repository-structure.md`, where D14 lives), and
+> `- **D<n>** (date): ...` bullets (`roastpilot-agent/README.md`, where D9
+> lives). **Those last two formats are why an earlier revision of this audit
+> recorded D9 and D14 as never defined — they are defined, and that claim was
+> wrong** (corrected 9 Aug 2026, roastpilot-agent#750). The only real gap is
+> D144, deliberately renumbered to D145; it is not a number to reclaim. Re-derived
+> across all five formats, the highest number defined anywhere is still D150, so
+> the free number above is unchanged.
+>
+> D125 records the RP-D eval-model
 > correction — discriminates only on hardware/simulator, not replay; D124 records
 > the RP-D scorer + RP-B c11 design, roastpilot-agent#711/#709; D123 the #718
-> catalogue query-scope won't-fix).
+> catalogue query-scope won't-fix.
 
 > **STATUS UPDATE — 21 Jun 2026 (superseded by the 2 Aug block above):** the D35 control work
 > is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC

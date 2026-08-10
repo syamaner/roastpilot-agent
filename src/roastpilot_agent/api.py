@@ -82,6 +82,7 @@ from roastpilot_agent.mcp_client import (
     MCPServerProcess,
     RoastSessionState,
     project_mic_status,
+    project_recordable_ambient,
 )
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
@@ -1207,18 +1208,26 @@ class RoastRunner:
         reads the persisted columns, so the only cost of a failure here is a
         run's ambient triad reading back ``None``.
 
-        Only a ``status == "ok"`` reading persists real values; a
-        ``"disabled"``/``"unavailable"`` MCP ambient config persists nulls (the
-        MCP's own fail-soft contract — never a fault or a recovery)."""
+        The triad comes from :func:`project_recordable_ambient` rather than a
+        second hand-rolled ``status == "ok"`` test (#745): a ``status``-only
+        check records a frozen reading from a stopped probe, or one nothing can
+        date, as this run's corpus breadcrumb while the live paths correctly saw
+        ambient as absent — a mislabelled RP-B arm (#709). That predicate's own
+        docstring carries the full rationale, including why a populated column
+        is NOT evidence that the doctrine reasoned on ambient (#742); it is not
+        repeated here.
+
+        A ``"disabled"``/``"unavailable"`` MCP ambient config, and now a
+        stopped-but-``"ok"`` runtime or an undateable reading, persist nulls
+        (the MCP's own fail-soft contract — never a fault or a recovery)."""
         if self._ambient_persisted or not snapshot.charge_detected:
             return
         state = None if self._raw_state is None else self._raw_state.last_state
         if state is None:
             return
-        ambient = state.ambient_status
-        temperature_c = ambient.temperature_c if ambient.status == "ok" else None
-        humidity_percent = ambient.humidity_percent if ambient.status == "ok" else None
-        pressure_hpa = ambient.pressure_hpa if ambient.status == "ok" else None
+        temperature_c, humidity_percent, pressure_hpa = project_recordable_ambient(
+            state.ambient_status
+        )
         try:
             await self._store.set_ambient(
                 self._run_id,
