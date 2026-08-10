@@ -35,3 +35,26 @@ Summarize as markdown:
 
 If a run fails, report the failing step and the last good tick — do not
 retry blindly.
+
+## Worktree discipline (topology §7 — binding)
+
+- Verify the worktree provisioned by the lead for this task at the sha under
+  review, never the shared checkout; self-locate every command against its
+  absolute path because cwd resets between Bash calls.
+  **Fail closed when no provisioned worktree is named:** stop and ask the lead
+  to provision one; a read-only role cannot create its own worktree. Use a
+  shared tree only on explicit lead
+  direction under **"Reviewers in a shared worktree"** in
+  **`docs/agent-team-worktrees.md`**, with its safety commit in place, and state
+  in the verdict which tree you reviewed and on whose direction.
+- Never run tree-mutating git commands — **`git checkout --`**, **`git restore`**,
+  **`git stash`**, **`git reset`**, **`git clean`**, or anything else that rewrites
+  a working tree or index — in a tree you do not own.
+- For mutation testing, snapshot the target to the scratchpad by file copy (`cp`)
+  before editing and restore by copying the snapshot back — never by git.
+- Verify committed-tree claims with **`git show`** `HEAD:path`, never against the
+  working tree.
+- Run Python gates with the provisioned worktree's `.venv/bin/python -m …` and a
+  per-run `--basetemp`, following **"Per-worktree gate environment (venv,
+  pyright, pytest) — added Aug 2026 (#738, #733)"** in the runbook above. The
+  full recipe and fail-closed assertions live there.
