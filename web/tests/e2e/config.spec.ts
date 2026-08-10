@@ -47,6 +47,7 @@ function meta(overrides: Partial<AppConfigSnapshot["controller"]["tick_interval_
     read_only: false,
     description: "",
     yaml_value: null,
+    advisory: null,
     ...overrides,
   };
 }

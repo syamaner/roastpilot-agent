@@ -35,12 +35,44 @@
 #            boundary reverts to the advisor's own judgment alone, e.g.
 #            POST_FC_LOOP=0 CEILING_GUARD=0 ./scripts/roast-live.sh for the
 #            full pre-promotion baseline
-#          ROASTPILOT_ADVISOR__MODEL_SLUG / ROASTPILOT_ADVISOR__PROMPT_VERSION
-#            override the advisor model + control-teaching prompt (defaults
-#            openai/gpt-4o + c3). The banner prints the resolved pair and tags it
-#            ⚠ EXPERIMENT when non-default, e.g. roast 8:
-#              ROASTPILOT_ADVISOR__MODEL_SLUG=openai/gpt-4.1-mini \
-#              ROASTPILOT_ADVISOR__PROMPT_VERSION=c6 ./scripts/roast-live.sh
+#          ROASTPILOT_ADVISOR__MODEL_SLUG / …__PROMPT_VERSION set the advisor
+#            model + control-teaching prompt (schema defaults openai/gpt-4o +
+#            c3). The banner prints the RESOLVED values — env over the saved
+#            ~/.roastpilot/config.yaml over the schema defaults, the same order
+#            the agent uses — and tags them ⚠ EXPERIMENT when non-default.
+#            ⚠ The env trap the banner surfaces rather than hides (#746):
+#            setting either PINS that value for every roast in the session,
+#            because env beats the saved file — the /config UI selector becomes
+#            a silent no-op. Never use them to switch arms in a prompt A/B;
+#            switch in /config between roasts and confirm the arm at GET
+#            /api/config (see the banner note below — it is a LAUNCH-TIME
+#            snapshot and does NOT re-print between roasts).
+#            The model slug now DOES change the advice model (#747 / D151,
+#            9 Aug 2026): model_slug_by_phase ships EMPTY, so model_for(phase)
+#            falls back to model_slug in the one phase that consults the
+#            advisor (DEVELOPMENT; pre-FC is deterministic under D35). Before
+#            that fix the map shipped populated with gpt-4o and shadowed every
+#            operator-set slug — roast 8 was launched as a gpt-4.1-mini arm and
+#            ran gpt-4o for all 19 decisions. The banner still reports the model
+#            DEVELOPMENT RESOLVES to and still flags a shadowed slug, because a
+#            hand-pinned phase slot can shadow it again.
+#            ⚠ It also warns when that model has no clean FC-latency screen on
+#            record (D151). That is a WARNING, not a gate: nothing rejects a
+#            model. D40/D41 measured sonnet-4.6 / gpt-5.5 / opus-4.8 /
+#            gpt-5-mini@low busting the ~5 s post-FC slot, and until #747 the
+#            populated map made such a model unreachable by accident.
+#            ⚠ What a slow model COSTS, precisely: the controller awaits the
+#            advisory call inline at the end of its tick, and the serve loop is
+#            drain-operator-queue -> tick. So a call taking N seconds DELAYS
+#            the next telemetry read, the next safety evaluation, and the next
+#            drain of the operator queue — which is where the in-UI EMERGENCY
+#            STOP is consumed. N is bounded by controller.advisory_timeout_
+#            seconds (default 5 s, D151), and any failure falls back fail-closed to
+#            holding current targets, so it cannot hang forever and cannot
+#            actuate anything. Ctrl-C here is unaffected: it calls the
+#            controller directly and does not go through the queue. With the
+#            gpt-4o pin (~2 s) that delay is small; a busting model makes it
+#            seconds. Read the banner line before you charge.
 #
 set -euo pipefail
 
@@ -176,27 +208,36 @@ ADV="advisor configured"
 [ -n "${OPENROUTER_API_KEY:-}" ] || ADV="ADVISORY-PAUSED (no OPENROUTER_API_KEY)"
 
 # Derive the banner from the agent's OWN resolved config (the .venv is active by
-# now), so it can never drift from runtime: this covers ADAPTIVE_TRIM=1, a directly
-# exported var, AND pydantic's full truthy set (1/true/yes/on/…) identically, using
-# the same parser the serving agent used (Augment #402).
-TRIM="fixed 65% (proven roast-6 default)"
-if python -c "import sys; from roastpilot_agent.config import AppConfig as A; sys.exit(0 if A().controller.pre_first_crack_levers.late_maillard_trim.adaptive_depth_enabled else 1)" 2>/dev/null; then
-  TRIM="ADAPTIVE — #386 RoR-keyed depth (experiment, watch the cut)"
-fi
-
-# Drift-proof read of the resolved advisor model + prompt, tagged when non-default (e.g. roast 8 = mini+c6); rationale in the PR.
-ADVISOR_CFG="$(python -c '
-from roastpilot_agent.config import AppConfig
-
-adv = AppConfig().advisor
-fields = type(adv).model_fields
-default = (
-    adv.model_slug == fields["model_slug"].default
-    and adv.prompt_version == fields["prompt_version"].default
-)
-tag = "" if default else "   ⚠ EXPERIMENT — non-default, watch it"
-print(f"{adv.model_slug}  ·  prompt {adv.prompt_version}{tag}")
-' 2>/dev/null || echo 'unresolved (config read failed — check the agent output above)')"
+# now), so it can never drift from runtime. The seam is
+# roastpilot_agent.launch_banner, which resolves through the SAME
+# config_store.load_app_config the serving agent uses — env over the operator's
+# saved ~/.roastpilot/config.yaml over the schema defaults (#746). A bare
+# AppConfig() reads the environment ONLY (BaseSettings, no YAML source), so it
+# used to print the schema-default prompt while the agent genuinely ran the
+# version saved from the /config UI — the wrong arm shown at the one moment a
+# roast cannot be re-run. This also covers ADAPTIVE_TRIM=1, a directly exported
+# var, AND pydantic's full truthy set (1/true/yes/on/…) identically, because it
+# is the agent's own parser (Augment #402).
+#
+# Line 1 = the "Advisor cfg:" text, line 2 = the "Pre-FC trim:" text. A
+# malformed/unreadable saved config fails LOUD (reason on stderr, non-zero
+# exit) and both lines read "unresolved" — never a plausible-but-wrong version.
+#
+# ⚠ SCOPE: this is a LAUNCH-TIME snapshot, printed once. `start_roast` re-reads
+# the saved config per roast, so an arm switched in /config AFTER launch is live
+# for the next roast but is NOT reflected here. For roast 2 of an A/B, confirm
+# the arm at GET /api/config (saved vs effective per field) or on the live
+# dashboard — not by re-reading this banner, which still shows roast 1's arm.
+BANNER_UNRESOLVED='unresolved (config read failed — see the error above)'
+BANNER_LINES="$(python -m roastpilot_agent.launch_banner)" || BANNER_LINES=""
+# `|| true` so a missing/broken sed degrades to the "unresolved" banner below
+# rather than aborting the launcher under `set -e` with no diagnosis — the same
+# fail-soft direction the rest of this block takes (a banner is never a reason
+# to refuse to roast; the port guard is, and keeps its hard failure).
+ADVISOR_CFG="$(printf '%s\n' "$BANNER_LINES" | sed -n '1p' || true)"
+TRIM="$(printf '%s\n' "$BANNER_LINES" | sed -n '2p' || true)"
+[ -n "$ADVISOR_CFG" ] || ADVISOR_CFG="$BANNER_UNRESOLVED"
+[ -n "$TRIM" ] || TRIM="$BANNER_UNRESOLVED"
 
 echo "→ starting agent + spawning MCP child (takes a few seconds — don't Ctrl-C yet)…"
 echo "  MCP config: ${COFFEE_ROASTER_MCP_CONFIG}"

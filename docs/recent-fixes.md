@@ -18,6 +18,37 @@ Format: one entry per anti-pattern.
 
 ---
 
+## A config field the operator can edit must not be shadowed by a resolver default they cannot reach
+*(fixed by #747 / D151, 9 Aug 2026)*
+
+- **Signature:** a settings field paired with a `*_by_<something>` override map (or
+  any second-level resolver) where the MAP ships fully populated AND is absent from
+  the `*ConfigEdit` model. Grep for `default_factory=lambda: dict(DEFAULT_` in
+  `config.py`, and cross-check every `Field` in `AdvisorConfigEdit` /
+  `ControllerConfigEdit` / `MCPDeviceConfigEdit` against whatever actually reads it
+  at runtime.
+- **Wrong:** `model_slug_by_phase` defaulted to the pinned model for EVERY phase, so
+  `model_for(phase)` never reached its `model_slug` fallback. `/config` rendered an
+  editable Model box, `GET /api/config` reported the saved value `effective`, and the
+  roast ran gpt-4o regardless. Roast 8 (28 Jun 2026) was launched as a `gpt-4.1-mini`
+  arm, ran gpt-4o for all 19 decisions, and was written up as a mini hardware result
+  in D73/D74 and #396. Six weeks, no signal.
+- **Right:** ship the override map EMPTY so the resolver falls back to the editable
+  field; keep the mechanism for a real override. If a value genuinely must not be
+  operator-changeable, do not render an editable control for it — the defect is then
+  the OFFER, not the resolution.
+- **The tell that generalises:** "editable + reported effective + no observable
+  effect". When a field claims to be effective, assert it end-to-end against the
+  thing that CONSUMES it (`model_for(DEVELOPMENT)`), never against the field's own
+  round-trip through the config store. A read-back test passes happily while the
+  value does nothing.
+- **Guarded by:** `test_config.test_configured_model_slug_governs_the_phase_that_consults`
+  (both the constructed and the `ROASTPILOT_ADVISOR__MODEL_SLUG` route) and
+  `test_launch_banner.test_saved_model_slug_is_the_model_the_advisor_actually_uses`
+  (saved file → resolved config → the model the advisor picks).
+
+---
+
 ## The MCP stdio session's cancel scopes must enter AND exit in ONE owning task; stop/respawn is a request to that task
 *(fixed by #484, 9 Jul 2026)*
 
@@ -637,3 +668,73 @@ Format: one entry per anti-pattern.
   `docs/agent-team-worktrees.md` (§ "Branch freeze on PR-open") and the
   codex-wait rule's "signal must postdate the final-commit trigger" clause in
   AGENTS.md.
+
+## An operator-facing readout must resolve config through `load_app_config()`, never a bare `AppConfig()`
+
+*(fixed by #746, 9 Aug 2026)*
+
+- **Signature:** `grep -rn "AppConfig()" scripts/ src/` — any site that
+  CONSTRUCTS `AppConfig()` and then PRINTS/renders one of its values for the
+  operator. Especially `python -c` heredocs inside `scripts/*.sh`.
+- **Wrong:** `AppConfig` is a pydantic `BaseSettings` with
+  `env_prefix="ROASTPILOT_"` and **no YAML source**, so a bare `AppConfig()`
+  sees environment variables and schema defaults only. It never reads the
+  operator's saved `~/.roastpilot/config.yaml`. The serving agent resolves
+  through `config_store.load_app_config()` (env ?? saved file ?? default), so
+  the two views diverge for every value the operator set in the `/config` UI.
+  `scripts/roast-live.sh` printed `prompt c3` on its pre-charge banner while
+  the agent genuinely ran the saved `c10`, and its "non-default" tag never
+  fired because the env-only view matched the defaults. A readout that
+  disagrees with runtime is worse than no readout: it is trusted at exactly
+  the moment (pre-charge) when the roast cannot be re-run.
+- **Right:** resolve through `load_app_config()` and compare against the SCHEMA
+  defaults when deciding whether to tag a value as non-default. Put the
+  resolution in an importable seam (`roastpilot_agent/launch_banner.py`) with
+  unit tests, not in a shell heredoc, and fail LOUD on a malformed saved config
+  — print an explicit "unresolved" rather than a plausible-looking default.
+  Note the two legitimate exceptions found in the same sweep, which must stay
+  as they are: `config_store.load_app_config` itself, and
+  `replay.create_replay_app`'s `config or AppConfig()` fallback (deliberate —
+  a replay must reproduce a fixed recorded trajectory regardless of live
+  config; see the replay entry above). `scripts/advisor_smoke.py` is also
+  fine: the bare config it prints is the same object it then runs on, so its
+  readout is honest. **WRONG, corrected by #747 — and wrong in a way that
+  illustrates this very entry.** Same OBJECT, but not the same FIELD: it
+  printed `config.model_slug` while `PydanticAIAdvisor` resolves
+  `model_for(phase)`, so an env-set slug was printed and never called. Object
+  identity is not the check; following the field to its CONSUMER is. Fixed in
+  the #747 branch, which prints the phase-resolved model and names a shadowed
+  slug.
+- **Also:** resolving the right config is only half of it — the readout must
+  report the value the code path actually *consumes*, and it must know WHICH
+  code path consumes it. Four related traps in this same banner, all caught by
+  the local Codex pass pre-open, over two rounds:
+  (a) `advisor.model_slug` is shadowed by `model_slug_by_phase` (the advisor
+  calls `model_for(phase)`) — **the "ships populated" half of this is SUPERSEDED
+  by the #747 entry at the top of this file: since D151 the map ships EMPTY, so
+  the base slug normally IS the advice model. The banner must still print the
+  phase-resolved model, because a hand-pinned slot can shadow it again**;
+  (b) the base slug is NOT unused: `healthcheck()`
+  probes reachability with it, so an invalid one still drives the startup
+  advisor status — say "gives no roast advice", not "unused"; (c) only
+  `AUTO_ADVICE_PHASES` (DEVELOPMENT alone, under D35) consults the advisor at
+  all, so deriving the readout from the per-phase model MAP would advertise a
+  pre-FC model no advisory call can reach — import the controller's own gate;
+  (d) `late_maillard_trim.enabled=False` makes `_trim_engaged` always false, so
+  a depth or adaptive band left in the saved config is dead and must not be
+  announced. Before printing a config value, follow it to its consumer, and
+  check whether that consumer runs at all.
+- **And the symmetric half:** a warning that fires on inert config is as bad as
+  a missing one — it trains the operator to ignore the tag. Comparing the whole
+  `LateMaillardTrim` section against defaults tagged `base_trim`/`k_ror` on a
+  roast running the proven fixed 65 % cut, because those are read only in
+  adaptive mode. The fix that scales is a `ClassVar` group declared BESIDE the
+  fields (`LateMaillardTrim.ADAPTIVE_ONLY_FIELDS`), subtracted from a
+  whole-section scan: drift-proof both ways, because a new coefficient joins the
+  group in the same edit that adds it. Also note `FieldInfo.default` is
+  `PydanticUndefined` for a `default_factory` field, so a naive
+  value-vs-default scan would report it permanently non-default.
+- **Guarded by:** `tests/test_launch_banner.py` — a saved-only `prompt_version`
+  must reach the banner, a saved-only non-default must be tagged, a shadowed
+  `model_slug` must be reported as shadowed, and a disabled trim must report
+  the flat floor rather than its leftover depth.

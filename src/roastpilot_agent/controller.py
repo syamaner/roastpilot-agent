@@ -13,6 +13,7 @@ fan (``operator_recovery_required``).
 """
 
 import asyncio
+import logging
 import math
 import time
 from collections.abc import Awaitable, Callable
@@ -71,6 +72,7 @@ from roastpilot_agent.safety import (
 )
 
 __all__ = [
+    "AUTO_ADVICE_PHASES",
     "TRANSITION_TABLE",
     "UNIVERSAL_TARGETS",
     "AdvisoryCallPolicy",
@@ -89,6 +91,14 @@ __all__ = [
 
 Clock = Callable[[], float]
 AsyncSleep = Callable[[float], Awaitable[None]]
+
+
+#: #732: the controller is event-driven rather than log-driven, so this exists
+#: for exactly one purpose — the once-per-run ambient-decline warning, which has
+#: to reach an operator on paths no config validator can see and does not warrant
+#: a new server event kind (that would redden the FE event-kind contract test for
+#: a diagnostic).
+_log = logging.getLogger(__name__)
 
 
 # recording_origin_slug now lives in models.py (with RoastProfile) so the
@@ -388,7 +398,11 @@ _ADVICE_PHASES: frozenset[RoastPhase] = COMMAND_PHASE_MATRIX[RoastCommand.SET_HE
 # deterministic pre-FC phases (preheat AND charge→FC) are excluded — pre-FC is
 # deterministic and the advisor is not consulted there. With only DEVELOPMENT
 # left, post-FC is where the LLM advises (#223).
-_AUTO_ADVICE_PHASES: frozenset[RoastPhase] = _ADVICE_PHASES - _DETERMINISTIC_PRE_FC_PHASES
+# PUBLIC (#746): the roast-live launcher's banner reads this to report the model
+# the advisor will ACTUALLY be asked for, so a per-phase model in a phase that
+# never consults cannot be announced as the arm being run. Read-only — the
+# gating itself stays owned by ``_maybe_run_advisory`` below.
+AUTO_ADVICE_PHASES: frozenset[RoastPhase] = _ADVICE_PHASES - _DETERMINISTIC_PRE_FC_PHASES
 
 
 class AdvisoryCallPolicy:
@@ -447,7 +461,7 @@ class AdvisoryCallPolicy:
         """
         if manual_request:
             return AdvisoryTrigger.MANUAL
-        if phase not in _AUTO_ADVICE_PHASES:
+        if phase not in AUTO_ADVICE_PHASES:
             return None
         # First consult in an advice phase, or any phase transition since the
         # last call: ``_last_phase`` starts None, so the first eligible tick
@@ -797,6 +811,11 @@ class RoastController:
         # the pre-B2 fallback behaviour (see ``_run_advisory``'s
         # ``post_fc_loop_active`` gate).
         self._post_fc_engaged: bool = False
+        # #732: latched for the life of THIS controller (one per run), so the
+        # ambient-decline warning fires once rather than at 1 Hz. Deliberately
+        # NOT cleared on transition, unlike its neighbours above — the point is
+        # one line per run, not one per phase.
+        self._ambient_decline_warned: bool = False
         # D96 slice 1.5 (#561), Codex round-1 finding #3: latched TRUE the
         # moment ANY drop-failure clamp fires (see
         # ``_clamp_heat_after_failed_drop``), cleared unconditionally on
@@ -3463,7 +3482,7 @@ class RoastController:
             drop = self._safety.evaluate_drop_recommendation(phase=self._phase)
             await self._snapshots.persist_evaluation(drop)
             # The advisor advice path is reached only in DEVELOPMENT (the sole
-            # post-FC advice phase, _AUTO_ADVICE_PHASES), and
+            # post-FC advice phase, AUTO_ADVICE_PHASES), and
             # evaluate_drop_recommendation ALLOWs unconditionally in DEVELOPMENT —
             # so the REJECT/false branch here is unreachable today. Kept (not
             # collapsed) because it is the safety boundary if a future phase becomes
@@ -4588,6 +4607,108 @@ class RoastController:
             and self._post_fc_engaged
         )
 
+    def _doctrine_ambient(self, telemetry: RoastTelemetry) -> tuple[float | None, float | None]:
+        """Resolve the ambient pair the #709 fan doctrine may reason on (#732).
+
+        Two gates, in order, both failing toward "absent":
+
+        1. **The doctrine's own flag.** Off (the default) yields ``(None, None)``
+           so a roast on the live ``c3`` carries only always-null keys.
+        2. **Freshness.** ``c11`` picks a fan regime by comparing the reading
+           against ``threshold_c``, so an old reading does not degrade
+           gracefully — it seats the model confidently in the wrong regime, and
+           at the prompt a stale value looks exactly like a fresh one. Past
+           ``max_reading_age_seconds`` (or with the age unknown) the reading is
+           declined.
+
+        Declining nulls exactly the two fields a genuinely absent probe already
+        nulls, so a stale reading takes the identical absent-ambient path
+        ``c11`` was written for — no new teaching, no new branch. The doctrine's
+        two numbers stay populated in that case, again exactly as they are for
+        an unplugged probe: they describe the doctrine, not the room.
+
+        Advisory-only in both directions: this narrows what the ADVISOR is told
+        and touches no lever, verdict, or transition.
+
+        Args:
+            telemetry: This tick's telemetry, carrying the live triad and the
+                agent-clock age of its ambient reading.
+
+        Returns:
+            The ``(ambient_temp_c, ambient_humidity_pct)`` pair to place in the
+            advisor context, or ``(None, None)`` when the doctrine is disabled
+            or the reading is not fresh enough to reason on.
+        """
+        doctrine = self._config.ambient_fan_doctrine
+        if not doctrine.enabled:
+            return None, None
+        age_seconds = telemetry.ambient_age_seconds
+        # A RANGE check, not an upper bound, and written as ``not (lo <= x <=
+        # hi)`` so every way of being invalid fails CLOSED:
+        #
+        # * ``nan`` — every comparison against it is False, so a bare
+        #   ``age > max`` would admit it as fresh.
+        # * ``-inf`` and any negative — these satisfy ``x <= max`` and so slip
+        #   through an upper bound alone, forwarding an arbitrarily stale
+        #   reading. An earlier revision's comment claimed non-finite ages
+        #   failed closed; that was true of ``+inf`` and ``nan`` and false of
+        #   ``-inf``, which is exactly the kind of half-true claim worth not
+        #   leaving in a safety-adjacent comment.
+        #
+        # The live adapter cannot produce any of them (the age is a difference
+        # of one monotonic clock), but ``RoastTelemetry.ambient_age_seconds`` is
+        # a public float field with pydantic's default ``allow_inf_nan`` and the
+        # code deliberately supports other constructors — replay frames, the
+        # offline bake-off harness, a custom ``StateReader``. This is the only
+        # inequality in the doctrine path, so it is the only place the fail-open
+        # could hide.
+        if age_seconds is None or not (0.0 <= age_seconds <= doctrine.max_reading_age_seconds):
+            # The latch is spent only on a reading that EXISTS and is untrustworthy.
+            # A disabled, unplugged or not-yet-sampled probe also arrives here with
+            # ``age_seconds is None``, but nothing went stale — warning there would
+            # both mislead (a cadence complaint about a probe that never reported)
+            # and, worse, burn the run's one warning so a probe that starts fine and
+            # genuinely wedges later goes unreported. That is the case the warning
+            # exists for.
+            if telemetry.ambient_temp_c is not None:
+                self._warn_once_on_ambient_decline(age_seconds)
+            return None, None
+        return telemetry.ambient_temp_c, telemetry.ambient_humidity_pct
+
+    def _warn_once_on_ambient_decline(self, age_seconds: float | None) -> None:
+        """Log the FIRST ambient decline of a run, once (#732).
+
+        The cross-section config validator can only guard what it can see: the
+        ``/config`` path, which writes an explicit poll interval. It cannot see
+        an interval inherited from the hand-authored MCP yaml, a probe that
+        wedges mid-roast, a doctrine retired by the recovery path, or any future
+        constructor of :class:`RoastTelemetry`. Every one of those produces the
+        same silent outcome — ambient declined on every tick while the dashboard
+        Room tile, which reads the ungated telemetry, still shows a
+        temperature — and an RP-B arm recorded as "c11 with ambient" while the
+        model saw the absent branch throughout.
+
+        Observing the behaviour covers all of them where predicting it cannot,
+        which is why this exists alongside the validator rather than instead of
+        it. Once per run, because a per-tick log would be noise at 1 Hz and
+        would bury the transition that matters.
+
+        Args:
+            age_seconds: The declined reading's age, or ``None`` when unknown.
+        """
+        if self._ambient_decline_warned:
+            return
+        self._ambient_decline_warned = True
+        _log.warning(
+            "Ambient declined as stale for the advisor (age=%s, bound=%.1f s); c11 will use "
+            "its absent-ambient branch. If this persists, the effective ambient poll cadence "
+            "likely exceeds the freshness bound — check the MCP yaml's "
+            "ambient.poll_interval_seconds against "
+            "controller.ambient_fan_doctrine.max_reading_age_seconds. #732",
+            "unknown" if age_seconds is None else f"{age_seconds:.1f} s",
+            self._config.ambient_fan_doctrine.max_reading_age_seconds,
+        )
+
     def _build_advisor_context(
         self, telemetry: RoastTelemetry, limits: PhaseControlLimits
     ) -> AdvisorContext:
@@ -4605,6 +4726,7 @@ class RoastController:
             The populated :class:`AdvisorContext`.
         """
         assert self._profile is not None  # guarded by caller
+        doctrine_ambient_temp_c, doctrine_ambient_humidity_pct = self._doctrine_ambient(telemetry)
         return AdvisorContext(
             phase=self._phase,
             # Charge-referenced (#219): the DTR denominator the advisor reasons
@@ -4730,15 +4852,10 @@ class RoastController:
             # The two doctrine numbers come from the single config group the
             # operator re-fits from RP-D scores, never a second copy in the
             # prompt prose (#218). Read-only throughout: nothing here clamps or
-            # gates a lever.
-            ambient_temp_c=(
-                telemetry.ambient_temp_c if self._config.ambient_fan_doctrine.enabled else None
-            ),
-            ambient_humidity_pct=(
-                telemetry.ambient_humidity_pct
-                if self._config.ambient_fan_doctrine.enabled
-                else None
-            ),
+            # gates a lever. A reading too old to trust is declined by
+            # ``_doctrine_ambient`` (#732) rather than passed on.
+            ambient_temp_c=doctrine_ambient_temp_c,
+            ambient_humidity_pct=doctrine_ambient_humidity_pct,
             ambient_fan_threshold_c=(
                 self._config.ambient_fan_doctrine.threshold_c
                 if self._config.ambient_fan_doctrine.enabled

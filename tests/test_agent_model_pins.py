@@ -2,7 +2,7 @@
 
 The topology (``docs/agent-topology.md``) pins each named subagent to a full
 model ID with an explicit effort, and §12 requires a consistency mechanism when
-that fact is duplicated across the ten frontmatters, ``AGENTS.md``, and the §4
+that fact is duplicated across the agent frontmatters, ``AGENTS.md``, and the §4
 table. This test is that mechanism: a single authoritative mapping that fails if
 any agent frontmatter drifts (an alias creeps back, a model/effort changes
 without updating the map, or a role is added/removed), plus a repo-side guard
@@ -33,6 +33,7 @@ _EXPECTED: dict[str, tuple[str, str]] = {
     "ui-reviewer": ("claude-sonnet-5", "high"),
     "safety-reviewer": ("claude-opus-5", "xhigh"),
     "planning-architect": ("claude-fable-5", "high"),
+    "story-planner": ("claude-fable-5", "high"),
 }
 _ALIASES = {"sonnet", "opus", "fable", "haiku", "best", "default"}
 
@@ -98,9 +99,60 @@ def test_agents_md_prose_names_the_full_ids() -> None:
     assert re.search(r"claude-opus-5.{0,24}xhigh", agents_md, re.S), (
         "AGENTS.md must document safety-reviewer as claude-opus-5 at xhigh effort"
     )
-    assert "claude-fable-5" in agents_md and "planning-architect" in agents_md, (
-        "AGENTS.md must document the planning-architect claude-fable-5 pin"
+    assert re.search(r"claude-fable-5(?:(?!claude-)[\s\S]){0,400}planning-architect", agents_md), (
+        "AGENTS.md must associate planning-architect with the claude-fable-5 pin "
+        "with no other model ID intervening — a bare mention check is satisfiable "
+        "by the other Fable role's text"
     )
+    # Bind story-planner to the Fable pin the same way: the two-Fable-roles
+    # sentence must associate the full ID with the role, not merely mention both
+    # somewhere — otherwise re-pinning story-planner alone in prose stays green
+    # because planning-architect already satisfies the mention checks.
+    assert re.search(r"claude-fable-5(?:(?!claude-)[\s\S]){0,400}story-planner", agents_md), (
+        "AGENTS.md must associate story-planner with the claude-fable-5 pin (D152) "
+        "with no other model ID intervening"
+    )
+    # Converse guard: the association checks above pass on the shared
+    # two-Fable-roles sentence even if a LATER clause re-pins one role (e.g.
+    # "story-planner (model: claude-opus-5)"). Forbid any non-Fable model ID
+    # in the window straight after either role's name, anywhere in the prose.
+    for role in ("planning-architect", "story-planner"):
+        drift = re.search(
+            rf"{role}(?:(?!claude-)[\s\S]){{0,80}}claude-(?!fable-5)[a-z0-9.-]+",
+            agents_md,
+        )
+        found = drift.group(0) if drift else ""
+        assert drift is None, (
+            f"{role} appears re-associated with a non-Fable model in AGENTS.md prose: {found!r}"
+        )
+
+
+def test_topology_reference_table_rows_match_the_map() -> None:
+    """Light regex guard over the §4 reference table's Claude rows.
+
+    The module docstring has always claimed the §4 table as a guarded surface,
+    but until D152 added rows there nothing actually read the file — a drifted
+    table row (wrong model or effort text) stayed green. Cell-level regexes are
+    deliberately loose about prose and strict about the pinned ID + effort.
+    """
+    topo = (_REPO / "docs" / "agent-topology.md").read_text()
+
+    def cells(model: str, effort: str) -> str:
+        return rf"[^\n|]*\|[^\n|]*`{model}`[^\n|]*\|[^\n|]*`{effort}`"
+
+    rows = [
+        (r"\| Planning architect" + cells("claude-fable-5", "high"), "planning-architect"),
+        (r"\| Story planner" + cells("claude-fable-5", "high"), "story-planner"),
+        (r"\| Safety/critical" + cells("claude-opus-5", "xhigh"), "safety reviewer"),
+        (r"Claude fallback" + cells("claude-sonnet-5", "high"), "fallback implementer"),
+        (r"\| Mechanical contract" + cells("claude-sonnet-5", "medium"), "mechanical checker"),
+        (r"\| QA/product/security" + cells("claude-sonnet-5", "high"), "qa/product/security"),
+        (r"\| Independent PR triage" + cells("claude-sonnet-5", "high"), "pr triage"),
+    ]
+    for row_re, role in rows:
+        assert re.search(row_re, topo), (
+            f"§4 reference-table row for {role} drifted from the authoritative pin map"
+        )
 
 
 def test_workflow_model_pins_are_full_ids() -> None:

@@ -56,8 +56,9 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from roastpilot_agent.advisor_screen import screen_warning
 from roastpilot_agent.config import (
     AdvisorConfig,
     AppConfig,
@@ -66,6 +67,7 @@ from roastpilot_agent.config import (
     MCPDeviceConfig,
     PreFirstCrackLevers,
     SafetyLimits,
+    normalize_model_slug,
 )
 from roastpilot_agent.mcp_yaml import read_yaml_value, resolve_mcp_yaml_source_path
 
@@ -224,6 +226,15 @@ class ConfigFieldMeta(BaseModel, frozen=True):
     #: the key is simply absent from it (fails soft — see
     #: :func:`~roastpilot_agent.mcp_yaml.read_yaml_value`).
     yaml_value: Any = None
+    #: An operator-facing warning about the EFFECTIVE value, or ``None`` when
+    #: there is nothing to say (#754). Distinct from :attr:`description`, which
+    #: explains what the field is and never changes: this reacts to the value.
+    #: Populated today only for ``advisor.model_slug``, carrying the FC-latency
+    #: screen verdict from :mod:`~roastpilot_agent.advisor_screen` — the same
+    #: text the pre-charge launcher banner prints, so the two cannot drift.
+    #: ``None`` on the pinned baseline, so an ordinary config shows no warning
+    #: and the warning keeps its meaning.
+    advisory: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +398,27 @@ class AdvisorConfigEdit(BaseModel):
     timeout_seconds: float | None = Field(default=None, gt=0)
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
 
+    @field_validator("model_slug")
+    @classmethod
+    def _strip_model_slug(cls, value: str | None) -> str | None:
+        """Reject a blank slug at the EDIT boundary, before it is persisted.
+
+        Shares :func:`~roastpilot_agent.config.normalize_model_slug` with
+        ``AdvisorConfig`` (Claude review, folded pre-open) — three hand-rolled
+        copies of "strip, raise if empty" is the drift this PR is elsewhere
+        fixing. ``AdvisorConfig`` normalises too, but a PUT that saves ``"  "``
+        and only fails when the next roast reloads it is a bad trade: the
+        operator gets a 200, the file holds garbage, and the failure surfaces
+        mid-roast as provider errors.
+
+        Args:
+            value: The submitted slug, or ``None`` when the field is absent.
+
+        Returns:
+            The stripped slug, or ``None``.
+        """
+        return None if value is None else normalize_model_slug(value, "model_slug")
+
 
 class MCPDeviceConfigEdit(BaseModel):
     """Editable MCP device fields for ``PUT /api/config`` (D78-4, #420).
@@ -541,6 +573,7 @@ def _make_field_meta(
     description: str,
     injected_keys: frozenset[str] | None = None,
     yaml_value: Any = None,
+    advisory: str | None = None,
 ) -> ConfigFieldMeta:
     """Construct a :class:`ConfigFieldMeta` for one managed field.
 
@@ -562,6 +595,8 @@ def _make_field_meta(
         yaml_value: The value currently in the hand-authored MCP yaml for this
             field (#482), or ``None`` for non-``mcp_device`` fields and fields
             where no yaml value is resolvable.
+        advisory: An operator-facing warning about the effective value (#754),
+            or ``None`` when there is nothing to say.
 
     Returns:
         A frozen :class:`ConfigFieldMeta` instance.
@@ -607,6 +642,7 @@ def _make_field_meta(
         read_only=read_only,
         description=description,
         yaml_value=yaml_value,
+        advisory=advisory,
     )
 
 
@@ -666,6 +702,7 @@ def build_config_snapshot(
         read_only: bool = False,
         description: str = "",
         yaml_value: Any = None,
+        advisory: str | None = None,
     ) -> ConfigFieldMeta:
         return _make_field_meta(
             saved_value=saved,
@@ -676,6 +713,7 @@ def build_config_snapshot(
             description=description,
             injected_keys=injected_keys,
             yaml_value=yaml_value,
+            advisory=advisory,
         )
 
     # --- controller section ------------------------------------------------
@@ -890,6 +928,13 @@ def build_config_snapshot(
                 "The advisor model slug (provider/model-id via OpenRouter)."
                 " Default 'openai/gpt-4o' (#277 bake-off pin)."
             ),
+            # The FC-latency screen verdict for the model this config would
+            # actually run (#754). The launcher banner carries the same text
+            # from the same function, but it is a LAUNCH-TIME snapshot and
+            # /config is where an operator switches arms BETWEEN roasts (D78
+            # applies next-roast), so a warning living only in the banner
+            # missed the path the A/B workflow actually uses.
+            advisory=screen_warning(adv, effective.controller.advisory_timeout_seconds),
         ),
         prompt_version=_meta(
             adv_saved.get("prompt_version"),
@@ -937,9 +982,20 @@ def build_config_snapshot(
             adv.timeout_seconds,
             adv_def.timeout_seconds,
             "ROASTPILOT_ADVISOR__TIMEOUT_SECONDS",
+            # NOT the bound on the control loop (safety-reviewer finding,
+            # folded pre-open). The controller enforces its OWN
+            # ``advisory_timeout_seconds`` (5.0 s since D151) around the
+            # advisory await; this field has no runtime consumer in the agent
+            # today — ``build_model`` passes no timeout to the client. While
+            # both numbers were 10.0 the confusion was harmless; once the
+            # controller's dropped to 5.0 the old wording sent an operator
+            # hitting timeouts to raise a knob that changes nothing.
             description=(
-                "Per-call advisor timeout (seconds). The controller must not block"
-                " the tick loop past this; Default 10.0 s."
+                "Advisor request timeout (seconds), for tooling that reads it."
+                " NOT the control-loop bound: the controller cuts an advisory"
+                " call at its own advisory_timeout_seconds (default 5.0 s,"
+                " D151)."
+                " Default 10.0 s."
             ),
         ),
         temperature=_meta(

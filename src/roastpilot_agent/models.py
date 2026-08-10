@@ -399,13 +399,24 @@ class RoastTelemetry(BaseModel):
     carry the LATEST ambient reading (#464, D86 — revises D85), mirroring
     ``mic_status``'s precedent exactly: a pure observability projection off the
     MCP's ``ambient_status`` (mode/status + the ~30 s-cached triad), refreshed
-    every tick. ``None`` when the MCP ambient status is not ``"ok"``
-    (disabled/unavailable) or the source state carries no ambient status at all
-    (an older MCP / replay export). Distinct from the ONE-TIME charge-instant
-    value :meth:`RoastStore.set_ambient` persists onto ``roast_runs`` (#342,
-    D85) — that capture path is untouched; these fields are the live/current
-    reading for the SSE dashboard, never read by any safety gate or control
-    path.
+    every tick. ``None`` when the MCP ambient status is not ``"ok"``, when its
+    ambient runtime is no longer running (#732 — a stopped runtime keeps
+    reporting ``"ok"`` over a frozen reading), when any member of the reading is
+    non-finite (#752 — the triad is voided as a unit; see
+    :func:`~roastpilot_agent.mcp_client.project_live_ambient`), or when the
+    source state carries no ambient status at all (an older MCP / replay
+    export). Distinct from the
+    ONE-TIME charge-instant value :meth:`RoastStore.set_ambient` persists onto
+    ``roast_runs`` (#342, D85) — that capture path is untouched.
+
+    ``ambient_age_seconds`` carries how long the current reading has been the
+    current one (#732), measured in the **agent's** clock from its first
+    observation of that reading — never by subtracting the MCP's own monotonic
+    stamp, which is not comparable across processes. ``None`` means "no reading"
+    or "age unknown", the fail-closed value. No safety gate or control path
+    reads any of these fields; ambient reaches the *advisor* only through the
+    #709 doctrine's own ``enabled`` gate, which additionally declines a reading
+    older than its configured bound.
     """
 
     bean_temp_c: float
@@ -422,6 +433,7 @@ class RoastTelemetry(BaseModel):
     ambient_temp_c: float | None = None
     ambient_humidity_pct: float | None = None
     ambient_pressure_hpa: float | None = None
+    ambient_age_seconds: float | None = None
 
 
 class AppliedRoasterState(BaseModel):

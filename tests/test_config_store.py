@@ -7,6 +7,7 @@ All tests are hardware-free and use temporary directories for the config file.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ import pydantic
 import pytest
 from pydantic import BaseModel
 
-from roastpilot_agent.config import AppConfig, MCPDeviceConfig, SafetyLimits
+from roastpilot_agent.config import AdvisorConfig, AppConfig, MCPDeviceConfig, SafetyLimits
 from roastpilot_agent.config_store import (
     _ALL_SAFETY_ENV_KEYS,  # pyright: ignore[reportPrivateUsage]
     _NEVER_INJECT_NON_SAFETY_KEYS,  # pyright: ignore[reportPrivateUsage]
@@ -42,6 +43,7 @@ from roastpilot_agent.config_store import (
     load_saved_raw,
     persist_config_edit,
 )
+from roastpilot_agent.launch_banner import EXPERIMENT_TAG, resolve_banner_lines
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -203,6 +205,38 @@ def test_load_saved_config_invalid_yaml_raises_config_file_error(tmp_path: Path)
     path.write_text("advisor:\n  model_slug: [unclosed\n")
     with pytest.raises(ConfigFileError, match=str(path)):
         _load_saved_config(path)
+
+
+# ---------------------------------------------------------------------------
+# Module-wide env hygiene
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def restore_roastpilot_env() -> Iterator[None]:
+    """Restore ``ROASTPILOT_*`` exactly as it was around EVERY test here.
+
+    ``_inject_saved_as_env`` writes ``os.environ`` directly — that is its job —
+    so a test calling it leaves the injected vars set for the rest of the
+    session. Harmless while nothing downstream read them; it stopped being
+    harmless once tests in this file began asserting on an EFFECTIVE config,
+    because a leaked ``ROASTPILOT_ADVISOR__MODEL_SLUG`` wins over the saved file
+    and silently changes what is under test (it reddened four tests in
+    ``test_config_reload_on_roast.py`` under one valid file ordering — local
+    Codex P2, folded pre-open).
+
+    Fixed here at the source rather than defended against per-test: an autouse
+    snapshot/restore makes every test in this module order-independent,
+    including the ones that do the injecting.
+    """
+    before = {k: v for k, v in os.environ.items() if k.startswith("ROASTPILOT_")}
+    try:
+        yield
+    finally:
+        for key in [k for k in os.environ if k.startswith("ROASTPILOT_")]:
+            if key not in before:
+                del os.environ[key]
+        os.environ.update(before)
 
 
 # ---------------------------------------------------------------------------
@@ -1924,3 +1958,113 @@ def test_snapshot_yaml_value_degrades_safely_when_only_mcp_env_carries_the_sourc
     monkeypatch.setenv("COFFEE_ROASTER_MCP_CONFIG", str(yaml_path))
     snapshot_via_step3 = build_config_snapshot(effective, {})
     assert snapshot_via_step3.mcp_device.fc_mode.yaml_value == "audio"
+
+
+# ---------------------------------------------------------------------------
+# The advisor model advisory (#754) — /config must say what the banner says
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def no_roastpilot_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear inherited ``ROASTPILOT_*`` env for the advisory tests.
+
+    These assert on the EFFECTIVE model, and env beats everything. In-module
+    leaks are now fixed at source by ``restore_roastpilot_env``; this guards
+    the other direction — a real ``ROASTPILOT_ADVISOR__*`` exported in the
+    developer's own shell, which would otherwise decide which arm is
+    classified. Same rationale as ``test_launch_banner``'s ``config_file``.
+
+    It also WIRES an API key, because ``screen_warning`` is silent without one
+    (a key-less agent builds no advisor, so nothing can call a model). Stated
+    explicitly rather than inherited: a key-less run — which is exactly CI —
+    is what exposed the ambient dependency.
+    """
+    for key in list(os.environ):
+        if key.startswith("ROASTPILOT_"):
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv(AdvisorConfig().api_key_env, "test-key")
+
+
+def test_model_slug_advisory_is_none_on_the_pinned_baseline(no_roastpilot_env: None) -> None:
+    """The proven arm shows no warning, so the warning keeps its meaning."""
+    snapshot = build_config_snapshot(AppConfig(), {})
+
+    assert snapshot.advisor.model_slug.advisory is None
+
+
+def test_model_slug_advisory_fires_for_a_busted_model(no_roastpilot_env: None) -> None:
+    """A measured-busting model is named on /config, not only on the banner.
+
+    This is the #754 gap: the launcher banner is a launch-time snapshot, while
+    /config is where the operator switches arms BETWEEN roasts (D78 applies
+    next-roast), so the warning has to reach here too.
+    """
+    config = AppConfig(advisor=AdvisorConfig(model_slug="openai/gpt-5.5"))
+
+    advisory = build_config_snapshot(config, {}).advisor.model_slug.advisory
+
+    assert advisory is not None
+    assert "openai/gpt-5.5" in advisory
+    assert "BUSTED" in advisory
+
+
+def test_model_slug_advisory_reads_the_operators_model_not_the_default(
+    no_roastpilot_env: None,
+) -> None:
+    """The advisory describes the CONFIGURED model, not a schema default.
+
+    Mutation-proven gap (safety-reviewer, folded pre-open): wiring this to a
+    bare ``AdvisorConfig()`` left the whole suite green while /config silently
+    reported the default arm's verdict for every configuration — the exact
+    class of "editable, reported effective, no observable effect" defect that
+    #747 exists to fix.
+    """
+    busted = build_config_snapshot(
+        AppConfig(advisor=AdvisorConfig(model_slug="anthropic/claude-sonnet-4.6")), {}
+    ).advisor.model_slug.advisory
+    unknown = build_config_snapshot(
+        AppConfig(advisor=AdvisorConfig(model_slug="openai/gpt-6-hypothetical")), {}
+    ).advisor.model_slug.advisory
+
+    assert busted is not None and "anthropic/claude-sonnet-4.6" in busted
+    assert unknown is not None and "openai/gpt-6-hypothetical" in unknown
+    assert busted != unknown
+
+
+def test_config_advisory_is_the_same_text_the_launch_banner_prints(
+    no_roastpilot_env: None,
+) -> None:
+    """The one invariant ``advisor_screen`` exists to hold (#754).
+
+    The banner and /config are two consumers of one classification. If they can
+    disagree, an operator reading the pre-charge banner and an operator reading
+    /config get different answers about the same roast — which is the drift the
+    extraction was done to prevent, so it is asserted rather than assumed.
+    """
+    for slug in ("openai/gpt-4o", "openai/gpt-5.5", "openai/gpt-4.1-mini", "openai/nope"):
+        config = AppConfig(advisor=AdvisorConfig(model_slug=slug))
+        advisory = build_config_snapshot(config, {}).advisor.model_slug.advisory
+        banner = resolve_banner_lines(config).advisor_cfg
+
+        if advisory is None:
+            assert "⚠ " not in banner.replace(EXPERIMENT_TAG, "")
+        else:
+            assert advisory in banner
+
+
+def test_a_blank_model_slug_is_rejected_at_the_edit_boundary() -> None:
+    """A PUT saving a whitespace-only slug fails at save time, not mid-roast.
+
+    `min_length=1` admits `"  "`. Before D151 that was inert — the populated
+    phase map shadowed it — so this PR is what makes it live: the value would
+    reload on the next roast and ship a garbage identifier to the provider on
+    every DEVELOPMENT call, burning D30's consecutive-failure budget with no
+    signal at save time (local Codex P2, folded pre-open).
+    """
+    with pytest.raises(pydantic.ValidationError):
+        AdvisorConfigEdit(model_slug="   ")
+
+    # Padding alone is normalised rather than rejected, so the value the
+    # operator meant still saves — and saves in the form that gets dispatched.
+    assert AdvisorConfigEdit(model_slug=" openai/gpt-4o ").model_slug == "openai/gpt-4o"
