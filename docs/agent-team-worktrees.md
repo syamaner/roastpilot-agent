@@ -121,12 +121,12 @@ cd <abs worktree> && grep -Fx 'include-system-site-packages = false' .venv/pyven
 cd <abs worktree> && .venv/bin/python -m pip list
 cd <abs worktree> && .venv/bin/python -m pip install --upgrade pip
 cd <abs worktree> && .venv/bin/python -m pip install -e . --group dev
-cd <abs worktree> && .venv/bin/python -c 'import os, roastpilot_agent as r; print(os.path.realpath(r.__file__))'
-cd <abs worktree> && .venv/bin/python -c 'import numpy, os, sys; print(os.path.realpath(numpy.__file__)); print(os.path.realpath(numpy.__file__).startswith(os.path.realpath(sys.prefix)))'
-cd <abs worktree> && .venv/bin/python -m ruff check .
-cd <abs worktree> && .venv/bin/python -m ruff format --check .
-cd <abs worktree> && .venv/bin/python -m pyright
-cd <abs worktree> && env -u OPENROUTER_API_KEY .venv/bin/python -m pytest --basetemp "$(mktemp -d)"
+cd <abs worktree> && .venv/bin/python -c 'import roastpilot_agent as r; from pathlib import Path; p = Path(r.__file__).resolve(); print(p); print(p.is_relative_to(Path("<abs worktree>/src").resolve()))'
+cd <abs worktree> && .venv/bin/python -c 'import numpy, sys; from pathlib import Path; p = Path(numpy.__file__).resolve(); print(p); print(p.is_relative_to(Path(sys.prefix).resolve()))'
+cd <abs worktree> && env -u PYTHONPATH .venv/bin/python -m ruff check .
+cd <abs worktree> && env -u PYTHONPATH .venv/bin/python -m ruff format --check .
+cd <abs worktree> && env -u PYTHONPATH .venv/bin/python -m pyright
+cd <abs worktree> && env -u PYTHONPATH -u OPENROUTER_API_KEY .venv/bin/python -m pytest --basetemp "$(mktemp -d)"
 ```
 
 **Never create this venv with `--system-site-packages`.** Immediately after venv
@@ -140,22 +140,26 @@ itself a symlink or resolves outside the worktree — but cannot detect a symlin
 subdirectory inside an otherwise local venv. A config mismatch or a long
 inherited package list (for example, Django or torch is already present) has the
 same fail-closed result; never report gates from that environment. After
-dependency installation, the **primary assertion** is the
-first-party path command: it must print a path inside `<abs worktree>/src/`.
-Anything else means the gates are about to describe the wrong tree and this is
-**not a valid gate environment — discard the gate result and reinstall from the
-worktree or rebuild the venv**. An editable install pointed at the wrong directory
-triggers this; that is what happens when `pip install -e .` runs without
-self-locating, the cwd-resets rule above biting inside the gate recipe itself.
-This first-party assertion also catches subdirectory-level borrowing; it directly
-checks where the package under test comes from. Numpy remains the third-party
-provenance canary, including for `--system-site-packages` contamination: the
-recipe must print the resolved package path inside the worktree's own `.venv`
-and then `True`, proving that path is inside the resolved `sys.prefix`. `False`
-means contamination, so this is **not a valid gate environment — discard the
-gate result and rebuild the venv**. The prefix, first-party, and third-party path
-assertions cover different borrowing depths; none is individually sufficient.
-Version comparison is informational only: dependencies are ranged and
+dependency installation, the **primary assertion** is the first-party path
+command: it must print the resolved path and then `True`, proving component-aware
+containment within `<abs worktree>/src/`. `False` means the gates are about to
+describe the wrong tree and this is **not a valid gate environment — discard the
+gate result and reinstall from the worktree or rebuild the venv**. An editable
+install pointed at the wrong directory triggers this; that is what happens when
+`pip install -e .` runs without self-locating, the cwd-resets rule above biting
+inside the gate recipe itself. This first-party assertion also catches
+subdirectory-level borrowing; it directly checks where the package under test
+comes from. Numpy remains the third-party provenance canary, including for
+`--system-site-packages` contamination: the recipe must print the resolved
+package path and then `True`, proving component-aware containment within the
+resolved `sys.prefix`. `False` means contamination, so this is **not a valid gate
+environment — discard the gate result and rebuild the venv**. The prefix,
+first-party, and third-party path assertions cover different borrowing depths;
+none is individually sufficient. Every gate unsets inherited `PYTHONPATH`, which
+can silently outrank the venv for tooling imports even when both package probes
+pass. **A containment or provenance check is only as good as the comparison it
+performs and the environment it performs it in.** Version comparison is
+informational only: dependencies are ranged and
 the repository has no lockfile, so a fresh venv may legitimately resolve a newer
 version than an older repository venv; that difference must **not** trigger a
 rebuild. It is worth noticing while diagnosing an odd type error, but is not
