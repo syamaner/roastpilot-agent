@@ -34,13 +34,24 @@
 > EXCEEDING the onset-derived 13.01 by 1.08 pp — the wrong direction for any anchoring
 > explanation), and that narrow question is what #792 now owns.
 >
-> **The consequence to record before anyone re-derives a prior:** `rpd_corpus_score` reads
-> that field directly, June-versus-August DTRs are **not like-for-like**, and the per-origin
-> DTR priors were derived across the boundary. Exposure measured: of the **15 rated runs**
-> (the shipped RP-D corpus), exactly **one** is pre-#337 — `3fbfd888`. Its shipped scalar is
-> unaffected regardless, because its 203 °C drop misses the joint window by 8 °C and
-> `max(0.0, raw)` clamps before DTR can matter. **The RP-D result stands; the priors are the
-> thing to re-check.**
+> **The consequence to record:** `rpd_corpus_score` reads that field directly, so June-versus-
+> August DTRs are **not like-for-like** *inside the store corpus*. Exposure measured: of the
+> **15 rated runs** (the shipped RP-D corpus), exactly **one** is pre-#337 — `3fbfd888`.
+> **The RP-D result stands**, on the arithmetic rather than on a clamp: that roast's 203 °C
+> drop misses the 195 °C target by 8 °C, which exceeds the ±3 °C tolerance on its own, so it
+> is **not a HIT under either DTR definition**; its scalar does move, 0.063 → 0.155, shifting
+> the 15-run mean by about 0.006.
+>
+> **Two claims made here earlier were wrong, and are WITHDRAWN rather than restated
+> (round 4 on #795).** (1) That the scalar was "unaffected because `max(0.0, raw)` clamps
+> before DTR can matter" — it never clamps; `raw` is **positive** at +0.063, because the 8 °C
+> miss consumes 0.937 of a ≤1.0 budget rather than exhausting it. (2) That "the per-origin DTR
+> priors were derived across the boundary", with the priors named as the thing to re-check —
+> they are **not store-derived at all**. `scripts/alog_classify.py` computes them from Artisan
+> event marks and contains no reference to `telemetry_snapshots.development_percent`, so #337
+> cannot contaminate them and re-checking them on that basis would be a **false calibration
+> task**. Both were caught by Codex, verified independently, and are recorded here so neither
+> is reinstated from the older text above.
 >
 > **The D129 RP-B eval set was NOT regenerated, deliberately.** Its consumer #749 is cut
 > (below), and the name-to-run-id mapping is a gitignored operator-held file absent from

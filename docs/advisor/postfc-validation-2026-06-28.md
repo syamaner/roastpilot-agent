@@ -46,8 +46,11 @@
 > MCP-sourced, its frozen 14.09 *exceeds* the onset-derived 13.01 by 1.08 pp — the wrong
 > direction for any anchoring explanation. That one outlier is the open #792 question, and it
 > is much narrower than "the frozen column disagrees". The wider consequence is that June and
-> August DTRs are **not like-for-like**, and the per-origin priors were derived across that
-> boundary. See #792.
+> August DTRs are **not like-for-like** *within this store corpus*. It does **not** reach the
+> per-origin priors: those come from the Artisan `.alog` corpus plus external research, and
+> `scripts/alog_classify.py` computes them from Artisan event marks without ever reading
+> `telemetry_snapshots.development_percent` — so #337 cannot contaminate them, and re-checking
+> them on that basis would be a false calibration task. See #792.
 
 > **Read first — what these numbers mean.** This is a re-validation of the 21 Jun
 > pin (`openai/gpt-4o`, c1 prompt) against the expanded recorded corpus from roasts
@@ -118,7 +121,11 @@ and the 3% `drop_dev_margin_percent` guard required at least 10% (13 - 3). The m
 correctly identified the drop temp had been reached; the system held for development.
 
 **Outcome:** The drop finally executed at 203 °C (the development guard eventually
-released — DTR reached ~11.5%). The bean temperature was already past the 195 °C
+released — the DTR **the guard actually read** reached ~10.8 %, the receive-time value
+in force pre-#337). The corrected onset-derived figure for the same roast is 11.5 %,
+but that is the *physical* development, not the signal the loop acted on: this
+paragraph and the margin arithmetic below are a **control** narrative, so they must use
+the controller-time number or they rewrite the decision. The bean temperature was already past the 195 °C
 profile target and the operator's 195 °C bitter ceiling. **This is a CONTROL LOOP
 ISSUE, not a model failure.** The dev guard (intended to prevent premature drops)
 delayed the drop past the correct moment, producing the over-roast.
@@ -173,7 +180,10 @@ pattern from 186 °C bean temp through drop may explain the under-development.
 | 11 (drop) | 0 | 100 | **true** | allow | 190 |
 
 **Consistent pattern with roast 5:** heat cut to near-zero immediately post-FC,
-fan ramped aggressively upward. Drop at 190 °C, DTR 12.9%. Same structural
+fan ramped aggressively upward. Drop at 190 °C, DTR 12.9 % — the corrected
+onset-derived figure. The **controller-time** value frozen on this run is 14.09 %,
+and the 1.08 pp gap between them, in a direction no anchoring story explains, is the
+open #792 question; the trace table above is what the loop saw. Same structural
 behaviour, slightly different starting heat (20% vs 0%), same fan escalation.
 
 ---
