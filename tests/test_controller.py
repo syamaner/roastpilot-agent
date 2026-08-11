@@ -5162,8 +5162,11 @@ async def test_ambient_fan_doctrine_is_advisory_only_and_actuates_no_lever() -> 
 
 
 @pytest.mark.asyncio
-async def test_unknown_floor_never_rations_baseline_fan_through_advisor_timeout() -> None:
+async def test_unknown_floor_never_rations_baseline_fan_through_advisor_timeout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """#498: baseline mode never clamps fan without a known effective floor."""
+    caplog.set_level(logging.INFO, logger="roastpilot_agent.controller")
     config = _doctrine_on(post_fc_fan_ceiling_enabled=True)
     advisor = FakeAdvisor([decision(heat=60, fan=100), AdvisorFailureMode.TIMEOUT])
     harness = harness_in_development(
@@ -5184,8 +5187,14 @@ async def test_unknown_floor_never_rations_baseline_fan_through_advisor_timeout(
     await harness.controller.tick()
 
     assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_fan_ceiling_engaged_once is False  # pyright: ignore[reportPrivateUsage]
     assert harness.controller.snapshot().current_fan == 100
     assert harness.sink.advisor_decisions[-1].status == "timeout"
+    assert [
+        record
+        for record in caplog.records
+        if "D156/D157 post-FC fan ceiling released" in record.getMessage()
+    ] == []
 
 
 @pytest.mark.asyncio

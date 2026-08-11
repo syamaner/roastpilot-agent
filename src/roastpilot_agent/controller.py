@@ -4561,7 +4561,12 @@ class RoastController:
             or retained_request > self._post_fc_desired_fan_percent
         ):
             self._post_fc_desired_fan_percent = retained_request
-        self._log_post_fc_fan_ceiling_once(action="released", signal=signal)
+        # Keep the latch conservative even if the ceiling never engaged: an
+        # unknown brake state must fail toward MORE #498 fan authority, while
+        # permitting a later engagement would move toward less. Observability
+        # is narrower — only an actual engagement can truthfully be released.
+        if self._post_fc_fan_ceiling_engaged_once:
+            self._log_post_fc_fan_ceiling_once(action="released", signal=signal)
         return PostFcFanSignal(
             ambient_temp_c=signal.ambient_temp_c,
             current_heat_percent=signal.current_heat_percent,
