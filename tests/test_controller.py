@@ -5353,23 +5353,56 @@ async def test_start_run_clears_fan_ceiling_release_latch() -> None:
 
 
 def test_operator_resume_keeps_the_released_latch_unbindable() -> None:
-    """The exact scenario the D157 run-scoping was ratified for (#781
-    slice-2 fold round): heat at its floor, RoR climbing, so fan has already
-    been established as the only remaining brake and the ceiling releases —
-    then the operator resumes into a FRESH DEVELOPMENT dwell
+    """The scenario the D157 run-scoping was ratified for (#781 slice-2 fold
+    round): heat at its floor, RoR climbing, so fan has already been
+    established as the only remaining brake and the ceiling releases — then
+    the operator resumes into a FRESH DEVELOPMENT dwell
     (``OPERATOR_RECOVERY_REQUIRED`` → ``DEVELOPMENT``, mirroring
     :func:`test_operator_resume_never_rations_fan_while_brake_state_unknown`).
-    Per-dwell scoping would re-narrow the ceiling on that resumed dwell;
-    run-scoped must not.
+    Run-scoping means the release latch itself SURVIVES that resume — unlike
+    its per-dwell siblings, which reset on the same transition. This test
+    pins that the predicate honours the flag once it is set, given a signal
+    that is otherwise a genuine bind. On THIS direct resume edge specifically,
+    a per-dwell latch could not visibly re-narrow the ceiling in today's
+    wiring either — see the following paragraph for why. That is NOT true of
+    every resume path, though:
+    :func:`test_second_fc_edge_after_resume_to_pre_fc_can_still_bind` pins
+    the load-bearing edge (a resume back into pre-FC, then a SECOND true
+    first-crack detection) where the loop genuinely re-engages and per-dwell
+    scoping WOULD have re-narrowed the ceiling. That test is the reason the
+    fix matters; this one isolates the predicate's own behaviour on the
+    simpler, direct edge.
 
-    Asserts the CONSEQUENCE, not only the flag: a fresh signal that would
-    otherwise clearly bind (cool room, known floor, heat well above floor so
-    fan is NOT the only brake — the exact shape
+    Proves the CONSEQUENCE, not only the flag: the run-scoped
+    ``_post_fc_fan_ceiling_released`` flag survives the resume, and
+    ``post_fc_fan_ceiling_engaged`` DECLINES to engage a fresh signal that
+    would otherwise clearly bind (cool room, known floor, heat well above
+    floor so fan is NOT the only brake — the exact shape
     ``test_binds_when_heat_above_floor_even_while_climbing`` in
-    ``test_control_policy.py`` pins as a true bind) is still declined by
-    ``post_fc_fan_ceiling_engaged`` once it carries the resumed dwell's real
-    ``released`` state. A flag-only assertion would still pass even if that
-    predicate's own consumer were rewired to ignore the flag.
+    ``test_control_policy.py`` pins as a true bind) once that signal carries
+    ``released=True``.
+
+    Deliberately NOT routed through ``RoastController._post_fc_fan_signal``
+    (the real per-tick builder): on a resume, ``_post_fc_engaged`` stays
+    ``False`` by design (the true-FC-edge-only engagement gate in
+    ``transition_to``, #498/D96) — the post-FC loop never re-engages within
+    the same dwell, so ``_last_post_fc_output`` stays ``None`` and every real
+    post-resume signal the builder produces carries
+    ``post_fc_heat_floor_percent=None`` for the rest of that dwell. That
+    ALREADY forces ``post_fc_fan_ceiling_engaged`` to ``False`` through the
+    unrelated floor-unknown carve-out — which would swamp the very thing
+    this test exists to prove and make a real-builder version pass for the
+    wrong reason regardless of whether the run-scoped fix is present at all.
+    So this signal is hand-built to isolate the ONE thing under test: given
+    a signal that is otherwise a genuine bind and carries the resumed
+    dwell's real ``released`` value, does the predicate honour it. It is not
+    a claim that today's production wiring can reach a known-floor signal on
+    THIS direct resume edge — it structurally cannot, which is itself a
+    second (separate, floor-unknown) layer of #498 protection specific to
+    this edge. The resume-to-pre-FC edge is different — see
+    :func:`test_second_fc_edge_after_resume_to_pre_fc_can_still_bind`: the
+    loop genuinely re-engages there, a real known-floor signal IS reachable,
+    and per-dwell scoping would have re-narrowed the ceiling.
     """
     harness = harness_in_development(
         readings=[],
@@ -5398,6 +5431,104 @@ def test_operator_resume_keeps_the_released_latch_unbindable() -> None:
     )
     policy = harness.controller._policy()  # pyright: ignore[reportPrivateUsage]
     assert policy.post_fc_fan_ceiling_engaged(would_otherwise_bind) is False
+
+
+@pytest.mark.asyncio
+async def test_second_fc_edge_after_resume_to_pre_fc_can_still_bind() -> None:
+    """The load-bearing path run-scoping actually protects (lead correction,
+    #781 slice-2 fold round).
+
+    ``OPERATOR_RECOVERY_REQUIRED`` lists ``ROASTING_PRE_FIRST_CRACK`` among
+    its legal targets (the transition table; ``api.py``'s
+    ``_parse_resume_target`` accepts it too), and the true-FC-edge-only
+    ``_post_fc_engaged`` gate in ``transition_to`` is keyed purely on the
+    EDGE — ``previous is ROASTING_PRE_FIRST_CRACK and target is
+    DEVELOPMENT`` — never on "has first crack ever happened in this run".
+    So an operator can resume a recovered run back into pre-FC and let a
+    SECOND first-crack detection fire: that reaches a fresh DEVELOPMENT
+    dwell where the post-FC loop genuinely RE-ENGAGES, ``_last_post_fc_output``
+    gets genuinely repopulated, and the ceiling can genuinely bind again.
+    This is the edge :func:`test_operator_resume_keeps_the_released_latch_unbindable`
+    cannot reach (its direct ``OPERATOR_RECOVERY_REQUIRED`` → ``DEVELOPMENT``
+    edge never re-engages the loop) — THIS is where per-dwell scoping would
+    have re-narrowed the ceiling, and where the run-scoped fix earns its
+    keep.
+
+    Arms the release latch through REAL behaviour in the first dwell — an
+    ENGAGE tick (heat well above floor, cool room, climbing: the exact shape
+    ``test_ceiling_binds_while_heat_retains_downward_authority`` pins as a
+    true bind), then a RELEASE tick (heat driven to its floor, still
+    climbing: the carve-out) — never a hand-called
+    ``_arm_post_fc_fan_release``. ``_current_heat`` is set directly before
+    each tick, the same established idiom every sibling post-FC-loop test in
+    this module uses (the loop's own convergence timing is not what is under
+    test here).
+
+    Then walks the resume-to-pre-FC path and, in the second dwell:
+      1. proves this dwell genuinely COULD bind — ``_post_fc_engaged is
+         True`` and the live signal's floor is KNOWN. This is the
+         anti-vacuum guard: without it, the test would pass for the
+         unrelated floor-unknown reason if the loop ever stopped
+         re-engaging on this edge, exactly the failure mode this whole fold
+         round is about;
+      2. proves the flag survived the walk (run-scoped, not cleared by
+         ``transition_to``);
+      3. proves the consequence through the REAL builder,
+         ``RoastController._post_fc_fan_signal`` — unlike the direct-resume
+         test, this dwell can actually build a floor-known signal, so this
+         is the strongest form of the check available anywhere in this
+         module.
+    """
+    harness = make_harness(config=_fan_ceiling_loop_config(control_interval_seconds=5.0))
+    await _charge_through_fc(harness, fc_ror_c_per_min=4.0)
+    output = harness.controller._last_post_fc_output  # pyright: ignore[reportPrivateUsage]
+    assert output is not None and output.effective_floor_percent == 25
+
+    # Dwell 1 — ENGAGE: heat well above its floor, cool room, climbing.
+    harness.controller._current_heat = 70  # pyright: ignore[reportPrivateUsage]
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)]
+    await harness.controller.tick()
+    assert harness.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_fan_ceiling_released is False  # pyright: ignore[reportPrivateUsage]
+
+    # Dwell 1 — RELEASE: heat driven to its floor, still climbing (fan is
+    # now the only remaining brake).
+    harness.clock.advance(5.0)
+    harness.controller._current_heat = output.effective_floor_percent  # pyright: ignore[reportPrivateUsage]
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)]
+    await harness.controller.tick()
+    assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+
+    # Resume back into pre-FC, then a SECOND true FC edge into a fresh
+    # DEVELOPMENT dwell.
+    harness.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    harness.controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+
+    # The anti-vacuum guard: this dwell's loop genuinely re-engaged.
+    assert harness.controller._post_fc_engaged is True  # pyright: ignore[reportPrivateUsage]
+    # The flag under test survived the whole walk.
+    assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+
+    # Populate THIS dwell's own post-FC output with heat well above its
+    # floor and a cool, climbing signal — a genuine bind shape again.
+    # `_post_fc_last_actuation_monotonic` was reset by the FC edge itself, so
+    # the LOOP's own cadence gate does not block this tick — but the
+    # general command rate limit (`min_seconds_between_commands`, keyed on
+    # `_last_command_monotonic`, unaffected by any transition) still does
+    # unless the clock advances past it first.
+    harness.clock.advance(5.0)
+    harness.controller._current_heat = 70  # pyright: ignore[reportPrivateUsage]
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)]
+    await harness.controller.tick()
+
+    signal = harness.controller._post_fc_fan_signal(harness.sink.snapshots[-1])  # pyright: ignore[reportPrivateUsage]
+    assert signal is not None
+    # Anti-vacuum guard, restated on the actual signal handed to the
+    # predicate: the floor is KNOWN, not None.
+    assert signal.post_fc_heat_floor_percent is not None
+    assert signal.released is True
+    assert harness.controller._policy().post_fc_fan_ceiling_engaged(signal) is False  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
