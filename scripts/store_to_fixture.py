@@ -597,10 +597,14 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
             _CHARGE_KIND,
             run_started,
         )
+        accepted_first_crack = _event_time(connection, resolved, _FIRST_CRACK_KIND)
+        first_crack_source = (
+            None if accepted_first_crack is None else _first_crack_onset_utc(connection, resolved)
+        )
         first_crack = _resolve_utc_mark(
             connection,
             resolved,
-            _first_crack_onset_utc(connection, resolved),
+            first_crack_source,
             "fc_status_utc",
             _FIRST_CRACK_KIND,
             run_started,
@@ -608,7 +612,7 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
         frozen_row = connection.execute(
             "SELECT development_percent FROM telemetry_snapshots"
             " WHERE run_id = ? AND development_percent IS NOT NULL"
-            " ORDER BY tick DESC, id DESC LIMIT 1",
+            " ORDER BY id DESC LIMIT 1",
             (resolved,),
         ).fetchone()
         frozen_development_percent = (

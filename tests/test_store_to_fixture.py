@@ -585,6 +585,27 @@ async def test_distinct_first_crack_onsets_fail_closed(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_first_crack_onset_without_accepted_event_is_not_exportable(
+    tmp_path: Path,
+) -> None:
+    """A raw MCP onset cannot fabricate a mark the controller never accepted."""
+    db_path = tmp_path / "fc-onset-without-event.sqlite3"
+    store = await _backdated_store(db_path)
+    await store.connection.execute(
+        "DELETE FROM roast_events WHERE run_id = ? AND kind = ?",
+        ("backdated-run", RoastEventKind.FIRST_CRACK.value),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    with pytest.raises(
+        s2f.FixtureConversionError,
+        match=r"lacks required marks: \['first_crack_detected'\]",
+    ):
+        s2f.convert(db_path, tmp_path / "fixture")
+
+
+@pytest.mark.asyncio
 async def test_pre_schema_v3_store_falls_back_for_charge(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -718,6 +739,43 @@ async def test_frozen_dtr_cross_check_boundary(
     warning = capsys.readouterr().err
 
     assert ("development_time_percent cross-check differs" in warning) is should_warn
+
+
+@pytest.mark.asyncio
+async def test_frozen_dtr_cross_check_uses_latest_insert_after_tick_reset(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A resumed run's low tick but later insertion supplies the frozen DTR."""
+    db_path = tmp_path / "dtr-tick-reset.sqlite3"
+    store = await _backdated_store(db_path)
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET development_percent = NULL WHERE run_id = ?",
+        ("backdated-run",),
+    )
+    await store.connection.execute(
+        "INSERT INTO telemetry_snapshots"
+        " (run_id, tick, recorded_at_utc, elapsed_seconds, agent_phase,"
+        " development_percent) VALUES (?, ?, ?, NULL, ?, ?)",
+        ("backdated-run", 9999, _backdated_wall(1000.0), "development", 30.0),
+    )
+    await store.connection.execute(
+        "INSERT INTO telemetry_snapshots"
+        " (run_id, tick, recorded_at_utc, elapsed_seconds, agent_phase,"
+        " development_percent) VALUES (?, ?, ?, NULL, ?, ?)",
+        (
+            "backdated-run",
+            0,
+            _backdated_wall(1001.0),
+            "development",
+            _BACKDATED_FROZEN_DTR,
+        ),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    s2f.convert(db_path, tmp_path / "fixture")
+
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.asyncio
