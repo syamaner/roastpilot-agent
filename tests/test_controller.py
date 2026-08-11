@@ -5532,6 +5532,64 @@ async def test_second_fc_edge_after_resume_to_pre_fc_can_still_bind() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured_ceiling", "expect_engagement"),
+    [(70, True), (100, False)],
+)
+async def test_ceiling_at_the_lever_maximum_records_no_engagement(
+    configured_ceiling: int, expect_engagement: bool
+) -> None:
+    """A ceiling of 100 narrows nothing, so the CONTROLLER must record no
+    engagement (#800 fold round, the Codex P2).
+
+    The policy-level test in ``test_control_policy.py`` pins the predicate
+    itself. This one pins the site where the reported defect actually
+    manifested: ``_arm_post_fc_fan_release``'s engage branch, which logs a
+    "ceiling engaged" record and sets ``_post_fc_fan_ceiling_engaged_once``
+    — and that flag is what later licenses a matching "released" record. A
+    predicate fix that never reached this consumer would leave the false
+    scoring telemetry exactly as it was.
+
+    Both arms run the IDENTICAL binding tick (heat 70 well above its floor
+    25, cool room, bean climbing — the shape
+    ``test_ceiling_binds_while_heat_retains_downward_authority`` pins as a
+    true bind) and differ ONLY in the configured ceiling. The 70 arm is the
+    anti-vacuum guard: it proves this tick really does engage, so the 100
+    arm's ``False`` cannot be passing because the tick was inert. A single
+    un-parametrized 100-only test would assert nothing.
+
+    Found because a mutation that hand-rolled the engage conjunction —
+    dropping the ``>= _LEVER_MAX_PERCENT`` guard at this consumer — left the
+    entire suite green.
+    """
+    base = _fan_ceiling_loop_config(control_interval_seconds=5.0)
+    config = base.model_copy(
+        update={
+            "ambient_fan_doctrine": base.ambient_fan_doctrine.model_copy(
+                update={"post_fc_fan_ceiling_percent": configured_ceiling}
+            )
+        }
+    )
+    harness = make_harness(config=config)
+    await _charge_through_fc(harness, fc_ror_c_per_min=4.0)
+    output = harness.controller._last_post_fc_output  # pyright: ignore[reportPrivateUsage]
+    assert output is not None and output.effective_floor_percent == 25
+
+    harness.controller._current_heat = 70  # pyright: ignore[reportPrivateUsage]
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)]
+    await harness.controller.tick()
+
+    assert (
+        harness.controller._post_fc_fan_ceiling_engaged_once  # pyright: ignore[reportPrivateUsage]
+        is expect_engagement
+    )
+    assert (
+        harness.controller._post_fc_fan_ceiling_engage_logged  # pyright: ignore[reportPrivateUsage]
+        is expect_engagement
+    )
+
+
+@pytest.mark.asyncio
 async def test_operator_resume_never_rations_fan_while_brake_state_unknown() -> None:
     """A loop-inert resume has floor None, so climbing releases immediately."""
     harness = harness_in_development(
