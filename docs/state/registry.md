@@ -2,6 +2,89 @@
 
 ## Active Epic
 
+> **STATUS UPDATE — 11 Aug 2026 (the #792 data refresh is DONE; three control decisions
+> ratified; #749 is CUT).** Read before the overnight block below.
+>
+> **The post-#779 regeneration ran** (operator-authorised). All three `agent-store` corpus
+> entries were re-exported on the corrected onset anchors, and
+> `docs/advisor/store-roast-corpus-manifest.json` plus
+> `docs/advisor/postfc-validation-2026-06-28.md` now carry the corrected figures.
+> **Directions were derived per roast, never assumed, and they genuinely differ in sign:**
+> `3fbfd888` 10.8 → **11.5** (+0.7), `d251013e` 11.1 → **12.9** (+1.8),
+> `5a32334c` 12.7 → **12.6** (−0.1). The lone downward move is structural: that roast's
+> first crack is operator-marked, #784 leaves the FC mark alone, so only the denominator
+> moved. Cross-checked from first principles against the store's own event timestamps
+> (DTR via onset: `3fbfd888` 11.57 %, `5a32334c` 12.60 %, `d251013e` 13.01 % — labelled
+> because that is NOT the order the corrections are listed in above; the exporter reproduces
+> each to ~0.1 pp).
+>
+> **The validation report's central conclusion SURVIVES** — Colombia Washed roasts still
+> under-develop against the 17–18 % per-origin prior, now at 12.6 / 12.9 %. Two statements
+> did not: `d251013e` **has since been rated 3/5**, so the corpus carries two labelled
+> bake-off entries rather than one and that action item is discharged; and first-crack
+> temperatures re-resolved (188→187, 185→183, and `5a32334c` gained 186 °C where the
+> manifest carried null).
+>
+> **⚠ PROVENANCE the regeneration surfaced — bigger than the outlier it started as.** The
+> frozen `development_percent` is **version-stamped at #337** (closed 23 Jun 2026), so the
+> corpus holds **two definitions of DTR**: 9 runs before that boundary, 41 on or after.
+> `3fbfd888` (21 Jun) is PRE-#337, so its frozen 10.84 faithfully records the receive-time
+> anchor then in force — a version artefact, not a defect. `5a32334c` (27 Jun) agrees to
+> 0.02 pp. **Only `d251013e` is genuinely anomalous** (post-#337, MCP-sourced, frozen 14.09
+> EXCEEDING the onset-derived 13.01 by 1.08 pp — the wrong direction for any anchoring
+> explanation), and that narrow question is what #792 now owns.
+>
+> **The consequence to record:** `rpd_corpus_score` reads that field directly, so June-versus-
+> August DTRs are **not like-for-like** *inside the store corpus*. Exposure measured: of the
+> **15 rated runs** (the shipped RP-D corpus), exactly **one** is pre-#337 — `3fbfd888`.
+> **The RP-D result stands**, on the arithmetic rather than on a clamp: that roast's 203 °C
+> drop misses the 195 °C target by 8 °C, which exceeds the ±3 °C tolerance on its own, so it
+> is **not a HIT under either DTR definition**; its scalar does move, 0.063 → 0.155, shifting
+> the 15-run mean by about 0.006.
+>
+> **Two claims made here earlier were wrong, and are WITHDRAWN rather than restated
+> (round 4 on #795).** (1) That the scalar was "unaffected because `max(0.0, raw)` clamps
+> before DTR can matter" — it never clamps; `raw` is **positive** at +0.063, because the 8 °C
+> miss consumes 0.937 of a ≤1.0 budget rather than exhausting it. (2) That "the per-origin DTR
+> priors were derived across the boundary", with the priors named as the thing to re-check —
+> they are **not store-derived at all**. `scripts/alog_classify.py` computes them from Artisan
+> event marks and contains no reference to `telemetry_snapshots.development_percent`, so #337
+> cannot contaminate them and re-checking them on that basis would be a **false calibration
+> task**. Both were caught by Codex, verified independently, and are recorded here so neither
+> is reinstated from the older text above.
+>
+> **The D129 RP-B eval set was NOT regenerated, deliberately.** Its consumer #749 is cut
+> (below), and the name-to-run-id mapping is a gitignored operator-held file absent from
+> this machine. Inventing the mapping would have silently calibrated against the wrong
+> roasts — a worse outcome than not regenerating.
+>
+> **#749 IS CUT (operator spend decision, 11 Aug), and #740 goes with it.** Its purpose
+> was to inform an RP-B verdict hardware already delivered on 10 Aug. Do not start it and
+> do not write a contract for it. **#708 (recovery v2: runway-aware trigger + bounded
+> fast-raise) and #710 (deterministic joint-window drop planner) also stay unkicked** — they
+> are #707's children as defined further down this file, and their scope is unchanged. What
+> is new and NOT either of them is a curve-driven RoR-setpoint design, raised on 11 Aug and
+> deliberately NOT started, on the #567 precedent
+> (built across three slices, then parked on a negative bake-off). Offline support is
+> directional only — 4-star median required-RoR 4.9 vs 3-star 6.5, overlapping ranges,
+> n=16. Raise the design question BEFORE any contract, not after.
+>
+> **Three ratifications recorded.** **#781** — the post-FC fan **destination** ceiling
+> (value 70 = physical level 7, flag-gated default OFF), superseding the 6 Aug prompt-only
+> ratification; recorded as **D156** in the plan repo. The filed menu's slew clamp was
+> rejected because it bounds the step, not the destination, which is exactly what c11
+> already did. **#787** — option 1, refuse to export a non-monotonic telemetry clock.
+> **#793** filed for the ratified split-out: post-FC heat authority is silently inherited
+> from the pre-FC trim and nothing says so.
+>
+> **A correction worth keeping.** #781's carve-out was briefed as "heat at or below its
+> post-FC base ceiling"; both authoritative sources (c11's prose at `config.py:1195-1197`
+> and the issue) say **heat at its floor**. The paraphrase drifted and was caught by the
+> contract pass, not by a gate. Three of today's defects were the same shape — a durable
+> text written correctly once, then re-stated slightly wrong downstream (this, the
+> follow-up count below, and #758's body describing as open a half that had already
+> shipped in `6bd4944`). **Quote the authoritative line; do not summarise it.**
+
 > **STATUS UPDATE — 11 Aug 2026 (overnight: the fixture-anchor defect is CLOSED,
 > the non-finite family is finished, and seven follow-ups are filed). Read with the
 > 10 Aug evening block below.**
@@ -61,21 +144,68 @@
 > of 28 routes** at ~5.2–5.5× serialisation cost on the same event loop as the 1 Hz
 > controller tick; caught by the pre-open `safety-reviewer` pass and removed.
 >
-> **Seven follow-ups filed. Six had reachability established against the real store
-> rather than argued:**
-> **#783** (two siblings of #779's class: `store.py:1833` `fc_at`, and
-> `plant_model_arx_study.py` FC anchors);
-> **#785** (history `dev_pct` orders by a resettable tick);
-> **#786** (`store_to_fixture` and `rpd_corpus_score` re-derive the same UTC-parse and
-> nearest-row tie-break);
-> **#787** (**an agent restart resets tick AND `elapsed_seconds` together** — the same
-> five runs — so exported fixture row times are non-monotonic for them, independent of
-> the anchor fix; three candidate resolutions, operator to choose);
-> **#788** (exporter cross-check hygiene: degenerate mark sets escape the warning,
-> string-based onset dedup, imprecise fallback wording);
-> **#789** (non-finite required telemetry temperatures now serialise `null` while TS
-> declares them non-null). The seventh, **#792**, came from the review of this very
-> block: committed advisor reports carry pre-#779 confirmation-anchored figures.
+> **Seven follow-ups were filed overnight** (#783, #785, #786, #787, #788, #789, #792). Six
+> had reachability established against the real store rather than argued.
+>
+> **This block deliberately no longer carries an open/closed COUNT.** Three separate counts
+> here drifted within a single day, each one going stale the moment an issue was reopened,
+> and the third drift was introduced by the commit that fixed the second. A hand-maintained
+> tally beside a live board is a defect generator; **the board is the source of truth — run
+> `gh issue list --state open --limit 200` rather than trusting a number in this file** — the
+> bare command defaults to **30** and there are currently 43 open, so it would silently hide
+> the oldest 13 and reproduce, in the replacement, exactly the undercount it replaced. What
+> follows is the standing
+> context per issue, which does not rot the way a count does.
+>
+> **#787** (**an agent restart resets tick AND `elapsed_seconds` together** —
+> the same five runs — so exported fixture row times are non-monotonic for them,
+> independent of the anchor fix). Its precondition is now settled from the store: none of
+> the five is in the corpus manifest, none carries an operator rating, all are
+> `faulted`/`aborted`, and all five have `ambient_captured = 0`, so none can be in the
+> D129 ambient eval set either. **Operator ratified option 1 (refuse to export, fail
+> closed) on 11 Aug.** **#789** (non-finite required telemetry temperatures now serialise
+> `null` while TS declares them non-null). **#792**, whose scope has MOVED: the
+> regeneration it was filed for is done (11 Aug, see the block above), and what remains is the
+> single unexplained `d251013e` frozen-DTR discrepancy — frozen 14.09 against an onset-derived
+> 13.01, post-#337 and MCP-sourced, in a direction no anchoring story explains.
+>
+> **Only #786** (shared UTC-parse / nearest-row tie-break) is closed, won't-fix.
+>
+> **CORRECTION (11 Aug — #783, #785 and #788 were all REOPENED).** All three had been folded
+> into #787, and all three folds were wrong for the same reason: **#787 was ratified as one
+> narrow behaviour — *refuse to export a fixture with a non-monotonic telemetry clock* — not
+> as a class sweep.** The test that matters is not "is this an instance of the class" but
+> "**does #787's ratified FIX reach this site**", and for these three it does not:
+>
+> - **#783** is the onset-vs-confirmation **anchor** class (#779's siblings), and
+>   `scripts/plant_model_arx_study.py:382` still reads the `first_crack` **event row**
+>   rather than the backdated onset; `docs/recent-fixes.md:779-781` names that site and the
+>   history FC display as outstanding.
+> - **#788** is exporter cross-check hygiene (string-based onset dedup, fallback warning,
+>   degenerate mark sets escaping the cross-check) — a clock refusal never reaches it.
+> - **#785** *is* genuinely a resettable-clock defect, and it still is not covered:
+>   `store.py:1830-1832` selects `dev_pct` with `ORDER BY t.tick DESC`, so a restart that
+>   resets `tick` makes history show a **pre-restart** DTR. Class membership was never the
+>   point; the export path and a history read are different code.
+>
+> **Two lessons, and the second is the sharper one.** First: consolidating by surface
+> similarity rather than by defect class silently discards work, and it reads as tidy while
+> doing it. Second: **#785 was reopened a full round AFTER #783 and #788, because the same
+> commit that corrected those two explicitly asserted this one was fine.** A fix applied to
+> the instances you noticed, while restating confidence about the one you did not re-derive,
+> is not a class sweep — it is the same defect wearing the fix as cover.
+>
+> **The aggregate is the lesson, not any one of them** — but the lesson INVERTED over the
+> course of 11 Aug and the inversion is the useful part. Seven filings against two closed
+> stories took the board from 38 to 43 overnight (38 + 7 filed − 2 stories closed = 43),
+> which read as over-filing, and four were promptly retracted. **Three of those four
+> retractions were then reversed the same day**, leaving exactly one (#786) that was
+> genuinely surplus. So the overnight session's real error was much smaller than the
+> next morning's correction claimed, and **the correction itself did more damage than the
+> over-filing did** — it closed three live defects. Filing is still not free, and one issue
+> owning a class still beats N issues that are its instances — **but only when the issues
+> really are instances of that class, and only when the owning issue's ratified scope
+> actually reaches them.** Retracting is not free either, and it fails silently.
 >
 > **`scripts/rpd_corpus_score.py` is immune to the clock-reset class** — it reads
 > `ORDER BY id ASC`. The shipped RP-D corpus result (15 scored / 3 HITs) stands.
@@ -363,6 +493,15 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
+> **⚠ DO NOT FOLLOW THE NUMBER IN THIS PARAGRAPH — IT IS STALE (11 Aug 2026, #798).**
+> D153, D154, D155 and D156 have ALL been spent since it was written; the highest defined
+> anywhere in `~/git/roastpilot-plan` is **D156** (`roastpilot-agent/plan.md:135`), so the
+> next free is **D157** — but **re-derive it at use time** rather than trusting that number
+> too, because this paragraph has now gone stale four times. The derivation RULE below is
+> sound and is the part to keep; only the cached number rots. **#798** owns removing the
+> cached number entirely, which is the actual fix. The rest of this paragraph is retained
+> as written so the rule and its rationale stay legible:
+>
 > Next free plan decision number: **D153**. D150 is SPENT — it is the decision
 > that settled this very question, recorded in `00-repository-structure.md` on
 > 9 Aug 2026: **one shared D-number series for the whole `roastpilot-plan` repo,
@@ -425,6 +564,9 @@
 > across all five formats on 9 Aug 2026 the highest number defined anywhere was
 > D150; D151 and D152 have been spent since (see above), so the highest defined
 > anywhere is now D152 and the free number above (**D153**) follows from it.
+> **⚠ STALE as of 11 Aug 2026 (#798), same as the paragraph above:** D153-D156 are all spent,
+> the highest defined anywhere is **D156**, and the next free is **D157** — re-derived at use
+> time, not read from here.
 >
 > D125 records the RP-D eval-model
 > correction — discriminates only on hardware/simulator, not replay; D124 records

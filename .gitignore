@@ -59,6 +59,14 @@ web/dist/
 # (mirrors .artisan-fixtures/ — see scripts/rp_b_ambient_fixtures.py).
 .rp-b-fixtures/
 
+# Store-sourced replay fixtures (#224/D44), written by scripts/store_to_fixture.py
+# — personal roast telemetry, never committed; only the manifest + report are
+# (mirrors .artisan-fixtures/). Added 11 Aug 2026: the manifest's own note has
+# asserted "gitignored under .store-fixtures/" since June, but no rule existed, so
+# the protection was claimed and not enforced — one `git add -A` from committing
+# the operator's roast logs.
+.store-fixtures/
+
 # Large per-roast bake-off dumps (regenerable; commit the summary doc instead)
 docs/advisor/bakeoff-results-2026-06-16.json
 docs/advisor/bakeoff-results-2026-06-16.md

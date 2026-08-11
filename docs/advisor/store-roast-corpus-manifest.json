@@ -1,8 +1,8 @@
 {
-  "generated": "2026-06-28",
+  "generated": "2026-08-11",
   "schema_version": "1",
   "note": "Labelled corpus from the agent SQLite store (#224, D44). Fixtures are operator-personal data — LOCAL ONLY (gitignored under .store-fixtures/). Only this manifest + the report are committed. Operator rating 1-5; degree = drop-temp classification (classify_degree). Store schema at conversion: v6 (roasted_weight_grams absent = NULL in all entries — schema v7 not yet migrated to the real store).",
-  "conversion_note": "store_to_fixture.py patched to tolerate schema v6 stores (missing roasted_weight_grams column, PR #224 fix). Clock reconciliation validated: drop event correctly reads the phase_changed->cooling transition, not run_completed.",
+  "conversion_note": "REGENERATED 11 Aug 2026 on the #779/#784 onset anchors (PR #784): charge resolves from roast_runs.t0_detected_at_utc and first crack from raw_state_json.first_crack_status.detected_at_utc, each mapped onto the run-relative clock by the nearest telemetry row. The previous figures were CONFIRMATION-anchored. That does not shift DTR in one direction: a late FC mark shortens development and understates the ratio, while a late T0 mark shortens the total and OVERSTATES it, so the net depends on which backdate dominates - 5a32334c below is the counter-example. Correction directions were DERIVED PER ROAST, never assumed, and they genuinely differ: 3fbfd888 +0.7 pp, d251013e +1.8 pp, 5a32334c -0.1 pp. Cross-checked from first principles against the store's own event timestamps - DTR via onset computes 3fbfd888 11.57 %, 5a32334c 12.60 %, d251013e 13.01 % - labelled per roast because that is NOT the order the corrections are listed in above; the exporter reproduces each to within ~0.1 pp. PROVENANCE: the frozen telemetry development_percent is VERSION-STAMPED at #337 (the FC/T0 backdating consumer, closed 23 Jun 2026), so this corpus holds TWO definitions of DTR. 3fbfd888 ran 21 Jun, BEFORE it: its frozen 10.84 is a faithful record of the receive-time anchor the controller used then - a version artefact, not a defect. 5a32334c (27 Jun, post-#337) agrees to 0.02 pp (frozen 12.58 vs onset 12.60); there is no disagreement on that run. Only d251013e is genuinely anomalous: post-#337 and MCP-sourced, its frozen 14.09 EXCEEDS the onset-derived 13.01 by 1.08 pp, the wrong direction for any anchoring explanation. That single outlier is the open #792 question. Earlier note retained: store_to_fixture.py tolerates schema v6 stores (PR #224); the drop event correctly reads the phase_changed->cooling transition, not run_completed.",
   "entries": [
     {
       "label": "store-roast-3fbfd888",
@@ -10,11 +10,11 @@
       "source": "agent-store",
       "profile": "Ethiopia Yirgacheffe Koke (Natural)",
       "fc_source": "mcp",
-      "fc_temp_c": 188.0,
+      "fc_temp_c": 187.0,
       "drop_temp_c": 203.0,
-      "development_time_seconds": 63.2,
-      "development_time_percent": 10.8,
-      "total_roast_seconds": 583.2,
+      "development_time_seconds": 67.3,
+      "development_time_percent": 11.5,
+      "total_roast_seconds": 583.1,
       "degree": "over",
       "operator_rating": 2,
       "operator_notes": "Was bitter for my liking. too dark.",
@@ -25,7 +25,7 @@
       "post_fc_advisory_ticks": 9,
       "drop_rejected_count": 5,
       "usable_for_bakeoff": false,
-      "usable_note": "Drop 203 C = over-done (above the 196 C bitter ceiling); operator confirms bitter. Excluded from known-good medium set. Useful as NEGATIVE corpus entry (outcome label 2/5, degree=over)."
+      "usable_note": "Drop 203 C = over-done (above the 196 C bitter ceiling); operator confirms bitter. Excluded from known-good medium set. Useful as NEGATIVE corpus entry (outcome label 2/5, degree=over). DTR restated 10.8 -> 11.5 % on the #779 onset anchors; the classification is unchanged (drop temperature decides it)."
     },
     {
       "label": "store-roast-5a32334c",
@@ -33,11 +33,11 @@
       "source": "agent-store",
       "profile": "Colombia Excelso Huila (Washed)",
       "fc_source": "operator",
-      "fc_temp_c": null,
+      "fc_temp_c": 186.0,
       "drop_temp_c": 191.0,
       "development_time_seconds": 88.8,
-      "development_time_percent": 12.7,
-      "total_roast_seconds": 697.9,
+      "development_time_percent": 12.6,
+      "total_roast_seconds": 704.7,
       "degree": "core_medium",
       "operator_rating": 3,
       "operator_notes": "Nice and sweet. Caramel hints",
@@ -48,7 +48,7 @@
       "post_fc_advisory_ticks": 12,
       "drop_rejected_count": 0,
       "usable_for_bakeoff": true,
-      "usable_note": "Drop 191 C, core_medium, operator rating 3/5 (acceptable). FC was operator-marked (no MCP bean_temp_c in event). DTR 12.7% is slightly below target 13% — operator notes caramel, acceptable outcome. Candidate for known-good medium set extension."
+      "usable_note": "Drop 191 C, core_medium, operator rating 3/5 (acceptable) - operator notes caramel. FC was operator-marked, and #784 honours that override by leaving the FC mark on the event row, so only the T0 anchor moved: DTR 12.7 -> 12.6 %, the smallest shift of the three and the only DOWNWARD one, exactly as the operator-override asymmetry predicts. The manifest now carries a first-crack TEMPERATURE (186 C) where it previously held null. NOT caused by #784: _first_crack_temp_c already read the nearest telemetry row before it (scripts/store_to_fixture.py at f45db35~1:583-587), and #784 deliberately leaves this operator-marked FC on the same event-row anchor. What changed is what the manifest FIELD records - the old null reflected the operator event carrying no bean temperature, whereas this entry is populated from the exported summary's nearest-row reading. Two earlier explanations of this value were wrong; the anchor is unchanged and no #784 mechanism explains it. Candidate for known-good medium set extension."
     },
     {
       "label": "store-roast-d251013e",
@@ -56,29 +56,29 @@
       "source": "agent-store",
       "profile": "Colombia Excelso Huila (Washed)",
       "fc_source": "mcp",
-      "fc_temp_c": 185.0,
+      "fc_temp_c": 183.0,
       "drop_temp_c": 190.0,
-      "development_time_seconds": 77.3,
-      "development_time_percent": 11.1,
-      "total_roast_seconds": 694.7,
+      "development_time_seconds": 90.9,
+      "development_time_percent": 12.9,
+      "total_roast_seconds": 703.9,
       "degree": "core_medium",
-      "operator_rating": null,
-      "operator_notes": null,
+      "operator_rating": 3,
+      "operator_notes": "Tasted a bit flat. Sightly underdeveloped.",
       "charge_weight_grams": 250.0,
       "roasted_weight_grams": null,
       "fixture": ".store-fixtures/store-roast-d251013e/roast.jsonl",
       "telemetry_rows": 179,
       "post_fc_advisory_ticks": 11,
       "drop_rejected_count": 0,
-      "usable_for_bakeoff": false,
-      "usable_note": "Drop 190 C, core_medium, but operator_rating=NULL (unrated). Cannot serve as a labelled corpus entry until rated. Fixture is valid for replay; suspend until operator rates."
+      "usable_for_bakeoff": true,
+      "usable_note": "Drop 190 C, core_medium. NOW RATED 3/5 (\"Tasted a bit flat. Sightly underdeveloped.\") - the manifest's previous 'suspend until operator rates' gate is satisfied, so this entry becomes labelled and bake-off eligible. DTR restated 11.1 -> 12.9 %, the LARGEST correction of the three (+1.8 pp). Read the qualitative note alongside it: the operator called it slightly underdeveloped at what is now a measured 12.9 %."
     }
   ],
   "summary": {
     "total_converted": 3,
-    "usable_for_bakeoff": 1,
-    "pending_rating": 1,
+    "usable_for_bakeoff": 2,
+    "pending_rating": 0,
     "negative_corpus_only": 1,
-    "fully_labelled": 2
+    "fully_labelled": 3
   }
 }

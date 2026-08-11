@@ -1,5 +1,57 @@
 # Post-FC advisor validation — expanded corpus (#277 re-validation, 28 Jun 2026)
 
+> **⚠ FIGURES CORRECTED 11 Aug 2026 (#779 / PR #784, tracked as #792). The central
+> conclusion survives; two statements did not.** Every DTR below was originally computed
+> on **confirmation**-anchored marks. That does not shift DTR in a single direction: a late
+> FC mark shortens development and understates the ratio, while a late T0 mark shortens the
+> total and *overstates* it, so the net depends on which backdate dominates. The fixtures were
+> regenerated on the corrected **onset** anchors and each direction was derived from that
+> roast's own store data rather than assumed — they genuinely differ in sign:
+>
+> | label | DTR then | DTR now | Δ | development s |
+> |---|---:|---:|---:|---|
+> | `store-roast-3fbfd888` | 10.8 | **11.5** | +0.7 | 63.2 → 67.3 |
+> | `store-roast-5a32334c` | 12.7 | **12.6** | −0.1 | 88.8 → 88.8 |
+> | `store-roast-d251013e` | 11.1 | **12.9** | +1.8 | 77.3 → 90.9 |
+>
+> `5a32334c` is the only DOWNWARD move, and structurally so: its first crack was
+> operator-marked, and #784 honours that override by leaving the FC mark alone, so only
+> the T0 anchor moved and only the denominator grew.
+>
+> **What survives.** The report's central finding — Colombia Washed roasts 5 and 6
+> under-developed against the 17–18 % per-origin prior — is **unchanged**; at 12.6 % and
+> 12.9 % they are still 4–5 pp short. So is every trace-level observation (fan escalation
+> to 100 %, the five `development_incoherent` drop rejections, the drop-guard interaction),
+> because none of those depended on the anchor.
+>
+> **What changed.** (1) `d251013e` **has since been rated 3/5** ("tasted a bit flat.
+> Sightly underdeveloped"), so the "only `5a32334c` qualifies" statement below and its
+> matching action item are both retired — the corpus now carries two labelled bake-off
+> entries, not one. (2) First-crack temperatures were re-resolved: 188 → 187, 185 → 183,
+> and `5a32334c` gained a value (186 °C) where this report shows `n/a`. **I have now been wrong
+> twice about why, so the causal claim is withdrawn rather than replaced a third time.** What is
+> established: the anchor did NOT move (`store_to_fixture` sets `first_crack_source` only for an
+> `mcp`-accepted crack, so an operator-marked FC stays on the event row), and **#784 is not the
+> mechanism either** — `_first_crack_temp_c` already read the nearest telemetry row before #784
+> (`f45db35~1:583-587`). The change is in what the manifest FIELD records: the old `null` reflected
+> the operator event carrying no bean temperature, while the entry is now populated from the
+> exported summary's nearest-row reading. No #784 behaviour explains it.
+>
+> **Provenance, corrected 11 Aug.** The frozen `development_percent` is **version-stamped at
+> #337** (the FC/T0 backdating consumer, closed 23 Jun 2026), so this corpus holds **two
+> definitions of DTR**. `3fbfd888` ran 21 Jun, *before* it: its frozen 10.84 faithfully records
+> the receive-time anchor the controller used then — a version artefact, nothing to adjudicate.
+> `5a32334c` (27 Jun) agrees to **0.02 pp** (frozen 12.58 vs onset 12.60), so there is no
+> disagreement on that run at all. **Only `d251013e` is genuinely anomalous:** post-#337 and
+> MCP-sourced, its frozen 14.09 *exceeds* the onset-derived 13.01 by 1.08 pp — the wrong
+> direction for any anchoring explanation. That one outlier is the open #792 question, and it
+> is much narrower than "the frozen column disagrees". The wider consequence is that June and
+> August DTRs are **not like-for-like** *within this store corpus*. It does **not** reach the
+> per-origin priors: those come from the Artisan `.alog` corpus plus external research, and
+> `scripts/alog_classify.py` computes them from Artisan event marks without ever reading
+> `telemetry_snapshots.development_percent` — so #337 cannot contaminate them, and re-checking
+> them on that basis would be a false calibration task. See #792.
+
 > **Read first — what these numbers mean.** This is a re-validation of the 21 Jun
 > pin (`openai/gpt-4o`, c1 prompt) against the expanded recorded corpus from roasts
 > 3–6. It is NOT a scored bake-off run (no API calls were made — `OPENROUTER_API_KEY`
@@ -32,13 +84,24 @@ see section below). Full manifest: `docs/advisor/store-roast-corpus-manifest.jso
 
 | label | profile | FC source | FC °C | drop °C | DTR % | degree | rating | notes |
 |-------|---------|-----------|-------|---------|-------|--------|--------|-------|
-| store-roast-3fbfd888 | Ethiopia Yirgacheffe Koke (Natural) | mcp | 188 | 203 | 10.8 | over | 2/5 | bitter, too dark |
-| store-roast-5a32334c | Colombia Excelso Huila (Washed) | operator | n/a | 191 | 12.7 | core_medium | 3/5 | sweet, caramel hints |
-| store-roast-d251013e | Colombia Excelso Huila (Washed) | mcp | 185 | 190 | 11.1 | core_medium | unrated | — |
+| store-roast-3fbfd888 | Ethiopia Yirgacheffe Koke (Natural) | mcp | 187 | 203 | 11.5 | over | 2/5 | bitter, too dark |
+| store-roast-5a32334c | Colombia Excelso Huila (Washed) | operator | 186 | 191 | 12.6 | core_medium | 3/5 | sweet, caramel hints |
+| store-roast-d251013e | Colombia Excelso Huila (Washed) | mcp | 183 | 190 | 12.9 | core_medium | 3/5 | flat, slightly underdeveloped |
 
-**Only store-roast-5a32334c qualifies as a labelled known-good entry** for the bake-off set
-(rated + core_medium degree). The other two are blocked: 3fbfd888 = over-done (negative
-corpus); d251013e = unrated (suspend until operator rates).
+**Two entries are now labelled and bake-off ELIGIBLE** — `store-roast-5a32334c` and, since
+its 11 Aug rating, `store-roast-d251013e`. Only `3fbfd888` remains blocked, as over-done
+(negative corpus). *(As written on 28 Jun only `5a32334c` was eligible, `d251013e` being
+unrated then.)*
+
+**Eligible is not the same as known-good, and this document must not conflate them.**
+Eligibility is mechanical — rated, `core_medium`, and `usable_for_bakeoff: true` in the
+manifest. **Known-good is an operator judgement and it has NOT been given for
+`d251013e`,** whose rating note reads "flat, slightly underdeveloped" — which is not an
+obvious known-good for a scored ground-truth set. An earlier revision of this paragraph
+asserted known-good on the mechanical criteria alone, which contradicted the re-run
+section's own gate and could have put an unconfirmed roast into the scored set. The gate
+in "Recommended re-run scope" is authoritative: **the operator confirms known-good, and
+that confirmation is still outstanding for `d251013e`.**
 
 ---
 
@@ -46,7 +109,7 @@ corpus); d251013e = unrated (suspend until operator rates).
 
 ### Roast 3 (3fbfd888, Ethiopia Natural, drop 203 °C, rating 2 = bitter)
 
-**Post-FC sequence (9 decision ticks, ≈63 s development):**
+**Post-FC sequence (9 decision ticks, ≈67 s development):**
 
 | tick# | heat % | fan % | should_drop | verdict | bean °C |
 |-------|--------|-------|-------------|---------|---------|
@@ -68,7 +131,11 @@ and the 3% `drop_dev_margin_percent` guard required at least 10% (13 - 3). The m
 correctly identified the drop temp had been reached; the system held for development.
 
 **Outcome:** The drop finally executed at 203 °C (the development guard eventually
-released — DTR reached ~10.8%). The bean temperature was already past the 195 °C
+released — the DTR **the guard actually read** reached ~10.8 %, the receive-time value
+in force pre-#337). The corrected onset-derived figure for the same roast is 11.5 %,
+but that is the *physical* development, not the signal the loop acted on: this
+paragraph and the margin arithmetic below are a **control** narrative, so they must use
+the controller-time number or they rewrite the decision. The bean temperature was already past the 195 °C
 profile target and the operator's 195 °C bitter ceiling. **This is a CONTROL LOOP
 ISSUE, not a model failure.** The dev guard (intended to prevent premature drops)
 delayed the drop past the correct moment, producing the over-roast.
@@ -96,7 +163,7 @@ controller logic here.**
 
 **Model behaviour:** Heat cut to 0% immediately at FC (aggressive cooling), fan
 ramped systematically 50→70→90→100% to slow the RoR. No drop rejections — the dev
-guard did not fire. Drop called exactly at 191 °C (12.7% DTR). This is a clean
+guard did not fire. Drop called exactly at 191 °C (12.6% DTR). This is a clean
 profile: model correctly managed the temperature trajectory.
 
 **Concern flagged (operator decision required):** The model cut heat to 0% at FC
@@ -104,13 +171,13 @@ and raised fan to 100% across the entire development window. This is very aggres
 cooling. While the outcome was acceptable (rating 3, caramel notes), a 191 °C drop
 on Colombia Washed is on the light end for washed high-grown beans (per-origin priors
 in D59 recommend 17–18% DTR for washed high-grown, memory
-`per-origin-dtr-washed-highgrown.md`). DTR was 12.7%, below the per-origin target.
+`per-origin-dtr-washed-highgrown.md`). DTR was 12.6%, below the per-origin target.
 **The model appears to be over-cooling Colombia Washed** — the fan-100 + heat-0
 pattern from 186 °C bean temp through drop may explain the under-development.
 
-### Roast 6 (d251013e, Colombia Washed, drop 190 °C, unrated)
+### Roast 6 (d251013e, Colombia Washed, drop 190 °C, rating 3 = flat/slightly underdeveloped)
 
-**Post-FC sequence (11 decision ticks, ≈77 s development):**
+**Post-FC sequence (11 decision ticks, ≈91 s development):**
 
 | tick# | heat % | fan % | should_drop | verdict | bean °C |
 |-------|--------|-------|-------------|---------|---------|
@@ -123,7 +190,10 @@ pattern from 186 °C bean temp through drop may explain the under-development.
 | 11 (drop) | 0 | 100 | **true** | allow | 190 |
 
 **Consistent pattern with roast 5:** heat cut to near-zero immediately post-FC,
-fan ramped aggressively upward. Drop at 190 °C, DTR 11.1%. Same structural
+fan ramped aggressively upward. Drop at 190 °C, DTR 12.9 % — the corrected
+onset-derived figure. The **controller-time** value frozen on this run is 14.09 %,
+and the 1.08 pp gap between them, in a direction no anchoring story explains, is the
+open #792 question; the trace table above is what the loop saw. Same structural
 behaviour, slightly different starting heat (20% vs 0%), same fan escalation.
 
 ---
@@ -157,7 +227,7 @@ behaviour, slightly different starting heat (20% vs 0%), same fan escalation.
 6. **Fan escalation pattern is aggressive for washed high-grown.** On both
    Colombia Washed roasts (5a32334c, d251013e), gpt-4o escalated fan to 100%
    starting from ~186 °C bean temp. The roasts dropped at 190–191 °C with DTR
-   11–13%, below the per-origin target of 17–18% for washed high-grown (D59
+   12.6–12.9%, below the per-origin target of 17–18% for washed high-grown (D59
    priors). This could be:
    - the profile's `target_development_percent = 13%` being too low for Colombia
      Washed (per D59 washed high-grown priors, 17–18% is better);
@@ -203,7 +273,7 @@ from the screen-pass (which rejected several models) does not apply here. The he
 trajectory is generally correct.
 
 **The main gap is the per-origin profile/DTR mismatch, not the model.** Colombia
-Washed roasts 5 and 6 under-developed (DTR 11–13% vs the 17–18% per-origin prior
+Washed roasts 5 and 6 under-developed (DTR 12.6–12.9% vs the 17–18% per-origin prior
 for washed high-grown). This is attributable to the profile's 13% target being
 wrong for this bean, not to the model behaving incorrectly given its inputs. The
 model is reasoning from the profile; if the profile target is calibrated for a
@@ -216,9 +286,13 @@ gpt-4o called drop correctly; the dev guard blocked it past the ceiling.
 
 A scored bake-off run with the expanded corpus is warranted but not blocking:
 
-- Add `store-roast-5a32334c` to the bake-off test set once the operator confirms it
-  as known-good (the manifest marks it `usable_for_bakeoff: true`).
-- Rate `store-roast-d251013e` to unlock it (operator action required).
+- Add `store-roast-5a32334c` **and `store-roast-d251013e`** to the bake-off test set once
+  the operator confirms them as known-good (the manifest marks both
+  `usable_for_bakeoff: true` as of 11 Aug). `d251013e` became eligible when it was rated;
+  read its operator note ("a bit flat, slightly underdeveloped") alongside its 12.9 % DTR.
+- ~~Rate `store-roast-d251013e` to unlock it (operator action required).~~ **DONE** — rated
+  3/5 on 11 Aug ("tasted a bit flat. Sightly underdeveloped"); the entry is now labelled and
+  bake-off eligible.
 - When running the next bake-off, add a per-origin filter: score Colombia Washed
   fixtures separately and check whether the fan-escalation pattern lands in a
   worse heat-direction class than the aggregate.
@@ -258,10 +332,18 @@ decision belongs to the operator after reading the full scored output.
    Consider: (a) bean-temp ceiling overrides dev guard (always drop if bean ≥ bitter
    ceiling), or (b) lower the 3% dev margin. **Controller change — operator decision.**
 
-3. **Rate `store-roast-d251013e`** (the 27 Jun Colombia Washed run) to complete its
-   corpus label. Until rated it cannot serve as a bake-off or D42 reference.
+3. ~~**Rate `store-roast-d251013e`** (the 27 Jun Colombia Washed run) to complete its
+   corpus label. Until rated it cannot serve as a bake-off or D42 reference.~~ **DONE** —
+   rated 3/5 on 11 Aug ("tasted a bit flat. Sightly underdeveloped"); it is now a labelled
+   bake-off-eligible entry. *(This is the second copy of the same action item; the first is
+   at the end of the recommendations section above.)*
 
 4. **Schema v7 migration on live store** before the next roast (see command above).
 
-5. **Next bake-off: include store-roast-5a32334c** as a new test-set entry (first
-   agent-recorded reference roast in the scored set).
+5. **Next bake-off: include every entry named by the "Recommended re-run scope" list
+   above** — as of 11 Aug that is `store-roast-5a32334c` **and** `store-roast-d251013e`,
+   the first agent-recorded reference roasts in the scored set. Deliberately a **pointer
+   rather than a second roster**: this item named only `5a32334c` when it was written on
+   28 Jun and went stale the moment `d251013e` was rated, which is the same
+   corrected-in-one-place-and-left-standing-in-another defect that produced every earlier
+   round of review on this document. One list, one place to update.
