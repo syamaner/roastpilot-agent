@@ -1264,7 +1264,7 @@ class AmbientFanDoctrine(BaseModel):
     that means the post-FC control loop is engaged and has produced an output.
     With the loop inert, the floor stays unknown and the ceiling cannot bind.
     Likewise, if bean rate-of-rise is missing on the first-crack engagement
-    tick, the loop produces no output, the release latch arms for that dwell,
+    tick, the loop produces no output, the release latch arms for the whole run,
     and the ceiling never binds. This is #498-safe, but an A/B run with that
     single-tick RoR gap silently holds no airflow constant, just as surely as
     enabling the doctrine flags without the loop."""

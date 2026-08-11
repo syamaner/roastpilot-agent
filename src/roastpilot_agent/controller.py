@@ -1975,7 +1975,8 @@ class RoastController:
         # post-actuation arming in ``tick`` still runs later in the same tick.
         # If the taper early-returns — notably because bean RoR is missing — no
         # effective floor is stashed, so that later site treats the floor as
-        # unknown, arms release for the dwell, and the ceiling never binds. That
+        # unknown, arms release for the REST OF THE RUN, and the ceiling never
+        # binds. That
         # is deliberate and matches the documented baseline/resume carve-out:
         # unknown brake state fails toward full #498 fan authority.
         if self._last_post_fc_output is not None:
@@ -4565,7 +4566,7 @@ class RoastController:
         )
 
     def _arm_post_fc_fan_release(self, signal: PostFcFanSignal | None) -> PostFcFanSignal | None:
-        """Arm the one-way per-dwell fan-ceiling release when it becomes due.
+        """Arm the one-way RUN-scoped fan-ceiling release when it becomes due.
 
         This is the single mutation point for
         ``self._post_fc_fan_ceiling_released``. A fresh latching condition sets

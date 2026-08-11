@@ -136,8 +136,10 @@ class PostFcFanSignal:
             permanently release the ceiling.
         bean_ror_c_per_min: The current bean rate-of-rise, or ``None`` when
             unavailable.
-        released: The controller's one-way per-DEVELOPMENT-dwell latch. Once
-            true, the destination ceiling stays released for the dwell.
+        released: The controller's one-way RUN-scoped latch. Once true, the
+            destination ceiling stays released for the rest of the RUN --
+            it survives every ``transition_to`` call, including an operator
+            resume, and is cleared only by ``start_run``.
     """
 
     ambient_temp_c: float | None
@@ -563,11 +565,11 @@ class RoastControlPolicy:
         the looser phrasing describes a different, more permissive predicate.
 
         D157 resolves the sign-of-RoR feedback hazard with an operator-chosen
-        one-way per-DEVELOPMENT-dwell latch. This method is the LATCHING
+        one-way RUN-scoped latch. This method is the LATCHING
         condition, not a live per-tick ceiling gate: once it is true, the
-        controller permanently releases the ceiling for that dwell and never
+        controller permanently releases the ceiling for the rest of the run and never
         consults RoR again for this purpose. The accepted cost is that a later
-        heat recovery cannot re-engage the ceiling in the same dwell; that
+        heat recovery cannot re-engage the ceiling for the rest of that run; that
         direction deliberately fails toward full #498 fan-brake authority.
 
         D96 recovery is the explicit exception to the intuition that heat above
