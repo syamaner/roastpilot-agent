@@ -29,11 +29,17 @@
 > and `5a32334c` gained a value (186 °C) where this report shows `n/a`, because the
 > corrected mark now lands on a telemetry row.
 >
-> **One caveat deliberately left open.** The store's frozen `development_percent` does not
-> agree with either anchoring on every roast — 10.84 / 12.58 / **14.09** — and the last
-> exceeds even the onset-derived 13.01 %, so it is out of range and suspect on that run.
-> The exporter warns on the divergence rather than picking a side. Do not treat the frozen
-> column as ground truth on these June roasts. See #792.
+> **Provenance, corrected 11 Aug.** The frozen `development_percent` is **version-stamped at
+> #337** (the FC/T0 backdating consumer, closed 23 Jun 2026), so this corpus holds **two
+> definitions of DTR**. `3fbfd888` ran 21 Jun, *before* it: its frozen 10.84 faithfully records
+> the receive-time anchor the controller used then — a version artefact, nothing to adjudicate.
+> `5a32334c` (27 Jun) agrees to **0.02 pp** (frozen 12.58 vs onset 12.60), so there is no
+> disagreement on that run at all. **Only `d251013e` is genuinely anomalous:** post-#337 and
+> MCP-sourced, its frozen 14.09 *exceeds* the onset-derived 13.01 by 1.08 pp — the wrong
+> direction for any anchoring explanation. That one outlier is the open #792 question, and it
+> is much narrower than "the frozen column disagrees". The wider consequence is that June and
+> August DTRs are **not like-for-like**, and the per-origin priors were derived across that
+> boundary. See #792.
 
 > **Read first — what these numbers mean.** This is a re-validation of the 21 Jun
 > pin (`openai/gpt-4o`, c1 prompt) against the expanded recorded corpus from roasts

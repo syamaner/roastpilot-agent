@@ -23,11 +23,22 @@
 > temperatures re-resolved (188→187, 185→183, and `5a32334c` gained 186 °C where the
 > manifest carried null).
 >
-> **⚠ A caveat the regeneration surfaced and did NOT resolve.** The store's frozen
-> `development_percent` disagrees with both anchorings on these June roasts — 10.84 /
-> 12.58 / **14.09** — and the last EXCEEDS even the onset-derived 13.01 %, so it is out of
-> range and suspect on that run. The exporter warns rather than picking a side. Do not
-> treat the frozen column as ground truth on June-era roasts. Tracked on #792.
+> **⚠ PROVENANCE the regeneration surfaced — bigger than the outlier it started as.** The
+> frozen `development_percent` is **version-stamped at #337** (closed 23 Jun 2026), so the
+> corpus holds **two definitions of DTR**: 9 runs before that boundary, 41 on or after.
+> `3fbfd888` (21 Jun) is PRE-#337, so its frozen 10.84 faithfully records the receive-time
+> anchor then in force — a version artefact, not a defect. `5a32334c` (27 Jun) agrees to
+> 0.02 pp. **Only `d251013e` is genuinely anomalous** (post-#337, MCP-sourced, frozen 14.09
+> EXCEEDING the onset-derived 13.01 by 1.08 pp — the wrong direction for any anchoring
+> explanation), and that narrow question is what #792 now owns.
+>
+> **The consequence to record before anyone re-derives a prior:** `rpd_corpus_score` reads
+> that field directly, June-versus-August DTRs are **not like-for-like**, and the per-origin
+> DTR priors were derived across the boundary. Exposure measured: of the **15 rated runs**
+> (the shipped RP-D corpus), exactly **one** is pre-#337 — `3fbfd888`. Its shipped scalar is
+> unaffected regardless, because its 203 °C drop misses the joint window by 8 °C and
+> `max(0.0, raw)` clamps before DTR can matter. **The RP-D result stands; the priors are the
+> thing to re-check.**
 >
 > **The D129 RP-B eval set was NOT regenerated, deliberately.** Its consumer #749 is cut
 > (below), and the name-to-run-id mapping is a gitignored operator-held file absent from
