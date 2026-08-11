@@ -3864,10 +3864,11 @@ async def test_recover_on_start_survives_a_frozen_doctrine_the_live_poll_interva
 
     Raising there would strand an operator with a possibly-active run and no
     route into ``operator_recovery_required``. So the clash retires the doctrine
-    for the recovered run instead: fail-safe (advisory-only, and it lands on the
-    same absent-ambient branch the freshness gate already produces) and, above
-    all, recoverable. Asserted end to end rather than on the helper, because the
-    invariant at stake is the restart one."""
+    for the recovered run instead: fail-safe (the advisor gets the same
+    absent-ambient branch the freshness gate already produces, and destination
+    enforcement is disabled) and, above all, recoverable. Asserted end to end
+    rather than on the helper, because the invariant at stake is the restart
+    one."""
     await store.create_run(
         run_id="run-doctrine-voided",
         profile=_profile(),

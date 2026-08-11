@@ -123,13 +123,14 @@ without touching it:
   model's cross-field validator and its corrected module docstring for why:
   a law that can raise heat above entry with no deterministic 196 °C anchor
   would leave the bitter line owned solely by the advisor's own judgment.
-* **Fan is unaffected.** This law is heat-only; DEVELOPMENT's fan box stays
-  the full 0-100 range the advisor already has today (D89/#498). The
-  two-lever worst case (fan crashes RoR, heat recovers, temperature climbs
-  faster) is bounded by the SAME hard, non-compounding heat cap regardless
-  of how the fan is used or how many entry/exit cycles occur — the c8
-  advisor teaching (a separate slice) is a judgment/efficiency layer on top
-  of this structural bound, not a substitute for it.
+* **Fan authority is resolved outside this heat-only law.** The D96 recovery
+  law raises heat above the effective floor, which is exactly when D156's
+  ambient-conditioned DEVELOPMENT fan ceiling can bind. The two-lever worst
+  case (fan crashes RoR, heat recovers, temperature climbs faster) is bounded
+  by the SAME hard, non-compounding heat cap regardless of how the fan is used
+  or how many entry/exit cycles occur — the c8 advisor teaching (a separate
+  slice) is a judgment/efficiency layer on top of this structural bound, not a
+  substitute for it.
 * **Diagnostics (PR #560 Codex finding):** :attr:`PostFcControlOutput.
   recovery_active` alone cannot distinguish the ``GLIDING`` tail from
   ``HOLDING`` — it flips ``False`` the instant exit is confirmed even

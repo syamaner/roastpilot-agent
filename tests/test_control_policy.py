@@ -162,6 +162,36 @@ def test_no_clamp_at_or_above_threshold(ambient: float) -> None:
     )
 
 
+def test_ceiling_at_unrestricted_maximum_never_reports_engaged() -> None:
+    """A configured ceiling at the unrestricted 0-100 maximum narrows nothing,
+    so it must not be reported as engaged (#800 fold round): engagement means
+    the box narrowed, and a ceiling at 100 is indistinguishable from the
+    feature being off.
+
+    100 is the ONLY value reachable today (the field's own upper bound is
+    ``le=100``, so pydantic rejects anything higher before the predicate ever
+    sees it). The production predicate still tests ``>=`` rather than ``==``
+    — a deliberately defensive bound against that field's ceiling ever
+    moving, not a claim that a value above 100 is constructible now.
+    """
+    policy = RoastControlPolicy(
+        SafetyLimits(),
+        _PROFILE,
+        ambient_fan_doctrine=AmbientFanDoctrine(
+            enabled=True,
+            post_fc_fan_ceiling_enabled=True,
+            post_fc_fan_ceiling_percent=100,
+        ),
+    )
+    assert policy.post_fc_fan_ceiling_engaged(_BINDING_POST_FC_FAN_SIGNAL) is False
+    assert (
+        policy.limits_for(
+            RoastPhase.DEVELOPMENT, post_fc_fan_signal=_BINDING_POST_FC_FAN_SIGNAL
+        ).fan_ceiling_percent
+        == 100
+    )
+
+
 def test_carve_out_releases_when_heat_at_floor_and_climbing() -> None:
     """Fan remains unrestricted when it is the only brake left (#498)."""
     policy = RoastControlPolicy(
@@ -259,20 +289,15 @@ def test_default_constructed_policy_ignores_a_binding_signal() -> None:
     )
 
 
-def test_unknown_floor_with_a_falling_ror_still_binds() -> None:
-    """An unknown floor satisfies only the HEAT half of the carve-out.
-
-    ``post_fc_heat_floor_percent=None`` means the loop is not engaged. Release is
-    conjunctive, so an unknown floor with a flat or falling bean still clamps —
-    the negative-RoR leg the unknown-directions test leaves unpinned.
-    """
+def test_unknown_floor_with_a_falling_ror_never_binds() -> None:
+    """An unknown effective floor preserves full #498 fan authority."""
     policy = RoastControlPolicy(
         SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
     )
     signal = PostFcFanSignal(23.1, 70, None, -1.0)
     assert (
         policy.limits_for(RoastPhase.DEVELOPMENT, post_fc_fan_signal=signal).fan_ceiling_percent
-        == 70
+        == 100
     )
 
 
@@ -350,6 +375,52 @@ def test_fan_clamp_becomes_reachable_through_the_narrowed_box() -> None:
     assert evaluation.rule == "command_bounds"
     assert evaluation.adjusted_fan == 70
     assert evaluation.adjusted_heat == 70
+
+
+def test_released_signal_preserves_full_fan_range() -> None:
+    """A latched D157 signal keeps the DEVELOPMENT destination unrestricted."""
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    signal = PostFcFanSignal(
+        ambient_temp_c=23.1,
+        current_heat_percent=70,
+        post_fc_heat_floor_percent=25,
+        bean_ror_c_per_min=-1.0,
+        released=True,
+    )
+
+    assert (
+        policy.limits_for(RoastPhase.DEVELOPMENT, post_fc_fan_signal=signal).fan_ceiling_percent
+        == 100
+    )
+
+
+@pytest.mark.parametrize(
+    ("current_heat", "ror", "released", "expected"),
+    [
+        (25, 4.0, False, True),
+        (70, 4.0, False, False),
+        (25, 0.0, False, False),
+        (25, 4.0, True, True),
+    ],
+)
+def test_fan_ceiling_release_due_uses_live_conjunction_and_ignores_latch(
+    current_heat: int, ror: float, released: bool, expected: bool
+) -> None:
+    """The public latching condition is conjunctive and latch-independent."""
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    signal = PostFcFanSignal(
+        ambient_temp_c=23.1,
+        current_heat_percent=current_heat,
+        post_fc_heat_floor_percent=25,
+        bean_ror_c_per_min=ror,
+        released=released,
+    )
+
+    assert policy.fan_ceiling_release_due(signal) is expected
 
 
 @pytest.mark.parametrize("phase", _PRE_FC_PHASES)

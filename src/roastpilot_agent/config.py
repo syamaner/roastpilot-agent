@@ -1104,8 +1104,9 @@ class AmbientFanDoctrine(BaseModel):
     temperature-short drops to advisor fan aggression crashing the rate of
     rise, and the corpus put both crash roasts in the two coolest rooms
     (23.1 / 23.5 °C) while fan 100 at 25-31 °C repeatedly cupped fine. So the
-    doctrine is CONDITIONAL on ambient, never a blanket softening: #498's full
-    fan capability (including fan 100) is unchanged.
+    doctrine is CONDITIONAL on ambient, never a blanket softening. D156 may
+    ceiling-bind a cool-room destination while heat retains downward authority;
+    D157 preserves #498's full fan capability once fan may be the only brake.
 
     Both numbers live here, as DATA, rather than as constants written into the
     ``c11`` prose, which stays digit-free under test. Two reasons: the #218
@@ -1143,13 +1144,22 @@ class AmbientFanDoctrine(BaseModel):
     through the existing ``command_bounds`` clamp, never through a new safety
     rule. The optional fan slew clamp stays out because it bounds the step, not
     the destination.
+
+    Prompt selection is deliberately decoupled from both doctrine flags. They
+    may be true while ``c3`` (the live default) supplies no ambient teaching; in
+    that case the model simply sees the resolved number in
+    ``fan_ceiling_percent``. Told == enforced still holds structurally because
+    the same resolved box feeds the context and safety evaluation.
     """
 
     enabled: bool = False
-    """Whether the controller feeds the doctrine's ambient context to the
-    advisor. Default ``False`` — promotion is gated on the offline
-    decision-level bake-off plus a single-variable hardware roast scored by
-    RP-D (#711), both operator-gated."""
+    """Master flag for ambient context and destination-ceiling enforcement.
+
+    When false, the controller feeds no doctrine ambient to the advisor and
+    D156's policy conjunct cannot engage. Default ``False`` — promotion is
+    gated on the offline decision-level bake-off plus a single-variable
+    hardware roast scored by RP-D (#711), both operator-gated.
+    """
 
     threshold_c: float = Field(default=26.0, gt=0.0, le=60.0)
     """The boundary ``c11`` compares ``ambient_temp_c`` against, in Celsius.
@@ -1158,6 +1168,12 @@ class AmbientFanDoctrine(BaseModel):
     HYPOTHESIS to re-fit once several roasts span the ambient range with the
     RP-D joint score attached. Ten corpus roasts (23.1-31.6 °C) show no clean
     ambient-to-fan correlation, so this is a starting point, not a pin.
+
+    Documentary boundary reconciliation (D156): c11's prose places exactly
+    ``threshold_c`` in its inclusive warm/graduated branch, while deterministic
+    enforcement uses the strict cool test and therefore does NOT clamp at exact
+    equality. This one-point divergence fails toward free fan authority and is
+    #498-safe; the policy comparison deliberately remains ``ambient >= threshold``.
 
     Bounded because it is re-fit BY HAND, which is where a typo lands: an
     unbounded field accepts 260.0 for 26.0 and silently puts every roast in
@@ -1186,26 +1202,26 @@ class AmbientFanDoctrine(BaseModel):
     * at most TWO levels. Without this, a "whole multiple" alone accepts 100.0
       — a full floor-to-ceiling move as an ORDINARY, non-emergency,
       below-threshold step. That would make the docstring line above ("bounds
-      the STEP, never the destination") false, and with no deterministic slew
-      clamp in this release nothing downstream would catch it: it just moves
-      the fan slam this doctrine exists to prevent from the prose into the
-      config. Beyond two levels a step is not graduation in any meaningful
-      sense.
+      the STEP, never the destination") false. No deterministic SLEW clamp
+      catches it: D156/D157's distinct destination ceiling may narrow the box
+      while engaged, but does not turn a full-box ordinary move into graduation.
+      Beyond two levels a step is not graduation in any meaningful sense.
 
-    It bounds the STEP, never the destination: every fan value, including the
-    ceiling, stays reachable, and the teaching says so explicitly. It is also
-    subordinate to the fan-brake rule — when heat is at its floor and the bean
-    is still climbing, fan is the only brake left and graduation does not
-    apply."""
+    It bounds the STEP, never the destination: every fan value through the
+    currently told ceiling stays reachable. D156/D157 may separately narrow
+    that destination while engaged. The pace teaching remains subordinate to
+    the fan-brake rule — when heat is at its floor and the bean is still
+    climbing, fan is the only brake left and graduation does not apply."""
 
     max_reading_age_seconds: float = Field(default=90.0, gt=0.0, le=600.0)
-    """How old a live ambient reading may be and still reach the advisor (#732).
+    """How old ambient may be and still reach doctrine context or policy (#732).
 
-    Unlike the two fields above, this one is **controller-only**: it gates what
-    the controller populates and is never surfaced into ``AdvisorContext``, so
-    no prompt ever sees it. The group now holds knobs for two audiences —
-    ``threshold_c`` and ``step_max_pp`` are told to the model, this is not — and
-    a fourth field should say which it is.
+    Unlike the two fields above, this one is **controller-only**: it gates the
+    ambient value the controller supplies to both ``AdvisorContext`` and D156's
+    predicate, but the age limit itself is never surfaced into
+    ``AdvisorContext``, so no prompt sees it. The group holds knobs for two
+    audiences — ``threshold_c`` and ``step_max_pp`` are told to the model, this
+    is not — and a future field should say which it is.
 
     ``c11`` selects a fan regime by comparing ``ambient_temp_c`` against
     :attr:`threshold_c`, so a stale reading does not degrade gracefully — it
@@ -1244,7 +1260,14 @@ class AmbientFanDoctrine(BaseModel):
     """Whether the destination ceiling is deterministically ENFORCED on the
     DEVELOPMENT fan box (11 Aug ratification / D156, superseding the 6 Aug
     prompt-only posture). Default ``False``; enforcement also requires the
-    master :attr:`enabled` flag."""
+    master :attr:`enabled` flag and a known effective heat floor. In practice,
+    that means the post-FC control loop is engaged and has produced an output.
+    With the loop inert, the floor stays unknown and the ceiling cannot bind.
+    Likewise, if bean rate-of-rise is missing on the first-crack engagement
+    tick, the loop produces no output, the release latch arms for the whole run,
+    and the ceiling never binds. This is #498-safe, but an A/B run with that
+    single-tick RoR gap silently holds no airflow constant, just as surely as
+    enabling the doctrine flags without the loop."""
 
     post_fc_fan_ceiling_percent: int = Field(default=70, ge=10, le=100)
     """The DEVELOPMENT fan destination ceiling in a cool room, in percent.

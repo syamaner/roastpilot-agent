@@ -1713,10 +1713,10 @@ def test_c11_qualifies_the_fan_brake_and_does_not_regress_high_ambient_fan() -> 
     So the section must (1) explicitly QUALIFY rather than cancel the
     fan-as-active-brake teaching spliced above it; (2) sanction an aggressive
     regime up to the context fan ceiling when at/above the boundary, and name
-    the hot-room failure mode; (3) leave the fan ceiling and every fan value
-    available below the boundary too — changing the PACE, never capping the
-    lever; and (4) keep the c3 brake teaching itself byte-for-byte intact in
-    the assembled c11 (the qualification is additive, not a rewrite)."""
+    the hot-room failure mode; (3) preserve every fan value up to the context
+    ceiling below the boundary too — changing the PACE, not the destination;
+    and (4) keep the c3 brake teaching itself byte-for-byte intact in the
+    assembled c11 (the qualification is additive, not a rewrite)."""
     from roastpilot_agent.advisor import (
         _C3_FAN_BRAKE_SECTION,  # pyright: ignore[reportPrivateUsage]
         _C11_AMBIENT_FAN_SECTION,  # pyright: ignore[reportPrivateUsage]
@@ -1729,9 +1729,8 @@ def test_c11_qualifies_the_fan_brake_and_does_not_regress_high_ambient_fan() -> 
     # exists to prevent is named rather than merely implied.
     assert "fan ceiling" in lowered
     assert "smoke" in lowered and "scorches" in lowered
-    # (2) below the boundary the lever is NOT capped — only the pace changes.
-    assert "the fan ceiling is unchanged" in lowered
-    assert "every fan value stays available" in lowered
+    # (2) below the boundary only the pace changes within the context box.
+    assert "up to the fan ceiling given in context" in lowered
     # (2b) the below-threshold bullet bounds the STEP by the context field
     # (D124's ~15 pp, as data) while explicitly leaving the destination open.
     # Without a bound, "graduated" permits a 30-to-85 jump and this release
@@ -1740,6 +1739,7 @@ def test_c11_qualifies_the_fan_brake_and_does_not_regress_high_ambient_fan() -> 
     assert "ambient_fan_step_max_pp" in below
     assert "bounds the STEP, not the destination" in below
     assert "including the ceiling itself" in below.lower()
+    assert "ceiling is unchanged" not in below.lower()
     # (3) the c3 brake teaching survives VERBATIM and, critically, appears
     # BEFORE the qualifier — "the fan-brake rule above" only resolves if the
     # rule really is above it in the assembled text (the #499 splice-ordering
