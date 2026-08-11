@@ -583,8 +583,8 @@
 > defined anywhere in it.** The rule is the durable part; a cached number is not.
 >
 > ```
-> cd ~/git/roastpilot-plan && git pull --ff-only
-> grep -rhoE '\bD[0-9]{1,3}\b' --include='*.md' . | sed 's/D//' | sort -n | tail -1 \
+> cd ~/git/roastpilot-plan && git pull --ff-only \
+> && grep -rhoE '\bD[0-9]+\b' --include='*.md' . | sed 's/D//' | sort -n | tail -1 \
 >   | awk '{print "D" $1+1}'
 > ```
 >
@@ -594,6 +594,15 @@
 > is exactly the collision #798 exists to prevent, and an earlier revision of this very
 > paragraph shipped without it (caught in review on PR #801). Verify the output is one
 > higher than any number you can find in the repo before you use it.
+>
+> **The `&&` after the pull is load-bearing too, and for the same reason.** Without it a
+> failed `git pull` (no network, no credentials, a non-fast-forward checkout) still lets the
+> grep run against the STALE local clone and print a plausible number. That is the same
+> fail-open direction as the defect this block closes: an authoritative-looking answer
+> derived from a repository that is behind. Chained, nothing is emitted unless the refresh
+> succeeded. The digit class is `+` rather than `{1,3}` for the same durability reason: at
+> D1000 a three-digit bound stops matching, because the trailing word boundary fails, and
+> the command would then report D1000 as free forever.
 >
 > **Why the number was deleted rather than corrected (#798, closed 11 Aug 2026).** It had
 > been asserted and gone stale FOUR times, and the correction each time merely restarted the
