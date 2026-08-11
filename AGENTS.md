@@ -737,7 +737,7 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   |-------|------|
   | `pr-preflight` | Before opening ANY PR — gates, size + data/logic split, self-critique, domain reviewers, local `codex review` |
   | `triage-pr` | Before merging — independent PR-feedback triage (→ `pr-triage`), so the author never triages its own PR (D23) |
-  | `capture` | Screenshot a named SPA page state via the replay harness (E10+) |
+  | `capture` | Screenshot a named SPA page state via the replay harness (E10+). **Needs the Playwright MCP, which `.mcp.json` scopes to Claude** — a Codex session has no such server, so use the scripted Playwright fallback there |
   | `pre-roast-preflight` | Before charging beans — hardware + software readiness checks |
   | `roast-review` | After a roast — debrief the trace against profile targets |
   | `register-roast` | After a roast — capture the operator rating (D42) and register the run as a labelled fixture |
