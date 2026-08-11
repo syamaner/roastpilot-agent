@@ -21,7 +21,15 @@
 > ceiling under *either* scope: `transition_to` clears `_post_fc_engaged` unconditionally,
 > only the true first-crack edge sets it, the post-FC loop is gated on that flag, so
 > `_last_post_fc_output` stays `None` and the predicate is declined by its floor-unknown
-> carve-out before it ever reads the latch. The path that earns the change is one edge
+> carve-out before it ever reads the latch.
+>
+> **⚠ "Run-scoped" means within one PROCESS, not across a restart.** The latch is in-memory
+> only: `RoastController.__init__` sets it `False` and the restart-recovery path does not
+> restore it, so a roast that had earned release, then restarted, resumes UNLATCHED and a
+> later second first-crack edge can narrow the ceiling again. That is accepted and unchanged
+> (a restart with a possibly-active run enters `operator_recovery_required` and never
+> auto-resumes heat or fan), and the source comment at the field says so, but the exception
+> belongs here too rather than only in the code. The path that earns the change is one edge
 > further out: `operator_recovery_required` lists `ROASTING_PRE_FIRST_CRACK` among its legal
 > targets and `api.py::_parse_resume_target` accepts it, and the true-FC-edge gate is keyed on
 > the EDGE rather than on whether first crack has already happened this run. So a resume back
@@ -576,8 +584,16 @@
 >
 > ```
 > cd ~/git/roastpilot-plan && git pull --ff-only
-> grep -rhoE '\bD[0-9]{1,3}\b' --include='*.md' . | sed 's/D//' | sort -n | tail -1
+> grep -rhoE '\bD[0-9]{1,3}\b' --include='*.md' . | sed 's/D//' | sort -n | tail -1 \
+>   | awk '{print "D" $1+1}'
 > ```
+>
+> **The `awk` step is load-bearing, not cosmetic.** Without it the pipeline prints the
+> highest number that is already SPENT, directly under a sentence promising the next FREE
+> one, so a session following this file literally would reuse a live decision number. That
+> is exactly the collision #798 exists to prevent, and an earlier revision of this very
+> paragraph shipped without it (caught in review on PR #801). Verify the output is one
+> higher than any number you can find in the repo before you use it.
 >
 > **Why the number was deleted rather than corrected (#798, closed 11 Aug 2026).** It had
 > been asserted and gone stale FOUR times, and the correction each time merely restarted the
