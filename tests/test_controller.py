@@ -5180,6 +5180,7 @@ async def test_fan_ceiling_enforcement_on_distinguishes_cold_and_hot_baseline_mo
         harness.controller.request_advisory()
         await harness.controller.tick()
 
+    assert cold.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
     assert cold.controller.snapshot().current_fan == 70
     assert hot.controller.snapshot().current_fan == 100
 
@@ -5197,6 +5198,7 @@ async def test_fan_ceiling_told_equals_enforced_at_the_consult() -> None:
     harness.controller.request_advisory()
     await harness.controller.tick()
 
+    assert harness.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
     persisted = harness.sink.advisor_decisions[-1]
     evaluation = harness.sink.evaluations[-1]
     advisory_event = _advisory_payloads(harness)[-1]
@@ -5259,6 +5261,7 @@ async def test_new_development_dwell_starts_unlatched() -> None:
     await harness.controller.tick()
 
     assert harness.controller._post_fc_fan_ceiling_released is False  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
     assert harness.controller.snapshot().current_fan == 70
 
 
@@ -7062,7 +7065,9 @@ async def _charge_through_fc(
         fc_ror_c_per_min: The ``bean_ror_c_per_min`` on that SAME reading —
             the D88 taper's engagement anchor (``PostFcRorController.reset``'s
             ``ror_at_engagement_c_per_min``). ``None`` (default) leaves the FC
-            reading's RoR unset, exercising the controller's own
+            reading's RoR unset and the post-FC fan ceiling released for that
+            dwell; doctrine tests must pass an explicit climbing value. The
+            default exercises the controller's own
             RoR-unavailable-at-engagement fallback (floors to
             ``taper_end_ror_c_per_min``) — most callers of this helper only
             care about reaching DEVELOPMENT with a real actuated pre-FC heat,
@@ -7233,6 +7238,7 @@ async def test_fan_ceiling_binds_at_the_consult_in_loop_mode() -> None:
     command_evals = [
         e for e in harness.sink.evaluations if e.rule in ("all_clear", "command_bounds")
     ]
+    assert harness.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
     assert command_evals[-1].verdict is SafetyVerdict.CLAMP
     assert command_evals[-1].adjusted_fan == 70  # the CLAMPED value, never the raw 100
     assert harness.executor.targets == []
@@ -7272,6 +7278,7 @@ async def test_release_restores_advisor_requested_fan_on_next_taper_write(
         harness.controller.request_advisory()
         await harness.controller.tick()
 
+        assert harness.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
         assert harness.controller._post_fc_desired_fan_percent == 70  # pyright: ignore[reportPrivateUsage]
         assert harness.controller._post_fc_doctrine_clamped_fan_request_percent == 100  # pyright: ignore[reportPrivateUsage]
         consult_count = len(advisor.contexts)
@@ -7344,6 +7351,7 @@ async def test_release_restores_fan_through_subsequent_advisor_timeouts() -> Non
     harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)]
     harness.controller.request_advisory()
     await harness.controller.tick()
+    assert harness.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
 
     harness.clock.advance(5.0)
     harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)]
@@ -7452,6 +7460,7 @@ async def test_told_fan_ceiling_never_renarrows_after_stale_ambient() -> None:
         harness.controller.request_advisory()
         await harness.controller.tick()
 
+    assert harness.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
     assert [context.fan_ceiling_percent for context in advisor.contexts] == [70, 100, 100]
     assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
     assert harness.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
@@ -7489,6 +7498,7 @@ async def test_ceiling_binds_while_heat_retains_downward_authority() -> None:
     harness.controller.request_advisory()
     await harness.controller.tick()
 
+    assert harness.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
     assert harness.controller._post_fc_fan_ceiling_released is False  # pyright: ignore[reportPrivateUsage]
     assert advisor.contexts[-1].fan_ceiling_percent == 70
     assert harness.controller.snapshot().current_fan == 70
@@ -7517,6 +7527,7 @@ async def test_latch_does_not_set_on_flat_or_falling_ror_at_the_floor(ror: float
     harness.controller.request_advisory()
     await harness.controller.tick()
 
+    assert harness.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
     assert harness.controller._post_fc_fan_ceiling_released is False  # pyright: ignore[reportPrivateUsage]
     assert harness.controller.snapshot().current_fan == 70
 
@@ -7546,6 +7557,7 @@ async def test_taper_write_actuates_the_consult_clamped_value_and_never_renarrow
     harness.controller.request_advisory()
     await harness.controller.tick()
 
+    assert harness.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
     assert harness.executor.targets[-1][1] == 90
     assert harness.controller.snapshot().current_fan == 90
     assert advisor.contexts[-1].fan_ceiling_percent == 70
@@ -9759,6 +9771,7 @@ async def test_heat_raise_undo_corrective_never_cuts_fan() -> None:
     harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=2.0)]
     await harness.controller.tick()
 
+    assert harness.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
     assert advisor.contexts[-1].fan_ceiling_percent == 70
     assert harness.executor.targets[-1] == (60, 90)
     assert harness.controller.snapshot().current_heat == 60

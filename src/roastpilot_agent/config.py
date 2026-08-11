@@ -1261,7 +1261,12 @@ class AmbientFanDoctrine(BaseModel):
     DEVELOPMENT fan box (11 Aug ratification / D156, superseding the 6 Aug
     prompt-only posture). Default ``False``; enforcement also requires the
     master :attr:`enabled` flag and an engaged post-FC control loop. With the
-    loop inert, the unknown heat floor releases a climbing bean immediately."""
+    loop inert, the unknown heat floor releases a climbing bean immediately.
+    Likewise, if bean rate-of-rise is missing on the first-crack engagement
+    tick, no effective floor is stashed: the release latch arms for that dwell
+    and the ceiling never binds. This is #498-safe, but an A/B run with that
+    single-tick RoR gap silently holds no airflow constant, just as surely as
+    enabling the doctrine flags without the loop."""
 
     post_fc_fan_ceiling_percent: int = Field(default=70, ge=10, le=100)
     """The DEVELOPMENT fan destination ceiling in a cool room, in percent.

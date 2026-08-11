@@ -1937,11 +1937,14 @@ class RoastController:
         # before selecting the fan for this cadence-eligible write. If fan is
         # now the only brake, the advisor's retained pre-clamp request can ride
         # this SAME coalesced, safety-evaluated taper write; the consult remains
-        # target-only and never becomes a second writer. The FC-engagement tick
-        # has no stashed effective floor yet and stays on the existing
-        # post-actuation path below; treating that startup ``None`` as a live
-        # unknown floor would release before the ceiling ever had a chance to
-        # engage.
+        # target-only and never becomes a second writer. This guard provides
+        # same-tick ordering at THIS pre-write site only; the unguarded
+        # post-actuation arming in ``tick`` still runs later in the same tick.
+        # If the taper early-returns — notably because bean RoR is missing — no
+        # effective floor is stashed, so that later site treats the floor as
+        # unknown, arms release for the dwell, and the ceiling never binds. That
+        # is deliberate and matches the documented baseline/resume carve-out:
+        # unknown brake state fails toward full #498 fan authority.
         if self._last_post_fc_output is not None:
             self._arm_post_fc_fan_release(self._post_fc_fan_signal(telemetry))
         # dt_seconds is always > 0 here: control_interval_seconds is validated
@@ -4552,6 +4555,7 @@ class RoastController:
         self._post_fc_fan_ceiling_released = True
         retained_request = self._post_fc_doctrine_clamped_fan_request_percent
         if retained_request is not None and (
+            # The None arm is defensive/unreachable; paired state cannot lower fan.
             self._post_fc_desired_fan_percent is None
             or retained_request > self._post_fc_desired_fan_percent
         ):
