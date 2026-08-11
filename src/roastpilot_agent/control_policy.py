@@ -500,6 +500,12 @@ class RoastControlPolicy:
     def post_fc_fan_ceiling_engaged(self, signal: PostFcFanSignal | None) -> bool:
         """Whether the ambient-conditioned DEVELOPMENT fan ceiling applies.
 
+        Engagement requires a known effective heat floor. When that floor is
+        unknown, policy cannot tell whether fan is the only remaining brake,
+        so rationing fan would violate the fail-toward-full-authority direction
+        required by #498. The release predicate deliberately retains its
+        separate unknown-floor-as-at-floor semantics.
+
         Args:
             signal: The current post-FC fan inputs, or ``None`` when unavailable.
 
@@ -507,9 +513,9 @@ class RoastControlPolicy:
             ``True`` only when both flags and every clamp precondition hold.
         """
         doctrine = self._ambient_fan_doctrine
-        if not (doctrine.enabled and doctrine.post_fc_fan_ceiling_enabled):
+        if not self.post_fc_fan_ceiling_enabled():
             return False
-        if signal is None:
+        if signal is None or signal.post_fc_heat_floor_percent is None:
             return False
         ambient = signal.ambient_temp_c
         if ambient is None or not math.isfinite(ambient):
@@ -517,6 +523,11 @@ class RoastControlPolicy:
         if ambient >= doctrine.threshold_c:
             return False
         return not (signal.released or self._fan_is_only_brake(signal))
+
+    def post_fc_fan_ceiling_enabled(self) -> bool:
+        """Whether both operator-controlled doctrine gates enable the ceiling."""
+        doctrine = self._ambient_fan_doctrine
+        return doctrine.enabled and doctrine.post_fc_fan_ceiling_enabled
 
     def fan_ceiling_release_due(self, signal: PostFcFanSignal) -> bool:
         """Whether a fresh post-FC signal should arm the one-way release latch.

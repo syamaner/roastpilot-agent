@@ -259,20 +259,15 @@ def test_default_constructed_policy_ignores_a_binding_signal() -> None:
     )
 
 
-def test_unknown_floor_with_a_falling_ror_still_binds() -> None:
-    """An unknown floor satisfies only the HEAT half of the carve-out.
-
-    ``post_fc_heat_floor_percent=None`` means the loop is not engaged. Release is
-    conjunctive, so an unknown floor with a flat or falling bean still clamps —
-    the negative-RoR leg the unknown-directions test leaves unpinned.
-    """
+def test_unknown_floor_with_a_falling_ror_never_binds() -> None:
+    """An unknown effective floor preserves full #498 fan authority."""
     policy = RoastControlPolicy(
         SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
     )
     signal = PostFcFanSignal(23.1, 70, None, -1.0)
     assert (
         policy.limits_for(RoastPhase.DEVELOPMENT, post_fc_fan_signal=signal).fan_ceiling_percent
-        == 70
+        == 100
     )
 
 

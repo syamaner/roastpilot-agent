@@ -4543,14 +4543,15 @@ class RoastController:
         """
         if signal is None or signal.released:
             return signal
-        ceiling_engaged = self._policy().post_fc_fan_ceiling_engaged(signal)
+        policy = self._policy()
+        if not policy.post_fc_fan_ceiling_enabled():
+            return signal
+        ceiling_engaged = policy.post_fc_fan_ceiling_engaged(signal)
         if ceiling_engaged:
             self._log_post_fc_fan_ceiling_once(action="engaged", signal=signal)
             self._post_fc_fan_ceiling_engaged_once = True
             return signal
-        if not (
-            self._post_fc_fan_ceiling_engaged_once or self._policy().fan_ceiling_release_due(signal)
-        ):
+        if not (self._post_fc_fan_ceiling_engaged_once or policy.fan_ceiling_release_due(signal)):
             return signal
         self._post_fc_fan_ceiling_released = True
         retained_request = self._post_fc_doctrine_clamped_fan_request_percent

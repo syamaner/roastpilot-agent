@@ -1260,10 +1260,11 @@ class AmbientFanDoctrine(BaseModel):
     """Whether the destination ceiling is deterministically ENFORCED on the
     DEVELOPMENT fan box (11 Aug ratification / D156, superseding the 6 Aug
     prompt-only posture). Default ``False``; enforcement also requires the
-    master :attr:`enabled` flag and an engaged post-FC control loop. With the
-    loop inert, the unknown heat floor releases a climbing bean immediately.
+    master :attr:`enabled` flag and a known effective heat floor. In practice,
+    that means the post-FC control loop is engaged and has produced an output.
+    With the loop inert, the floor stays unknown and the ceiling cannot bind.
     Likewise, if bean rate-of-rise is missing on the first-crack engagement
-    tick, no effective floor is stashed: the release latch arms for that dwell
+    tick, the loop produces no output, the release latch arms for that dwell,
     and the ceiling never binds. This is #498-safe, but an A/B run with that
     single-tick RoR gap silently holds no airflow constant, just as surely as
     enabling the doctrine flags without the loop."""
