@@ -2,6 +2,67 @@
 
 ## Active Epic
 
+> **STATUS UPDATE — 11 Aug 2026 (overnight: the fixture-anchor defect is CLOSED,
+> the non-finite family is finished, and six follow-ups are filed). Read with the
+> 10 Aug evening block below.**
+>
+> **#779 CLOSED via PR #784.** `store_to_fixture` anchored both marks on
+> `roast_events` rows, which the agent stamps at the first-crack/T0 **confirmation**
+> while the controller honours the MCP's backdated **onset** (#337). Measured on the
+> fixture's own clock (the controller tick clock the exporter reads, not the wall
+> clock): **22.20 s** at first crack, **10.86 s** at T0. The two errors partly offset,
+> netting **3.07 pp low** — enough to turn a roast that **HIT** its 16 % DTR target
+> into one reading 3 pp under-developed. `charge_seconds` now resolves from
+> `roast_runs.t0_detected_at_utc` and `first_crack_seconds` from
+> `raw_state_json.first_crack_status.detected_at_utc`, each mapped onto the
+> run-relative clock by the nearest telemetry row (rows carry both clocks, so the
+> mapping self-calibrates). **Validated on the real store: 13.2 → 16.3 %** against a
+> frozen 16.2693 (residual 0.031 pp), first crack 179.0 → 177.0 °C, drop unchanged.
+> **This was a hard dependency of #749**, whose baseline arm is c10, the
+> DTR-*trusting* prompt — building that harness first would have calibrated it
+> against bad fixtures.
+>
+> **⚠ OPERATOR ACTION, GATES #749: regenerate the store-sourced fixtures**, including
+> the D129 RP-B eval set, before #749 runs. No store-sourced fixture is tracked in
+> git, so this is a local data step. The before → after table on #784 makes the
+> regeneration self-checking.
+>
+> **#757 in flight as PR #790** — the read/serialisation sibling of the #756
+> non-finite family. The SSE half is the real defect: a bare `NaN` token made the
+> SPA's `parseData` return `{}` and discard the **entire frame** every affected tick.
+> **The REST half's premise is corrected, not implemented:** the claimed 500 on
+> `GET /api/roasts/{run_id}` does not reproduce (28 API routes, 0 untyped), and the
+> `null` comes from FastAPI's `dump_json` fast path rather than from pydantic —
+> `model_dump(mode="json")` keeps a raw `inf`. The first cut set
+> `default_response_class=FiniteJSONResponse`, which **disabled that fast path on 26
+> of 28 routes** at ~5.2–5.5× serialisation cost on the same event loop as the 1 Hz
+> controller tick; caught by the pre-open `safety-reviewer` pass and removed.
+>
+> **Six follow-ups filed, each with reachability established against the real store
+> rather than argued:**
+> **#783** (two siblings of #779's class: `store.py:1833` `fc_at`, and
+> `plant_model_arx_study.py` FC anchors);
+> **#785** (history `dev_pct` orders by a resettable tick);
+> **#786** (`store_to_fixture` and `rpd_corpus_score` re-derive the same UTC-parse and
+> nearest-row tie-break);
+> **#787** (**an agent restart resets tick AND `elapsed_seconds` together** — the same
+> five runs — so exported fixture row times are non-monotonic for them, independent of
+> the anchor fix; three candidate resolutions, operator to choose);
+> **#788** (exporter cross-check hygiene: degenerate mark sets escape the warning,
+> string-based onset dedup, imprecise fallback wording);
+> **#789** (non-finite required telemetry temperatures now serialise `null` while TS
+> declares them non-null).
+>
+> **`scripts/rpd_corpus_score.py` is immune to the clock-reset class** — it reads
+> `ORDER BY id ASC`. The shipped RP-D corpus result (15 scored / 3 HITs) stands.
+>
+> **Process note worth keeping.** Three separate findings across #784 — the tick
+> ordering, the restart clock, and the operator-override gate — were **one mistake in
+> three shapes**: checking that a thing *existed* when what mattered was whether its
+> *precondition or provenance* held. The #790 finding was the inverse: a guard
+> ratified as free defence-in-depth was actively disabling the mechanism that made
+> the code correct. Both are recorded as classes to sweep rather than sites to patch.
+>
 > **STATUS UPDATE — 10 Aug 2026, EVENING (the RP-B hardware arm RAN; read before
 > the merge-status block below).** The paired single-variable c10-vs-c11 hardware
 > arm that #709 was waiting for is DONE, on Guatemala Conebosque (Washed),
