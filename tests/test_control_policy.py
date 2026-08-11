@@ -16,8 +16,18 @@ import pytest
 from pydantic import ValidationError
 
 from roastpilot_agent.advisor import AdvisorContext
-from roastpilot_agent.config import LateMaillardTrim, PreFirstCrackLevers, SafetyLimits
-from roastpilot_agent.control_policy import PhaseControlLimits, RoastControlPolicy, TrimSignal
+from roastpilot_agent.config import (
+    AmbientFanDoctrine,
+    LateMaillardTrim,
+    PreFirstCrackLevers,
+    SafetyLimits,
+)
+from roastpilot_agent.control_policy import (
+    PhaseControlLimits,
+    PostFcFanSignal,
+    RoastControlPolicy,
+    TrimSignal,
+)
 from roastpilot_agent.models import RoastPhase, RoastProfile
 from roastpilot_agent.roast_history import RoastCurveSample, estimate_first_crack_eta_seconds
 from roastpilot_agent.safety import SafetyPolicy, SafetyVerdict
@@ -38,6 +48,14 @@ _ALL_PHASES = tuple(RoastPhase)
 _PRE_FC_PHASES = (RoastPhase.PREHEATING, RoastPhase.ROASTING_PRE_FIRST_CRACK)
 _NON_PRE_FC_PHASES = tuple(p for p in _ALL_PHASES if p not in _PRE_FC_PHASES)
 
+_ENFORCED_AMBIENT_FAN_DOCTRINE = AmbientFanDoctrine(enabled=True, post_fc_fan_ceiling_enabled=True)
+_BINDING_POST_FC_FAN_SIGNAL = PostFcFanSignal(
+    ambient_temp_c=23.1,
+    current_heat_percent=70,
+    post_fc_heat_floor_percent=25,
+    bean_ror_c_per_min=-1.0,
+)
+
 
 def test_limits_for_resolves_full_lever_range_outside_pre_fc() -> None:
     """Non-pre-FC phases resolve the full 0–100 heat/fan box with no deterministic
@@ -54,6 +72,235 @@ def test_limits_for_resolves_full_lever_range_outside_pre_fc() -> None:
         assert not limits.has_deterministic_target
         assert limits.heat_target_percent is None
         assert limits.fan_target_percent is None
+
+
+def test_ceiling_binds_in_a_cool_room() -> None:
+    """A cool-room signal narrows only the DEVELOPMENT fan ceiling."""
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    unsignalled = policy.limits_for(RoastPhase.DEVELOPMENT)
+    narrowed = policy.limits_for(
+        RoastPhase.DEVELOPMENT, post_fc_fan_signal=_BINDING_POST_FC_FAN_SIGNAL
+    )
+
+    assert narrowed.fan_ceiling_percent == 70
+    assert (
+        narrowed.model_copy(update={"fan_ceiling_percent": unsignalled.fan_ceiling_percent})
+        == unsignalled
+    )
+
+
+@pytest.mark.parametrize("ror", [0.0, -1.0])
+def test_flat_or_falling_ror_at_the_floor_still_binds(ror: float) -> None:
+    """Only a strictly positive RoR makes fan the sole remaining brake."""
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    signal = PostFcFanSignal(
+        ambient_temp_c=23.1,
+        current_heat_percent=25,
+        post_fc_heat_floor_percent=25,
+        bean_ror_c_per_min=ror,
+    )
+    assert (
+        policy.limits_for(RoastPhase.DEVELOPMENT, post_fc_fan_signal=signal).fan_ceiling_percent
+        == 70
+    )
+
+
+def test_no_clamp_when_ambient_absent() -> None:
+    """Absent ambient, including a stale reading represented as None, fails open."""
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    signal = PostFcFanSignal(
+        ambient_temp_c=None,
+        current_heat_percent=70,
+        post_fc_heat_floor_percent=25,
+        bean_ror_c_per_min=-1.0,
+    )
+    assert (
+        policy.limits_for(RoastPhase.DEVELOPMENT, post_fc_fan_signal=signal).fan_ceiling_percent
+        == 100
+    )
+
+
+@pytest.mark.parametrize("ambient", [float("nan"), float("-inf"), float("inf")])
+def test_no_clamp_on_non_finite_ambient(ambient: float) -> None:
+    """Every non-finite public signal value preserves full fan authority."""
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    signal = PostFcFanSignal(
+        ambient_temp_c=ambient,
+        current_heat_percent=70,
+        post_fc_heat_floor_percent=25,
+        bean_ror_c_per_min=-1.0,
+    )
+    assert (
+        policy.limits_for(RoastPhase.DEVELOPMENT, post_fc_fan_signal=signal).fan_ceiling_percent
+        == 100
+    )
+
+
+@pytest.mark.parametrize("ambient", [26.0, 31.6])
+def test_no_clamp_at_or_above_threshold(ambient: float) -> None:
+    """The cool-room branch is strictly below the configured threshold."""
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    signal = PostFcFanSignal(
+        ambient_temp_c=ambient,
+        current_heat_percent=70,
+        post_fc_heat_floor_percent=25,
+        bean_ror_c_per_min=-1.0,
+    )
+    assert (
+        policy.limits_for(RoastPhase.DEVELOPMENT, post_fc_fan_signal=signal).fan_ceiling_percent
+        == 100
+    )
+
+
+def test_carve_out_releases_when_heat_at_floor_and_climbing() -> None:
+    """Fan remains unrestricted when it is the only brake left (#498)."""
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    signal = PostFcFanSignal(
+        ambient_temp_c=23.1,
+        current_heat_percent=25,
+        post_fc_heat_floor_percent=25,
+        bean_ror_c_per_min=2.0,
+    )
+    assert (
+        policy.limits_for(RoastPhase.DEVELOPMENT, post_fc_fan_signal=signal).fan_ceiling_percent
+        == 100
+    )
+
+
+def test_carve_out_unknowns_release_their_conjunct() -> None:
+    """Unknown RoR or floor fails toward keeping full fan brake authority."""
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    signals = (
+        PostFcFanSignal(23.1, 25, 25, None),
+        PostFcFanSignal(23.1, 25, 25, float("nan")),
+        PostFcFanSignal(23.1, 70, None, 2.0),
+    )
+    for signal in signals:
+        assert (
+            policy.limits_for(RoastPhase.DEVELOPMENT, post_fc_fan_signal=signal).fan_ceiling_percent
+            == 100
+        )
+
+
+def test_binds_when_heat_above_floor_even_while_climbing() -> None:
+    """Pin the 10 Aug arm's shape against the superseded base-ceiling form.
+
+    Heat ~70 against floor 25 in a cool room while the bean climbs leaves ~45 pp
+    of downward heat-brake authority. Fan is NOT the only brake, so the ceiling
+    MUST hold. The superseded "at or below base ceiling" form got this exact case
+    wrong and would bind only by the accident of recovery elevating heat above
+    that base ceiling.
+    """
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    signal = PostFcFanSignal(23.1, 70, 25, 2.0)
+    assert (
+        policy.limits_for(RoastPhase.DEVELOPMENT, post_fc_fan_signal=signal).fan_ceiling_percent
+        == 70
+    )
+
+
+def test_heat_below_floor_also_releases() -> None:
+    """The carve-out tolerates an off-by-one or downward-collapsed box."""
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    signal = PostFcFanSignal(23.1, 20, 25, 2.0)
+    assert (
+        policy.limits_for(RoastPhase.DEVELOPMENT, post_fc_fan_signal=signal).fan_ceiling_percent
+        == 100
+    )
+
+
+def test_flag_off_is_a_total_no_op() -> None:
+    """Both master and destination flags independently gate enforcement."""
+    doctrines = (
+        AmbientFanDoctrine(enabled=True, post_fc_fan_ceiling_enabled=False),
+        AmbientFanDoctrine(enabled=False, post_fc_fan_ceiling_enabled=True),
+    )
+    for doctrine in doctrines:
+        policy = RoastControlPolicy(SafetyLimits(), _PROFILE, ambient_fan_doctrine=doctrine)
+        assert (
+            policy.limits_for(
+                RoastPhase.DEVELOPMENT,
+                post_fc_fan_signal=_BINDING_POST_FC_FAN_SIGNAL,
+            ).fan_ceiling_percent
+            == 100
+        )
+
+
+def test_only_development_narrows() -> None:
+    """Cooling/lifecycle stay full-range and pre-FC keeps its lever-derived box."""
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    assert (
+        policy.limits_for(
+            RoastPhase.COOLING, post_fc_fan_signal=_BINDING_POST_FC_FAN_SIGNAL
+        ).fan_ceiling_percent
+        == 100
+    )
+    other_non_pre_fc = (
+        phase
+        for phase in _NON_PRE_FC_PHASES
+        if phase not in (RoastPhase.DEVELOPMENT, RoastPhase.COOLING)
+    )
+    for phase in other_non_pre_fc:
+        assert (
+            policy.limits_for(
+                phase, post_fc_fan_signal=_BINDING_POST_FC_FAN_SIGNAL
+            ).fan_ceiling_percent
+            == 100
+        )
+    for phase in _PRE_FC_PHASES:
+        assert policy.limits_for(
+            phase, post_fc_fan_signal=_BINDING_POST_FC_FAN_SIGNAL
+        ) == policy.limits_for(phase)
+
+
+def test_unsignalled_call_is_unchanged() -> None:
+    """Existing callers keep the full DEVELOPMENT box with both flags on."""
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    assert policy.limits_for(RoastPhase.DEVELOPMENT) == RoastControlPolicy(
+        SafetyLimits(), _PROFILE
+    ).limits_for(RoastPhase.DEVELOPMENT)
+
+
+def test_fan_clamp_becomes_reachable_through_the_narrowed_box() -> None:
+    """The existing command-bounds rule enforces the narrowed fan destination."""
+    limits = SafetyLimits()
+    policy = RoastControlPolicy(
+        limits, _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    box = policy.limits_for(RoastPhase.DEVELOPMENT, post_fc_fan_signal=_BINDING_POST_FC_FAN_SIGNAL)
+    evaluation = SafetyPolicy(limits).evaluate_command(
+        requested_heat=70,
+        requested_fan=100,
+        seconds_since_last_command=None,
+        bounds=box,
+    )
+
+    assert evaluation.verdict is SafetyVerdict.CLAMP
+    assert evaluation.rule == "command_bounds"
+    assert evaluation.adjusted_fan == 70
+    assert evaluation.adjusted_heat == 70
 
 
 @pytest.mark.parametrize("phase", _PRE_FC_PHASES)
