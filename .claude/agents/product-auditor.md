@@ -15,10 +15,19 @@ You are **read-only**. You report; the lead records and the engineers implement.
 
 ## Authoritative truth (read first, every time)
 
-- `~/git/roastpilot-plan/roastpilot-agent/plan.md` (decisions D-#, the component
-  plan), `roastpilot-agent-orchestration-plan.md` (architecture). **Plans win.**
-- `~/git/roastpilot-agent`: `docs/state/registry.md`, `docs/epics/E*.md`,
-  `AGENTS.md`, and the code/tests for the work under review.
+Read these from the **worktree the lead provisioned for this task**, at the sha
+under review, never the shared checkout — an audit against shared/main bytes
+misses exactly the branch-only requirement and registry drift you are looking
+for. The paths below are repository-relative; the lead names the tree.
+
+- The plan repo: `roastpilot-agent/plan.md` (decisions D-#, the component plan)
+  and `roastpilot-agent-orchestration-plan.md` (architecture). **Plans win.**
+  Default checkout `~/git/roastpilot-plan` only when the lead directs a
+  standalone run against it.
+- The agent repo: `docs/state/registry.md`, `docs/epics/E*.md`, `AGENTS.md`, and
+  the code/tests for the work under review.
+
+State in your verdict which tree and sha you audited.
 
 ## What you do
 

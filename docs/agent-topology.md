@@ -416,9 +416,10 @@ This topology is ready when:
   role definitions they bind**, not only stated here. Delivered by **#733**
   (Aug 2026).
   §7 binds every **read-only** role, so the criterion is satisfied only when all
-  eight carry the controls: `mcp-contract-checker`, `planning-architect`,
-  `pr-triage`, `qa`, `safety-reviewer`, `security-reviewer`, `sim-roast-runner`
-  and `ui-reviewer`. (`story-planner`, added by D152, is read-only but carries
+  nine carry the controls: `mcp-contract-checker`, `planning-architect`,
+  `pr-triage`, `product-auditor`, `qa`, `safety-reviewer`, `security-reviewer`,
+  `sim-roast-runner` and `ui-reviewer`. (`product-auditor` joined this roster in
+  #802, when it was narrowed from the write-capable `product-pm`.) (`story-planner`, added by D152, is read-only but carries
   no shell at all — no Bash, no Edit/Write — so the §7 mutate-then-restore
   hazard cannot arise for it and it does not gate this criterion. The §7
   own-worktree requirement still binds its READS: its agent definition
@@ -428,15 +429,15 @@ This topology is ready when:
   All eleven Bash-capable role definitions carry the controls, and
   `tests/test_agent_worktree_controls.py` guards their **presence**, not
   comprehension. Carrying the rule in all
-  eight prompts does not on its own satisfy this criterion: because a read-only
+  nine prompts does not on its own satisfy this criterion: because a read-only
   role cannot create its own worktree, the lead-side provisioning and
   `git worktree list` verification required by §8 item 6 must be in force too,
-  or every invocation still starts in the shared checkout with eight compliant
+  or every invocation still starts in the shared checkout with nine compliant
   prompts. The two Bash-capable
   WRITING roles (`engineer-be`, `engineer-fe`) fall outside §7 as
   written, but the mutate-then-restore hazard is identical for them — an
   implementer runs mutation tests as readily as a reviewer — so #733 covered
-  all eleven even though only the eight gate this criterion. Enumerated
+  all eleven even though only the nine gate this criterion. Enumerated
   rather than sampled because an earlier draft named four: a partial list can be
   fully satisfied while most bound roles remain able to repeat the incident. Added because §7 declares those rules normative while
   the roles it binds are silent on them, so without this criterion the topology
