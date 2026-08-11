@@ -1202,12 +1202,7 @@ class RoastStore:
 
     @staticmethod
     def _optional_float(value: object) -> float | None:
-        """Read a nullable numeric SQLite column as ``float | None``.
-
-        Shared by every optional REAL projection (roasted weight, ambient
-        triad, #342) so a ``None`` row value stays ``None`` rather than
-        coercing to ``0.0``. Legacy non-finite values also project as absent in
-        the read model, including for non-wire consumers."""
+        """Project one nullable numeric SQLite value as a finite float or ``None``."""
         if value is None:
             return None
         converted = float(cast("float", value))
@@ -1887,7 +1882,7 @@ class RoastStore:
                         charge_weight_grams=corrected_charge or profile.bean_weight_grams,
                         roasted_weight_grams=roasted_weight,
                     ),
-                    development_percent=None if row["dev_pct"] is None else float(row["dev_pct"]),
+                    development_percent=self._optional_float(row["dev_pct"]),
                     advisor_consults=int(row["advisor_consults"]),
                     advisor_failed=int(row["advisor_failed"]),
                     advisor_clamped=int(row["advisor_clamped"]),
@@ -2034,9 +2029,7 @@ class RoastStore:
             TimelineEvent(
                 kind=RoastEventKind(str(row["kind"])),
                 source=RoastEventSource(str(row["source"])),
-                monotonic_seconds=None
-                if row["monotonic_seconds"] is None
-                else float(row["monotonic_seconds"]),
+                monotonic_seconds=self._optional_float(row["monotonic_seconds"]),
                 recorded_at_utc=str(row["recorded_at_utc"]),
                 payload=_loads(row["payload_json"]),
             )
@@ -2329,7 +2322,8 @@ class RoastStore:
         usable = [
             row
             for row in pre_drop_rows
-            if row["charge_elapsed_seconds"] is not None and row["bean_temp_c"] is not None
+            if self._optional_float(row["charge_elapsed_seconds"]) is not None
+            and self._optional_float(row["bean_temp_c"]) is not None
         ]
         if not usable:
             return None

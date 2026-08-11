@@ -13,6 +13,7 @@ from typing import Any, cast, get_args
 import pydantic
 import pytest
 
+import roastpilot_agent.models as models_module
 from roastpilot_agent.models import (
     DEFAULT_ROAST_STYLE,
     ROAST_STYLE_TARGETS,
@@ -118,6 +119,34 @@ def test_sse_event_render_does_not_mutate_shared_data() -> None:
     assert original_nested["value"] is non_finite
     assert original_items[0] is non_finite
     assert math.isnan(non_finite)
+
+
+def test_sse_event_render_reuses_sanitized_data_for_all_subscribers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fan-out renders pay the recursive sanitising cost only on first render."""
+    calls = 0
+    original = sanitize_non_finite
+
+    def counting_sanitizer(value: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(models_module, "sanitize_non_finite", counting_sanitizer)
+    event = SseEvent(
+        event=SseEventType.TELEMETRY,
+        data={"nested": [{"value": float("nan")}]},
+        id=12,
+    )
+
+    first = event.render()
+    first_render_calls = calls
+    second = event.render()
+
+    assert first_render_calls > 0
+    assert calls == first_render_calls
+    assert second == first
 
 
 def test_wire_model_float_fields_are_sanitized_by_reflection() -> None:

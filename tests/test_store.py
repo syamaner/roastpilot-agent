@@ -1026,6 +1026,59 @@ async def test_telemetry_read_projects_persisted_non_finite_float_as_absent(
 
 
 @pytest.mark.asyncio
+async def test_list_runs_projects_non_finite_development_percent_as_absent(
+    tmp_store: RoastStore,
+) -> None:
+    """History cannot admit a legacy non-finite development percentage."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.record_telemetry(
+            run_id="run-1",
+            tick=1,
+            agent_phase=RoastPhase.DEVELOPMENT,
+            elapsed_seconds=5.0,
+            interval_seconds=0.0,
+            telemetry=None,
+            development_percent=12.5,
+        )
+        await tmp_store.connection.execute(
+            "UPDATE telemetry_snapshots SET development_percent = ? WHERE run_id = ?",
+            (float("inf"), "run-1"),
+        )
+        await tmp_store.connection.commit()
+
+        [summary] = await tmp_store.list_runs()
+        assert summary.development_percent is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_timeline_projects_non_finite_monotonic_seconds_as_absent(
+    tmp_store: RoastStore,
+) -> None:
+    """Timeline reads cannot admit a legacy non-finite monotonic timestamp."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.RUN_STARTED,
+            source=RoastEventSource.CONTROLLER,
+            monotonic_seconds=1.0,
+        )
+        await tmp_store.connection.execute(
+            "UPDATE roast_events SET monotonic_seconds = ? WHERE run_id = ?",
+            (float("-inf"), "run-1"),
+        )
+        await tmp_store.connection.commit()
+
+        [event] = (await tmp_store.read_timeline("run-1")).events
+        assert event.monotonic_seconds is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_telemetry_read_preserves_insertion_order_across_tick_restart(
     tmp_store: RoastStore,
 ) -> None:
@@ -4210,6 +4263,65 @@ async def test_load_reference_roast_composes_find_and_build(tmp_store: RoastStor
 
         # No qualifying reference for a bean nobody has roasted.
         assert await tmp_store.load_reference_roast("ethiopia-nope-yet", 250.0) is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_load_reference_roast_drops_non_finite_required_curve_samples(
+    tmp_store: RoastStore,
+) -> None:
+    """Rows without finite required time/temperature never enter the curve."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        await tmp_store.create_run(
+            run_id="non-finite-curve",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        rows = (
+            (1, RoastPhase.ROASTING_PRE_FIRST_CRACK, 600.0, 180.0, None),
+            (2, RoastPhase.ROASTING_PRE_FIRST_CRACK, 605.0, 184.0, None),
+            (3, RoastPhase.DEVELOPMENT, 612.0, 188.0, 1.0),
+            (4, RoastPhase.DEVELOPMENT, 715.0, 190.0, 15.1),
+        )
+        for tick, phase, charge_elapsed, bean_temp, dev_pct in rows:
+            await _record_row(
+                tmp_store,
+                "non-finite-curve",
+                tick,
+                phase=phase,
+                charge_elapsed=charge_elapsed,
+                bean_temp=bean_temp,
+                dev_pct=dev_pct,
+            )
+        await tmp_store.connection.execute(
+            "UPDATE telemetry_snapshots SET bean_temp_c = ? WHERE run_id = ? AND tick = ?",
+            (float("inf"), "non-finite-curve", 2),
+        )
+        await tmp_store.connection.execute(
+            "UPDATE telemetry_snapshots SET charge_elapsed_seconds = ?"
+            " WHERE run_id = ? AND tick = ?",
+            (float("-inf"), "non-finite-curve", 3),
+        )
+        await tmp_store.connection.commit()
+        await tmp_store.complete_run(
+            run_id="non-finite-curve",
+            outcome="completed",
+            agent_phase=RoastPhase.COMPLETE,
+        )
+        await tmp_store.set_operator_rating("non-finite-curve", rating=5)
+
+        reference = await tmp_store.load_reference_roast(slug, 250.0)
+        assert reference is not None
+        assert [(sample.t_s, sample.bean_c) for sample in reference.curve] == [
+            (600.0, 180.0),
+            (715.0, 190.0),
+        ]
     finally:
         await tmp_store.close()
 
