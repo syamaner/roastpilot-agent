@@ -27,7 +27,7 @@ _EXPECTED: dict[str, tuple[str, str]] = {
     "mcp-contract-checker": ("claude-sonnet-5", "medium"),
     "sim-roast-runner": ("claude-sonnet-5", "medium"),
     "pr-triage": ("claude-sonnet-5", "high"),
-    "product-pm": ("claude-sonnet-5", "high"),
+    "product-auditor": ("claude-sonnet-5", "high"),
     "qa": ("claude-sonnet-5", "high"),
     "security-reviewer": ("claude-sonnet-5", "high"),
     "ui-reviewer": ("claude-sonnet-5", "high"),
