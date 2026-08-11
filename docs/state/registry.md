@@ -2,6 +2,8 @@
 
 ## Active Epic
 
+**11 Aug 2026 — #781 closed by slice 2: D156/D157 wire the flag-gated post-FC fan destination ceiling and one-way per-dwell release latch.**
+
 > **STATUS UPDATE — 11 Aug 2026 (the #792 data refresh is DONE; three control decisions
 > ratified; #749 is CUT).** Read before the overnight block below.
 >
