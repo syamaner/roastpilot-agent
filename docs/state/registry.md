@@ -493,6 +493,15 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
+> **⚠ DO NOT FOLLOW THE NUMBER IN THIS PARAGRAPH — IT IS STALE (11 Aug 2026, #798).**
+> D153, D154, D155 and D156 have ALL been spent since it was written; the highest defined
+> anywhere in `~/git/roastpilot-plan` is **D156** (`roastpilot-agent/plan.md:135`), so the
+> next free is **D157** — but **re-derive it at use time** rather than trusting that number
+> too, because this paragraph has now gone stale four times. The derivation RULE below is
+> sound and is the part to keep; only the cached number rots. **#798** owns removing the
+> cached number entirely, which is the actual fix. The rest of this paragraph is retained
+> as written so the rule and its rationale stay legible:
+>
 > Next free plan decision number: **D153**. D150 is SPENT — it is the decision
 > that settled this very question, recorded in `00-repository-structure.md` on
 > 9 Aug 2026: **one shared D-number series for the whole `roastpilot-plan` repo,
@@ -555,6 +564,9 @@
 > across all five formats on 9 Aug 2026 the highest number defined anywhere was
 > D150; D151 and D152 have been spent since (see above), so the highest defined
 > anywhere is now D152 and the free number above (**D153**) follows from it.
+> **⚠ STALE as of 11 Aug 2026 (#798), same as the paragraph above:** D153-D156 are all spent,
+> the highest defined anywhere is **D156**, and the next free is **D157** — re-derived at use
+> time, not read from here.
 >
 > D125 records the RP-D eval-model
 > correction — discriminates only on hardware/simulator, not replay; D124 records
