@@ -125,8 +125,16 @@ class PostFcFanSignal:
         ambient_temp_c: The doctrine-gated ambient temperature, or ``None``
             when unavailable, stale, malformed, or disabled.
         current_heat_percent: The heat the controller is actuating this tick.
-        post_fc_heat_floor_percent: The loop's effective floor for this step,
-            or ``None`` when the loop is not engaged.
+        post_fc_heat_floor_percent: The loop's effective floor for this step
+            (``min(heat_floor_percent, effective_ceiling_percent)`` after D88's
+            downward box collapse), or ``None`` when the loop is not engaged.
+            ``None`` satisfies only the HEAT half of the carve-out, not the
+            carve-out itself: an unknown floor with a flat or falling RoR still
+            clamps, because release is conjunctive. Supply the loop's own
+            ``effective_floor_percent``, never the command box's narrowed
+            ``heat_floor_percent`` — that one is narrowed to the actuated heat,
+            which would make the floor test true on essentially every tick and
+            permanently release the ceiling.
         bean_ror_c_per_min: The current bean rate-of-rise, or ``None`` when
             unavailable.
     """
@@ -511,11 +519,31 @@ class RoastControlPolicy:
     def _fan_is_only_brake(self, signal: PostFcFanSignal) -> bool:
         """Whether heat cannot brake while the bean may still be climbing.
 
+        Release is deliberately CONJUNCTIVE: both heat at its effective floor AND
+        a possibly-climbing bean. Heat bottomed out with RoR flat or falling does
+        NOT release the ceiling, because the roast is under control and the
+        fan-slam this ceiling exists to prevent is still the failure mode. State
+        it as the conjunction rather than as "released once heat bottoms out" —
+        the looser phrasing describes a different, more permissive predicate.
+
+        Slice-2 hazard, recorded here because the predicate lives in this file:
+        with heat pinned at its floor, FAN is the sole remaining input to the
+        sign of RoR, and the sign of RoR gates fan's own ceiling. That is a loop.
+        Measured on this code, cool room, heat at floor 25: RoR ``+0.1`` resolves
+        to ceiling 100, RoR ``0.0`` to ceiling 70. Wired without damping, fan 100
+        flattens RoR, the ceiling engages, fan drops to 70, RoR turns positive
+        and the ceiling releases again — and the advisor is TOLD a box flipping
+        between 70 and 100 with no explanation, the told-instability shape #563
+        burned on. ``post_fc_deadband_threshold_percent`` is a HEAT deadband and
+        will not damp it. Before wiring, slice 2 must add either a one-way latch
+        (release for the rest of the run once heat first reaches its effective
+        floor) or an RoR margin.
+
         Args:
             signal: The current post-FC fan inputs.
 
         Returns:
-            ``True`` when heat is at its effective floor and RoR may be positive.
+            ``True`` when heat is at its effective floor AND RoR may be positive.
         """
         ror = signal.bean_ror_c_per_min
         may_be_climbing = ror is None or not math.isfinite(ror) or ror > 0.0

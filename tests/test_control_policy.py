@@ -227,6 +227,55 @@ def test_heat_below_floor_also_releases() -> None:
     )
 
 
+def test_both_flags_off_is_a_total_no_op() -> None:
+    """The default doctrine — both flags off — ignores even a binding signal.
+
+    ``test_flag_off_is_a_total_no_op`` covers the two one-flag-on shapes; this
+    pins the shipped default, which is the state every existing deployment runs.
+    """
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE, ambient_fan_doctrine=AmbientFanDoctrine())
+    assert (
+        policy.limits_for(
+            RoastPhase.DEVELOPMENT, post_fc_fan_signal=_BINDING_POST_FC_FAN_SIGNAL
+        ).fan_ceiling_percent
+        == 100
+    )
+
+
+def test_default_constructed_policy_ignores_a_binding_signal() -> None:
+    """Slice 1 is a runtime no-op for every EXISTING caller.
+
+    Constructed the way the controller constructs it (`controller.py` passes no
+    ``ambient_fan_doctrine``), a binding signal must still resolve the full
+    0-100 fan box. Asserted directly rather than left implied by the conjunction
+    of the flag tests, because this is the property the slice actually claims.
+    """
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE)
+    assert (
+        policy.limits_for(
+            RoastPhase.DEVELOPMENT, post_fc_fan_signal=_BINDING_POST_FC_FAN_SIGNAL
+        ).fan_ceiling_percent
+        == 100
+    )
+
+
+def test_unknown_floor_with_a_falling_ror_still_binds() -> None:
+    """An unknown floor satisfies only the HEAT half of the carve-out.
+
+    ``post_fc_heat_floor_percent=None`` means the loop is not engaged. Release is
+    conjunctive, so an unknown floor with a flat or falling bean still clamps —
+    the negative-RoR leg the unknown-directions test leaves unpinned.
+    """
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    signal = PostFcFanSignal(23.1, 70, None, -1.0)
+    assert (
+        policy.limits_for(RoastPhase.DEVELOPMENT, post_fc_fan_signal=signal).fan_ceiling_percent
+        == 70
+    )
+
+
 def test_flag_off_is_a_total_no_op() -> None:
     """Both master and destination flags independently gate enforcement."""
     doctrines = (

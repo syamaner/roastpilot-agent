@@ -1145,18 +1145,6 @@ class AmbientFanDoctrine(BaseModel):
     the destination.
     """
 
-    def __init__(self, **data: object) -> None:
-        """Construct the doctrine from heterogeneous configuration values.
-
-        Pydantic validates every supplied value against its declared field type;
-        the broad input shape preserves model-copy and typed override helpers that
-        forward values for different fields through one keyword mapping.
-
-        Args:
-            **data: Field values to validate.
-        """
-        super().__init__(**data)
-
     enabled: bool = False
     """Whether the controller feeds the doctrine's ambient context to the
     advisor. Default ``False`` — promotion is gated on the offline
