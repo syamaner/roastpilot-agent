@@ -2,6 +2,62 @@
 
 ## Active Epic
 
+> **STATUS UPDATE — 11 Aug 2026 (the #792 data refresh is DONE; three control decisions
+> ratified; #749 is CUT).** Read before the overnight block below.
+>
+> **The post-#779 regeneration ran** (operator-authorised). All three `agent-store` corpus
+> entries were re-exported on the corrected onset anchors, and
+> `docs/advisor/store-roast-corpus-manifest.json` plus
+> `docs/advisor/postfc-validation-2026-06-28.md` now carry the corrected figures.
+> **Directions were derived per roast, never assumed, and they genuinely differ in sign:**
+> `3fbfd888` 10.8 → **11.5** (+0.7), `d251013e` 11.1 → **12.9** (+1.8),
+> `5a32334c` 12.7 → **12.6** (−0.1). The lone downward move is structural: that roast's
+> first crack is operator-marked, #784 leaves the FC mark alone, so only the denominator
+> moved. Cross-checked from first principles against the store's own event timestamps
+> (DTR via onset = 11.57 / 12.60 / 13.01 %; the exporter reproduces each to ~0.1 pp).
+>
+> **The validation report's central conclusion SURVIVES** — Colombia Washed roasts still
+> under-develop against the 17–18 % per-origin prior, now at 12.6 / 12.9 %. Two statements
+> did not: `d251013e` **has since been rated 3/5**, so the corpus carries two labelled
+> bake-off entries rather than one and that action item is discharged; and first-crack
+> temperatures re-resolved (188→187, 185→183, and `5a32334c` gained 186 °C where the
+> manifest carried null).
+>
+> **⚠ A caveat the regeneration surfaced and did NOT resolve.** The store's frozen
+> `development_percent` disagrees with both anchorings on these June roasts — 10.84 /
+> 12.58 / **14.09** — and the last EXCEEDS even the onset-derived 13.01 %, so it is out of
+> range and suspect on that run. The exporter warns rather than picking a side. Do not
+> treat the frozen column as ground truth on June-era roasts. Tracked on #792.
+>
+> **The D129 RP-B eval set was NOT regenerated, deliberately.** Its consumer #749 is cut
+> (below), and the name-to-run-id mapping is a gitignored operator-held file absent from
+> this machine. Inventing the mapping would have silently calibrated against the wrong
+> roasts — a worse outcome than not regenerating.
+>
+> **#749 IS CUT (operator spend decision, 11 Aug), and #740 goes with it.** Its purpose
+> was to inform an RP-B verdict hardware already delivered on 10 Aug. Do not start it and
+> do not write a contract for it. **#708 and #710 also stay unkicked**: a curve-driven
+> RoR-setpoint design was raised and deliberately NOT started, on the #567 precedent
+> (built across three slices, then parked on a negative bake-off). Offline support is
+> directional only — 4-star median required-RoR 4.9 vs 3-star 6.5, overlapping ranges,
+> n=16. Raise the design question BEFORE any contract, not after.
+>
+> **Three ratifications recorded.** **#781** — the post-FC fan **destination** ceiling
+> (value 70 = physical level 7, flag-gated default OFF), superseding the 6 Aug prompt-only
+> ratification; recorded as **D156** in the plan repo. The filed menu's slew clamp was
+> rejected because it bounds the step, not the destination, which is exactly what c11
+> already did. **#787** — option 1, refuse to export a non-monotonic telemetry clock.
+> **#793** filed for the ratified split-out: post-FC heat authority is silently inherited
+> from the pre-FC trim and nothing says so.
+>
+> **A correction worth keeping.** #781's carve-out was briefed as "heat at or below its
+> post-FC base ceiling"; both authoritative sources (c11's prose at `config.py:1195-1197`
+> and the issue) say **heat at its floor**. The paraphrase drifted and was caught by the
+> contract pass, not by a gate. Three of today's defects were the same shape — a durable
+> text written correctly once, then re-stated slightly wrong downstream (this, the
+> follow-up count below, and #758's body describing as open a half that had already
+> shipped in `6bd4944`). **Quote the authoritative line; do not summarise it.**
+
 > **STATUS UPDATE — 11 Aug 2026 (overnight: the fixture-anchor defect is CLOSED,
 > the non-finite family is finished, and seven follow-ups are filed). Read with the
 > 10 Aug evening block below.**
@@ -61,21 +117,29 @@
 > of 28 routes** at ~5.2–5.5× serialisation cost on the same event loop as the 1 Hz
 > controller tick; caught by the pre-open `safety-reviewer` pass and removed.
 >
-> **Seven follow-ups filed. Six had reachability established against the real store
-> rather than argued:**
-> **#783** (two siblings of #779's class: `store.py:1833` `fc_at`, and
-> `plant_model_arx_study.py` FC anchors);
-> **#785** (history `dev_pct` orders by a resettable tick);
-> **#786** (`store_to_fixture` and `rpd_corpus_score` re-derive the same UTC-parse and
-> nearest-row tie-break);
-> **#787** (**an agent restart resets tick AND `elapsed_seconds` together** — the same
-> five runs — so exported fixture row times are non-monotonic for them, independent of
-> the anchor fix; three candidate resolutions, operator to choose);
-> **#788** (exporter cross-check hygiene: degenerate mark sets escape the warning,
-> string-based onset dedup, imprecise fallback wording);
-> **#789** (non-finite required telemetry temperatures now serialise `null` while TS
-> declares them non-null). The seventh, **#792**, came from the review of this very
-> block: committed advisor reports carry pre-#779 confirmation-anchored figures.
+> **Seven follow-ups were filed overnight; THREE remain open** (corrected 11 Aug — the
+> original wording read as seven live tickets). Six had reachability established against
+> the real store rather than argued.
+>
+> **Open:** **#787** (**an agent restart resets tick AND `elapsed_seconds` together** —
+> the same five runs — so exported fixture row times are non-monotonic for them,
+> independent of the anchor fix). Its precondition is now settled from the store: none of
+> the five is in the corpus manifest, none carries an operator rating, all are
+> `faulted`/`aborted`, and all five have `ambient_captured = 0`, so none can be in the
+> D129 ambient eval set either. **Operator ratified option 1 (refuse to export, fail
+> closed) on 11 Aug.** **#789** (non-finite required telemetry temperatures now serialise
+> `null` while TS declares them non-null). **#792** (committed advisor reports carried
+> pre-#779 confirmation-anchored figures — **regenerated 11 Aug**, see the block below).
+>
+> **Closed as consolidation or notes**, so the count above is not a live backlog:
+> **#783** (two siblings of #779's class) and **#785** (history `dev_pct` orders by a
+> resettable tick) folded into #787's class sweep, as did **#788** (exporter cross-check
+> hygiene); **#786** (shared UTC-parse / nearest-row tie-break) closed won't-fix.
+>
+> **The aggregate is the lesson, not any one of them.** Seven filings against two closed
+> stories took the board from 38 to 43 overnight and four were retracted within a day.
+> Each was individually defensible; filing is not free, and one issue owning a class beats
+> N issues that are its instances.
 >
 > **`scripts/rpd_corpus_score.py` is immune to the clock-reset class** — it reads
 > `ORDER BY id ASC`. The shipped RP-D corpus result (15 scored / 3 HITs) stands.
