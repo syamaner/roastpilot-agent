@@ -97,6 +97,7 @@ async def _record_marks(
         kind=RoastEventKind.FIRST_CRACK,
         source=RoastEventSource.CONTROLLER,
         monotonic_seconds=_MONOTONIC_OFFSET + first_crack_s,
+        payload={"source": RoastEventSource.MCP.value},
     )
     await store.record_event(
         run_id=run_id,
@@ -234,6 +235,7 @@ async def _synthetic_store(
         kind=RoastEventKind.FIRST_CRACK,
         source=RoastEventSource.CONTROLLER,
         monotonic_seconds=_MONOTONIC_OFFSET + first_crack_s,
+        payload={"source": RoastEventSource.MCP.value},
     )
     await store.record_event(
         run_id=run_id,
@@ -607,6 +609,85 @@ async def test_first_crack_onset_without_accepted_event_is_not_exportable(
         match=r"lacks required marks: \['first_crack_detected'\]",
     ):
         s2f.convert(db_path, tmp_path / "fixture")
+
+
+@pytest.mark.asyncio
+async def test_operator_first_crack_event_overrides_pending_mcp_onset(tmp_path: Path) -> None:
+    """An operator acceptance remains authoritative over pending MCP state."""
+    db_path = tmp_path / "operator-first-crack.sqlite3"
+    store = await _backdated_store(db_path)
+    await store.connection.execute(
+        "UPDATE roast_events SET payload_json = ? WHERE run_id = ? AND kind = ?",
+        (
+            json.dumps({"bean_temp_c": 171.7, "source": RoastEventSource.OPERATOR.value}),
+            "backdated-run",
+            RoastEventKind.FIRST_CRACK.value,
+        ),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    entry = s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    _, ground = bakeoff_replay.load_roast(out_dir / "roast.jsonl")
+    confirmation_temp = round(60.0 + (194.0 - 60.0) * (600.0 / 720.0), 1)
+
+    assert entry["first_crack_anchor"] == "event_row"
+    assert ground.first_crack_seconds == 600.0
+    assert ground.first_crack_seconds != _BACKDATED_FIRST_CRACK_SECONDS
+    assert summary["first_crack_temp_c"] == confirmation_temp
+    assert summary["development_time_percent"] == pytest.approx(17.9, abs=0.05)
+
+
+@pytest.mark.asyncio
+async def test_mcp_first_crack_event_still_uses_status_onset(tmp_path: Path) -> None:
+    """An explicitly MCP-sourced acceptance retains the preferred onset."""
+    db_path = tmp_path / "mcp-first-crack.sqlite3"
+    store = await _backdated_store(db_path)
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    entry = s2f.convert(db_path, out_dir)
+    _, ground = bakeoff_replay.load_roast(out_dir / "roast.jsonl")
+
+    assert entry["first_crack_anchor"] == "fc_status_utc"
+    assert ground.first_crack_seconds == _BACKDATED_FIRST_CRACK_SECONDS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload_json",
+    [
+        pytest.param(None, id="missing-payload"),
+        pytest.param(json.dumps({}), id="missing-source"),
+        pytest.param(json.dumps({"source": None}), id="null-source"),
+        pytest.param(json.dumps({"source": "unknown"}), id="unknown-source"),
+        pytest.param(json.dumps({"source": "MCP"}), id="wrong-case"),
+        pytest.param(json.dumps({"source": 7}), id="non-string-source"),
+        pytest.param(json.dumps([]), id="non-object-payload"),
+        pytest.param("{malformed", id="malformed-payload"),
+    ],
+)
+async def test_non_mcp_first_crack_provenance_uses_event_row(
+    tmp_path: Path, payload_json: str | None
+) -> None:
+    """Missing, malformed, or unrecognised provenance fails safe to the event."""
+    db_path = tmp_path / "non-mcp-first-crack.sqlite3"
+    store = await _backdated_store(db_path)
+    await store.connection.execute(
+        "UPDATE roast_events SET payload_json = ? WHERE run_id = ? AND kind = ?",
+        (payload_json, "backdated-run", RoastEventKind.FIRST_CRACK.value),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    entry = s2f.convert(db_path, out_dir)
+    _, ground = bakeoff_replay.load_roast(out_dir / "roast.jsonl")
+
+    assert entry["first_crack_anchor"] == "event_row"
+    assert ground.first_crack_seconds == 600.0
 
 
 @pytest.mark.asyncio

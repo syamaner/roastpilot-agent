@@ -286,6 +286,39 @@ def _event_time(connection: sqlite3.Connection, run_id: str, kind: str) -> float
     return float(row["monotonic_seconds"])
 
 
+def _first_crack_event_source(connection: sqlite3.Connection, run_id: str) -> str | None:
+    """Read provenance from the accepted first-crack event payload.
+
+    The selected row uses the same ordering and timestamp requirement as
+    :func:`_event_time`, so provenance gates the exact event that supplies the
+    fallback mark. Missing, malformed, non-object, null, and non-string payload
+    values all fail safe as unknown provenance.
+
+    Args:
+        connection: An open store connection.
+        run_id: The run id.
+
+    Returns:
+        The payload's string ``source``, or ``None`` when it is not usable.
+    """
+    row = connection.execute(
+        "SELECT payload_json FROM roast_events"
+        " WHERE run_id = ? AND kind = ? AND monotonic_seconds IS NOT NULL"
+        " ORDER BY recorded_at_utc ASC, id ASC LIMIT 1",
+        (run_id, _FIRST_CRACK_KIND),
+    ).fetchone()
+    if row is None or row["payload_json"] is None:
+        return None
+    try:
+        payload: Any = json.loads(row["payload_json"])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    source = cast(dict[str, object], payload).get("source")
+    return source if isinstance(source, str) else None
+
+
 def _parse_utc(value: str) -> datetime | None:
     """Parse an ISO-8601 instant, treating a missing offset as UTC.
 
@@ -638,10 +671,10 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
             run_started,
             mapping_block_reason,
         )
-        accepted_first_crack = _event_time(connection, resolved, _FIRST_CRACK_KIND)
+        accepted_first_crack_source = _first_crack_event_source(connection, resolved)
         first_crack_source: str | None = None
         first_crack_onset_count = 0
-        if accepted_first_crack is not None:
+        if accepted_first_crack_source == "mcp":
             first_crack_source, first_crack_onset_count = _first_crack_onset_utc(
                 connection, resolved
             )
