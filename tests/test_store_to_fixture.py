@@ -266,6 +266,42 @@ async def _synthetic_store(
     return store
 
 
+async def _sparse_store(db_path: Path, *, run_id: str, include_telemetry: bool) -> RoastStore:
+    """Build a faulted run with only a run-start event and optional one row."""
+    store = RoastStore(db_path=db_path)
+    await store.initialize()
+    await store.create_run(
+        run_id=run_id,
+        profile=_PROFILE,
+        config=AppConfig(),
+        agent_phase=RoastPhase.STARTING,
+    )
+    if include_telemetry:
+        await store.record_telemetry(
+            run_id=run_id,
+            tick=0,
+            agent_phase=RoastPhase.STARTING,
+            elapsed_seconds=0.0,
+            interval_seconds=0.0,
+            telemetry=RoastTelemetry(bean_temp_c=20.0, env_temp_c=21.0),
+            heat_level_percent=0,
+            fan_level_percent=0,
+            development_percent=None,
+        )
+    await store.record_event(
+        run_id=run_id,
+        kind=RoastEventKind.RUN_STARTED,
+        source=RoastEventSource.CONTROLLER,
+        monotonic_seconds=_MONOTONIC_OFFSET,
+    )
+    await store.complete_run(
+        run_id=run_id,
+        outcome="faulted",
+        agent_phase=RoastPhase.FAULTED,
+    )
+    return store
+
+
 _BACKDATED_ORIGIN = datetime.fromisoformat("2026-08-10T20:00:00+00:00")
 _BACKDATED_WALL_SKEW = 0.13
 _BACKDATED_T0_SECONDS = 49.0
@@ -759,34 +795,237 @@ async def test_negative_utc_mapping_falls_back_instead_of_exporting_negative_mar
 
 
 @pytest.mark.asyncio
-async def test_elapsed_clock_restart_blocks_both_preferred_anchor_mappings(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+async def test_both_telemetry_clock_axes_reset_is_refused_before_output(
+    tmp_path: Path,
 ) -> None:
-    """A reset elapsed clock restores both marks to warned event-row fallbacks."""
-    db_path = tmp_path / "elapsed-clock-reset.sqlite3"
-    store = await _backdated_store(db_path)
-    # Simulate agent recovery at the original 500-second row: wall time and
-    # insertion order continue, but elapsed_seconds restarts at 100.
+    """T1: overlapping tick/elapsed restart segments refuse before mkdir."""
+    db_path = tmp_path / "both-clock-axes-reset.sqlite3"
+    run_id = "both-clock-axes-reset"
+    store = await _synthetic_store(db_path, run_id=run_id, outcome="faulted")
     await store.connection.execute(
-        "UPDATE telemetry_snapshots SET elapsed_seconds = elapsed_seconds - 400.0"
-        " WHERE run_id = ? AND elapsed_seconds >= 500.0",
-        ("backdated-run",),
+        "UPDATE telemetry_snapshots"
+        " SET tick = tick - 100, elapsed_seconds = elapsed_seconds - 500.0"
+        " WHERE run_id = ? AND tick >= 100",
+        (run_id,),
     )
     await store.connection.commit()
     await store.close()
 
     out_dir = tmp_path / "fixture"
-    entry = s2f.convert(db_path, out_dir)
-    warning = capsys.readouterr().err
-    _, ground = bakeoff_replay.load_roast(out_dir / "roast.jsonl")
+    with pytest.raises(s2f.FixtureConversionError) as exc_info:
+        s2f.convert(db_path, out_dir, run_id)
 
-    assert entry["charge_anchor"] == "event_row"
-    assert entry["first_crack_anchor"] == "event_row"
-    assert warning.count("detected clock restart") == 2
-    assert ground.t0_seconds == 60.0
-    assert ground.first_crack_seconds == 600.0
-    assert ground.drop_seconds == 720.0
-    assert ground.first_crack_seconds != 175.0  # post-reset UTC mapping
+    message = str(exc_info.value)
+    assert run_id in message
+    assert "tick 99 -> 0" in message
+    assert "elapsed_seconds 495.0 -> 0.0" in message
+    assert "agent restarts reset the run-relative clock" in message
+    assert not out_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_elapsed_only_clock_reset_is_refused(tmp_path: Path) -> None:
+    """T2: elapsed reversal is refused while ticks remain strictly increasing."""
+    db_path = tmp_path / "elapsed-only-clock-reset.sqlite3"
+    run_id = "elapsed-only-reset"
+    store = await _synthetic_store(db_path, run_id=run_id, outcome="faulted")
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET elapsed_seconds = elapsed_seconds - 500.0"
+        " WHERE run_id = ? AND tick >= 100",
+        (run_id,),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    with pytest.raises(s2f.FixtureConversionError) as exc_info:
+        s2f.read_store_roast(db_path, run_id)
+
+    message = str(exc_info.value)
+    assert "elapsed_seconds 495.0 -> 0.0" in message
+    assert "tick " not in message
+
+
+@pytest.mark.asyncio
+async def test_tick_only_clock_reset_is_refused(tmp_path: Path) -> None:
+    """T3: a tick-only reset is refused even while elapsed time stays monotonic."""
+    db_path = tmp_path / "tick-only-clock-reset.sqlite3"
+    store = await _synthetic_store(db_path, run_id="tick-only-reset", outcome="faulted")
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET tick = tick - 100 WHERE run_id = ? AND tick >= 100",
+        ("tick-only-reset",),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    with pytest.raises(s2f.FixtureConversionError) as exc_info:
+        s2f.convert(db_path, tmp_path / "fixture", "tick-only-reset")
+
+    message = str(exc_info.value)
+    assert "tick 99 -> 0" in message
+    assert "elapsed_seconds" not in message
+
+
+@pytest.mark.asyncio
+async def test_monotonic_telemetry_clock_exports_normally(tmp_path: Path) -> None:
+    """T4: a normal strictly increasing clock remains exportable."""
+    db_path = tmp_path / "monotonic-clock.sqlite3"
+    store = await _synthetic_store(db_path, run_id="monotonic-clock")
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    entry = s2f.convert(db_path, out_dir, "monotonic-clock")
+
+    assert entry["run_id"] == "monotonic-clock"
+    assert (out_dir / "roast.jsonl").is_file()
+    assert (out_dir / "summary.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_null_elapsed_clock_uses_tick_fallback(tmp_path: Path) -> None:
+    """T5: legacy all-NULL elapsed values export via the tick fallback."""
+    db_path = tmp_path / "null-elapsed-clock.sqlite3"
+    run_id = "null-elapsed-clock"
+    store = await _synthetic_store(db_path, run_id=run_id)
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET elapsed_seconds = NULL WHERE run_id = ?",
+        (run_id,),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir, run_id)
+    rows = [json.loads(line) for line in (out_dir / "roast.jsonl").read_text().splitlines()]
+    telemetry_seconds = [row["monotonic_seconds"] for row in rows if row["type"] == "telemetry"]
+
+    assert telemetry_seconds[:3] == [0.0, 1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_single_telemetry_row_reaches_missing_marks_refusal(tmp_path: Path) -> None:
+    """T6: a one-row clock passes the guard and fails honestly on marks."""
+    db_path = tmp_path / "single-row.sqlite3"
+    run_id = "single-row"
+    store = await _sparse_store(db_path, run_id=run_id, include_telemetry=True)
+    await store.close()
+
+    with pytest.raises(s2f.FixtureConversionError) as exc_info:
+        s2f.convert(db_path, tmp_path / "fixture", run_id)
+
+    message = str(exc_info.value)
+    assert "lacks required marks" in message
+    assert "telemetry clock" not in message
+
+
+@pytest.mark.asyncio
+async def test_no_telemetry_uses_existing_refusal(tmp_path: Path) -> None:
+    """T7: no telemetry retains its existing, distinct diagnosis."""
+    db_path = tmp_path / "no-telemetry.sqlite3"
+    run_id = "no-telemetry"
+    store = await _sparse_store(db_path, run_id=run_id, include_telemetry=False)
+    await store.close()
+
+    with pytest.raises(s2f.FixtureConversionError) as exc_info:
+        s2f.convert(db_path, tmp_path / "fixture", run_id)
+
+    message = str(exc_info.value)
+    assert message == f"run {run_id} has no telemetry snapshots"
+    assert "telemetry clock" not in message
+
+
+@pytest.mark.asyncio
+async def test_non_finite_elapsed_clock_is_refused_in_its_own_terms(
+    tmp_path: Path,
+) -> None:
+    """T8: positive infinity is invalid without claiming a backwards step."""
+    db_path = tmp_path / "non-finite-elapsed.sqlite3"
+    run_id = "non-finite-elapsed"
+    store = await _synthetic_store(db_path, run_id=run_id, outcome="faulted")
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET elapsed_seconds = ? WHERE run_id = ? AND tick = 100",
+        (float("inf"), run_id),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    with pytest.raises(s2f.FixtureConversionError) as exc_info:
+        s2f.convert(db_path, tmp_path / "fixture", run_id)
+
+    message = str(exc_info.value)
+    assert "elapsed_seconds has non-finite value inf" in message
+    assert "elapsed_seconds 495.0 ->" not in message
+
+
+@pytest.mark.asyncio
+async def test_first_elapsed_clock_violation_remains_deterministic(tmp_path: Path) -> None:
+    """A later non-finite value does not replace the first elapsed violation."""
+    db_path = tmp_path / "multiple-elapsed-violations.sqlite3"
+    run_id = "multiple-elapsed-violations"
+    store = await _synthetic_store(db_path, run_id=run_id, outcome="faulted")
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET elapsed_seconds = 0.0 WHERE run_id = ? AND tick = 100",
+        (run_id,),
+    )
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET elapsed_seconds = ? WHERE run_id = ? AND tick = 110",
+        (float("inf"), run_id),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    with pytest.raises(s2f.FixtureConversionError) as exc_info:
+        s2f.read_store_roast(db_path, run_id)
+
+    message = str(exc_info.value)
+    assert "elapsed_seconds 495.0 -> 0.0" in message
+    assert "non-finite" not in message
+
+
+@pytest.mark.asyncio
+async def test_cli_announces_clock_refusal_before_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T9: the CLI announces a both-axis refusal and leaves no directory."""
+    db_path = tmp_path / "cli-clock-reset.sqlite3"
+    run_id = "cli-clock-reset"
+    store = await _synthetic_store(db_path, run_id=run_id, outcome="faulted")
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots"
+        " SET tick = tick - 100, elapsed_seconds = elapsed_seconds - 500.0"
+        " WHERE run_id = ? AND tick >= 100",
+        (run_id,),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    result = s2f.main([str(db_path), "--run-id", run_id, "--out-dir", str(out_dir)])
+    captured = capsys.readouterr()
+
+    assert result == 1
+    assert captured.err.startswith("error:")
+    assert "tick" in captured.err
+    assert "elapsed_seconds" in captured.err
+    assert not out_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_equal_telemetry_clock_values_are_not_reversals(tmp_path: Path) -> None:
+    """Equal consecutive values on either clock axis remain exportable."""
+    db_path = tmp_path / "equal-clock-values.sqlite3"
+    run_id = "equal-clock-values"
+    store = await _synthetic_store(db_path, run_id=run_id)
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET tick = 99, elapsed_seconds = 495.0"
+        " WHERE run_id = ? AND tick = 100",
+        (run_id,),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    entry = s2f.convert(db_path, tmp_path / "fixture", run_id)
+
+    assert entry["run_id"] == run_id
 
 
 @pytest.mark.asyncio
@@ -908,10 +1147,10 @@ async def test_frozen_dtr_cross_check_boundary(
 
 
 @pytest.mark.asyncio
-async def test_frozen_dtr_cross_check_uses_latest_insert_after_tick_reset(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+async def test_tick_reset_is_refused_before_frozen_dtr_cross_check(
+    tmp_path: Path,
 ) -> None:
-    """A resumed run's low tick but later insertion supplies the frozen DTR."""
+    """A resumed run is refused before its frozen DTR can be cross-checked."""
     db_path = tmp_path / "dtr-tick-reset.sqlite3"
     store = await _backdated_store(db_path)
     await store.connection.execute(
@@ -939,9 +1178,8 @@ async def test_frozen_dtr_cross_check_uses_latest_insert_after_tick_reset(
     await store.connection.commit()
     await store.close()
 
-    s2f.convert(db_path, tmp_path / "fixture")
-
-    assert capsys.readouterr().err == ""
+    with pytest.raises(s2f.FixtureConversionError, match="tick 9999 -> 0"):
+        s2f.convert(db_path, tmp_path / "fixture")
 
 
 @pytest.mark.asyncio

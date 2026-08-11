@@ -781,3 +781,5 @@ Format: one entry per anti-pattern.
   `scripts/plant_model_arx_study.py` remain sibling follow-up sites.
 - **Guarded by:** `tests/test_store_to_fixture.py` backdated-anchor invariant,
   temperature, provenance, fallback, ambiguity, and frozen-DTR tests.
+
+- **#787 (11 Aug 2026):** Before whole-run ordering or arithmetic assumes a telemetry clock is monotonic, scan both `tick` and non-NULL `elapsed_seconds` in immutable `telemetry_snapshots.id` order; a resettable-column `ORDER BY` sorts the defect away, while equal values and legacy NULL elapsed values remain valid and non-finite elapsed values require their own honest refusal.

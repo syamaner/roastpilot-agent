@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sqlite3
 import sys
 from dataclasses import dataclass
@@ -384,34 +385,59 @@ def _utc_to_run_seconds(
     return None if mapped < 0.0 else mapped
 
 
-def _elapsed_clock_restarted(connection: sqlite3.Connection, run_id: str) -> bool:
-    """Whether persisted elapsed seconds decrease in insertion order.
+def _telemetry_clock_violations(connection: sqlite3.Connection, run_id: str) -> list[str]:
+    """Describe the first persisted telemetry-clock violation on each axis.
 
-    A decrease proves that an agent restart reset the run-relative clock, so a
-    wall-clock instant cannot be mapped safely onto that clock without stitching
-    segments. This exporter deliberately falls back to accepted event rows
-    instead of inventing such a reconstruction.
+    Insertion order is the only trustworthy ordering because both ``tick`` and
+    ``elapsed_seconds`` can reset after an agent restart. Null elapsed values are
+    legitimate legacy rows and are skipped on that axis; non-finite values are
+    invalid clocks in their own right.
 
     Args:
         connection: An open store connection.
         run_id: The run id.
 
     Returns:
-        ``True`` when any non-null elapsed value is below its predecessor in
-        telemetry insertion order; otherwise ``False``.
+        At most one detailed violation for ``tick`` and one for
+        ``elapsed_seconds``, in that deterministic axis order.
     """
     rows = connection.execute(
-        "SELECT elapsed_seconds FROM telemetry_snapshots"
-        " WHERE run_id = ? AND elapsed_seconds IS NOT NULL ORDER BY id ASC",
+        "SELECT id, tick, elapsed_seconds FROM telemetry_snapshots"
+        " WHERE run_id = ? ORDER BY id ASC",
         (run_id,),
     ).fetchall()
-    previous: float | None = None
+    tick_violation: str | None = None
+    elapsed_violation: str | None = None
+    previous_tick: int | None = None
+    previous_elapsed: float | None = None
     for row in rows:
-        current = float(row["elapsed_seconds"])
-        if previous is not None and current < previous:
-            return True
-        previous = current
-    return False
+        row_id = int(row["id"])
+        current_tick = int(row["tick"])
+        if tick_violation is None and previous_tick is not None and current_tick < previous_tick:
+            tick_violation = f"tick {previous_tick} -> {current_tick} at telemetry row id {row_id}"
+        previous_tick = current_tick
+
+        if row["elapsed_seconds"] is None:
+            continue
+        current_elapsed = float(row["elapsed_seconds"])
+        if not math.isfinite(current_elapsed):
+            if elapsed_violation is None:
+                elapsed_violation = (
+                    "elapsed_seconds has non-finite value "
+                    f"{current_elapsed!r} at telemetry row id {row_id}"
+                )
+            continue
+        if (
+            elapsed_violation is None
+            and previous_elapsed is not None
+            and current_elapsed < previous_elapsed
+        ):
+            elapsed_violation = (
+                f"elapsed_seconds {previous_elapsed} -> {current_elapsed} "
+                f"at telemetry row id {row_id}"
+            )
+        previous_elapsed = current_elapsed
+    return [violation for violation in (tick_violation, elapsed_violation) if violation is not None]
 
 
 def _first_crack_onset_utc(connection: sqlite3.Connection, run_id: str) -> tuple[str | None, int]:
@@ -478,14 +504,11 @@ def _resolve_utc_mark(
     preferred_anchor: str,
     event_kind: str,
     run_started: float,
-    mapping_block_reason: str | None = None,
 ) -> _AnchorResolution:
     """Resolve a preferred UTC mark, falling back to its established event row."""
     fallback_reason = "source absent"
     if preferred_iso is not None:
-        if mapping_block_reason is not None:
-            fallback_reason = mapping_block_reason
-        elif _parse_utc(preferred_iso) is None:
+        if _parse_utc(preferred_iso) is None:
             fallback_reason = "source unparseable"
         else:
             mapped = _utc_to_run_seconds(connection, run_id, preferred_iso)
@@ -554,11 +577,20 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
 
     Raises:
         FileNotFoundError: If the store file does not exist.
-        FixtureConversionError: If no matching completed run exists.
+        FixtureConversionError: If no matching completed run exists or its
+            telemetry clock is invalid or non-monotonic.
     """
     connection = _connect_readonly(db_path)
     try:
         resolved = _resolve_run_id(connection, run_id)
+        clock_violations = _telemetry_clock_violations(connection, resolved)
+        if clock_violations:
+            raise FixtureConversionError(
+                f"run {resolved} telemetry clock cannot be exported: "
+                f"{'; '.join(clock_violations)}; agent restarts reset the "
+                "run-relative clock, so clock violations are refused rather "
+                "than stitched"
+            )
         # Guard: ``roasted_weight_grams`` was added in store schema v7 (#388),
         # ``corrected_charge_grams`` in v12 (#520). Real stores from roasts 3–6
         # are at v6 (both columns absent); treat either as NULL so the
@@ -650,13 +682,6 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
                 f"run {resolved} has no run_started event — event/telemetry clocks "
                 f"cannot be reconciled"
             )
-        elapsed_clock_restarted = _elapsed_clock_restarted(connection, resolved)
-        # A restart also leaves the exported telemetry rows themselves with
-        # non-monotonic times. That pre-existing fixture defect is tracked for a
-        # separate fix; this story only refuses unsafe preferred-anchor mapping.
-        mapping_block_reason = (
-            "source unmappable: detected clock restart" if elapsed_clock_restarted else None
-        )
         charge_source = (
             None
             if run_row is None or run_row["t0_detected_at_utc"] is None
@@ -669,7 +694,6 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
             "run_row_utc",
             _CHARGE_KIND,
             run_started,
-            mapping_block_reason,
         )
         accepted_first_crack_source = _first_crack_event_source(connection, resolved)
         first_crack_source: str | None = None
@@ -691,7 +715,6 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
             "fc_status_utc",
             _FIRST_CRACK_KIND,
             run_started,
-            mapping_block_reason,
         )
         frozen_row = connection.execute(
             "SELECT development_percent FROM telemetry_snapshots"
@@ -769,7 +792,8 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
 
     Raises:
         FileNotFoundError: If the store file does not exist.
-        FixtureConversionError: If no matching completed run exists.
+        FixtureConversionError: If no matching completed run exists or its
+            telemetry clock is invalid or non-monotonic.
     """
     return _read_store_roast(db_path, run_id).roast
 
@@ -1044,7 +1068,8 @@ def convert(db_path: Path, out_dir: Path, run_id: str | None = None) -> dict[str
 
     Raises:
         FileNotFoundError: If the store file does not exist.
-        FixtureConversionError: If the run is unusable (no telemetry / marks).
+        FixtureConversionError: If the run is unusable (including an invalid or
+            non-monotonic telemetry clock, no telemetry, or missing marks).
     """
     read_result = _read_store_roast(db_path, run_id)
     roast = read_result.roast
