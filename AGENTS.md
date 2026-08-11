@@ -699,7 +699,10 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   CONSULT any external model about the slice at all** — not a review of
   finished work, and equally not a design critique, an implementation
   suggestion, a debugging opinion, or a second opinion on a failing test —
-  and MUST state at handback whether it did. Scoping the ban to "review"
+  and MUST state at handback whether it **consulted** one — the disclosure
+  question must be the same question the ban asks, never the narrower "did you
+  obtain a review", or a worker that consulted answers "no" truthfully and the
+  recovery path below never fires. Scoping the ban to "review"
   would leave the same hole one word further out: a worker that asks another
   family to propose the implementation, then never calls the result a review,
   can disclose truthfully that it obtained none while the branch is still

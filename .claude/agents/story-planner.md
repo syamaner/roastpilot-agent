@@ -201,24 +201,25 @@ is what "specced" means: delegation without one is forbidden (fail-closed).
    <base-sha>` (without `-b` Git creates a detached HEAD and the handback
    commit lands on no branch), the #738 fresh-venv-in-worktree rule,
    `.venv/bin/python -m ...` invocation, the full gates before handback, the
-   rule that the worker MUST NOT obtain any external model review of its own
-   work by ANY means — the `claude` CLI, a direct provider HTTP call, a vendor
-   SDK, another agent CLI, or a hosted service — and MUST state at handback
-   whether it did. The ban covers CONSULTING an external model about the slice
-   at all, not only reviewing finished work: a design critique, an
-   implementation suggestion or a debugging opinion shapes the branch by the
-   same family that is meant to supply the independent pass, while letting the
-   worker truthfully disclose it obtained no review. Write it on the
-   capability, never on a binary name: a name-scoped ban is a lexical guard on
-   a capability problem and fails OPEN (D154). A Codex session discovers
-   `.claude/agents/` and calls those roles unprompted, and a worker that
-   reviews its own output breaks D23 and hollows out the mandatory Opus safety
-   floor. The handback disclosure is the whole verification — read-only
-   reviewers leave no git-visible artifact — and an AFFIRMATIVE disclosure
-   fails the slice closed: the lead re-delegates it from this contract in a
-   fresh worktree, or records an explicit operator decision naming which lens
-   now supplies the independent pass. State both the ban and that consequence
-   in the delegation prompt, plus
+   rule that the worker MUST NOT CONSULT any external model about the slice by
+   ANY means — the `claude` CLI, a direct provider HTTP call, a vendor SDK,
+   another agent CLI, or a hosted service — covering a design critique, an
+   implementation suggestion or a debugging opinion exactly as much as a review
+   of finished work, since each shapes the branch by the family meant to supply
+   the independent pass. **The handback disclosure MUST ask the same question
+   the ban asks** — "did you consult any external model about this slice?", not
+   "did you obtain a review" — because a disclosure narrower than its ban lets
+   a worker that consulted answer "no" truthfully and the recovery path never
+   fires. Write both on the capability, never on a binary name: a name-scoped
+   ban is a lexical guard on a capability problem and fails OPEN (D154). A
+   Codex session discovers `.claude/agents/` and calls those roles unprompted,
+   and a worker that reviews its own output breaks D23 and hollows out the
+   mandatory Opus safety floor. That disclosure is the whole verification —
+   read-only reviewers leave no git-visible artifact — and an AFFIRMATIVE
+   answer fails the slice closed: the lead re-delegates it from this contract
+   in a fresh worktree, or records an explicit operator decision naming which
+   lens now supplies the independent pass. State the ban, the disclosure
+   question and that consequence in the delegation prompt, plus
    any slice-specific fixtures or contract tests that must be regenerated.
 
    Every item in this section is MANDATORY in the generated contract, not a
