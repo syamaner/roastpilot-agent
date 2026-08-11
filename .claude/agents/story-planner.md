@@ -201,11 +201,15 @@ is what "specced" means: delegation without one is forbidden (fail-closed).
    <base-sha>` (without `-b` Git creates a detached HEAD and the handback
    commit lands on no branch), the #738 fresh-venv-in-worktree rule,
    `.venv/bin/python -m ...` invocation, the full gates before handback, the
-   rule that the worker MUST NOT invoke `claude` in any form (`claude -p`,
-   `--agent`, or otherwise) and MUST state at handback whether it invoked any
-   external reviewer — a Codex session discovers `.claude/agents/` and calls
-   those roles unprompted, and a worker that reviews its own output breaks D23
-   and hollows out the mandatory Opus safety floor — and
+   rule that the worker MUST NOT obtain any external model review of its own
+   work by ANY means — the `claude` CLI, a direct provider HTTP call, a vendor
+   SDK, another agent CLI, or a hosted service — and MUST state at handback
+   whether it did. Write it on the capability, never on a binary name: a
+   name-scoped ban is a lexical guard on a capability problem and fails OPEN
+   (D154). A Codex session discovers `.claude/agents/` and calls those roles
+   unprompted, and a worker that reviews its own output breaks D23 and hollows
+   out the mandatory Opus safety floor. The handback disclosure is the whole
+   verification — read-only reviewers leave no git-visible artifact — and
    any slice-specific fixtures or contract tests that must be regenerated.
 
    Every item in this section is MANDATORY in the generated contract, not a

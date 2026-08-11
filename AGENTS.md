@@ -694,20 +694,31 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   so no ignored secret may reach its context) with per-command
   self-location, the #738 fresh-venv-in-worktree rule, `.venv/bin/python -m
   ...` invocation, and the full gates before handback. **The worker MUST NOT
-  invoke `claude` in any form** (`claude -p`, `--agent`, or otherwise), and
-  MUST state at handback whether it invoked any external reviewer. This is
-  load-bearing, not hygiene: a Codex session **discovers `.claude/agents/` and
-  calls those roles unprompted** (observed 11 Aug 2026 with Codex coordinating
-  — nobody told it the CLI existed). Useful in the coordinator seat; in the
-  implementer seat a worker that runs `safety-reviewer` on its own output and
-  folds the findings has adjudicated its own review, breaking **D23**, and has
-  turned the mandatory Opus floor into a lens the author already shaped the
-  code to pass — which is exactly the cross-family independence that pin buys.
-  It also spends Claude credits outside the `subagents/agent-*.jsonl` tree
-  where per-model accounting looks. Deliberately a directive rather than a
-  mechanism: Codex sandbox/MCP config is operator-level, so a repo-committed
-  guard would be advisory while reading as enforcement. The lead verifies via
-  `git log` on the branch plus the handback statement. Codex's directives
+  obtain any external model review of its own work, by ANY means**, and MUST
+  state at handback whether it did. The rule is written on the CAPABILITY, not
+  on a binary name: the `claude` CLI (`claude -p`, `--agent`) is only the
+  route we happened to observe, and a worker with shell and network can reach
+  the same outcome through a direct provider HTTP call, a vendor SDK, another
+  agent CLI, or a hosted service without ever running anything named `claude`.
+  A name-scoped ban would be a lexical guard on a capability problem, which
+  fails OPEN (D154). This is load-bearing, not hygiene: a Codex session
+  **discovers `.claude/agents/` and calls those roles unprompted** (observed
+  11 Aug 2026 with Codex coordinating — nobody told it the CLI existed).
+  Useful in the coordinator seat; in the implementer seat a worker that runs
+  `safety-reviewer` on its own output and folds the findings has adjudicated
+  its own review, breaking **D23**, and has turned the mandatory Opus floor
+  into a lens the author already shaped the code to pass — which is exactly
+  the cross-family independence that pin buys. It also spends provider credits
+  outside the `subagents/agent-*.jsonl` tree where per-model accounting looks.
+  Deliberately a directive rather than a mechanism: Codex sandbox/MCP config
+  is operator-level, so a repo-committed guard would be advisory while reading
+  as enforcement. **The handback disclosure is the whole verification**, and
+  the lead should treat it that way: the review roles are read-only, so an
+  undisclosed run leaves NO git-visible artifact — findings folded into
+  ordinary commits are indistinguishable from organic work, and `git log`
+  would only ever catch a worker that also disclosed honestly. Where that
+  residual risk is unacceptable for a slice, the answer is a fresh independent
+  review of the handed-back branch, not a stronger reading of the log. Codex's directives
   are ONLY the contract's numbered sections; nonce-delimited
   `UNTRUSTED-QUOTE` blocks exist for the human ratification read and are
   STRIPPED from the delegation prompt entirely, along with every URL to
