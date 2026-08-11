@@ -4529,6 +4529,156 @@ async def test_charge_capture_still_latches_immediately_for_an_absent_probe(
     assert service.runner._ambient_persisted is True  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.asyncio
+async def test_expired_window_store_failure_cannot_be_backfilled_by_recovery(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#796 review finding: latch the expired-window DECISION, not just the write.
+
+    Reproduces the exact reachable-corruption sequence: the grace window
+    expires with the probe still malformed, the first post-expiry
+    ``set_ambient`` call fails transiently (so ``_ambient_persisted`` stays
+    False), and only THEN does the probe recover to a valid reading. Before
+    this fix, the early-return guard no longer applied once the triad stopped
+    being all-``None`` on the retry tick, so the recovered reading — taken
+    arbitrarily late in the roast, possibly during cooling next to a hot
+    roaster — would be written into the charge-time ambient columns. The fix
+    pins the expired-window triad to all-``None`` before every write attempt,
+    so the retry can only ever persist nulls.
+    """
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    raw_state = _FakeRawState(
+        _session_state(
+            fc_status="pending",
+            audio_running=False,
+            ambient_status=_ambient_status(temperature_c=float("inf")),
+        )
+    )
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+    await _drive_to_charge(service, mcp, clock)
+    assert service.runner is not None
+
+    original_set_ambient = store.set_ambient
+    calls: list[tuple[float | None, float | None, float | None]] = []
+    attempts = 0
+
+    async def _fails_once_then_succeeds(
+        run_id_arg: str,
+        *,
+        temperature_c: float | None,
+        humidity_percent: float | None,
+        pressure_hpa: float | None,
+    ) -> None:
+        nonlocal attempts
+        attempts += 1
+        calls.append((temperature_c, humidity_percent, pressure_hpa))
+        if attempts == 1:
+            raise RuntimeError("disk full")
+        await original_set_ambient(
+            run_id_arg,
+            temperature_c=temperature_c,
+            humidity_percent=humidity_percent,
+            pressure_hpa=pressure_hpa,
+        )
+
+    monkeypatch.setattr(store, "set_ambient", _fails_once_then_succeeds)
+
+    # Advance past the deadline (probe still malformed) until the first
+    # post-expiry write is attempted and fails.
+    for _ in range(40):
+        await _tick(service, clock)
+        if attempts >= 1:
+            break
+    assert attempts == 1
+    assert calls == [(None, None, None)]
+    assert service.runner._ambient_persisted is False  # pyright: ignore[reportPrivateUsage]
+
+    # The probe recovers to a valid reading before the retry tick.
+    raw_state.set_state(
+        _session_state(
+            fc_status="pending",
+            audio_running=False,
+            ambient_status=_ambient_status(
+                temperature_c=28.49, humidity_percent=38.6, pressure_hpa=1008.56
+            ),
+        )
+    )
+    await _tick(service, clock)
+
+    assert calls == [(None, None, None), (None, None, None)]
+    assert service.runner._ambient_persisted is True  # pyright: ignore[reportPrivateUsage]
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.ambient_temp_c is None
+    assert detail.ambient_humidity_pct is None
+    assert detail.ambient_pressure_hpa is None
+
+
+@pytest.mark.asyncio
+async def test_expired_window_write_stays_retryable_after_a_transient_failure(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#796: the fail-soft/retryable contract survives the latch fix — a store
+    error on the first post-expiry NULL write must not block a later tick from
+    retrying and successfully persisting nulls."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    raw_state = _FakeRawState(
+        _session_state(
+            fc_status="pending",
+            audio_running=False,
+            ambient_status=_ambient_status(temperature_c=float("inf")),
+        )
+    )
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+    await _drive_to_charge(service, mcp, clock)
+    assert service.runner is not None
+
+    original_set_ambient = store.set_ambient
+    calls: list[tuple[float | None, float | None, float | None]] = []
+    attempts = 0
+
+    async def _fails_once_then_succeeds(
+        run_id_arg: str,
+        *,
+        temperature_c: float | None,
+        humidity_percent: float | None,
+        pressure_hpa: float | None,
+    ) -> None:
+        nonlocal attempts
+        attempts += 1
+        calls.append((temperature_c, humidity_percent, pressure_hpa))
+        if attempts == 1:
+            raise RuntimeError("disk full")
+        await original_set_ambient(
+            run_id_arg,
+            temperature_c=temperature_c,
+            humidity_percent=humidity_percent,
+            pressure_hpa=pressure_hpa,
+        )
+
+    monkeypatch.setattr(store, "set_ambient", _fails_once_then_succeeds)
+
+    for _ in range(40):
+        await _tick(service, clock)
+        if attempts >= 1:
+            break
+    assert attempts == 1
+    assert service.runner._ambient_persisted is False  # pyright: ignore[reportPrivateUsage]
+
+    # Probe still malformed on the retry tick — the retry must still fire and
+    # this time succeed.
+    await _tick(service, clock)
+
+    assert attempts == 2
+    assert calls == [(None, None, None), (None, None, None)]
+    assert service.runner._ambient_persisted is True  # pyright: ignore[reportPrivateUsage]
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.ambient_temp_c is None
+
+
 @pytest.mark.parametrize(
     "charge_elapsed_seconds",
     [None, float("nan"), float("-inf"), float("inf")],

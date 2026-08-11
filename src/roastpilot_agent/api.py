@@ -1274,7 +1274,20 @@ class RoastRunner:
         write for a bounded post-charge grace period. This covers both malformed
         readings and a live runtime awaiting its first sample without turning a
         later roast reading into "ambient at charge". A store failure remains
-        fail-soft and unlatched, as before.
+        fail-soft and unlatched, as before — but once the deadline has passed,
+        the outcome for THIS run is settled as "no ambient", and that decision
+        is latched into the values written, not just into whether a write is
+        attempted. Without this, a transient ``set_ambient`` failure on the
+        first post-deadline tick leaves ``_ambient_persisted`` False; if the
+        probe then recovers before a later tick's retry, the early-return guard
+        above no longer applies (the triad is no longer ``(None, None, None)``),
+        and a reading taken arbitrarily late in the roast — possibly during
+        cooling, next to a hot roaster — would be written into the charge-time
+        ambient columns. That is exactly the mislabel class #745 removed. So the
+        expired-window triad is forced to all-``None`` before the write,
+        regardless of what the probe reports on that tick; the write itself
+        stays fail-soft and retryable (retrying a NULL write is harmless), only
+        the *values* are pinned.
 
         A ``"disabled"``/``"unavailable"`` MCP ambient config, a stopped-but-
         ``"ok"`` runtime, or another legitimately absent probe persists nulls
@@ -1298,12 +1311,18 @@ class RoastRunner:
         triad = project_recordable_ambient(state.ambient_status)
         if self._ambient_grace_deadline is None:
             self._ambient_grace_deadline = self._clock() + AMBIENT_CAPTURE_GRACE_SECONDS
+        window_expired = self._clock() > self._ambient_grace_deadline
         if (
-            triad == (None, None, None)
+            not window_expired
+            and triad == (None, None, None)
             and ambient_reading_is_live(state.ambient_status)
-            and self._clock() <= self._ambient_grace_deadline
         ):
             return
+        # Once the window has expired, the outcome is settled: pin the triad to
+        # all-None so a transient store failure below can never leave the door
+        # open for a later-recovered reading to be substituted in its place.
+        if window_expired:
+            triad = (None, None, None)
         temperature_c, humidity_percent, pressure_hpa = triad
         try:
             await self._store.set_ambient(
