@@ -864,6 +864,35 @@ def ambient_reading_token(status: AmbientStatus) -> float | None:
     return stamp
 
 
+def ambient_reading_is_malformed(status: AmbientStatus) -> bool:
+    """Whether a live ambient runtime published an unusable reading (#758).
+
+    This composes the existing liveness and recordability projections rather
+    than duplicating their rejection rules.  A live runtime that has not
+    sampled yet is absent, not malformed: all four reading fields are ``None``
+    in that state.  Unknown and non-live states likewise fail toward "not
+    malformed", preserving the existing quiet absent-probe behaviour.
+
+    Args:
+        status: The MCP ambient status from ``RoastSessionState``.
+
+    Returns:
+        ``True`` only when the runtime is affirmatively live, it published at
+        least one reading field, and the recordable projection voids the triad.
+    """
+    if not ambient_reading_is_live(status):
+        return False
+    reading = (
+        status.temperature_c,
+        status.humidity_percent,
+        status.pressure_hpa,
+        status.last_reading_monotonic_seconds,
+    )
+    if all(value is None for value in reading):
+        return False
+    return project_recordable_ambient(status) == (None, None, None)
+
+
 def project_recordable_ambient(
     status: AmbientStatus,
 ) -> tuple[float | None, float | None, float | None]:
