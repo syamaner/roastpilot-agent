@@ -144,14 +144,17 @@
 > of 28 routes** at ~5.2–5.5× serialisation cost on the same event loop as the 1 Hz
 > controller tick; caught by the pre-open `safety-reviewer` pass and removed.
 >
-> **Seven follow-ups were filed overnight; FIVE remain open** (corrected 11 Aug twice — the
-> original wording read as seven live tickets, and a later count of "three" went stale the
-> moment #783 and #788 were reopened; verified against the API, not recounted from this
-> file). Six had reachability established against the real store rather than argued.
+> **Seven follow-ups were filed overnight** (#783, #785, #786, #787, #788, #789, #792). Six
+> had reachability established against the real store rather than argued.
 >
-> **Open (five):** **#783** and **#788** — reopened 11 Aug; see the correction below for
-> why the consolidation was wrong, not repeated here. Then: **#787** (**an agent restart
-> resets tick AND `elapsed_seconds` together** —
+> **This block deliberately no longer carries an open/closed COUNT.** Three separate counts
+> here drifted within a single day, each one going stale the moment an issue was reopened,
+> and the third drift was introduced by the commit that fixed the second. A hand-maintained
+> tally beside a live board is a defect generator; **the board is the source of truth — run
+> `gh issue list` rather than trusting a number in this file.** What follows is the standing
+> context per issue, which does not rot the way a count does.
+>
+> **#787** (**an agent restart resets tick AND `elapsed_seconds` together** —
 > the same five runs — so exported fixture row times are non-monotonic for them,
 > independent of the anchor fix). Its precondition is now settled from the store: none of
 > the five is in the corpus manifest, none carries an operator rating, all are
@@ -163,31 +166,43 @@
 > single unexplained `d251013e` frozen-DTR discrepancy — frozen 14.09 against an onset-derived
 > 13.01, post-#337 and MCP-sourced, in a direction no anchoring story explains.
 >
-> **Closed as consolidation or notes**, so the count above is not a live backlog:
-> **#785** (history `dev_pct` orders by a resettable tick) folded into #787's class sweep —
-> it is genuinely an instance of that class; **#786** (shared UTC-parse / nearest-row
-> tie-break) closed won't-fix.
+> **Only #786** (shared UTC-parse / nearest-row tie-break) is closed, won't-fix.
 >
-> **CORRECTION (11 Aug, caught by Codex on #795): #783 and #788 were REOPENED.** Folding
-> them into #787 lost their scope. #787 is ratified narrowly as *refuse to export a
-> non-monotonic telemetry clock* — the resettable-**clock** class. **#783** is the
-> onset-vs-confirmation **anchor** class (#779's siblings), and
-> `scripts/plant_model_arx_study.py:382` still reads the `first_crack` **event row**
-> rather than the backdated onset, with `docs/recent-fixes.md:779-781` naming that site and
-> the history FC display as outstanding. **#788** is exporter cross-check hygiene
-> (string-based onset dedup, fallback warning, degenerate mark sets escaping the
-> cross-check), which a clock-monotonicity refusal never reaches. The repository's own fix
-> note and the board had drifted apart; the board was wrong. **The lesson is narrower than
-> "we over-filed": consolidating by surface similarity rather than by defect class silently
-> discards work, and it reads as tidy while doing it.**
+> **CORRECTION (11 Aug — #783, #785 and #788 were all REOPENED).** All three had been folded
+> into #787, and all three folds were wrong for the same reason: **#787 was ratified as one
+> narrow behaviour — *refuse to export a fixture with a non-monotonic telemetry clock* — not
+> as a class sweep.** The test that matters is not "is this an instance of the class" but
+> "**does #787's ratified FIX reach this site**", and for these three it does not:
 >
-> **The aggregate is the lesson, not any one of them.** Seven filings against two closed
-> stories took the board from 38 to 43 overnight (38 + 7 filed − 2 stories closed = 43).
-> **TWO of the seven were genuinely retracted** (#785, #786). Two more — #783, #788 — were
-> retracted and then **reopened the same day**, because the retraction was wrong; they are
-> not evidence of over-filing, they are evidence of over-consolidating. Each filing was
-> individually defensible; filing is not free, and one issue owning a class beats N issues
-> that are its instances — **but only when the issues really are instances of that class.**
+> - **#783** is the onset-vs-confirmation **anchor** class (#779's siblings), and
+>   `scripts/plant_model_arx_study.py:382` still reads the `first_crack` **event row**
+>   rather than the backdated onset; `docs/recent-fixes.md:779-781` names that site and the
+>   history FC display as outstanding.
+> - **#788** is exporter cross-check hygiene (string-based onset dedup, fallback warning,
+>   degenerate mark sets escaping the cross-check) — a clock refusal never reaches it.
+> - **#785** *is* genuinely a resettable-clock defect, and it still is not covered:
+>   `store.py:1830-1832` selects `dev_pct` with `ORDER BY t.tick DESC`, so a restart that
+>   resets `tick` makes history show a **pre-restart** DTR. Class membership was never the
+>   point; the export path and a history read are different code.
+>
+> **Two lessons, and the second is the sharper one.** First: consolidating by surface
+> similarity rather than by defect class silently discards work, and it reads as tidy while
+> doing it. Second: **#785 was reopened a full round AFTER #783 and #788, because the same
+> commit that corrected those two explicitly asserted this one was fine.** A fix applied to
+> the instances you noticed, while restating confidence about the one you did not re-derive,
+> is not a class sweep — it is the same defect wearing the fix as cover.
+>
+> **The aggregate is the lesson, not any one of them** — but the lesson INVERTED over the
+> course of 11 Aug and the inversion is the useful part. Seven filings against two closed
+> stories took the board from 38 to 43 overnight (38 + 7 filed − 2 stories closed = 43),
+> which read as over-filing, and four were promptly retracted. **Three of those four
+> retractions were then reversed the same day**, leaving exactly one (#786) that was
+> genuinely surplus. So the overnight session's real error was much smaller than the
+> next morning's correction claimed, and **the correction itself did more damage than the
+> over-filing did** — it closed three live defects. Filing is still not free, and one issue
+> owning a class still beats N issues that are its instances — **but only when the issues
+> really are instances of that class, and only when the owning issue's ratified scope
+> actually reaches them.** Retracting is not free either, and it fails silently.
 >
 > **`scripts/rpd_corpus_score.py` is immune to the clock-reset class** — it reads
 > `ORDER BY id ASC`. The shipped RP-D corpus result (15 scored / 3 HITs) stands.
