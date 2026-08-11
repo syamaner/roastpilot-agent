@@ -45,8 +45,11 @@
 > live member.
 >
 > **⚠ TWO CITATIONS IN THIS FILE WERE WRONG AND ARE CORRECTED IN PLACE.** Both carry an
-> inline `[Corrected 12 Aug 2026: …]` marker at the claim itself; find them with
-> `rg -n 'Corrected 12 Aug 2026' docs/state/registry.md` rather than by line number — an
+> inline correction marker at the claim itself, opening with a bracket, the word Corrected,
+> and this block's date; find both with
+> `rg -n '^>\s*\[Corrected 12 Aug 2026' docs/state/registry.md` rather than by line number
+> (the anchor matters: an unanchored pattern also matches this sentence and the command
+> itself, which is how the first two attempts at this line failed) — an
 > earlier draft of THIS paragraph cited them as "lines 158 and 264", which inserting this
 > block promptly falsified, in the very sentence warning about citation drift.
 > The first is the sharper one: the paragraph warning "quote the authoritative line; do not
