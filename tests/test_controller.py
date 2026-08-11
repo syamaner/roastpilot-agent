@@ -5278,8 +5278,57 @@ async def test_stale_ambient_reaches_the_predicate_as_none_and_never_clamps() ->
     assert harness.controller.snapshot().current_fan == 100
 
 
-def test_new_development_dwell_starts_unlatched() -> None:
-    """A transition clears release so a known-floor signal can bind next dwell."""
+def test_fan_ceiling_release_latch_survives_transitions_within_a_run() -> None:
+    """D157 (#781 slice-2 fold round): the release latch is RUN-scoped, not
+    dwell-scoped. Once armed it must survive every ``transition_to`` call for
+    the rest of the run — including a full COOLING → COMPLETE → IDLE →
+    STARTING → PREHEATING → ROASTING_PRE_FIRST_CRACK → DEVELOPMENT walk back
+    into a fresh dwell — unlike its per-dwell sibling
+    ``_post_fc_fan_ceiling_engaged_once``, which DOES reset.
+
+    Note: this walk calls ``transition_to(RoastPhase.STARTING)`` directly,
+    which the transition table permits but which a real run never does —
+    only ``start_run`` reaches STARTING in production. That path (and the
+    run-scoped latch's actual clearing point) is covered separately by
+    :func:`test_start_run_clears_fan_ceiling_release_latch`.
+    """
+    harness = harness_in_development(
+        readings=[],
+        config=_doctrine_on(post_fc_fan_ceiling_enabled=True),
+    )
+    releasing = PostFcFanSignal(
+        ambient_temp_c=23.1,
+        current_heat_percent=25,
+        post_fc_heat_floor_percent=25,
+        bean_ror_c_per_min=4.0,
+    )
+    harness.controller._arm_post_fc_fan_release(releasing)  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+
+    for phase in (
+        RoastPhase.COOLING,
+        RoastPhase.COMPLETE,
+        RoastPhase.IDLE,
+        RoastPhase.STARTING,
+        RoastPhase.PREHEATING,
+        RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        RoastPhase.DEVELOPMENT,
+    ):
+        harness.controller.transition_to(phase)
+        assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+
+    # The per-dwell sibling DID reset on every one of those same transitions —
+    # only the release latch is special-cased to survive within a run.
+    assert harness.controller._post_fc_fan_ceiling_engaged_once is False  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_start_run_clears_fan_ceiling_release_latch() -> None:
+    """``start_run`` is the ONE place the D157 run-scoped release latch
+    clears — never ``transition_to`` (see
+    :func:`test_fan_ceiling_release_latch_survives_transitions_within_a_run`).
+    A fresh run must always start unlatched even though the latch survived
+    every transition on the way back to IDLE."""
     harness = harness_in_development(
         readings=[],
         config=_doctrine_on(post_fc_fan_ceiling_enabled=True),
@@ -5294,26 +5343,61 @@ def test_new_development_dwell_starts_unlatched() -> None:
     assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
 
     harness.controller.transition_to(RoastPhase.COOLING)
+    harness.controller.transition_to(RoastPhase.COMPLETE)
+    harness.controller.transition_to(RoastPhase.IDLE)
+    assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+
+    await harness.controller.start_run(PROFILE)
+
     assert harness.controller._post_fc_fan_ceiling_released is False  # pyright: ignore[reportPrivateUsage]
-    for phase in (
-        RoastPhase.COMPLETE,
-        RoastPhase.IDLE,
-        RoastPhase.STARTING,
-        RoastPhase.PREHEATING,
-        RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        RoastPhase.DEVELOPMENT,
-    ):
-        harness.controller.transition_to(phase)
-    binding = PostFcFanSignal(
+
+
+def test_operator_resume_keeps_the_released_latch_unbindable() -> None:
+    """The exact scenario the D157 run-scoping was ratified for (#781
+    slice-2 fold round): heat at its floor, RoR climbing, so fan has already
+    been established as the only remaining brake and the ceiling releases —
+    then the operator resumes into a FRESH DEVELOPMENT dwell
+    (``OPERATOR_RECOVERY_REQUIRED`` → ``DEVELOPMENT``, mirroring
+    :func:`test_operator_resume_never_rations_fan_while_brake_state_unknown`).
+    Per-dwell scoping would re-narrow the ceiling on that resumed dwell;
+    run-scoped must not.
+
+    Asserts the CONSEQUENCE, not only the flag: a fresh signal that would
+    otherwise clearly bind (cool room, known floor, heat well above floor so
+    fan is NOT the only brake — the exact shape
+    ``test_binds_when_heat_above_floor_even_while_climbing`` in
+    ``test_control_policy.py`` pins as a true bind) is still declined by
+    ``post_fc_fan_ceiling_engaged`` once it carries the resumed dwell's real
+    ``released`` state. A flag-only assertion would still pass even if that
+    predicate's own consumer were rewired to ignore the flag.
+    """
+    harness = harness_in_development(
+        readings=[],
+        config=_doctrine_on(post_fc_fan_ceiling_enabled=True),
+    )
+    releasing = PostFcFanSignal(
+        ambient_temp_c=23.1,
+        current_heat_percent=25,
+        post_fc_heat_floor_percent=25,
+        bean_ror_c_per_min=4.0,  # heat AT floor + climbing: fan is the only remaining brake
+    )
+    harness.controller._arm_post_fc_fan_release(releasing)  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+
+    harness.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+
+    assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+
+    would_otherwise_bind = PostFcFanSignal(
         ambient_temp_c=23.1,
         current_heat_percent=70,
         post_fc_heat_floor_percent=25,
-        bean_ror_c_per_min=0.0,
+        bean_ror_c_per_min=2.0,
+        released=harness.controller._post_fc_fan_ceiling_released,  # pyright: ignore[reportPrivateUsage]
     )
-    harness.controller._arm_post_fc_fan_release(binding)  # pyright: ignore[reportPrivateUsage]
-
-    assert harness.controller._post_fc_fan_ceiling_released is False  # pyright: ignore[reportPrivateUsage]
-    assert harness.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
+    policy = harness.controller._policy()  # pyright: ignore[reportPrivateUsage]
+    assert policy.post_fc_fan_ceiling_engaged(would_otherwise_bind) is False
 
 
 @pytest.mark.asyncio
@@ -7482,7 +7566,9 @@ async def test_latch_releases_for_the_remainder_of_the_dwell() -> None:
 
 @pytest.mark.asyncio
 async def test_told_fan_ceiling_never_renarrows_after_stale_ambient() -> None:
-    """An engaged ceiling releases on stale ambient and stays released."""
+    """An engaged ceiling releases on stale ambient and stays released — for
+    the rest of the RUN (D157 run-scoping, #781 slice-2 fold round), not just
+    the dwell: a transition to COOLING must not re-arm it."""
     advisor = FakeAdvisor(
         [decision(heat=70, fan=30)],
         default_decision=decision(heat=70, fan=100),
@@ -7517,7 +7603,9 @@ async def test_told_fan_ceiling_never_renarrows_after_stale_ambient() -> None:
     assert harness.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
 
     harness.controller.transition_to(RoastPhase.COOLING)
-    assert harness.controller._post_fc_fan_ceiling_released is False  # pyright: ignore[reportPrivateUsage]
+    # Run-scoped: the release latch itself survives the transition...
+    assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+    # ...while its per-dwell sibling still resets, exactly as before.
     assert harness.controller._post_fc_fan_ceiling_engaged_once is False  # pyright: ignore[reportPrivateUsage]
 
 

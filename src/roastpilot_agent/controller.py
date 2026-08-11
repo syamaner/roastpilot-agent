@@ -843,8 +843,17 @@ class RoastController:
         self._post_fc_raise_suppressed_after_clamp: bool = False
         # D157: one-way release of the ambient-conditioned DEVELOPMENT fan
         # destination ceiling. The live RoR conjunction can arm it, but once
-        # armed no later RoR is consulted for this purpose. Cleared on every
-        # phase transition, making it strictly per-DEVELOPMENT-dwell state.
+        # armed no later RoR is consulted for this purpose. RUN-scoped, not
+        # dwell-scoped (operator ratification, #781 slice 2 fold round): once
+        # released within a run it stays released for the rest of that run,
+        # including across an operator resume that re-enters DEVELOPMENT — a
+        # per-dwell clear would let a resume re-narrow a ceiling that fan had
+        # already earned full release from, a strict LOSS of #498 fan
+        # authority. So this field is deliberately NOT cleared in
+        # ``transition_to``; it is cleared only in ``start_run``, once per new
+        # run. (Neither scope survives an agent restart — the latch is
+        # in-memory and a restart builds a fresh controller; restart never
+        # auto-resumes heat or fan regardless.)
         self._post_fc_fan_ceiling_released: bool = False
         # D157: whether the ambient-conditioned ceiling has bound at least
         # once in this DEVELOPMENT dwell. If any later signal would stop the
@@ -1280,10 +1289,20 @@ class RoastController:
         # drop that keeps failing finally succeeds, or the dwell ends"
         # behaviour.
         self._post_fc_raise_suppressed_after_clamp = False
-        # D157: the fan-ceiling release latch is likewise per-DEVELOPMENT-dwell
-        # state. Clear it unconditionally on every transition so a later dwell
-        # never inherits free-fan authority from an earlier one.
-        self._post_fc_fan_ceiling_released = False
+        # D157: the engaged-once / logging flags stay per-DEVELOPMENT-dwell
+        # state — clear them unconditionally on every transition, same
+        # discipline as the fields above.
+        #
+        # ``_post_fc_fan_ceiling_released`` is DELIBERATELY NOT cleared here.
+        # It is run-scoped, not dwell-scoped (operator ratification, #781
+        # slice 2 fold round): once the ceiling has released within a run, it
+        # stays released for the rest of that run, including across an
+        # operator resume that re-enters DEVELOPMENT. Per-dwell clearing would
+        # let a resume re-enter DEVELOPMENT unlatched, so the ceiling could
+        # bind again on a roast where fan had already been established as the
+        # only remaining brake — a strict LOSS of #498 fan authority relative
+        # to run-scoped. Do not "fix" this back to per-dwell; it is cleared at
+        # run start instead (see ``start_run``).
         self._post_fc_fan_ceiling_engaged_once = False
         self._post_fc_fan_ceiling_engage_logged = False
         self._post_fc_fan_ceiling_release_logged = False
@@ -3838,6 +3857,11 @@ class RoastController:
         # new roast fires on its own merits, not on a previous run's timer.
         self._advisory_policy = AdvisoryCallPolicy(self._config)
         self._consecutive_advisor_failures = 0  # new run: availability streak resets (D30)
+        # D157 (#781 slice 2 fold round): the fan-ceiling release latch is
+        # RUN-scoped, not dwell-scoped — ``transition_to`` deliberately does
+        # NOT clear it, so it must be cleared here instead, once per new run.
+        # A fresh run must start unlatched; a resumed run must not.
+        self._post_fc_fan_ceiling_released = False
         # v0.1.9 recording metadata (#176): derive an origin slug from the bean
         # profile + a per-origin roast number, and hand them to start_session so
         # set_recording_metadata fires BEFORE start_roast_session (the MCP applies

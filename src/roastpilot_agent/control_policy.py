@@ -506,6 +506,11 @@ class RoastControlPolicy:
         required by #498. The release predicate deliberately retains its
         separate unknown-floor-as-at-floor semantics.
 
+        Engagement also means the fan box is actually narrowed: a configured
+        ceiling at or above the unrestricted maximum (100) is indistinguishable
+        from the feature being off, so it must not be reported as engaged —
+        a ceiling that narrows nothing is not an engagement.
+
         Args:
             signal: The current post-FC fan inputs, or ``None`` when unavailable.
 
@@ -514,6 +519,8 @@ class RoastControlPolicy:
         """
         doctrine = self._ambient_fan_doctrine
         if not self.post_fc_fan_ceiling_enabled():
+            return False
+        if doctrine.post_fc_fan_ceiling_percent >= _LEVER_MAX_PERCENT:
             return False
         if signal is None or signal.post_fc_heat_floor_percent is None:
             return False

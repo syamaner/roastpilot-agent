@@ -162,6 +162,36 @@ def test_no_clamp_at_or_above_threshold(ambient: float) -> None:
     )
 
 
+def test_ceiling_at_unrestricted_maximum_never_reports_engaged() -> None:
+    """A configured ceiling at the unrestricted 0-100 maximum narrows nothing,
+    so it must not be reported as engaged (#800 fold round): engagement means
+    the box narrowed, and a ceiling at 100 is indistinguishable from the
+    feature being off.
+
+    100 is the ONLY value reachable today (the field's own upper bound is
+    ``le=100``, so pydantic rejects anything higher before the predicate ever
+    sees it). The production predicate still tests ``>=`` rather than ``==``
+    — a deliberately defensive bound against that field's ceiling ever
+    moving, not a claim that a value above 100 is constructible now.
+    """
+    policy = RoastControlPolicy(
+        SafetyLimits(),
+        _PROFILE,
+        ambient_fan_doctrine=AmbientFanDoctrine(
+            enabled=True,
+            post_fc_fan_ceiling_enabled=True,
+            post_fc_fan_ceiling_percent=100,
+        ),
+    )
+    assert policy.post_fc_fan_ceiling_engaged(_BINDING_POST_FC_FAN_SIGNAL) is False
+    assert (
+        policy.limits_for(
+            RoastPhase.DEVELOPMENT, post_fc_fan_signal=_BINDING_POST_FC_FAN_SIGNAL
+        ).fan_ceiling_percent
+        == 100
+    )
+
+
 def test_carve_out_releases_when_heat_at_floor_and_climbing() -> None:
     """Fan remains unrestricted when it is the only brake left (#498)."""
     policy = RoastControlPolicy(
