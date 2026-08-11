@@ -27,7 +27,10 @@ for. The paths below are repository-relative; the lead names the tree.
 - The agent repo: `docs/state/registry.md`, `docs/epics/E*.md`, `AGENTS.md`, and
   the code/tests for the work under review.
 
-State in your verdict which tree and sha you audited.
+State in your verdict which tree and sha you audited **whenever your output
+format has room for it**. Some callers constrain you to a fixed schema (the
+`review-branch` workflow accepts a findings array and nothing else); there,
+omit the provenance line rather than forcing it into a finding.
 
 ## What you do
 
