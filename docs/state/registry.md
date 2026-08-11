@@ -151,7 +151,10 @@
 > here drifted within a single day, each one going stale the moment an issue was reopened,
 > and the third drift was introduced by the commit that fixed the second. A hand-maintained
 > tally beside a live board is a defect generator; **the board is the source of truth — run
-> `gh issue list` rather than trusting a number in this file.** What follows is the standing
+> `gh issue list --state open --limit 200` rather than trusting a number in this file** — the
+> bare command defaults to **30** and there are currently 43 open, so it would silently hide
+> the oldest 13 and reproduce, in the replacement, exactly the undercount it replaced. What
+> follows is the standing
 > context per issue, which does not rot the way a count does.
 >
 > **#787** (**an agent restart resets tick AND `elapsed_seconds` together** —
