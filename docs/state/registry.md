@@ -36,14 +36,19 @@
 > draws control-loop conclusions from them**. Either regenerate both alongside the
 > fixtures, or explicitly correct and freeze them as historical. Tracked as **#792**.
 >
-> **The correction direction is NOT uniform across those three entries**, and assuming
-> it is would hand #792 a wrong premise. The two `fc_source: "mcp"` entries
-> (10.8 %, 11.1 %) have both marks corrected, so they **understate** development, the
-> ~3 pp direction measured on `eaafde88`. The middle entry is `fc_source: "operator"`,
-> and #784 honours an operator first-crack override by leaving its FC mark untouched —
-> so only T0 moves earlier, the denominator enlarges against a fixed development time,
-> and its archived 12.7 % is **overstated**. Re-derive each entry rather than applying
-> one direction to all three.
+> **Do NOT assume a correction direction for these entries.** DTR is
+> `(drop − fc) / (drop − t0)`: moving first crack earlier raises the numerator while
+> moving T0 earlier raises the denominator, so the sign depends on which backdate
+> dominates **on that roast**. The only measured figure here is `eaafde88`
+> (+3.07 pp, FC delay 22.20 s against T0 10.86 s) and it is **not** one of these
+> entries; the manifest carries no run ids and the fixtures are untracked, so the
+> per-entry delays cannot be derived from committed data. Derive each direction from
+> its own store data at regeneration time. The one structural asymmetry worth knowing
+> is that the middle entry is `fc_source: "operator"`, and #784 honours an operator
+> first-crack override by leaving its FC mark untouched — so if its T0 anchor applies,
+> only the denominator moves and its archived 12.7 % can only fall, never rise. Feeding
+> #792 an assumed direction would give the "do the conclusions change?" decision an
+> unsupported premise.
 >
 > **#757 CLOSED via PR #790** (`30f665c`) — the read/serialisation sibling of the #756
 > non-finite family. The SSE half is the real defect: a bare `NaN` token made the
