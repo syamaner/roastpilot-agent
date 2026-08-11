@@ -33,8 +33,10 @@ Format: one entry per anti-pattern.
 - **Guarded by:**
   `test_list_runs_development_percent_uses_insertion_order_after_tick_reset`,
   `test_build_reference_roast_curve_uses_insertion_order_after_tick_reset`,
-  `test_list_runs_advisor_counts_use_exact_fk_with_duplicate_ticks`, and
-  `test_list_runs_null_advisor_fk_does_not_guess_by_tick`.
+  `test_list_runs_advisor_counts_use_exact_fk_with_duplicate_ticks`,
+  `test_list_runs_null_advisor_fk_does_not_guess_by_tick`, and
+  `test_list_runs_dangling_advisor_fk_does_not_guess_by_tick` (a NULL FK and an
+  orphaned non-NULL FK are different states and are guarded separately).
 
 ---
 
