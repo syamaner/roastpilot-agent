@@ -846,10 +846,17 @@ class RoastController:
         # armed no later RoR is consulted for this purpose. RUN-scoped, not
         # dwell-scoped (operator ratification, #781 slice 2 fold round): once
         # released within a run it stays released for the rest of that run,
-        # including across an operator resume that re-enters DEVELOPMENT — a
-        # per-dwell clear would let a resume re-narrow a ceiling that fan had
+        # including across an operator resume that returns to pre-first-crack
+        # and reaches DEVELOPMENT again on a SECOND true first-crack edge — a
+        # per-dwell clear would let that resume re-narrow a ceiling fan had
         # already earned full release from, a strict LOSS of #498 fan
-        # authority. So this field is deliberately NOT cleared in
+        # authority. Name that edge precisely, because the obvious one is
+        # inert: a DIRECT ``operator_recovery_required -> development`` resume
+        # leaves the post-FC loop disengaged, so the effective floor is
+        # unknown and the predicate is declined by its floor-unknown carve-out
+        # before it ever reads this field. A reader who checks only that edge
+        # will conclude this field does nothing and revert it — which has
+        # already happened once in analysis. So this field is NOT cleared in
         # ``transition_to``; it is cleared only in ``start_run``, once per new
         # run. (Neither scope survives an agent restart — the latch is
         # in-memory and a restart builds a fresh controller; restart never
@@ -1297,12 +1304,19 @@ class RoastController:
         # It is run-scoped, not dwell-scoped (operator ratification, #781
         # slice 2 fold round): once the ceiling has released within a run, it
         # stays released for the rest of that run, including across an
-        # operator resume that re-enters DEVELOPMENT. Per-dwell clearing would
-        # let a resume re-enter DEVELOPMENT unlatched, so the ceiling could
-        # bind again on a roast where fan had already been established as the
-        # only remaining brake — a strict LOSS of #498 fan authority relative
-        # to run-scoped. Do not "fix" this back to per-dwell; it is cleared at
-        # run start instead (see ``start_run``).
+        # operator resume that returns to pre-first-crack and reaches
+        # DEVELOPMENT again on a SECOND true first-crack edge. Per-dwell
+        # clearing would let that resume re-enter DEVELOPMENT unlatched, so
+        # the ceiling could bind again on a roast where fan had already been
+        # established as the only remaining brake — a strict LOSS of #498 fan
+        # authority relative to run-scoped. The DIRECT
+        # ``operator_recovery_required -> development`` resume is NOT the
+        # load-bearing edge: it leaves the post-FC loop disengaged, so the
+        # floor is unknown and the predicate declines on that carve-out before
+        # reading this field. Checking only that edge makes the field look
+        # inert, which is how it nearly got reverted. Do not "fix" this back
+        # to per-dwell; it is cleared at run start instead (see
+        # ``start_run``).
         self._post_fc_fan_ceiling_engaged_once = False
         self._post_fc_fan_ceiling_engage_logged = False
         self._post_fc_fan_ceiling_release_logged = False
@@ -3861,6 +3875,18 @@ class RoastController:
         # RUN-scoped, not dwell-scoped — ``transition_to`` deliberately does
         # NOT clear it, so it must be cleared here instead, once per new run.
         # A fresh run must start unlatched; a resumed run must not.
+        #
+        # This is the ONLY clear site, and there are TWO places a later reader
+        # is likely to "restore symmetry" by adding a second one. Neither is
+        # correct. The first is ``transition_to``'s per-dwell cluster (see the
+        # comment there). The second is the ``target in (STARTING, PREHEATING)``
+        # per-run cluster further down that same method, whose own comment
+        # declares a recovery-resume into preheating to be "back before
+        # charge" — that reasoning is sound for the pre-T0 guard it was
+        # written for, but adding this field there re-narrows the fan box to
+        # the ceiling on the ``recovery -> preheating -> pre-FC -> development``
+        # resume family, which is precisely the #498 loss run-scoping exists
+        # to prevent (measured, safety review).
         self._post_fc_fan_ceiling_released = False
         # v0.1.9 recording metadata (#176): derive an origin slug from the bean
         # profile + a per-origin roast number, and hand them to start_session so
