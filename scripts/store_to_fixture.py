@@ -347,27 +347,26 @@ def _utc_to_run_seconds(
             nearest_elapsed = float(row["elapsed_seconds"])
     if nearest_elapsed is None or nearest_delta_seconds is None:
         return None
-    return nearest_elapsed + nearest_delta_seconds
+    mapped = nearest_elapsed + nearest_delta_seconds
+    return None if mapped < 0.0 else mapped
 
 
-def _first_crack_onset_utc(connection: sqlite3.Connection, run_id: str) -> str | None:
-    """Read the single distinct MCP first-crack onset from raw telemetry state.
+def _first_crack_onset_utc(connection: sqlite3.Connection, run_id: str) -> tuple[str | None, int]:
+    """Read the earliest distinct MCP first-crack onset from raw telemetry state.
 
     Malformed JSON and missing/null/non-string paths are skipped per row so one
-    bad snapshot cannot hide a later valid onset. Multiple distinct values are
-    a store anomaly and fail closed instead of choosing one silently.
+    bad snapshot cannot hide a later valid onset. When a resumed MCP session
+    legitimately re-stamps the onset, the earliest parseable UTC value wins.
 
     Args:
         connection: An open store connection.
         run_id: The run id.
 
     Returns:
-        The sole non-empty ``detected_at_utc`` value, or ``None`` when no row
-        carries one.
-
-    Raises:
-        FixtureConversionError: If snapshots contain multiple distinct onset
-            values for the run.
+        A pair of the chosen onset (or ``None`` when absent) and the number of
+        distinct non-empty values seen. If every value is unparseable, the first
+        encountered value is returned so normal unparseable-source fallback and
+        warning behavior still applies.
     """
     rows = connection.execute(
         "SELECT raw_state_json FROM telemetry_snapshots"
@@ -393,11 +392,11 @@ def _first_crack_onset_utc(connection: sqlite3.Connection, run_id: str) -> str |
             continue
         if detected_at not in distinct:
             distinct.append(detected_at)
-    if len(distinct) > 1:
-        raise FixtureConversionError(
-            f"run {run_id} has ambiguous first-crack onset values: {distinct}"
-        )
-    return None if not distinct else distinct[0]
+    if not distinct:
+        return None, 0
+    parseable = [(parsed, value) for value in distinct if (parsed := _parse_utc(value)) is not None]
+    chosen = min(parseable, key=lambda item: item[0])[1] if parseable else distinct[0]
+    return chosen, len(distinct)
 
 
 @dataclass(frozen=True)
@@ -442,6 +441,7 @@ class _StoreReadResult:
     roast: StoreRoast
     charge_fallback_reason: str | None
     first_crack_fallback_reason: str | None
+    first_crack_onset_warning: str | None
     frozen_development_percent: float | None
 
 
@@ -598,8 +598,17 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
             run_started,
         )
         accepted_first_crack = _event_time(connection, resolved, _FIRST_CRACK_KIND)
-        first_crack_source = (
-            None if accepted_first_crack is None else _first_crack_onset_utc(connection, resolved)
+        first_crack_source: str | None = None
+        first_crack_onset_count = 0
+        if accepted_first_crack is not None:
+            first_crack_source, first_crack_onset_count = _first_crack_onset_utc(
+                connection, resolved
+            )
+        first_crack_onset_warning = (
+            f"first crack source has {first_crack_onset_count} distinct onset values; "
+            f"chose earliest {first_crack_source}"
+            if first_crack_onset_count > 1 and first_crack_source is not None
+            else None
         )
         first_crack = _resolve_utc_mark(
             connection,
@@ -665,6 +674,7 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
             roast=roast,
             charge_fallback_reason=charge.fallback_reason,
             first_crack_fallback_reason=first_crack.fallback_reason,
+            first_crack_onset_warning=first_crack_onset_warning,
             frozen_development_percent=frozen_development_percent,
         )
     finally:
@@ -979,9 +989,29 @@ def convert(db_path: Path, out_dir: Path, run_id: str | None = None) -> dict[str
             "shortens development, so DTR understated",
             file=sys.stderr,
         )
+    if read_result.first_crack_onset_warning is not None:
+        print(
+            f"warning: run {roast.run_id} {read_result.first_crack_onset_warning}",
+            file=sys.stderr,
+        )
     exported_development_percent = summary["development_time_percent"]
     frozen_development_percent = read_result.frozen_development_percent
-    if (
+    preferred_anchors = [
+        label
+        for anchor, label in (
+            (roast.charge_anchor, "charge=run_row_utc"),
+            (roast.first_crack_anchor, "first_crack=fc_status_utc"),
+        )
+        if anchor not in (None, "event_row")
+    ]
+    if frozen_development_percent is None and preferred_anchors:
+        print(
+            f"warning: run {roast.run_id} development_time_percent could not be "
+            "cross-checked because no frozen development_percent exists; preferred "
+            f"anchors: {', '.join(preferred_anchors)}",
+            file=sys.stderr,
+        )
+    elif (
         frozen_development_percent is not None
         and exported_development_percent is not None
         and abs(float(exported_development_percent) - frozen_development_percent) > 0.5

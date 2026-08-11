@@ -559,8 +559,10 @@ async def test_missing_first_crack_status_path_falls_back(
 
 
 @pytest.mark.asyncio
-async def test_distinct_first_crack_onsets_fail_closed(tmp_path: Path) -> None:
-    """T10: two distinct FC onset timestamps are an ambiguous store anomaly."""
+async def test_distinct_first_crack_onsets_choose_earliest_with_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T10: resumed-session FC onsets choose the earliest and warn loudly."""
     db_path = tmp_path / "fc-ambiguous.sqlite3"
     store = await _backdated_store(db_path)
     second_onset = _backdated_wall(574.0)
@@ -575,13 +577,15 @@ async def test_distinct_first_crack_onsets_fail_closed(tmp_path: Path) -> None:
     await store.connection.commit()
     await store.close()
 
-    first_onset = _backdated_wall(_BACKDATED_FIRST_CRACK_SECONDS)
-    with pytest.raises(s2f.FixtureConversionError) as exc_info:
-        s2f.convert(db_path, tmp_path / "fixture")
-    message = str(exc_info.value)
-    assert "backdated-run" in message
-    assert first_onset in message
-    assert second_onset in message
+    out_dir = tmp_path / "fixture"
+    entry = s2f.convert(db_path, out_dir)
+    warning = capsys.readouterr().err
+    _, ground = bakeoff_replay.load_roast(out_dir / "roast.jsonl")
+
+    assert entry["first_crack_anchor"] == "fc_status_utc"
+    assert ground.first_crack_seconds == 574.0
+    assert "2 distinct onset values" in warning
+    assert f"chose earliest {second_onset}" in warning
 
 
 @pytest.mark.asyncio
@@ -649,6 +653,31 @@ async def test_unmappable_utc_anchors_fall_back(
 
 
 @pytest.mark.asyncio
+async def test_negative_utc_mapping_falls_back_instead_of_exporting_negative_mark(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A preferred instant before telemetry is unmappable, never a negative mark."""
+    db_path = tmp_path / "negative-mapping.sqlite3"
+    store = await _backdated_store(db_path)
+    await store.connection.execute(
+        "UPDATE roast_runs SET t0_detected_at_utc = ? WHERE id = ?",
+        (_backdated_wall(-10.0), "backdated-run"),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    entry = s2f.convert(db_path, out_dir)
+    warning = capsys.readouterr().err
+    _, ground = bakeoff_replay.load_roast(out_dir / "roast.jsonl")
+
+    assert entry["charge_anchor"] == "event_row"
+    assert ground.t0_seconds == 60.0
+    assert ground.t0_seconds >= 0.0
+    assert "run_row_utc source unmappable" in warning
+
+
+@pytest.mark.asyncio
 async def test_both_absent_utc_sources_fall_back_independently(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -711,6 +740,31 @@ async def test_frozen_dtr_mismatch_emits_cross_check_warning(
     assert "development_time_percent" in warning
     assert "17.9" in warning
     assert f"{_BACKDATED_FROZEN_DTR}" in warning
+
+
+@pytest.mark.asyncio
+async def test_preferred_anchors_without_frozen_dtr_warn_unverifiable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Preferred anchors are never silently treated as verified without frozen DTR."""
+    db_path = tmp_path / "no-frozen-dtr.sqlite3"
+    store = await _backdated_store(db_path)
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET development_percent = NULL WHERE run_id = ?",
+        ("backdated-run",),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    entry = s2f.convert(db_path, tmp_path / "fixture")
+    warning = capsys.readouterr().err
+
+    assert entry["charge_anchor"] == "run_row_utc"
+    assert entry["first_crack_anchor"] == "fc_status_utc"
+    assert "could not be cross-checked" in warning
+    assert "no frozen development_percent exists" in warning
+    assert "charge=run_row_utc" in warning
+    assert "first_crack=fc_status_utc" in warning
 
 
 @pytest.mark.asyncio
