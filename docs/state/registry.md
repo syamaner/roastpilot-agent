@@ -144,11 +144,14 @@
 > of 28 routes** at ~5.2–5.5× serialisation cost on the same event loop as the 1 Hz
 > controller tick; caught by the pre-open `safety-reviewer` pass and removed.
 >
-> **Seven follow-ups were filed overnight; THREE remain open** (corrected 11 Aug — the
-> original wording read as seven live tickets). Six had reachability established against
-> the real store rather than argued.
+> **Seven follow-ups were filed overnight; FIVE remain open** (corrected 11 Aug twice — the
+> original wording read as seven live tickets, and a later count of "three" went stale the
+> moment #783 and #788 were reopened; verified against the API, not recounted from this
+> file). Six had reachability established against the real store rather than argued.
 >
-> **Open:** **#787** (**an agent restart resets tick AND `elapsed_seconds` together** —
+> **Open (five):** **#783** and **#788** — reopened 11 Aug; see the correction below for
+> why the consolidation was wrong, not repeated here. Then: **#787** (**an agent restart
+> resets tick AND `elapsed_seconds` together** —
 > the same five runs — so exported fixture row times are non-monotonic for them,
 > independent of the anchor fix). Its precondition is now settled from the store: none of
 > the five is in the corpus manifest, none carries an operator rating, all are
@@ -179,10 +182,12 @@
 > discards work, and it reads as tidy while doing it.**
 >
 > **The aggregate is the lesson, not any one of them.** Seven filings against two closed
-> stories took the board from 38 to 43 overnight (38 + 7 filed − 2 stories closed = 43),
-> and four of the seven were retracted within a day.
-> Each was individually defensible; filing is not free, and one issue owning a class beats
-> N issues that are its instances.
+> stories took the board from 38 to 43 overnight (38 + 7 filed − 2 stories closed = 43).
+> **TWO of the seven were genuinely retracted** (#785, #786). Two more — #783, #788 — were
+> retracted and then **reopened the same day**, because the retraction was wrong; they are
+> not evidence of over-filing, they are evidence of over-consolidating. Each filing was
+> individually defensible; filing is not free, and one issue owning a class beats N issues
+> that are its instances — **but only when the issues really are instances of that class.**
 >
 > **`scripts/rpd_corpus_score.py` is immune to the clock-reset class** — it reads
 > `ORDER BY id ASC`. The shipped RP-D corpus result (15 scored / 3 HITs) stands.
