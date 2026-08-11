@@ -161,9 +161,22 @@
 > 13.01, post-#337 and MCP-sourced, in a direction no anchoring story explains.
 >
 > **Closed as consolidation or notes**, so the count above is not a live backlog:
-> **#783** (two siblings of #779's class) and **#785** (history `dev_pct` orders by a
-> resettable tick) folded into #787's class sweep, as did **#788** (exporter cross-check
-> hygiene); **#786** (shared UTC-parse / nearest-row tie-break) closed won't-fix.
+> **#785** (history `dev_pct` orders by a resettable tick) folded into #787's class sweep —
+> it is genuinely an instance of that class; **#786** (shared UTC-parse / nearest-row
+> tie-break) closed won't-fix.
+>
+> **CORRECTION (11 Aug, caught by Codex on #795): #783 and #788 were REOPENED.** Folding
+> them into #787 lost their scope. #787 is ratified narrowly as *refuse to export a
+> non-monotonic telemetry clock* — the resettable-**clock** class. **#783** is the
+> onset-vs-confirmation **anchor** class (#779's siblings), and
+> `scripts/plant_model_arx_study.py:382` still reads the `first_crack` **event row**
+> rather than the backdated onset, with `docs/recent-fixes.md:779-781` naming that site and
+> the history FC display as outstanding. **#788** is exporter cross-check hygiene
+> (string-based onset dedup, fallback warning, degenerate mark sets escaping the
+> cross-check), which a clock-monotonicity refusal never reaches. The repository's own fix
+> note and the board had drifted apart; the board was wrong. **The lesson is narrower than
+> "we over-filed": consolidating by surface similarity rather than by defect class silently
+> discards work, and it reads as tidy while doing it.**
 >
 > **The aggregate is the lesson, not any one of them.** Seven filings against two closed
 > stories took the board from 38 to 43 overnight (38 + 7 filed − 2 stories closed = 43),

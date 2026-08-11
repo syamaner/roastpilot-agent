@@ -88,10 +88,20 @@ see section below). Full manifest: `docs/advisor/store-roast-corpus-manifest.jso
 | store-roast-5a32334c | Colombia Excelso Huila (Washed) | operator | 186 | 191 | 12.6 | core_medium | 3/5 | sweet, caramel hints |
 | store-roast-d251013e | Colombia Excelso Huila (Washed) | mcp | 183 | 190 | 12.9 | core_medium | 3/5 | flat, slightly underdeveloped |
 
-**Two entries now qualify as labelled known-good** for the bake-off set (rated +
-`core_medium` degree): `store-roast-5a32334c` and — since its 11 Aug rating —
-`store-roast-d251013e`. Only `3fbfd888` remains blocked, as over-done (negative corpus).
-*(As written on 28 Jun only `5a32334c` qualified, `d251013e` being unrated then.)*
+**Two entries are now labelled and bake-off ELIGIBLE** — `store-roast-5a32334c` and, since
+its 11 Aug rating, `store-roast-d251013e`. Only `3fbfd888` remains blocked, as over-done
+(negative corpus). *(As written on 28 Jun only `5a32334c` was eligible, `d251013e` being
+unrated then.)*
+
+**Eligible is not the same as known-good, and this document must not conflate them.**
+Eligibility is mechanical — rated, `core_medium`, and `usable_for_bakeoff: true` in the
+manifest. **Known-good is an operator judgement and it has NOT been given for
+`d251013e`,** whose rating note reads "flat, slightly underdeveloped" — which is not an
+obvious known-good for a scored ground-truth set. An earlier revision of this paragraph
+asserted known-good on the mechanical criteria alone, which contradicted the re-run
+section's own gate and could have put an unconfirmed roast into the scored set. The gate
+in "Recommended re-run scope" is authoritative: **the operator confirms known-good, and
+that confirmation is still outstanding for `d251013e`.**
 
 ---
 
