@@ -694,14 +694,21 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   so no ignored secret may reach its context) with per-command
   self-location, the #738 fresh-venv-in-worktree rule, `.venv/bin/python -m
   ...` invocation, and the full gates before handback. **The worker MUST NOT
-  obtain any external model review of its own work, by ANY means**, and MUST
-  state at handback whether it did. The rule is written on the CAPABILITY, not
-  on a binary name: the `claude` CLI (`claude -p`, `--agent`) is only the
-  route we happened to observe, and a worker with shell and network can reach
-  the same outcome through a direct provider HTTP call, a vendor SDK, another
-  agent CLI, or a hosted service without ever running anything named `claude`.
-  A name-scoped ban would be a lexical guard on a capability problem, which
-  fails OPEN (D154). This is load-bearing, not hygiene: a Codex session
+  CONSULT any external model about the slice at all** — not a review of
+  finished work, and equally not a design critique, an implementation
+  suggestion, a debugging opinion, or a second opinion on a failing test —
+  and MUST state at handback whether it did. Scoping the ban to "review"
+  would leave the same hole one word further out: a worker that asks another
+  family to propose the implementation, then never calls the result a review,
+  can disclose truthfully that it obtained none while the branch is still
+  shaped by the very family meant to supply the independent pass. The rule is
+  written on the CAPABILITY, not on a binary name: the `claude` CLI
+  (`claude -p`, `--agent`) is only the route we happened to observe, and a
+  worker with shell and network can reach the same outcome through a direct
+  provider HTTP call, a vendor SDK, another agent CLI, or a hosted service
+  without ever running anything named `claude`. A name-scoped ban would be a
+  lexical guard on a capability problem, which fails OPEN (D154). This is
+  load-bearing, not hygiene: a Codex session
   **discovers `.claude/agents/` and calls those roles unprompted** (observed
   11 Aug 2026 with Codex coordinating — nobody told it the CLI existed).
   Useful in the coordinator seat; in the implementer seat a worker that runs
@@ -716,9 +723,18 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   the lead should treat it that way: the review roles are read-only, so an
   undisclosed run leaves NO git-visible artifact — findings folded into
   ordinary commits are indistinguishable from organic work, and `git log`
-  would only ever catch a worker that also disclosed honestly. Where that
-  residual risk is unacceptable for a slice, the answer is a fresh independent
-  review of the handed-back branch, not a stronger reading of the log. Codex's directives
+  would only ever catch a worker that also disclosed honestly. **An
+  AFFIRMATIVE disclosure fails the slice closed, and must change what happens
+  next** — otherwise honesty is costless and the disclosure duty buys nothing,
+  since the ordinary Claude review already runs on every Codex branch. Once a
+  worker has consulted a Claude-family model, a Claude-family review can no
+  longer serve as the cross-family lens for that branch, so the lead MUST
+  either (a) discard the branch and re-delegate the slice from the same
+  contract in a fresh worktree — the default — or (b) record an explicit
+  operator decision to proceed on the PR, naming which lens now supplies the
+  independent pass (for a Claude-contaminated branch that is the local
+  `codex review` plus the operator, not `safety-reviewer`). Silently
+  continuing with the normal flow is not one of the options. Codex's directives
   are ONLY the contract's numbered sections; nonce-delimited
   `UNTRUSTED-QUOTE` blocks exist for the human ratification read and are
   STRIPPED from the delegation prompt entirely, along with every URL to

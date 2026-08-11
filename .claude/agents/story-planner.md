@@ -204,12 +204,21 @@ is what "specced" means: delegation without one is forbidden (fail-closed).
    rule that the worker MUST NOT obtain any external model review of its own
    work by ANY means — the `claude` CLI, a direct provider HTTP call, a vendor
    SDK, another agent CLI, or a hosted service — and MUST state at handback
-   whether it did. Write it on the capability, never on a binary name: a
-   name-scoped ban is a lexical guard on a capability problem and fails OPEN
-   (D154). A Codex session discovers `.claude/agents/` and calls those roles
-   unprompted, and a worker that reviews its own output breaks D23 and hollows
-   out the mandatory Opus safety floor. The handback disclosure is the whole
-   verification — read-only reviewers leave no git-visible artifact — and
+   whether it did. The ban covers CONSULTING an external model about the slice
+   at all, not only reviewing finished work: a design critique, an
+   implementation suggestion or a debugging opinion shapes the branch by the
+   same family that is meant to supply the independent pass, while letting the
+   worker truthfully disclose it obtained no review. Write it on the
+   capability, never on a binary name: a name-scoped ban is a lexical guard on
+   a capability problem and fails OPEN (D154). A Codex session discovers
+   `.claude/agents/` and calls those roles unprompted, and a worker that
+   reviews its own output breaks D23 and hollows out the mandatory Opus safety
+   floor. The handback disclosure is the whole verification — read-only
+   reviewers leave no git-visible artifact — and an AFFIRMATIVE disclosure
+   fails the slice closed: the lead re-delegates it from this contract in a
+   fresh worktree, or records an explicit operator decision naming which lens
+   now supplies the independent pass. State both the ban and that consequence
+   in the delegation prompt, plus
    any slice-specific fixtures or contract tests that must be regenerated.
 
    Every item in this section is MANDATORY in the generated contract, not a
