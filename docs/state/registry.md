@@ -3,7 +3,7 @@
 ## Active Epic
 
 > **STATUS UPDATE — 11 Aug 2026 (overnight: the fixture-anchor defect is CLOSED,
-> the non-finite family is finished, and six follow-ups are filed). Read with the
+> the non-finite family is finished, and seven follow-ups are filed). Read with the
 > 10 Aug evening block below.**
 >
 > **#779 CLOSED via PR #784.** `store_to_fixture` anchored both marks on
@@ -31,10 +31,19 @@
 > the old confirmation anchors, so correcting only the local fixtures would leave the
 > repository-visible numbers wrong:
 > `docs/advisor/store-roast-corpus-manifest.json` (three `agent-store` entries, DTR
-> 10.8 / 12.7 / 11.1 %, each understating development by the recognition delay) and
+> 10.8 / 12.7 / 11.1 %) and
 > `docs/advisor/postfc-validation-2026-06-28.md`, which repeats those values **and
 > draws control-loop conclusions from them**. Either regenerate both alongside the
 > fixtures, or explicitly correct and freeze them as historical. Tracked as **#792**.
+>
+> **The correction direction is NOT uniform across those three entries**, and assuming
+> it is would hand #792 a wrong premise. The two `fc_source: "mcp"` entries
+> (10.8 %, 11.1 %) have both marks corrected, so they **understate** development, the
+> ~3 pp direction measured on `eaafde88`. The middle entry is `fc_source: "operator"`,
+> and #784 honours an operator first-crack override by leaving its FC mark untouched —
+> so only T0 moves earlier, the denominator enlarges against a fixed development time,
+> and its archived 12.7 % is **overstated**. Re-derive each entry rather than applying
+> one direction to all three.
 >
 > **#757 CLOSED via PR #790** (`30f665c`) — the read/serialisation sibling of the #756
 > non-finite family. The SSE half is the real defect: a bare `NaN` token made the
@@ -47,7 +56,7 @@
 > of 28 routes** at ~5.2–5.5× serialisation cost on the same event loop as the 1 Hz
 > controller tick; caught by the pre-open `safety-reviewer` pass and removed.
 >
-> **Six follow-ups filed, each with reachability established against the real store
+> **Seven follow-ups filed. Six had reachability established against the real store
 > rather than argued:**
 > **#783** (two siblings of #779's class: `store.py:1833` `fc_at`, and
 > `plant_model_arx_study.py` FC anchors);
@@ -60,7 +69,8 @@
 > **#788** (exporter cross-check hygiene: degenerate mark sets escape the warning,
 > string-based onset dedup, imprecise fallback wording);
 > **#789** (non-finite required telemetry temperatures now serialise `null` while TS
-> declares them non-null).
+> declares them non-null). The seventh, **#792**, came from the review of this very
+> block: committed advisor reports carry pre-#779 confirmation-anchored figures.
 >
 > **`scripts/rpd_corpus_score.py` is immune to the clock-reset class** — it reads
 > `ORDER BY id ASC`. The shipped RP-D corpus result (15 scored / 3 HITs) stands.
