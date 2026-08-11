@@ -330,5 +330,10 @@ decision belongs to the operator after reading the full scored output.
 
 4. **Schema v7 migration on live store** before the next roast (see command above).
 
-5. **Next bake-off: include store-roast-5a32334c** as a new test-set entry (first
-   agent-recorded reference roast in the scored set).
+5. **Next bake-off: include every entry named by the "Recommended re-run scope" list
+   above** — as of 11 Aug that is `store-roast-5a32334c` **and** `store-roast-d251013e`,
+   the first agent-recorded reference roasts in the scored set. Deliberately a **pointer
+   rather than a second roster**: this item named only `5a32334c` when it was written on
+   28 Jun and went stale the moment `d251013e` was rated, which is the same
+   corrected-in-one-place-and-left-standing-in-another defect that produced every earlier
+   round of review on this document. One list, one place to update.
