@@ -4529,14 +4529,32 @@ async def test_charge_capture_still_latches_immediately_for_an_absent_probe(
     assert service.runner._ambient_persisted is True  # pyright: ignore[reportPrivateUsage]
 
 
-@pytest.mark.parametrize("charge_elapsed_seconds", [None, float("nan")], ids=("none", "nan"))
+@pytest.mark.parametrize(
+    "charge_elapsed_seconds",
+    [None, float("nan"), float("-inf"), float("inf")],
+    ids=("none", "nan", "neg-inf", "inf"),
+)
 @pytest.mark.asyncio
-async def test_unknown_charge_clock_fails_toward_latching(
+async def test_an_unusable_charge_clock_cannot_affect_the_window(
     store: RoastStore,
     monkeypatch: pytest.MonkeyPatch,
     charge_elapsed_seconds: float | None,
 ) -> None:
-    """#758: missing or non-finite charge clocks never open an unbounded retry."""
+    """#758 review finding 1: the window does not consult the charge clock at all.
+
+    It used to. That clock freezes at drop (``_effective_now`` returns
+    ``min(now, drop_monotonic)``), so a roast dropped inside the window held it
+    below the bound forever and wrote whatever the probe reported whenever it
+    recovered — a cooling-time reading stamped as "the room at charge". The
+    window is now a wall-clock deadline, so no value of this field, however
+    degenerate, changes the outcome: with the deadline still open every case
+    retries without writing.
+
+    ``-inf`` is parametrised deliberately: under the old charge-clock guard it
+    was the ONE value the ``math.isfinite`` clause actually caught, and the
+    parametrisation that named that clause omitted it, so the mutation removing
+    the clause left the test passing.
+    """
     clock = FakeClock()
     mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
     raw_state = _FakeRawState(
@@ -4558,6 +4576,44 @@ async def test_unknown_charge_clock_fails_toward_latching(
     await service.runner._persist_ambient_if_charged(  # pyright: ignore[reportPrivateUsage]
         snapshot
     )
+
+    assert calls == []
+    assert service.runner._ambient_persisted is False  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_a_frozen_charge_clock_cannot_hold_the_window_open(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#758 review finding 1, the defect itself: a drop must not extend the window.
+
+    Advancing only the runner's clock past the deadline must latch NULLs even
+    though the charge clock is pinned below the bound, so a probe recovering
+    later can never overwrite the run's charge ambient with a cooling reading.
+    """
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    raw_state = _FakeRawState(
+        _session_state(
+            fc_status="pending",
+            audio_running=False,
+            ambient_status=_ambient_status(temperature_c=float("inf")),
+        )
+    )
+    calls = _capture_ambient_writes(store, monkeypatch)
+    service, _ = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+    assert service.runner is not None
+    # Charge clock frozen at 12 s, as a drop inside the window would leave it.
+    frozen = replace(
+        service.runner.controller_snapshot(),
+        charge_detected=True,
+        charge_elapsed_seconds=12.0,
+    )
+    await service.runner._persist_ambient_if_charged(frozen)  # pyright: ignore[reportPrivateUsage]
+    assert calls == []
+
+    clock.advance(api_module.AMBIENT_CAPTURE_GRACE_SECONDS + 1.0)
+    await service.runner._persist_ambient_if_charged(frozen)  # pyright: ignore[reportPrivateUsage]
 
     assert calls == [(None, None, None)]
     assert service.runner._ambient_persisted is True  # pyright: ignore[reportPrivateUsage]
@@ -4623,6 +4679,69 @@ async def test_restart_restores_charge_clock_so_resumed_dtr_survives(store: Roas
     # The DTR denominator is the restored charge clock — non-zero, ≈120 s, NOT 0.0.
     assert ctx.roast_elapsed_seconds > 0.0
     assert ctx.roast_elapsed_seconds == pytest.approx(120.0, abs=10.0)
+
+
+@pytest.mark.asyncio
+async def test_restart_inside_the_grace_window_does_not_reopen_the_capture(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#758 review finding 2: a restart must not re-open the grace window.
+
+    Before the window existed, the capture always wrote on the first charged
+    tick, so a CHARGED run was already captured by the time any restart could
+    happen and ``recover()``'s seed had nothing to do. The window makes
+    charged-but-uncaptured routinely reachable, and a fresh runner would restart
+    its own deadline and write whatever the probe reports NOW as this run's
+    charge ambient — a mid-roast reading in the column that means "the room at
+    charge". A runner-local deadline cannot close that; only the seed can.
+
+    Here the run charged (``t0_detected_at_utc`` set) with ``ambient_captured``
+    still 0, and the probe is healthy again post-restart. Nothing may be written.
+    """
+    await store.create_run(
+        run_id="run-window-restart",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    )
+    await store.record_t0_detected_at(
+        "run-window-restart", t0_detected_at_utc="2026-08-11T09:00:00+00:00"
+    )
+
+    clock = FakeClock()
+    mcp = FakeMCPClient()
+    raw_state = _FakeRawState(
+        _session_state(
+            fc_status="pending",
+            audio_running=False,
+            ambient_status=_ambient_status(
+                temperature_c=28.49, humidity_percent=38.6, pressure_hpa=1008.56
+            ),
+        )
+    )
+    calls = _capture_ambient_writes(store, monkeypatch)
+    service = RoastService(
+        store,
+        config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+        clock=clock,
+        raw_state=raw_state,
+    )
+    await service.recover_on_start()
+    assert service.runner is not None
+    assert service.runner._ambient_persisted is True  # pyright: ignore[reportPrivateUsage]
+
+    snapshot = replace(service.runner.controller_snapshot(), charge_detected=True)
+    await service.runner._persist_ambient_if_charged(  # pyright: ignore[reportPrivateUsage]
+        snapshot
+    )
+
+    assert calls == []
+    detail = await store.read_run("run-window-restart")
+    assert detail is not None
+    assert detail.ambient_temp_c is None
 
 
 @pytest.mark.asyncio
