@@ -693,7 +693,21 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   verified empty before delegation — Codex is an external-family provider,
   so no ignored secret may reach its context) with per-command
   self-location, the #738 fresh-venv-in-worktree rule, `.venv/bin/python -m
-  ...` invocation, and the full gates before handback. Codex's directives
+  ...` invocation, and the full gates before handback. **The worker MUST NOT
+  invoke `claude` in any form** (`claude -p`, `--agent`, or otherwise), and
+  MUST state at handback whether it invoked any external reviewer. This is
+  load-bearing, not hygiene: a Codex session **discovers `.claude/agents/` and
+  calls those roles unprompted** (observed 11 Aug 2026 with Codex coordinating
+  — nobody told it the CLI existed). Useful in the coordinator seat; in the
+  implementer seat a worker that runs `safety-reviewer` on its own output and
+  folds the findings has adjudicated its own review, breaking **D23**, and has
+  turned the mandatory Opus floor into a lens the author already shaped the
+  code to pass — which is exactly the cross-family independence that pin buys.
+  It also spends Claude credits outside the `subagents/agent-*.jsonl` tree
+  where per-model accounting looks. Deliberately a directive rather than a
+  mechanism: Codex sandbox/MCP config is operator-level, so a repo-committed
+  guard would be advisory while reading as enforcement. The lead verifies via
+  `git log` on the branch plus the handback statement. Codex's directives
   are ONLY the contract's numbered sections; nonce-delimited
   `UNTRUSTED-QUOTE` blocks exist for the human ratification read and are
   STRIPPED from the delegation prompt entirely, along with every URL to

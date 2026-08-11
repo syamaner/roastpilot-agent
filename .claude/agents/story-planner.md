@@ -200,8 +200,17 @@ is what "specced" means: delegation without one is forbidden (fail-closed).
    provisioning command `git worktree add -b <planned-branch> <path>
    <base-sha>` (without `-b` Git creates a detached HEAD and the handback
    commit lands on no branch), the #738 fresh-venv-in-worktree rule,
-   `.venv/bin/python -m ...` invocation, the full gates before handback, and
+   `.venv/bin/python -m ...` invocation, the full gates before handback, the
+   rule that the worker MUST NOT invoke `claude` in any form (`claude -p`,
+   `--agent`, or otherwise) and MUST state at handback whether it invoked any
+   external reviewer — a Codex session discovers `.claude/agents/` and calls
+   those roles unprompted, and a worker that reviews its own output breaks D23
+   and hollows out the mandatory Opus safety floor — and
    any slice-specific fixtures or contract tests that must be regenerated.
+
+   Every item in this section is MANDATORY in the generated contract, not a
+   menu: the delegated worker's only specification is this contract, so a trap
+   omitted here is a trap the worker never sees.
 8. **Risk profile** — blast radius (roaster hardware consequence; data
    sensitivity; principal scope and capability), and what a reviewer should
    try to break first.
