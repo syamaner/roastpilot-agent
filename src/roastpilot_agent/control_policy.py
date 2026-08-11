@@ -552,6 +552,13 @@ class RoastControlPolicy:
         heat recovery cannot re-engage the ceiling in the same dwell; that
         direction deliberately fails toward full #498 fan-brake authority.
 
+        D96 recovery is the explicit exception to the intuition that heat above
+        its floor means useful downward authority remains: while recovery is
+        actively ADDING heat, this ceiling can bind even as the bean climbs.
+        That interaction requires ``recovery_enabled`` (default off) and fails
+        to the deterministic bitter-ceiling guard and emergency stop rather
+        than to an unbounded burn; changing it is outside D156/D157.
+
         Args:
             signal: The current post-FC fan inputs.
 

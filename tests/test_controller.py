@@ -32,7 +32,7 @@ from roastpilot_agent.config import (
     PreFirstCrackLevers,
     SafetyLimits,
 )
-from roastpilot_agent.control_policy import PhaseControlLimits, TrimSignal
+from roastpilot_agent.control_policy import PhaseControlLimits, PostFcFanSignal, TrimSignal
 from roastpilot_agent.controller import (
     TERMINAL_LATCH_PHASES,
     TRANSITION_TABLE,
@@ -7249,6 +7249,144 @@ async def test_fan_ceiling_binds_at_the_consult_in_loop_mode() -> None:
 
 
 @pytest.mark.asyncio
+async def test_release_restores_advisor_requested_fan_on_next_taper_write(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#498: release restores the advisor's own request without a new consult."""
+    advisor = FakeAdvisor(
+        [decision(heat=50, fan=30), decision(heat=99, fan=100)],
+    )
+    harness = make_harness(
+        config=_fan_ceiling_loop_config(control_interval_seconds=5.0),
+        advisor=advisor,
+    )
+    await _charge_through_fc(harness, fc_ror_c_per_min=4.0)
+    output = harness.controller._last_post_fc_output  # pyright: ignore[reportPrivateUsage]
+    assert output is not None
+
+    with caplog.at_level(logging.INFO, logger="roastpilot_agent.controller"):
+        harness.clock.advance(5.0)
+        harness.reader.readings = [
+            _fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)
+        ]
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+
+        assert harness.controller._post_fc_desired_fan_percent == 70  # pyright: ignore[reportPrivateUsage]
+        assert harness.controller._post_fc_doctrine_clamped_fan_request_percent == 100  # pyright: ignore[reportPrivateUsage]
+        consult_count = len(advisor.contexts)
+        harness.controller.operator_pause_advisory()
+
+        harness.clock.advance(5.0)
+        harness.reader.readings = [
+            _fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)
+        ]
+        await harness.controller.tick()
+        assert harness.controller.snapshot().current_fan == 70
+
+        harness.controller._current_heat = output.effective_floor_percent  # pyright: ignore[reportPrivateUsage]
+        harness.clock.advance(5.0)
+        harness.reader.readings = [
+            _fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)
+        ]
+        await harness.controller.tick()
+
+    assert len(advisor.contexts) == consult_count
+    assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_desired_fan_percent == 100  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller.snapshot().current_fan == 100
+
+    released_signal = harness.controller._post_fc_fan_signal(harness.sink.snapshots[-1])  # pyright: ignore[reportPrivateUsage]
+    assert released_signal is not None and released_signal.released
+    harness.controller._log_post_fc_fan_ceiling_once(  # pyright: ignore[reportPrivateUsage]
+        action="released", signal=released_signal
+    )
+    ceiling_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if "D156/D157 post-FC fan ceiling" in record.getMessage()
+    ]
+    assert sum("engaged" in message for message in ceiling_logs) == 1
+    assert sum("released" in message for message in ceiling_logs) == 1
+    for message in ceiling_logs:
+        assert "ceiling=70 %" in message
+        assert "ambient=23.1 °C" in message
+        assert "effective_floor=25 %" in message
+        assert "bean_ror=4.0 °C/min" in message
+
+    harness.controller.transition_to(RoastPhase.COOLING)
+    assert harness.controller._post_fc_desired_fan_percent is None  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_doctrine_clamped_fan_request_percent is None  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_fan_ceiling_engage_logged is False  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_fan_ceiling_release_logged is False  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_release_restores_fan_through_subsequent_advisor_timeouts() -> None:
+    """The retained request survives failed consults for the rest of the dwell."""
+    advisor = FakeAdvisor(
+        [
+            decision(heat=50, fan=30),
+            decision(heat=99, fan=100),
+            AdvisorFailureMode.TIMEOUT,
+            AdvisorFailureMode.TIMEOUT,
+        ]
+    )
+    harness = make_harness(
+        config=_fan_ceiling_loop_config(control_interval_seconds=5.0),
+        advisor=advisor,
+    )
+    await _charge_through_fc(harness, fc_ror_c_per_min=4.0)
+    output = harness.controller._last_post_fc_output  # pyright: ignore[reportPrivateUsage]
+    assert output is not None
+
+    harness.clock.advance(5.0)
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    harness.clock.advance(5.0)
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)]
+    await harness.controller.tick()
+    assert harness.controller.snapshot().current_fan == 70
+    assert harness.controller._post_fc_doctrine_clamped_fan_request_percent == 100  # pyright: ignore[reportPrivateUsage]
+
+    harness.controller._current_heat = output.effective_floor_percent  # pyright: ignore[reportPrivateUsage]
+    harness.clock.advance(5.0)
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)]
+    await harness.controller.tick()
+
+    assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_desired_fan_percent == 100  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller.snapshot().current_fan == 100
+    assert [record.status for record in harness.sink.advisor_decisions[-2:]] == [
+        "timeout",
+        "timeout",
+    ]
+
+
+def test_fan_release_restore_is_strictly_upward_only() -> None:
+    """A retained older request can never lower a newer, higher fan desire."""
+    harness = harness_in_development(
+        readings=[_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)],
+        config=_doctrine_on(post_fc_fan_ceiling_enabled=True),
+    )
+    harness.controller._post_fc_desired_fan_percent = 90  # pyright: ignore[reportPrivateUsage]
+    harness.controller._post_fc_doctrine_clamped_fan_request_percent = 80  # pyright: ignore[reportPrivateUsage]
+
+    signal = PostFcFanSignal(
+        ambient_temp_c=23.1,
+        current_heat_percent=25,
+        post_fc_heat_floor_percent=25,
+        bean_ror_c_per_min=4.0,
+    )
+    harness.controller._arm_post_fc_fan_release(signal)  # pyright: ignore[reportPrivateUsage]
+
+    assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_desired_fan_percent == 90  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
 async def test_latch_releases_for_the_remainder_of_the_dwell() -> None:
     """One at-floor climbing tick releases monotonically despite later recovery."""
     advisor = FakeAdvisor(
@@ -7401,6 +7539,7 @@ async def test_taper_write_actuates_the_consult_clamped_value_and_never_renarrow
     harness.controller.request_advisory()
     await harness.controller.tick()
     assert harness.controller._post_fc_desired_fan_percent == 90  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_doctrine_clamped_fan_request_percent is None  # pyright: ignore[reportPrivateUsage]
 
     harness.clock.advance(5.0)
     harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=-1.0)]
@@ -7411,6 +7550,7 @@ async def test_taper_write_actuates_the_consult_clamped_value_and_never_renarrow
     assert harness.controller.snapshot().current_fan == 90
     assert advisor.contexts[-1].fan_ceiling_percent == 70
     assert harness.controller._post_fc_desired_fan_percent == 70  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_doctrine_clamped_fan_request_percent == 90  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio

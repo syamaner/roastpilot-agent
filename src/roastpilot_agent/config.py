@@ -1144,6 +1144,12 @@ class AmbientFanDoctrine(BaseModel):
     through the existing ``command_bounds`` clamp, never through a new safety
     rule. The optional fan slew clamp stays out because it bounds the step, not
     the destination.
+
+    Prompt selection is deliberately decoupled from both doctrine flags. They
+    may be true while ``c3`` (the live default) supplies no ambient teaching; in
+    that case the model simply sees the resolved number in
+    ``fan_ceiling_percent``. Told == enforced still holds structurally because
+    the same resolved box feeds the context and safety evaluation.
     """
 
     enabled: bool = False

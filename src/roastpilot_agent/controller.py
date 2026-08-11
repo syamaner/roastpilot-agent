@@ -98,11 +98,9 @@ Clock = Callable[[], float]
 AsyncSleep = Callable[[float], Awaitable[None]]
 
 
-#: #732: the controller is event-driven rather than log-driven, so this exists
-#: for exactly one purpose — the once-per-run ambient-decline warning, which has
-#: to reach an operator on paths no config validator can see and does not warrant
-#: a new server event kind (that would redden the FE event-kind contract test for
-#: a diagnostic).
+#: The controller is event-driven rather than log-driven. Logs here are reserved
+#: for low-volume control diagnostics that must reach an operator but do not
+#: warrant a new server event kind (which would expand the FE event contract).
 _log = logging.getLogger(__name__)
 
 
@@ -853,6 +851,10 @@ class RoastController:
         # ceiling binding, the release latch above arms so the told box cannot
         # oscillate back to a narrower ceiling within the same dwell.
         self._post_fc_fan_ceiling_engaged_once: bool = False
+        # D156/D157 scoring observability: each transition logs once per dwell,
+        # even though the predicate is evaluated on every tick and consult.
+        self._post_fc_fan_ceiling_engage_logged: bool = False
+        self._post_fc_fan_ceiling_release_logged: bool = False
         # #498 (D89 Tier 1, safety-reviewer BLOCKER-1 fix): the advisor's
         # safety-evaluated fan TARGET in loop mode — a held desire, never an
         # actuated value. The advisor consult and the taper's own write both
@@ -878,6 +880,11 @@ class RoastController:
         # earlier one (D88 C2 discipline, restart-never-auto-resumes intact —
         # this is a target value, never itself a write).
         self._post_fc_desired_fan_percent: int | None = None
+        # The advisor's own pre-clamp fan request when, and only when, D156's
+        # narrowed destination ceiling caused the clamp. Retained so D157 can
+        # restore that actor-authored request when the box releases, rather
+        # than leaving the last brake rationed at the obsolete ceiling.
+        self._post_fc_doctrine_clamped_fan_request_percent: int | None = None
         self._last_command_monotonic: float | None = None
         self._t0_streak = 0
         self._t0_confirmed = False
@@ -1255,6 +1262,7 @@ class RoastController:
         # both levers directly) never inherits a stale desired fan from an
         # earlier engagement.
         self._post_fc_desired_fan_percent = None
+        self._post_fc_doctrine_clamped_fan_request_percent = None
         # D96 slice 2 (#559): the stashed last-computed post-FC output is
         # likewise per-engagement state — clear it unconditionally on every
         # transition (same discipline as the two fields immediately above)
@@ -1277,6 +1285,8 @@ class RoastController:
         # never inherits free-fan authority from an earlier one.
         self._post_fc_fan_ceiling_released = False
         self._post_fc_fan_ceiling_engaged_once = False
+        self._post_fc_fan_ceiling_engage_logged = False
+        self._post_fc_fan_ceiling_release_logged = False
         if previous in TERMINAL_LATCH_PHASES and target not in TERMINAL_LATCH_PHASES:
             # Leaving a terminal HOLD phase is an EXPLICIT operator action
             # (acknowledge → idle, resume, start cooling): the operator now owns
@@ -1923,6 +1933,17 @@ class RoastController:
             # against, so feed the loop its own configured cadence as a sane
             # dt rather than an arbitrary/zero value.
             dt_seconds = config.control_interval_seconds
+        # D157/#498: resolve a release against the currently actuated heat
+        # before selecting the fan for this cadence-eligible write. If fan is
+        # now the only brake, the advisor's retained pre-clamp request can ride
+        # this SAME coalesced, safety-evaluated taper write; the consult remains
+        # target-only and never becomes a second writer. The FC-engagement tick
+        # has no stashed effective floor yet and stays on the existing
+        # post-actuation path below; treating that startup ``None`` as a live
+        # unknown floor would release before the ceiling ever had a chance to
+        # engage.
+        if self._last_post_fc_output is not None:
+            self._arm_post_fc_fan_release(self._post_fc_fan_signal(telemetry))
         # dt_seconds is always > 0 here: control_interval_seconds is validated
         # `gt=0` on the config model, and `elapsed` above is only used when it
         # already cleared the `>= control_interval_seconds` (itself > 0) gate.
@@ -3464,6 +3485,24 @@ class RoastController:
                 # ``transition_to`` alongside ``_post_fc_engaged`` (D88 C2
                 # discipline).
                 self._post_fc_desired_fan_percent = evaluation.adjusted_fan
+                # Retain provenance only when THIS consult's resolved box proves
+                # D156 caused the fan clamp: the ceiling is below the full
+                # 0–100 lever, the advisor asked above it, and safety landed on
+                # that exact ceiling. Any other accepted consult supersedes the
+                # prior request and clears the retention; a failed consult never
+                # reaches this branch, so the last successful actor request
+                # remains available through an outage.
+                doctrine = self._config.ambient_fan_doctrine
+                self._post_fc_doctrine_clamped_fan_request_percent = (
+                    decision.target_fan
+                    if doctrine.enabled
+                    and doctrine.post_fc_fan_ceiling_enabled
+                    and control_box.fan_ceiling_percent == doctrine.post_fc_fan_ceiling_percent
+                    and control_box.fan_ceiling_percent < 100
+                    and decision.target_fan > control_box.fan_ceiling_percent
+                    and evaluation.adjusted_fan == control_box.fan_ceiling_percent
+                    else None
+                )
             else:
                 await self._execute_advisor_levers(
                     heat=evaluation.adjusted_heat, fan=evaluation.adjusted_fan
@@ -4440,7 +4479,10 @@ class RoastController:
         as ``None`` and cannot clamp. The heat floor comes only from the loop's
         stashed :attr:`PostFcControlOutput.effective_floor_percent`; the command
         box floor is narrowed to actuated heat and would spuriously release on
-        every tick.
+        every tick. That stash can lag the live loop by up to one control
+        interval. The harmful direction — a stashed floor below the live floor,
+        keeping the fan ceiling bound — requires D96 recovery entry and
+        self-heals on the next accepted loop actuation.
 
         When the loop is not engaged the floor is ``None``. Policy deliberately
         treats that as heat having no remaining downward authority, so a
@@ -4482,6 +4524,13 @@ class RoastController:
         actuated fan follows on the taper's next coalesced write, bounded by
         ``post_first_crack_control.control_interval_seconds``.
 
+        If D156 previously clamped an advisor fan request, arming restores that
+        exact ADVISOR-requested value as the held desire, upward only. This is
+        not a lever move invented by the controller: it is an actor-authored fan
+        request that the newly full-range box now permits. The method performs
+        no roaster write; the taper remains the single writer and evaluates the
+        restored target through the normal safety policy.
+
         Args:
             signal: This tick's immutable signal, or ``None``.
 
@@ -4493,6 +4542,7 @@ class RoastController:
             return signal
         ceiling_engaged = self._policy().post_fc_fan_ceiling_engaged(signal)
         if ceiling_engaged:
+            self._log_post_fc_fan_ceiling_once(action="engaged", signal=signal)
             self._post_fc_fan_ceiling_engaged_once = True
             return signal
         if not (
@@ -4500,12 +4550,59 @@ class RoastController:
         ):
             return signal
         self._post_fc_fan_ceiling_released = True
+        retained_request = self._post_fc_doctrine_clamped_fan_request_percent
+        if retained_request is not None and (
+            self._post_fc_desired_fan_percent is None
+            or retained_request > self._post_fc_desired_fan_percent
+        ):
+            self._post_fc_desired_fan_percent = retained_request
+        self._log_post_fc_fan_ceiling_once(action="released", signal=signal)
         return PostFcFanSignal(
             ambient_temp_c=signal.ambient_temp_c,
             current_heat_percent=signal.current_heat_percent,
             post_fc_heat_floor_percent=signal.post_fc_heat_floor_percent,
             bean_ror_c_per_min=signal.bean_ror_c_per_min,
             released=True,
+        )
+
+    def _log_post_fc_fan_ceiling_once(
+        self, *, action: Literal["engaged", "released"], signal: PostFcFanSignal
+    ) -> None:
+        """Log one interpretable fan-ceiling transition per DEVELOPMENT dwell.
+
+        Args:
+            action: Whether the ceiling first engaged or its latch first released.
+            signal: The signal whose values caused that transition.
+        """
+        if action == "engaged":
+            if self._post_fc_fan_ceiling_engage_logged:
+                return
+            self._post_fc_fan_ceiling_engage_logged = True
+        else:
+            if self._post_fc_fan_ceiling_release_logged:
+                return
+            self._post_fc_fan_ceiling_release_logged = True
+        ambient = (
+            "unavailable" if signal.ambient_temp_c is None else f"{signal.ambient_temp_c:.1f} °C"
+        )
+        effective_floor = (
+            "unknown"
+            if signal.post_fc_heat_floor_percent is None
+            else f"{signal.post_fc_heat_floor_percent:d} %"
+        )
+        bean_ror = (
+            "unknown"
+            if signal.bean_ror_c_per_min is None
+            else f"{signal.bean_ror_c_per_min:.1f} °C/min"
+        )
+        _log.info(
+            "D156/D157 post-FC fan ceiling %s: ceiling=%d %%, ambient=%s, "
+            "effective_floor=%s, bean_ror=%s. #781",
+            action,
+            self._config.ambient_fan_doctrine.post_fc_fan_ceiling_percent,
+            ambient,
+            effective_floor,
+            bean_ror,
         )
 
     def _damp_trim_depth(self, raw_depth: int, trim: LateMaillardTrim) -> int:
