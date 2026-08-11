@@ -141,8 +141,10 @@
 > `faulted`/`aborted`, and all five have `ambient_captured = 0`, so none can be in the
 > D129 ambient eval set either. **Operator ratified option 1 (refuse to export, fail
 > closed) on 11 Aug.** **#789** (non-finite required telemetry temperatures now serialise
-> `null` while TS declares them non-null). **#792** (committed advisor reports carried
-> pre-#779 confirmation-anchored figures — **regenerated 11 Aug**, see the block below).
+> `null` while TS declares them non-null). **#792**, whose scope has MOVED: the
+> regeneration it was filed for is done (11 Aug, see the block above), and what remains is the
+> single unexplained `d251013e` frozen-DTR discrepancy — frozen 14.09 against an onset-derived
+> 13.01, post-#337 and MCP-sourced, in a direction no anchoring story explains.
 >
 > **Closed as consolidation or notes**, so the count above is not a live backlog:
 > **#783** (two siblings of #779's class) and **#785** (history `dev_pct` orders by a

@@ -28,13 +28,14 @@
 > Sightly underdeveloped"), so the "only `5a32334c` qualifies" statement below and its
 > matching action item are both retired — the corpus now carries two labelled bake-off
 > entries, not one. (2) First-crack temperatures were re-resolved: 188 → 187, 185 → 183,
-> and `5a32334c` gained a value (186 °C) where this report shows `n/a`. **Correcting my own
-> first explanation of that last one:** it is *not* because the mark moved. For an
-> operator-marked first crack `store_to_fixture` sets `first_crack_source` only when the
-> accepted source is `mcp` (`scripts/store_to_fixture.py:674-678`), so `5a32334c` still
-> anchors on the event row exactly as before. What changed is that #784 maps each mark onto
-> the nearest telemetry row, and that mapping can now read a temperature the old export left
-> null. Same anchor, newly resolvable value.
+> and `5a32334c` gained a value (186 °C) where this report shows `n/a`. **I have now been wrong
+> twice about why, so the causal claim is withdrawn rather than replaced a third time.** What is
+> established: the anchor did NOT move (`store_to_fixture` sets `first_crack_source` only for an
+> `mcp`-accepted crack, so an operator-marked FC stays on the event row), and **#784 is not the
+> mechanism either** — `_first_crack_temp_c` already read the nearest telemetry row before #784
+> (`f45db35~1:583-587`). The change is in what the manifest FIELD records: the old `null` reflected
+> the operator event carrying no bean temperature, while the entry is now populated from the
+> exported summary's nearest-row reading. No #784 behaviour explains it.
 >
 > **Provenance, corrected 11 Aug.** The frozen `development_percent` is **version-stamped at
 > #337** (the FC/T0 backdating consumer, closed 23 Jun 2026), so this corpus holds **two
