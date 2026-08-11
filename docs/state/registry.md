@@ -4,6 +4,60 @@
 
 **11 Aug 2026 — #781 closed by slice 2: D156/D157 wire the flag-gated post-FC fan destination ceiling and a one-way RUN-scoped release latch: once released it stays released for the rest of the run, surviving every transition including an operator resume, and is cleared only by `start_run`. The load-bearing case is a resume back to pre-first-crack reaching DEVELOPMENT again on a second first-crack edge; the direct recovery-to-DEVELOPMENT resume is separately inert because the floor is unknown there. In practice enforcement also requires the post-FC control loop: with the loop inert, the unknown heat floor releases a climbing bean immediately.**
 
+> **STATUS UPDATE — 12 Aug 2026 (the #787 sweep RAN, and it inverted the issue's premise;
+> two citations in this file corrected). Read before the block below.**
+>
+> **Both members #787 named are LATENT. An unnamed sibling is LIVE.** Measured against a
+> read-only copy of the operator's store, by running the defective and the corrected
+> expression over every run and diffing the outputs — not by arguing reachability.
+>
+> - **`store.py:1832` (`dev_pct … ORDER BY t.tick DESC`) produces the same value as
+>   `ORDER BY t.id DESC` on EVERY run.** All five restart-affected runs carry **0 rows with
+>   a non-null `development_percent`** (they are faulted/aborted bring-up runs that never
+>   reached development), so the subquery returns NULL under either ordering. The claim
+>   carried in #785, in #787, and in the 11 Aug overnight block below — that history "shows a stale
+>   development percentage" — is **correct as a mechanism and false as a present-tense
+>   statement about this store.** It shows nothing.
+> - **`store.py:2298` (reference-roast curve) is latent too:** 0 of the 15 rated runs has a
+>   tick reset, and that read requires a rated run.
+> - **The live sibling: a lookup keyed on `tick` where an exact foreign key already exists.**
+>   `tick` is not unique within a run, and the dominant cause is **not** restarts — the
+>   controller writes several `safety_evaluations` rows per tick (28 runs, including both
+>   RP-B arms and all three `agent-store` corpus entries). `advisor_decisions.safety_evaluation_id`
+>   is an FK to `safety_evaluations(id)`, populated **368 of 368**. The history counts
+>   (`store.py:1841-1847`) and the SPA trace tables discard it and guess by tick, last-wins.
+>   Measured: **27 of 368** advisor rows misjoin across **17 runs**; on **10** rows across
+>   **3 rated roasts** the verdict differs, every one an `allow` reported as a `reject`, so
+>   history **over-reports rejections**. On the SPA, **438 of 806** (54%) decision-trace rows
+>   across **20 runs** are attached to an advisor recommendation that did not produce them.
+>   The FE cannot do better today: `TimelineSafetyEvaluation` carries no `id` on the wire and
+>   the TS type drops `safety_evaluation_id`, while `models.py:1504` documents the field as
+>   being there "so the FE can join an advisor decision to its verdict".
+>
+> **The lesson, and it is the one to carry: measure the DEFECT, not its precondition.**
+> Reachability for the five restart-affected runs was established carefully and then restated
+> as the defect firing. One query settles latent-vs-live, and it changes what the work is
+> worth. Sweeping the *class* rather than the issue's *named mechanism* is what surfaced the
+> live member.
+>
+> **⚠ TWO CITATIONS IN THIS FILE WERE WRONG AND ARE CORRECTED IN PLACE.** Both carry an
+> inline `[Corrected 12 Aug 2026: …]` marker at the claim itself; find them with
+> `rg -n 'Corrected 12 Aug 2026' docs/state/registry.md` rather than by line number — an
+> earlier draft of THIS paragraph cited them as "lines 158 and 264", which inserting this
+> block promptly falsified, in the very sentence warning about citation drift.
+> The first is the sharper one: the paragraph warning "quote the authoritative line; do not
+> summarise it" **contained a drifted citation of its own** — it cited `config.py:1195-1197`
+> as "c11's prose", which at `634ebf4` is the middle of an `AmbientFanDoctrine` docstring
+> about lever quantisation. The cite was
+> plausibly right when written on 11 Aug and drifted when #797 and #800 moved `config.py`.
+> **Prefer a symbol to a line number for anything durable:** c11's prose is
+> `_CONTROL_TEACHING_PROMPTS["c11"]` in `advisor.py` (the fan-brake carve-out text is inside
+> that section), and the config-side mirror is the `AmbientFanDoctrine` docstring in
+> `config.py`. Both are greppable and survive line drift; verify with
+> `rg -n '_CONTROL_TEACHING_PROMPTS\["c11"\]' src/roastpilot_agent/advisor.py`.
+> A line number in this file is a claim with a short half-life, because this file is read at
+> the start of every task and its cites are followed rather than re-derived.
+>
 > **STATUS UPDATE — 11 Aug 2026, evening (#781 CLOSED via PR #800; #787 reopened as a
 > sweep with #785 folded in; D157 amended twice). Read before the block below.**
 >
@@ -156,7 +210,13 @@
 >
 > **A correction worth keeping.** #781's carve-out was briefed as "heat at or below its
 > post-FC base ceiling"; both authoritative sources (c11's prose at `config.py:1195-1197`
-> and the issue) say **heat at its floor**. The paraphrase drifted and was caught by the
+> and the issue) say **heat at its floor**.
+> [Corrected 12 Aug 2026: that `config.py:1195-1197` cite is WRONG at `634ebf4` — those
+> lines are an `AmbientFanDoctrine` docstring about lever quantisation. c11's prose is
+> `_CONTROL_TEACHING_PROMPTS["c11"]` in `advisor.py`; the config-side mirror is the
+> `AmbientFanDoctrine` docstring in `config.py`. The cite drifted when #797/#800 moved
+> `config.py`. The **substance below is unaffected** — "heat at its floor" is still what
+> both sources say. See the 12 Aug block at the top: cite durable text by symbol, not line.] The paraphrase drifted and was caught by the
 > contract pass, not by a gate. Three of today's defects were the same shape — a durable
 > text written correctly once, then re-stated slightly wrong downstream (this, the
 > follow-up count below, and #758's body describing as open a half that had already
@@ -264,6 +324,12 @@
 >   `store.py:1830-1832` selects `dev_pct` with `ORDER BY t.tick DESC`, so a restart that
 >   resets `tick` makes history show a **pre-restart** DTR. Class membership was never the
 >   point; the export path and a history read are different code.
+>   [Corrected 12 Aug 2026: the MECHANISM is right, the present-tense consequence is NOT.
+>   Measured over every run in the operator's store, `ORDER BY t.tick DESC` and
+>   `ORDER BY t.id DESC` return the SAME value everywhere, because all five
+>   restart-affected runs have 0 rows with a non-null `development_percent` — none reached
+>   development. History shows no stale DTR; it shows nothing. The fix is still correct and
+>   is being made, but it hardens a LATENT trap. See the 12 Aug block at the top.]
 >
 > **Two lessons, and the second is the sharper one.** First: consolidating by surface
 > similarity rather than by defect class silently discards work, and it reads as tidy while
