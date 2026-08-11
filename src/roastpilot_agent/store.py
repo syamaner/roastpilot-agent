@@ -1800,13 +1800,13 @@ class RoastStore:
         Advisor stats (#184) — consults, clamped, rejected, failed — are
         aggregated here from ``advisor_decisions`` so the history list no longer
         N+1s ``GET /api/roasts/{id}/timeline`` to derive them client-side. The
-        counts reproduce the SPA's prior ``advisorSummary`` exactly: ``consults``
-        is every persisted decision row; ``failed`` is those whose ``status`` is
-        not ``ok``; ``clamped`` / ``rejected`` count a consult against the
-        *latest* safety evaluation at the consult's ``tick`` (the same
-        last-wins-by-tick join the SPA did against the timeline rows). The
-        ``idx_advisor_run_tick`` / ``idx_safety_run_tick`` indexes cover the
-        lookups; all are correlated subqueries (one statement, no N+1). A run with
+        counts are FK-exact: ``consults`` is every persisted decision row;
+        ``failed`` is those whose ``status`` is not ``ok``; ``clamped`` /
+        ``rejected`` count a consult against its linked safety evaluation. The
+        ``idx_advisor_run_tick`` index covers the advisor lookups; all are
+        correlated subqueries (one statement, no N+1). A NULL or dangling
+        advisor-side safety FK counts as neither clamped nor rejected, so pre-FK
+        rows under-report rather than guessing from a non-unique tick. A run with
         no advisor decisions yields zeros, which the SPA renders as "no advice".
 
         The clamp/reject verdict values the clamped/rejected subqueries compare
@@ -1829,7 +1829,7 @@ class RoastStore:
             " r.ambient_temp_c, r.ambient_humidity_pct, r.ambient_pressure_hpa,"
             " (SELECT t.development_percent FROM telemetry_snapshots t"
             "  WHERE t.run_id = r.id AND t.development_percent IS NOT NULL"
-            "  ORDER BY t.tick DESC LIMIT 1) AS dev_pct,"
+            "  ORDER BY t.id DESC LIMIT 1) AS dev_pct,"
             " (SELECT e.recorded_at_utc FROM roast_events e"
             "  WHERE e.run_id = r.id AND e.kind = 'first_crack'"
             "  ORDER BY e.recorded_at_utc ASC LIMIT 1) AS fc_at,"
@@ -1839,12 +1839,10 @@ class RoastStore:
             "  WHERE a.run_id = r.id AND a.status != 'ok') AS advisor_failed,"
             " (SELECT COUNT(*) FROM advisor_decisions a WHERE a.run_id = r.id AND"
             "  (SELECT s.verdict FROM safety_evaluations s"
-            "   WHERE s.run_id = r.id AND s.tick = a.tick"
-            "   ORDER BY s.id DESC LIMIT 1) = ?) AS advisor_clamped,"
+            "   WHERE s.id = a.safety_evaluation_id) = ?) AS advisor_clamped,"
             " (SELECT COUNT(*) FROM advisor_decisions a WHERE a.run_id = r.id AND"
             "  (SELECT s.verdict FROM safety_evaluations s"
-            "   WHERE s.run_id = r.id AND s.tick = a.tick"
-            "   ORDER BY s.id DESC LIMIT 1) = ?) AS advisor_rejected"
+            "   WHERE s.id = a.safety_evaluation_id) = ?) AS advisor_rejected"
             " FROM roast_runs r WHERE r.excluded = 0"
             " ORDER BY r.started_at_utc DESC, r.rowid DESC",
             # D15: the verdict values bound as query parameters come from the typed
@@ -2295,7 +2293,7 @@ class RoastStore:
         async with self.connection.execute(
             "SELECT charge_elapsed_seconds, bean_temp_c, env_temp_c,"
             " bean_ror_c_per_min, agent_phase, development_percent"
-            " FROM telemetry_snapshots WHERE run_id = ? ORDER BY tick ASC, id ASC",
+            " FROM telemetry_snapshots WHERE run_id = ? ORDER BY id ASC",
             (run_id,),
         ) as cursor:
             rows = list(await cursor.fetchall())
