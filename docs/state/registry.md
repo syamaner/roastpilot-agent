@@ -23,11 +23,20 @@
 > against bad fixtures.
 >
 > **⚠ OPERATOR ACTION, GATES #749: regenerate the store-sourced fixtures**, including
-> the D129 RP-B eval set, before #749 runs. No store-sourced fixture is tracked in
-> git, so this is a local data step. The before → after table on #784 makes the
+> the D129 RP-B eval set, before #749 runs. The before → after table on #784 makes the
 > regeneration self-checking.
 >
-> **#757 in flight as PR #790** — the read/serialisation sibling of the #756
+> **The regeneration is NOT purely local.** No store-sourced *fixture* is tracked in
+> git, but two **committed derivatives** carry `store_to_fixture` output computed with
+> the old confirmation anchors, so correcting only the local fixtures would leave the
+> repository-visible numbers wrong:
+> `docs/advisor/store-roast-corpus-manifest.json` (three `agent-store` entries, DTR
+> 10.8 / 12.7 / 11.1 %, each understating development by the recognition delay) and
+> `docs/advisor/postfc-validation-2026-06-28.md`, which repeats those values **and
+> draws control-loop conclusions from them**. Either regenerate both alongside the
+> fixtures, or explicitly correct and freeze them as historical. Tracked as **#792**.
+>
+> **#757 CLOSED via PR #790** (`30f665c`) — the read/serialisation sibling of the #756
 > non-finite family. The SSE half is the real defect: a bare `NaN` token made the
 > SPA's `parseData` return `{}` and discard the **entire frame** every affected tick.
 > **The REST half's premise is corrected, not implemented:** the claimed 500 on
