@@ -263,8 +263,8 @@ checklist before you open.
   Before writing code, decompose the story into an **ordered list of coherent PRs**, each
   with its scope, rough size, dependencies, and which reviewers it triggers
   (safety / security / qa). You should know the planned review units and why each is
-  coherent *before* PR1 opens. This lives in the story brief (a lead / `product-pm`
-  activity); for a story delegated to Codex-MCP, the `story-planner` contract
+  coherent *before* PR1 opens. This lives in the story brief (a lead activity);
+  for a story delegated to Codex-MCP, the `story-planner` contract
   carries the PR plan (D152) and the lead adopts it into the brief — one plan,
   not two competing ones. Reactively discovering unrelated responsibilities in a large diff is the
   failure mode this prevents (#587's ~800-line module and #600's ~2,000-line harness
@@ -629,8 +629,10 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   (dependency bumps), `sim-roast-runner` (mock vertical slice + decision-trace
   summaries), `ui-reviewer` (Playwright against the replay harness). **Team
   roles** (define each once; reuse as an agent-team teammate, standalone, or a
-  workflow stage): `product-pm` (product reviewer — audit vs plan, record
-  decisions, write the next brief; never edits src/tests), `qa` (test quality
+  workflow stage): `product-auditor` (product/plan audit lens — audit vs plan,
+  surface registry/epic drift and the decisions that need recording; READ-ONLY,
+  writes nothing, and never authors a brief — the `story-planner` contract is the
+  implementation brief under D152), `qa` (test quality
   beyond coverage), `pr-triage` (independent PR-feedback triage — also the
   `triage-pr` skill), `engineer-fe` (web/ SPA), `engineer-be` (Python agent),
   `story-planner` (implementation contracts before any code — required before any
@@ -642,7 +644,7 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   (`engineer-be`, `engineer-fe` — Codex-MCP is the default implementer for contracted
   slices, D152; see the delegation bullet below), mechanical checks
   (`mcp-contract-checker`, `sim-roast-runner`), and
-  routine review/audit (`pr-triage`, `qa`, `ui-reviewer`, `product-pm`,
+  routine review/audit (`pr-triage`, `qa`, `ui-reviewer`, `product-auditor`,
   `security-reviewer`) — all pinned to the full ID `model: claude-sonnet-5`
   (implementers, reviewers, and triage at `effort: high`; the mechanical checks
   `mcp-contract-checker` and `sim-roast-runner` at `effort: medium`). **Reserve
@@ -726,8 +728,20 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   cited plan files — issue or plan drift means replan, not delegate; (3) the remaining weekly
   allowance is at or above the 20% budget stop. D23 is unchanged:
   Codex-as-author never adjudicates review feedback on its own PR.
-- **Skills** (`.claude/skills/`): `triage-pr` (→ `pr-triage`), `capture` (drive
-  the replay harness + SPA, screenshot a named page state — E10+).
+- **Skills** (`.claude/skills/`) — read the relevant `SKILL.md` in full before
+  acting. Claude registers these natively; **Codex discovers them from this table
+  and then reads the file**, so keep the table complete or a Codex session goes
+  blind to the ones omitted:
+
+  | Skill | When |
+  |-------|------|
+  | `pr-preflight` | Before opening ANY PR — gates, size + data/logic split, self-critique, domain reviewers, local `codex review` |
+  | `triage-pr` | Before merging — independent PR-feedback triage (→ `pr-triage`), so the author never triages its own PR (D23) |
+  | `capture` | Screenshot a named SPA page state via the replay harness (E10+) |
+  | `pre-roast-preflight` | Before charging beans — hardware + software readiness checks |
+  | `roast-review` | After a roast — debrief the trace against profile targets |
+  | `register-roast` | After a roast — capture the operator rating (D42) and register the run as a labelled fixture |
+  | `add-bean-profile` | Add a bean profile from a supplier product URL plus the operator's specifics |
 - **Workflows** (`.claude/workflows/`): `review-branch` (cross-checked roster
   review of the branch diff).
 - **MCP** (`.mcp.json`): the Microsoft **Playwright MCP** (`@playwright/mcp`) —

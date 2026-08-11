@@ -9,9 +9,10 @@ guidance) have both landed.
 Slice 2 updated each existing agent's `model` pin and
 `effort`, and the corresponding model-selection guidance in `AGENTS.md` (so the
 prose and the pins agree rather than contradict); it preserves their current
-tools and capabilities, including `product-pm`'s documentation-write scope
-(`Edit`/`Write` for decisions and briefs, never `src/` or `tests/`) and
-`ui-reviewer`'s Playwright MCP access. The §4 reference table describes generic
+tools and capabilities, except that `product-pm` was narrowed to the read-only
+`product-auditor` (#802 — its documentation-write scope moved to the lead, and
+its brief-writing role was superseded by the D152 `story-planner` contract), and
+`ui-reviewer` keeps its Playwright MCP access. The §4 reference table describes generic
 role archetypes, not a tool-set remap of the existing fleet. Operator note:
 `claude-opus-5` and `claude-fable-5` availability was confirmed for this
 environment before Slice 1 shipped, so the planning-architect's Fable pin
@@ -431,8 +432,8 @@ This topology is ready when:
   role cannot create its own worktree, the lead-side provisioning and
   `git worktree list` verification required by §8 item 6 must be in force too,
   or every invocation still starts in the shared checkout with eight compliant
-  prompts. The three Bash-capable
-  WRITING roles (`engineer-be`, `engineer-fe`, `product-pm`) fall outside §7 as
+  prompts. The two Bash-capable
+  WRITING roles (`engineer-be`, `engineer-fe`) fall outside §7 as
   written, but the mutate-then-restore hazard is identical for them — an
   implementer runs mutation tests as readily as a reviewer — so #733 covered
   all eleven even though only the eight gate this criterion. Enumerated

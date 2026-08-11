@@ -1,7 +1,7 @@
 export const meta = {
   name: 'review-branch',
   description:
-    'Cross-checked roster review of the current branch diff: fan out the role agents as lenses (correctness, qa, product-pm, + safety/security/ui when relevant), adversarially verify each finding, then a single pr-triage verdict.',
+    'Cross-checked roster review of the current branch diff: fan out the role agents as lenses (correctness, qa, product-auditor, + safety/security/ui when relevant), adversarially verify each finding, then a single pr-triage verdict.',
   whenToUse:
     'Run on a PR/branch before merge for a multi-lens, cross-checked review you can rerun. Pass {base:"<ref>"} to diff against a non-default base.',
   phases: [
@@ -129,7 +129,7 @@ const reviewBase = `Review ONLY the changes in ${diffScope} of this repo (read t
 const lenses = [
   { key: 'correctness', prompt: `${reviewBase}\n\nLens: CORRECTNESS — logic bugs, edge cases, error handling, races, off-by-one, missing await, broken invariants.` },
   { key: 'qa', agentType: 'qa', prompt: `${reviewBase}\n\nLens: TEST QUALITY — do tests assert real behavior (not smoke)? Coverage delta, acceptance criteria with no test, Playwright/screenshot paths, over-mocking. Findings = weak/missing tests.` },
-  { key: 'product', agentType: 'product-pm', prompt: `${reviewBase}\n\nLens: PRODUCT/PLAN — does it match the plan/epic/decisions? Dropped requirements, undefined "done", drift between registry/epic tables and code, violated architecture invariants. Review only — do NOT edit anything.` },
+  { key: 'product', agentType: 'product-auditor', prompt: `${reviewBase}\n\nLens: PRODUCT/PLAN — does it match the plan/epic/decisions? Dropped requirements, undefined "done", drift between registry/epic tables and code, violated architecture invariants. Review only — do NOT edit anything.` },
 ]
 // Safety fires on the file-based surface, and ALSO on a new provider-calling path:
 // checklist class 6 (contention with the roast advisor) is safety-adjacent, and
