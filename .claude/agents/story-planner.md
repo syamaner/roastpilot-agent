@@ -202,14 +202,20 @@ is what "specced" means: delegation without one is forbidden (fail-closed).
    commit lands on no branch), the #738 fresh-venv-in-worktree rule,
    `.venv/bin/python -m ...` invocation, the full gates before handback, the
    INVARIANT that the handed-back branch must be attributable to the Codex
-   family ALONE — any influence from a model outside that family, at any stage,
-   in any form, by any route, breaks that attribution — with the handback
-   disclosure asked in those same terms ("did any model outside your own family
-   influence this slice in any way?"). **Carry it as the invariant; do NOT
+   worker acting on its RATIFIED INPUTS alone — this contract and lead-authored
+   directives, which are the sanctioned channel; any OTHER model input the
+   worker itself procures, at any stage, in any form, by any route, breaks that
+   attribution — with the handback disclosure asked in those same terms
+   ("apart from the ratified contract and the lead's directives, did you obtain
+   input from any model in any way?"). The discriminator is WHO PROCURED IT,
+   not which family produced it: you are a Fable model and this contract is
+   mandatory, so a family-scoped rule would fail closed on every compliant
+   delegation, including this one. **Carry it as the invariant; do NOT
    render it in the contract as a list of prohibited activities.** Four review
    rounds each defeated an enumerated form by finding a structurally DIFFERENT
    route rather than another instance, which is the D154 signal to change the
-   failure direction instead of patching again (D157's remedy). A Codex session
+   failure direction instead of patching again (the technique D157 reached for
+   when its own enumeration proved incomplete, cited for that alone). A Codex session
    discovers `.claude/agents/` and calls those roles unprompted, and a worker
    whose branch was shaped by the reviewing family breaks D23 and hollows out
    the mandatory Opus safety floor. That disclosure is the whole verification —

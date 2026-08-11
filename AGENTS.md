@@ -696,10 +696,20 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   so no ignored secret may reach its context) with per-command
   self-location, the #738 fresh-venv-in-worktree rule, `.venv/bin/python -m
   ...` invocation, and the full gates before handback. **INVARIANT: the handed-back branch
-  must be attributable to the Codex family ALONE.** Any influence from a model
-  outside that family — at any stage, in any form, by any route — breaks that
-  attribution, and the worker MUST disclose it at handback in those terms
-  ("did any model outside your own family influence this slice in any way?").
+  must be attributable to the Codex worker acting on its RATIFIED INPUTS
+  ALONE.** The ratified inputs are exactly two, and they are the sanctioned
+  channel: the `story-planner` contract (Fable-authored by design and
+  maintainer-ratified) and lead-authored directives. Any OTHER model influence
+  the worker itself procures — at any stage, in any form, by any route —
+  breaks that attribution, and the worker MUST disclose it at handback in those
+  terms ("apart from the ratified contract and the lead's directives, did you
+  obtain input from any model in any way?"). The discriminator is WHO
+  PROCURED IT, not which family produced it: the contract arrives through a
+  channel the maintainer ratified, which is what makes the later Claude review
+  independent of the worker's own choices; a model the worker consults itself
+  never passed that gate. Scoping it to "any model outside the Codex family"
+  would fail closed on EVERY compliant delegation, since D152 makes that
+  Fable-authored contract mandatory and the implementer's only specification.
   **This is stated as an invariant on purpose, and MUST NOT be rewritten as a
   list of prohibited activities.** Four successive review rounds on the PR that
   introduced it each defeated an enumerated form by finding a structurally
@@ -709,8 +719,13 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   implementation (a disclosure asking only about reviews evades it), then the
   disclosure wording itself. That is precisely the pattern **D154** names as
   the signal to change a design's failure direction instead of patching it
-  again, and the remedy D157 used: an enumeration is incomplete by
-  construction, so what follows is illustration and never the definition.
+  again. It is also the remedy D157 reached for when its own first formulation
+  proved incomplete on an unrelated control predicate — "stating it as an
+  invariant rather than enumerating the axes is deliberate: the first
+  formulation was an enumeration and the enumeration was incomplete" — cited
+  here for that technique only, not for its subject matter. An enumeration is
+  incomplete by construction, so what follows is illustration, never the
+  definition.
   Illustrations, non-exhaustive: the `claude` CLI (`claude -p`, `--agent`), a
   direct provider HTTP call, a vendor SDK, another agent CLI, a hosted
   service; a review of finished work, a design critique, an implementation
