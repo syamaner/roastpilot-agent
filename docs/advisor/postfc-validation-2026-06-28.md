@@ -266,8 +266,10 @@ gpt-4o called drop correctly; the dev guard blocked it past the ceiling.
 
 A scored bake-off run with the expanded corpus is warranted but not blocking:
 
-- Add `store-roast-5a32334c` to the bake-off test set once the operator confirms it
-  as known-good (the manifest marks it `usable_for_bakeoff: true`).
+- Add `store-roast-5a32334c` **and `store-roast-d251013e`** to the bake-off test set once
+  the operator confirms them as known-good (the manifest marks both
+  `usable_for_bakeoff: true` as of 11 Aug). `d251013e` became eligible when it was rated;
+  read its operator note ("a bit flat, slightly underdeveloped") alongside its 12.9 % DTR.
 - ~~Rate `store-roast-d251013e` to unlock it (operator action required).~~ **DONE** — rated
   3/5 on 11 Aug ("tasted a bit flat. Sightly underdeveloped"); the entry is now labelled and
   bake-off eligible.

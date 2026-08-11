@@ -49,8 +49,11 @@
 >
 > **#749 IS CUT (operator spend decision, 11 Aug), and #740 goes with it.** Its purpose
 > was to inform an RP-B verdict hardware already delivered on 10 Aug. Do not start it and
-> do not write a contract for it. **#708 and #710 also stay unkicked**: a curve-driven
-> RoR-setpoint design was raised and deliberately NOT started, on the #567 precedent
+> do not write a contract for it. **#708 (recovery v2: runway-aware trigger + bounded
+> fast-raise) and #710 (deterministic joint-window drop planner) also stay unkicked** — they
+> are #707's children as defined further down this file, and their scope is unchanged. What
+> is new and NOT either of them is a curve-driven RoR-setpoint design, raised on 11 Aug and
+> deliberately NOT started, on the #567 precedent
 > (built across three slices, then parked on a negative bake-off). Offline support is
 > directional only — 4-star median required-RoR 4.9 vs 3-star 6.5, overlapping ranges,
 > n=16. Raise the design question BEFORE any contract, not after.
@@ -152,7 +155,8 @@
 > hygiene); **#786** (shared UTC-parse / nearest-row tie-break) closed won't-fix.
 >
 > **The aggregate is the lesson, not any one of them.** Seven filings against two closed
-> stories took the board from 38 to 43 overnight and four were retracted within a day.
+> stories took the board from 38 to 43 overnight (38 + 7 filed − 2 stories closed = 43),
+> and four of the seven were retracted within a day.
 > Each was individually defensible; filing is not free, and one issue owning a class beats
 > N issues that are its instances.
 >
