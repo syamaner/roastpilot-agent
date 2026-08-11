@@ -344,13 +344,14 @@ class AdvisorContext(BaseModel):
     # deliberately NOT in the prompt prose (the #218 two-copies discipline), so
     # it can be re-fit from RP-D scores without a prompt edit.
     #
-    # Read-only context with no control authority — no lever is derived from
-    # these, and neither the controller nor safety.evaluate_command reads them
-    # back. #498's fan capability (including fan 100) is untouched: this
-    # changes what the model is TOLD, never the box that is ENFORCED. The
-    # pressure leg of the triad is deliberately omitted: the doctrine drives
-    # off temperature first with humidity as context, and an unused third
-    # field would be context the model must ignore.
+    # Read-only context with no control authority — neither the controller nor
+    # safety.evaluate_command reads these SERIALIZED fields back. D156 uses the
+    # same doctrine-gated telemetry ambient independently when resolving the
+    # told-and-enforced consult box, so fan 100 may be destination-clamped while
+    # heat retains downward authority; D157 restores #498's full capability once
+    # fan may be the only brake. The pressure leg of the triad is deliberately
+    # omitted: the doctrine drives off temperature first with humidity as
+    # context, and an unused third field would be context the model must ignore.
     #
     # Default ``None`` for the uncaptured / disabled / unavailable cases and
     # every older caller (the drop-only bake-off, replayed contexts that
@@ -381,14 +382,17 @@ class AdvisorContext(BaseModel):
     # 10`` so 15 pp is one level from some starting values and two from
     # others). Data rather than prose for the same reason as the boundary
     # above, and present
-    # at all because "graduated steps" with no bound is not a bound: with no
-    # deterministic slew clamp in this release, an unbounded graduation still
-    # permits the fan slam the doctrine exists to prevent.
+    # at all because "graduated steps" with no bound is not a bound: there is no
+    # deterministic slew clamp in this release, so pace remains prose-shaped.
+    # D156/D157 may separately ceiling-bound the DESTINATION the context tells
+    # the advisor, but an unbounded graduation inside that box can still permit
+    # the fan slam the doctrine exists to prevent.
     #
-    # Bounds the STEP, never the destination — the fan ceiling and every fan
-    # value stay reachable — and it is subordinate to the fan-brake rule, which
-    # takes precedence whenever fan is the only brake left. ``None`` for
-    # callers that build no controller.
+    # Bounds the STEP, never the destination — every fan value through the
+    # context's current ceiling stays reachable. D156/D157 may separately
+    # narrow that destination ceiling. The pace teaching is subordinate to the
+    # fan-brake rule, which takes precedence whenever fan is the only brake left.
+    # ``None`` for callers that build no controller.
     ambient_fan_step_max_pp: float | None = None
 
 
@@ -1814,10 +1818,11 @@ _CONTROL_TEACHING_PROMPTS["c10"] = _CONTROL_TEACHING_PROMPTS["c9"].replace(
 # 23.9 °C cupped a 4 and fan 85-100 at 25-31 °C repeatedly cupped fine. There
 # is no clean ambient-to-fan correlation in ten noisy points, and that has a
 # design consequence: below the boundary the teaching steers the PROCESS
-# (graduate the steps, read the rate-of-rise response) and never caps the fan.
-# #498's capability — including fan 100 — is untouched, and a soft fan in a
-# genuinely hot room (the smoke/scorching failure #498 fixed) stays explicitly
-# warned against.
+# (graduate the steps, read the rate-of-rise response) and adds no slew clamp.
+# D156/D157 may separately narrow the told-and-enforced destination in a cool
+# room while heat retains downward authority; #498 keeps full fan capability
+# once fan may be the only brake. A soft fan in a genuinely hot room (the
+# smoke/scorching failure #498 fixed) stays explicitly warned against.
 #
 # This section QUALIFIES the fan-as-active-brake teaching (spliced above it in
 # assembly order) and must never read as cancelling it: fan is still a primary
@@ -1826,8 +1831,9 @@ _CONTROL_TEACHING_PROMPTS["c10"] = _CONTROL_TEACHING_PROMPTS["c9"].replace(
 # Two safety-relevant clauses come from the pre-open safety review, and both
 # exist because in post-FC loop mode the deterministic loop owns heat and FAN
 # IS THE ADVISOR'S LEVER, while the safety gate clamps fan only to
-# [floor, ceiling] with no slew limit — so this prose is the ONLY thing shaping
-# fan pace, and it shapes an actuated value:
+# [floor, ceiling] with no slew limit. This prose therefore still shapes fan
+# PACE; D156/D157 may separately narrow the DESTINATION ceiling, told through
+# the same context box and enforced by command_bounds:
 #   (a) an explicit PRECEDENCE carve-out, because the graduated-steps
 #       preference would otherwise ration the brake in exactly the emergency
 #       the fan-brake rule exists to handle (heat at its floor, bean still
@@ -1846,8 +1852,9 @@ _CONTROL_TEACHING_PROMPTS["c10"] = _CONTROL_TEACHING_PROMPTS["c9"].replace(
 # discipline; the guard test asserts the section is digit-free). The boundary
 # arrives as DATA in ``ambient_fan_threshold_c``, so the operator's ratified
 # ~26 °C HYPOTHESIS re-fits from RP-D (#711) joint scores by changing config
-# alone. Prompt-only doctrine: no deterministic fan slew clamp ships with this
-# (6 Aug ratification). Selectable-only; c3 stays the live default, and
+# alone. No deterministic fan SLEW clamp ships; the flag-gated destination
+# ceiling of D156/D157 is a distinct mechanism and remains told through
+# ``fan_ceiling_percent``. Selectable-only; c3 stays the live default, and
 # promotion is gated on the offline decision-level bake-off plus a
 # single-variable hardware roast scored by RP-D — operator-gated.
 _C11_AMBIENT_FAN_SECTION = (

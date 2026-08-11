@@ -21,9 +21,8 @@ Scope of #273: introduce the policy and resolve the **limit box** from the one
 source. The pre-FC *lever* values (heat 100 / fan low, the n8n decision-tree
 targets) are #222's job; this object is deliberately structured so #222 adds that
 lever resolution as another method on the same policy, with no second copy of the
-numbers. Today every phase resolves the full 0–100 heat/fan range — exactly the
-gate's current behaviour — so wiring the gate to read the box here is a verdict
-no-op (#273's invariant), and #222 narrows the range per phase.
+numbers. #222 narrows the pre-FC range; D156/D157 may additionally narrow the
+DEVELOPMENT fan destination when its doubly flag-gated ambient signal engages.
 """
 
 import math
@@ -39,18 +38,18 @@ from roastpilot_agent.config import (
 )
 from roastpilot_agent.models import RoastPhase, RoastProfile
 
-# The full lever range. Phases the deterministic pre-FC policy does not own
-# (development → drop, cooling, the lifecycle states) resolve to this full
-# 0–100 box, reproducing the gate's pre-#222 clamp exactly. #222 narrows the
-# two pre-FC phases (PREHEATING / ROASTING_PRE_FIRST_CRACK) on this same object.
+# The full lever range. Cooling and lifecycle phases resolve to this full
+# 0–100 box. #222 narrows the two pre-FC phases (PREHEATING /
+# ROASTING_PRE_FIRST_CRACK); D156/D157 may narrow DEVELOPMENT fan only, on this
+# same object, while leaving heat full-range.
 _LEVER_MIN_PERCENT = 0
 _LEVER_MAX_PERCENT = 100
 
 # The pre-first-crack phases the deterministic lever policy owns (D35 §3/§4-A):
 # preheat and charge→FC. In both the controller sets heat/fan from the policy
 # every tick and the free-form advisor is NOT consulted (#222). Every other
-# phase resolves the full 0–100 box and carries no deterministic target (the
-# post-FC LLM owns development → drop; #223).
+# phase carries no deterministic target; DEVELOPMENT's advisor-owned fan
+# destination may be ceiling-bound by D156/D157, while later phases stay 0–100.
 _PRE_FIRST_CRACK_PHASES: frozenset[RoastPhase] = frozenset(
     {RoastPhase.PREHEATING, RoastPhase.ROASTING_PRE_FIRST_CRACK}
 )
@@ -137,12 +136,15 @@ class PostFcFanSignal:
             permanently release the ceiling.
         bean_ror_c_per_min: The current bean rate-of-rise, or ``None`` when
             unavailable.
+        released: The controller's one-way per-DEVELOPMENT-dwell latch. Once
+            true, the destination ceiling stays released for the dwell.
     """
 
     ambient_temp_c: float | None
     current_heat_percent: int
     post_fc_heat_floor_percent: int | None = None
     bean_ror_c_per_min: float | None = None
+    released: bool = False
 
 
 class PhaseControlLimits(BaseModel):
@@ -390,7 +392,7 @@ class RoastControlPolicy:
         plan's "fan controlled", not raised — raising fan pre-FC crashes RoR into
         the crack, the #218 anti-pattern).
 
-        Every other phase resolves the full 0–100 range with no deterministic
+        Every other phase starts from the full 0–100 range with no deterministic
         target — development → drop is the post-FC LLM's box (#223); the lifecycle
         states do not actuate. In DEVELOPMENT only, ``post_fc_fan_signal`` may
         narrow the fan destination ceiling when both doctrine flags are on, the
@@ -514,7 +516,23 @@ class RoastControlPolicy:
             return False
         if ambient >= doctrine.threshold_c:
             return False
-        return not self._fan_is_only_brake(signal)
+        return not (signal.released or self._fan_is_only_brake(signal))
+
+    def fan_ceiling_release_due(self, signal: PostFcFanSignal) -> bool:
+        """Whether a fresh post-FC signal should arm the one-way release latch.
+
+        This is the latch-independent latching condition: heat is at its
+        effective floor AND the bean may still be climbing. It deliberately
+        ignores ``signal.released`` so callers can ask whether the live signal
+        itself warrants first release, mirroring :meth:`trim_window_open`.
+
+        Args:
+            signal: The current post-FC fan inputs.
+
+        Returns:
+            ``True`` when fan may be the only remaining brake.
+        """
+        return self._fan_is_only_brake(signal)
 
     def _fan_is_only_brake(self, signal: PostFcFanSignal) -> bool:
         """Whether heat cannot brake while the bean may still be climbing.
@@ -526,18 +544,13 @@ class RoastControlPolicy:
         it as the conjunction rather than as "released once heat bottoms out" —
         the looser phrasing describes a different, more permissive predicate.
 
-        Slice-2 hazard, recorded here because the predicate lives in this file:
-        with heat pinned at its floor, FAN is the sole remaining input to the
-        sign of RoR, and the sign of RoR gates fan's own ceiling. That is a loop.
-        Measured on this code, cool room, heat at floor 25: RoR ``+0.1`` resolves
-        to ceiling 100, RoR ``0.0`` to ceiling 70. Wired without damping, fan 100
-        flattens RoR, the ceiling engages, fan drops to 70, RoR turns positive
-        and the ceiling releases again — and the advisor is TOLD a box flipping
-        between 70 and 100 with no explanation, the told-instability shape #563
-        burned on. ``post_fc_deadband_threshold_percent`` is a HEAT deadband and
-        will not damp it. Before wiring, slice 2 must add either a one-way latch
-        (release for the rest of the run once heat first reaches its effective
-        floor) or an RoR margin.
+        D157 resolves the sign-of-RoR feedback hazard with an operator-chosen
+        one-way per-DEVELOPMENT-dwell latch. This method is the LATCHING
+        condition, not a live per-tick ceiling gate: once it is true, the
+        controller permanently releases the ceiling for that dwell and never
+        consults RoR again for this purpose. The accepted cost is that a later
+        heat recovery cannot re-engage the ceiling in the same dwell; that
+        direction deliberately fails toward full #498 fan-brake authority.
 
         Args:
             signal: The current post-FC fan inputs.

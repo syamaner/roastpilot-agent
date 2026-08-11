@@ -352,6 +352,52 @@ def test_fan_clamp_becomes_reachable_through_the_narrowed_box() -> None:
     assert evaluation.adjusted_heat == 70
 
 
+def test_released_signal_preserves_full_fan_range() -> None:
+    """A latched D157 signal keeps the DEVELOPMENT destination unrestricted."""
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    signal = PostFcFanSignal(
+        ambient_temp_c=23.1,
+        current_heat_percent=70,
+        post_fc_heat_floor_percent=25,
+        bean_ror_c_per_min=-1.0,
+        released=True,
+    )
+
+    assert (
+        policy.limits_for(RoastPhase.DEVELOPMENT, post_fc_fan_signal=signal).fan_ceiling_percent
+        == 100
+    )
+
+
+@pytest.mark.parametrize(
+    ("current_heat", "ror", "released", "expected"),
+    [
+        (25, 4.0, False, True),
+        (70, 4.0, False, False),
+        (25, 0.0, False, False),
+        (25, 4.0, True, True),
+    ],
+)
+def test_fan_ceiling_release_due_uses_live_conjunction_and_ignores_latch(
+    current_heat: int, ror: float, released: bool, expected: bool
+) -> None:
+    """The public latching condition is conjunctive and latch-independent."""
+    policy = RoastControlPolicy(
+        SafetyLimits(), _PROFILE, ambient_fan_doctrine=_ENFORCED_AMBIENT_FAN_DOCTRINE
+    )
+    signal = PostFcFanSignal(
+        ambient_temp_c=23.1,
+        current_heat_percent=current_heat,
+        post_fc_heat_floor_percent=25,
+        bean_ror_c_per_min=ror,
+        released=released,
+    )
+
+    assert policy.fan_ceiling_release_due(signal) is expected
+
+
 @pytest.mark.parametrize("phase", _PRE_FC_PHASES)
 def test_pre_fc_phases_resolve_narrowed_box_with_deterministic_target(
     phase: RoastPhase,

@@ -4744,6 +4744,25 @@ def _fresh_ambient(
     )
 
 
+def _fan_doctrine_reading(
+    *,
+    ambient_temp_c: float,
+    bean_ror_c_per_min: float,
+    bean_temp_c: float = 185.0,
+    ambient_age_seconds: float = 2.0,
+) -> RoastTelemetry:
+    """Build a doctrine reading with ambient freshness and RoR made explicit."""
+    return _fresh_ambient(
+        ambient_temp_c=ambient_temp_c,
+        ambient_age_seconds=ambient_age_seconds,
+    ).model_copy(
+        update={
+            "bean_temp_c": bean_temp_c,
+            "bean_ror_c_per_min": bean_ror_c_per_min,
+        }
+    )
+
+
 @pytest.mark.parametrize("age_seconds", [2.0, 600.0, None])
 def test_advisor_context_omits_the_ambient_doctrine_while_it_is_disabled(
     age_seconds: float | None,
@@ -5116,20 +5135,20 @@ async def test_non_finite_adapter_ambient_reaches_the_doctrine_as_an_absent_read
 
 @pytest.mark.asyncio
 async def test_ambient_fan_doctrine_is_advisory_only_and_actuates_no_lever() -> None:
-    """#709 invariant (the reason ``safety-reviewer`` gates this PR): the
-    ambient doctrine is prompt-only. Two ticks whose ONLY difference is the
-    ambient reading — one far below the boundary, one far above — must actuate
-    IDENTICAL heat/fan for the same advisor decision. Nothing in the controller
-    or the safety policy reads ambient back, so #498's fan capability is
-    untouched and no fan slew clamp ships with this release (6 Aug
-    ratification: prompt-only, no clamp)."""
+    """D156/D157 supersede the recorded 6 Aug prompt-only decision visibly here.
+
+    Enforcement now exists, but its destination flag is OFF in this test, so
+    cold and hot rooms remain identical and fan 100 stays available. This edit
+    is the visible act of superseding that recorded operator decision while
+    preserving its assertions as the flag-OFF no-op proof.
+    """
     cold = harness_in_development(
-        readings=[_fresh_ambient(ambient_temp_c=23.1)],
+        readings=[_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=-1.0)],
         advisor=FakeAdvisor([decision(heat=60, fan=100)]),
         config=_doctrine_on(),
     )
     hot = harness_in_development(
-        readings=[_fresh_ambient(ambient_temp_c=31.6)],
+        readings=[_fan_doctrine_reading(ambient_temp_c=31.6, bean_ror_c_per_min=-1.0)],
         advisor=FakeAdvisor([decision(heat=60, fan=100)]),
         config=_doctrine_on(),
     )
@@ -5139,6 +5158,148 @@ async def test_ambient_fan_doctrine_is_advisory_only_and_actuates_no_lever() -> 
     assert cold.controller.snapshot().current_heat == hot.controller.snapshot().current_heat == 60
     # Fan 100 lands in BOTH rooms — the doctrine never restrains the lever.
     assert cold.controller.snapshot().current_fan == hot.controller.snapshot().current_fan == 100
+
+
+@pytest.mark.asyncio
+async def test_fan_ceiling_enforcement_on_distinguishes_cold_and_hot_baseline_mode() -> None:
+    """With both flags on, only the strictly cool baseline consult clamps."""
+    config = _doctrine_on(post_fc_fan_ceiling_enabled=True)
+    cold = harness_in_development(
+        readings=[_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=-1.0)],
+        advisor=FakeAdvisor([decision(heat=60, fan=100)]),
+        config=config,
+    )
+    hot = harness_in_development(
+        readings=[_fan_doctrine_reading(ambient_temp_c=31.6, bean_ror_c_per_min=-1.0)],
+        advisor=FakeAdvisor([decision(heat=60, fan=100)]),
+        config=config,
+    )
+
+    for harness in (cold, hot):
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+
+    assert cold.controller.snapshot().current_fan == 70
+    assert hot.controller.snapshot().current_fan == 100
+
+
+@pytest.mark.asyncio
+async def test_fan_ceiling_told_equals_enforced_at_the_consult() -> None:
+    """One consult persists the same narrowed box it enforces by identity."""
+    advisor = FakeAdvisor([decision(heat=60, fan=100)])
+    harness = harness_in_development(
+        readings=[_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=-1.0)],
+        advisor=advisor,
+        config=_doctrine_on(post_fc_fan_ceiling_enabled=True),
+    )
+
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    persisted = harness.sink.advisor_decisions[-1]
+    evaluation = harness.sink.evaluations[-1]
+    advisory_event = _advisory_payloads(harness)[-1]
+    event_evaluation = cast(dict[str, object], advisory_event["evaluation"])
+    assert advisor.contexts[-1].fan_ceiling_percent == 70
+    assert persisted.context.fan_ceiling_percent == 70
+    assert evaluation.verdict is SafetyVerdict.CLAMP
+    assert evaluation.adjusted_fan == 70
+    assert event_evaluation["adjusted_fan"] == 70
+
+
+@pytest.mark.asyncio
+async def test_stale_ambient_reaches_the_predicate_as_none_and_never_clamps() -> None:
+    """A stale cool probe is declined before policy and preserves fan 100."""
+    harness = harness_in_development(
+        readings=[
+            _fan_doctrine_reading(
+                ambient_temp_c=23.1,
+                ambient_age_seconds=600.0,
+                bean_ror_c_per_min=-1.0,
+            )
+        ],
+        advisor=FakeAdvisor([decision(heat=60, fan=100)]),
+        config=_doctrine_on(post_fc_fan_ceiling_enabled=True),
+    )
+
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    signal = harness.controller._post_fc_fan_signal(harness.sink.snapshots[-1])  # pyright: ignore[reportPrivateUsage]
+    assert signal is not None and signal.ambient_temp_c is None
+    assert harness.controller.snapshot().current_fan == 100
+
+
+@pytest.mark.asyncio
+async def test_new_development_dwell_starts_unlatched() -> None:
+    """A COOLING transition clears release and the next dwell binds again."""
+    harness = harness_in_development(
+        readings=[_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=0.0)],
+        advisor=FakeAdvisor([decision(heat=60, fan=100)]),
+        config=_doctrine_on(post_fc_fan_ceiling_enabled=True),
+    )
+    climbing = _fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)
+    signal = harness.controller._post_fc_fan_signal(climbing)  # pyright: ignore[reportPrivateUsage]
+    harness.controller._arm_post_fc_fan_release(signal)  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+
+    harness.controller.transition_to(RoastPhase.COOLING)
+    assert harness.controller._post_fc_fan_ceiling_released is False  # pyright: ignore[reportPrivateUsage]
+    for phase in (
+        RoastPhase.COMPLETE,
+        RoastPhase.IDLE,
+        RoastPhase.STARTING,
+        RoastPhase.PREHEATING,
+        RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        RoastPhase.DEVELOPMENT,
+    ):
+        harness.controller.transition_to(phase)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    assert harness.controller._post_fc_fan_ceiling_released is False  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller.snapshot().current_fan == 70
+
+
+@pytest.mark.asyncio
+async def test_operator_resume_never_rations_fan_while_brake_state_unknown() -> None:
+    """A loop-inert resume has floor None, so climbing releases immediately."""
+    harness = harness_in_development(
+        readings=[_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)],
+        advisor=FakeAdvisor([decision(heat=60, fan=100)]),
+        config=_doctrine_on(post_fc_fan_ceiling_enabled=True),
+    )
+    harness.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller.snapshot().current_fan == 100
+
+
+@pytest.mark.asyncio
+async def test_732_retirement_kills_enforcement_through_the_master_flag() -> None:
+    """A retired doctrine cannot keep enforcing a destination ceiling."""
+    config = _BASELINE_POST_FC_CONFIG.model_copy(
+        update={
+            "ambient_fan_doctrine": AmbientFanDoctrine(
+                enabled=False,
+                post_fc_fan_ceiling_enabled=True,
+            )
+        }
+    )
+    harness = harness_in_development(
+        readings=[_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=-1.0)],
+        advisor=FakeAdvisor([decision(heat=60, fan=100)]),
+        config=config,
+    )
+
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    assert harness.controller.snapshot().current_fan == 100
 
 
 def test_advisor_context_roast_style_forwards_the_profiles_style_name() -> None:
@@ -6950,6 +7111,18 @@ def _post_fc_config(**overrides: object) -> ControllerConfig:
     )
 
 
+def _fan_ceiling_loop_config(**overrides: object) -> ControllerConfig:
+    """Enable both D156 doctrine flags together with the post-FC loop."""
+    config = _post_fc_config(**overrides)
+    return config.model_copy(
+        update={
+            "ambient_fan_doctrine": _doctrine_on(
+                post_fc_fan_ceiling_enabled=True
+            ).ambient_fan_doctrine
+        }
+    )
+
+
 def _ceiling_guard_config(**overrides: object) -> ControllerConfig:
     """A ``ControllerConfig`` with the D88 ceiling-guard drop ENABLED (own
     flag) and the RoR-taper loop explicitly OFF, unless the caller overrides
@@ -7025,47 +7198,45 @@ async def test_post_fc_loop_enabled_actuates_heat_deterministically_fan_from_adv
 
 
 @pytest.mark.asyncio
-async def test_post_fc_loop_enabled_fan_clamp_actuates_clamped_value_heat_still_holds() -> None:
-    """#498: a loop-mode fan CLAMP actuates the CLAMPED value (never the raw
-    request) and records a CLAMP verdict — the SAME safety path as baseline —
-    while heat still holds at the taper's value regardless of the clamp.
+async def test_fan_ceiling_binds_at_the_consult_in_loop_mode() -> None:
+    """The real doctrine narrows the consult and the taper actuates its CLAMP.
 
-    DEVELOPMENT's phase box is [0, 100] for both levers with no config knob to
-    narrow it (control_policy.py), so a fan CLAMP is manufactured the same way
-    the #273 told==enforced proof does it for the pre-FC box
-    (``test_pre_fc_deterministic_box_told_equals_enforced``): resolve the real
-    box, narrow ONLY fan_ceiling_percent, and have the controller hand that box
-    to both the advisor context and the gate for this one consult.
+    Heat remains above the loop output's effective floor, so climbing RoR does
+    not release D157. The advisor's fan 100 request is command-bounds CLAMPED to
+    70 at the consult, stored as the desired fan, and actuated by the taper's
+    next single coalesced write while heat continues to hold.
 
     #498 coalesced-writer note (BLOCKER-1 fix): the advisor's CLAMP is
     recorded at the FIRST tick under the narrowed box (its bounds-only
     evaluation, which sets the desired fan) but the taper's single writer
     does not APPLY the clamped fan until the NEXT tick — two ticks are
     driven to observe both the recorded verdict and the eventual write."""
-    config = _post_fc_config(control_interval_seconds=5.0)
-    advisor = FakeAdvisor([decision(heat=50, fan=30)], default_decision=decision(heat=99, fan=95))
-    harness = make_harness(config=config, advisor=advisor)
-    await _charge_through_fc(harness)
-    assert harness.controller.snapshot().current_fan == 30  # unchanged from the pre-FC lever
-    narrowed_box = harness.controller._control_limits().model_copy(  # pyright: ignore[reportPrivateUsage]
-        update={"fan_ceiling_percent": 70}
+    config = _fan_ceiling_loop_config(control_interval_seconds=5.0)
+    advisor = FakeAdvisor(
+        [decision(heat=50, fan=30)],
+        default_decision=decision(heat=99, fan=100),
     )
-    harness.controller._control_limits = lambda *a, **k: narrowed_box  # type: ignore[method-assign] # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    harness = make_harness(config=config, advisor=advisor)
+    await _charge_through_fc(harness, fc_ror_c_per_min=4.0)
+    assert harness.controller.snapshot().current_fan == 30  # unchanged from the pre-FC lever
+    output = harness.controller._last_post_fc_output  # pyright: ignore[reportPrivateUsage]
+    assert output is not None
+    assert harness.controller.snapshot().current_heat > output.effective_floor_percent
     harness.clock.advance(5.0)  # past the command rate-limit + post-FC control cadence
-    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=4.0)]
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)]
     harness.controller.request_advisory()
     await harness.controller.tick()
-    # This tick's advisor consult CLAMPS the requested 95 to the narrowed
+    # This tick's advisor consult CLAMPS the requested 100 to the narrowed
     # ceiling (70) and sets it as the desired fan — the taper's own write
     # this tick was a no-op (fan already 30, matching the FC-edge desire).
     command_evals = [
         e for e in harness.sink.evaluations if e.rule in ("all_clear", "command_bounds")
     ]
     assert command_evals[-1].verdict is SafetyVerdict.CLAMP
-    assert command_evals[-1].adjusted_fan == 70  # the CLAMPED value, never the raw 95
+    assert command_evals[-1].adjusted_fan == 70  # the CLAMPED value, never the raw 100
     assert harness.executor.targets == []
     harness.clock.advance(5.0)
-    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=4.0)]
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)]
     harness.controller.request_advisory()
     await harness.controller.tick()
     # The clamped fan is what actually reaches the roaster on the NEXT tick's
@@ -7074,6 +7245,131 @@ async def test_post_fc_loop_enabled_fan_clamp_actuates_clamped_value_heat_still_
     assert harness.executor.targets == [(100, 70)]
     assert harness.controller.snapshot().current_heat == 100
     assert harness.controller.snapshot().current_fan == 70
+
+
+@pytest.mark.asyncio
+async def test_latch_releases_for_the_remainder_of_the_dwell() -> None:
+    """One at-floor climbing tick releases monotonically despite later recovery."""
+    advisor = FakeAdvisor(
+        [decision(heat=70, fan=30)],
+        default_decision=decision(heat=70, fan=100),
+    )
+    harness = make_harness(
+        config=_fan_ceiling_loop_config(control_interval_seconds=5.0),
+        advisor=advisor,
+    )
+    await _charge_through_fc(harness, fc_ror_c_per_min=4.0)
+    output = harness.controller._last_post_fc_output  # pyright: ignore[reportPrivateUsage]
+    assert output is not None
+    harness.controller._current_heat = output.effective_floor_percent  # pyright: ignore[reportPrivateUsage]
+    # Freeze deterministic actuation while retaining the real loop output stash,
+    # isolating the fan latch and consult path from a second PI computation.
+    harness.controller._post_fc_engaged = False  # pyright: ignore[reportPrivateUsage]
+
+    harness.clock.advance(5.0)
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller.snapshot().current_fan == 100
+
+    harness.clock.advance(5.0)
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=0.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert harness.controller.snapshot().current_heat > output.effective_floor_percent
+    assert advisor.contexts[-1].fan_ceiling_percent == 100
+    assert harness.controller.snapshot().current_fan == 100
+
+
+@pytest.mark.asyncio
+async def test_ceiling_binds_while_heat_retains_downward_authority() -> None:
+    """Pin the wrong-field trap and the 10 Aug hardware arm's exact shape.
+
+    Hardware ran at heat ~70 against effective floor 25, cool room, bean
+    climbing. The command box's ``heat_floor_percent`` is narrowed to actuated
+    heat; sourcing that wrong field would make the latch set every tick and fail
+    this test. The builder must source ``PostFcOutput.effective_floor_percent``.
+    """
+    advisor = FakeAdvisor(
+        [decision(heat=70, fan=30)],
+        default_decision=decision(heat=70, fan=100),
+    )
+    harness = make_harness(
+        config=_fan_ceiling_loop_config(control_interval_seconds=5.0),
+        advisor=advisor,
+    )
+    await _charge_through_fc(harness, fc_ror_c_per_min=4.0)
+    output = harness.controller._last_post_fc_output  # pyright: ignore[reportPrivateUsage]
+    assert output is not None and output.effective_floor_percent == 25
+    harness.controller._current_heat = 70  # pyright: ignore[reportPrivateUsage]
+    harness.controller._post_fc_engaged = False  # pyright: ignore[reportPrivateUsage]
+
+    harness.clock.advance(5.0)
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=4.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    assert harness.controller._post_fc_fan_ceiling_released is False  # pyright: ignore[reportPrivateUsage]
+    assert advisor.contexts[-1].fan_ceiling_percent == 70
+    assert harness.controller.snapshot().current_fan == 70
+
+
+@pytest.mark.parametrize("ror", [0.0, -1.0])
+@pytest.mark.asyncio
+async def test_latch_does_not_set_on_flat_or_falling_ror_at_the_floor(ror: float) -> None:
+    """At-floor heat alone never releases; the climbing conjunct is required."""
+    advisor = FakeAdvisor(
+        [decision(heat=25, fan=30)],
+        default_decision=decision(heat=25, fan=100),
+    )
+    harness = make_harness(
+        config=_fan_ceiling_loop_config(control_interval_seconds=5.0),
+        advisor=advisor,
+    )
+    await _charge_through_fc(harness, fc_ror_c_per_min=4.0)
+    output = harness.controller._last_post_fc_output  # pyright: ignore[reportPrivateUsage]
+    assert output is not None
+    harness.controller._current_heat = output.effective_floor_percent  # pyright: ignore[reportPrivateUsage]
+    harness.controller._post_fc_engaged = False  # pyright: ignore[reportPrivateUsage]
+
+    harness.clock.advance(5.0)
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=ror)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    assert harness.controller._post_fc_fan_ceiling_released is False  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller.snapshot().current_fan == 70
+
+
+@pytest.mark.asyncio
+async def test_taper_write_actuates_the_consult_clamped_value_and_never_renarrows() -> None:
+    """A warm desired 90 lands after cooling; only the next consult clamps."""
+    advisor = FakeAdvisor(
+        [decision(heat=99, fan=30)],
+        default_decision=decision(heat=99, fan=90),
+    )
+    harness = make_harness(
+        config=_fan_ceiling_loop_config(control_interval_seconds=5.0),
+        advisor=advisor,
+    )
+    await _charge_through_fc(harness, fc_ror_c_per_min=4.0)
+
+    harness.clock.advance(5.0)
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=31.6, bean_ror_c_per_min=-1.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert harness.controller._post_fc_desired_fan_percent == 90  # pyright: ignore[reportPrivateUsage]
+
+    harness.clock.advance(5.0)
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=-1.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    assert harness.executor.targets[-1][1] == 90
+    assert harness.controller.snapshot().current_fan == 90
+    assert advisor.contexts[-1].fan_ceiling_percent == 70
+    assert harness.controller._post_fc_desired_fan_percent == 70  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -9230,6 +9526,62 @@ async def _confirm_recovery_raise(harness: Harness, *, entry_heat: int) -> int:
     assert raised_heat > entry_heat
     assert harness.controller.phase is RoastPhase.DEVELOPMENT
     return raised_heat
+
+
+@pytest.mark.asyncio
+async def test_heat_raise_undo_corrective_never_cuts_fan() -> None:
+    """The failed-drop corrective is heat-down-only under a binding ceiling.
+
+    Current fan 90 already reached the roaster. A cool, climbing tick with heat
+    above effective floor makes the consult ceiling bind at 70, but when the
+    advisor's drop fails the :2424 corrective must hold that already-actuated
+    fan 90 while undoing only the recovery raise. Narrowing the corrective box
+    would create a silent no-actor fan cut.
+    """
+    advisor = FakeAdvisor(
+        [decision(heat=50, fan=90), decision(heat=50, fan=90)],
+        default_decision=decision(heat=50, fan=90, drop=True),
+    )
+    base_config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=220.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+    )
+    config = base_config.model_copy(
+        update={
+            "ambient_fan_doctrine": _doctrine_on(
+                post_fc_fan_ceiling_enabled=True
+            ).ambient_fan_doctrine
+        }
+    )
+    harness = make_harness(
+        config=config,
+        advisor=advisor,
+        executor=_AlwaysFailingDropExecutor(),
+        limits=_ISOLATED_CEILING_GUARD_LIMITS,
+    )
+    await _charge_through_fc_at_heat(
+        harness,
+        expected_pre_fc_heat=60,
+        fc_bean_temp_c=183.0,
+        fc_ror_c_per_min=7.0,
+    )
+    await _confirm_recovery_raise(harness, entry_heat=60)
+    assert harness.controller.snapshot().current_fan == 90
+    raised_heat = harness.controller.snapshot().current_heat
+    assert raised_heat > 60
+
+    harness.clock.advance(5.0)
+    harness.reader.readings = [_fan_doctrine_reading(ambient_temp_c=23.1, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+
+    assert advisor.contexts[-1].fan_ceiling_percent == 70
+    assert harness.executor.targets[-1] == (60, 90)
+    assert harness.controller.snapshot().current_heat == 60
+    assert harness.controller.snapshot().current_fan == 90
 
 
 @pytest.mark.asyncio

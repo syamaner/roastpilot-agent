@@ -2299,11 +2299,11 @@ class RoastService:
         ``operator_recovery_required``, which the restart invariant forbids.
 
         So a clash retires the doctrine for the recovered run and retries. That
-        is a strictly fail-safe degradation and not a control change: the
-        doctrine is advisory-only — ``ambient_fan_doctrine`` is read nowhere but
-        the two context fields — and ``c11`` takes its absent-ambient branch
-        either way (the unqualified fan-brake rule, #498's full capability
-        intact).
+        is a strictly fail-safe degradation: flipping the doctrine's master
+        ``enabled`` flag off both sends ``c11`` down its absent-ambient branch
+        and kills D156/D157 ceiling enforcement through the policy's master
+        conjunct. A retired doctrine therefore cannot keep enforcing a ceiling
+        the prompt no longer teaches; #498's full fan capability remains intact.
 
         Precisely, because the shape is NOT identical: retiring also nulls
         ``ambient_fan_threshold_c`` and ``ambient_fan_step_max_pp``, which the

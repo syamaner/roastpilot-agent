@@ -416,9 +416,10 @@ class SafetyPolicy:
         carries are the clamp range — the *same* limits placed in the advisor
         context, so the value the model is told equals the value enforced here
         (told == enforced). When ``bounds`` is ``None`` the range is the full
-        0–100 lever (the historical behaviour, preserved unchanged); the policy
-        resolves that same 0–100 box for every phase today, so wiring the gate to
-        the policy is a verdict no-op until #222 narrows a phase.
+        0–100 lever (the historical behaviour, preserved unchanged). #222 may
+        narrow pre-FC bounds, and D156/D157 may narrow the DEVELOPMENT fan
+        destination on the advisor consult; both reuse this existing
+        ``command_bounds`` CLAMP rather than adding a verdict.
 
         Args:
             requested_heat: The requested heat level (deliberately unbounded —
