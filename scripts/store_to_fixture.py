@@ -351,6 +351,36 @@ def _utc_to_run_seconds(
     return None if mapped < 0.0 else mapped
 
 
+def _elapsed_clock_restarted(connection: sqlite3.Connection, run_id: str) -> bool:
+    """Whether persisted elapsed seconds decrease in insertion order.
+
+    A decrease proves that an agent restart reset the run-relative clock, so a
+    wall-clock instant cannot be mapped safely onto that clock without stitching
+    segments. This exporter deliberately falls back to accepted event rows
+    instead of inventing such a reconstruction.
+
+    Args:
+        connection: An open store connection.
+        run_id: The run id.
+
+    Returns:
+        ``True`` when any non-null elapsed value is below its predecessor in
+        telemetry insertion order; otherwise ``False``.
+    """
+    rows = connection.execute(
+        "SELECT elapsed_seconds FROM telemetry_snapshots"
+        " WHERE run_id = ? AND elapsed_seconds IS NOT NULL ORDER BY id ASC",
+        (run_id,),
+    ).fetchall()
+    previous: float | None = None
+    for row in rows:
+        current = float(row["elapsed_seconds"])
+        if previous is not None and current < previous:
+            return True
+        previous = current
+    return False
+
+
 def _first_crack_onset_utc(connection: sqlite3.Connection, run_id: str) -> tuple[str | None, int]:
     """Read the earliest distinct MCP first-crack onset from raw telemetry state.
 
@@ -415,11 +445,14 @@ def _resolve_utc_mark(
     preferred_anchor: str,
     event_kind: str,
     run_started: float,
+    mapping_block_reason: str | None = None,
 ) -> _AnchorResolution:
     """Resolve a preferred UTC mark, falling back to its established event row."""
     fallback_reason = "source absent"
     if preferred_iso is not None:
-        if _parse_utc(preferred_iso) is None:
+        if mapping_block_reason is not None:
+            fallback_reason = mapping_block_reason
+        elif _parse_utc(preferred_iso) is None:
             fallback_reason = "source unparseable"
         else:
             mapped = _utc_to_run_seconds(connection, run_id, preferred_iso)
@@ -584,6 +617,13 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
                 f"run {resolved} has no run_started event — event/telemetry clocks "
                 f"cannot be reconciled"
             )
+        elapsed_clock_restarted = _elapsed_clock_restarted(connection, resolved)
+        # A restart also leaves the exported telemetry rows themselves with
+        # non-monotonic times. That pre-existing fixture defect is tracked for a
+        # separate fix; this story only refuses unsafe preferred-anchor mapping.
+        mapping_block_reason = (
+            "source unmappable: detected clock restart" if elapsed_clock_restarted else None
+        )
         charge_source = (
             None
             if run_row is None or run_row["t0_detected_at_utc"] is None
@@ -596,6 +636,7 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
             "run_row_utc",
             _CHARGE_KIND,
             run_started,
+            mapping_block_reason,
         )
         accepted_first_crack = _event_time(connection, resolved, _FIRST_CRACK_KIND)
         first_crack_source: str | None = None
@@ -617,6 +658,7 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
             "fc_status_utc",
             _FIRST_CRACK_KIND,
             run_started,
+            mapping_block_reason,
         )
         frozen_row = connection.execute(
             "SELECT development_percent FROM telemetry_snapshots"

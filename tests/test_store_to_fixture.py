@@ -678,6 +678,37 @@ async def test_negative_utc_mapping_falls_back_instead_of_exporting_negative_mar
 
 
 @pytest.mark.asyncio
+async def test_elapsed_clock_restart_blocks_both_preferred_anchor_mappings(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A reset elapsed clock restores both marks to warned event-row fallbacks."""
+    db_path = tmp_path / "elapsed-clock-reset.sqlite3"
+    store = await _backdated_store(db_path)
+    # Simulate agent recovery at the original 500-second row: wall time and
+    # insertion order continue, but elapsed_seconds restarts at 100.
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET elapsed_seconds = elapsed_seconds - 400.0"
+        " WHERE run_id = ? AND elapsed_seconds >= 500.0",
+        ("backdated-run",),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    entry = s2f.convert(db_path, out_dir)
+    warning = capsys.readouterr().err
+    _, ground = bakeoff_replay.load_roast(out_dir / "roast.jsonl")
+
+    assert entry["charge_anchor"] == "event_row"
+    assert entry["first_crack_anchor"] == "event_row"
+    assert warning.count("detected clock restart") == 2
+    assert ground.t0_seconds == 60.0
+    assert ground.first_crack_seconds == 600.0
+    assert ground.drop_seconds == 720.0
+    assert ground.first_crack_seconds != 175.0  # post-reset UTC mapping
+
+
+@pytest.mark.asyncio
 async def test_both_absent_utc_sources_fall_back_independently(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
