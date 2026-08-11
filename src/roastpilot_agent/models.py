@@ -10,13 +10,14 @@ invariant. Use ``.value`` at serialization boundaries.
 """
 
 import json
+import math
 import re
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Annotated, Any, Literal, cast
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, StrictBool, field_validator, model_validator
 
 
 class RoastPhase(Enum):
@@ -2021,6 +2022,7 @@ class SseEvent(BaseModel):
     event: SseEventType
     data: dict[str, Any] = Field(default_factory=dict)
     id: int | None = None
+    _rendered_data_json: str | None = PrivateAttr(default=None)
 
     def render(self) -> str:
         """Serialize to the SSE wire format (``id:``/``event:``/``data:`` +
@@ -2029,5 +2031,39 @@ class SseEvent(BaseModel):
         if self.id is not None:
             lines.append(f"id: {self.id}")
         lines.append(f"event: {self.event.value}")
-        lines.append(f"data: {json.dumps(self.data, sort_keys=True)}")
+        if self._rendered_data_json is None:
+            # EventBroadcaster constructs one event, then the replay buffer and
+            # subscriber queues share it read-only; production consumers only call
+            # render(), and payload enrichment builds a new dict before construction.
+            # No nested data can therefore change between subscriber renders. Cache
+            # the O(payload) sanitise+dumps work once per event on the 1 Hz hot path.
+            self._rendered_data_json = json.dumps(
+                sanitize_non_finite(self.data), sort_keys=True, allow_nan=False
+            )
+        lines.append(f"data: {self._rendered_data_json}")
         return "\n".join(lines) + "\n\n"
+
+
+def sanitize_non_finite(value: object) -> object:
+    """Return a JSON-ready copy with every non-finite float replaced by ``None``.
+
+    Dictionary keys are copied but not sanitised, while dictionaries, lists, and
+    tuples are rebuilt so sanitising a shared event or response cannot mutate its
+    source. The wire contract requires string keys; an out-of-contract non-finite
+    float key therefore fails closed at the strict JSON backstop.
+
+    Args:
+        value: Arbitrarily nested value headed for a JSON wire boundary.
+
+    Returns:
+        The original scalar or a recursively sanitised container copy.
+    """
+    if isinstance(value, dict):
+        mapping = cast("dict[object, object]", value)
+        return {key: sanitize_non_finite(item) for key, item in mapping.items()}
+    if isinstance(value, (list, tuple)):
+        items = cast("list[object] | tuple[object, ...]", value)
+        return [sanitize_non_finite(item) for item in items]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value

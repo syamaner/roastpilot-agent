@@ -22,8 +22,8 @@ from unittest import mock
 
 import pytest
 import pytest_asyncio
-from fastapi import HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 
@@ -33,6 +33,7 @@ from roastpilot_agent.advisor import AdvisorContext, FakeAdvisor, RoastDecision
 from roastpilot_agent.api import (
     _DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     EventBroadcaster,
+    FiniteJSONResponse,
     QueuedOperatorAction,
     RoastConfigError,
     RoastRunConflictError,
@@ -897,6 +898,89 @@ async def test_get_roast_detail_and_404(client: AsyncClient, store: RoastStore) 
     assert missing.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_typed_roast_detail_projects_persisted_non_finite_float_as_null(
+    service: RoastService, store: RoastStore
+) -> None:
+    """The store model and typed response both project a legacy REAL as absent."""
+    await store.create_run(
+        run_id="run-non-finite",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.connection.execute(
+        "UPDATE roast_runs SET ambient_pressure_hpa = ? WHERE id = ?",
+        (float("inf"), "run-non-finite"),
+    )
+    await store.connection.commit()
+
+    transport = ASGITransport(app=create_app(service), raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.get("/api/roasts/run-non-finite")
+        history = await instance.get("/api/roasts")
+
+    assert response.status_code == 200
+    assert response.json()["ambient_pressure_hpa"] is None
+
+    assert history.status_code == 200
+    [summary] = history.json()["runs"]
+    assert summary["ambient_pressure_hpa"] is None
+
+
+def test_finite_json_response_matches_starlette_for_finite_content() -> None:
+    """The custom REST sink is byte-identical for ordinary JSON content."""
+    content = {"unicode": "café", "nested": [1.25, None, {"ok": True}]}
+    assert FiniteJSONResponse(content).body == JSONResponse(content).body
+
+
+def test_finite_json_response_replaces_nested_non_finite_floats() -> None:
+    """Direct response construction replaces every non-finite float with null."""
+
+    def reject_constant(token: str) -> object:
+        raise ValueError(f"non-finite JSON token: {token}")
+
+    response = FiniteJSONResponse(
+        {
+            "nan": float("nan"),
+            "positive_infinity": float("inf"),
+            "nested": {"negative_infinity": float("-inf")},
+            "items": [{"value": float("nan")}, float("inf")],
+        }
+    )
+    payload = json.loads(bytes(response.body), parse_constant=reject_constant)
+    assert payload == {
+        "nan": None,
+        "positive_infinity": None,
+        "nested": {"negative_infinity": None},
+        "items": [{"value": None}, None],
+    }
+
+
+@pytest.mark.asyncio
+async def test_finite_json_response_protects_an_untyped_route() -> None:
+    """A route without FastAPI's typed fast path can opt in to strict JSON."""
+
+    def reject_constant(token: str) -> object:
+        raise ValueError(f"non-finite JSON token: {token}")
+
+    app = FastAPI(default_response_class=FiniteJSONResponse)
+
+    @app.get("/untyped")
+    async def untyped():  # pyright: ignore[reportUnusedFunction]
+        return {"value": float("nan"), "nested": [float("inf"), float("-inf")]}
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        response = await instance.get("/untyped")
+
+    assert response.status_code == 200
+    assert json.loads(response.text, parse_constant=reject_constant) == {
+        "value": None,
+        "nested": [None, None],
+    }
+
+
 # --- telemetry (downsample) ---
 
 
@@ -930,6 +1014,36 @@ async def test_telemetry_default_returns_every_snapshot(
     assert body["point_count"] == 5
     assert [p["tick"] for p in body["points"]] == [0, 1, 2, 3, 4]
     assert body["points"][0]["heat_level_percent"] == 60
+
+
+@pytest.mark.asyncio
+async def test_telemetry_and_timeline_sanitize_persisted_non_finite_floats(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """Legacy telemetry and event payloads stay available through JSON endpoints."""
+    await _seed_telemetry(store, "run-non-finite-series", 1)
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET bean_ror_c_per_min = ? WHERE run_id = ?",
+        (float("-inf"), "run-non-finite-series"),
+    )
+    await store.record_event(
+        run_id="run-non-finite-series",
+        kind=RoastEventKind.SAFETY_ALERT,
+        source=RoastEventSource.SAFETY,
+        payload={"nested": {"value": float("nan")}},
+    )
+    await store.connection.commit()
+
+    telemetry = await client.get("/api/roasts/run-non-finite-series/telemetry")
+    assert telemetry.status_code == 200
+    assert telemetry.json()["points"][0]["bean_ror_c_per_min"] is None
+
+    timeline = await client.get("/api/roasts/run-non-finite-series/timeline")
+    assert timeline.status_code == 200
+    assert timeline.json()["events"][0]["payload"] == {"nested": {"value": None}}
+
+    missing = await client.get("/api/roasts/nope/telemetry")
+    assert missing.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -2718,6 +2832,29 @@ def test_event_broadcaster_emits_typed_telemetry() -> None:
     assert event.data["post_fc_ror_setpoint_c_per_min"] == pytest.approx(6.4)
     assert event.data["post_fc_smoothed_ror_c_per_min"] == pytest.approx(4.8)
     assert event.data["post_fc_effective_heat_ceiling_percent"] == 75
+
+
+def test_event_broadcaster_telemetry_renders_non_finite_as_null() -> None:
+    """The real telemetry emit path produces a strict-JSON subscriber frame."""
+
+    def reject_constant(token: str) -> object:
+        raise ValueError(f"non-finite JSON token: {token}")
+
+    broadcaster = EventBroadcaster()
+    queue = broadcaster.subscribe()
+    broadcaster.emit_telemetry(
+        TelemetryEventData(
+            agent_phase=RoastPhase.DEVELOPMENT,
+            bean_temp_c=200.0,
+            env_temp_c=210.0,
+            bean_ror_c_per_min=float("nan"),
+        )
+    )
+
+    event = queue.get_nowait()
+    data_line = next(line for line in event.render().splitlines() if line.startswith("data: "))
+    payload = json.loads(data_line.removeprefix("data: "), parse_constant=reject_constant)
+    assert payload["bean_ror_c_per_min"] is None
 
 
 def test_event_broadcaster_wraps_non_dict_payload() -> None:

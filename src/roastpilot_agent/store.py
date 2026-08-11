@@ -9,6 +9,7 @@ migration mechanism. Write paths land in E6-S2, recovery reads in E6-S3.
 import asyncio
 import hashlib
 import json
+import math
 import re
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -1201,12 +1202,11 @@ class RoastStore:
 
     @staticmethod
     def _optional_float(value: object) -> float | None:
-        """Read a nullable numeric SQLite column as ``float | None``.
-
-        Shared by every optional REAL projection (roasted weight, ambient
-        triad, #342) so a ``None`` row value stays ``None`` rather than
-        coercing to ``0.0``."""
-        return None if value is None else float(cast("float", value))
+        """Project one nullable numeric SQLite value as a finite float or ``None``."""
+        if value is None:
+            return None
+        converted = float(cast("float", value))
+        return converted if math.isfinite(converted) else None
 
     # --- E6-S3: recovery reads, run completion, immutability exceptions ---
 
@@ -1882,7 +1882,7 @@ class RoastStore:
                         charge_weight_grams=corrected_charge or profile.bean_weight_grams,
                         roasted_weight_grams=roasted_weight,
                     ),
-                    development_percent=None if row["dev_pct"] is None else float(row["dev_pct"]),
+                    development_percent=self._optional_float(row["dev_pct"]),
                     advisor_consults=int(row["advisor_consults"]),
                     advisor_failed=int(row["advisor_failed"]),
                     advisor_clamped=int(row["advisor_clamped"]),
@@ -1979,18 +1979,12 @@ class RoastStore:
         return [
             TelemetryPoint(
                 tick=int(row["tick"]),
-                elapsed_seconds=None
-                if row["elapsed_seconds"] is None
-                else float(row["elapsed_seconds"]),
+                elapsed_seconds=self._optional_float(row["elapsed_seconds"]),
                 agent_phase=RoastPhase(str(row["agent_phase"])),
-                bean_temp_c=None if row["bean_temp_c"] is None else float(row["bean_temp_c"]),
-                env_temp_c=None if row["env_temp_c"] is None else float(row["env_temp_c"]),
-                bean_ror_c_per_min=None
-                if row["bean_ror_c_per_min"] is None
-                else float(row["bean_ror_c_per_min"]),
-                env_ror_c_per_min=None
-                if row["env_ror_c_per_min"] is None
-                else float(row["env_ror_c_per_min"]),
+                bean_temp_c=self._optional_float(row["bean_temp_c"]),
+                env_temp_c=self._optional_float(row["env_temp_c"]),
+                bean_ror_c_per_min=self._optional_float(row["bean_ror_c_per_min"]),
+                env_ror_c_per_min=self._optional_float(row["env_ror_c_per_min"]),
                 heat_level_percent=None
                 if row["heat_level_percent"] is None
                 else int(row["heat_level_percent"]),
@@ -1998,24 +1992,20 @@ class RoastStore:
                 if row["fan_level_percent"] is None
                 else int(row["fan_level_percent"]),
                 cooling_on=None if row["cooling_on"] is None else bool(row["cooling_on"]),
-                development_percent=None
-                if row["development_percent"] is None
-                else float(row["development_percent"]),
-                charge_elapsed_seconds=None
-                if row["charge_elapsed_seconds"] is None
-                else float(row["charge_elapsed_seconds"]),
+                development_percent=self._optional_float(row["development_percent"]),
+                charge_elapsed_seconds=self._optional_float(row["charge_elapsed_seconds"]),
                 post_fc_recovery_enabled=None
                 if row["post_fc_recovery_enabled"] is None
                 else bool(row["post_fc_recovery_enabled"]),
                 post_fc_heat_authority_state=None
                 if row["post_fc_heat_authority_state"] is None
                 else PostFcHeatAuthorityState(str(row["post_fc_heat_authority_state"])),
-                post_fc_ror_setpoint_c_per_min=None
-                if row["post_fc_ror_setpoint_c_per_min"] is None
-                else float(row["post_fc_ror_setpoint_c_per_min"]),
-                post_fc_smoothed_ror_c_per_min=None
-                if row["post_fc_smoothed_ror_c_per_min"] is None
-                else float(row["post_fc_smoothed_ror_c_per_min"]),
+                post_fc_ror_setpoint_c_per_min=self._optional_float(
+                    row["post_fc_ror_setpoint_c_per_min"]
+                ),
+                post_fc_smoothed_ror_c_per_min=self._optional_float(
+                    row["post_fc_smoothed_ror_c_per_min"]
+                ),
                 post_fc_effective_heat_ceiling_percent=None
                 if row["post_fc_effective_heat_ceiling_percent"] is None
                 else int(row["post_fc_effective_heat_ceiling_percent"]),
@@ -2039,9 +2029,7 @@ class RoastStore:
             TimelineEvent(
                 kind=RoastEventKind(str(row["kind"])),
                 source=RoastEventSource(str(row["source"])),
-                monotonic_seconds=None
-                if row["monotonic_seconds"] is None
-                else float(row["monotonic_seconds"]),
+                monotonic_seconds=self._optional_float(row["monotonic_seconds"]),
                 recorded_at_utc=str(row["recorded_at_utc"]),
                 payload=_loads(row["payload_json"]),
             )
@@ -2334,7 +2322,8 @@ class RoastStore:
         usable = [
             row
             for row in pre_drop_rows
-            if row["charge_elapsed_seconds"] is not None and row["bean_temp_c"] is not None
+            if self._optional_float(row["charge_elapsed_seconds"]) is not None
+            and self._optional_float(row["bean_temp_c"]) is not None
         ]
         if not usable:
             return None

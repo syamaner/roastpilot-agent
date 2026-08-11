@@ -5,12 +5,15 @@ handshake's JSON round trip, and RoastProfile validation (D7).
 """
 
 import json
+import math
 from datetime import UTC, datetime, timedelta
 from enum import Enum
+from typing import Any, cast, get_args
 
 import pydantic
 import pytest
 
+import roastpilot_agent.models as models_module
 from roastpilot_agent.models import (
     DEFAULT_ROAST_STYLE,
     ROAST_STYLE_TARGETS,
@@ -29,8 +32,15 @@ from roastpilot_agent.models import (
     RoastProfile,
     RoastStyle,
     RoastStyleTarget,
+    RoastSummary,
+    SseEvent,
+    SseEventType,
     TastingEntryRequest,
+    TelemetryEventData,
+    TelemetryPoint,
+    TimelineEvent,
     roast_style_target,
+    sanitize_non_finite,
     weight_loss_percent,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
@@ -44,6 +54,132 @@ ALL_SHARED_ENUMS: list[type[Enum]] = [
     MicHealth,
     RoastStyle,
 ]
+
+
+def test_sse_event_render_replaces_nested_non_finite_floats() -> None:
+    """SSE data stays strict JSON when non-finite floats occur anywhere."""
+
+    def reject_constant(token: str) -> object:
+        raise ValueError(f"non-finite JSON token: {token}")
+
+    event = SseEvent(
+        event=SseEventType.TELEMETRY,
+        data={
+            "nan": float("nan"),
+            "positive_infinity": float("inf"),
+            "negative_infinity": float("-inf"),
+            "nested": {"value": float("nan")},
+            "items": [{"value": float("inf")}, {"value": float("-inf")}],
+        },
+    )
+
+    data_line = next(line for line in event.render().splitlines() if line.startswith("data: "))
+    payload = json.loads(data_line.removeprefix("data: "), parse_constant=reject_constant)
+
+    assert payload == {
+        "nan": None,
+        "positive_infinity": None,
+        "negative_infinity": None,
+        "nested": {"value": None},
+        "items": [{"value": None}, {"value": None}],
+    }
+
+
+def test_sse_event_render_preserves_finite_wire_output() -> None:
+    """Finite payloads keep the renderer's prior byte representation."""
+    event = SseEvent(
+        event=SseEventType.TELEMETRY,
+        data={"bean_temp_c": 200.5, "nested": (1.5, {"value": 2.5})},
+        id=9,
+    )
+
+    assert event.render() == (
+        'id: 9\nevent: telemetry\ndata: {"bean_temp_c": 200.5, "nested": [1.5, {"value": 2.5}]}\n\n'
+    )
+
+
+def test_sse_event_render_does_not_mutate_shared_data() -> None:
+    """Rendering leaves the shared fan-out event and nested containers intact."""
+    non_finite = float("nan")
+    event = SseEvent(
+        event=SseEventType.TELEMETRY,
+        data={"nested": {"value": non_finite}, "items": [non_finite]},
+    )
+    original_data = event.data
+    original_nested = event.data["nested"]
+    original_items = event.data["items"]
+
+    event.render()
+
+    assert event.data is original_data
+    assert event.data["nested"] is original_nested
+    assert event.data["items"] is original_items
+    assert isinstance(original_nested, dict)
+    assert isinstance(original_items, list)
+    assert original_nested["value"] is non_finite
+    assert original_items[0] is non_finite
+    assert math.isnan(non_finite)
+
+
+def test_sse_event_render_reuses_sanitized_data_for_all_subscribers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fan-out renders pay the recursive sanitising cost only on first render."""
+    calls = 0
+    original = sanitize_non_finite
+
+    def counting_sanitizer(value: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(models_module, "sanitize_non_finite", counting_sanitizer)
+    event = SseEvent(
+        event=SseEventType.TELEMETRY,
+        data={"nested": [{"value": float("nan")}]},
+        id=12,
+    )
+
+    first = event.render()
+    first_render_calls = calls
+    second = event.render()
+
+    assert first_render_calls > 0
+    assert calls == first_render_calls
+    assert second == first
+
+
+def test_wire_model_float_fields_are_sanitized_by_reflection() -> None:
+    """Every float field in the named wire-model registry becomes strict JSON."""
+    model_registry = (
+        TelemetryEventData,
+        RoastSummary,
+        RoastDetail,
+        TelemetryPoint,
+        TimelineEvent,
+    )
+    assert {model.__name__ for model in model_registry} == {
+        "TelemetryEventData",
+        "RoastSummary",
+        "RoastDetail",
+        "TelemetryPoint",
+        "TimelineEvent",
+    }
+
+    for model_type in model_registry:
+        float_fields = {
+            name
+            for name, field in model_type.model_fields.items()
+            if field.annotation is float or float in get_args(field.annotation)
+        }
+        assert float_fields, f"{model_type.__name__} has no reflected float fields"
+        planted = cast("dict[str, Any]", {name: float("inf") for name in float_fields})
+        raw = model_type.model_construct(**planted).model_dump(mode="json")
+        sanitized = sanitize_non_finite(raw)
+
+        json.dumps(sanitized, allow_nan=False)
+        assert isinstance(sanitized, dict)
+        assert all(sanitized[name] is None for name in float_fields)
 
 
 @pytest.mark.parametrize("enum_type", ALL_SHARED_ENUMS)

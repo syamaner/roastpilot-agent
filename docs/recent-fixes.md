@@ -18,6 +18,31 @@ Format: one entry per anti-pattern.
 
 ---
 
+## JSON wire sinks must sanitize non-finite floats as a class
+*(fixed by #757, 11 Aug 2026)*
+
+- **Signature:** raw `json.dumps` in `SseEvent.render`, or direct/dynamic
+  `JSONResponse` construction outside a typed FastAPI response path.
+- **Wrong:** patching individual float producers lets the next optional field or
+  nested event payload emit a bare non-finite SSE token. Directly constructing a
+  plain `JSONResponse`, or adding an untyped route, would raise on the same value.
+- **Right:** recursively copy and sanitize at the SSE sink and any explicit dynamic
+  JSON response site, projecting non-finite floats to `null`; keep strict encoding
+  as the fail-closed backstop.
+  Keep typed REST routes on FastAPI's default response placeholder: its
+  response-field `dump_json` fast path produces `null` without an extra tree copy.
+  Do not install the sanitising response class globally, because a concrete default
+  disables that fast path. Use it for direct response construction or opt in on a
+  reviewed untyped route. Without that opt-in, a hypothetical untyped route fails
+  loudly with 500 on a non-finite value rather than quietly blanking one; new routes
+  should normally carry a response model like the existing routes.
+- **Guarded by:** `test_sse_event_render_replaces_nested_non_finite_floats`,
+  `test_wire_model_float_fields_are_sanitized_by_reflection`,
+  `test_finite_json_response_protects_an_untyped_route`, and
+  `test_telemetry_and_timeline_sanitize_persisted_non_finite_floats`.
+
+---
+
 ## A config field the operator can edit must not be shadowed by a resolver default they cannot reach
 *(fixed by #747 / D151, 9 Aug 2026)*
 
