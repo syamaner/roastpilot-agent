@@ -585,8 +585,13 @@
 > generator, and this file is read at the start of every task, so a stale number here produces
 > duplicate decision records, which is precisely what D150 exists to prevent. Same reasoning
 > retired the hand-maintained issue-count tally on 11 Aug. Note the tokens appear in **five**
-> different formats across the plan repo (table rows, headings, inline references, commit
-> subjects, cross-ref lists), so a grep for one shape undercounts.
+> different formats across the plan repo, enumerated authoritatively further down this file:
+> `| D<n> |` table rows, `**D<n> (date) — ...**` paragraphs, `## D<n>: ...` headings,
+> `**D<n> — ...**` bold paragraphs with the date inside the sentence, and
+> `- **D<n>** (date): ...` bullets. All five live in `*.md` files, which is why the command
+> above greps `*.md` and needs no `git log` pass. Do not paraphrase that list from memory:
+> an earlier draft of THIS paragraph invented "commit subjects" and "cross-ref lists" as
+> formats, which would have implied the command undercounts.
 > Do **not** derive the number from any one file's own maximum:
 > that per-file reading is exactly what produced the collisions described below,
 > and it produced another on 9 Aug (see the operator flag there).
