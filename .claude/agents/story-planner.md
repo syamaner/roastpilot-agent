@@ -200,8 +200,35 @@ is what "specced" means: delegation without one is forbidden (fail-closed).
    provisioning command `git worktree add -b <planned-branch> <path>
    <base-sha>` (without `-b` Git creates a detached HEAD and the handback
    commit lands on no branch), the #738 fresh-venv-in-worktree rule,
-   `.venv/bin/python -m ...` invocation, the full gates before handback, and
+   `.venv/bin/python -m ...` invocation, the full gates before handback, the
+   INVARIANT that the handed-back branch must be attributable to the Codex
+   worker acting on its RATIFIED INPUTS alone — this contract and lead-authored
+   directives, which are the sanctioned channel; any OTHER model input the
+   worker itself procures, at any stage, in any form, by any route, breaks that
+   attribution — with the handback disclosure asked in those same terms
+   ("apart from the ratified contract and the lead's directives, did you obtain
+   input from any model in any way?"). The discriminator is WHO PROCURED IT,
+   not which family produced it: you are a Fable model and this contract is
+   mandatory, so a family-scoped rule would fail closed on every compliant
+   delegation, including this one. **Carry it as the invariant; do NOT
+   render it in the contract as a list of prohibited activities.** Four review
+   rounds each defeated an enumerated form by finding a structurally DIFFERENT
+   route rather than another instance, which is the D154 signal to change the
+   failure direction instead of patching again (the technique D157 reached for
+   when its own enumeration proved incomplete, cited for that alone). A Codex session
+   discovers `.claude/agents/` and calls those roles unprompted, and a worker
+   whose branch was shaped by the reviewing family breaks D23 and hollows out
+   the mandatory Opus safety floor. That disclosure is the whole verification —
+   read-only reviewers leave no git-visible artifact — and an AFFIRMATIVE
+   answer fails the slice closed: the lead re-delegates it from this contract
+   in a fresh worktree, or records an explicit operator decision naming which
+   lens now supplies the independent pass. State the invariant, the disclosure
+   question and that consequence in the delegation prompt, plus
    any slice-specific fixtures or contract tests that must be regenerated.
+
+   Every item in this section is MANDATORY in the generated contract, not a
+   menu: the delegated worker's only specification is this contract, so a trap
+   omitted here is a trap the worker never sees.
 8. **Risk profile** — blast radius (roaster hardware consequence; data
    sensitivity; principal scope and capability), and what a reviewer should
    try to break first.
