@@ -485,7 +485,7 @@ class RoastControlPolicy:
         fan_ceiling = (
             self._ambient_fan_doctrine.post_fc_fan_ceiling_percent
             if phase is RoastPhase.DEVELOPMENT
-            and self._post_fc_fan_ceiling_engaged(post_fc_fan_signal)
+            and self.post_fc_fan_ceiling_engaged(post_fc_fan_signal)
             else _LEVER_MAX_PERCENT
         )
         return PhaseControlLimits(
@@ -497,7 +497,7 @@ class RoastControlPolicy:
             emergency_drop_temp_c=emergency,
         )
 
-    def _post_fc_fan_ceiling_engaged(self, signal: PostFcFanSignal | None) -> bool:
+    def post_fc_fan_ceiling_engaged(self, signal: PostFcFanSignal | None) -> bool:
         """Whether the ambient-conditioned DEVELOPMENT fan ceiling applies.
 
         Args:

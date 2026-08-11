@@ -370,10 +370,12 @@ class AdvisorContext(BaseModel):
     # ``drop_dev_margin_percent``: one config-owned constant surfaced into
     # context, never a second copy in prose (#218).
     #
-    # Advisory only, like every field above: no lever is derived from it and no
-    # control path reads it back. ``None`` when the context is built without a
-    # controller (older callers, the drop-only bake-off) — the c11 teaching
-    # then has no boundary to compare against and says so.
+    # Read-only advisor context, not an advisory-only policy input: the
+    # controller also uses the config-owned threshold with ``ambient_temp_c``
+    # to resolve the enforced fan box before building this context. No control
+    # path reads the serialized context field back. ``None`` when the context
+    # is built without a controller (older callers, the drop-only bake-off) —
+    # the c11 teaching then has no boundary to compare against and says so.
     ambient_fan_threshold_c: float | None = None
     # #709 (RP-B): the size of an ORDINARY below-threshold fan step, in
     # percentage points, from ``ControllerConfig.ambient_fan_doctrine.step_max_pp``
@@ -1878,8 +1880,8 @@ _C11_AMBIENT_FAN_SECTION = (
     "regime in graduated steps rather than one slam - an ordinary step here is "
     "no larger than ambient_fan_step_max_pp percentage points - and watch what "
     "the rate of rise actually does after each step before taking the next "
-    "one. This bounds the STEP, not the destination: the fan ceiling is "
-    "unchanged and every fan value stays available to you, including the "
+    "one. This bounds the STEP, not the destination: every fan value up to "
+    "the fan ceiling given in context stays available to you, including the "
     "ceiling itself. What changes is the PACE at which you get there, never "
     "where you can get to.\n"
     "- THIS PACE GUIDANCE GOVERNS THE ORDINARY APPROACH ONLY. If heat is "

@@ -2,7 +2,7 @@
 
 ## Active Epic
 
-**11 Aug 2026 — #781 closed by slice 2: D156/D157 wire the flag-gated post-FC fan destination ceiling and one-way per-dwell release latch.**
+**11 Aug 2026 — #781 closed by slice 2: D156/D157 wire the flag-gated post-FC fan destination ceiling and one-way per-dwell release latch. In practice enforcement also requires the post-FC control loop: with the loop inert, the unknown heat floor releases a climbing bean immediately.**
 
 > **STATUS UPDATE — 11 Aug 2026 (the #792 data refresh is DONE; three control decisions
 > ratified; #749 is CUT).** Read before the overnight block below.

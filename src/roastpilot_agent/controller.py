@@ -848,6 +848,11 @@ class RoastController:
         # armed no later RoR is consulted for this purpose. Cleared on every
         # phase transition, making it strictly per-DEVELOPMENT-dwell state.
         self._post_fc_fan_ceiling_released: bool = False
+        # D157: whether the ambient-conditioned ceiling has bound at least
+        # once in this DEVELOPMENT dwell. If any later signal would stop the
+        # ceiling binding, the release latch above arms so the told box cannot
+        # oscillate back to a narrower ceiling within the same dwell.
+        self._post_fc_fan_ceiling_engaged_once: bool = False
         # #498 (D89 Tier 1, safety-reviewer BLOCKER-1 fix): the advisor's
         # safety-evaluated fan TARGET in loop mode — a held desire, never an
         # actuated value. The advisor consult and the taper's own write both
@@ -1271,6 +1276,7 @@ class RoastController:
         # state. Clear it unconditionally on every transition so a later dwell
         # never inherits free-fan authority from an earlier one.
         self._post_fc_fan_ceiling_released = False
+        self._post_fc_fan_ceiling_engaged_once = False
         if previous in TERMINAL_LATCH_PHASES and target not in TERMINAL_LATCH_PHASES:
             # Leaving a terminal HOLD phase is an EXPLICIT operator action
             # (acknowledge → idle, resume, start cooling): the operator now owns
@@ -4469,8 +4475,12 @@ class RoastController:
         This is the single mutation point for
         ``self._post_fc_fan_ceiling_released``. A fresh latching condition sets
         it once; an already-released signal returns without reading RoR again.
-        The returned signal is re-stamped on the arming tick so the same consult
-        already sees the release, preserving zero-tick #498 brake authority.
+        After the ceiling first binds, any signal that would stop it binding
+        also arms the release so the told ceiling cannot re-narrow in the same
+        dwell. The returned signal is re-stamped on the arming tick so the same
+        consult box is freed with zero delay. With the post-FC loop engaged, the
+        actuated fan follows on the taper's next coalesced write, bounded by
+        ``post_first_crack_control.control_interval_seconds``.
 
         Args:
             signal: This tick's immutable signal, or ``None``.
@@ -4481,7 +4491,13 @@ class RoastController:
         """
         if signal is None or signal.released:
             return signal
-        if not self._policy().fan_ceiling_release_due(signal):
+        ceiling_engaged = self._policy().post_fc_fan_ceiling_engaged(signal)
+        if ceiling_engaged:
+            self._post_fc_fan_ceiling_engaged_once = True
+            return signal
+        if not (
+            self._post_fc_fan_ceiling_engaged_once or self._policy().fan_ceiling_release_due(signal)
+        ):
             return signal
         self._post_fc_fan_ceiling_released = True
         return PostFcFanSignal(

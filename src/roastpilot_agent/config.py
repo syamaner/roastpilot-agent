@@ -1254,7 +1254,8 @@ class AmbientFanDoctrine(BaseModel):
     """Whether the destination ceiling is deterministically ENFORCED on the
     DEVELOPMENT fan box (11 Aug ratification / D156, superseding the 6 Aug
     prompt-only posture). Default ``False``; enforcement also requires the
-    master :attr:`enabled` flag."""
+    master :attr:`enabled` flag and an engaged post-FC control loop. With the
+    loop inert, the unknown heat floor releases a climbing bean immediately."""
 
     post_fc_fan_ceiling_percent: int = Field(default=70, ge=10, le=100)
     """The DEVELOPMENT fan destination ceiling in a cool room, in percent.

@@ -518,9 +518,9 @@ async def test_advisor_context_box_equals_gate_box_told_equals_enforced() -> Non
     assert context.fan_ceiling_percent == enforced.fan_ceiling_percent
     assert context.bitter_ceiling_temp_c == enforced.bitter_ceiling_temp_c
     assert context.emergency_drop_temp_c == enforced.emergency_drop_temp_c
-    # DEVELOPMENT keeps the full 0–100 box (the post-FC LLM's box, #223); the
-    # profile-aware bitter ceiling: PROFILE drops at 205 °C, above 196, so the
-    # told ceiling stays the hard 196.
+    # With the ambient doctrine off, DEVELOPMENT keeps the full 0–100 box (the
+    # post-FC LLM's box, #223); the profile-aware bitter ceiling: PROFILE drops
+    # at 205 °C, above 196, so the told ceiling stays the hard 196.
     assert (context.heat_floor_percent, context.heat_ceiling_percent) == (0, 100)
     assert (context.fan_floor_percent, context.fan_ceiling_percent) == (0, 100)
     assert context.bitter_ceiling_temp_c == 196.0
@@ -769,7 +769,8 @@ def test_pre_fc_box_is_narrowed_with_deterministic_target(phase: RoastPhase) -> 
     """D35 §3 (#222): the two pre-FC phases resolve a NARROWED box with a
     deterministic lever target — heat pinned high (floor == the n8n heat 100
     target, so a momentum-killing cut is impossible) and fan capped low (≤ the
-    n8n fan 30). The development phase by contrast keeps the full 0–100 box."""
+    n8n fan 30). With the ambient doctrine off, the development phase by
+    contrast keeps the full 0–100 box."""
     harness = make_harness()
     harness.controller.load_profile(PROFILE)
     for step in NORMAL_PATH:
@@ -7280,6 +7281,46 @@ async def test_latch_releases_for_the_remainder_of_the_dwell() -> None:
     assert harness.controller.snapshot().current_heat > output.effective_floor_percent
     assert advisor.contexts[-1].fan_ceiling_percent == 100
     assert harness.controller.snapshot().current_fan == 100
+
+
+@pytest.mark.asyncio
+async def test_told_fan_ceiling_never_renarrows_after_stale_ambient() -> None:
+    """An engaged ceiling releases on stale ambient and stays released."""
+    advisor = FakeAdvisor(
+        [decision(heat=70, fan=30)],
+        default_decision=decision(heat=70, fan=100),
+    )
+    harness = make_harness(
+        config=_fan_ceiling_loop_config(control_interval_seconds=5.0),
+        advisor=advisor,
+    )
+    await _charge_through_fc(harness, fc_ror_c_per_min=4.0)
+    output = harness.controller._last_post_fc_output  # pyright: ignore[reportPrivateUsage]
+    assert output is not None
+    harness.controller._current_heat = 70  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._current_heat > output.effective_floor_percent  # pyright: ignore[reportPrivateUsage]
+    harness.controller._post_fc_engaged = False  # pyright: ignore[reportPrivateUsage]
+    advisor.contexts.clear()
+
+    for ambient_age_seconds in (2.0, 600.0, 2.0):
+        harness.clock.advance(5.0)
+        harness.reader.readings = [
+            _fan_doctrine_reading(
+                ambient_temp_c=23.1,
+                ambient_age_seconds=ambient_age_seconds,
+                bean_ror_c_per_min=0.0,
+            )
+        ]
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+
+    assert [context.fan_ceiling_percent for context in advisor.contexts] == [70, 100, 100]
+    assert harness.controller._post_fc_fan_ceiling_released is True  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_fan_ceiling_engaged_once is True  # pyright: ignore[reportPrivateUsage]
+
+    harness.controller.transition_to(RoastPhase.COOLING)
+    assert harness.controller._post_fc_fan_ceiling_released is False  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._post_fc_fan_ceiling_engaged_once is False  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
