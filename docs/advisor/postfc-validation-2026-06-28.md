@@ -2,7 +2,9 @@
 
 > **⚠ FIGURES CORRECTED 11 Aug 2026 (#779 / PR #784, tracked as #792). The central
 > conclusion survives; two statements did not.** Every DTR below was originally computed
-> on **confirmation**-anchored marks, which understate development. The fixtures were
+> on **confirmation**-anchored marks. That does not shift DTR in a single direction: a late
+> FC mark shortens development and understates the ratio, while a late T0 mark shortens the
+> total and *overstates* it, so the net depends on which backdate dominates. The fixtures were
 > regenerated on the corrected **onset** anchors and each direction was derived from that
 > roast's own store data rather than assumed — they genuinely differ in sign:
 >
@@ -26,8 +28,13 @@
 > Sightly underdeveloped"), so the "only `5a32334c` qualifies" statement below and its
 > matching action item are both retired — the corpus now carries two labelled bake-off
 > entries, not one. (2) First-crack temperatures were re-resolved: 188 → 187, 185 → 183,
-> and `5a32334c` gained a value (186 °C) where this report shows `n/a`, because the
-> corrected mark now lands on a telemetry row.
+> and `5a32334c` gained a value (186 °C) where this report shows `n/a`. **Correcting my own
+> first explanation of that last one:** it is *not* because the mark moved. For an
+> operator-marked first crack `store_to_fixture` sets `first_crack_source` only when the
+> accepted source is `mcp` (`scripts/store_to_fixture.py:674-678`), so `5a32334c` still
+> anchors on the event row exactly as before. What changed is that #784 maps each mark onto
+> the nearest telemetry row, and that mapping can now read a temperature the old export left
+> null. Same anchor, newly resolvable value.
 >
 > **Provenance, corrected 11 Aug.** The frozen `development_percent` is **version-stamped at
 > #337** (the FC/T0 backdating consumer, closed 23 Jun 2026), so this corpus holds **two
@@ -302,8 +309,11 @@ decision belongs to the operator after reading the full scored output.
    Consider: (a) bean-temp ceiling overrides dev guard (always drop if bean ≥ bitter
    ceiling), or (b) lower the 3% dev margin. **Controller change — operator decision.**
 
-3. **Rate `store-roast-d251013e`** (the 27 Jun Colombia Washed run) to complete its
-   corpus label. Until rated it cannot serve as a bake-off or D42 reference.
+3. ~~**Rate `store-roast-d251013e`** (the 27 Jun Colombia Washed run) to complete its
+   corpus label. Until rated it cannot serve as a bake-off or D42 reference.~~ **DONE** —
+   rated 3/5 on 11 Aug ("tasted a bit flat. Sightly underdeveloped"); it is now a labelled
+   bake-off-eligible entry. *(This is the second copy of the same action item; the first is
+   at the end of the recommendations section above.)*
 
 4. **Schema v7 migration on live store** before the next roast (see command above).
 

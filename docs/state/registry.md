@@ -14,7 +14,9 @@
 > `5a32334c` 12.7 → **12.6** (−0.1). The lone downward move is structural: that roast's
 > first crack is operator-marked, #784 leaves the FC mark alone, so only the denominator
 > moved. Cross-checked from first principles against the store's own event timestamps
-> (DTR via onset = 11.57 / 12.60 / 13.01 %; the exporter reproduces each to ~0.1 pp).
+> (DTR via onset: `3fbfd888` 11.57 %, `5a32334c` 12.60 %, `d251013e` 13.01 % — labelled
+> because that is NOT the order the corrections are listed in above; the exporter reproduces
+> each to ~0.1 pp).
 >
 > **The validation report's central conclusion SURVIVES** — Colombia Washed roasts still
 > under-develop against the 17–18 % per-origin prior, now at 12.6 / 12.9 %. Two statements
