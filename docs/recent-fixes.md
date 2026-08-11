@@ -738,3 +738,21 @@ Format: one entry per anti-pattern.
   must reach the banner, a saved-only non-default must be tagged, a shadowed
   `model_slug` must be reported as shadowed, and a disabled trim must report
   the flat floor rather than its leftover depth.
+
+## A roast-landmark consumer must use the backdated onset, not agent receipt time
+
+*(fixed for store fixture export by #779, 11 Aug 2026)*
+
+- **Signature:** consumers of `roast_events.kind IN ('t0_detected',
+  'first_crack')`, or an `agent_phase == "development"` transition, that use
+  the row timestamp as the landmark without checking the controller's
+  backdated T0/first-crack instant.
+- **Wrong / Right:** T0 and first-crack event rows are stamped when the agent
+  receives/confirms detection, so they make development time and landmark
+  temperature late. Prefer `roast_runs.t0_detected_at_utc` and
+  `raw_state_json.first_crack_status.detected_at_utc`, mapped through paired
+  telemetry wall/elapsed clocks; retain a warned event-row fallback for old or
+  operator-marked runs. The history-list FC display and
+  `scripts/plant_model_arx_study.py` remain sibling follow-up sites.
+- **Guarded by:** `tests/test_store_to_fixture.py` backdated-anchor invariant,
+  temperature, provenance, fallback, ambiguity, and frozen-DTR tests.

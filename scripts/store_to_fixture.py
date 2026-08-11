@@ -28,14 +28,14 @@ Event-kind mapping (store → the fixture's three event kinds):
   drop), so it would corrupt ``drop_temp_c`` + the degree label, and a roast that
   cooled-but-never-completed (e.g. roast 2) records no ``run_completed`` at all.
 
-**Two clocks — reconciled via ``run_started``.** Telemetry ``elapsed_seconds``
-is **run-relative** (≈0 at the first tick), but ``roast_events.monotonic_seconds``
-is the **absolute** ``time.monotonic()`` reading (hundreds of thousands of
-seconds — process uptime). They do NOT share an origin. So every event time is
-rebased onto the telemetry clock by subtracting the ``run_started`` event's
-``monotonic_seconds`` (the controller's ``_run_started_monotonic``) before any
-nearest-row match or truncation. (A run with no ``run_started`` event — and so no
-resolvable offset — cannot be reconciled and is rejected.)
+**Three clocks — reconciled deliberately.** Telemetry ``elapsed_seconds`` is
+**run-relative**, while ``roast_events.monotonic_seconds`` is the absolute
+``time.monotonic()`` reading. Event-row fallbacks are rebased by subtracting the
+``run_started`` event's monotonic timestamp. The controller's backdated T0/first
+crack truths are wall-clock UTC instants instead: each is mapped onto the
+run-relative clock through the nearest telemetry row's paired
+``recorded_at_utc`` / ``elapsed_seconds`` values. MCP monotonic timestamps are a
+foreign clock domain and are never mixed with the agent clocks.
 
 The output fixture ``monotonic_seconds`` is on that single reconciled run-relative
 clock: telemetry from the snapshot's ``elapsed_seconds`` (``tick × tick_interval``
@@ -58,9 +58,9 @@ import json
 import sqlite3
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -126,10 +126,17 @@ class StoreRoast:
         telemetry: Tick-ordered telemetry rows (``tick`` / ``elapsed_seconds`` /
             ``bean_temp_c`` / ``env_temp_c`` / ``heat_level_percent`` /
             ``fan_level_percent``).
-        charge_seconds: ``t0_detected`` time, **rebased onto the run-relative
-            telemetry clock** (absolute event monotonic − ``run_started``), or
-            ``None``.
-        first_crack_seconds: ``first_crack`` time, rebased, or ``None``.
+        charge_seconds: T0 time on the run-relative telemetry clock, preferring
+            ``roast_runs.t0_detected_at_utc`` and falling back to the rebased
+            event row, or ``None``.
+        charge_anchor: ``"run_row_utc"`` or ``"event_row"`` according to the
+            source used for ``charge_seconds``; ``None`` iff the mark is absent.
+        first_crack_seconds: First-crack time on the run-relative clock,
+            preferring ``raw_state_json.first_crack_status.detected_at_utc`` and
+            falling back to the rebased event row, or ``None``.
+        first_crack_anchor: ``"fc_status_utc"`` or ``"event_row"`` according
+            to the source used for ``first_crack_seconds``; ``None`` iff the
+            mark is absent.
         drop_seconds: The drop instant — the transition into cooling
             (``phase_changed`` with ``phase == "cooling"``) — rebased, or ``None``.
         tastings: Every persisted tasting entry (#522, D91), oldest first, as
@@ -157,7 +164,9 @@ class StoreRoast:
     roaster_driver: str
     telemetry: list[dict[str, Any]]
     charge_seconds: float | None
+    charge_anchor: str | None
     first_crack_seconds: float | None
+    first_crack_anchor: str | None
     drop_seconds: float | None
     tastings: list[dict[str, Any]]
     completed_at_utc: str | None
@@ -277,6 +286,231 @@ def _event_time(connection: sqlite3.Connection, run_id: str, kind: str) -> float
     return float(row["monotonic_seconds"])
 
 
+def _first_crack_event_source(connection: sqlite3.Connection, run_id: str) -> str | None:
+    """Read provenance from the accepted first-crack event payload.
+
+    The selected row uses the same ordering and timestamp requirement as
+    :func:`_event_time`, so provenance gates the exact event that supplies the
+    fallback mark. Missing, malformed, non-object, null, and non-string payload
+    values all fail safe as unknown provenance.
+
+    Args:
+        connection: An open store connection.
+        run_id: The run id.
+
+    Returns:
+        The payload's string ``source``, or ``None`` when it is not usable.
+    """
+    row = connection.execute(
+        "SELECT payload_json FROM roast_events"
+        " WHERE run_id = ? AND kind = ? AND monotonic_seconds IS NOT NULL"
+        " ORDER BY recorded_at_utc ASC, id ASC LIMIT 1",
+        (run_id, _FIRST_CRACK_KIND),
+    ).fetchone()
+    if row is None or row["payload_json"] is None:
+        return None
+    try:
+        payload: Any = json.loads(row["payload_json"])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    source = cast(dict[str, object], payload).get("source")
+    return source if isinstance(source, str) else None
+
+
+def _parse_utc(value: str) -> datetime | None:
+    """Parse an ISO-8601 instant, treating a missing offset as UTC.
+
+    Args:
+        value: ISO-8601 timestamp; Python 3.11 accepts both ``Z`` and explicit
+            offsets.
+
+    Returns:
+        An offset-aware datetime, or ``None`` when ``value`` is unparseable.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _utc_to_run_seconds(
+    connection: sqlite3.Connection, run_id: str, target_iso: str
+) -> float | None:
+    """Map a wall-clock UTC instant onto the run-relative telemetry clock.
+
+    The nearest usable telemetry row supplies the paired wall/elapsed anchor.
+    Iteration follows tick/id order and updates only for a strictly closer row,
+    so the earliest row deterministically wins an equal-distance tie.
+
+    Args:
+        connection: An open store connection.
+        run_id: The run id.
+        target_iso: ISO-8601 wall-clock instant to map.
+
+    Returns:
+        Run-relative seconds, or ``None`` when the target or every telemetry
+        wall timestamp is unparseable, or no row has both required clocks.
+    """
+    target = _parse_utc(target_iso)
+    if target is None:
+        return None
+    rows = connection.execute(
+        "SELECT recorded_at_utc, elapsed_seconds FROM telemetry_snapshots"
+        " WHERE run_id = ? AND elapsed_seconds IS NOT NULL"
+        " AND recorded_at_utc IS NOT NULL ORDER BY tick ASC, id ASC",
+        (run_id,),
+    ).fetchall()
+    nearest_elapsed: float | None = None
+    nearest_delta_seconds: float | None = None
+    nearest_distance: float | None = None
+    for row in rows:
+        recorded = _parse_utc(str(row["recorded_at_utc"]))
+        if recorded is None:
+            continue
+        delta_seconds = (target - recorded).total_seconds()
+        distance = abs(delta_seconds)
+        if nearest_distance is None or distance < nearest_distance:
+            nearest_distance = distance
+            nearest_delta_seconds = delta_seconds
+            nearest_elapsed = float(row["elapsed_seconds"])
+    if nearest_elapsed is None or nearest_delta_seconds is None:
+        return None
+    mapped = nearest_elapsed + nearest_delta_seconds
+    return None if mapped < 0.0 else mapped
+
+
+def _elapsed_clock_restarted(connection: sqlite3.Connection, run_id: str) -> bool:
+    """Whether persisted elapsed seconds decrease in insertion order.
+
+    A decrease proves that an agent restart reset the run-relative clock, so a
+    wall-clock instant cannot be mapped safely onto that clock without stitching
+    segments. This exporter deliberately falls back to accepted event rows
+    instead of inventing such a reconstruction.
+
+    Args:
+        connection: An open store connection.
+        run_id: The run id.
+
+    Returns:
+        ``True`` when any non-null elapsed value is below its predecessor in
+        telemetry insertion order; otherwise ``False``.
+    """
+    rows = connection.execute(
+        "SELECT elapsed_seconds FROM telemetry_snapshots"
+        " WHERE run_id = ? AND elapsed_seconds IS NOT NULL ORDER BY id ASC",
+        (run_id,),
+    ).fetchall()
+    previous: float | None = None
+    for row in rows:
+        current = float(row["elapsed_seconds"])
+        if previous is not None and current < previous:
+            return True
+        previous = current
+    return False
+
+
+def _first_crack_onset_utc(connection: sqlite3.Connection, run_id: str) -> tuple[str | None, int]:
+    """Read the earliest distinct MCP first-crack onset from raw telemetry state.
+
+    Malformed JSON and missing/null/non-string paths are skipped per row so one
+    bad snapshot cannot hide a later valid onset. When a resumed MCP session
+    legitimately re-stamps the onset, the earliest parseable UTC value wins.
+
+    Args:
+        connection: An open store connection.
+        run_id: The run id.
+
+    Returns:
+        A pair of the chosen onset (or ``None`` when absent) and the number of
+        distinct non-empty values seen. If every value is unparseable, the first
+        encountered value is returned so normal unparseable-source fallback and
+        warning behavior still applies.
+    """
+    rows = connection.execute(
+        "SELECT raw_state_json FROM telemetry_snapshots"
+        " WHERE run_id = ? AND raw_state_json IS NOT NULL"
+        " ORDER BY tick ASC, id ASC",
+        (run_id,),
+    ).fetchall()
+    distinct: list[str] = []
+    for row in rows:
+        try:
+            document: Any = json.loads(row["raw_state_json"])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(document, dict):
+            continue
+        document_map = cast(dict[str, object], document)
+        status = document_map.get("first_crack_status")
+        if not isinstance(status, dict):
+            continue
+        status_map = cast(dict[str, object], status)
+        detected_at = status_map.get("detected_at_utc")
+        if not isinstance(detected_at, str) or not detected_at:
+            continue
+        if detected_at not in distinct:
+            distinct.append(detected_at)
+    if not distinct:
+        return None, 0
+    parseable = [(parsed, value) for value in distinct if (parsed := _parse_utc(value)) is not None]
+    chosen = min(parseable, key=lambda item: item[0])[1] if parseable else distinct[0]
+    return chosen, len(distinct)
+
+
+@dataclass(frozen=True)
+class _AnchorResolution:
+    """One resolved mark plus private fallback-warning provenance."""
+
+    seconds: float | None
+    anchor: str | None
+    fallback_reason: str | None
+
+
+def _resolve_utc_mark(
+    connection: sqlite3.Connection,
+    run_id: str,
+    preferred_iso: str | None,
+    preferred_anchor: str,
+    event_kind: str,
+    run_started: float,
+    mapping_block_reason: str | None = None,
+) -> _AnchorResolution:
+    """Resolve a preferred UTC mark, falling back to its established event row."""
+    fallback_reason = "source absent"
+    if preferred_iso is not None:
+        if mapping_block_reason is not None:
+            fallback_reason = mapping_block_reason
+        elif _parse_utc(preferred_iso) is None:
+            fallback_reason = "source unparseable"
+        else:
+            mapped = _utc_to_run_seconds(connection, run_id, preferred_iso)
+            if mapped is not None:
+                return _AnchorResolution(mapped, preferred_anchor, None)
+            fallback_reason = "source unmappable"
+    event_seconds = _rebase(_event_time(connection, run_id, event_kind), run_started)
+    return _AnchorResolution(
+        event_seconds,
+        None if event_seconds is None else "event_row",
+        fallback_reason,
+    )
+
+
+@dataclass(frozen=True)
+class _StoreReadResult:
+    """Private reader result carrying warning/cross-check data into ``convert``."""
+
+    roast: StoreRoast
+    charge_fallback_reason: str | None
+    first_crack_fallback_reason: str | None
+    first_crack_onset_warning: str | None
+    frozen_development_percent: float | None
+
+
 def _drop_time(connection: sqlite3.Connection, run_id: str) -> float | None:
     """The drop instant: the earliest transition INTO cooling, or ``None``.
 
@@ -308,15 +542,15 @@ def _drop_time(connection: sqlite3.Connection, run_id: str) -> float | None:
     return float(row["monotonic_seconds"])
 
 
-def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
-    """Read one completed roast out of the agent SQLite store (read-only).
+def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadResult:
+    """Read one roast plus private conversion provenance from the store.
 
     Args:
         db_path: Path to the SQLite store.
         run_id: An explicit run id, or ``None`` for the most-recent completed run.
 
     Returns:
-        The roast's telemetry, marks, and operator label.
+        The roast, fallback reasons, and frozen achieved DTR.
 
     Raises:
         FileNotFoundError: If the store file does not exist.
@@ -342,9 +576,14 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
             if "corrected_charge_grams" in _store_cols
             else "NULL AS corrected_charge_grams"
         )
+        _t0_col = (
+            "t0_detected_at_utc"
+            if "t0_detected_at_utc" in _store_cols
+            else "NULL AS t0_detected_at_utc"
+        )
         run_row = connection.execute(
             f"SELECT operator_rating, operator_notes, {_weight_col},"
-            f" {_corrected_charge_col}, profile_json, completed_at_utc"
+            f" {_corrected_charge_col}, {_t0_col}, profile_json, completed_at_utc"
             " FROM roast_runs WHERE id = ?",
             (resolved,),
         ).fetchone()
@@ -411,6 +650,58 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
                 f"run {resolved} has no run_started event — event/telemetry clocks "
                 f"cannot be reconciled"
             )
+        elapsed_clock_restarted = _elapsed_clock_restarted(connection, resolved)
+        # A restart also leaves the exported telemetry rows themselves with
+        # non-monotonic times. That pre-existing fixture defect is tracked for a
+        # separate fix; this story only refuses unsafe preferred-anchor mapping.
+        mapping_block_reason = (
+            "source unmappable: detected clock restart" if elapsed_clock_restarted else None
+        )
+        charge_source = (
+            None
+            if run_row is None or run_row["t0_detected_at_utc"] is None
+            else str(run_row["t0_detected_at_utc"])
+        )
+        charge = _resolve_utc_mark(
+            connection,
+            resolved,
+            charge_source,
+            "run_row_utc",
+            _CHARGE_KIND,
+            run_started,
+            mapping_block_reason,
+        )
+        accepted_first_crack_source = _first_crack_event_source(connection, resolved)
+        first_crack_source: str | None = None
+        first_crack_onset_count = 0
+        if accepted_first_crack_source == "mcp":
+            first_crack_source, first_crack_onset_count = _first_crack_onset_utc(
+                connection, resolved
+            )
+        first_crack_onset_warning = (
+            f"first crack source has {first_crack_onset_count} distinct onset values; "
+            f"chose earliest {first_crack_source}"
+            if first_crack_onset_count > 1 and first_crack_source is not None
+            else None
+        )
+        first_crack = _resolve_utc_mark(
+            connection,
+            resolved,
+            first_crack_source,
+            "fc_status_utc",
+            _FIRST_CRACK_KIND,
+            run_started,
+            mapping_block_reason,
+        )
+        frozen_row = connection.execute(
+            "SELECT development_percent FROM telemetry_snapshots"
+            " WHERE run_id = ? AND development_percent IS NOT NULL"
+            " ORDER BY id DESC LIMIT 1",
+            (resolved,),
+        ).fetchone()
+        frozen_development_percent = (
+            None if frozen_row is None else float(frozen_row["development_percent"])
+        )
         frozen_charge_weight_grams: float | None = None
         if run_row is not None and run_row["profile_json"] is not None:
             try:
@@ -429,7 +720,7 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
         # correction when present), never the stale frozen default alone, the
         # same class of fix #522 applied to tastings on the sibling value.
         effective_charge_weight_grams = corrected_charge_grams or frozen_charge_weight_grams
-        return StoreRoast(
+        roast = StoreRoast(
             run_id=resolved,
             operator_rating=None
             if run_row is None or run_row["operator_rating"] is None
@@ -444,18 +735,43 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
             else float(run_row["roasted_weight_grams"]),
             roaster_driver=_ROASTER_DRIVER,
             telemetry=telemetry,
-            charge_seconds=_rebase(_event_time(connection, resolved, _CHARGE_KIND), run_started),
-            first_crack_seconds=_rebase(
-                _event_time(connection, resolved, _FIRST_CRACK_KIND), run_started
-            ),
+            charge_seconds=charge.seconds,
+            charge_anchor=charge.anchor,
+            first_crack_seconds=first_crack.seconds,
+            first_crack_anchor=first_crack.anchor,
             drop_seconds=_rebase(_drop_time(connection, resolved), run_started),
             tastings=tastings,
             completed_at_utc=None
             if run_row is None or run_row["completed_at_utc"] is None
             else str(run_row["completed_at_utc"]),
         )
+        return _StoreReadResult(
+            roast=roast,
+            charge_fallback_reason=charge.fallback_reason,
+            first_crack_fallback_reason=first_crack.fallback_reason,
+            first_crack_onset_warning=first_crack_onset_warning,
+            frozen_development_percent=frozen_development_percent,
+        )
     finally:
         connection.close()
+
+
+def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
+    """Read one completed roast out of the agent SQLite store (read-only).
+
+    Args:
+        db_path: Path to the SQLite store.
+        run_id: An explicit run id, or ``None`` for the most-recent completed run.
+
+    Returns:
+        The roast's telemetry, resolved marks, anchor provenance, and operator
+        label.
+
+    Raises:
+        FileNotFoundError: If the store file does not exist.
+        FixtureConversionError: If no matching completed run exists.
+    """
+    return _read_store_roast(db_path, run_id).roast
 
 
 def _rebase(event_seconds: float | None, run_started_seconds: float) -> float | None:
@@ -730,9 +1046,57 @@ def convert(db_path: Path, out_dir: Path, run_id: str | None = None) -> dict[str
         FileNotFoundError: If the store file does not exist.
         FixtureConversionError: If the run is unusable (no telemetry / marks).
     """
-    roast = read_store_roast(db_path, run_id)
+    read_result = _read_store_roast(db_path, run_id)
+    roast = read_result.roast
     rows = build_fixture_rows(roast)
     summary = build_summary(roast, rows)
+    if roast.charge_anchor == "event_row":
+        print(
+            f"warning: run {roast.run_id} charge uses event_row because preferred "
+            f"run_row_utc {read_result.charge_fallback_reason}; late charge shortens "
+            "the denominator, so DTR overstated",
+            file=sys.stderr,
+        )
+    if roast.first_crack_anchor == "event_row":
+        print(
+            f"warning: run {roast.run_id} first crack uses event_row because preferred "
+            f"fc_status_utc {read_result.first_crack_fallback_reason}; late first crack "
+            "shortens development, so DTR understated",
+            file=sys.stderr,
+        )
+    if read_result.first_crack_onset_warning is not None:
+        print(
+            f"warning: run {roast.run_id} {read_result.first_crack_onset_warning}",
+            file=sys.stderr,
+        )
+    exported_development_percent = summary["development_time_percent"]
+    frozen_development_percent = read_result.frozen_development_percent
+    preferred_anchors = [
+        label
+        for anchor, label in (
+            (roast.charge_anchor, "charge=run_row_utc"),
+            (roast.first_crack_anchor, "first_crack=fc_status_utc"),
+        )
+        if anchor not in (None, "event_row")
+    ]
+    if frozen_development_percent is None and preferred_anchors:
+        print(
+            f"warning: run {roast.run_id} development_time_percent could not be "
+            "cross-checked because no frozen development_percent exists; preferred "
+            f"anchors: {', '.join(preferred_anchors)}",
+            file=sys.stderr,
+        )
+    elif (
+        frozen_development_percent is not None
+        and exported_development_percent is not None
+        and abs(float(exported_development_percent) - frozen_development_percent) > 0.5
+    ):
+        print(
+            f"warning: run {roast.run_id} development_time_percent cross-check differs: "
+            f"exported {exported_development_percent}, frozen "
+            f"{frozen_development_percent}",
+            file=sys.stderr,
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
     fixture = out_dir / "roast.jsonl"
     fixture.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
@@ -744,6 +1108,9 @@ def convert(db_path: Path, out_dir: Path, run_id: str | None = None) -> dict[str
         "degree": summary["degree"],
         "operator_rating": summary["operator_rating"],
         "telemetry_rows": sum(1 for r in rows if r["type"] == "telemetry"),
+        "charge_anchor": roast.charge_anchor,
+        "first_crack_anchor": roast.first_crack_anchor,
+        "development_time_percent": summary["development_time_percent"],
     }
 
 
@@ -778,7 +1145,9 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"converted run {entry['run_id']} -> {entry['fixture']} "
         f"(drop {entry['drop_temp_c']} °C, degree {entry['degree']}, "
-        f"rating {entry['operator_rating']}, rows {entry['telemetry_rows']})"
+        f"rating {entry['operator_rating']}, rows {entry['telemetry_rows']}, "
+        f"charge anchor {entry['charge_anchor']}, first-crack anchor "
+        f"{entry['first_crack_anchor']})"
     )
     return 0
 
