@@ -4,6 +4,81 @@
 
 **11 Aug 2026 — #781 closed by slice 2: D156/D157 wire the flag-gated post-FC fan destination ceiling and a one-way RUN-scoped release latch: once released it stays released for the rest of the run, surviving every transition including an operator resume, and is cleared only by `start_run`. The load-bearing case is a resume back to pre-first-crack reaching DEVELOPMENT again on a second first-crack edge; the direct recovery-to-DEVELOPMENT resume is separately inert because the floor is unknown there. In practice enforcement also requires the post-FC control loop: with the loop inert, the unknown heat floor releases a climbing bean immediately.**
 
+> **STATUS UPDATE — 11 Aug 2026, evening (#781 CLOSED via PR #800; #787 reopened as a
+> sweep with #785 folded in; D157 amended twice). Read before the block below.**
+>
+> **#781 is closed by PR #800** (`a8b9cc1`), which carries two operator-ratified changes on
+> top of the slice-2 wiring.
+>
+> **1. The fan-ceiling release latch is RUN-scoped, not per-DEVELOPMENT-dwell.** The clear
+> moved out of `transition_to` into `start_run`; the three siblings
+> (`_post_fc_fan_ceiling_engaged_once` and the two once-per-dwell log flags) stay per-dwell.
+> The per-dwell form had been justified on symmetry with the fields cleared in the same
+> `transition_to` cluster, which is a code-symmetry argument that undersold the safety axis.
+>
+> **⚠ The load-bearing edge is NOT the obvious one, and this matters more than the change
+> itself.** A DIRECT `operator_recovery_required -> development` resume cannot re-narrow the
+> ceiling under *either* scope: `transition_to` clears `_post_fc_engaged` unconditionally,
+> only the true first-crack edge sets it, the post-FC loop is gated on that flag, so
+> `_last_post_fc_output` stays `None` and the predicate is declined by its floor-unknown
+> carve-out before it ever reads the latch.
+>
+> **⚠ "Run-scoped" means within one PROCESS, not across a restart.** The latch is in-memory
+> only: `RoastController.__init__` sets it `False` and the restart-recovery path does not
+> restore it, so a roast that had earned release, then restarted, resumes UNLATCHED and a
+> later second first-crack edge can narrow the ceiling again. That is accepted and unchanged
+> (a restart with a possibly-active run enters `operator_recovery_required` and never
+> auto-resumes heat or fan), and the source comment at the field says so, but the exception
+> belongs here too rather than only in the code. The path that earns the change is one edge
+> further out: `operator_recovery_required` lists `ROASTING_PRE_FIRST_CRACK` among its legal
+> targets and `api.py::_parse_resume_target` accepts it, and the true-FC-edge gate is keyed on
+> the EDGE rather than on whether first crack has already happened this run. So a resume back
+> to pre-first-crack followed by a second detection re-engages the loop and reaches a dwell
+> with a KNOWN floor (measured: `effective_floor_percent` 25), where the ceiling genuinely
+> binds. **An analysis during the PR checked only the direct edge, concluded the change was
+> behaviourally inert, and nearly had the field reverted.** A pre-open `safety-reviewer` pass
+> then enumerated the graph: of 31 within-run paths back to DEVELOPMENT that avoid
+> `start_run`, **20 can reach a known floor and every one ends on a second first-crack edge**,
+> across five families (direct, via preheating, via faulted, via cooling, via
+> cooling->complete->idle). Do not re-derive this from the direct-resume edge.
+>
+> **2. A ceiling equal to the lever maximum is not an engagement.** `post_fc_fan_ceiling_percent`
+> legally accepts 100, at which the fan box is not narrowed at all, yet the controller logged an
+> engagement and set `engaged_once`, which then licensed a false release record. Fixed in the
+> shared predicate (`post_fc_fan_ceiling_engaged` now requires the ceiling BELOW
+> `_LEVER_MAX_PERCENT`) rather than as another conjunct at the consuming site: this was the
+> **fifth** member of that false-telemetry class and the previous four were each fixed at their
+> own consumer, which is why a fifth kept appearing. A 9,600-combination sweep confirmed the
+> resolved fan box is unchanged. **Still an open operator call:** whether config should simply
+> REJECT 100, the delete-the-surface option. Nothing is blocked on it.
+>
+> **The recurring failure of this session, worth reading before the next sweep.** The same
+> stale `per-dwell` claim was fixed six times at increasing radius: the three sites the diff
+> touched, then three more docstrings in `src/` (found by sweeping the concept, after a review
+> named only three), then this very file (found by Codex, because the sweep had been scoped to
+> `src/` and never touched `docs/`). Each round fixed what was in front of it and left the
+> siblings one directory out. **Sweep by widening the radius, not by fixing the list you were
+> handed.** Three separate checks also ran, produced confident output, and verified nothing: a
+> test count reconstructed from progress dots (the missing pytest summary line is `-qq`,
+> because `pyproject` already sets `-q`, not buffering); a probe that measured an inert loop
+> because the baseline test config ships `post_first_crack_control.enabled=False`; and a
+> reviewer finding read from that reviewer's own uncommitted mutation. Check what you are
+> actually reading, against `git show HEAD:` and against the exit code.
+>
+> **#787 is REOPENED as the resettable-clock sweep and #785 is CLOSED into it.** #787's narrow
+> ratified behaviour (refuse to export a non-monotonic telemetry clock) shipped in `21c9f90`;
+> what stays open is the sweep its own body always named. Known members: `store.py:1832` (the
+> history `dev_pct` subquery, #785's own site) and **`store.py:2298`** (the reference-roast
+> curve read), which #785 did not name. `scripts/store_to_fixture.py:366/:463/:625` are
+> GUARDED rather than open, because `21c9f90`'s refusal raises before them; they become live
+> again if that guard is ever relaxed to stitching or truncation. `scripts/rpd_corpus_score.py`
+> is immune. **#783 and #788 stay standalone** (different classes, different fix sites; folding
+> them was tried overnight and reverted).
+>
+> **Plan repo:** D157 amended for the run scope (`d9b0d28`), then path-corrected (`5863f95`)
+> to name the load-bearing edge, both as addenda rather than rewrites so the supersession stays
+> traceable.
+
 > **STATUS UPDATE — 11 Aug 2026 (the #792 data refresh is DONE; three control decisions
 > ratified; #749 is CUT).** Read before the overnight block below.
 >
@@ -495,22 +570,53 @@
 > #681: this line previously called E11 "not started" and then described its shipped
 > half in the same sentence, which would have a cold-start session plan E11 from
 > scratch.)
-> **⚠ DO NOT FOLLOW THE NUMBER IN THIS PARAGRAPH — IT IS STALE (11 Aug 2026, #798).**
-> D153, D154, D155 and D156 have ALL been spent since it was written; the highest defined
-> anywhere in `~/git/roastpilot-plan` is **D156** (`roastpilot-agent/plan.md:135`), so the
-> next free is **D157** — but **re-derive it at use time** rather than trusting that number
-> too, because this paragraph has now gone stale four times. The derivation RULE below is
-> sound and is the part to keep; only the cached number rots. **#798** owns removing the
-> cached number entirely, which is the actual fix. The rest of this paragraph is retained
+> **⚠ THIS PARAGRAPH ONCE CACHED A DECISION NUMBER. It no longer does (#798, closed
+> 11 Aug 2026).** Every number it asserted went stale, four times over, including one
+> revision whose own warning-about-staleness went stale. The derivation RULE below is sound
+> and is the part to keep; only a cached number rots. The rest of the paragraph is retained
 > as written so the rule and its rationale stay legible:
 >
-> Next free plan decision number: **D153**. D150 is SPENT — it is the decision
-> that settled this very question, recorded in `00-repository-structure.md` on
-> 9 Aug 2026: **one shared D-number series for the whole `roastpilot-plan` repo,
-> next free being one past the highest defined anywhere in it.** D151 is SPENT
-> (the advisor `model_slug` shadowing fix, #747/#755, 9 Aug) and D152 is SPENT
-> (Codex-MCP default-implementer adoption, #764, 9 Aug), both in
-> `roastpilot-agent/plan.md`. Take **D153**.
+> **Next free plan decision number: DERIVE IT, do not read it from here.** This file
+> deliberately no longer asserts one. D150 is the decision that settled the question,
+> recorded in `00-repository-structure.md` on 9 Aug 2026: **one shared D-number series
+> for the whole `roastpilot-plan` repo, next free being one past the highest number
+> defined anywhere in it.** The rule is the durable part; a cached number is not.
+>
+> ```
+> cd ~/git/roastpilot-plan && git pull --ff-only \
+> && grep -rhoE '\bD[0-9]+\b' --include='*.md' . | sed 's/D//' | sort -n | tail -1 \
+>   | awk '{print "D" $1+1}'
+> ```
+>
+> **The `awk` step is load-bearing, not cosmetic.** Without it the pipeline prints the
+> highest number that is already SPENT, directly under a sentence promising the next FREE
+> one, so a session following this file literally would reuse a live decision number. That
+> is exactly the collision #798 exists to prevent, and an earlier revision of this very
+> paragraph shipped without it (caught in review on PR #801). Verify the output is one
+> higher than any number you can find in the repo before you use it.
+>
+> **The `&&` after the pull is load-bearing too, and for the same reason.** Without it a
+> failed `git pull` (no network, no credentials, a non-fast-forward checkout) still lets the
+> grep run against the STALE local clone and print a plausible number. That is the same
+> fail-open direction as the defect this block closes: an authoritative-looking answer
+> derived from a repository that is behind. Chained, nothing is emitted unless the refresh
+> succeeded. The digit class is `+` rather than `{1,3}` for the same durability reason: at
+> D1000 a three-digit bound stops matching, because the trailing word boundary fails, and
+> the command would then report D1000 as free forever.
+>
+> **Why the number was deleted rather than corrected (#798, closed 11 Aug 2026).** It had
+> been asserted and gone stale FOUR times, and the correction each time merely restarted the
+> same clock. A hand-maintained number sitting beside a live source of truth is a defect
+> generator, and this file is read at the start of every task, so a stale number here produces
+> duplicate decision records, which is precisely what D150 exists to prevent. Same reasoning
+> retired the hand-maintained issue-count tally on 11 Aug. Note the tokens appear in **five**
+> different formats across the plan repo, enumerated authoritatively further down this file:
+> `| D<n> |` table rows, `**D<n> (date) — ...**` paragraphs, `## D<n>: ...` headings,
+> `**D<n> — ...**` bold paragraphs with the date inside the sentence, and
+> `- **D<n>** (date): ...` bullets. All five live in `*.md` files, which is why the command
+> above greps `*.md` and needs no `git log` pass. Do not paraphrase that list from memory:
+> an earlier draft of THIS paragraph invented "commit subjects" and "cross-ref lists" as
+> formats, which would have implied the command undercounts.
 > Do **not** derive the number from any one file's own maximum:
 > that per-file reading is exactly what produced the collisions described below,
 > and it produced another on 9 Aug (see the operator flag there).
@@ -563,12 +669,11 @@
 > recorded D9 and D14 as never defined — they are defined, and that claim was
 > wrong** (corrected 9 Aug 2026, roastpilot-agent#750). The only real gap is
 > D144, deliberately renumbered to D145; it is not a number to reclaim. Re-derived
-> across all five formats on 9 Aug 2026 the highest number defined anywhere was
-> D150; D151 and D152 have been spent since (see above), so the highest defined
-> anywhere is now D152 and the free number above (**D153**) follows from it.
-> **⚠ STALE as of 11 Aug 2026 (#798), same as the paragraph above:** D153-D156 are all spent,
-> the highest defined anywhere is **D156**, and the next free is **D157** — re-derived at use
-> time, not read from here.
+> the sweep must cover all five formats. **No current highest-number is asserted here
+> either (#798, closed 11 Aug 2026)** — see the derivation command above. The historical
+> figures that used to sit in this paragraph had themselves gone stale twice, the second time
+> while carrying a warning that the paragraph above it was stale, which is as clear a
+> demonstration as the defect gets.
 >
 > D125 records the RP-D eval-model
 > correction — discriminates only on hardware/simulator, not replay; D124 records
