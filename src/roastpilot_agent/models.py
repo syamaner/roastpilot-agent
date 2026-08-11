@@ -2039,8 +2039,10 @@ class SseEvent(BaseModel):
 def sanitize_non_finite(value: object) -> object:
     """Return a JSON-ready copy with every non-finite float replaced by ``None``.
 
-    Dictionary keys are preserved, while dictionaries, lists, and tuples are
-    rebuilt so sanitising a shared event or response cannot mutate its source.
+    Dictionary keys are copied but not sanitised, while dictionaries, lists, and
+    tuples are rebuilt so sanitising a shared event or response cannot mutate its
+    source. The wire contract requires string keys; an out-of-contract non-finite
+    float key therefore fails closed at the strict JSON backstop.
 
     Args:
         value: Arbitrarily nested value headed for a JSON wire boundary.

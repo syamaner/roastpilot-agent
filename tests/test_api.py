@@ -959,7 +959,7 @@ def test_finite_json_response_replaces_nested_non_finite_floats() -> None:
 
 @pytest.mark.asyncio
 async def test_finite_json_response_protects_an_untyped_route() -> None:
-    """A route without Pydantic projection still emits strict JSON, not a 500."""
+    """A route without FastAPI's typed fast path can opt in to strict JSON."""
 
     def reject_constant(token: str) -> object:
         raise ValueError(f"non-finite JSON token: {token}")

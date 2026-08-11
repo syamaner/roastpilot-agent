@@ -151,11 +151,12 @@ _log = logging.getLogger(__name__)
 
 
 class FiniteJSONResponse(JSONResponse):
-    """Defence-in-depth JSON response for direct or future untyped paths.
+    """Strict JSON response for direct construction or per-route opt-in.
 
-    Every current app route has a typed response that Pydantic serialises before
-    this boundary. The sanitiser protects direct response construction and any
-    future route that reaches Starlette without that typed projection.
+    Typed app routes retain FastAPI's default response placeholder so its
+    response-field ``dump_json`` fast path serialises them. Installing this class
+    globally would disable that fast path; use it only where a response model is
+    not in the path.
     """
 
     def render(self, content: Any) -> bytes:
@@ -4711,7 +4712,6 @@ def create_app(
         title="roastpilot-agent",
         version=__version__,
         lifespan=lifespan or _lifespan,
-        default_response_class=FiniteJSONResponse,
     )
     app.add_middleware(
         _RouteBodyLimitMiddleware,
