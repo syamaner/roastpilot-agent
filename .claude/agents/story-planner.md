@@ -201,24 +201,22 @@ is what "specced" means: delegation without one is forbidden (fail-closed).
    <base-sha>` (without `-b` Git creates a detached HEAD and the handback
    commit lands on no branch), the #738 fresh-venv-in-worktree rule,
    `.venv/bin/python -m ...` invocation, the full gates before handback, the
-   rule that the worker MUST NOT CONSULT any external model about the slice by
-   ANY means — the `claude` CLI, a direct provider HTTP call, a vendor SDK,
-   another agent CLI, or a hosted service — covering a design critique, an
-   implementation suggestion or a debugging opinion exactly as much as a review
-   of finished work, since each shapes the branch by the family meant to supply
-   the independent pass. **The handback disclosure MUST ask the same question
-   the ban asks** — "did you consult any external model about this slice?", not
-   "did you obtain a review" — because a disclosure narrower than its ban lets
-   a worker that consulted answer "no" truthfully and the recovery path never
-   fires. Write both on the capability, never on a binary name: a name-scoped
-   ban is a lexical guard on a capability problem and fails OPEN (D154). A
-   Codex session discovers `.claude/agents/` and calls those roles unprompted,
-   and a worker that reviews its own output breaks D23 and hollows out the
-   mandatory Opus safety floor. That disclosure is the whole verification —
+   INVARIANT that the handed-back branch must be attributable to the Codex
+   family ALONE — any influence from a model outside that family, at any stage,
+   in any form, by any route, breaks that attribution — with the handback
+   disclosure asked in those same terms ("did any model outside your own family
+   influence this slice in any way?"). **Carry it as the invariant; do NOT
+   render it in the contract as a list of prohibited activities.** Four review
+   rounds each defeated an enumerated form by finding a structurally DIFFERENT
+   route rather than another instance, which is the D154 signal to change the
+   failure direction instead of patching again (D157's remedy). A Codex session
+   discovers `.claude/agents/` and calls those roles unprompted, and a worker
+   whose branch was shaped by the reviewing family breaks D23 and hollows out
+   the mandatory Opus safety floor. That disclosure is the whole verification —
    read-only reviewers leave no git-visible artifact — and an AFFIRMATIVE
    answer fails the slice closed: the lead re-delegates it from this contract
    in a fresh worktree, or records an explicit operator decision naming which
-   lens now supplies the independent pass. State the ban, the disclosure
+   lens now supplies the independent pass. State the invariant, the disclosure
    question and that consequence in the delegation prompt, plus
    any slice-specific fixtures or contract tests that must be regenerated.
 

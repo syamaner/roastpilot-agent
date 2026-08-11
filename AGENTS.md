@@ -695,24 +695,26 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   verified empty before delegation — Codex is an external-family provider,
   so no ignored secret may reach its context) with per-command
   self-location, the #738 fresh-venv-in-worktree rule, `.venv/bin/python -m
-  ...` invocation, and the full gates before handback. **The worker MUST NOT
-  CONSULT any external model about the slice at all** — not a review of
-  finished work, and equally not a design critique, an implementation
-  suggestion, a debugging opinion, or a second opinion on a failing test —
-  and MUST state at handback whether it **consulted** one — the disclosure
-  question must be the same question the ban asks, never the narrower "did you
-  obtain a review", or a worker that consulted answers "no" truthfully and the
-  recovery path below never fires. Scoping the ban to "review"
-  would leave the same hole one word further out: a worker that asks another
-  family to propose the implementation, then never calls the result a review,
-  can disclose truthfully that it obtained none while the branch is still
-  shaped by the very family meant to supply the independent pass. The rule is
-  written on the CAPABILITY, not on a binary name: the `claude` CLI
-  (`claude -p`, `--agent`) is only the route we happened to observe, and a
-  worker with shell and network can reach the same outcome through a direct
-  provider HTTP call, a vendor SDK, another agent CLI, or a hosted service
-  without ever running anything named `claude`. A name-scoped ban would be a
-  lexical guard on a capability problem, which fails OPEN (D154). This is
+  ...` invocation, and the full gates before handback. **INVARIANT: the handed-back branch
+  must be attributable to the Codex family ALONE.** Any influence from a model
+  outside that family — at any stage, in any form, by any route — breaks that
+  attribution, and the worker MUST disclose it at handback in those terms
+  ("did any model outside your own family influence this slice in any way?").
+  **This is stated as an invariant on purpose, and MUST NOT be rewritten as a
+  list of prohibited activities.** Four successive review rounds on the PR that
+  introduced it each defeated an enumerated form by finding a structurally
+  DIFFERENT route rather than another instance of a known one: `claude` the
+  binary (a raw provider HTTP call evades it), then obtaining a review (asking
+  for the implementation instead evades it), then consulting during
+  implementation (a disclosure asking only about reviews evades it), then the
+  disclosure wording itself. That is precisely the pattern **D154** names as
+  the signal to change a design's failure direction instead of patching it
+  again, and the remedy D157 used: an enumeration is incomplete by
+  construction, so what follows is illustration and never the definition.
+  Illustrations, non-exhaustive: the `claude` CLI (`claude -p`, `--agent`), a
+  direct provider HTTP call, a vendor SDK, another agent CLI, a hosted
+  service; a review of finished work, a design critique, an implementation
+  suggestion, a debugging opinion, a second opinion on a failing test. This is
   load-bearing, not hygiene: a Codex session
   **discovers `.claude/agents/` and calls those roles unprompted** (observed
   11 Aug 2026 with Codex coordinating — nobody told it the CLI existed).
