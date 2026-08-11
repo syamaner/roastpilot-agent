@@ -26,11 +26,17 @@ gate's current behaviour — so wiring the gate to read the box here is a verdic
 no-op (#273's invariant), and #222 narrows the range per phase.
 """
 
+import math
 from dataclasses import dataclass
 
 from pydantic import BaseModel, Field, model_validator
 
-from roastpilot_agent.config import PostFirstCrackControl, PreFirstCrackLevers, SafetyLimits
+from roastpilot_agent.config import (
+    AmbientFanDoctrine,
+    PostFirstCrackControl,
+    PreFirstCrackLevers,
+    SafetyLimits,
+)
 from roastpilot_agent.models import RoastPhase, RoastProfile
 
 # The full lever range. Phases the deterministic pre-FC policy does not own
@@ -98,6 +104,44 @@ class TrimSignal:
     #: Used by the adaptive trim depth formula (#386) when
     #: ``LateMaillardTrim.adaptive_depth_enabled`` is ``True``; ignored (fails
     #: closed to the fixed depth) when ``None``.
+    bean_ror_c_per_min: float | None = None
+
+
+@dataclass(frozen=True)
+class PostFcFanSignal:
+    """Inputs for resolving the ambient-conditioned post-FC fan ceiling.
+
+    Side-effect free and immutable. The ambient value is doctrine-gated before
+    construction: ``None`` represents a disabled doctrine, absent or unplugged
+    probe, stale reading, or malformed live reading. The policy still rejects a
+    non-finite value because public API callers may construct signals directly.
+
+    The effective heat floor is the loop's per-step floor after its D88 box
+    collapse, not the static configured floor. ``None`` means the loop is not
+    engaged and fails toward preserving full fan authority. All temperatures
+    are Celsius.
+
+    Attributes:
+        ambient_temp_c: The doctrine-gated ambient temperature, or ``None``
+            when unavailable, stale, malformed, or disabled.
+        current_heat_percent: The heat the controller is actuating this tick.
+        post_fc_heat_floor_percent: The loop's effective floor for this step
+            (``min(heat_floor_percent, effective_ceiling_percent)`` after D88's
+            downward box collapse), or ``None`` when the loop is not engaged.
+            ``None`` satisfies only the HEAT half of the carve-out, not the
+            carve-out itself: an unknown floor with a flat or falling RoR still
+            clamps, because release is conjunctive. Supply the loop's own
+            ``effective_floor_percent``, never the command box's narrowed
+            ``heat_floor_percent`` — that one is narrowed to the actuated heat,
+            which would make the floor test true on essentially every tick and
+            permanently release the ceiling.
+        bean_ror_c_per_min: The current bean rate-of-rise, or ``None`` when
+            unavailable.
+    """
+
+    ambient_temp_c: float | None
+    current_heat_percent: int
+    post_fc_heat_floor_percent: int | None = None
     bean_ror_c_per_min: float | None = None
 
 
@@ -274,6 +318,7 @@ class RoastControlPolicy:
         *,
         pre_fc_levers: PreFirstCrackLevers | None = None,
         post_fc_control: PostFirstCrackControl | None = None,
+        ambient_fan_doctrine: AmbientFanDoctrine | None = None,
     ) -> None:
         """Construct the policy from the safety limits, profile, and pre/post-FC config.
 
@@ -297,6 +342,10 @@ class RoastControlPolicy:
                 config; keyword-only with a default so existing callers that do
                 not yet have this config in scope are unaffected (mirrors
                 ``pre_fc_levers``'s own optional-with-default shape).
+            ambient_fan_doctrine: The ambient-conditioned post-FC fan doctrine.
+                ``None`` uses :class:`AmbientFanDoctrine` defaults, whose master
+                and destination-ceiling flags are both off, so existing callers
+                and boxes are unchanged.
         """
         self._limits = limits
         self._profile = profile
@@ -304,9 +353,16 @@ class RoastControlPolicy:
         self._post_fc_control = (
             post_fc_control if post_fc_control is not None else PostFirstCrackControl()
         )
+        self._ambient_fan_doctrine = (
+            ambient_fan_doctrine if ambient_fan_doctrine is not None else AmbientFanDoctrine()
+        )
 
     def limits_for(
-        self, phase: RoastPhase, *, trim_signal: TrimSignal | None = None
+        self,
+        phase: RoastPhase,
+        *,
+        trim_signal: TrimSignal | None = None,
+        post_fc_fan_signal: PostFcFanSignal | None = None,
     ) -> PhaseControlLimits:
         """Resolve the control box for ``phase`` from the single source.
 
@@ -336,9 +392,15 @@ class RoastControlPolicy:
 
         Every other phase resolves the full 0–100 range with no deterministic
         target — development → drop is the post-FC LLM's box (#223); the lifecycle
-        states do not actuate. The bitter ceiling is the configured hard ceiling,
-        capped at the active profile's drop target when that is lower; the
-        emergency-drop bound is the configured hard bound.
+        states do not actuate. In DEVELOPMENT only, ``post_fc_fan_signal`` may
+        narrow the fan destination ceiling when both doctrine flags are on, the
+        ambient is finite and strictly cool, and fan is not the only remaining
+        brake. Missing, stale, non-finite, or otherwise unknown inputs fail toward
+        preserving full fan authority. The signal is ignored outside DEVELOPMENT,
+        so cooling airflow and lifecycle boxes remain unrestricted. The bitter
+        ceiling is the configured hard ceiling, capped at the active profile's
+        drop target when that is lower; the emergency-drop bound is the configured
+        hard bound.
 
         Args:
             phase: The agent phase the controller is currently in.
@@ -346,6 +408,10 @@ class RoastControlPolicy:
                 keyed on, or ``None`` (the controller cannot resolve one, or the
                 caller does not want the trim — both fail closed to the flat
                 floor). Ignored outside the pre-FC phases.
+            post_fc_fan_signal: The doctrine-gated ambient, current heat,
+                effective post-FC heat floor, and bean RoR used to resolve the
+                DEVELOPMENT fan ceiling. ``None`` preserves the full range and
+                the signal is ignored outside DEVELOPMENT.
 
         Returns:
             The :class:`PhaseControlLimits` box for ``phase`` — the *same*
@@ -414,14 +480,76 @@ class RoastControlPolicy:
                 heat_target_percent=heat,
                 fan_target_percent=fan_target,
             )
+        fan_ceiling = (
+            self._ambient_fan_doctrine.post_fc_fan_ceiling_percent
+            if phase is RoastPhase.DEVELOPMENT
+            and self._post_fc_fan_ceiling_engaged(post_fc_fan_signal)
+            else _LEVER_MAX_PERCENT
+        )
         return PhaseControlLimits(
             heat_floor_percent=_LEVER_MIN_PERCENT,
             heat_ceiling_percent=_LEVER_MAX_PERCENT,
             fan_floor_percent=_LEVER_MIN_PERCENT,
-            fan_ceiling_percent=_LEVER_MAX_PERCENT,
+            fan_ceiling_percent=fan_ceiling,
             bitter_ceiling_temp_c=bitter,
             emergency_drop_temp_c=emergency,
         )
+
+    def _post_fc_fan_ceiling_engaged(self, signal: PostFcFanSignal | None) -> bool:
+        """Whether the ambient-conditioned DEVELOPMENT fan ceiling applies.
+
+        Args:
+            signal: The current post-FC fan inputs, or ``None`` when unavailable.
+
+        Returns:
+            ``True`` only when both flags and every clamp precondition hold.
+        """
+        doctrine = self._ambient_fan_doctrine
+        if not (doctrine.enabled and doctrine.post_fc_fan_ceiling_enabled):
+            return False
+        if signal is None:
+            return False
+        ambient = signal.ambient_temp_c
+        if ambient is None or not math.isfinite(ambient):
+            return False
+        if ambient >= doctrine.threshold_c:
+            return False
+        return not self._fan_is_only_brake(signal)
+
+    def _fan_is_only_brake(self, signal: PostFcFanSignal) -> bool:
+        """Whether heat cannot brake while the bean may still be climbing.
+
+        Release is deliberately CONJUNCTIVE: both heat at its effective floor AND
+        a possibly-climbing bean. Heat bottomed out with RoR flat or falling does
+        NOT release the ceiling, because the roast is under control and the
+        fan-slam this ceiling exists to prevent is still the failure mode. State
+        it as the conjunction rather than as "released once heat bottoms out" —
+        the looser phrasing describes a different, more permissive predicate.
+
+        Slice-2 hazard, recorded here because the predicate lives in this file:
+        with heat pinned at its floor, FAN is the sole remaining input to the
+        sign of RoR, and the sign of RoR gates fan's own ceiling. That is a loop.
+        Measured on this code, cool room, heat at floor 25: RoR ``+0.1`` resolves
+        to ceiling 100, RoR ``0.0`` to ceiling 70. Wired without damping, fan 100
+        flattens RoR, the ceiling engages, fan drops to 70, RoR turns positive
+        and the ceiling releases again — and the advisor is TOLD a box flipping
+        between 70 and 100 with no explanation, the told-instability shape #563
+        burned on. ``post_fc_deadband_threshold_percent`` is a HEAT deadband and
+        will not damp it. Before wiring, slice 2 must add either a one-way latch
+        (release for the rest of the run once heat first reaches its effective
+        floor) or an RoR margin.
+
+        Args:
+            signal: The current post-FC fan inputs.
+
+        Returns:
+            ``True`` when heat is at its effective floor AND RoR may be positive.
+        """
+        ror = signal.bean_ror_c_per_min
+        may_be_climbing = ror is None or not math.isfinite(ror) or ror > 0.0
+        heat_floor = signal.post_fc_heat_floor_percent
+        heat_at_floor = heat_floor is None or signal.current_heat_percent <= heat_floor
+        return may_be_climbing and heat_at_floor
 
     def trim_window_open(self, trim_signal: TrimSignal | None) -> bool:
         """Whether a *fresh* late-Maillard trim engagement's window is open (#327).

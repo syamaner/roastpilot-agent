@@ -421,6 +421,39 @@ def test_ambient_fan_threshold_accepts_a_real_refit() -> None:
     assert AmbientFanDoctrine(threshold_c=31.6).threshold_c == 31.6
 
 
+def test_ambient_fan_doctrine_ceiling_defaults_off_at_70() -> None:
+    """The deterministic destination ceiling ships inert at Hottop level 7."""
+    doctrine = AmbientFanDoctrine()
+    assert doctrine.post_fc_fan_ceiling_enabled is False
+    assert doctrine.post_fc_fan_ceiling_percent == 70
+
+
+@pytest.mark.parametrize("value", [75, 15])
+def test_ceiling_rejects_a_non_multiple_of_10(value: int) -> None:
+    """D126: only exactly actuatable Hottop fan levels may be ceilings."""
+    with pytest.raises(pydantic.ValidationError, match=r"whole multiple.*D126"):
+        AmbientFanDoctrine(post_fc_fan_ceiling_percent=value)
+
+
+def test_ceiling_bounds() -> None:
+    """The ceiling preserves airflow and can never invert the fan box."""
+    for value in (10, 50, 100):
+        assert (
+            AmbientFanDoctrine(post_fc_fan_ceiling_percent=value).post_fc_fan_ceiling_percent
+            == value
+        )
+    for value in (0, 105):
+        with pytest.raises(pydantic.ValidationError):
+            AmbientFanDoctrine(post_fc_fan_ceiling_percent=value)
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("nan")])
+def test_ceiling_is_finite_by_construction(value: float) -> None:
+    """The integer config type rejects non-finite destination ceilings."""
+    with pytest.raises(pydantic.ValidationError):
+        AmbientFanDoctrine(post_fc_fan_ceiling_percent=value)  # type: ignore[arg-type]
+
+
 def test_ambient_fan_step_is_a_whole_number_of_real_hottop_levels() -> None:
     """#709 / D126, pinned against the REAL driver rather than a copy of its
     formula. The bound only means anything if a step of this size maps to a
