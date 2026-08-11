@@ -14,7 +14,9 @@ directly into the broadcaster.
 import asyncio
 import contextlib
 import json
+import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, cast
@@ -3254,6 +3256,7 @@ def _ambient_status(
     pressure_hpa: float | None = 1008.56,
     reason: str | None = None,
     ambient_running: bool | None = None,
+    last_reading_monotonic_seconds: float | None = 10.0,
 ) -> AmbientStatus:
     """An ``AmbientStatus`` mirror instance (#342, D85).
 
@@ -3275,8 +3278,43 @@ def _ambient_status(
         temperature_c=temperature_c,
         humidity_percent=humidity_percent,
         pressure_hpa=pressure_hpa,
-        last_reading_monotonic_seconds=10.0 if status == "ok" else None,
+        last_reading_monotonic_seconds=(last_reading_monotonic_seconds if status == "ok" else None),
     )
+
+
+def _capture_ambient_writes(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> list[tuple[float | None, float | None, float | None]]:
+    """Wrap ``set_ambient`` and return the triads it receives."""
+    calls: list[tuple[float | None, float | None, float | None]] = []
+    original = store.set_ambient
+
+    async def _record(
+        run_id: str,
+        *,
+        temperature_c: float | None,
+        humidity_percent: float | None,
+        pressure_hpa: float | None,
+    ) -> None:
+        calls.append((temperature_c, humidity_percent, pressure_hpa))
+        await original(
+            run_id,
+            temperature_c=temperature_c,
+            humidity_percent=humidity_percent,
+            pressure_hpa=pressure_hpa,
+        )
+
+    monkeypatch.setattr(store, "set_ambient", _record)
+    return calls
+
+
+async def _drive_to_charge(service: RoastService, mcp: FakeMCPClient, clock: FakeClock) -> None:
+    """Tick through the debounced T0 transition into a charged snapshot."""
+    mcp.frames = [_reading(bean=178.0, env=185.0, t0_detected=True)]
+    for _ in range(ControllerConfig().t0_debounce_ticks + 1):
+        await _tick(service, clock)
+    assert service.runner is not None
+    assert service.runner.controller_snapshot().charge_detected is True
 
 
 def _session_state(
@@ -4231,6 +4269,298 @@ async def test_ambient_capture_runs_once_not_every_tick(store: RoastStore) -> No
     detail = await store.read_run(run_id)
     assert detail is not None
     assert detail.ambient_temp_c == pytest.approx(28.49)  # unchanged — latched
+
+
+@pytest.mark.asyncio
+async def test_malformed_ambient_warns_once_per_run(
+    store: RoastStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#758: repeated malformed ticks emit one actionable raw-value warning."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    malformed = _ambient_status(temperature_c=float("inf"))
+    raw_state = _FakeRawState(
+        _session_state(fc_status="pending", audio_running=False, ambient_status=malformed)
+    )
+    service, _ = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+
+    with caplog.at_level(logging.WARNING, logger="roastpilot_agent.api"):
+        await _drive_to_charge(service, mcp, clock)
+
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "roastpilot_agent.api" and "#758" in record.getMessage()
+    ]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "temperature_c=inf" in message
+    assert "humidity_percent=38.6" in message
+    assert "pressure_hpa=1008.56" in message
+    assert "last_reading_monotonic_seconds=10.0" in message
+    assert all(term not in message.lower() for term in ("poll", "cadence", "stale"))
+
+
+@pytest.mark.asyncio
+async def test_malformed_ambient_warns_before_charge(
+    store: RoastStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#758: the diagnostic is per tick and not gated on charge detection."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    raw_state = _FakeRawState(
+        _session_state(
+            fc_status="pending",
+            audio_running=False,
+            ambient_status=_ambient_status(temperature_c=float("inf")),
+        )
+    )
+    service, _ = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+
+    with caplog.at_level(logging.WARNING, logger="roastpilot_agent.api"):
+        await _tick(service, clock)
+
+    assert service.runner is not None
+    assert service.runner.controller_snapshot().charge_detected is False
+    assert sum("#758" in record.getMessage() for record in caplog.records) == 1
+
+
+@pytest.mark.parametrize(
+    "ambient",
+    [
+        _ambient_status(
+            status="unavailable",
+            temperature_c=None,
+            humidity_percent=None,
+            pressure_hpa=None,
+        ),
+        _ambient_status(ambient_running=False),
+        _ambient_status(
+            temperature_c=None,
+            humidity_percent=None,
+            pressure_hpa=None,
+            last_reading_monotonic_seconds=None,
+        ),
+    ],
+    ids=("unavailable", "stopped-with-frozen-triad", "live-never-sampled"),
+)
+@pytest.mark.asyncio
+async def test_absent_ambient_never_triggers_the_malformed_warning(
+    store: RoastStore,
+    caplog: pytest.LogCaptureFixture,
+    ambient: AmbientStatus,
+) -> None:
+    """#758: unavailable, stopped, and never-sampled probes stay quiet."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    raw_state = _FakeRawState(
+        _session_state(fc_status="pending", audio_running=False, ambient_status=ambient)
+    )
+    service, _ = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+
+    with caplog.at_level(logging.WARNING, logger="roastpilot_agent.api"):
+        for _ in range(4):
+            await _tick(service, clock)
+
+    assert not any("#758" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_malformed_warning_is_not_the_cadence_warning(
+    store: RoastStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#758 does not consume or impersonate the independent #732 warning."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    raw_state = _FakeRawState(
+        _session_state(
+            fc_status="pending",
+            audio_running=False,
+            ambient_status=_ambient_status(temperature_c=float("inf")),
+        )
+    )
+    config = AppConfig(
+        controller=ControllerConfig(
+            telemetry_log_interval_seconds=1.0,
+            ambient_fan_doctrine=AmbientFanDoctrine(enabled=True),
+        ),
+        mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=30.0),
+    )
+    service, _ = await _live_service(
+        store, mcp=mcp, clock=clock, raw_state=raw_state, config=config
+    )
+
+    with (
+        caplog.at_level(logging.WARNING, logger="roastpilot_agent.api"),
+        caplog.at_level(logging.WARNING, logger="roastpilot_agent.controller"),
+    ):
+        await _tick(service, clock)
+
+    assert any(
+        record.name == "roastpilot_agent.api" and "#758" in record.getMessage()
+        for record in caplog.records
+    )
+    assert not any(
+        record.name == "roastpilot_agent.controller" and "#732" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_charge_capture_retries_through_a_transient_malformed_reading(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#758: a malformed charge tick does not permanently spend the latch."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    raw_state = _FakeRawState(
+        _session_state(
+            fc_status="pending",
+            audio_running=False,
+            ambient_status=_ambient_status(temperature_c=float("inf")),
+        )
+    )
+    calls = _capture_ambient_writes(store, monkeypatch)
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+    await _drive_to_charge(service, mcp, clock)
+    await _tick(service, clock)
+    raw_state.set_state(_session_state(fc_status="pending", audio_running=False))
+    await _tick(service, clock)
+
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert (detail.ambient_temp_c, detail.ambient_humidity_pct, detail.ambient_pressure_hpa) == (
+        28.49,
+        38.6,
+        1008.56,
+    )
+    assert calls == [(28.49, 38.6, 1008.56)]
+    assert service.runner is not None
+    assert service.runner._ambient_persisted is True  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_charge_capture_retries_a_live_not_yet_sampled_probe(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#758: a live probe awaiting its first sample gets the same bounded retry."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    never_sampled = _ambient_status(
+        temperature_c=None,
+        humidity_percent=None,
+        pressure_hpa=None,
+        last_reading_monotonic_seconds=None,
+    )
+    raw_state = _FakeRawState(
+        _session_state(fc_status="pending", audio_running=False, ambient_status=never_sampled)
+    )
+    calls = _capture_ambient_writes(store, monkeypatch)
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+    await _drive_to_charge(service, mcp, clock)
+    raw_state.set_state(_session_state(fc_status="pending", audio_running=False))
+    await _tick(service, clock)
+
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.ambient_temp_c == pytest.approx(28.49)
+    assert calls == [(28.49, 38.6, 1008.56)]
+
+
+@pytest.mark.asyncio
+async def test_charge_capture_gives_up_after_the_grace_window(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#758: a live malformed probe cannot retry past the bounded window."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    raw_state = _FakeRawState(
+        _session_state(
+            fc_status="pending",
+            audio_running=False,
+            ambient_status=_ambient_status(temperature_c=float("inf")),
+        )
+    )
+    calls = _capture_ambient_writes(store, monkeypatch)
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+    await _drive_to_charge(service, mcp, clock)
+    assert service.runner is not None
+    for _ in range(40):
+        if service.runner._ambient_persisted:  # pyright: ignore[reportPrivateUsage]
+            break
+        await _tick(service, clock)
+
+    elapsed = service.runner.controller_snapshot().charge_elapsed_seconds
+    assert elapsed is not None
+    assert elapsed > api_module.AMBIENT_CAPTURE_GRACE_SECONDS
+    assert calls == [(None, None, None)]
+    assert service.runner._ambient_persisted is True  # pyright: ignore[reportPrivateUsage]
+
+    raw_state.set_state(_session_state(fc_status="pending", audio_running=False))
+    await _tick(service, clock)
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.ambient_temp_c is None
+    assert calls == [(None, None, None)]
+
+
+@pytest.mark.asyncio
+async def test_charge_capture_still_latches_immediately_for_an_absent_probe(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#758: a legitimately unavailable probe gets no retry window."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    unavailable = _ambient_status(
+        status="unavailable",
+        temperature_c=None,
+        humidity_percent=None,
+        pressure_hpa=None,
+    )
+    raw_state = _FakeRawState(
+        _session_state(fc_status="pending", audio_running=False, ambient_status=unavailable)
+    )
+    calls = _capture_ambient_writes(store, monkeypatch)
+    service, _ = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+    await _drive_to_charge(service, mcp, clock)
+
+    assert calls == [(None, None, None)]
+    assert service.runner is not None
+    assert service.runner._ambient_persisted is True  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("charge_elapsed_seconds", [None, float("nan")], ids=("none", "nan"))
+@pytest.mark.asyncio
+async def test_unknown_charge_clock_fails_toward_latching(
+    store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    charge_elapsed_seconds: float | None,
+) -> None:
+    """#758: missing or non-finite charge clocks never open an unbounded retry."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    raw_state = _FakeRawState(
+        _session_state(
+            fc_status="pending",
+            audio_running=False,
+            ambient_status=_ambient_status(temperature_c=float("inf")),
+        )
+    )
+    calls = _capture_ambient_writes(store, monkeypatch)
+    service, _ = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+    assert service.runner is not None
+    snapshot = replace(
+        service.runner.controller_snapshot(),
+        charge_detected=True,
+        charge_elapsed_seconds=charge_elapsed_seconds,
+    )
+
+    await service.runner._persist_ambient_if_charged(  # pyright: ignore[reportPrivateUsage]
+        snapshot
+    )
+
+    assert calls == [(None, None, None)]
+    assert service.runner._ambient_persisted is True  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio

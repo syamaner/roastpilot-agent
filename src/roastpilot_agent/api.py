@@ -82,6 +82,8 @@ from roastpilot_agent.mcp_client import (
     MCPConnectionError,
     MCPServerProcess,
     RoastSessionState,
+    ambient_reading_is_live,
+    ambient_reading_is_malformed,
     project_mic_status,
     project_recordable_ambient,
     reset_non_finite_telemetry_warnings,
@@ -643,6 +645,13 @@ class _TickCounter:
         self.value = 0
 
 
+# The MCP ambient reading is cached for about 30 seconds, so one bad read can
+# shadow charge for a full cache period.  Three periods with margin allow a
+# truthful charge-room capture while room drift remains negligible.  This is
+# deliberately independent of the doctrine's max-reading-age configuration.
+AMBIENT_CAPTURE_GRACE_SECONDS: float = 90.0
+
+
 class RoastRunner:
     """Drives one live roast: the controller tick loop wired to MCP, the store,
     the operator queue, and the SSE broadcaster (E9 vertical slice).
@@ -704,6 +713,9 @@ class RoastRunner:
         # persisted value and so cannot double as a "not yet written" sentinel
         # the way ``t0_detected_at_utc IS NULL`` does for the T0 write-once guard.
         self._ambient_persisted = False
+        # One operator diagnostic per runner. This is intentionally not persisted:
+        # a restart constructs a new runner and may warn once again.
+        self._ambient_malformed_warned = False
         self._scheduler: TickScheduler | None = None
 
     async def start(self, profile: RoastProfile, *, recording_roast_num: int | None = None) -> None:
@@ -1220,17 +1232,17 @@ class RoastRunner:
         self._t0_persisted = True
 
     async def _persist_ambient_if_charged(self, snapshot: ControllerSnapshot) -> None:
-        """Persist the MCP-owned ambient reading once, at charge (#342, D85).
+        """Persist the MCP-owned ambient reading once, near charge (#342, D85).
 
-        Mirrors :meth:`_persist_t0_if_charged` exactly: fires the same tick the
-        controller first reports its charge clock stamped, reads the ambient
-        triad off the *already-available* raw MCP state (``self._raw_state``,
-        the same ``RoastSessionState`` :meth:`_live_mic_status` projects
-        ``mic_status`` from — no redundant extra MCP round-trip), and swallows
-        any store error so a bad write never crashes the safety tick. Read-only
-        corpus metadata: no safety gate, transition, or advisor context ever
-        reads the persisted columns, so the only cost of a failure here is a
-        run's ambient triad reading back ``None``.
+        Starts on the same charged tick as :meth:`_persist_t0_if_charged`, reads
+        the ambient triad off the *already-available* raw MCP state
+        (``self._raw_state``, the same ``RoastSessionState``
+        :meth:`_live_mic_status` projects ``mic_status`` from — no redundant
+        extra MCP round-trip), and swallows any store error so a bad write never
+        crashes the safety tick. Read-only corpus metadata: no safety gate,
+        transition, or advisor context ever reads the persisted columns, so the
+        only cost of a failure here is a run's ambient triad reading back
+        ``None``.
 
         The triad comes from :func:`project_recordable_ambient` rather than a
         second hand-rolled ``status == "ok"`` test (#745): a ``status``-only
@@ -1241,17 +1253,34 @@ class RoastRunner:
         is NOT evidence that the doctrine reasoned on ambient (#742); it is not
         repeated here.
 
-        A ``"disabled"``/``"unavailable"`` MCP ambient config, and now a
-        stopped-but-``"ok"`` runtime or an undateable reading, persist nulls
-        (the MCP's own fail-soft contract — never a fault or a recovery)."""
+        A live probe with a temporarily unusable reading retries without a
+        write for a bounded post-charge grace period. This covers both malformed
+        readings and a live runtime awaiting its first sample without turning a
+        later roast reading into "ambient at charge". A store failure remains
+        fail-soft and unlatched, as before.
+
+        A ``"disabled"``/``"unavailable"`` MCP ambient config, a stopped-but-
+        ``"ok"`` runtime, an expired or unknown charge clock, or another
+        legitimately absent probe persists nulls immediately (the MCP's own
+        fail-soft contract — never a fault or a recovery). If a roast is dropped
+        inside the grace period, its frozen charge clock can leave a live but
+        unusable probe harmlessly retrying until finalisation; that aborted-roast
+        corner leaves the already-null columns and latch unchanged."""
         if self._ambient_persisted or not snapshot.charge_detected:
             return
         state = None if self._raw_state is None else self._raw_state.last_state
         if state is None:
             return
-        temperature_c, humidity_percent, pressure_hpa = project_recordable_ambient(
-            state.ambient_status
-        )
+        triad = project_recordable_ambient(state.ambient_status)
+        if (
+            triad == (None, None, None)
+            and ambient_reading_is_live(state.ambient_status)
+            and snapshot.charge_elapsed_seconds is not None
+            and math.isfinite(snapshot.charge_elapsed_seconds)
+            and snapshot.charge_elapsed_seconds <= AMBIENT_CAPTURE_GRACE_SECONDS
+        ):
+            return
+        temperature_c, humidity_percent, pressure_hpa = triad
         try:
             await self._store.set_ambient(
                 self._run_id,
@@ -1265,6 +1294,32 @@ class RoastRunner:
             # reading back None (see test_ambient_capture_is_fail_soft_on_store_error).
             return
         self._ambient_persisted = True
+
+    def _warn_once_on_malformed_ambient(self, state: RoastSessionState | None) -> None:
+        """Warn once when a live probe publishes unusable ambient bytes (#758).
+
+        The latch is runner-local and deliberately not persisted, so a process
+        restart may emit one fresh diagnostic for the recovered run.
+        """
+        if (
+            self._ambient_malformed_warned
+            or state is None
+            or not ambient_reading_is_malformed(state.ambient_status)
+        ):
+            return
+        status = state.ambient_status
+        _log.warning(
+            "Ambient probe reports live (status='ok', ambient_running=True) but its reading is "
+            "unusable (temperature_c=%r, humidity_percent=%r, pressure_hpa=%r, "
+            "last_reading_monotonic_seconds=%r); this run's ambient will read as absent "
+            "(corpus columns NULL, advisor on the absent-ambient branch) until a usable "
+            "reading arrives — check the ambient probe / MCP ambient reader. #758",
+            status.temperature_c,
+            status.humidity_percent,
+            status.pressure_hpa,
+            status.last_reading_monotonic_seconds,
+        )
+        self._ambient_malformed_warned = True
 
     @staticmethod
     def _backdated_charge_utc(charge_elapsed_seconds: float | None) -> str | None:
@@ -1311,6 +1366,7 @@ class RoastRunner:
         await self._persist_ambient_if_charged(snapshot)
         telemetry = snapshot.telemetry
         raw = None if self._raw_state is None else self._raw_state.last_state
+        self._warn_once_on_malformed_ambient(raw)
         accepted_post_fc = snapshot.accepted_post_fc_output
         if telemetry is not None:
             self._emitter.emit_telemetry(

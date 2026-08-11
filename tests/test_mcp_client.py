@@ -46,6 +46,7 @@ from roastpilot_agent.mcp_client import (
     SetRecordingMetadataResult,
     StartRoastSessionResult,
     ambient_reading_is_live,
+    ambient_reading_is_malformed,
     ambient_reading_token,
     applied_state_from_event,
     event_backdate_seconds,
@@ -3134,6 +3135,65 @@ def test_ambient_reading_is_live_asks_only_the_runtime_question() -> None:
     # pre-open).
     assert ambient_reading_is_live(_ambient_status_with(status="unavailable")) is False
     assert ambient_reading_is_live(_ambient_status_with(status="disabled")) is False
+
+
+_MALFORMED_AMBIENT_CASES = (
+    ("infinite member", _ambient_status_with(temperature_c=float("inf")), True),
+    ("nan member", _ambient_status_with(humidity_percent=float("nan")), True),
+    ("partial triad", _ambient_status_with(pressure_hpa=None), True),
+    (
+        "nan stamp",
+        _ambient_status_with(last_reading_monotonic_seconds=float("nan")),
+        True,
+    ),
+    ("triad without stamp", _ambient_status_with(last_reading_monotonic_seconds=None), True),
+    (
+        "stamp without triad",
+        _ambient_status_with(temperature_c=None, humidity_percent=None, pressure_hpa=None),
+        True,
+    ),
+    ("healthy", _ambient_status_with(), False),
+    (
+        "live never sampled",
+        _ambient_status_with(
+            temperature_c=None,
+            humidity_percent=None,
+            pressure_hpa=None,
+            last_reading_monotonic_seconds=None,
+        ),
+        False,
+    ),
+    ("stopped with frozen reading", _ambient_status_with(ambient_running=False), False),
+    ("unavailable with preserved reading", _ambient_status_with(status="unavailable"), False),
+    ("disabled with preserved reading", _ambient_status_with(status="disabled"), False),
+)
+
+
+@pytest.mark.parametrize(
+    ("_description", "status", "expected"),
+    _MALFORMED_AMBIENT_CASES,
+    ids=[case[0] for case in _MALFORMED_AMBIENT_CASES],
+)
+def test_ambient_reading_is_malformed_only_for_a_live_unusable_reading(
+    _description: str, status: AmbientStatus, expected: bool
+) -> None:
+    """#758: malformed means live, published, and voided; absence stays quiet."""
+    assert ambient_reading_is_malformed(status) is expected
+
+
+@pytest.mark.parametrize(
+    ("_description", "status"),
+    [
+        (description, status)
+        for description, status, expected in _MALFORMED_AMBIENT_CASES
+        if expected
+    ],
+    ids=[case[0] for case in _MALFORMED_AMBIENT_CASES if case[2]],
+)
+def test_malformed_implies_recordable_voids(_description: str, status: AmbientStatus) -> None:
+    """#758: the diagnostic predicate never disagrees with recordability."""
+    assert ambient_reading_is_malformed(status) is True
+    assert project_recordable_ambient(status) == (None, None, None)
 
 
 def test_project_live_ambient_non_ok_status_is_none() -> None:
