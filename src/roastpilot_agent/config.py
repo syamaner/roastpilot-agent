@@ -1137,10 +1137,12 @@ class AmbientFanDoctrine(BaseModel):
     ``reference_curve.enabled``. A bake-off arm that forgets the flag measures
     the fallback, not the doctrine.
 
-    Advisory only, whatever the flag says: nothing in the controller or the
-    safety policy reads these values back, and no clamp, gate, or slew
-    enforces either number. This release is prompt-only by ratification (6 Aug);
-    the optional deterministic fan slew clamp stays out of it.
+    ``threshold_c`` and ``step_max_pp`` remain advisory. The destination ceiling
+    is the one deterministically enforced number, gated on both ``enabled`` and
+    ``post_fc_fan_ceiling_enabled`` (D156): it narrows the DEVELOPMENT box
+    through the existing ``command_bounds`` clamp, never through a new safety
+    rule. The optional fan slew clamp stays out because it bounds the step, not
+    the destination.
     """
 
     enabled: bool = False
@@ -1238,6 +1240,26 @@ class AmbientFanDoctrine(BaseModel):
     ``Infinity`` token into ``config_json``. Ten minutes exceeds any real
     freshness bound: past a whole roast's length this is not a staleness gate."""
 
+    post_fc_fan_ceiling_enabled: bool = False
+    """Whether the destination ceiling is deterministically ENFORCED on the
+    DEVELOPMENT fan box (11 Aug ratification / D156, superseding the 6 Aug
+    prompt-only posture). Default ``False``; enforcement also requires the
+    master :attr:`enabled` flag."""
+
+    post_fc_fan_ceiling_percent: int = Field(default=70, ge=10, le=100)
+    """The DEVELOPMENT fan destination ceiling in a cool room, in percent.
+
+    Default 70 is physical Hottop level 7 under the driver's
+    ``(value + 5) // 10`` quantisation (D126), matching the level c10's fan 65
+    actually actuated so #708's later timing A/B stays single-variable. It is a
+    first-cut hypothesis to re-fit from RP-D joint scores, like
+    :attr:`threshold_c`.
+
+    Typed as ``int`` so non-finite values are rejected by construction. Bounded
+    because it is re-fit by hand: 10 preserves at least one physical fan level
+    (a typo'd 0 would abolish DEVELOPMENT airflow), while 100 prevents the
+    narrowed box from inverting."""
+
     @model_validator(mode="after")
     def _step_must_be_a_whole_number_of_hottop_levels(self) -> "AmbientFanDoctrine":
         """Reject a step that is not a whole number of Hottop fan levels.
@@ -1255,6 +1277,27 @@ class AmbientFanDoctrine(BaseModel):
                 "model is told maps to a whole number of physical fan levels under "
                 f"the driver's (value + 5) // 10 quantisation (D126). Got "
                 f"{self.step_max_pp:g}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _ceiling_must_be_a_whole_number_of_hottop_levels(self) -> "AmbientFanDoctrine":
+        """Reject a ceiling that is not a whole number of Hottop fan levels.
+
+        Returns:
+            The validated model.
+
+        Raises:
+            ValueError: If ``post_fc_fan_ceiling_percent`` is not a multiple of 10.
+        """
+        if self.post_fc_fan_ceiling_percent % HOTTOP_FAN_LEVEL_PP != 0:
+            raise ValueError(
+                "ambient_fan_doctrine.post_fc_fan_ceiling_percent must be a whole "
+                f"multiple of {HOTTOP_FAN_LEVEL_PP:g} pp (one Hottop fan level): the "
+                "driver quantises with (value + 5) // 10 (D126), so a non-multiple "
+                "ceiling (e.g. 75) would actuate the NEXT level up (80) and the "
+                "physically moved fan would exceed the enforced ceiling. Got "
+                f"{self.post_fc_fan_ceiling_percent:d}"
             )
         return self
 

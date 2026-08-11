@@ -4675,7 +4675,7 @@ def test_advisor_context_reference_fields_populated_from_cached_reference_roast(
     assert second_ctx.reference_landmarks == reference.landmarks
 
 
-def _doctrine_on(**overrides: float) -> ControllerConfig:
+def _doctrine_on(**overrides: object) -> ControllerConfig:
     """A config with the #709 ambient fan doctrine enabled.
 
     The doctrine is inert by default (the ``reference_curve`` posture), so a
@@ -4688,6 +4688,13 @@ def _doctrine_on(**overrides: float) -> ControllerConfig:
     loop to its production default, changing which actor owns heat and making
     an ambient assertion fail for an unrelated reason.
 
+    The overrides are deliberately typed ``object`` and routed through
+    ``model_validate`` rather than the constructor: the doctrine now mixes
+    ``bool``/``int``/``float`` fields, and a typed ``**kwargs`` constructor call
+    cannot express that. Widening the MODEL's ``__init__`` instead would blind
+    pyright at every ``AmbientFanDoctrine(...)`` site in the repository, so the
+    accommodation lives here, in the one helper that needs it.
+
     Args:
         **overrides: Field overrides for the doctrine group.
 
@@ -4695,7 +4702,11 @@ def _doctrine_on(**overrides: float) -> ControllerConfig:
         The controller config.
     """
     return _BASELINE_POST_FC_CONFIG.model_copy(
-        update={"ambient_fan_doctrine": AmbientFanDoctrine(enabled=True, **overrides)}
+        update={
+            "ambient_fan_doctrine": AmbientFanDoctrine.model_validate(
+                {"enabled": True, **overrides}
+            )
+        }
     )
 
 
