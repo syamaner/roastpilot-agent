@@ -973,6 +973,58 @@ async def test_telemetry_round_trips_charge_elapsed_seconds(tmp_store: RoastStor
         await tmp_store.close()
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        (12.5, 12.5),
+        (float("nan"), None),
+        (float("inf"), None),
+        (float("-inf"), None),
+    ],
+)
+def test_optional_float_projects_non_finite_values_as_absent(
+    value: float | None, expected: float | None
+) -> None:
+    """Nullable SQLite REAL projection rejects every non-finite value."""
+    result = RoastStore._optional_float(value)  # pyright: ignore[reportPrivateUsage]
+    if expected is None:
+        assert result is None
+    else:
+        assert result == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_telemetry_read_projects_persisted_non_finite_float_as_absent(
+    tmp_store: RoastStore,
+) -> None:
+    """A pre-fix telemetry REAL row cannot leak non-finite data from the store."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.record_telemetry(
+            run_id="run-1",
+            tick=1,
+            agent_phase=RoastPhase.DEVELOPMENT,
+            elapsed_seconds=5.0,
+            interval_seconds=5.0,
+            telemetry=RoastTelemetry(
+                bean_temp_c=184.0,
+                env_temp_c=205.0,
+                bean_ror_c_per_min=4.2,
+            ),
+        )
+        await tmp_store.connection.execute(
+            "UPDATE telemetry_snapshots SET bean_ror_c_per_min = ? WHERE run_id = ?",
+            (float("-inf"), "run-1"),
+        )
+        await tmp_store.connection.commit()
+
+        [point] = await tmp_store.read_telemetry_points("run-1")
+        assert point.bean_ror_c_per_min is None
+    finally:
+        await tmp_store.close()
+
+
 @pytest.mark.asyncio
 async def test_telemetry_read_preserves_insertion_order_across_tick_restart(
     tmp_store: RoastStore,

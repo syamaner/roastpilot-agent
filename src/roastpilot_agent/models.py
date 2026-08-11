@@ -10,6 +10,7 @@ invariant. Use ``.value`` at serialization boundaries.
 """
 
 import json
+import math
 import re
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -2029,5 +2030,30 @@ class SseEvent(BaseModel):
         if self.id is not None:
             lines.append(f"id: {self.id}")
         lines.append(f"event: {self.event.value}")
-        lines.append(f"data: {json.dumps(self.data, sort_keys=True)}")
+        lines.append(
+            f"data: {json.dumps(sanitize_non_finite(self.data), sort_keys=True, allow_nan=False)}"
+        )
         return "\n".join(lines) + "\n\n"
+
+
+def sanitize_non_finite(value: object) -> object:
+    """Return a JSON-ready copy with every non-finite float replaced by ``None``.
+
+    Dictionary keys are preserved, while dictionaries, lists, and tuples are
+    rebuilt so sanitising a shared event or response cannot mutate its source.
+
+    Args:
+        value: Arbitrarily nested value headed for a JSON wire boundary.
+
+    Returns:
+        The original scalar or a recursively sanitised container copy.
+    """
+    if isinstance(value, dict):
+        mapping = cast("dict[object, object]", value)
+        return {key: sanitize_non_finite(item) for key, item in mapping.items()}
+    if isinstance(value, (list, tuple)):
+        items = cast("list[object] | tuple[object, ...]", value)
+        return [sanitize_non_finite(item) for item in items]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value

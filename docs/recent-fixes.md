@@ -18,6 +18,26 @@ Format: one entry per anti-pattern.
 
 ---
 
+## JSON wire sinks must sanitize non-finite floats as a class
+*(fixed by #757, 11 Aug 2026)*
+
+- **Signature:** `json.dumps` / `JSONResponse` output that can reach SSE or REST
+  without passing through `sanitize_non_finite` while retaining `allow_nan=False`.
+- **Wrong:** patching individual float producers lets the next optional field or
+  nested event payload emit a bare non-finite SSE token. Directly constructing a
+  plain `JSONResponse`, or adding an untyped route, would raise on the same value.
+- **Right:** recursively copy and sanitize at every JSON wire sink, projecting
+  non-finite floats to `null`; keep strict encoding as the fail-closed backstop.
+  Current REST routes are all typed and Pydantic already pre-serialises their
+  non-finite values as `null`, so the REST sink is defence-in-depth for direct or
+  future untyped paths — not a repair for a live endpoint outage.
+- **Guarded by:** `test_sse_event_render_replaces_nested_non_finite_floats`,
+  `test_wire_model_float_fields_are_sanitized_by_reflection`,
+  `test_finite_json_response_protects_an_untyped_route`, and
+  `test_telemetry_and_timeline_sanitize_persisted_non_finite_floats`.
+
+---
+
 ## A config field the operator can edit must not be shadowed by a resolver default they cannot reach
 *(fixed by #747 / D151, 9 Aug 2026)*
 

@@ -476,6 +476,22 @@ async def test_every_sse_event_type_has_a_real_frame(all_sse_frames: list[SseEve
     assert not missing, f"no real frame captured for: {sorted(m.value for m in missing)}"
 
 
+@pytest.mark.asyncio
+async def test_every_real_sse_frame_renders_as_strict_json(
+    all_sse_frames: list[SseEvent],
+) -> None:
+    """The fail-closed SSE encoder accepts every frame shape in the fixture harness."""
+
+    def reject_constant(token: str) -> object:
+        raise ValueError(f"non-finite JSON token: {token}")
+
+    for frame in all_sse_frames:
+        data_line = next(line for line in frame.render().splitlines() if line.startswith("data: "))
+        json.loads(data_line.removeprefix("data: "), parse_constant=reject_constant)
+
+    assert SseEvent(event=SseEventType.HEARTBEAT).render() == "event: heartbeat\ndata: {}\n\n"
+
+
 def _build_sse_payload(all_sse_frames: list[SseEvent]) -> _FixturePayload:
     """The canonical SSE-fixture payload, built from real wire frames (#121).
 

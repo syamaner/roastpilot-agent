@@ -16,6 +16,7 @@ and the SSE stream (S3) extend :class:`RoastService` in place.
 
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import time
@@ -126,6 +127,7 @@ from roastpilot_agent.models import (
     TelemetryEventData,
     TelemetrySeries,
     recording_origin_slug,
+    sanitize_non_finite,
 )
 from roastpilot_agent.safety import (
     OPERATOR_ACTION_COMMAND,
@@ -146,6 +148,26 @@ from roastpilot_agent.store import (
 )
 
 _log = logging.getLogger(__name__)
+
+
+class FiniteJSONResponse(JSONResponse):
+    """Defence-in-depth JSON response for direct or future untyped paths.
+
+    Every current app route has a typed response that Pydantic serialises before
+    this boundary. The sanitiser protects direct response construction and any
+    future route that reaches Starlette without that typed projection.
+    """
+
+    def render(self, content: Any) -> bytes:
+        """Encode content with Starlette-compatible strict JSON settings."""
+        return json.dumps(
+            sanitize_non_finite(content),
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=None,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
 
 #: The route paths the access-log quiet filter targets, as the single source of
 #: truth (issue #267). Both the FastAPI route registration in :func:`create_app`
@@ -4171,7 +4193,7 @@ class _RouteBodyLimitMiddleware:
         await self._app(scope, replay_receive, send)
 
     async def _reject(self, scope: Scope, receive: Receive, send: Send) -> None:
-        response = JSONResponse(
+        response = FiniteJSONResponse(
             status_code=413,
             content={"detail": f"request body exceeds {self._max_body_bytes}-byte limit"},
         )
@@ -4185,7 +4207,7 @@ async def _request_validation_error_handler(request: Request, exc: Exception) ->
         error["type"] == "string_too_long" and tuple(error["loc"]) == ("body", "url")
         for error in validation_error.errors()
     ):
-        return JSONResponse(
+        return FiniteJSONResponse(
             status_code=422,
             content={"detail": _DRAFT_BEAN_FROM_URL_TOO_LONG_DETAIL},
         )
@@ -4689,6 +4711,7 @@ def create_app(
         title="roastpilot-agent",
         version=__version__,
         lifespan=lifespan or _lifespan,
+        default_response_class=FiniteJSONResponse,
     )
     app.add_middleware(
         _RouteBodyLimitMiddleware,
