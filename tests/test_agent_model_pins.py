@@ -12,12 +12,14 @@ against committed settings that could silently defeat the pins.
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 
 import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
 _AGENTS_DIR = _REPO / ".claude" / "agents"
+_CODEX_DIR = _REPO / ".codex"
 
 # The single authoritative (model, effort) mapping for every named subagent.
 # Any change to an agent's frontmatter must be reflected here, and vice versa.
@@ -36,6 +38,11 @@ _EXPECTED: dict[str, tuple[str, str]] = {
     "story-planner": ("claude-fable-5", "high"),
 }
 _ALIASES = {"sonnet", "opus", "fable", "haiku", "best", "default"}
+_EXPECTED_CODEX: dict[str, tuple[str, str]] = {
+    "engineer-be": ("gpt-5.6-terra", "high"),
+    "engineer-fe": ("gpt-5.6-terra", "high"),
+    "repair": ("gpt-5.6-terra", "medium"),
+}
 
 
 def _frontmatter(path: Path) -> dict[str, str]:
@@ -222,3 +229,26 @@ def test_committed_settings_do_not_defeat_the_pins() -> None:
                 pinned == e or pinned.startswith(e + "-") for e in allowed
             )
             assert permitted, f"{rel} availableModels {allowed} does not permit pinned id {pinned}"
+
+
+def test_codex_project_agents_are_bounded_and_pinned() -> None:
+    """Project Codex roles stay leaf-only and do not inherit the parent model."""
+    project_config = tomllib.loads((_CODEX_DIR / "config.toml").read_text())
+    assert "model" not in project_config
+    assert project_config["agents"] == {
+        "enabled": True,
+        "max_concurrent_threads_per_session": 3,
+    }
+
+    files = sorted((_CODEX_DIR / "agents").glob("*.toml"))
+    assert {path.stem for path in files} == set(_EXPECTED_CODEX)
+    for path in files:
+        data = tomllib.loads(path.read_text())
+        model, effort = _EXPECTED_CODEX[path.stem]
+        assert data["name"] == path.stem
+        assert data["model"] == model
+        assert data["model_reasoning_effort"] == effort
+        assert data["agents"]["enabled"] is False
+        instructions = data["developer_instructions"]
+        assert "do not spawn agents" in instructions.lower()
+        assert "invoke Claude Code or any other model" in instructions

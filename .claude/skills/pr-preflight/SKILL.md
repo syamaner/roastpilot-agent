@@ -1,28 +1,24 @@
 ---
 name: pr-preflight
-description: Run the full pre-open preflight on the current branch BEFORE opening a PR — gates, a size + data/logic split check, an adversarial self-critique, the domain reviewer (incl. security-reviewer for external-input surfaces), and a LOCAL `codex review` diverse-lens pass before the branch is even pushed — so review findings and lint fold into the first push instead of becoming post-open rework. Use before opening any PR.
+description: Run the pre-open gates, size check, self-critique, and minimum sufficient risk-routed independent review before opening a draft PR.
 ---
 
 Run this on the PR branch **before** `gh pr create`. The build's PR-flow metrics
 flag **large PRs** and **high rework** (most rework is review findings landing
 *after* the PR opens). This checklist opens a PR that is already small and clean,
-so the post-open review/rework loop shrinks. Work the five steps in order; fix at each
-before moving on. **Steps 1-4 must pass BEFORE the branch is pushed**, and step 5 carries
-the PR from draft to ready, so it is the only step that touches GitHub at all.
+so the post-open review/rework loop shrinks. Work steps 1-3, then apply the
+minimum-sufficient review routing in `AGENTS.md` before pushing and opening a
+draft PR.
 
-**Prerequisite for step 5:** the `codex` CLI must be installed AND authenticated. Check both:
-`codex --version` proves only that the binary exists and exits zero even when credentials are
-missing or expired, so also confirm login status (`codex login status`, or whatever the
-installed version calls it) before relying on the pass. It is a separate subscription, not part of this repo's toolchain. If it
-is genuinely unavailable, **STOP and ask the operator**; do not proceed on your own judgement
-(Codex P2, #682). An earlier version of this note said to record the gap and compensate by
-running the domain reviewer plus `qa`. That is not a substitute, and offering it was a real
-weakening: both are Claude-family lenses, and the entire measured value of this step is that a
-DIFFERENT model family catches what a same-family lens co-accepts (F1-S8: five rounds and
-roughly fifteen real P1s on a diff two Opus passes had called clean). Substituting more of the
-same family rebuilds precisely the gap this step closes, while reading like diligence. Only the
-operator may accept shipping a review-worthy PR without the diverse lens, and that acceptance
-goes in the PR body.
+**D158 pilot override:** the Codex-led topology supersedes the legacy fixed
+Claude-domain-review plus local-Codex-review sequence in sections 4-5 below.
+Those sections are retained temporarily as historical rationale for the draft
+and ready-head gates, but they are not the pilot's local-review procedure. The
+Codex parent selects one independent, diff-focused review and adds only the
+contract- or diff-triggered lenses listed in `AGENTS.md`; it does not run the
+full roster. Open as a draft and stop there unless the task explicitly authorizes
+the ready transition. The GitHub exact-head Claude approval, ready-head Codex
+wait, conversation resolution, CI, CodeQL, and Codecov rules remain unchanged.
 
 ## 0. Orient
 
@@ -128,7 +124,13 @@ Read your own diff as a hostile reviewer would. Check:
 
 Fix what you find now, before the PR exists.
 
-## 4. Domain review ON THE BRANCH (shift review left — MANDATORY)
+## Legacy sections 4-5 (superseded locally by D158)
+
+The text below records the pre-D158 fixed-review flow and remains useful for its
+GitHub lifecycle rationale. Do not execute its local reviewer fan-out during the
+pilot; use the risk routing in `AGENTS.md`.
+
+### 4. Former domain-review flow
 
 Before opening — not after — run the right reviewer against the branch diff and
 **resolve its findings**. This step is NOT optional: gates passing is not a
@@ -164,7 +166,7 @@ prevented).
   defect is the system working. Remove the *catchable-pre-open* findings, not the
   review itself.
 
-## 5. Fold the DIVERSE lens LOCALLY before pushing, then let the draft run the gates
+### 5. Former local-Codex and ready-transition flow
 
 Steps 1–4 are the Claude family (author + subagent reviewers); they share blind spots —
 a same-family lens co-accepts a bug the author already rationalised. **Codex is a
