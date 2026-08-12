@@ -65,7 +65,10 @@
 > summarise it" **contained a drifted citation of its own** — it cited `config.py:1195-1197`
 > as "c11's prose", which at `634ebf4` is the middle of an `AmbientFanDoctrine` docstring
 > about lever quantisation. The cite was
-> plausibly right when written on 11 Aug and drifted when #797 and #800 moved `config.py`.
+> plausibly right when written on 11 Aug and drifted in **#800** (`a8b9cc1`) alone — verified,
+> not assumed: at `eed04fd`, which already contains #797, `config.py:1195-1197` still reads
+> "…subordinate to the fan-brake rule — when heat is at its floor and the bean…", and only
+> `a8b9cc1` moves that text away.
 > **Prefer a symbol to a line number for anything durable:** c11's prose is
 > **`_C11_AMBIENT_FAN_SECTION` in `advisor.py`** — that is the symbol whose literal CONTAINS
 > the fan-brake carve-out ("the only brake left once heat is already at its floor");
