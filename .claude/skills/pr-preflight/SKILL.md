@@ -11,6 +11,8 @@ and wait, conversation resolution, CI, CodeQL handling, and Codecov rules in
 
 ## 0. Orient
 
+Before using HEAD-based size or review evidence, run `git status --porcelain`; it must be empty so staged, unstaged, or untracked work cannot be omitted. Otherwise stop, reconcile and commit intended work, then restart preflight from the new `HEAD`. This does not replace the stricter fresh-worktree plus ignored-file admission check before worker delegation in `AGENTS.md`.
+
 Record the branch, merge base, and current head:
 
 ```bash

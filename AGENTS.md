@@ -606,10 +606,8 @@ resource-exhaustion, secret-hygiene, cross-feature-contention — because no pre
 covered web/application security; the file-based routing above never fired since it
 touched no safety file. `security-reviewer` + the checklist close that gap.) If the change
 adds a provider-calling path that could contend with the roast advisor (checklist class 6),
-ALSO run `safety-reviewer`. This capability routing is not limited to `pr-preflight`: the
-`review-branch` roster workflow (`.claude/workflows/review-branch.mjs`) should likewise include
-`security-reviewer` in its lens set when the branch diff matches the external-input test, so the
-roster pass and the pre-open pass agree.
+ALSO run `safety-reviewer`. During the D158 pilot, this capability routing is
+the pre-open path.
 
 **Also verify:** tests assert real behavior (not smoke); new code is covered or
 carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`,
@@ -764,8 +762,10 @@ concern unless the consequence is high or the first reviewer reports
 uncertainty. Do not invoke `pr-triage` without findings or `product-auditor` on
 every slice. Model review does not repeat lint, formatting, typecheck, tests, or
 coverage. Give each reviewer only the contract, relevant diff/tests, and the
-minimum supporting context for its lens. The legacy `review-branch` workflow is
-an explicitly requested deep multi-lens audit, not the default pre-open path.
+minimum supporting context for its lens. The unchanged legacy `review-branch`
+workflow is dormant and unavailable during the D158 pilot: its Claude-coordinator
+fan-out violates the Codex-parent-only crossing and depth-one topology. A future
+refactor or retirement decision is outside this PR.
 Before relying on a selected independent reviewer, verify that its CLI or
 service is authenticated and usable. If it is unavailable, stop and ask the
 operator; do not silently substitute self-review or another same-family lens.
@@ -798,9 +798,8 @@ operator; do not silently substitute self-review or another same-family lens.
   | `roast-review` | After a roast — debrief the trace against profile targets |
   | `register-roast` | After a roast — capture the operator rating (D42) and register the run as a labelled fixture |
   | `add-bean-profile` | Add a bean profile from a supplier product URL plus the operator's specifics |
-- **Workflows** (`.claude/workflows/`): `review-branch` is an opt-in deep,
-  cross-checked roster review; normal pre-open review follows the risk routing
-  above.
+- **Workflows** (`.claude/workflows/`): `review-branch` remains unchanged but
+  dormant and unavailable during the D158 pilot; use the risk routing above.
 - **MCP** (`.mcp.json`): the Microsoft **Playwright MCP** (`@playwright/mcp`) —
   agent-driven browser/screenshots for `ui-reviewer`'s direction-match review
   (D24). Interactive sessions only; the deterministic CI gate is the scripted

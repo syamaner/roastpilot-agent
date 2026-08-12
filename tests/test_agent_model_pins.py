@@ -236,9 +236,7 @@ def test_codex_project_agents_are_bounded_and_pinned() -> None:
     project_config = tomllib.loads((_CODEX_DIR / "config.toml").read_text())
     assert "model" not in project_config
     agents_config = project_config["agents"]
-    assert {
-        key: value for key, value in agents_config.items() if not isinstance(value, dict)
-    } == {
+    assert {key: value for key, value in agents_config.items() if not isinstance(value, dict)} == {
         "enabled": True,
         "max_concurrent_threads_per_session": 3,
         "max_depth": 1,
@@ -283,9 +281,26 @@ def test_claude_implementation_roles_follow_slice_routing() -> None:
 
 
 def test_pr_preflight_has_one_live_d158_review_flow() -> None:
-    """The pilot must not retain executable legacy fixed-review instructions."""
+    """The pilot admits committed work and excludes legacy coordinator fan-out."""
     preflight = (_REPO / ".claude" / "skills" / "pr-preflight" / "SKILL.md").read_text()
+    agents_md = (_REPO / "AGENTS.md").read_text()
     assert "Legacy sections" not in preflight
     assert "codex review --base" not in preflight
     assert "Minimum sufficient independent review" in preflight
     assert "Rerun every triggered reviewer whose evidence the change invalidated" in preflight
+    assert "git status --porcelain`" in preflight
+    assert (
+        "does not replace the stricter fresh-worktree plus ignored-file admission check"
+        in preflight
+    )
+    assert "git status --porcelain --ignored` is empty before delegation" in agents_md
+    assert "restart preflight from the new `HEAD`" in preflight
+    assert re.search(
+        r"review-branch`\s+workflow is dormant and unavailable during the D158 pilot",
+        agents_md,
+    )
+    assert re.search(
+        r"Claude-coordinator\s+fan-out violates the Codex-parent-only crossing "
+        r"and depth-one topology",
+        agents_md,
+    )
