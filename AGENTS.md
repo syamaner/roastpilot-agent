@@ -644,6 +644,9 @@ its cross-reference to the former AGENTS.md implementation-delegation bullet.
 - Delivery orchestration is not product authority. Codex MUST NOT silently
   change acceptance criteria, scope, architecture, safety boundaries, or the
   ratified implementation contract. It escalates those decisions to the human.
+- The top-level Codex orchestrator never implements a PR slice itself. Every
+  implementation slice requires a ratified `story-planner` contract and
+  dispatch to a Codex or Claude leaf.
 - Only the top-level Codex orchestrator may cross the Codex/Claude boundary.
   Claude agents do not invoke Codex; Codex implementation/repair agents do not
   invoke Claude Code or any other model and do not spawn agents. Default Codex
@@ -723,8 +726,10 @@ available subscription headroom, not comparable per-task monetary cost.
   Use the other capable family only while preserving its own review and repair
   reserve; if both are `reserve-only` or that is not possible, escalate before
   allocating implementation work.
-- Both constrained: use the cheapest capable worker while preserving mandatory
-  safety/security review; escalate before consuming reserved capacity.
+- Both constrained: prefer the capable family with healthier remaining
+  non-reserved headroom. If headroom is equal or indeterminate, ask the
+  operator; never infer comparable cost from CLI headroom. Preserve mandatory
+  safety/security review and escalate before consuming reserved capacity.
 - Safety-critical review capacity is never spent on routine implementation.
 
 This two-family reserve policy replaces D152's one-family percentage stop. The

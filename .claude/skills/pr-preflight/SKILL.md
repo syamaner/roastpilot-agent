@@ -87,8 +87,19 @@ Do not push a fold that has not completed this loop.
 ## 5. Draft and ready-head handoff
 
 Push only the clean, reviewed commit, open the PR as a draft, and record its head
-SHA. Independently triage all runner, Claude, Codex, Codecov, and human findings.
-A head-moving repair re-enters steps 1 and 4 before it is pushed.
+SHA. Before ready authorization can be exercised, verify local `HEAD` matches
+the current PR head, the current-head required draft checks have finished green,
+and every draft-phase runner, Claude, and reviewer finding has been independently
+triaged and resolved. A head-moving repair re-enters steps 1 and 4 before it is
+pushed.
+
+Before ready authorization or merge, inspect all CodeQL checks. Verify the
+CodeQL workflow run `headSha` equals the current PR head and that its `Analyze
+actions`, `Analyze javascript-typescript`, and `Analyze python` jobs succeeded.
+Verify the `github-advanced-security` CodeQL result reports no new alerts; any
+alert requires independent triage before ready or merge. Use `gh pr checks` to
+inspect PR checks and `gh run view <run-id> --json headSha,jobs` to verify the
+workflow run and Analyze jobs.
 
 Move the PR to ready only when the task or operator authorizes it. The ready
 transition starts the GitHub Codex review; a draft-phase verdict does not satisfy
