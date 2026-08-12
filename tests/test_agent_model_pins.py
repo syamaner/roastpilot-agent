@@ -11,7 +11,11 @@ against committed settings that could silently defeat the pins.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -256,13 +260,42 @@ def test_codex_project_agents_are_bounded_and_pinned() -> None:
         assert isinstance(registration["description"], str)
         assert registration["description"].strip()
         assert registration["config_file"] == f"agents/{path.name}"
-        assert data["name"] == path.stem
+        assert "name" not in data
+        assert "description" not in data
         assert data["model"] == model
         assert data["model_reasoning_effort"] == effort
         assert data["agents"]["enabled"] is False
         instructions = data["developer_instructions"]
         assert "do not spawn agents" in instructions.lower()
         assert "invoke Claude Code or any other model" in instructions
+
+
+def test_codex_leaf_configs_pass_installed_strict_parse() -> None:
+    """Each leaf config must pass the installed Codex strict-config parser."""
+    codex = shutil.which("codex")
+    if codex is None:
+        pytest.skip("installed Codex CLI is unavailable")
+
+    for path in sorted((_CODEX_DIR / "agents").glob("*.toml")):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            codex_home = temp_path / "codex-home"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(path.read_text())
+            inert_cwd = temp_path / "inert-cwd"
+            inert_cwd.mkdir()
+            result = subprocess.run(
+                [codex, "app-server", "--stdio", "--strict-config"],
+                cwd=inert_cwd,
+                env={**os.environ, "CODEX_HOME": str(codex_home)},
+                input="",
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            assert result.returncode == 0, (
+                f"{path.name}: strict config parse failed:\n{result.stderr}"
+            )
 
 
 def test_claude_implementation_roles_follow_slice_routing() -> None:
