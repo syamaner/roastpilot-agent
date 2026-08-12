@@ -2915,6 +2915,48 @@ async def test_list_runs_first_crack_time_none_without_fc(tmp_store: RoastStore)
         await tmp_store.close()
 
 
+@pytest.mark.asyncio
+async def test_list_runs_development_percent_uses_insertion_order_after_tick_reset(
+    tmp_path: Path,
+) -> None:
+    """The latest development percent survives an overlapping restart clock."""
+    store = await seeded_store(RoastStore(tmp_path / "dev-pct-restart.sqlite3"))
+    try:
+        for tick, development_percent in enumerate((10.0, 11.0, 12.0)):
+            wrote = await store.record_telemetry(
+                run_id="run-1",
+                tick=tick,
+                agent_phase=RoastPhase.DEVELOPMENT,
+                elapsed_seconds=float(tick),
+                interval_seconds=0.0,
+                telemetry=None,
+                development_percent=development_percent,
+            )
+            assert wrote
+
+        # A real restart creates a fresh store instance and resets both clocks.
+        await store.close()
+        store = RoastStore(store.db_path)
+        await store.initialize()
+        for tick, development_percent in enumerate((20.0, 21.0)):
+            wrote = await store.record_telemetry(
+                run_id="run-1",
+                tick=tick,
+                agent_phase=RoastPhase.DEVELOPMENT,
+                elapsed_seconds=float(tick),
+                interval_seconds=0.0,
+                telemetry=None,
+                development_percent=development_percent,
+            )
+            assert wrote
+
+        runs = await store.list_runs()
+        assert len(runs) == 1
+        assert runs[0].development_percent == 21.0
+    finally:
+        await store.close()
+
+
 def _advisor_context() -> AdvisorContext:
     """A minimal AdvisorContext for the advisor-stats projection tests (#184)."""
     return AdvisorContext(
@@ -2977,10 +3019,9 @@ async def _record_consult(
 async def test_list_runs_aggregates_advisor_stats(tmp_store: RoastStore) -> None:
     """``list_runs`` projects per-run advisor consult/clamp/reject/fail counts (#184).
 
-    These reproduce the SPA's prior client-side ``advisorSummary`` so the history
-    advisor column renders identically without N+1ing ``/timeline``: ``consults``
-    is every persisted decision; ``failed`` is the non-``ok`` statuses; ``clamped``
-    / ``rejected`` count a consult against the safety verdict at its tick.
+    This monotonic, one-evaluation-per-tick control pins the pre-change counts:
+    ``consults`` is every persisted decision, ``failed`` is every non-``ok``
+    status, and clamp/reject counts follow the decision's linked evaluation.
     """
     await seeded_store(tmp_store)
     try:
@@ -3020,41 +3061,114 @@ async def test_list_runs_advisor_stats_zero_without_consults(tmp_store: RoastSto
 
 
 @pytest.mark.asyncio
-async def test_list_runs_advisor_clamp_counts_latest_verdict_per_tick(
+async def test_list_runs_advisor_counts_use_exact_fk_with_duplicate_ticks(
     tmp_store: RoastStore,
 ) -> None:
-    """Clamp/reject counts use the LATEST safety verdict at the consult's tick (#184).
-
-    The SPA's ``advisorSummary`` joined each consult to the *last* safety
-    evaluation at its tick (last-wins-by-tick). Recording two evaluations at one
-    tick — an earlier ``CLAMP`` then a later ``REJECT`` — and asserting the consult
-    counts as ``rejected`` (not ``clamped``) proves the projection mirrors that
-    join, the failure mode an id-blind aggregation would get wrong.
-    """
+    """Clamp/reject counts follow each FK, never a later same-tick row."""
     await seeded_store(tmp_store)
     try:
-        # Earlier verdict at tick 8 (lower id): CLAMP.
+        # The FK points at CLAMP; a later ALLOW at the same tick must not hide it.
+        await _record_consult(tmp_store, tick=8, status="ok", verdict=SafetyVerdict.CLAMP)
         await tmp_store.record_safety_evaluation(
             run_id="run-1",
             tick=8,
             evaluation=SafetyEvaluation(
                 rule="r",
-                verdict=SafetyVerdict.CLAMP,
+                verdict=SafetyVerdict.ALLOW,
                 input_heat=120,
                 input_fan=40,
                 adjusted_heat=100,
                 adjusted_fan=40,
-                reason="earlier",
+                reason="later same-tick allow",
             ),
         )
-        # The consult and its later verdict (higher id) at the same tick: REJECT.
+
+        # The FK points at ALLOW; a later REJECT must not fabricate a rejection.
+        await _record_consult(tmp_store, tick=9, status="ok", verdict=SafetyVerdict.ALLOW)
+        await tmp_store.record_safety_evaluation(
+            run_id="run-1",
+            tick=9,
+            evaluation=SafetyEvaluation(
+                rule="r",
+                verdict=SafetyVerdict.REJECT,
+                input_heat=120,
+                input_fan=40,
+                adjusted_heat=100,
+                adjusted_fan=40,
+                reason="later same-tick reject",
+            ),
+        )
+
+        runs = await tmp_store.list_runs()
+        assert len(runs) == 1
+        summary = runs[0]
+        assert summary.advisor_consults == 2
+        assert summary.advisor_clamped == 1
+        assert summary.advisor_rejected == 0
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_null_advisor_fk_does_not_guess_by_tick(
+    tmp_store: RoastStore,
+) -> None:
+    """A NULL advisor FK counts as neither even with a same-tick reject."""
+    await seeded_store(tmp_store)
+    try:
         await _record_consult(tmp_store, tick=8, status="ok", verdict=SafetyVerdict.REJECT)
+        await tmp_store.connection.execute(
+            "UPDATE advisor_decisions SET safety_evaluation_id = NULL WHERE run_id = ?",
+            ("run-1",),
+        )
+        await tmp_store.connection.commit()
+
         runs = await tmp_store.list_runs()
         assert len(runs) == 1
         summary = runs[0]
         assert summary.advisor_consults == 1
         assert summary.advisor_clamped == 0
-        assert summary.advisor_rejected == 1
+        assert summary.advisor_rejected == 0
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_dangling_advisor_fk_does_not_guess_by_tick(
+    tmp_store: RoastStore,
+) -> None:
+    """A corrupt dangling advisor FK stays closed instead of tick-falling back."""
+    await seeded_store(tmp_store)
+    try:
+        await _record_consult(tmp_store, tick=8, status="ok", verdict=SafetyVerdict.ALLOW)
+        await tmp_store.record_safety_evaluation(
+            run_id="run-1",
+            tick=8,
+            evaluation=SafetyEvaluation(
+                rule="r",
+                verdict=SafetyVerdict.REJECT,
+                input_heat=120,
+                input_fan=40,
+                adjusted_heat=100,
+                adjusted_fan=40,
+                reason="later same-tick reject",
+            ),
+        )
+        # Shape a corrupt legacy row that normal FK enforcement would reject.
+        await tmp_store.connection.execute("PRAGMA foreign_keys = OFF")
+        await tmp_store.connection.execute(
+            "UPDATE advisor_decisions SET safety_evaluation_id = ? WHERE run_id = ?",
+            (999_999, "run-1"),
+        )
+        await tmp_store.connection.commit()
+        await tmp_store.connection.execute("PRAGMA foreign_keys = ON")
+
+        runs = await tmp_store.list_runs()
+        assert len(runs) == 1
+        summary = runs[0]
+        assert summary.advisor_consults == 1
+        assert summary.advisor_clamped == 0
+        assert summary.advisor_rejected == 0
     finally:
         await tmp_store.close()
 
@@ -3329,6 +3443,66 @@ async def _record_row(
         development_percent=dev_pct,
         charge_elapsed_seconds=charge_elapsed,
     )
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_curve_uses_insertion_order_after_tick_reset(
+    tmp_path: Path,
+) -> None:
+    """Reference samples stay chronological across overlapping restart ticks."""
+    profile = _reference_profile()
+    store = RoastStore(tmp_path / "reference-restart.sqlite3")
+    await store.initialize()
+    try:
+        await store.create_run(
+            run_id="restart-reference",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        for tick, charge_elapsed, bean_temp in (
+            (0, 10.0, 150.0),
+            (1, 20.0, 160.0),
+            (2, 30.0, 170.0),
+        ):
+            await _record_row(
+                store,
+                "restart-reference",
+                tick,
+                phase=RoastPhase.DEVELOPMENT,
+                charge_elapsed=charge_elapsed,
+                bean_temp=bean_temp,
+            )
+
+        await store.close()
+        store = RoastStore(store.db_path)
+        await store.initialize()
+        for tick, charge_elapsed, bean_temp in (
+            (0, 40.0, 180.0),
+            (1, 50.0, 190.0),
+        ):
+            await _record_row(
+                store,
+                "restart-reference",
+                tick,
+                phase=RoastPhase.DEVELOPMENT,
+                charge_elapsed=charge_elapsed,
+                bean_temp=bean_temp,
+            )
+        await store.complete_run(
+            run_id="restart-reference",
+            outcome="completed",
+            agent_phase=RoastPhase.COMPLETE,
+        )
+        await store.set_operator_rating("restart-reference", rating=4)
+
+        reference = await store._build_reference_roast(  # pyright: ignore[reportPrivateUsage]
+            "restart-reference", "test-slug"
+        )
+        assert reference is not None
+        assert [sample.t_s for sample in reference.curve] == [10.0, 20.0, 30.0, 40.0, 50.0]
+    finally:
+        await store.close()
 
 
 async def _seed_unbuildable_run(
