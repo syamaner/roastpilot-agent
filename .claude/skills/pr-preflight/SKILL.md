@@ -19,6 +19,9 @@ contract- or diff-triggered lenses listed in `AGENTS.md`; it does not run the
 full roster. Open as a draft and stop there unless the task explicitly authorizes
 the ready transition. The GitHub exact-head Claude approval, ready-head Codex
 wait, conversation resolution, CI, CodeQL, and Codecov rules remain unchanged.
+Verify that the selected review CLI or service is authenticated and usable. If
+it is unavailable, stop and ask the operator; never silently substitute
+self-review or another same-family lens.
 
 ## 0. Orient
 

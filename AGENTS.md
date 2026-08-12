@@ -264,12 +264,13 @@ checklist before you open.
   with its scope, rough size, dependencies, and which reviewers it triggers
   (safety / security / qa). You should know the planned review units and why each is
   coherent *before* PR1 opens. This lives in the story brief (a lead activity);
-  for a story delegated to Codex-MCP, the `story-planner` contract
-  carries the PR plan (D152) and the lead adopts it into the brief — one plan,
-  not two competing ones. Reactively discovering unrelated responsibilities in a large diff is the
-  failure mode this prevents (#587's ~800-line module and #600's ~2,000-line harness
-  combined concerns that should have been identified at kickoff); line count is the
-  prompt to inspect the design, not the design itself.
+  for a story delegated to an implementation worker under the D158 pilot, the
+  `story-planner` contract carries the PR plan and the lead adopts it into the
+  brief — one plan, not two competing ones. Reactively discovering unrelated
+  responsibilities in a large diff is the failure mode this prevents (#587's
+  ~800-line module and #600's ~2,000-line harness combined concerns that should
+  have been identified at kickoff); line count is the prompt to inspect the
+  design, not the design itself.
 - **Keep logic PRs reviewably small — target about 400 changed logic lines.** This is a
   planning and reviewability guide, not an automatic pass/fail threshold. Measure
   **logic** lines from the branch's MERGE BASE (not the advancing `origin/main` tip):
@@ -624,7 +625,9 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
 **Pilot authority:** this section and D158 supersede the Claude-main-loop
 orchestration and fixed local-review-roster clauses in `docs/agent-topology.md`
 and D152 for this pilot. Those sources remain historical context; do not run two
-orchestrators or maintain a second full copy of this topology there.
+orchestrators or maintain a second full copy of this topology there. D158 also
+supersedes that document's §10 roughly-20% Codex-MCP budget-stop threshold and
+its cross-reference to the former AGENTS.md implementation-delegation bullet.
 
 ### Authority and orchestration
 
@@ -749,6 +752,9 @@ every slice. Model review does not repeat lint, formatting, typecheck, tests, or
 coverage. Give each reviewer only the contract, relevant diff/tests, and the
 minimum supporting context for its lens. The legacy `review-branch` workflow is
 an explicitly requested deep multi-lens audit, not the default pre-open path.
+Before relying on a selected independent reviewer, verify that its CLI or
+service is authenticated and usable. If it is unavailable, stop and ask the
+operator; do not silently substitute self-review or another same-family lens.
 
 ### Codex project agents
 
@@ -767,7 +773,7 @@ an explicitly requested deep multi-lens audit, not the default pre-open path.
 
   | Skill | When |
   |-------|------|
-  | `pr-preflight` | Before opening ANY PR — gates, size + data/logic split, self-critique, domain reviewers, local `codex review` |
+  | `pr-preflight` | Before opening ANY PR — gates, size + data/logic split, self-critique, and minimum sufficient risk-routed independent review |
   | `triage-pr` | Before merging — independent PR-feedback triage (→ `pr-triage`), so the author never triages its own PR (D23) |
   | `capture` | Screenshot a named SPA page state via the replay harness (E10+). **Needs the Playwright MCP, which `.mcp.json` scopes to Claude** — a Codex session has no such server, so use the scripted Playwright fallback there |
   | `pre-roast-preflight` | Before charging beans — hardware + software readiness checks |
