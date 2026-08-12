@@ -719,6 +719,10 @@ available subscription headroom, not comparable per-task monetary cost.
   Codex for independent review and repair.
 - Claude constrained, Codex healthy: use Codex implementation and the minimum
   sufficient targeted Claude assurance.
+- Any family marked `reserve-only` is unavailable for routine implementation.
+  Use the other capable family only while preserving its own review and repair
+  reserve; if both are `reserve-only` or that is not possible, escalate before
+  allocating implementation work.
 - Both constrained: use the cheapest capable worker while preserving mandatory
   safety/security review; escalate before consuming reserved capacity.
 - Safety-critical review capacity is never spent on routine implementation.

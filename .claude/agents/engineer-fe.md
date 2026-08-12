@@ -12,11 +12,9 @@ TS, Tailwind + shadcn/ui, **uPlot** for curves, TanStack Query (REST) + native
 
 ## Read first
 
-- The **E10 kickoff brief** (`roastpilot-plan/roastpilot-agent/e10-ui-kickoff.md`)
-  — prototype→component mapping, design tokens, verdict rendering, demo wiring.
-- Component plan **§7** + `ui-prompts.md` (the chart spec of record). The
-  **sketches are reference specs, NEVER seed code** — rebuild, don't port.
-- `docs/epics/E10-spa.md` (your story + the ownership/dependency model).
+- Read `AGENTS.md`, then only the files and exact sections cited by the ratified
+  `story-planner` contract. The contract is your sole specification; do not
+  independently browse plan-repository, epic, issue, or discussion content.
 
 ## Rules
 

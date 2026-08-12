@@ -29,8 +29,8 @@ Run the gates for every surface the diff touches:
 - Python: `.venv/bin/python -m ruff check .`,
   `.venv/bin/python -m ruff format --check .`,
   `.venv/bin/python -m pyright`, and `.venv/bin/python -m pytest`.
-- Python coverage: run pytest with branch coverage and
-  `--cov-report=term-missing`; cover every changed line and branch. Use
+- Python coverage: `.venv/bin/python -m pytest --cov=roastpilot_agent
+  --cov-branch --cov-report=term-missing`; cover every changed line and branch. Use
   `# pragma: no cover` only for a demonstrably unreachable path and record why.
 - Web: from `web/`, run `npm run lint`, `npm run typecheck`, `npm test`, and
   `npm run build`.
