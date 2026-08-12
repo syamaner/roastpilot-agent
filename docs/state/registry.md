@@ -5,7 +5,8 @@
 **11 Aug 2026 — #781 closed by slice 2: D156/D157 wire the flag-gated post-FC fan destination ceiling and a one-way RUN-scoped release latch: once released it stays released for the rest of the run, surviving every transition including an operator resume, and is cleared only by `start_run`. The load-bearing case is a resume back to pre-first-crack reaching DEVELOPMENT again on a second first-crack edge; the direct recovery-to-DEVELOPMENT resume is separately inert because the floor is unknown there. In practice enforcement also requires the post-FC control loop: with the loop inert, the unknown heat floor releases a climbing bean immediately.**
 
 > **STATUS UPDATE — 12 Aug 2026 (the #787 sweep RAN, and it inverted the issue's premise;
-> two citations in this file corrected). Read before the block below.**
+> two wrong claims in this file corrected — one mis-citation, one factual). Read before the
+> block below.**
 >
 > **Both members #787 named are LATENT. An unnamed sibling is LIVE.** Measured against a
 > read-only copy of the operator's store, by running the defective and the corrected
@@ -28,12 +29,17 @@
 >   `tick` is not unique within a run, and the dominant cause is **not** restarts — the
 >   controller writes several `safety_evaluations` rows per tick (28 runs, including both
 >   RP-B arms and all three `agent-store` corpus entries). `advisor_decisions.safety_evaluation_id`
->   is an FK to `safety_evaluations(id)`, populated **368 of 368**. The history counts
->   (`store.py:1841-1847`) and the SPA trace tables discard it and guess by tick, last-wins.
->   Measured: **27 of 368** advisor rows misjoin across **17 runs**; on **10** rows across
->   **3 rated roasts** the verdict differs, every one an `allow` reported as a `reject`, so
->   history **over-reports rejections**. On the SPA, **438 of 806** (54%) decision-trace rows
->   across **20 runs** are attached to an advisor recommendation that did not produce them.
+>   is an FK to `safety_evaluations(id)`, populated **368 of 368**. The history counts and the
+>   SPA trace tables both discarded it and guessed by tick, last-wins.
+>   **All figures below are PRE-#809 measurements.** **The store half is now FIXED** — PR #809
+>   (`7df0f4d`) landed slice 1, which re-keys the history counts onto
+>   `a.safety_evaluation_id` and moves both named tick orderings onto insertion `id`. **The
+>   SPA half is still LIVE** and is slice 2's job.
+>   Measured before that fix: **27 of 368** advisor rows misjoined across **17 runs**; on
+>   **10** rows across **3 rated roasts** the verdict differed, every one an `allow` reported
+>   as a `reject`, so history **over-reported rejections**. On the SPA — still true today —
+>   **438 of 806** (54%) decision-trace rows across **20 runs** are attached to an advisor
+>   recommendation that did not produce them.
 >   The FE cannot do better today: `TimelineSafetyEvaluation` carries no `id` on the wire and
 >   the TS type drops `safety_evaluation_id`, while `models.py:1504` documents the field as
 >   being there "so the FE can join an advisor decision to its verdict".
@@ -44,7 +50,10 @@
 > worth. Sweeping the *class* rather than the issue's *named mechanism* is what surfaced the
 > live member.
 >
-> **⚠ TWO CITATIONS IN THIS FILE WERE WRONG AND ARE CORRECTED IN PLACE.** Both carry an
+> **⚠ TWO CLAIMS IN THIS FILE WERE WRONG AND ARE CORRECTED IN PLACE — one a mis-citation,
+> one a factual error.** The first marker fixes a citation that pointed at the wrong symbol;
+> the second fixes the tick-ordering mechanism and its stated consequence, and carries no
+> citation at all. Both carry an
 > inline correction marker at the claim itself, opening with a bracket, the word Corrected,
 > and this block's date; find both with
 > `rg -n '^>\s*\[Corrected 12 Aug 2026' docs/state/registry.md` rather than by line number
