@@ -232,19 +232,32 @@ def test_committed_settings_do_not_defeat_the_pins() -> None:
 
 
 def test_codex_project_agents_are_bounded_and_pinned() -> None:
-    """Project Codex roles stay leaf-only and do not inherit the parent model."""
+    """Project Codex roles are registered, bounded, leaf-only, and pinned."""
     project_config = tomllib.loads((_CODEX_DIR / "config.toml").read_text())
     assert "model" not in project_config
-    assert project_config["agents"] == {
+    agents_config = project_config["agents"]
+    assert {
+        key: value for key, value in agents_config.items() if not isinstance(value, dict)
+    } == {
         "enabled": True,
         "max_concurrent_threads_per_session": 3,
+        "max_depth": 1,
     }
+
+    registered_roles = {
+        name: value for name, value in agents_config.items() if isinstance(value, dict)
+    }
+    assert set(registered_roles) == set(_EXPECTED_CODEX)
 
     files = sorted((_CODEX_DIR / "agents").glob("*.toml"))
     assert {path.stem for path in files} == set(_EXPECTED_CODEX)
     for path in files:
         data = tomllib.loads(path.read_text())
         model, effort = _EXPECTED_CODEX[path.stem]
+        registration = registered_roles[path.stem]
+        assert isinstance(registration["description"], str)
+        assert registration["description"].strip()
+        assert registration["config_file"] == f"agents/{path.name}"
         assert data["name"] == path.stem
         assert data["model"] == model
         assert data["model_reasoning_effort"] == effort

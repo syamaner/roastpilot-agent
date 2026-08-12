@@ -776,12 +776,11 @@ operator; do not silently substitute self-review or another same-family lens.
   and `repair`. Their files pin `gpt-5.6-terra`; backend/frontend use `high`
   reasoning and repair uses `medium`. Each role carries only its role-specific
   boundary and inherits shared policy from this file.
-- `.codex/config.toml` enables subagents and caps concurrent spawned threads at
-  three. Codex CLI 0.147.0 exposes no supported project setting for maximum
-  subagent depth, so policy requires depth one and each leaf configuration
-  disables further spawning as a structural guard. Repository configuration is
-  not a hard sandbox guarantee; the parent verifies the leaf handback and must
-  not add an undocumented depth key.
+- `.codex/config.toml` registers all three roles, enables subagents, caps
+  concurrent spawned threads at three, and sets maximum depth one. Each leaf
+  configuration also disables further spawning as defense in depth. Repository
+  configuration is not a hard sandbox guarantee; the parent verifies the leaf
+  handback.
 
 ### Shared agent resources
 
