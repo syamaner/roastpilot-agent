@@ -496,10 +496,10 @@ churn. Codex itself does not review a PR while it sits in **draft**: GitHub's Co
 connector fires automatically only at the ready transition (opened ready, or a draft
 marked ready), confirmed against roastpilot-cloud PR #150 (27 Jul 2026), where Codex
 produced no review during the draft phase and then reviewed automatically the moment the
-PR was marked ready. So the pre-ready fold for Codex specifically has to happen locally,
-via `codex review --base origin/main` (the `pr-preflight` skill's step 5), before the diff is
-even pushed; that is exactly where the #587-style rounds belong (a local pre-push fold,
-not post-open rework). A GitHub-side `@codex review` comment left on a draft is a
+PR was marked ready. Under the D158 pilot, the pre-ready fold is the
+minimum-sufficient independent review selected by the Codex parent and run locally under
+`pr-preflight`; it is not the former fixed local-Codex step. A GitHub-side `@codex review`
+comment left on a draft is a
 different thing again, and is NOT simply inert: D105 observed on 19 Jul 2026 that it does
 run and does post findings-reviews, but never completes the clean-verdict flow on a draft,
 so a draft waiting on a clean signal waits forever. Both facts hold, because they describe
@@ -709,6 +709,11 @@ opposite-family substantive review where practical. If capacity is not reliably
 observable, ask for `healthy`, `constrained`, or `reserve-only`; never invent a
 percentage.
 
+Prefer the authenticated host CLIs' subscription views as the observable
+signal: `/status` in Codex and `/usage` in Claude Code. Record the reading at
+slice start and map it conservatively to the three statuses. These readings show
+available subscription headroom, not comparable per-task monetary cost.
+
 - Both healthy: prefer Codex implementation and targeted Claude assurance.
 - Codex constrained, Claude healthy: use Claude implementation and preserve
   Codex for independent review and repair.
@@ -764,8 +769,13 @@ operator; do not silently substitute self-review or another same-family lens.
   boundary and inherits shared policy from this file.
 - `.codex/config.toml` enables subagents and caps concurrent spawned threads at
   three. Codex CLI 0.147.0 exposes no supported project setting for maximum
-  subagent depth, so depth one is enforced by this policy and by disabling
-  spawning inside each leaf configuration; do not add an undocumented key.
+  subagent depth, so policy requires depth one and each leaf configuration
+  disables further spawning as a structural guard. Repository configuration is
+  not a hard sandbox guarantee; the parent verifies the leaf handback and must
+  not add an undocumented depth key.
+
+### Shared agent resources
+
 - **Skills** (`.claude/skills/`) — read the relevant `SKILL.md` in full before
   acting. Claude registers these natively; **Codex discovers them from this table
   and then reads the file**, so keep the table complete or a Codex session goes

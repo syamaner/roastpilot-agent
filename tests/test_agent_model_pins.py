@@ -252,3 +252,27 @@ def test_codex_project_agents_are_bounded_and_pinned() -> None:
         instructions = data["developer_instructions"]
         assert "do not spawn agents" in instructions.lower()
         assert "invoke Claude Code or any other model" in instructions
+
+
+def test_claude_implementation_roles_follow_slice_routing() -> None:
+    """Claude implementation capacity remains leaf-only and slice-scoped."""
+    for role in ("engineer-be", "engineer-fe"):
+        instructions = (_AGENTS_DIR / f"{role}.md").read_text()
+        assert "one approved PR slice" in instructions
+        assert "One PR per story" not in instructions
+        assert "Do not invoke Codex or spawn agents" in instructions
+
+    planner = (_AGENTS_DIR / "story-planner.md").read_text()
+    assert "Codex-MCP" not in planner
+    assert "budget stop" not in planner
+    for status in ("healthy", "constrained", "reserve-only"):
+        assert f"`{status}`" in planner
+
+
+def test_pr_preflight_has_one_live_d158_review_flow() -> None:
+    """The pilot must not retain executable legacy fixed-review instructions."""
+    preflight = (_REPO / ".claude" / "skills" / "pr-preflight" / "SKILL.md").read_text()
+    assert "Legacy sections" not in preflight
+    assert "codex review --base" not in preflight
+    assert "Minimum sufficient independent review" in preflight
+    assert "Rerun every triggered reviewer whose evidence the change invalidated" in preflight
