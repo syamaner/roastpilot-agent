@@ -34,7 +34,8 @@ TS, Tailwind + shadcn/ui, **uPlot** for curves, TanStack Query (REST) + native
   parent.
 - Keep `tsc`/eslint clean and tests green before handing off. Implement exactly
   one approved PR slice from the ratified `story-planner` contract. Only the
-  slice that finishes the story updates the E10 status table and registry.
+  slice that finishes the story updates the contract-named epic's status table
+  and registry.
 
 ## Worktree discipline (topology §7 — binding)
 

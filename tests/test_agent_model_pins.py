@@ -279,6 +279,16 @@ def test_claude_implementation_roles_follow_slice_routing() -> None:
     for status in ("healthy", "constrained", "reserve-only"):
         assert f"`{status}`" in planner
 
+    architect = (_AGENTS_DIR / "planning-architect.md").read_text()
+    assert "Opus PM" not in architect
+    assert "Codex parent orchestrator to adjudicate" in architect
+    assert "Codex parent owns delivery orchestration and\nscope decomposition" in architect
+    assert "human retains product authority per `AGENTS.md`" in architect
+
+    frontend = (_AGENTS_DIR / "engineer-fe.md").read_text()
+    assert "E10 status table" not in frontend
+    assert "contract-named epic's status table\n  and registry" in frontend
+
 
 def test_pr_preflight_has_one_live_d158_review_flow() -> None:
     """The pilot admits committed work and excludes legacy coordinator fan-out."""
