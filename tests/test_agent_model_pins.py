@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import tomllib
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -237,19 +238,33 @@ def test_committed_settings_do_not_defeat_the_pins() -> None:
 
 def test_codex_project_agents_are_bounded_and_pinned() -> None:
     """Project Codex roles are registered, bounded, leaf-only, and pinned."""
-    project_config = tomllib.loads((_CODEX_DIR / "config.toml").read_text())
+    project_config = cast(
+        dict[str, object], tomllib.loads((_CODEX_DIR / "config.toml").read_text())
+    )
     assert "model" not in project_config
-    agents_config = project_config["agents"]
+    raw_agents_config = project_config["agents"]
+    assert isinstance(raw_agents_config, dict)
+    agents_config = cast(dict[str, object], raw_agents_config)
     assert {key: value for key, value in agents_config.items() if not isinstance(value, dict)} == {
         "enabled": True,
         "max_concurrent_threads_per_session": 3,
-        "max_depth": 1,
     }
 
-    registered_roles = {
-        name: value for name, value in agents_config.items() if isinstance(value, dict)
+    registered_roles: dict[str, dict[str, object]] = {
+        name: cast(dict[str, object], value)
+        for name, value in agents_config.items()
+        if isinstance(value, dict)
     }
     assert set(registered_roles) == set(_EXPECTED_CODEX)
+    agents_md = (_REPO / "AGENTS.md").read_text()
+    assert "parent dispatches only the three registered named roles" in agents_md
+    assert "Unnamed or default worker dispatch\n  is forbidden" in agents_md
+    assert "Topology depth one remains mandatory\n  policy" in agents_md
+    assert "Codex 0.147.0 V2 does not enforce parent depth through\n  `max_depth`" in agents_md
+    assert (
+        "Codex 0.147.0 V2 runtime verification established that\n"
+        "  each leaf's `agents.enabled = false` removes spawn capability" in agents_md
+    )
 
     files = sorted((_CODEX_DIR / "agents").glob("*.toml"))
     assert {path.stem for path in files} == set(_EXPECTED_CODEX)

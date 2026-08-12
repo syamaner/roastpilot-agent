@@ -645,6 +645,9 @@ its cross-reference to the former AGENTS.md implementation-delegation bullet.
 - The top-level Codex orchestrator never implements a PR slice itself. Every
   implementation slice requires a ratified `story-planner` contract and
   dispatch to a Codex or Claude leaf.
+- For Codex work, the parent dispatches only the three registered named roles:
+  `engineer-be`, `engineer-fe`, and `repair`. Unnamed or default worker dispatch
+  is forbidden.
 - Only the top-level Codex orchestrator may cross the Codex/Claude boundary.
   Claude agents do not invoke Codex; Codex implementation/repair agents do not
   invoke Claude Code or any other model and do not spawn agents. Default Codex
@@ -776,9 +779,11 @@ operator; do not silently substitute self-review or another same-family lens.
   and `repair`. Their files pin `gpt-5.6-terra`; backend/frontend use `high`
   reasoning and repair uses `medium`. Each role carries only its role-specific
   boundary and inherits shared policy from this file.
-- `.codex/config.toml` registers all three roles, enables subagents, caps
-  concurrent spawned threads at three, and sets maximum depth one. Each leaf
-  configuration also disables further spawning as defense in depth. Repository
+- `.codex/config.toml` registers all three roles, enables subagents, and caps
+  concurrent spawned threads at three. Topology depth one remains mandatory
+  policy: installed Codex 0.147.0 V2 does not enforce parent depth through
+  `max_depth`. Fresh Codex 0.147.0 V2 runtime verification established that
+  each leaf's `agents.enabled = false` removes spawn capability. Repository
   configuration is not a hard sandbox guarantee; the parent verifies the leaf
   handback.
 
