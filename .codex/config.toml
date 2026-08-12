@@ -1,3 +1,5 @@
+project_doc_max_bytes = 131072
+
 [agents]
 enabled = true
 max_concurrent_threads_per_session = 3

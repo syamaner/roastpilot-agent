@@ -11,6 +11,7 @@ against committed settings that could silently defeat the pins.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -25,6 +26,7 @@ import pytest
 _REPO = Path(__file__).resolve().parents[1]
 _AGENTS_DIR = _REPO / ".claude" / "agents"
 _CODEX_DIR = _REPO / ".codex"
+_PROJECT_DOC_MAX_BYTES = 131072
 
 # The single authoritative (model, effort) mapping for every named subagent.
 # Any change to an agent's frontmatter must be reflected here, and vice versa.
@@ -242,6 +244,9 @@ def test_codex_project_agents_are_bounded_and_pinned() -> None:
         dict[str, object], tomllib.loads((_CODEX_DIR / "config.toml").read_text())
     )
     assert "model" not in project_config
+    project_doc_max_bytes = project_config["project_doc_max_bytes"]
+    assert type(project_doc_max_bytes) is int
+    assert project_doc_max_bytes == _PROJECT_DOC_MAX_BYTES
     raw_agents_config = project_config["agents"]
     assert isinstance(raw_agents_config, dict)
     agents_config = cast(dict[str, object], raw_agents_config)
@@ -285,6 +290,17 @@ def test_codex_project_agents_are_bounded_and_pinned() -> None:
         assert "invoke Claude Code or any other model" in instructions
 
 
+def test_agents_md_fits_configured_project_document_budget() -> None:
+    """AGENTS.md remains comfortably below the configured model-visible budget."""
+    project_config = cast(
+        dict[str, object], tomllib.loads((_CODEX_DIR / "config.toml").read_text())
+    )
+    project_doc_max_bytes = project_config["project_doc_max_bytes"]
+    assert type(project_doc_max_bytes) is int
+    assert project_doc_max_bytes == _PROJECT_DOC_MAX_BYTES
+    assert (_REPO / "AGENTS.md").stat().st_size <= project_doc_max_bytes * 3 // 4
+
+
 def test_codex_leaf_configs_pass_installed_strict_parse() -> None:
     """Each leaf config must pass the installed Codex strict-config parser."""
     codex = shutil.which("codex")
@@ -311,6 +327,47 @@ def test_codex_leaf_configs_pass_installed_strict_parse() -> None:
             assert result.returncode == 0, (
                 f"{path.name}: strict config parse failed:\n{result.stderr}"
             )
+
+
+def test_installed_codex_exposes_required_agents_md_sections() -> None:
+    """Installed Codex exposes the required AGENTS.md sections for this trusted repo."""
+    codex = shutil.which("codex")
+    if codex is None:
+        pytest.skip("installed Codex CLI is unavailable")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        codex_home = Path(temp_dir)
+        (codex_home / "config.toml").write_text(f'[projects."{_REPO}"]\ntrust_level = "trusted"\n')
+        result = subprocess.run(
+            [codex, "debug", "prompt-input"],
+            cwd=_REPO,
+            env={**os.environ, "CODEX_HOME": str(codex_home)},
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+    assert result.returncode == 0, f"prompt-input failed:\n{result.stderr}"
+    prompt_input = cast(list[object], json.loads(result.stdout))
+    agents_blocks: list[str] = []
+    for message in prompt_input:
+        if not isinstance(message, dict):
+            continue
+        message_data = cast(dict[str, object], message)
+        content = message_data.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in cast(list[object], content):
+            if not isinstance(block, dict):
+                continue
+            block_data = cast(dict[str, object], block)
+            text = block_data.get("text")
+            if isinstance(text, str) and "# AGENTS.md - roastpilot-agent" in text:
+                agents_blocks.append(text)
+
+    assert len(agents_blocks) == 1
+    assert "Codex-Led Delivery Topology" in agents_blocks[0]
+    assert "Hardware Safety Notes" in agents_blocks[0]
 
 
 def test_claude_implementation_roles_follow_slice_routing() -> None:
