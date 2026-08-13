@@ -939,6 +939,82 @@ def test_worktree_metadata_admission_rejects_mismatch_before_provider_lookup(
         _REAL_VALIDATE_WORKTREE_METADATA(arguments)
 
 
+def test_git_output_runs_fixed_subprocess_and_returns_bounded_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Git admission helper accepts a small, valid fixed-command response."""
+    stub = tmp_path / "git"
+    stub.write_text("#!/bin/sh\nprintf 'expected metadata\\n'\n")
+    stub.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+
+    assert usage_cli._git_output(["status", "--porcelain"]) == (  # pyright: ignore[reportPrivateUsage]
+        0,
+        "expected metadata",
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("head -c 4097 /dev/zero", "unavailable"),
+        ("printf '\\377'", "unavailable"),
+    ],
+)
+def test_git_output_rejects_oversized_or_invalid_utf8_response(
+    body: str, expected: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Git admission never retains over-limit or malformed command output."""
+    stub = tmp_path / "git"
+    stub.write_text(f"#!/bin/sh\n{body}\n")
+    stub.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+
+    with pytest.raises(CaptureUsageError, match=expected):
+        usage_cli._git_output(["status", "--porcelain"])  # pyright: ignore[reportPrivateUsage]
+
+
+def test_git_output_timeout_kills_term_ignoring_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hung fixed Git stub is killed as a session group and cannot survive admission."""
+    marker = tmp_path / "git-stub-pid"
+    stub = tmp_path / "git"
+    stub.write_text(f"#!/bin/sh\ntrap '' TERM\necho $$ > '{marker}'\nsleep 30\n")
+    stub.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(usage_cli, "_GIT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(usage_cli, "TERMINATE_GRACE_SECONDS", 0.01)
+    real_start_deadline = usage_cli._start_deadline  # pyright: ignore[reportPrivateUsage]
+
+    def start_after_stub_ready(
+        process: subprocess.Popen[bytes], seconds: int, timed_out: threading.Event
+    ) -> threading.Timer:
+        for _ in range(50):
+            if marker.exists():
+                return real_start_deadline(process, seconds, timed_out)
+            time.sleep(0.01)
+        pytest.fail("fixed Git stub did not establish the timeout readiness handshake")
+
+    monkeypatch.setattr(usage_cli, "_start_deadline", start_after_stub_ready)
+
+    with pytest.raises(CaptureUsageError, match="Git worktree metadata is unavailable"):
+        usage_cli._git_output(["status", "--porcelain"])  # pyright: ignore[reportPrivateUsage]
+
+    pid = int(marker.read_text())
+    for _ in range(20):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        proc_stat = Path(f"/proc/{pid}/stat")
+        if not proc_stat.exists() or proc_stat.read_text().split()[2] == "Z":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("Git timeout cleanup left a live fixed-command process")
+
+
 def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
