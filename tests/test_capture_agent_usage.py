@@ -1036,6 +1036,7 @@ def test_early_closed_stdin_fails_without_appending_valid_terminal_usage(
     """A provider-free child closing stdin early cannot yield a successful capture record."""
     monkeypatch.chdir(tmp_path)
     Path("prompt").write_bytes(b"safe")
+
     def large_prompt(_: Path) -> bytes:
         return b"x" * 1_048_576
 
