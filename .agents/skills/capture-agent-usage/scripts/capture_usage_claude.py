@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, BinaryIO
 
 from capture_usage_models import (
@@ -122,25 +122,45 @@ def _model_usage(model_usage: object) -> tuple[ClaudeModelUsage, ...]:
     return tuple(parsed)
 
 
+def _finite_sum(values: Iterable[float], field: str) -> float:
+    """Return a deterministic finite sum of already-validated model estimates."""
+    try:
+        total = math.fsum(values)
+    except OverflowError as exc:
+        raise ClaudeUsageParseError(f"malformed Claude usage field: {field}") from exc
+    if not math.isfinite(total) or total < 0:
+        raise ClaudeUsageParseError(f"malformed Claude usage field: {field}")
+    return total
+
+
 def _terminal_usage(event: Mapping[str, Any]) -> ParsedUsage:
-    """Extract the sole result-level whole-tree total from a terminal event."""
+    """Validate top-level usage and normalize totals from whole-tree model usage."""
     usage = event.get("usage")
     if not isinstance(usage, dict):
         raise ClaudeUsageParseError("Claude result event is missing usage")
     if set(usage) != CLAUDE_RESULT_USAGE_KEYS:
         raise ClaudeUsageParseError("malformed Claude terminal usage schema")
-    total_cost = event.get("total_cost_usd")
+    for field in (
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens",
+    ):
+        _non_negative_integer(usage[field], field)
+    _non_negative_number(event.get("total_cost_usd"), "total_cost_usd")
+    model_usage = _model_usage(event.get("modelUsage"))
+    model_costs = tuple(item.estimated_usd for item in model_usage)
+    if any(cost is None for cost in model_costs):
+        raise ClaudeUsageParseError("malformed Claude modelUsage entry")
     return ParsedUsage(
-        input_tokens=_non_negative_integer(usage["input_tokens"], "input_tokens"),
-        cached_input_tokens=_non_negative_integer(
-            usage["cache_read_input_tokens"], "cache_read_input_tokens"
+        input_tokens=sum(item.input_tokens for item in model_usage),
+        cached_input_tokens=sum(item.cached_input_tokens for item in model_usage),
+        cache_creation_input_tokens=sum(item.cache_creation_input_tokens for item in model_usage),
+        output_tokens=sum(item.output_tokens for item in model_usage),
+        claude_model_usage=model_usage,
+        estimated_usd=_finite_sum(
+            (cost for cost in model_costs if cost is not None), "modelUsage costUSD sum"
         ),
-        cache_creation_input_tokens=_non_negative_integer(
-            usage["cache_creation_input_tokens"], "cache_creation_input_tokens"
-        ),
-        output_tokens=_non_negative_integer(usage["output_tokens"], "output_tokens"),
-        claude_model_usage=_model_usage(event.get("modelUsage")),
-        estimated_usd=_non_negative_number(total_cost, "total_cost_usd"),
         estimate_basis=EstimateBasis.CLIENT_SIDE_ESTIMATE,
     )
 

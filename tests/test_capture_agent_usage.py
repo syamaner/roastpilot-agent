@@ -98,7 +98,7 @@ def test_codex_fixture_extracts_terminal_usage_without_content() -> None:
 
 
 def test_claude_fixture_uses_whole_tree_terminal_model_usage() -> None:
-    """Claude repeated message IDs cannot change result-level whole-tree totals."""
+    """Only per-model whole-tree totals survive conflicting messages and top-level usage."""
     with (FIXTURES / "claude-2.1.228.jsonl").open("rb") as stream:
         usage = parse_claude_stream(stream)
 
@@ -106,13 +106,26 @@ def test_claude_fixture_uses_whole_tree_terminal_model_usage() -> None:
     assert usage.cached_input_tokens == 20
     assert usage.cache_creation_input_tokens == 30
     assert usage.output_tokens == 20
-    assert usage.estimated_usd == 0.123
+    assert usage.estimated_usd == pytest.approx(0.123)
     assert usage.estimate_basis is EstimateBasis.CLIENT_SIDE_ESTIMATE
     assert usage.claude_model_usage is not None
-    assert [(item.model, item.input_tokens) for item in usage.claude_model_usage] == [
-        ("synthetic-primary", 5),
-        ("synthetic-secondary", 11),
+    assert [
+        (
+            item.model,
+            item.input_tokens,
+            item.cached_input_tokens,
+            item.cache_creation_input_tokens,
+            item.output_tokens,
+            item.estimated_usd,
+        )
+        for item in usage.claude_model_usage
+    ] == [
+        ("synthetic-primary", 5, 8, 13, 7, 0.045),
+        ("synthetic-secondary", 11, 12, 17, 13, 0.078),
     ]
+    terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
+    assert terminal["usage"]["input_tokens"] != usage.input_tokens
+    assert terminal["total_cost_usd"] != usage.estimated_usd
     assert "SANITIZED_MESSAGE" not in usage.model_dump_json()
     assert "SANITIZED_TOOL_RESULT" not in usage.model_dump_json()
 
@@ -213,6 +226,20 @@ def test_claude_terminal_usage_extra_or_model_usage_drift_fails_closed() -> None
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     terminal["usage"]["unknown"] = 0
     with pytest.raises(ClaudeUsageParseError, match="usage schema"):
+        parse_claude_stream(_stream(json.dumps(terminal) + "\n"))
+
+
+def test_claude_malformed_top_level_usage_and_non_finite_model_sum_fail_closed() -> None:
+    """Top-level fields remain validated even though modelUsage alone supplies totals."""
+    terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
+    terminal["usage"]["input_tokens"] = "invalid"
+    with pytest.raises(ClaudeUsageParseError, match="malformed Claude usage field"):
+        parse_claude_stream(_stream(json.dumps(terminal) + "\n"))
+
+    terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
+    for model in terminal["modelUsage"].values():
+        model["costUSD"] = 1e308
+    with pytest.raises(ClaudeUsageParseError, match="modelUsage costUSD sum"):
         parse_claude_stream(_stream(json.dumps(terminal) + "\n"))
 
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
