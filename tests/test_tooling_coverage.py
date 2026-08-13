@@ -234,6 +234,43 @@ def test_normalize_coverage_xml_rewrites_nested_tooling_filename(tmp_path: Path)
     )
 
 
+def test_normalize_coverage_xml_rewrites_tooling_only_app_looking_filename(tmp_path: Path) -> None:
+    """An app-looking rootless filename maps to tooling when the real app file is absent."""
+    filename = "src/roastpilot_agent/helper.py"
+    coverage_xml = _coverage_fixture(tmp_path, (filename, "script_only.py", "skill_only.py"))
+    tooling_file = tmp_path / "scripts" / filename
+    tooling_file.parent.mkdir(parents=True)
+    tooling_file.touch()
+
+    tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+    assert _coverage_filenames(coverage_xml)[0] == f"scripts/{filename}"
+
+
+def test_normalize_coverage_xml_rejects_ambiguous_app_looking_filename(tmp_path: Path) -> None:
+    """An app-looking name present in both app and tooling roots is ambiguous."""
+    filename = "src/roastpilot_agent/helper.py"
+    coverage_xml = _coverage_fixture(tmp_path, (filename, "script_only.py", "skill_only.py"))
+    app_file = tmp_path / filename
+    app_file.touch()
+    tooling_file = tmp_path / "scripts" / filename
+    tooling_file.parent.mkdir(parents=True)
+    tooling_file.touch()
+
+    with pytest.raises(ValueError, match="resolve exactly once"):
+        tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+
+def test_normalize_coverage_xml_rejects_missing_app_looking_filename(tmp_path: Path) -> None:
+    """An app-looking filename must still resolve to an actual app or tooling file."""
+    coverage_xml = _coverage_fixture(
+        tmp_path, ("src/roastpilot_agent/missing.py", "script_only.py", "skill_only.py")
+    )
+
+    with pytest.raises(ValueError, match="resolve exactly once"):
+        tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+
 def test_skill_script_roots_rejects_symlinked_skill_scripts_root(tmp_path: Path) -> None:
     """Discovery cannot treat an outside symlinked skill scripts directory as local tooling."""
     outside = tmp_path / "outside"
@@ -448,6 +485,9 @@ def _coverage_fixture(tmp_path: Path, filenames: tuple[str, ...]) -> Path:
     skills.mkdir(parents=True)
     (scripts / "script_only.py").touch()
     (skills / "skill_only.py").touch()
+    app = tmp_path / "src" / "roastpilot_agent"
+    app.mkdir(parents=True)
+    (app / "app.py").touch()
     coverage_xml = tmp_path / "coverage.xml"
     root = ElementTree.Element("coverage")
     classes = ElementTree.SubElement(ElementTree.SubElement(root, "packages"), "classes")

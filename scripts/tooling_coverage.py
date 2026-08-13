@@ -150,12 +150,16 @@ def _normalize_coverage_filename(
     path = PurePosixPath(filename)
     if "\\" in filename or path.is_absolute() or any(part in {".", ".."} for part in path.parts):
         raise ValueError(f"coverage XML filename is unsafe: {filename!r}")
-    if filename.startswith(APP_COVERAGE_ROOT):
-        return filename
     if any(filename == root or filename.startswith(f"{root}/") for root in tooling_roots):
         raise ValueError(f"coverage XML filename has an unexpected prefix: {filename!r}")
 
     matches: list[str] = []
+    if filename.startswith(APP_COVERAGE_ROOT):
+        _require_non_symlink_components(repo_root, path, filename)
+        app_candidate = repo_root / filename
+        if app_candidate.exists() or app_candidate.is_symlink():
+            _regular_file(app_candidate, f"coverage XML app candidate for {filename!r}")
+            matches.append(APP_COVERAGE_ROOT)
     for root in tooling_roots:
         _require_non_symlink_root(repo_root, root)
         candidate = repo_root / root / filename
@@ -165,6 +169,8 @@ def _normalize_coverage_filename(
             matches.append(root)
     if len(matches) != 1:
         raise ValueError(f"coverage XML filename must resolve exactly once: {filename!r}")
+    if matches[0] == APP_COVERAGE_ROOT:
+        return filename
     return f"{matches[0]}/{filename}"
 
 
