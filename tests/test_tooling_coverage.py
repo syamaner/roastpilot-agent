@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import re
+import runpy
+import sys
 import tomllib
+import xml.etree.ElementTree as ElementTree
 from collections.abc import Iterable
 from pathlib import Path
 from typing import cast
@@ -68,6 +71,18 @@ def test_coverage_sources_and_ci_values_are_exactly_in_parity() -> None:
 
     assert sources == EXPECTED_SOURCES
     assert ci_sources == sources
+
+
+def test_ci_normalizes_coverage_filenames_before_codecov_upload() -> None:
+    """CI rewrites local coverage paths before the Codecov action reads them."""
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    pytest_index = workflow.index("- name: Run tests with coverage")
+    normalize_index = workflow.index("- name: Normalize coverage filenames for Codecov")
+    upload_index = workflow.index("- name: Upload coverage to Codecov")
+
+    assert pytest_index < normalize_index < upload_index
+    assert "run: python scripts/tooling_coverage.py coverage.xml" in workflow
 
 
 def test_each_discovered_skill_root_is_registered_in_flattened_settings() -> None:
@@ -169,6 +184,181 @@ def test_current_flattened_roots_have_unique_module_stems() -> None:
     """Current direct modules from flattened roots do not shadow one another."""
     tooling_coverage.require_unique_module_stems(
         REPO_ROOT, ("src", "scripts", *tooling_coverage.skill_script_roots(REPO_ROOT))
+    )
+
+
+def test_normalize_coverage_xml_rewrites_tooling_filenames(tmp_path: Path) -> None:
+    """Rootless tooling names become unique repository-relative XML paths."""
+    coverage_xml = _coverage_fixture(
+        tmp_path, ("src/roastpilot_agent/app.py", "script_only.py", "skill_only.py")
+    )
+
+    tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+    assert _coverage_filenames(coverage_xml) == (
+        "src/roastpilot_agent/app.py",
+        "scripts/script_only.py",
+        ".agents/skills/demo/scripts/skill_only.py",
+    )
+
+
+def test_normalize_coverage_xml_rejects_missing_tooling_match(tmp_path: Path) -> None:
+    """An XML filename without a tooling file match fails closed."""
+    coverage_xml = _coverage_fixture(tmp_path, ("missing.py",))
+
+    with pytest.raises(ValueError, match="resolve exactly once"):
+        tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+
+def test_normalize_coverage_xml_rejects_ambiguous_tooling_match(tmp_path: Path) -> None:
+    """An XML filename shared by tooling roots fails closed."""
+    coverage_xml = _coverage_fixture(tmp_path, ("shared.py",))
+    (tmp_path / "scripts" / "shared.py").touch()
+    (tmp_path / ".agents" / "skills" / "demo" / "scripts" / "shared.py").touch()
+
+    with pytest.raises(ValueError, match="resolve exactly once"):
+        tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+
+def test_normalize_coverage_xml_rejects_unsafe_filename(tmp_path: Path) -> None:
+    """Traversal and non-POSIX filenames fail before filesystem resolution."""
+    coverage_xml = _coverage_fixture(tmp_path, ("../escape.py",))
+
+    with pytest.raises(ValueError, match="unsafe"):
+        tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+
+def test_normalize_coverage_xml_rejects_a_class_without_filename(tmp_path: Path) -> None:
+    """A malformed class entry cannot bypass path verification."""
+    coverage_xml = _coverage_fixture(tmp_path, ())
+    report = ElementTree.parse(coverage_xml)
+    classes = report.find(".//classes")
+    assert classes is not None
+    ElementTree.SubElement(classes, "class")
+    report.write(coverage_xml, encoding="utf-8", xml_declaration=True)
+
+    with pytest.raises(ValueError, match="has no filename"):
+        tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+
+def test_normalize_coverage_xml_rejects_unexpected_prefixed_filename(tmp_path: Path) -> None:
+    """Only the app's established repository-relative prefix is permitted."""
+    coverage_xml = _coverage_fixture(tmp_path, ("scripts/script_only.py",))
+
+    with pytest.raises(ValueError, match="unexpected prefix"):
+        tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+
+def test_normalize_coverage_xml_rejects_duplicate_final_names(tmp_path: Path) -> None:
+    """Duplicate final names cannot silently collapse Codecov evidence."""
+    coverage_xml = _coverage_fixture(tmp_path, ("script_only.py", "script_only.py"))
+
+    with pytest.raises(ValueError, match="duplicate final filenames"):
+        tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+
+def test_normalize_coverage_xml_requires_each_tooling_root_with_classes(tmp_path: Path) -> None:
+    """A report omitting a populated tooling root fails before upload."""
+    coverage_xml = _coverage_fixture(tmp_path, ("src/roastpilot_agent/app.py",))
+
+    with pytest.raises(ValueError, match="missing filenames for tooling root"):
+        tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+
+def test_normalize_coverage_xml_rejects_malformed_or_oversized_input(tmp_path: Path) -> None:
+    """Malformed and bounded-size-invalid local artifacts fail closed."""
+    malformed = tmp_path / "malformed.xml"
+    malformed.write_text("<coverage>", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed"):
+        tooling_coverage.normalize_coverage_xml(malformed, tmp_path)
+
+    oversized = tmp_path / "oversized.xml"
+    oversized.write_bytes(b"x" * (tooling_coverage.MAX_COVERAGE_XML_BYTES + 1))
+    with pytest.raises(ValueError, match="size limit"):
+        tooling_coverage.normalize_coverage_xml(oversized, tmp_path)
+
+
+def test_normalize_coverage_xml_rejects_symlink_candidate(tmp_path: Path) -> None:
+    """A symlink candidate never becomes a trusted coverage source path."""
+    coverage_xml = _coverage_fixture(tmp_path, ("linked.py",))
+    target = tmp_path / "outside.py"
+    target.touch()
+    (tmp_path / "scripts" / "linked.py").symlink_to(target)
+
+    with pytest.raises(ValueError, match="regular non-symlink"):
+        tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+
+def test_normalize_coverage_xml_cleans_up_after_atomic_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed replacement removes the temporary XML artifact."""
+    coverage_xml = _coverage_fixture(tmp_path, ("script_only.py", "skill_only.py"))
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        """Simulate a local CI replacement failure."""
+        del source, destination
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(tooling_coverage.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+    assert not tuple(tmp_path.glob(".coverage-*"))
+
+
+def test_main_normalizes_coverage_xml_from_current_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CI command entry point normalizes exactly one local report."""
+    coverage_xml = _coverage_fixture(tmp_path, ("script_only.py", "skill_only.py"))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["tooling_coverage.py", str(coverage_xml)])
+
+    assert tooling_coverage.main() == 0
+
+
+def test_script_entrypoint_normalizes_coverage_xml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The direct CI script command exits successfully after normalization."""
+    coverage_xml = _coverage_fixture(tmp_path, ("script_only.py", "skill_only.py"))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["tooling_coverage.py", str(coverage_xml)])
+
+    with pytest.raises(SystemExit) as exit_status:
+        runpy.run_path(str(REPO_ROOT / "scripts" / "tooling_coverage.py"), run_name="__main__")
+
+    assert exit_status.value.code == 0
+
+
+def test_main_rejects_an_invalid_argument_count() -> None:
+    """The CI command requires exactly one report path."""
+    with pytest.raises(ValueError, match="usage"):
+        tooling_coverage.main(())
+
+
+def _coverage_fixture(tmp_path: Path, filenames: tuple[str, ...]) -> Path:
+    """Create local tooling files and a minimal Coverage.py XML report."""
+    scripts = tmp_path / "scripts"
+    skills = tmp_path / ".agents" / "skills" / "demo" / "scripts"
+    scripts.mkdir()
+    skills.mkdir(parents=True)
+    (scripts / "script_only.py").touch()
+    (skills / "skill_only.py").touch()
+    coverage_xml = tmp_path / "coverage.xml"
+    root = ElementTree.Element("coverage")
+    classes = ElementTree.SubElement(ElementTree.SubElement(root, "packages"), "classes")
+    for filename in filenames:
+        ElementTree.SubElement(classes, "class", filename=filename)
+    ElementTree.ElementTree(root).write(coverage_xml, encoding="utf-8", xml_declaration=True)
+    return coverage_xml
+
+
+def _coverage_filenames(coverage_xml: Path) -> tuple[str, ...]:
+    """Return class filenames from a local Coverage.py XML report."""
+    return tuple(
+        class_element.attrib["filename"]
+        for class_element in ElementTree.parse(coverage_xml).findall(".//class")
     )
 
 

@@ -57,6 +57,9 @@ jobs:
       - name: Run tests with coverage
         run: python -m pytest --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report=xml --cov-report=term-missing:skip-covered
 
+      - name: Normalize coverage filenames for Codecov
+        run: python scripts/tooling_coverage.py coverage.xml
+
       # Continuous server-drift auto-catch (#121): regenerate the SPA contract
       # surface from the real server models and fail if it differs from the
       # committed mirror. The in-sync pytest tests above already gate drift
