@@ -1127,7 +1127,7 @@ def test_real_pipe_backpressure_interleaves_prompt_write_and_stdout_drain(
     stub = tmp_path / "codex"
     stub.write_text(
         "#!" + sys.executable + "\n"
-        "import sys\n"
+        "import sys, time\n"
         "if '--version' in sys.argv: print('codex 0.147.0'); raise SystemExit()\n"
         'print(\'{\\"type\\":\\"turn.started\\"}\', flush=True)\n'
         "while not __import__('pathlib').Path('parser-started').exists(): time.sleep(0.01)\n"
