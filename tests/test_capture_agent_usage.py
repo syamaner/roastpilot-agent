@@ -143,6 +143,35 @@ class _LazyOpaqueItemStream:
         return result
 
 
+class _LazyTypeFirstStream:
+    """Produce a large retained type-first event while recording bounded consumption."""
+
+    def __init__(self, payload_bytes: int) -> None:
+        """Initialize a retained type-first event whose payload need not materialize."""
+        self._prefix = b'{"type":"turn.started","payload":"'
+        self._payload_remaining = payload_bytes
+        self._suffix = b'"}\n'
+        self._suffix_offset = 0
+        self.consumed = 0
+
+    def read(self, size: int) -> bytes:
+        """Return only bounded slices until the parser rejects this retained event."""
+        if self._prefix:
+            result = self._prefix[:size]
+            self._prefix = self._prefix[len(result) :]
+        elif self._payload_remaining:
+            count = min(size, self._payload_remaining)
+            self._payload_remaining -= count
+            result = b"x" * count
+        elif self._suffix_offset < len(self._suffix):
+            result = self._suffix[self._suffix_offset : self._suffix_offset + size]
+            self._suffix_offset += len(result)
+        else:
+            result = b""
+        self.consumed += len(result)
+        return result
+
+
 class _RepeatedEventStream:
     """Stream repeated small events without materializing their aggregate byte total."""
 
@@ -516,6 +545,60 @@ def test_codex_streams_a_five_mebibyte_opaque_item_with_bounded_reads() -> None:
     assert max(stream.requests) == READ_CHUNK_BYTES
     assert len(stream.requests) > 50
     assert "ignored" not in usage.model_dump_json()
+
+
+def test_codex_rejects_type_first_retained_event_before_multi_mebibyte_consumption() -> None:
+    """A known retained root type cannot consume the opaque eight-mebibyte allowance."""
+    stream = _LazyTypeFirstStream(2 * 1024 * 1024)
+    with pytest.raises(CodexUsageParseError, match="Codex retained event exceeds size limit"):
+        parse_codex_stream(stream)
+    assert MAX_EVENT_BYTES < stream.consumed <= MAX_EVENT_BYTES + READ_CHUNK_BYTES
+
+
+def test_codex_accepts_late_discriminator_opaque_item_within_fixed_budget() -> None:
+    """An item discriminator after a large payload retains its deliberate opaque allowance."""
+    stream = _LazyOpaqueItemStream(2 * 1024 * 1024, _codex_terminal_event())
+    assert parse_codex_stream(stream).input_tokens == 1
+
+
+def test_codex_pipe_read1_rejects_before_writer_eof() -> None:
+    """Buffered pipe parsing handles a type-first oversized event without awaiting writer EOF."""
+    read_fd, write_fd = os.pipe()
+    reader = os.fdopen(read_fd, "rb")
+    writer_may_close = threading.Event()
+    writer_started = threading.Event()
+
+    def write_open_event() -> None:
+        """Write a retained oversized event then deliberately retain the pipe's write end."""
+        payload = b'{"type":"turn.started","payload":"' + (b"x" * (MAX_EVENT_BYTES + 1))
+        writer_started.set()
+        try:
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(write_fd, payload[offset:])
+            writer_may_close.wait(timeout=2)
+        except BrokenPipeError:
+            pass
+        finally:
+            os.close(write_fd)
+
+    writer = threading.Thread(target=write_open_event, daemon=True)
+    writer.start()
+    assert writer_started.wait(timeout=1)
+    try:
+        with pytest.raises(CodexUsageParseError, match="Codex retained event exceeds size limit"):
+            parse_codex_stream(reader)
+    finally:
+        reader.close()
+        writer_may_close.set()
+        writer.join(timeout=2)
+    assert not writer.is_alive()
+
+
+def test_codex_rejects_blank_jsonl_event() -> None:
+    """Whitespace-only Codex JSONL events do not pass scanner completion."""
+    with pytest.raises(CodexUsageParseError, match="blank Codex JSONL event"):
+        parse_codex_stream(BytesIO(b" \t\r\n"))
 
 
 def test_codex_counts_small_items_as_opaque_not_retained_budget() -> None:

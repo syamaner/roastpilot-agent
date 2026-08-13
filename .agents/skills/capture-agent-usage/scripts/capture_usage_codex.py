@@ -55,6 +55,15 @@ class _ReadableBinaryStream(Protocol):
         """Read at most ``size`` binary bytes from the stream."""
 
 
+def _read_chunk(stream: _ReadableBinaryStream) -> bytes:
+    """Read promptly from buffered pipes while retaining test-stream compatibility."""
+    read1 = getattr(stream, "read1", None)
+    chunk = read1(READ_CHUNK_BYTES) if callable(read1) else stream.read(READ_CHUNK_BYTES)
+    if not isinstance(chunk, bytes) or len(chunk) > READ_CHUNK_BYTES:
+        raise CodexUsageParseError("usage stream read exceeds size limit")
+    return chunk
+
+
 class _JsonRootScanner:
     """Incrementally validate one JSON root object without retaining its payload."""
 
@@ -76,6 +85,16 @@ class _JsonRootScanner:
     def is_opaque_item(self) -> bool:
         """Return whether this complete root has exactly one allowed item type."""
         return self._root_type_count == 1 and self._root_type_value in OPAQUE_ITEM_TYPES
+
+    @property
+    def has_nonopaque_root_type(self) -> bool:
+        """Return whether a root discriminator rules out streamed opaque-item handling."""
+        return self._root_type_count == 1 and not self.is_opaque_item
+
+    @property
+    def has_root_content(self) -> bool:
+        """Return whether the event contains more than JSONL whitespace."""
+        return self._root_started
 
     def consume(self, text: str) -> None:
         """Consume decoded JSON characters without preserving opaque payload values."""
@@ -428,14 +447,15 @@ def parse_codex_stream(stream: _ReadableBinaryStream) -> ParsedUsage:
         event_count += 1
         if event_count > MAX_EVENT_COUNT:
             raise CodexUsageParseError("usage stream exceeds event count limit")
+        if not scanner.has_root_content:
+            raise CodexUsageParseError("blank Codex JSONL event")
         scanner.finish()
         if scanner.is_opaque_item:
-            if event_bytes > MAX_CODEX_OPAQUE_EVENT_BYTES:
-                raise CodexUsageParseError("Codex opaque event exceeds size limit")
             opaque_total_bytes += event_bytes
             if opaque_total_bytes > MAX_CODEX_OPAQUE_TOTAL_BYTES:
                 raise CodexUsageParseError("Codex opaque stream exceeds total byte limit")
             if event_bytes <= MAX_EVENT_BYTES:
+                # Preserve recursive duplicate-key rejection while the event is bounded.
                 terminal_marker_seen, parsed = _apply_retained_event(
                     bytes(retained_line), terminal_marker_seen, parsed
                 )
@@ -476,13 +496,13 @@ def parse_codex_stream(stream: _ReadableBinaryStream) -> ParsedUsage:
             complete_event()
         else:
             scanner.consume(text)
+        if scanner.has_nonopaque_root_type and event_bytes > MAX_EVENT_BYTES:
+            raise CodexUsageParseError("Codex retained event exceeds size limit")
 
     while True:
-        chunk = stream.read(READ_CHUNK_BYTES)
+        chunk = _read_chunk(stream)
         if chunk == b"":
             break
-        if not isinstance(chunk, bytes) or len(chunk) > READ_CHUNK_BYTES:
-            raise CodexUsageParseError("usage stream read exceeds size limit")
         offset = 0
         while offset < len(chunk):
             newline = chunk.find(b"\n", offset)
