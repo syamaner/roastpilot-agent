@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Iterable, Mapping
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, BinaryIO
 
 from capture_usage_models import ClaudeModelUsage, EstimateBasis, ParsedUsage
+from capture_usage_stream import BoundedStreamError, bounded_jsonl_lines
 
 CLAUDE_EVENT_TYPES = frozenset({"system", "user", "assistant", "rate_limit_event", "result"})
 """Opaque event types observed in the sanitized Claude Code 2.1.228 fixture."""
@@ -139,11 +140,11 @@ def _terminal_usage(event: Mapping[str, Any]) -> ParsedUsage:
     )
 
 
-def parse_claude_stream(lines: Iterable[str]) -> ParsedUsage:
+def parse_claude_stream(stream: BinaryIO) -> ParsedUsage:
     """Parse a complete Claude stream using only the terminal result-level totals.
 
     Args:
-        lines: Streaming JSONL stdout from the fixed Claude harness command.
+        stream: Binary JSONL stdout from the fixed Claude harness command.
 
     Returns:
         Normalized aggregate and per-model whole-tree usage.
@@ -152,15 +153,18 @@ def parse_claude_stream(lines: Iterable[str]) -> ParsedUsage:
         ClaudeUsageParseError: If the event grammar, result usage, or model totals are invalid.
     """
     parsed: ParsedUsage | None = None
-    for line in lines:
-        if not line.strip():
-            raise ClaudeUsageParseError("blank Claude JSONL event")
-        event = _event_from_line(line)
-        if event["type"] != "result":
-            continue
-        if parsed is not None:
-            raise ClaudeUsageParseError("multiple Claude terminal result events")
-        parsed = _terminal_usage(event)
+    try:
+        for line in bounded_jsonl_lines(stream):
+            if not line.strip():
+                raise ClaudeUsageParseError("blank Claude JSONL event")
+            event = _event_from_line(line)
+            if event["type"] != "result":
+                continue
+            if parsed is not None:
+                raise ClaudeUsageParseError("multiple Claude terminal result events")
+            parsed = _terminal_usage(event)
+    except BoundedStreamError as exc:
+        raise ClaudeUsageParseError(str(exc)) from exc
     if parsed is None:
         raise ClaudeUsageParseError("Claude stream has no terminal result usage event")
     return parsed

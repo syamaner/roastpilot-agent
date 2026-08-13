@@ -141,14 +141,14 @@ def _print_parsed_json(value: object) -> None:
 
 def parse_codex_command(arguments: argparse.Namespace) -> int:
     """Parse a supplied sanitized Codex JSONL file without creating a record."""
-    with arguments.stream.open("r", encoding="utf-8") as stream:
+    with arguments.stream.open("rb") as stream:
         _print_parsed_json(parse_codex_stream(stream))
     return 0
 
 
 def parse_claude_command(arguments: argparse.Namespace) -> int:
     """Parse a supplied sanitized Claude JSONL file without creating a record."""
-    with arguments.stream.open("r", encoding="utf-8") as stream:
+    with arguments.stream.open("rb") as stream:
         _print_parsed_json(parse_claude_stream(stream))
     return 0
 
