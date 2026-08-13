@@ -55,6 +55,10 @@ VERSION_TIMEOUT_SECONDS = 5
 TERMINATE_GRACE_SECONDS = 1
 _SEMVER = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 _SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_VERIFIED_HARNESS_VERSIONS = {
+    HarnessFamily.CODEX: "0.147.0",
+    HarnessFamily.CLAUDE: "2.1.228",
+}
 _GIT_TIMEOUT_SECONDS = 5
 _GIT_OUTPUT_LIMIT = 4096
 
@@ -518,6 +522,8 @@ def run_command(arguments: argparse.Namespace) -> int:
     try:
         executable = _resolved_executable(arguments.harness)
         version = _harness_version(executable)
+        if version != _VERIFIED_HARNESS_VERSIONS[arguments.harness]:
+            raise CaptureUsageError("selected harness version is not verified")
         started_at = _utc_now()
         started_monotonic = time.monotonic()
         arguments.started_at = started_at

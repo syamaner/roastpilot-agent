@@ -642,6 +642,51 @@ def test_capacity_and_outcome_commands_persist_closed_metadata(
     assert error.value.code == 2
 
 
+@pytest.mark.parametrize(
+    ("family", "source"),
+    [
+        (HarnessFamily.CLAUDE, CapacitySource.CLI_STATUS),
+        (HarnessFamily.CODEX, CapacitySource.CLI_USAGE),
+    ],
+)
+def test_capacity_snapshot_rejects_impossible_source_family_pairs_without_append(
+    family: HarnessFamily,
+    source: CapacitySource,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct CLI source labels cannot be attributed to the other harness family."""
+    now = datetime(2026, 8, 13, tzinfo=UTC)
+    with pytest.raises(ValidationError, match="capacity snapshots require"):
+        CapacitySnapshotRecord(
+            captured_at=now,
+            task_id="811",
+            slice_id="capture",
+            family=family,
+            status=CapacityStatus.HEALTHY,
+            source=source,
+        )
+
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit, match="metadata input is invalid"):
+        main(
+            [
+                "snapshot-capacity",
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--family",
+                family.name.lower(),
+                "--status",
+                "healthy",
+                "--source",
+                source.name.lower(),
+            ]
+        )
+    assert not (tmp_path / ".agent-usage").exists()
+
+
 def test_annotate_outcome_rejects_duplicate_finding_counts_without_append(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1112,7 +1157,8 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
     def run_for(output: bytes, code: int, harness: str = "codex") -> tuple[int | None, str]:
         def fake_popen(argv: list[str], **_: object) -> Process:
             if argv[-1] == "--version":
-                return Process(b"codex 0.147.0\n", 0)
+                version = "0.147.0" if harness == "codex" else "2.1.228"
+                return Process(f"{harness} {version}\n".encode(), 0)
             return Process(output, code)
 
         def fake_which(_: str) -> str:
@@ -1236,6 +1282,82 @@ def test_invalid_version_never_spawns_a_run(
     monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
     with pytest.raises(CaptureUsageError, match="version"):
         usage_cli._harness_version("/stub/codex")  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    ("harness", "version"),
+    [
+        ("codex", "0.146.0"),
+        ("codex", "0.148.0"),
+        ("claude", "2.1.227"),
+        ("claude", "2.1.229"),
+    ],
+)
+def test_run_rejects_unverified_family_version_before_harness_launch(
+    harness: str, version: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only each frozen family version may proceed from its fixed version probe."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"safe")
+    calls = 0
+
+    class VersionProcess:
+        """Completed fixed version probe with no task-launch behavior."""
+
+        stdin = None
+        stdout = BytesIO(f"{harness} {version}\n".encode())
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+        def terminate(self) -> None:
+            raise AssertionError("completed version probe must not terminate")
+
+        def kill(self) -> None:
+            raise AssertionError("completed version probe must not kill")
+
+    def fake_popen(*_args: object, **_kwargs: object) -> VersionProcess:
+        nonlocal calls
+        calls += 1
+        return VersionProcess()
+
+    def fake_which(_name: str) -> str:
+        return "/stub/harness"
+
+    monkeypatch.setattr(usage_cli.shutil, "which", fake_which)
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+    with pytest.raises(SystemExit, match="version is not verified"):
+        main(
+            [
+                "run",
+                "--harness",
+                harness,
+                "--prompt-file",
+                "prompt",
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                "measurement-pilot",
+                "--model",
+                "model",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
+    assert calls == 1
+    assert not (tmp_path / ".agent-usage").exists()
 
 
 def test_version_probe_timeout_kills_reaps_and_never_reaches_a_run(

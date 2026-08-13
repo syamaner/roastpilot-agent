@@ -247,6 +247,15 @@ class CapacitySnapshotRecord(CaptureModel):
     status: CapacityStatus
     source: CapacitySource
 
+    @model_validator(mode="after")
+    def validate_source_family(self) -> CapacitySnapshotRecord:
+        """Bind each direct CLI source to the only harness family it can observe."""
+        if self.source is CapacitySource.CLI_STATUS and self.family is not HarnessFamily.CODEX:
+            raise ValueError("CLI_STATUS capacity snapshots require CODEX")
+        if self.source is CapacitySource.CLI_USAGE and self.family is not HarnessFamily.CLAUDE:
+            raise ValueError("CLI_USAGE capacity snapshots require CLAUDE")
+        return self
+
 
 class OutcomeRecord(CaptureModel):
     """Closed pilot-quality metadata appended after a completed slice."""
