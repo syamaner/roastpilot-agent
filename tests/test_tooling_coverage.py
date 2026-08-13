@@ -97,6 +97,26 @@ def test_missing_synthetic_skill_root_fails_registration_guard() -> None:
         )
 
 
+def test_stale_synthetic_skill_root_fails_registration_guard() -> None:
+    """A stale configured skill root fails closed."""
+    discovered = (".agents/skills/current/scripts",)
+    with pytest.raises(ValueError, match="stale/scripts"):
+        tooling_coverage.require_registered_roots(
+            discovered,
+            {"coverage": (*discovered, ".agents/skills/stale/scripts")},
+        )
+
+
+def test_duplicate_synthetic_skill_root_fails_registration_guard() -> None:
+    """A duplicated configured skill root fails closed."""
+    discovered = (".agents/skills/current/scripts",)
+    with pytest.raises(ValueError, match="current/scripts"):
+        tooling_coverage.require_registered_roots(
+            discovered,
+            {"coverage": (*discovered, *discovered)},
+        )
+
+
 def test_missing_skill_script_roots_fail_discovery(tmp_path: Path) -> None:
     """A repository without any skill script roots fails closed."""
     with pytest.raises(ValueError, match="no .agents/skills"):
@@ -127,6 +147,18 @@ def test_synthetic_module_stem_collision_fails_guard(tmp_path: Path) -> None:
         directory = tmp_path / root
         directory.mkdir(parents=True)
         (directory / "shared_name.py").touch()
+
+    with pytest.raises(ValueError, match="shared_name"):
+        tooling_coverage.require_unique_module_stems(tmp_path, ("src", "scripts"))
+
+
+def test_synthetic_module_and_package_name_collision_fails_guard(tmp_path: Path) -> None:
+    """A module and direct child package cannot share a flattened import name."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "shared_name.py").touch()
+    package = tmp_path / "scripts" / "shared_name"
+    package.mkdir(parents=True)
+    (package / "__init__.py").touch()
 
     with pytest.raises(ValueError, match="shared_name"):
         tooling_coverage.require_unique_module_stems(tmp_path, ("src", "scripts"))

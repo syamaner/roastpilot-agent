@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
@@ -29,32 +29,40 @@ def require_registered_roots(
     discovered_skill_roots: Sequence[str],
     configured_roots: Mapping[str, Iterable[str]],
 ) -> None:
-    """Require every discovered skill root in each flattened-tooling setting.
+    """Require exact skill-root registration in each flattened-tooling setting.
 
     Args:
         discovered_skill_roots: Roots discovered under ``.agents/skills``.
         configured_roots: Setting names mapped to their configured roots.
 
     Raises:
-        ValueError: If a discovered root is missing or duplicated in a setting.
+        ValueError: If a skill root is missing, stale, or duplicated in a setting.
     """
     for setting, roots in configured_roots.items():
-        root_list = tuple(roots)
-        for root in discovered_skill_roots:
-            if root_list.count(root) != 1:
-                raise ValueError(f"{setting} must register {root!r} exactly once")
+        configured_skill_roots = tuple(root for root in roots if root.startswith(".agents/skills/"))
+        if Counter(configured_skill_roots) != Counter(discovered_skill_roots):
+            raise ValueError(
+                f"{setting} skill roots must exactly match discovered roots: "
+                f"{configured_skill_roots!r} != {tuple(discovered_skill_roots)!r}"
+            )
 
 
 def duplicate_module_stems(repo_root: Path, roots: Iterable[str]) -> dict[str, tuple[str, ...]]:
-    """Return duplicate stems directly importable from the supplied sys.path roots.
+    """Return duplicate names directly importable from the supplied sys.path roots.
 
     Package-contained modules are intentionally excluded because their package
     qualification prevents the flattened-name collision this guard targets.
     """
     found: dict[str, list[str]] = defaultdict(list)
     for root in roots:
-        for module in sorted((repo_root / root).glob("*.py")):
+        root_path = repo_root / root
+        for module in sorted(root_path.glob("*.py")):
+            if module.name == "__init__.py":
+                continue
             found[module.stem].append(root)
+        for package in sorted(root_path.iterdir()):
+            if package.is_dir() and (package / "__init__.py").is_file():
+                found[package.name].append(root)
     return {stem: tuple(root_list) for stem, root_list in found.items() if len(root_list) > 1}
 
 
