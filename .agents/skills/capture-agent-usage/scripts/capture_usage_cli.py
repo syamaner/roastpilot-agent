@@ -18,7 +18,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
-from typing import NoReturn, TypeVar
+from typing import BinaryIO, NoReturn, TypeVar
 
 from capture_usage_claude import (
     ClaudeUsageMissingTerminalError,
@@ -196,9 +196,8 @@ def _print_parsed_json(value: ParsedUsage) -> None:
 
 def parse_codex_command(arguments: argparse.Namespace) -> int:
     """Parse a supplied sanitized Codex JSONL file without creating a record."""
-    _print_parsed_json(
-        parse_codex_stream(BytesIO(_input_bytes(arguments.stream, MAX_STREAM_BYTES)))
-    )
+    with _open_stream_input(arguments.stream) as stream:
+        _print_parsed_json(parse_codex_stream(stream))
     return 0
 
 
@@ -208,6 +207,30 @@ def parse_claude_command(arguments: argparse.Namespace) -> int:
         parse_claude_stream(BytesIO(_input_bytes(arguments.stream, MAX_STREAM_BYTES)))
     )
     return 0
+
+
+def _open_stream_input(path: Path) -> BinaryIO:
+    """Open one regular no-follow input stream without materializing its contents."""
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise CaptureUsageError("platform cannot securely open prompt input")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise CaptureUsageError("input file cannot be safely opened") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise CaptureUsageError("input file is not an accepted regular input")
+        stream = os.fdopen(descriptor, "rb")
+        descriptor = -1
+        return stream
+    except CaptureUsageError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise CaptureUsageError("input file cannot be safely opened") from exc
 
 
 def _input_bytes(path: Path, maximum: int = MAX_PROMPT_BYTES) -> bytes:
