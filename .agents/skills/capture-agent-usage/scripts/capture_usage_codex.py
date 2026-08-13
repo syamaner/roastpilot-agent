@@ -330,10 +330,14 @@ def _event_from_line(line: str) -> Mapping[str, Any]:
             result[key] = value
         return result
 
+    malformed_json = False
+    event: object = None
     try:
         event = json.loads(line, object_pairs_hook=reject_duplicate_keys)
-    except json.JSONDecodeError as exc:
-        raise CodexUsageParseError("malformed Codex JSONL event") from exc
+    except json.JSONDecodeError:
+        malformed_json = True
+    if malformed_json:
+        raise CodexUsageParseError("malformed Codex JSONL event") from None
     if not isinstance(event, dict):
         raise CodexUsageParseError("malformed Codex event object")
     event_type = event.get("type")
@@ -348,10 +352,14 @@ def _apply_retained_event(
     line: bytes, terminal_marker_seen: bool, parsed: ParsedUsage | None
 ) -> tuple[bool, ParsedUsage | None]:
     """Strictly decode a retained event and apply frozen terminal usage semantics."""
+    invalid_utf8 = False
+    decoded = ""
     try:
         decoded = line.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise CodexUsageParseError("usage stream contains invalid UTF-8") from exc
+    except UnicodeDecodeError:
+        invalid_utf8 = True
+    if invalid_utf8:
+        raise CodexUsageParseError("usage stream contains invalid UTF-8") from None
     if not decoded.strip():
         raise CodexUsageParseError("blank Codex JSONL event")
     event = _event_from_line(decoded)
@@ -453,10 +461,14 @@ def parse_codex_stream(stream: _ReadableBinaryStream) -> ParsedUsage:
         remaining = MAX_EVENT_BYTES - len(retained_line)
         if remaining > 0:
             retained_line.extend(segment[:remaining])
+        invalid_utf8 = False
+        text = ""
         try:
             text = decoder.decode(segment, final=False)
-        except UnicodeDecodeError as exc:
-            raise CodexUsageParseError("usage stream contains invalid UTF-8") from exc
+        except UnicodeDecodeError:
+            invalid_utf8 = True
+        if invalid_utf8:
+            raise CodexUsageParseError("usage stream contains invalid UTF-8") from None
         if has_newline:
             if not text.endswith("\n") or decoder.getstate()[0]:
                 raise CodexUsageParseError("usage stream contains invalid UTF-8")
@@ -479,10 +491,13 @@ def parse_codex_stream(stream: _ReadableBinaryStream) -> ParsedUsage:
                 break
             consume_segment(chunk[offset : newline + 1], True)
             offset = newline + 1
+    invalid_utf8 = False
     try:
         decoder.decode(b"", final=True)
-    except UnicodeDecodeError as exc:
-        raise CodexUsageParseError("usage stream contains invalid UTF-8") from exc
+    except UnicodeDecodeError:
+        invalid_utf8 = True
+    if invalid_utf8:
+        raise CodexUsageParseError("usage stream contains invalid UTF-8") from None
     if event_bytes:
         raise CodexUsageParseError("usage stream contains a partial event")
     if parsed is None:

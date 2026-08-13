@@ -448,6 +448,24 @@ def test_binary_stream_ingestion_rejects_overlong_partial_and_invalid_utf8_event
         parse_codex_stream(BytesIO(b"{not-json}\n"))
 
 
+@pytest.mark.parametrize(
+    "stream",
+    [
+        b'{"type":"item.updated","payload":"CHUNK_SENTINEL\xff"}\n',
+        b'{"type":"item.updated","payload":"FLUSH_SENTINEL' + b"\xc3",
+    ],
+)
+def test_codex_utf8_errors_do_not_chain_raw_provider_bytes(stream: bytes) -> None:
+    """Chunk and final-flush UTF-8 errors retain no raw provider segment through chaining."""
+    with pytest.raises(CodexUsageParseError, match="usage stream contains invalid UTF-8") as error:
+        parse_codex_stream(BytesIO(stream))
+    exception = error.value
+    assert exception.__cause__ is None
+    assert exception.__context__ is None
+    assert exception.__suppress_context__
+    assert "SENTINEL" not in repr(exception.args)
+
+
 def test_binary_stream_ingestion_rejects_event_count_and_total_byte_overflow() -> None:
     """Finite caps bound both endless short streams and many valid large events."""
     with pytest.raises(CodexUsageParseError, match="event count limit"):
