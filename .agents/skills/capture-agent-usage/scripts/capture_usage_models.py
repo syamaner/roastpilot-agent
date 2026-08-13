@@ -96,7 +96,7 @@ class ClaudeModelUsage(CaptureModel):
     cached_input_tokens: TokenCount
     cache_creation_input_tokens: TokenCount
     output_tokens: TokenCount
-    estimated_usd: float | None = Field(default=None, ge=0)
+    estimated_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class ParsedUsage(CaptureModel):
@@ -108,7 +108,7 @@ class ParsedUsage(CaptureModel):
     output_tokens: TokenCount | None = None
     reasoning_output_tokens: TokenCount | None = None
     claude_model_usage: tuple[ClaudeModelUsage, ...] | None = None
-    estimated_usd: float | None = Field(default=None, ge=0)
+    estimated_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     estimate_basis: EstimateBasis = EstimateBasis.NOT_EXPOSED
 
     @model_validator(mode="after")
@@ -153,7 +153,7 @@ class TaskUsageRecord(CaptureModel):
     output_tokens: TokenCount | None = None
     reasoning_output_tokens: TokenCount | None = None
     claude_model_usage: tuple[ClaudeModelUsage, ...] | None = None
-    estimated_usd: float | None = Field(default=None, ge=0)
+    estimated_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     estimate_basis: EstimateBasis = EstimateBasis.NOT_EXPOSED
     whole_tree_verified: bool = False
     usage_complete: bool

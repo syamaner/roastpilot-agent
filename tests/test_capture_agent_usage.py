@@ -104,6 +104,22 @@ def test_unknown_events_fail_closed(parser: object, event: str) -> None:
         parser([event])  # type: ignore[operator]
 
 
+def test_parser_errors_do_not_echo_untrusted_discriminators() -> None:
+    """Event type and subtype drift reports only a fixed safe category."""
+    sentinel = "SENTINEL_EVENT_CONTENT"
+    with pytest.raises(CodexUsageParseError) as codex_error:
+        parse_codex_stream([json.dumps({"type": sentinel})])
+    assert sentinel not in str(codex_error.value)
+
+    with pytest.raises(ClaudeUsageParseError) as claude_type_error:
+        parse_claude_stream([json.dumps({"type": sentinel})])
+    assert sentinel not in str(claude_type_error.value)
+
+    with pytest.raises(ClaudeUsageParseError) as claude_subtype_error:
+        parse_claude_stream([json.dumps({"type": "system", "subtype": sentinel})])
+    assert sentinel not in str(claude_subtype_error.value)
+
+
 def test_malformed_or_missing_terminal_usage_fails_closed() -> None:
     """A zero-exit-like stream without required terminal usage cannot normalize."""
     with pytest.raises(CodexUsageParseError, match="terminal"):
@@ -154,6 +170,28 @@ def test_estimate_basis_and_closed_record_grammar_reject_invalid_values() -> Non
         ParsedUsage.model_validate({"unknown_raw_output": "forbidden"})
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_estimates_reject_at_model_boundary(value: float) -> None:
+    """Closed usage records cannot serialize non-finite estimated costs as null."""
+    with pytest.raises(ValidationError):
+        ParsedUsage(
+            estimated_usd=value,
+            estimate_basis=EstimateBasis.CLIENT_SIDE_ESTIMATE,
+        )
+
+
+@pytest.mark.parametrize("field", ["total_cost_usd", "costUSD"])
+def test_non_finite_json_estimates_reject_at_parser_boundary(field: str) -> None:
+    """JSON non-finite aggregate and per-model estimates fail closed."""
+    terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
+    if field == "total_cost_usd":
+        terminal[field] = float("inf")
+    else:
+        terminal["modelUsage"]["synthetic-primary"][field] = float("nan")
+    with pytest.raises(ClaudeUsageParseError, match="malformed Claude usage field"):
+        parse_claude_stream([json.dumps(terminal)])
+
+
 def test_sink_uses_private_modes_and_refuses_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -174,6 +212,27 @@ def test_sink_uses_private_modes_and_refuses_symlink(
     with pytest.raises(CaptureUsageError, match="securely open"):
         append_record(link, _task_record())
     assert not target.exists()
+
+
+def test_sink_refuses_nested_symlink_and_accepts_nested_real_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Intermediate sink components cannot redirect records outside the cwd."""
+    monkeypatch.chdir(tmp_path)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    Path("jump").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(CaptureUsageError, match="securely open"):
+        append_record(Path("jump/nested/usage.jsonl"), _task_record())
+    assert not (outside / "nested" / "usage.jsonl").exists()
+
+    sink = Path("real/nested/usage.jsonl")
+    append_record(sink, _task_record())
+    assert sink.exists()
+    assert stat.S_IMODE(sink.parent.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(sink.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(sink.stat().st_mode) == 0o600
 
 
 def test_capacity_and_outcome_commands_persist_closed_metadata(
@@ -274,3 +333,17 @@ def test_sink_path_rejects_absolute_or_traversal_content() -> None:
                 "../not-allowed.jsonl",
             ]
         )
+
+
+def test_cli_filesystem_errors_do_not_echo_untrusted_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CLI filesystem failures report a fixed category without path disclosure."""
+    monkeypatch.chdir(tmp_path)
+    sentinel = "SENTINEL_PATH_CONTENT"
+    with pytest.raises(SystemExit) as error:
+        main(["parse-codex", sentinel])
+    captured = capsys.readouterr()
+    assert sentinel not in str(error.value)
+    assert sentinel not in captured.err
+    assert "local filesystem operation failed" in str(error.value)

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import stat
 import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -62,6 +61,40 @@ def _sink_path(value: str) -> Path:
     return path
 
 
+def _open_sink_parent(path: Path) -> tuple[int, str]:
+    """Open or create the relative sink parent without following symlinks."""
+    if (
+        not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+        or os.open not in os.supports_dir_fd
+        or os.mkdir not in os.supports_dir_fd
+    ):
+        raise CaptureUsageError("platform cannot securely traverse usage sink directories")
+    if not path.parts or path.name in {"", "."}:
+        raise CaptureUsageError("sink path must name a file")
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(".", flags)
+    try:
+        for component in path.parts[:-1]:
+            try:
+                child_descriptor = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                child_descriptor = os.open(component, flags, dir_fd=descriptor)
+            try:
+                os.fchmod(child_descriptor, 0o700)
+            except OSError:
+                os.close(child_descriptor)
+                raise
+            os.close(descriptor)
+            descriptor = child_descriptor
+    except OSError:
+        os.close(descriptor)
+        raise
+    return descriptor, path.name
+
+
 def append_record(path: Path, record: UsageRecord) -> None:
     """Validate and append one record through a private, no-follow JSONL sink.
 
@@ -75,29 +108,30 @@ def append_record(path: Path, record: UsageRecord) -> None:
     if path.is_absolute() or ".." in path.parts:
         raise CaptureUsageError("sink path must be relative and non-traversing")
     validated = USAGE_RECORD_ADAPTER.validate_python(record)
-    directory = path.parent
+    parent_descriptor: int | None = None
+    descriptor: int | None = None
     try:
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        directory_status = directory.lstat()
-        if stat.S_ISLNK(directory_status.st_mode) or not stat.S_ISDIR(directory_status.st_mode):
-            raise CaptureUsageError("usage sink directory is not a real directory")
-        os.chmod(directory, 0o700)
-        if not hasattr(os, "O_NOFOLLOW"):
-            raise CaptureUsageError("platform does not support no-follow usage sink opens")
+        parent_descriptor, filename = _open_sink_parent(path)
         descriptor = os.open(
-            path,
+            filename,
             os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW,
             0o600,
+            dir_fd=parent_descriptor,
         )
-    except OSError as exc:
+    except (CaptureUsageError, OSError) as exc:
         raise CaptureUsageError("could not securely open usage sink") from exc
+    finally:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
     try:
+        assert descriptor is not None
         os.fchmod(descriptor, 0o600)
         os.write(descriptor, (validated.model_dump_json() + "\n").encode("utf-8"))
     except OSError as exc:
         raise CaptureUsageError("could not append usage record") from exc
     finally:
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _print_parsed_json(value: object) -> None:
@@ -236,14 +270,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     try:
         return int(arguments.handler(arguments))
-    except (
-        CaptureUsageError,
-        CodexUsageParseError,
-        ClaudeUsageParseError,
-        OSError,
-        ValueError,
-    ) as exc:
+    except CaptureUsageError as exc:
         _exit_with_error(str(exc))
+    except CodexUsageParseError:
+        _exit_with_error("Codex usage stream is invalid")
+    except ClaudeUsageParseError:
+        _exit_with_error("Claude usage stream is invalid")
+    except OSError:
+        _exit_with_error("local filesystem operation failed")
+    except ValueError:
+        _exit_with_error("metadata input is invalid")
 
 
 if __name__ == "__main__":

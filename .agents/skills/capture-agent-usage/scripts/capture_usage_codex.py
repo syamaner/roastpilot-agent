@@ -37,7 +37,7 @@ def _event_from_line(line: str) -> Mapping[str, Any]:
     if not isinstance(event_type, str):
         raise CodexUsageParseError("Codex event is missing a string type discriminator")
     if event_type not in CODEX_EVENT_TYPES:
-        raise CodexUsageParseError(f"unknown Codex event type: {event_type}")
+        raise CodexUsageParseError("unknown Codex event type")
     return event
 
 

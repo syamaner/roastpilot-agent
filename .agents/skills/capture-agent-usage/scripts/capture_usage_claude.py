@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -58,7 +59,12 @@ def _non_negative_integer(value: object, field: str) -> int:
 
 def _non_negative_number(value: object, field: str) -> float:
     """Validate a client-side estimate while rejecting booleans and negatives."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
         raise ClaudeUsageParseError(f"malformed Claude usage field: {field}")
     return float(value)
 
@@ -75,11 +81,11 @@ def _event_from_line(line: str) -> Mapping[str, Any]:
     if not isinstance(event_type, str):
         raise ClaudeUsageParseError("Claude event is missing a string type discriminator")
     if event_type not in CLAUDE_EVENT_TYPES:
-        raise ClaudeUsageParseError(f"unknown Claude event type: {event_type}")
+        raise ClaudeUsageParseError("unknown Claude event type")
     if event_type == "system":
         subtype = event.get("subtype")
         if subtype not in CLAUDE_SYSTEM_SUBTYPES:
-            raise ClaudeUsageParseError(f"unknown Claude system subtype: {subtype}")
+            raise ClaudeUsageParseError("unknown Claude system subtype")
     return event
 
 
