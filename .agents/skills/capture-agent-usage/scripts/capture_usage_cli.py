@@ -328,7 +328,16 @@ def _launch_argv(
 ) -> list[str]:
     """Build the fixed, closed harness argv with stdin prompt delivery."""
     if harness is HarnessFamily.CODEX:
-        argv = [executable, "exec", "--json", "--ephemeral", "--model", model]
+        argv = [
+            executable,
+            "exec",
+            "--json",
+            "--ephemeral",
+            "--sandbox",
+            "read-only",
+            "--model",
+            model,
+        ]
         argv.extend(["-c", "agents.enabled=false"])
         if effort is not None:
             argv.extend(["-c", f'model_reasoning_effort="{effort}"'])
@@ -340,6 +349,10 @@ def _launch_argv(
         "stream-json",
         "--verbose",
         "--no-session-persistence",
+        "--tools",
+        "",
+        "--permission-mode",
+        "plan",
         "--model",
         model,
     ]
@@ -479,6 +492,8 @@ def run_command(arguments: argparse.Namespace) -> int:
 
 def _validate_run_metadata(arguments: argparse.Namespace) -> None:
     """Validate every caller-supplied record field before external launch."""
+    if arguments.role in {"engineer-be", "engineer-fe", "repair"}:
+        raise CaptureUsageError("measurement capture role is not permitted")
     if arguments.effort is not None and arguments.effort not in _SUPPORTED_EFFORTS:
         raise CaptureUsageError("effort is not supported by the selected harness")
     now = _utc_now()

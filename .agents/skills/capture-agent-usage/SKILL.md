@@ -17,8 +17,8 @@ frozen parser grammar, and `annotate-outcome` after final gates to record closed
 counts and rework metadata. The default `.agent-usage/usage.jsonl` is local-only and
 gitignored.
 
-For an explicitly authorized implementation task, the parent may use `run` with a
-maintainer-selected `--prompt-file` and explicit task, slice, harness, role, model,
-repository, branch, and SHA metadata; effort, parent, and whole-tree fields are optional.
-It sends that prompt only to the selected provider on stdin and records normalized
-metadata and usage totals only.
+`run` is measurement and validation only: never use it for implementation or repair.
+Its maintainer-selected `--prompt-file` is sent only to the selected provider on stdin,
+while normalized metadata and usage totals are recorded. The `role` field is
+caller-supplied attribution metadata, never agent selection; native named-agent dispatch
+remains required for implementation slices.

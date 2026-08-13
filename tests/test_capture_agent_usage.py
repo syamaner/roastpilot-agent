@@ -476,7 +476,7 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
                 "--slice-id",
                 "capture",
                 "--role",
-                "engineer-be",
+                "validation",
                 "--model",
                 "gpt-5.6-terra",
                 "--effort",
@@ -499,6 +499,8 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
         "exec",
         "--json",
         "--ephemeral",
+        "--sandbox",
+        "read-only",
         "--model",
         "gpt-5.6-terra",
         "-c",
@@ -535,6 +537,10 @@ def test_launch_argv_uses_fixed_claude_flags_and_closed_effort_mapping() -> None
         "stream-json",
         "--verbose",
         "--no-session-persistence",
+        "--tools",
+        "",
+        "--permission-mode",
+        "plan",
         "--model",
         "opus",
         "--effort",
@@ -547,6 +553,8 @@ def test_launch_argv_uses_fixed_claude_flags_and_closed_effort_mapping() -> None
         "exec",
         "--json",
         "--ephemeral",
+        "--sandbox",
+        "read-only",
         "--model",
         "terra",
         "-c",
@@ -689,7 +697,7 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
             "--slice-id",
             "capture",
             "--role",
-            "engineer-be",
+            "validation",
             "--model",
             "gpt-5.6-terra",
             "--repository",
@@ -945,7 +953,7 @@ def test_invalid_cli_metadata_rejects_before_executable_lookup(
         "--slice-id",
         "capture",
         "--role",
-        "engineer-be",
+        "validation",
         "--model",
         "gpt-5.6-terra",
         "--repository",
@@ -1001,7 +1009,7 @@ def test_provider_free_executable_integration_captures_only_normalized_usage(
                 "--slice-id",
                 "capture",
                 "--role",
-                "engineer-be",
+                "validation",
                 "--model",
                 "gpt-5.6-terra",
                 "--repository",
@@ -1119,7 +1127,7 @@ def test_run_timeout_kills_and_reaps_term_ignoring_child_without_a_record(
                 "--slice-id",
                 "capture",
                 "--role",
-                "engineer-be",
+                "validation",
                 "--model",
                 "gpt-5.6-terra",
                 "--repository",
@@ -1175,7 +1183,7 @@ def test_prompt_cap_and_read_failure_reject_before_spawn_without_echoing_content
                 "--slice-id",
                 "capture",
                 "--role",
-                "engineer-be",
+                "validation",
                 "--model",
                 "gpt-5.6-terra",
                 "--repository",
@@ -1211,7 +1219,7 @@ def test_prompt_cap_and_read_failure_reject_before_spawn_without_echoing_content
                 "--slice-id",
                 "capture",
                 "--role",
-                "engineer-be",
+                "validation",
                 "--model",
                 "gpt-5.6-terra",
                 "--repository",
@@ -1252,11 +1260,51 @@ def test_run_rejects_unsupported_effort_before_executable_lookup(
                 "--slice-id",
                 "capture",
                 "--role",
-                "engineer-be",
+                "validation",
                 "--model",
                 "gpt-5.6-terra",
                 "--effort",
                 "unsafe",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
+
+
+@pytest.mark.parametrize("role", ["engineer-be", "engineer-fe", "repair"])
+def test_run_rejects_protected_implementation_roles_before_lookup(
+    role: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Measurement capture cannot select an implementation or repair role."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"safe")
+
+    def fail_which(_: str) -> str:
+        raise AssertionError("protected role must reject before executable lookup")
+
+    monkeypatch.setattr(usage_cli.shutil, "which", fail_which)
+    with pytest.raises(SystemExit, match="role is not permitted"):
+        main(
+            [
+                "run",
+                "--harness",
+                "codex",
+                "--prompt-file",
+                "prompt",
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                role,
+                "--model",
+                "gpt-5.6-terra",
                 "--repository",
                 "syamaner/roastpilot-agent",
                 "--branch",
@@ -1298,7 +1346,7 @@ def test_run_rejects_non_regular_or_symlink_prompt_before_launch(
                 "--slice-id",
                 "capture",
                 "--role",
-                "engineer-be",
+                "validation",
                 "--model",
                 "gpt-5.6-terra",
                 "--repository",

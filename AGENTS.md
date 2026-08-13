@@ -802,7 +802,7 @@ operator; do not silently substitute self-review or another same-family lens.
   | `roast-review` | After a roast — debrief the trace against profile targets |
   | `register-roast` | After a roast — capture the operator rating (D42) and register the run as a labelled fixture |
   | `add-bean-profile` | Add a bean profile from a supplier product URL plus the operator's specifics |
-  | `capture-agent-usage` | Opt-in, top-level-Codex-parent-only local usage metadata capture; leaves must never invoke it to cross the family boundary |
+  | `capture-agent-usage` | Opt-in, top-level-Codex-parent-only measurement/validation metadata capture; never implementation or repair. Its role is caller attribution, not agent selection; native named-agent dispatch remains required for slices. |
 - **Workflows** (`.claude/workflows/`): `review-branch` remains unchanged but
   dormant and unavailable during the D158 pilot; use the risk routing above.
 - **MCP** (`.mcp.json`): the Microsoft **Playwright MCP** (`@playwright/mcp`) —
