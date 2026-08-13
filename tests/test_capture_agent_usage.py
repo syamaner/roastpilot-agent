@@ -66,7 +66,7 @@ def _task_record() -> TaskUsageRecord:
         task_id="811",
         slice_id="capture-usage",
         harness=HarnessFamily.CODEX,
-        role="engineer-be",
+        role="measurement-pilot",
         model="gpt-5.6-terra",
         repository="syamaner/roastpilot-agent",
         branch="feature/811-capture-agent-usage",
@@ -620,7 +620,7 @@ def test_record_builder_preserves_explicit_whole_tree_verification() -> None:
         task_id="811",
         slice_id="capture",
         harness=HarnessFamily.CODEX,
-        role="engineer-be",
+        role="measurement-pilot",
         model="gpt-5.6-terra",
         effort=None,
         repository="syamaner/roastpilot-agent",
@@ -1277,7 +1277,10 @@ def test_run_rejects_unsupported_effort_before_executable_lookup(
         )
 
 
-@pytest.mark.parametrize("role", ["engineer-be", "engineer-fe", "repair"])
+@pytest.mark.parametrize(
+    "role",
+    ["engineer-be", "engineer-fe", "repair", "Engineer-BE", "REPAIR", "engineer_be", "engineer.fe"],
+)
 def test_run_rejects_protected_implementation_roles_before_lookup(
     role: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1315,6 +1318,30 @@ def test_run_rejects_protected_implementation_roles_before_lookup(
                 "4a3cca6",
             ]
         )
+
+
+@pytest.mark.parametrize("role", ["measurement-pilot", "repair-audit", "engineer-be-audit"])
+def test_run_allows_neutral_or_near_miss_attribution_roles(role: str) -> None:
+    """Only normalized exact protected role names are denied."""
+    assert (
+        usage_cli._validate_run_metadata(  # pyright: ignore[reportPrivateUsage]
+            argparse.Namespace(
+                task_id="811",
+                slice_id="capture",
+                harness=HarnessFamily.CODEX,
+                role=role,
+                model="gpt-5.6-terra",
+                effort=None,
+                repository="syamaner/roastpilot-agent",
+                branch="feature/811",
+                base_sha="2bed7013",
+                head_sha="4a3cca6",
+                whole_tree_verified=False,
+                parent_task_id=None,
+            )
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("value", [Path("prompt-link"), Path("prompt-dir")])

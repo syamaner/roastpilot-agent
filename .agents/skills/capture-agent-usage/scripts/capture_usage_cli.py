@@ -492,7 +492,8 @@ def run_command(arguments: argparse.Namespace) -> int:
 
 def _validate_run_metadata(arguments: argparse.Namespace) -> None:
     """Validate every caller-supplied record field before external launch."""
-    if arguments.role in {"engineer-be", "engineer-fe", "repair"}:
+    normalized_role = arguments.role.casefold().replace("_", "-").replace(".", "-")
+    if normalized_role in {"engineer-be", "engineer-fe", "repair"}:
         raise CaptureUsageError("measurement capture role is not permitted")
     if arguments.effort is not None and arguments.effort not in _SUPPORTED_EFFORTS:
         raise CaptureUsageError("effort is not supported by the selected harness")
