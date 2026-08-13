@@ -180,6 +180,20 @@ def test_synthetic_module_and_package_name_collision_fails_guard(tmp_path: Path)
         tooling_coverage.require_unique_module_stems(tmp_path, ("src", "scripts"))
 
 
+def test_synthetic_module_and_namespace_package_collision_fails_guard(tmp_path: Path) -> None:
+    """A direct namespace package shadows a flattened root module name."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "shared_name.py").touch()
+    namespace = tmp_path / "scripts" / "shared_name"
+    namespace.mkdir(parents=True)
+    (namespace / "child.py").touch()
+    (namespace / "__pycache__").mkdir()
+    (namespace / "__pycache__" / "ignored.py").touch()
+
+    with pytest.raises(ValueError, match="shared_name"):
+        tooling_coverage.require_unique_module_stems(tmp_path, ("src", "scripts"))
+
+
 def test_current_flattened_roots_have_unique_module_stems() -> None:
     """Current direct modules from flattened roots do not shadow one another."""
     tooling_coverage.require_unique_module_stems(

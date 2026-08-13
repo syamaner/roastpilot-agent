@@ -67,9 +67,21 @@ def duplicate_module_stems(repo_root: Path, roots: Iterable[str]) -> dict[str, t
                 continue
             found[module.stem].append(root)
         for package in sorted(root_path.iterdir()):
-            if package.is_dir() and (package / "__init__.py").is_file():
+            if _is_importable_top_level_package(package):
                 found[package.name].append(root)
     return {stem: tuple(root_list) for stem, root_list in found.items() if len(root_list) > 1}
+
+
+def _is_importable_top_level_package(path: Path) -> bool:
+    """Return whether a direct child can provide one importable package name."""
+    if not path.is_dir() or not path.name.isidentifier() or path.name == "__pycache__":
+        return False
+    if (path / "__init__.py").is_file():
+        return True
+    return any(
+        module.is_file() and "__pycache__" not in module.relative_to(path).parts
+        for module in path.rglob("*.py")
+    )
 
 
 def require_unique_module_stems(repo_root: Path, roots: Iterable[str]) -> None:
