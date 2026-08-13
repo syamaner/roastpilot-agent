@@ -198,6 +198,21 @@ def test_codex_updated_and_failed_events_are_recognized_without_terminal_usage()
         parse_codex_stream(_stream('{"type":"item.updated"}\n{"type":"turn.failed"}\n'))
 
 
+@pytest.mark.parametrize(
+    "stream",
+    [
+        _codex_terminal_event() + b'{"type":"turn.failed"}\n',
+        b'{"type":"turn.failed"}\n' + _codex_terminal_event(),
+        b'{"type":"turn.failed"}\n{"type":"turn.failed"}\n',
+        _codex_terminal_event() + _codex_terminal_event(),
+    ],
+)
+def test_codex_multiple_terminal_markers_fail_closed(stream: bytes) -> None:
+    """Failed and completed terminal markers cannot coexist or repeat in either order."""
+    with pytest.raises(CodexUsageParseError, match="multiple Codex terminal"):
+        parse_codex_stream(BytesIO(stream))
+
+
 def test_nonzero_recognized_codex_failure_appends_one_incomplete_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -271,6 +286,7 @@ def test_nonzero_recognized_codex_failure_appends_one_incomplete_record(
                 "2bed7013",
                 "--head-sha",
                 "4a3cca6",
+                "--whole-tree-verified",
             ]
         )
         == 0
@@ -280,6 +296,7 @@ def test_nonzero_recognized_codex_failure_appends_one_incomplete_record(
     record = json.loads(records[0])
     assert not record["success"] and not record["usage_complete"]
     assert record["input_tokens"] is None and record["estimated_usd"] is None
+    assert not record["whole_tree_verified"]
 
 
 def test_binary_stream_ingestion_rejects_overlong_partial_and_invalid_utf8_events() -> None:
@@ -934,6 +951,22 @@ def test_task_usage_record_rejects_exit_and_harness_family_mislabeling() -> None
                 ],
             }
         )
+    with pytest.raises(ValidationError, match="whole-tree"):
+        TaskUsageRecord.model_validate(
+            {
+                **base,
+                "exit_code": 1,
+                "success": False,
+                "usage_complete": False,
+                "whole_tree_verified": True,
+                "input_tokens": None,
+                "cached_input_tokens": None,
+                "cache_creation_input_tokens": None,
+                "output_tokens": None,
+                "reasoning_output_tokens": None,
+                "estimated_usd": None,
+            }
+        )
 
 
 def test_record_builder_preserves_explicit_whole_tree_verification() -> None:
@@ -955,7 +988,7 @@ def test_record_builder_preserves_explicit_whole_tree_verification() -> None:
         whole_tree_verified=True,
     )
     record = usage_cli._record_from_usage(  # pyright: ignore[reportPrivateUsage]
-        arguments, "0.147.0", 0, ParsedUsage(input_tokens=1), 0
+        arguments, "0.147.0", 0, ParsedUsage(input_tokens=1), now, 0
     )
     assert record.whole_tree_verified
 
@@ -980,9 +1013,8 @@ def test_record_elapsed_ms_uses_monotonic_value_despite_wall_clock_regression(
         parent_task_id=None,
         whole_tree_verified=False,
     )
-    monkeypatch.setattr(usage_cli, "_utc_now", lambda: started - timedelta(seconds=5))
     record = usage_cli._record_from_usage(  # pyright: ignore[reportPrivateUsage]
-        arguments, "0.147.0", 0, ParsedUsage(input_tokens=1), 250
+        arguments, "0.147.0", 0, ParsedUsage(input_tokens=1), started - timedelta(seconds=5), 250
     )
     assert record.completed_at < record.started_at
     assert record.elapsed_ms == 250
@@ -1078,7 +1110,7 @@ def test_worktree_metadata_canonicalizes_short_shas_before_record_build(
     _REAL_VALIDATE_WORKTREE_METADATA(arguments)
     assert (arguments.head_sha, arguments.base_sha) == (head, base)
     record = usage_cli._record_from_usage(  # pyright: ignore[reportPrivateUsage]
-        arguments, "0.147.0", 0, ParsedUsage(input_tokens=1), 1
+        arguments, "0.147.0", 0, ParsedUsage(input_tokens=1), arguments.started_at, 1
     )
     assert (record.head_sha, record.base_sha) == (head, base)
 
@@ -1311,6 +1343,96 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
         assert result is None and "worktree is not clean" in error
         assert validations == 2
         assert not (tmp_path / ".agent-usage/usage.jsonl").exists()
+
+
+@pytest.mark.parametrize("output", [_codex_terminal_event(), b'{"type":"turn.started"}\n'])
+def test_run_elapsed_snapshot_precedes_post_run_revalidation(
+    output: bytes, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Slow post-run admission cannot inflate complete or incomplete harness elapsed time."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"safe")
+    ticks = iter((0.0, 0.125, 99.0))
+    monkeypatch.setattr(usage_cli.time, "monotonic", lambda: next(ticks))
+    validations = 0
+
+    class Input:
+        """Minimal successful prompt pipe."""
+
+        closed = False
+
+        def write(self, value: bytes) -> int:
+            return len(value)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Process:
+        """Completed provider-free process stream."""
+
+        def __init__(self, stream: bytes, code: int) -> None:
+            self.stdin = Input()
+            self.stdout = BytesIO(stream)
+            self.code = code
+
+        def poll(self) -> int:
+            return self.code
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return self.code
+
+        def terminate(self) -> None:
+            raise AssertionError("completed process must not terminate")
+
+        def kill(self) -> None:
+            raise AssertionError("completed process must not kill")
+
+    def fake_popen(argv: list[str], **_: object) -> Process:
+        return Process(b"codex 0.147.0\n", 0) if argv[-1] == "--version" else Process(output, 1)
+
+    def revalidate(_: argparse.Namespace) -> None:
+        nonlocal validations
+        validations += 1
+        if validations == 2:
+            assert next(ticks) == 99.0
+
+    def fake_which(_name: str) -> str:
+        return "/stub/codex"
+
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(usage_cli.shutil, "which", fake_which)
+    monkeypatch.setattr(usage_cli, "_validate_worktree_metadata", revalidate)
+    assert (
+        main(
+            [
+                "run",
+                "--harness",
+                "codex",
+                "--prompt-file",
+                "prompt",
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                "measurement-pilot",
+                "--model",
+                "gpt-5.6-terra",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
+        == 0
+    )
+    record = json.loads((tmp_path / ".agent-usage/usage.jsonl").read_text())
+    assert record["elapsed_ms"] == 125
 
 
 @pytest.mark.parametrize(

@@ -476,11 +476,15 @@ def _launch_argv(
 
 
 def _record_from_usage(
-    arguments: argparse.Namespace, version: str, exit_code: int, usage: ParsedUsage, elapsed_ms: int
+    arguments: argparse.Namespace,
+    version: str,
+    exit_code: int,
+    usage: ParsedUsage,
+    completed_at: datetime,
+    elapsed_ms: int,
 ) -> TaskUsageRecord:
     """Build one closed task record from explicit metadata and parsed usage only."""
     started_at = arguments.started_at
-    completed_at = _utc_now()
     return TaskUsageRecord(
         captured_at=completed_at,
         task_id=arguments.task_id,
@@ -563,6 +567,7 @@ def run_command(arguments: argparse.Namespace) -> int:
             if exit_code == 0:
                 raise CaptureUsageError("successful harness run has no terminal usage") from None
             completed_at = _utc_now()
+            elapsed_ms = int((time.monotonic() - started_monotonic) * 1000)
             _validate_worktree_metadata(arguments)
             append_record(
                 arguments.output,
@@ -580,12 +585,12 @@ def run_command(arguments: argparse.Namespace) -> int:
                     head_sha=arguments.head_sha,
                     started_at=started_at,
                     completed_at=completed_at,
-                    elapsed_ms=int((time.monotonic() - started_monotonic) * 1000),
+                    elapsed_ms=elapsed_ms,
                     exit_code=exit_code,
                     success=False,
                     harness_version=version,
                     usage_complete=False,
-                    whole_tree_verified=arguments.whole_tree_verified,
+                    whole_tree_verified=False,
                     parent_task_id=arguments.parent_task_id,
                 ),
             )
@@ -595,6 +600,8 @@ def run_command(arguments: argparse.Namespace) -> int:
         exit_code = process.wait(timeout=LAUNCH_TIMEOUT_SECONDS)
         if timed_out.is_set():
             raise CaptureUsageError("harness run timed out")
+        completed_at = _utc_now()
+        elapsed_ms = int((time.monotonic() - started_monotonic) * 1000)
         _validate_worktree_metadata(arguments)
         append_record(
             arguments.output,
@@ -603,7 +610,8 @@ def run_command(arguments: argparse.Namespace) -> int:
                 version,
                 exit_code,
                 usage,
-                int((time.monotonic() - started_monotonic) * 1000),
+                completed_at,
+                elapsed_ms,
             ),
         )
         return 0
@@ -653,7 +661,7 @@ def _validate_run_metadata(arguments: argparse.Namespace) -> None:
         exit_code=1,
         success=False,
         harness_version="0.0.0",
-        usage_complete=False,
+        usage_complete=True,
         whole_tree_verified=arguments.whole_tree_verified,
         parent_task_id=arguments.parent_task_id,
     )

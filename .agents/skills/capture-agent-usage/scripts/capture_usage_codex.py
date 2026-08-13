@@ -76,15 +76,19 @@ def parse_codex_stream(stream: BinaryIO) -> ParsedUsage:
         CodexUsageParseError: If the event grammar, usage object, or terminal event is invalid.
     """
     parsed: ParsedUsage | None = None
+    terminal_marker_seen = False
     try:
         for line in bounded_jsonl_lines(stream):
             if not line.strip():
                 raise CodexUsageParseError("blank Codex JSONL event")
             event = _event_from_line(line)
-            if event["type"] != "turn.completed":
+            if event["type"] not in {"turn.failed", "turn.completed"}:
                 continue
-            if parsed is not None:
+            if terminal_marker_seen:
                 raise CodexUsageParseError("multiple Codex terminal usage events")
+            terminal_marker_seen = True
+            if event["type"] == "turn.failed":
+                continue
             usage = event.get("usage")
             if not isinstance(usage, dict):
                 raise CodexUsageParseError("Codex turn.completed event is missing usage")

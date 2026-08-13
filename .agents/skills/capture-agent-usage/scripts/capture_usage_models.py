@@ -227,6 +227,8 @@ class TaskUsageRecord(CaptureModel):
             )
         ):
             raise ValueError("incomplete usage must not invent partial token or cost totals")
+        if not self.usage_complete and self.whole_tree_verified:
+            raise ValueError("incomplete usage cannot claim whole-tree verification")
         if self.harness is HarnessFamily.CODEX and self.claude_model_usage is not None:
             raise ValueError("Codex records must not contain Claude model usage")
         if self.harness is HarnessFamily.CLAUDE and self.reasoning_output_tokens is not None:
