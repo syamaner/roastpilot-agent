@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import BinaryIO, cast
 
 import capture_usage_cli as usage_cli
+import capture_usage_codex as usage_codex
 import pytest
 from capture_usage_claude import (
     CLAUDE_EVENT_TYPES,
@@ -464,6 +465,20 @@ def test_codex_utf8_errors_do_not_chain_raw_provider_bytes(stream: bytes) -> Non
     assert exception.__context__ is None
     assert exception.__suppress_context__
     assert "SENTINEL" not in repr(exception.args)
+
+
+def test_malformed_retained_codex_json_does_not_chain_raw_provider_text() -> None:
+    """A retained JSON decoder failure exposes neither sentinel text nor decoder context."""
+    sentinel = "RETAINED_JSON_SENTINEL"
+    with pytest.raises(CodexUsageParseError, match="malformed Codex JSONL event") as error:
+        usage_codex._event_from_line(  # pyright: ignore[reportPrivateUsage]
+            f'{{"type":"turn.started","payload":"{sentinel}",}}'
+        )
+    exception = error.value
+    assert exception.__cause__ is None
+    assert exception.__context__ is None
+    assert exception.__suppress_context__
+    assert sentinel not in repr(exception.args)
 
 
 def test_binary_stream_ingestion_rejects_event_count_and_total_byte_overflow() -> None:
@@ -923,6 +938,26 @@ def test_fifo_inputs_fail_promptly_before_parse_or_provider_lookup(
             ]
         )
     assert not (tmp_path / ".agent-usage").exists()
+
+
+def test_parse_codex_rejects_final_symlink_without_leaking_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The sanitized parse command refuses a final symlink before reading its target."""
+    monkeypatch.chdir(tmp_path)
+    target = Path("TARGET_PATH_SECRET.jsonl")
+    target.write_text("TARGET_CONTENT_SENTINEL\n")
+    link = Path("SYMLINK_PATH_SECRET.jsonl")
+    link.symlink_to(target)
+
+    with pytest.raises(SystemExit, match="input file cannot be safely opened") as error:
+        main(["parse-codex", str(link)])
+    captured = capsys.readouterr()
+    output = f"{error.value}{captured.out}{captured.err}"
+    assert target.read_text() == "TARGET_CONTENT_SENTINEL\n"
+    assert "TARGET_CONTENT_SENTINEL" not in output
+    assert target.name not in output
+    assert link.name not in output
 
 
 def test_sink_refuses_nested_symlink_and_accepts_nested_real_directory(
