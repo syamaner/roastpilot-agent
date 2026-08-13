@@ -266,7 +266,7 @@ def test_sink_uses_private_modes_and_refuses_symlink(
 ) -> None:
     """The sink is append-only, metadata-only, mode-restricted, and no-follow."""
     monkeypatch.chdir(tmp_path)
-    sink = Path("usage/records.jsonl")
+    sink = Path(".agent-usage/usage/records.jsonl")
     append_record(sink, _task_record())
     append_record(sink, _task_record())
     assert stat.S_IMODE(sink.parent.stat().st_mode) == 0o700
@@ -275,8 +275,9 @@ def test_sink_uses_private_modes_and_refuses_symlink(
     assert len(lines) == 2
     assert json.loads(lines[0])["record_type"] == "TASK_USAGE"
 
-    target = Path("target.jsonl")
-    link = Path("link.jsonl")
+    target = Path(".agent-usage/target.jsonl")
+    link = Path(".agent-usage/link.jsonl")
+    link.parent.mkdir(exist_ok=True)
     link.symlink_to(target)
     with pytest.raises(CaptureUsageError, match="securely open"):
         append_record(link, _task_record())
@@ -290,13 +291,14 @@ def test_sink_refuses_nested_symlink_and_accepts_nested_real_directory(
     monkeypatch.chdir(tmp_path)
     outside = tmp_path.parent / f"{tmp_path.name}-outside"
     outside.mkdir()
-    Path("jump").symlink_to(outside, target_is_directory=True)
+    Path(".agent-usage").mkdir()
+    Path(".agent-usage/jump").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(CaptureUsageError, match="securely open"):
-        append_record(Path("jump/nested/usage.jsonl"), _task_record())
+        append_record(Path(".agent-usage/jump/nested/usage.jsonl"), _task_record())
     assert not (outside / "nested" / "usage.jsonl").exists()
 
-    sink = Path("real/nested/usage.jsonl")
+    sink = Path(".agent-usage/real/nested/usage.jsonl")
     append_record(sink, _task_record())
     assert sink.exists()
     assert stat.S_IMODE(sink.parent.parent.stat().st_mode) == 0o700
@@ -309,7 +311,7 @@ def test_capacity_and_outcome_commands_persist_closed_metadata(
 ) -> None:
     """Capacity avoids raw percentages and outcome rejects unknown review lenses."""
     monkeypatch.chdir(tmp_path)
-    sink = Path("usage.jsonl")
+    sink = Path(".agent-usage/usage.jsonl")
     assert (
         main(
             [
@@ -388,6 +390,28 @@ def test_sink_path_rejects_absolute_or_traversal_content() -> None:
                 "/tmp/not-allowed.jsonl",
             ]
         )
+
+
+@pytest.mark.parametrize(
+    "sink",
+    [
+        Path("src/usage.jsonl"),
+        Path("AGENTS.md"),
+        Path(".agent-usage"),
+        Path(".agent-usage-escape/file"),
+        Path("/private/tmp/usage.jsonl"),
+        Path("../usage.jsonl"),
+    ],
+)
+def test_append_record_rejects_paths_outside_private_sink(
+    sink: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Programmatic capture cannot modify tracked or lookalike path components."""
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(CaptureUsageError, match="confined to .agent-usage"):
+        append_record(sink, _task_record())
+    assert not (tmp_path / "src").exists()
+    assert not (tmp_path / ".agent-usage-escape").exists()
     with pytest.raises(SystemExit):
         main(
             [

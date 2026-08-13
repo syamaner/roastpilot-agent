@@ -31,6 +31,7 @@ from capture_usage_models import (
 )
 
 DEFAULT_SINK = Path(".agent-usage/usage.jsonl")
+SINK_ROOT = ".agent-usage"
 
 
 class CaptureUsageError(ValueError):
@@ -54,11 +55,22 @@ def _parse_time(value: str) -> datetime:
 
 
 def _sink_path(value: str) -> Path:
-    """Reject absolute and traversal sink paths before filesystem access."""
+    """Accept only relative file descendants of the private sink root."""
     path = Path(value)
-    if path.is_absolute() or ".." in path.parts:
-        raise argparse.ArgumentTypeError("sink path must be a relative non-traversing path")
+    if not _is_confined_sink_path(path):
+        raise argparse.ArgumentTypeError("sink path must be a .agent-usage descendant")
     return path
+
+
+def _is_confined_sink_path(path: Path) -> bool:
+    """Return whether ``path`` names a non-traversing file beneath ``.agent-usage``."""
+    return (
+        not path.is_absolute()
+        and ".." not in path.parts
+        and len(path.parts) >= 2
+        and path.parts[0] == SINK_ROOT
+        and path.name not in {"", "."}
+    )
 
 
 def _open_sink_parent(path: Path) -> tuple[int, str]:
@@ -105,8 +117,8 @@ def append_record(path: Path, record: UsageRecord) -> None:
     Raises:
         CaptureUsageError: If the sink is unsafe or cannot be securely opened.
     """
-    if path.is_absolute() or ".." in path.parts:
-        raise CaptureUsageError("sink path must be relative and non-traversing")
+    if not _is_confined_sink_path(path):
+        raise CaptureUsageError("sink path must be confined to .agent-usage")
     validated = USAGE_RECORD_ADAPTER.validate_python(record)
     parent_descriptor: int | None = None
     descriptor: int | None = None
