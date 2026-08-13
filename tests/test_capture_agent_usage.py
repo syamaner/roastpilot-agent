@@ -19,7 +19,14 @@ from typing import BinaryIO, cast
 
 import capture_usage_cli as usage_cli
 import pytest
-from capture_usage_claude import ClaudeUsageParseError, parse_claude_stream
+from capture_usage_claude import (
+    CLAUDE_EVENT_TYPES,
+    CLAUDE_MODEL_USAGE_KEYS,
+    CLAUDE_RESULT_USAGE_KEYS,
+    CLAUDE_SYSTEM_SUBTYPES,
+    ClaudeUsageParseError,
+    parse_claude_stream,
+)
 from capture_usage_cli import CaptureUsageError, append_record, main
 from capture_usage_codex import CodexUsageParseError, parse_codex_stream
 from capture_usage_models import (
@@ -150,6 +157,43 @@ def test_claude_fixture_uses_whole_tree_terminal_model_usage() -> None:
     assert terminal["total_cost_usd"] != usage.estimated_usd
     assert "SANITIZED_MESSAGE" not in usage.model_dump_json()
     assert "SANITIZED_TOOL_RESULT" not in usage.model_dump_json()
+
+
+def test_claude_2_1_231_fixture_matches_frozen_grammar_without_content() -> None:
+    """The admitted Claude fixture changes neither grammar nor retained content."""
+    fixture = FIXTURES / "claude-2.1.231.jsonl"
+    events = [json.loads(line) for line in fixture.read_text().splitlines()]
+    with fixture.open("rb") as stream:
+        usage = parse_claude_stream(stream)
+
+    assert {event["type"] for event in events} <= CLAUDE_EVENT_TYPES
+    assert (
+        frozenset({"system", "user", "assistant", "rate_limit_event", "result"})
+        == CLAUDE_EVENT_TYPES
+    )
+    assert {
+        event["subtype"] for event in events if event["type"] == "system"
+    } <= CLAUDE_SYSTEM_SUBTYPES
+    assert frozenset({"hook_started", "hook_response", "init"}) == CLAUDE_SYSTEM_SUBTYPES
+    terminal = events[-1]
+    assert set(terminal["usage"]) == CLAUDE_RESULT_USAGE_KEYS
+    assert all(
+        set(model_usage) == CLAUDE_MODEL_USAGE_KEYS
+        for model_usage in terminal["modelUsage"].values()
+    )
+    assert usage.input_tokens == 5
+    assert usage.cached_input_tokens == 11
+    assert usage.cache_creation_input_tokens == 13
+    assert usage.output_tokens == 7
+    assert usage.estimated_usd == pytest.approx(0.017)
+    serialized = usage.model_dump_json()
+    for sentinel in ("SANITIZED_MESSAGE", "SANITIZED_RESULT", "request_0", "message_0"):
+        assert sentinel not in serialized
+
+    terminal["usage"]["SANITIZED_MESSAGE"] = 0
+    with pytest.raises(ClaudeUsageParseError) as exc_info:
+        parse_claude_stream(_stream(json.dumps(terminal) + "\n"))
+    assert "SANITIZED_MESSAGE" not in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -1301,7 +1345,7 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
     def run_for(output: bytes, code: int, harness: str = "codex") -> tuple[int | None, str]:
         def fake_popen(argv: list[str], **_: object) -> Process:
             if argv[-1] == "--version":
-                version = "0.147.0" if harness == "codex" else "2.1.228"
+                version = "0.147.0" if harness == "codex" else "2.1.231"
                 return Process(f"{harness} {version}\n".encode(), 0)
             return Process(output, code)
 
@@ -1360,7 +1404,7 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
     assert parsed["input_tokens"] == 16
 
     (tmp_path / ".agent-usage/usage.jsonl").unlink()
-    success_terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
+    success_terminal = json.loads((FIXTURES / "claude-2.1.231.jsonl").read_text().splitlines()[-1])
     result, record = run_for((json.dumps(success_terminal) + "\n").encode(), 0, "claude")
     assert result == 0
     parsed = json.loads(record)
@@ -1541,8 +1585,9 @@ def test_invalid_version_never_spawns_a_run(
     [
         ("codex", "0.146.0"),
         ("codex", "0.148.0"),
-        ("claude", "2.1.227"),
-        ("claude", "2.1.229"),
+        ("claude", "2.1.228"),
+        ("claude", "2.1.230"),
+        ("claude", "2.1.232"),
     ],
 )
 def test_run_rejects_unverified_family_version_before_harness_launch(
