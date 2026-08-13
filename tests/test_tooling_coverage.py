@@ -216,6 +216,24 @@ def test_normalize_coverage_xml_rewrites_tooling_filenames(tmp_path: Path) -> No
     )
 
 
+def test_normalize_coverage_xml_rewrites_nested_tooling_filename(tmp_path: Path) -> None:
+    """A safe rootless package-contained tooling filename resolves once."""
+    coverage_xml = _coverage_fixture(
+        tmp_path, ("helpers/parser.py", "script_only.py", "skill_only.py")
+    )
+    nested = tmp_path / "scripts" / "helpers"
+    nested.mkdir()
+    (nested / "parser.py").touch()
+
+    tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+    assert _coverage_filenames(coverage_xml) == (
+        "scripts/helpers/parser.py",
+        "scripts/script_only.py",
+        ".agents/skills/demo/scripts/skill_only.py",
+    )
+
+
 def test_normalize_coverage_xml_rejects_missing_tooling_match(tmp_path: Path) -> None:
     """An XML filename without a tooling file match fails closed."""
     coverage_xml = _coverage_fixture(tmp_path, ("missing.py",))
@@ -237,6 +255,14 @@ def test_normalize_coverage_xml_rejects_ambiguous_tooling_match(tmp_path: Path) 
 def test_normalize_coverage_xml_rejects_unsafe_filename(tmp_path: Path) -> None:
     """Traversal and non-POSIX filenames fail before filesystem resolution."""
     coverage_xml = _coverage_fixture(tmp_path, ("../escape.py",))
+
+    with pytest.raises(ValueError, match="unsafe"):
+        tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+
+def test_normalize_coverage_xml_rejects_nested_traversal_filename(tmp_path: Path) -> None:
+    """Nested relative names retain the traversal rejection boundary."""
+    coverage_xml = _coverage_fixture(tmp_path, ("helpers/../escape.py",))
 
     with pytest.raises(ValueError, match="unsafe"):
         tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)

@@ -137,18 +137,30 @@ def _normalize_coverage_filename(
         raise ValueError(f"coverage XML filename is unsafe: {filename!r}")
     if filename.startswith(APP_COVERAGE_ROOT):
         return filename
-    if len(path.parts) != 1:
+    if any(filename == root or filename.startswith(f"{root}/") for root in tooling_roots):
         raise ValueError(f"coverage XML filename has an unexpected prefix: {filename!r}")
 
     matches: list[str] = []
     for root in tooling_roots:
         candidate = repo_root / root / filename
         if candidate.exists() or candidate.is_symlink():
+            _require_non_symlink_components(repo_root / root, path, filename)
             _regular_file(candidate, f"coverage XML candidate for {filename!r}")
             matches.append(root)
     if len(matches) != 1:
         raise ValueError(f"coverage XML filename must resolve exactly once: {filename!r}")
     return f"{matches[0]}/{filename}"
+
+
+def _require_non_symlink_components(root: Path, path: PurePosixPath, filename: str) -> None:
+    """Reject a nested tooling candidate whose path escapes through a symlink."""
+    component = root
+    for part in path.parts:
+        component /= part
+        if component.is_symlink():
+            raise ValueError(
+                f"coverage XML candidate for {filename!r} must be a regular non-symlink file"
+            )
 
 
 def _regular_file(path: Path, description: str) -> Path:
