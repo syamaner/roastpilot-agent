@@ -241,6 +241,8 @@ class CapacitySnapshotRecord(CaptureModel):
     schema_version: Literal[1] = AGENT_USAGE_SCHEMA_VERSION
     tool_version: SafeIdentifier = SKILL_VERSION
     captured_at: datetime
+    task_id: SafeIdentifier
+    slice_id: SafeIdentifier
     family: HarnessFamily
     status: CapacityStatus
     source: CapacitySource

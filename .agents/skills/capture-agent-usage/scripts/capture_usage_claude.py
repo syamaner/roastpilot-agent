@@ -35,6 +35,16 @@ CLAUDE_RESULT_USAGE_KEYS = frozenset(
     }
 )
 """Exact terminal usage keys observed in Claude Code 2.1.228."""
+CLAUDE_SUCCESS_SUBTYPE = "success"
+CLAUDE_FAILURE_SUBTYPES = frozenset(
+    {
+        "error_max_turns",
+        "error_max_budget_usd",
+        "error_max_structured_output_retries",
+        "error_during_execution",
+    }
+)
+"""Closed result failure subtypes observed in Claude Code 2.1.228."""
 CLAUDE_MODEL_USAGE_KEYS = frozenset(
     {
         "inputTokens",
@@ -149,7 +159,12 @@ def _finite_sum(values: Iterable[float], field: str) -> float:
 
 def _terminal_usage(event: Mapping[str, Any]) -> ParsedUsage:
     """Validate top-level usage and normalize totals from whole-tree model usage."""
-    if event.get("subtype") != "success" or event.get("is_error") is not False:
+    subtype = event.get("subtype")
+    is_error = event.get("is_error")
+    if not (
+        (subtype == CLAUDE_SUCCESS_SUBTYPE and is_error is False)
+        or (subtype in CLAUDE_FAILURE_SUBTYPES and is_error is True)
+    ):
         raise ClaudeUsageParseError("Claude terminal result status is invalid")
     usage = event.get("usage")
     if not isinstance(usage, dict):

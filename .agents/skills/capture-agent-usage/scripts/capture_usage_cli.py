@@ -117,7 +117,8 @@ def _open_sink_parent(path: Path) -> tuple[int, str]:
             try:
                 child_descriptor = os.open(component, flags, dir_fd=descriptor)
             except FileNotFoundError:
-                os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                with suppress(FileExistsError):
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
                 child_descriptor = os.open(component, flags, dir_fd=descriptor)
             try:
                 os.fchmod(child_descriptor, 0o700)
@@ -554,6 +555,7 @@ def run_command(arguments: argparse.Namespace) -> int:
             if exit_code == 0:
                 raise CaptureUsageError("successful harness run has no terminal usage") from None
             completed_at = _utc_now()
+            _validate_worktree_metadata(arguments)
             append_record(
                 arguments.output,
                 TaskUsageRecord(
@@ -585,6 +587,7 @@ def run_command(arguments: argparse.Namespace) -> int:
         exit_code = process.wait(timeout=LAUNCH_TIMEOUT_SECONDS)
         if timed_out.is_set():
             raise CaptureUsageError("harness run timed out")
+        _validate_worktree_metadata(arguments)
         append_record(
             arguments.output,
             _record_from_usage(
@@ -692,6 +695,8 @@ def snapshot_capacity(arguments: argparse.Namespace) -> int:
         arguments.output,
         CapacitySnapshotRecord(
             captured_at=arguments.captured_at or _utc_now(),
+            task_id=arguments.task_id,
+            slice_id=arguments.slice_id,
             family=arguments.family,
             status=arguments.status,
             source=arguments.source,
@@ -762,6 +767,8 @@ def build_parser() -> argparse.ArgumentParser:
     outcome.set_defaults(handler=annotate_outcome)
 
     capacity = commands.add_parser("snapshot-capacity", help="append qualitative capacity metadata")
+    capacity.add_argument("--task-id", required=True)
+    capacity.add_argument("--slice-id", required=True)
     capacity.add_argument(
         "--family", type=lambda value: _enum_option(HarnessFamily, value), required=True
     )

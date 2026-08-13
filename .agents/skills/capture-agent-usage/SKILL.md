@@ -12,7 +12,7 @@ For a failed harness with recognizable usage, capture exits 0 after appending th
 while the record itself has `success=false`; this indicates capture succeeded, not the task.
 
 Use `scripts/capture_usage_cli.py snapshot-capacity` only for a qualitative capacity
-observation. Use `parse-codex` or `parse-claude` with sanitized streams to verify the
+observation joined to its required task and slice identifiers. Use `parse-codex` or `parse-claude` with sanitized streams to verify the
 frozen parser grammar, and `annotate-outcome` after final gates to record closed finding
 counts and rework metadata joined to the required task and slice identifiers. The default `.agent-usage/usage.jsonl` is local-only and
 gitignored.

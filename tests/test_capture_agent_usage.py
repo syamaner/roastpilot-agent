@@ -379,6 +379,23 @@ def test_claude_terminal_requires_observed_success_status(field: str, value: obj
         parse_claude_stream(_stream(json.dumps(terminal) + "\n"))
 
 
+@pytest.mark.parametrize(
+    "subtype",
+    [
+        "error_max_turns",
+        "error_max_budget_usd",
+        "error_max_structured_output_retries",
+        "error_during_execution",
+    ],
+)
+def test_claude_observed_failure_statuses_retain_terminal_usage(subtype: str) -> None:
+    """Observed failure statuses still provide whole-tree terminal totals for failed runs."""
+    terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
+    terminal["subtype"] = subtype
+    terminal["is_error"] = True
+    assert parse_claude_stream(_stream(json.dumps(terminal) + "\n")).input_tokens == 16
+
+
 def test_claude_malformed_top_level_usage_and_non_finite_model_sum_fail_closed() -> None:
     """Top-level fields remain validated even though modelUsage alone supplies totals."""
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
@@ -479,6 +496,38 @@ def test_sink_rejects_short_os_write(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert len(sink.read_text().splitlines()) == 1
 
 
+def test_sink_parent_retries_a_secure_open_after_concurrent_directory_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A creator winning mkdir's EEXIST race is reopened through the no-follow path."""
+    monkeypatch.chdir(tmp_path)
+    original_mkdir = usage_cli.os.mkdir
+    raced = False
+
+    def create_then_report_race(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            original_mkdir(path, mode, dir_fd=dir_fd)
+            raise FileExistsError
+        original_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(usage_cli.os, "mkdir", create_then_report_race)
+    monkeypatch.setattr(
+        usage_cli.os,
+        "supports_dir_fd",
+        usage_cli.os.supports_dir_fd | {create_then_report_race},
+    )
+    sink = Path(".agent-usage/raced/usage.jsonl")
+    append_record(sink, _task_record())
+    assert raced and sink.exists()
+
+
 def test_sink_rejects_hard_link_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A multiply-linked sink target cannot be modified through capture."""
     monkeypatch.chdir(tmp_path)
@@ -530,6 +579,10 @@ def test_capacity_and_outcome_commands_persist_closed_metadata(
         main(
             [
                 "snapshot-capacity",
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
                 "--family",
                 "codex",
                 "--status",
@@ -564,6 +617,8 @@ def test_capacity_and_outcome_commands_persist_closed_metadata(
     records = [json.loads(line) for line in sink.read_text(encoding="utf-8").splitlines()]
     assert records[0] == CapacitySnapshotRecord(
         captured_at=datetime.fromisoformat(records[0]["captured_at"]),
+        task_id="811",
+        slice_id="capture",
         family=HarnessFamily.CODEX,
         status=CapacityStatus.HEALTHY,
         source=CapacitySource.OPERATOR,
@@ -1054,7 +1109,7 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
         def kill(self) -> None:
             raise AssertionError("completed stub must not kill")
 
-    def run_for(output: bytes, code: int) -> tuple[int | None, str]:
+    def run_for(output: bytes, code: int, harness: str = "codex") -> tuple[int | None, str]:
         def fake_popen(argv: list[str], **_: object) -> Process:
             if argv[-1] == "--version":
                 return Process(b"codex 0.147.0\n", 0)
@@ -1068,7 +1123,7 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
         args = [
             "run",
             "--harness",
-            "codex",
+            harness,
             "--prompt-file",
             "prompt",
             "--task-id",
@@ -1105,6 +1160,16 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
     assert parsed["input_tokens"] == 1
 
     (tmp_path / ".agent-usage/usage.jsonl").unlink()
+    claude_terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
+    claude_terminal["subtype"] = "error_max_turns"
+    claude_terminal["is_error"] = True
+    result, record = run_for((json.dumps(claude_terminal) + "\n").encode(), 3, "claude")
+    assert result == 0
+    parsed = json.loads(record)
+    assert not parsed["success"] and parsed["usage_complete"]
+    assert parsed["input_tokens"] == 16
+
+    (tmp_path / ".agent-usage/usage.jsonl").unlink()
     result, record = run_for(b'{"type":"turn.started"}\n', 3)
     assert result == 0
     parsed = json.loads(record)
@@ -1120,6 +1185,21 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
     assert result is None and "stream is invalid" in error
     assert "SENTINEL" not in error
     assert not (tmp_path / ".agent-usage/usage.jsonl").exists()
+
+    for output in (_codex_terminal_event(), b'{"type":"turn.started"}\n'):
+        validations = 0
+
+        def admit_only_before_launch(_: argparse.Namespace) -> None:
+            nonlocal validations
+            validations += 1
+            if validations == 2:
+                raise CaptureUsageError("current worktree is not clean")
+
+        monkeypatch.setattr(usage_cli, "_validate_worktree_metadata", admit_only_before_launch)
+        result, error = run_for(output, 3)
+        assert result is None and "worktree is not clean" in error
+        assert validations == 2
+        assert not (tmp_path / ".agent-usage/usage.jsonl").exists()
 
 
 @pytest.mark.parametrize(
