@@ -55,7 +55,7 @@ def _task_record() -> TaskUsageRecord:
 
 
 def test_codex_fixture_extracts_terminal_usage_without_content() -> None:
-    """The Codex fixture provides only terminal usage, not content retention."""
+    """A tool-using Codex fixture retains only terminal usage totals."""
     with (FIXTURES / "codex-0.147.0.jsonl").open(encoding="utf-8") as stream:
         usage = parse_codex_stream(stream)
 
@@ -67,6 +67,8 @@ def test_codex_fixture_extracts_terminal_usage_without_content() -> None:
     serialized = usage.model_dump_json()
     assert "SANITIZED_MESSAGE" not in serialized
     assert "item_0" not in serialized
+    assert "SANITIZED_COMMAND" not in serialized
+    assert "SANITIZED_TOOL_OUTPUT" not in serialized
 
 
 def test_claude_fixture_uses_whole_tree_terminal_model_usage() -> None:
@@ -86,6 +88,7 @@ def test_claude_fixture_uses_whole_tree_terminal_model_usage() -> None:
         ("synthetic-secondary", 11),
     ]
     assert "SANITIZED_MESSAGE" not in usage.model_dump_json()
+    assert "SANITIZED_TOOL_RESULT" not in usage.model_dump_json()
 
 
 @pytest.mark.parametrize(
@@ -109,6 +112,28 @@ def test_malformed_or_missing_terminal_usage_fails_closed() -> None:
         parse_claude_stream(['{"type":"assistant"}\n'])
     with pytest.raises(CodexUsageParseError, match="schema"):
         parse_codex_stream(['{"type":"turn.completed","usage":{"input_tokens":1}}\n'])
+
+
+@pytest.mark.parametrize("removed_key", ["speed", "input_tokens"])
+def test_claude_terminal_usage_missing_installed_key_fails_closed(removed_key: str) -> None:
+    """Every installed terminal usage key is required even when not retained."""
+    terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
+    del terminal["usage"][removed_key]
+    with pytest.raises(ClaudeUsageParseError, match="usage schema"):
+        parse_claude_stream([json.dumps(terminal)])
+
+
+def test_claude_terminal_usage_extra_or_model_usage_drift_fails_closed() -> None:
+    """Unknown terminal or per-model schema keys cannot be silently accepted."""
+    terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
+    terminal["usage"]["unknown"] = 0
+    with pytest.raises(ClaudeUsageParseError, match="usage schema"):
+        parse_claude_stream([json.dumps(terminal)])
+
+    terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
+    terminal["modelUsage"]["synthetic-primary"]["unknown"] = 0
+    with pytest.raises(ClaudeUsageParseError, match="modelUsage schema"):
+        parse_claude_stream([json.dumps(terminal)])
 
 
 def test_whole_tree_defaults_false_and_incomplete_usage_rejects_totals() -> None:

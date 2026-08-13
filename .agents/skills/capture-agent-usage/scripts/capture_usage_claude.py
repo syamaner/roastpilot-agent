@@ -8,10 +8,41 @@ from typing import Any
 
 from capture_usage_models import ClaudeModelUsage, EstimateBasis, ParsedUsage
 
-CLAUDE_EVENT_TYPES = frozenset({"system", "assistant", "rate_limit_event", "result"})
-"""Event types observed in the sanitized Claude Code 2.1.228 fixture."""
+CLAUDE_EVENT_TYPES = frozenset({"system", "user", "assistant", "rate_limit_event", "result"})
+"""Opaque event types observed in the sanitized Claude Code 2.1.228 fixture."""
 CLAUDE_SYSTEM_SUBTYPES = frozenset({"hook_started", "hook_response", "init"})
 """System subtypes observed in the sanitized Claude Code 2.1.228 fixture."""
+CLAUDE_RESULT_USAGE_KEYS = frozenset(
+    {
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+        "cache_creation",
+        "inference_geo",
+        "iterations",
+        "output_tokens_details",
+        "server_tool_use",
+        "service_tier",
+        "speed",
+    }
+)
+"""Exact terminal usage keys observed in Claude Code 2.1.228."""
+CLAUDE_MODEL_USAGE_KEYS = frozenset(
+    {
+        "inputTokens",
+        "outputTokens",
+        "cacheReadInputTokens",
+        "cacheCreationInputTokens",
+        "webSearchRequests",
+        "costUSD",
+        "contextWindow",
+        "maxOutputTokens",
+        "canonicalModel",
+        "provider",
+    }
+)
+"""Exact per-model usage keys observed in Claude Code 2.1.228."""
 
 
 class ClaudeUsageParseError(ValueError):
@@ -60,14 +91,7 @@ def _model_usage(model_usage: object) -> tuple[ClaudeModelUsage, ...]:
     for model, usage in model_usage.items():
         if not isinstance(model, str) or not isinstance(usage, dict):
             raise ClaudeUsageParseError("malformed Claude modelUsage entry")
-        required = {
-            "inputTokens",
-            "outputTokens",
-            "cacheReadInputTokens",
-            "cacheCreationInputTokens",
-            "costUSD",
-        }
-        if not required.issubset(usage):
+        if set(usage) != CLAUDE_MODEL_USAGE_KEYS:
             raise ClaudeUsageParseError("malformed Claude modelUsage schema")
         parsed.append(
             ClaudeModelUsage(
@@ -91,13 +115,7 @@ def _terminal_usage(event: Mapping[str, Any]) -> ParsedUsage:
     usage = event.get("usage")
     if not isinstance(usage, dict):
         raise ClaudeUsageParseError("Claude result event is missing usage")
-    expected = {
-        "input_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-        "output_tokens",
-    }
-    if set(usage) != expected:
+    if set(usage) != CLAUDE_RESULT_USAGE_KEYS:
         raise ClaudeUsageParseError("malformed Claude terminal usage schema")
     total_cost = event.get("total_cost_usd")
     return ParsedUsage(

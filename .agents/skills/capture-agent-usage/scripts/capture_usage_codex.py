@@ -9,9 +9,9 @@ from typing import Any
 from capture_usage_models import EstimateBasis, ParsedUsage
 
 CODEX_EVENT_TYPES = frozenset(
-    {"thread.started", "turn.started", "item.completed", "turn.completed"}
+    {"thread.started", "turn.started", "item.started", "item.completed", "turn.completed"}
 )
-"""Event types observed in the sanitized Codex 0.147.0 fixture."""
+"""Opaque event types observed in the sanitized Codex 0.147.0 fixture."""
 
 
 class CodexUsageParseError(ValueError):
