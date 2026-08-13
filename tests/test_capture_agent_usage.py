@@ -1039,12 +1039,59 @@ def test_worktree_metadata_admission_rejects_mismatch_before_provider_lookup(
         _REAL_VALIDATE_WORKTREE_METADATA(arguments)
 
 
+def test_worktree_metadata_canonicalizes_short_shas_before_record_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepted abbreviated input is replaced with resolved full commit identifiers."""
+    head = "a" * 40
+    base = "b" * 40
+    arguments = argparse.Namespace(
+        repository="syamaner/roastpilot-agent",
+        branch="feature/811",
+        head_sha=head[:7],
+        base_sha=base[:7],
+        started_at=datetime(2026, 8, 13, tzinfo=UTC),
+        task_id="811",
+        slice_id="capture",
+        harness=HarnessFamily.CODEX,
+        role="measurement-pilot",
+        model="gpt-5.6-terra",
+        effort=None,
+        parent_task_id=None,
+        whole_tree_verified=False,
+    )
+    expected: dict[tuple[str, ...], tuple[int, str]] = {
+        ("remote", "get-url", "origin"): (0, "https://github.com/syamaner/roastpilot-agent.git"),
+        ("branch", "--show-current"): (0, "feature/811"),
+        ("rev-parse", "HEAD"): (0, head),
+        ("rev-parse", "--verify", f"{head[:7]}^{{commit}}"): (0, head),
+        ("rev-parse", "--verify", f"{base[:7]}^{{commit}}"): (0, base),
+        ("merge-base", "HEAD", "origin/main"): (0, base),
+        ("status", "--porcelain"): (0, ""),
+    }
+
+    def fake_git_output(command: list[str]) -> tuple[int, str]:
+        return expected[tuple(command)]
+
+    monkeypatch.setattr(usage_cli, "_git_output", fake_git_output)
+
+    _REAL_VALIDATE_WORKTREE_METADATA(arguments)
+    assert (arguments.head_sha, arguments.base_sha) == (head, base)
+    record = usage_cli._record_from_usage(  # pyright: ignore[reportPrivateUsage]
+        arguments, "0.147.0", 0, ParsedUsage(input_tokens=1), 1
+    )
+    assert (record.head_sha, record.base_sha) == (head, base)
+
+
 def test_git_output_runs_fixed_subprocess_and_returns_bounded_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The Git admission helper accepts a small, valid fixed-command response."""
+    marker = tmp_path / "argv"
     stub = tmp_path / "git"
-    stub.write_text("#!/bin/sh\nprintf 'expected metadata\\n'\n")
+    stub.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' \"$*\" > '{marker}'\nprintf 'expected metadata\\n'\n"
+    )
     stub.chmod(0o700)
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
 
@@ -1052,6 +1099,24 @@ def test_git_output_runs_fixed_subprocess_and_returns_bounded_text(
         0,
         "expected metadata",
     )
+    assert marker.read_text().strip() == "-c core.fsmonitor=false status --porcelain"
+
+
+def test_git_status_admission_disables_ambient_fsmonitor_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fixed Git config prevents an inherited fsmonitor command from executing."""
+    sentinel = tmp_path / "fsmonitor-ran"
+    hook = tmp_path / "fsmonitor-hook"
+    hook.write_text(f"#!/bin/sh\ntouch '{sentinel}'\n")
+    hook.chmod(0o700)
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.fsmonitor")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(hook))
+
+    status, _ = usage_cli._git_output(["status", "--porcelain"])  # pyright: ignore[reportPrivateUsage]
+    assert status == 0
+    assert not sentinel.exists()
 
 
 @pytest.mark.parametrize(

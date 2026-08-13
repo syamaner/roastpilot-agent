@@ -329,7 +329,7 @@ def _git_output(arguments: list[str]) -> tuple[int, str]:
     timed_out = threading.Event()
     try:
         process = subprocess.Popen(
-            ["git", *arguments],
+            ["git", "-c", "core.fsmonitor=false", *arguments],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -392,6 +392,8 @@ def _validate_worktree_metadata(arguments: argparse.Namespace) -> None:
     status_code, status = _git_output(["status", "--porcelain"])
     if status_code != 0 or status:
         raise CaptureUsageError("current worktree is not clean")
+    arguments.head_sha = head
+    arguments.base_sha = merge_base
 
 
 def _harness_version(executable: str) -> str:
