@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import BinaryIO, cast
 
 import capture_usage_cli as usage_cli
+import capture_usage_codex as usage_codex
 import pytest
 from capture_usage_claude import (
     CLAUDE_EVENT_TYPES,
@@ -28,7 +29,14 @@ from capture_usage_claude import (
     parse_claude_stream,
 )
 from capture_usage_cli import CaptureUsageError, append_record, main
-from capture_usage_codex import CodexUsageParseError, parse_codex_stream
+from capture_usage_codex import (
+    MAX_CODEX_OPAQUE_EVENT_BYTES,
+    MAX_CODEX_OPAQUE_TOTAL_BYTES,
+    MAX_JSON_NESTING_DEPTH,
+    READ_CHUNK_BYTES,
+    CodexUsageParseError,
+    parse_codex_stream,
+)
 from capture_usage_models import (
     MAX_EVENT_BYTES,
     MAX_EVENT_COUNT,
@@ -77,6 +85,116 @@ def _opaque_codex_event(size: int) -> bytes:
     suffix = b'"}\n'
     assert size >= len(prefix) + len(suffix)
     return prefix + (b"x" * (size - len(prefix) - len(suffix))) + suffix
+
+
+def _opaque_item_event(payload_bytes: int) -> bytes:
+    """Return one complete opaque item event with an exact payload byte count."""
+    return b'{"payload":"' + (b"x" * payload_bytes) + b'","type":"item.updated"}\n'
+
+
+class _LazyOpaqueItemStream:
+    """Produce a large item event in bounded read responses without full materialization."""
+
+    def __init__(self, payload_bytes: int, trailer: bytes = b"") -> None:
+        """Initialize a deterministic payload length and bounded read accounting."""
+        self._parts = [
+            b'{"nested":{"type":"ignored"},"type":"item.updated","payload":"',
+            b'"}\n' + trailer,
+        ]
+        self._payload_remaining = payload_bytes
+        self._part_index = 0
+        self._part_offset = 0
+        self.requests: list[int] = []
+
+    def read(self, size: int) -> bytes:
+        """Return at most the requested bytes while never creating a large payload span."""
+        self.requests.append(size)
+        if size > READ_CHUNK_BYTES:
+            raise AssertionError("parser requested an unbounded read")
+        if self._part_index == 0:
+            return self._take_prefix(size)
+        if self._part_index == 1:
+            count = min(size, self._payload_remaining)
+            self._payload_remaining -= count
+            if self._payload_remaining == 0:
+                self._part_index = 2
+            return b"x" * count
+        if self._part_index == 2:
+            return self._take_suffix(size)
+        return b""
+
+    def _take_prefix(self, size: int) -> bytes:
+        """Return the initial structural bytes, preserving chunk boundaries."""
+        prefix = self._parts[0]
+        result = prefix[self._part_offset : self._part_offset + size]
+        self._part_offset += len(result)
+        if self._part_offset == len(prefix):
+            self._part_index = 1
+            self._part_offset = 0
+        return result
+
+    def _take_suffix(self, size: int) -> bytes:
+        """Return the terminal string/object/newline bytes after the large payload."""
+        suffix = self._parts[1]
+        result = suffix[self._part_offset : self._part_offset + size]
+        self._part_offset += len(result)
+        if self._part_offset == len(suffix):
+            self._part_index = 3
+        return result
+
+
+class _LazyTypeFirstStream:
+    """Produce a large retained type-first event while recording bounded consumption."""
+
+    def __init__(self, payload_bytes: int) -> None:
+        """Initialize a retained type-first event whose payload need not materialize."""
+        self._prefix = b'{"type":"turn.started","payload":"'
+        self._payload_remaining = payload_bytes
+        self._suffix = b'"}\n'
+        self._suffix_offset = 0
+        self.consumed = 0
+
+    def read(self, size: int) -> bytes:
+        """Return only bounded slices until the parser rejects this retained event."""
+        if self._prefix:
+            result = self._prefix[:size]
+            self._prefix = self._prefix[len(result) :]
+        elif self._payload_remaining:
+            count = min(size, self._payload_remaining)
+            self._payload_remaining -= count
+            result = b"x" * count
+        elif self._suffix_offset < len(self._suffix):
+            result = self._suffix[self._suffix_offset : self._suffix_offset + size]
+            self._suffix_offset += len(result)
+        else:
+            result = b""
+        self.consumed += len(result)
+        return result
+
+
+class _RepeatedEventStream:
+    """Stream repeated small events without materializing their aggregate byte total."""
+
+    def __init__(self, event: bytes, repeats: int, trailer: bytes) -> None:
+        """Initialize a finite repeated-event source plus a terminal trailer."""
+        self._event = event
+        self._repeats = repeats
+        self._trailer = trailer
+        self._index = 0
+        self._offset = 0
+
+    def read(self, size: int) -> bytes:
+        """Return bounded fragments from the repeated stream."""
+        assert size <= READ_CHUNK_BYTES
+        source = self._event if self._index < self._repeats else self._trailer
+        if self._index > self._repeats:
+            return b""
+        result = source[self._offset : self._offset + size]
+        self._offset += len(result)
+        if self._offset == len(source):
+            self._offset = 0
+            self._index += 1
+        return result
 
 
 def _task_record() -> TaskUsageRecord:
@@ -356,8 +474,40 @@ def test_binary_stream_ingestion_rejects_overlong_partial_and_invalid_utf8_event
         parse_codex_stream(BytesIO(b'{"type":"turn.started"}'))
     with pytest.raises(ClaudeUsageParseError, match="invalid UTF-8"):
         parse_claude_stream(BytesIO(b"\xff\n"))
-    with pytest.raises(CodexUsageParseError, match="malformed Codex JSONL event"):
+    with pytest.raises(CodexUsageParseError, match="malformed Codex JSON"):
         parse_codex_stream(BytesIO(b"{not-json}\n"))
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        b'{"type":"item.updated","payload":"CHUNK_SENTINEL\xff"}\n',
+        b'{"type":"item.updated","payload":"FLUSH_SENTINEL' + b"\xc3",
+    ],
+)
+def test_codex_utf8_errors_do_not_chain_raw_provider_bytes(stream: bytes) -> None:
+    """Chunk and final-flush UTF-8 errors retain no raw provider segment through chaining."""
+    with pytest.raises(CodexUsageParseError, match="usage stream contains invalid UTF-8") as error:
+        parse_codex_stream(BytesIO(stream))
+    exception = error.value
+    assert exception.__cause__ is None
+    assert exception.__context__ is None
+    assert exception.__suppress_context__
+    assert "SENTINEL" not in repr(exception.args)
+
+
+def test_malformed_retained_codex_json_does_not_chain_raw_provider_text() -> None:
+    """A retained JSON decoder failure exposes neither sentinel text nor decoder context."""
+    sentinel = "RETAINED_JSON_SENTINEL"
+    with pytest.raises(CodexUsageParseError, match="malformed Codex JSONL event") as error:
+        usage_codex._event_from_line(  # pyright: ignore[reportPrivateUsage]
+            f'{{"type":"turn.started","payload":"{sentinel}",}}'
+        )
+    exception = error.value
+    assert exception.__cause__ is None
+    assert exception.__context__ is None
+    assert exception.__suppress_context__
+    assert sentinel not in repr(exception.args)
 
 
 def test_binary_stream_ingestion_rejects_event_count_and_total_byte_overflow() -> None:
@@ -385,6 +535,224 @@ def test_binary_stream_ingestion_checks_trailing_schema_after_terminal_usage() -
     """A terminal usage event never suppresses later stream-schema drift."""
     with pytest.raises(CodexUsageParseError, match="unknown Codex event type"):
         parse_codex_stream(BytesIO(_codex_terminal_event() + b'{"type":"unexpected"}\n'))
+
+
+def test_codex_streams_a_five_mebibyte_opaque_item_with_bounded_reads() -> None:
+    """A large nested/type-after-payload item is discarded before terminal usage retention."""
+    stream = _LazyOpaqueItemStream(5 * 1024 * 1024, _codex_terminal_event())
+    usage = parse_codex_stream(stream)
+    assert usage.input_tokens == 1
+    assert max(stream.requests) == READ_CHUNK_BYTES
+    assert len(stream.requests) > 50
+    assert "ignored" not in usage.model_dump_json()
+
+
+def test_codex_rejects_type_first_retained_event_before_multi_mebibyte_consumption() -> None:
+    """A known retained root type cannot consume the opaque eight-mebibyte allowance."""
+    stream = _LazyTypeFirstStream(2 * 1024 * 1024)
+    with pytest.raises(CodexUsageParseError, match="Codex retained event exceeds size limit"):
+        parse_codex_stream(stream)
+    assert MAX_EVENT_BYTES < stream.consumed <= MAX_EVENT_BYTES + READ_CHUNK_BYTES
+
+
+def test_codex_accepts_late_discriminator_opaque_item_within_fixed_budget() -> None:
+    """An item discriminator after a large payload retains its deliberate opaque allowance."""
+    stream = _LazyOpaqueItemStream(2 * 1024 * 1024, _codex_terminal_event())
+    assert parse_codex_stream(stream).input_tokens == 1
+
+
+def test_codex_pipe_read1_rejects_before_writer_eof() -> None:
+    """Buffered pipe parsing handles a type-first oversized event without awaiting writer EOF."""
+    read_fd, write_fd = os.pipe()
+    reader = os.fdopen(read_fd, "rb")
+    writer_may_close = threading.Event()
+    writer_started = threading.Event()
+
+    def write_open_event() -> None:
+        """Write a retained oversized event then deliberately retain the pipe's write end."""
+        payload = b'{"type":"turn.started","payload":"' + (b"x" * (MAX_EVENT_BYTES + 1))
+        writer_started.set()
+        try:
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(write_fd, payload[offset:])
+            writer_may_close.wait(timeout=2)
+        except BrokenPipeError:
+            pass
+        finally:
+            os.close(write_fd)
+
+    writer = threading.Thread(target=write_open_event, daemon=True)
+    writer.start()
+    assert writer_started.wait(timeout=1)
+    try:
+        with pytest.raises(CodexUsageParseError, match="Codex retained event exceeds size limit"):
+            parse_codex_stream(reader)
+    finally:
+        reader.close()
+        writer_may_close.set()
+        writer.join(timeout=2)
+    assert not writer.is_alive()
+
+
+def test_codex_rejects_blank_jsonl_event() -> None:
+    """Whitespace-only Codex JSONL events do not pass scanner completion."""
+    with pytest.raises(CodexUsageParseError, match="blank Codex JSONL event"):
+        parse_codex_stream(BytesIO(b" \t\r\n"))
+
+
+def test_codex_counts_small_items_as_opaque_not_retained_budget() -> None:
+    """Many valid sub-64-KiB item events can exceed the retained budget before a terminal."""
+    item = _opaque_item_event(32_000)
+    usage = parse_codex_stream(BytesIO(item * 40 + _codex_terminal_event()))
+    assert usage.output_tokens == 1
+
+
+def test_codex_opaque_event_and_total_boundaries_are_exact() -> None:
+    """Opaque item event and aggregate byte limits accept exact bounds and reject one over."""
+    prefix = b'{"type":"item.updated","payload":"'
+    suffix = b'"}\n'
+    exact_payload = MAX_CODEX_OPAQUE_EVENT_BYTES - len(prefix) - len(suffix)
+    exact = prefix + (b"x" * exact_payload) + suffix
+    assert parse_codex_stream(BytesIO(exact + _codex_terminal_event())).input_tokens == 1
+    with pytest.raises(CodexUsageParseError, match="opaque event exceeds size limit"):
+        parse_codex_stream(BytesIO(prefix + (b"x" * (exact_payload + 1)) + suffix))
+
+    medium = _opaque_item_event(8_000)
+    repeats = MAX_CODEX_OPAQUE_TOTAL_BYTES // len(medium)
+    assert (
+        parse_codex_stream(
+            _RepeatedEventStream(medium, repeats, _codex_terminal_event())
+        ).input_tokens
+        == 1
+    )
+    with pytest.raises(CodexUsageParseError, match="opaque stream exceeds total byte limit"):
+        parse_codex_stream(_RepeatedEventStream(medium, repeats + 1, _codex_terminal_event()))
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        b'{"type":"turn.completed","payload":"' + (b"x" * MAX_EVENT_BYTES) + b'"}\n',
+        b'{"type":"turn.failed","payload":"' + (b"x" * MAX_EVENT_BYTES) + b'"}\n',
+        b'{"type":"unexpected","payload":"' + (b"x" * MAX_EVENT_BYTES) + b'"}\n',
+        b'{"payload":"' + (b"x" * MAX_EVENT_BYTES) + b'"}\n',
+        b'{"type":7,"payload":"' + (b"x" * MAX_EVENT_BYTES) + b'"}\n',
+    ],
+)
+def test_oversized_non_item_events_fail_closed(event: bytes) -> None:
+    """Terminal, unknown, missing, and non-string discriminators never enter discard mode."""
+    with pytest.raises(CodexUsageParseError) as error:
+        parse_codex_stream(BytesIO(event))
+    assert "x" * 20 not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        b'{"type":"item.updated","type":"item.updated","payload":"x"}\n',
+        b'{"payload":"x","type":"item.updated","type":"item.updated"}\n',
+        b'{"type":"item.updated","payload":"x"} {}\n',
+        b'{"type":"item.updated","payload":"unterminated}\n',
+        b'{"type":"item.updated","payload":"x"}',
+        b'{"type":"item.updated","payload":"\xff"}\n',
+    ],
+)
+def test_opaque_scanner_rejects_ambiguous_or_incomplete_json(event: bytes) -> None:
+    """Discard requires one unambiguous root type and complete strict JSON through newline."""
+    with pytest.raises(CodexUsageParseError) as error:
+        parse_codex_stream(BytesIO(event))
+    assert "payload" not in str(error.value)
+
+
+def test_opaque_scanner_ignores_nested_type_and_counts_discarded_events() -> None:
+    """Only root type counts, while discarded events still consume the global event budget."""
+    item = b'{"nested":{"type":"turn.completed"},"type":"item.updated"}\n'
+    assert parse_codex_stream(BytesIO(item + _codex_terminal_event())).input_tokens == 1
+    with pytest.raises(CodexUsageParseError, match="event count limit"):
+        parse_codex_stream(BytesIO(item * (MAX_EVENT_COUNT + 1)))
+
+
+@pytest.mark.parametrize(
+    "number", [b"0", b"-0", b"1", b"-1.5", b"1e2", b"1e+2", b"1e-2", b"-1.5E+3"]
+)
+def test_opaque_scanner_accepts_rfc_json_number_forms(number: bytes) -> None:
+    """Opaque numeric values follow stdlib JSON's ASCII signed-exponent grammar."""
+    event = b'{"type":"item.updated","value":' + number + b"}\n"
+    assert parse_codex_stream(BytesIO(event + _codex_terminal_event())).input_tokens == 1
+
+
+def test_opaque_scanner_handles_large_signed_exponents_and_rejects_unicode_digits() -> None:
+    """Oversized opaque values retain RFC numeric grammar without leaking rejected payload bytes."""
+    payload = b"x" * MAX_EVENT_BYTES
+    valid = b'{"type":"item.updated","payload":"' + payload + b'","value":1e-2}\n'
+    assert parse_codex_stream(BytesIO(valid + _codex_terminal_event())).input_tokens == 1
+
+    unicode_digit = "١".encode()
+    invalid = (
+        b'{"type":"item.updated","payload":"' + payload + b'","value":' + unicode_digit + b"}\n"
+    )
+    with pytest.raises(CodexUsageParseError, match="malformed Codex JSON event") as error:
+        parse_codex_stream(BytesIO(invalid))
+    assert unicode_digit.decode() not in str(error.value)
+
+
+def test_opaque_scanner_enforces_json_nesting_depth_boundary() -> None:
+    """Opaque item structures accept the fixed shallow depth and reject one level deeper."""
+    prefix = b'{"type":"item.updated","payload":'
+    suffix = b"}\n"
+    exact_nesting = MAX_JSON_NESTING_DEPTH - 1
+    exact = prefix + (b"[" * exact_nesting) + b"0" + (b"]" * exact_nesting) + suffix
+    assert parse_codex_stream(BytesIO(exact + _codex_terminal_event())).input_tokens == 1
+
+    one_over = prefix + (b"[" * (exact_nesting + 1)) + b"0" + (b"]" * (exact_nesting + 1)) + suffix
+    with pytest.raises(CodexUsageParseError, match="malformed Codex JSON event"):
+        parse_codex_stream(BytesIO(one_over))
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        b'{"before":"split\\u003a\\"escape","nested":{"type":"ignored"},"type":"item.completed"}\n',
+        b'{"type":"item.updated",}\n',
+        b'{"type":"item.updated","values":[1,]}\n',
+    ],
+)
+def test_opaque_scanner_handles_chunk_split_escapes_and_rejects_trailing_commas(
+    event: bytes,
+) -> None:
+    """Scanner state crosses one-byte reads without accepting malformed JSON punctuation."""
+
+    class OneByteStream:
+        """Expose exactly one byte per bounded reader request."""
+
+        def __init__(self, content: bytes) -> None:
+            self._content = content
+            self._offset = 0
+
+        def read(self, size: int) -> bytes:
+            assert size <= READ_CHUNK_BYTES
+            if self._offset == len(self._content):
+                return b""
+            result = self._content[self._offset : self._offset + 1]
+            self._offset += 1
+            return result
+
+    if event.endswith(b'"}\n'):
+        assert parse_codex_stream(OneByteStream(event + _codex_terminal_event())).input_tokens == 1
+    else:
+        with pytest.raises(CodexUsageParseError, match="malformed Codex JSON"):
+            parse_codex_stream(OneByteStream(event))
+
+
+def test_parse_codex_streams_large_secure_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI parses a disk file above the old materialization cap without retaining it."""
+    monkeypatch.chdir(tmp_path)
+    path = Path("opaque.jsonl")
+    path.write_bytes(_opaque_item_event((2 * 1024 * 1024) - 64) + _codex_terminal_event())
+    assert main(["parse-codex", str(path)]) == 0
 
 
 @pytest.mark.parametrize(
@@ -653,6 +1021,26 @@ def test_fifo_inputs_fail_promptly_before_parse_or_provider_lookup(
             ]
         )
     assert not (tmp_path / ".agent-usage").exists()
+
+
+def test_parse_codex_rejects_final_symlink_without_leaking_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The sanitized parse command refuses a final symlink before reading its target."""
+    monkeypatch.chdir(tmp_path)
+    target = Path("TARGET_PATH_SECRET.jsonl")
+    target.write_text("TARGET_CONTENT_SENTINEL\n")
+    link = Path("SYMLINK_PATH_SECRET.jsonl")
+    link.symlink_to(target)
+
+    with pytest.raises(SystemExit, match="input file cannot be safely opened") as error:
+        main(["parse-codex", str(link)])
+    captured = capsys.readouterr()
+    output = f"{error.value}{captured.out}{captured.err}"
+    assert target.read_text() == "TARGET_CONTENT_SENTINEL\n"
+    assert "TARGET_CONTENT_SENTINEL" not in output
+    assert target.name not in output
+    assert link.name not in output
 
 
 def test_sink_refuses_nested_symlink_and_accepts_nested_real_directory(
@@ -2066,7 +2454,7 @@ def test_run_timeout_kills_and_reaps_term_ignoring_child_without_a_record(
     class BlockingOutput:
         """Pipe that remains open until the fake child is killed."""
 
-        def readline(self, _: int) -> bytes:
+        def read(self, _: int) -> bytes:
             released.wait(timeout=1)
             return b""
 
