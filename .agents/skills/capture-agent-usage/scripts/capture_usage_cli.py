@@ -157,7 +157,9 @@ def append_record(path: Path, record: UsageRecord) -> None:
     try:
         assert descriptor is not None
         os.fchmod(descriptor, 0o600)
-        os.write(descriptor, (validated.model_dump_json() + "\n").encode("utf-8"))
+        payload = (validated.model_dump_json() + "\n").encode("utf-8")
+        if os.write(descriptor, payload) != len(payload):
+            raise OSError("short usage record write")
     except OSError as exc:
         raise CaptureUsageError("could not append usage record") from exc
     finally:

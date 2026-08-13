@@ -318,6 +318,18 @@ def test_sink_uses_private_modes_and_refuses_symlink(
     assert not target.exists()
 
 
+def test_sink_rejects_short_os_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A partial JSONL write cannot be treated as a complete durable record."""
+    monkeypatch.chdir(tmp_path)
+
+    def short_write(_: int, payload: bytes) -> int:
+        return len(payload) - 1
+
+    monkeypatch.setattr(usage_cli.os, "write", short_write)
+    with pytest.raises(CaptureUsageError, match="could not append usage record"):
+        append_record(Path(".agent-usage/usage.jsonl"), _task_record())
+
+
 def test_sink_refuses_nested_symlink_and_accepts_nested_real_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
