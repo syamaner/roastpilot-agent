@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -1488,8 +1489,17 @@ def test_timeout_kills_real_stdout_inheriting_descendant_without_record(
             ]
         )
     descendant = int(marker.read_text())
-    with pytest.raises(ProcessLookupError):
-        os.kill(descendant, 0)
+    for _ in range(20):
+        try:
+            os.kill(descendant, 0)
+        except ProcessLookupError:
+            break
+        proc_stat = Path(f"/proc/{descendant}/stat")
+        if not proc_stat.exists() or proc_stat.read_text().split()[2] == "Z":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("process-group cleanup left a live descendant")
     assert not (tmp_path / ".agent-usage").exists()
 
 
