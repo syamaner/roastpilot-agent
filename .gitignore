@@ -67,6 +67,9 @@ web/dist/
 # the operator's roast logs.
 .store-fixtures/
 
+# Opt-in agent-usage pilot: local metadata only, never commit the append-only sink.
+.agent-usage/
+
 # Large per-roast bake-off dumps (regenerable; commit the summary doc instead)
 docs/advisor/bakeoff-results-2026-06-16.json
 docs/advisor/bakeoff-results-2026-06-16.md
