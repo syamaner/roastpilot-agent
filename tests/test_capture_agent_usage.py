@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -174,6 +175,14 @@ def test_malformed_or_missing_terminal_usage_fails_closed() -> None:
         parse_claude_stream(_stream('{"type":"assistant"}\n'))
     with pytest.raises(CodexUsageParseError, match="schema"):
         parse_codex_stream(_stream('{"type":"turn.completed","usage":{"input_tokens":1}}\n'))
+    with pytest.raises(CodexUsageParseError):
+        parse_codex_stream(_stream('{"type":"unexpected"}\n'))
+
+
+def test_codex_updated_and_failed_events_are_recognized_without_terminal_usage() -> None:
+    """Observed opaque updates and failed turns take the missing-terminal path."""
+    with pytest.raises(CodexUsageParseError, match="terminal"):
+        parse_codex_stream(_stream('{"type":"item.updated"}\n{"type":"turn.failed"}\n'))
 
 
 def test_binary_stream_ingestion_rejects_overlong_partial_and_invalid_utf8_events() -> None:
@@ -300,6 +309,7 @@ def test_sink_uses_private_modes_and_refuses_symlink(
 ) -> None:
     """The sink is append-only, metadata-only, mode-restricted, and no-follow."""
     monkeypatch.chdir(tmp_path)
+    sink = tmp_path / ".agent-usage/usage.jsonl"
     sink = Path(".agent-usage/usage/records.jsonl")
     append_record(sink, _task_record())
     append_record(sink, _task_record())
@@ -321,12 +331,36 @@ def test_sink_uses_private_modes_and_refuses_symlink(
 def test_sink_rejects_short_os_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A partial JSONL write cannot be treated as a complete durable record."""
     monkeypatch.chdir(tmp_path)
+    sink = tmp_path / ".agent-usage/usage.jsonl"
+    original_write = usage_cli.os.write
 
     def short_write(_: int, payload: bytes) -> int:
         return len(payload) - 1
 
     monkeypatch.setattr(usage_cli.os, "write", short_write)
     with pytest.raises(CaptureUsageError, match="could not append usage record"):
+        append_record(sink.relative_to(tmp_path), _task_record())
+    monkeypatch.setattr(usage_cli.os, "write", original_write)
+    append_record(sink.relative_to(tmp_path), _task_record())
+    assert len(sink.read_text().splitlines()) == 1
+
+
+def test_sink_rejects_hard_link_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A multiply-linked sink target cannot be modified through capture."""
+    monkeypatch.chdir(tmp_path)
+    Path(".agent-usage").mkdir()
+    Path(".agent-usage/usage.jsonl").write_text("existing\n")
+    os.link(".agent-usage/usage.jsonl", ".agent-usage/other.jsonl")
+    with pytest.raises(CaptureUsageError, match="could not append usage record"):
+        append_record(Path(".agent-usage/usage.jsonl"), _task_record())
+
+
+def test_sink_rejects_fifo_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nonblocking admission rejects a FIFO without opening a writer stall."""
+    monkeypatch.chdir(tmp_path)
+    Path(".agent-usage").mkdir()
+    os.mkfifo(".agent-usage/usage.jsonl")
+    with pytest.raises(CaptureUsageError, match="could not securely open usage sink"):
         append_record(Path(".agent-usage/usage.jsonl"), _task_record())
 
 
@@ -511,6 +545,9 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
         "exec",
         "--json",
         "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--strict-config",
         "--sandbox",
         "read-only",
         "--model",
@@ -549,6 +586,8 @@ def test_launch_argv_uses_fixed_claude_flags_and_closed_effort_mapping() -> None
         "stream-json",
         "--verbose",
         "--no-session-persistence",
+        "--safe-mode",
+        "--strict-mcp-config",
         "--tools",
         "",
         "--permission-mode",
@@ -565,6 +604,9 @@ def test_launch_argv_uses_fixed_claude_flags_and_closed_effort_mapping() -> None
         "exec",
         "--json",
         "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--strict-config",
         "--sandbox",
         "read-only",
         "--model",

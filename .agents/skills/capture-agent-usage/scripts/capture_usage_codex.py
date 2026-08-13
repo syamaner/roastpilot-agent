@@ -9,7 +9,15 @@ from typing import Any, BinaryIO
 from capture_usage_models import BoundedStreamError, EstimateBasis, ParsedUsage, bounded_jsonl_lines
 
 CODEX_EVENT_TYPES = frozenset(
-    {"thread.started", "turn.started", "item.started", "item.completed", "turn.completed"}
+    {
+        "thread.started",
+        "turn.started",
+        "item.started",
+        "item.updated",
+        "item.completed",
+        "turn.failed",
+        "turn.completed",
+    }
 )
 """Opaque event types observed in the sanitized Codex 0.147.0 fixture."""
 

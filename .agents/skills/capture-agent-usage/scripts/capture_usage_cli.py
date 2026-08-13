@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -145,7 +147,7 @@ def append_record(path: Path, record: UsageRecord) -> None:
         parent_descriptor, filename = _open_sink_parent(path)
         descriptor = os.open(
             filename,
-            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
             0o600,
             dir_fd=parent_descriptor,
         )
@@ -156,10 +158,21 @@ def append_record(path: Path, record: UsageRecord) -> None:
             os.close(parent_descriptor)
     try:
         assert descriptor is not None
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+            raise OSError("unsafe usage sink target")
         os.fchmod(descriptor, 0o600)
         payload = (validated.model_dump_json() + "\n").encode("utf-8")
-        if os.write(descriptor, payload) != len(payload):
-            raise OSError("short usage record write")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        offset = os.lseek(descriptor, 0, os.SEEK_END)
+        try:
+            if os.write(descriptor, payload) != len(payload):
+                raise OSError("short usage record write")
+        except OSError:
+            os.ftruncate(descriptor, offset)
+            raise
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
     except OSError as exc:
         raise CaptureUsageError("could not append usage record") from exc
     finally:
@@ -226,11 +239,17 @@ def _prompt_bytes(path: Path) -> bytes:
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
     """Terminate, then kill and reap one still-live child process."""
     if process.poll() is None:
-        process.terminate()
+        if hasattr(process, "pid"):
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
         try:
             process.wait(timeout=TERMINATE_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
-            process.kill()
+            if hasattr(process, "pid"):
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
             process.wait()
 
 
@@ -304,6 +323,7 @@ def _harness_version(executable: str) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             shell=False,
+            start_new_session=True,
         )
         assert process.stdout is not None
         deadline = _start_deadline(process, VERSION_TIMEOUT_SECONDS, timed_out)
@@ -337,6 +357,9 @@ def _launch_argv(
             "exec",
             "--json",
             "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--strict-config",
             "--sandbox",
             "read-only",
             "--model",
@@ -353,6 +376,8 @@ def _launch_argv(
         "stream-json",
         "--verbose",
         "--no-session-persistence",
+        "--safe-mode",
+        "--strict-mcp-config",
         "--tools",
         "",
         "--permission-mode",
@@ -422,6 +447,7 @@ def run_command(arguments: argparse.Namespace) -> int:
             stderr=subprocess.DEVNULL,
             shell=False,
             cwd=".",
+            start_new_session=True,
         )
         assert process.stdout is not None
         deadline = _start_deadline(process, LAUNCH_TIMEOUT_SECONDS, timed_out)
