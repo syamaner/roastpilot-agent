@@ -31,6 +31,7 @@ from capture_usage_cli import CaptureUsageError, append_record, main
 from capture_usage_codex import (
     MAX_CODEX_OPAQUE_EVENT_BYTES,
     MAX_CODEX_OPAQUE_TOTAL_BYTES,
+    MAX_JSON_NESTING_DEPTH,
     READ_CHUNK_BYTES,
     CodexUsageParseError,
     parse_codex_stream,
@@ -554,6 +555,19 @@ def test_opaque_scanner_ignores_nested_type_and_counts_discarded_events() -> Non
     assert parse_codex_stream(BytesIO(item + _codex_terminal_event())).input_tokens == 1
     with pytest.raises(CodexUsageParseError, match="event count limit"):
         parse_codex_stream(BytesIO(item * (MAX_EVENT_COUNT + 1)))
+
+
+def test_opaque_scanner_enforces_json_nesting_depth_boundary() -> None:
+    """Opaque item structures accept the fixed shallow depth and reject one level deeper."""
+    prefix = b'{"type":"item.updated","payload":'
+    suffix = b"}\n"
+    exact_nesting = MAX_JSON_NESTING_DEPTH - 1
+    exact = prefix + (b"[" * exact_nesting) + b"0" + (b"]" * exact_nesting) + suffix
+    assert parse_codex_stream(BytesIO(exact + _codex_terminal_event())).input_tokens == 1
+
+    one_over = prefix + (b"[" * (exact_nesting + 1)) + b"0" + (b"]" * (exact_nesting + 1)) + suffix
+    with pytest.raises(CodexUsageParseError, match="malformed Codex JSON event"):
+        parse_codex_stream(BytesIO(one_over))
 
 
 @pytest.mark.parametrize(

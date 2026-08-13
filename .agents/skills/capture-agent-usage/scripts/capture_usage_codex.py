@@ -36,6 +36,8 @@ MAX_CODEX_OPAQUE_TOTAL_BYTES = 67_108_864
 READ_CHUNK_BYTES = 65_536
 """Largest read request and retained-line carry buffer bound."""
 _STRING_CAPTURE_LIMIT = 64
+MAX_JSON_NESTING_DEPTH = 64
+"""Maximum shallow JSON container depth accepted by the frozen Codex grammar."""
 
 
 class CodexUsageParseError(ValueError):
@@ -230,6 +232,8 @@ class _JsonRootScanner:
         """Consume structural punctuation through the root-only JSON grammar."""
         if character in "[{":
             if not self._expect_value():
+                self._reject()
+            if len(self._stack) >= MAX_JSON_NESTING_DEPTH:
                 self._reject()
             if character == "{":
                 self._stack.append(("object", "key_or_end", None))
