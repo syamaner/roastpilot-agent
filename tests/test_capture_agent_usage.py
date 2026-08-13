@@ -185,6 +185,90 @@ def test_codex_updated_and_failed_events_are_recognized_without_terminal_usage()
         parse_codex_stream(_stream('{"type":"item.updated"}\n{"type":"turn.failed"}\n'))
 
 
+def test_nonzero_recognized_codex_failure_appends_one_incomplete_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recognized failed turn is an incomplete failed capture, not parser drift."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"safe")
+
+    class Input:
+        """Minimal writable child stdin."""
+
+        closed = False
+
+        def write(self, value: bytes) -> int:
+            return len(value)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Process:
+        """Completed version or failed-turn harness stub."""
+
+        def __init__(self, output: bytes, code: int) -> None:
+            self.stdin = Input()
+            self.stdout = BytesIO(output)
+            self.code = code
+
+        def poll(self) -> int:
+            return self.code
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return self.code
+
+        def terminate(self) -> None:
+            raise AssertionError("completed process must not terminate")
+
+        def kill(self) -> None:
+            raise AssertionError("completed process must not kill")
+
+    def fake_popen(argv: list[str], **_: object) -> Process:
+        if argv[-1] == "--version":
+            return Process(b"codex 0.147.0\n", 0)
+        return Process(b'{"type":"turn.failed"}\n', 1)
+
+    def fake_which(_: str) -> str:
+        return "/stub/codex"
+
+    monkeypatch.setattr(usage_cli.shutil, "which", fake_which)
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+    assert (
+        main(
+            [
+                "run",
+                "--harness",
+                "codex",
+                "--prompt-file",
+                "prompt",
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                "validation",
+                "--model",
+                "gpt-5.6-terra",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
+        == 0
+    )
+    records = (tmp_path / ".agent-usage/usage.jsonl").read_text().splitlines()
+    assert len(records) == 1
+    record = json.loads(records[0])
+    assert not record["success"] and not record["usage_complete"]
+    assert record["input_tokens"] is None and record["estimated_usd"] is None
+
+
 def test_binary_stream_ingestion_rejects_overlong_partial_and_invalid_utf8_events() -> None:
     """The reader rejects unsafe input before decoding or parsing event content."""
     sentinel = b"SENTINEL_OVERSIZED_EVENT"
@@ -1340,6 +1424,72 @@ def test_run_timeout_kills_and_reaps_term_ignoring_child_without_a_record(
             ]
         )
     assert calls == 2 and observed == {"killed": True, "reaped": True}
+    assert not (tmp_path / ".agent-usage").exists()
+
+
+def test_timeout_kills_real_stdout_inheriting_descendant_without_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A process-group deadline kills a TERM-ignoring descendant holding stdout open."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"safe")
+    marker = tmp_path / "descendant-pid"
+    stub = tmp_path / "codex"
+    stub.write_text(
+        "#!" + sys.executable + "\n"
+        "import os, signal, sys, time\n"
+        "if '--version' in sys.argv: print('codex 0.147.0'); raise SystemExit()\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        " Path('descendant-pid').write_text(str(os.getpid()))\n"
+        " signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        " time.sleep(30)\n"
+        " raise SystemExit()\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(30)\n"
+    )
+    stub.write_text(
+        stub.read_text().replace(
+            "import os, signal, sys, time", "from pathlib import Path\nimport os, signal, sys, time"
+        )
+    )
+    stub.chmod(0o700)
+    monkeypatch.setattr(usage_cli, "LAUNCH_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(usage_cli, "TERMINATE_GRACE_SECONDS", 0.01)
+
+    def fake_which(_: str) -> str:
+        return str(stub)
+
+    monkeypatch.setattr(usage_cli.shutil, "which", fake_which)
+    with pytest.raises(SystemExit, match="timed out"):
+        main(
+            [
+                "run",
+                "--harness",
+                "codex",
+                "--prompt-file",
+                "prompt",
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                "validation",
+                "--model",
+                "gpt-5.6-terra",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
+    descendant = int(marker.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(descendant, 0)
     assert not (tmp_path / ".agent-usage").exists()
 
 
