@@ -215,7 +215,7 @@ def _input_bytes(path: Path, maximum: int = MAX_PROMPT_BYTES) -> bytes:
     if not hasattr(os, "O_NOFOLLOW"):
         raise CaptureUsageError("platform cannot securely open prompt input")
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         raise CaptureUsageError("input file cannot be safely opened") from exc
     try:

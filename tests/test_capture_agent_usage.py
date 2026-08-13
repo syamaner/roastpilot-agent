@@ -564,6 +564,52 @@ def test_sink_rejects_fifo_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         append_record(Path(".agent-usage/usage.jsonl"), _task_record())
 
 
+def test_fifo_inputs_fail_promptly_before_parse_or_provider_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No-writer FIFOs cannot block either the sanitized parser or prompt admission."""
+    monkeypatch.chdir(tmp_path)
+    parse_fifo = Path("sanitized.jsonl")
+    prompt_fifo = Path("prompt")
+    os.mkfifo(parse_fifo)
+    os.mkfifo(prompt_fifo)
+
+    with pytest.raises(SystemExit, match="input file is not an accepted regular input"):
+        main(["parse-codex", str(parse_fifo)])
+
+    def fail_which(_name: str) -> str:
+        raise AssertionError("FIFO prompt must reject before provider lookup")
+
+    monkeypatch.setattr(usage_cli.shutil, "which", fail_which)
+    with pytest.raises(SystemExit, match="prompt file cannot be safely opened"):
+        main(
+            [
+                "run",
+                "--harness",
+                "codex",
+                "--prompt-file",
+                str(prompt_fifo),
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                "measurement-pilot",
+                "--model",
+                "gpt-5.6-terra",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
+    assert not (tmp_path / ".agent-usage").exists()
+
+
 def test_sink_refuses_nested_symlink_and_accepts_nested_real_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
