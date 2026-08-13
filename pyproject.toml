@@ -246,7 +246,7 @@ markers = [
 
 [tool.coverage.run]
 branch = true
-source = ["roastpilot_agent"]
+source = ["roastpilot_agent", "scripts", ".agents/skills/capture-agent-usage/scripts"]
 
 [tool.coverage.report]
 show_missing = true

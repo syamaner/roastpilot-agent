@@ -55,7 +55,7 @@ jobs:
         run: python -m pyright --pythonpath "${pythonLocation}/bin/python"
 
       - name: Run tests with coverage
-        run: python -m pytest --cov=roastpilot_agent --cov-report=xml --cov-report=term-missing:skip-covered
+        run: python -m pytest --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report=xml --cov-report=term-missing:skip-covered
 
       # Continuous server-drift auto-catch (#121): regenerate the SPA contract
       # surface from the real server models and fail if it differs from the

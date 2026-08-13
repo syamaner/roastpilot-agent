@@ -2,6 +2,8 @@ coverage:
   status:
     patch:
       default:
+        paths:
+          - 'src/roastpilot_agent/'
         # Best-effort guard for the #624/#625 trap: codecov silently posts
         # NO patch status when a diff has zero coverable lines (pure
         # deletions), deadlocking the app-pinned required check.
@@ -16,7 +18,18 @@ coverage:
         # fully-tested diffs. Project coverage still trends via the
         # project status below.
         threshold: 2%
+      tooling:
+        paths:
+          - 'scripts/'
+          - '\.agents/skills/'
     project:
       default:
+        paths:
+          - 'src/roastpilot_agent/'
         threshold: 1%
         if_not_found: success
+      tooling:
+        informational: true
+        paths:
+          - 'scripts/'
+          - '\.agents/skills/'
