@@ -6,8 +6,7 @@ import json
 from collections.abc import Mapping
 from typing import Any, BinaryIO
 
-from capture_usage_models import EstimateBasis, ParsedUsage
-from capture_usage_stream import BoundedStreamError, bounded_jsonl_lines
+from capture_usage_models import BoundedStreamError, EstimateBasis, ParsedUsage, bounded_jsonl_lines
 
 CODEX_EVENT_TYPES = frozenset(
     {"thread.started", "turn.started", "item.started", "item.completed", "turn.completed"}

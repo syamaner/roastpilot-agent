@@ -7,8 +7,13 @@ import math
 from collections.abc import Mapping
 from typing import Any, BinaryIO
 
-from capture_usage_models import ClaudeModelUsage, EstimateBasis, ParsedUsage
-from capture_usage_stream import BoundedStreamError, bounded_jsonl_lines
+from capture_usage_models import (
+    BoundedStreamError,
+    ClaudeModelUsage,
+    EstimateBasis,
+    ParsedUsage,
+    bounded_jsonl_lines,
+)
 
 CLAUDE_EVENT_TYPES = frozenset({"system", "user", "assistant", "rate_limit_event", "result"})
 """Opaque event types observed in the sanitized Claude Code 2.1.228 fixture."""

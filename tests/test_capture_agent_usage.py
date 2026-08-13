@@ -13,6 +13,9 @@ from capture_usage_claude import ClaudeUsageParseError, parse_claude_stream
 from capture_usage_cli import CaptureUsageError, append_record, main
 from capture_usage_codex import CodexUsageParseError, parse_codex_stream
 from capture_usage_models import (
+    MAX_EVENT_BYTES,
+    MAX_EVENT_COUNT,
+    MAX_STREAM_BYTES,
     CapacitySnapshotRecord,
     CapacitySource,
     CapacityStatus,
@@ -21,7 +24,6 @@ from capture_usage_models import (
     ParsedUsage,
     TaskUsageRecord,
 )
-from capture_usage_stream import MAX_EVENT_BYTES, MAX_EVENT_COUNT, MAX_STREAM_BYTES
 from pydantic import ValidationError
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agent-usage"
