@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
 import inspect
 import json
 import stat
 import subprocess
+import threading
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -511,6 +513,12 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
     assert "SENTINEL_PROMPT_CONTENT" not in str(observed["argv"])
     assert "SENTINEL_PROMPT_CONTENT" not in str(observed["version_argv"])
     assert json.loads(record)["effort"] == "high"
+    parsed_record = json.loads(record)
+    assert parsed_record["harness_version"] == "0.147.0"
+    assert not parsed_record["whole_tree_verified"]
+    assert {
+        item.relative_to(tmp_path).as_posix() for item in tmp_path.rglob("*") if item.is_file()
+    } == {"prompt.txt", ".agent-usage/usage.jsonl"}
 
 
 def test_launch_argv_uses_fixed_claude_flags_and_closed_effort_mapping() -> None:
@@ -589,6 +597,30 @@ def test_task_usage_record_rejects_exit_and_harness_family_mislabeling() -> None
                 ],
             }
         )
+
+
+def test_record_builder_preserves_explicit_whole_tree_verification() -> None:
+    """The opt-in assertion is false by default and true only when explicitly supplied."""
+    now = datetime(2026, 8, 13, tzinfo=UTC)
+    arguments = argparse.Namespace(
+        started_at=now,
+        task_id="811",
+        slice_id="capture",
+        harness=HarnessFamily.CODEX,
+        role="engineer-be",
+        model="gpt-5.6-terra",
+        effort=None,
+        repository="syamaner/roastpilot-agent",
+        branch="feature/811",
+        base_sha="2bed7013",
+        head_sha="4a3cca6",
+        parent_task_id=None,
+        whole_tree_verified=True,
+    )
+    record = usage_cli._record_from_usage(  # pyright: ignore[reportPrivateUsage]
+        arguments, "0.147.0", 0, ParsedUsage(input_tokens=1)
+    )
+    assert record.whole_tree_verified
 
 
 def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
@@ -732,6 +764,213 @@ def test_invalid_version_never_spawns_a_run(
     monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
     with pytest.raises(CaptureUsageError, match="version"):
         usage_cli._harness_version("/stub/codex")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_run_timeout_kills_and_reaps_term_ignoring_child_without_a_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The end-to-end timer kills a TERM-ignoring stream before any append."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"safe")
+    monkeypatch.setattr(usage_cli, "LAUNCH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(usage_cli, "TERMINATE_GRACE_SECONDS", 0.001)
+    released = threading.Event()
+    observed: dict[str, bool] = {"killed": False, "reaped": False}
+
+    class BlockingOutput:
+        """Pipe that remains open until the fake child is killed."""
+
+        def readline(self, _: int) -> bytes:
+            released.wait(timeout=1)
+            return b""
+
+        def close(self) -> None:
+            return None
+
+    class Input:
+        """Writable stdin stub."""
+
+        closed = False
+
+        def write(self, value: bytes) -> int:
+            return len(value)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class HungProcess:
+        """A child that ignores terminate until kill releases its stdout."""
+
+        stdin = Input()
+        stdout = BlockingOutput()
+
+        def poll(self) -> int | None:
+            return -9 if observed["killed"] else None
+
+        def terminate(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            observed["killed"] = True
+            released.set()
+
+        def wait(self, timeout: float | None = None) -> int:
+            if not observed["killed"] and timeout is not None:
+                raise subprocess.TimeoutExpired("stub", timeout)
+            observed["reaped"] = True
+            return -9
+
+    class VersionProcess:
+        """A completed version probe stub."""
+
+        stdin = None
+        stdout = BytesIO(b"codex 0.147.0\n")
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+        def terminate(self) -> None:
+            raise AssertionError("version must not terminate")
+
+        def kill(self) -> None:
+            raise AssertionError("version must not kill")
+
+    calls = 0
+
+    def fake_popen(argv: list[str], **_: object) -> VersionProcess | HungProcess:
+        nonlocal calls
+        calls += 1
+        return VersionProcess() if argv[-1] == "--version" else HungProcess()
+
+    def fake_which(_name: str) -> str:
+        return "/stub/codex"
+
+    monkeypatch.setattr(usage_cli.shutil, "which", fake_which)
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+    with pytest.raises(SystemExit, match="timed out"):
+        main(
+            [
+                "run",
+                "--harness",
+                "codex",
+                "--prompt-file",
+                "prompt",
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                "engineer-be",
+                "--model",
+                "gpt-5.6-terra",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
+    assert calls == 2 and observed == {"killed": True, "reaped": True}
+    assert not (tmp_path / ".agent-usage").exists()
+
+
+@pytest.mark.parametrize("option", ["--extra-arg", "--executable", "--cwd", "--env", "--timeout"])
+def test_run_rejects_passthrough_options_before_lookup(
+    option: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The closed grammar offers no command, cwd, environment, or timeout escape hatch."""
+
+    def fail_which(_: str) -> str:
+        raise AssertionError("unknown CLI option must reject before executable lookup")
+
+    monkeypatch.setattr(usage_cli.shutil, "which", fail_which)
+    with pytest.raises(SystemExit):
+        main(["run", option, "unsafe"])
+
+
+def test_prompt_cap_and_read_failure_reject_before_spawn_without_echoing_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Prompt growth and read errors fail closed before any executable lookup."""
+    monkeypatch.chdir(tmp_path)
+    sentinel = "PROMPT_READ_SENTINEL"
+    Path("large").write_bytes(b"x" * (usage_cli.MAX_PROMPT_BYTES + 1))
+
+    def fail_which(_: str) -> str:
+        raise AssertionError("unsafe prompt must not spawn")
+
+    monkeypatch.setattr(usage_cli.shutil, "which", fail_which)
+    with pytest.raises(SystemExit, match="prompt file") as oversized:
+        main(
+            [
+                "run",
+                "--harness",
+                "codex",
+                "--prompt-file",
+                "large",
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                "engineer-be",
+                "--model",
+                "gpt-5.6-terra",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
+    assert sentinel not in str(oversized.value)
+
+    Path("read-error").write_text("safe")
+    real_fdopen = usage_cli.os.fdopen
+
+    def failing_fdopen(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise OSError(sentinel)
+
+    monkeypatch.setattr(usage_cli.os, "fdopen", failing_fdopen)
+    with pytest.raises(SystemExit, match="prompt file") as failed_read:
+        main(
+            [
+                "run",
+                "--harness",
+                "codex",
+                "--prompt-file",
+                "read-error",
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                "engineer-be",
+                "--model",
+                "gpt-5.6-terra",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
+    assert sentinel not in str(failed_read.value)
+    monkeypatch.setattr(usage_cli.os, "fdopen", real_fdopen)
 
 
 def test_run_rejects_unsupported_effort_before_executable_lookup(

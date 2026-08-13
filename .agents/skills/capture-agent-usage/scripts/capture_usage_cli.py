@@ -199,10 +199,14 @@ def _prompt_bytes(path: Path) -> bytes:
         if len(prompt) > MAX_PROMPT_BYTES:
             raise CaptureUsageError("prompt file is not an accepted regular input")
         return prompt
-    except (CaptureUsageError, OSError):
+    except CaptureUsageError:
         if descriptor >= 0:
             os.close(descriptor)
         raise
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise CaptureUsageError("prompt file cannot be safely opened") from exc
 
 
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
