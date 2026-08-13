@@ -234,6 +234,20 @@ def test_normalize_coverage_xml_rewrites_nested_tooling_filename(tmp_path: Path)
     )
 
 
+def test_normalize_coverage_xml_rejects_nested_intermediate_symlink(tmp_path: Path) -> None:
+    """A nested candidate may not escape its tooling root through a directory symlink."""
+    coverage_xml = _coverage_fixture(
+        tmp_path, ("helpers/parser.py", "script_only.py", "skill_only.py")
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "parser.py").touch()
+    (tmp_path / "scripts" / "helpers").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="regular non-symlink"):
+        tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+
 def test_normalize_coverage_xml_rejects_missing_tooling_match(tmp_path: Path) -> None:
     """An XML filename without a tooling file match fails closed."""
     coverage_xml = _coverage_fixture(tmp_path, ("missing.py",))
@@ -266,6 +280,20 @@ def test_normalize_coverage_xml_rejects_nested_traversal_filename(tmp_path: Path
 
     with pytest.raises(ValueError, match="unsafe"):
         tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+
+def test_normalize_coverage_xml_requires_a_filename_for_nested_only_tooling_root(
+    tmp_path: Path,
+) -> None:
+    """Nested-only regular Python content still requires a coverage XML filename."""
+    scripts = tmp_path / "scripts" / "helpers"
+    scripts.mkdir(parents=True)
+    (scripts / "parser.py").touch()
+
+    with pytest.raises(ValueError, match="missing filenames"):
+        tooling_coverage._require_tooling_coverage_filenames(  # pyright: ignore[reportPrivateUsage]
+            tmp_path, ("scripts",), ()
+        )
 
 
 def test_normalize_coverage_xml_rejects_a_class_without_filename(tmp_path: Path) -> None:

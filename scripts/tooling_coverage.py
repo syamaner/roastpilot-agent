@@ -176,11 +176,24 @@ def _require_tooling_coverage_filenames(
     """Require a final XML name for each tooling root that has Python files."""
     for root in tooling_roots:
         root_path = repo_root / root
-        has_classes = any(
-            file.is_file() and not file.is_symlink() for file in root_path.glob("*.py")
-        )
+        has_classes = _has_regular_python_content(root_path)
         if has_classes and not any(name.startswith(f"{root}/") for name in final_names):
             raise ValueError(f"coverage XML is missing filenames for tooling root {root!r}")
+
+
+def _has_regular_python_content(root: Path) -> bool:
+    """Return whether a tooling root has non-cache regular Python content at any depth."""
+    for file in root.rglob("*.py"):
+        relative = file.relative_to(root)
+        if "__pycache__" in relative.parts or file.is_symlink() or not file.is_file():
+            continue
+        if any(
+            (root / Path(*relative.parts[:index])).is_symlink()
+            for index in range(1, len(relative.parts))
+        ):
+            continue
+        return True
+    return False
 
 
 def _write_xml_atomically(report_path: Path, report: ElementTree.Element) -> None:
