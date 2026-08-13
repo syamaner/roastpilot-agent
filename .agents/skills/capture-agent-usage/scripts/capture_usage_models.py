@@ -205,6 +205,8 @@ class TaskUsageRecord(CaptureModel):
     @model_validator(mode="after")
     def validate_usage(self) -> TaskUsageRecord:
         """Protect normalized usage and client-estimate provenance invariants."""
+        if self.success != (self.exit_code == 0):
+            raise ValueError("success must match the harness exit code")
         if self.estimated_usd is None and self.estimate_basis is not EstimateBasis.NOT_EXPOSED:
             raise ValueError("an absent estimated_usd requires NOT_EXPOSED")
         if (
@@ -225,6 +227,10 @@ class TaskUsageRecord(CaptureModel):
             )
         ):
             raise ValueError("incomplete usage must not invent partial token or cost totals")
+        if self.harness is HarnessFamily.CODEX and self.claude_model_usage is not None:
+            raise ValueError("Codex records must not contain Claude model usage")
+        if self.harness is HarnessFamily.CLAUDE and self.reasoning_output_tokens is not None:
+            raise ValueError("Claude records must not contain Codex reasoning usage")
         return self
 
 

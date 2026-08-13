@@ -13,7 +13,7 @@ import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import BinaryIO, NoReturn, TypeVar
+from typing import NoReturn, TypeVar
 
 from capture_usage_claude import (
     ClaudeUsageMissingTerminalError,
@@ -44,8 +44,9 @@ DEFAULT_SINK = Path(".agent-usage/usage.jsonl")
 SINK_ROOT = ".agent-usage"
 MAX_PROMPT_BYTES = 65_536
 """Prompt cap limits one explicitly-authorized stdin payload to 64 KiB."""
-LAUNCH_TIMEOUT_SECONDS = 120
+LAUNCH_TIMEOUT_SECONDS = 3600
 VERSION_TIMEOUT_SECONDS = 5
+TERMINATE_GRACE_SECONDS = 1
 _SEMVER = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 _SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
@@ -181,8 +182,8 @@ def parse_claude_command(arguments: argparse.Namespace) -> int:
     return 0
 
 
-def _prompt_stream(path: Path) -> BinaryIO:
-    """Open one regular, non-symlink prompt file without exposing its path."""
+def _prompt_bytes(path: Path) -> bytes:
+    """Read one fixed-size regular prompt through a no-follow descriptor."""
     if not hasattr(os, "O_NOFOLLOW"):
         raise CaptureUsageError("platform cannot securely open prompt input")
     try:
@@ -190,13 +191,71 @@ def _prompt_stream(path: Path) -> BinaryIO:
     except OSError as exc:
         raise CaptureUsageError("prompt file cannot be safely opened") from exc
     try:
-        status = os.fstat(descriptor)
-        if not stat.S_ISREG(status.st_mode) or status.st_size > MAX_PROMPT_BYTES:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise CaptureUsageError("prompt file is not an accepted regular input")
-        return os.fdopen(descriptor, "rb")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            prompt = stream.read(MAX_PROMPT_BYTES + 1)
+        if len(prompt) > MAX_PROMPT_BYTES:
+            raise CaptureUsageError("prompt file is not an accepted regular input")
+        return prompt
     except (CaptureUsageError, OSError):
-        os.close(descriptor)
+        if descriptor >= 0:
+            os.close(descriptor)
         raise
+
+
+def _stop_process(process: subprocess.Popen[bytes]) -> None:
+    """Terminate, then kill and reap one still-live child process."""
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def _close_stdin(process: subprocess.Popen[bytes]) -> None:
+    """Close child stdin on every completion or error path."""
+    if process.stdin is not None and not process.stdin.closed:
+        process.stdin.close()
+
+
+def _write_prompt(process: subprocess.Popen[bytes], prompt: bytes) -> None:
+    """Send bounded transient prompt bytes to a child without retaining them."""
+    assert process.stdin is not None
+    try:
+        process.stdin.write(prompt)
+    except BrokenPipeError:
+        pass
+    finally:
+        _close_stdin(process)
+
+
+def _terminate_for_deadline(process: subprocess.Popen[bytes], timed_out: threading.Event) -> None:
+    """Fail closed on a live child deadline, including TERM-ignoring children."""
+    if process.poll() is not None:
+        return
+    timed_out.set()
+    _stop_process(process)
+
+
+def _start_deadline(
+    process: subprocess.Popen[bytes], seconds: int, timed_out: threading.Event
+) -> threading.Timer:
+    """Start a daemon deadline that owns only process termination."""
+    deadline = threading.Timer(seconds, lambda: _terminate_for_deadline(process, timed_out))
+    deadline.daemon = True
+    deadline.start()
+    return deadline
+
+
+def _cancel_deadline(deadline: threading.Timer | None) -> None:
+    """Join a deadline callback so it cannot race record persistence."""
+    if deadline is not None:
+        deadline.cancel()
+        deadline.join()
 
 
 def _resolved_executable(harness: HarnessFamily) -> str:
@@ -221,28 +280,15 @@ def _harness_version(executable: str) -> str:
             shell=False,
         )
         assert process.stdout is not None
-        deadline = threading.Timer(
-            VERSION_TIMEOUT_SECONDS,
-            lambda: _terminate_for_deadline(process, timed_out),
-        )
-        deadline.daemon = True
-        deadline.start()
+        deadline = _start_deadline(process, VERSION_TIMEOUT_SECONDS, timed_out)
         output = process.stdout.read(4097)
         returncode = process.wait(timeout=VERSION_TIMEOUT_SECONDS)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CaptureUsageError("selected harness version is unavailable") from exc
     finally:
-        if deadline is not None:
-            deadline.cancel()
-            deadline.join()
+        _cancel_deadline(deadline)
         if process is not None:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+            _stop_process(process)
             if process.stdout is not None:
                 process.stdout.close()
     if timed_out.is_set():
@@ -320,7 +366,7 @@ def _record_from_usage(
 def run_command(arguments: argparse.Namespace) -> int:
     """Launch one selected harness with a bounded prompt and append closed metadata."""
     _validate_run_metadata(arguments)
-    prompt = _prompt_stream(arguments.prompt_file)
+    prompt = _prompt_bytes(arguments.prompt_file)
     process: subprocess.Popen[bytes] | None = None
     deadline: threading.Timer | None = None
     timed_out = threading.Event()
@@ -331,19 +377,15 @@ def run_command(arguments: argparse.Namespace) -> int:
         arguments.started_at = started_at
         process = subprocess.Popen(
             _launch_argv(arguments.harness, executable, arguments.model, arguments.effort),
-            stdin=prompt,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             shell=False,
             cwd=".",
         )
         assert process.stdout is not None
-        deadline = threading.Timer(
-            LAUNCH_TIMEOUT_SECONDS,
-            lambda: _terminate_for_deadline(process, timed_out),
-        )
-        deadline.daemon = True
-        deadline.start()
+        deadline = _start_deadline(process, LAUNCH_TIMEOUT_SECONDS, timed_out)
+        _write_prompt(process, prompt)
         parser = (
             parse_codex_stream if arguments.harness is HarnessFamily.CODEX else parse_claude_stream
         )
@@ -392,27 +434,12 @@ def run_command(arguments: argparse.Namespace) -> int:
     except subprocess.TimeoutExpired as exc:
         raise CaptureUsageError("harness run timed out") from exc
     finally:
-        if deadline is not None:
-            deadline.cancel()
-            deadline.join()
-        prompt.close()
+        _cancel_deadline(deadline)
         if process is not None:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+            _close_stdin(process)
+            _stop_process(process)
             if process.stdout is not None:
                 process.stdout.close()
-
-
-def _terminate_for_deadline(process: subprocess.Popen[bytes], timed_out: threading.Event) -> None:
-    """Mark a full-stream deadline expiry and stop the still-running child."""
-    if process.poll() is None:
-        timed_out.set()
-        process.terminate()
 
 
 def _validate_run_metadata(arguments: argparse.Namespace) -> None:

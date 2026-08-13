@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import stat
 import subprocess
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import cast
 
 import capture_usage_cli as usage_cli
 import pytest
@@ -411,8 +412,23 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
     class FakeProcess:
         """Minimal fixed harness process with a complete terminal event."""
 
+        class RecordingInput:
+            """Minimal writable pipe retaining bytes only for this test assertion."""
+
+            def __init__(self) -> None:
+                self.value = b""
+                self.closed = False
+
+            def write(self, value: bytes) -> int:
+                self.value += value
+                return len(value)
+
+            def close(self) -> None:
+                self.closed = True
+
         def __init__(self, output: bytes, exit_code: int = 0) -> None:
             self.stdout = BytesIO(output)
+            self.stdin = self.RecordingInput()
             self.exit_code = exit_code
 
         def wait(self, timeout: float | None = None) -> int:
@@ -435,9 +451,9 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
             return FakeProcess(b"codex-cli 0.147.0\n")
         observed["argv"] = argv
         observed["kwargs"] = kwargs
-        stdin = cast(BinaryIO, kwargs["stdin"])
-        observed["prompt"] = stdin.read()
-        return FakeProcess(_codex_terminal_event())
+        process = FakeProcess(_codex_terminal_event())
+        observed["process"] = process
+        return process
 
     def fake_which(_: str) -> str:
         return "/stub/codex"
@@ -486,7 +502,9 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
         'model_reasoning_effort="high"',
         "-",
     ]
-    assert observed["prompt"] == sentinel
+    process = cast(FakeProcess, observed["process"])
+    assert process.stdin.value == sentinel
+    assert process.stdin.closed
     assert observed["kwargs"]["shell"] is False  # type: ignore[index]
     record = (tmp_path / ".agent-usage/usage.jsonl").read_text()
     assert sentinel.decode() not in record
@@ -541,6 +559,36 @@ def test_deadline_callback_does_not_mark_an_already_exited_process_timed_out() -
         cast(subprocess.Popen[bytes], ExitedProcess()), timed_out
     )
     assert not timed_out.is_set()
+
+
+def test_deadline_callback_has_one_definition_and_uses_robust_stop() -> None:
+    """The timer callback cannot regress to a terminate-only cleanup path."""
+    source = inspect.getsource(usage_cli)
+    assert source.count("def _terminate_for_deadline(") == 1
+    callback = usage_cli._terminate_for_deadline  # pyright: ignore[reportPrivateUsage]
+    assert "_stop_process(process)" in inspect.getsource(callback)
+
+
+def test_task_usage_record_rejects_exit_and_harness_family_mislabeling() -> None:
+    """Persisted records cannot claim success or family-specific fields incorrectly."""
+    base = _task_record().model_dump()
+    with pytest.raises(ValidationError, match="success"):
+        TaskUsageRecord.model_validate({**base, "exit_code": 1})
+    with pytest.raises(ValidationError, match="Codex"):
+        TaskUsageRecord.model_validate(
+            {
+                **base,
+                "claude_model_usage": [
+                    {
+                        "model": "claude",
+                        "input_tokens": 1,
+                        "cached_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "output_tokens": 1,
+                    }
+                ],
+            }
+        )
 
 
 def test_run_rejects_unsupported_effort_before_executable_lookup(
