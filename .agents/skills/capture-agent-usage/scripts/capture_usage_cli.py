@@ -238,15 +238,21 @@ def _close_stdin(process: subprocess.Popen[bytes]) -> None:
         process.stdin.close()
 
 
-def _write_prompt(process: subprocess.Popen[bytes], prompt: bytes) -> None:
-    """Send bounded transient prompt bytes to a child without retaining them."""
+def _write_prompt(process: subprocess.Popen[bytes], prompt: bytes) -> bool:
+    """Send bounded transient prompt bytes and report only a fixed success state."""
     assert process.stdin is not None
     try:
         process.stdin.write(prompt)
     except BrokenPipeError:
-        pass
+        return True
+    except (OSError, ValueError):
+        return False
     finally:
-        _close_stdin(process)
+        try:
+            _close_stdin(process)
+        except (OSError, ValueError):
+            return False
+    return True
 
 
 def _terminate_for_deadline(process: subprocess.Popen[bytes], timed_out: threading.Event) -> None:
@@ -402,7 +408,10 @@ def run_command(arguments: argparse.Namespace) -> int:
         )
         assert process.stdout is not None
         deadline = _start_deadline(process, LAUNCH_TIMEOUT_SECONDS, timed_out)
-        writer = threading.Thread(target=_write_prompt, args=(process, prompt), daemon=True)
+        writer_result = [False]
+        writer = threading.Thread(
+            target=lambda: writer_result.__setitem__(0, _write_prompt(process, prompt)), daemon=True
+        )
         writer.start()
         parser = (
             parse_codex_stream if arguments.harness is HarnessFamily.CODEX else parse_claude_stream
@@ -410,7 +419,12 @@ def run_command(arguments: argparse.Namespace) -> int:
         try:
             usage = parser(process.stdout)
             writer.join()
+            if not writer_result[0]:
+                raise CaptureUsageError("prompt delivery failed") from None
         except (CodexUsageMissingTerminalError, ClaudeUsageMissingTerminalError):
+            writer.join()
+            if not writer_result[0]:
+                raise CaptureUsageError("prompt delivery failed") from None
             exit_code = process.wait(timeout=LAUNCH_TIMEOUT_SECONDS)
             if timed_out.is_set():
                 raise CaptureUsageError("harness run timed out") from None

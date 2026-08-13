@@ -853,6 +853,44 @@ def test_harness_version_retains_only_the_first_semver(monkeypatch: pytest.Monke
     assert usage_cli._harness_version("/stub/codex") == "0.147.0"  # pyright: ignore[reportPrivateUsage]
 
 
+def test_writer_failure_is_fixed_and_parent_visible() -> None:
+    """A stdin write failure returns a safe state instead of escaping the writer thread."""
+
+    class BrokenInput:
+        """Minimal pipe that rejects the prompt write."""
+
+        closed = False
+
+        def write(self, _: bytes) -> int:
+            raise OSError("PROMPT_SENTINEL")
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Process:
+        """Minimal process with the failing stdin pipe."""
+
+        stdin = BrokenInput()
+
+    assert not usage_cli._write_prompt(  # pyright: ignore[reportPrivateUsage]
+        cast(subprocess.Popen[bytes], Process()), b"PROMPT_SENTINEL"
+    )
+
+
+@pytest.mark.parametrize("value", ["invalid", "2026-08-13T12:00:00"])
+def test_captured_at_requires_valid_timezone(value: str) -> None:
+    """Outcome timestamps cannot be malformed or timezone-naive."""
+    with pytest.raises(argparse.ArgumentTypeError):
+        usage_cli._parse_time(value)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("value", ["SECURITY:MEDIUM:-1", "SECURITY:UNKNOWN:1", "bad"])
+def test_finding_count_rejects_malformed_or_negative_values(value: str) -> None:
+    """Outcome finding counts remain a closed non-negative grammar."""
+    with pytest.raises(argparse.ArgumentTypeError):
+        usage_cli._finding_count(value)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_capture_modules_do_not_load_roaster_control_dependencies() -> None:
     """Usage capture stays import-separated from controller, safety, and MCP code."""
     blocked = {
