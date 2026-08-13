@@ -258,6 +258,17 @@ def test_skill_script_roots_rejects_symlinked_agents_ancestor(tmp_path: Path) ->
         tooling_coverage.skill_script_roots(tmp_path)
 
 
+def test_skill_script_roots_rejects_a_symlinked_repository_root(tmp_path: Path) -> None:
+    """Discovery rejects a repository root path that is itself a symlink."""
+    real_root = tmp_path / "real-root"
+    (real_root / ".agents" / "skills" / "demo" / "scripts").mkdir(parents=True)
+    linked_root = tmp_path / "linked-root"
+    linked_root.symlink_to(real_root, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="tooling root must not traverse a symlink"):
+        tooling_coverage.skill_script_roots(linked_root)
+
+
 def test_normalize_coverage_xml_rejects_nested_intermediate_symlink(tmp_path: Path) -> None:
     """A nested candidate may not escape its tooling root through a directory symlink."""
     coverage_xml = _coverage_fixture(
