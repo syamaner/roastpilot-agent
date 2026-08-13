@@ -861,7 +861,8 @@ def test_harness_version_retains_only_the_first_semver(monkeypatch: pytest.Monke
     assert usage_cli._harness_version("/stub/codex") == "0.147.0"  # pyright: ignore[reportPrivateUsage]
 
 
-def test_writer_failure_is_fixed_and_parent_visible() -> None:
+@pytest.mark.parametrize("error", [OSError("PROMPT_SENTINEL"), BrokenPipeError()])
+def test_writer_failure_is_fixed_and_parent_visible(error: OSError) -> None:
     """A stdin write failure returns a safe state instead of escaping the writer thread."""
 
     class BrokenInput:
@@ -870,7 +871,7 @@ def test_writer_failure_is_fixed_and_parent_visible() -> None:
         closed = False
 
         def write(self, _: bytes) -> int:
-            raise OSError("PROMPT_SENTINEL")
+            raise error
 
         def close(self) -> None:
             self.closed = True
@@ -1027,6 +1028,127 @@ def test_provider_free_executable_integration_captures_only_normalized_usage(
     record = (tmp_path / ".agent-usage/usage.jsonl").read_text()
     assert "INTEGRATION_PROMPT_SENTINEL" not in record
     assert json.loads(record)["input_tokens"] == 1
+
+
+def test_early_closed_stdin_fails_without_appending_valid_terminal_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider-free child closing stdin early cannot yield a successful capture record."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"safe")
+    def large_prompt(_: Path) -> bytes:
+        return b"x" * 1_048_576
+
+    monkeypatch.setattr(usage_cli, "_prompt_bytes", large_prompt)
+    stub = tmp_path / "codex"
+    terminal = json.dumps(
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 1,
+                "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 1,
+                "reasoning_output_tokens": 0,
+            },
+        },
+        separators=(",", ":"),
+    )
+    started = 'printf \'{"type":"turn.started","pad":"\'; head -c 60000 /dev/zero'
+    stub.write_text(
+        "#!/bin/sh\n"
+        + 'if [ "$1" = "--version" ]; then echo \'codex 0.147.0\'; exit 0; fi\n'
+        + started
+        + " | tr '\\0' x; printf '\"}\\n'\n"
+        + "exec 0<&-\n"
+        + f"printf '%s\\n' '{terminal}'\n"
+    )
+    stub.chmod(0o700)
+
+    def fake_which(_: str) -> str:
+        return str(stub)
+
+    monkeypatch.setattr(usage_cli.shutil, "which", fake_which)
+    with pytest.raises(SystemExit, match="prompt delivery failed"):
+        main(
+            [
+                "run",
+                "--harness",
+                "codex",
+                "--prompt-file",
+                "prompt",
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                "validation",
+                "--model",
+                "gpt-5.6-terra",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
+    assert not (tmp_path / ".agent-usage").exists()
+
+
+def test_real_pipe_backpressure_interleaves_prompt_write_and_stdout_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real child proves stdout drains while near-limit stdin is still being written."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"p" * usage_cli.MAX_PROMPT_BYTES)
+    stub = tmp_path / "codex"
+    stub.write_text(
+        "#!" + sys.executable + "\n"
+        "import sys\n"
+        "if '--version' in sys.argv: print('codex 0.147.0'); raise SystemExit()\n"
+        'sys.stdout.write(\'{\\"type\\":\\"turn.started\\",\\"pad\\":\\"\' + '
+        "('x'*60000) + '\\\"}\\n'); sys.stdout.flush()\n"
+        "sys.stdin.buffer.read()\n"
+        'print(\'{\\"type\\":\\"turn.completed\\",\\"usage\\":{\\"input_tokens\\":1,\\"cached_input_tokens\\":0,\\"cache_write_input_tokens\\":0,\\"output_tokens\\":1,\\"reasoning_output_tokens\\":0}}\')\n'
+    )
+    stub.chmod(0o700)
+
+    def fake_which(_: str) -> str:
+        return str(stub)
+
+    monkeypatch.setattr(usage_cli.shutil, "which", fake_which)
+    monkeypatch.setattr(usage_cli, "LAUNCH_TIMEOUT_SECONDS", 2)
+    assert (
+        main(
+            [
+                "run",
+                "--harness",
+                "codex",
+                "--prompt-file",
+                "prompt",
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                "validation",
+                "--model",
+                "gpt-5.6-terra",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
+        == 0
+    )
 
 
 def test_run_timeout_kills_and_reaps_term_ignoring_child_without_a_record(

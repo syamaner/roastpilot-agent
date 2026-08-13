@@ -242,10 +242,12 @@ def _write_prompt(process: subprocess.Popen[bytes], prompt: bytes) -> bool:
     """Send bounded transient prompt bytes and report only a fixed success state."""
     assert process.stdin is not None
     try:
-        process.stdin.write(prompt)
-    except BrokenPipeError:
-        return True
-    except (OSError, ValueError):
+        if process.stdin.write(prompt) != len(prompt):
+            return False
+        flush = getattr(process.stdin, "flush", None)
+        if flush is not None:
+            flush()
+    except (BrokenPipeError, OSError, ValueError):
         return False
     finally:
         try:
