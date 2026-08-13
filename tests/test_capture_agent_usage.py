@@ -591,6 +591,149 @@ def test_task_usage_record_rejects_exit_and_harness_family_mislabeling() -> None
         )
 
 
+def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only recognized terminal usage can produce a complete failed-run record."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"PROMPT_SENTINEL")
+
+    class Input:
+        """Tiny closed test pipe."""
+
+        closed = False
+
+        def write(self, value: bytes) -> int:
+            return len(value)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Process:
+        """Stub process returning an exact supplied stream and exit code."""
+
+        def __init__(self, output: bytes, code: int) -> None:
+            self.stdin = Input()
+            self.stdout = BytesIO(output)
+            self.code = code
+
+        def poll(self) -> int:
+            return self.code
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return self.code
+
+        def terminate(self) -> None:
+            raise AssertionError("completed stub must not terminate")
+
+        def kill(self) -> None:
+            raise AssertionError("completed stub must not kill")
+
+    def run_for(output: bytes, code: int) -> tuple[int | None, str]:
+        def fake_popen(argv: list[str], **_: object) -> Process:
+            if argv[-1] == "--version":
+                return Process(b"codex 0.147.0\n", 0)
+            return Process(output, code)
+
+        def fake_which(_: str) -> str:
+            return "/stub/codex"
+
+        monkeypatch.setattr(usage_cli.shutil, "which", fake_which)
+        monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+        args = [
+            "run",
+            "--harness",
+            "codex",
+            "--prompt-file",
+            "prompt",
+            "--task-id",
+            "811",
+            "--slice-id",
+            "capture",
+            "--role",
+            "engineer-be",
+            "--model",
+            "gpt-5.6-terra",
+            "--repository",
+            "syamaner/roastpilot-agent",
+            "--branch",
+            "feature/811",
+            "--base-sha",
+            "2bed7013",
+            "--head-sha",
+            "4a3cca6",
+        ]
+        try:
+            result = main(args)
+        except SystemExit as exc:
+            result = None
+            error = str(exc)
+        else:
+            error = ""
+        sink = tmp_path / ".agent-usage/usage.jsonl"
+        return result, sink.read_text() if sink.exists() else error
+
+    result, record = run_for(_codex_terminal_event(), 3)
+    assert result == 0
+    parsed = json.loads(record)
+    assert not parsed["success"] and parsed["usage_complete"]
+    assert parsed["input_tokens"] == 1
+
+    (tmp_path / ".agent-usage/usage.jsonl").unlink()
+    result, record = run_for(b'{"type":"turn.started"}\n', 3)
+    assert result == 0
+    parsed = json.loads(record)
+    assert not parsed["success"] and not parsed["usage_complete"]
+    assert all(parsed[key] is None for key in ("input_tokens", "estimated_usd"))
+
+    (tmp_path / ".agent-usage/usage.jsonl").unlink()
+    result, error = run_for(b'{"type":"turn.started"}\n', 0)
+    assert result is None and "terminal usage" in error
+    assert not (tmp_path / ".agent-usage/usage.jsonl").exists()
+
+    result, error = run_for(b'{"type":"unknown-SENTINEL"}\n', 3)
+    assert result is None and "stream is invalid" in error
+    assert "SENTINEL" not in error
+    assert not (tmp_path / ".agent-usage/usage.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    ("version_output", "exit_code"),
+    [(b"no version\n", 0), (b"x" * 4097, 0), (b"codex 0.147.0\n", 1)],
+)
+def test_invalid_version_never_spawns_a_run(
+    version_output: bytes, exit_code: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bad, excessive, and nonzero version probes fail before a task launch."""
+
+    class VersionProcess:
+        """Completed version-only stub."""
+
+        def __init__(self) -> None:
+            self.stdout = BytesIO(version_output)
+
+        def poll(self) -> int:
+            return exit_code
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return exit_code
+
+        def terminate(self) -> None:
+            raise AssertionError("completed version stub must not terminate")
+
+        def kill(self) -> None:
+            raise AssertionError("completed version stub must not kill")
+
+    def fake_popen(*_args: object, **_kwargs: object) -> VersionProcess:
+        return VersionProcess()
+
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+    with pytest.raises(CaptureUsageError, match="version"):
+        usage_cli._harness_version("/stub/codex")  # pyright: ignore[reportPrivateUsage]
+
+
 def test_run_rejects_unsupported_effort_before_executable_lookup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
