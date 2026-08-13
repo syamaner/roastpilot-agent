@@ -153,8 +153,9 @@ def test_synthetic_module_stem_collision_fails_guard(tmp_path: Path) -> None:
 
 
 def test_synthetic_module_and_package_name_collision_fails_guard(tmp_path: Path) -> None:
-    """A module and direct child package cannot share a flattened import name."""
+    """A module and package collide while root ``__init__`` stays ignored."""
     (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "__init__.py").touch()
     (tmp_path / "src" / "shared_name.py").touch()
     package = tmp_path / "scripts" / "shared_name"
     package.mkdir(parents=True)
