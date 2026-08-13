@@ -557,6 +557,30 @@ def test_opaque_scanner_ignores_nested_type_and_counts_discarded_events() -> Non
         parse_codex_stream(BytesIO(item * (MAX_EVENT_COUNT + 1)))
 
 
+@pytest.mark.parametrize(
+    "number", [b"0", b"-0", b"1", b"-1.5", b"1e2", b"1e+2", b"1e-2", b"-1.5E+3"]
+)
+def test_opaque_scanner_accepts_rfc_json_number_forms(number: bytes) -> None:
+    """Opaque numeric values follow stdlib JSON's ASCII signed-exponent grammar."""
+    event = b'{"type":"item.updated","value":' + number + b"}\n"
+    assert parse_codex_stream(BytesIO(event + _codex_terminal_event())).input_tokens == 1
+
+
+def test_opaque_scanner_handles_large_signed_exponents_and_rejects_unicode_digits() -> None:
+    """Oversized opaque values retain RFC numeric grammar without leaking rejected payload bytes."""
+    payload = b"x" * MAX_EVENT_BYTES
+    valid = b'{"type":"item.updated","payload":"' + payload + b'","value":1e-2}\n'
+    assert parse_codex_stream(BytesIO(valid + _codex_terminal_event())).input_tokens == 1
+
+    unicode_digit = "١".encode()
+    invalid = (
+        b'{"type":"item.updated","payload":"' + payload + b'","value":' + unicode_digit + b"}\n"
+    )
+    with pytest.raises(CodexUsageParseError, match="malformed Codex JSON event") as error:
+        parse_codex_stream(BytesIO(invalid))
+    assert unicode_digit.decode() not in str(error.value)
+
+
 def test_opaque_scanner_enforces_json_nesting_depth_boundary() -> None:
     """Opaque item structures accept the fixed shallow depth and reject one level deeper."""
     prefix = b'{"type":"item.updated","payload":'

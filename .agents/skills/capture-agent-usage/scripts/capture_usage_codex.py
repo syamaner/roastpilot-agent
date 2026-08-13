@@ -102,7 +102,7 @@ class _JsonRootScanner:
                 self._string_truncated = False
             elif character in "{}[],:":
                 self._consume_punctuation(character)
-            elif character == "-" or character.isdigit():
+            elif character in "-0123456789":
                 self._primitive_kind = "number"
                 self._primitive_state = (
                     "minus" if character == "-" else ("zero" if character == "0" else "integer")
@@ -199,10 +199,12 @@ class _JsonRootScanner:
             "exponent": {"digit": "exponent"},
         }
         state = self._primitive_state
-        if character.isdigit():
+        if character in "0123456789":
             category = "digit"
-        elif character in ".+-":
+        elif character == ".":
             category = character
+        elif character in "+-":
+            category = "+-"
         elif character in "eE":
             category = "eE"
         else:
