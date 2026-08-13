@@ -11,13 +11,22 @@ against committed settings that could silently defeat the pins.
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import shutil
+import subprocess
+import tempfile
+import tomllib
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
 _AGENTS_DIR = _REPO / ".claude" / "agents"
+_CODEX_DIR = _REPO / ".codex"
+_PROJECT_DOC_MAX_BYTES = 131072
 
 # The single authoritative (model, effort) mapping for every named subagent.
 # Any change to an agent's frontmatter must be reflected here, and vice versa.
@@ -36,6 +45,11 @@ _EXPECTED: dict[str, tuple[str, str]] = {
     "story-planner": ("claude-fable-5", "high"),
 }
 _ALIASES = {"sonnet", "opus", "fable", "haiku", "best", "default"}
+_EXPECTED_CODEX: dict[str, tuple[str, str]] = {
+    "engineer-be": ("gpt-5.6-terra", "high"),
+    "engineer-fe": ("gpt-5.6-terra", "high"),
+    "repair": ("gpt-5.6-terra", "medium"),
+}
 
 
 def _frontmatter(path: Path) -> dict[str, str]:
@@ -222,3 +236,186 @@ def test_committed_settings_do_not_defeat_the_pins() -> None:
                 pinned == e or pinned.startswith(e + "-") for e in allowed
             )
             assert permitted, f"{rel} availableModels {allowed} does not permit pinned id {pinned}"
+
+
+def test_codex_project_agents_are_bounded_and_pinned() -> None:
+    """Project Codex roles are registered, bounded, leaf-only, and pinned."""
+    project_config = cast(
+        dict[str, object], tomllib.loads((_CODEX_DIR / "config.toml").read_text())
+    )
+    assert "model" not in project_config
+    project_doc_max_bytes = project_config["project_doc_max_bytes"]
+    assert type(project_doc_max_bytes) is int
+    assert project_doc_max_bytes == _PROJECT_DOC_MAX_BYTES
+    raw_agents_config = project_config["agents"]
+    assert isinstance(raw_agents_config, dict)
+    agents_config = cast(dict[str, object], raw_agents_config)
+    assert {key: value for key, value in agents_config.items() if not isinstance(value, dict)} == {
+        "enabled": True,
+        "max_concurrent_threads_per_session": 3,
+    }
+
+    registered_roles: dict[str, dict[str, object]] = {
+        name: cast(dict[str, object], value)
+        for name, value in agents_config.items()
+        if isinstance(value, dict)
+    }
+    assert set(registered_roles) == set(_EXPECTED_CODEX)
+    agents_md = (_REPO / "AGENTS.md").read_text()
+    assert "parent dispatches only the three registered named roles" in agents_md
+    assert "Unnamed or default worker dispatch\n  is forbidden" in agents_md
+    assert "Topology depth one remains mandatory\n  policy" in agents_md
+    assert "Codex 0.147.0 V2 does not enforce parent depth through\n  `max_depth`" in agents_md
+    assert (
+        "Codex 0.147.0 V2 runtime verification established that\n"
+        "  each leaf's `agents.enabled = false` removes spawn capability" in agents_md
+    )
+
+    files = sorted((_CODEX_DIR / "agents").glob("*.toml"))
+    assert {path.stem for path in files} == set(_EXPECTED_CODEX)
+    for path in files:
+        data = tomllib.loads(path.read_text())
+        model, effort = _EXPECTED_CODEX[path.stem]
+        registration = registered_roles[path.stem]
+        assert isinstance(registration["description"], str)
+        assert registration["description"].strip()
+        assert registration["config_file"] == f"agents/{path.name}"
+        assert "name" not in data
+        assert "description" not in data
+        assert data["model"] == model
+        assert data["model_reasoning_effort"] == effort
+        assert data["agents"]["enabled"] is False
+        instructions = data["developer_instructions"]
+        assert "do not spawn agents" in instructions.lower()
+        assert "invoke Claude Code or any other model" in instructions
+
+
+def test_agents_md_fits_configured_project_document_budget() -> None:
+    """AGENTS.md remains comfortably below the configured model-visible budget."""
+    project_config = cast(
+        dict[str, object], tomllib.loads((_CODEX_DIR / "config.toml").read_text())
+    )
+    project_doc_max_bytes = project_config["project_doc_max_bytes"]
+    assert type(project_doc_max_bytes) is int
+    assert project_doc_max_bytes == _PROJECT_DOC_MAX_BYTES
+    assert (_REPO / "AGENTS.md").stat().st_size <= project_doc_max_bytes * 3 // 4
+
+
+def test_codex_leaf_configs_pass_installed_strict_parse() -> None:
+    """Each leaf config must pass the installed Codex strict-config parser."""
+    codex = shutil.which("codex")
+    if codex is None:
+        pytest.skip("installed Codex CLI is unavailable")
+
+    for path in sorted((_CODEX_DIR / "agents").glob("*.toml")):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            codex_home = temp_path / "codex-home"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(path.read_text())
+            inert_cwd = temp_path / "inert-cwd"
+            inert_cwd.mkdir()
+            result = subprocess.run(
+                [codex, "app-server", "--stdio", "--strict-config"],
+                cwd=inert_cwd,
+                env={**os.environ, "CODEX_HOME": str(codex_home)},
+                input="",
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            assert result.returncode == 0, (
+                f"{path.name}: strict config parse failed:\n{result.stderr}"
+            )
+
+
+def test_installed_codex_exposes_required_agents_md_sections() -> None:
+    """Installed Codex exposes the required AGENTS.md sections for this trusted repo."""
+    codex = shutil.which("codex")
+    if codex is None:
+        pytest.skip("installed Codex CLI is unavailable")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        codex_home = Path(temp_dir)
+        (codex_home / "config.toml").write_text(f'[projects."{_REPO}"]\ntrust_level = "trusted"\n')
+        result = subprocess.run(
+            [codex, "debug", "prompt-input"],
+            cwd=_REPO,
+            env={**os.environ, "CODEX_HOME": str(codex_home)},
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+    assert result.returncode == 0, f"prompt-input failed:\n{result.stderr}"
+    prompt_input = cast(list[object], json.loads(result.stdout))
+    agents_blocks: list[str] = []
+    for message in prompt_input:
+        if not isinstance(message, dict):
+            continue
+        message_data = cast(dict[str, object], message)
+        content = message_data.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in cast(list[object], content):
+            if not isinstance(block, dict):
+                continue
+            block_data = cast(dict[str, object], block)
+            text = block_data.get("text")
+            if isinstance(text, str) and "# AGENTS.md - roastpilot-agent" in text:
+                agents_blocks.append(text)
+
+    assert len(agents_blocks) == 1
+    assert "Codex-Led Delivery Topology" in agents_blocks[0]
+    assert "Hardware Safety Notes" in agents_blocks[0]
+
+
+def test_claude_implementation_roles_follow_slice_routing() -> None:
+    """Claude implementation capacity remains leaf-only and slice-scoped."""
+    for role in ("engineer-be", "engineer-fe"):
+        instructions = (_AGENTS_DIR / f"{role}.md").read_text()
+        assert "one approved PR slice" in instructions
+        assert "One PR per story" not in instructions
+        assert "Do not invoke Codex or spawn agents" in instructions
+
+    planner = (_AGENTS_DIR / "story-planner.md").read_text()
+    assert "Codex-MCP" not in planner
+    assert "budget stop" not in planner
+    for status in ("healthy", "constrained", "reserve-only"):
+        assert f"`{status}`" in planner
+
+    architect = (_AGENTS_DIR / "planning-architect.md").read_text()
+    assert "Opus PM" not in architect
+    assert "Codex parent orchestrator to adjudicate" in architect
+    assert "Codex parent owns delivery orchestration and\nscope decomposition" in architect
+    assert "human retains product authority per `AGENTS.md`" in architect
+
+    frontend = (_AGENTS_DIR / "engineer-fe.md").read_text()
+    assert "E10 status table" not in frontend
+    assert "contract-named epic's status table\n  and registry" in frontend
+
+
+def test_pr_preflight_has_one_live_d158_review_flow() -> None:
+    """The pilot admits committed work and excludes legacy coordinator fan-out."""
+    preflight = (_REPO / ".claude" / "skills" / "pr-preflight" / "SKILL.md").read_text()
+    agents_md = (_REPO / "AGENTS.md").read_text()
+    assert "Legacy sections" not in preflight
+    assert "codex review --base" not in preflight
+    assert "Minimum sufficient independent review" in preflight
+    assert "Rerun every triggered reviewer whose evidence the change invalidated" in preflight
+    assert "git status --porcelain`" in preflight
+    assert (
+        "does not replace the stricter fresh-worktree plus ignored-file admission check"
+        in preflight
+    )
+    assert "git status --porcelain --ignored` is empty before delegation" in agents_md
+    assert "restart preflight from the new `HEAD`" in preflight
+    assert re.search(
+        r"review-branch`\s+workflow is dormant and unavailable during the D158 pilot",
+        agents_md,
+    )
+    assert re.search(
+        r"Claude-coordinator\s+fan-out violates the Codex-parent-only crossing "
+        r"and depth-one topology",
+        agents_md,
+    )

@@ -1,6 +1,6 @@
 ---
 name: engineer-fe
-description: Frontend engineer for the web/ SPA — React + TypeScript + Vite, Tailwind + shadcn/ui, uPlot, TanStack Query + native EventSource. Implements one page/area, consuming the shared foundation read-only. Use as an agent-team teammate (one per page) or standalone for a single SPA story. Recommended with worktree isolation when teammates run in parallel.
+description: Frontend engineer for one approved SPA PR slice — React + TypeScript + Vite, Tailwind + shadcn/ui, uPlot, TanStack Query + native EventSource. Implements one page/area while consuming the shared foundation read-only.
 tools: Read, Grep, Glob, Bash, Edit, Write
 model: claude-sonnet-5
 effort: high
@@ -12,11 +12,9 @@ TS, Tailwind + shadcn/ui, **uPlot** for curves, TanStack Query (REST) + native
 
 ## Read first
 
-- The **E10 kickoff brief** (`roastpilot-plan/roastpilot-agent/e10-ui-kickoff.md`)
-  — prototype→component mapping, design tokens, verdict rendering, demo wiring.
-- Component plan **§7** + `ui-prompts.md` (the chart spec of record). The
-  **sketches are reference specs, NEVER seed code** — rebuild, don't port.
-- `docs/epics/E10-spa.md` (your story + the ownership/dependency model).
+- Read `AGENTS.md`, then only the files and exact sections cited by the ratified
+  `story-planner` contract. The contract is your sole specification; do not
+  independently browse plan-repository, epic, issue, or discussion content.
 
 ## Rules
 
@@ -32,8 +30,12 @@ TS, Tailwind + shadcn/ui, **uPlot** for curves, TanStack Query (REST) + native
   never a hardcoded command×phase matrix.
 - **Name and write your tests** (component tests that assert interaction, not just
   render) + the Playwright states your story needs against the replay harness.
-- Keep `tsc`/eslint clean and tests green before handing off. One PR per story;
-  the completing PR updates the E10 status table + registry.
+- Do not invoke Codex or spawn agents. Return review or scope needs to the Codex
+  parent.
+- Keep `tsc`/eslint clean and tests green before handing off. Implement exactly
+  one approved PR slice from the ratified `story-planner` contract. Only the
+  slice that finishes the story updates the contract-named epic's status table
+  and registry.
 
 ## Worktree discipline (topology §7 — binding)
 
