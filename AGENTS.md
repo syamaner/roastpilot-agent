@@ -789,10 +789,9 @@ operator; do not silently substitute self-review or another same-family lens.
 
 ### Shared agent resources
 
-- **Skills** (`.claude/skills/`) — read the relevant `SKILL.md` in full before
-  acting. Claude registers these natively; **Codex discovers them from this table
-  and then reads the file**, so keep the table complete or a Codex session goes
-  blind to the ones omitted:
+- **Skills** (`.claude/skills/` and shared `.agents/skills/`) — read the relevant
+  `SKILL.md` in full before acting. Claude registers its native skills; **Codex
+  discovers them from this table and then reads the file**, so keep the table complete:
 
   | Skill | When |
   |-------|------|

@@ -12,6 +12,7 @@ import sys
 import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from typing import NoReturn, TypeVar
 
@@ -27,6 +28,7 @@ from capture_usage_codex import (
 )
 from capture_usage_models import (
     AGENT_USAGE_SCHEMA_VERSION,
+    MAX_STREAM_BYTES,
     USAGE_RECORD_ADAPTER,
     CapacitySnapshotRecord,
     CapacitySource,
@@ -163,41 +165,43 @@ def append_record(path: Path, record: UsageRecord) -> None:
             os.close(descriptor)
 
 
-def _print_parsed_json(value: object) -> None:
+def _print_parsed_json(value: ParsedUsage) -> None:
     """Print only normalized parser fields for explicit local inspection."""
-    print(value.model_dump_json())  # type: ignore[union-attr]
+    print(value.model_dump_json())
 
 
 def parse_codex_command(arguments: argparse.Namespace) -> int:
     """Parse a supplied sanitized Codex JSONL file without creating a record."""
-    with arguments.stream.open("rb") as stream:
-        _print_parsed_json(parse_codex_stream(stream))
+    _print_parsed_json(
+        parse_codex_stream(BytesIO(_input_bytes(arguments.stream, MAX_STREAM_BYTES)))
+    )
     return 0
 
 
 def parse_claude_command(arguments: argparse.Namespace) -> int:
     """Parse a supplied sanitized Claude JSONL file without creating a record."""
-    with arguments.stream.open("rb") as stream:
-        _print_parsed_json(parse_claude_stream(stream))
+    _print_parsed_json(
+        parse_claude_stream(BytesIO(_input_bytes(arguments.stream, MAX_STREAM_BYTES)))
+    )
     return 0
 
 
-def _prompt_bytes(path: Path) -> bytes:
-    """Read one fixed-size regular prompt through a no-follow descriptor."""
+def _input_bytes(path: Path, maximum: int = MAX_PROMPT_BYTES) -> bytes:
+    """Read one regular no-follow input into a fixed transient byte buffer."""
     if not hasattr(os, "O_NOFOLLOW"):
         raise CaptureUsageError("platform cannot securely open prompt input")
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError as exc:
-        raise CaptureUsageError("prompt file cannot be safely opened") from exc
+        raise CaptureUsageError("input file cannot be safely opened") from exc
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise CaptureUsageError("prompt file is not an accepted regular input")
+            raise CaptureUsageError("input file is not an accepted regular input")
         with os.fdopen(descriptor, "rb") as stream:
             descriptor = -1
-            prompt = stream.read(MAX_PROMPT_BYTES + 1)
-        if len(prompt) > MAX_PROMPT_BYTES:
-            raise CaptureUsageError("prompt file is not an accepted regular input")
+            prompt = stream.read(maximum + 1)
+        if len(prompt) > maximum:
+            raise CaptureUsageError("input file is not an accepted regular input")
         return prompt
     except CaptureUsageError:
         if descriptor >= 0:
@@ -206,6 +210,14 @@ def _prompt_bytes(path: Path) -> bytes:
     except OSError as exc:
         if descriptor >= 0:
             os.close(descriptor)
+        raise CaptureUsageError("input file cannot be safely opened") from exc
+
+
+def _prompt_bytes(path: Path) -> bytes:
+    """Read one bounded regular prompt without exposing its contents."""
+    try:
+        return _input_bytes(path)
+    except CaptureUsageError as exc:
         raise CaptureUsageError("prompt file cannot be safely opened") from exc
 
 
@@ -311,6 +323,7 @@ def _launch_argv(
     """Build the fixed, closed harness argv with stdin prompt delivery."""
     if harness is HarnessFamily.CODEX:
         argv = [executable, "exec", "--json", "--ephemeral", "--model", model]
+        argv.extend(["-c", "agents.enabled=false"])
         if effort is not None:
             argv.extend(["-c", f'model_reasoning_effort="{effort}"'])
         return [*argv, "-"]
@@ -389,12 +402,14 @@ def run_command(arguments: argparse.Namespace) -> int:
         )
         assert process.stdout is not None
         deadline = _start_deadline(process, LAUNCH_TIMEOUT_SECONDS, timed_out)
-        _write_prompt(process, prompt)
+        writer = threading.Thread(target=_write_prompt, args=(process, prompt), daemon=True)
+        writer.start()
         parser = (
             parse_codex_stream if arguments.harness is HarnessFamily.CODEX else parse_claude_stream
         )
         try:
             usage = parser(process.stdout)
+            writer.join()
         except (CodexUsageMissingTerminalError, ClaudeUsageMissingTerminalError):
             exit_code = process.wait(timeout=LAUNCH_TIMEOUT_SECONDS)
             if timed_out.is_set():
@@ -438,6 +453,8 @@ def run_command(arguments: argparse.Namespace) -> int:
     except subprocess.TimeoutExpired as exc:
         raise CaptureUsageError("harness run timed out") from exc
     finally:
+        if "writer" in locals():
+            writer.join(timeout=TERMINATE_GRACE_SECONDS)
         _cancel_deadline(deadline)
         if process is not None:
             _close_stdin(process)

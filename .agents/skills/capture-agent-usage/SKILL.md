@@ -6,6 +6,10 @@ description: Opt-in, parent-only local capture of metadata-only Codex and Claude
 Use only from the top-level Codex parent; leaves must not invoke it or cross the
 Codex/Claude family boundary. The skill records local metadata only, never prompts,
 responses, tool output, environment values, or CLI raw output.
+Never run it during an active roast or on a host currently controlling roaster hardware.
+
+For a failed harness with recognizable usage, capture exits 0 after appending the record
+while the record itself has `success=false`; this indicates capture succeeded, not the task.
 
 Use `scripts/capture_usage_cli.py snapshot-capacity` only for a qualitative capacity
 observation. Use `parse-codex` or `parse-claude` with sanitized streams to verify the

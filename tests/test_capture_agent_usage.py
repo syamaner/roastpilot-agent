@@ -7,6 +7,7 @@ import inspect
 import json
 import stat
 import subprocess
+import sys
 import threading
 from datetime import UTC, datetime
 from io import BytesIO
@@ -501,6 +502,8 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
         "--model",
         "gpt-5.6-terra",
         "-c",
+        "agents.enabled=false",
+        "-c",
         'model_reasoning_effort="high"',
         "-",
     ]
@@ -546,6 +549,8 @@ def test_launch_argv_uses_fixed_claude_flags_and_closed_effort_mapping() -> None
         "--ephemeral",
         "--model",
         "terra",
+        "-c",
+        "agents.enabled=false",
         "-",
     ]
 
@@ -846,6 +851,136 @@ def test_harness_version_retains_only_the_first_semver(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
     assert usage_cli._harness_version("/stub/codex") == "0.147.0"  # pyright: ignore[reportPrivateUsage]
+
+
+def test_capture_modules_do_not_load_roaster_control_dependencies() -> None:
+    """Usage capture stays import-separated from controller, safety, and MCP code."""
+    blocked = {
+        "roastpilot_agent.controller",
+        "roastpilot_agent.safety",
+        "roastpilot_agent.mcp_client",
+    }
+    assert not blocked.intersection(vars(usage_cli))
+    scripts = Path(usage_cli.__file__).parent
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import capture_usage_cli, capture_usage_codex, capture_usage_claude, "
+                "capture_usage_models; blocked={'roastpilot_agent.controller',"
+                "'roastpilot_agent.safety','roastpilot_agent.mcp_client'}; "
+                "raise SystemExit(bool(blocked & set(sys.modules)))"
+            ),
+        ],
+        cwd=scripts,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    assert result.returncode == 0
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("--task-id", "bad value"),
+        ("--branch", "bad value"),
+        ("--base-sha", "not-a-sha"),
+        ("--repository", "invalid"),
+    ],
+)
+def test_invalid_cli_metadata_rejects_before_executable_lookup(
+    field: str, value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closed metadata grammar fails before any selected executable can run."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"safe")
+    arguments = [
+        "run",
+        "--harness",
+        "codex",
+        "--prompt-file",
+        "prompt",
+        "--task-id",
+        "811",
+        "--slice-id",
+        "capture",
+        "--role",
+        "engineer-be",
+        "--model",
+        "gpt-5.6-terra",
+        "--repository",
+        "syamaner/roastpilot-agent",
+        "--branch",
+        "feature/811",
+        "--base-sha",
+        "2bed7013",
+        "--head-sha",
+        "4a3cca6",
+    ]
+    arguments[arguments.index(field) + 1] = value
+
+    def fail_which(_: str) -> str:
+        raise AssertionError("invalid metadata must not spawn")
+
+    monkeypatch.setattr(usage_cli.shutil, "which", fail_which)
+    with pytest.raises(SystemExit, match="metadata"):
+        main(arguments)
+
+
+def test_provider_free_executable_integration_captures_only_normalized_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A local executable receives stdin and emits a bounded terminal stream only."""
+    monkeypatch.chdir(tmp_path)
+    prompt = tmp_path / "prompt"
+    prompt.write_text("INTEGRATION_PROMPT_SENTINEL")
+    stub = tmp_path / "codex"
+    stub.write_text(
+        "#!" + sys.executable + "\n"
+        "import sys\n"
+        "if '--version' in sys.argv: print('codex 0.147.0'); raise SystemExit()\n"
+        "sys.stdin.buffer.read()\n"
+        'print(\'{\\"type\\":\\"turn.completed\\",\\"usage\\":{\\"input_tokens\\":1,\\"cached_input_tokens\\":0,\\"cache_write_input_tokens\\":0,\\"output_tokens\\":1,\\"reasoning_output_tokens\\":0}}\')\n'
+    )
+    stub.chmod(0o700)
+
+    def fake_which(_: str) -> str:
+        return str(stub)
+
+    monkeypatch.setattr(usage_cli.shutil, "which", fake_which)
+    assert (
+        main(
+            [
+                "run",
+                "--harness",
+                "codex",
+                "--prompt-file",
+                "prompt",
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                "engineer-be",
+                "--model",
+                "gpt-5.6-terra",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
+        == 0
+    )
+    record = (tmp_path / ".agent-usage/usage.jsonl").read_text()
+    assert "INTEGRATION_PROMPT_SENTINEL" not in record
+    assert json.loads(record)["input_tokens"] == 1
 
 
 def test_run_timeout_kills_and_reaps_term_ignoring_child_without_a_record(
@@ -1211,4 +1346,4 @@ def test_cli_filesystem_errors_do_not_echo_untrusted_paths(
     captured = capsys.readouterr()
     assert sentinel not in str(error.value)
     assert sentinel not in captured.err
-    assert "local filesystem operation failed" in str(error.value)
+    assert "input file cannot be safely opened" in str(error.value)
