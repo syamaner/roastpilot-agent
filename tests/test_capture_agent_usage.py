@@ -6,12 +6,13 @@ import argparse
 import inspect
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, cast
@@ -35,7 +36,18 @@ from capture_usage_models import (
 )
 from pydantic import ValidationError
 
+_REAL_VALIDATE_WORKTREE_METADATA = usage_cli._validate_worktree_metadata  # pyright: ignore[reportPrivateUsage]
 FIXTURES = Path(__file__).parent / "fixtures" / "agent-usage"
+
+
+@pytest.fixture(autouse=True)
+def isolate_run_metadata_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep launcher tests provider-free unless they exercise Git admission directly."""
+
+    def skip_worktree_validation(_arguments: argparse.Namespace) -> None:
+        return None
+
+    monkeypatch.setattr(usage_cli, "_validate_worktree_metadata", skip_worktree_validation)
 
 
 def _stream(*events: str) -> BytesIO:
@@ -313,6 +325,19 @@ def test_binary_stream_ingestion_checks_trailing_schema_after_terminal_usage() -
         parse_codex_stream(BytesIO(_codex_terminal_event() + b'{"type":"unexpected"}\n'))
 
 
+@pytest.mark.parametrize(
+    "stream",
+    [
+        b'{"type":"turn.started","type":"turn.started"}\n',
+        b'{"type":"turn.completed","usage":{"input_tokens":1,"input_tokens":2}}\n',
+    ],
+)
+def test_codex_duplicate_json_keys_fail_closed(stream: bytes) -> None:
+    """Duplicate discriminators or nested token keys cannot be normalized ambiguously."""
+    with pytest.raises(CodexUsageParseError, match="duplicate JSON keys"):
+        parse_codex_stream(BytesIO(stream))
+
+
 @pytest.mark.parametrize("removed_key", ["speed", "input_tokens"])
 def test_claude_terminal_usage_missing_installed_key_fails_closed(removed_key: str) -> None:
     """Every installed terminal usage key is required even when not retained."""
@@ -327,6 +352,30 @@ def test_claude_terminal_usage_extra_or_model_usage_drift_fails_closed() -> None
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     terminal["usage"]["unknown"] = 0
     with pytest.raises(ClaudeUsageParseError, match="usage schema"):
+        parse_claude_stream(_stream(json.dumps(terminal) + "\n"))
+
+
+def test_claude_duplicate_json_keys_fail_closed() -> None:
+    """Duplicate result or model-usage keys cannot select a retained value silently."""
+    duplicate_result = b'{"type":"result","type":"result"}\n'
+    duplicate_model = (
+        b'{"type":"result","subtype":"success","is_error":false,"usage":{},'
+        b'"modelUsage":{"model":{"inputTokens":1,"inputTokens":2}}}\n'
+    )
+    for stream in (duplicate_result, duplicate_model):
+        with pytest.raises(ClaudeUsageParseError, match="duplicate JSON keys"):
+            parse_claude_stream(BytesIO(stream))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("subtype", "error"), ("subtype", "unknown"), ("is_error", True), ("is_error", "false")],
+)
+def test_claude_terminal_requires_observed_success_status(field: str, value: object) -> None:
+    """Only the observed success/false result status may supply terminal usage."""
+    terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
+    terminal[field] = value
+    with pytest.raises(ClaudeUsageParseError, match="status is invalid"):
         parse_claude_stream(_stream(json.dumps(terminal) + "\n"))
 
 
@@ -499,6 +548,8 @@ def test_capacity_and_outcome_commands_persist_closed_metadata(
                 "annotate-outcome",
                 "--task-id",
                 "811",
+                "--slice-id",
+                "capture",
                 "--finding-count",
                 "SECURITY:MEDIUM:2",
                 "--repair-commit-count",
@@ -518,12 +569,15 @@ def test_capacity_and_outcome_commands_persist_closed_metadata(
         source=CapacitySource.OPERATOR,
     ).model_dump(mode="json")
     assert records[1]["finding_counts"] == {"SECURITY": {"MEDIUM": 2}}
+    assert records[1]["slice_id"] == "capture"
     with pytest.raises(SystemExit) as error:
         main(
             [
                 "annotate-outcome",
                 "--task-id",
                 "811",
+                "--slice-id",
+                "capture",
                 "--finding-count",
                 "OTHER:MEDIUM:1",
                 "--repair-commit-count",
@@ -531,6 +585,30 @@ def test_capacity_and_outcome_commands_persist_closed_metadata(
             ]
         )
     assert error.value.code == 2
+
+
+def test_annotate_outcome_rejects_duplicate_finding_counts_without_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One lens/severity pair has one closed count and cannot be overwritten."""
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit, match="duplicate finding count"):
+        main(
+            [
+                "annotate-outcome",
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--finding-count",
+                "SECURITY:MEDIUM:1",
+                "--finding-count",
+                "SECURITY:MEDIUM:2",
+                "--repair-commit-count",
+                "0",
+            ]
+        )
+    assert not (tmp_path / ".agent-usage").exists()
 
 
 def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
@@ -702,8 +780,8 @@ def test_launch_argv_uses_fixed_claude_flags_and_closed_effort_mapping() -> None
     ]
 
 
-def test_deadline_callback_does_not_mark_an_already_exited_process_timed_out() -> None:
-    """A timer racing a natural exit cannot suppress a completed record."""
+def test_deadline_callback_marks_exited_leader_with_possible_live_descendants() -> None:
+    """A deadline still cleans a group when only its direct leader has exited."""
 
     class ExitedProcess:
         """Minimal completed process for the deadline boundary."""
@@ -711,14 +789,21 @@ def test_deadline_callback_does_not_mark_an_already_exited_process_timed_out() -
         def poll(self) -> int:
             return 0
 
-        def terminate(self) -> None:
-            raise AssertionError("an exited process must not be terminated")
+        pid = 1234
 
     timed_out = usage_cli.threading.Event()
-    usage_cli._terminate_for_deadline(  # pyright: ignore[reportPrivateUsage]
-        cast(subprocess.Popen[bytes], ExitedProcess()), timed_out
-    )
-    assert not timed_out.is_set()
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        signals: list[int] = []
+
+        def record_signal(_pid: int, value: signal.Signals) -> None:
+            signals.append(int(value))
+
+        monkeypatch.setattr(usage_cli.os, "killpg", record_signal)
+        usage_cli._terminate_for_deadline(  # pyright: ignore[reportPrivateUsage]
+            cast(subprocess.Popen[bytes], ExitedProcess()), timed_out
+        )
+    assert timed_out.is_set()
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
 
 
 def test_deadline_callback_has_one_definition_and_uses_robust_stop() -> None:
@@ -770,9 +855,88 @@ def test_record_builder_preserves_explicit_whole_tree_verification() -> None:
         whole_tree_verified=True,
     )
     record = usage_cli._record_from_usage(  # pyright: ignore[reportPrivateUsage]
-        arguments, "0.147.0", 0, ParsedUsage(input_tokens=1)
+        arguments, "0.147.0", 0, ParsedUsage(input_tokens=1), 0
     )
     assert record.whole_tree_verified
+
+
+def test_record_elapsed_ms_uses_monotonic_value_despite_wall_clock_regression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit timestamps may move backwards without corrupting monotonic elapsed time."""
+    started = datetime(2026, 8, 13, 12, tzinfo=UTC)
+    arguments = argparse.Namespace(
+        started_at=started,
+        task_id="811",
+        slice_id="capture",
+        harness=HarnessFamily.CODEX,
+        role="measurement-pilot",
+        model="gpt-5.6-terra",
+        effort=None,
+        repository="syamaner/roastpilot-agent",
+        branch="feature/811",
+        base_sha="2bed7013",
+        head_sha="4a3cca6",
+        parent_task_id=None,
+        whole_tree_verified=False,
+    )
+    monkeypatch.setattr(usage_cli, "_utc_now", lambda: started - timedelta(seconds=5))
+    record = usage_cli._record_from_usage(  # pyright: ignore[reportPrivateUsage]
+        arguments, "0.147.0", 0, ParsedUsage(input_tokens=1), 250
+    )
+    assert record.completed_at < record.started_at
+    assert record.elapsed_ms == 250
+
+
+@pytest.mark.parametrize(
+    ("query", "result", "message"),
+    [
+        (["remote", "get-url", "origin"], (0, "https://example.invalid/other.git"), "repository"),
+        (["branch", "--show-current"], (0, "wrong-branch"), "branch or head"),
+        (["rev-parse", "HEAD"], (0, "deadbeef"), "branch or head"),
+        (["rev-parse", "--verify", "4a3cca6^{commit}"], (1, ""), "branch or head"),
+        (["rev-parse", "--verify", "2bed7013^{commit}"], (0, "older-base"), "base metadata"),
+        (["status", "--porcelain"], (0, " M unsafe"), "worktree is not clean"),
+    ],
+)
+def test_worktree_metadata_admission_rejects_mismatch_before_provider_lookup(
+    query: list[str],
+    result: tuple[int, str],
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repository metadata must match a clean current Git worktree before any provider lookup."""
+    arguments = argparse.Namespace(
+        repository="syamaner/roastpilot-agent",
+        branch="feature/811",
+        head_sha="4a3cca6",
+        base_sha="2bed7013",
+    )
+    expected: dict[tuple[str, ...], tuple[int, str]] = {
+        ("remote", "get-url", "origin"): (0, "https://github.com/syamaner/roastpilot-agent.git"),
+        ("branch", "--show-current"): (0, "feature/811"),
+        ("rev-parse", "HEAD"): (0, "4a3cca6"),
+        ("rev-parse", "--verify", "4a3cca6^{commit}"): (0, "4a3cca6"),
+        ("rev-parse", "--verify", "2bed7013^{commit}"): (0, "2bed7013"),
+        ("merge-base", "HEAD", "origin/main"): (0, "2bed7013"),
+        ("status", "--porcelain"): (0, ""),
+    }
+    expected[tuple(query)] = result
+
+    def fake_git_output(command: list[str]) -> tuple[int, str]:
+        return expected[tuple(command)]
+
+    def fail_provider_lookup(_name: str) -> str:
+        pytest.fail("provider lookup must follow Git admission")
+
+    monkeypatch.setattr(usage_cli, "_git_output", fake_git_output)
+    monkeypatch.setattr(
+        usage_cli.shutil,
+        "which",
+        fail_provider_lookup,
+    )
+    with pytest.raises(CaptureUsageError, match=message):
+        _REAL_VALIDATE_WORKTREE_METADATA(arguments)
 
 
 def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
@@ -1435,6 +1599,7 @@ def test_timeout_kills_real_stdout_inheriting_descendant_without_record(
     monkeypatch.chdir(tmp_path)
     Path("prompt").write_bytes(b"safe")
     marker = tmp_path / "descendant-pid"
+    ready = tmp_path / "descendant-ready"
     stub = tmp_path / "codex"
     stub.write_text(
         "#!" + sys.executable + "\n"
@@ -1443,11 +1608,11 @@ def test_timeout_kills_real_stdout_inheriting_descendant_without_record(
         "child = os.fork()\n"
         "if child == 0:\n"
         " Path('descendant-pid').write_text(str(os.getpid()))\n"
+        " Path('descendant-ready').write_text('ready')\n"
         " signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         " time.sleep(30)\n"
         " raise SystemExit()\n"
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-        "time.sleep(30)\n"
+        "raise SystemExit()\n"
     )
     stub.write_text(
         stub.read_text().replace(
@@ -1458,10 +1623,28 @@ def test_timeout_kills_real_stdout_inheriting_descendant_without_record(
     monkeypatch.setattr(usage_cli, "LAUNCH_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(usage_cli, "TERMINATE_GRACE_SECONDS", 0.01)
 
+    real_start_deadline = usage_cli._start_deadline  # pyright: ignore[reportPrivateUsage]
+    deadline_calls = 0
+
+    def start_after_descendant_ready(
+        process: subprocess.Popen[bytes], seconds: int, timed_out: threading.Event
+    ) -> threading.Timer:
+        nonlocal deadline_calls
+        deadline_calls += 1
+        if deadline_calls == 2:
+            for _ in range(50):
+                if ready.exists():
+                    break
+                time.sleep(0.01)
+            else:
+                pytest.fail("descendant did not establish the timeout readiness handshake")
+        return real_start_deadline(process, seconds, timed_out)
+
     def fake_which(_: str) -> str:
         return str(stub)
 
     monkeypatch.setattr(usage_cli.shutil, "which", fake_which)
+    monkeypatch.setattr(usage_cli, "_start_deadline", start_after_descendant_ready)
     with pytest.raises(SystemExit, match="timed out"):
         main(
             [

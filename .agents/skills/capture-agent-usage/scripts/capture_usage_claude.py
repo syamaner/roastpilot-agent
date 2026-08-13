@@ -81,8 +81,18 @@ def _non_negative_number(value: object, field: str) -> float:
 
 def _event_from_line(line: str) -> Mapping[str, Any]:
     """Decode one JSONL object and enforce the fixture's top-level grammar."""
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        """Build one JSON object only when every key is unique."""
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ClaudeUsageParseError("Claude event contains duplicate JSON keys")
+            result[key] = value
+        return result
+
     try:
-        event = json.loads(line)
+        event = json.loads(line, object_pairs_hook=reject_duplicate_keys)
     except json.JSONDecodeError as exc:
         raise ClaudeUsageParseError("malformed Claude JSONL event") from exc
     if not isinstance(event, dict):
@@ -139,6 +149,8 @@ def _finite_sum(values: Iterable[float], field: str) -> float:
 
 def _terminal_usage(event: Mapping[str, Any]) -> ParsedUsage:
     """Validate top-level usage and normalize totals from whole-tree model usage."""
+    if event.get("subtype") != "success" or event.get("is_error") is not False:
+        raise ClaudeUsageParseError("Claude terminal result status is invalid")
     usage = event.get("usage")
     if not isinstance(usage, dict):
         raise ClaudeUsageParseError("Claude result event is missing usage")

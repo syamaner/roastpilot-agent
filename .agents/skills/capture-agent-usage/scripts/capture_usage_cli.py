@@ -12,7 +12,9 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Sequence
+from contextlib import suppress
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -53,6 +55,8 @@ VERSION_TIMEOUT_SECONDS = 5
 TERMINATE_GRACE_SECONDS = 1
 _SEMVER = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 _SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_GIT_TIMEOUT_SECONDS = 5
+_GIT_OUTPUT_LIMIT = 4096
 
 
 class CaptureUsageError(ValueError):
@@ -237,20 +241,24 @@ def _prompt_bytes(path: Path) -> bytes:
 
 
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
-    """Terminate, then kill and reap one still-live child process."""
-    if process.poll() is None:
-        if hasattr(process, "pid"):
+    """Terminate, then kill and reap a child process group and its descendants."""
+    if hasattr(process, "pid"):
+        with suppress(OSError):
             os.killpg(process.pid, signal.SIGTERM)
-        else:
-            process.terminate()
-        try:
+    elif process.poll() is None:
+        process.terminate()
+    try:
+        if process.poll() is None:
             process.wait(timeout=TERMINATE_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            if hasattr(process, "pid"):
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
-            process.wait()
+    except subprocess.TimeoutExpired:
+        pass
+    if hasattr(process, "pid"):
+        with suppress(OSError):
+            os.killpg(process.pid, signal.SIGKILL)
+    elif process.poll() is None:
+        process.kill()
+    if process.poll() is None:
+        process.wait()
 
 
 def _close_stdin(process: subprocess.Popen[bytes]) -> None:
@@ -279,9 +287,7 @@ def _write_prompt(process: subprocess.Popen[bytes], prompt: bytes) -> bool:
 
 
 def _terminate_for_deadline(process: subprocess.Popen[bytes], timed_out: threading.Event) -> None:
-    """Fail closed on a live child deadline, including TERM-ignoring children."""
-    if process.poll() is not None:
-        return
+    """Fail closed at the run deadline, including surviving group descendants."""
     timed_out.set()
     _stop_process(process)
 
@@ -309,6 +315,78 @@ def _resolved_executable(harness: HarnessFamily) -> str:
     if executable is None:
         raise CaptureUsageError("selected harness executable is unavailable")
     return executable
+
+
+def _git_output(arguments: list[str]) -> tuple[int, str]:
+    """Run a fixed Git query with bounded, metadata-only output."""
+    process: subprocess.Popen[bytes] | None = None
+    deadline: threading.Timer | None = None
+    timed_out = threading.Event()
+    try:
+        process = subprocess.Popen(
+            ["git", *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            cwd=".",
+            start_new_session=True,
+        )
+        assert process.stdout is not None
+        deadline = _start_deadline(process, _GIT_TIMEOUT_SECONDS, timed_out)
+        output = process.stdout.read(_GIT_OUTPUT_LIMIT + 1)
+        returncode = process.wait(timeout=_GIT_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CaptureUsageError("Git worktree metadata is unavailable") from exc
+    finally:
+        _cancel_deadline(deadline)
+        if process is not None:
+            _stop_process(process)
+            if process.stdout is not None:
+                process.stdout.close()
+    if timed_out.is_set() or len(output) > _GIT_OUTPUT_LIMIT:
+        raise CaptureUsageError("Git worktree metadata is unavailable")
+    try:
+        return returncode, output.decode("utf-8", "strict").strip()
+    except UnicodeDecodeError as exc:
+        raise CaptureUsageError("Git worktree metadata is unavailable") from exc
+
+
+def _validate_worktree_metadata(arguments: argparse.Namespace) -> None:
+    """Bind explicit run metadata to the current clean RoastPilot worktree."""
+    origin_status, origin = _git_output(["remote", "get-url", "origin"])
+    if (
+        origin_status != 0
+        or origin
+        not in {
+            "https://github.com/syamaner/roastpilot-agent.git",
+            "git@github.com:syamaner/roastpilot-agent.git",
+        }
+        or arguments.repository != "syamaner/roastpilot-agent"
+    ):
+        raise CaptureUsageError("repository metadata does not match the current worktree")
+    branch_status, branch = _git_output(["branch", "--show-current"])
+    head_status, head = _git_output(["rev-parse", "HEAD"])
+    supplied_head_status, supplied_head = _git_output(
+        ["rev-parse", "--verify", f"{arguments.head_sha}^{{commit}}"]
+    )
+    if (
+        branch_status != 0
+        or head_status != 0
+        or supplied_head_status != 0
+        or branch != arguments.branch
+        or head != supplied_head
+    ):
+        raise CaptureUsageError("branch or head metadata does not match the current worktree")
+    base_status, supplied_base = _git_output(
+        ["rev-parse", "--verify", f"{arguments.base_sha}^{{commit}}"]
+    )
+    merge_base_status, merge_base = _git_output(["merge-base", "HEAD", "origin/main"])
+    if base_status != 0 or merge_base_status != 0 or supplied_base != merge_base:
+        raise CaptureUsageError("base metadata does not match the current worktree")
+    status_code, status = _git_output(["status", "--porcelain"])
+    if status_code != 0 or status:
+        raise CaptureUsageError("current worktree is not clean")
 
 
 def _harness_version(executable: str) -> str:
@@ -391,7 +469,7 @@ def _launch_argv(
 
 
 def _record_from_usage(
-    arguments: argparse.Namespace, version: str, exit_code: int, usage: ParsedUsage
+    arguments: argparse.Namespace, version: str, exit_code: int, usage: ParsedUsage, elapsed_ms: int
 ) -> TaskUsageRecord:
     """Build one closed task record from explicit metadata and parsed usage only."""
     started_at = arguments.started_at
@@ -410,7 +488,7 @@ def _record_from_usage(
         head_sha=arguments.head_sha,
         started_at=started_at,
         completed_at=completed_at,
-        elapsed_ms=int((completed_at - started_at).total_seconds() * 1000),
+        elapsed_ms=elapsed_ms,
         exit_code=exit_code,
         success=exit_code == 0,
         harness_version=version,
@@ -431,6 +509,7 @@ def _record_from_usage(
 def run_command(arguments: argparse.Namespace) -> int:
     """Launch one selected harness with a bounded prompt and append closed metadata."""
     _validate_run_metadata(arguments)
+    _validate_worktree_metadata(arguments)
     prompt = _prompt_bytes(arguments.prompt_file)
     process: subprocess.Popen[bytes] | None = None
     deadline: threading.Timer | None = None
@@ -439,6 +518,7 @@ def run_command(arguments: argparse.Namespace) -> int:
         executable = _resolved_executable(arguments.harness)
         version = _harness_version(executable)
         started_at = _utc_now()
+        started_monotonic = time.monotonic()
         arguments.started_at = started_at
         process = subprocess.Popen(
             _launch_argv(arguments.harness, executable, arguments.model, arguments.effort),
@@ -490,7 +570,7 @@ def run_command(arguments: argparse.Namespace) -> int:
                     head_sha=arguments.head_sha,
                     started_at=started_at,
                     completed_at=completed_at,
-                    elapsed_ms=int((completed_at - started_at).total_seconds() * 1000),
+                    elapsed_ms=int((time.monotonic() - started_monotonic) * 1000),
                     exit_code=exit_code,
                     success=False,
                     harness_version=version,
@@ -505,8 +585,23 @@ def run_command(arguments: argparse.Namespace) -> int:
         exit_code = process.wait(timeout=LAUNCH_TIMEOUT_SECONDS)
         if timed_out.is_set():
             raise CaptureUsageError("harness run timed out")
-        append_record(arguments.output, _record_from_usage(arguments, version, exit_code, usage))
+        append_record(
+            arguments.output,
+            _record_from_usage(
+                arguments,
+                version,
+                exit_code,
+                usage,
+                int((time.monotonic() - started_monotonic) * 1000),
+            ),
+        )
         return 0
+    except OSError as exc:
+        if "writer" in locals():
+            writer.join(timeout=TERMINATE_GRACE_SECONDS)
+            if not writer_result[0]:
+                raise CaptureUsageError("prompt delivery failed") from None
+        raise CaptureUsageError("harness run failed") from exc
     except subprocess.TimeoutExpired as exc:
         raise CaptureUsageError("harness run timed out") from exc
     finally:
@@ -514,7 +609,8 @@ def run_command(arguments: argparse.Namespace) -> int:
             writer.join(timeout=TERMINATE_GRACE_SECONDS)
         _cancel_deadline(deadline)
         if process is not None:
-            _close_stdin(process)
+            with suppress(OSError, ValueError):
+                _close_stdin(process)
             _stop_process(process)
             if process.stdout is not None:
                 process.stdout.close()
@@ -573,12 +669,15 @@ def annotate_outcome(arguments: argparse.Namespace) -> int:
     """Append closed pilot outcome metadata with no reviewer text or findings body."""
     counts: dict[FindingLens, dict[FindingSeverity, int]] = {}
     for lens, severity, count in arguments.finding_count:
+        if severity in counts.setdefault(lens, {}):
+            raise CaptureUsageError("duplicate finding count is not permitted")
         counts.setdefault(lens, {})[severity] = count
     append_record(
         arguments.output,
         OutcomeRecord(
             captured_at=arguments.captured_at or _utc_now(),
             task_id=arguments.task_id,
+            slice_id=arguments.slice_id,
             finding_counts=counts,
             repair_commit_count=arguments.repair_commit_count,
             final_gate_passed=arguments.final_gate_passed,
@@ -654,6 +753,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     outcome = commands.add_parser("annotate-outcome", help="append closed task outcome metadata")
     outcome.add_argument("--task-id", required=True)
+    outcome.add_argument("--slice-id", required=True)
     outcome.add_argument("--finding-count", type=_finding_count, action="append", required=True)
     outcome.add_argument("--repair-commit-count", type=int, required=True)
     outcome.add_argument("--final-gate-passed", action="store_true")

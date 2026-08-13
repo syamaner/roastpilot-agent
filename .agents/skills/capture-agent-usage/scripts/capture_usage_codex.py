@@ -39,8 +39,18 @@ def _non_negative_integer(value: object, field: str) -> int:
 
 def _event_from_line(line: str) -> Mapping[str, Any]:
     """Decode one JSONL object and reject non-object or missing-type events."""
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        """Build one JSON object only when every key is unique."""
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise CodexUsageParseError("Codex event contains duplicate JSON keys")
+            result[key] = value
+        return result
+
     try:
-        event = json.loads(line)
+        event = json.loads(line, object_pairs_hook=reject_duplicate_keys)
     except json.JSONDecodeError as exc:
         raise CodexUsageParseError("malformed Codex JSONL event") from exc
     if not isinstance(event, dict):

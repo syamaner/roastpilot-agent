@@ -254,6 +254,7 @@ class OutcomeRecord(CaptureModel):
     tool_version: SafeIdentifier = SKILL_VERSION
     captured_at: datetime
     task_id: SafeIdentifier
+    slice_id: SafeIdentifier
     finding_counts: dict[FindingLens, dict[FindingSeverity, TokenCount]]
     repair_commit_count: TokenCount
     final_gate_passed: bool
