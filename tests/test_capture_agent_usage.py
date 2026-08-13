@@ -766,6 +766,88 @@ def test_invalid_version_never_spawns_a_run(
         usage_cli._harness_version("/stub/codex")  # pyright: ignore[reportPrivateUsage]
 
 
+def test_version_probe_timeout_kills_reaps_and_never_reaches_a_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hung version stream is killed and cannot create a task record."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(usage_cli, "VERSION_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(usage_cli, "TERMINATE_GRACE_SECONDS", 0.001)
+    released = threading.Event()
+    observed = {"calls": 0, "killed": False, "reaped": False}
+
+    class BlockingOutput:
+        """Version stdout that stays open until the child is killed."""
+
+        def read(self, _: int) -> bytes:
+            released.wait(timeout=1)
+            return b""
+
+        def close(self) -> None:
+            return None
+
+    class HungVersion:
+        """TERM-ignoring version child that must be killed and reaped."""
+
+        stdin = None
+        stdout = BlockingOutput()
+
+        def poll(self) -> int | None:
+            return -9 if observed["killed"] else None
+
+        def terminate(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            observed["killed"] = True
+            released.set()
+
+        def wait(self, timeout: float | None = None) -> int:
+            if not observed["killed"] and timeout is not None:
+                raise subprocess.TimeoutExpired("stub", timeout)
+            observed["reaped"] = True
+            return -9
+
+    def fake_popen(*_args: object, **_kwargs: object) -> HungVersion:
+        observed["calls"] += 1
+        return HungVersion()
+
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+    with pytest.raises(CaptureUsageError, match="version"):
+        usage_cli._harness_version("/stub/codex")  # pyright: ignore[reportPrivateUsage]
+    assert observed == {"calls": 1, "killed": True, "reaped": True}
+    assert not (tmp_path / ".agent-usage").exists()
+
+
+def test_harness_version_retains_only_the_first_semver(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Version metadata freezes the first semantic version from bounded output."""
+
+    class VersionProcess:
+        """Completed multi-version output stub."""
+
+        stdin = None
+        stdout = BytesIO(b"codex 0.147.0 compatibility 9.9.9\n")
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+        def terminate(self) -> None:
+            raise AssertionError("completed probe must not terminate")
+
+        def kill(self) -> None:
+            raise AssertionError("completed probe must not kill")
+
+    def fake_popen(*_args: object, **_kwargs: object) -> VersionProcess:
+        return VersionProcess()
+
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+    assert usage_cli._harness_version("/stub/codex") == "0.147.0"  # pyright: ignore[reportPrivateUsage]
+
+
 def test_run_timeout_kills_and_reaps_term_ignoring_child_without_a_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
