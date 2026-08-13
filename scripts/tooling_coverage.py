@@ -21,14 +21,27 @@ def skill_script_roots(repo_root: Path) -> tuple[str, ...]:
     Raises:
         ValueError: If no skill script roots exist.
     """
-    roots = tuple(
-        path.relative_to(repo_root).as_posix()
-        for path in sorted((repo_root / ".agents" / "skills").glob("*/scripts"))
-        if path.is_dir()
-    )
+    _require_non_symlink_root(repo_root, ".agents/skills")
+    roots: list[str] = []
+    for path in sorted((repo_root / ".agents" / "skills").glob("*/scripts")):
+        relative = path.relative_to(repo_root).as_posix()
+        _require_non_symlink_root(repo_root, relative)
+        if path.is_dir():
+            roots.append(relative)
     if not roots:
         raise ValueError("no .agents/skills/*/scripts roots found")
-    return roots
+    return tuple(roots)
+
+
+def _require_non_symlink_root(repo_root: Path, root: str) -> None:
+    """Reject a tooling root reached through a symlinked repository component."""
+    if repo_root.is_symlink():
+        raise ValueError("tooling root must not traverse a symlink")
+    component = repo_root
+    for part in PurePosixPath(root).parts:
+        component /= part
+        if component.is_symlink():
+            raise ValueError("tooling root must not traverse a symlink")
 
 
 def require_registered_roots(
@@ -113,6 +126,8 @@ def normalize_coverage_xml(coverage_xml: Path, repo_root: Path) -> None:
         raise ValueError("coverage XML is malformed") from error
 
     tooling_roots = ("scripts", *skill_script_roots(repo_root))
+    for root in tooling_roots:
+        _require_non_symlink_root(repo_root, root)
     final_names: list[str] = []
     for class_element in report.findall(".//class"):
         filename = class_element.get("filename")
@@ -142,6 +157,7 @@ def _normalize_coverage_filename(
 
     matches: list[str] = []
     for root in tooling_roots:
+        _require_non_symlink_root(repo_root, root)
         candidate = repo_root / root / filename
         if candidate.exists() or candidate.is_symlink():
             _require_non_symlink_components(repo_root / root, path, filename)

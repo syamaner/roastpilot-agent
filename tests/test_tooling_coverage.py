@@ -234,6 +234,30 @@ def test_normalize_coverage_xml_rewrites_nested_tooling_filename(tmp_path: Path)
     )
 
 
+def test_skill_script_roots_rejects_symlinked_skill_scripts_root(tmp_path: Path) -> None:
+    """Discovery cannot treat an outside symlinked skill scripts directory as local tooling."""
+    outside = tmp_path / "outside"
+    (outside / "scripts").mkdir(parents=True)
+    (outside / "scripts" / "leak.py").touch()
+    skill = tmp_path / ".agents" / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "scripts").symlink_to(outside / "scripts", target_is_directory=True)
+
+    with pytest.raises(ValueError, match="tooling root must not traverse a symlink"):
+        tooling_coverage.skill_script_roots(tmp_path)
+
+
+def test_skill_script_roots_rejects_symlinked_agents_ancestor(tmp_path: Path) -> None:
+    """Discovery rejects a symlinked .agents ancestor before considering skill content."""
+    outside = tmp_path / "outside"
+    (outside / "skills" / "demo" / "scripts").mkdir(parents=True)
+    (outside / "skills" / "demo" / "scripts" / "leak.py").touch()
+    (tmp_path / ".agents").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="tooling root must not traverse a symlink"):
+        tooling_coverage.skill_script_roots(tmp_path)
+
+
 def test_normalize_coverage_xml_rejects_nested_intermediate_symlink(tmp_path: Path) -> None:
     """A nested candidate may not escape its tooling root through a directory symlink."""
     coverage_xml = _coverage_fixture(
