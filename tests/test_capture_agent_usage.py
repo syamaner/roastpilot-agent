@@ -129,6 +129,7 @@ def test_claude_fixture_uses_whole_tree_terminal_model_usage() -> None:
     assert usage.output_tokens == 20
     assert usage.estimated_usd == pytest.approx(0.123)
     assert usage.estimate_basis is EstimateBasis.CLIENT_SIDE_ESTIMATE
+    assert usage.claude_terminal_success is True
     assert usage.claude_model_usage is not None
     assert [
         (
@@ -1359,6 +1360,24 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
     assert parsed["input_tokens"] == 16
 
     (tmp_path / ".agent-usage/usage.jsonl").unlink()
+    success_terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
+    result, record = run_for((json.dumps(success_terminal) + "\n").encode(), 0, "claude")
+    assert result == 0
+    parsed = json.loads(record)
+    assert parsed["success"] and parsed["usage_complete"]
+
+    (tmp_path / ".agent-usage/usage.jsonl").unlink()
+    result, error = run_for((json.dumps(success_terminal) + "\n").encode(), 3, "claude")
+    assert result is None and "terminal status disagrees" in error
+    assert not (tmp_path / ".agent-usage/usage.jsonl").exists()
+
+    failure_terminal = dict(success_terminal)
+    failure_terminal["subtype"] = "error_max_turns"
+    failure_terminal["is_error"] = True
+    result, error = run_for((json.dumps(failure_terminal) + "\n").encode(), 0, "claude")
+    assert result is None and "terminal status disagrees" in error
+    assert not (tmp_path / ".agent-usage/usage.jsonl").exists()
+
     result, record = run_for(b'{"type":"turn.started"}\n', 3)
     assert result == 0
     parsed = json.loads(record)

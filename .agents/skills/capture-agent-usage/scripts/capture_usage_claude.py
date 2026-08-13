@@ -189,6 +189,7 @@ def _terminal_usage(event: Mapping[str, Any]) -> ParsedUsage:
         cache_creation_input_tokens=sum(item.cache_creation_input_tokens for item in model_usage),
         output_tokens=sum(item.output_tokens for item in model_usage),
         claude_model_usage=model_usage,
+        claude_terminal_success=is_error is False,
         estimated_usd=_finite_sum(
             (cost for cost in model_costs if cost is not None), "modelUsage costUSD sum"
         ),

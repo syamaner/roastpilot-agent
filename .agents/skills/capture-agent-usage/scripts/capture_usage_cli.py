@@ -600,6 +600,12 @@ def run_command(arguments: argparse.Namespace) -> int:
         exit_code = process.wait(timeout=LAUNCH_TIMEOUT_SECONDS)
         if timed_out.is_set():
             raise CaptureUsageError("harness run timed out")
+        if (
+            arguments.harness is HarnessFamily.CLAUDE
+            and usage.claude_terminal_success is not None
+            and usage.claude_terminal_success is not (exit_code == 0)
+        ):
+            raise CaptureUsageError("Claude terminal status disagrees with harness exit")
         completed_at = _utc_now()
         elapsed_ms = int((time.monotonic() - started_monotonic) * 1000)
         _validate_worktree_metadata(arguments)

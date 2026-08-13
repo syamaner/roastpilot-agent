@@ -151,6 +151,7 @@ class ParsedUsage(CaptureModel):
     output_tokens: TokenCount | None = None
     reasoning_output_tokens: TokenCount | None = None
     claude_model_usage: tuple[ClaudeModelUsage, ...] | None = None
+    claude_terminal_success: bool | None = None
     estimated_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     estimate_basis: EstimateBasis = EstimateBasis.NOT_EXPOSED
 
