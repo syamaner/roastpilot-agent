@@ -57,7 +57,7 @@ _SEMVER = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 _SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _VERIFIED_HARNESS_VERSIONS = {
     HarnessFamily.CODEX: "0.147.0",
-    HarnessFamily.CLAUDE: "2.1.228",
+    HarnessFamily.CLAUDE: "2.1.231",
 }
 _GIT_TIMEOUT_SECONDS = 5
 _GIT_OUTPUT_LIMIT = 4096

@@ -16,9 +16,9 @@ from capture_usage_models import (
 )
 
 CLAUDE_EVENT_TYPES = frozenset({"system", "user", "assistant", "rate_limit_event", "result"})
-"""Opaque event types observed in the sanitized Claude Code 2.1.228 fixture."""
+"""Opaque event types observed unchanged in sanitized 2.1.228 and 2.1.231 fixtures."""
 CLAUDE_SYSTEM_SUBTYPES = frozenset({"hook_started", "hook_response", "init"})
-"""System subtypes observed in the sanitized Claude Code 2.1.228 fixture."""
+"""System subtypes observed unchanged in sanitized 2.1.228 and 2.1.231 fixtures."""
 CLAUDE_RESULT_USAGE_KEYS = frozenset(
     {
         "input_tokens",
@@ -34,7 +34,7 @@ CLAUDE_RESULT_USAGE_KEYS = frozenset(
         "speed",
     }
 )
-"""Exact terminal usage keys observed in Claude Code 2.1.228."""
+"""Exact terminal usage keys observed unchanged in Claude Code 2.1.228 and 2.1.231."""
 CLAUDE_SUCCESS_SUBTYPE = "success"
 CLAUDE_FAILURE_SUBTYPES = frozenset(
     {
@@ -44,7 +44,7 @@ CLAUDE_FAILURE_SUBTYPES = frozenset(
         "error_during_execution",
     }
 )
-"""Closed result failure subtypes observed in Claude Code 2.1.228."""
+"""Closed failure subtypes observed unchanged in Claude Code 2.1.228 and 2.1.231."""
 CLAUDE_MODEL_USAGE_KEYS = frozenset(
     {
         "inputTokens",
@@ -59,7 +59,7 @@ CLAUDE_MODEL_USAGE_KEYS = frozenset(
         "provider",
     }
 )
-"""Exact per-model usage keys observed in Claude Code 2.1.228."""
+"""Exact model usage keys observed unchanged in Claude Code 2.1.228 and 2.1.231."""
 
 
 class ClaudeUsageParseError(ValueError):
