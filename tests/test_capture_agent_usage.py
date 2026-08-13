@@ -1279,7 +1279,19 @@ def test_run_rejects_unsupported_effort_before_executable_lookup(
 
 @pytest.mark.parametrize(
     "role",
-    ["engineer-be", "engineer-fe", "repair", "Engineer-BE", "REPAIR", "engineer_be", "engineer.fe"],
+    [
+        "engineer-be",
+        "engineer-fe",
+        "repair",
+        "Engineer-BE",
+        "REPAIR",
+        "engineer_be",
+        "engineer.fe",
+        "engineer:be",
+        "engineer--be",
+        "repair-",
+        "ENGINEER:_BE",
+    ],
 )
 def test_run_rejects_protected_implementation_roles_before_lookup(
     role: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1318,6 +1330,7 @@ def test_run_rejects_protected_implementation_roles_before_lookup(
                 "4a3cca6",
             ]
         )
+    assert not (tmp_path / ".agent-usage").exists()
 
 
 @pytest.mark.parametrize("role", ["measurement-pilot", "repair-audit", "engineer-be-audit"])
