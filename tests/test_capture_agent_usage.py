@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
+from typing import BinaryIO, cast
 
+import capture_usage_cli as usage_cli
 import pytest
 from capture_usage_claude import ClaudeUsageParseError, parse_claude_stream
 from capture_usage_cli import CaptureUsageError, append_record, main
@@ -393,6 +396,236 @@ def test_capacity_and_outcome_commands_persist_closed_metadata(
             ]
         )
     assert error.value.code == 2
+
+
+def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The opt-in launcher passes prompt bytes only to fixed harness stdin."""
+    monkeypatch.chdir(tmp_path)
+    prompt = tmp_path / "prompt.txt"
+    sentinel = b"SENTINEL_PROMPT_CONTENT"
+    prompt.write_bytes(sentinel)
+    observed: dict[str, object] = {}
+
+    class FakeProcess:
+        """Minimal fixed harness process with a complete terminal event."""
+
+        def __init__(self, output: bytes, exit_code: int = 0) -> None:
+            self.stdout = BytesIO(output)
+            self.exit_code = exit_code
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return self.exit_code
+
+        def poll(self) -> int:
+            return self.exit_code
+
+        def terminate(self) -> None:
+            raise AssertionError("completed process must not terminate")
+
+        def kill(self) -> None:
+            raise AssertionError("completed process must not be killed")
+
+    def fake_popen(argv: list[str], **kwargs: object) -> FakeProcess:
+        if argv[-1] == "--version":
+            observed["version_argv"] = argv
+            observed["version_kwargs"] = kwargs
+            return FakeProcess(b"codex-cli 0.147.0\n")
+        observed["argv"] = argv
+        observed["kwargs"] = kwargs
+        stdin = cast(BinaryIO, kwargs["stdin"])
+        observed["prompt"] = stdin.read()
+        return FakeProcess(_codex_terminal_event())
+
+    def fake_which(_: str) -> str:
+        return "/stub/codex"
+
+    monkeypatch.setattr(usage_cli.shutil, "which", fake_which)
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+    assert (
+        main(
+            [
+                "run",
+                "--harness",
+                "codex",
+                "--prompt-file",
+                str(prompt),
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                "engineer-be",
+                "--model",
+                "gpt-5.6-terra",
+                "--effort",
+                "high",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
+        == 0
+    )
+    assert observed["version_argv"] == ["/stub/codex", "--version"]
+    assert observed["argv"] == [
+        "/stub/codex",
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--model",
+        "gpt-5.6-terra",
+        "-c",
+        'model_reasoning_effort="high"',
+        "-",
+    ]
+    assert observed["prompt"] == sentinel
+    assert observed["kwargs"]["shell"] is False  # type: ignore[index]
+    record = (tmp_path / ".agent-usage/usage.jsonl").read_text()
+    assert sentinel.decode() not in record
+    assert "SENTINEL_PROMPT_CONTENT" not in str(observed["argv"])
+    assert "SENTINEL_PROMPT_CONTENT" not in str(observed["version_argv"])
+    assert json.loads(record)["effort"] == "high"
+
+
+def test_launch_argv_uses_fixed_claude_flags_and_closed_effort_mapping() -> None:
+    """Claude has all installed mandatory flags and accepts no arbitrary effort form."""
+    assert usage_cli._launch_argv(  # pyright: ignore[reportPrivateUsage]
+        HarnessFamily.CLAUDE, "/stub/claude", "opus", "max"
+    ) == [
+        "/stub/claude",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--no-session-persistence",
+        "--model",
+        "opus",
+        "--effort",
+        "max",
+    ]
+    assert usage_cli._launch_argv(  # pyright: ignore[reportPrivateUsage]
+        HarnessFamily.CODEX, "/stub/codex", "terra", None
+    ) == [
+        "/stub/codex",
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--model",
+        "terra",
+        "-",
+    ]
+
+
+def test_deadline_callback_does_not_mark_an_already_exited_process_timed_out() -> None:
+    """A timer racing a natural exit cannot suppress a completed record."""
+
+    class ExitedProcess:
+        """Minimal completed process for the deadline boundary."""
+
+        def poll(self) -> int:
+            return 0
+
+        def terminate(self) -> None:
+            raise AssertionError("an exited process must not be terminated")
+
+    timed_out = usage_cli.threading.Event()
+    usage_cli._terminate_for_deadline(  # pyright: ignore[reportPrivateUsage]
+        cast(subprocess.Popen[bytes], ExitedProcess()), timed_out
+    )
+    assert not timed_out.is_set()
+
+
+def test_run_rejects_unsupported_effort_before_executable_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only installed-version effort values can influence fixed argv."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"safe")
+
+    def fail_which(_: str) -> str:
+        raise AssertionError("executable lookup must not run")
+
+    monkeypatch.setattr(usage_cli.shutil, "which", fail_which)
+    with pytest.raises(SystemExit, match="effort is not supported"):
+        main(
+            [
+                "run",
+                "--harness",
+                "codex",
+                "--prompt-file",
+                "prompt",
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                "engineer-be",
+                "--model",
+                "gpt-5.6-terra",
+                "--effort",
+                "unsafe",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
+
+
+@pytest.mark.parametrize("value", [Path("prompt-link"), Path("prompt-dir")])
+def test_run_rejects_non_regular_or_symlink_prompt_before_launch(
+    value: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Prompt authorization refuses links and non-regular inputs before executable lookup."""
+    monkeypatch.chdir(tmp_path)
+    if value.name == "prompt-link":
+        Path("target").write_text("x")
+        value.symlink_to("target")
+    else:
+        value.mkdir()
+
+    def fail_which(_: str) -> str:
+        raise AssertionError("executable lookup must not run")
+
+    monkeypatch.setattr(usage_cli.shutil, "which", fail_which)
+    with pytest.raises(SystemExit, match="prompt file"):
+        main(
+            [
+                "run",
+                "--harness",
+                "codex",
+                "--prompt-file",
+                str(value),
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                "engineer-be",
+                "--model",
+                "gpt-5.6-terra",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
 
 
 def test_gitignore_contains_exactly_one_agent_usage_rule() -> None:

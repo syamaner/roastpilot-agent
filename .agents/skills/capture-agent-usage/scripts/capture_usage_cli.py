@@ -1,22 +1,30 @@
-"""Safe non-launching commands for the local agent-usage capture pilot.
-
-The contract-required live harness runner is deliberately absent until its prompt-to-
-external-service authorization is explicitly approved. These commands only parse local
-sanitized streams or append closed metadata records.
-"""
+"""Parent-only, metadata-only local agent-usage capture commands."""
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
+import shutil
+import stat
+import subprocess
 import sys
+import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NoReturn, TypeVar
+from typing import BinaryIO, NoReturn, TypeVar
 
-from capture_usage_claude import ClaudeUsageParseError, parse_claude_stream
-from capture_usage_codex import CodexUsageParseError, parse_codex_stream
+from capture_usage_claude import (
+    ClaudeUsageMissingTerminalError,
+    ClaudeUsageParseError,
+    parse_claude_stream,
+)
+from capture_usage_codex import (
+    CodexUsageMissingTerminalError,
+    CodexUsageParseError,
+    parse_codex_stream,
+)
 from capture_usage_models import (
     AGENT_USAGE_SCHEMA_VERSION,
     USAGE_RECORD_ADAPTER,
@@ -27,11 +35,19 @@ from capture_usage_models import (
     FindingSeverity,
     HarnessFamily,
     OutcomeRecord,
+    ParsedUsage,
+    TaskUsageRecord,
     UsageRecord,
 )
 
 DEFAULT_SINK = Path(".agent-usage/usage.jsonl")
 SINK_ROOT = ".agent-usage"
+MAX_PROMPT_BYTES = 65_536
+"""Prompt cap limits one explicitly-authorized stdin payload to 64 KiB."""
+LAUNCH_TIMEOUT_SECONDS = 120
+VERSION_TIMEOUT_SECONDS = 5
+_SEMVER = re.compile(r"\b(\d+\.\d+\.\d+)\b")
+_SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 
 class CaptureUsageError(ValueError):
@@ -165,6 +181,269 @@ def parse_claude_command(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _prompt_stream(path: Path) -> BinaryIO:
+    """Open one regular, non-symlink prompt file without exposing its path."""
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise CaptureUsageError("platform cannot securely open prompt input")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise CaptureUsageError("prompt file cannot be safely opened") from exc
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_size > MAX_PROMPT_BYTES:
+            raise CaptureUsageError("prompt file is not an accepted regular input")
+        return os.fdopen(descriptor, "rb")
+    except (CaptureUsageError, OSError):
+        os.close(descriptor)
+        raise
+
+
+def _resolved_executable(harness: HarnessFamily) -> str:
+    """Resolve the fixed executable selected by the closed harness enum."""
+    executable = shutil.which("codex" if harness is HarnessFamily.CODEX else "claude")
+    if executable is None:
+        raise CaptureUsageError("selected harness executable is unavailable")
+    return executable
+
+
+def _harness_version(executable: str) -> str:
+    """Return only the first semantic version from fixed executable output."""
+    process: subprocess.Popen[bytes] | None = None
+    deadline: threading.Timer | None = None
+    timed_out = threading.Event()
+    try:
+        process = subprocess.Popen(
+            [executable, "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+        )
+        assert process.stdout is not None
+        deadline = threading.Timer(
+            VERSION_TIMEOUT_SECONDS,
+            lambda: _terminate_for_deadline(process, timed_out),
+        )
+        deadline.daemon = True
+        deadline.start()
+        output = process.stdout.read(4097)
+        returncode = process.wait(timeout=VERSION_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CaptureUsageError("selected harness version is unavailable") from exc
+    finally:
+        if deadline is not None:
+            deadline.cancel()
+            deadline.join()
+        if process is not None:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
+    if timed_out.is_set():
+        raise CaptureUsageError("selected harness version is unavailable")
+    if len(output) > 4096:
+        raise CaptureUsageError("selected harness version is invalid")
+    match = _SEMVER.search(output.decode("utf-8", "ignore"))
+    if returncode != 0 or match is None:
+        raise CaptureUsageError("selected harness version is invalid")
+    return match.group(1)
+
+
+def _launch_argv(
+    harness: HarnessFamily, executable: str, model: str, effort: str | None
+) -> list[str]:
+    """Build the fixed, closed harness argv with stdin prompt delivery."""
+    if harness is HarnessFamily.CODEX:
+        argv = [executable, "exec", "--json", "--ephemeral", "--model", model]
+        if effort is not None:
+            argv.extend(["-c", f'model_reasoning_effort="{effort}"'])
+        return [*argv, "-"]
+    argv = [
+        executable,
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--no-session-persistence",
+        "--model",
+        model,
+    ]
+    if effort is not None:
+        argv.extend(["--effort", effort])
+    return argv
+
+
+def _record_from_usage(
+    arguments: argparse.Namespace, version: str, exit_code: int, usage: ParsedUsage
+) -> TaskUsageRecord:
+    """Build one closed task record from explicit metadata and parsed usage only."""
+    started_at = arguments.started_at
+    completed_at = _utc_now()
+    return TaskUsageRecord(
+        captured_at=completed_at,
+        task_id=arguments.task_id,
+        slice_id=arguments.slice_id,
+        harness=arguments.harness,
+        role=arguments.role,
+        model=arguments.model,
+        effort=arguments.effort,
+        repository=arguments.repository,
+        branch=arguments.branch,
+        base_sha=arguments.base_sha,
+        head_sha=arguments.head_sha,
+        started_at=started_at,
+        completed_at=completed_at,
+        elapsed_ms=int((completed_at - started_at).total_seconds() * 1000),
+        exit_code=exit_code,
+        success=exit_code == 0,
+        harness_version=version,
+        input_tokens=usage.input_tokens,
+        cached_input_tokens=usage.cached_input_tokens,
+        cache_creation_input_tokens=usage.cache_creation_input_tokens,
+        output_tokens=usage.output_tokens,
+        reasoning_output_tokens=usage.reasoning_output_tokens,
+        claude_model_usage=usage.claude_model_usage,
+        estimated_usd=usage.estimated_usd,
+        estimate_basis=usage.estimate_basis,
+        whole_tree_verified=arguments.whole_tree_verified,
+        usage_complete=True,
+        parent_task_id=arguments.parent_task_id,
+    )
+
+
+def run_command(arguments: argparse.Namespace) -> int:
+    """Launch one selected harness with a bounded prompt and append closed metadata."""
+    _validate_run_metadata(arguments)
+    prompt = _prompt_stream(arguments.prompt_file)
+    process: subprocess.Popen[bytes] | None = None
+    deadline: threading.Timer | None = None
+    timed_out = threading.Event()
+    try:
+        executable = _resolved_executable(arguments.harness)
+        version = _harness_version(executable)
+        started_at = _utc_now()
+        arguments.started_at = started_at
+        process = subprocess.Popen(
+            _launch_argv(arguments.harness, executable, arguments.model, arguments.effort),
+            stdin=prompt,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            cwd=".",
+        )
+        assert process.stdout is not None
+        deadline = threading.Timer(
+            LAUNCH_TIMEOUT_SECONDS,
+            lambda: _terminate_for_deadline(process, timed_out),
+        )
+        deadline.daemon = True
+        deadline.start()
+        parser = (
+            parse_codex_stream if arguments.harness is HarnessFamily.CODEX else parse_claude_stream
+        )
+        try:
+            usage = parser(process.stdout)
+        except (CodexUsageMissingTerminalError, ClaudeUsageMissingTerminalError):
+            exit_code = process.wait(timeout=LAUNCH_TIMEOUT_SECONDS)
+            if timed_out.is_set():
+                raise CaptureUsageError("harness run timed out") from None
+            if exit_code == 0:
+                raise CaptureUsageError("successful harness run has no terminal usage") from None
+            completed_at = _utc_now()
+            append_record(
+                arguments.output,
+                TaskUsageRecord(
+                    captured_at=completed_at,
+                    task_id=arguments.task_id,
+                    slice_id=arguments.slice_id,
+                    harness=arguments.harness,
+                    role=arguments.role,
+                    model=arguments.model,
+                    effort=arguments.effort,
+                    repository=arguments.repository,
+                    branch=arguments.branch,
+                    base_sha=arguments.base_sha,
+                    head_sha=arguments.head_sha,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    elapsed_ms=int((completed_at - started_at).total_seconds() * 1000),
+                    exit_code=exit_code,
+                    success=False,
+                    harness_version=version,
+                    usage_complete=False,
+                    whole_tree_verified=arguments.whole_tree_verified,
+                    parent_task_id=arguments.parent_task_id,
+                ),
+            )
+            return 0
+        except (CodexUsageParseError, ClaudeUsageParseError):
+            raise CaptureUsageError("harness usage stream is invalid") from None
+        exit_code = process.wait(timeout=LAUNCH_TIMEOUT_SECONDS)
+        if timed_out.is_set():
+            raise CaptureUsageError("harness run timed out")
+        append_record(arguments.output, _record_from_usage(arguments, version, exit_code, usage))
+        return 0
+    except subprocess.TimeoutExpired as exc:
+        raise CaptureUsageError("harness run timed out") from exc
+    finally:
+        if deadline is not None:
+            deadline.cancel()
+            deadline.join()
+        prompt.close()
+        if process is not None:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
+
+
+def _terminate_for_deadline(process: subprocess.Popen[bytes], timed_out: threading.Event) -> None:
+    """Mark a full-stream deadline expiry and stop the still-running child."""
+    if process.poll() is None:
+        timed_out.set()
+        process.terminate()
+
+
+def _validate_run_metadata(arguments: argparse.Namespace) -> None:
+    """Validate every caller-supplied record field before external launch."""
+    if arguments.effort is not None and arguments.effort not in _SUPPORTED_EFFORTS:
+        raise CaptureUsageError("effort is not supported by the selected harness")
+    now = _utc_now()
+    TaskUsageRecord(
+        captured_at=now,
+        task_id=arguments.task_id,
+        slice_id=arguments.slice_id,
+        harness=arguments.harness,
+        role=arguments.role,
+        model=arguments.model,
+        effort=arguments.effort,
+        repository=arguments.repository,
+        branch=arguments.branch,
+        base_sha=arguments.base_sha,
+        head_sha=arguments.head_sha,
+        started_at=now,
+        completed_at=now,
+        elapsed_ms=0,
+        exit_code=1,
+        success=False,
+        harness_version="0.0.0",
+        usage_complete=False,
+        whole_tree_verified=arguments.whole_tree_verified,
+        parent_task_id=arguments.parent_task_id,
+    )
+
+
 def _finding_count(value: str) -> tuple[FindingLens, FindingSeverity, int]:
     """Parse one closed ``LENS:SEVERITY:COUNT`` outcome option."""
     lens, separator, remainder = value.partition(":")
@@ -231,7 +510,7 @@ def _enum_option(enum_type: type[EnumMember], value: str) -> EnumMember:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the safe, non-launching command grammar for the capture utility."""
+    """Build the closed parent-only command grammar for the capture utility."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--schema-version", action="version", version=str(AGENT_USAGE_SCHEMA_VERSION)
@@ -245,6 +524,25 @@ def build_parser() -> argparse.ArgumentParser:
     parse_claude = commands.add_parser("parse-claude", help="parse a sanitized Claude stream")
     parse_claude.add_argument("stream", type=Path)
     parse_claude.set_defaults(handler=parse_claude_command)
+
+    run = commands.add_parser("run", help="opt-in parent-only selected harness capture")
+    run.add_argument(
+        "--harness", type=lambda value: _enum_option(HarnessFamily, value), required=True
+    )
+    run.add_argument("--prompt-file", type=Path, required=True)
+    run.add_argument("--task-id", required=True)
+    run.add_argument("--slice-id", required=True)
+    run.add_argument("--role", required=True)
+    run.add_argument("--model", required=True)
+    run.add_argument("--effort")
+    run.add_argument("--repository", required=True)
+    run.add_argument("--branch", required=True)
+    run.add_argument("--base-sha", required=True)
+    run.add_argument("--head-sha", required=True)
+    run.add_argument("--parent-task-id")
+    run.add_argument("--whole-tree-verified", action="store_true")
+    _add_output_option(run)
+    run.set_defaults(handler=run_command)
 
     outcome = commands.add_parser("annotate-outcome", help="append closed task outcome metadata")
     outcome.add_argument("--task-id", required=True)

@@ -18,6 +18,10 @@ class CodexUsageParseError(ValueError):
     """Raised when a Codex stream cannot prove a complete usage result."""
 
 
+class CodexUsageMissingTerminalError(CodexUsageParseError):
+    """Raised only when a complete Codex stream lacks terminal usage."""
+
+
 def _non_negative_integer(value: object, field: str) -> int:
     """Validate one token field without accepting booleans or partial values."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -92,5 +96,7 @@ def parse_codex_stream(stream: BinaryIO) -> ParsedUsage:
     except BoundedStreamError as exc:
         raise CodexUsageParseError(str(exc)) from exc
     if parsed is None:
-        raise CodexUsageParseError("Codex stream has no terminal turn.completed usage event")
+        raise CodexUsageMissingTerminalError(
+            "Codex stream has no terminal turn.completed usage event"
+        )
     return parsed

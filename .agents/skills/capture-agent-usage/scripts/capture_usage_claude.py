@@ -56,6 +56,10 @@ class ClaudeUsageParseError(ValueError):
     """Raised when a Claude stream cannot prove complete whole-tree usage."""
 
 
+class ClaudeUsageMissingTerminalError(ClaudeUsageParseError):
+    """Raised only when a complete Claude stream lacks a result usage event."""
+
+
 def _non_negative_integer(value: object, field: str) -> int:
     """Validate one token field without accepting booleans or partial values."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -191,5 +195,5 @@ def parse_claude_stream(stream: BinaryIO) -> ParsedUsage:
     except BoundedStreamError as exc:
         raise ClaudeUsageParseError(str(exc)) from exc
     if parsed is None:
-        raise ClaudeUsageParseError("Claude stream has no terminal result usage event")
+        raise ClaudeUsageMissingTerminalError("Claude stream has no terminal result usage event")
     return parsed
