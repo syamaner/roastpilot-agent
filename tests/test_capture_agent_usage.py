@@ -12,7 +12,7 @@ import threading
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
-from typing import cast
+from typing import BinaryIO, cast
 
 import capture_usage_cli as usage_cli
 import pytest
@@ -1102,16 +1102,35 @@ def test_early_closed_stdin_fails_without_appending_valid_terminal_usage(
 def test_real_pipe_backpressure_interleaves_prompt_write_and_stdout_drain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A real child proves stdout drains while near-limit stdin is still being written."""
+    """A real pipe requires parsing to start before the child drains prompt stdin.
+
+    The 4 MiB transient test prompt exceeds normal pipe capacity. The child emits a
+    valid event then waits for the parser-start marker before reading stdin. Thus a
+    synchronous write-before-read parent cannot create the marker and times out,
+    while the concurrent production writer/parser exchange completes under two seconds.
+    """
     monkeypatch.chdir(tmp_path)
-    Path("prompt").write_bytes(b"p" * usage_cli.MAX_PROMPT_BYTES)
+    Path("prompt").write_bytes(b"prompt input is deliberately not persisted")
+    marker = tmp_path / "parser-started"
+
+    def large_prompt(_: Path) -> bytes:
+        return b"p" * (4 * 1024 * 1024)
+
+    original_parse = usage_cli.parse_codex_stream
+
+    def mark_then_parse(stream: BinaryIO) -> ParsedUsage:
+        marker.write_text("started")
+        return original_parse(stream)
+
+    monkeypatch.setattr(usage_cli, "_prompt_bytes", large_prompt)
+    monkeypatch.setattr(usage_cli, "parse_codex_stream", mark_then_parse)
     stub = tmp_path / "codex"
     stub.write_text(
         "#!" + sys.executable + "\n"
         "import sys\n"
         "if '--version' in sys.argv: print('codex 0.147.0'); raise SystemExit()\n"
-        'sys.stdout.write(\'{\\"type\\":\\"turn.started\\",\\"pad\\":\\"\' + '
-        "('x'*60000) + '\\\"}\\n'); sys.stdout.flush()\n"
+        'print(\'{\\"type\\":\\"turn.started\\"}\', flush=True)\n'
+        "while not __import__('pathlib').Path('parser-started').exists(): time.sleep(0.01)\n"
         "sys.stdin.buffer.read()\n"
         'print(\'{\\"type\\":\\"turn.completed\\",\\"usage\\":{\\"input_tokens\\":1,\\"cached_input_tokens\\":0,\\"cache_write_input_tokens\\":0,\\"output_tokens\\":1,\\"reasoning_output_tokens\\":0}}\')\n'
     )
@@ -1150,6 +1169,9 @@ def test_real_pipe_backpressure_interleaves_prompt_write_and_stdout_drain(
         )
         == 0
     )
+    assert {
+        item.relative_to(tmp_path).as_posix() for item in tmp_path.rglob("*") if item.is_file()
+    } == {"prompt", "codex", "parser-started", ".agent-usage/usage.jsonl"}
 
 
 def test_run_timeout_kills_and_reaps_term_ignoring_child_without_a_record(
