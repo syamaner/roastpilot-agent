@@ -22,6 +22,7 @@ from typing import BinaryIO, NoReturn, TypeVar
 
 from capture_usage_claude import (
     ClaudeAuthorityError,
+    ClaudeAuthorityMode,
     ClaudeUsageMissingTerminalError,
     ClaudeUsageParseError,
     parse_claude_stream,
@@ -41,6 +42,8 @@ from capture_usage_models import (
     FindingLens,
     FindingSeverity,
     HarnessFamily,
+    NativeClaudeRole,
+    NativeWorkerUsageRecord,
     OutcomeRecord,
     ParsedUsage,
     TaskUsageRecord,
@@ -52,6 +55,7 @@ SINK_ROOT = ".agent-usage"
 MAX_PROMPT_BYTES = 65_536
 """Prompt cap limits one explicitly-authorized stdin payload to 64 KiB."""
 LAUNCH_TIMEOUT_SECONDS = 3600
+NATIVE_LAUNCH_TIMEOUT_SECONDS = 14_400
 VERSION_TIMEOUT_SECONDS = 5
 TERMINATE_GRACE_SECONDS = 1
 _SEMVER = re.compile(r"\b(\d+\.\d+\.\d+)\b")
@@ -423,6 +427,68 @@ def _validate_worktree_metadata(arguments: argparse.Namespace) -> None:
     arguments.base_sha = merge_base
 
 
+def _native_effort(role: NativeClaudeRole) -> str:
+    """Read the one committed effort frontmatter value for a native role."""
+    path = Path(".claude") / "agents" / f"{role.value}.md"
+    content: str | None = None
+    with suppress(CaptureUsageError, UnicodeDecodeError):
+        content = _input_bytes(path).decode("utf-8", "strict")
+    if content is None:
+        raise CaptureUsageError("native agent frontmatter is unavailable")
+    lines = content.splitlines()
+    if not lines or lines[0] != "---":
+        raise CaptureUsageError("native agent frontmatter is invalid")
+    try:
+        end = lines.index("---", 1)
+    except ValueError:
+        raise CaptureUsageError("native agent frontmatter is invalid") from None
+    values = [line.removeprefix("effort: ") for line in lines[1:end] if line.startswith("effort: ")]
+    if len(values) != 1 or values[0] not in _SUPPORTED_EFFORTS:
+        raise CaptureUsageError("native agent frontmatter is invalid")
+    return values[0]
+
+
+def _validate_native_worktree(arguments: argparse.Namespace, *, post_exit: bool) -> str:
+    """Attest the native worker's exact repository, branch, and commit provenance."""
+    origin_status, origin = _git_output(["remote", "get-url", "origin"])
+    if (
+        origin_status != 0
+        or origin
+        not in {
+            "https://github.com/syamaner/roastpilot-agent.git",
+            "git@github.com:syamaner/roastpilot-agent.git",
+        }
+        or arguments.repository != "syamaner/roastpilot-agent"
+    ):
+        raise CaptureUsageError("native repository metadata does not match the current worktree")
+    branch_status, branch = _git_output(["branch", "--show-current"])
+    head_status, head = _git_output(["rev-parse", "HEAD"])
+    base_status, base = _git_output(["rev-parse", "--verify", f"{arguments.base_sha}^{{commit}}"])
+    merge_status, merge_base = _git_output(["merge-base", "HEAD", "origin/main"])
+    status_args = ["status", "--porcelain"] if post_exit else ["status", "--porcelain", "--ignored"]
+    clean_status, dirty = _git_output(status_args)
+    if (
+        branch_status != 0
+        or head_status != 0
+        or base_status != 0
+        or merge_status != 0
+        or clean_status != 0
+        or branch != arguments.branch
+        or merge_base != base
+        or dirty
+    ):
+        raise CaptureUsageError("native worktree attestation failed")
+    if not post_exit:
+        if head != base:
+            raise CaptureUsageError("native worktree attestation failed")
+        arguments.base_sha = base
+        return head
+    ancestry_status, _ = _git_output(["merge-base", "--is-ancestor", base, head])
+    if ancestry_status != 0 or head == base:
+        raise CaptureUsageError("native worktree attestation failed")
+    return head
+
+
 def _harness_version(executable: str) -> str:
     """Return only the first semantic version from fixed executable output."""
     process: subprocess.Popen[bytes] | None = None
@@ -500,6 +566,207 @@ def _launch_argv(
     if effort is not None:
         argv.extend(["--effort", effort])
     return argv
+
+
+def _native_claude_argv(executable: str, role: NativeClaudeRole) -> list[str]:
+    """Build the exact installed native-Claude worker argv."""
+    return [
+        executable,
+        "--agent",
+        role.value,
+        "--setting-sources",
+        "project",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--no-session-persistence",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--permission-mode",
+        "auto",
+    ]
+
+
+def _validate_native_metadata(arguments: argparse.Namespace, role: NativeClaudeRole) -> None:
+    """Validate caller metadata through the closed native record model before launch."""
+    now = _utc_now()
+    try:
+        NativeWorkerUsageRecord(
+            captured_at=now,
+            task_id=arguments.task_id,
+            slice_id=arguments.slice_id,
+            native_role=role,
+            model="pending",
+            effort="pending",
+            repository=arguments.repository,
+            branch=arguments.branch,
+            base_sha=arguments.base_sha,
+            final_head_sha=arguments.base_sha,
+            parent_task_id=arguments.parent_task_id,
+            started_at=now,
+            completed_at=now,
+            elapsed_ms=0,
+            exit_code=1,
+            success=False,
+            harness_version="0.0.0",
+            input_tokens=0,
+            cached_input_tokens=0,
+            cache_creation_input_tokens=0,
+            output_tokens=0,
+            claude_model_usage=(),
+        )
+    except ValueError:
+        raise CaptureUsageError("native capture metadata is invalid") from None
+
+
+def _native_record_from_usage(
+    arguments: argparse.Namespace,
+    role: NativeClaudeRole,
+    effort: str,
+    version: str,
+    final_head_sha: str,
+    exit_code: int,
+    usage: ParsedUsage,
+    completed_at: datetime,
+    elapsed_ms: int,
+) -> NativeWorkerUsageRecord:
+    """Build one complete native record from attested and parsed metadata only."""
+    if (
+        usage.claude_init_model is None
+        or usage.input_tokens is None
+        or usage.cached_input_tokens is None
+        or usage.cache_creation_input_tokens is None
+        or usage.output_tokens is None
+        or usage.claude_model_usage is None
+    ):
+        raise CaptureUsageError("native Claude usage is incomplete")
+    return NativeWorkerUsageRecord(
+        captured_at=completed_at,
+        task_id=arguments.task_id,
+        slice_id=arguments.slice_id,
+        native_role=role,
+        model=usage.claude_init_model,
+        effort=effort,
+        repository=arguments.repository,
+        branch=arguments.branch,
+        base_sha=arguments.base_sha,
+        final_head_sha=final_head_sha,
+        parent_task_id=arguments.parent_task_id,
+        started_at=arguments.started_at,
+        completed_at=completed_at,
+        elapsed_ms=elapsed_ms,
+        exit_code=exit_code,
+        success=exit_code == 0,
+        harness_version=version,
+        input_tokens=usage.input_tokens,
+        cached_input_tokens=usage.cached_input_tokens,
+        cache_creation_input_tokens=usage.cache_creation_input_tokens,
+        output_tokens=usage.output_tokens,
+        claude_model_usage=usage.claude_model_usage,
+        estimated_usd=usage.estimated_usd,
+        estimate_basis=usage.estimate_basis,
+    )
+
+
+def run_native_claude_command(arguments: argparse.Namespace) -> int:
+    """Launch one registered Claude implementation worker and append complete usage."""
+    role = NativeClaudeRole(arguments.role)
+    _validate_native_metadata(arguments, role)
+    _validate_native_worktree(arguments, post_exit=False)
+    effort = _native_effort(role)
+    prompt = _prompt_bytes(arguments.prompt_file)
+    process: subprocess.Popen[bytes] | None = None
+    deadline: threading.Timer | None = None
+    timed_out = threading.Event()
+    writer: threading.Thread | None = None
+    writer_result = [False]
+    try:
+        executable = _resolved_executable(HarnessFamily.CLAUDE)
+        version = _harness_version(executable)
+        if version != _VERIFIED_HARNESS_VERSIONS[HarnessFamily.CLAUDE]:
+            raise CaptureUsageError("selected harness version is not verified")
+        _validate_native_worktree(arguments, post_exit=False)
+        started_at = _utc_now()
+        started_monotonic = time.monotonic()
+        arguments.started_at = started_at
+        process = subprocess.Popen(
+            _native_claude_argv(executable, role),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            cwd=".",
+            start_new_session=True,
+        )
+        assert process.stdout is not None
+        deadline = _start_deadline(process, NATIVE_LAUNCH_TIMEOUT_SECONDS, timed_out)
+        writer = threading.Thread(
+            target=lambda: writer_result.__setitem__(0, _write_prompt(process, prompt)),
+            daemon=True,
+        )
+        writer.start()
+        try:
+            usage = parse_claude_stream(
+                process.stdout,
+                require_launch_authority=False,
+                authority_mode=ClaudeAuthorityMode.NATIVE,
+            )
+        except ClaudeUsageMissingTerminalError:
+            if timed_out.is_set():
+                raise CaptureUsageError("native Claude run timed out") from None
+            raise CaptureUsageError("native Claude run has no terminal usage") from None
+        except ClaudeAuthorityError:
+            raise CaptureUsageError("native Claude launch authority is not attested") from None
+        except ClaudeUsageParseError:
+            if timed_out.is_set():
+                raise CaptureUsageError("native Claude run timed out") from None
+            raise CaptureUsageError("native Claude usage stream is invalid") from None
+        writer.join()
+        if not writer_result[0]:
+            raise CaptureUsageError("prompt delivery failed")
+        exit_code = process.wait(timeout=NATIVE_LAUNCH_TIMEOUT_SECONDS)
+        if timed_out.is_set():
+            raise CaptureUsageError("native Claude run timed out")
+        if usage.claude_terminal_success is not (exit_code == 0):
+            raise CaptureUsageError("Claude terminal status disagrees with harness exit")
+        completed_at = _utc_now()
+        elapsed_ms = int((time.monotonic() - started_monotonic) * 1000)
+        final_head_sha = _validate_native_worktree(arguments, post_exit=True)
+        append_record(
+            arguments.output,
+            _native_record_from_usage(
+                arguments,
+                role,
+                effort,
+                version,
+                final_head_sha,
+                exit_code,
+                usage,
+                completed_at,
+                elapsed_ms,
+            ),
+        )
+        return 0
+    except OSError:
+        if writer is not None:
+            writer.join(timeout=TERMINATE_GRACE_SECONDS)
+            if not writer_result[0]:
+                raise CaptureUsageError("prompt delivery failed") from None
+        raise CaptureUsageError("native Claude run failed") from None
+    except subprocess.TimeoutExpired:
+        raise CaptureUsageError("native Claude run timed out") from None
+    finally:
+        if writer is not None:
+            writer.join(timeout=TERMINATE_GRACE_SECONDS)
+        _cancel_deadline(deadline)
+        if process is not None:
+            with suppress(OSError, ValueError):
+                _close_stdin(process)
+            _stop_process(process)
+            if process.stdout is not None:
+                process.stdout.close()
 
 
 def _record_from_usage(
@@ -807,6 +1074,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_output_option(run)
     run.set_defaults(handler=run_command)
 
+    native = commands.add_parser(
+        "run-native-claude", help="capture one registered Claude implementation worker"
+    )
+    native.add_argument("--role", choices=("engineer-be", "engineer-fe"), required=True)
+    native.add_argument("--prompt-file", type=Path, required=True)
+    native.add_argument("--task-id", required=True)
+    native.add_argument("--slice-id", required=True)
+    native.add_argument("--parent-task-id", required=True)
+    native.add_argument("--repository", required=True)
+    native.add_argument("--branch", required=True)
+    native.add_argument("--base-sha", required=True)
+    _add_output_option(native)
+    native.set_defaults(handler=run_native_claude_command)
+
     outcome = commands.add_parser("annotate-outcome", help="append closed task outcome metadata")
     outcome.add_argument("--task-id", required=True)
     outcome.add_argument("--slice-id", required=True)
@@ -837,27 +1118,29 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _exit_with_error(message: str) -> NoReturn:
     """Exit without echoing parser input content."""
-    raise SystemExit(f"capture-agent-usage: {message}")
+    raise SystemExit(f"capture-agent-usage: {message}") from None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run a safe subcommand and present only metadata-safe errors."""
     parser = build_parser()
     arguments = parser.parse_args(argv)
+    failure: str | None = None
     try:
         return int(arguments.handler(arguments))
     except CaptureUsageError as exc:
-        _exit_with_error(str(exc))
+        failure = str(exc)
     except CodexUsageParseError:
-        _exit_with_error("Codex usage stream is invalid")
+        failure = "Codex usage stream is invalid"
     except ClaudeAuthorityError:
-        _exit_with_error("Claude launch authority is not attested")
+        failure = "Claude launch authority is not attested"
     except ClaudeUsageParseError:
-        _exit_with_error("Claude usage stream is invalid")
+        failure = "Claude usage stream is invalid"
     except OSError:
-        _exit_with_error("local filesystem operation failed")
+        failure = "local filesystem operation failed"
     except ValueError:
-        _exit_with_error("metadata input is invalid")
+        failure = "metadata input is invalid"
+    _exit_with_error(failure)
 
 
 if __name__ == "__main__":

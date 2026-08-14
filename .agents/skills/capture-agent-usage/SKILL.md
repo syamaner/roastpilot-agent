@@ -24,3 +24,9 @@ Its maintainer-selected `--prompt-file` is sent only to the selected provider on
 while normalized metadata and usage totals are recorded. The `role` field is
 caller-supplied attribution metadata, never agent selection; native named-agent dispatch
 remains required for implementation slices.
+
+Under D160, `run-native-claude` is the separate parent-only instrumentation path for an
+already-selected `engineer-be` or `engineer-fe` implementation slice. It launches that
+registered project agent with fixed arguments, sends the ratified prompt on stdin, and
+records complete normalized metadata only. It cannot select `repair`, persist prompt or
+raw output, claim whole-tree coverage, or replace the parent's routing authority.
