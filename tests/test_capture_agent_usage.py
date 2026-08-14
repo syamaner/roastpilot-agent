@@ -3530,6 +3530,21 @@ def test_native_claude_malformed_partial_and_blank_events_fail_closed(stream: by
         )
 
 
+def test_native_claude_rejects_a_stream_that_breaks_the_bounded_read_contract() -> None:
+    """A nonconforming stream cannot force an over-limit read allocation downstream."""
+
+    class OversizedRead:
+        def read(self, size: int, /) -> bytes:
+            return b"x" * (size + 1)
+
+    with pytest.raises(ClaudeUsageParseError, match="read exceeds size limit"):
+        parse_claude_stream(
+            cast(BinaryIO, OversizedRead()),
+            require_launch_authority=False,
+            authority_mode=ClaudeAuthorityMode.NATIVE,
+        )
+
+
 def test_oversized_system_hook_before_init_invalidates_later_authority() -> None:
     """Discarded pre-init hook activity prevents a later init from attesting launch order."""
     lines = _native_fixture_bytes().splitlines(keepends=True)
@@ -3690,6 +3705,16 @@ def _native_cli_args(role: str = "engineer-be") -> list[str]:
 def _native_stub_which(_name: str) -> str:
     """Resolve the provider-free native harness stub."""
     return "/stub/claude"
+
+
+def _native_stub_resolved(_family: HarnessFamily) -> str:
+    """Resolve the provider-free native harness after its family is selected."""
+    return "/stub/claude"
+
+
+def _native_stub_version(_executable: str) -> str:
+    """Return the one version admitted by the native launcher."""
+    return "2.1.231"
 
 
 def _native_stub_effort(_role: NativeClaudeRole) -> str:
@@ -3904,6 +3929,86 @@ def test_native_command_prevents_records_on_launch_boundary_failures(
     assert not Path(".agent-usage/usage.jsonl").exists()
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        b'{"type":"assistant"}\n',
+        b'{"type":"unknown"}\n',
+        _native_fixture_bytes(),
+    ],
+)
+def test_native_command_fails_closed_for_deadline_state_at_each_parse_boundary(
+    output: bytes, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shared deadline state blocks missing, malformed, and complete native streams."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"safe")
+    process = _NativeProcess(output)
+
+    def expired_deadline(
+        _process: subprocess.Popen[bytes], _seconds: int, timed_out: threading.Event
+    ) -> None:
+        timed_out.set()
+
+    def fake_popen(_argv: list[str], **_kwargs: object) -> _NativeProcess:
+        return process
+
+    monkeypatch.setattr(usage_cli, "_resolved_executable", _native_stub_resolved)
+    monkeypatch.setattr(usage_cli, "_harness_version", _native_stub_version)
+    monkeypatch.setattr(usage_cli, "_native_effort", _native_stub_effort)
+    monkeypatch.setattr(usage_cli, "_validate_native_worktree", _native_stub_attestation)
+    monkeypatch.setattr(usage_cli, "_start_deadline", expired_deadline)
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+    with pytest.raises(SystemExit, match="native Claude run timed out"):
+        main(_native_cli_args())
+    assert not Path(".agent-usage/usage.jsonl").exists()
+
+
+def test_native_command_severs_prompt_and_wait_transport_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native stdout and wait transport errors remain fixed, content-free failures."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"safe")
+    monkeypatch.setattr(usage_cli, "_resolved_executable", _native_stub_resolved)
+    monkeypatch.setattr(usage_cli, "_harness_version", _native_stub_version)
+    monkeypatch.setattr(usage_cli, "_native_effort", _native_stub_effort)
+    monkeypatch.setattr(usage_cli, "_validate_native_worktree", _native_stub_attestation)
+
+    class BrokenOutput:
+        def read(self, _size: int, /) -> bytes:
+            raise OSError("SENTINEL_STDOUT")
+
+        def close(self) -> None:
+            return None
+
+    broken_output = _NativeProcess(b"", writer_fail=True)
+    broken_output.stdout = cast(BytesIO, BrokenOutput())
+
+    def broken_popen(_argv: list[str], **_kwargs: object) -> _NativeProcess:
+        return broken_output
+
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", broken_popen)
+    with pytest.raises(SystemExit, match="prompt delivery failed") as output_error:
+        main(_native_cli_args())
+    _assert_no_exception_chain_or_sentinel(output_error.value, "SENTINEL_STDOUT")
+
+    class WaitTimeout(_NativeProcess):
+        def wait(self, timeout: float | None = None) -> int:
+            raise subprocess.TimeoutExpired("SENTINEL_WAIT", timeout or 0)
+
+    wait_timeout = WaitTimeout(_native_fixture_bytes())
+
+    def timeout_popen(_argv: list[str], **_kwargs: object) -> _NativeProcess:
+        return wait_timeout
+
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", timeout_popen)
+    with pytest.raises(SystemExit, match="native Claude run timed out") as wait_error:
+        main(_native_cli_args())
+    _assert_no_exception_chain_or_sentinel(wait_error.value, "SENTINEL_WAIT")
+    assert not Path(".agent-usage/usage.jsonl").exists()
+
+
 def test_native_invalid_utf8_error_retains_no_provider_bytes_or_exception_chain() -> None:
     """Incremental native decoding severs raw provider bytes before surfacing failure."""
     sentinel = "NATIVE_UTF8_SENTINEL"
@@ -4045,3 +4150,31 @@ def test_native_worktree_attestation_rejects_each_provenance_break(
     monkeypatch.setattr(usage_cli, "_git_output", fake_git)
     with pytest.raises(CaptureUsageError):
         usage_cli._validate_native_worktree(arguments, post_exit=post_exit)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    ("error_type", "message"),
+    [
+        (CodexUsageParseError, "Codex usage stream is invalid"),
+        (ClaudeAuthorityError, "Claude launch authority is not attested"),
+        (ClaudeUsageParseError, "Claude usage stream is invalid"),
+        (OSError, "local filesystem operation failed"),
+        (ValueError, "metadata input is invalid"),
+    ],
+)
+def test_cli_fixed_error_mapping_severs_every_exception_chain(
+    error_type: type[Exception], message: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Top-level categories never retain the raw exception that selected them."""
+
+    def fail(_arguments: argparse.Namespace) -> int:
+        raise error_type("SENTINEL_MAIN_ERROR")
+
+    class StubParser:
+        def parse_args(self, _argv: object) -> argparse.Namespace:
+            return argparse.Namespace(handler=fail)
+
+    monkeypatch.setattr(usage_cli, "build_parser", StubParser)
+    with pytest.raises(SystemExit, match=message) as error:
+        main([])
+    _assert_no_exception_chain_or_sentinel(error.value, "SENTINEL_MAIN_ERROR")

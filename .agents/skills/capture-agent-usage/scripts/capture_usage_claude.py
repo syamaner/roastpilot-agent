@@ -206,7 +206,9 @@ def _native_stream_events(
             raise ClaudeUsageParseError("native usage stream contains invalid UTF-8") from None
         try:
             if has_newline:
-                if not text.endswith("\n") or decoder.getstate()[0]:
+                if not text.endswith("\n") or decoder.getstate()[0]:  # pragma: no cover
+                    # The byte splitter includes an ASCII newline, which cannot end a
+                    # valid UTF-8 segment with pending decoder state.
                     raise ClaudeUsageParseError("native usage stream contains invalid UTF-8")
                 scanner.consume(text[:-1])
                 return complete_event()
@@ -485,7 +487,8 @@ def parse_claude_stream(
     if parsed is None:
         raise ClaudeUsageMissingTerminalError("Claude stream has no terminal result usage event")
     if authority_mode is ClaudeAuthorityMode.NATIVE:
-        if init_model is None or parsed.claude_model_usage is None:
+        if init_model is None or parsed.claude_model_usage is None:  # pragma: no cover
+            # The validated init and terminal constructors make this a type-narrowing guard.
             raise ClaudeAuthorityError("Claude init authority is not attested")
         if parsed.claude_model_canonical_names is None:
             raise ClaudeUsageParseError("malformed Claude modelUsage entry")
