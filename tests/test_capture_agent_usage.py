@@ -3817,6 +3817,41 @@ def test_native_command_rejects_invalid_required_metadata_before_provider_lookup
         main(args)
 
 
+def test_native_command_rechecks_worktree_after_version_before_worker_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A change after version probing blocks the write-capable worker launch and record."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"safe")
+    stages: list[str] = []
+    version_probed = False
+
+    def fake_attestation(_arguments: argparse.Namespace, *, post_exit: bool) -> str:
+        assert not post_exit
+        stages.append("after-version" if version_probed else "initial")
+        if version_probed:
+            raise CaptureUsageError("native worktree attestation failed")
+        return "4c1ac63"
+
+    def fake_popen(argv: list[str], **_: object) -> _NativeProcess:
+        nonlocal version_probed
+        if argv[-1] != "--version":
+            raise AssertionError("native worker launch must be blocked")
+        version_probed = True
+        return _NativeProcess(b"Claude 2.1.231\n")
+
+    monkeypatch.setattr(usage_cli.shutil, "which", _native_stub_which)
+    monkeypatch.setattr(usage_cli, "_native_effort", _native_stub_effort)
+    monkeypatch.setattr(usage_cli, "_validate_native_worktree", fake_attestation)
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+    with pytest.raises(SystemExit) as error:
+        main(_native_cli_args())
+
+    assert str(error.value) == "capture-agent-usage: native worktree attestation failed"
+    assert stages == ["initial", "after-version"]
+    assert not (tmp_path / ".agent-usage").exists()
+
+
 @pytest.mark.parametrize(
     ("output", "code", "expected"),
     [

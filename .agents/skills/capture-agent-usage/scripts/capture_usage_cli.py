@@ -687,6 +687,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
         version = _harness_version(executable)
         if version != _VERIFIED_HARNESS_VERSIONS[HarnessFamily.CLAUDE]:
             raise CaptureUsageError("selected harness version is not verified")
+        _validate_native_worktree(arguments, post_exit=False)
         started_at = _utc_now()
         started_monotonic = time.monotonic()
         arguments.started_at = started_at
