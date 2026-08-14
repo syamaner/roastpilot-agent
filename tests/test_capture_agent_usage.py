@@ -445,6 +445,27 @@ def test_parse_claude_prints_only_normalized_usage(
         assert key not in output
 
 
+def test_parse_claude_authority_error_is_fixed_and_creates_no_sink(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A drifted init exits through the Claude authority boundary without retaining input."""
+    monkeypatch.chdir(tmp_path)
+    events = [
+        json.loads(line) for line in (FIXTURES / "claude-2.1.231.jsonl").read_text().splitlines()
+    ]
+    events[0]["permissionMode"] = "SENTINEL_DRIFT"
+    stream = tmp_path / "claude-drifted.jsonl"
+    stream.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+    with pytest.raises(SystemExit) as error:
+        main(["parse-claude", str(stream)])
+
+    assert str(error.value) == "capture-agent-usage: Claude launch authority is not attested"
+    assert "SENTINEL_DRIFT" not in str(error.value)
+    assert capsys.readouterr().out == ""
+    assert not (tmp_path / ".agent-usage").exists()
+
+
 @pytest.mark.parametrize(
     ("parser", "event"),
     [
