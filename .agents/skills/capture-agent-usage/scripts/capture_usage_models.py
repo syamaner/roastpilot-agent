@@ -52,10 +52,15 @@ def bounded_jsonl_lines(stream: BinaryIO) -> Iterator[str]:
         total_bytes += len(raw_line)
         if total_bytes > MAX_STREAM_BYTES:
             raise BoundedStreamError("usage stream exceeds total byte limit")
+        invalid_utf8 = False
+        text = ""
         try:
-            yield raw_line.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise BoundedStreamError("usage stream contains invalid UTF-8") from exc
+            text = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            invalid_utf8 = True
+        if invalid_utf8:
+            raise BoundedStreamError("usage stream contains invalid UTF-8") from None
+        yield text
 
 
 class HarnessFamily(Enum):

@@ -17,6 +17,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, cast
 
+import capture_usage_claude as usage_claude
 import capture_usage_cli as usage_cli
 import capture_usage_codex as usage_codex
 import pytest
@@ -42,6 +43,7 @@ from capture_usage_models import (
     MAX_EVENT_BYTES,
     MAX_EVENT_COUNT,
     MAX_STREAM_BYTES,
+    BoundedStreamError,
     CapacitySnapshotRecord,
     CapacitySource,
     CapacityStatus,
@@ -49,6 +51,7 @@ from capture_usage_models import (
     HarnessFamily,
     ParsedUsage,
     TaskUsageRecord,
+    bounded_jsonl_lines,
 )
 from pydantic import ValidationError
 
@@ -74,6 +77,21 @@ def _stream(*events: str) -> BytesIO:
 def _parse_claude_lax(stream: BinaryIO) -> ParsedUsage:
     """Parse a sanitized fixture without asserting a live launch boundary."""
     return parse_claude_stream(stream, require_launch_authority=False)
+
+
+def _exception_chain(exception: BaseException) -> tuple[BaseException, ...]:
+    """Return every distinct exception reachable through cause or context."""
+    chain: list[BaseException] = []
+    pending = [exception.__cause__, exception.__context__]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        pending.extend((current.__cause__, current.__context__))
+    return tuple(chain)
 
 
 def _codex_terminal_event() -> bytes:
@@ -665,6 +683,94 @@ def test_malformed_retained_codex_json_does_not_chain_raw_provider_text() -> Non
     assert exception.__context__ is None
     assert exception.__suppress_context__
     assert sentinel not in repr(exception.args)
+
+
+def _assert_no_exception_chain_or_sentinel(exception: BaseException, sentinel: str) -> None:
+    """Assert that an ingestion error retains neither a chain nor provider content."""
+    reachable = (exception, *_exception_chain(exception))
+    assert len(reachable) == 1
+    assert all(sentinel not in repr(item.args) and sentinel not in repr(item) for item in reachable)
+
+
+def test_bounded_jsonl_utf8_error_does_not_retain_provider_bytes() -> None:
+    """The binary reader severs invalid UTF-8 bytes before surfacing its fixed error."""
+    sentinel = "UTF8_SENTINEL"
+    with pytest.raises(BoundedStreamError, match="usage stream contains invalid UTF-8") as error:
+        list(bounded_jsonl_lines(BytesIO(b'"UTF8_SENTINEL"\xff\n')))
+    exception = error.value
+    assert exception.__cause__ is None
+    assert exception.__context__ is None
+    assert exception.__suppress_context__
+    _assert_no_exception_chain_or_sentinel(exception, sentinel)
+
+
+def test_malformed_claude_json_does_not_retain_provider_text() -> None:
+    """Claude JSON decoder failures expose only the fixed parser error."""
+    sentinel = "JSON_SENTINEL"
+    with pytest.raises(ClaudeUsageParseError, match="malformed Claude JSONL event") as error:
+        usage_claude._event_from_line(  # pyright: ignore[reportPrivateUsage]
+            '{"type":"system","payload":"JSON_SENTINEL",}'
+        )
+    exception = error.value
+    assert exception.__cause__ is None
+    assert exception.__context__ is None
+    assert exception.__suppress_context__
+    _assert_no_exception_chain_or_sentinel(exception, sentinel)
+
+
+def test_claude_utf8_error_does_not_retain_provider_bytes_transitively() -> None:
+    """End-to-end Claude decoding retains no raw bytes through nested exception links."""
+    sentinel = "E2E_SENTINEL"
+    with pytest.raises(ClaudeUsageParseError, match="usage stream contains invalid UTF-8") as error:
+        parse_claude_stream(BytesIO(b'{"k":"E2E_SENTINEL"\xff\n'), require_launch_authority=False)
+    exception = error.value
+    assert exception.__cause__ is None
+    assert exception.__context__ is None
+    assert exception.__suppress_context__
+    _assert_no_exception_chain_or_sentinel(exception, sentinel)
+
+
+def test_malformed_claude_stream_does_not_retain_provider_text() -> None:
+    """End-to-end Claude JSON errors do not expose the malformed provider record."""
+    sentinel = "MALFORMED_SENTINEL"
+    with pytest.raises(ClaudeUsageParseError, match="malformed Claude JSONL event") as error:
+        parse_claude_stream(
+            BytesIO(b'{"type" "MALFORMED_SENTINEL"}\n'), require_launch_authority=False
+        )
+    exception = error.value
+    assert exception.__cause__ is None
+    assert exception.__context__ is None
+    assert exception.__suppress_context__
+    _assert_no_exception_chain_or_sentinel(exception, sentinel)
+
+
+@pytest.mark.parametrize(
+    ("stream", "message"),
+    [
+        (b'{"type":"user"}', "usage stream contains a partial event"),
+        (b"x" * (MAX_EVENT_BYTES + 1) + b"\n", "usage stream event exceeds size limit"),
+    ],
+)
+def test_claude_bounded_stream_errors_preserve_fixed_messages(stream: bytes, message: str) -> None:
+    """Claude translates every bounded-reader failure without changing its fixed text."""
+    with pytest.raises(ClaudeUsageParseError, match=message) as error:
+        parse_claude_stream(BytesIO(stream), require_launch_authority=False)
+    exception = error.value
+    assert exception.__cause__ is None
+    assert exception.__context__ is None
+    assert exception.__suppress_context__
+    assert _exception_chain(exception) == ()
+
+
+def test_claude_duplicate_key_error_remains_outside_json_decode_translation() -> None:
+    """Claude duplicate-key rejection retains its specific fixed parser error."""
+    with pytest.raises(
+        ClaudeUsageParseError, match="Claude event contains duplicate JSON keys"
+    ) as error:
+        usage_claude._event_from_line(  # pyright: ignore[reportPrivateUsage]
+            '{"type":"system","type":"system"}'
+        )
+    assert _exception_chain(error.value) == ()
 
 
 def test_binary_stream_ingestion_rejects_event_count_and_total_byte_overflow() -> None:

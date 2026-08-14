@@ -107,10 +107,14 @@ def _event_from_line(line: str) -> Mapping[str, Any]:
             result[key] = value
         return result
 
+    malformed_json = False
+    event: object = None
     try:
         event = json.loads(line, object_pairs_hook=reject_duplicate_keys)
-    except json.JSONDecodeError as exc:
-        raise ClaudeUsageParseError("malformed Claude JSONL event") from exc
+    except json.JSONDecodeError:
+        malformed_json = True
+    if malformed_json:
+        raise ClaudeUsageParseError("malformed Claude JSONL event") from None
     if not isinstance(event, dict):
         raise ClaudeUsageParseError("malformed Claude event object")
     event_type = event.get("type")
@@ -237,6 +241,7 @@ def parse_claude_stream(stream: BinaryIO, *, require_launch_authority: bool) -> 
     parsed: ParsedUsage | None = None
     saw_init = False
     saw_pre_init_activity = False
+    bounded_failure: str | None = None
     try:
         for line in bounded_jsonl_lines(stream):
             if not line.strip():
@@ -260,7 +265,9 @@ def parse_claude_stream(stream: BinaryIO, *, require_launch_authority: bool) -> 
                 raise ClaudeAuthorityError("Claude init authority is not attested")
             parsed = _terminal_usage(event)
     except BoundedStreamError as exc:
-        raise ClaudeUsageParseError(str(exc)) from exc
+        bounded_failure = str(exc)
+    if bounded_failure is not None:
+        raise ClaudeUsageParseError(bounded_failure) from None
     if parsed is None:
         raise ClaudeUsageMissingTerminalError("Claude stream has no terminal result usage event")
     return parsed
