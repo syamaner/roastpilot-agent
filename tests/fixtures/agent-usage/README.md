@@ -15,6 +15,10 @@ costs, and token counts with synthetic values.
   attests empty `tools`, empty `mcp_servers`, and `permissionMode: plan`; it
   proves the closed event and terminal usage grammars remain unchanged while
   using wholly synthetic content.
+- `claude-2.1.231-native.jsonl` is a synthetic-conforming native-profile fixture
+  with non-empty tools, `permissionMode: auto`, and a model field. It validates
+  parser and launch-boundary logic only; it is not observed provenance and proves
+  neither native role resolution nor whole-tree coverage.
 
 No prompt, response, credential, environment value, repository path, or live
 session identifier is retained.
