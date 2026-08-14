@@ -70,6 +70,13 @@ class HarnessFamily(Enum):
     CLAUDE = "CLAUDE"
 
 
+class NativeClaudeRole(Enum):
+    """Registered Claude implementation roles that native capture can attest."""
+
+    ENGINEER_BE = "engineer-be"
+    ENGINEER_FE = "engineer-fe"
+
+
 class EstimateBasis(Enum):
     """The provenance of a normalized estimated USD amount."""
 
@@ -157,6 +164,8 @@ class ParsedUsage(CaptureModel):
     reasoning_output_tokens: TokenCount | None = None
     claude_model_usage: tuple[ClaudeModelUsage, ...] | None = None
     claude_terminal_success: bool | None = None
+    claude_init_model: SafeIdentifier | None = Field(default=None, exclude=True)
+    claude_model_canonical_names: tuple[str, ...] | None = Field(default=None, exclude=True)
     estimated_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     estimate_basis: EstimateBasis = EstimateBasis.NOT_EXPOSED
 
@@ -242,6 +251,66 @@ class TaskUsageRecord(CaptureModel):
         return self
 
 
+class NativeWorkerUsageRecord(CaptureModel):
+    """A complete Claude-native implementation-worker usage capture.
+
+    The role attests only that this recorder built and executed the exact
+    ``claude --agent <role>`` argv for the process whose usage this record totals;
+    not an in-stream role echo and not routing authority (D160).
+    """
+
+    record_type: Literal["NATIVE_WORKER_USAGE"] = "NATIVE_WORKER_USAGE"
+    schema_version: Literal[1] = AGENT_USAGE_SCHEMA_VERSION
+    tool_version: SafeIdentifier = SKILL_VERSION
+    captured_at: datetime
+    task_id: SafeIdentifier
+    slice_id: SafeIdentifier
+    harness: Literal[HarnessFamily.CLAUDE] = HarnessFamily.CLAUDE
+    native_role: NativeClaudeRole
+    model: SafeIdentifier
+    effort: SafeIdentifier
+    repository: RepositoryName
+    branch: GitReference
+    base_sha: GitSha
+    final_head_sha: GitSha
+    parent_task_id: SafeIdentifier
+    started_at: datetime
+    completed_at: datetime
+    elapsed_ms: Annotated[int, Field(ge=0)]
+    exit_code: int
+    success: bool
+    harness_version: SafeIdentifier
+    input_tokens: TokenCount
+    cached_input_tokens: TokenCount
+    cache_creation_input_tokens: TokenCount
+    output_tokens: TokenCount
+    claude_model_usage: tuple[ClaudeModelUsage, ...]
+    estimated_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    estimate_basis: EstimateBasis = EstimateBasis.NOT_EXPOSED
+    usage_complete: Literal[True] = True
+    whole_tree_verified: Literal[False] = False
+
+    @field_validator("harness", mode="before")
+    @classmethod
+    def normalize_serialized_claude_literal(cls, value: object) -> object:
+        """Round-trip the sole JSON enum value without widening the literal type."""
+        return HarnessFamily.CLAUDE if value == HarnessFamily.CLAUDE.value else value
+
+    @model_validator(mode="after")
+    def validate_usage(self) -> NativeWorkerUsageRecord:
+        """Protect complete usage, exit, and estimate provenance invariants."""
+        if self.success != (self.exit_code == 0):
+            raise ValueError("success must match the harness exit code")
+        if self.estimated_usd is None and self.estimate_basis is not EstimateBasis.NOT_EXPOSED:
+            raise ValueError("an absent estimated_usd requires NOT_EXPOSED")
+        if (
+            self.estimated_usd is not None
+            and self.estimate_basis is not EstimateBasis.CLIENT_SIDE_ESTIMATE
+        ):
+            raise ValueError("estimated_usd must be labelled CLIENT_SIDE_ESTIMATE")
+        return self
+
+
 class CapacitySnapshotRecord(CaptureModel):
     """A qualitative capacity observation without raw readings or percentages."""
 
@@ -291,7 +360,9 @@ class OutcomeRecord(CaptureModel):
         return value
 
 
-UsageRecord: TypeAlias = TaskUsageRecord | CapacitySnapshotRecord | OutcomeRecord
+UsageRecord: TypeAlias = (
+    TaskUsageRecord | NativeWorkerUsageRecord | CapacitySnapshotRecord | OutcomeRecord
+)
 """The closed append-only record union."""
 
 USAGE_RECORD_ADAPTER = TypeAdapter(Annotated[UsageRecord, Field(discriminator="record_type")])
