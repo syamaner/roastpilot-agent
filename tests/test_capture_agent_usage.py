@@ -472,6 +472,27 @@ def test_parse_claude_prints_only_normalized_usage(
         assert key not in output
 
 
+@pytest.mark.parametrize(
+    ("command", "fixture"),
+    [
+        ("parse-codex", "codex-0.147.0.jsonl"),
+        ("parse-claude", "claude-2.1.231.jsonl"),
+    ],
+)
+def test_detached_parse_commands_cannot_create_native_worker_usage_sink(
+    command: str, fixture: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sanitized inspection is detached from native-worker record ingestion."""
+    monkeypatch.chdir(tmp_path)
+    stream = tmp_path / "sanitized.jsonl"
+    stream.write_bytes((FIXTURES / fixture).read_bytes())
+
+    assert main([command, str(stream)]) == 0
+    assert not (tmp_path / ".agent-usage").exists()
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args(["run-native-codex"])
+
+
 def test_parse_claude_authority_error_is_fixed_and_creates_no_sink(
     capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3852,6 +3873,60 @@ def test_native_command_rechecks_worktree_after_version_before_worker_launch(
     assert not (tmp_path / ".agent-usage").exists()
 
 
+@pytest.mark.parametrize("sink_kind", ["symlink", "fifo", "hard-link"])
+def test_native_command_refuses_unsafe_final_sink_without_modification(
+    sink_kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native-worker records use the shared secure final-sink admission boundary."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"safe")
+    sink_parent = Path(".agent-usage")
+    sink_parent.mkdir()
+    sink = sink_parent / "usage.jsonl"
+    sentinel = "SENTINEL_UNSAFE_SINK"
+    expected_error = "could not securely open usage sink"
+    target: Path | None = None
+
+    if sink_kind == "symlink":
+        if not hasattr(Path, "symlink_to"):
+            pytest.skip("platform lacks symlink support")
+        target = Path(f"{sentinel}-target")
+        target.write_text("unchanged\n")
+        sink.symlink_to(target)
+    elif sink_kind == "fifo":
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("platform lacks FIFO support")
+        os.mkfifo(sink)
+    else:
+        if not hasattr(os, "link"):
+            pytest.skip("platform lacks hard-link support")
+        sink.write_text("unchanged\n")
+        os.link(sink, sink_parent / "linked.jsonl")
+        expected_error = "could not append usage record"
+
+    def fake_popen(_argv: list[str], **_: object) -> _NativeProcess:
+        return _NativeProcess(_native_fixture_bytes())
+
+    monkeypatch.setattr(usage_cli, "_resolved_executable", _native_stub_resolved)
+    monkeypatch.setattr(usage_cli, "_harness_version", _native_stub_version)
+    monkeypatch.setattr(usage_cli, "_native_effort", _native_stub_effort)
+    monkeypatch.setattr(usage_cli, "_validate_native_worktree", _native_stub_attestation)
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+    with pytest.raises(SystemExit) as error:
+        main(_native_cli_args())
+
+    assert str(error.value) == f"capture-agent-usage: {expected_error}"
+    assert sentinel not in str(error.value)
+    if sink_kind == "fifo":
+        assert stat.S_ISFIFO(sink.stat().st_mode)
+    elif sink_kind == "hard-link":
+        assert sink.read_text() == "unchanged\n"
+        assert (sink_parent / "linked.jsonl").read_text() == "unchanged\n"
+    else:
+        assert target is not None and target.read_text() == "unchanged\n"
+        assert sink.is_symlink()
+
+
 @pytest.mark.parametrize(
     ("output", "code", "expected"),
     [
@@ -4143,6 +4218,8 @@ def test_native_worktree_attestation_uses_ignored_precheck_and_final_commit(
         ("branch", False),
         ("dirty", False),
         ("pre-head", False),
+        ("merge-base", False),
+        ("merge-base", True),
         ("ancestry", True),
         ("missing-commit", True),
     ],
@@ -4175,7 +4252,7 @@ def test_native_worktree_attestation_rejects_each_provenance_break(
         if key == ("rev-parse", "--verify", "4c1ac63^{commit}"):
             return 0, "4c1ac63"
         if key == ("merge-base", "HEAD", "origin/main"):
-            return 0, "4c1ac63"
+            return 0, "wrong-base" if mode == "merge-base" else "4c1ac63"
         if key[0] == "status":
             return 0, "?? ignored-secret" if mode == "dirty" else ""
         if key[0:2] == ("merge-base", "--is-ancestor"):
