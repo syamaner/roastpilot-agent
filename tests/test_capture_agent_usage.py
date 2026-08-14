@@ -412,6 +412,24 @@ def test_claude_launch_authority_attestation_fails_closed() -> None:
             require_launch_authority=True,
         )
 
+    for pre_init in (
+        {"type": "assistant", "message": "PRE_INIT_SENTINEL"},
+        {"type": "system", "subtype": "hook_started", "id": "PRE_INIT_SENTINEL"},
+    ):
+        stream = _stream(
+            json.dumps(pre_init) + "\n", json.dumps(init) + "\n", json.dumps(terminal) + "\n"
+        )
+        with pytest.raises(ClaudeAuthorityError) as error:
+            parse_claude_stream(BytesIO(stream.getvalue()), require_launch_authority=True)
+        assert str(error.value) == "Claude init authority is not attested"
+        assert "PRE_INIT_SENTINEL" not in str(error.value)
+        assert (
+            parse_claude_stream(
+                BytesIO(stream.getvalue()), require_launch_authority=False
+            ).input_tokens
+            == 5
+        )
+
 
 def test_parse_claude_prints_only_normalized_usage(
     capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1939,6 +1957,27 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
     )
     assert "SENTINEL_TOOL" not in error
     assert not (tmp_path / ".agent-usage/usage.jsonl").exists()
+
+    for pre_init in (
+        {"type": "assistant", "message": "PRE_INIT_SENTINEL"},
+        {"type": "system", "subtype": "hook_response", "id": "PRE_INIT_SENTINEL"},
+    ):
+        result, error = run_for(
+            (
+                json.dumps(pre_init)
+                + "\n"
+                + claude_init
+                + "\n"
+                + json.dumps(success_terminal)
+                + "\n"
+            ).encode(),
+            0,
+            "claude",
+        )
+        assert result is None
+        assert error == "capture-agent-usage: Claude launch authority is not attested"
+        assert "PRE_INIT_SENTINEL" not in error
+        assert not (tmp_path / ".agent-usage/usage.jsonl").exists()
 
     result, record = run_for(b'{"type":"assistant"}\n', 3, "claude")
     assert result == 0

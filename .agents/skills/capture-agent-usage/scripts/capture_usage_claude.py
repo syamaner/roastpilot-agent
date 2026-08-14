@@ -236,6 +236,7 @@ def parse_claude_stream(stream: BinaryIO, *, require_launch_authority: bool) -> 
     """
     parsed: ParsedUsage | None = None
     saw_init = False
+    saw_pre_init_activity = False
     try:
         for line in bounded_jsonl_lines(stream):
             if not line.strip():
@@ -244,10 +245,14 @@ def parse_claude_stream(stream: BinaryIO, *, require_launch_authority: bool) -> 
             if event["type"] == "system" and event.get("subtype") == "init":
                 if saw_init:
                     raise ClaudeAuthorityError("Claude init authority is duplicated")
+                if require_launch_authority and saw_pre_init_activity:
+                    raise ClaudeAuthorityError("Claude init authority is not attested")
                 _validate_init_authority(event, require_launch_authority)
                 saw_init = True
                 continue
             if event["type"] != "result":
+                if not saw_init:
+                    saw_pre_init_activity = True
                 continue
             if parsed is not None:
                 raise ClaudeUsageParseError("multiple Claude terminal result events")
