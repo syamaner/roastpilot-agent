@@ -18,6 +18,22 @@ Format: one entry per anti-pattern.
 
 ---
 
+## Known-opaque-provider authority must be attested at the terminal boundary
+*(fixed by #813, 14 Aug 2026)*
+
+- **Signature:** an opaque provider launch that treats its startup/init event as
+  optional, accepts a duplicate init, or normalizes terminal usage before proving
+  its fixed tools, MCP, and permission boundary.
+- **Wrong / Right:** accepting an installed event grammar is not evidence of the
+  selected launch authority. Validate the stable init subset without retaining
+  it, require exactly one approved init before a live terminal record, and map
+  every malformed, duplicate, missing, or drifted authority state to one fixed
+  content-free failure.
+- **Guarded by:** `test_claude_launch_authority_attestation_fails_closed` and
+  `test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord`.
+
+---
+
 ## Run-local clocks cannot order or identify persisted rows across a restart
 *(fixed by #787 slice 1, 12 Aug 2026)*
 

@@ -60,10 +60,16 @@ CLAUDE_MODEL_USAGE_KEYS = frozenset(
     }
 )
 """Exact model usage keys observed unchanged in Claude Code 2.1.228 and 2.1.231."""
+CLAUDE_PERMISSION_MODES = frozenset({"default", "plan"})
+"""Permission vocabularies observed in sanitized Claude init events."""
 
 
 class ClaudeUsageParseError(ValueError):
     """Raised when a Claude stream cannot prove complete whole-tree usage."""
+
+
+class ClaudeAuthorityError(ClaudeUsageParseError):
+    """Raised when a Claude launch cannot prove its fixed authority boundary."""
 
 
 class ClaudeUsageMissingTerminalError(ClaudeUsageParseError):
@@ -117,6 +123,22 @@ def _event_from_line(line: str) -> Mapping[str, Any]:
         if subtype not in CLAUDE_SYSTEM_SUBTYPES:
             raise ClaudeUsageParseError("unknown Claude system subtype")
     return event
+
+
+def _validate_init_authority(event: Mapping[str, Any], require_launch_authority: bool) -> None:
+    """Validate the observed init authority fields without retaining their contents."""
+    tools = event.get("tools")
+    mcp_servers = event.get("mcp_servers")
+    permission_mode = event.get("permissionMode")
+    if (
+        not isinstance(tools, list)
+        or not isinstance(mcp_servers, list)
+        or not isinstance(permission_mode, str)
+        or permission_mode not in CLAUDE_PERMISSION_MODES
+    ):
+        raise ClaudeAuthorityError("Claude init authority is malformed")
+    if require_launch_authority and (tools != [] or mcp_servers != [] or permission_mode != "plan"):
+        raise ClaudeAuthorityError("Claude init authority is not attested")
 
 
 def _model_usage(model_usage: object) -> tuple[ClaudeModelUsage, ...]:
@@ -197,28 +219,45 @@ def _terminal_usage(event: Mapping[str, Any]) -> ParsedUsage:
     )
 
 
-def parse_claude_stream(stream: BinaryIO) -> ParsedUsage:
+def parse_claude_stream(stream: BinaryIO, *, require_launch_authority: bool) -> ParsedUsage:
     """Parse a complete Claude stream using only the terminal result-level totals.
 
     Args:
         stream: Binary JSONL stdout from the fixed Claude harness command.
+        require_launch_authority: Whether the init event must prove the fixed
+            no-tools, no-MCP, plan-permission launch boundary.
 
     Returns:
         Normalized aggregate and per-model whole-tree usage.
 
     Raises:
-        ClaudeUsageParseError: If the event grammar, result usage, or model totals are invalid.
+        ClaudeUsageParseError: If the event grammar, init authority, result usage,
+            or model totals are invalid.
     """
     parsed: ParsedUsage | None = None
+    saw_init = False
+    saw_pre_init_activity = False
     try:
         for line in bounded_jsonl_lines(stream):
             if not line.strip():
                 raise ClaudeUsageParseError("blank Claude JSONL event")
             event = _event_from_line(line)
+            if event["type"] == "system" and event.get("subtype") == "init":
+                if saw_init:
+                    raise ClaudeAuthorityError("Claude init authority is duplicated")
+                if require_launch_authority and saw_pre_init_activity:
+                    raise ClaudeAuthorityError("Claude init authority is not attested")
+                _validate_init_authority(event, require_launch_authority)
+                saw_init = True
+                continue
             if event["type"] != "result":
+                if not saw_init:
+                    saw_pre_init_activity = True
                 continue
             if parsed is not None:
                 raise ClaudeUsageParseError("multiple Claude terminal result events")
+            if require_launch_authority and not saw_init:
+                raise ClaudeAuthorityError("Claude init authority is not attested")
             parsed = _terminal_usage(event)
     except BoundedStreamError as exc:
         raise ClaudeUsageParseError(str(exc)) from exc

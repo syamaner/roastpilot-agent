@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import BinaryIO, NoReturn, TypeVar
 
 from capture_usage_claude import (
+    ClaudeAuthorityError,
     ClaudeUsageMissingTerminalError,
     ClaudeUsageParseError,
     parse_claude_stream,
@@ -204,7 +205,10 @@ def parse_codex_command(arguments: argparse.Namespace) -> int:
 def parse_claude_command(arguments: argparse.Namespace) -> int:
     """Parse a supplied sanitized Claude JSONL file without creating a record."""
     _print_parsed_json(
-        parse_claude_stream(BytesIO(_input_bytes(arguments.stream, MAX_STREAM_BYTES)))
+        parse_claude_stream(
+            BytesIO(_input_bytes(arguments.stream, MAX_STREAM_BYTES)),
+            require_launch_authority=False,
+        )
     )
     return 0
 
@@ -572,11 +576,11 @@ def run_command(arguments: argparse.Namespace) -> int:
             target=lambda: writer_result.__setitem__(0, _write_prompt(process, prompt)), daemon=True
         )
         writer.start()
-        parser = (
-            parse_codex_stream if arguments.harness is HarnessFamily.CODEX else parse_claude_stream
-        )
         try:
-            usage = parser(process.stdout)
+            if arguments.harness is HarnessFamily.CODEX:
+                usage = parse_codex_stream(process.stdout)
+            else:
+                usage = parse_claude_stream(process.stdout, require_launch_authority=True)
             writer.join()
             if not writer_result[0]:
                 raise CaptureUsageError("prompt delivery failed") from None
@@ -618,6 +622,8 @@ def run_command(arguments: argparse.Namespace) -> int:
                 ),
             )
             return 0
+        except ClaudeAuthorityError:
+            raise CaptureUsageError("Claude launch authority is not attested") from None
         except (CodexUsageParseError, ClaudeUsageParseError):
             raise CaptureUsageError("harness usage stream is invalid") from None
         exit_code = process.wait(timeout=LAUNCH_TIMEOUT_SECONDS)
@@ -844,6 +850,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         _exit_with_error(str(exc))
     except CodexUsageParseError:
         _exit_with_error("Codex usage stream is invalid")
+    except ClaudeAuthorityError:
+        _exit_with_error("Claude launch authority is not attested")
     except ClaudeUsageParseError:
         _exit_with_error("Claude usage stream is invalid")
     except OSError:

@@ -11,8 +11,10 @@ costs, and token counts with synthetic values.
   events and the exact installed terminal usage schema. Its duplicate assistant
   ID and second model are synthetic adversarial cases for whole-tree accounting.
 - `claude-2.1.231.jsonl` is derived from a parent-run capture with the same fixed
-  no-tools, no-MCP, plan-permission boundary. It proves the closed event and
-  terminal usage grammars remain unchanged while using wholly synthetic content.
+  no-tools, no-MCP, plan-permission boundary. Its sanitized full init inventory
+  attests empty `tools`, empty `mcp_servers`, and `permissionMode: plan`; it
+  proves the closed event and terminal usage grammars remain unchanged while
+  using wholly synthetic content.
 
 No prompt, response, credential, environment value, repository path, or live
 session identifier is retained.
