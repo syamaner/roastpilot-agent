@@ -3415,16 +3415,16 @@ def test_native_and_measurement_authority_modes_remain_distinct() -> None:
         )
 
     measurement_events = [
-        json.loads(line)
-        for line in (FIXTURES / "claude-2.1.231.jsonl").read_bytes().splitlines()
+        json.loads(line) for line in (FIXTURES / "claude-2.1.231.jsonl").read_bytes().splitlines()
     ]
-    measurement_usage = cast(
-        dict[str, dict[str, object]], measurement_events[-1]["modelUsage"]
-    )
+    measurement_usage = cast(dict[str, dict[str, object]], measurement_events[-1]["modelUsage"])
     measurement_usage[next(iter(measurement_usage))]["canonicalModel"] = 7
-    assert parse_claude_stream(
-        _native_stream_from(measurement_events), require_launch_authority=False
-    ).output_tokens == 7
+    assert (
+        parse_claude_stream(
+            _native_stream_from(measurement_events), require_launch_authority=False
+        ).output_tokens
+        == 7
+    )
 
 
 def _padded_native_event(event_type: str, size: int, subtype: str | None = None) -> bytes:
