@@ -25,6 +25,7 @@ from capture_usage_claude import (
     CLAUDE_MODEL_USAGE_KEYS,
     CLAUDE_RESULT_USAGE_KEYS,
     CLAUDE_SYSTEM_SUBTYPES,
+    ClaudeAuthorityError,
     ClaudeUsageParseError,
     parse_claude_stream,
 )
@@ -68,6 +69,11 @@ def isolate_run_metadata_validation(monkeypatch: pytest.MonkeyPatch) -> None:
 def _stream(*events: str) -> BytesIO:
     """Build a binary JSONL stream matching the future fixed subprocess stdout type."""
     return BytesIO("".join(events).encode("utf-8"))
+
+
+def _parse_claude_lax(stream: BinaryIO) -> ParsedUsage:
+    """Parse a sanitized fixture without asserting a live launch boundary."""
+    return parse_claude_stream(stream, require_launch_authority=False)
 
 
 def _codex_terminal_event() -> bytes:
@@ -246,7 +252,7 @@ def test_codex_fixture_extracts_terminal_usage_without_content() -> None:
 def test_claude_fixture_uses_whole_tree_terminal_model_usage() -> None:
     """Only per-model whole-tree totals survive conflicting messages and top-level usage."""
     with (FIXTURES / "claude-2.1.228.jsonl").open("rb") as stream:
-        usage = parse_claude_stream(stream)
+        usage = parse_claude_stream(stream, require_launch_authority=False)
 
     assert usage.input_tokens == 16
     assert usage.cached_input_tokens == 20
@@ -282,7 +288,7 @@ def test_claude_2_1_231_fixture_matches_frozen_grammar_without_content() -> None
     fixture = FIXTURES / "claude-2.1.231.jsonl"
     events = [json.loads(line) for line in fixture.read_text().splitlines()]
     with fixture.open("rb") as stream:
-        usage = parse_claude_stream(stream)
+        usage = parse_claude_stream(stream, require_launch_authority=True)
 
     assert {event["type"] for event in events} <= CLAUDE_EVENT_TYPES
     assert (
@@ -310,15 +316,122 @@ def test_claude_2_1_231_fixture_matches_frozen_grammar_without_content() -> None
 
     terminal["usage"]["SANITIZED_MESSAGE"] = 0
     with pytest.raises(ClaudeUsageParseError) as exc_info:
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"))
+        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
     assert "SANITIZED_MESSAGE" not in str(exc_info.value)
+
+
+def test_claude_launch_authority_attestation_fails_closed() -> None:
+    """Only the live Claude path admits one exact empty-tools init before result."""
+    events = [
+        json.loads(line) for line in (FIXTURES / "claude-2.1.231.jsonl").read_text().splitlines()
+    ]
+    init = events[0]
+    terminal = events[-1]
+    assert list(init) == [
+        "agents",
+        "analytics_disabled",
+        "apiKeySource",
+        "capabilities",
+        "claude_code_version",
+        "cwd",
+        "fast_mode_disabled_reason",
+        "fast_mode_state",
+        "mcp_servers",
+        "messaging_socket_path",
+        "model",
+        "output_style",
+        "permissionMode",
+        "plugins",
+        "product_feedback_disabled",
+        "session_id",
+        "skills",
+        "slash_commands",
+        "subtype",
+        "terminal_slash_commands",
+        "tools",
+        "type",
+        "uuid",
+    ]
+    legacy = (FIXTURES / "claude-2.1.228.jsonl").read_bytes()
+    assert parse_claude_stream(BytesIO(legacy), require_launch_authority=False).input_tokens == 16
+    with pytest.raises(ClaudeAuthorityError):
+        parse_claude_stream(BytesIO(legacy), require_launch_authority=True)
+
+    for field, value in (("tools", ["SENTINEL_TOOL"]), ("mcp_servers", ["SENTINEL_MCP"])):
+        drifted = {**init, field: value}
+        with pytest.raises(ClaudeAuthorityError) as error:
+            parse_claude_stream(
+                _stream(json.dumps(drifted) + "\n", json.dumps(terminal) + "\n"),
+                require_launch_authority=True,
+            )
+        assert "SENTINEL" not in str(error.value)
+
+    for field, value in (("permissionMode", "unknown-SENTINEL"), ("permissionMode", 1)):
+        malformed = {**init, field: value}
+        for strict in (False, True):
+            with pytest.raises(ClaudeAuthorityError) as error:
+                parse_claude_stream(
+                    _stream(json.dumps(malformed) + "\n", json.dumps(terminal) + "\n"),
+                    require_launch_authority=strict,
+                )
+            assert "SENTINEL" not in str(error.value)
+
+    for field, value in (("tools", None), ("mcp_servers", "none"), ("permissionMode", None)):
+        malformed = {key: item for key, item in init.items() if key != field}
+        for strict in (False, True):
+            with pytest.raises(ClaudeAuthorityError):
+                parse_claude_stream(
+                    _stream(json.dumps(malformed) + "\n", json.dumps(terminal) + "\n"),
+                    require_launch_authority=strict,
+                )
+        malformed[field] = value
+        for strict in (False, True):
+            with pytest.raises(ClaudeAuthorityError):
+                parse_claude_stream(
+                    _stream(json.dumps(malformed) + "\n", json.dumps(terminal) + "\n"),
+                    require_launch_authority=strict,
+                )
+
+    duplicate = _stream(
+        json.dumps(init) + "\n", json.dumps(init) + "\n", json.dumps(terminal) + "\n"
+    )
+    for strict in (False, True):
+        with pytest.raises(ClaudeAuthorityError):
+            parse_claude_stream(BytesIO(duplicate.getvalue()), require_launch_authority=strict)
+    assert (
+        parse_claude_stream(
+            _stream(json.dumps(terminal) + "\n"), require_launch_authority=False
+        ).input_tokens
+        == 5
+    )
+    with pytest.raises(ClaudeAuthorityError):
+        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=True)
+    with pytest.raises(ClaudeAuthorityError):
+        parse_claude_stream(
+            _stream(json.dumps(terminal) + "\n", json.dumps(init) + "\n"),
+            require_launch_authority=True,
+        )
+
+
+def test_parse_claude_prints_only_normalized_usage(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inspection command validates lax init grammar without retaining authority data."""
+    monkeypatch.chdir(tmp_path)
+    stream = tmp_path / "claude.jsonl"
+    stream.write_bytes((FIXTURES / "claude-2.1.231.jsonl").read_bytes())
+    assert main(["parse-claude", str(stream)]) == 0
+    output = capsys.readouterr().out
+    assert '"input_tokens":5' in output
+    for key in ("tools", "mcp_servers", "permissionMode", "session_id"):
+        assert key not in output
 
 
 @pytest.mark.parametrize(
     ("parser", "event"),
     [
         (parse_codex_stream, '{"type":"unexpected"}\n'),
-        (parse_claude_stream, '{"type":"unexpected"}\n'),
+        (_parse_claude_lax, '{"type":"unexpected"}\n'),
     ],
 )
 def test_unknown_events_fail_closed(parser: object, event: str) -> None:
@@ -335,11 +448,16 @@ def test_parser_errors_do_not_echo_untrusted_discriminators() -> None:
     assert sentinel not in str(codex_error.value)
 
     with pytest.raises(ClaudeUsageParseError) as claude_type_error:
-        parse_claude_stream(_stream(json.dumps({"type": sentinel}) + "\n"))
+        parse_claude_stream(
+            _stream(json.dumps({"type": sentinel}) + "\n"), require_launch_authority=False
+        )
     assert sentinel not in str(claude_type_error.value)
 
     with pytest.raises(ClaudeUsageParseError) as claude_subtype_error:
-        parse_claude_stream(_stream(json.dumps({"type": "system", "subtype": sentinel}) + "\n"))
+        parse_claude_stream(
+            _stream(json.dumps({"type": "system", "subtype": sentinel}) + "\n"),
+            require_launch_authority=False,
+        )
     assert sentinel not in str(claude_subtype_error.value)
 
 
@@ -348,7 +466,7 @@ def test_malformed_or_missing_terminal_usage_fails_closed() -> None:
     with pytest.raises(CodexUsageParseError, match="terminal"):
         parse_codex_stream(_stream('{"type":"turn.started"}\n'))
     with pytest.raises(ClaudeUsageParseError, match="terminal"):
-        parse_claude_stream(_stream('{"type":"assistant"}\n'))
+        parse_claude_stream(_stream('{"type":"assistant"}\n'), require_launch_authority=False)
     with pytest.raises(CodexUsageParseError, match="schema"):
         parse_codex_stream(_stream('{"type":"turn.completed","usage":{"input_tokens":1}}\n'))
     with pytest.raises(CodexUsageParseError):
@@ -473,7 +591,7 @@ def test_binary_stream_ingestion_rejects_overlong_partial_and_invalid_utf8_event
     with pytest.raises(CodexUsageParseError, match="partial event"):
         parse_codex_stream(BytesIO(b'{"type":"turn.started"}'))
     with pytest.raises(ClaudeUsageParseError, match="invalid UTF-8"):
-        parse_claude_stream(BytesIO(b"\xff\n"))
+        parse_claude_stream(BytesIO(b"\xff\n"), require_launch_authority=False)
     with pytest.raises(CodexUsageParseError, match="malformed Codex JSON"):
         parse_codex_stream(BytesIO(b"{not-json}\n"))
 
@@ -774,7 +892,7 @@ def test_claude_terminal_usage_missing_installed_key_fails_closed(removed_key: s
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     del terminal["usage"][removed_key]
     with pytest.raises(ClaudeUsageParseError, match="usage schema"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"))
+        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
 
 
 def test_claude_terminal_usage_extra_or_model_usage_drift_fails_closed() -> None:
@@ -782,7 +900,7 @@ def test_claude_terminal_usage_extra_or_model_usage_drift_fails_closed() -> None
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     terminal["usage"]["unknown"] = 0
     with pytest.raises(ClaudeUsageParseError, match="usage schema"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"))
+        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
 
 
 def test_claude_duplicate_json_keys_fail_closed() -> None:
@@ -794,7 +912,7 @@ def test_claude_duplicate_json_keys_fail_closed() -> None:
     )
     for stream in (duplicate_result, duplicate_model):
         with pytest.raises(ClaudeUsageParseError, match="duplicate JSON keys"):
-            parse_claude_stream(BytesIO(stream))
+            parse_claude_stream(BytesIO(stream), require_launch_authority=False)
 
 
 @pytest.mark.parametrize(
@@ -806,7 +924,7 @@ def test_claude_terminal_requires_observed_success_status(field: str, value: obj
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     terminal[field] = value
     with pytest.raises(ClaudeUsageParseError, match="status is invalid"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"))
+        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
 
 
 @pytest.mark.parametrize(
@@ -823,7 +941,12 @@ def test_claude_observed_failure_statuses_retain_terminal_usage(subtype: str) ->
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     terminal["subtype"] = subtype
     terminal["is_error"] = True
-    assert parse_claude_stream(_stream(json.dumps(terminal) + "\n")).input_tokens == 16
+    assert (
+        parse_claude_stream(
+            _stream(json.dumps(terminal) + "\n"), require_launch_authority=False
+        ).input_tokens
+        == 16
+    )
 
 
 def test_claude_malformed_top_level_usage_and_non_finite_model_sum_fail_closed() -> None:
@@ -831,18 +954,18 @@ def test_claude_malformed_top_level_usage_and_non_finite_model_sum_fail_closed()
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     terminal["usage"]["input_tokens"] = "invalid"
     with pytest.raises(ClaudeUsageParseError, match="malformed Claude usage field"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"))
+        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
 
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     for model in terminal["modelUsage"].values():
         model["costUSD"] = 1e308
     with pytest.raises(ClaudeUsageParseError, match="modelUsage costUSD sum"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"))
+        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
 
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     terminal["modelUsage"]["synthetic-primary"]["unknown"] = 0
     with pytest.raises(ClaudeUsageParseError, match="modelUsage schema"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"))
+        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
 
 
 def test_whole_tree_defaults_false_and_incomplete_usage_rejects_totals() -> None:
@@ -882,7 +1005,7 @@ def test_non_finite_json_estimates_reject_at_parser_boundary(field: str) -> None
     else:
         terminal["modelUsage"]["synthetic-primary"][field] = float("nan")
     with pytest.raises(ClaudeUsageParseError, match="malformed Claude usage field"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"))
+        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
 
 
 def test_sink_uses_private_modes_and_refuses_symlink(
@@ -1783,9 +1906,12 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
 
     (tmp_path / ".agent-usage/usage.jsonl").unlink()
     claude_terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
+    claude_init = (FIXTURES / "claude-2.1.231.jsonl").read_text().splitlines()[0]
     claude_terminal["subtype"] = "error_max_turns"
     claude_terminal["is_error"] = True
-    result, record = run_for((json.dumps(claude_terminal) + "\n").encode(), 3, "claude")
+    result, record = run_for(
+        (claude_init + "\n" + json.dumps(claude_terminal) + "\n").encode(), 3, "claude"
+    )
     assert result == 0
     parsed = json.loads(record)
     assert not parsed["success"] and parsed["usage_complete"]
@@ -1793,20 +1919,46 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
 
     (tmp_path / ".agent-usage/usage.jsonl").unlink()
     success_terminal = json.loads((FIXTURES / "claude-2.1.231.jsonl").read_text().splitlines()[-1])
-    result, record = run_for((json.dumps(success_terminal) + "\n").encode(), 0, "claude")
+    result, record = run_for(
+        (claude_init + "\n" + json.dumps(success_terminal) + "\n").encode(), 0, "claude"
+    )
     assert result == 0
     parsed = json.loads(record)
     assert parsed["success"] and parsed["usage_complete"]
 
     (tmp_path / ".agent-usage/usage.jsonl").unlink()
-    result, error = run_for((json.dumps(success_terminal) + "\n").encode(), 3, "claude")
+    drifted_init = json.loads(claude_init)
+    drifted_init["tools"] = ["SENTINEL_TOOL"]
+    result, error = run_for(
+        (json.dumps(drifted_init) + "\n" + json.dumps(success_terminal) + "\n").encode(),
+        0,
+        "claude",
+    )
+    assert (
+        result is None and error == "capture-agent-usage: Claude launch authority is not attested"
+    )
+    assert "SENTINEL_TOOL" not in error
+    assert not (tmp_path / ".agent-usage/usage.jsonl").exists()
+
+    result, record = run_for(b'{"type":"assistant"}\n', 3, "claude")
+    assert result == 0
+    parsed = json.loads(record)
+    assert not parsed["success"] and not parsed["usage_complete"]
+    assert parsed["input_tokens"] is None and parsed["estimated_usd"] is None
+
+    (tmp_path / ".agent-usage/usage.jsonl").unlink()
+    result, error = run_for(
+        (claude_init + "\n" + json.dumps(success_terminal) + "\n").encode(), 3, "claude"
+    )
     assert result is None and "terminal status disagrees" in error
     assert not (tmp_path / ".agent-usage/usage.jsonl").exists()
 
     failure_terminal = dict(success_terminal)
     failure_terminal["subtype"] = "error_max_turns"
     failure_terminal["is_error"] = True
-    result, error = run_for((json.dumps(failure_terminal) + "\n").encode(), 0, "claude")
+    result, error = run_for(
+        (claude_init + "\n" + json.dumps(failure_terminal) + "\n").encode(), 0, "claude"
+    )
     assert result is None and "terminal status disagrees" in error
     assert not (tmp_path / ".agent-usage/usage.jsonl").exists()
 

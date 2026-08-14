@@ -13,7 +13,9 @@ while the record itself has `success=false`; this indicates capture succeeded, n
 
 Use `scripts/capture_usage_cli.py snapshot-capacity` only for a qualitative capacity
 observation joined to its required task and slice identifiers. Use `parse-codex` or `parse-claude` with sanitized streams to verify the
-frozen parser grammar, and `annotate-outcome` after final gates to record closed finding
+frozen parser grammar; `parse-claude` validates Claude init grammar but makes no
+launch-authority claim. The live `run` path additionally attests empty tools,
+empty MCP servers, and plan permission before it records usage. Use `annotate-outcome` after final gates to record closed finding
 counts and rework metadata joined to the required task and slice identifiers. The default `.agent-usage/usage.jsonl` is local-only and
 gitignored.
 
