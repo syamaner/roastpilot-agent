@@ -147,6 +147,34 @@ def _transcript_fd(cwd: Path, session_id: str) -> int:
         _close(project)
 
 
+def reject_existing_owned_session(cwd: Path, session_id: str) -> None:
+    """Reject a pre-existing exact parent file or adjacent session directory.
+
+    A missing Claude tree is expected before a new Claude invocation.  Any other
+    inability to inspect the expected components fails closed without discovery.
+    """
+    project = descriptor = None
+    try:
+        try:
+            project = _project_directory(cwd)
+        except TranscriptError:
+            return
+        for name, flags in (
+            (session_id + ".jsonl", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC),
+            (session_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC),
+        ):
+            try:
+                descriptor = os.open(name, flags, dir_fd=project)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise TranscriptError("owned Claude session path is invalid") from None
+            raise TranscriptError("owned Claude session already exists")
+    finally:
+        _close(descriptor)
+        _close(project)
+
+
 def _require_no_subagents(cwd: Path, session_id: str) -> None:
     """Permit only an absent adjacent session directory; reject every other state."""
     project = directory = child = None
@@ -175,6 +203,8 @@ def _require_no_subagents(cwd: Path, session_id: str) -> None:
         except OSError:
             raise TranscriptError("owned Claude session tree is invalid") from None
         raise TranscriptError("native Claude worker has subagents")
+    except OSError:
+        raise TranscriptError("owned Claude session tree is invalid") from None
     finally:
         _close(child)
         _close(directory)
@@ -281,7 +311,9 @@ def parse_owned_transcript(
                     )
                 )
                 parent = row.get("parentUuid")
-                key = (session_id, parent if isinstance(parent, str) else None, message_id)
+                if parent is not None and not isinstance(parent, str):
+                    raise TranscriptError("owned Claude transcript is invalid")
+                key = (session_id, parent, message_id)
                 if key in seen and seen[key] != values:
                     raise TranscriptError("owned Claude transcript usage conflicts")
                 seen[key] = values

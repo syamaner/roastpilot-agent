@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -76,7 +77,7 @@ def test_owned_transcript_counts_identical_assistant_usage_once(
     project.mkdir(parents=True)
     transcript = project / f"{session_id}.jsonl"
     transcript.write_bytes((FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes())
-    monkeypatch.setattr(usage_transcript.Path, "home", classmethod(lambda _cls: home))
+    monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
 
     usage = usage_transcript.parse_owned_transcript(
         tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
@@ -103,7 +104,7 @@ def _install_owned_transcript(
     project.mkdir(parents=True)
     transcript = project / f"{session_id}.jsonl"
     transcript.write_bytes(content)
-    monkeypatch.setattr(usage_transcript.Path, "home", classmethod(lambda _cls: home))
+    monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
     return transcript, session_id
 
 
@@ -192,6 +193,120 @@ def test_project_encoding_is_ascii_safe_without_discovery() -> None:
     source = inspect.getsource(usage_transcript)
     for forbidden in ("glob(", "rglob(", "os.walk", "listdir", "scandir"):
         assert forbidden not in source
+
+
+@pytest.mark.parametrize("name", ["parent.jsonl", "session-directory"])
+def test_preexisting_exact_session_rejects_before_launch(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A generated session cannot be bound to stale Claude-owned state."""
+    session_id = "11111111-1111-4111-8111-111111111111"
+    home = tmp_path / "home"
+    project = home / ".claude" / "projects" / usage_transcript._project_name(tmp_path)  # pyright: ignore[reportPrivateUsage]
+    project.mkdir(parents=True)
+    if name == "parent.jsonl":
+        (project / f"{session_id}.jsonl").write_bytes(b"x\n")
+    else:
+        (project / session_id).mkdir()
+    monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.reject_existing_owned_session(tmp_path, session_id)
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda value: value[:-1],
+        lambda value: value.replace(b"\n", b"", 1),
+        lambda value: value.replace(b'"type":"agent-setting"', b'"type":"unknown"', 1),
+        lambda value: value.replace(b'"sessionId":', b'"sessionId":"wrong", "sessionId":', 1),
+        lambda value: value.replace(
+            b'"sessionId":"11111111-1111-4111-8111-111111111111"', b'"sessionId":"wrong"', 1
+        ),
+        lambda value: value + b"\n",
+        lambda value: value.replace(
+            b'"parentUuid":"22222222-2222-4222-8222-222222222222"', b'"parentUuid":7', 1
+        ),
+    ],
+)
+def test_owned_transcript_rejects_jsonl_and_binding_boundaries(
+    mutator: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Malformed JSONL, duplicate keys, blank rows and malformed parent identity fail closed."""
+    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    transcript, session_id = _install_owned_transcript(
+        tmp_path, monkeypatch, cast(Callable[[bytes], bytes], mutator)(content)
+    )
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        )
+    assert transcript.read_bytes() != b""
+
+
+def test_owned_transcript_rejects_row_and_file_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact parser independently applies row, file and row-count limits."""
+    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, content)
+    monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_ROWS", 1)
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        )
+    monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_ROWS", 500_000)
+    monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_ROW_BYTES", 1)
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        )
+    monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_ROW_BYTES", 4 * 1024 * 1024)
+    monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_BYTES", 1)
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        )
+    assert transcript.read_bytes() == content
+
+
+@pytest.mark.parametrize("role", list(NativeClaudeRole))
+def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
+    role: NativeClaudeRole,
+) -> None:
+    """D161 session persistence is native-only and no native stdout grammar survives."""
+    session_id = "11111111-1111-4111-8111-111111111111"
+    argv = usage_cli._native_claude_argv("claude", role, session_id)  # pyright: ignore[reportPrivateUsage]
+    assert argv == [
+        "claude",
+        "--agent",
+        role.value,
+        "--setting-sources",
+        "project",
+        "-p",
+        "--session-id",
+        session_id,
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--permission-mode",
+        "auto",
+    ]
+    assert "--no-session-persistence" not in argv and "--output-format" not in argv
+    generic = usage_cli._launch_argv(HarnessFamily.CLAUDE, "claude", "model", "high")  # pyright: ignore[reportPrivateUsage]
+    assert "--no-session-persistence" in generic
+
+
+@pytest.mark.parametrize("role", ["repair", "engineer-be ", "Engineer-BE", "engineer_be", "x"])
+def test_native_roles_reject_before_provider_lookup(
+    role: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only byte-exact registered implementation leaves enter native lookup."""
+    monkeypatch.setattr(
+        usage_cli.shutil, "which", lambda _: (_ for _ in ()).throw(AssertionError())
+    )
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args(["run-native-claude", "--role", role])
 
 
 @pytest.fixture(autouse=True)

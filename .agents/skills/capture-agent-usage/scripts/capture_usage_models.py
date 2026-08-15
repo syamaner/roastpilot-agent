@@ -262,7 +262,7 @@ class NativeWorkerUsageRecord(CaptureModel):
 
     The role attests only that this recorder built and executed the exact
     ``claude --agent <role>`` argv for the process whose usage this record totals;
-    not an in-stream role echo and not routing authority (D160).
+    not an in-stream role echo and not routing authority (D161).
     """
 
     record_type: Literal["NATIVE_WORKER_USAGE"] = "NATIVE_WORKER_USAGE"

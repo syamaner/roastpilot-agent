@@ -53,7 +53,12 @@ from capture_usage_models import (
     TaskUsageRecord,
     UsageRecord,
 )
-from capture_usage_transcript import TranscriptError, TranscriptUsage, parse_owned_transcript
+from capture_usage_transcript import (
+    TranscriptError,
+    TranscriptUsage,
+    parse_owned_transcript,
+    reject_existing_owned_session,
+)
 
 DEFAULT_SINK = Path(".agent-usage/usage.jsonl")
 SINK_ROOT = ".agent-usage"
@@ -680,6 +685,10 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
     if os.environ.get("CLAUDE_CONFIG_DIR") is not None:
         raise CaptureUsageError("native Claude config directory is not permitted")
     session_id = str(uuid4())
+    try:
+        reject_existing_owned_session(Path.cwd(), session_id)
+    except TranscriptError:
+        raise CaptureUsageError("native Claude session path is invalid") from None
     prompt = _prompt_bytes(arguments.prompt_file)
     process: subprocess.Popen[bytes] | None = None
     deadline: threading.Timer | None = None
