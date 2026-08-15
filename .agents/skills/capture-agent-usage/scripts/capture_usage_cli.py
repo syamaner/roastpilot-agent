@@ -39,6 +39,7 @@ from capture_usage_codex import (
 from capture_usage_models import (
     AGENT_USAGE_SCHEMA_VERSION,
     MAX_STREAM_BYTES,
+    NATIVE_WORKER_USAGE_SCHEMA_VERSION,
     USAGE_RECORD_ADAPTER,
     CapacitySnapshotRecord,
     CapacitySource,
@@ -1053,7 +1054,12 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the closed parent-only command grammar for the capture utility."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--schema-version", action="version", version=str(AGENT_USAGE_SCHEMA_VERSION)
+        "--schema-version",
+        action="version",
+        version=(
+            f"generic={AGENT_USAGE_SCHEMA_VERSION} "
+            f"native-worker={NATIVE_WORKER_USAGE_SCHEMA_VERSION}"
+        ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
 

@@ -313,6 +313,16 @@ def test_native_record_uses_distinct_schema_v2_and_adapter_roundtrips() -> None:
     assert _task_record().schema_version == 1
 
 
+def test_schema_version_cli_reports_generic_and_native_worker_families(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Discovery exposes both append-only record families without changing generic v1."""
+    with pytest.raises(SystemExit) as result:
+        main(["--schema-version"])
+    assert result.value.code == 0
+    assert capsys.readouterr().out == "generic=1 native-worker=2\n"
+
+
 def test_native_cli_exposes_no_caller_session_id() -> None:
     """The parent, never the caller, owns UUID attribution."""
     with pytest.raises(SystemExit):
