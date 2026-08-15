@@ -612,7 +612,7 @@ def _native_transcript_bytes(session_id: str = _NATIVE_SESSION_ID) -> bytes:
 
 
 def _configure_native_launcher(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fixed_session: bool = True
 ) -> tuple[Path, list[tuple[list[str], dict[str, object]]]]:
     """Install a private Claude parent location and fixed launcher dependencies."""
     monkeypatch.chdir(tmp_path)
@@ -630,7 +630,8 @@ def _configure_native_launcher(
         return "7d60f41" if post_exit else "4c1ac63"
 
     monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
-    monkeypatch.setattr(usage_cli, "uuid4", lambda: _NATIVE_SESSION_ID)
+    if fixed_session:
+        monkeypatch.setattr(usage_cli, "uuid4", lambda: _NATIVE_SESSION_ID)
     monkeypatch.setattr(usage_cli, "_native_effort", fixed_effort)
     monkeypatch.setattr(usage_cli, "_resolved_executable", fixed_executable)
     monkeypatch.setattr(usage_cli, "_validate_native_worktree", fixed_attestation)
@@ -663,6 +664,46 @@ def _native_popen(
         return process
 
     return fake
+
+
+def test_native_command_generates_distinct_real_uuid_sessions_per_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each native launch owns a new UUIDv4, preventing transcript/preflight aliasing."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch, fixed_session=False)
+    preflight_sessions: list[str] = []
+    real_preflight = usage_transcript.reject_existing_owned_session
+
+    def spy_preflight(cwd: Path, session_id: str) -> None:
+        preflight_sessions.append(session_id)
+        real_preflight(cwd, session_id)
+
+    def fake(argv: list[str], **kwargs: object) -> _NativeProcess:
+        observed.append((argv, kwargs))
+        if argv[-1] == "--version":
+            return _NativeProcess(b"Claude Code 2.1.231\n")
+        session_id = argv[argv.index("--session-id") + 1]
+        (project / f"{session_id}.jsonl").write_bytes(_native_transcript_bytes(session_id))
+        return _NativeProcess()
+
+    monkeypatch.setattr(usage_cli, "reject_existing_owned_session", spy_preflight)
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake)
+    assert main(_native_cli_args()) == 0
+    assert main(_native_cli_args()) == 0
+
+    worker_sessions = [
+        argv[argv.index("--session-id") + 1] for argv, _ in observed if "--session-id" in argv
+    ]
+    assert len(worker_sessions) == len(preflight_sessions) == 2
+    assert worker_sessions == preflight_sessions and worker_sessions[0] != worker_sessions[1]
+    assert all(UUID(session_id).version == 4 for session_id in worker_sessions)
+    records = [
+        USAGE_RECORD_ADAPTER.validate_json(line)
+        for line in Path(".agent-usage/usage.jsonl").read_text().splitlines()
+    ]
+    assert [
+        record.session_id for record in records if isinstance(record, NativeWorkerUsageRecord)
+    ] == worker_sessions
 
 
 def test_native_command_launches_exact_worker_and_records_immutable_transcript(

@@ -654,8 +654,6 @@ def _native_record_from_usage(
     elapsed_ms: int,
 ) -> NativeWorkerUsageRecord:
     """Build one complete native record from attested and parsed metadata only."""
-    if usage.usage_message_count < 1:
-        raise CaptureUsageError("native Claude usage is incomplete")
     return NativeWorkerUsageRecord(
         captured_at=completed_at,
         task_id=arguments.task_id,
