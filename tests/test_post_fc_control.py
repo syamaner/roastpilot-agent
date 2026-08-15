@@ -1934,10 +1934,10 @@ def test_invalid_projection_releases_projection_recovery_and_snapshot_restores_a
         _projection(development_elapsed_seconds=60.0, charge_elapsed_seconds=499.0),
     ],
 )
-def test_projection_clock_regression_and_expired_entry_runway_are_inert(
+def test_projection_clock_regression_and_expired_entry_runway_cannot_enter(
     regressing: PostFcProjectionInputs,
 ) -> None:
-    """Accepted clocks never move backward, and a passed entry horizon is inert."""
+    """Accepted clocks never move backward, and a passed entry cannot re-enter."""
     controller = PostFcRorController(
         _projection_recovery_config(recovery_trigger_margin_c_per_min=50.0)
     )
@@ -1952,7 +1952,48 @@ def test_projection_clock_regression_and_expired_entry_runway_are_inert(
         dt_seconds=5.0,
         projection=_projection(development_elapsed_seconds=95.0),
     )
-    assert expired.projection_valid is False
+    assert expired.projection_valid is True
+    assert expired.projected_entry_temp_c is None
+    assert expired.projected_cutoff_temp_c is not None
+    assert expired.recovery_trigger is PostFcRecoveryTrigger.NONE
+
+
+def test_projection_recovery_remains_active_between_entry_and_cutoff_horizons() -> None:
+    """Passing +2 does not release authority before the ratified +5 cutoff."""
+    controller = PostFcRorController(
+        _projection_recovery_config(
+            recovery_confirm_ticks=1,
+            recovery_trigger_margin_c_per_min=50.0,
+        )
+    )
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    entered = controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(development_elapsed_seconds=60.0),
+    )
+    assert entered.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+
+    between_horizons = controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(development_elapsed_seconds=95.0),
+    )
+    assert between_horizons.projection_valid is True
+    assert between_horizons.projected_entry_temp_c is None
+    assert between_horizons.projected_cutoff_temp_c is not None
+    assert between_horizons.heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+    assert between_horizons.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+
+    cutoff = controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(development_elapsed_seconds=110.0),
+    )
+    assert cutoff.heat_authority_state is PostFcHeatAuthorityState.GLIDING
+    assert cutoff.recovery_trigger is PostFcRecoveryTrigger.NONE
+    assert controller.snapshot_state().recovery_cutoff_reached is True
 
 
 def test_v2_fast_raise_preserves_a_ki_zero_bias_handoff() -> None:

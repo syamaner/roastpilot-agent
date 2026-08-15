@@ -986,8 +986,10 @@ class PostFcRorController:
 
         Invalid input is deliberately content-free: it returns no partial
         runway or temperature that a caller could mistake for a control value.
-        Clock state advances only for a fully valid positive-entry-runway
-        projection, so snapshot/restore also makes clock acceptance atomic.
+        Clock state advances only for a fully valid projection. After the +2
+        entry horizon passes, a valid cutoff-only result keeps an already
+        active recovery evaluating through the +5 cutoff while remaining
+        ineligible for a new projection-triggered entry.
         """
         config = self._config
         if not config.recovery_projection_enabled or inputs is None:
@@ -1035,7 +1037,18 @@ class PostFcRorController:
                 target_drop_temp_c=inputs.target_drop_temp_c,
             )
         if entry_runway <= 0.0:
-            return _ProjectionResult()
+            # Entry authority has expired, but an already-active projection
+            # recovery still needs the +5 temperature projection to decide
+            # whether to glide early or continue until the hard cutoff.
+            cutoff_temp = inputs.bean_temp_c + smoothed_ror_c_per_min * cutoff_runway / 60.0
+            self._recovery_last_development_elapsed_seconds = development
+            self._recovery_last_charge_elapsed_seconds = charge
+            return _ProjectionResult(
+                valid=True,
+                cutoff_temp_c=cutoff_temp,
+                cutoff_runway_seconds=cutoff_runway,
+                target_drop_temp_c=inputs.target_drop_temp_c,
+            )
         entry_temp = inputs.bean_temp_c + smoothed_ror_c_per_min * entry_runway / 60.0
         cutoff_temp = inputs.bean_temp_c + smoothed_ror_c_per_min * cutoff_runway / 60.0
         self._recovery_last_development_elapsed_seconds = development
