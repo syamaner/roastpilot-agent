@@ -1891,6 +1891,16 @@ def test_projection_on_target_glides_and_cutoff_latches_all_recovery_until_reset
         PostFcHeatAuthorityState.HOLDING,
         PostFcHeatAuthorityState.HOLDING,
     ]
+    missing_projection = [
+        controller.compute(measured_ror_c_per_min=0.0, dt_seconds=5.0, projection=None)
+        for _ in range(3)
+    ]
+    assert all(
+        output.heat_authority_state is PostFcHeatAuthorityState.HOLDING
+        and output.recovery_trigger is PostFcRecoveryTrigger.NONE
+        for output in missing_projection
+    )
+    assert controller.snapshot_state().recovery_ticks_above_trigger == 0
     controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
     assert controller.snapshot_state().recovery_cutoff_reached is False
 
