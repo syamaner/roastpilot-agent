@@ -153,12 +153,20 @@ def reject_existing_owned_session(cwd: Path, session_id: str) -> None:
     A missing Claude tree is expected before a new Claude invocation.  Any other
     inability to inspect the expected components fails closed without discovery.
     """
-    project = descriptor = None
+    root = projects = project = descriptor = None
     try:
+        root = _directory(None, str(Path.home() / ".claude"))
+        projects = _directory(root, "projects")
         try:
-            project = _project_directory(cwd)
-        except TranscriptError:
+            project = os.open(
+                _project_name(cwd),
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=projects,
+            )
+        except FileNotFoundError:
             return
+        except OSError:
+            raise TranscriptError("owned Claude session path is invalid") from None
         for name, flags in (
             (session_id + ".jsonl", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC),
             (session_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC),
@@ -173,6 +181,8 @@ def reject_existing_owned_session(cwd: Path, session_id: str) -> None:
     finally:
         _close(descriptor)
         _close(project)
+        _close(projects)
+        _close(root)
 
 
 def _require_no_subagents(cwd: Path, session_id: str) -> None:

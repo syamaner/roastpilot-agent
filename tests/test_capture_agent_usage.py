@@ -213,6 +213,30 @@ def test_preexisting_exact_session_rejects_before_launch(
         usage_transcript.reject_existing_owned_session(tmp_path, session_id)
 
 
+@pytest.mark.parametrize("component", [".claude", "projects", "project"])
+def test_preflight_rejects_unsafe_or_missing_resolver_components(
+    component: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a securely absent final project is accepted as first-use state."""
+    home = tmp_path / "home"
+    if component == ".claude":
+        home.mkdir()
+        (home / ".claude").symlink_to(tmp_path / "outside")
+    else:
+        (home / ".claude").mkdir(parents=True)
+        if component == "projects":
+            (home / ".claude" / "projects").symlink_to(tmp_path / "outside")
+        else:
+            projects = home / ".claude" / "projects"
+            projects.mkdir()
+            (projects / usage_transcript._project_name(tmp_path)).symlink_to(tmp_path / "outside")  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.reject_existing_owned_session(
+            tmp_path, "11111111-1111-4111-8111-111111111111"
+        )
+
+
 @pytest.mark.parametrize(
     "mutator",
     [

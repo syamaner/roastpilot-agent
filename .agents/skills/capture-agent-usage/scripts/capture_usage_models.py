@@ -317,6 +317,16 @@ class NativeWorkerUsageRecord(CaptureModel):
             and self.estimate_basis is not EstimateBasis.CLIENT_SIDE_ESTIMATE
         ):
             raise ValueError("estimated_usd must be labelled CLIENT_SIDE_ESTIMATE")
+        if len(self.claude_model_usage) != 1 or self.claude_model_usage[0].model != self.model:
+            raise ValueError("native usage must contain the sole parent model")
+        model_usage = self.claude_model_usage[0]
+        if (
+            model_usage.input_tokens != self.input_tokens
+            or model_usage.cached_input_tokens != self.cached_input_tokens
+            or model_usage.cache_creation_input_tokens != self.cache_creation_input_tokens
+            or model_usage.output_tokens != self.output_tokens
+        ):
+            raise ValueError("native totals must equal parent model usage")
         return self
 
 
