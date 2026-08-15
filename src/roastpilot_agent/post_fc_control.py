@@ -809,6 +809,16 @@ class PostFcRorController:
                 tick). The clamp is a pure no-op under normal cadence (where
                 ``dt_seconds`` already approximately equals
                 ``control_interval_seconds``).
+            projection: Unrounded live bean temperature, profile targets, and
+                elapsed clocks used by recovery-v2 projection. Its
+                ``development_elapsed_seconds`` is seconds since accepted
+                first crack; ``charge_elapsed_seconds`` is seconds since
+                charge, and both must share that charge-relative origin (so
+                development elapsed cannot exceed charge elapsed). ``None``,
+                disabled projection recovery, non-finite or inconsistent
+                values, or clocks that move backwards make projection invalid
+                for this tick without raising or advancing projection clock
+                state; the existing RoR recovery path remains available.
 
         Returns:
             The :class:`PostFcControlOutput` for this step: the clamped
