@@ -296,6 +296,10 @@ describe("toTraceRows", () => {
       recommendedHeat: null,
       rationale: null,
     });
+    expect(rows.map((row) => row.rowId)).toEqual([
+      "trace-evaluation-101",
+      "trace-evaluation-102",
+    ]);
   });
 
   it("uses tick fallback only for null-FK commands", () => {

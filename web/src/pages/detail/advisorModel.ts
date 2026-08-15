@@ -33,6 +33,8 @@ import type {
  * provider/model, latency, and (no) verdict, and must render its failure.
  */
 export interface AdvisorRow {
+  /** Stable advisor-view identity from existing linkage plus projection insertion order. */
+  rowId: string;
   tick: number;
   /** Seconds since T0 for this tick (from telemetry), or `null` if unknown. */
   elapsedSeconds: number | null;
@@ -87,13 +89,17 @@ export function toAdvisorRows(
     timeline.safety_evaluations.map((evaluation) => [evaluation.id, evaluation]),
   );
 
-  return timeline.advisor_decisions.map((advisor) => {
+  return timeline.advisor_decisions.map((advisor, index) => {
     const evaluation =
       advisor.safety_evaluation_id === null
         ? undefined
         : evaluationById.get(advisor.safety_evaluation_id);
     const decision = readDecision(advisor);
     return {
+      rowId:
+        advisor.safety_evaluation_id === null
+          ? `advisor-unlinked-projection-${index}`
+          : `advisor-evaluation-${advisor.safety_evaluation_id}-projection-${index}`,
       tick: advisor.tick,
       elapsedSeconds: elapsed.get(advisor.tick) ?? null,
       beanTempC: beanByTick.get(advisor.tick) ?? null,

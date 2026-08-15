@@ -43,6 +43,21 @@ describe("toAdvisorRows", () => {
     });
   });
 
+  it("uses insertion-ordered projection identities for unlinked same-tick advisors", () => {
+    const timeline = duplicateTickTimeline(null);
+    timeline.advisor_decisions.push({
+      ...timeline.advisor_decisions[0],
+      recorded_at_utc: "2026-06-07T09:10:01Z",
+    });
+
+    const rows = toAdvisorRows(timeline, EMPTY_SERIES);
+    expect(rows.map((row) => row.rowId)).toEqual([
+      "advisor-unlinked-projection-0",
+      "advisor-unlinked-projection-1",
+    ]);
+    expect(rows.map((row) => row.tick)).toEqual([7, 7]);
+  });
+
   it.each([
     ["null", null],
     ["dangling", 999],

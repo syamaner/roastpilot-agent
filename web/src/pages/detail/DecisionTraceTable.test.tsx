@@ -7,6 +7,7 @@ import type { TraceRow } from "./traceModel";
 
 function row(overrides: Partial<TraceRow> = {}): TraceRow {
   return {
+    rowId: "evaluation-1",
     tick: 1,
     elapsedSeconds: 60,
     recordedAtUtc: "2026-06-07T09:01:00Z",
@@ -38,7 +39,7 @@ const ALL_SIX: SafetyVerdict[] = [
 describe("DecisionTraceTable", () => {
   it("renders all six verdict labels in the verdict column (it shows history)", () => {
     const rows = ALL_SIX.map((verdict, i) => row({ tick: i, verdict }));
-    render(<DecisionTraceTable rows={rows} selectedTick={null} onSelect={() => {}} />);
+    render(<DecisionTraceTable rows={rows} selectedRowId={null} onSelect={() => {}} />);
     const cells = screen.getAllByTestId("trace-verdict");
     const labels = cells.map((c) => c.textContent);
     // The enum spelling — EMERGENCY STOP, not ESTOP; ALLOW, never ACCEPT.
@@ -52,17 +53,17 @@ describe("DecisionTraceTable", () => {
     ]);
   });
 
-  it("calls onSelect with the row's tick when a row is clicked", () => {
+  it("calls onSelect with the row identity and tick when a row is clicked", () => {
     const onSelect = vi.fn();
     render(
-      <DecisionTraceTable rows={[row({ tick: 7 })]} selectedTick={null} onSelect={onSelect} />,
+      <DecisionTraceTable rows={[row({ rowId: "evaluation-7", tick: 7 })]} selectedRowId={null} onSelect={onSelect} />,
     );
     fireEvent.click(screen.getByTestId("trace-row"));
-    expect(onSelect).toHaveBeenCalledWith(7);
+    expect(onSelect).toHaveBeenCalledWith("evaluation-7", 7);
   });
 
   it("marks the selected row via data-selected / aria-selected", () => {
-    render(<DecisionTraceTable rows={[row({ tick: 7 })]} selectedTick={7} onSelect={() => {}} />);
+    render(<DecisionTraceTable rows={[row({ rowId: "evaluation-7", tick: 7 })]} selectedRowId="evaluation-7" onSelect={() => {}} />);
     const tr = screen.getByTestId("trace-row");
     expect(tr).toHaveAttribute("data-selected", "true");
     expect(tr).toHaveAttribute("aria-selected", "true");
@@ -72,7 +73,7 @@ describe("DecisionTraceTable", () => {
     const onSelect = vi.fn();
     const long = "a very long rationale ".repeat(8);
     render(
-      <DecisionTraceTable rows={[row({ rationale: long })]} selectedTick={null} onSelect={onSelect} />,
+      <DecisionTraceTable rows={[row({ rationale: long })]} selectedRowId={null} onSelect={onSelect} />,
     );
     const toggle = screen.getByTestId("trace-rationale-toggle");
     expect(toggle).toHaveTextContent("more");
@@ -86,7 +87,7 @@ describe("DecisionTraceTable", () => {
     render(
       <DecisionTraceTable
         rows={[row({ recommendedHeat: 105, executedHeat: 100 })]}
-        selectedTick={null}
+        selectedRowId={null}
         onSelect={() => {}}
       />,
     );
@@ -96,7 +97,27 @@ describe("DecisionTraceTable", () => {
   });
 
   it("renders an empty state when there are no rows", () => {
-    render(<DecisionTraceTable rows={[]} selectedTick={null} onSelect={() => {}} />);
+    render(<DecisionTraceTable rows={[]} selectedRowId={null} onSelect={() => {}} />);
     expect(screen.getByTestId("decision-trace-empty")).toBeInTheDocument();
+  });
+
+  it("distinguishes same-tick trace rows by their evaluation identities", () => {
+    const onSelect = vi.fn();
+    render(
+      <DecisionTraceTable
+        rows={[
+          row({ rowId: "evaluation-101", tick: 8, verdict: "clamp" }),
+          row({ rowId: "evaluation-102", tick: 8, verdict: "reject" }),
+        ]}
+        selectedRowId="evaluation-101"
+        onSelect={onSelect}
+      />,
+    );
+
+    const [first, second] = screen.getAllByTestId("trace-row");
+    expect(first).toHaveAttribute("data-selected", "true");
+    expect(second).toHaveAttribute("data-selected", "false");
+    fireEvent.click(second);
+    expect(onSelect).toHaveBeenCalledWith("evaluation-102", 8);
   });
 });

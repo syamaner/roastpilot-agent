@@ -40,6 +40,8 @@ import type {
  * verdict column renders ALL SIX verdicts (it's history, not advisory state).
  */
 export interface TraceRow {
+  /** Stable trace-view identity derived from the exact safety evaluation primary key. */
+  rowId: string;
   /** Controller tick — the curve-highlight anchor. */
   tick: number;
   /** Seconds since T0 for this tick (from telemetry), or `null` if unknown. */
@@ -293,6 +295,7 @@ export function toTraceRows(
       commandByEvaluationId.get(evaluation.id) ?? fallbackCommandByTick.get(evaluation.tick);
     const decision = readDecision(advisor);
     return {
+      rowId: `trace-evaluation-${evaluation.id}`,
       tick: evaluation.tick,
       elapsedSeconds: elapsed.get(evaluation.tick) ?? null,
       recordedAtUtc: evaluation.recorded_at_utc,

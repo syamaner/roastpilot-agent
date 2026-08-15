@@ -6,6 +6,7 @@ import type { AdvisorRow } from "./advisorModel";
 
 function row(overrides: Partial<AdvisorRow> = {}): AdvisorRow {
   return {
+    rowId: "advisor-projection-0",
     tick: 4,
     elapsedSeconds: 120,
     beanTempC: 178,
@@ -31,7 +32,7 @@ describe("AdvisorTimeline", () => {
     render(
       <AdvisorTimeline
         rows={[row({ recommendedHeat: 105, verdict: "clamp" })]}
-        selectedTick={null}
+        selectedRowId={null}
         onSelect={() => {}}
       />,
     );
@@ -50,7 +51,7 @@ describe("AdvisorTimeline", () => {
     render(
       <AdvisorTimeline
         rows={[row({ elapsedSeconds: 240, beanTempC: 178 })]}
-        selectedTick={null}
+        selectedRowId={null}
         onSelect={() => {}}
       />,
     );
@@ -63,7 +64,7 @@ describe("AdvisorTimeline", () => {
     render(
       <AdvisorTimeline
         rows={[row({ beanTempC: null })]}
-        selectedTick={null}
+        selectedRowId={null}
         onSelect={() => {}}
       />,
     );
@@ -85,7 +86,7 @@ describe("AdvisorTimeline", () => {
             verdictReason: null,
           }),
         ]}
-        selectedTick={null}
+        selectedRowId={null}
         onSelect={() => {}}
       />,
     );
@@ -108,7 +109,7 @@ describe("AdvisorTimeline", () => {
         rationale: null,
       }),
     );
-    render(<AdvisorTimeline rows={rows} selectedTick={null} onSelect={() => {}} />);
+    render(<AdvisorTimeline rows={rows} selectedRowId={null} onSelect={() => {}} />);
     expect(screen.queryByTestId("advisor-timeline-empty")).toBeNull();
     expect(screen.getAllByTestId("advisor-row")).toHaveLength(3);
     expect(screen.getAllByTestId("advisor-status")).toHaveLength(3);
@@ -118,7 +119,7 @@ describe("AdvisorTimeline", () => {
     render(
       <AdvisorTimeline
         rows={[row({ verdict: "fault" })]}
-        selectedTick={null}
+        selectedRowId={null}
         onSelect={() => {}}
       />,
     );
@@ -127,19 +128,43 @@ describe("AdvisorTimeline", () => {
     expect(screen.getByTestId("advisor-verdict-label")).toHaveTextContent("FAULT");
   });
 
-  it("calls onSelect with the row's tick on click and marks the selected row", () => {
+  it("calls onSelect with the row identity and tick on click and marks the selected row", () => {
     const onSelect = vi.fn();
     render(
-      <AdvisorTimeline rows={[row({ tick: 8 })]} selectedTick={8} onSelect={onSelect} />,
+      <AdvisorTimeline
+        rows={[row({ rowId: "advisor-projection-8", tick: 8 })]}
+        selectedRowId="advisor-projection-8"
+        onSelect={onSelect}
+      />,
     );
     const tr = screen.getByTestId("advisor-row");
     expect(tr).toHaveAttribute("data-selected", "true");
     fireEvent.click(tr);
-    expect(onSelect).toHaveBeenCalledWith(8);
+    expect(onSelect).toHaveBeenCalledWith("advisor-projection-8", 8);
   });
 
   it("renders an empty state only when there were zero consults", () => {
-    render(<AdvisorTimeline rows={[]} selectedTick={null} onSelect={() => {}} />);
+    render(<AdvisorTimeline rows={[]} selectedRowId={null} onSelect={() => {}} />);
     expect(screen.getByTestId("advisor-timeline-empty")).toBeInTheDocument();
+  });
+
+  it("distinguishes same-tick advisor rows by their stable identities", () => {
+    const onSelect = vi.fn();
+    render(
+      <AdvisorTimeline
+        rows={[
+          row({ rowId: "advisor-projection-0", tick: 8 }),
+          row({ rowId: "advisor-projection-1", tick: 8, model: "second-model" }),
+        ]}
+        selectedRowId="advisor-projection-0"
+        onSelect={onSelect}
+      />,
+    );
+
+    const [first, second] = screen.getAllByTestId("advisor-row");
+    expect(first).toHaveAttribute("data-selected", "true");
+    expect(second).toHaveAttribute("data-selected", "false");
+    fireEvent.click(second);
+    expect(onSelect).toHaveBeenCalledWith("advisor-projection-1", 8);
   });
 });

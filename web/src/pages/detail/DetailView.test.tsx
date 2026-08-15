@@ -73,6 +73,64 @@ describe("DetailView trace-row → curve highlight", () => {
     fireEvent.click(traceRow("REJECT"));
     expect(window.__chart?.highlightTime).toBe(360);
   });
+
+  it("independently selects and toggles same-tick trace rows while sharing their curve time", () => {
+    const duplicateEvaluation = {
+      ...FIXTURE_TIMELINE.safety_evaluations[1],
+      id: 22,
+      verdict: "reject" as const,
+      reason: "same-tick independent evaluation",
+      recorded_at_utc: "2026-06-07T09:16:01Z",
+    };
+    const duplicateAdvisor = {
+      ...FIXTURE_TIMELINE.advisor_decisions[1],
+      safety_evaluation_id: 22,
+      decision: {
+        ...FIXTURE_TIMELINE.advisor_decisions[1].decision,
+        rationale: "same-tick independent advisor decision",
+      },
+      recorded_at_utc: "2026-06-07T09:16:01Z",
+    };
+    const timeline = {
+      ...FIXTURE_TIMELINE,
+      safety_evaluations: [
+        FIXTURE_TIMELINE.safety_evaluations[0],
+        FIXTURE_TIMELINE.safety_evaluations[1],
+        duplicateEvaluation,
+        FIXTURE_TIMELINE.safety_evaluations[2],
+      ],
+      advisor_decisions: [
+        FIXTURE_TIMELINE.advisor_decisions[0],
+        FIXTURE_TIMELINE.advisor_decisions[1],
+        duplicateAdvisor,
+        FIXTURE_TIMELINE.advisor_decisions[2],
+      ],
+    };
+    render(
+      <DetailView detail={FIXTURE_DETAIL} telemetry={FIXTURE_TELEMETRY} timeline={timeline} />,
+      { wrapper: wrapper() },
+    );
+
+    const sameTickRows = within(screen.getByTestId("decision-trace-table"))
+      .getAllByTestId("trace-row")
+      .filter((row) => row.getAttribute("data-tick") === "8");
+    expect(sameTickRows).toHaveLength(2);
+    const [first, second] = sameTickRows;
+
+    fireEvent.click(first);
+    expect(first).toHaveAttribute("data-selected", "true");
+    expect(second).toHaveAttribute("data-selected", "false");
+    expect(window.__chart?.highlightTime).toBe(240);
+
+    fireEvent.click(second);
+    expect(first).toHaveAttribute("data-selected", "false");
+    expect(second).toHaveAttribute("data-selected", "true");
+    expect(window.__chart?.highlightTime).toBe(240);
+
+    fireEvent.click(second);
+    expect(second).toHaveAttribute("data-selected", "false");
+    expect(window.__chart?.highlightTime).toBeNull();
+  });
 });
 
 afterEach(() => {

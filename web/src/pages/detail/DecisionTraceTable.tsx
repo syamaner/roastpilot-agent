@@ -7,9 +7,9 @@
  * ALL SIX verdicts (ALLOW / CLAMP / REJECT / RECOVERY / FAULT / EMERGENCY STOP)
  * via `verdictLabel` — not just the three advisory badges.
  *
- * Rows are selectable: clicking a row reports its tick so the page highlights the
- * matching timestamp on the curve; clicking the selected row again toggles it off
- * (the page owns the toggle). The rationale truncates with an expand control.
+ * Rows are selectable by stable view identity; the row tick separately anchors the
+ * matching timestamp on the curve. The page owns toggle-off. The rationale truncates
+ * with an expand control.
  */
 
 import { useState } from "react";
@@ -38,10 +38,10 @@ const TONE_CLASS: Record<VerdictTone, string> = {
 
 export interface DecisionTraceTableProps {
   rows: TraceRow[];
-  /** The currently highlighted tick (the selected row), or `null`. */
-  selectedTick: number | null;
-  /** Toggle selection for a row's tick (re-selecting the same tick clears it). */
-  onSelect: (tick: number) => void;
+  /** The currently selected view-row identity, or `null`. */
+  selectedRowId: string | null;
+  /** Toggle selection for a view row, retaining its tick for curve placement. */
+  onSelect: (rowId: string, tick: number) => void;
   /**
    * The table container's `data-testid`. Defaults to `decision-trace-table` — the
    * #253 column-header guard scopes to exactly that id, so the modal copy of this
@@ -54,7 +54,7 @@ export interface DecisionTraceTableProps {
 
 export function DecisionTraceTable({
   rows,
-  selectedTick,
+  selectedRowId,
   onSelect,
   tableTestId = "decision-trace-table",
   className,
@@ -88,9 +88,9 @@ export function DecisionTraceTable({
         <tbody>
           {rows.map((row) => (
             <TraceTableRow
-              key={`${row.tick}-${row.recordedAtUtc}`}
+              key={row.rowId}
               row={row}
-              selected={row.tick === selectedTick}
+              selected={row.rowId === selectedRowId}
               onSelect={onSelect}
             />
           ))}
@@ -103,7 +103,7 @@ export function DecisionTraceTable({
 interface TraceTableRowProps {
   row: TraceRow;
   selected: boolean;
-  onSelect: (tick: number) => void;
+  onSelect: (rowId: string, tick: number) => void;
 }
 
 function TraceTableRow({ row, selected, onSelect }: TraceTableRowProps): React.JSX.Element {
@@ -117,7 +117,7 @@ function TraceTableRow({ row, selected, onSelect }: TraceTableRowProps): React.J
       data-verdict={row.verdict}
       data-selected={selected ? "true" : "false"}
       aria-selected={selected}
-      onClick={() => onSelect(row.tick)}
+      onClick={() => onSelect(row.rowId, row.tick)}
       className={cn(
         "cursor-pointer border-b border-border/60 transition-colors last:border-b-0",
         selected ? "bg-secondary" : "hover:bg-secondary/50",
