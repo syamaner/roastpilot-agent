@@ -1837,8 +1837,8 @@ def test_projection_does_not_depend_on_taper_setpoint() -> None:
     assert entries == [3, 3]
 
 
-def test_conebosque_shape_enters_before_target_and_reaches_cap_boundedly() -> None:
-    """Live-cadence projection enters before v1 and reaches the cap boundedly."""
+def test_conebosque_shape_enters_at_twelve_percent_and_reaches_cap_boundedly() -> None:
+    """Live-cadence projection enters with four DTR points and reaches the cap."""
     config = _projection_recovery_config(
         taper_start_max_ror_c_per_min=6.0,
         taper_end_ror_c_per_min=6.0,
@@ -1851,9 +1851,9 @@ def test_conebosque_shape_enters_before_target_and_reaches_cap_boundedly() -> No
 
     entry_projection: PostFcProjectionInputs | None = None
     for development, charge, ror in (
-        (60.0, 500.0, 6.0),
-        (65.0, 505.0, 5.5),
-        (70.0, 510.0, 4.9),
+        (50.0, 490.0, 6.0),
+        (55.0, 495.0, 5.5),
+        (60.0, 500.0, 4.9),
     ):
         entry_projection = _projection(
             development_elapsed_seconds=development,
@@ -1867,15 +1867,14 @@ def test_conebosque_shape_enters_before_target_and_reaches_cap_boundedly() -> No
         v1_output = v1.compute(measured_ror_c_per_min=ror, dt_seconds=5.0)
 
     assert entry_projection is not None
-    assert 100.0 * 60.0 / 500.0 == 12.0
-    entry_dtr = 100.0 * 70.0 / 510.0
-    assert entry_dtr == pytest.approx(13.72549019607843)
-    assert entry_projection.target_development_percent - entry_dtr > 2.0
+    entry_dtr = 100.0 * 60.0 / 500.0
+    assert entry_dtr == 12.0
+    assert entry_projection.target_development_percent - entry_dtr == 4.0
     assert entered.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
     assert v1_output.recovery_trigger is PostFcRecoveryTrigger.NONE
     cap = min(config.heat_ceiling_percent, 60 + config.recovery_headroom_percentage_points)
     post_entry: list[PostFcControlOutput] = []
-    for development, charge in ((75.0, 515.0), (80.0, 520.0)):
+    for development, charge in ((65.0, 505.0), (70.0, 510.0)):
         post_entry.append(
             v2.compute(
                 measured_ror_c_per_min=0.0,
@@ -1936,6 +1935,88 @@ def test_v2_fast_raise_is_bounded_non_lowering_and_non_compounding(
     )
     assert next_tick.recovery_fast_raise_applied is False
     assert next_tick.heat_percent <= 75
+
+
+def test_v2_fast_raise_reentry_reseeds_without_addition() -> None:
+    """A second independent v2 entry reuses, rather than adds, its floor."""
+    controller = PostFcRorController(
+        _projection_recovery_config(
+            recovery_confirm_ticks=1,
+            ki_percent_per_ror_second=0.0,
+            recovery_entry_step_pp=10,
+        )
+    )
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    first_entry = controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(),
+    )
+    first_bias = controller.snapshot_state().bias_percent
+    assert first_entry.recovery_fast_raise_applied is True
+    assert first_entry.heat_percent == 70
+    assert first_bias == 70.0
+
+    released = controller.compute(
+        measured_ror_c_per_min=20.0,
+        dt_seconds=5.0,
+        projection=_projection(bean_temp_c=200.0),
+    )
+    assert released.heat_authority_state is PostFcHeatAuthorityState.GLIDING
+
+    second_entry = controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(),
+    )
+    assert second_entry.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+    assert second_entry.recovery_fast_raise_applied is True
+    assert second_entry.heat_percent == 70
+    assert controller.snapshot_state().bias_percent == first_bias
+
+
+def test_projection_input_is_byte_identical_when_projection_flag_is_false() -> None:
+    """Supplying ignored v2 inputs cannot perturb the v1 command sequence."""
+    config = _recovery_config(ror_smoothing_alpha=1.0)
+    with_inputs = PostFcRorController(config)
+    without_inputs = PostFcRorController(config)
+    for controller in (with_inputs, without_inputs):
+        controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    for tick, measured_ror in enumerate((6.0, 4.8, 4.7, 5.8, 6.1), start=1):
+        with_output = with_inputs.compute(
+            measured_ror_c_per_min=measured_ror,
+            dt_seconds=5.0,
+            projection=_projection(
+                development_elapsed_seconds=50.0 + 5.0 * tick,
+                charge_elapsed_seconds=490.0 + 5.0 * tick,
+            ),
+        )
+        without_output = without_inputs.compute(
+            measured_ror_c_per_min=measured_ror,
+            dt_seconds=5.0,
+        )
+        assert with_output == without_output
+        assert with_inputs.snapshot_state() == without_inputs.snapshot_state()
+
+
+def test_same_tick_projection_and_ror_confirmation_prefers_projection() -> None:
+    """The typed projection trigger wins when both entry paths confirm."""
+    config = _projection_recovery_config(recovery_confirm_ticks=1)
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    output = controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(),
+    )
+
+    assert output.error_c_per_min > config.recovery_trigger_margin_c_per_min
+    assert output.projected_entry_temp_c is not None
+    assert output.projected_entry_temp_c < 197.0
+    assert output.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
 
 
 def test_projection_on_target_glides_and_cutoff_latches_all_recovery_until_reset() -> None:
