@@ -20,6 +20,7 @@ from typing import BinaryIO, cast
 import capture_usage_claude as usage_claude
 import capture_usage_cli as usage_cli
 import capture_usage_codex as usage_codex
+import capture_usage_transcript as usage_transcript
 import pytest
 from capture_usage_claude import (
     CLAUDE_EVENT_TYPES,
@@ -66,6 +67,33 @@ from pydantic import TypeAdapter, ValidationError
 _REAL_VALIDATE_WORKTREE_METADATA = usage_cli._validate_worktree_metadata  # pyright: ignore[reportPrivateUsage]
 FIXTURES = Path(__file__).parent / "fixtures" / "agent-usage"
 USAGE_RECORD_ADAPTER = cast(TypeAdapter[UsageRecord], _USAGE_RECORD_ADAPTER)
+
+
+def test_owned_transcript_counts_identical_assistant_usage_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The committed 2.1.231 fixture is read only at its exact expected path."""
+    session_id = "11111111-1111-4111-8111-111111111111"
+    home = tmp_path / "home"
+    project = home / ".claude" / "projects" / usage_transcript._project_name(tmp_path)  # pyright: ignore[reportPrivateUsage]
+    project.mkdir(parents=True)
+    transcript = project / f"{session_id}.jsonl"
+    transcript.write_bytes((FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes())
+    monkeypatch.setattr(usage_transcript.Path, "home", classmethod(lambda _cls: home))
+
+    usage = usage_transcript.parse_owned_transcript(
+        tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+    )
+
+    assert usage.usage_message_count == 2
+    assert usage.input_tokens == 4
+    assert usage.cached_input_tokens == 30
+    assert usage.cache_creation_input_tokens == 35
+    assert usage.output_tokens == 11
+    assert (
+        transcript.read_bytes()
+        == (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    )
 
 
 @pytest.fixture(autouse=True)
