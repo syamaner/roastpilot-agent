@@ -2655,6 +2655,7 @@ class RoastController:
                 recovery_trigger=PostFcRecoveryTrigger.NONE,
                 recovery_projection_short_ticks=0,
                 recovery_projection_on_target_ticks=0,
+                recovery_projection_release_latched=state.recovery_projection_release_latched,
                 recovery_last_development_elapsed_seconds=(
                     state.recovery_last_development_elapsed_seconds
                 ),

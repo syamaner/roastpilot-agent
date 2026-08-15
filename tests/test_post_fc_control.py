@@ -1391,6 +1391,7 @@ def test_reset_clears_recovery_state_from_active_and_mid_glide() -> None:
             recovery_trigger=PostFcRecoveryTrigger.PROJECTION,
             recovery_projection_short_ticks=2,
             recovery_projection_on_target_ticks=1,
+            recovery_projection_release_latched=True,
             recovery_last_development_elapsed_seconds=60.0,
             recovery_last_charge_elapsed_seconds=500.0,
             recovery_cutoff_reached=True,
@@ -1406,6 +1407,7 @@ def test_reset_clears_recovery_state_from_active_and_mid_glide() -> None:
     assert cleared_from_active.recovery_trigger is PostFcRecoveryTrigger.NONE
     assert cleared_from_active.recovery_projection_short_ticks == 0
     assert cleared_from_active.recovery_projection_on_target_ticks == 0
+    assert cleared_from_active.recovery_projection_release_latched is False
     assert cleared_from_active.recovery_last_development_elapsed_seconds is None
     assert cleared_from_active.recovery_last_charge_elapsed_seconds is None
     assert cleared_from_active.recovery_cutoff_reached is False
@@ -2028,6 +2030,47 @@ def test_on_target_cutoff_projection_blocks_overlapping_entry_reconfirmation() -
         for output in after_release
     )
     assert after_release[-1].heat_authority_state is PostFcHeatAuthorityState.HOLDING
+    assert controller.snapshot_state().recovery_projection_release_latched is True
+
+    worsened = [
+        controller.compute(
+            measured_ror_c_per_min=0.0,
+            dt_seconds=5.0,
+            projection=_projection(),
+        )
+        for _ in range(2)
+    ]
+    assert worsened[-1].heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+    assert worsened[-1].recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+    assert controller.snapshot_state().recovery_projection_release_latched is False
+
+
+def test_overlapping_cutoff_projection_does_not_veto_initial_entry() -> None:
+    """D162's +2 entry signal remains independent of the later +5 view."""
+    controller = PostFcRorController(
+        _projection_recovery_config(
+            recovery_confirm_ticks=2,
+            recovery_trigger_margin_c_per_min=50.0,
+        )
+    )
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    overlap = _projection(bean_temp_c=189.5)
+
+    outputs = [
+        controller.compute(
+            measured_ror_c_per_min=12.0,
+            dt_seconds=5.0,
+            projection=overlap,
+        )
+        for _ in range(2)
+    ]
+
+    assert outputs[-1].projected_entry_temp_c is not None
+    assert outputs[-1].projected_entry_temp_c < 197.0
+    assert outputs[-1].projected_cutoff_temp_c is not None
+    assert outputs[-1].projected_cutoff_temp_c >= 200.0
+    assert outputs[-1].heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+    assert outputs[-1].recovery_trigger is PostFcRecoveryTrigger.PROJECTION
 
 
 @pytest.mark.parametrize(

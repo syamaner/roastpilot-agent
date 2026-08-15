@@ -279,6 +279,12 @@ class PostFcControllerState:
     recovery_trigger: PostFcRecoveryTrigger
     recovery_projection_short_ticks: int
     recovery_projection_on_target_ticks: int
+    #: Whether a projection-triggered recovery has just released because the
+    #: +5 projection reached target. While that same +5 condition remains
+    #: true, it blocks only projection re-entry; the independent RoR trigger
+    #: remains available. This prevents an unchanged +2/+5 overlap from
+    #: cycling recovery without letting +5 veto the first +2 entry.
+    recovery_projection_release_latched: bool
     recovery_last_development_elapsed_seconds: float | None
     recovery_last_charge_elapsed_seconds: float | None
     recovery_cutoff_reached: bool
@@ -415,6 +421,7 @@ class PostFcRorController:
         self._recovery_trigger = PostFcRecoveryTrigger.NONE
         self._recovery_projection_short_ticks = 0
         self._recovery_projection_on_target_ticks = 0
+        self._recovery_projection_release_latched = False
         self._recovery_last_development_elapsed_seconds: float | None = None
         self._recovery_last_charge_elapsed_seconds: float | None = None
         self._recovery_cutoff_reached = False
@@ -506,6 +513,7 @@ class PostFcRorController:
         self._recovery_trigger = PostFcRecoveryTrigger.NONE
         self._recovery_projection_short_ticks = 0
         self._recovery_projection_on_target_ticks = 0
+        self._recovery_projection_release_latched = False
         self._recovery_last_development_elapsed_seconds = None
         self._recovery_last_charge_elapsed_seconds = None
         self._recovery_cutoff_reached = False
@@ -668,6 +676,7 @@ class PostFcRorController:
             recovery_trigger=self._recovery_trigger,
             recovery_projection_short_ticks=self._recovery_projection_short_ticks,
             recovery_projection_on_target_ticks=self._recovery_projection_on_target_ticks,
+            recovery_projection_release_latched=self._recovery_projection_release_latched,
             recovery_last_development_elapsed_seconds=self._recovery_last_development_elapsed_seconds,
             recovery_last_charge_elapsed_seconds=self._recovery_last_charge_elapsed_seconds,
             recovery_cutoff_reached=self._recovery_cutoff_reached,
@@ -693,6 +702,7 @@ class PostFcRorController:
         self._recovery_trigger = state.recovery_trigger
         self._recovery_projection_short_ticks = state.recovery_projection_short_ticks
         self._recovery_projection_on_target_ticks = state.recovery_projection_on_target_ticks
+        self._recovery_projection_release_latched = state.recovery_projection_release_latched
         self._recovery_last_development_elapsed_seconds = (
             state.recovery_last_development_elapsed_seconds
         )
@@ -1152,6 +1162,7 @@ class PostFcRorController:
                 else:
                     self._recovery_projection_on_target_ticks = 0
                 if self._recovery_projection_on_target_ticks >= config.recovery_confirm_ticks:
+                    self._recovery_projection_release_latched = True
                     self._begin_recovery_glide()
                 return None
             if error_c_per_min <= config.recovery_exit_margin_c_per_min:
@@ -1164,15 +1175,16 @@ class PostFcRorController:
         if self._recovery_cutoff_reached:
             self._advance_glide()
             return None
-        # The +2 shortfall and +5 on-target predicates can both be true: the
-        # trajectory may miss the earlier horizon yet still reach the target
-        # within the additional bounded runway. In that overlap the +5
-        # continuation result wins. Otherwise a confirmed on-target exit
-        # would immediately start reconfirming the unchanged +2 shortfall and
-        # cycle between recovery and glide until the entry horizon expired.
+        # D162 makes +2 the independent entry signal, so +5 must not veto the
+        # first entry even when both predicates overlap. After an on-target
+        # release, however, retain that release while the same +5 condition
+        # remains true; otherwise the unchanged +2 shortfall would immediately
+        # reconfirm and cycle between recovery and glide.
+        if self._recovery_projection_release_latched and projection.valid:
+            self._recovery_projection_release_latched = self._projection_is_on_target(projection)
         projection_short = (
             v2
-            and not self._projection_is_on_target(projection)
+            and not self._recovery_projection_release_latched
             and self._projection_is_short(projection)
         )
         self._recovery_projection_short_ticks = (
