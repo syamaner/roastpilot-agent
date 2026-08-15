@@ -865,6 +865,52 @@ async def test_typed_writers_round_trip_enum_values(tmp_store: RoastStore) -> No
 
 
 @pytest.mark.asyncio
+async def test_timeline_round_trips_safety_ids_and_command_provenance(
+    tmp_store: RoastStore,
+) -> None:
+    """Timeline wire rows retain safety IDs and both command FK states (#787)."""
+    await seeded_store(tmp_store)
+    try:
+        evaluation_id = await tmp_store.record_safety_evaluation(
+            run_id="run-1",
+            tick=7,
+            evaluation=SafetyEvaluation(
+                rule="command_bounds",
+                verdict=SafetyVerdict.CLAMP,
+                input_heat=120,
+                input_fan=40,
+                adjusted_heat=100,
+                adjusted_fan=40,
+                reason="clamped",
+            ),
+        )
+        await tmp_store.record_command(
+            run_id="run-1",
+            tick=7,
+            tool=RoastCommand.SET_HEAT,
+            source="advisor",
+            status="ok",
+            safety_evaluation_id=evaluation_id,
+        )
+        await tmp_store.record_command(
+            run_id="run-1",
+            tick=7,
+            tool=RoastCommand.SET_FAN,
+            source="operator",
+            status="ok",
+        )
+
+        timeline = await tmp_store.read_timeline("run-1")
+        assert [evaluation.id for evaluation in timeline.safety_evaluations] == [evaluation_id]
+        assert [command.safety_evaluation_id for command in timeline.commands] == [
+            evaluation_id,
+            None,
+        ]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_advisor_decision_stores_hash_never_raw_context(
     tmp_store: RoastStore,
 ) -> None:
