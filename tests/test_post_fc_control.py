@@ -1385,6 +1385,17 @@ def test_reset_clears_recovery_state_from_active_and_mid_glide() -> None:
         controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0)  # confirm entry
     active_snapshot = controller.snapshot_state()
     assert active_snapshot.recovery_active is True  # precondition: genuinely active
+    controller.restore_state(
+        dataclasses.replace(
+            active_snapshot,
+            recovery_trigger=PostFcRecoveryTrigger.PROJECTION,
+            recovery_projection_short_ticks=2,
+            recovery_projection_on_target_ticks=1,
+            recovery_last_development_elapsed_seconds=60.0,
+            recovery_last_charge_elapsed_seconds=500.0,
+            recovery_cutoff_reached=True,
+        )
+    )
 
     controller.reset(initial_heat_percent=55, ror_at_engagement_c_per_min=6.0)
     cleared_from_active = controller.snapshot_state()
@@ -1392,6 +1403,12 @@ def test_reset_clears_recovery_state_from_active_and_mid_glide() -> None:
     assert cleared_from_active.recovery_ticks_within_exit == 0
     assert cleared_from_active.recovery_active is False
     assert cleared_from_active.recovery_ticks_since_exit is None
+    assert cleared_from_active.recovery_trigger is PostFcRecoveryTrigger.NONE
+    assert cleared_from_active.recovery_projection_short_ticks == 0
+    assert cleared_from_active.recovery_projection_on_target_ticks == 0
+    assert cleared_from_active.recovery_last_development_elapsed_seconds is None
+    assert cleared_from_active.recovery_last_charge_elapsed_seconds is None
+    assert cleared_from_active.recovery_cutoff_reached is False
     # The first post-reset tick computes the D88 BASE ceiling for the NEW
     # engagement heat (55), never a leaked recovery cap from the old one.
     first_tick = controller.compute(measured_ror_c_per_min=6.0, dt_seconds=5.0)
@@ -1756,8 +1773,8 @@ def test_recovery_projection_defaults_and_cross_field_guards() -> None:
         _projection_recovery_config(recovery_projection_entry_horizon_pp=float("nan"))
 
 
-def test_projection_entry_needs_three_uninterrupted_short_ticks_and_wins_tie() -> None:
-    """A non-short tick resets confirmation, and projection wins a same-tick tie."""
+def test_projection_entry_needs_three_uninterrupted_short_ticks() -> None:
+    """A non-short tick resets projection confirmation before entry."""
     controller = PostFcRorController(
         _projection_recovery_config(recovery_trigger_margin_c_per_min=50.0)
     )
@@ -1816,6 +1833,60 @@ def test_projection_does_not_depend_on_taper_setpoint() -> None:
                 entries.append(tick)
                 break
     assert entries == [3, 3]
+
+
+def test_conebosque_shape_enters_at_twelve_percent_and_reaches_cap_boundedly() -> None:
+    """Projection enters with four DTR points left, before v1, and reaches the cap."""
+    config = _projection_recovery_config(
+        taper_start_max_ror_c_per_min=6.0,
+        taper_end_ror_c_per_min=6.0,
+        taper_duration_seconds=1.0,
+    )
+    projection = _projection(development_elapsed_seconds=60.0, charge_elapsed_seconds=500.0)
+    v2 = PostFcRorController(config)
+    v1 = PostFcRorController(config.model_copy(update={"recovery_projection_enabled": False}))
+    for controller in (v2, v1):
+        controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    for ror in (6.0, 5.5, 4.9):
+        entered = v2.compute(
+            measured_ror_c_per_min=ror,
+            dt_seconds=5.0,
+            projection=projection,
+        )
+        v1_output = v1.compute(measured_ror_c_per_min=ror, dt_seconds=5.0)
+
+    assert 100.0 * 60.0 / 500.0 == 12.0
+    assert projection.target_development_percent - 12.0 == 4.0
+    assert entered.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+    assert v1_output.recovery_trigger is PostFcRecoveryTrigger.NONE
+    cap = min(config.heat_ceiling_percent, 60 + config.recovery_headroom_percentage_points)
+    post_entry = [
+        v2.compute(measured_ror_c_per_min=0.0, dt_seconds=5.0, projection=projection)
+        for _ in range(2)
+    ]
+    assert post_entry[-1].heat_percent == cap
+
+
+def test_v2_sustained_shortfall_stays_at_cap_for_500_ticks() -> None:
+    """The projection path cannot compound beyond the unchanged D96 cap."""
+    config = _projection_recovery_config()
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    outputs = [
+        controller.compute(
+            measured_ror_c_per_min=0.0,
+            dt_seconds=5.0,
+            projection=_projection(),
+        )
+        for _ in range(500)
+    ]
+    cap = min(config.heat_ceiling_percent, 60 + config.recovery_headroom_percentage_points)
+    assert max(output.heat_percent for output in outputs) == cap
+    first_cap_tick = next(
+        index for index, output in enumerate(outputs, start=1) if output.heat_percent == cap
+    )
+    assert first_cap_tick <= 4
 
 
 @pytest.mark.parametrize("trigger_projection", [False, True])
@@ -1966,7 +2037,9 @@ def test_on_target_cutoff_projection_blocks_overlapping_entry_reconfirmation() -
         _projection(bean_temp_c=float("nan")),
         _projection(development_elapsed_seconds=None),
         _projection(charge_elapsed_seconds=0.0),
+        _projection(development_elapsed_seconds=-1.0),
         _projection(development_elapsed_seconds=501.0),
+        _projection(target_development_percent=96.0),
         _projection(target_development_percent=99.0),
     ],
 )
