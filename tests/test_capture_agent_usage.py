@@ -367,6 +367,31 @@ def test_owned_transcript_rejects_remaining_identity_and_usage_mutations(
         transcript.unlink()
 
 
+def test_owned_transcript_rejects_assistant_root_agent_id_without_retaining_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parent transcript cannot claim a child-agent identity at the assistant root."""
+    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    lines = content.splitlines()
+    lines[2] = lines[2].replace(
+        b'"version":"2.1.231"',
+        b'"agentId":"SENTINEL_CHILD_ID","version":"2.1.231"',
+        1,
+    )
+    transcript, session_id = _install_owned_transcript(
+        tmp_path, monkeypatch, b"\n".join(lines) + b"\n"
+    )
+    with pytest.raises(usage_transcript.TranscriptError) as error:
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        )
+    assert str(error.value) == "owned Claude transcript is invalid"
+    assert "SENTINEL_CHILD_ID" not in str(error.value)
+    assert error.value.__cause__ is None and error.value.__context__ is None
+    assert not (tmp_path / ".agent-usage").exists()
+    assert b"SENTINEL_CHILD_ID" in transcript.read_bytes()
+
+
 @pytest.mark.parametrize(
     "content,session_id",
     [
