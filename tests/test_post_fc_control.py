@@ -1775,6 +1775,44 @@ def test_recovery_projection_defaults_and_cross_field_guards() -> None:
         _projection_recovery_config(recovery_projection_entry_horizon_pp=float("nan"))
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("recovery_projection_entry_horizon_pp", 0.0, "greater than 0"),
+        ("recovery_projection_entry_horizon_pp", 20.1, "less than or equal to 20"),
+        ("recovery_projection_entry_horizon_pp", float("nan"), "finite number"),
+        ("recovery_projection_entry_horizon_pp", float("inf"), "finite number"),
+        ("recovery_projection_entry_horizon_pp", float("-inf"), "finite number"),
+        ("recovery_projection_cutoff_horizon_pp", 0.0, "greater than 0"),
+        ("recovery_projection_cutoff_horizon_pp", 20.1, "less than or equal to 20"),
+        ("recovery_projection_cutoff_horizon_pp", float("nan"), "finite number"),
+        ("recovery_projection_cutoff_horizon_pp", float("inf"), "finite number"),
+        ("recovery_projection_cutoff_horizon_pp", float("-inf"), "finite number"),
+        ("recovery_projection_margin_c", 0.0, "greater than 0"),
+        ("recovery_projection_margin_c", -1.0, "greater than 0"),
+        ("recovery_projection_margin_c", float("nan"), "finite number"),
+        ("recovery_projection_margin_c", float("inf"), "finite number"),
+        ("recovery_projection_margin_c", float("-inf"), "finite number"),
+        ("recovery_entry_step_pp", -1, "greater than or equal to 0"),
+        ("recovery_entry_step_pp", 51, "less than or equal to 50"),
+    ],
+)
+def test_recovery_projection_knob_bounds_reject_each_invalid_class(
+    field: str,
+    value: float | int,
+    message: str,
+) -> None:
+    """Every new tuning bound and finite constraint has a direct guard."""
+    with pytest.raises(ValueError, match=message):
+        _projection_recovery_config(**{field: value})
+
+
+@pytest.mark.parametrize("step", [0, 50])
+def test_recovery_entry_step_accepts_exact_bounds(step: int) -> None:
+    """The ratified inclusive fast-raise bounds remain usable."""
+    assert _projection_recovery_config(recovery_entry_step_pp=step).recovery_entry_step_pp == step
+
+
 def test_projection_entry_needs_three_uninterrupted_short_ticks() -> None:
     """A non-short tick resets projection confirmation before entry."""
     controller = PostFcRorController(
@@ -2181,7 +2219,21 @@ def test_overlapping_cutoff_projection_does_not_veto_initial_entry() -> None:
     [
         None,
         _projection(bean_temp_c=float("nan")),
+        _projection(bean_temp_c=float("inf")),
+        _projection(bean_temp_c=float("-inf")),
+        _projection(target_drop_temp_c=float("nan")),
+        _projection(target_drop_temp_c=float("inf")),
+        _projection(target_drop_temp_c=float("-inf")),
+        _projection(target_development_percent=float("nan")),
+        _projection(target_development_percent=float("inf")),
+        _projection(target_development_percent=float("-inf")),
         _projection(development_elapsed_seconds=None),
+        _projection(development_elapsed_seconds=float("nan")),
+        _projection(development_elapsed_seconds=float("inf")),
+        _projection(development_elapsed_seconds=float("-inf")),
+        _projection(charge_elapsed_seconds=float("nan")),
+        _projection(charge_elapsed_seconds=float("inf")),
+        _projection(charge_elapsed_seconds=float("-inf")),
         _projection(charge_elapsed_seconds=0.0),
         _projection(development_elapsed_seconds=-1.0),
         _projection(development_elapsed_seconds=501.0),
