@@ -17,8 +17,10 @@
  *                        event's charge-clock (see `turningPointSeconds`), and
  *                        dry-end (#351) from the persisted `drying_end` event's
  *                        server threshold (see `dryEndSeconds`).
- *   - `toTraceRows`    : safety evaluations joined by `tick` to their advisor
- *                        decision + executed command → the decision-trace table.
+ *   - `toTraceRows`    : safety evaluations joined by their persisted foreign
+ *                        keys to advisor decisions + executed commands → the
+ *                        decision-trace table. Legacy NULL-FK commands retain
+ *                        their scoped tick fallback.
  *   - `headlineStats`  : title-block stats derived from the same telemetry phases.
  */
 
@@ -29,6 +31,7 @@ import type {
   TelemetryPoint,
   TelemetrySeries,
   TimelineAdvisorDecision,
+  TimelineCommand,
 } from "@/lib/types";
 
 /**
@@ -37,7 +40,7 @@ import type {
  * verdict column renders ALL SIX verdicts (it's history, not advisory state).
  */
 export interface TraceRow {
-  /** Controller tick — the join key and the curve-highlight anchor. */
+  /** Controller tick — the curve-highlight anchor. */
   tick: number;
   /** Seconds since T0 for this tick (from telemetry), or `null` if unknown. */
   elapsedSeconds: number | null;
@@ -252,9 +255,10 @@ function firstPhaseBeanTemp(
 // --- Trace-table projection ---------------------------------------------------
 
 /**
- * Join the timeline's three trace streams by `tick` into table rows — one row per
- * safety evaluation (the verdict is the spine), enriched with the advisor
- * recommendation it judged and the command it produced.
+ * Join the timeline's three trace streams into table rows — one row per safety
+ * evaluation (the verdict is the spine), enriched through exact persisted FKs
+ * with the advisor recommendation it judged and the command it produced. A
+ * NULL-FK command alone may use the legacy tick fallback.
  *
  * The advisor `decision` payload is typed `dict[str, Any]` on the wire (opaque by
  * design), so we read its known `RoastDecision` keys defensively: present →
@@ -267,12 +271,26 @@ export function toTraceRows(
 ): TraceRow[] {
   if (!timeline) return [];
   const elapsed = tickElapsedIndex(series);
-  const advisorByTick = lastByTick(timeline.advisor_decisions);
-  const commandByTick = lastByTick(timeline.commands);
+  const advisorByEvaluationId = new Map<number, TimelineAdvisorDecision>();
+  for (const advisor of timeline.advisor_decisions) {
+    if (advisor.safety_evaluation_id !== null) {
+      advisorByEvaluationId.set(advisor.safety_evaluation_id, advisor);
+    }
+  }
+  const commandByEvaluationId = new Map<number, TimelineCommand>();
+  const fallbackCommandByTick = new Map<number, TimelineCommand>();
+  for (const command of timeline.commands) {
+    if (command.safety_evaluation_id === null) {
+      fallbackCommandByTick.set(command.tick, command);
+    } else {
+      commandByEvaluationId.set(command.safety_evaluation_id, command);
+    }
+  }
 
   return timeline.safety_evaluations.map((evaluation) => {
-    const advisor = advisorByTick.get(evaluation.tick);
-    const command = commandByTick.get(evaluation.tick);
+    const advisor = advisorByEvaluationId.get(evaluation.id);
+    const command =
+      commandByEvaluationId.get(evaluation.id) ?? fallbackCommandByTick.get(evaluation.tick);
     const decision = readDecision(advisor);
     return {
       tick: evaluation.tick,
@@ -321,13 +339,6 @@ export function headlineStats(
 }
 
 // --- internals ----------------------------------------------------------------
-
-/** Index records by tick, keeping the last record for a tick (insertion order). */
-function lastByTick<T extends { tick: number }>(records: readonly T[]): Map<number, T> {
-  const index = new Map<number, T>();
-  for (const record of records) index.set(record.tick, record);
-  return index;
-}
 
 interface DecisionFields {
   heat: number | null;

@@ -2,16 +2,16 @@
  * Advisor-decision timeline projection for the roast detail page (#170).
  *
  * The existing `traceModel.toTraceRows` is SAFETY-spined: one row per safety
- * evaluation, enriched with the advisor recommendation joined by tick. That model
- * cannot surface a consult the advisor FAILED on — a `timeout` / `malformed` /
- * `provider_error` produces NO safety evaluation, so a roast where every consult
- * failed would render a blank decision-trace panel (#170 forbids exactly that).
+ * evaluation, enriched with the advisor recommendation joined through its exact
+ * safety-evaluation FK. That model cannot surface a consult the advisor FAILED on,
+ * because a failed decision has no recommendation for a safety-spined row; a roast
+ * where every consult failed would render a blank decision-trace panel (#170
+ * forbids exactly that), even though failures persist linked safety evaluations.
  *
  * This module is the ADVISOR-spined complement: one row per persisted
  * `advisor_decisions` entry — including preheat consults and failures — joined to
- * the safety verdict it produced (by `tick`, the same key both rows are persisted
- * under on the controller path; see `api.py` `_RunSink.persist_*`). Failures show
- * the failure, never a blank.
+ * the safety verdict it produced by `safety_evaluation_id`. Failures show the
+ * failure, never a blank.
  *
  * Everything is read from the REST `RoastTimeline` contract; nothing is inferred.
  * All temperatures Celsius. The advisor `decision` payload is opaque `dict` on the
@@ -73,7 +73,7 @@ export interface AdvisorSummary {
 
 /**
  * Project the timeline's advisor decisions into timeline rows, joined to the
- * safety verdict each produced (by tick) and placed on the curve's seconds axis.
+ * safety verdict each produced (by exact FK) and placed on the curve's seconds axis.
  * Insertion order is preserved (the store reads `ORDER BY id ASC`).
  */
 export function toAdvisorRows(
@@ -83,10 +83,15 @@ export function toAdvisorRows(
   if (!timeline) return [];
   const elapsed = tickElapsedIndex(series);
   const beanByTick = tickBeanTempIndex(series);
-  const verdictByTick = lastByTick(timeline.safety_evaluations);
+  const evaluationById = new Map(
+    timeline.safety_evaluations.map((evaluation) => [evaluation.id, evaluation]),
+  );
 
   return timeline.advisor_decisions.map((advisor) => {
-    const evaluation = verdictByTick.get(advisor.tick);
+    const evaluation =
+      advisor.safety_evaluation_id === null
+        ? undefined
+        : evaluationById.get(advisor.safety_evaluation_id);
     const decision = readDecision(advisor);
     return {
       tick: advisor.tick,
@@ -116,7 +121,9 @@ export function toAdvisorRows(
  */
 export function advisorSummary(timeline: RoastTimeline | undefined): AdvisorSummary {
   const decisions = timeline?.advisor_decisions ?? [];
-  const verdictByTick = lastByTick(timeline?.safety_evaluations ?? []);
+  const evaluationById = new Map(
+    (timeline?.safety_evaluations ?? []).map((evaluation) => [evaluation.id, evaluation]),
+  );
 
   let ok = 0;
   let failed = 0;
@@ -128,7 +135,10 @@ export function advisorSummary(timeline: RoastTimeline | undefined): AdvisorSumm
     } else {
       failed += 1;
     }
-    const verdict = verdictByTick.get(decision.tick)?.verdict;
+    const verdict =
+      decision.safety_evaluation_id === null
+        ? undefined
+        : evaluationById.get(decision.safety_evaluation_id)?.verdict;
     if (verdict === "clamp") clamped += 1;
     if (verdict === "reject") rejected += 1;
   }
@@ -183,13 +193,6 @@ function tickBeanTempIndex(series: TelemetrySeries | undefined): Map<number, num
   for (const p of series.points) {
     index.set(p.tick, p.bean_temp_c);
   }
-  return index;
-}
-
-/** Index records by tick, keeping the last record for a tick (insertion order). */
-function lastByTick<T extends { tick: number }>(records: readonly T[]): Map<number, T> {
-  const index = new Map<number, T>();
-  for (const record of records) index.set(record.tick, record);
   return index;
 }
 

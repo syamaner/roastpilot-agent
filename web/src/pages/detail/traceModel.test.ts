@@ -263,7 +263,7 @@ describe("toCurveMarkers", () => {
 });
 
 describe("toTraceRows", () => {
-  it("joins safety evals to advisor decisions + commands by tick", () => {
+  it("preserves the monotonic one-evaluation-per-tick fixture projection", () => {
     const rows = toTraceRows(FIXTURE_TIMELINE, FIXTURE_TELEMETRY);
     expect(rows).toHaveLength(FIXTURE_TIMELINE.safety_evaluations.length);
 
@@ -279,6 +279,30 @@ describe("toTraceRows", () => {
     expect(clamp.commandTool).toBe("set_heat");
     // Placed on the curve axis via telemetry's elapsed seconds (tick 8 → 240 s).
     expect(clamp.elapsedSeconds).toBe(240);
+  });
+
+  it("joins an advisor only to its non-last same-tick evaluation FK", () => {
+    const timeline = duplicateTickTimeline();
+
+    const rows = toTraceRows(timeline, undefined);
+
+    expect(rows[0]).toMatchObject({
+      verdict: "clamp",
+      recommendedHeat: 81,
+      rationale: "linked to evaluation 101",
+    });
+    expect(rows[1]).toMatchObject({
+      verdict: "reject",
+      recommendedHeat: null,
+      rationale: null,
+    });
+  });
+
+  it("uses tick fallback only for null-FK commands", () => {
+    const rows = toTraceRows(duplicateTickTimeline(), undefined);
+
+    expect(rows[0]).toMatchObject({ verdict: "clamp", commandTool: "set_heat" });
+    expect(rows[1]).toMatchObject({ verdict: "reject", commandTool: "set_fan" });
   });
 
   it("falls back executed→input when nothing was adjusted", () => {
@@ -301,6 +325,7 @@ describe("toTraceRows", () => {
       advisor_decisions: [],
       commands: [],
       safety_evaluations: verdicts.map((verdict, i) => ({
+        id: i + 1,
         tick: i,
         rule: "r",
         verdict,
@@ -332,6 +357,80 @@ describe("toTraceRows", () => {
     expect(toTraceRows(undefined, FIXTURE_TELEMETRY)).toEqual([]);
   });
 });
+
+function duplicateTickTimeline(): RoastTimeline {
+  return {
+    run_id: "duplicate-tick",
+    events: [],
+    safety_evaluations: [
+      {
+        id: 101,
+        tick: 7,
+        rule: "bounds",
+        verdict: "clamp",
+        input_heat: 81,
+        input_fan: 40,
+        adjusted_heat: 80,
+        adjusted_fan: 40,
+        reason: "first evaluation at tick",
+        recorded_at_utc: "2026-06-07T09:14:00Z",
+      },
+      {
+        id: 102,
+        tick: 7,
+        rule: "drop_guard",
+        verdict: "reject",
+        input_heat: 0,
+        input_fan: 100,
+        adjusted_heat: null,
+        adjusted_fan: null,
+        reason: "last evaluation at tick",
+        recorded_at_utc: "2026-06-07T09:14:01Z",
+      },
+    ],
+    advisor_decisions: [
+      {
+        tick: 7,
+        provider: "fake",
+        model: "fixture",
+        prompt_version: "v1",
+        latency_ms: 5,
+        status: "ok",
+        decision: {
+          target_heat: 81,
+          target_fan: 40,
+          should_drop: false,
+          confidence: 0.9,
+          rationale: "linked to evaluation 101",
+        },
+        safety_evaluation_id: 101,
+        recorded_at_utc: "2026-06-07T09:14:00Z",
+      },
+    ],
+    commands: [
+      {
+        tick: 7,
+        tool: "set_fan",
+        source: "operator",
+        status: "ok",
+        args: { percent: 40 },
+        result: { ok: true },
+        safety_evaluation_id: null,
+        recorded_at_utc: "2026-06-07T09:14:00Z",
+      },
+      {
+        tick: 7,
+        tool: "set_heat",
+        source: "safety",
+        status: "ok",
+        args: { percent: 80 },
+        result: { ok: true },
+        safety_evaluation_id: 101,
+        recorded_at_utc: "2026-06-07T09:14:01Z",
+      },
+    ],
+  } as RoastTimeline;
+}
 
 describe("tickToSeconds", () => {
   it("maps a tick to its telemetry elapsed seconds", () => {
