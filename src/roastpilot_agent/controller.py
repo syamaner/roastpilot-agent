@@ -2353,29 +2353,36 @@ class RoastController:
         """
         if not self._config.post_first_crack_control.recovery_projection_enabled:
             return
-        if (
-            not before.recovery_active
-            and after.recovery_active
-            and after.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
-        ):
-            if (
-                output.projected_entry_temp_c is None
-                or output.projection_entry_runway_seconds is None
-                or projection.development_elapsed_seconds is None
-            ):
-                _log.info("D162 recovery-v2 projection entered; diagnostics unavailable. #708")
-            else:
+        if not before.recovery_active and after.recovery_active:
+            if after.recovery_trigger is PostFcRecoveryTrigger.PROJECTION:
+                if (  # pragma: no cover - valid entry has diagnostics
+                    output.projected_entry_temp_c is None
+                    or output.projection_entry_runway_seconds is None
+                    or projection.development_elapsed_seconds is None
+                ):
+                    _log.info("D162 recovery-v2 projection entered; diagnostics unavailable. #708")
+                else:
+                    _log.info(
+                        "D162 recovery-v2 projection entered: target=%.1f °C, projected=%.1f °C, "
+                        "shortfall=%.1f °C, runway=%.1f s, charge=%.1f s, development=%.1f s. #708",
+                        projection.target_drop_temp_c,
+                        output.projected_entry_temp_c,
+                        projection.target_drop_temp_c - output.projected_entry_temp_c,
+                        output.projection_entry_runway_seconds,
+                        projection.charge_elapsed_seconds,
+                        projection.development_elapsed_seconds,
+                    )
+                return
+            if after.recovery_trigger is PostFcRecoveryTrigger.ROR_ERROR:
                 _log.info(
-                    "D162 recovery-v2 projection entered: target=%.1f °C, projected=%.1f °C, "
-                    "shortfall=%.1f °C, runway=%.1f s, charge=%.1f s, development=%.1f s. #708",
-                    projection.target_drop_temp_c,
-                    output.projected_entry_temp_c,
-                    projection.target_drop_temp_c - output.projected_entry_temp_c,
-                    output.projection_entry_runway_seconds,
-                    projection.charge_elapsed_seconds,
-                    projection.development_elapsed_seconds,
+                    "D162 recovery-v2 RoR entered: trigger=%s, heat=%d%%, ceiling=%d%%, "
+                    "fast_raise=%s. #708",
+                    after.recovery_trigger.value,
+                    output.heat_percent,
+                    output.effective_ceiling_percent,
+                    output.recovery_fast_raise_applied,
                 )
-            return
+                return
         if (
             before.recovery_active
             and before.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
@@ -2391,7 +2398,9 @@ class RoastController:
             )
             return
         if not before.recovery_cutoff_reached and after.recovery_cutoff_reached:
-            if output.projection_cutoff_runway_seconds is None:
+            if (  # pragma: no cover - the cutoff latch requires a valid cutoff runway
+                output.projection_cutoff_runway_seconds is None
+            ):
                 _log.info("D162 recovery-v2 +5 pp cutoff reached; authority released. #708")
             else:
                 _log.info(
@@ -2411,7 +2420,9 @@ class RoastController:
             and output.projection_cutoff_runway_seconds is not None
             and output.projection_cutoff_runway_seconds > 0.0
         ):
-            if output.projected_cutoff_temp_c is None:
+            if (  # pragma: no cover - a valid on-target projection has a cutoff temperature
+                output.projected_cutoff_temp_c is None
+            ):
                 _log.info("D162 recovery-v2 projection on target; bounded glide begins. #708")
             else:
                 _log.info(

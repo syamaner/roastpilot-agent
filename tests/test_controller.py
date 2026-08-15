@@ -9515,6 +9515,27 @@ async def _enter_v2_projection_recovery(
         assert len(entries) == 1
 
 
+def _arm_inactive_v2_ror_entry(harness: Harness) -> None:
+    """Clear the FC projection candidate before an isolated RoR-entry tick."""
+    post_fc = harness.controller._post_fc_controller  # pyright: ignore[reportPrivateUsage]
+    post_fc.restore_state(
+        replace(
+            post_fc.snapshot_state(),
+            recovery_active=False,
+            recovery_ticks_above_trigger=0,
+            recovery_ticks_within_exit=0,
+            recovery_ticks_since_exit=None,
+            recovery_trigger=PostFcRecoveryTrigger.NONE,
+            recovery_projection_short_ticks=0,
+            recovery_projection_on_target_ticks=0,
+            recovery_projection_release_latched=False,
+            recovery_last_development_elapsed_seconds=None,
+            recovery_last_charge_elapsed_seconds=None,
+            recovery_cutoff_reached=False,
+        )
+    )
+
+
 @pytest.mark.asyncio
 async def test_v2_controller_wires_live_clocks_and_logs_only_after_accepted_write(
     caplog: pytest.LogCaptureFixture,
@@ -9563,6 +9584,148 @@ async def test_v2_controller_wires_live_clocks_and_logs_only_after_accepted_writ
     assert "target=205.0 °C" in entries[0]
     assert "charge=515.0 s" in entries[0]
     assert "development=75.0 s" in entries[0]
+
+
+@pytest.mark.asyncio
+async def test_v2_logs_accepted_ror_entry_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An accepted D162 RoR fast-raise entry emits one bounded event."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        recovery_projection_enabled=True,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        ceiling_guard_temp_c=220.0,
+    )
+    harness = make_harness(config=config, limits=_ISOLATED_CEILING_GUARD_LIMITS)
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    _arm_inactive_v2_ror_entry(harness)
+    harness.clock.advance(6.0)
+    now = harness.clock()
+    harness.controller._charge_monotonic = now - 500.0  # pyright: ignore[reportPrivateUsage]
+    harness.controller._first_crack_monotonic = now - 60.0  # pyright: ignore[reportPrivateUsage]
+    targets_before = len(harness.executor.targets)
+    with caplog.at_level(logging.INFO, logger="roastpilot_agent.controller"):
+        harness.reader.readings = [reading(bean=203.0, bean_ror_c_per_min=0.0)]
+        await harness.controller.tick()
+        entered = harness.controller._post_fc_controller.snapshot_state()  # pyright: ignore[reportPrivateUsage]
+        assert entered.recovery_active is True
+        assert entered.recovery_trigger is PostFcRecoveryTrigger.ROR_ERROR
+        assert len(harness.executor.targets) == targets_before + 1
+        accepted = harness.controller._accepted_post_fc_output  # pyright: ignore[reportPrivateUsage]
+        assert accepted is not None
+        assert accepted.recovery_fast_raise_applied is True
+
+        harness.clock.advance(6.0)
+        harness.reader.readings = [reading(bean=203.0, bean_ror_c_per_min=0.0)]
+        await harness.controller.tick()
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "recovery-v2 RoR entered" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    assert "trigger=ror_error" in messages[0]
+    assert "heat=" in messages[0]
+    assert "ceiling=" in messages[0]
+    assert "fast_raise=True" in messages[0]
+
+
+@pytest.mark.asyncio
+async def test_v2_ror_entry_log_requires_accepted_write(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Rejected, failed, and drop-suppressed RoR entries emit no event."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        recovery_projection_enabled=True,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        ceiling_guard_temp_c=220.0,
+    )
+
+    failed_executor = _ArmableFlakySetTargetsExecutor([])
+    failed = make_harness(
+        config=config,
+        executor=failed_executor,
+        limits=_ISOLATED_CEILING_GUARD_LIMITS,
+    )
+    await _charge_through_fc_at_heat(
+        failed, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    _arm_inactive_v2_ror_entry(failed)
+    failed.clock.advance(6.0)
+    now = failed.clock()
+    failed.controller._charge_monotonic = now - 500.0  # pyright: ignore[reportPrivateUsage]
+    failed.controller._first_crack_monotonic = now - 60.0  # pyright: ignore[reportPrivateUsage]
+    failed_executor.arm_next_failure()
+
+    rejected = make_harness(config=config, limits=_ISOLATED_CEILING_GUARD_LIMITS)
+    await _charge_through_fc_at_heat(
+        rejected, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    _arm_inactive_v2_ror_entry(rejected)
+    rejected.clock.advance(6.0)
+    now = rejected.clock()
+    rejected.controller._charge_monotonic = now - 500.0  # pyright: ignore[reportPrivateUsage]
+    rejected.controller._first_crack_monotonic = now - 60.0  # pyright: ignore[reportPrivateUsage]
+    rejected.controller._last_command_monotonic = now  # pyright: ignore[reportPrivateUsage]
+
+    suppressed = make_harness(config=config, limits=_ISOLATED_CEILING_GUARD_LIMITS)
+    await _charge_through_fc_at_heat(
+        suppressed, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    _arm_inactive_v2_ror_entry(suppressed)
+    suppressed.clock.advance(6.0)
+    now = suppressed.clock()
+    suppressed.controller._charge_monotonic = now - 500.0  # pyright: ignore[reportPrivateUsage]
+    suppressed.controller._first_crack_monotonic = now - 100.0  # pyright: ignore[reportPrivateUsage]
+
+    with caplog.at_level(logging.INFO, logger="roastpilot_agent.controller"):
+        failed.reader.readings = [reading(bean=203.0, bean_ror_c_per_min=0.0)]
+        await failed.controller.tick()
+        rejected.reader.readings = [reading(bean=203.0, bean_ror_c_per_min=0.0)]
+        await rejected.controller.tick()
+        suppressed.reader.readings = [
+            reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=0.0)
+        ]
+        await suppressed.controller.tick()
+
+    assert all("recovery-v2 RoR entered" not in record.getMessage() for record in caplog.records)
+    assert failed.controller._post_fc_controller.snapshot_state().recovery_active is False  # pyright: ignore[reportPrivateUsage]
+    assert rejected.controller._post_fc_controller.snapshot_state().recovery_active is False  # pyright: ignore[reportPrivateUsage]
+    assert suppressed.controller.phase is RoastPhase.COOLING
+
+
+@pytest.mark.asyncio
+async def test_v1_ror_entry_remains_unlogged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The v2 logger stays entirely disabled for the unchanged v1 recovery path."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        recovery_projection_enabled=False,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+    )
+    harness = make_harness(config=config)
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    with caplog.at_level(logging.INFO, logger="roastpilot_agent.controller"):
+        harness.clock.advance(6.0)
+        harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=0.0)]
+        await harness.controller.tick()
+
+    assert (
+        harness.controller._post_fc_controller.snapshot_state().recovery_trigger  # pyright: ignore[reportPrivateUsage]
+        is PostFcRecoveryTrigger.ROR_ERROR
+    )
+    assert all("D162 recovery-v2" not in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio
