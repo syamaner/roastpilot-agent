@@ -2329,13 +2329,17 @@ class RoastController:
         self._last_post_fc_output = output
         self._accepted_post_fc_output = output
         self._log_recovery_v2_transition_if_accepted(
-            before=before, output=output, projection=projection
+            before=before,
+            after=self._post_fc_controller.snapshot_state(),
+            output=output,
+            projection=projection,
         )
 
     def _log_recovery_v2_transition_if_accepted(
         self,
         *,
         before: PostFcControllerState,
+        after: PostFcControllerState,
         output: PostFcControlOutput,
         projection: PostFcProjectionInputs,
     ) -> None:
@@ -2343,6 +2347,7 @@ class RoastController:
 
         Args:
             before: State before the accepted compute step.
+            after: Raw controller state after the accepted compute step.
             output: The accepted output.
             projection: The live values used for the accepted projection.
         """
@@ -2350,25 +2355,32 @@ class RoastController:
             return
         if (
             not before.recovery_active
-            and output.recovery_active
-            and output.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+            and after.recovery_active
+            and after.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
         ):
-            assert output.projected_entry_temp_c is not None
-            assert output.projection_entry_runway_seconds is not None
-            _log.info(
-                "D162 recovery-v2 projection entered: target=%.1f °C, projected=%.1f °C, "
-                "shortfall=%.1f °C, runway=%.1f s, charge=%.1f s, development=%.1f s. #708",
-                projection.target_drop_temp_c,
-                output.projected_entry_temp_c,
-                projection.target_drop_temp_c - output.projected_entry_temp_c,
-                output.projection_entry_runway_seconds,
-                projection.charge_elapsed_seconds,
-                projection.development_elapsed_seconds,
-            )
+            if (
+                output.projected_entry_temp_c is None
+                or output.projection_entry_runway_seconds is None
+                or projection.development_elapsed_seconds is None
+            ):
+                _log.info("D162 recovery-v2 projection entered; diagnostics unavailable. #708")
+            else:
+                _log.info(
+                    "D162 recovery-v2 projection entered: target=%.1f °C, projected=%.1f °C, "
+                    "shortfall=%.1f °C, runway=%.1f s, charge=%.1f s, development=%.1f s. #708",
+                    projection.target_drop_temp_c,
+                    output.projected_entry_temp_c,
+                    projection.target_drop_temp_c - output.projected_entry_temp_c,
+                    output.projection_entry_runway_seconds,
+                    projection.charge_elapsed_seconds,
+                    projection.development_elapsed_seconds,
+                )
             return
         if (
             before.recovery_active
             and before.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+            and not after.recovery_active
+            and not after.recovery_cutoff_reached
             and not output.projection_valid
         ):
             _log.info(
@@ -2378,38 +2390,37 @@ class RoastController:
                 output.effective_ceiling_percent,
             )
             return
-        if (
-            before.recovery_active
-            and before.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
-            and not before.recovery_cutoff_reached
-            and output.projection_valid
-            and output.projection_cutoff_runway_seconds is not None
-            and output.projection_cutoff_runway_seconds <= 0.0
-        ):
-            _log.info(
-                "D162 recovery-v2 +5 pp cutoff reached; authority released "
-                "(target=%.1f °C, cutoff_runway=%.1f s, heat=%d%%). #708",
-                projection.target_drop_temp_c,
-                output.projection_cutoff_runway_seconds,
-                output.heat_percent,
-            )
+        if not before.recovery_cutoff_reached and after.recovery_cutoff_reached:
+            if output.projection_cutoff_runway_seconds is None:
+                _log.info("D162 recovery-v2 +5 pp cutoff reached; authority released. #708")
+            else:
+                _log.info(
+                    "D162 recovery-v2 +5 pp cutoff reached; authority released "
+                    "(target=%.1f °C, cutoff_runway=%.1f s, heat=%d%%). #708",
+                    projection.target_drop_temp_c,
+                    output.projection_cutoff_runway_seconds,
+                    output.heat_percent,
+                )
             return
         if (
             before.recovery_active
             and before.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+            and not after.recovery_active
+            and not after.recovery_cutoff_reached
             and output.projection_valid
             and output.projection_cutoff_runway_seconds is not None
             and output.projection_cutoff_runway_seconds > 0.0
-            and output.heat_authority_state is PostFcHeatAuthorityState.GLIDING
         ):
-            assert output.projected_cutoff_temp_c is not None
-            _log.info(
-                "D162 recovery-v2 projection on target; bounded glide begins: "
-                "target=%.1f °C, projected=%.1f °C, cutoff_runway=%.1f s. #708",
-                projection.target_drop_temp_c,
-                output.projected_cutoff_temp_c,
-                output.projection_cutoff_runway_seconds,
-            )
+            if output.projected_cutoff_temp_c is None:
+                _log.info("D162 recovery-v2 projection on target; bounded glide begins. #708")
+            else:
+                _log.info(
+                    "D162 recovery-v2 projection on target; bounded glide begins: "
+                    "target=%.1f °C, projected=%.1f °C, cutoff_runway=%.1f s. #708",
+                    projection.target_drop_temp_c,
+                    output.projected_cutoff_temp_c,
+                    output.projection_cutoff_runway_seconds,
+                )
 
     async def _execute_deterministic_drop(self, reason: DropReason) -> bool:
         """Shared drop-execution sequence for every deterministic (non-advisor,

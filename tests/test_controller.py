@@ -9569,14 +9569,16 @@ async def test_v2_controller_wires_live_clocks_and_logs_only_after_accepted_writ
 async def test_v2_logs_accepted_on_target_glide_once(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """An accepted +5 projection at target logs the bounded glide once."""
+    """A one-tick accepted glide logs even when it has already settled."""
     config = _recovery_config(
         pre_fc_heat_target_percent=60,
         recovery_projection_enabled=True,
         recovery_trigger_margin_c_per_min=50.0,
         recovery_confirm_ticks=1,
+        recovery_exit_glide_pp_per_tick=50,
+        ceiling_guard_temp_c=220.0,
     )
-    harness = make_harness(config=config)
+    harness = make_harness(config=config, limits=_ISOLATED_CEILING_GUARD_LIMITS)
     with caplog.at_level(logging.INFO, logger="roastpilot_agent.controller"):
         await _enter_v2_projection_recovery(harness)
 
@@ -9584,6 +9586,10 @@ async def test_v2_logs_accepted_on_target_glide_once(
         harness.clock.advance(5.0)
         harness.reader.readings = [reading(bean=200.0, bean_ror_c_per_min=5.0)]
         await harness.controller.tick()
+        assert (
+            harness.controller.snapshot().post_fc_heat_authority_state
+            is PostFcHeatAuthorityState.HOLDING
+        )
 
     messages = [
         record.getMessage()
@@ -9591,6 +9597,43 @@ async def test_v2_logs_accepted_on_target_glide_once(
         if "D162 recovery-v2" in record.getMessage()
     ]
     assert sum("projection on target" in message for message in messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_v2_logs_accepted_projection_entry_with_zero_headroom(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Raw accepted recovery entry remains observable when authority is HOLDING."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        recovery_projection_enabled=True,
+        recovery_trigger_margin_c_per_min=50.0,
+        recovery_confirm_ticks=2,
+        recovery_headroom_percentage_points=0,
+    )
+    harness = make_harness(config=config)
+    with caplog.at_level(logging.INFO, logger="roastpilot_agent.controller"):
+        await _charge_through_fc_at_heat(
+            harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+        )
+        now = harness.clock()
+        harness.controller._charge_monotonic = now - 500.0  # pyright: ignore[reportPrivateUsage]
+        harness.controller._first_crack_monotonic = now - 60.0  # pyright: ignore[reportPrivateUsage]
+        harness.clock.advance(5.0)
+        harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=0.0)]
+        await harness.controller.tick()
+
+    state = harness.controller._post_fc_controller.snapshot_state()  # pyright: ignore[reportPrivateUsage]
+    assert state.recovery_active is True
+    assert state.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+    assert (
+        harness.controller.snapshot().post_fc_heat_authority_state
+        is PostFcHeatAuthorityState.HOLDING
+    )
+    assert (
+        sum("recovery-v2 projection entered" in record.getMessage() for record in caplog.records)
+        == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -9653,6 +9696,102 @@ async def test_v2_logs_accepted_plus_five_cutoff_once(
     assert len(messages) == 1
     assert "target=205.0 °C" in messages[0]
     assert "cutoff_runway=" in messages[0]
+
+
+@pytest.mark.asyncio
+async def test_v2_logs_accepted_cutoff_from_ror_recovery_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The raw cutoff latch is observable for an accepted RoR recovery exit."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        recovery_projection_enabled=True,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        ceiling_guard_temp_c=220.0,
+    )
+    harness = make_harness(config=config, limits=_ISOLATED_CEILING_GUARD_LIMITS)
+    with caplog.at_level(logging.INFO, logger="roastpilot_agent.controller"):
+        await _charge_through_fc_at_heat(
+            harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+        )
+        # Establish the accepted ordinary-RoR state independently of the
+        # projection path, then cross its live +5 cutoff through controller
+        # tick/acceptance rather than calling the logging helper directly.
+        post_fc = harness.controller._post_fc_controller  # pyright: ignore[reportPrivateUsage]
+        post_fc.restore_state(
+            replace(
+                post_fc.snapshot_state(),
+                recovery_active=True,
+                recovery_trigger=PostFcRecoveryTrigger.ROR_ERROR,
+                recovery_cutoff_reached=False,
+                recovery_last_development_elapsed_seconds=None,
+                recovery_last_charge_elapsed_seconds=None,
+            )
+        )
+        now = harness.clock()
+        harness.controller._charge_monotonic = now - 500.5  # pyright: ignore[reportPrivateUsage]
+        harness.controller._first_crack_monotonic = now - 130.2  # pyright: ignore[reportPrivateUsage]
+        harness.clock.advance(6.0)
+        harness.reader.readings = [reading(bean=203.0, bean_ror_c_per_min=0.0)]
+        await harness.controller.tick()
+        harness.clock.advance(6.0)
+        harness.reader.readings = [reading(bean=203.0, bean_ror_c_per_min=0.0)]
+        await harness.controller.tick()
+
+    state = harness.controller._post_fc_controller.snapshot_state()  # pyright: ignore[reportPrivateUsage]
+    assert state.recovery_cutoff_reached is True
+    assert sum("+5 pp cutoff reached" in record.getMessage() for record in caplog.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_v2_logs_first_live_fractional_cutoff_from_inactive_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The first live post-FC projection keeps fractional clocks through +5."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        recovery_projection_enabled=True,
+        recovery_trigger_margin_c_per_min=50.0,
+        recovery_confirm_ticks=2,
+    )
+    harness = make_harness(config=config)
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    cutoff_development = (PROFILE.target_development_percent + 5.0) * 500.5 / 100.0
+    with caplog.at_level(logging.INFO, logger="roastpilot_agent.controller"):
+        # Do not reset the post-FC controller: this is its first live
+        # projection tick, deliberately just before the fractional +5 bound.
+        harness.clock.advance(5.0)
+        now = harness.clock()
+        harness.controller._charge_monotonic = now - 500.5  # pyright: ignore[reportPrivateUsage]
+        harness.controller._first_crack_monotonic = (  # pyright: ignore[reportPrivateUsage]
+            now - (cutoff_development - 0.04)
+        )
+        harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=0.0)]
+        await harness.controller.tick()
+        before_cutoff = harness.controller._post_fc_controller.snapshot_state()  # pyright: ignore[reportPrivateUsage]
+        assert before_cutoff.recovery_active is False
+        assert before_cutoff.recovery_cutoff_reached is False
+        assert before_cutoff.recovery_last_charge_elapsed_seconds == pytest.approx(500.5)
+        assert before_cutoff.recovery_last_development_elapsed_seconds == pytest.approx(
+            cutoff_development - 0.04
+        )
+
+        harness.clock.advance(5.0)
+        now = harness.clock()
+        harness.controller._charge_monotonic = now - 500.5  # pyright: ignore[reportPrivateUsage]
+        harness.controller._first_crack_monotonic = (  # pyright: ignore[reportPrivateUsage]
+            now - (cutoff_development + 0.04)
+        )
+        harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=0.0)]
+        await harness.controller.tick()
+        after_cutoff = harness.controller._post_fc_controller.snapshot_state()  # pyright: ignore[reportPrivateUsage]
+        assert after_cutoff.recovery_active is False
+        assert after_cutoff.recovery_cutoff_reached is True
+
+    assert sum("+5 pp cutoff reached" in record.getMessage() for record in caplog.records) == 1
 
 
 #: A :class:`SafetyLimits` companion for ``_recovery_config(ceiling_guard_temp_c=220.0, ...)``
