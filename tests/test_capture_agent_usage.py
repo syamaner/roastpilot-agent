@@ -52,6 +52,7 @@ from capture_usage_models import (
     EstimateBasis,
     HarnessFamily,
     NativeClaudeRole,
+    NativeWorkerUsageRecord,
     ParsedUsage,
     TaskUsageRecord,
     UsageRecord,
@@ -234,6 +235,72 @@ def test_preflight_rejects_unsafe_or_missing_resolver_components(
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.reject_existing_owned_session(
             tmp_path, "11111111-1111-4111-8111-111111111111"
+        )
+
+
+def _native_record_payload() -> dict[str, object]:
+    """Build one complete native record payload for boundary validation."""
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    return {
+        "captured_at": now,
+        "task_id": "816",
+        "slice_id": "native",
+        "native_role": "engineer-be",
+        "model": "claude-sonnet-5",
+        "effort": "high",
+        "repository": "syamaner/roastpilot-agent",
+        "branch": "feature/816",
+        "base_sha": "4c1ac63",
+        "final_head_sha": "7d60f41",
+        "parent_task_id": "parent",
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "subagent_count": 0,
+        "usage_message_count": 1,
+        "started_at": now,
+        "completed_at": now,
+        "elapsed_ms": 0,
+        "exit_code": 0,
+        "success": True,
+        "harness_version": "2.1.231",
+        "input_tokens": 2,
+        "cached_input_tokens": 3,
+        "cache_creation_input_tokens": 4,
+        "output_tokens": 5,
+        "claude_model_usage": [
+            {
+                "model": "claude-sonnet-5",
+                "input_tokens": 2,
+                "cached_input_tokens": 3,
+                "cache_creation_input_tokens": 4,
+                "output_tokens": 5,
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("whole_tree_verified", False),
+        ("subagent_count", 1),
+        ("usage_message_count", 0),
+        ("output_tokens", 6),
+        ("model", "other"),
+    ],
+)
+def test_native_record_rejects_incomplete_or_inconsistent_truth(field: str, value: object) -> None:
+    """False tree evidence, descendants and inconsistent sole-model sums are unrepresentable."""
+    payload = _native_record_payload()
+    payload[field] = value
+    with pytest.raises(ValidationError):
+        NativeWorkerUsageRecord.model_validate(payload)
+
+
+def test_native_cli_exposes_no_caller_session_id() -> None:
+    """The parent, never the caller, owns UUID attribution."""
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args(
+            ["run-native-claude", "--role", "engineer-be", "--session-id", "caller"]
         )
 
 
