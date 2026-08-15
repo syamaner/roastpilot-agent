@@ -9746,6 +9746,54 @@ async def test_ceiling_guard_drop_takes_precedence_over_recovery_raise_same_tick
 
 
 @pytest.mark.asyncio
+async def test_zero_headroom_v2_fast_raise_is_suppressed_on_guard_drop_tick() -> None:
+    """A v2 entry-floor raise is suppressed even when its ceiling is not elevated."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=196.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=0,
+        recovery_projection_enabled=True,
+    )
+    harness = make_harness(config=config)
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=190.0, bean_ror_c_per_min=12.0)]
+    await harness.controller.tick()
+    lowered_heat = harness.controller.snapshot().current_heat
+    assert lowered_heat < 60
+
+    post_fc = harness.controller._post_fc_controller  # pyright: ignore[reportPrivateUsage]
+    before_probe = post_fc.snapshot_state()
+    probe = post_fc.compute(measured_ror_c_per_min=0.0, dt_seconds=5.0)
+    post_fc.restore_state(before_probe)
+    assert probe.recovery_fast_raise_applied is True
+    assert probe.heat_authority_state is PostFcHeatAuthorityState.HOLDING
+    assert probe.heat_percent > lowered_heat
+
+    targets_before_drop_tick = list(harness.executor.targets)
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=0.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.COOLING
+    assert all(
+        heat <= lowered_heat
+        for heat, _fan in harness.executor.targets[len(targets_before_drop_tick) :]
+    )
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in executed
+
+
+@pytest.mark.asyncio
 async def test_zero_elevation_recovery_does_not_suppress_a_drop_tick_write() -> None:
     """PR #560 round 3 Codex finding: entry heat ALREADY AT
     ``heat_ceiling_percent`` (the default 100, via ``_charge_through_fc``'s

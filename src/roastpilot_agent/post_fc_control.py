@@ -1164,7 +1164,17 @@ class PostFcRorController:
         if self._recovery_cutoff_reached:
             self._advance_glide()
             return None
-        projection_short = v2 and self._projection_is_short(projection)
+        # The +2 shortfall and +5 on-target predicates can both be true: the
+        # trajectory may miss the earlier horizon yet still reach the target
+        # within the additional bounded runway. In that overlap the +5
+        # continuation result wins. Otherwise a confirmed on-target exit
+        # would immediately start reconfirming the unchanged +2 shortfall and
+        # cycle between recovery and glide until the entry horizon expired.
+        projection_short = (
+            v2
+            and not self._projection_is_on_target(projection)
+            and self._projection_is_short(projection)
+        )
         self._recovery_projection_short_ticks = (
             self._recovery_projection_short_ticks + 1 if projection_short else 0
         )

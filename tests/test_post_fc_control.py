@@ -1905,6 +1905,60 @@ def test_projection_on_target_glides_and_cutoff_latches_all_recovery_until_reset
     assert controller.snapshot_state().recovery_cutoff_reached is False
 
 
+def test_on_target_cutoff_projection_blocks_overlapping_entry_reconfirmation() -> None:
+    """A sufficient +5 projection cannot re-enter on the still-short +2 view."""
+    controller = PostFcRorController(
+        _projection_recovery_config(
+            recovery_confirm_ticks=2,
+            recovery_trigger_margin_c_per_min=50.0,
+        )
+    )
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    entry_outputs = [
+        controller.compute(
+            measured_ror_c_per_min=0.0,
+            dt_seconds=5.0,
+            projection=_projection(),
+        )
+        for _ in range(2)
+    ]
+    assert entry_outputs[-1].heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+
+    # At these exact inputs the +2 projection is still below target-minus-
+    # margin, while the later +5 projection already reaches the target.
+    overlap = _projection(bean_temp_c=189.5)
+    release_outputs = [
+        controller.compute(
+            measured_ror_c_per_min=12.0,
+            dt_seconds=5.0,
+            projection=overlap,
+        )
+        for _ in range(2)
+    ]
+    for released in release_outputs:
+        assert released.projected_entry_temp_c is not None
+        assert released.projected_entry_temp_c < 197.0
+        assert released.projected_cutoff_temp_c is not None
+        assert released.projected_cutoff_temp_c >= 200.0
+    assert release_outputs[-1].heat_authority_state is PostFcHeatAuthorityState.GLIDING
+
+    after_release = [
+        controller.compute(
+            measured_ror_c_per_min=12.0,
+            dt_seconds=5.0,
+            projection=overlap,
+        )
+        for _ in range(4)
+    ]
+    assert all(
+        output.heat_authority_state is not PostFcHeatAuthorityState.RECOVERING
+        and output.recovery_trigger is PostFcRecoveryTrigger.NONE
+        for output in after_release
+    )
+    assert after_release[-1].heat_authority_state is PostFcHeatAuthorityState.HOLDING
+
+
 @pytest.mark.parametrize(
     "projection",
     [
