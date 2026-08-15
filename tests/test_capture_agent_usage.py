@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import inspect
 import json
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -16,7 +18,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import BinaryIO, NoReturn, cast
+from uuid import UUID
 
 import capture_usage_claude as usage_claude
 import capture_usage_cli as usage_cli
@@ -304,9 +307,9 @@ def test_native_cli_exposes_no_caller_session_id() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "mutator",
-    [
+def _transcript_mutators() -> tuple[Callable[[bytes], bytes], ...]:
+    """Return typed JSONL mutations for closed parser boundary checks."""
+    return (
         lambda value: value[:-1],
         lambda value: value.replace(b"\n", b"", 1),
         lambda value: value.replace(b'"type":"agent-setting"', b'"type":"unknown"', 1),
@@ -318,21 +321,112 @@ def test_native_cli_exposes_no_caller_session_id() -> None:
         lambda value: value.replace(
             b'"parentUuid":"22222222-2222-4222-8222-222222222222"', b'"parentUuid":7', 1
         ),
-    ],
-)
+    )
+
+
+@pytest.mark.parametrize("mutator", _transcript_mutators())
 def test_owned_transcript_rejects_jsonl_and_binding_boundaries(
-    mutator: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mutator: Callable[[bytes], bytes], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Malformed JSONL, duplicate keys, blank rows and malformed parent identity fail closed."""
     content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
-    transcript, session_id = _install_owned_transcript(
-        tmp_path, monkeypatch, cast(Callable[[bytes], bytes], mutator)(content)
-    )
+    transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, mutator(content))
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.parse_owned_transcript(
             tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
         )
     assert transcript.read_bytes() != b""
+
+
+def test_owned_transcript_rejects_remaining_identity_and_usage_mutations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact parent binds one setting, session, model, effort, time and nonempty totals."""
+    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    lines = content.splitlines()
+    conflicting = list(lines)
+    conflicting[3] = conflicting[3].replace(b'"output_tokens":7', b'"output_tokens":8')
+    variants = (
+        b"\n".join(lines[1:]) + b"\n",
+        b"\n".join((lines[0], lines[0], *lines[1:])) + b"\n",
+        content.replace(b'"model":"claude-sonnet-5"', b'"model":"wrong-model"', 1),
+        content.replace(b'"timestamp":"2026-01-01T00:00:01.000Z"', b'"timestamp":"invalid"', 1),
+        content.replace(b'"usage":{"input_tokens":2', b'"usage":{}', 1),
+        b"\n".join(lines[:2]) + b"\n",
+        b"\n".join(conflicting) + b"\n",
+    )
+    for index, variant in enumerate(variants):
+        case = tmp_path / str(index)
+        case.mkdir()
+        transcript, session_id = _install_owned_transcript(case, monkeypatch, variant)
+        with pytest.raises(usage_transcript.TranscriptError):
+            usage_transcript.parse_owned_transcript(
+                case, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+            )
+        assert transcript.read_bytes() == variant
+        transcript.unlink()
+
+
+@pytest.mark.parametrize(
+    "content,session_id",
+    [
+        (
+            b'{"type":"assistant","secret":"SENTINEL_TRANSCRIPT_JSON"}\n',
+            "11111111-1111-4111-8111-111111111111",
+        ),
+        (
+            b'{"type":"assistant","secret":"SENTINEL_TRANSCRIPT_UTF8\xff"}\n',
+            "11111111-1111-4111-8111-111111111111",
+        ),
+        (b"", "SENTINEL_TRANSCRIPT_PATH"),
+    ],
+)
+def test_owned_transcript_errors_are_fixed_and_content_free(
+    content: bytes, session_id: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Malformed transcript bytes and inaccessible paths never escape through exception state."""
+    transcript, expected_session = _install_owned_transcript(tmp_path, monkeypatch, content)
+    if session_id != expected_session:
+        transcript.unlink()
+    with pytest.raises(usage_transcript.TranscriptError) as error:
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        )
+    assert str(error.value) in {
+        "owned Claude transcript is unavailable",
+        "owned Claude transcript is invalid",
+    }
+    assert "SENTINEL_TRANSCRIPT" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+def test_owned_transcript_reader_never_mutates_its_exact_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reader has no write, create, delete, rename or copy capability on transcripts."""
+    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, content)
+    before = transcript.stat()
+
+    def deny_mutation(*_args: object, **_kwargs: object) -> NoReturn:
+        raise AssertionError("transcript reader must not mutate")
+
+    for name in ("write", "mkdir", "unlink", "rename"):
+        monkeypatch.setattr(os, name, deny_mutation)
+    monkeypatch.setattr(shutil, "copyfile", deny_mutation)
+    assert (
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        ).usage_message_count
+        == 2
+    )
+    after = transcript.stat()
+    assert (after.st_ino, after.st_mtime_ns, transcript.read_bytes()) == (
+        before.st_ino,
+        before.st_mtime_ns,
+        content,
+    )
 
 
 def test_owned_transcript_rejects_row_and_file_bounds(
@@ -393,11 +487,432 @@ def test_native_roles_reject_before_provider_lookup(
     role: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Only byte-exact registered implementation leaves enter native lookup."""
+
+    def no_which(_name: str) -> str:
+        raise AssertionError("provider lookup")
+
     monkeypatch.setattr(
-        usage_cli.shutil, "which", lambda _: (_ for _ in ()).throw(AssertionError())
+        usage_cli.shutil,
+        "which",
+        no_which,
     )
     with pytest.raises(SystemExit):
         usage_cli.build_parser().parse_args(["run-native-claude", "--role", role])
+
+
+class _NativeInput:
+    """Minimal writable stdin retaining bytes only for provider-free assertions."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        """Initialize a successful or deliberately broken synthetic pipe."""
+        self.value = b""
+        self.closed = False
+        self._fail = fail
+
+    def write(self, value: bytes) -> int:
+        """Retain the bounded prompt or simulate a closed child stdin."""
+        if self._fail:
+            raise BrokenPipeError
+        self.value += value
+        return len(value)
+
+    def flush(self) -> None:
+        """Model a successful pipe flush."""
+
+    def close(self) -> None:
+        """Mark the synthetic stdin as closed."""
+        self.closed = True
+
+
+class _NativeProcess:
+    """Completed provider-free native or version process."""
+
+    def __init__(self, output: bytes = b"", code: int = 0, *, prompt_fail: bool = False) -> None:
+        """Initialize deterministic process output and exit state."""
+        self.stdout = BytesIO(output)
+        self.stdin = _NativeInput(fail=prompt_fail)
+        self._code = code
+
+    def poll(self) -> int:
+        """Return the fixed completed status."""
+        return self._code
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Return the fixed completed status without blocking."""
+        del timeout
+        return self._code
+
+    def terminate(self) -> None:
+        """Reject stopping an already-complete synthetic process."""
+        raise AssertionError("completed process must not terminate")
+
+    def kill(self) -> None:
+        """Reject killing an already-complete synthetic process."""
+        raise AssertionError("completed process must not be killed")
+
+
+_NATIVE_SESSION_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def _native_cli_args(role: str = "engineer-be") -> list[str]:
+    """Return closed native command metadata for provider-free tests."""
+    return [
+        "run-native-claude",
+        "--role",
+        role,
+        "--prompt-file",
+        "prompt",
+        "--task-id",
+        "816",
+        "--slice-id",
+        "native-1",
+        "--parent-task-id",
+        "parent-816",
+        "--repository",
+        "syamaner/roastpilot-agent",
+        "--branch",
+        "feature/816-native-transcript-usage-1",
+        "--base-sha",
+        "4c1ac63",
+    ]
+
+
+def _native_transcript_bytes(session_id: str = _NATIVE_SESSION_ID) -> bytes:
+    """Return the closed parent fixture bound to one generated session."""
+    return (
+        (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl")
+        .read_bytes()
+        .replace(b"11111111-1111-4111-8111-111111111111", session_id.encode())
+    )
+
+
+def _configure_native_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, list[tuple[list[str], dict[str, object]]]]:
+    """Install a private Claude parent location and fixed launcher dependencies."""
+    monkeypatch.chdir(tmp_path)
+    home = tmp_path / "home"
+    project = home / ".claude" / "projects" / usage_transcript._project_name(tmp_path)  # pyright: ignore[reportPrivateUsage]
+    project.mkdir(parents=True)
+
+    def fixed_effort(_role: NativeClaudeRole) -> str:
+        return "high"
+
+    def fixed_executable(_family: HarnessFamily) -> str:
+        return "claude"
+
+    def fixed_attestation(_arguments: argparse.Namespace, *, post_exit: bool) -> str:
+        return "7d60f41" if post_exit else "4c1ac63"
+
+    monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
+    monkeypatch.setattr(usage_cli, "uuid4", lambda: _NATIVE_SESSION_ID)
+    monkeypatch.setattr(usage_cli, "_native_effort", fixed_effort)
+    monkeypatch.setattr(usage_cli, "_resolved_executable", fixed_executable)
+    monkeypatch.setattr(usage_cli, "_validate_native_worktree", fixed_attestation)
+    monkeypatch.setattr(usage_cli, "_utc_now", lambda: datetime(2026, 1, 1, tzinfo=UTC))
+    Path("prompt").write_bytes(b"SENTINEL_NATIVE_PROMPT")
+    return project, []
+
+
+def _native_popen(
+    project: Path,
+    observed: list[tuple[list[str], dict[str, object]]],
+    processes: list[_NativeProcess],
+    *,
+    code: int = 0,
+    prompt_fail: bool = False,
+    transcript: bytes | None = None,
+) -> Callable[..., _NativeProcess]:
+    """Return a fake version/worker launcher that creates only one parent transcript."""
+
+    def fake(argv: list[str], **kwargs: object) -> _NativeProcess:
+        observed.append((argv, kwargs))
+        if argv[-1] == "--version":
+            process = _NativeProcess(b"Claude Code 2.1.231\\n")
+            processes.append(process)
+            return process
+        if transcript is not None:
+            (project / f"{_NATIVE_SESSION_ID}.jsonl").write_bytes(transcript)
+        process = _NativeProcess(code=code, prompt_fail=prompt_fail)
+        processes.append(process)
+        return process
+
+    return fake
+
+
+def test_native_command_launches_exact_worker_and_records_immutable_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D161 binds a UUID session, fixed argv and stdin to one immutable parent transcript."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    transcript = _native_transcript_bytes()
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(project, observed, processes, transcript=transcript),
+    )
+
+    assert main(_native_cli_args()) == 0
+
+    assert len(observed) == 2
+    argv, kwargs = observed[1]
+    expected_argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+        "claude", NativeClaudeRole.ENGINEER_BE, _NATIVE_SESSION_ID
+    )
+    assert argv == expected_argv
+    assert kwargs["shell"] is False
+    assert kwargs["stdout"] is subprocess.DEVNULL and kwargs["stderr"] is subprocess.DEVNULL
+    assert kwargs["stdin"] is subprocess.PIPE
+    assert UUID(_NATIVE_SESSION_ID).version == 4
+    assert processes[1].stdin.value == b"SENTINEL_NATIVE_PROMPT" and processes[1].stdin.closed
+    stored = project / f"{_NATIVE_SESSION_ID}.jsonl"
+    before = stored.stat()
+    raw = Path(".agent-usage/usage.jsonl").read_text()
+    record = USAGE_RECORD_ADAPTER.validate_json(raw)
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert record.success and record.usage_complete and record.final_head_sha == "7d60f41"
+    assert (
+        record.session_id == _NATIVE_SESSION_ID
+        and record.native_role is NativeClaudeRole.ENGINEER_BE
+    )
+    assert b"SENTINEL_NATIVE_PROMPT" not in raw.encode()
+    after = stored.stat()
+    assert (after.st_ino, after.st_mtime_ns, stored.read_bytes()) == (
+        before.st_ino,
+        before.st_mtime_ns,
+        transcript,
+    )
+
+
+def test_native_command_records_nonzero_complete_transcript_as_unsuccessful(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed owned transcript retains usage even when its worker exits nonzero."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(project, observed, processes, code=2, transcript=_native_transcript_bytes()),
+    )
+    assert main(_native_cli_args()) == 0
+    record = USAGE_RECORD_ADAPTER.validate_json(Path(".agent-usage/usage.jsonl").read_text())
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert not record.success and record.exit_code == 2 and record.usage_complete
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["version", "prompt", "timeout", "post-dirty", "post-missing", "post-wrong-base", "transcript"],
+)
+def test_native_command_fails_closed_at_transcript_launch_boundaries(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Version, delivery, deadline, final provenance and absent transcript append nothing."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch)
+
+    def attestation(_arguments: argparse.Namespace, *, post_exit: bool) -> str:
+        if post_exit and failure in {"post-dirty", "post-missing", "post-wrong-base"}:
+            raise CaptureUsageError("native worktree attestation failed")
+        return "7d60f41" if post_exit else "4c1ac63"
+
+    def fake(argv: list[str], **kwargs: object) -> _NativeProcess:
+        observed.append((argv, kwargs))
+        if argv[-1] == "--version":
+            version = (
+                b"Claude Code 2.1.999\\n" if failure == "version" else b"Claude Code 2.1.231\\n"
+            )
+            return _NativeProcess(version)
+        if failure != "transcript":
+            (project / f"{_NATIVE_SESSION_ID}.jsonl").write_bytes(_native_transcript_bytes())
+        return _NativeProcess(prompt_fail=failure == "prompt")
+
+    monkeypatch.setattr(usage_cli, "_validate_native_worktree", attestation)
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake)
+    if failure == "timeout":
+        deadline_calls = 0
+
+        def expire_worker(_process: _NativeProcess, _seconds: int, event: threading.Event) -> None:
+            nonlocal deadline_calls
+            deadline_calls += 1
+            if deadline_calls == 2:
+                event.set()
+
+        monkeypatch.setattr(
+            usage_cli,
+            "_start_deadline",
+            expire_worker,
+        )
+    with pytest.raises(SystemExit) as error:
+        main(_native_cli_args())
+    assert "SENTINEL_NATIVE_PROMPT" not in str(error.value)
+    assert not Path(".agent-usage/usage.jsonl").exists()
+    assert len(observed) == (1 if failure == "version" else 2)
+
+
+@pytest.mark.parametrize("sink_kind", ["symlink", "fifo", "hardlink"])
+def test_native_command_refuses_unsafe_sink_after_complete_transcript(
+    sink_kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The transcript path cannot bypass shared final-sink admission."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    sink_parent = Path(".agent-usage")
+    sink_parent.mkdir()
+    sink = sink_parent / "usage.jsonl"
+    target = Path("SENTINEL_UNSAFE_TARGET")
+    if sink_kind == "symlink":
+        target.write_text("unchanged\\n")
+        sink.symlink_to(target)
+    elif sink_kind == "fifo":
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("platform lacks FIFO support")
+        os.mkfifo(sink)
+    else:
+        target.write_text("unchanged\\n")
+        os.link(target, sink)
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(project, observed, processes, transcript=_native_transcript_bytes()),
+    )
+    with pytest.raises(SystemExit) as error:
+        main(_native_cli_args())
+    assert "SENTINEL_UNSAFE_TARGET" not in str(error.value)
+    if sink_kind != "fifo":
+        assert target.read_text() == "unchanged\\n"
+    if sink_kind == "symlink":
+        assert sink.is_symlink()
+    elif sink_kind == "fifo":
+        assert stat.S_ISFIFO(sink.stat().st_mode)
+    else:
+        assert sink.stat().st_nlink == 2
+
+
+def test_native_config_directory_rejects_before_provider_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user Claude configuration directory blocks lookup and worker launch."""
+    _configure_native_launcher(tmp_path, monkeypatch)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "SENTINEL_CONFIG")
+
+    def no_provider(_family: HarnessFamily) -> str:
+        raise AssertionError("provider lookup")
+
+    monkeypatch.setattr(
+        usage_cli,
+        "_resolved_executable",
+        no_provider,
+    )
+    with pytest.raises(SystemExit, match="config directory is not permitted") as error:
+        main(_native_cli_args())
+    assert "SENTINEL_CONFIG" not in str(error.value)
+
+
+def test_native_cli_script_suppresses_bytecode_only_when_executed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Copied CLI execution is bytecode-clean while import leaves interpreter policy unchanged."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    source = Path(usage_cli.__file__)
+    for name in (
+        "capture_usage_cli.py",
+        "capture_usage_models.py",
+        "capture_usage_claude.py",
+        "capture_usage_codex.py",
+        "capture_usage_transcript.py",
+    ):
+        shutil.copy2(source.parent / name, scripts / name)
+    executed = subprocess.run(
+        [sys.executable, str(scripts / "capture_usage_cli.py"), "--help"],
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    assert executed.returncode == 0
+    assert not list(scripts.rglob("__pycache__"))
+    before = sys.dont_write_bytecode
+    spec = importlib.util.spec_from_file_location(
+        "capture_usage_cli_import_probe", scripts / source.name
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert sys.dont_write_bytecode is before
+    monkeypatch.delitem(sys.modules, "capture_usage_cli_import_probe", raising=False)
+
+
+def test_native_precheck_rejects_ignored_bytecode_before_provider_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ignored local bytecode is part of native launch admission, not a harmless exception."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"safe")
+
+    def fake_git(argv: list[str]) -> tuple[int, str]:
+        if argv == ["remote", "get-url", "origin"]:
+            return 0, "https://github.com/syamaner/roastpilot-agent.git"
+        if argv == ["branch", "--show-current"]:
+            return 0, "feature/816-native-transcript-usage-1"
+        if argv == ["rev-parse", "HEAD"]:
+            return 0, "4c1ac63"
+        if argv == ["rev-parse", "--verify", "4c1ac63^{commit}"]:
+            return 0, "4c1ac63"
+        if argv == ["merge-base", "HEAD", "origin/main"]:
+            return 0, "4c1ac63"
+        if argv == ["status", "--porcelain", "--ignored"]:
+            return 0, "!! .claude/__pycache__/worker.pyc"
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(usage_cli, "_git_output", fake_git)
+
+    def no_provider(_family: HarnessFamily) -> str:
+        raise AssertionError("provider lookup")
+
+    monkeypatch.setattr(
+        usage_cli,
+        "_resolved_executable",
+        no_provider,
+    )
+    with pytest.raises(SystemExit, match="native worktree attestation failed"):
+        main(_native_cli_args())
+
+
+@pytest.mark.parametrize("failure", ["dirty", "missing-commit", "wrong-base"])
+def test_native_post_exit_attestation_rejects_each_final_provenance_break(
+    failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final cleanliness, committed advance and exact merge base independently gate append."""
+    arguments = argparse.Namespace(
+        repository="syamaner/roastpilot-agent",
+        branch="feature/816-native-transcript-usage-1",
+        base_sha="4c1ac63",
+    )
+
+    def fake_git(argv: list[str]) -> tuple[int, str]:
+        if argv == ["remote", "get-url", "origin"]:
+            return 0, "https://github.com/syamaner/roastpilot-agent.git"
+        if argv == ["branch", "--show-current"]:
+            return 0, arguments.branch
+        if argv == ["rev-parse", "HEAD"]:
+            return 0, "4c1ac63" if failure == "missing-commit" else "7d60f41"
+        if argv == ["rev-parse", "--verify", "4c1ac63^{commit}"]:
+            return 0, "4c1ac63"
+        if argv == ["merge-base", "HEAD", "origin/main"]:
+            return 0, "wrong-base" if failure == "wrong-base" else "4c1ac63"
+        if argv == ["status", "--porcelain"]:
+            return 0, " M ignored" if failure == "dirty" else ""
+        if argv[:2] == ["merge-base", "--is-ancestor"]:
+            return 0, ""
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(usage_cli, "_git_output", fake_git)
+    with pytest.raises(CaptureUsageError, match="native worktree attestation failed"):
+        usage_cli._validate_native_worktree(arguments, post_exit=True)  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.fixture(autouse=True)

@@ -141,10 +141,11 @@ def _transcript_fd(cwd: Path, session_id: str) -> int:
         result, descriptor = descriptor, None
         return result
     except (OSError, TranscriptError):
-        raise TranscriptError("owned Claude transcript is unavailable") from None
+        pass
     finally:
         _close(descriptor)
         _close(project)
+    raise TranscriptError("owned Claude transcript is unavailable")
 
 
 def reject_existing_owned_session(cwd: Path, session_id: str) -> None:
@@ -225,9 +226,12 @@ def _timestamp(value: object) -> datetime:
     if not isinstance(value, str):
         raise TranscriptError("owned Claude transcript chronology is invalid")
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
     except ValueError:
-        raise TranscriptError("owned Claude transcript chronology is invalid") from None
+        parsed = None
+    if parsed is None:
+        raise TranscriptError("owned Claude transcript chronology is invalid")
+    return parsed
 
 
 def parse_owned_transcript(
@@ -245,6 +249,7 @@ def parse_owned_transcript(
     model: str | None = None
     agent_settings = 0
     last_timestamp: datetime | None = None
+    invalid = False
     try:
         with os.fdopen(descriptor, "rb") as stream:
             for line in bounded_jsonl_lines(
@@ -256,7 +261,9 @@ def parse_owned_transcript(
                 try:
                     row = json.loads(line, object_pairs_hook=_reject_duplicates)
                 except (json.JSONDecodeError, TranscriptError):
-                    raise TranscriptError("owned Claude transcript is invalid") from None
+                    row = None
+                if row is None:
+                    raise TranscriptError("owned Claude transcript is invalid")
                 if (
                     not isinstance(row, dict)
                     or row.get("type") not in _ALLOWED_TYPES
@@ -331,8 +338,12 @@ def parse_owned_transcript(
                     model = row_model
                 elif model != row_model:
                     raise TranscriptError("owned Claude transcript model is invalid")
+    except TranscriptError:
+        raise
     except (OSError, ValueError):
-        raise TranscriptError("owned Claude transcript is invalid") from None
+        invalid = True
+    if invalid:
+        raise TranscriptError("owned Claude transcript is invalid")
     if agent_settings != 1 or not seen or model is None:
         raise TranscriptError("owned Claude transcript is incomplete")
     _require_no_subagents(cwd, session_id)

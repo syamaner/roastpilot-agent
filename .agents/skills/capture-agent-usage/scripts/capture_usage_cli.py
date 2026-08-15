@@ -43,6 +43,7 @@ from capture_usage_models import (
     CapacitySnapshotRecord,
     CapacitySource,
     CapacityStatus,
+    ClaudeModelUsage,
     FindingLens,
     FindingSeverity,
     HarnessFamily,
@@ -626,7 +627,15 @@ def _validate_native_metadata(arguments: argparse.Namespace, role: NativeClaudeR
             cached_input_tokens=0,
             cache_creation_input_tokens=0,
             output_tokens=0,
-            claude_model_usage=(),
+            claude_model_usage=(
+                ClaudeModelUsage(
+                    model="pending",
+                    input_tokens=0,
+                    cached_input_tokens=0,
+                    cache_creation_input_tokens=0,
+                    output_tokens=0,
+                ),
+            ),
             whole_tree_verified=True,
         )
     except ValueError:
