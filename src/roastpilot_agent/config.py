@@ -737,8 +737,9 @@ class PostFirstCrackControl(BaseModel):
     #: above) — unlike the RoR-taper's own never-add-heat law, which can
     #: only ever lower the ceiling and so carries no such requirement.
     recovery_enabled: bool = Field(default=False)
-    #: Enables the experimental post-FC temperature projection recovery path.
-    #: It is deliberately opt-in until a supervised hardware roast promotes it.
+    #: Enables the experimental post-FC temperature projection recovery path
+    #: and its bounded fast-entry floor for both projection and ordinary RoR
+    #: recovery triggers. It is opt-in until a supervised roast promotes it.
     recovery_projection_enabled: bool = Field(default=False)
     #: Percentage points beyond the target DTR at which a projected shortfall
     #: may enter recovery.
@@ -753,7 +754,8 @@ class PostFirstCrackControl(BaseModel):
     #: Minimum projected temperature shortfall (Celsius) required for entry.
     recovery_projection_margin_c: float = Field(default=3.0, gt=0, allow_inf_nan=False)
     #: One-time heat floor, in percentage points above engagement heat, applied
-    #: whenever v2 enters recovery.
+    #: whenever recovery enters while projection mode is enabled, including an
+    #: entry confirmed by the ordinary RoR-error trigger.
     recovery_entry_step_pp: int = Field(default=10, ge=0, le=50)
     #: The RoR shortfall (°C/min) below the taper setpoint that ENTERS
     #: recovery, once sustained for ``recovery_confirm_ticks`` consecutive

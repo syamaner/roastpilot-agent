@@ -1121,8 +1121,14 @@ class PostFcRorController:
             and projection.cutoff_runway_seconds is not None
             and (projection.cutoff_runway_seconds <= 0.0)
         ):
+            was_active = self._recovery_active
             self._begin_recovery_glide()
             self._recovery_cutoff_reached = True
+            # The first cutoff tick begins the glide at step one. Later valid
+            # projections remain beyond the cutoff, so advance an existing
+            # glide here instead of repeatedly freezing it at that first step.
+            if not was_active:
+                self._advance_glide()
             return None
         if self._recovery_active:
             if self._recovery_trigger is PostFcRecoveryTrigger.PROJECTION:

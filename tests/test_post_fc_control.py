@@ -1874,15 +1874,23 @@ def test_projection_on_target_glides_and_cutoff_latches_all_recovery_until_reset
     )
     assert cutoff.recovery_trigger is PostFcRecoveryTrigger.NONE
     assert controller.snapshot_state().recovery_cutoff_reached is True
-    after_cutoff = controller.compute(measured_ror_c_per_min=0.0, dt_seconds=5.0, projection=None)
-    assert after_cutoff.heat_authority_state is not PostFcHeatAuthorityState.RECOVERING
+    after_cutoff_states: list[PostFcHeatAuthorityState] = []
+    after_cutoff_ceilings: list[int] = []
     for development in (115.0, 120.0, 125.0):
         later = controller.compute(
             measured_ror_c_per_min=0.0,
             dt_seconds=5.0,
             projection=_projection(development_elapsed_seconds=development),
         )
+        after_cutoff_states.append(later.heat_authority_state)
+        after_cutoff_ceilings.append(later.effective_ceiling_percent)
         assert later.heat_authority_state is not PostFcHeatAuthorityState.RECOVERING
+    assert after_cutoff_ceilings == [60, 60, 60]
+    assert after_cutoff_states == [
+        PostFcHeatAuthorityState.HOLDING,
+        PostFcHeatAuthorityState.HOLDING,
+        PostFcHeatAuthorityState.HOLDING,
+    ]
     controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
     assert controller.snapshot_state().recovery_cutoff_reached is False
 
@@ -1994,6 +2002,16 @@ def test_projection_recovery_remains_active_between_entry_and_cutoff_horizons() 
     assert cutoff.heat_authority_state is PostFcHeatAuthorityState.GLIDING
     assert cutoff.recovery_trigger is PostFcRecoveryTrigger.NONE
     assert controller.snapshot_state().recovery_cutoff_reached is True
+    after_cutoff = [
+        controller.compute(
+            measured_ror_c_per_min=0.0,
+            dt_seconds=5.0,
+            projection=_projection(development_elapsed_seconds=development),
+        )
+        for development in (115.0, 120.0)
+    ]
+    assert [output.effective_ceiling_percent for output in after_cutoff] == [65, 60]
+    assert after_cutoff[-1].heat_authority_state is PostFcHeatAuthorityState.HOLDING
 
 
 def test_v2_fast_raise_preserves_a_ki_zero_bias_handoff() -> None:
