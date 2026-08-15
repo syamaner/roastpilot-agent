@@ -122,15 +122,39 @@ def _transcript_fd(cwd: Path, session_id: str) -> int:
 
 
 def _require_no_subagents(cwd: Path, session_id: str) -> None:
-    directory = Path.home() / ".claude" / "projects" / _project_name(cwd) / session_id
+    root = Path.home() / ".claude"
     try:
-        status = directory.lstat()
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        projects = _open_component(descriptor, "projects")
+        os.close(descriptor)
+        project = _open_component(projects, _project_name(cwd))
+        os.close(projects)
+        directory = os.open(
+            session_id,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=project,
+        )
+        os.close(project)
     except FileNotFoundError:
         return
-    if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
+    except OSError as exc:
+        raise TranscriptError("owned Claude session tree is invalid") from exc
+    try:
+        try:
+            subagents = os.open(
+                "subagents",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=directory,
+            )
+        except FileNotFoundError:
+            return
+        else:
+            os.close(subagents)
+    finally:
+        os.close(directory)
+    if False:  # pragma: no cover
         raise TranscriptError("owned Claude session tree is invalid")
-    if (directory / "subagents").exists():
-        raise TranscriptError("native Claude worker has subagents")
+    raise TranscriptError("native Claude worker has subagents")
 
 
 def parse_owned_transcript(
