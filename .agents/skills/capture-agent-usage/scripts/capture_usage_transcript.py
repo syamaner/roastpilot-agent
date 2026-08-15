@@ -78,8 +78,8 @@ def _open_component(parent: int, component: str) -> int:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         descriptor = os.open(component, flags, dir_fd=parent)
-    except OSError as exc:
-        raise TranscriptError("owned Claude transcript is unavailable") from exc
+    except OSError:
+        raise TranscriptError("owned Claude transcript is unavailable") from None
     if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
         os.close(descriptor)
         raise TranscriptError("owned Claude transcript is unavailable")
@@ -96,8 +96,8 @@ def _transcript_fd(cwd: Path, session_id: str) -> int:
     root = Path.home() / ".claude"
     try:
         descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except OSError as exc:
-        raise TranscriptError("owned Claude transcript is unavailable") from exc
+    except OSError:
+        raise TranscriptError("owned Claude transcript is unavailable") from None
     try:
         projects = _open_component(descriptor, "projects")
         os.close(descriptor)
@@ -109,7 +109,7 @@ def _transcript_fd(cwd: Path, session_id: str) -> int:
     except Exception:
         with __import__("contextlib").suppress(OSError):
             os.close(descriptor)
-        raise
+        raise TranscriptError("owned Claude transcript is unavailable") from None
     status = os.fstat(transcript)
     if (
         not stat.S_ISREG(status.st_mode)
@@ -137,8 +137,8 @@ def _require_no_subagents(cwd: Path, session_id: str) -> None:
         os.close(project)
     except FileNotFoundError:
         return
-    except OSError as exc:
-        raise TranscriptError("owned Claude session tree is invalid") from exc
+    except OSError:
+        raise TranscriptError("owned Claude session tree is invalid") from None
     try:
         try:
             subagents = os.open(
