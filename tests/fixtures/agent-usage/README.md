@@ -22,7 +22,9 @@ costs, and token counts with synthetic values.
 - `claude-2.1.231-transcript/parent.jsonl` is derived from three bounded persisted
   `--agent engineer-be --session-id` probes: tools-disabled, read-only, and an
   isolated write-capable probe that exercised the `Write` tool. The write probe
-  produced the same closed row-type inventory as the first two probes.
+  produced the same closed row-type inventory as the first two probes; that
+  comparison is parent-owned out-of-band observation, not something the synthetic
+  fixture bytes independently prove.
   All content, paths, request/message/session IDs, timestamps, and token counts are
   synthetic. The observed D161 leaf grammar is: the project directory encodes each
   non-alphanumeric path character as `-`; `agent-setting` binds the exact native
