@@ -1927,7 +1927,10 @@ def test_v2_fast_raise_is_bounded_non_lowering_and_non_compounding(
     assert entered.recovery_trigger is (
         PostFcRecoveryTrigger.PROJECTION if trigger_projection else PostFcRecoveryTrigger.ROR_ERROR
     )
-    assert 70 <= entered.heat_percent <= 75
+    # The natural PI output is already 73, above the 70-point entry floor.
+    # Pinning it proves the floor uses max rather than overwriting a safely
+    # higher command with the lower floor target.
+    assert entered.heat_percent == 73
     assert 700.0 <= entered.integrator < 1000.0
     assert entered.recovery_fast_raise_applied is True
     next_tick = controller.compute(
