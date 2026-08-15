@@ -20,9 +20,13 @@ from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, NoReturn, TypeVar
 
+if __name__ == "__main__":
+    sys.dont_write_bytecode = True
+
+from uuid import uuid4
+
 from capture_usage_claude import (
     ClaudeAuthorityError,
-    ClaudeAuthorityMode,
     ClaudeUsageMissingTerminalError,
     ClaudeUsageParseError,
     parse_claude_stream,
@@ -49,6 +53,7 @@ from capture_usage_models import (
     TaskUsageRecord,
     UsageRecord,
 )
+from capture_usage_transcript import TranscriptError, TranscriptUsage, parse_owned_transcript
 
 DEFAULT_SINK = Path(".agent-usage/usage.jsonl")
 SINK_ROOT = ".agent-usage"
@@ -568,7 +573,7 @@ def _launch_argv(
     return argv
 
 
-def _native_claude_argv(executable: str, role: NativeClaudeRole) -> list[str]:
+def _native_claude_argv(executable: str, role: NativeClaudeRole, session_id: str) -> list[str]:
     """Build the exact installed native-Claude worker argv."""
     return [
         executable,
@@ -577,10 +582,8 @@ def _native_claude_argv(executable: str, role: NativeClaudeRole) -> list[str]:
         "--setting-sources",
         "project",
         "-p",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--no-session-persistence",
+        "--session-id",
+        session_id,
         "--strict-mcp-config",
         "--mcp-config",
         '{"mcpServers":{}}',
@@ -605,6 +608,9 @@ def _validate_native_metadata(arguments: argparse.Namespace, role: NativeClaudeR
             base_sha=arguments.base_sha,
             final_head_sha=arguments.base_sha,
             parent_task_id=arguments.parent_task_id,
+            session_id="00000000-0000-4000-8000-000000000000",
+            subagent_count=0,
+            usage_message_count=1,
             started_at=now,
             completed_at=now,
             elapsed_ms=0,
@@ -616,6 +622,7 @@ def _validate_native_metadata(arguments: argparse.Namespace, role: NativeClaudeR
             cache_creation_input_tokens=0,
             output_tokens=0,
             claude_model_usage=(),
+            whole_tree_verified=True,
         )
     except ValueError:
         raise CaptureUsageError("native capture metadata is invalid") from None
@@ -628,32 +635,28 @@ def _native_record_from_usage(
     version: str,
     final_head_sha: str,
     exit_code: int,
-    usage: ParsedUsage,
+    usage: TranscriptUsage,
     completed_at: datetime,
     elapsed_ms: int,
 ) -> NativeWorkerUsageRecord:
     """Build one complete native record from attested and parsed metadata only."""
-    if (
-        usage.claude_init_model is None
-        or usage.input_tokens is None
-        or usage.cached_input_tokens is None
-        or usage.cache_creation_input_tokens is None
-        or usage.output_tokens is None
-        or usage.claude_model_usage is None
-    ):
+    if usage.usage_message_count < 1:
         raise CaptureUsageError("native Claude usage is incomplete")
     return NativeWorkerUsageRecord(
         captured_at=completed_at,
         task_id=arguments.task_id,
         slice_id=arguments.slice_id,
         native_role=role,
-        model=usage.claude_init_model,
+        model=usage.model,
         effort=effort,
         repository=arguments.repository,
         branch=arguments.branch,
         base_sha=arguments.base_sha,
         final_head_sha=final_head_sha,
         parent_task_id=arguments.parent_task_id,
+        session_id=usage.session_id,
+        subagent_count=0,
+        usage_message_count=usage.usage_message_count,
         started_at=arguments.started_at,
         completed_at=completed_at,
         elapsed_ms=elapsed_ms,
@@ -664,9 +667,7 @@ def _native_record_from_usage(
         cached_input_tokens=usage.cached_input_tokens,
         cache_creation_input_tokens=usage.cache_creation_input_tokens,
         output_tokens=usage.output_tokens,
-        claude_model_usage=usage.claude_model_usage,
-        estimated_usd=usage.estimated_usd,
-        estimate_basis=usage.estimate_basis,
+        claude_model_usage=usage.model_usage,
     )
 
 
@@ -676,6 +677,9 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
     _validate_native_metadata(arguments, role)
     _validate_native_worktree(arguments, post_exit=False)
     effort = _native_effort(role)
+    if os.environ.get("CLAUDE_CONFIG_DIR") is not None:
+        raise CaptureUsageError("native Claude config directory is not permitted")
+    session_id = str(uuid4())
     prompt = _prompt_bytes(arguments.prompt_file)
     process: subprocess.Popen[bytes] | None = None
     deadline: threading.Timer | None = None
@@ -692,47 +696,32 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
         started_monotonic = time.monotonic()
         arguments.started_at = started_at
         process = subprocess.Popen(
-            _native_claude_argv(executable, role),
+            _native_claude_argv(executable, role, session_id),
             stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             shell=False,
             cwd=".",
             start_new_session=True,
         )
-        assert process.stdout is not None
         deadline = _start_deadline(process, NATIVE_LAUNCH_TIMEOUT_SECONDS, timed_out)
         writer = threading.Thread(
             target=lambda: writer_result.__setitem__(0, _write_prompt(process, prompt)),
             daemon=True,
         )
         writer.start()
-        try:
-            usage = parse_claude_stream(
-                process.stdout,
-                require_launch_authority=False,
-                authority_mode=ClaudeAuthorityMode.NATIVE,
-            )
-        except ClaudeUsageMissingTerminalError:
-            if timed_out.is_set():
-                raise CaptureUsageError("native Claude run timed out") from None
-            raise CaptureUsageError("native Claude run has no terminal usage") from None
-        except ClaudeAuthorityError:
-            raise CaptureUsageError("native Claude launch authority is not attested") from None
-        except ClaudeUsageParseError:
-            if timed_out.is_set():
-                raise CaptureUsageError("native Claude run timed out") from None
-            raise CaptureUsageError("native Claude usage stream is invalid") from None
         writer.join()
         if not writer_result[0]:
             raise CaptureUsageError("prompt delivery failed")
         exit_code = process.wait(timeout=NATIVE_LAUNCH_TIMEOUT_SECONDS)
         if timed_out.is_set():
             raise CaptureUsageError("native Claude run timed out")
-        if usage.claude_terminal_success is not (exit_code == 0):
-            raise CaptureUsageError("Claude terminal status disagrees with harness exit")
         completed_at = _utc_now()
         elapsed_ms = int((time.monotonic() - started_monotonic) * 1000)
+        try:
+            usage = parse_owned_transcript(Path.cwd(), session_id, role, effort)
+        except TranscriptError:
+            raise CaptureUsageError("native Claude transcript is invalid") from None
         final_head_sha = _validate_native_worktree(arguments, post_exit=True)
         append_record(
             arguments.output,
@@ -765,8 +754,6 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
             with suppress(OSError, ValueError):
                 _close_stdin(process)
             _stop_process(process)
-            if process.stdout is not None:
-                process.stdout.close()
 
 
 def _record_from_usage(
