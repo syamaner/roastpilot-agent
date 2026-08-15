@@ -25,8 +25,13 @@ while normalized metadata and usage totals are recorded. The `role` field is
 caller-supplied attribution metadata, never agent selection; native named-agent dispatch
 remains required for implementation slices.
 
-Under D160, `run-native-claude` is the separate parent-only instrumentation path for an
+Under D161, `run-native-claude` is the separate parent-only instrumentation path for an
 already-selected `engineer-be` or `engineer-fe` implementation slice. It launches that
-registered project agent with fixed arguments, sends the ratified prompt on stdin, and
-records complete normalized metadata only. It cannot select `repair`, persist prompt or
-raw output, claim whole-tree coverage, or replace the parent's routing authority.
+registered project agent with a parent-generated session ID and accepts Claude-owned
+plaintext transcript persistence under Claude's configured retention. After exit, the
+parent reads only that exact session's parent transcript, deduplicates numeric usage,
+rejects any subagent tree, and writes a complete verified metadata record. It never
+copies transcript content or a host path into the sink, output, fixture, or exception;
+cannot select `repair`, delete or rewrite Claude transcripts, or replace routing
+authority. The generic `run` path remains measurement/validation-only and retains its
+no-session-persistence boundary.
