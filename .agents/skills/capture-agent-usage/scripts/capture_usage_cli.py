@@ -719,7 +719,14 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
         completed_at = _utc_now()
         elapsed_ms = int((time.monotonic() - started_monotonic) * 1000)
         try:
-            usage = parse_owned_transcript(Path.cwd(), session_id, role, effort)
+            usage = parse_owned_transcript(
+                Path.cwd(),
+                session_id,
+                role,
+                effort,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
         except TranscriptError:
             raise CaptureUsageError("native Claude transcript is invalid") from None
         final_head_sha = _validate_native_worktree(arguments, post_exit=True)
