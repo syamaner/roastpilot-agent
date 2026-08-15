@@ -344,7 +344,7 @@ def parse_owned_transcript(
         invalid = True
     if invalid:
         raise TranscriptError("owned Claude transcript is invalid")
-    if agent_settings != 1 or not seen or model is None:
+    if agent_settings == 0 or not seen or model is None:
         raise TranscriptError("owned Claude transcript is incomplete")
     _require_no_subagents(cwd, session_id)
     totals = tuple(sum(item[index] for item in seen.values()) for index in range(4))

@@ -98,6 +98,24 @@ def test_owned_transcript_counts_identical_assistant_usage_once(
     )
 
 
+def test_owned_transcript_accepts_repeated_matching_agent_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude may repeat the same parent-role attestation during one session."""
+    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    lines = content.splitlines()
+    repeated = b"\n".join((*lines[:2], lines[0], *lines[2:])) + b"\n"
+    transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, repeated)
+
+    usage = usage_transcript.parse_owned_transcript(
+        tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+    )
+
+    assert usage.usage_message_count == 2
+    assert usage.model == "claude-sonnet-5"
+    assert transcript.read_bytes() == repeated
+
+
 def _install_owned_transcript(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
 ) -> tuple[Path, str]:
@@ -365,14 +383,13 @@ def test_owned_transcript_rejects_jsonl_and_binding_boundaries(
 def test_owned_transcript_rejects_remaining_identity_and_usage_mutations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The exact parent binds one setting, session, model, effort, time and nonempty totals."""
+    """The exact parent binds a setting, session, model, effort, time and nonempty totals."""
     content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
     lines = content.splitlines()
     conflicting = list(lines)
     conflicting[3] = conflicting[3].replace(b'"output_tokens":7', b'"output_tokens":8')
     variants = (
         b"\n".join(lines[1:]) + b"\n",
-        b"\n".join((lines[0], lines[0], *lines[1:])) + b"\n",
         content.replace(b'"model":"claude-sonnet-5"', b'"model":"wrong-model"', 1),
         content.replace(b'"timestamp":"2026-01-01T00:00:01.000Z"', b'"timestamp":"invalid"', 1),
         content.replace(b'"usage":{"input_tokens":2', b'"usage":{}', 1),
