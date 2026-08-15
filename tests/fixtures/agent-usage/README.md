@@ -19,8 +19,10 @@ costs, and token counts with synthetic values.
   with non-empty tools, `permissionMode: auto`, and a model field. It validates
   parser and launch-boundary logic only; it is not observed provenance and proves
   neither native role resolution nor whole-tree coverage.
-- `claude-2.1.231-transcript/parent.jsonl` is derived from two bounded,
-  tools-disabled/read-only persisted `--agent engineer-be --session-id` probes.
+- `claude-2.1.231-transcript/parent.jsonl` is derived from three bounded persisted
+  `--agent engineer-be --session-id` probes: tools-disabled, read-only, and an
+  isolated write-capable probe that exercised the `Write` tool. The write probe
+  produced the same closed row-type inventory as the first two probes.
   All content, paths, request/message/session IDs, timestamps, and token counts are
   synthetic. The observed D161 leaf grammar is: the project directory encodes each
   non-alphanumeric path character as `-`; `agent-setting` binds the exact native
@@ -32,9 +34,11 @@ costs, and token counts with synthetic values.
   `server_tool_use`, `service_tier`, `cache_creation`, `inference_geo`,
   `iterations`, and `speed`. Repeated tool-use assistant rows carried the same
   message ID and byte-identical usage, establishing the required deduplication
-  case. Native implementation roles are leaves: neither probe created a subagent
-  directory or exposed an agent ID, so any subagent transcript is an authority
-  violation rather than valid descendant consumption.
+  case; the synthetic duplicate uses distinct outer transcript UUIDs so a parser
+  cannot substitute outer-row deduplication. A second assistant row deliberately
+  omits every optional usage key. Native implementation roles are leaves: no probe
+  created a subagent directory or exposed an agent ID, so any subagent transcript
+  is an authority violation rather than valid descendant consumption.
 
 No prompt, response, credential, environment value, repository path, or live
 session identifier is retained.
