@@ -39,6 +39,9 @@ costs, and token counts with synthetic values.
   omits every optional usage key. Native implementation roles are leaves: no probe
   created a subagent directory or exposed an agent ID, so any subagent transcript
   is an authority violation rather than valid descendant consumption.
+  `engineer-fe.jsonl` is a synthetic-conforming role-binding variant with the
+  observed `auto` permission-mode shape; it ensures both eligible native roles are
+  exercised without claiming a separate frontend probe.
 
 No prompt, response, credential, environment value, repository path, or live
 session identifier is retained.
