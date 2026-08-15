@@ -9,9 +9,9 @@
  * a roast where the advisor never returned a usable decision renders its failures
  * rather than a blank panel.
  *
- * Rows are selectable: clicking reports the tick so the page highlights the curve
- * (re-clicking the selected row toggles it off — the page owns the toggle). It
- * renders HISTORY read straight from the REST contract; nothing is inferred.
+ * Rows are selectable by stable view identity; their tick separately anchors the
+ * curve highlight (the page owns toggle-off). It renders HISTORY read straight from
+ * the REST contract; nothing is inferred.
  */
 
 import { useState } from "react";
@@ -33,10 +33,10 @@ const STATUS_TONE_CLASS: Record<"ok" | "fail", string> = {
 
 export interface AdvisorTimelineProps {
   rows: AdvisorRow[];
-  /** The currently highlighted tick (selected row), or `null`. */
-  selectedTick: number | null;
-  /** Toggle selection for a row's tick (re-selecting the same tick clears it). */
-  onSelect: (tick: number) => void;
+  /** The currently selected view-row identity, or `null`. */
+  selectedRowId: string | null;
+  /** Toggle selection for a view row, retaining its tick for curve placement. */
+  onSelect: (rowId: string, tick: number) => void;
   /**
    * The table container's `data-testid`. Defaults to `advisor-timeline`; the modal
    * copy of this timeline (#271) passes a DISTINCT id so the inline and modal
@@ -48,7 +48,7 @@ export interface AdvisorTimelineProps {
 
 export function AdvisorTimeline({
   rows,
-  selectedTick,
+  selectedRowId,
   onSelect,
   tableTestId = "advisor-timeline",
   className,
@@ -86,9 +86,9 @@ export function AdvisorTimeline({
         <tbody>
           {rows.map((row) => (
             <AdvisorTimelineRow
-              key={`${row.tick}-${row.recordedAtUtc}`}
+              key={row.rowId}
               row={row}
-              selected={row.tick === selectedTick}
+              selected={row.rowId === selectedRowId}
               onSelect={onSelect}
             />
           ))}
@@ -101,7 +101,7 @@ export function AdvisorTimeline({
 interface AdvisorTimelineRowProps {
   row: AdvisorRow;
   selected: boolean;
-  onSelect: (tick: number) => void;
+  onSelect: (rowId: string, tick: number) => void;
 }
 
 function AdvisorTimelineRow({
@@ -119,7 +119,7 @@ function AdvisorTimelineRow({
       data-status={row.status}
       data-selected={selected ? "true" : "false"}
       aria-selected={selected}
-      onClick={() => onSelect(row.tick)}
+      onClick={() => onSelect(row.rowId, row.tick)}
       className={cn(
         "cursor-pointer border-b border-border/60 transition-colors last:border-b-0",
         selected ? "bg-secondary" : "hover:bg-secondary/50",

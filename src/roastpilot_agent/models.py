@@ -1485,8 +1485,12 @@ class TimelineEvent(BaseModel):
 
 
 class TimelineSafetyEvaluation(BaseModel):
-    """One safety verdict in the decision trace (plan §5 ``safety_evaluations``)."""
+    """One safety verdict in the decision trace (plan §5 ``safety_evaluations``).
 
+    ``id`` is the frontend join key for linked advisor decisions and commands.
+    """
+
+    id: int
     tick: int
     rule: str
     verdict: TimelineVerdict
@@ -1519,7 +1523,11 @@ class TimelineAdvisorDecision(BaseModel):
 
 class TimelineCommand(BaseModel):
     """One executed/failed MCP command in the decision trace (plan §5
-    ``command_log``)."""
+    ``command_log``).
+
+    ``safety_evaluation_id`` links to the verdict that produced the command;
+    ``None`` remains valid for operator-dispatch rows without a provenance FK.
+    """
 
     tick: int
     tool: RoastCommand
@@ -1527,6 +1535,7 @@ class TimelineCommand(BaseModel):
     status: CommandTraceStatus
     args: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
+    safety_evaluation_id: int | None = None
     recorded_at_utc: str
 
 

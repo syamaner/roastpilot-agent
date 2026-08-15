@@ -734,6 +734,7 @@ export interface TimelineEvent {
 }
 
 export interface TimelineSafetyEvaluation {
+  id: number;
   tick: number;
   rule: string;
   verdict: SafetyVerdict;
@@ -753,6 +754,7 @@ export interface TimelineAdvisorDecision {
   latency_ms: number | null;
   status: AdvisorTraceStatus;
   decision: Record<string, unknown> | null;
+  safety_evaluation_id: number | null;
   recorded_at_utc: string;
 }
 
@@ -763,6 +765,7 @@ export interface TimelineCommand {
   status: CommandTraceStatus;
   args: Record<string, unknown> | null;
   result: Record<string, unknown> | null;
+  safety_evaluation_id: number | null;
   recorded_at_utc: string;
 }
 

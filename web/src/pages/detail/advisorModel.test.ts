@@ -16,7 +16,7 @@ const EMPTY_SERIES: TelemetrySeries = {
 };
 
 describe("toAdvisorRows", () => {
-  it("emits one row per persisted consult, joined to its verdict by tick", () => {
+  it("preserves the monotonic one-evaluation-per-tick fixture projection", () => {
     const rows = toAdvisorRows(FIXTURE_TIMELINE, FIXTURE_TELEMETRY);
     // The fixture has three ok consults at ticks 4, 8, 12.
     expect(rows.map((r) => r.tick)).toEqual([4, 8, 12]);
@@ -32,6 +32,43 @@ describe("toAdvisorRows", () => {
     expect(clamp.elapsedSeconds).toBe(240);
     // Bean-temp (#325) is joined from the same telemetry tick (92 + 8*8.2 = 157.6 °C).
     expect(clamp.beanTempC).toBeCloseTo(157.6, 5);
+  });
+
+  it("joins a decision to its non-last same-tick evaluation FK", () => {
+    const rows = toAdvisorRows(duplicateTickTimeline(101), EMPTY_SERIES);
+
+    expect(rows[0]).toMatchObject({
+      verdict: "clamp",
+      verdictReason: "first evaluation at tick",
+    });
+  });
+
+  it("uses insertion-ordered projection identities for unlinked same-tick advisors", () => {
+    const timeline = duplicateTickTimeline(null);
+    timeline.advisor_decisions.push({
+      ...timeline.advisor_decisions[0],
+      recorded_at_utc: "2026-06-07T09:10:01Z",
+    });
+
+    const rows = toAdvisorRows(timeline, EMPTY_SERIES);
+    expect(rows.map((row) => row.rowId)).toEqual([
+      "advisor-unlinked-projection-0",
+      "advisor-unlinked-projection-1",
+    ]);
+    expect(rows.map((row) => row.tick)).toEqual([7, 7]);
+  });
+
+  it.each([
+    ["null", null],
+    ["dangling", 999],
+  ])("does not guess by tick for a %s advisor FK", (_label, safetyEvaluationId) => {
+    const timeline = duplicateTickTimeline(safetyEvaluationId);
+
+    expect(toAdvisorRows(timeline, EMPTY_SERIES)[0]).toMatchObject({
+      verdict: null,
+      verdictReason: null,
+    });
+    expect(advisorSummary(timeline)).toMatchObject({ clamped: 0, rejected: 0 });
   });
 
   it("leaves beanTempC null when the tick has no telemetry join (#325)", () => {
@@ -91,6 +128,16 @@ describe("advisorSummary", () => {
     });
   });
 
+  it("counts verdicts through exact FKs when duplicate ticks disagree", () => {
+    expect(advisorSummary(duplicateTickTimeline(101))).toEqual({
+      consults: 1,
+      ok: 1,
+      failed: 0,
+      clamped: 1,
+      rejected: 0,
+    });
+  });
+
   it("counts failures for an all-provider_error roast", () => {
     const summary = advisorSummary(FIXTURE_TIMELINE_FAILED);
     expect(summary).toEqual({
@@ -119,3 +166,50 @@ describe("advisorSummary", () => {
     });
   });
 });
+
+function duplicateTickTimeline(safetyEvaluationId: number | null): RoastTimeline {
+  return {
+    run_id: "duplicate-tick",
+    events: [],
+    safety_evaluations: [
+      {
+        id: 101,
+        tick: 7,
+        rule: "bounds",
+        verdict: "clamp",
+        input_heat: 81,
+        input_fan: 40,
+        adjusted_heat: 80,
+        adjusted_fan: 40,
+        reason: "first evaluation at tick",
+        recorded_at_utc: "2026-06-07T09:14:00Z",
+      },
+      {
+        id: 102,
+        tick: 7,
+        rule: "drop_guard",
+        verdict: "reject",
+        input_heat: 0,
+        input_fan: 100,
+        adjusted_heat: null,
+        adjusted_fan: null,
+        reason: "last evaluation at tick",
+        recorded_at_utc: "2026-06-07T09:14:01Z",
+      },
+    ],
+    advisor_decisions: [
+      {
+        tick: 7,
+        provider: "fake",
+        model: "fixture",
+        prompt_version: "v1",
+        latency_ms: 5,
+        status: "ok",
+        decision: { target_heat: 81, target_fan: 40, should_drop: false },
+        safety_evaluation_id: safetyEvaluationId,
+        recorded_at_utc: "2026-06-07T09:14:00Z",
+      },
+    ],
+    commands: [],
+  } as RoastTimeline;
+}

@@ -2034,7 +2034,7 @@ class RoastStore:
             for row in event_rows
         ]
         async with self.connection.execute(
-            "SELECT tick, rule, verdict, input_heat, input_fan, adjusted_heat,"
+            "SELECT id, tick, rule, verdict, input_heat, input_fan, adjusted_heat,"
             " adjusted_fan, reason, recorded_at_utc FROM safety_evaluations"
             " WHERE run_id = ? ORDER BY id ASC",
             (run_id,),
@@ -2042,6 +2042,7 @@ class RoastStore:
             safety_rows = await cursor.fetchall()
         safety_evaluations = [
             TimelineSafetyEvaluation(
+                id=int(row["id"]),
                 tick=int(row["tick"]),
                 rule=str(row["rule"]),
                 # The store CHECK constraints pin these columns to the typed
@@ -2081,7 +2082,8 @@ class RoastStore:
         ]
         async with self.connection.execute(
             "SELECT tick, tool, source, status, args_json, result_json,"
-            " recorded_at_utc FROM command_log WHERE run_id = ? ORDER BY id ASC",
+            " safety_evaluation_id, recorded_at_utc FROM command_log"
+            " WHERE run_id = ? ORDER BY id ASC",
             (run_id,),
         ) as cursor:
             command_rows = await cursor.fetchall()
@@ -2093,6 +2095,9 @@ class RoastStore:
                 status=cast(CommandTraceStatus, str(row["status"])),
                 args=_loads(row["args_json"]),
                 result=_loads(row["result_json"]),
+                safety_evaluation_id=None
+                if row["safety_evaluation_id"] is None
+                else int(row["safety_evaluation_id"]),
                 recorded_at_utc=str(row["recorded_at_utc"]),
             )
             for row in command_rows

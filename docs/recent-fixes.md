@@ -35,24 +35,32 @@ Format: one entry per anti-pattern.
 ---
 
 ## Run-local clocks cannot order or identify persisted rows across a restart
-*(fixed by #787 slice 1, 12 Aug 2026)*
+*(fixed by #787 slices 1–2, 15 Aug 2026)*
 
 - **Signature:** `ORDER BY ... tick|elapsed_seconds`, whole-run clock arithmetic,
   or `s.tick = a.tick` where an exact `safety_evaluation_id` exists.
 - **Wrong:** treating `tick` as monotonic or unique; a restart resets it and each
   tick can persist several safety evaluations, so clock ordering interleaves
   sessions and last-by-tick joins can attach the wrong verdict.
-- **Right:** use insertion `id` for whole-run order and the advisor decision's
-  exact safety FK for verdict counts. A NULL/dangling advisor FK counts as
-  neither rather than guessing; do not copy that rule onto command rows whose
-  measured operator-dispatch history has NULL FKs and still needs its tick join.
+- **Right:** use insertion `id` for whole-run order and exact safety FKs for
+  advisor verdict counts and detail projections. A NULL/dangling advisor FK
+  counts as neither rather than guessing; do not copy that rule onto command
+  rows whose measured operator-dispatch history has NULL FKs and still needs
+  its scoped tick fallback. `api.py` `_record_dispatch_command` still writes
+  those NULL command FKs by design, leaving a display-provenance gap; no
+  follow-up issue was filed under the operator's standing backlog instruction.
 - **Guarded by:**
   `test_list_runs_development_percent_uses_insertion_order_after_tick_reset`,
   `test_build_reference_roast_curve_uses_insertion_order_after_tick_reset`,
   `test_list_runs_advisor_counts_use_exact_fk_with_duplicate_ticks`,
   `test_list_runs_null_advisor_fk_does_not_guess_by_tick`, and
-  `test_list_runs_dangling_advisor_fk_does_not_guess_by_tick` (a NULL FK and an
-  orphaned non-NULL FK are different states and are guarded separately).
+  `test_list_runs_dangling_advisor_fk_does_not_guess_by_tick`; plus the Vitest
+  guards “joins an advisor only to its non-last same-tick evaluation FK”,
+  “uses tick fallback only for null-FK commands”, “joins a decision to its
+  non-last same-tick evaluation FK”, “does not guess by tick for a null/dangling
+  advisor FK”, and “counts verdicts through exact FKs when duplicate ticks
+  disagree”. A NULL FK and an orphaned non-NULL FK are different states and are
+  guarded separately.
 
 ---
 

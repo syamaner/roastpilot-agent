@@ -3,8 +3,8 @@
  *
  * The pure composition of the detail page: given the three REST payloads it
  * derives the trace rows + curve + headline stats and lays out the screen. It
- * owns the `selectedTick` → `LiveCurve.highlightTime` wiring (trace-row click
- * highlights the matching timestamp on the curve; re-clicking the same row
+ * owns the selected view-row → `LiveCurve.highlightTime` wiring (a row click
+ * highlights its tick's timestamp on the curve; re-clicking the same row
  * toggles it off). Kept free of the query layer so the snapshot harness can feed
  * it fixed REST-shaped data for deterministic Playwright baselines.
  *
@@ -51,6 +51,11 @@ export interface DetailViewProps {
   timeline: RoastTimeline | undefined;
 }
 
+interface SelectedRow {
+  rowId: string;
+  tick: number;
+}
+
 export function DetailView({ detail, telemetry, timeline }: DetailViewProps): React.JSX.Element {
   // #533 (repo-wide widget-visibility pass, the accepted #527 round-1 gap):
   // RoastRating / RoastedWeight / ChargeWeight / RoastTastings each POST a
@@ -63,10 +68,9 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
   // and ExportOptions are unaffected — they are pure read-outs, not forms.
   const isCompletedRun = detail.completed_at_utc !== null;
 
-  // The single source of truth for the trace-row → curve highlight. A row click
-  // sets its tick; clicking the same tick again clears it (toggle-off on
-  // re-click). The page owns the toggle; the chart just renders `highlightTime`.
-  const [selectedTick, setSelectedTick] = useState<number | null>(null);
+  // The single source of truth for selection and curve highlighting. Row identity
+  // distinguishes same-tick history entries; tick only anchors the curve timestamp.
+  const [selectedRow, setSelectedRow] = useState<SelectedRow | null>(null);
 
   // #205/#344: smooth bean + RoR for display only; the persisted raw series is unchanged.
   const points = useMemo(() => smoothCurveForDisplay(toCurvePoints(telemetry)), [telemetry]);
@@ -77,10 +81,10 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
   const stats = useMemo(() => headlineStats(timeline, telemetry), [timeline, telemetry]);
 
   const highlightTime =
-    selectedTick === null ? null : tickToSeconds(telemetry, selectedTick);
+    selectedRow === null ? null : tickToSeconds(telemetry, selectedRow.tick);
 
-  const onSelectRow = (tick: number) =>
-    setSelectedTick((current) => (current === tick ? null : tick));
+  const onSelectRow = (rowId: string, tick: number) =>
+    setSelectedRow((current) => (current?.rowId === rowId ? null : { rowId, tick }));
 
   // Selecting a row that lives only in a "View all" modal would point the curve
   // highlight off-screen behind the overlay (#126). When the selection happens
@@ -88,9 +92,9 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
   // is in frame; an inline selection toggles as before.
   const selectFrom =
     (close: () => void, inModal: boolean) =>
-    (tick: number) => {
+    (rowId: string, tick: number) => {
       if (inModal) close();
-      onSelectRow(tick);
+      onSelectRow(rowId, tick);
     };
 
   return (
@@ -121,7 +125,7 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
           renderRows={(slice, ctx) => (
             <AdvisorTimeline
               rows={slice}
-              selectedTick={selectedTick}
+              selectedRowId={selectedRow?.rowId ?? null}
               onSelect={selectFrom(ctx.close, ctx.inModal)}
               tableTestId={ctx.tableTestId}
             />
@@ -139,7 +143,7 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
           renderRows={(slice, ctx) => (
             <DecisionTraceTable
               rows={slice}
-              selectedTick={selectedTick}
+              selectedRowId={selectedRow?.rowId ?? null}
               onSelect={selectFrom(ctx.close, ctx.inModal)}
               tableTestId={ctx.tableTestId}
             />

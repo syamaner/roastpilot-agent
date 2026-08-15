@@ -158,6 +158,7 @@ export const FIXTURE_TIMELINE: RoastTimeline = {
   ],
   safety_evaluations: [
     {
+      id: 1,
       tick: 4,
       rule: "rate_limit",
       verdict: "allow",
@@ -169,6 +170,7 @@ export const FIXTURE_TIMELINE: RoastTimeline = {
       recorded_at_utc: "2026-06-07T09:14:00Z",
     },
     {
+      id: 2,
       tick: 8,
       rule: "bounds",
       verdict: "clamp",
@@ -180,6 +182,7 @@ export const FIXTURE_TIMELINE: RoastTimeline = {
       recorded_at_utc: "2026-06-07T09:16:00Z",
     },
     {
+      id: 3,
       tick: 12,
       rule: "drop_guard",
       verdict: "reject",
@@ -200,6 +203,7 @@ export const FIXTURE_TIMELINE: RoastTimeline = {
       latency_ms: 820,
       status: "ok",
       decision: { target_heat: 80, target_fan: 40, should_drop: false, confidence: 0.86, rationale: "Holding heat; RoR climbing as expected after charge." },
+      safety_evaluation_id: 1,
       recorded_at_utc: "2026-06-07T09:14:00Z",
     },
     {
@@ -210,6 +214,7 @@ export const FIXTURE_TIMELINE: RoastTimeline = {
       latency_ms: 910,
       status: "ok",
       decision: { target_heat: 105, target_fan: 40, should_drop: false, confidence: 0.78, rationale: "RoR stalling near first crack; push heat to keep momentum into development." },
+      safety_evaluation_id: 2,
       recorded_at_utc: "2026-06-07T09:16:00Z",
     },
     {
@@ -220,12 +225,13 @@ export const FIXTURE_TIMELINE: RoastTimeline = {
       latency_ms: 760,
       status: "ok",
       decision: { target_heat: 0, target_fan: 100, should_drop: true, confidence: 0.4, rationale: "Considering an early drop, but development ratio is still low." },
+      safety_evaluation_id: 3,
       recorded_at_utc: "2026-06-07T09:18:30Z",
     },
   ],
   commands: [
-    { tick: 4, tool: "set_heat", source: "advisor", status: "ok", args: { percent: 80 }, result: { ok: true }, recorded_at_utc: "2026-06-07T09:14:00Z" },
-    { tick: 8, tool: "set_heat", source: "safety", status: "ok", args: { percent: 100 }, result: { ok: true }, recorded_at_utc: "2026-06-07T09:16:00Z" },
+    { tick: 4, tool: "set_heat", source: "advisor", status: "ok", args: { percent: 80 }, result: { ok: true }, safety_evaluation_id: 1, recorded_at_utc: "2026-06-07T09:14:00Z" },
+    { tick: 8, tool: "set_heat", source: "safety", status: "ok", args: { percent: 100 }, result: { ok: true }, safety_evaluation_id: 2, recorded_at_utc: "2026-06-07T09:16:00Z" },
   ],
 };
 
@@ -320,6 +326,7 @@ export const FIXTURE_TIMELINE_FAILED: RoastTimeline = {
       latency_ms: 180,
       status: "provider_error",
       decision: null,
+      safety_evaluation_id: null,
       recorded_at_utc: "2026-06-07T09:12:30Z",
     },
     {
@@ -330,6 +337,7 @@ export const FIXTURE_TIMELINE_FAILED: RoastTimeline = {
       latency_ms: 180,
       status: "provider_error",
       decision: null,
+      safety_evaluation_id: null,
       recorded_at_utc: "2026-06-07T09:14:00Z",
     },
     {
@@ -340,6 +348,7 @@ export const FIXTURE_TIMELINE_FAILED: RoastTimeline = {
       latency_ms: 180,
       status: "provider_error",
       decision: null,
+      safety_evaluation_id: null,
       recorded_at_utc: "2026-06-07T09:16:00Z",
     },
   ],
@@ -412,6 +421,7 @@ export const FIXTURE_TIMELINE_LONG: RoastTimeline = {
     const recordedAt = `2026-06-07T09:${String(12 + i).padStart(2, "0")}:00Z`;
     return isClamp
       ? {
+          id: i + 1,
           tick: i,
           rule: "bounds",
           verdict: "clamp" as const,
@@ -424,6 +434,7 @@ export const FIXTURE_TIMELINE_LONG: RoastTimeline = {
           recorded_at_utc: recordedAt,
         }
       : {
+          id: i + 1,
           tick: i,
           rule: "rate_limit",
           verdict: "allow" as const,
@@ -454,6 +465,7 @@ export const FIXTURE_TIMELINE_LONG: RoastTimeline = {
           ? "Pushing heat near first crack to hold momentum into development."
           : `Holding heat; RoR tracking the profile (tick ${i}).`,
       },
+      safety_evaluation_id: i + 1,
       recorded_at_utc: recordedAt,
     };
   }),
