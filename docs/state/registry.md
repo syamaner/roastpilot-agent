@@ -34,15 +34,16 @@
 >   **All figures below are PRE-#809 measurements.** **The store half is now FIXED** — PR #809
 >   (`7df0f4d`) landed slice 1, which re-keys the history counts onto
 >   `a.safety_evaluation_id` and moves both named tick orderings onto insertion `id`. **The
->   SPA half is still LIVE** and is slice 2's job.
+>   SPA half is now FIXED by #787 slice 2**, which carries the row ids on the wire and
+>   re-keys the detail projections onto `safety_evaluation_id`.
 >   Measured before that fix: **27 of 368** advisor rows misjoined across **17 runs**; on
 >   **10** rows across **3 rated roasts** the verdict differed, every one an `allow` reported
->   as a `reject`, so history **over-reported rejections**. On the SPA — still true today —
->   **438 of 806** (54%) decision-trace rows across **20 runs** are attached to an advisor
+>   as a `reject`, so history **over-reported rejections**. Before slice 2, on the SPA,
+>   **438 of 806** (54%) decision-trace rows across **20 runs** were attached to an advisor
 >   recommendation that did not produce them.
->   The FE cannot do better today: `TimelineSafetyEvaluation` carries no `id` on the wire and
->   the TS type drops `safety_evaluation_id`, while `models.py:1504` documents the field as
->   being there "so the FE can join an advisor decision to its verdict".
+>   The FE could not do better before slice 2: `TimelineSafetyEvaluation` carried no `id` on
+>   the wire and the TS type dropped `safety_evaluation_id`, while the model contract
+>   documented the field as the FE join key. Both keys are now present and used.
 >
 > **The lesson, and it is the one to carry: measure the DEFECT, not its precondition.**
 > Reachability for the five restart-affected runs was established carefully and then restated
