@@ -3620,6 +3620,9 @@ def _native_record(**updates: object) -> NativeWorkerUsageRecord:
         "base_sha": "4c1ac63",
         "final_head_sha": "7d60f41",
         "parent_task_id": "parent-816",
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "subagent_count": 0,
+        "usage_message_count": 1,
         "started_at": datetime(2026, 8, 14, tzinfo=UTC),
         "completed_at": datetime(2026, 8, 14, tzinfo=UTC),
         "elapsed_ms": 1,
@@ -3636,12 +3639,12 @@ def _native_record(**updates: object) -> NativeWorkerUsageRecord:
     return NativeWorkerUsageRecord.model_validate(values)
 
 
-def test_native_record_requires_parent_and_permanently_denies_whole_tree_claim() -> None:
-    """Native persisted grammar cannot omit parentage or claim unproven coverage."""
+def test_native_record_requires_parent_and_verified_complete_tree() -> None:
+    """Native persisted grammar requires parentage and a complete leaf tree."""
     with pytest.raises(ValidationError):
         _native_record(parent_task_id=None)
     with pytest.raises(ValidationError):
-        _native_record(whole_tree_verified=True)
+        _native_record(whole_tree_verified=False)
     payload = json.loads(_native_record().model_dump_json())
     payload["reasoning_output_tokens"] = 1
     with pytest.raises(ValidationError):
