@@ -12,6 +12,9 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator,
 AGENT_USAGE_SCHEMA_VERSION = 1
 """The append-only on-disk record schema version."""
 
+NATIVE_WORKER_USAGE_SCHEMA_VERSION = 2
+"""D161 native-worker record schema, distinct from generic capture records."""
+
 SKILL_VERSION = "0.1.0"
 """The version of the capture skill's normalized record grammar."""
 
@@ -266,7 +269,7 @@ class NativeWorkerUsageRecord(CaptureModel):
     """
 
     record_type: Literal["NATIVE_WORKER_USAGE"] = "NATIVE_WORKER_USAGE"
-    schema_version: Literal[1] = AGENT_USAGE_SCHEMA_VERSION
+    schema_version: Literal[2] = NATIVE_WORKER_USAGE_SCHEMA_VERSION
     tool_version: SafeIdentifier = SKILL_VERSION
     captured_at: datetime
     task_id: SafeIdentifier

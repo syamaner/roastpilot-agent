@@ -299,6 +299,20 @@ def test_native_record_rejects_incomplete_or_inconsistent_truth(field: str, valu
         NativeWorkerUsageRecord.model_validate(payload)
 
 
+def test_native_record_uses_distinct_schema_v2_and_adapter_roundtrips() -> None:
+    """D161 records cannot be mistaken for the generic v1 append-only record shape."""
+    record = NativeWorkerUsageRecord.model_validate(_native_record_payload())
+    serialized = json.loads(record.model_dump_json())
+    assert serialized["schema_version"] == 2
+    roundtrip = USAGE_RECORD_ADAPTER.validate_json(record.model_dump_json())
+    assert isinstance(roundtrip, NativeWorkerUsageRecord) and roundtrip.schema_version == 2
+    prior_shape = dict(serialized)
+    prior_shape["schema_version"] = 1
+    with pytest.raises(ValidationError):
+        NativeWorkerUsageRecord.model_validate(prior_shape)
+    assert _task_record().schema_version == 1
+
+
 def test_native_cli_exposes_no_caller_session_id() -> None:
     """The parent, never the caller, owns UUID attribution."""
     with pytest.raises(SystemExit):
