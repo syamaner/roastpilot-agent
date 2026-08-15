@@ -1837,36 +1837,55 @@ def test_projection_does_not_depend_on_taper_setpoint() -> None:
     assert entries == [3, 3]
 
 
-def test_conebosque_shape_enters_at_twelve_percent_and_reaches_cap_boundedly() -> None:
-    """Projection enters with four DTR points left, before v1, and reaches the cap."""
+def test_conebosque_shape_enters_before_target_and_reaches_cap_boundedly() -> None:
+    """Live-cadence projection enters before v1 and reaches the cap boundedly."""
     config = _projection_recovery_config(
         taper_start_max_ror_c_per_min=6.0,
         taper_end_ror_c_per_min=6.0,
         taper_duration_seconds=1.0,
     )
-    projection = _projection(development_elapsed_seconds=60.0, charge_elapsed_seconds=500.0)
     v2 = PostFcRorController(config)
     v1 = PostFcRorController(config.model_copy(update={"recovery_projection_enabled": False}))
     for controller in (v2, v1):
         controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
 
-    for ror in (6.0, 5.5, 4.9):
+    entry_projection: PostFcProjectionInputs | None = None
+    for development, charge, ror in (
+        (60.0, 500.0, 6.0),
+        (65.0, 505.0, 5.5),
+        (70.0, 510.0, 4.9),
+    ):
+        entry_projection = _projection(
+            development_elapsed_seconds=development,
+            charge_elapsed_seconds=charge,
+        )
         entered = v2.compute(
             measured_ror_c_per_min=ror,
             dt_seconds=5.0,
-            projection=projection,
+            projection=entry_projection,
         )
         v1_output = v1.compute(measured_ror_c_per_min=ror, dt_seconds=5.0)
 
+    assert entry_projection is not None
     assert 100.0 * 60.0 / 500.0 == 12.0
-    assert projection.target_development_percent - 12.0 == 4.0
+    entry_dtr = 100.0 * 70.0 / 510.0
+    assert entry_dtr == pytest.approx(13.72549019607843)
+    assert entry_projection.target_development_percent - entry_dtr > 2.0
     assert entered.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
     assert v1_output.recovery_trigger is PostFcRecoveryTrigger.NONE
     cap = min(config.heat_ceiling_percent, 60 + config.recovery_headroom_percentage_points)
-    post_entry = [
-        v2.compute(measured_ror_c_per_min=0.0, dt_seconds=5.0, projection=projection)
-        for _ in range(2)
-    ]
+    post_entry: list[PostFcControlOutput] = []
+    for development, charge in ((75.0, 515.0), (80.0, 520.0)):
+        post_entry.append(
+            v2.compute(
+                measured_ror_c_per_min=0.0,
+                dt_seconds=5.0,
+                projection=_projection(
+                    development_elapsed_seconds=development,
+                    charge_elapsed_seconds=charge,
+                ),
+            )
+        )
     assert post_entry[-1].heat_percent == cap
 
 
