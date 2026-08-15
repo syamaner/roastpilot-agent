@@ -737,6 +737,24 @@ class PostFirstCrackControl(BaseModel):
     #: above) — unlike the RoR-taper's own never-add-heat law, which can
     #: only ever lower the ceiling and so carries no such requirement.
     recovery_enabled: bool = Field(default=False)
+    #: Enables the experimental post-FC temperature projection recovery path.
+    #: It is deliberately opt-in until a supervised hardware roast promotes it.
+    recovery_projection_enabled: bool = Field(default=False)
+    #: Percentage points beyond the target DTR at which a projected shortfall
+    #: may enter recovery.
+    recovery_projection_entry_horizon_pp: float = Field(
+        default=2.0, gt=0, le=20, allow_inf_nan=False
+    )
+    #: Percentage points beyond the target DTR that end recovery authority for
+    #: this post-FC engagement.
+    recovery_projection_cutoff_horizon_pp: float = Field(
+        default=5.0, gt=0, le=20, allow_inf_nan=False
+    )
+    #: Minimum projected temperature shortfall (Celsius) required for entry.
+    recovery_projection_margin_c: float = Field(default=3.0, gt=0, allow_inf_nan=False)
+    #: One-time heat floor, in percentage points above engagement heat, applied
+    #: whenever v2 enters recovery.
+    recovery_entry_step_pp: int = Field(default=10, ge=0, le=50)
     #: The RoR shortfall (°C/min) below the taper setpoint that ENTERS
     #: recovery, once sustained for ``recovery_confirm_ticks`` consecutive
     #: computed ticks. Default 1.0 — deliberately the SAME value as
@@ -951,6 +969,16 @@ class PostFirstCrackControl(BaseModel):
                 "recovery is a relaxation of the taper's own never-add-heat-beyond-entry "
                 "ceiling, and is completely inert (and would mislabel the launch banner) "
                 "when the taper loop itself never runs"
+            )
+        if self.recovery_projection_enabled and not self.recovery_enabled:
+            raise ValueError(
+                "recovery_projection_enabled requires recovery_enabled=True — projection "
+                "is an alternate recovery-entry signal, not an inert standalone flag"
+            )
+        if self.recovery_projection_cutoff_horizon_pp <= self.recovery_projection_entry_horizon_pp:
+            raise ValueError(
+                "recovery_projection_cutoff_horizon_pp must be strictly greater than "
+                "recovery_projection_entry_horizon_pp"
             )
         return self
 

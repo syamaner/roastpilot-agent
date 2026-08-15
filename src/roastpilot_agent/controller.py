@@ -59,6 +59,7 @@ from roastpilot_agent.models import (
 from roastpilot_agent.post_fc_control import (
     PostFcControllerState,
     PostFcControlOutput,
+    PostFcRecoveryTrigger,
     PostFcRorController,
 )
 from roastpilot_agent.roast_history import (
@@ -2645,6 +2646,14 @@ class RoastController:
                 recovery_ticks_within_exit=0,
                 recovery_active=False,
                 recovery_ticks_since_exit=None,
+                recovery_trigger=PostFcRecoveryTrigger.NONE,
+                recovery_projection_short_ticks=0,
+                recovery_projection_on_target_ticks=0,
+                recovery_last_development_elapsed_seconds=(
+                    state.recovery_last_development_elapsed_seconds
+                ),
+                recovery_last_charge_elapsed_seconds=state.recovery_last_charge_elapsed_seconds,
+                recovery_cutoff_reached=state.recovery_cutoff_reached,
             )
         )
         self._post_fc_raise_suppressed_after_clamp = True

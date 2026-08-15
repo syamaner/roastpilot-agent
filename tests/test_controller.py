@@ -9,7 +9,7 @@ extend this suite.
 import asyncio
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
@@ -63,6 +63,7 @@ from roastpilot_agent.models import (
     RoastStyle,
     RoastTelemetry,
 )
+from roastpilot_agent.post_fc_control import PostFcRecoveryTrigger
 from roastpilot_agent.roast_history import DecisionTraceEntry, RoastMilestoneKind
 from roastpilot_agent.safety import (
     COMMAND_PHASE_MATRIX,
@@ -9452,6 +9453,39 @@ def _recovery_config(
         ),
         post_first_crack_control=PostFirstCrackControl(**overrides),  # type: ignore[arg-type]
     )
+
+
+def test_force_recovery_exit_preserves_v2_cutoff_and_accepted_clocks() -> None:
+    """Forced safety clamping clears v2 entry state without reopening its cutoff."""
+    harness = make_harness(
+        config=_recovery_config(recovery_projection_enabled=True),
+    )
+    original = harness.controller._post_fc_controller.snapshot_state()  # pyright: ignore[reportPrivateUsage]
+    state = replace(
+        original,
+        recovery_active=True,
+        recovery_ticks_above_trigger=2,
+        recovery_ticks_within_exit=1,
+        recovery_ticks_since_exit=3,
+        recovery_trigger=PostFcRecoveryTrigger.PROJECTION,
+        recovery_projection_short_ticks=2,
+        recovery_projection_on_target_ticks=1,
+        recovery_last_development_elapsed_seconds=80.0,
+        recovery_last_charge_elapsed_seconds=500.0,
+        recovery_cutoff_reached=True,
+    )
+    harness.controller._force_recovery_exit(state)  # pyright: ignore[reportPrivateUsage]
+    forced = harness.controller._post_fc_controller.snapshot_state()  # pyright: ignore[reportPrivateUsage]
+    assert forced.recovery_active is False
+    assert forced.recovery_ticks_above_trigger == 0
+    assert forced.recovery_ticks_within_exit == 0
+    assert forced.recovery_ticks_since_exit is None
+    assert forced.recovery_trigger is PostFcRecoveryTrigger.NONE
+    assert forced.recovery_projection_short_ticks == 0
+    assert forced.recovery_projection_on_target_ticks == 0
+    assert forced.recovery_last_development_elapsed_seconds == 80.0
+    assert forced.recovery_last_charge_elapsed_seconds == 500.0
+    assert forced.recovery_cutoff_reached is True
 
 
 #: A :class:`SafetyLimits` companion for ``_recovery_config(ceiling_guard_temp_c=220.0, ...)``
