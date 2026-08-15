@@ -2,33 +2,18 @@
 
 from __future__ import annotations
 
-import codecs
 import json
 import math
 from collections.abc import Iterable, Mapping
-from contextlib import suppress
-from enum import Enum
-from typing import Any, BinaryIO, Protocol
+from typing import Any, BinaryIO
 
-from capture_usage_codex import (
-    READ_CHUNK_BYTES,
-    CodexUsageParseError,
-    _JsonRootScanner,  # pyright: ignore[reportPrivateUsage]
-)
 from capture_usage_models import (
-    MAX_EVENT_BYTES,
     BoundedStreamError,
     ClaudeModelUsage,
     EstimateBasis,
     ParsedUsage,
-    SafeIdentifier,
     bounded_jsonl_lines,
 )
-from pydantic import TypeAdapter
-
-NATIVE_MAX_OPAQUE_EVENT_BYTES = 4 * 1024 * 1024
-NATIVE_MAX_EVENT_COUNT = 500_000
-NATIVE_MAX_STREAM_BYTES = 256 * 1024 * 1024
 
 CLAUDE_EVENT_TYPES = frozenset({"system", "user", "assistant", "rate_limit_event", "result"})
 """Opaque event types observed unchanged in sanitized 2.1.228 and 2.1.231 fixtures."""
@@ -77,7 +62,6 @@ CLAUDE_MODEL_USAGE_KEYS = frozenset(
 """Exact model usage keys observed unchanged in Claude Code 2.1.228 and 2.1.231."""
 CLAUDE_PERMISSION_MODES = frozenset({"default", "plan"})
 """Permission vocabularies observed in sanitized Claude init events."""
-_SAFE_IDENTIFIER_ADAPTER = TypeAdapter(SafeIdentifier)
 
 
 class ClaudeUsageParseError(ValueError):
@@ -90,156 +74,6 @@ class ClaudeAuthorityError(ClaudeUsageParseError):
 
 class ClaudeUsageMissingTerminalError(ClaudeUsageParseError):
     """Raised only when a complete Claude stream lacks a result usage event."""
-
-
-class ClaudeAuthorityMode(Enum):
-    """Closed init-attestation modes for the Claude stream parser."""
-
-    MEASUREMENT = "MEASUREMENT"
-    NATIVE = "NATIVE"
-
-
-class _ReadableBinaryStream(Protocol):
-    """The bounded-read interface accepted from native Claude stdout."""
-
-    def read(self, size: int, /) -> bytes:
-        """Read at most ``size`` bytes."""
-
-
-class _ClaudeRootScanner(_JsonRootScanner):
-    """Extend the shared structural scanner with one bounded root subtype value."""
-
-    def __init__(self) -> None:
-        """Initialize root-type scanning and exact subtype duplicate detection."""
-        super().__init__()
-        self.root_subtype: str | None = None
-        self._root_subtype_count = 0
-
-    @property
-    def root_type(self) -> str | None:
-        """Return the one bounded root type captured by the structural scanner."""
-        value = getattr(self, "_root_type_value", None)
-        return value if isinstance(value, str) else None
-
-    def _emit(self, kind: str, value: str | None, truncated: bool) -> None:
-        """Capture a root string subtype before applying the shared JSON state update."""
-        stack = getattr(self, "_stack", ())
-        if len(stack) == 1:
-            _container, state, key = stack[-1]
-            if state in {"value", "value_or_end"} and key == "subtype":
-                self._root_subtype_count += 1
-                if self._root_subtype_count != 1:
-                    raise CodexUsageParseError("Claude event contains duplicate JSON keys")
-                if kind != "string" or truncated:
-                    raise CodexUsageParseError("malformed native Claude JSON event")
-                self.root_subtype = value
-        super()._emit(kind, value, truncated)
-
-
-def _native_read_chunk(stream: _ReadableBinaryStream) -> bytes:
-    """Read promptly from a pipe without requesting an opaque-event-sized allocation."""
-    read1 = getattr(stream, "read1", None)
-    chunk = read1(READ_CHUNK_BYTES) if callable(read1) else stream.read(READ_CHUNK_BYTES)
-    if not isinstance(chunk, bytes) or len(chunk) > READ_CHUNK_BYTES:
-        raise ClaudeUsageParseError("native usage stream read exceeds size limit")
-    return chunk
-
-
-def _native_stream_events(
-    stream: _ReadableBinaryStream,
-) -> Iterable[tuple[str, bytes | None]]:
-    """Yield retained events and discard structurally valid oversized opaque events."""
-    event_count = 0
-    stream_bytes = 0
-    event_bytes = 0
-    retained = bytearray()
-    scanner = _ClaudeRootScanner()
-    decoder = codecs.getincrementaldecoder("utf-8")("strict")
-
-    def complete_event() -> tuple[str, bytes | None]:
-        """Finish one event and return content only when it fits the retained bound."""
-        nonlocal event_count, event_bytes, retained, scanner, decoder
-        event_count += 1
-        if event_count > NATIVE_MAX_EVENT_COUNT:
-            raise ClaudeUsageParseError("native usage stream exceeds event count limit")
-        try:
-            scanner.finish()
-        except CodexUsageParseError:
-            raise ClaudeUsageParseError("malformed native Claude JSON event") from None
-        event_type = scanner.root_type
-        if not isinstance(event_type, str) or event_type not in CLAUDE_EVENT_TYPES:
-            raise ClaudeUsageParseError("unknown native Claude event type")
-        if event_bytes > MAX_EVENT_BYTES:
-            opaque = event_type in {"user", "assistant", "rate_limit_event"} or (
-                event_type == "system" and scanner.root_subtype in {"hook_started", "hook_response"}
-            )
-            if not opaque:
-                raise ClaudeUsageParseError("native retained event exceeds size limit")
-            result: tuple[str, bytes | None] = (event_type, None)
-        else:
-            result = (event_type, bytes(retained))
-        event_bytes = 0
-        retained = bytearray()
-        scanner = _ClaudeRootScanner()
-        decoder = codecs.getincrementaldecoder("utf-8")("strict")
-        return result
-
-    def consume_segment(segment: bytes, has_newline: bool) -> tuple[str, bytes | None] | None:
-        """Account, incrementally validate, and conditionally retain one segment."""
-        nonlocal event_bytes, stream_bytes
-        event_bytes += len(segment)
-        stream_bytes += len(segment)
-        if event_bytes > NATIVE_MAX_OPAQUE_EVENT_BYTES:
-            raise ClaudeUsageParseError("native usage stream event exceeds size limit")
-        if stream_bytes > NATIVE_MAX_STREAM_BYTES:
-            raise ClaudeUsageParseError("native usage stream exceeds total byte limit")
-        remaining = MAX_EVENT_BYTES - len(retained)
-        if remaining > 0:
-            retained.extend(segment[:remaining])
-        invalid_utf8 = False
-        text = ""
-        try:
-            text = decoder.decode(segment, final=False)
-        except UnicodeDecodeError:
-            invalid_utf8 = True
-        if invalid_utf8:
-            raise ClaudeUsageParseError("native usage stream contains invalid UTF-8") from None
-        try:
-            if has_newline:
-                if not text.endswith("\n") or decoder.getstate()[0]:  # pragma: no cover
-                    # The byte splitter includes an ASCII newline, which cannot end a
-                    # valid UTF-8 segment with pending decoder state.
-                    raise ClaudeUsageParseError("native usage stream contains invalid UTF-8")
-                scanner.consume(text[:-1])
-                return complete_event()
-            scanner.consume(text)
-        except CodexUsageParseError:
-            raise ClaudeUsageParseError("malformed native Claude JSON event") from None
-        return None
-
-    while True:
-        chunk = _native_read_chunk(stream)
-        if chunk == b"":
-            break
-        offset = 0
-        while offset < len(chunk):
-            newline = chunk.find(b"\n", offset)
-            if newline < 0:
-                consume_segment(chunk[offset:], False)
-                break
-            completed = consume_segment(chunk[offset : newline + 1], True)
-            assert completed is not None
-            yield completed
-            offset = newline + 1
-    invalid_utf8 = False
-    try:
-        decoder.decode(b"", final=True)
-    except UnicodeDecodeError:
-        invalid_utf8 = True
-    if invalid_utf8:
-        raise ClaudeUsageParseError("native usage stream contains invalid UTF-8") from None
-    if event_bytes:
-        raise ClaudeUsageParseError("native usage stream contains a partial event")
 
 
 def _non_negative_integer(value: object, field: str) -> int:
@@ -295,9 +129,7 @@ def _event_from_line(line: str) -> Mapping[str, Any]:
     return event
 
 
-def _validate_init_authority(
-    event: Mapping[str, Any], require_launch_authority: bool, authority_mode: ClaudeAuthorityMode
-) -> str | None:
+def _validate_init_authority(event: Mapping[str, Any], require_launch_authority: bool) -> None:
     """Validate the observed init authority fields without retaining their contents."""
     tools = event.get("tools")
     mcp_servers = event.get("mcp_servers")
@@ -306,27 +138,9 @@ def _validate_init_authority(
         not isinstance(tools, list)
         or not isinstance(mcp_servers, list)
         or not isinstance(permission_mode, str)
-        or (
-            authority_mode is not ClaudeAuthorityMode.NATIVE
-            and permission_mode not in CLAUDE_PERMISSION_MODES
-        )
+        or permission_mode not in CLAUDE_PERMISSION_MODES
     ):
         raise ClaudeAuthorityError("Claude init authority is malformed")
-    if authority_mode is ClaudeAuthorityMode.NATIVE:
-        model = event.get("model")
-        if (
-            tools == []
-            or mcp_servers != []
-            or permission_mode != "auto"
-            or not isinstance(model, str)
-        ):
-            raise ClaudeAuthorityError("Claude init authority is not attested")
-        validated_model: str | None = None
-        with suppress(ValueError):
-            validated_model = _SAFE_IDENTIFIER_ADAPTER.validate_python(model)
-        if validated_model is None:
-            raise ClaudeAuthorityError("Claude init authority is malformed") from None
-        return validated_model
     if require_launch_authority and (tools != [] or mcp_servers != [] or permission_mode != "plan"):
         raise ClaudeAuthorityError("Claude init authority is not attested")
     return None
@@ -421,7 +235,6 @@ def parse_claude_stream(
     stream: BinaryIO,
     *,
     require_launch_authority: bool,
-    authority_mode: ClaudeAuthorityMode = ClaudeAuthorityMode.MEASUREMENT,
 ) -> ParsedUsage:
     """Parse a complete Claude stream using only the terminal result-level totals.
 
@@ -440,33 +253,18 @@ def parse_claude_stream(
     parsed: ParsedUsage | None = None
     saw_init = False
     saw_pre_init_activity = False
-    init_model: str | None = None
     bounded_failure: str | None = None
     try:
-        events: Iterable[tuple[str, bytes | None]]
-        if authority_mode is ClaudeAuthorityMode.NATIVE:
-            events = _native_stream_events(stream)
-        else:
-            events = (("", line.encode("utf-8")) for line in bounded_jsonl_lines(stream))
-        for _opaque_type, raw_line in events:
-            if raw_line is None:
-                if not saw_init:
-                    saw_pre_init_activity = True
-                continue
-            line = raw_line.decode("utf-8")
+        for line in bounded_jsonl_lines(stream):
             if not line.strip():
                 raise ClaudeUsageParseError("blank Claude JSONL event")
             event = _event_from_line(line)
             if event["type"] == "system" and event.get("subtype") == "init":
                 if saw_init:
                     raise ClaudeAuthorityError("Claude init authority is duplicated")
-                if (
-                    require_launch_authority or authority_mode is ClaudeAuthorityMode.NATIVE
-                ) and saw_pre_init_activity:
+                if require_launch_authority and saw_pre_init_activity:
                     raise ClaudeAuthorityError("Claude init authority is not attested")
-                init_model = _validate_init_authority(
-                    event, require_launch_authority, authority_mode
-                )
+                _validate_init_authority(event, require_launch_authority)
                 saw_init = True
                 continue
             if event["type"] != "result":
@@ -475,9 +273,7 @@ def parse_claude_stream(
                 continue
             if parsed is not None:
                 raise ClaudeUsageParseError("multiple Claude terminal result events")
-            if (
-                require_launch_authority or authority_mode is ClaudeAuthorityMode.NATIVE
-            ) and not saw_init:
+            if require_launch_authority and not saw_init:
                 raise ClaudeAuthorityError("Claude init authority is not attested")
             parsed = _terminal_usage(event)
     except BoundedStreamError as exc:
@@ -486,15 +282,4 @@ def parse_claude_stream(
         raise ClaudeUsageParseError(bounded_failure) from None
     if parsed is None:
         raise ClaudeUsageMissingTerminalError("Claude stream has no terminal result usage event")
-    if authority_mode is ClaudeAuthorityMode.NATIVE:
-        if init_model is None or parsed.claude_model_usage is None:  # pragma: no cover
-            # The validated init and terminal constructors make this a type-narrowing guard.
-            raise ClaudeAuthorityError("Claude init authority is not attested")
-        if parsed.claude_model_canonical_names is None:
-            raise ClaudeUsageParseError("malformed Claude modelUsage entry")
-        if init_model not in {
-            item.model for item in parsed.claude_model_usage
-        } and init_model not in set(parsed.claude_model_canonical_names):
-            raise ClaudeAuthorityError("Claude init authority is not attested")
-        return parsed.model_copy(update={"claude_init_model": init_model})
     return parsed

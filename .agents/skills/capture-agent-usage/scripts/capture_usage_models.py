@@ -12,6 +12,9 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator,
 AGENT_USAGE_SCHEMA_VERSION = 1
 """The append-only on-disk record schema version."""
 
+NATIVE_WORKER_USAGE_SCHEMA_VERSION = 2
+"""D161 native-worker record schema, distinct from generic capture records."""
+
 SKILL_VERSION = "0.1.0"
 """The version of the capture skill's normalized record grammar."""
 
@@ -27,7 +30,13 @@ class BoundedStreamError(ValueError):
     """Raised when a binary JSONL stream exceeds the closed ingestion grammar."""
 
 
-def bounded_jsonl_lines(stream: BinaryIO) -> Iterator[str]:
+def bounded_jsonl_lines(
+    stream: BinaryIO,
+    *,
+    max_event_bytes: int = MAX_EVENT_BYTES,
+    max_event_count: int = MAX_EVENT_COUNT,
+    max_stream_bytes: int = MAX_STREAM_BYTES,
+) -> Iterator[str]:
     """Yield complete UTF-8 JSONL lines under fixed byte and count limits.
 
     Args:
@@ -39,18 +48,18 @@ def bounded_jsonl_lines(stream: BinaryIO) -> Iterator[str]:
     event_count = 0
     total_bytes = 0
     while True:
-        raw_line = stream.readline(MAX_EVENT_BYTES + 1)
+        raw_line = stream.readline(max_event_bytes + 1)
         if raw_line == b"":
             return
-        if len(raw_line) > MAX_EVENT_BYTES:
+        if len(raw_line) > max_event_bytes:
             raise BoundedStreamError("usage stream event exceeds size limit")
         if not raw_line.endswith(b"\n"):
             raise BoundedStreamError("usage stream contains a partial event")
         event_count += 1
-        if event_count > MAX_EVENT_COUNT:
+        if event_count > max_event_count:
             raise BoundedStreamError("usage stream exceeds event count limit")
         total_bytes += len(raw_line)
-        if total_bytes > MAX_STREAM_BYTES:
+        if total_bytes > max_stream_bytes:
             raise BoundedStreamError("usage stream exceeds total byte limit")
         invalid_utf8 = False
         text = ""
@@ -256,11 +265,11 @@ class NativeWorkerUsageRecord(CaptureModel):
 
     The role attests only that this recorder built and executed the exact
     ``claude --agent <role>`` argv for the process whose usage this record totals;
-    not an in-stream role echo and not routing authority (D160).
+    not an in-stream role echo and not routing authority (D161).
     """
 
     record_type: Literal["NATIVE_WORKER_USAGE"] = "NATIVE_WORKER_USAGE"
-    schema_version: Literal[1] = AGENT_USAGE_SCHEMA_VERSION
+    schema_version: Literal[2] = NATIVE_WORKER_USAGE_SCHEMA_VERSION
     tool_version: SafeIdentifier = SKILL_VERSION
     captured_at: datetime
     task_id: SafeIdentifier
@@ -274,6 +283,9 @@ class NativeWorkerUsageRecord(CaptureModel):
     base_sha: GitSha
     final_head_sha: GitSha
     parent_task_id: SafeIdentifier
+    session_id: SafeIdentifier
+    subagent_count: Literal[0]
+    usage_message_count: Annotated[int, Field(ge=1)]
     started_at: datetime
     completed_at: datetime
     elapsed_ms: Annotated[int, Field(ge=0)]
@@ -288,7 +300,7 @@ class NativeWorkerUsageRecord(CaptureModel):
     estimated_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     estimate_basis: EstimateBasis = EstimateBasis.NOT_EXPOSED
     usage_complete: Literal[True] = True
-    whole_tree_verified: Literal[False] = False
+    whole_tree_verified: Literal[True] = True
 
     @field_validator("harness", mode="before")
     @classmethod
@@ -308,6 +320,16 @@ class NativeWorkerUsageRecord(CaptureModel):
             and self.estimate_basis is not EstimateBasis.CLIENT_SIDE_ESTIMATE
         ):
             raise ValueError("estimated_usd must be labelled CLIENT_SIDE_ESTIMATE")
+        if len(self.claude_model_usage) != 1 or self.claude_model_usage[0].model != self.model:
+            raise ValueError("native usage must contain the sole parent model")
+        model_usage = self.claude_model_usage[0]
+        if (
+            model_usage.input_tokens != self.input_tokens
+            or model_usage.cached_input_tokens != self.cached_input_tokens
+            or model_usage.cache_creation_input_tokens != self.cache_creation_input_tokens
+            or model_usage.output_tokens != self.output_tokens
+        ):
+            raise ValueError("native totals must equal parent model usage")
         return self
 
 

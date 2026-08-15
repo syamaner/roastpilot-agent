@@ -3,32 +3,35 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import inspect
 import json
 import os
+import shutil
 import signal
 import stat
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import BinaryIO, NoReturn, cast
+from uuid import UUID
 
 import capture_usage_claude as usage_claude
 import capture_usage_cli as usage_cli
 import capture_usage_codex as usage_codex
+import capture_usage_transcript as usage_transcript
 import pytest
 from capture_usage_claude import (
     CLAUDE_EVENT_TYPES,
     CLAUDE_MODEL_USAGE_KEYS,
     CLAUDE_RESULT_USAGE_KEYS,
     CLAUDE_SYSTEM_SUBTYPES,
-    NATIVE_MAX_OPAQUE_EVENT_BYTES,
     ClaudeAuthorityError,
-    ClaudeAuthorityMode,
     ClaudeUsageParseError,
     parse_claude_stream,
 )
@@ -66,6 +69,940 @@ from pydantic import TypeAdapter, ValidationError
 _REAL_VALIDATE_WORKTREE_METADATA = usage_cli._validate_worktree_metadata  # pyright: ignore[reportPrivateUsage]
 FIXTURES = Path(__file__).parent / "fixtures" / "agent-usage"
 USAGE_RECORD_ADAPTER = cast(TypeAdapter[UsageRecord], _USAGE_RECORD_ADAPTER)
+
+
+def test_owned_transcript_counts_identical_assistant_usage_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The committed 2.1.231 fixture is read only at its exact expected path."""
+    session_id = "11111111-1111-4111-8111-111111111111"
+    home = tmp_path / "home"
+    project = home / ".claude" / "projects" / usage_transcript._project_name(tmp_path)  # pyright: ignore[reportPrivateUsage]
+    project.mkdir(parents=True)
+    transcript = project / f"{session_id}.jsonl"
+    transcript.write_bytes((FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes())
+    monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
+
+    usage = usage_transcript.parse_owned_transcript(
+        tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+    )
+
+    assert usage.usage_message_count == 2
+    assert usage.input_tokens == 4
+    assert usage.cached_input_tokens == 30
+    assert usage.cache_creation_input_tokens == 35
+    assert usage.output_tokens == 11
+    assert (
+        transcript.read_bytes()
+        == (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    )
+
+
+def _install_owned_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
+) -> tuple[Path, str]:
+    """Install a synthetic parent at its one accepted exact location."""
+    session_id = "11111111-1111-4111-8111-111111111111"
+    home = tmp_path / "home"
+    project = home / ".claude" / "projects" / usage_transcript._project_name(tmp_path)  # pyright: ignore[reportPrivateUsage]
+    project.mkdir(parents=True)
+    transcript = project / f"{session_id}.jsonl"
+    transcript.write_bytes(content)
+    monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
+    return transcript, session_id
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        (b'"agentSetting":"engineer-be"', b'"agentSetting":"engineer-fe"'),
+        (b'"version":"2.1.231"', b'"version":"2.1.999"'),
+        (b'"effort":"high"', b'"effort":"low"'),
+        (b'"input_tokens":2', b'"input_tokens":true'),
+        (b'"input_tokens":2', b'"input_tokens":-1'),
+        (b'"output_tokens":7', b'"extra_usage":1,"output_tokens":7'),
+    ],
+)
+def test_owned_transcript_rejects_closed_mutations(
+    old: bytes, new: bytes, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Identity and accounting schema drift is rejected without transcript mutation."""
+    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    mutated = content.replace(old, new)
+    transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, mutated)
+    before = transcript.stat()
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        )
+    after = transcript.stat()
+    assert (after.st_ino, after.st_mtime_ns, transcript.read_bytes()) == (
+        before.st_ino,
+        before.st_mtime_ns,
+        mutated,
+    )
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo", "directory"])
+def test_owned_transcript_rejects_unsafe_exact_file_types(
+    kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exact-tree reading never follows or parses an unsafe final filesystem object."""
+    transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, b"safe\n")
+    transcript.unlink()
+    if kind == "symlink":
+        transcript.symlink_to(tmp_path / "outside")
+    elif kind == "hardlink":
+        target = tmp_path / "outside"
+        target.write_bytes(b"safe\n")
+        os.link(target, transcript)
+    elif kind == "fifo":
+        os.mkfifo(transcript)
+    else:
+        transcript.mkdir()
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        )
+
+
+def test_owned_transcript_rejects_subagents_and_lifecycle_skew(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leaf authority and the 120-second run binding are mandatory."""
+    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, content)
+    session_tree = transcript.with_suffix("")
+    (session_tree / "subagents").mkdir(parents=True)
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        )
+    (session_tree / "subagents").rmdir()
+    session_tree.rmdir()
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path,
+            session_id,
+            NativeClaudeRole.ENGINEER_BE,
+            "high",
+            started_at=datetime(2026, 8, 1, tzinfo=UTC),
+            completed_at=datetime(2026, 8, 1, tzinfo=UTC),
+        )
+
+
+def test_project_encoding_is_ascii_safe_without_discovery() -> None:
+    """Installed path encoding is deterministic and resolver source never scans projects."""
+    assert usage_transcript._project_name(Path("/tmp/café spaces")) == "-tmp-caf--spaces"  # pyright: ignore[reportPrivateUsage]
+    source = inspect.getsource(usage_transcript)
+    for forbidden in ("glob(", "rglob(", "os.walk", "listdir", "scandir"):
+        assert forbidden not in source
+
+
+@pytest.mark.parametrize("name", ["parent.jsonl", "session-directory"])
+def test_preexisting_exact_session_rejects_before_launch(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A generated session cannot be bound to stale Claude-owned state."""
+    session_id = "11111111-1111-4111-8111-111111111111"
+    home = tmp_path / "home"
+    project = home / ".claude" / "projects" / usage_transcript._project_name(tmp_path)  # pyright: ignore[reportPrivateUsage]
+    project.mkdir(parents=True)
+    if name == "parent.jsonl":
+        (project / f"{session_id}.jsonl").write_bytes(b"x\n")
+    else:
+        (project / session_id).mkdir()
+    monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.reject_existing_owned_session(tmp_path, session_id)
+
+
+@pytest.mark.parametrize("component", [".claude", "projects", "project"])
+def test_preflight_rejects_unsafe_or_missing_resolver_components(
+    component: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a securely absent final project is accepted as first-use state."""
+    home = tmp_path / "home"
+    if component == ".claude":
+        home.mkdir()
+        (home / ".claude").symlink_to(tmp_path / "outside")
+    else:
+        (home / ".claude").mkdir(parents=True)
+        if component == "projects":
+            (home / ".claude" / "projects").symlink_to(tmp_path / "outside")
+        else:
+            projects = home / ".claude" / "projects"
+            projects.mkdir()
+            (projects / usage_transcript._project_name(tmp_path)).symlink_to(tmp_path / "outside")  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.reject_existing_owned_session(
+            tmp_path, "11111111-1111-4111-8111-111111111111"
+        )
+
+
+def _native_record_payload() -> dict[str, object]:
+    """Build one complete native record payload for boundary validation."""
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    return {
+        "captured_at": now,
+        "task_id": "816",
+        "slice_id": "native",
+        "native_role": "engineer-be",
+        "model": "claude-sonnet-5",
+        "effort": "high",
+        "repository": "syamaner/roastpilot-agent",
+        "branch": "feature/816",
+        "base_sha": "4c1ac63",
+        "final_head_sha": "7d60f41",
+        "parent_task_id": "parent",
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "subagent_count": 0,
+        "usage_message_count": 1,
+        "started_at": now,
+        "completed_at": now,
+        "elapsed_ms": 0,
+        "exit_code": 0,
+        "success": True,
+        "harness_version": "2.1.231",
+        "input_tokens": 2,
+        "cached_input_tokens": 3,
+        "cache_creation_input_tokens": 4,
+        "output_tokens": 5,
+        "claude_model_usage": [
+            {
+                "model": "claude-sonnet-5",
+                "input_tokens": 2,
+                "cached_input_tokens": 3,
+                "cache_creation_input_tokens": 4,
+                "output_tokens": 5,
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("whole_tree_verified", False),
+        ("subagent_count", 1),
+        ("usage_message_count", 0),
+        ("output_tokens", 6),
+        ("model", "other"),
+    ],
+)
+def test_native_record_rejects_incomplete_or_inconsistent_truth(field: str, value: object) -> None:
+    """False tree evidence, descendants and inconsistent sole-model sums are unrepresentable."""
+    payload = _native_record_payload()
+    payload[field] = value
+    with pytest.raises(ValidationError):
+        NativeWorkerUsageRecord.model_validate(payload)
+
+
+def test_native_record_uses_distinct_schema_v2_and_adapter_roundtrips() -> None:
+    """D161 records cannot be mistaken for the generic v1 append-only record shape."""
+    record = NativeWorkerUsageRecord.model_validate(_native_record_payload())
+    serialized = json.loads(record.model_dump_json())
+    assert serialized["schema_version"] == 2
+    roundtrip = USAGE_RECORD_ADAPTER.validate_json(record.model_dump_json())
+    assert isinstance(roundtrip, NativeWorkerUsageRecord) and roundtrip.schema_version == 2
+    prior_shape = dict(serialized)
+    prior_shape["schema_version"] = 1
+    with pytest.raises(ValidationError):
+        NativeWorkerUsageRecord.model_validate(prior_shape)
+    assert _task_record().schema_version == 1
+
+
+def test_schema_version_cli_reports_generic_and_native_worker_families(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Discovery exposes both append-only record families without changing generic v1."""
+    with pytest.raises(SystemExit) as result:
+        main(["--schema-version"])
+    assert result.value.code == 0
+    assert capsys.readouterr().out == "generic=1 native-worker=2\n"
+
+
+def test_native_cli_exposes_no_caller_session_id() -> None:
+    """The parent, never the caller, owns UUID attribution."""
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args(
+            ["run-native-claude", "--role", "engineer-be", "--session-id", "caller"]
+        )
+
+
+def _transcript_mutators() -> tuple[Callable[[bytes], bytes], ...]:
+    """Return typed JSONL mutations for closed parser boundary checks."""
+    return (
+        lambda value: value[:-1],
+        lambda value: value.replace(b"\n", b"", 1),
+        lambda value: value.replace(b'"type":"agent-setting"', b'"type":"unknown"', 1),
+        lambda value: value.replace(b'"sessionId":', b'"sessionId":"wrong", "sessionId":', 1),
+        lambda value: value.replace(
+            b'"sessionId":"11111111-1111-4111-8111-111111111111"', b'"sessionId":"wrong"', 1
+        ),
+        lambda value: value + b"\n",
+        lambda value: value.replace(
+            b'"parentUuid":"22222222-2222-4222-8222-222222222222"', b'"parentUuid":7', 1
+        ),
+    )
+
+
+@pytest.mark.parametrize("mutator", _transcript_mutators())
+def test_owned_transcript_rejects_jsonl_and_binding_boundaries(
+    mutator: Callable[[bytes], bytes], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Malformed JSONL, duplicate keys, blank rows and malformed parent identity fail closed."""
+    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, mutator(content))
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        )
+    assert transcript.read_bytes() != b""
+
+
+def test_owned_transcript_rejects_remaining_identity_and_usage_mutations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact parent binds one setting, session, model, effort, time and nonempty totals."""
+    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    lines = content.splitlines()
+    conflicting = list(lines)
+    conflicting[3] = conflicting[3].replace(b'"output_tokens":7', b'"output_tokens":8')
+    variants = (
+        b"\n".join(lines[1:]) + b"\n",
+        b"\n".join((lines[0], lines[0], *lines[1:])) + b"\n",
+        content.replace(b'"model":"claude-sonnet-5"', b'"model":"wrong-model"', 1),
+        content.replace(b'"timestamp":"2026-01-01T00:00:01.000Z"', b'"timestamp":"invalid"', 1),
+        content.replace(b'"usage":{"input_tokens":2', b'"usage":{}', 1),
+        b"\n".join(lines[:2]) + b"\n",
+        b"\n".join(conflicting) + b"\n",
+    )
+    for index, variant in enumerate(variants):
+        case = tmp_path / str(index)
+        case.mkdir()
+        transcript, session_id = _install_owned_transcript(case, monkeypatch, variant)
+        with pytest.raises(usage_transcript.TranscriptError):
+            usage_transcript.parse_owned_transcript(
+                case, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+            )
+        assert transcript.read_bytes() == variant
+        transcript.unlink()
+
+
+def test_owned_transcript_rejects_assistant_root_agent_id_without_retaining_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parent transcript cannot claim a child-agent identity at the assistant root."""
+    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    lines = content.splitlines()
+    lines[2] = lines[2].replace(
+        b'"version":"2.1.231"',
+        b'"agentId":"SENTINEL_CHILD_ID","version":"2.1.231"',
+        1,
+    )
+    transcript, session_id = _install_owned_transcript(
+        tmp_path, monkeypatch, b"\n".join(lines) + b"\n"
+    )
+    with pytest.raises(usage_transcript.TranscriptError) as error:
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        )
+    assert str(error.value) == "owned Claude transcript is invalid"
+    assert "SENTINEL_CHILD_ID" not in str(error.value)
+    assert error.value.__cause__ is None and error.value.__context__ is None
+    assert not (tmp_path / ".agent-usage").exists()
+    assert b"SENTINEL_CHILD_ID" in transcript.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "content,session_id",
+    [
+        (
+            b'{"type":"assistant","secret":"SENTINEL_TRANSCRIPT_JSON"}\n',
+            "11111111-1111-4111-8111-111111111111",
+        ),
+        (
+            b'{"type":"assistant","secret":"SENTINEL_TRANSCRIPT_UTF8\xff"}\n',
+            "11111111-1111-4111-8111-111111111111",
+        ),
+        (b"", "SENTINEL_TRANSCRIPT_PATH"),
+    ],
+)
+def test_owned_transcript_errors_are_fixed_and_content_free(
+    content: bytes, session_id: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Malformed transcript bytes and inaccessible paths never escape through exception state."""
+    transcript, expected_session = _install_owned_transcript(tmp_path, monkeypatch, content)
+    if session_id != expected_session:
+        transcript.unlink()
+    with pytest.raises(usage_transcript.TranscriptError) as error:
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        )
+    assert str(error.value) in {
+        "owned Claude transcript is unavailable",
+        "owned Claude transcript is invalid",
+    }
+    assert "SENTINEL_TRANSCRIPT" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+def test_owned_transcript_reader_never_mutates_its_exact_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reader has no write, create, delete, rename or copy capability on transcripts."""
+    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, content)
+    before = transcript.stat()
+
+    def deny_mutation(*_args: object, **_kwargs: object) -> NoReturn:
+        raise AssertionError("transcript reader must not mutate")
+
+    for name in ("write", "mkdir", "unlink", "rename"):
+        monkeypatch.setattr(os, name, deny_mutation)
+    monkeypatch.setattr(shutil, "copyfile", deny_mutation)
+    assert (
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        ).usage_message_count
+        == 2
+    )
+    after = transcript.stat()
+    assert (after.st_ino, after.st_mtime_ns, transcript.read_bytes()) == (
+        before.st_ino,
+        before.st_mtime_ns,
+        content,
+    )
+
+
+def test_owned_transcript_rejects_row_and_file_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact parser independently applies row, file and row-count limits."""
+    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, content)
+    monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_ROWS", 1)
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        )
+    monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_ROWS", 500_000)
+    monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_ROW_BYTES", 1)
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        )
+    monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_ROW_BYTES", 4 * 1024 * 1024)
+    monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_BYTES", 1)
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        )
+    assert transcript.read_bytes() == content
+
+
+@pytest.mark.parametrize("role", list(NativeClaudeRole))
+def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
+    role: NativeClaudeRole,
+) -> None:
+    """D161 session persistence is native-only and no native stdout grammar survives."""
+    session_id = "11111111-1111-4111-8111-111111111111"
+    argv = usage_cli._native_claude_argv("claude", role, session_id)  # pyright: ignore[reportPrivateUsage]
+    assert argv == [
+        "claude",
+        "--agent",
+        role.value,
+        "--setting-sources",
+        "project",
+        "-p",
+        "--session-id",
+        session_id,
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--permission-mode",
+        "auto",
+    ]
+    assert "--no-session-persistence" not in argv and "--output-format" not in argv
+    generic = usage_cli._launch_argv(HarnessFamily.CLAUDE, "claude", "model", "high")  # pyright: ignore[reportPrivateUsage]
+    assert "--no-session-persistence" in generic
+
+
+@pytest.mark.parametrize("role", ["repair", "engineer-be ", "Engineer-BE", "engineer_be", "x"])
+def test_native_roles_reject_before_provider_lookup(
+    role: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only byte-exact registered implementation leaves enter native lookup."""
+
+    def no_which(_name: str) -> str:
+        raise AssertionError("provider lookup")
+
+    monkeypatch.setattr(
+        usage_cli.shutil,
+        "which",
+        no_which,
+    )
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args(["run-native-claude", "--role", role])
+
+
+class _NativeInput:
+    """Minimal writable stdin retaining bytes only for provider-free assertions."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        """Initialize a successful or deliberately broken synthetic pipe."""
+        self.value = b""
+        self.closed = False
+        self._fail = fail
+
+    def write(self, value: bytes) -> int:
+        """Retain the bounded prompt or simulate a closed child stdin."""
+        if self._fail:
+            raise BrokenPipeError
+        self.value += value
+        return len(value)
+
+    def flush(self) -> None:
+        """Model a successful pipe flush."""
+
+    def close(self) -> None:
+        """Mark the synthetic stdin as closed."""
+        self.closed = True
+
+
+class _NativeProcess:
+    """Completed provider-free native or version process."""
+
+    def __init__(self, output: bytes = b"", code: int = 0, *, prompt_fail: bool = False) -> None:
+        """Initialize deterministic process output and exit state."""
+        self.stdout = BytesIO(output)
+        self.stdin = _NativeInput(fail=prompt_fail)
+        self._code = code
+
+    def poll(self) -> int:
+        """Return the fixed completed status."""
+        return self._code
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Return the fixed completed status without blocking."""
+        del timeout
+        return self._code
+
+    def terminate(self) -> None:
+        """Reject stopping an already-complete synthetic process."""
+        raise AssertionError("completed process must not terminate")
+
+    def kill(self) -> None:
+        """Reject killing an already-complete synthetic process."""
+        raise AssertionError("completed process must not be killed")
+
+
+_NATIVE_SESSION_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def _native_cli_args(role: str = "engineer-be") -> list[str]:
+    """Return closed native command metadata for provider-free tests."""
+    return [
+        "run-native-claude",
+        "--role",
+        role,
+        "--prompt-file",
+        "prompt",
+        "--task-id",
+        "816",
+        "--slice-id",
+        "native-1",
+        "--parent-task-id",
+        "parent-816",
+        "--repository",
+        "syamaner/roastpilot-agent",
+        "--branch",
+        "feature/816-native-transcript-usage-1",
+        "--base-sha",
+        "4c1ac63",
+    ]
+
+
+def _native_transcript_bytes(session_id: str = _NATIVE_SESSION_ID) -> bytes:
+    """Return the closed parent fixture bound to one generated session."""
+    return (
+        (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl")
+        .read_bytes()
+        .replace(b"11111111-1111-4111-8111-111111111111", session_id.encode())
+    )
+
+
+def _configure_native_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fixed_session: bool = True
+) -> tuple[Path, list[tuple[list[str], dict[str, object]]]]:
+    """Install a private Claude parent location and fixed launcher dependencies."""
+    monkeypatch.chdir(tmp_path)
+    home = tmp_path / "home"
+    project = home / ".claude" / "projects" / usage_transcript._project_name(tmp_path)  # pyright: ignore[reportPrivateUsage]
+    project.mkdir(parents=True)
+
+    def fixed_effort(_role: NativeClaudeRole) -> str:
+        return "high"
+
+    def fixed_executable(_family: HarnessFamily) -> str:
+        return "claude"
+
+    def fixed_attestation(_arguments: argparse.Namespace, *, post_exit: bool) -> str:
+        return "7d60f41" if post_exit else "4c1ac63"
+
+    monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
+    if fixed_session:
+        monkeypatch.setattr(usage_cli, "uuid4", lambda: _NATIVE_SESSION_ID)
+    monkeypatch.setattr(usage_cli, "_native_effort", fixed_effort)
+    monkeypatch.setattr(usage_cli, "_resolved_executable", fixed_executable)
+    monkeypatch.setattr(usage_cli, "_validate_native_worktree", fixed_attestation)
+    monkeypatch.setattr(usage_cli, "_utc_now", lambda: datetime(2026, 1, 1, tzinfo=UTC))
+    Path("prompt").write_bytes(b"SENTINEL_NATIVE_PROMPT")
+    return project, []
+
+
+def _native_popen(
+    project: Path,
+    observed: list[tuple[list[str], dict[str, object]]],
+    processes: list[_NativeProcess],
+    *,
+    code: int = 0,
+    prompt_fail: bool = False,
+    transcript: bytes | None = None,
+) -> Callable[..., _NativeProcess]:
+    """Return a fake version/worker launcher that creates only one parent transcript."""
+
+    def fake(argv: list[str], **kwargs: object) -> _NativeProcess:
+        observed.append((argv, kwargs))
+        if argv[-1] == "--version":
+            process = _NativeProcess(b"Claude Code 2.1.231\\n")
+            processes.append(process)
+            return process
+        if transcript is not None:
+            (project / f"{_NATIVE_SESSION_ID}.jsonl").write_bytes(transcript)
+        process = _NativeProcess(code=code, prompt_fail=prompt_fail)
+        processes.append(process)
+        return process
+
+    return fake
+
+
+def test_native_command_generates_distinct_real_uuid_sessions_per_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each native launch owns a new UUIDv4, preventing transcript/preflight aliasing."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch, fixed_session=False)
+    preflight_sessions: list[str] = []
+    real_preflight = usage_transcript.reject_existing_owned_session
+
+    def spy_preflight(cwd: Path, session_id: str) -> None:
+        preflight_sessions.append(session_id)
+        real_preflight(cwd, session_id)
+
+    def fake(argv: list[str], **kwargs: object) -> _NativeProcess:
+        observed.append((argv, kwargs))
+        if argv[-1] == "--version":
+            return _NativeProcess(b"Claude Code 2.1.231\n")
+        session_id = argv[argv.index("--session-id") + 1]
+        (project / f"{session_id}.jsonl").write_bytes(_native_transcript_bytes(session_id))
+        return _NativeProcess()
+
+    monkeypatch.setattr(usage_cli, "reject_existing_owned_session", spy_preflight)
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake)
+    assert main(_native_cli_args()) == 0
+    assert main(_native_cli_args()) == 0
+
+    worker_sessions = [
+        argv[argv.index("--session-id") + 1] for argv, _ in observed if "--session-id" in argv
+    ]
+    assert len(worker_sessions) == len(preflight_sessions) == 2
+    assert worker_sessions == preflight_sessions and worker_sessions[0] != worker_sessions[1]
+    assert all(UUID(session_id).version == 4 for session_id in worker_sessions)
+    records = [
+        USAGE_RECORD_ADAPTER.validate_json(line)
+        for line in Path(".agent-usage/usage.jsonl").read_text().splitlines()
+    ]
+    assert [
+        record.session_id for record in records if isinstance(record, NativeWorkerUsageRecord)
+    ] == worker_sessions
+
+
+def test_native_command_launches_exact_worker_and_records_immutable_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D161 binds a UUID session, fixed argv and stdin to one immutable parent transcript."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    transcript = _native_transcript_bytes()
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(project, observed, processes, transcript=transcript),
+    )
+
+    assert main(_native_cli_args()) == 0
+
+    assert len(observed) == 2
+    argv, kwargs = observed[1]
+    expected_argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+        "claude", NativeClaudeRole.ENGINEER_BE, _NATIVE_SESSION_ID
+    )
+    assert argv == expected_argv
+    assert kwargs["shell"] is False
+    assert kwargs["stdout"] is subprocess.DEVNULL and kwargs["stderr"] is subprocess.DEVNULL
+    assert kwargs["stdin"] is subprocess.PIPE
+    assert UUID(_NATIVE_SESSION_ID).version == 4
+    assert processes[1].stdin.value == b"SENTINEL_NATIVE_PROMPT" and processes[1].stdin.closed
+    stored = project / f"{_NATIVE_SESSION_ID}.jsonl"
+    before = stored.stat()
+    raw = Path(".agent-usage/usage.jsonl").read_text()
+    record = USAGE_RECORD_ADAPTER.validate_json(raw)
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert record.success and record.usage_complete and record.final_head_sha == "7d60f41"
+    assert (
+        record.session_id == _NATIVE_SESSION_ID
+        and record.native_role is NativeClaudeRole.ENGINEER_BE
+    )
+    assert b"SENTINEL_NATIVE_PROMPT" not in raw.encode()
+    after = stored.stat()
+    assert (after.st_ino, after.st_mtime_ns, stored.read_bytes()) == (
+        before.st_ino,
+        before.st_mtime_ns,
+        transcript,
+    )
+
+
+def test_native_command_records_nonzero_complete_transcript_as_unsuccessful(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed owned transcript retains usage even when its worker exits nonzero."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(project, observed, processes, code=2, transcript=_native_transcript_bytes()),
+    )
+    assert main(_native_cli_args()) == 0
+    record = USAGE_RECORD_ADAPTER.validate_json(Path(".agent-usage/usage.jsonl").read_text())
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert not record.success and record.exit_code == 2 and record.usage_complete
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["version", "prompt", "timeout", "post-dirty", "post-missing", "post-wrong-base", "transcript"],
+)
+def test_native_command_fails_closed_at_transcript_launch_boundaries(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Version, delivery, deadline, final provenance and absent transcript append nothing."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch)
+
+    def attestation(_arguments: argparse.Namespace, *, post_exit: bool) -> str:
+        if post_exit and failure in {"post-dirty", "post-missing", "post-wrong-base"}:
+            raise CaptureUsageError("native worktree attestation failed")
+        return "7d60f41" if post_exit else "4c1ac63"
+
+    def fake(argv: list[str], **kwargs: object) -> _NativeProcess:
+        observed.append((argv, kwargs))
+        if argv[-1] == "--version":
+            version = (
+                b"Claude Code 2.1.999\\n" if failure == "version" else b"Claude Code 2.1.231\\n"
+            )
+            return _NativeProcess(version)
+        if failure != "transcript":
+            (project / f"{_NATIVE_SESSION_ID}.jsonl").write_bytes(_native_transcript_bytes())
+        return _NativeProcess(prompt_fail=failure == "prompt")
+
+    monkeypatch.setattr(usage_cli, "_validate_native_worktree", attestation)
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake)
+    if failure == "timeout":
+        deadline_calls = 0
+
+        def expire_worker(_process: _NativeProcess, _seconds: int, event: threading.Event) -> None:
+            nonlocal deadline_calls
+            deadline_calls += 1
+            if deadline_calls == 2:
+                event.set()
+
+        monkeypatch.setattr(
+            usage_cli,
+            "_start_deadline",
+            expire_worker,
+        )
+    with pytest.raises(SystemExit) as error:
+        main(_native_cli_args())
+    assert "SENTINEL_NATIVE_PROMPT" not in str(error.value)
+    assert not Path(".agent-usage/usage.jsonl").exists()
+    assert len(observed) == (1 if failure == "version" else 2)
+
+
+@pytest.mark.parametrize("sink_kind", ["symlink", "fifo", "hardlink"])
+def test_native_command_refuses_unsafe_sink_after_complete_transcript(
+    sink_kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The transcript path cannot bypass shared final-sink admission."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    sink_parent = Path(".agent-usage")
+    sink_parent.mkdir()
+    sink = sink_parent / "usage.jsonl"
+    target = Path("SENTINEL_UNSAFE_TARGET")
+    if sink_kind == "symlink":
+        target.write_text("unchanged\\n")
+        sink.symlink_to(target)
+    elif sink_kind == "fifo":
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("platform lacks FIFO support")
+        os.mkfifo(sink)
+    else:
+        target.write_text("unchanged\\n")
+        os.link(target, sink)
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(project, observed, processes, transcript=_native_transcript_bytes()),
+    )
+    with pytest.raises(SystemExit) as error:
+        main(_native_cli_args())
+    assert "SENTINEL_UNSAFE_TARGET" not in str(error.value)
+    if sink_kind != "fifo":
+        assert target.read_text() == "unchanged\\n"
+    if sink_kind == "symlink":
+        assert sink.is_symlink()
+    elif sink_kind == "fifo":
+        assert stat.S_ISFIFO(sink.stat().st_mode)
+    else:
+        assert sink.stat().st_nlink == 2
+
+
+def test_native_config_directory_rejects_before_provider_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user Claude configuration directory blocks lookup and worker launch."""
+    _configure_native_launcher(tmp_path, monkeypatch)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "SENTINEL_CONFIG")
+
+    def no_provider(_family: HarnessFamily) -> str:
+        raise AssertionError("provider lookup")
+
+    monkeypatch.setattr(
+        usage_cli,
+        "_resolved_executable",
+        no_provider,
+    )
+    with pytest.raises(SystemExit, match="config directory is not permitted") as error:
+        main(_native_cli_args())
+    assert "SENTINEL_CONFIG" not in str(error.value)
+
+
+def test_native_cli_script_suppresses_bytecode_only_when_executed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Copied CLI execution is bytecode-clean while import leaves interpreter policy unchanged."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    source = Path(usage_cli.__file__)
+    for name in (
+        "capture_usage_cli.py",
+        "capture_usage_models.py",
+        "capture_usage_claude.py",
+        "capture_usage_codex.py",
+        "capture_usage_transcript.py",
+    ):
+        shutil.copy2(source.parent / name, scripts / name)
+    executed = subprocess.run(
+        [sys.executable, str(scripts / "capture_usage_cli.py"), "--help"],
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    assert executed.returncode == 0
+    assert not list(scripts.rglob("__pycache__"))
+    before = sys.dont_write_bytecode
+    spec = importlib.util.spec_from_file_location(
+        "capture_usage_cli_import_probe", scripts / source.name
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert sys.dont_write_bytecode is before
+    monkeypatch.delitem(sys.modules, "capture_usage_cli_import_probe", raising=False)
+
+
+def test_native_precheck_rejects_ignored_bytecode_before_provider_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ignored local bytecode is part of native launch admission, not a harmless exception."""
+    monkeypatch.chdir(tmp_path)
+    Path("prompt").write_bytes(b"safe")
+
+    def fake_git(argv: list[str]) -> tuple[int, str]:
+        if argv == ["remote", "get-url", "origin"]:
+            return 0, "https://github.com/syamaner/roastpilot-agent.git"
+        if argv == ["branch", "--show-current"]:
+            return 0, "feature/816-native-transcript-usage-1"
+        if argv == ["rev-parse", "HEAD"]:
+            return 0, "4c1ac63"
+        if argv == ["rev-parse", "--verify", "4c1ac63^{commit}"]:
+            return 0, "4c1ac63"
+        if argv == ["merge-base", "HEAD", "origin/main"]:
+            return 0, "4c1ac63"
+        if argv == ["status", "--porcelain", "--ignored"]:
+            return 0, "!! .claude/__pycache__/worker.pyc"
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(usage_cli, "_git_output", fake_git)
+
+    def no_provider(_family: HarnessFamily) -> str:
+        raise AssertionError("provider lookup")
+
+    monkeypatch.setattr(
+        usage_cli,
+        "_resolved_executable",
+        no_provider,
+    )
+    with pytest.raises(SystemExit, match="native worktree attestation failed"):
+        main(_native_cli_args())
+
+
+@pytest.mark.parametrize("failure", ["dirty", "missing-commit", "wrong-base"])
+def test_native_post_exit_attestation_rejects_each_final_provenance_break(
+    failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final cleanliness, committed advance and exact merge base independently gate append."""
+    arguments = argparse.Namespace(
+        repository="syamaner/roastpilot-agent",
+        branch="feature/816-native-transcript-usage-1",
+        base_sha="4c1ac63",
+    )
+
+    def fake_git(argv: list[str]) -> tuple[int, str]:
+        if argv == ["remote", "get-url", "origin"]:
+            return 0, "https://github.com/syamaner/roastpilot-agent.git"
+        if argv == ["branch", "--show-current"]:
+            return 0, arguments.branch
+        if argv == ["rev-parse", "HEAD"]:
+            return 0, "4c1ac63" if failure == "missing-commit" else "7d60f41"
+        if argv == ["rev-parse", "--verify", "4c1ac63^{commit}"]:
+            return 0, "4c1ac63"
+        if argv == ["merge-base", "HEAD", "origin/main"]:
+            return 0, "wrong-base" if failure == "wrong-base" else "4c1ac63"
+        if argv == ["status", "--porcelain"]:
+            return 0, " M ignored" if failure == "dirty" else ""
+        if argv[:2] == ["merge-base", "--is-ancestor"]:
+            return 0, ""
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(usage_cli, "_git_output", fake_git)
+    with pytest.raises(CaptureUsageError, match="native worktree attestation failed"):
+        usage_cli._validate_native_worktree(arguments, post_exit=True)  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.fixture(autouse=True)
@@ -3326,942 +4263,6 @@ def test_cli_filesystem_errors_do_not_echo_untrusted_paths(
     assert sentinel not in str(error.value)
     assert sentinel not in captured.err
     assert "input file cannot be safely opened" in str(error.value)
-
-
-def _native_fixture_bytes() -> bytes:
-    """Return the synthetic-conforming native Claude fixture bytes."""
-    return (FIXTURES / "claude-2.1.231-native.jsonl").read_bytes()
-
-
-def _native_events() -> list[dict[str, object]]:
-    """Return independently mutable native fixture event objects."""
-    return [json.loads(line) for line in _native_fixture_bytes().splitlines()]
-
-
-def _native_stream_from(events: list[dict[str, object]]) -> BytesIO:
-    """Encode native fixture event objects as one complete JSONL stream."""
-    return BytesIO(b"".join(json.dumps(event).encode() + b"\n" for event in events))
-
-
-def test_native_claude_fixture_attests_init_model_without_persisting_crosscheck_fields() -> None:
-    """Native parsing retains only internal cross-check state and normalized usage."""
-    usage = parse_claude_stream(
-        BytesIO(_native_fixture_bytes()),
-        require_launch_authority=False,
-        authority_mode=ClaudeAuthorityMode.NATIVE,
-    )
-    assert usage.claude_init_model == "synthetic-native"
-    assert usage.input_tokens == 11
-    dumped = usage.model_dump()
-    assert "claude_init_model" not in dumped
-    assert "claude_model_canonical_names" not in dumped
-    assert usage.claude_model_usage is not None
-    assert "canonical_model" not in usage.claude_model_usage[0].model_dump()
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("tools", []),
-        ("permissionMode", "plan"),
-        ("permissionMode", "default"),
-        ("model", None),
-        ("model", 7),
-        ("model", "invalid model"),
-        ("mcp_servers", None),
-        ("mcp_servers", [{"name": "SENTINEL_MCP"}]),
-    ],
-)
-def test_native_claude_init_authority_rejects_every_unattested_conjunct(
-    field: str, value: object
-) -> None:
-    """The native profile cannot accept measurement or ambiguous init authority."""
-    events = _native_events()
-    events[0][field] = value
-    with pytest.raises(ClaudeAuthorityError) as error:
-        parse_claude_stream(
-            _native_stream_from(events),
-            require_launch_authority=False,
-            authority_mode=ClaudeAuthorityMode.NATIVE,
-        )
-    _assert_no_exception_chain_or_sentinel(error.value, "SENTINEL_MCP")
-
-
-def test_native_claude_rejects_missing_duplicate_late_init_and_model_contradiction() -> None:
-    """Exactly one pre-activity init and a terminal-matching model are required."""
-    events = _native_events()
-    variants = (
-        events[1:],
-        [events[0], events[0], *events[1:]],
-        [events[1], events[0], events[2]],
-    )
-    for variant in variants:
-        with pytest.raises(ClaudeAuthorityError):
-            parse_claude_stream(
-                _native_stream_from(variant),
-                require_launch_authority=False,
-                authority_mode=ClaudeAuthorityMode.NATIVE,
-            )
-    events[0]["model"] = "contradictory-model"
-    with pytest.raises(ClaudeAuthorityError):
-        parse_claude_stream(
-            _native_stream_from(events),
-            require_launch_authority=False,
-            authority_mode=ClaudeAuthorityMode.NATIVE,
-        )
-
-    events = _native_events()
-    model_usage = cast(dict[str, dict[str, object]], events[-1]["modelUsage"])
-    model_usage["synthetic-native"]["canonicalModel"] = 7
-    with pytest.raises(ClaudeUsageParseError):
-        parse_claude_stream(
-            _native_stream_from(events),
-            require_launch_authority=False,
-            authority_mode=ClaudeAuthorityMode.NATIVE,
-        )
-
-
-def test_native_and_measurement_authority_modes_remain_distinct() -> None:
-    """Neither authority profile can silently stand in for the other."""
-    with pytest.raises(ClaudeAuthorityError):
-        parse_claude_stream(
-            BytesIO(_native_fixture_bytes()),
-            require_launch_authority=True,
-        )
-    with pytest.raises(ClaudeAuthorityError):
-        parse_claude_stream(
-            BytesIO((FIXTURES / "claude-2.1.231.jsonl").read_bytes()),
-            require_launch_authority=False,
-            authority_mode=ClaudeAuthorityMode.NATIVE,
-        )
-
-    measurement_events = [
-        json.loads(line) for line in (FIXTURES / "claude-2.1.231.jsonl").read_bytes().splitlines()
-    ]
-    measurement_usage = cast(dict[str, dict[str, object]], measurement_events[-1]["modelUsage"])
-    measurement_usage[next(iter(measurement_usage))]["canonicalModel"] = 7
-    assert (
-        parse_claude_stream(
-            _native_stream_from(measurement_events), require_launch_authority=False
-        ).output_tokens
-        == 7
-    )
-
-
-def _padded_native_event(event_type: str, size: int, subtype: str | None = None) -> bytes:
-    """Build one structurally valid synthetic event with an exact byte size."""
-    fields = f'{{"type":"{event_type}"'
-    if subtype is not None:
-        fields += f',"subtype":"{subtype}"'
-    prefix = (fields + ',"payload":"').encode()
-    suffix = b'"}\n'
-    assert size >= len(prefix) + len(suffix)
-    return prefix + (b"x" * (size - len(prefix) - len(suffix))) + suffix
-
-
-@pytest.mark.parametrize(
-    "opaque_event",
-    [
-        _padded_native_event("assistant", MAX_EVENT_BYTES + 1),
-        _padded_native_event("system", MAX_EVENT_BYTES + 1, "hook_started"),
-        _padded_native_event("system", MAX_EVENT_BYTES + 1, "hook_response"),
-    ],
-)
-def test_native_claude_streams_and_discards_oversized_opaque_events(
-    opaque_event: bytes,
-) -> None:
-    """Large opaque activity is structurally consumed without entering normalized output."""
-    lines = _native_fixture_bytes().splitlines(keepends=True)
-    usage = parse_claude_stream(
-        BytesIO(lines[0] + opaque_event + lines[-1]),
-        require_launch_authority=False,
-        authority_mode=ClaudeAuthorityMode.NATIVE,
-    )
-    assert usage.output_tokens == 19
-    assert "payload" not in usage.model_dump_json()
-
-
-@pytest.mark.parametrize(
-    "retained_event",
-    [
-        _padded_native_event("result", MAX_EVENT_BYTES + 1),
-        _padded_native_event("system", MAX_EVENT_BYTES + 1, "init"),
-        b'{"type":"system","subtype":"hook_started","subtype":"hook_response","payload":"'
-        + (b"x" * MAX_EVENT_BYTES)
-        + b'"}\n',
-        b'{"type":"system","subtype":7,"payload":"' + (b"x" * MAX_EVENT_BYTES) + b'"}\n',
-    ],
-)
-def test_native_claude_retained_events_keep_the_64kib_limit(retained_event: bytes) -> None:
-    """Oversized retained authority and ambiguous system grammar fail closed."""
-    with pytest.raises(ClaudeUsageParseError):
-        parse_claude_stream(
-            BytesIO(retained_event),
-            require_launch_authority=False,
-            authority_mode=ClaudeAuthorityMode.NATIVE,
-        )
-
-
-def test_native_claude_opaque_bound_count_and_total_limits_fail_closed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Every native ingestion limit is independently enforced with fixed errors."""
-    with pytest.raises(ClaudeUsageParseError, match="event exceeds size limit"):
-        parse_claude_stream(
-            BytesIO(_padded_native_event("assistant", NATIVE_MAX_OPAQUE_EVENT_BYTES + 1)),
-            require_launch_authority=False,
-            authority_mode=ClaudeAuthorityMode.NATIVE,
-        )
-
-    monkeypatch.setattr(usage_claude, "NATIVE_MAX_EVENT_COUNT", 2)
-    with pytest.raises(ClaudeUsageParseError, match="event count limit"):
-        parse_claude_stream(
-            BytesIO(_native_fixture_bytes()),
-            require_launch_authority=False,
-            authority_mode=ClaudeAuthorityMode.NATIVE,
-        )
-
-    monkeypatch.setattr(usage_claude, "NATIVE_MAX_EVENT_COUNT", 500_000)
-    monkeypatch.setattr(usage_claude, "NATIVE_MAX_STREAM_BYTES", 100)
-    with pytest.raises(ClaudeUsageParseError, match="total byte limit"):
-        parse_claude_stream(
-            BytesIO(_native_fixture_bytes()),
-            require_launch_authority=False,
-            authority_mode=ClaudeAuthorityMode.NATIVE,
-        )
-
-
-@pytest.mark.parametrize(
-    "stream",
-    [
-        b'{"type":"assistant"}\n{broken}\n',
-        b'{"type":"assistant"}',
-        b'{"type":"assistant","payload":"split\xc3',
-        b'{"type":"unknown"}\n',
-        b"\n",
-    ],
-)
-def test_native_claude_malformed_partial_and_blank_events_fail_closed(stream: bytes) -> None:
-    """Native structural and retained parsing errors never become opaque activity."""
-    with pytest.raises(ClaudeUsageParseError):
-        parse_claude_stream(
-            BytesIO(stream),
-            require_launch_authority=False,
-            authority_mode=ClaudeAuthorityMode.NATIVE,
-        )
-
-
-def test_native_claude_rejects_a_stream_that_breaks_the_bounded_read_contract() -> None:
-    """A nonconforming stream cannot force an over-limit read allocation downstream."""
-
-    class OversizedRead:
-        def read(self, size: int, /) -> bytes:
-            return b"x" * (size + 1)
-
-    with pytest.raises(ClaudeUsageParseError, match="read exceeds size limit"):
-        parse_claude_stream(
-            cast(BinaryIO, OversizedRead()),
-            require_launch_authority=False,
-            authority_mode=ClaudeAuthorityMode.NATIVE,
-        )
-
-
-def test_oversized_system_hook_before_init_invalidates_later_authority() -> None:
-    """Discarded pre-init hook activity prevents a later init from attesting launch order."""
-    lines = _native_fixture_bytes().splitlines(keepends=True)
-    hook = _padded_native_event("system", MAX_EVENT_BYTES + 1, "hook_started")
-    with pytest.raises(ClaudeAuthorityError):
-        parse_claude_stream(
-            BytesIO(hook + lines[0] + lines[-1]),
-            require_launch_authority=False,
-            authority_mode=ClaudeAuthorityMode.NATIVE,
-        )
-
-
-def _native_record(**updates: object) -> NativeWorkerUsageRecord:
-    """Build one valid closed native usage record for model-boundary tests."""
-    values: dict[str, object] = {
-        "captured_at": datetime(2026, 8, 14, tzinfo=UTC),
-        "task_id": "816",
-        "slice_id": "native-1",
-        "native_role": NativeClaudeRole.ENGINEER_BE,
-        "model": "synthetic-native",
-        "effort": "high",
-        "repository": "syamaner/roastpilot-agent",
-        "branch": "feature/816-native-worker-usage-1",
-        "base_sha": "4c1ac63",
-        "final_head_sha": "7d60f41",
-        "parent_task_id": "parent-816",
-        "started_at": datetime(2026, 8, 14, tzinfo=UTC),
-        "completed_at": datetime(2026, 8, 14, tzinfo=UTC),
-        "elapsed_ms": 1,
-        "exit_code": 0,
-        "success": True,
-        "harness_version": "2.1.231",
-        "input_tokens": 1,
-        "cached_input_tokens": 2,
-        "cache_creation_input_tokens": 3,
-        "output_tokens": 4,
-        "claude_model_usage": (),
-    }
-    values.update(updates)
-    return NativeWorkerUsageRecord.model_validate(values)
-
-
-def test_native_record_requires_parent_and_permanently_denies_whole_tree_claim() -> None:
-    """Native persisted grammar cannot omit parentage or claim unproven coverage."""
-    with pytest.raises(ValidationError):
-        _native_record(parent_task_id=None)
-    with pytest.raises(ValidationError):
-        _native_record(whole_tree_verified=True)
-    payload = json.loads(_native_record().model_dump_json())
-    payload["reasoning_output_tokens"] = 1
-    with pytest.raises(ValidationError):
-        USAGE_RECORD_ADAPTER.validate_python(payload)
-    with pytest.raises(ValidationError):
-        _native_record(success=False)
-    with pytest.raises(ValidationError):
-        _native_record(estimated_usd=1.0, estimate_basis=EstimateBasis.NOT_EXPOSED)
-    with pytest.raises(ValidationError):
-        _native_record(estimated_usd=None, estimate_basis=EstimateBasis.CLIENT_SIDE_ESTIMATE)
-
-
-def test_native_record_builder_rejects_incomplete_parser_state() -> None:
-    """No direct builder path can turn absent terminal totals into a native record."""
-    arguments = argparse.Namespace(
-        task_id="816",
-        slice_id="native-1",
-        repository="syamaner/roastpilot-agent",
-        branch="feature/816-native-worker-usage-1",
-        base_sha="4c1ac63",
-        parent_task_id="parent-816",
-        started_at=datetime(2026, 8, 14, tzinfo=UTC),
-    )
-    with pytest.raises(CaptureUsageError, match="usage is incomplete"):
-        usage_cli._native_record_from_usage(  # pyright: ignore[reportPrivateUsage]
-            arguments,
-            NativeClaudeRole.ENGINEER_BE,
-            "high",
-            "2.1.231",
-            "7d60f41",
-            1,
-            ParsedUsage(),
-            datetime(2026, 8, 14, tzinfo=UTC),
-            1,
-        )
-
-
-class _NativeInput:
-    """Minimal writable stdin retaining bytes only for provider-free assertions."""
-
-    def __init__(self, *, fail: bool = False) -> None:
-        self.value = b""
-        self.closed = False
-        self.fail = fail
-
-    def write(self, value: bytes) -> int:
-        """Retain or reject the supplied test bytes."""
-        if self.fail:
-            raise BrokenPipeError
-        self.value += value
-        return len(value)
-
-    def flush(self) -> None:
-        """Model a successful flush."""
-
-    def close(self) -> None:
-        """Mark the synthetic pipe closed."""
-        self.closed = True
-
-
-class _NativeProcess:
-    """Completed provider-free Claude or version process."""
-
-    def __init__(self, output: bytes, code: int = 0, *, writer_fail: bool = False) -> None:
-        self.stdout = BytesIO(output)
-        self.stdin = _NativeInput(fail=writer_fail)
-        self.code = code
-
-    def poll(self) -> int:
-        """Return the fixed completion status."""
-        return self.code
-
-    def wait(self, timeout: float | None = None) -> int:
-        """Return the fixed completion status without blocking."""
-        del timeout
-        return self.code
-
-    def terminate(self) -> None:
-        """Reject termination of an already-completed stub."""
-        raise AssertionError("completed process must not terminate")
-
-    def kill(self) -> None:
-        """Reject killing an already-completed stub."""
-        raise AssertionError("completed process must not be killed")
-
-
-def _native_cli_args(role: str = "engineer-be") -> list[str]:
-    """Return the closed native command arguments used by provider-free tests."""
-    return [
-        "run-native-claude",
-        "--role",
-        role,
-        "--prompt-file",
-        "prompt",
-        "--task-id",
-        "816",
-        "--slice-id",
-        "native-1",
-        "--parent-task-id",
-        "parent-816",
-        "--repository",
-        "syamaner/roastpilot-agent",
-        "--branch",
-        "feature/816-native-worker-usage-1",
-        "--base-sha",
-        "4c1ac63",
-    ]
-
-
-def _native_stub_which(_name: str) -> str:
-    """Resolve the provider-free native harness stub."""
-    return "/stub/claude"
-
-
-def _native_stub_resolved(_family: HarnessFamily) -> str:
-    """Resolve the provider-free native harness after its family is selected."""
-    return "/stub/claude"
-
-
-def _native_stub_version(_executable: str) -> str:
-    """Return the one version admitted by the native launcher."""
-    return "2.1.231"
-
-
-def _native_stub_effort(_role: NativeClaudeRole) -> str:
-    """Return the committed fixture effort for launcher-only tests."""
-    return "high"
-
-
-def _native_stub_attestation(_arguments: argparse.Namespace, *, post_exit: bool) -> str:
-    """Return deterministic pre/post commit provenance for launcher-only tests."""
-    return "7d60f41" if post_exit else "4c1ac63"
-
-
-@pytest.mark.parametrize("role", ["engineer-be", "engineer-fe"])
-def test_native_command_owns_exact_named_agent_launch_and_persists_metadata_only(
-    role: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The one-process launcher binds exact argv, stdin, final head, and closed usage."""
-    monkeypatch.chdir(tmp_path)
-    sentinel = b"SENTINEL_NATIVE_PROMPT"
-    Path("prompt").write_bytes(sentinel)
-    observed: dict[str, object] = {}
-
-    def fake_popen(argv: list[str], **kwargs: object) -> _NativeProcess:
-        if argv[-1] == "--version":
-            return _NativeProcess(b"Claude Code 2.1.231\n")
-        observed["argv"] = argv
-        observed["kwargs"] = kwargs
-        process = _NativeProcess(_native_fixture_bytes())
-        observed["process"] = process
-        return process
-
-    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(usage_cli.shutil, "which", _native_stub_which)
-    monkeypatch.setattr(usage_cli, "_native_effort", _native_stub_effort)
-    monkeypatch.setattr(usage_cli, "_validate_native_worktree", _native_stub_attestation)
-    assert main(_native_cli_args(role)) == 0
-    assert observed["argv"] == [
-        "/stub/claude",
-        "--agent",
-        role,
-        "--setting-sources",
-        "project",
-        "-p",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--no-session-persistence",
-        "--strict-mcp-config",
-        "--mcp-config",
-        '{"mcpServers":{}}',
-        "--permission-mode",
-        "auto",
-    ]
-    assert observed["kwargs"]["shell"] is False  # type: ignore[index]
-    process = cast(_NativeProcess, observed["process"])
-    assert process.stdin.value == sentinel and process.stdin.closed
-    raw = Path(".agent-usage/usage.jsonl").read_text()
-    assert sentinel.decode() not in raw and str(tmp_path) not in raw
-    record = USAGE_RECORD_ADAPTER.validate_json(raw)
-    assert isinstance(record, NativeWorkerUsageRecord)
-    assert record.native_role.value == role
-    assert record.model == "synthetic-native"
-    assert record.final_head_sha == "7d60f41"
-    assert record.parent_task_id == "parent-816"
-    assert not record.whole_tree_verified
-
-
-@pytest.mark.parametrize(
-    "role",
-    ["repair", "Engineer-BE", "engineer_be", "engineer-be ", "engineer-be\n", "codex", ""],
-)
-def test_native_command_rejects_every_nonexact_or_unregistered_role(role: str) -> None:
-    """The CLI grammar admits only the two byte-exact registered Claude roles."""
-    with pytest.raises(SystemExit):
-        main(_native_cli_args(role))
-
-
-def test_native_command_exposes_no_detached_or_caller_attribution_overrides() -> None:
-    """Native capture has no harness, model, effort, head, or whole-tree override."""
-    parser = usage_cli.build_parser()
-    for option in ("--harness", "--model", "--effort", "--head-sha", "--whole-tree-verified"):
-        with pytest.raises(SystemExit):
-            parser.parse_args([*_native_cli_args(), option, "sentinel"])
-
-
-def test_native_command_rejects_invalid_required_metadata_before_provider_lookup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The native model rejects malformed parentage before worktree or provider access."""
-    monkeypatch.chdir(tmp_path)
-    Path("prompt").write_bytes(b"safe")
-    args = _native_cli_args()
-    args[args.index("parent-816")] = "invalid parent"
-
-    def forbidden_provider_lookup(_name: str) -> str:
-        raise AssertionError("provider lookup is forbidden")
-
-    monkeypatch.setattr(usage_cli.shutil, "which", forbidden_provider_lookup)
-    with pytest.raises(SystemExit, match="native capture metadata is invalid"):
-        main(args)
-
-
-def test_native_command_rechecks_worktree_after_version_before_worker_launch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A change after version probing blocks the write-capable worker launch and record."""
-    monkeypatch.chdir(tmp_path)
-    Path("prompt").write_bytes(b"safe")
-    stages: list[str] = []
-    version_probed = False
-
-    def fake_attestation(_arguments: argparse.Namespace, *, post_exit: bool) -> str:
-        assert not post_exit
-        stages.append("after-version" if version_probed else "initial")
-        if version_probed:
-            raise CaptureUsageError("native worktree attestation failed")
-        return "4c1ac63"
-
-    def fake_popen(argv: list[str], **_: object) -> _NativeProcess:
-        nonlocal version_probed
-        if argv[-1] != "--version":
-            raise AssertionError("native worker launch must be blocked")
-        version_probed = True
-        return _NativeProcess(b"Claude 2.1.231\n")
-
-    monkeypatch.setattr(usage_cli.shutil, "which", _native_stub_which)
-    monkeypatch.setattr(usage_cli, "_native_effort", _native_stub_effort)
-    monkeypatch.setattr(usage_cli, "_validate_native_worktree", fake_attestation)
-    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
-    with pytest.raises(SystemExit) as error:
-        main(_native_cli_args())
-
-    assert str(error.value) == "capture-agent-usage: native worktree attestation failed"
-    assert stages == ["initial", "after-version"]
-    assert not (tmp_path / ".agent-usage").exists()
-
-
-@pytest.mark.parametrize("sink_kind", ["symlink", "fifo", "hard-link"])
-def test_native_command_refuses_unsafe_final_sink_without_modification(
-    sink_kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Native-worker records use the shared secure final-sink admission boundary."""
-    monkeypatch.chdir(tmp_path)
-    Path("prompt").write_bytes(b"safe")
-    sink_parent = Path(".agent-usage")
-    sink_parent.mkdir()
-    sink = sink_parent / "usage.jsonl"
-    sentinel = "SENTINEL_UNSAFE_SINK"
-    expected_error = "could not securely open usage sink"
-    target: Path | None = None
-
-    if sink_kind == "symlink":
-        if not hasattr(Path, "symlink_to"):
-            pytest.skip("platform lacks symlink support")
-        target = Path(f"{sentinel}-target")
-        target.write_text("unchanged\n")
-        sink.symlink_to(target)
-    elif sink_kind == "fifo":
-        if not hasattr(os, "mkfifo"):
-            pytest.skip("platform lacks FIFO support")
-        os.mkfifo(sink)
-    else:
-        if not hasattr(os, "link"):
-            pytest.skip("platform lacks hard-link support")
-        sink.write_text("unchanged\n")
-        os.link(sink, sink_parent / "linked.jsonl")
-        expected_error = "could not append usage record"
-
-    def fake_popen(_argv: list[str], **_: object) -> _NativeProcess:
-        return _NativeProcess(_native_fixture_bytes())
-
-    monkeypatch.setattr(usage_cli, "_resolved_executable", _native_stub_resolved)
-    monkeypatch.setattr(usage_cli, "_harness_version", _native_stub_version)
-    monkeypatch.setattr(usage_cli, "_native_effort", _native_stub_effort)
-    monkeypatch.setattr(usage_cli, "_validate_native_worktree", _native_stub_attestation)
-    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
-    with pytest.raises(SystemExit) as error:
-        main(_native_cli_args())
-
-    assert str(error.value) == f"capture-agent-usage: {expected_error}"
-    assert sentinel not in str(error.value)
-    if sink_kind == "fifo":
-        assert stat.S_ISFIFO(sink.stat().st_mode)
-    elif sink_kind == "hard-link":
-        assert sink.read_text() == "unchanged\n"
-        assert (sink_parent / "linked.jsonl").read_text() == "unchanged\n"
-    else:
-        assert target is not None and target.read_text() == "unchanged\n"
-        assert sink.is_symlink()
-
-
-@pytest.mark.parametrize(
-    ("output", "code", "expected"),
-    [
-        (b'{"type":"assistant"}\n', 1, "no terminal usage"),
-        (_native_fixture_bytes(), 1, "terminal status disagrees"),
-        (
-            (FIXTURES / "claude-2.1.231.jsonl").read_bytes(),
-            0,
-            "launch authority is not attested",
-        ),
-        (b'{"type":"unknown"}\n', 1, "usage stream is invalid"),
-    ],
-)
-def test_native_command_writes_nothing_for_incomplete_or_contradictory_usage(
-    output: bytes,
-    code: int,
-    expected: str,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Native capture never ports the measurement path's incomplete-record behavior."""
-    monkeypatch.chdir(tmp_path)
-    Path("prompt").write_bytes(b"safe")
-    monkeypatch.setattr(usage_cli.shutil, "which", _native_stub_which)
-    monkeypatch.setattr(usage_cli, "_native_effort", _native_stub_effort)
-    monkeypatch.setattr(usage_cli, "_validate_native_worktree", _native_stub_attestation)
-
-    def fake_popen(argv: list[str], **_: object) -> _NativeProcess:
-        return (
-            _NativeProcess(b"Claude 2.1.231\n")
-            if argv[-1] == "--version"
-            else _NativeProcess(output, code)
-        )
-
-    monkeypatch.setattr(
-        usage_cli.subprocess,
-        "Popen",
-        fake_popen,
-    )
-    with pytest.raises(SystemExit, match=expected):
-        main(_native_cli_args())
-    assert not Path(".agent-usage/usage.jsonl").exists()
-
-
-def test_native_failed_worker_with_complete_terminal_usage_records_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A nonzero native worker is measurable only with a matching complete terminal."""
-    monkeypatch.chdir(tmp_path)
-    Path("prompt").write_bytes(b"safe")
-    events = _native_events()
-    events[-1]["subtype"] = "error_max_turns"
-    events[-1]["is_error"] = True
-    output = _native_stream_from(events).read()
-    monkeypatch.setattr(usage_cli.shutil, "which", _native_stub_which)
-    monkeypatch.setattr(usage_cli, "_native_effort", _native_stub_effort)
-    monkeypatch.setattr(usage_cli, "_validate_native_worktree", _native_stub_attestation)
-
-    def fake_popen(argv: list[str], **_: object) -> _NativeProcess:
-        return (
-            _NativeProcess(b"Claude 2.1.231\n")
-            if argv[-1] == "--version"
-            else _NativeProcess(output, 2)
-        )
-
-    monkeypatch.setattr(
-        usage_cli.subprocess,
-        "Popen",
-        fake_popen,
-    )
-    assert main(_native_cli_args()) == 0
-    record = USAGE_RECORD_ADAPTER.validate_json(Path(".agent-usage/usage.jsonl").read_text())
-    assert isinstance(record, NativeWorkerUsageRecord)
-    assert not record.success and record.exit_code == 2 and record.usage_complete
-
-
-@pytest.mark.parametrize("failure", ["version", "prompt", "post-attestation", "popen"])
-def test_native_command_prevents_records_on_launch_boundary_failures(
-    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Version drift, prompt failure, and post-run provenance each fail before append."""
-    monkeypatch.chdir(tmp_path)
-    Path("prompt").write_bytes(b"safe")
-    launches = 0
-
-    def fake_popen(argv: list[str], **_: object) -> _NativeProcess:
-        nonlocal launches
-        if argv[-1] == "--version":
-            version = b"Claude 2.1.999\n" if failure == "version" else b"Claude 2.1.231\n"
-            return _NativeProcess(version)
-        launches += 1
-        if failure == "popen":
-            raise OSError("SENTINEL_PROVIDER_PATH")
-        return _NativeProcess(_native_fixture_bytes(), writer_fail=failure == "prompt")
-
-    def fake_attestation(_arguments: argparse.Namespace, *, post_exit: bool) -> str:
-        if post_exit and failure == "post-attestation":
-            raise CaptureUsageError("native worktree attestation failed")
-        return "7d60f41" if post_exit else "4c1ac63"
-
-    monkeypatch.setattr(usage_cli.shutil, "which", _native_stub_which)
-    monkeypatch.setattr(usage_cli, "_native_effort", _native_stub_effort)
-    monkeypatch.setattr(usage_cli, "_validate_native_worktree", fake_attestation)
-    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
-    with pytest.raises(SystemExit) as error:
-        main(_native_cli_args())
-    assert "SENTINEL_PROVIDER_PATH" not in str(error.value)
-    assert _exception_chain(error.value) == ()
-    assert launches == (0 if failure == "version" else 1)
-    assert not Path(".agent-usage/usage.jsonl").exists()
-
-
-@pytest.mark.parametrize(
-    "output",
-    [
-        b'{"type":"assistant"}\n',
-        b'{"type":"unknown"}\n',
-        _native_fixture_bytes(),
-    ],
-)
-def test_native_command_fails_closed_for_deadline_state_at_each_parse_boundary(
-    output: bytes, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Shared deadline state blocks missing, malformed, and complete native streams."""
-    monkeypatch.chdir(tmp_path)
-    Path("prompt").write_bytes(b"safe")
-    process = _NativeProcess(output)
-
-    def expired_deadline(
-        _process: subprocess.Popen[bytes], _seconds: int, timed_out: threading.Event
-    ) -> None:
-        timed_out.set()
-
-    def fake_popen(_argv: list[str], **_kwargs: object) -> _NativeProcess:
-        return process
-
-    monkeypatch.setattr(usage_cli, "_resolved_executable", _native_stub_resolved)
-    monkeypatch.setattr(usage_cli, "_harness_version", _native_stub_version)
-    monkeypatch.setattr(usage_cli, "_native_effort", _native_stub_effort)
-    monkeypatch.setattr(usage_cli, "_validate_native_worktree", _native_stub_attestation)
-    monkeypatch.setattr(usage_cli, "_start_deadline", expired_deadline)
-    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
-    with pytest.raises(SystemExit, match="native Claude run timed out"):
-        main(_native_cli_args())
-    assert not Path(".agent-usage/usage.jsonl").exists()
-
-
-def test_native_command_severs_prompt_and_wait_transport_failures(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Native stdout and wait transport errors remain fixed, content-free failures."""
-    monkeypatch.chdir(tmp_path)
-    Path("prompt").write_bytes(b"safe")
-    monkeypatch.setattr(usage_cli, "_resolved_executable", _native_stub_resolved)
-    monkeypatch.setattr(usage_cli, "_harness_version", _native_stub_version)
-    monkeypatch.setattr(usage_cli, "_native_effort", _native_stub_effort)
-    monkeypatch.setattr(usage_cli, "_validate_native_worktree", _native_stub_attestation)
-
-    class BrokenOutput:
-        def read(self, _size: int, /) -> bytes:
-            raise OSError("SENTINEL_STDOUT")
-
-        def close(self) -> None:
-            return None
-
-    broken_output = _NativeProcess(b"", writer_fail=True)
-    broken_output.stdout = cast(BytesIO, BrokenOutput())
-
-    def broken_popen(_argv: list[str], **_kwargs: object) -> _NativeProcess:
-        return broken_output
-
-    monkeypatch.setattr(usage_cli.subprocess, "Popen", broken_popen)
-    with pytest.raises(SystemExit, match="prompt delivery failed") as output_error:
-        main(_native_cli_args())
-    _assert_no_exception_chain_or_sentinel(output_error.value, "SENTINEL_STDOUT")
-
-    class WaitTimeout(_NativeProcess):
-        def wait(self, timeout: float | None = None) -> int:
-            raise subprocess.TimeoutExpired("SENTINEL_WAIT", timeout or 0)
-
-    wait_timeout = WaitTimeout(_native_fixture_bytes())
-
-    def timeout_popen(_argv: list[str], **_kwargs: object) -> _NativeProcess:
-        return wait_timeout
-
-    monkeypatch.setattr(usage_cli.subprocess, "Popen", timeout_popen)
-    with pytest.raises(SystemExit, match="native Claude run timed out") as wait_error:
-        main(_native_cli_args())
-    _assert_no_exception_chain_or_sentinel(wait_error.value, "SENTINEL_WAIT")
-    assert not Path(".agent-usage/usage.jsonl").exists()
-
-
-def test_native_invalid_utf8_error_retains_no_provider_bytes_or_exception_chain() -> None:
-    """Incremental native decoding severs raw provider bytes before surfacing failure."""
-    sentinel = "NATIVE_UTF8_SENTINEL"
-    stream = BytesIO(b'{"type":"assistant","payload":"NATIVE_UTF8_SENTINEL\xff"}\n')
-    with pytest.raises(ClaudeUsageParseError) as error:
-        parse_claude_stream(
-            stream,
-            require_launch_authority=False,
-            authority_mode=ClaudeAuthorityMode.NATIVE,
-        )
-    _assert_no_exception_chain_or_sentinel(error.value, sentinel)
-
-
-def test_native_effort_reads_regular_committed_frontmatter_without_error_chains(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Effort uses no-follow bounded bytes and content-free fixed failures."""
-    monkeypatch.chdir(tmp_path)
-    agent_dir = Path(".claude/agents")
-    agent_dir.mkdir(parents=True)
-    path = agent_dir / "engineer-be.md"
-    path.write_text("---\nmodel: synthetic\neffort: high\n---\nbody\n")
-    assert usage_cli._native_effort(NativeClaudeRole.ENGINEER_BE) == "high"  # pyright: ignore[reportPrivateUsage]
-    path.unlink()
-    secret = tmp_path / "SENTINEL_FRONTMATTER_TARGET"
-    secret.write_text("---\neffort: high\n---\n")
-    path.symlink_to(secret)
-    with pytest.raises(CaptureUsageError) as error:
-        usage_cli._native_effort(NativeClaudeRole.ENGINEER_BE)  # pyright: ignore[reportPrivateUsage]
-    _assert_no_exception_chain_or_sentinel(error.value, "SENTINEL_FRONTMATTER_TARGET")
-
-
-@pytest.mark.parametrize(
-    "content",
-    [
-        "body only\n",
-        "---\neffort: high\nbody\n",
-        "---\n---\n",
-        "---\neffort: high\neffort: medium\n---\n",
-        "---\neffort: impossible\n---\n",
-    ],
-)
-def test_native_effort_rejects_ambiguous_or_unsupported_frontmatter(
-    content: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Effort never defaults when committed frontmatter is missing or ambiguous."""
-    monkeypatch.chdir(tmp_path)
-    path = Path(".claude/agents/engineer-be.md")
-    path.parent.mkdir(parents=True)
-    path.write_text(content)
-    with pytest.raises(CaptureUsageError, match="frontmatter is invalid"):
-        usage_cli._native_effort(NativeClaudeRole.ENGINEER_BE)  # pyright: ignore[reportPrivateUsage]
-
-
-def test_native_worktree_attestation_uses_ignored_precheck_and_final_commit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Pre/post provenance uses distinct cleanliness and descendant requirements."""
-    arguments = argparse.Namespace(
-        repository="syamaner/roastpilot-agent",
-        branch="feature/816-native-worker-usage-1",
-        base_sha="4c1ac63",
-    )
-    calls: list[tuple[str, ...]] = []
-
-    def fake_git(argv: list[str]) -> tuple[int, str]:
-        calls.append(tuple(argv))
-        key = tuple(argv)
-        if key == ("remote", "get-url", "origin"):
-            return 0, "https://github.com/syamaner/roastpilot-agent.git"
-        if key == ("branch", "--show-current"):
-            return 0, arguments.branch
-        if key == ("rev-parse", "--verify", "4c1ac63^{commit}"):
-            return 0, "4c1ac63"
-        if key == ("merge-base", "HEAD", "origin/main"):
-            return 0, "4c1ac63"
-        if key in {("status", "--porcelain", "--ignored"), ("status", "--porcelain")}:
-            return 0, ""
-        if key == ("merge-base", "--is-ancestor", "4c1ac63", "7d60f41"):
-            return 0, ""
-        if key == ("rev-parse", "HEAD"):
-            post = ("status", "--porcelain", "--ignored") in calls
-            return 0, "7d60f41" if post else "4c1ac63"
-        raise AssertionError(key)
-
-    monkeypatch.setattr(usage_cli, "_git_output", fake_git)
-    assert usage_cli._validate_native_worktree(arguments, post_exit=False) == "4c1ac63"  # pyright: ignore[reportPrivateUsage]
-    assert usage_cli._validate_native_worktree(arguments, post_exit=True) == "7d60f41"  # pyright: ignore[reportPrivateUsage]
-    assert ("status", "--porcelain", "--ignored") in calls
-    assert ("status", "--porcelain") in calls
-
-
-@pytest.mark.parametrize(
-    ("mode", "post_exit"),
-    [
-        ("origin", False),
-        ("branch", False),
-        ("dirty", False),
-        ("pre-head", False),
-        ("merge-base", False),
-        ("merge-base", True),
-        ("ancestry", True),
-        ("missing-commit", True),
-    ],
-)
-def test_native_worktree_attestation_rejects_each_provenance_break(
-    mode: str, post_exit: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Repository, branch, clean state, base binding, and committed advance are load-bearing."""
-    arguments = argparse.Namespace(
-        repository="syamaner/roastpilot-agent",
-        branch="feature/816-native-worker-usage-1",
-        base_sha="4c1ac63",
-    )
-
-    def fake_git(argv: list[str]) -> tuple[int, str]:
-        key = tuple(argv)
-        if key == ("remote", "get-url", "origin"):
-            return (
-                0,
-                "https://example.invalid/repository.git"
-                if mode == "origin"
-                else "https://github.com/syamaner/roastpilot-agent.git",
-            )
-        if key == ("branch", "--show-current"):
-            return 0, "wrong-branch" if mode == "branch" else arguments.branch
-        if key == ("rev-parse", "HEAD"):
-            if not post_exit:
-                return 0, "7d60f41" if mode == "pre-head" else "4c1ac63"
-            return 0, "4c1ac63" if mode == "missing-commit" else "7d60f41"
-        if key == ("rev-parse", "--verify", "4c1ac63^{commit}"):
-            return 0, "4c1ac63"
-        if key == ("merge-base", "HEAD", "origin/main"):
-            return 0, "wrong-base" if mode == "merge-base" else "4c1ac63"
-        if key[0] == "status":
-            return 0, "?? ignored-secret" if mode == "dirty" else ""
-        if key[0:2] == ("merge-base", "--is-ancestor"):
-            return (1 if mode == "ancestry" else 0), ""
-        raise AssertionError(key)
-
-    monkeypatch.setattr(usage_cli, "_git_output", fake_git)
-    with pytest.raises(CaptureUsageError):
-        usage_cli._validate_native_worktree(arguments, post_exit=post_exit)  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.parametrize(
