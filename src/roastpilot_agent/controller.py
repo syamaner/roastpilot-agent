@@ -59,6 +59,7 @@ from roastpilot_agent.models import (
 from roastpilot_agent.post_fc_control import (
     PostFcControllerState,
     PostFcControlOutput,
+    PostFcRecoveryTrigger,
     PostFcRorController,
 )
 from roastpilot_agent.roast_history import (
@@ -2027,15 +2028,14 @@ class RoastController:
         # recover on its own even while the drop keeps failing — so only a
         # genuine RAISE (strictly greater than actuated) is suppressed.
         #
-        # `heat_authority_state is not HOLDING` MUST stay as the first
-        # condition (not dropped in favor of the actuated-level check alone):
-        # D88's own never-add-heat-beyond-entry law can ALSO legitimately
-        # raise heat above `self._current_heat` outside D96 entirely (e.g.
-        # the anti-stall floor recovering FROM a 0% bumpless handoff up
-        # toward `effective_ceiling` — a plain D88 write, recovery-inactive,
-        # that must NEVER be suppressed by a D96-specific guard). Requiring
-        # BOTH conditions scopes the skip to exactly "a D96 recovery/glide
-        # raise, on a drop-eligible tick" — never an ordinary D88 climb.
+        # A D96/v2-specific authority signal MUST stay alongside the
+        # actuated-level check: D88's own never-add-heat-beyond-entry law can
+        # ALSO legitimately raise heat above `self._current_heat` outside
+        # recovery entirely (e.g. the anti-stall floor recovering FROM a 0%
+        # bumpless handoff). That ordinary D88 climb must NEVER be suppressed
+        # by this guard. The signal below is either actual elevated/gliding
+        # authority OR this tick's explicit v2 fast-entry floor, so requiring
+        # it scopes the skip to a recovery raise on a drop-eligible tick.
         #
         # BOTH mirrors below must track their sources exactly — a future
         # change to either `_maybe_ceiling_guard_drop`'s or
@@ -2068,8 +2068,15 @@ class RoastController:
             and telemetry.bean_temp_c >= self._profile.target_drop_temp_c
             and system_dev_percent >= self._profile.target_development_percent
         )
-        recovery_ceiling_elevated = (
+        # A v2 fast-entry floor can be a genuine recovery raise even when the
+        # recovery ceiling itself equals the D88 base (zero headroom, or an
+        # engagement already at the static ceiling). Keep the authority enum
+        # tied to actual ceiling elevation, but include this tick-scoped flag
+        # in the same-tick drop suppression so the floor cannot raise heat
+        # immediately before an eligible drop.
+        recovery_raise_authorized_this_tick = (
             output.heat_authority_state is not PostFcHeatAuthorityState.HOLDING
+            or output.recovery_fast_raise_applied
         )
         tentative_write_would_raise_heat = output.heat_percent > self._current_heat
         # D96 slice 1.5 (#561), Codex round-1 finding #3: the pre-existing
@@ -2113,7 +2120,7 @@ class RoastController:
         heat_suppressed_this_tick = tentative_write_would_raise_heat and (
             self._post_fc_raise_suppressed_after_clamp
             or (
-                recovery_ceiling_elevated
+                recovery_raise_authorized_this_tick
                 and (guard_eligible_this_tick or deterministic_drop_eligible_this_tick)
             )
         )
@@ -2645,6 +2652,15 @@ class RoastController:
                 recovery_ticks_within_exit=0,
                 recovery_active=False,
                 recovery_ticks_since_exit=None,
+                recovery_trigger=PostFcRecoveryTrigger.NONE,
+                recovery_projection_short_ticks=0,
+                recovery_projection_on_target_ticks=0,
+                recovery_projection_release_latched=state.recovery_projection_release_latched,
+                recovery_last_development_elapsed_seconds=(
+                    state.recovery_last_development_elapsed_seconds
+                ),
+                recovery_last_charge_elapsed_seconds=state.recovery_last_charge_elapsed_seconds,
+                recovery_cutoff_reached=state.recovery_cutoff_reached,
             )
         )
         self._post_fc_raise_suppressed_after_clamp = True

@@ -158,7 +158,9 @@ without touching it:
   identical to before this fix.
 """
 
+import math
 from dataclasses import dataclass
+from enum import Enum
 
 from pydantic import BaseModel
 
@@ -175,8 +177,41 @@ __all__ = [
     "PostFcControlOutput",
     "PostFcControllerState",
     "PostFcHeatAuthorityState",
+    "PostFcProjectionInputs",
+    "PostFcRecoveryTrigger",
     "PostFcRorController",
 ]
+
+
+class PostFcRecoveryTrigger(Enum):
+    """The signal that most recently entered bounded heat recovery."""
+
+    NONE = "none"
+    ROR_ERROR = "ror_error"
+    PROJECTION = "projection"
+
+
+@dataclass(frozen=True)
+class PostFcProjectionInputs:
+    """Unrounded live clocks and profile targets used by recovery v2."""
+
+    bean_temp_c: float
+    target_drop_temp_c: float
+    target_development_percent: float
+    development_elapsed_seconds: float | None
+    charge_elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class _ProjectionResult:
+    """Private, content-free projection diagnostics for one control tick."""
+
+    valid: bool = False
+    entry_temp_c: float | None = None
+    cutoff_temp_c: float | None = None
+    entry_runway_seconds: float | None = None
+    cutoff_runway_seconds: float | None = None
+    target_drop_temp_c: float | None = None
 
 
 @dataclass(frozen=True)
@@ -241,6 +276,18 @@ class PostFcControllerState:
     #: function of this counter, never a separately-mutated descending value,
     #: so nothing can drift out of sync with it.
     recovery_ticks_since_exit: int | None
+    recovery_trigger: PostFcRecoveryTrigger
+    recovery_projection_short_ticks: int
+    recovery_projection_on_target_ticks: int
+    #: Whether a projection-triggered recovery has just released because the
+    #: +5 projection reached target. While that same +5 condition remains
+    #: true, it blocks only projection re-entry; the independent RoR trigger
+    #: remains available. This prevents an unchanged +2/+5 overlap from
+    #: cycling recovery without letting +5 veto the first +2 entry.
+    recovery_projection_release_latched: bool
+    recovery_last_development_elapsed_seconds: float | None
+    recovery_last_charge_elapsed_seconds: float | None
+    recovery_cutoff_reached: bool
 
 
 class PostFcControlOutput(BaseModel, frozen=True):
@@ -318,6 +365,14 @@ class PostFcControlOutput(BaseModel, frozen=True):
     #: prefer :attr:`heat_authority_state` directly when the HOLDING/
     #: RECOVERING/GLIDING distinction matters.
     recovery_active: bool
+    #: Internal recovery-v2 diagnostics. These fields are not wire models.
+    recovery_trigger: PostFcRecoveryTrigger = PostFcRecoveryTrigger.NONE
+    projection_valid: bool = False
+    projected_entry_temp_c: float | None = None
+    projected_cutoff_temp_c: float | None = None
+    projection_entry_runway_seconds: float | None = None
+    projection_cutoff_runway_seconds: float | None = None
+    recovery_fast_raise_applied: bool = False
 
 
 class PostFcRorController:
@@ -363,6 +418,13 @@ class PostFcRorController:
         self._recovery_ticks_within_exit: int = 0
         self._recovery_active: bool = False
         self._recovery_ticks_since_exit: int | None = None
+        self._recovery_trigger = PostFcRecoveryTrigger.NONE
+        self._recovery_projection_short_ticks = 0
+        self._recovery_projection_on_target_ticks = 0
+        self._recovery_projection_release_latched = False
+        self._recovery_last_development_elapsed_seconds: float | None = None
+        self._recovery_last_charge_elapsed_seconds: float | None = None
+        self._recovery_cutoff_reached = False
 
     def reset(self, *, initial_heat_percent: int, ror_at_engagement_c_per_min: float) -> None:
         """Seed the loop for a bumpless handoff at first-crack engagement.
@@ -448,6 +510,13 @@ class PostFcRorController:
         self._recovery_ticks_within_exit = 0
         self._recovery_active = False
         self._recovery_ticks_since_exit = None
+        self._recovery_trigger = PostFcRecoveryTrigger.NONE
+        self._recovery_projection_short_ticks = 0
+        self._recovery_projection_on_target_ticks = 0
+        self._recovery_projection_release_latched = False
+        self._recovery_last_development_elapsed_seconds = None
+        self._recovery_last_charge_elapsed_seconds = None
+        self._recovery_cutoff_reached = False
         config = self._config
         self._taper_r0_c_per_min = max(
             config.taper_end_ror_c_per_min,
@@ -604,6 +673,13 @@ class PostFcRorController:
             recovery_ticks_within_exit=self._recovery_ticks_within_exit,
             recovery_active=self._recovery_active,
             recovery_ticks_since_exit=self._recovery_ticks_since_exit,
+            recovery_trigger=self._recovery_trigger,
+            recovery_projection_short_ticks=self._recovery_projection_short_ticks,
+            recovery_projection_on_target_ticks=self._recovery_projection_on_target_ticks,
+            recovery_projection_release_latched=self._recovery_projection_release_latched,
+            recovery_last_development_elapsed_seconds=self._recovery_last_development_elapsed_seconds,
+            recovery_last_charge_elapsed_seconds=self._recovery_last_charge_elapsed_seconds,
+            recovery_cutoff_reached=self._recovery_cutoff_reached,
         )
 
     def restore_state(self, state: PostFcControllerState) -> None:
@@ -623,8 +699,23 @@ class PostFcRorController:
         self._recovery_ticks_within_exit = state.recovery_ticks_within_exit
         self._recovery_active = state.recovery_active
         self._recovery_ticks_since_exit = state.recovery_ticks_since_exit
+        self._recovery_trigger = state.recovery_trigger
+        self._recovery_projection_short_ticks = state.recovery_projection_short_ticks
+        self._recovery_projection_on_target_ticks = state.recovery_projection_on_target_ticks
+        self._recovery_projection_release_latched = state.recovery_projection_release_latched
+        self._recovery_last_development_elapsed_seconds = (
+            state.recovery_last_development_elapsed_seconds
+        )
+        self._recovery_last_charge_elapsed_seconds = state.recovery_last_charge_elapsed_seconds
+        self._recovery_cutoff_reached = state.recovery_cutoff_reached
 
-    def compute(self, *, measured_ror_c_per_min: float, dt_seconds: float) -> PostFcControlOutput:
+    def compute(
+        self,
+        *,
+        measured_ror_c_per_min: float,
+        dt_seconds: float,
+        projection: PostFcProjectionInputs | None = None,
+    ) -> PostFcControlOutput:
         """Run one PI control step and return the commanded heat + diagnostics.
 
         Steps (D88):
@@ -728,6 +819,16 @@ class PostFcRorController:
                 tick). The clamp is a pure no-op under normal cadence (where
                 ``dt_seconds`` already approximately equals
                 ``control_interval_seconds``).
+            projection: Unrounded live bean temperature, profile targets, and
+                elapsed clocks used by recovery-v2 projection. Its
+                ``development_elapsed_seconds`` is seconds since accepted
+                first crack; ``charge_elapsed_seconds`` is seconds since
+                charge, and both must share that charge-relative origin (so
+                development elapsed cannot exceed charge elapsed). ``None``,
+                disabled projection recovery, non-finite or inconsistent
+                values, or clocks that move backwards make projection invalid
+                for this tick without raising or advancing projection clock
+                state; the existing RoR recovery path remains available.
 
         Returns:
             The :class:`PostFcControlOutput` for this step: the clamped
@@ -780,7 +881,8 @@ class PostFcRorController:
         # deadband-gated value the PI's own P/I terms use), then read the
         # ceiling/floor below. Inert (recovery never activates) whenever
         # `config.recovery_enabled` is False, the default.
-        self._advance_recovery_state(error)
+        projection_result = self._projection_result(projection, ema)
+        fast_raise_target = self._advance_recovery_state(error, projection_result)
 
         pre_step_integrator = self._integrator
         # Same gap-cap applies to the integrator's accumulation: anti-windup
@@ -825,6 +927,8 @@ class PostFcRorController:
         self._integrator = pre_step_integrator if pushing_further else tentative_integrator
 
         clamped = max(float(floor), min(float(ceiling), unclamped))
+        if fast_raise_target is not None:
+            clamped = max(clamped, float(fast_raise_target))
         heat_authority_state = self._heat_authority_state()
         return PostFcControlOutput(
             heat_percent=round(clamped),
@@ -837,6 +941,13 @@ class PostFcRorController:
             saturated=saturated,
             heat_authority_state=heat_authority_state,
             recovery_active=heat_authority_state is not PostFcHeatAuthorityState.HOLDING,
+            recovery_trigger=self._recovery_trigger,
+            projection_valid=projection_result.valid,
+            projected_entry_temp_c=projection_result.entry_temp_c,
+            projected_cutoff_temp_c=projection_result.cutoff_temp_c,
+            projection_entry_runway_seconds=projection_result.entry_runway_seconds,
+            projection_cutoff_runway_seconds=projection_result.cutoff_runway_seconds,
+            recovery_fast_raise_applied=fast_raise_target is not None,
         )
 
     def _heat_authority_state(self) -> PostFcHeatAuthorityState:
@@ -888,107 +999,230 @@ class PostFcRorController:
             )
         return PostFcHeatAuthorityState.HOLDING
 
-    def _advance_recovery_state(self, error_c_per_min: float) -> None:
-        """Advance the D96 (#559) recovery entry/exit counters for one tick.
+    def _projection_result(
+        self, inputs: PostFcProjectionInputs | None, smoothed_ror_c_per_min: float
+    ) -> _ProjectionResult:
+        """Validate and calculate this tick's projection without raising.
 
-        Inert (every counter stays 0, ``recovery_active`` stays ``False``)
-        whenever ``PostFirstCrackControl.recovery_enabled`` is ``False`` (the
-        default) — this method still runs every tick regardless of the flag,
-        but it can never SET ``recovery_active`` True while the flag is off,
-        so a flag-off engagement's ceiling is always exactly the D88 value.
-
-        **Entry** (only reachable while NOT already active): counts
-        consecutive ticks where ``error_c_per_min`` exceeds
-        ``recovery_trigger_margin_c_per_min`` (RoR persistently BELOW the
-        taper setpoint — a POSITIVE error under this loop's sign convention).
-        Resets to 0 the instant a tick does not exceed the margin — entry
-        requires an UNBROKEN run of ``recovery_confirm_ticks`` ticks. Once
-        confirmed, ``recovery_active`` flips ``True`` immediately (no glide
-        on entry — D96: the failure this responds to, roast 15, was itself a
-        delay in getting any raise authority) and the exit counter/tick-since-
-        exit state both reset (a fresh entry is not still "gliding" from a
-        prior exit).
-
-        **Exit** (only reachable while active): counts consecutive ticks
-        where ``error_c_per_min`` has fallen to or below
-        ``recovery_exit_margin_c_per_min`` (strictly smaller than the entry
-        margin — a config validator enforces this asymmetry, the limit-cycle
-        guard). Resets to 0 the instant a tick's error exceeds the exit
-        margin. Once confirmed, ``recovery_active`` flips ``False`` and
-        ``recovery_ticks_since_exit`` starts counting from 0 (immediately
-        incremented to 1 THIS tick — see below) so
-        :meth:`_effective_ceiling_percent`'s glide begins descending on the
-        very next ceiling read, not one tick later.
-
-        **While gliding** (``recovery_active`` is ``False`` and
-        ``recovery_ticks_since_exit`` is not ``None``): this method still
-        increments the counter by 1 every tick regardless of
-        ``error_c_per_min`` — the glide is a pure function of elapsed ticks
-        since exit, not of the RoR error, so it cannot itself be re-triggered
-        by a noisy sample mid-glide. A fresh entry (if the error climbs back
-        above the trigger margin again while gliding) clears the glide state
-        immediately, per the entry branch above.
-
-        Args:
-            error_c_per_min: This tick's ``setpoint - ema`` (before the PI
-                deadband is applied) — positive means RoR is below setpoint.
+        Invalid input is deliberately content-free: it returns no partial
+        runway or temperature that a caller could mistake for a control value.
+        Clock state advances only for a fully valid projection. After the +2
+        entry horizon passes, a valid cutoff-only result keeps an already
+        active recovery evaluating through the +5 cutoff while remaining
+        ineligible for a new projection-triggered entry.
         """
         config = self._config
-        if not config.recovery_enabled:
-            return
+        if not config.recovery_projection_enabled or inputs is None:
+            return _ProjectionResult()
+        values = (
+            inputs.bean_temp_c,
+            inputs.target_drop_temp_c,
+            inputs.target_development_percent,
+            inputs.development_elapsed_seconds,
+            inputs.charge_elapsed_seconds,
+            smoothed_ror_c_per_min,
+        )
+        if any(value is None or not math.isfinite(value) for value in values):
+            return _ProjectionResult()
+        development = inputs.development_elapsed_seconds
+        assert development is not None
+        charge = inputs.charge_elapsed_seconds
+        if charge <= 0.0 or development < 0.0 or development > charge:
+            return _ProjectionResult()
+        if (
+            self._recovery_last_development_elapsed_seconds is not None
+            and development < self._recovery_last_development_elapsed_seconds
+        ) or (
+            self._recovery_last_charge_elapsed_seconds is not None
+            and charge < self._recovery_last_charge_elapsed_seconds
+        ):
+            return _ProjectionResult()
+        entry_fraction = (
+            inputs.target_development_percent + config.recovery_projection_entry_horizon_pp
+        ) / 100.0
+        cutoff_fraction = (
+            inputs.target_development_percent + config.recovery_projection_cutoff_horizon_pp
+        ) / 100.0
+        if not 0.0 < entry_fraction < 1.0 or not 0.0 < cutoff_fraction < 1.0:
+            return _ProjectionResult()
+        entry_runway = (entry_fraction * charge - development) / (1.0 - entry_fraction)
+        cutoff_runway = (cutoff_fraction * charge - development) / (1.0 - cutoff_fraction)
+        if cutoff_runway <= 0.0:
+            # The cutoff is valid even though no entry runway remains.
+            self._recovery_last_development_elapsed_seconds = development
+            self._recovery_last_charge_elapsed_seconds = charge
+            return _ProjectionResult(
+                valid=True,
+                cutoff_runway_seconds=cutoff_runway,
+                target_drop_temp_c=inputs.target_drop_temp_c,
+            )
+        if entry_runway <= 0.0:
+            # Entry authority has expired, but an already-active projection
+            # recovery still needs the +5 temperature projection to decide
+            # whether to glide early or continue until the hard cutoff.
+            cutoff_temp = inputs.bean_temp_c + smoothed_ror_c_per_min * cutoff_runway / 60.0
+            self._recovery_last_development_elapsed_seconds = development
+            self._recovery_last_charge_elapsed_seconds = charge
+            return _ProjectionResult(
+                valid=True,
+                cutoff_temp_c=cutoff_temp,
+                cutoff_runway_seconds=cutoff_runway,
+                target_drop_temp_c=inputs.target_drop_temp_c,
+            )
+        entry_temp = inputs.bean_temp_c + smoothed_ror_c_per_min * entry_runway / 60.0
+        cutoff_temp = inputs.bean_temp_c + smoothed_ror_c_per_min * cutoff_runway / 60.0
+        self._recovery_last_development_elapsed_seconds = development
+        self._recovery_last_charge_elapsed_seconds = charge
+        return _ProjectionResult(
+            valid=True,
+            entry_temp_c=entry_temp,
+            cutoff_temp_c=cutoff_temp,
+            entry_runway_seconds=entry_runway,
+            cutoff_runway_seconds=cutoff_runway,
+            target_drop_temp_c=inputs.target_drop_temp_c,
+        )
+
+    def _begin_recovery_glide(self) -> None:
+        """Release active recovery through the existing bounded glide."""
         if self._recovery_active:
-            # Active: only the EXIT counter advances.
+            self._recovery_active = False
+            self._recovery_ticks_since_exit = 1
+        self._recovery_ticks_above_trigger = 0
+        self._recovery_ticks_within_exit = 0
+        self._recovery_projection_short_ticks = 0
+        self._recovery_projection_on_target_ticks = 0
+        self._recovery_trigger = PostFcRecoveryTrigger.NONE
+
+    def _advance_glide(self) -> None:
+        """Advance an existing glide and clear it once it reaches D88."""
+        if self._recovery_ticks_since_exit is None:
+            return
+        self._recovery_ticks_since_exit += 1
+        glided_down = self._recovery_ceiling_percent() - (
+            self._config.recovery_exit_glide_pp_per_tick * self._recovery_ticks_since_exit
+        )
+        if glided_down <= self._never_add_heat_ceiling_percent():
+            self._recovery_ticks_since_exit = None
+
+    def _enter_recovery(self, trigger: PostFcRecoveryTrigger) -> int | None:
+        """Enter recovery and return the v2 entry-floor target, if enabled."""
+        self._recovery_active = True
+        self._recovery_trigger = trigger
+        self._recovery_ticks_above_trigger = 0
+        self._recovery_ticks_within_exit = 0
+        self._recovery_projection_short_ticks = 0
+        self._recovery_projection_on_target_ticks = 0
+        self._recovery_ticks_since_exit = None
+        if not self._config.recovery_projection_enabled:
+            return None
+        target = min(
+            self._recovery_ceiling_percent(),
+            self._heat_engage_percent + self._config.recovery_entry_step_pp,
+        )
+        if self._config.ki_percent_per_ror_second > 0.0:
+            self._integrator = max(
+                self._integrator, target / self._config.ki_percent_per_ror_second
+            )
+        else:
+            self._bias_percent = max(self._bias_percent, float(target))
+        return target
+
+    def _advance_recovery_state(
+        self, error_c_per_min: float, projection: _ProjectionResult
+    ) -> int | None:
+        """Advance v1/v2 recovery and return a one-tick v2 fast-raise floor."""
+        config = self._config
+        if not config.recovery_enabled:
+            return None
+        v2 = config.recovery_projection_enabled
+        if (
+            v2
+            and projection.valid
+            and projection.cutoff_runway_seconds is not None
+            and (projection.cutoff_runway_seconds <= 0.0)
+        ):
+            was_active = self._recovery_active
+            self._begin_recovery_glide()
+            self._recovery_cutoff_reached = True
+            # The first cutoff tick begins the glide at step one. Later valid
+            # projections remain beyond the cutoff, so advance an existing
+            # glide here instead of repeatedly freezing it at that first step.
+            if not was_active:
+                self._advance_glide()
+            return None
+        if self._recovery_active:
+            if self._recovery_trigger is PostFcRecoveryTrigger.PROJECTION:
+                if not projection.valid:
+                    self._begin_recovery_glide()
+                    return None
+                # The target comparison is supplied by the finite projection
+                # result; its on-target flag is encoded by the caller's helper.
+                if self._projection_is_on_target(projection):
+                    self._recovery_projection_on_target_ticks += 1
+                else:
+                    self._recovery_projection_on_target_ticks = 0
+                if self._recovery_projection_on_target_ticks >= config.recovery_confirm_ticks:
+                    self._recovery_projection_release_latched = True
+                    self._begin_recovery_glide()
+                return None
             if error_c_per_min <= config.recovery_exit_margin_c_per_min:
                 self._recovery_ticks_within_exit += 1
             else:
                 self._recovery_ticks_within_exit = 0
             if self._recovery_ticks_within_exit >= config.recovery_confirm_ticks:
-                self._recovery_active = False
-                self._recovery_ticks_within_exit = 0
-                self._recovery_ticks_above_trigger = 0
-                self._recovery_ticks_since_exit = 1
-        elif self._recovery_ticks_since_exit is not None:
-            # Gliding down from a prior exit: the entry condition can still
-            # re-trigger (re-checked below); otherwise the glide simply
-            # advances by one tick.
-            if error_c_per_min > config.recovery_trigger_margin_c_per_min:
-                self._recovery_ticks_above_trigger += 1
-            else:
-                self._recovery_ticks_above_trigger = 0
-            if self._recovery_ticks_above_trigger >= config.recovery_confirm_ticks:
-                self._recovery_active = True
-                self._recovery_ticks_above_trigger = 0
-                self._recovery_ticks_within_exit = 0
-                self._recovery_ticks_since_exit = None
-            else:
-                self._recovery_ticks_since_exit += 1
-                # Settle back to HOLDING the instant the glide arithmetic
-                # itself reaches the D88 base (PR #560 Codex finding's
-                # corollary): without this, `_recovery_ticks_since_exit`
-                # would keep counting forever after the ceiling has already
-                # numerically bottomed out, permanently reporting GLIDING
-                # even once nothing is actually elevated any more. This
-                # mirrors `_effective_ceiling_percent`'s own
-                # `max(base, glided_down)` floor — once the glide's raw
-                # arithmetic value would fall AT or below that floor, there
-                # is nothing left to glide down from.
-                config_headroom = config.recovery_headroom_percentage_points
-                recovery_ceiling = min(
-                    config.heat_ceiling_percent,
-                    self._heat_engage_percent + config_headroom,
-                )
-                glided_down = recovery_ceiling - (
-                    config.recovery_exit_glide_pp_per_tick * self._recovery_ticks_since_exit
-                )
-                if glided_down <= self._never_add_heat_ceiling_percent():
-                    self._recovery_ticks_since_exit = None
-        else:
-            # Never engaged (or fully settled back to the D88 base ceiling)
-            # this engagement: only the ENTRY counter advances.
-            if error_c_per_min > config.recovery_trigger_margin_c_per_min:
-                self._recovery_ticks_above_trigger += 1
-            else:
-                self._recovery_ticks_above_trigger = 0
-            if self._recovery_ticks_above_trigger >= config.recovery_confirm_ticks:
-                self._recovery_active = True
-                self._recovery_ticks_above_trigger = 0
+                self._begin_recovery_glide()
+            return None
+        if self._recovery_cutoff_reached:
+            self._advance_glide()
+            return None
+        # D162 makes +2 the independent entry signal, so +5 must not veto the
+        # first entry even when both predicates overlap. After an on-target
+        # release, however, retain that release while the same +5 condition
+        # remains true; otherwise the unchanged +2 shortfall would immediately
+        # reconfirm and cycle between recovery and glide.
+        if self._recovery_projection_release_latched and projection.valid:
+            self._recovery_projection_release_latched = self._projection_is_on_target(projection)
+        projection_short = (
+            v2
+            and not self._recovery_projection_release_latched
+            and self._projection_is_short(projection)
+        )
+        self._recovery_projection_short_ticks = (
+            self._recovery_projection_short_ticks + 1 if projection_short else 0
+        )
+        ror_short = error_c_per_min > config.recovery_trigger_margin_c_per_min
+        self._recovery_ticks_above_trigger = (
+            self._recovery_ticks_above_trigger + 1 if ror_short else 0
+        )
+        projection_confirmed = (
+            projection_short
+            and self._recovery_projection_short_ticks >= config.recovery_confirm_ticks
+        )
+        ror_confirmed = self._recovery_ticks_above_trigger >= config.recovery_confirm_ticks
+        if projection_confirmed or ror_confirmed:
+            return self._enter_recovery(
+                PostFcRecoveryTrigger.PROJECTION
+                if projection_confirmed
+                else PostFcRecoveryTrigger.ROR_ERROR
+            )
+        self._advance_glide()
+        return None
+
+    def _projection_is_short(self, projection: _ProjectionResult) -> bool:
+        """Return whether a valid entry projection is below the configured margin."""
+        return (
+            projection.valid
+            and projection.entry_temp_c is not None
+            and projection.target_drop_temp_c is not None
+            and projection.entry_temp_c
+            < projection.target_drop_temp_c - self._config.recovery_projection_margin_c
+        )
+
+    def _projection_is_on_target(self, projection: _ProjectionResult) -> bool:
+        """Return whether a valid cutoff projection reaches the profile target."""
+        return (
+            projection.valid
+            and projection.cutoff_temp_c is not None
+            and projection.target_drop_temp_c is not None
+            and projection.cutoff_temp_c >= projection.target_drop_temp_c
+        )

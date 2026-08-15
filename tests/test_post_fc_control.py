@@ -23,12 +23,45 @@ from roastpilot_agent.config import PostFirstCrackControl
 from roastpilot_agent.post_fc_control import (
     PostFcControlOutput,
     PostFcHeatAuthorityState,
+    PostFcProjectionInputs,
+    PostFcRecoveryTrigger,
     PostFcRorController,
 )
 
 
 def _config(**overrides: object) -> PostFirstCrackControl:
     return PostFirstCrackControl(**overrides)  # type: ignore[arg-type]
+
+
+def _projection(
+    *,
+    bean_temp_c: float = 180.0,
+    target_drop_temp_c: float = 200.0,
+    target_development_percent: float = 16.0,
+    development_elapsed_seconds: float | None = 60.0,
+    charge_elapsed_seconds: float = 500.0,
+) -> PostFcProjectionInputs:
+    """Build a valid, deliberately short recovery-v2 projection."""
+    return PostFcProjectionInputs(
+        bean_temp_c=bean_temp_c,
+        target_drop_temp_c=target_drop_temp_c,
+        target_development_percent=target_development_percent,
+        development_elapsed_seconds=development_elapsed_seconds,
+        charge_elapsed_seconds=charge_elapsed_seconds,
+    )
+
+
+def _projection_recovery_config(**overrides: object) -> PostFirstCrackControl:
+    """Build the explicitly enabled v2 configuration used by focused tests."""
+    values: dict[str, object] = {
+        "recovery_enabled": True,
+        "recovery_projection_enabled": True,
+        "recovery_confirm_ticks": 3,
+        "ror_smoothing_alpha": 1.0,
+        "kp_percent_per_ror": 0.0,
+    }
+    values.update(overrides)
+    return _config(**values)
 
 
 # ---------------------------------------------------------------------------
@@ -1352,6 +1385,18 @@ def test_reset_clears_recovery_state_from_active_and_mid_glide() -> None:
         controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0)  # confirm entry
     active_snapshot = controller.snapshot_state()
     assert active_snapshot.recovery_active is True  # precondition: genuinely active
+    controller.restore_state(
+        dataclasses.replace(
+            active_snapshot,
+            recovery_trigger=PostFcRecoveryTrigger.PROJECTION,
+            recovery_projection_short_ticks=2,
+            recovery_projection_on_target_ticks=1,
+            recovery_projection_release_latched=True,
+            recovery_last_development_elapsed_seconds=60.0,
+            recovery_last_charge_elapsed_seconds=500.0,
+            recovery_cutoff_reached=True,
+        )
+    )
 
     controller.reset(initial_heat_percent=55, ror_at_engagement_c_per_min=6.0)
     cleared_from_active = controller.snapshot_state()
@@ -1359,6 +1404,13 @@ def test_reset_clears_recovery_state_from_active_and_mid_glide() -> None:
     assert cleared_from_active.recovery_ticks_within_exit == 0
     assert cleared_from_active.recovery_active is False
     assert cleared_from_active.recovery_ticks_since_exit is None
+    assert cleared_from_active.recovery_trigger is PostFcRecoveryTrigger.NONE
+    assert cleared_from_active.recovery_projection_short_ticks == 0
+    assert cleared_from_active.recovery_projection_on_target_ticks == 0
+    assert cleared_from_active.recovery_projection_release_latched is False
+    assert cleared_from_active.recovery_last_development_elapsed_seconds is None
+    assert cleared_from_active.recovery_last_charge_elapsed_seconds is None
+    assert cleared_from_active.recovery_cutoff_reached is False
     # The first post-reset tick computes the D88 BASE ceiling for the NEW
     # engagement heat (55), never a leaked recovery cap from the old one.
     first_tick = controller.compute(measured_ror_c_per_min=6.0, dt_seconds=5.0)
@@ -1697,3 +1749,614 @@ def test_drop_and_estop_precedence_over_recovery_raise() -> None:
     # unconditionally responsible for running the drop/e-stop checks in its
     # own tick order regardless of this value.
     assert isinstance(output.heat_percent, int)
+
+
+# ---------------------------------------------------------------------------
+# Recovery v2 projection control law (#708 slice 1)
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_projection_defaults_and_cross_field_guards() -> None:
+    """The experimental projection knobs are opt-in and bounded at load time."""
+    defaults = PostFirstCrackControl()
+    assert defaults.recovery_projection_enabled is False
+    assert defaults.recovery_projection_entry_horizon_pp == 2.0
+    assert defaults.recovery_projection_cutoff_horizon_pp == 5.0
+    assert defaults.recovery_projection_margin_c == 3.0
+    assert defaults.recovery_entry_step_pp == 10
+    with pytest.raises(ValueError, match="requires recovery_enabled"):
+        _config(recovery_projection_enabled=True)
+    with pytest.raises(ValueError, match="strictly greater"):
+        _projection_recovery_config(
+            recovery_projection_entry_horizon_pp=5.0,
+            recovery_projection_cutoff_horizon_pp=5.0,
+        )
+    with pytest.raises(ValueError):
+        _projection_recovery_config(recovery_projection_entry_horizon_pp=float("nan"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("recovery_projection_entry_horizon_pp", 0.0, "greater than 0"),
+        ("recovery_projection_entry_horizon_pp", 20.1, "less than or equal to 20"),
+        ("recovery_projection_entry_horizon_pp", float("nan"), "finite number"),
+        ("recovery_projection_entry_horizon_pp", float("inf"), "finite number"),
+        ("recovery_projection_entry_horizon_pp", float("-inf"), "finite number"),
+        ("recovery_projection_cutoff_horizon_pp", 0.0, "greater than 0"),
+        ("recovery_projection_cutoff_horizon_pp", 20.1, "less than or equal to 20"),
+        ("recovery_projection_cutoff_horizon_pp", float("nan"), "finite number"),
+        ("recovery_projection_cutoff_horizon_pp", float("inf"), "finite number"),
+        ("recovery_projection_cutoff_horizon_pp", float("-inf"), "finite number"),
+        ("recovery_projection_margin_c", 0.0, "greater than 0"),
+        ("recovery_projection_margin_c", -1.0, "greater than 0"),
+        ("recovery_projection_margin_c", float("nan"), "finite number"),
+        ("recovery_projection_margin_c", float("inf"), "finite number"),
+        ("recovery_projection_margin_c", float("-inf"), "finite number"),
+        ("recovery_entry_step_pp", -1, "greater than or equal to 0"),
+        ("recovery_entry_step_pp", 51, "less than or equal to 50"),
+    ],
+)
+def test_recovery_projection_knob_bounds_reject_each_invalid_class(
+    field: str,
+    value: float | int,
+    message: str,
+) -> None:
+    """Every new tuning bound and finite constraint has a direct guard."""
+    with pytest.raises(ValueError, match=message):
+        _projection_recovery_config(**{field: value})
+
+
+@pytest.mark.parametrize("step", [0, 50])
+def test_recovery_entry_step_accepts_exact_bounds(step: int) -> None:
+    """The ratified inclusive fast-raise bounds remain usable."""
+    assert _projection_recovery_config(recovery_entry_step_pp=step).recovery_entry_step_pp == step
+
+
+def test_projection_entry_needs_three_uninterrupted_short_ticks() -> None:
+    """A non-short tick resets projection confirmation before entry."""
+    controller = PostFcRorController(
+        _projection_recovery_config(recovery_trigger_margin_c_per_min=50.0)
+    )
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    for development in (60.0, 65.0):
+        output = controller.compute(
+            measured_ror_c_per_min=0.0,
+            dt_seconds=5.0,
+            projection=_projection(development_elapsed_seconds=development),
+        )
+        assert output.recovery_active is False
+    controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(bean_temp_c=199.0, development_elapsed_seconds=70.0),
+    )
+    assert controller.snapshot_state().recovery_projection_short_ticks == 0
+    controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(development_elapsed_seconds=75.0),
+    )
+    controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(development_elapsed_seconds=80.0),
+    )
+    entered = controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(development_elapsed_seconds=85.0),
+    )
+    assert entered.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+    assert entered.heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+
+
+def test_projection_does_not_depend_on_taper_setpoint() -> None:
+    """Changing taper parameters cannot move an entry driven only by projection."""
+    entries: list[int] = []
+    for taper_end in (2.0, 5.0):
+        controller = PostFcRorController(
+            _projection_recovery_config(
+                taper_end_ror_c_per_min=taper_end,
+                taper_start_max_ror_c_per_min=9.0,
+                recovery_trigger_margin_c_per_min=50.0,
+            )
+        )
+        controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+        for tick in range(1, 5):
+            output = controller.compute(
+                measured_ror_c_per_min=0.0,
+                dt_seconds=5.0,
+                projection=_projection(development_elapsed_seconds=55.0 + tick * 5.0),
+            )
+            if output.recovery_trigger is PostFcRecoveryTrigger.PROJECTION:
+                entries.append(tick)
+                break
+    assert entries == [3, 3]
+
+
+def test_conebosque_shape_enters_at_twelve_percent_and_reaches_cap_boundedly() -> None:
+    """Live-cadence projection enters with four DTR points and reaches the cap."""
+    config = _projection_recovery_config(
+        taper_start_max_ror_c_per_min=6.0,
+        taper_end_ror_c_per_min=6.0,
+        taper_duration_seconds=1.0,
+    )
+    v2 = PostFcRorController(config)
+    v1 = PostFcRorController(config.model_copy(update={"recovery_projection_enabled": False}))
+    for controller in (v2, v1):
+        controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    entry_projection: PostFcProjectionInputs | None = None
+    for development, charge, ror in (
+        (50.0, 490.0, 6.0),
+        (55.0, 495.0, 5.5),
+        (60.0, 500.0, 4.9),
+    ):
+        entry_projection = _projection(
+            development_elapsed_seconds=development,
+            charge_elapsed_seconds=charge,
+        )
+        entered = v2.compute(
+            measured_ror_c_per_min=ror,
+            dt_seconds=5.0,
+            projection=entry_projection,
+        )
+        v1_output = v1.compute(measured_ror_c_per_min=ror, dt_seconds=5.0)
+
+    assert entry_projection is not None
+    entry_dtr = 100.0 * 60.0 / 500.0
+    assert entry_dtr == 12.0
+    assert entry_projection.target_development_percent - entry_dtr == 4.0
+    assert entered.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+    assert v1_output.recovery_trigger is PostFcRecoveryTrigger.NONE
+    cap = min(config.heat_ceiling_percent, 60 + config.recovery_headroom_percentage_points)
+    post_entry: list[PostFcControlOutput] = []
+    for development, charge in ((65.0, 505.0), (70.0, 510.0)):
+        post_entry.append(
+            v2.compute(
+                measured_ror_c_per_min=0.0,
+                dt_seconds=5.0,
+                projection=_projection(
+                    development_elapsed_seconds=development,
+                    charge_elapsed_seconds=charge,
+                ),
+            )
+        )
+    assert post_entry[-1].heat_percent == cap
+
+
+def test_v2_sustained_shortfall_stays_at_cap_for_500_ticks() -> None:
+    """The projection path cannot compound beyond the unchanged D96 cap."""
+    config = _projection_recovery_config()
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    outputs = [
+        controller.compute(
+            measured_ror_c_per_min=0.0,
+            dt_seconds=5.0,
+            projection=_projection(),
+        )
+        for _ in range(500)
+    ]
+    cap = min(config.heat_ceiling_percent, 60 + config.recovery_headroom_percentage_points)
+    assert max(output.heat_percent for output in outputs) == cap
+    first_cap_tick = next(
+        index for index, output in enumerate(outputs, start=1) if output.heat_percent == cap
+    )
+    assert first_cap_tick <= 4
+
+
+@pytest.mark.parametrize("trigger_projection", [False, True])
+def test_v2_fast_raise_is_bounded_non_lowering_and_non_compounding(
+    trigger_projection: bool,
+) -> None:
+    """Every v2 entry gets one bounded raise regardless of its trigger."""
+    controller = PostFcRorController(
+        _projection_recovery_config(
+            recovery_confirm_ticks=1,
+            recovery_headroom_percentage_points=15,
+            recovery_entry_step_pp=10,
+        )
+    )
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    projection = _projection() if trigger_projection else _projection(bean_temp_c=199.0)
+    entered = controller.compute(measured_ror_c_per_min=0.0, dt_seconds=5.0, projection=projection)
+    assert entered.recovery_trigger is (
+        PostFcRecoveryTrigger.PROJECTION if trigger_projection else PostFcRecoveryTrigger.ROR_ERROR
+    )
+    # The natural PI output is already 73, above the 70-point entry floor.
+    # Pinning it proves the floor uses max rather than overwriting a safely
+    # higher command with the lower floor target.
+    assert entered.heat_percent == 73
+    assert 700.0 <= entered.integrator < 1000.0
+    assert entered.recovery_fast_raise_applied is True
+    next_tick = controller.compute(
+        measured_ror_c_per_min=0.0, dt_seconds=5.0, projection=projection
+    )
+    assert next_tick.recovery_fast_raise_applied is False
+    assert next_tick.heat_percent <= 75
+
+
+def test_v2_fast_raise_reentry_reseeds_without_addition() -> None:
+    """A second independent v2 entry reuses, rather than adds, its floor."""
+    controller = PostFcRorController(
+        _projection_recovery_config(
+            recovery_confirm_ticks=1,
+            ki_percent_per_ror_second=0.0,
+            recovery_entry_step_pp=10,
+        )
+    )
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    first_entry = controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(),
+    )
+    first_bias = controller.snapshot_state().bias_percent
+    assert first_entry.recovery_fast_raise_applied is True
+    assert first_entry.heat_percent == 70
+    assert first_bias == 70.0
+
+    released = controller.compute(
+        measured_ror_c_per_min=20.0,
+        dt_seconds=5.0,
+        projection=_projection(bean_temp_c=200.0),
+    )
+    assert released.heat_authority_state is PostFcHeatAuthorityState.GLIDING
+
+    second_entry = controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(),
+    )
+    assert second_entry.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+    assert second_entry.recovery_fast_raise_applied is True
+    assert second_entry.heat_percent == 70
+    assert controller.snapshot_state().bias_percent == first_bias
+
+
+def test_projection_input_is_byte_identical_when_projection_flag_is_false() -> None:
+    """Supplying ignored v2 inputs cannot perturb the v1 command sequence."""
+    config = _recovery_config(ror_smoothing_alpha=1.0)
+    with_inputs = PostFcRorController(config)
+    without_inputs = PostFcRorController(config)
+    for controller in (with_inputs, without_inputs):
+        controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    for tick, measured_ror in enumerate((6.0, 4.8, 4.7, 5.8, 6.1), start=1):
+        with_output = with_inputs.compute(
+            measured_ror_c_per_min=measured_ror,
+            dt_seconds=5.0,
+            projection=_projection(
+                development_elapsed_seconds=50.0 + 5.0 * tick,
+                charge_elapsed_seconds=490.0 + 5.0 * tick,
+            ),
+        )
+        without_output = without_inputs.compute(
+            measured_ror_c_per_min=measured_ror,
+            dt_seconds=5.0,
+        )
+        assert with_output == without_output
+        assert with_inputs.snapshot_state() == without_inputs.snapshot_state()
+
+
+def test_same_tick_projection_and_ror_confirmation_prefers_projection() -> None:
+    """The typed projection trigger wins when both entry paths confirm."""
+    config = _projection_recovery_config(recovery_confirm_ticks=1)
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    output = controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(),
+    )
+
+    assert output.error_c_per_min > config.recovery_trigger_margin_c_per_min
+    assert output.projected_entry_temp_c is not None
+    assert output.projected_entry_temp_c < 197.0
+    assert output.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+
+
+def test_projection_on_target_glides_and_cutoff_latches_all_recovery_until_reset() -> None:
+    """The +5 horizon releases through glide and prevents every later entry."""
+    controller = PostFcRorController(_projection_recovery_config(recovery_confirm_ticks=3))
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    for development in (60.0, 65.0, 70.0):
+        controller.compute(
+            measured_ror_c_per_min=0.0,
+            dt_seconds=5.0,
+            projection=_projection(development_elapsed_seconds=development),
+        )
+    output: PostFcControlOutput | None = None
+    for tick, development in enumerate((75.0, 80.0, 85.0), start=1):
+        output = controller.compute(
+            measured_ror_c_per_min=20.0,
+            dt_seconds=5.0,
+            projection=_projection(bean_temp_c=200.0, development_elapsed_seconds=development),
+        )
+        if tick < 3:
+            assert output.heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+    assert output is not None
+    assert output.heat_authority_state is PostFcHeatAuthorityState.GLIDING
+    cutoff = controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(development_elapsed_seconds=110.0),
+    )
+    assert cutoff.recovery_trigger is PostFcRecoveryTrigger.NONE
+    assert controller.snapshot_state().recovery_cutoff_reached is True
+    after_cutoff_states: list[PostFcHeatAuthorityState] = []
+    after_cutoff_ceilings: list[int] = []
+    for development in (115.0, 120.0, 125.0):
+        later = controller.compute(
+            measured_ror_c_per_min=0.0,
+            dt_seconds=5.0,
+            projection=_projection(development_elapsed_seconds=development),
+        )
+        after_cutoff_states.append(later.heat_authority_state)
+        after_cutoff_ceilings.append(later.effective_ceiling_percent)
+        assert later.heat_authority_state is not PostFcHeatAuthorityState.RECOVERING
+    assert after_cutoff_ceilings == [60, 60, 60]
+    assert after_cutoff_states == [
+        PostFcHeatAuthorityState.HOLDING,
+        PostFcHeatAuthorityState.HOLDING,
+        PostFcHeatAuthorityState.HOLDING,
+    ]
+    missing_projection = [
+        controller.compute(measured_ror_c_per_min=0.0, dt_seconds=5.0, projection=None)
+        for _ in range(3)
+    ]
+    assert all(
+        output.heat_authority_state is PostFcHeatAuthorityState.HOLDING
+        and output.recovery_trigger is PostFcRecoveryTrigger.NONE
+        for output in missing_projection
+    )
+    assert controller.snapshot_state().recovery_ticks_above_trigger == 0
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    assert controller.snapshot_state().recovery_cutoff_reached is False
+
+
+def test_on_target_cutoff_projection_blocks_overlapping_entry_reconfirmation() -> None:
+    """A sufficient +5 projection cannot re-enter on the still-short +2 view."""
+    controller = PostFcRorController(
+        _projection_recovery_config(
+            recovery_confirm_ticks=2,
+            recovery_trigger_margin_c_per_min=50.0,
+        )
+    )
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    entry_outputs = [
+        controller.compute(
+            measured_ror_c_per_min=0.0,
+            dt_seconds=5.0,
+            projection=_projection(),
+        )
+        for _ in range(2)
+    ]
+    assert entry_outputs[-1].heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+
+    # At these exact inputs the +2 projection is still below target-minus-
+    # margin, while the later +5 projection already reaches the target.
+    overlap = _projection(bean_temp_c=189.5)
+    release_outputs = [
+        controller.compute(
+            measured_ror_c_per_min=12.0,
+            dt_seconds=5.0,
+            projection=overlap,
+        )
+        for _ in range(2)
+    ]
+    for released in release_outputs:
+        assert released.projected_entry_temp_c is not None
+        assert released.projected_entry_temp_c < 197.0
+        assert released.projected_cutoff_temp_c is not None
+        assert released.projected_cutoff_temp_c >= 200.0
+    assert release_outputs[-1].heat_authority_state is PostFcHeatAuthorityState.GLIDING
+
+    after_release = [
+        controller.compute(
+            measured_ror_c_per_min=12.0,
+            dt_seconds=5.0,
+            projection=overlap,
+        )
+        for _ in range(4)
+    ]
+    assert all(
+        output.heat_authority_state is not PostFcHeatAuthorityState.RECOVERING
+        and output.recovery_trigger is PostFcRecoveryTrigger.NONE
+        for output in after_release
+    )
+    assert after_release[-1].heat_authority_state is PostFcHeatAuthorityState.HOLDING
+    assert controller.snapshot_state().recovery_projection_release_latched is True
+
+    worsened = [
+        controller.compute(
+            measured_ror_c_per_min=0.0,
+            dt_seconds=5.0,
+            projection=_projection(),
+        )
+        for _ in range(2)
+    ]
+    assert worsened[-1].heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+    assert worsened[-1].recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+    assert controller.snapshot_state().recovery_projection_release_latched is False
+
+
+def test_overlapping_cutoff_projection_does_not_veto_initial_entry() -> None:
+    """D162's +2 entry signal remains independent of the later +5 view."""
+    controller = PostFcRorController(
+        _projection_recovery_config(
+            recovery_confirm_ticks=2,
+            recovery_trigger_margin_c_per_min=50.0,
+        )
+    )
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    overlap = _projection(bean_temp_c=189.5)
+
+    outputs = [
+        controller.compute(
+            measured_ror_c_per_min=12.0,
+            dt_seconds=5.0,
+            projection=overlap,
+        )
+        for _ in range(2)
+    ]
+
+    assert outputs[-1].projected_entry_temp_c is not None
+    assert outputs[-1].projected_entry_temp_c < 197.0
+    assert outputs[-1].projected_cutoff_temp_c is not None
+    assert outputs[-1].projected_cutoff_temp_c >= 200.0
+    assert outputs[-1].heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+    assert outputs[-1].recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+
+
+@pytest.mark.parametrize(
+    "projection",
+    [
+        None,
+        _projection(bean_temp_c=float("nan")),
+        _projection(bean_temp_c=float("inf")),
+        _projection(bean_temp_c=float("-inf")),
+        _projection(target_drop_temp_c=float("nan")),
+        _projection(target_drop_temp_c=float("inf")),
+        _projection(target_drop_temp_c=float("-inf")),
+        _projection(target_development_percent=float("nan")),
+        _projection(target_development_percent=float("inf")),
+        _projection(target_development_percent=float("-inf")),
+        _projection(development_elapsed_seconds=None),
+        _projection(development_elapsed_seconds=float("nan")),
+        _projection(development_elapsed_seconds=float("inf")),
+        _projection(development_elapsed_seconds=float("-inf")),
+        _projection(charge_elapsed_seconds=float("nan")),
+        _projection(charge_elapsed_seconds=float("inf")),
+        _projection(charge_elapsed_seconds=float("-inf")),
+        _projection(charge_elapsed_seconds=0.0),
+        _projection(development_elapsed_seconds=-1.0),
+        _projection(development_elapsed_seconds=501.0),
+        _projection(target_development_percent=96.0),
+        _projection(target_development_percent=99.0),
+    ],
+)
+def test_invalid_projection_is_inert_and_v1_remains_available(
+    projection: PostFcProjectionInputs | None,
+) -> None:
+    """Bad projection never crosses the control boundary or disables v1."""
+    controller = PostFcRorController(_projection_recovery_config(recovery_confirm_ticks=1))
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    output = controller.compute(measured_ror_c_per_min=0.0, dt_seconds=5.0, projection=projection)
+    assert output.projection_valid is False
+    assert output.recovery_trigger is PostFcRecoveryTrigger.ROR_ERROR
+
+
+def test_invalid_projection_releases_projection_recovery_and_snapshot_restores_all_fields() -> None:
+    """Invalid active projection glides out; tentative state remains reversible."""
+    controller = PostFcRorController(_projection_recovery_config(recovery_confirm_ticks=1))
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    controller.compute(measured_ror_c_per_min=0.0, dt_seconds=5.0, projection=_projection())
+    assert (
+        controller.compute(
+            measured_ror_c_per_min=0.0, dt_seconds=5.0, projection=_projection()
+        ).heat_authority_state
+        is PostFcHeatAuthorityState.RECOVERING
+    )
+    before = controller.snapshot_state()
+    released = controller.compute(measured_ror_c_per_min=0.0, dt_seconds=5.0, projection=None)
+    assert released.heat_authority_state is PostFcHeatAuthorityState.GLIDING
+    controller.restore_state(before)
+    assert controller.snapshot_state() == before
+
+
+@pytest.mark.parametrize(
+    "regressing",
+    [
+        _projection(development_elapsed_seconds=59.0),
+        _projection(development_elapsed_seconds=60.0, charge_elapsed_seconds=499.0),
+    ],
+)
+def test_projection_clock_regression_and_expired_entry_runway_cannot_enter(
+    regressing: PostFcProjectionInputs,
+) -> None:
+    """Accepted clocks never move backward, and a passed entry cannot re-enter."""
+    controller = PostFcRorController(
+        _projection_recovery_config(recovery_trigger_margin_c_per_min=50.0)
+    )
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    controller.compute(measured_ror_c_per_min=0.0, dt_seconds=5.0, projection=_projection())
+    regressed = controller.compute(
+        measured_ror_c_per_min=0.0, dt_seconds=5.0, projection=regressing
+    )
+    assert regressed.projection_valid is False
+    expired = controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(development_elapsed_seconds=95.0),
+    )
+    assert expired.projection_valid is True
+    assert expired.projected_entry_temp_c is None
+    assert expired.projected_cutoff_temp_c is not None
+    assert expired.recovery_trigger is PostFcRecoveryTrigger.NONE
+
+
+def test_projection_recovery_remains_active_between_entry_and_cutoff_horizons() -> None:
+    """Passing +2 does not release authority before the ratified +5 cutoff."""
+    controller = PostFcRorController(
+        _projection_recovery_config(
+            recovery_confirm_ticks=1,
+            recovery_trigger_margin_c_per_min=50.0,
+        )
+    )
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    entered = controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(development_elapsed_seconds=60.0),
+    )
+    assert entered.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+
+    between_horizons = controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(development_elapsed_seconds=95.0),
+    )
+    assert between_horizons.projection_valid is True
+    assert between_horizons.projected_entry_temp_c is None
+    assert between_horizons.projected_cutoff_temp_c is not None
+    assert between_horizons.heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+    assert between_horizons.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+
+    cutoff = controller.compute(
+        measured_ror_c_per_min=0.0,
+        dt_seconds=5.0,
+        projection=_projection(development_elapsed_seconds=110.0),
+    )
+    assert cutoff.heat_authority_state is PostFcHeatAuthorityState.GLIDING
+    assert cutoff.recovery_trigger is PostFcRecoveryTrigger.NONE
+    assert controller.snapshot_state().recovery_cutoff_reached is True
+    after_cutoff = [
+        controller.compute(
+            measured_ror_c_per_min=0.0,
+            dt_seconds=5.0,
+            projection=_projection(development_elapsed_seconds=development),
+        )
+        for development in (115.0, 120.0)
+    ]
+    assert [output.effective_ceiling_percent for output in after_cutoff] == [65, 60]
+    assert after_cutoff[-1].heat_authority_state is PostFcHeatAuthorityState.HOLDING
+
+
+def test_v2_fast_raise_preserves_a_ki_zero_bias_handoff() -> None:
+    """The no-integral branch carries the v2 one-time floor through bias."""
+    controller = PostFcRorController(
+        _projection_recovery_config(recovery_confirm_ticks=1, ki_percent_per_ror_second=0.0)
+    )
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    output = controller.compute(
+        measured_ror_c_per_min=0.0, dt_seconds=5.0, projection=_projection()
+    )
+    assert output.heat_percent == 70
+    assert output.recovery_fast_raise_applied is True

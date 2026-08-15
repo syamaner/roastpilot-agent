@@ -9,7 +9,7 @@ extend this suite.
 import asyncio
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
@@ -63,6 +63,7 @@ from roastpilot_agent.models import (
     RoastStyle,
     RoastTelemetry,
 )
+from roastpilot_agent.post_fc_control import PostFcRecoveryTrigger
 from roastpilot_agent.roast_history import DecisionTraceEntry, RoastMilestoneKind
 from roastpilot_agent.safety import (
     COMMAND_PHASE_MATRIX,
@@ -9454,6 +9455,39 @@ def _recovery_config(
     )
 
 
+def test_force_recovery_exit_preserves_v2_cutoff_and_accepted_clocks() -> None:
+    """Forced safety clamping clears v2 entry state without reopening its cutoff."""
+    harness = make_harness(
+        config=_recovery_config(recovery_projection_enabled=True),
+    )
+    original = harness.controller._post_fc_controller.snapshot_state()  # pyright: ignore[reportPrivateUsage]
+    state = replace(
+        original,
+        recovery_active=True,
+        recovery_ticks_above_trigger=2,
+        recovery_ticks_within_exit=1,
+        recovery_ticks_since_exit=3,
+        recovery_trigger=PostFcRecoveryTrigger.PROJECTION,
+        recovery_projection_short_ticks=2,
+        recovery_projection_on_target_ticks=1,
+        recovery_last_development_elapsed_seconds=80.0,
+        recovery_last_charge_elapsed_seconds=500.0,
+        recovery_cutoff_reached=True,
+    )
+    harness.controller._force_recovery_exit(state)  # pyright: ignore[reportPrivateUsage]
+    forced = harness.controller._post_fc_controller.snapshot_state()  # pyright: ignore[reportPrivateUsage]
+    assert forced.recovery_active is False
+    assert forced.recovery_ticks_above_trigger == 0
+    assert forced.recovery_ticks_within_exit == 0
+    assert forced.recovery_ticks_since_exit is None
+    assert forced.recovery_trigger is PostFcRecoveryTrigger.NONE
+    assert forced.recovery_projection_short_ticks == 0
+    assert forced.recovery_projection_on_target_ticks == 0
+    assert forced.recovery_last_development_elapsed_seconds == 80.0
+    assert forced.recovery_last_charge_elapsed_seconds == 500.0
+    assert forced.recovery_cutoff_reached is True
+
+
 #: A :class:`SafetyLimits` companion for ``_recovery_config(ceiling_guard_temp_c=220.0, ...)``
 #: (#563). The told bitter ceiling now reads ``ceiling_guard_temp_c`` directly
 #: (:meth:`~roastpilot_agent.control_policy.RoastControlPolicy._bitter_ceiling_temp_c`),
@@ -9703,6 +9737,54 @@ async def test_ceiling_guard_drop_takes_precedence_over_recovery_raise_same_tick
     # law's tentative raise was fully suppressed, not merely superseded by a
     # later drop.
     assert harness.executor.targets == targets_before_the_tick
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in executed
+
+
+@pytest.mark.asyncio
+async def test_zero_headroom_v2_fast_raise_is_suppressed_on_guard_drop_tick() -> None:
+    """A v2 entry-floor raise is suppressed even when its ceiling is not elevated."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=196.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=0,
+        recovery_projection_enabled=True,
+    )
+    harness = make_harness(config=config)
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=190.0, bean_ror_c_per_min=12.0)]
+    await harness.controller.tick()
+    lowered_heat = harness.controller.snapshot().current_heat
+    assert lowered_heat < 60
+
+    post_fc = harness.controller._post_fc_controller  # pyright: ignore[reportPrivateUsage]
+    before_probe = post_fc.snapshot_state()
+    probe = post_fc.compute(measured_ror_c_per_min=0.0, dt_seconds=5.0)
+    post_fc.restore_state(before_probe)
+    assert probe.recovery_fast_raise_applied is True
+    assert probe.heat_authority_state is PostFcHeatAuthorityState.HOLDING
+    assert probe.heat_percent > lowered_heat
+
+    targets_before_drop_tick = list(harness.executor.targets)
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=0.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.COOLING
+    assert all(
+        heat <= lowered_heat
+        for heat, _fan in harness.executor.targets[len(targets_before_drop_tick) :]
+    )
     executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
     assert {
         "command": "drop_beans",
