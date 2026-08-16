@@ -54,7 +54,8 @@ class LaunchBannerLines:
         advisor_cfg: The ``Advisor cfg:`` line — model slug, control-teaching
             prompt version, and the experiment tag when either is non-default.
         trim: The ``Pre-FC trim:`` line — the resolved late-Maillard trim depth
-            and whether adaptive depth (#386) is active.
+            and whether adaptive depth (#386) is active, including the depth's
+            conditional coupling to post-FC D88/D96 bases at first crack.
     """
 
     advisor_cfg: str
@@ -170,16 +171,27 @@ def _trim_line(config: AppConfig) -> str:
         the resolved state is non-default.
     """
     trim = config.controller.pre_first_crack_levers.late_maillard_trim
+    post_fc = config.controller.post_first_crack_control
     heat_target = config.controller.pre_first_crack_levers.heat_target_percent
+    if not post_fc.enabled:
+        authority = "loop off: advisor-driven; no D88/D96 caps"
+        compact_authority = authority
+    elif not post_fc.recovery_enabled:
+        authority = "loop on: actual FC heat sets D88 base; recovery off"
+        compact_authority = "actual FC heat→D88 base; recovery off"
+    else:
+        authority = "loop on: actual FC heat sets base/recovery caps"
+        compact_authority = "actual FC heat→base/recovery caps"
     if not trim.enabled:
         return (
-            f"DISABLED — no trim window; flat pre-FC floor {heat_target}% "
-            f"(config; a bean's pre_fc_heat overrides){EXPERIMENT_TAG}"
+            f"DISABLED: flat {heat_target}%; bean pre_fc_heat replaces it up/down; {authority}"
+            f"{EXPERIMENT_TAG}"
         )
     if trim.adaptive_depth_enabled:
         return (
-            f"ADAPTIVE — #386 RoR-keyed depth, base {trim.base_trim}% "
-            f"within {trim.min_trim}–{trim.max_trim}% (experiment, watch the cut)"
+            f"ADAPTIVE base {trim.base_trim}% ({trim.min_trim}–{trim.max_trim}%); open: bean "
+            f"pre_fc_heat binds lower; {authority}"
+            " (experiment, watch the cut)"
         )
     # "proven roast-6 default" is a claim about the whole ACTIVE fixed-mode
     # trim, not just its depth: moving the window or the bean-temp threshold
@@ -190,8 +202,18 @@ def _trim_line(config: AppConfig) -> str:
     # tag that fires on the proven baseline arm teaches the operator to ignore it.
     changed = sorted(_changed_fields(trim) - type(trim).ADAPTIVE_ONLY_FIELDS)
     if not changed:
-        return f"fixed {trim.trim_heat_percent}% (proven roast-6 default)"
-    return f"fixed {trim.trim_heat_percent}% (non-default: {', '.join(changed)}){EXPERIMENT_TAG}"
+        return (
+            f"fixed {trim.trim_heat_percent}% (open: bean pre_fc_heat binds lower; {authority}; "
+            "proven roast-6 default)"
+        )
+    # The non-default suffix and its experiment tag consume display budget. Keep
+    # the open-window truth compact here so a single changed field still fits.
+    prefix = f"fixed {trim.trim_heat_percent}% (open: lower pre_fc_heat; "
+    suffix = f"; non-default: {', '.join(changed)}){EXPERIMENT_TAG}"
+    line = f"{prefix}{compact_authority}{suffix}"
+    if len(line) <= 150:
+        return line
+    return f"{prefix}{compact_authority}; non-default: {len(changed)} settings){EXPERIMENT_TAG}"
 
 
 def resolve_banner_lines(config: AppConfig) -> LaunchBannerLines:

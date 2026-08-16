@@ -357,7 +357,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
   {
     key:            "controller.late_maillard_trim_heat_percent",
     label:          "Trim heat",
-    hint:           "Trimmed heat level (%) held once the late-Maillard window opens. Default 65 — a moderate reduction, not a stall.",
+    hint:           "Trimmed heat (%) once the late-Maillard window opens. If open at first crack and the post-FC RoR loop is enabled, actual actuated heat at FC sets the D88/base cap; it sets the recovery cap only when recovery is enabled; lower bean pre_fc_heat may bind. Before starting, confirm the current saved/effective loop and recovery settings on this Config page. Default 65 — a moderate reduction, not a stall.",
     type:           "number",
     unit:           "%",
     min:            10,   // ge=10 in LateMaillardTrimEdit

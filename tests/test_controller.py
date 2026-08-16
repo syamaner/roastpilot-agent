@@ -1829,6 +1829,65 @@ async def test_damp_trim_depth_state_does_not_advance_on_actuator_failure() -> N
     assert harness.controller._trim_depth_applied != applied_before_failure  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.asyncio
+async def test_fc_reset_uses_actual_heat_after_trim_actuator_failure() -> None:
+    """A failed trim target never becomes the post-FC engagement heat.
+
+    The real pre-FC trim path resolves 60 %, but its armed ``set_targets``
+    call fails, leaving the roaster at its already actuated 80 %. The genuine
+    first-crack transition must therefore reset D88/D96 from 80, not from the
+    unlanded 60 % target.
+    """
+    trim = LateMaillardTrim(trim_heat_percent=60)
+    config = ControllerConfig(
+        pre_first_crack_levers=PreFirstCrackLevers(
+            heat_target_percent=80,
+            late_maillard_trim=trim,
+        ),
+        post_first_crack_control=PostFirstCrackControl(
+            enabled=True,
+            ceiling_guard_drop_enabled=True,
+            recovery_enabled=True,
+            recovery_headroom_percentage_points=15,
+        ),
+    )
+    log: list[str] = []
+    flaky_executor = _ArmableFlakySetTargetsExecutor(log)
+    harness = make_harness(config=config, executor=flaky_executor)
+    await _charge_into_pre_fc(harness)
+    assert harness.controller.snapshot().current_heat == 80
+
+    flaky_executor.arm_next_failure()
+    failed_trim = False
+    bean = 162.0
+    for _ in range(8):
+        harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=30.0)]
+        await harness.controller.tick()
+        if RoastEventKind.COMMAND_FAILED in harness.events.kinds():
+            failed_trim = True
+            break
+        harness.clock.advance(3.0)
+        bean += 0.5
+
+    assert failed_trim
+    assert trim.trim_heat_percent == 60
+    actual_heat = harness.controller.snapshot().current_heat
+    assert actual_heat == 80
+    assert actual_heat != trim.trim_heat_percent
+
+    harness.reader.readings = [
+        reading(bean=178.0, first_crack_detected=True, bean_ror_c_per_min=6.0)
+    ]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+
+    post_fc = harness.controller._post_fc_controller  # pyright: ignore[reportPrivateUsage]
+    state = post_fc.snapshot_state()
+    assert state.heat_engage_percent == actual_heat
+    assert post_fc._never_add_heat_ceiling_percent() == 80  # pyright: ignore[reportPrivateUsage]
+    assert post_fc._recovery_ceiling_percent() == 95  # pyright: ignore[reportPrivateUsage]
+
+
 def test_damping_deadband_gte_slew_rejected_at_construction() -> None:
     """``LateMaillardTrim`` must reject ``deadband >= slew`` at construction (#412 Fix 3).
 

@@ -359,6 +359,28 @@ def test_effective_ceiling_never_exceeds_static_heat_ceiling() -> None:
     assert output.effective_ceiling_percent == 80
 
 
+def test_config_examples_pin_actual_actuated_base_and_recovery_ceilings() -> None:
+    """Pin ``config.py``'s actual-actuated-FC 65/80 and 60/75 examples."""
+    config = _recovery_config(
+        taper_start_max_ror_c_per_min=6.0,
+        taper_end_ror_c_per_min=6.0,
+        recovery_confirm_ticks=1,
+        ror_smoothing_alpha=1.0,
+        kp_percent_per_ror=0.0,
+        ki_percent_per_ror_second=0.0,
+    )
+
+    for engage, expected_base, expected_recovery in ((65, 65, 80), (60, 60, 75)):
+        controller = PostFcRorController(config)
+        controller.reset(initial_heat_percent=engage, ror_at_engagement_c_per_min=6.0)
+
+        holding = controller.compute(measured_ror_c_per_min=6.0, dt_seconds=5.0)
+        recovering = controller.compute(measured_ror_c_per_min=4.0, dt_seconds=5.0)
+
+        assert holding.effective_ceiling_percent == expected_base
+        assert recovering.effective_ceiling_percent == expected_recovery
+
+
 def test_b2_zero_heat_engagement_ceiling_is_one_not_zero() -> None:
     """B2's anti-stall floor: a 0% heat-at-engagement handoff must not pin
     the effective ceiling (and therefore the whole DEVELOPMENT dwell) at 0%
