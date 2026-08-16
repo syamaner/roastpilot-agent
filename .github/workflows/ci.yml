@@ -345,12 +345,15 @@ jobs:
     needs: [quality, pytest-ordinary, pytest-serial, pytest-stress, package, coverage]
     steps:
       - name: Require every Python quality gate to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
           python3 - <<'PY'
           import json
+          import os
           import sys
 
-          needs = json.loads(r'''${{ toJSON(needs) }}''')
+          needs = json.loads(os.environ["NEEDS_JSON"])
           failed = {
               name: details["result"]
               for name, details in needs.items()

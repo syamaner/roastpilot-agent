@@ -290,9 +290,12 @@ def test_checks_is_a_fail_closed_aggregate_of_every_python_gate() -> None:
     }
     check_steps = _steps(checks_job)
     assert len(check_steps) == 1
-    check_run = check_steps[0]["run"]
+    check_step = check_steps[0]
+    check_run = check_step["run"]
     assert isinstance(check_run, str)
-    assert "toJSON(needs)" in check_run
+    assert _mapping(check_step["env"]) == {"NEEDS_JSON": "${{ toJSON(needs) }}"}
+    assert 'os.environ["NEEDS_JSON"]' in check_run
+    assert "${{" not in check_run
     assert '"success"' in check_run
     for job in jobs.values():
         mapped_job = _mapping(job)
