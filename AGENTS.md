@@ -81,6 +81,12 @@ python -m pip install -e . --group dev
 python -m pytest
 ```
 
+For a fast local loop, run `python -m pytest -m 'not stress and not slow'`.
+`stress` tests exercise real production resource limits, `slow` tests use real
+subprocesses or MCP sessions, and `serial` tests must not run concurrently with
+other tests. The full gate (`python -m pytest`, all markers) remains mandatory
+before handback and before opening a PR.
+
 ### Lint And Format
 
 ```bash

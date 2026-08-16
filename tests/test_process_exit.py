@@ -16,6 +16,8 @@ import pytest
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND
 from roastpilot_agent.mcp_client import resolve_mcp_command
 
+pytestmark = pytest.mark.serial(reason="drives POSIX process groups with killpg")
+
 
 def _kill_process_group(pid: int) -> None:
     """Best-effort kill one POSIX process group."""

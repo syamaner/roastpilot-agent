@@ -876,9 +876,12 @@ class _BlockingEnterFactory:
 async def test_start_cancelled_mid_flight_reaps_the_owner() -> None:
     """#484 Low-1: cancelling ``start()`` while it awaits ``ready`` (e.g. Ctrl-C
     during a slow spawn) must reap the owner task and clear per-spawn state, not
-    orphan it. Exercises ``start()``'s ``except BaseException`` reap path."""
+    orphan it. Exercises ``start()``'s ``except BaseException`` reap path.
+
+    The short stop bound is test configuration, not the behaviour under test.
+    """
     factory = _BlockingEnterFactory()
-    process = MCPServerProcess(session_factory=factory)
+    process = MCPServerProcess(MCPConfig(stop_timeout_seconds=0.05), session_factory=factory)
     start_task = asyncio.create_task(process.start())
     # Let start() reach its `await ready` (the owner is blocked in __aenter__).
     await asyncio.sleep(0.05)

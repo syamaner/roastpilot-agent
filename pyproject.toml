@@ -236,12 +236,14 @@ path = "src/roastpilot_agent/__init__.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q --strict-markers --durations=25 --durations-min=1.0"
 pythonpath = ["src", "scripts", ".agents/skills/capture-agent-usage/scripts"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "slow: spawns a real subprocess / initialises a real MCP session (still hardware-free)",
+    "stress: production-size resource-bound regression: exercises a real production limit (bytes, counts, corpus) at its real value; slow by construction; ALWAYS runs in CI (in the full gate now, in a dedicated lane after slice 2); locally deselectable with `-m 'not stress'`.",
+    "serial: must not run concurrently with any other test: mutates a shared repository path, drives real process groups / a real MCP child, or depends on process-global state; runs in the serial lane after slice 2. Reason is stated at the marker site.",
 ]
 
 [tool.coverage.run]

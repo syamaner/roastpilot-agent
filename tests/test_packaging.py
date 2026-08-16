@@ -26,6 +26,7 @@ import pytest
 
 pytestmark = [
     pytest.mark.skipif(shutil.which("npm") is None, reason="npm not installed"),
+    pytest.mark.serial(reason="mutates web/dist and builds from the shared repository cwd"),
     # Runs `python -m build --wheel` (a real subprocess build invoking npm ci +
     # vite build) then a clean-venv pip install: much slower than a unit test.
     pytest.mark.slow,
