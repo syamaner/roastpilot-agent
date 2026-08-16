@@ -63,31 +63,28 @@
    charging. **Post-promotion, "missing" means an explicit `=0` toggle (or an
    env var) is quietly turning a flag OFF from its new default** — the same
    stop-and-fix rule applies either direction now.
-3. Quick preflight → charge → watch especially the **post-FC heat behaviour**:
-   - when the post-FC RoR loop is enabled, engagement heat is the actual pre-FC
-     heat at the true-FC edge: with an open trim window, only a lower
-     bean-specific `pre_fc_heat` can bind below the resolved trim; otherwise
-     `pre_fc_heat` replaces the flat pre-FC floor higher or lower. The D88 base
-     cap is `max(1, min(static heat ceiling, engagement heat))`, including its
-     1% anti-stall floor. With the loop disabled, post-FC heat is advisor-driven
-     and the D88/D96 caps are not enforced;
-   - with the loop enabled and recovery disabled, the taper should EASE heat down from that cap
-     (its setpoint decays from the measured engagement RoR toward 4 °C/min
-     over ~90 s) and must never rise above it;
-   - with the loop enabled and bounded recovery enabled, heat may rise only to
-     the active recovery ceiling: the greater of the D88 base cap and the
-     configured recovery term (engagement plus configured headroom, bounded by
-     the static heat ceiling). D162's runway-aware path retains that same cap
-     and releases recovery authority at its configured cutoff before gliding
-     back to the base cap. A rise beyond the applicable cap is a stop-and-record
-     failure;
-   - the deterministic drop fires at bean ≥ target AND dev ≥ target; the
-     ceiling guard drops at bean ≥ 196 °C regardless of dev; the advisor keeps
-     drop-earlier-only authority. Compare against roast 1.
+3. Quick preflight → charge → watch especially the **post-FC heat behaviour**.
+   Setup: actual heat at FC is engagement heat; an open trim accepts only a
+   lower bean-specific `pre_fc_heat`, otherwise it replaces the flat floor
+   higher or lower. D88 base: `max(1, min(static ceiling, engagement heat))`.
+   - **Post-FC RoR loop off:** heat is advisor-driven; D88/D96 caps do not apply.
+   - **Loop on, recovery off:** taper EASES down from the D88 base and never rises
+     above it.
+   - **Loop on, recovery on:** heat may rise only to the active recovery ceiling
+     before D162 glides to the base at cutoff. A rise beyond the applicable cap
+     is a stop-and-record failure.
+   - **Drops:** deterministic at bean ≥ target AND dev ≥ target; ceiling guard
+     at bean ≥ 196 °C regardless of dev; advisor keeps drop-earlier-only
+     authority. Compare against roast 1.
 4. End the run.
 
 ## After
 - Run **roast-review** on both. Compare: did the #405 loop hold the RoR + release the drop cleanly vs the advisor-driven baseline? Note DTR, drop temp, and any oscillation.
 
 ## Safety
-- Roast 2 is the **first hardware run of the D88 taper + ceiling guard** — supervise it. **Emergency stop is available from every phase.** When the post-FC loop is enabled and recovery is disabled, post-FC heat only ever moves DOWN from the D88 base cap, `max(1, min(static heat ceiling, actual pre-FC heat at FC))`; with an open trim, only a lower bean-specific `pre_fc_heat` can bind, otherwise it replaces the flat floor higher or lower. If bounded recovery is explicitly enabled with that loop, it may rise only to the active recovery ceiling before releasing through D162; a rise beyond that applicable cap is a stop-and-record event. With the loop disabled, post-FC heat is advisor-driven rather than D88/D96-capped. No drop lands above 196 °C with the guard on. A restart mid-run enters `operator_recovery_required` (no auto-resume of heat/fan).
+- Roast 2 is the **first hardware run of the D88 taper + ceiling guard** — supervise it. **Emergency stop is available from every phase.**
+- **Post-FC RoR loop off:** heat is advisor-driven, not D88/D96-capped.
+- **Loop on, recovery off:** heat only moves DOWN from the D88 base cap, `max(1, min(static heat ceiling, actual pre-FC heat at FC))`.
+- **Loop on, recovery on:** heat may rise only to the active recovery ceiling; a rise beyond it is a stop-and-record event. With an open trim, only a lower bean-specific `pre_fc_heat` can bind; otherwise it replaces the flat floor higher or lower.
+- **Ceiling guard:** no drop above 196 °C when on. A restart mid-run enters
+  `operator_recovery_required` — no auto-resume of heat or fan.

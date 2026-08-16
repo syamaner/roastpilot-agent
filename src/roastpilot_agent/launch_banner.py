@@ -174,17 +174,15 @@ def _trim_line(config: AppConfig) -> str:
     heat_target = config.controller.pre_first_crack_levers.heat_target_percent
     if not trim.enabled:
         return (
-            f"DISABLED — no trim window; flat pre-FC floor {heat_target}% (config; bean "
-            "pre_fc_heat replaces that floor higher or lower; when the post-FC loop is "
-            "enabled, actual pre-FC "
-            f"heat at FC is the D88/D96 basis){EXPERIMENT_TAG}"
+            f"DISABLED: flat {heat_target}%; bean pre_fc_heat replaces it up/down; post-FC RoR "
+            "loop on: FC heat sets base/recovery caps"
+            f"{EXPERIMENT_TAG}"
         )
     if trim.adaptive_depth_enabled:
         return (
-            f"ADAPTIVE — #386 RoR-keyed depth, base {trim.base_trim}% "
-            f"within {trim.min_trim}–{trim.max_trim}%; when its window is open and the "
-            "post-FC loop is enabled, actual pre-FC heat at FC is the D88/D96 basis "
-            "(a lower bean pre_fc_heat can bind; experiment, watch the cut)"
+            f"ADAPTIVE {trim.base_trim}% ({trim.min_trim}–{trim.max_trim}%); open: bean "
+            "pre_fc_heat binds lower; post-FC RoR loop on: FC heat sets base/recovery caps"
+            " (experiment, watch the cut)"
         )
     # "proven roast-6 default" is a claim about the whole ACTIVE fixed-mode
     # trim, not just its depth: moving the window or the bean-temp threshold
@@ -196,14 +194,13 @@ def _trim_line(config: AppConfig) -> str:
     changed = sorted(_changed_fields(trim) - type(trim).ADAPTIVE_ONLY_FIELDS)
     if not changed:
         return (
-            f"fixed {trim.trim_heat_percent}% (when its window is open and the post-FC loop "
-            "is enabled, actual pre-FC heat at FC is the D88/D96 basis; a lower bean "
-            "pre_fc_heat can bind; proven roast-6 default)"
+            f"fixed {trim.trim_heat_percent}% (open: bean pre_fc_heat binds lower; post-FC "
+            "RoR loop on: FC heat sets base/recovery caps; proven roast-6 default)"
         )
     return (
-        f"fixed {trim.trim_heat_percent}% (when its window is open and the post-FC loop is "
-        "enabled, actual pre-FC heat at FC is the D88/D96 basis; a lower bean pre_fc_heat "
-        f"can bind; non-default: {', '.join(changed)}){EXPERIMENT_TAG}"
+        f"fixed {trim.trim_heat_percent}% (open: bean pre_fc_heat binds lower; post-FC RoR loop "
+        "on: FC heat sets base/recovery caps; "
+        f"non-default: {', '.join(changed)}){EXPERIMENT_TAG}"
     )
 
 
