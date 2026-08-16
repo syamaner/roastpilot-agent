@@ -86,7 +86,7 @@
 ## Safety
 - Roast 2 is the **first hardware run of the D88 taper + ceiling guard** — supervise it. **Emergency stop is available from every phase.**
 - **Post-FC RoR loop off:** heat is advisor-driven, not D88/D96-capped.
-- **Loop on, recovery off:** heat only moves DOWN from the D88 base cap, `max(1, min(static heat ceiling, actual actuated pre-FC heat at FC))`.
+- **Loop on, recovery off:** heat may move only up to, never above, the D88 base cap, `max(1, min(static heat ceiling, actual actuated pre-FC heat at FC))`; exceeding it is a stop-and-record event.
 - **Loop on, recovery on:** heat may rise only to the active recovery ceiling; a rise beyond it is a stop-and-record event. With an open trim, only a lower bean-specific `pre_fc_heat` can bind; otherwise it replaces the flat floor higher or lower.
 - **Ceiling guard:** no drop above 196 °C when on. A restart mid-run enters
   `operator_recovery_required` — no auto-resume of heat or fan.

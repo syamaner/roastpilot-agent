@@ -7,6 +7,7 @@ nesting), validation rejections, and the guidance-vs-safety-bound link.
 
 import inspect
 import os
+from pathlib import Path
 
 import pydantic
 import pytest
@@ -69,6 +70,15 @@ def test_trim_authority_comment_distinguishes_override_and_ceiling_terms() -> No
     assert "actual actuated FC heat 60" in source
     assert "65/80" in source
     assert "60/75" in source
+
+
+def test_runbook_recovery_off_describes_the_d88_ceiling_not_heat_direction() -> None:
+    """Recovery-off runbook text keeps PI heat motion bounded, not one-way."""
+    runbook = (Path(__file__).parents[1] / "docs" / "roast-session-runbook.md").read_text()
+
+    assert "heat may move only up to, never above, the D88 base cap" in runbook
+    assert "exceeding it is a stop-and-record event" in runbook
+    assert "heat only moves DOWN from the D88 base cap" not in runbook
 
 
 def test_controller_defaults_match_orchestration_plan() -> None:
