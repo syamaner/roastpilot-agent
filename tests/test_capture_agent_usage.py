@@ -1855,8 +1855,9 @@ def test_codex_counts_small_items_as_opaque_not_retained_budget() -> None:
     assert usage.output_tokens == 1
 
 
-def test_codex_opaque_event_and_total_boundaries_are_exact() -> None:
-    """Opaque item event and aggregate byte limits accept exact bounds and reject one over."""
+@pytest.mark.stress
+def test_codex_opaque_event_boundary_is_exact() -> None:
+    """The real opaque item event byte limit accepts exact and rejects one over."""
     prefix = b'{"type":"item.updated","payload":"'
     suffix = b'"}\n'
     exact_payload = MAX_CODEX_OPAQUE_EVENT_BYTES - len(prefix) - len(suffix)
@@ -1865,8 +1866,17 @@ def test_codex_opaque_event_and_total_boundaries_are_exact() -> None:
     with pytest.raises(CodexUsageParseError, match="opaque event exceeds size limit"):
         parse_codex_stream(BytesIO(prefix + (b"x" * (exact_payload + 1)) + suffix))
 
-    medium = _opaque_item_event(8_000)
+
+@pytest.mark.stress
+def test_codex_opaque_total_boundary_is_exact() -> None:
+    """The real aggregate opaque stream byte limit accepts exact and rejects one over."""
+    prefix = b'{"type":"item.updated","payload":"'
+    suffix = b'"}\n'
+    event_bytes = 128 * 1024
+    medium = prefix + (b"x" * (event_bytes - len(prefix) - len(suffix))) + suffix
+    assert len(medium) == event_bytes
     repeats = MAX_CODEX_OPAQUE_TOTAL_BYTES // len(medium)
+    assert repeats * len(medium) == MAX_CODEX_OPAQUE_TOTAL_BYTES
     assert (
         parse_codex_stream(
             _RepeatedEventStream(medium, repeats, _codex_terminal_event())
@@ -1875,6 +1885,39 @@ def test_codex_opaque_event_and_total_boundaries_are_exact() -> None:
     )
     with pytest.raises(CodexUsageParseError, match="opaque stream exceeds total byte limit"):
         parse_codex_stream(_RepeatedEventStream(medium, repeats + 1, _codex_terminal_event()))
+
+
+def test_codex_opaque_event_boundary_is_fast_and_exact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reduced valid opaque event bound preserves exact comparison behaviour."""
+    event_limit = 4 * MAX_EVENT_BYTES
+    monkeypatch.setattr(usage_codex, "MAX_CODEX_OPAQUE_EVENT_BYTES", event_limit)
+    prefix = b'{"type":"item.updated","payload":"'
+    suffix = b'"}\n'
+    exact_payload = event_limit - len(prefix) - len(suffix)
+    exact = prefix + (b"x" * exact_payload) + suffix
+    assert parse_codex_stream(BytesIO(exact + _codex_terminal_event())).input_tokens == 1
+    with pytest.raises(CodexUsageParseError, match="opaque event exceeds size limit"):
+        parse_codex_stream(BytesIO(prefix + (b"x" * (exact_payload + 1)) + suffix))
+
+
+def test_codex_opaque_total_boundary_is_fast_and_exact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reduced valid opaque total bound preserves exact comparison behaviour."""
+    medium = _opaque_item_event(80_000)
+    event_limit = 4 * MAX_EVENT_BYTES
+    total_limit = 4 * len(medium)
+    monkeypatch.setattr(usage_codex, "MAX_CODEX_OPAQUE_EVENT_BYTES", event_limit)
+    monkeypatch.setattr(usage_codex, "MAX_CODEX_OPAQUE_TOTAL_BYTES", total_limit)
+    assert event_limit <= total_limit
+    assert (
+        parse_codex_stream(
+            _RepeatedEventStream(medium, total_limit // len(medium), _codex_terminal_event())
+        ).input_tokens
+        == 1
+    )
+    with pytest.raises(CodexUsageParseError, match="opaque stream exceeds total byte limit"):
+        parse_codex_stream(
+            _RepeatedEventStream(medium, (total_limit // len(medium)) + 1, _codex_terminal_event())
+        )
 
 
 @pytest.mark.parametrize(

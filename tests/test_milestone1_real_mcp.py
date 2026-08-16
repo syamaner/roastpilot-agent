@@ -44,10 +44,13 @@ from roastpilot_agent.models import (
 from roastpilot_agent.store import RoastStore
 from tests.conftest import FakeClock
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("coffee-roaster-mcp") is None,
-    reason="coffee-roaster-mcp not installed (the E9-S2 real-subprocess slice)",
-)
+pytestmark = [
+    pytest.mark.serial(reason="drives a real MCP child and verifies process teardown"),
+    pytest.mark.skipif(
+        shutil.which("coffee-roaster-mcp") is None,
+        reason="coffee-roaster-mcp not installed (the E9-S2 real-subprocess slice)",
+    ),
+]
 
 # A bootstrap-safe mock config that enables auto-T0 (config-file only) with a
 # small drop threshold so the engineered charge drop trips it quickly — keeping

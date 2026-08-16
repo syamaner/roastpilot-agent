@@ -64,6 +64,7 @@ pytestmark = [
         not os.path.isfile(resolve_mcp_command(DEFAULT_MCP_COMMAND)),
         reason="coffee-roaster-mcp not installed where the spawn resolves it",
     ),
+    pytest.mark.serial(reason="drives a real MCP child and verifies process teardown"),
     # Spawns a real subprocess and initialises an MCP session twice: slower than
     # a unit test, so tag it for opt-out (still runs hardware-free in CI).
     pytest.mark.slow,
