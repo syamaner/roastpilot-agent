@@ -444,13 +444,13 @@ class PostFcRorController:
         proportional term alone would have to make up the entire gap,
         producing a visible heat step at the exact tick the loop engages.
 
-        The production caller invokes this method only on the true first-crack
-        edge and passes ``RoastController._current_heat``. When the late-Maillard
-        trim window is open at first crack, that value is the resolved trim
-        depth; otherwise it is the flat pre-FC heat floor. It therefore becomes
-        the engagement basis for both the D88 base ceiling and the D96/D162
-        bounded-recovery ceiling, rather than a separately configured post-FC
-        baseline.
+        The production caller invokes this method on the true first-crack edge
+        and passes ``RoastController._current_heat``. When the post-FC loop is
+        enabled, that actual pre-FC heat at FC becomes the engagement basis for
+        the D88 base and D96/D162 bounded-recovery ceilings: it is the resolved
+        trim depth when the window is open, unless a lower per-bean
+        ``pre_fc_heat`` has already bound it. With the loop disabled, post-FC
+        heat remains advisor-driven and those caps do not apply.
 
         **``r0`` — the taper's starting setpoint (D88):**
         ``r0 = clamp(ror_at_engagement_c_per_min, taper_end_ror_c_per_min,
@@ -497,11 +497,12 @@ class PostFcRorController:
                 loop takes over. Seeds the handoff bias AND becomes
                 ``heat_engage_percent`` — the never-add-heat-beyond-entry
                 basis for every subsequent :meth:`compute` call's effective
-                ceiling this engagement (D88), including the resolved trim
-                depth when its window was open at first crack. Not otherwise
-                validated against the config's box (a value outside the box is
-                clamped the same way any other output is clamped, on the very
-                first :meth:`compute` call).
+                ceiling this engagement (D88) when the post-FC loop is enabled,
+                including a lower per-bean ``pre_fc_heat`` or resolved trim
+                depth at first crack. Not otherwise validated against the
+                config's box (a value outside the box is clamped the same way
+                any other output is clamped, on the very first :meth:`compute`
+                call).
             ror_at_engagement_c_per_min: The EMA-smoothed bean RoR (°C/min)
                 the roast measured at this same handoff instant. Anchors the
                 taper's starting setpoint ``r0`` (see above) — never a fixed

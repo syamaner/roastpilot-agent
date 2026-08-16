@@ -1487,9 +1487,10 @@ class RoastController:
                 and self._last_telemetry.bean_ror_c_per_min is not None
                 else self._config.post_first_crack_control.taper_end_ror_c_per_min
             )
-            # When the trim window is open at this true-FC edge, ``_current_heat``
-            # is the resolved trim depth; reset makes it the engagement basis
-            # for both the D88 base and D96/D162 recovery ceilings.
+            # With the post-FC loop enabled, reset uses the actual pre-FC heat
+            # at this true-FC edge as the D88/D96 engagement basis: the resolved
+            # trim depth when its window is open, unless lower bean pre_fc_heat
+            # already bound it. The loop's enabled gate remains below.
             self._post_fc_controller.reset(
                 initial_heat_percent=self._current_heat,
                 ror_at_engagement_c_per_min=ror_at_engagement,

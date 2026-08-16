@@ -1535,9 +1535,10 @@ def test_format_post_fc_loop_readout_recovery_enabled_shows_cap() -> None:
     # The headroom cap shown is the resolved value, not a hardcoded default.
     assert "15" in text
     assert lines[2] == (
-        "⚠️  BOUNDED-BIDIRECTIONAL HEAT RECOVERY: ENABLED (D96 — the taper may raise heat "
-        "up to 15 pp above entry when RoR runs persistently below setpoint; entry is the "
-        "pre-FC heat at FC, the trim level when its window was open)"
+        "⚠️  BOUNDED-BIDIRECTIONAL HEAT RECOVERY: ENABLED (D96 — when the post-FC RoR "
+        "loop is enabled, the taper may raise heat up to 15 pp above entry when RoR runs "
+        "persistently below setpoint; entry is actual pre-FC heat at FC, from an open trim "
+        "window or lower bean pre_fc_heat)"
     )
     assert "bidirectional heat recovery: disabled" not in text
     assert "recovery v2 projection: disabled" in text
@@ -1556,8 +1557,9 @@ def test_format_post_fc_loop_readout_recovery_disabled_by_default() -> None:
     assert "bidirectional heat recovery: disabled" in text
     assert "D88 never-add-heat-beyond-entry stands" in text
     assert lines[2] == (
-        "  bidirectional heat recovery: disabled (D88 never-add-heat-beyond-entry stands; "
-        "entry is the pre-FC heat at FC, the trim level when its window was open)"
+        "  bidirectional heat recovery: disabled (when the post-FC RoR loop is enabled, "
+        "D88 never-add-heat-beyond-entry stands; entry is actual pre-FC heat at FC, from "
+        "an open trim window or lower bean pre_fc_heat)"
     )
     assert "BOUNDED-BIDIRECTIONAL" not in text
     assert "recovery v2 projection: disabled" in text

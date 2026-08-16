@@ -761,14 +761,17 @@ def _format_post_fc_loop_readout(
             ``post_first_crack_control.recovery_headroom_percentage_points``
             value, shown alongside the flag so the operator confirms the
             CAP, not just that recovery is on — the number that actually
-            bounds how far above entry heat the loop may raise. Only
-            rendered when ``recovery_enabled`` is ``True``.
+            bounds how far above entry heat the loop may raise when the
+            post-FC loop is enabled. Only rendered when ``recovery_enabled``
+            is ``True``.
         recovery_projection_enabled: Whether the D162 runway-aware projection
             trigger is enabled.
         recovery_projection_entry_horizon_pp: Resolved DTR percentage-point
-            horizon where a projected miss may enter recovery.
+            horizon where a projected miss may enter recovery when the
+            post-FC loop is enabled.
         recovery_projection_cutoff_horizon_pp: Resolved DTR percentage-point
-            horizon where recovery authority unconditionally releases.
+            horizon where recovery authority unconditionally releases when the
+            post-FC loop is enabled.
         recovery_projection_margin_c: Resolved projected-temperature shortfall
             required for entry.
         recovery_entry_step_pp: Resolved one-time fast-raise floor above entry.
@@ -794,14 +797,16 @@ def _format_post_fc_loop_readout(
     if recovery_enabled:
         lines.append(
             "⚠️  BOUNDED-BIDIRECTIONAL HEAT RECOVERY: ENABLED "
-            f"(D96 — the taper may raise heat up to {recovery_headroom_percentage_points:g} pp "
-            "above entry when RoR runs persistently below setpoint; entry is the pre-FC heat "
-            "at FC, the trim level when its window was open)"
+            f"(D96 — when the post-FC RoR loop is enabled, the taper may raise heat up to "
+            f"{recovery_headroom_percentage_points:g} pp above entry when RoR runs persistently "
+            "below setpoint; entry is actual pre-FC heat at FC, from an open trim window or "
+            "lower bean pre_fc_heat)"
         )
     else:
         lines.append(
-            "  bidirectional heat recovery: disabled (D88 never-add-heat-beyond-entry stands; "
-            "entry is the pre-FC heat at FC, the trim level when its window was open)"
+            "  bidirectional heat recovery: disabled (when the post-FC RoR loop is enabled, "
+            "D88 never-add-heat-beyond-entry stands; entry is actual pre-FC heat at FC, from "
+            "an open trim window or lower bean pre_fc_heat)"
         )
     v2_values = (
         f"entry=+{recovery_projection_entry_horizon_pp:g} pp, "
