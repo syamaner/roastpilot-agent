@@ -359,8 +359,8 @@ def test_effective_ceiling_never_exceeds_static_heat_ceiling() -> None:
     assert output.effective_ceiling_percent == 80
 
 
-def test_config_examples_pin_trim_derived_base_and_recovery_ceilings() -> None:
-    """Pin ``config.py``'s 65/80 and 60/75 engagement examples."""
+def test_config_examples_pin_actual_actuated_base_and_recovery_ceilings() -> None:
+    """Pin ``config.py``'s actual-actuated-FC 65/80 and 60/75 examples."""
     config = _recovery_config(
         taper_start_max_ror_c_per_min=6.0,
         taper_end_ror_c_per_min=6.0,

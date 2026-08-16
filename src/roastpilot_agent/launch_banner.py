@@ -171,17 +171,26 @@ def _trim_line(config: AppConfig) -> str:
         the resolved state is non-default.
     """
     trim = config.controller.pre_first_crack_levers.late_maillard_trim
+    post_fc = config.controller.post_first_crack_control
     heat_target = config.controller.pre_first_crack_levers.heat_target_percent
+    if not post_fc.enabled:
+        authority = "loop off: advisor-driven; no D88/D96 caps"
+        compact_authority = authority
+    elif not post_fc.recovery_enabled:
+        authority = "loop on: actual FC heat sets D88 base; recovery off"
+        compact_authority = "actual FC heat→D88 base; recovery off"
+    else:
+        authority = "loop on: actual FC heat sets base/recovery caps"
+        compact_authority = "actual FC heat→base/recovery caps"
     if not trim.enabled:
         return (
-            f"DISABLED: flat {heat_target}%; bean pre_fc_heat replaces it up/down; post-FC RoR "
-            "loop on: FC heat sets base/recovery caps"
+            f"DISABLED: flat {heat_target}%; bean pre_fc_heat replaces it up/down; {authority}"
             f"{EXPERIMENT_TAG}"
         )
     if trim.adaptive_depth_enabled:
         return (
             f"ADAPTIVE base {trim.base_trim}% ({trim.min_trim}–{trim.max_trim}%); open: bean "
-            "pre_fc_heat binds lower; post-FC RoR loop on: FC heat sets base/recovery caps"
+            f"pre_fc_heat binds lower; {authority}"
             " (experiment, watch the cut)"
         )
     # "proven roast-6 default" is a claim about the whole ACTIVE fixed-mode
@@ -194,14 +203,17 @@ def _trim_line(config: AppConfig) -> str:
     changed = sorted(_changed_fields(trim) - type(trim).ADAPTIVE_ONLY_FIELDS)
     if not changed:
         return (
-            f"fixed {trim.trim_heat_percent}% (open: bean pre_fc_heat binds lower; post-FC "
-            "RoR loop on: FC heat sets base/recovery caps; proven roast-6 default)"
+            f"fixed {trim.trim_heat_percent}% (open: bean pre_fc_heat binds lower; {authority}; "
+            "proven roast-6 default)"
         )
-    return (
-        f"fixed {trim.trim_heat_percent}% (open: bean pre_fc_heat binds lower; post-FC RoR loop "
-        "on: FC heat sets base/recovery caps; "
-        f"non-default: {', '.join(changed)}){EXPERIMENT_TAG}"
-    )
+    # The non-default suffix and its experiment tag consume display budget. Keep
+    # the open-window truth compact here so a single changed field still fits.
+    prefix = f"fixed {trim.trim_heat_percent}% (open: lower pre_fc_heat; "
+    suffix = f"; non-default: {', '.join(changed)}){EXPERIMENT_TAG}"
+    line = f"{prefix}{compact_authority}{suffix}"
+    if len(line) <= 150:
+        return line
+    return f"{prefix}{compact_authority}; non-default: {len(changed)} settings){EXPERIMENT_TAG}"
 
 
 def resolve_banner_lines(config: AppConfig) -> LaunchBannerLines:

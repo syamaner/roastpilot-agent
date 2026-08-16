@@ -801,14 +801,15 @@ def _format_post_fc_loop_readout(
             "⚠️  BOUNDED-BIDIRECTIONAL HEAT RECOVERY: ENABLED "
             f"(D96 — when the post-FC RoR loop is enabled, the taper may raise heat up to "
             f"{recovery_headroom_percentage_points:g} pp above entry when RoR runs persistently "
-            "below setpoint; entry is actual pre-FC heat at FC: an open trim admits only "
+            "below setpoint; entry is actual actuated pre-FC heat at FC: an open trim admits only "
             "a lower bean pre_fc_heat, otherwise that bean setting replaces the flat floor "
             "higher or lower)"
         )
     else:
         lines.append(
             "  bidirectional heat recovery: disabled (when the post-FC RoR loop is enabled, "
-            "D88 never-add-heat-beyond-entry stands; entry is actual pre-FC heat at FC: an "
+            "D88 never-add-heat-beyond-entry stands; entry is actual actuated pre-FC heat at "
+            "FC: an "
             "open trim admits only a lower bean pre_fc_heat, otherwise that bean setting "
             "replaces the flat floor higher or lower)"
         )

@@ -64,7 +64,8 @@
    env var) is quietly turning a flag OFF from its new default** — the same
    stop-and-fix rule applies either direction now.
 3. Quick preflight → charge → watch especially the **post-FC heat behaviour**.
-   Setup: actual heat at FC is engagement heat; an open trim accepts only a
+   Setup: actual actuated heat at FC is engagement heat, not merely the resolved
+   trim target; an open trim accepts only a
    lower bean-specific `pre_fc_heat`, otherwise it replaces the flat floor
    higher or lower. D88 base: `max(1, min(static ceiling, engagement heat))`.
    - **Post-FC RoR loop off:** heat is advisor-driven; D88/D96 caps do not apply.
@@ -85,7 +86,7 @@
 ## Safety
 - Roast 2 is the **first hardware run of the D88 taper + ceiling guard** — supervise it. **Emergency stop is available from every phase.**
 - **Post-FC RoR loop off:** heat is advisor-driven, not D88/D96-capped.
-- **Loop on, recovery off:** heat only moves DOWN from the D88 base cap, `max(1, min(static heat ceiling, actual pre-FC heat at FC))`.
+- **Loop on, recovery off:** heat only moves DOWN from the D88 base cap, `max(1, min(static heat ceiling, actual actuated pre-FC heat at FC))`.
 - **Loop on, recovery on:** heat may rise only to the active recovery ceiling; a rise beyond it is a stop-and-record event. With an open trim, only a lower bean-specific `pre_fc_heat` can bind; otherwise it replaces the flat floor higher or lower.
 - **Ceiling guard:** no drop above 196 °C when on. A restart mid-run enters
   `operator_recovery_required` — no auto-resume of heat or fan.

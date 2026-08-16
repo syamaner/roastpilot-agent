@@ -446,9 +446,10 @@ class PostFcRorController:
 
         The production caller invokes this method on the true first-crack edge
         and passes ``RoastController._current_heat``. When the post-FC loop is
-        enabled, that actual pre-FC heat at FC becomes the engagement basis for
+        enabled, that actual, actuated pre-FC heat at FC becomes the engagement basis for
         the D88 base and D96/D162 bounded-recovery ceilings: with an open trim
-        window it is the resolved trim depth unless a lower per-bean
+        window it is the resolved trim depth only if that trim was actuated,
+        unless a lower per-bean
         ``pre_fc_heat`` has already bound it; otherwise ``pre_fc_heat`` replaces
         the flat floor higher or lower. With the loop disabled, post-FC heat
         remains advisor-driven and those caps do not apply.

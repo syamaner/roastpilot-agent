@@ -65,6 +65,8 @@ def test_trim_authority_comment_distinguishes_override_and_ceiling_terms() -> No
     assert "``max(1, min(heat_ceiling_percent, heat_engage_percent))``" in source
     assert "``min(heat_ceiling_percent, heat_engage_percent +" in source
     assert "``max(base_ceiling, recovery_term)``, never below the D88 base" in source
+    assert "actual actuated FC heat 65" in source
+    assert "actual actuated FC heat 60" in source
     assert "65/80" in source
     assert "60/75" in source
 

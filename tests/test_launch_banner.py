@@ -28,6 +28,7 @@ from roastpilot_agent.config import (
     AppConfig,
     ControllerConfig,
     LateMaillardTrim,
+    PostFirstCrackControl,
     PreFirstCrackLevers,
 )
 from roastpilot_agent.config_store import (
@@ -506,8 +507,8 @@ def test_trim_line_reports_saved_non_default_depth(config_file: Path) -> None:
     lines = load_banner_lines()
 
     assert lines.trim == (
-        "fixed 60% (open: bean pre_fc_heat binds lower; post-FC RoR loop on: FC heat sets "
-        "base/recovery caps; "
+        "fixed 60% (open: lower pre_fc_heat; actual FC heat→D88 "
+        "base; recovery off; "
         f"non-default: trim_heat_percent){EXPERIMENT_TAG}"
     )
 
@@ -531,8 +532,8 @@ def test_trim_line_flags_a_non_default_window_at_the_proven_depth() -> None:
     lines = resolve_banner_lines(config)
 
     assert lines.trim == (
-        "fixed 65% (open: bean pre_fc_heat binds lower; post-FC RoR loop on: FC heat sets "
-        "base/recovery caps; "
+        "fixed 65% (open: lower pre_fc_heat; actual FC heat→D88 "
+        "base; recovery off; "
         f"non-default: window_fc_eta_seconds){EXPERIMENT_TAG}"
     )
     assert "proven" not in lines.trim
@@ -558,8 +559,8 @@ def test_inert_adaptive_coefficients_do_not_tag_a_default_fixed_arm() -> None:
     lines = resolve_banner_lines(config)
 
     assert lines.trim == (
-        "fixed 65% (open: bean pre_fc_heat binds lower; post-FC RoR loop on: FC heat sets "
-        "base/recovery caps; proven roast-6 default)"
+        "fixed 65% (open: bean pre_fc_heat binds lower; loop on: actual FC heat sets D88 "
+        "base; recovery off; proven roast-6 default)"
     )
     assert EXPERIMENT_TAG not in lines.trim
 
@@ -610,8 +611,8 @@ def test_changed_fields_skips_default_factory_fields() -> None:
 def test_trim_line_default_depth_is_untagged(config_file: Path) -> None:
     """The proven 65 % default keeps its plain, untagged wording."""
     assert load_banner_lines().trim == (
-        "fixed 65% (open: bean pre_fc_heat binds lower; post-FC RoR loop on: FC heat sets "
-        "base/recovery caps; proven roast-6 default)"
+        "fixed 65% (open: bean pre_fc_heat binds lower; loop on: actual FC heat sets D88 "
+        "base; recovery off; proven roast-6 default)"
     )
 
 
@@ -638,8 +639,8 @@ def test_disabled_trim_is_reported_as_disabled_not_as_its_dead_depth(
     trim = load_banner_lines().trim
 
     assert trim == (
-        "DISABLED: flat 100%; bean pre_fc_heat replaces it up/down; post-FC RoR loop on: FC "
-        "heat sets base/recovery caps"
+        "DISABLED: flat 100%; bean pre_fc_heat replaces it up/down; loop on: actual FC "
+        "heat sets D88 base; recovery off"
         f"{EXPERIMENT_TAG}"
     )
     assert len(trim) <= 150
@@ -667,11 +668,77 @@ def test_trim_line_reports_saved_adaptive_state(config_file: Path) -> None:
     lines = load_banner_lines()
 
     assert lines.trim == (
-        "ADAPTIVE base 65% (45–75%); open: bean pre_fc_heat binds lower; post-FC RoR loop on: "
-        "FC heat sets base/recovery caps (experiment, watch the cut)"
+        "ADAPTIVE base 65% (45–75%); open: bean pre_fc_heat binds lower; loop on: "
+        "actual FC heat sets D88 base; recovery off (experiment, watch the cut)"
     )
     assert len(lines.trim) <= 150
     assert "base/recovery caps 65" not in lines.trim
+
+
+@pytest.mark.parametrize(
+    ("trim", "post_fc", "authority", "trim_truth"),
+    [
+        (
+            LateMaillardTrim(),
+            PostFirstCrackControl(enabled=False),
+            "loop off: advisor-driven; no D88/D96 caps",
+            "open: bean pre_fc_heat binds lower",
+        ),
+        (
+            LateMaillardTrim(adaptive_depth_enabled=True),
+            PostFirstCrackControl(enabled=True, recovery_enabled=False),
+            "loop on: actual FC heat sets D88 base; recovery off",
+            "open: bean pre_fc_heat binds lower",
+        ),
+        (
+            LateMaillardTrim(enabled=False),
+            PostFirstCrackControl(enabled=True, recovery_enabled=True),
+            "loop on: actual FC heat sets base/recovery caps",
+            "bean pre_fc_heat replaces it up/down",
+        ),
+    ],
+)
+def test_trim_line_renders_resolved_post_fc_authority(
+    trim: LateMaillardTrim,
+    post_fc: PostFirstCrackControl,
+    authority: str,
+    trim_truth: str,
+) -> None:
+    """Every trim branch renders the resolved loop/recovery authority state."""
+    config = AppConfig(
+        controller=ControllerConfig(
+            pre_first_crack_levers=PreFirstCrackLevers(late_maillard_trim=trim),
+            post_first_crack_control=post_fc,
+        )
+    )
+
+    line = resolve_banner_lines(config).trim
+
+    assert authority in line
+    assert trim_truth in line
+    assert len(line) <= 150
+
+
+def test_trim_line_summarizes_all_fixed_non_defaults_within_display_bound() -> None:
+    """A long fixed-mode diff becomes a truthful count, never a truncation."""
+    trim = LateMaillardTrim(
+        trim_heat_percent=60,
+        window_fc_eta_seconds=30.0,
+        min_bean_temp_c=160.0,
+    )
+    config = AppConfig(
+        controller=ControllerConfig(
+            pre_first_crack_levers=PreFirstCrackLevers(late_maillard_trim=trim),
+            post_first_crack_control=PostFirstCrackControl(recovery_enabled=True),
+        )
+    )
+
+    line = resolve_banner_lines(config).trim
+
+    assert "actual FC heat→base/recovery caps" in line
+    assert "non-default: 3 settings" in line
+    assert "trim_heat_percent" not in line
+    assert len(line) <= 150
 
 
 def test_adaptive_line_wins_over_the_fixed_depth_wording() -> None:
@@ -779,8 +846,8 @@ def test_main_prints_advisor_then_trim(
     assert len(out) == 2
     assert out[0] == "openai/gpt-4o  ·  prompt c10" + EXPERIMENT_TAG
     assert out[1] == (
-        "fixed 65% (open: bean pre_fc_heat binds lower; post-FC RoR loop on: FC heat sets "
-        "base/recovery caps; proven roast-6 default)"
+        "fixed 65% (open: bean pre_fc_heat binds lower; loop on: actual FC heat sets D88 "
+        "base; recovery off; proven roast-6 default)"
     )
 
 
@@ -802,8 +869,8 @@ def test_multiline_value_cannot_split_the_two_line_contract(
     assert len(out) == 2
     assert "bad slug" in out[0] and "\n" not in out[0]
     assert out[1] == (
-        "fixed 65% (open: bean pre_fc_heat binds lower; post-FC RoR loop on: FC heat sets "
-        "base/recovery caps; proven roast-6 default)"
+        "fixed 65% (open: bean pre_fc_heat binds lower; loop on: actual FC heat sets D88 "
+        "base; recovery off; proven roast-6 default)"
     )
 
 
