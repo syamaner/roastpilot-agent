@@ -357,7 +357,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
   {
     key:            "controller.late_maillard_trim_heat_percent",
     label:          "Trim heat",
-    hint:           "Trimmed heat level (%) held once the late-Maillard window opens. Default 65 — a moderate reduction, not a stall.",
+    hint:           "Trimmed heat level (%) held once the late-Maillard window opens. When the window is open at first crack, that resolved level is also the post-FC base heat cap. Default 65 — a moderate reduction, not a stall.",
     type:           "number",
     unit:           "%",
     min:            10,   // ge=10 in LateMaillardTrimEdit

@@ -505,7 +505,10 @@ def test_trim_line_reports_saved_non_default_depth(config_file: Path) -> None:
 
     lines = load_banner_lines()
 
-    assert lines.trim == f"fixed 60% (non-default: trim_heat_percent){EXPERIMENT_TAG}"
+    assert lines.trim == (
+        "fixed 60% (post-FC base heat cap when the window is open; "
+        f"non-default: trim_heat_percent){EXPERIMENT_TAG}"
+    )
 
 
 def test_trim_line_flags_a_non_default_window_at_the_proven_depth() -> None:
@@ -526,7 +529,10 @@ def test_trim_line_flags_a_non_default_window_at_the_proven_depth() -> None:
 
     lines = resolve_banner_lines(config)
 
-    assert lines.trim == f"fixed 65% (non-default: window_fc_eta_seconds){EXPERIMENT_TAG}"
+    assert lines.trim == (
+        "fixed 65% (post-FC base heat cap when the window is open; "
+        f"non-default: window_fc_eta_seconds){EXPERIMENT_TAG}"
+    )
     assert "proven" not in lines.trim
 
 
@@ -549,7 +555,9 @@ def test_inert_adaptive_coefficients_do_not_tag_a_default_fixed_arm() -> None:
 
     lines = resolve_banner_lines(config)
 
-    assert lines.trim == "fixed 65% (proven roast-6 default)"
+    assert lines.trim == (
+        "fixed 65% (post-FC base heat cap when the window is open; proven roast-6 default)"
+    )
     assert EXPERIMENT_TAG not in lines.trim
 
 
@@ -598,7 +606,9 @@ def test_changed_fields_skips_default_factory_fields() -> None:
 
 def test_trim_line_default_depth_is_untagged(config_file: Path) -> None:
     """The proven 65 % default keeps its plain, untagged wording."""
-    assert load_banner_lines().trim == "fixed 65% (proven roast-6 default)"
+    assert load_banner_lines().trim == (
+        "fixed 65% (post-FC base heat cap when the window is open; proven roast-6 default)"
+    )
 
 
 def test_disabled_trim_is_reported_as_disabled_not_as_its_dead_depth(
@@ -623,8 +633,9 @@ def test_disabled_trim_is_reported_as_disabled_not_as_its_dead_depth(
 
     trim = load_banner_lines().trim
 
-    assert trim.startswith(
-        "DISABLED — no trim window; flat pre-FC floor 100% (config; a bean's pre_fc_heat overrides)"
+    assert trim == (
+        "DISABLED — no trim window; flat pre-FC floor 100% is the post-FC base heat cap "
+        f"(config; a bean's pre_fc_heat overrides both){EXPERIMENT_TAG}"
     )
     assert EXPERIMENT_TAG in trim
     assert "ADAPTIVE" not in trim
@@ -649,7 +660,11 @@ def test_trim_line_reports_saved_adaptive_state(config_file: Path) -> None:
 
     lines = load_banner_lines()
 
-    assert lines.trim.startswith("ADAPTIVE — #386 RoR-keyed depth, base 65% within 45–75%")
+    assert lines.trim == (
+        "ADAPTIVE — #386 RoR-keyed depth, base 65% within 45–75%; when the window is open "
+        "at FC, the resolved depth is the post-FC base heat cap (experiment, watch the cut)"
+    )
+    assert "post-FC base heat cap 65" not in lines.trim
 
 
 def test_adaptive_line_wins_over_the_fixed_depth_wording() -> None:
@@ -756,7 +771,9 @@ def test_main_prints_advisor_then_trim(
     out = capsys.readouterr().out.splitlines()
     assert len(out) == 2
     assert out[0] == "openai/gpt-4o  ·  prompt c10" + EXPERIMENT_TAG
-    assert out[1] == "fixed 65% (proven roast-6 default)"
+    assert out[1] == (
+        "fixed 65% (post-FC base heat cap when the window is open; proven roast-6 default)"
+    )
 
 
 def test_multiline_value_cannot_split_the_two_line_contract(
@@ -776,7 +793,9 @@ def test_multiline_value_cannot_split_the_two_line_contract(
     out = capsys.readouterr().out.splitlines()
     assert len(out) == 2
     assert "bad slug" in out[0] and "\n" not in out[0]
-    assert out[1] == "fixed 65% (proven roast-6 default)"
+    assert out[1] == (
+        "fixed 65% (post-FC base heat cap when the window is open; proven roast-6 default)"
+    )
 
 
 def test_one_line_preserves_deliberate_spacing() -> None:

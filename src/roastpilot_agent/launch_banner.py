@@ -54,7 +54,8 @@ class LaunchBannerLines:
         advisor_cfg: The ``Advisor cfg:`` line — model slug, control-teaching
             prompt version, and the experiment tag when either is non-default.
         trim: The ``Pre-FC trim:`` line — the resolved late-Maillard trim depth
-            and whether adaptive depth (#386) is active.
+            and whether adaptive depth (#386) is active, including the depth's
+            coupling to the post-FC base heat cap at first crack.
     """
 
     advisor_cfg: str
@@ -173,13 +174,15 @@ def _trim_line(config: AppConfig) -> str:
     heat_target = config.controller.pre_first_crack_levers.heat_target_percent
     if not trim.enabled:
         return (
-            f"DISABLED — no trim window; flat pre-FC floor {heat_target}% "
-            f"(config; a bean's pre_fc_heat overrides){EXPERIMENT_TAG}"
+            f"DISABLED — no trim window; flat pre-FC floor {heat_target}% is the "
+            "post-FC base heat cap "
+            f"(config; a bean's pre_fc_heat overrides both){EXPERIMENT_TAG}"
         )
     if trim.adaptive_depth_enabled:
         return (
             f"ADAPTIVE — #386 RoR-keyed depth, base {trim.base_trim}% "
-            f"within {trim.min_trim}–{trim.max_trim}% (experiment, watch the cut)"
+            f"within {trim.min_trim}–{trim.max_trim}%; when the window is open at FC, "
+            "the resolved depth is the post-FC base heat cap (experiment, watch the cut)"
         )
     # "proven roast-6 default" is a claim about the whole ACTIVE fixed-mode
     # trim, not just its depth: moving the window or the bean-temp threshold
@@ -190,8 +193,14 @@ def _trim_line(config: AppConfig) -> str:
     # tag that fires on the proven baseline arm teaches the operator to ignore it.
     changed = sorted(_changed_fields(trim) - type(trim).ADAPTIVE_ONLY_FIELDS)
     if not changed:
-        return f"fixed {trim.trim_heat_percent}% (proven roast-6 default)"
-    return f"fixed {trim.trim_heat_percent}% (non-default: {', '.join(changed)}){EXPERIMENT_TAG}"
+        return (
+            f"fixed {trim.trim_heat_percent}% (post-FC base heat cap when the window "
+            "is open; proven roast-6 default)"
+        )
+    return (
+        f"fixed {trim.trim_heat_percent}% (post-FC base heat cap when the window is open; "
+        f"non-default: {', '.join(changed)}){EXPERIMENT_TAG}"
+    )
 
 
 def resolve_banner_lines(config: AppConfig) -> LaunchBannerLines:

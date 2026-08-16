@@ -64,11 +64,18 @@
    env var) is quietly turning a flag OFF from its new default** — the same
    stop-and-fix rule applies either direction now.
 3. Quick preflight → charge → watch especially the **post-FC heat behaviour**:
-   - the taper should EASE heat down from its value at FC engagement (setpoint
-     decays from the measured engagement RoR toward 4 °C/min over ~90 s);
-   - heat must **never rise above its value at engagement** (the never-add-heat
-     clamp is law — if you see heat climb post-FC, that is a D88 failure:
-     e-stop and record);
+   - the engagement heat is the pre-FC heat at the true-FC edge: the resolved
+     trim level when its window is open at first crack, otherwise the flat
+     pre-FC floor. That engagement value is the D88 base heat cap;
+   - with recovery disabled, the taper should EASE heat down from that cap
+     (its setpoint decays from the measured engagement RoR toward 4 °C/min
+     over ~90 s) and must never rise above it;
+   - with bounded recovery enabled, heat may rise only to the hard recovery
+     cap — engagement plus the configured headroom, still bounded by the
+     static heat ceiling. D162's runway-aware path retains that same cap and
+     releases recovery authority at its configured cutoff before gliding back
+     to the base cap. A rise beyond the applicable cap is a stop-and-record
+     failure;
    - the deterministic drop fires at bean ≥ target AND dev ≥ target; the
      ceiling guard drops at bean ≥ 196 °C regardless of dev; the advisor keeps
      drop-earlier-only authority. Compare against roast 1.
@@ -78,4 +85,4 @@
 - Run **roast-review** on both. Compare: did the #405 loop hold the RoR + release the drop cleanly vs the advisor-driven baseline? Note DTR, drop temp, and any oscillation.
 
 ## Safety
-- Roast 2 is the **first hardware run of the D88 taper + ceiling guard** — supervise it. **Emergency stop is available from every phase.** The structural expectations: post-FC heat only ever moves DOWN from its engagement value (72→91 % class runaways are impossible by construction — seeing one is a stop-and-record event), and no drop lands above 196 °C with the guard on. A restart mid-run enters `operator_recovery_required` (no auto-resume of heat/fan).
+- Roast 2 is the **first hardware run of the D88 taper + ceiling guard** — supervise it. **Emergency stop is available from every phase.** With recovery disabled, post-FC heat only ever moves DOWN from its engagement value. If bounded recovery is explicitly enabled, it may add only the configured, statically bounded headroom before releasing through the D162 path; a rise beyond that applicable cap is a stop-and-record event. No drop lands above 196 °C with the guard on. A restart mid-run enters `operator_recovery_required` (no auto-resume of heat/fan).

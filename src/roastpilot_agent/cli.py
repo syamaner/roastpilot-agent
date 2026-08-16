@@ -795,11 +795,13 @@ def _format_post_fc_loop_readout(
         lines.append(
             "⚠️  BOUNDED-BIDIRECTIONAL HEAT RECOVERY: ENABLED "
             f"(D96 — the taper may raise heat up to {recovery_headroom_percentage_points:g} pp "
-            "above entry when RoR runs persistently below setpoint)"
+            "above entry when RoR runs persistently below setpoint; entry is the pre-FC heat "
+            "at FC, the trim level when its window was open)"
         )
     else:
         lines.append(
-            "  bidirectional heat recovery: disabled (D88 never-add-heat-beyond-entry stands)"
+            "  bidirectional heat recovery: disabled (D88 never-add-heat-beyond-entry stands; "
+            "entry is the pre-FC heat at FC, the trim level when its window was open)"
         )
     v2_values = (
         f"entry=+{recovery_projection_entry_horizon_pp:g} pp, "
