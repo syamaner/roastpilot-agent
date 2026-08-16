@@ -106,6 +106,13 @@ AsyncSleep = Callable[[float], Awaitable[None]]
 _log = logging.getLogger(__name__)
 
 
+def _recovery_v2_cutoff_latch_label(horizon_pp: float) -> str:
+    """Render the shared bounded D162 cutoff-latch diagnostic label."""
+    return (
+        f"D162 recovery-v2 +{horizon_pp:g} pp cutoff latched; further recovery entry disabled. #708"
+    )
+
+
 # recording_origin_slug now lives in models.py (with RoastProfile) so the
 # store's per-origin recording-count query (#385) can derive the same slug from a
 # completed run's frozen profile without importing the controller. Re-exported
@@ -2351,7 +2358,8 @@ class RoastController:
             output: The accepted output.
             projection: The live values used for the accepted projection.
         """
-        if not self._config.post_first_crack_control.recovery_projection_enabled:
+        config = self._config.post_first_crack_control
+        if not config.recovery_projection_enabled:
             return
         if not before.recovery_active and after.recovery_active:
             if after.recovery_trigger is PostFcRecoveryTrigger.PROJECTION:
@@ -2373,7 +2381,8 @@ class RoastController:
                         projection.development_elapsed_seconds,
                     )
                 return
-            if after.recovery_trigger is PostFcRecoveryTrigger.ROR_ERROR:
+            is_ror_entry = after.recovery_trigger is PostFcRecoveryTrigger.ROR_ERROR
+            if is_ror_entry:  # pragma: no branch - only projection/RoR entries
                 _log.info(
                     "D162 recovery-v2 RoR entered: trigger=%s, heat=%d%%, ceiling=%d%%, "
                     "fast_raise=%s. #708",
@@ -2398,14 +2407,17 @@ class RoastController:
             )
             return
         if not before.recovery_cutoff_reached and after.recovery_cutoff_reached:
+            cutoff_label = _recovery_v2_cutoff_latch_label(
+                config.recovery_projection_cutoff_horizon_pp
+            )
             if (  # pragma: no cover - the cutoff latch requires a valid cutoff runway
                 output.projection_cutoff_runway_seconds is None
             ):
-                _log.info("D162 recovery-v2 +5 pp cutoff reached; authority released. #708")
+                _log.info("%s", cutoff_label)
             else:
                 _log.info(
-                    "D162 recovery-v2 +5 pp cutoff reached; authority released "
-                    "(target=%.1f °C, cutoff_runway=%.1f s, heat=%d%%). #708",
+                    "%s (target=%.1f °C, cutoff_runway=%.1f s, heat=%d%%).",
+                    cutoff_label,
                     projection.target_drop_temp_c,
                     output.projection_cutoff_runway_seconds,
                     output.heat_percent,

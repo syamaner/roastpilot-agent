@@ -44,6 +44,7 @@ from roastpilot_agent.controller import (
     RoastController,
     RoastPhase,
     TickScheduler,
+    _recovery_v2_cutoff_latch_label,  # pyright: ignore[reportPrivateUsage]
     recording_origin_slug,
 )
 from roastpilot_agent.mcp_client import RoasterControlAdapter, RoasterMCPClient
@@ -9834,12 +9835,13 @@ async def test_v2_logs_accepted_invalid_active_projection_once(
 async def test_v2_logs_accepted_plus_five_cutoff_once(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The accepted +5 DTR cutoff releases authority without adding a drop rule."""
+    """The accepted configured cutoff latches while its glide remains active."""
     config = _recovery_config(
         pre_fc_heat_target_percent=60,
         recovery_projection_enabled=True,
         recovery_trigger_margin_c_per_min=50.0,
         recovery_confirm_ticks=1,
+        recovery_projection_cutoff_horizon_pp=4.5,
     )
     harness = make_harness(config=config)
     with caplog.at_level(logging.INFO, logger="roastpilot_agent.controller"):
@@ -9850,15 +9852,27 @@ async def test_v2_logs_accepted_plus_five_cutoff_once(
         harness.clock.advance(5.0)
         harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=0.0)]
         await harness.controller.tick()
+        assert (
+            harness.controller.snapshot().post_fc_heat_authority_state
+            is PostFcHeatAuthorityState.GLIDING
+        )
 
     messages = [
-        record.getMessage()
-        for record in caplog.records
-        if "+5 pp cutoff reached" in record.getMessage()
+        record.getMessage() for record in caplog.records if "cutoff latched" in record.getMessage()
     ]
     assert len(messages) == 1
+    assert "+4.5 pp" in messages[0]
+    assert "further recovery entry disabled" in messages[0]
+    assert "authority released" not in messages[0]
     assert "target=205.0 °C" in messages[0]
     assert "cutoff_runway=" in messages[0]
+
+
+def test_v2_cutoff_latch_label_covers_the_unreachable_fallback_format() -> None:
+    """Both cutoff branches share the configured bounded latch label."""
+    assert _recovery_v2_cutoff_latch_label(4.5) == (
+        "D162 recovery-v2 +4.5 pp cutoff latched; further recovery entry disabled. #708"
+    )
 
 
 @pytest.mark.asyncio
@@ -9904,7 +9918,7 @@ async def test_v2_logs_accepted_cutoff_from_ror_recovery_once(
 
     state = harness.controller._post_fc_controller.snapshot_state()  # pyright: ignore[reportPrivateUsage]
     assert state.recovery_cutoff_reached is True
-    assert sum("+5 pp cutoff reached" in record.getMessage() for record in caplog.records) == 1
+    assert sum("cutoff latched" in record.getMessage() for record in caplog.records) == 1
 
 
 @pytest.mark.asyncio
@@ -9954,7 +9968,12 @@ async def test_v2_logs_first_live_fractional_cutoff_from_inactive_state(
         assert after_cutoff.recovery_active is False
         assert after_cutoff.recovery_cutoff_reached is True
 
-    assert sum("+5 pp cutoff reached" in record.getMessage() for record in caplog.records) == 1
+    messages = [
+        record.getMessage() for record in caplog.records if "cutoff latched" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    assert "further recovery entry disabled" in messages[0]
+    assert "authority released" not in messages[0]
 
 
 #: A :class:`SafetyLimits` companion for ``_recovery_config(ceiling_guard_temp_c=220.0, ...)``
