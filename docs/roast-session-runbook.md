@@ -70,9 +70,10 @@
    - **Post-FC RoR loop off:** heat is advisor-driven; D88/D96 caps do not apply.
    - **Loop on, recovery off:** taper EASES down from the D88 base and never rises
      above it.
-   - **Loop on, recovery on:** heat may rise only to the active recovery ceiling
-     before D162 glides to the base at cutoff. A rise beyond the applicable cap
-     is a stop-and-record failure.
+   - **Loop on, recovery on:** heat stays under the active recovery ceiling.
+     Only with recovery-v2 projection enabled does D162 release at its cutoff
+     and glide to the D88 base; otherwise the existing RoR exit governs. A rise
+     beyond the applicable cap is a stop-and-record failure.
    - **Drops:** deterministic at bean ≥ target AND dev ≥ target; ceiling guard
      at bean ≥ 196 °C regardless of dev; advisor keeps drop-earlier-only
      authority. Compare against roast 1.

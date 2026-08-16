@@ -10,6 +10,8 @@ describe("late-Maillard trim schema", () => {
     expect(field?.hint).toContain("post-FC RoR loop is enabled");
     expect(field?.hint).toContain("actual heat at FC sets base/recovery caps");
     expect(field?.hint).toContain("lower bean pre_fc_heat may bind");
-    expect(field?.hint).toContain("Confirm the post-FC RoR loop state in the launch banner/readout");
+    expect(field?.hint).toContain(
+      "Confirm effective loop state in the agent startup readout labelled POST-FC RoR LOOP",
+    );
   });
 });

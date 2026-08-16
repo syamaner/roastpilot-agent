@@ -667,7 +667,7 @@ def test_trim_line_reports_saved_adaptive_state(config_file: Path) -> None:
     lines = load_banner_lines()
 
     assert lines.trim == (
-        "ADAPTIVE 65% (45–75%); open: bean pre_fc_heat binds lower; post-FC RoR loop on: "
+        "ADAPTIVE base 65% (45–75%); open: bean pre_fc_heat binds lower; post-FC RoR loop on: "
         "FC heat sets base/recovery caps (experiment, watch the cut)"
     )
     assert len(lines.trim) <= 150

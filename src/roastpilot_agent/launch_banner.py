@@ -180,7 +180,7 @@ def _trim_line(config: AppConfig) -> str:
         )
     if trim.adaptive_depth_enabled:
         return (
-            f"ADAPTIVE {trim.base_trim}% ({trim.min_trim}–{trim.max_trim}%); open: bean "
+            f"ADAPTIVE base {trim.base_trim}% ({trim.min_trim}–{trim.max_trim}%); open: bean "
             "pre_fc_heat binds lower; post-FC RoR loop on: FC heat sets base/recovery caps"
             " (experiment, watch the cut)"
         )
