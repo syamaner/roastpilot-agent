@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import runpy
+import shlex
 import sys
 import tomllib
 import xml.etree.ElementTree as ElementTree
@@ -139,7 +140,14 @@ def test_ci_normalizes_coverage_filenames_before_codecov_upload() -> None:
     codecov_with = _mapping(codecov_step["with"])
     assert codecov_with["files"] == "./coverage.xml"
     assert codecov_with["disable_search"] is True
-    assert pytest_runs and all("--cov-report=" in run for run in pytest_runs)
+    assert pytest_runs and all(
+        "--cov-report=" in shlex.split(run)
+        and not any(
+            token.startswith("--cov-report=") and token != "--cov-report="
+            for token in shlex.split(run)
+        )
+        for run in pytest_runs
+    )
 
 
 def test_each_discovered_skill_root_is_registered_in_flattened_settings() -> None:
