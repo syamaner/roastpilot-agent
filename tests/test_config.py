@@ -5,6 +5,7 @@ Documented defaults, env-var loading (``ROASTPILOT_`` prefix with ``__``
 nesting), validation rejections, and the guidance-vs-safety-bound link.
 """
 
+import inspect
 import os
 
 import pydantic
@@ -20,6 +21,7 @@ from roastpilot_agent.config import (
     AppConfig,
     BeanSourcingConfig,
     ControllerConfig,
+    LateMaillardTrim,
     MCPDeviceConfig,
     PostFirstCrackControl,
     SafetyLimits,
@@ -49,6 +51,22 @@ def _declared_le(model: type[pydantic.BaseModel], field: str) -> float:
         if bound is not None:
             return float(bound)
     raise AssertionError(f"{model.__name__}.{field} declares no le constraint")
+
+
+def test_trim_authority_comment_distinguishes_override_and_ceiling_terms() -> None:
+    """The canonical trim commentary keeps the D88/D96 truth classes distinct."""
+    source = " ".join(inspect.getsource(LateMaillardTrim).replace("#: ", "").split())
+
+    assert "lower per-bean ``pre_fc_heat`` can bind below that resolved depth" in source
+    assert (
+        "``pre_fc_heat`` instead replaces the flat configured floor and may be higher or lower"
+        in source
+    )
+    assert "``max(1, min(heat_ceiling_percent, heat_engage_percent))``" in source
+    assert "``min(heat_ceiling_percent, heat_engage_percent +" in source
+    assert "``max(base_ceiling, recovery_term)``, never below the D88 base" in source
+    assert "65/80" in source
+    assert "60/75" in source
 
 
 def test_controller_defaults_match_orchestration_plan() -> None:

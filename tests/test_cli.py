@@ -1537,8 +1537,9 @@ def test_format_post_fc_loop_readout_recovery_enabled_shows_cap() -> None:
     assert lines[2] == (
         "⚠️  BOUNDED-BIDIRECTIONAL HEAT RECOVERY: ENABLED (D96 — when the post-FC RoR "
         "loop is enabled, the taper may raise heat up to 15 pp above entry when RoR runs "
-        "persistently below setpoint; entry is actual pre-FC heat at FC, from an open trim "
-        "window or lower bean pre_fc_heat)"
+        "persistently below setpoint; entry is actual pre-FC heat at FC: an open trim admits "
+        "only a lower bean pre_fc_heat, otherwise that bean setting replaces the flat floor "
+        "higher or lower)"
     )
     assert "bidirectional heat recovery: disabled" not in text
     assert "recovery v2 projection: disabled" in text
@@ -1558,11 +1559,17 @@ def test_format_post_fc_loop_readout_recovery_disabled_by_default() -> None:
     assert "D88 never-add-heat-beyond-entry stands" in text
     assert lines[2] == (
         "  bidirectional heat recovery: disabled (when the post-FC RoR loop is enabled, "
-        "D88 never-add-heat-beyond-entry stands; entry is actual pre-FC heat at FC, from "
-        "an open trim window or lower bean pre_fc_heat)"
+        "D88 never-add-heat-beyond-entry stands; entry is actual pre-FC heat at FC: an "
+        "open trim admits only a lower bean pre_fc_heat, otherwise that bean setting "
+        "replaces the flat floor higher or lower)"
     )
     assert "BOUNDED-BIDIRECTIONAL" not in text
     assert "recovery v2 projection: disabled" in text
+    assert lines[3] == (
+        "  recovery v2 projection: disabled "
+        "(D162 — operative only when the post-FC RoR loop is enabled; entry=+2 pp, "
+        "cutoff=+5 pp, margin=3 °C, fast-raise=+10 pp)"
+    )
 
 
 def test_format_post_fc_loop_readout_v2_enabled_shows_all_resolved_knobs() -> None:
@@ -1582,6 +1589,11 @@ def test_format_post_fc_loop_readout_v2_enabled_shows_all_resolved_knobs() -> No
     text = "\n".join(lines)
     assert len(lines) == 4
     assert "RECOVERY V2 PROJECTION: ENABLED" in text
+    assert lines[3] == (
+        "⚠️  RECOVERY V2 PROJECTION: ENABLED "
+        "(D162 — operative only when the post-FC RoR loop is enabled; entry=+1.5 pp, "
+        "cutoff=+4.5 pp, margin=2.5 °C, fast-raise=+12 pp)"
+    )
     assert "entry=+1.5 pp" in text
     assert "cutoff=+4.5 pp" in text
     assert "margin=2.5 °C" in text

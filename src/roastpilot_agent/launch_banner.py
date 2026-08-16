@@ -174,8 +174,9 @@ def _trim_line(config: AppConfig) -> str:
     heat_target = config.controller.pre_first_crack_levers.heat_target_percent
     if not trim.enabled:
         return (
-            f"DISABLED — no trim window; flat pre-FC floor {heat_target}% (config; a lower "
-            "bean pre_fc_heat can bind; when the post-FC loop is enabled, actual pre-FC "
+            f"DISABLED — no trim window; flat pre-FC floor {heat_target}% (config; bean "
+            "pre_fc_heat replaces that floor higher or lower; when the post-FC loop is "
+            "enabled, actual pre-FC "
             f"heat at FC is the D88/D96 basis){EXPERIMENT_TAG}"
         )
     if trim.adaptive_depth_enabled:

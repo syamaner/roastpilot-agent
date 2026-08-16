@@ -447,10 +447,11 @@ class PostFcRorController:
         The production caller invokes this method on the true first-crack edge
         and passes ``RoastController._current_heat``. When the post-FC loop is
         enabled, that actual pre-FC heat at FC becomes the engagement basis for
-        the D88 base and D96/D162 bounded-recovery ceilings: it is the resolved
-        trim depth when the window is open, unless a lower per-bean
-        ``pre_fc_heat`` has already bound it. With the loop disabled, post-FC
-        heat remains advisor-driven and those caps do not apply.
+        the D88 base and D96/D162 bounded-recovery ceilings: with an open trim
+        window it is the resolved trim depth unless a lower per-bean
+        ``pre_fc_heat`` has already bound it; otherwise ``pre_fc_heat`` replaces
+        the flat floor higher or lower. With the loop disabled, post-FC heat
+        remains advisor-driven and those caps do not apply.
 
         **``r0`` — the taper's starting setpoint (D88):**
         ``r0 = clamp(ror_at_engagement_c_per_min, taper_end_ror_c_per_min,
@@ -498,8 +499,9 @@ class PostFcRorController:
                 ``heat_engage_percent`` — the never-add-heat-beyond-entry
                 basis for every subsequent :meth:`compute` call's effective
                 ceiling this engagement (D88) when the post-FC loop is enabled,
-                including a lower per-bean ``pre_fc_heat`` or resolved trim
-                depth at first crack. Not otherwise validated against the
+                including a lower per-bean ``pre_fc_heat`` under an open trim,
+                or a higher-or-lower replacement of the flat floor otherwise.
+                Not otherwise validated against the
                 config's box (a value outside the box is clamped the same way
                 any other output is clamped, on the very first :meth:`compute`
                 call).

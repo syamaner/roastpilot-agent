@@ -310,16 +310,16 @@ class LateMaillardTrim(BaseModel):
     #: adaptive trim depth is the pre-FC heat carried into
     #: ``PostFcRorController.reset`` and becomes ``heat_engage_percent``. A
     #: lower per-bean ``pre_fc_heat`` can bind below that resolved depth, so the
-    #: actual pre-FC heat at FC is the only engagement basis. The D88 base
-    #: ceiling is exactly
-    #: ``max(1, min(heat_ceiling_percent, heat_engage_percent))``; while D96/D162
-    #: recovery is active its hard ceiling is exactly
+    #: actual pre-FC heat at FC is the only engagement basis. If the window never
+    #: opens or trim is disabled, ``pre_fc_heat`` instead replaces the flat
+    #: configured floor and may be higher or lower. The D88 base ceiling is
+    #: exactly ``max(1, min(heat_ceiling_percent, heat_engage_percent))``. The
+    #: configured D96/D162 recovery term is
     #: ``min(heat_ceiling_percent, heat_engage_percent +
-    #: recovery_headroom_percentage_points)``. With schema defaults, engagement
-    #: 65 and headroom 15 give base/recovery ceilings 65/80; a resolved trim of
-    #: 60 gives 60/75. If the window never opens or trim is disabled, engagement
-    #: instead inherits the actual flat pre-FC heat at FC, likewise subject to a
-    #: lower per-bean ``pre_fc_heat``. With the post-FC loop disabled, post-FC
+    #: recovery_headroom_percentage_points)``; the active effective ceiling is
+    #: ``max(base_ceiling, recovery_term)``, never below the D88 base. With
+    #: schema defaults, engagement 65 and headroom 15 give base/recovery ceilings
+    #: 65/80; a resolved trim of 60 gives 60/75. With the post-FC loop disabled, post-FC
     #: heat remains advisor-driven and these D88/D96 caps do not apply. D156
     #: documents this inherited authority and defers any independent post-FC
     #: engagement baseline until after the timing A/B; this field creates no
@@ -679,7 +679,9 @@ class PostFirstCrackControl(BaseModel):
     #: never-add-heat-beyond-entry clamp (``effective_ceiling``) narrows the
     #: EFFECTIVE ceiling to the actual heat the roast held at FC engagement,
     #: whenever that is lower than this static value, when the post-FC loop is
-    #: enabled. A lower per-bean ``pre_fc_heat`` can bind that engagement heat.
+    #: enabled. With an open trim window, a lower per-bean ``pre_fc_heat`` can
+    #: bind that engagement heat; otherwise it replaces the flat floor higher or
+    #: lower.
     #: See
     #: ``LateMaillardTrim.trim_heat_percent`` for the pre-FC trim provenance of
     #: that engagement heat when the trim window is open at first crack.
@@ -840,11 +842,15 @@ class PostFirstCrackControl(BaseModel):
     #: of tuning (see the module docstring's structural
     #: runaway-impossibility argument). Always further bounded by
     #: ``heat_ceiling_percent`` (the static outer box): the effective
-    #: recovery ceiling is, when the post-FC loop and recovery are enabled,
-    #: ``min(heat_ceiling_percent, heat_engage_percent + recovery_headroom_percentage_points)``.
+    #: recovery term is, when the post-FC loop and recovery are enabled,
+    #: ``min(heat_ceiling_percent, heat_engage_percent + recovery_headroom_percentage_points)``;
+    #: the active effective ceiling is ``max(base_ceiling, recovery_term)``, so
+    #: it never falls below D88's ``max(1, min(heat_ceiling_percent,
+    #: heat_engage_percent))`` base.
     #: See ``LateMaillardTrim.trim_heat_percent`` for how the actual pre-FC heat
-    #: at first crack, including a lower per-bean ``pre_fc_heat``, supplies
-    #: ``heat_engage_percent`` to this bound.
+    #: at first crack supplies ``heat_engage_percent`` to this bound: an open
+    #: trim admits only a lower per-bean ``pre_fc_heat``; otherwise it replaces
+    #: the flat floor higher or lower.
     recovery_headroom_percentage_points: int = Field(default=15, ge=0, le=50)
     #: The maximum percentage points the EFFECTIVE CEILING may fall per tick
     #: while gliding back down from the recovery ceiling toward
@@ -1097,7 +1103,8 @@ class PreFirstCrackLevers(BaseModel):
     #: (the trim only ever lowers heat — a validator pins this). See
     #: ``LateMaillardTrim.trim_heat_percent`` for the single canonical account
     #: of how an open trim window supplies the post-FC engagement heat only
-    #: when the post-FC loop is enabled.
+    #: when the post-FC loop is enabled; outside that window, a bean
+    #: ``pre_fc_heat`` replaces the flat floor higher or lower.
     late_maillard_trim: LateMaillardTrim = Field(default_factory=LateMaillardTrim)
 
     @model_validator(mode="after")

@@ -65,19 +65,21 @@
    stop-and-fix rule applies either direction now.
 3. Quick preflight → charge → watch especially the **post-FC heat behaviour**:
    - when the post-FC RoR loop is enabled, engagement heat is the actual pre-FC
-     heat at the true-FC edge: the resolved trim level when its window is open
-     at first crack, otherwise the flat pre-FC floor; a lower bean-specific
-     `pre_fc_heat` can bind below either. That engagement value is the D88 base
-     heat cap. With the loop disabled, post-FC heat is advisor-driven and the
-     D88/D96 caps are not enforced;
+     heat at the true-FC edge: with an open trim window, only a lower
+     bean-specific `pre_fc_heat` can bind below the resolved trim; otherwise
+     `pre_fc_heat` replaces the flat pre-FC floor higher or lower. The D88 base
+     cap is `max(1, min(static heat ceiling, engagement heat))`, including its
+     1% anti-stall floor. With the loop disabled, post-FC heat is advisor-driven
+     and the D88/D96 caps are not enforced;
    - with the loop enabled and recovery disabled, the taper should EASE heat down from that cap
      (its setpoint decays from the measured engagement RoR toward 4 °C/min
      over ~90 s) and must never rise above it;
-   - with the loop enabled and bounded recovery enabled, heat may rise only to the hard recovery
-     cap — engagement plus the configured headroom, still bounded by the
-     static heat ceiling. D162's runway-aware path retains that same cap and
-     releases recovery authority at its configured cutoff before gliding back
-     to the base cap. A rise beyond the applicable cap is a stop-and-record
+   - with the loop enabled and bounded recovery enabled, heat may rise only to
+     the active recovery ceiling: the greater of the D88 base cap and the
+     configured recovery term (engagement plus configured headroom, bounded by
+     the static heat ceiling). D162's runway-aware path retains that same cap
+     and releases recovery authority at its configured cutoff before gliding
+     back to the base cap. A rise beyond the applicable cap is a stop-and-record
      failure;
    - the deterministic drop fires at bean ≥ target AND dev ≥ target; the
      ceiling guard drops at bean ≥ 196 °C regardless of dev; the advisor keeps
@@ -88,4 +90,4 @@
 - Run **roast-review** on both. Compare: did the #405 loop hold the RoR + release the drop cleanly vs the advisor-driven baseline? Note DTR, drop temp, and any oscillation.
 
 ## Safety
-- Roast 2 is the **first hardware run of the D88 taper + ceiling guard** — supervise it. **Emergency stop is available from every phase.** When the post-FC loop is enabled and recovery is disabled, post-FC heat only ever moves DOWN from the actual pre-FC heat at FC (including a lower bean-specific `pre_fc_heat`). If bounded recovery is explicitly enabled with that loop, it may add only the configured, statically bounded headroom before releasing through the D162 path; a rise beyond that applicable cap is a stop-and-record event. With the loop disabled, post-FC heat is advisor-driven rather than D88/D96-capped. No drop lands above 196 °C with the guard on. A restart mid-run enters `operator_recovery_required` (no auto-resume of heat/fan).
+- Roast 2 is the **first hardware run of the D88 taper + ceiling guard** — supervise it. **Emergency stop is available from every phase.** When the post-FC loop is enabled and recovery is disabled, post-FC heat only ever moves DOWN from the D88 base cap, `max(1, min(static heat ceiling, actual pre-FC heat at FC))`; with an open trim, only a lower bean-specific `pre_fc_heat` can bind, otherwise it replaces the flat floor higher or lower. If bounded recovery is explicitly enabled with that loop, it may rise only to the active recovery ceiling before releasing through D162; a rise beyond that applicable cap is a stop-and-record event. With the loop disabled, post-FC heat is advisor-driven rather than D88/D96-capped. No drop lands above 196 °C with the guard on. A restart mid-run enters `operator_recovery_required` (no auto-resume of heat/fan).

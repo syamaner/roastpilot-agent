@@ -640,8 +640,9 @@ def test_disabled_trim_is_reported_as_disabled_not_as_its_dead_depth(
     trim = load_banner_lines().trim
 
     assert trim == (
-        "DISABLED — no trim window; flat pre-FC floor 100% (config; a lower bean "
-        "pre_fc_heat can bind; when the post-FC loop is enabled, actual pre-FC heat at FC "
+        "DISABLED — no trim window; flat pre-FC floor 100% (config; bean pre_fc_heat "
+        "replaces that floor higher or lower; when the post-FC loop is enabled, actual pre-FC "
+        "heat at FC "
         f"is the D88/D96 basis){EXPERIMENT_TAG}"
     )
     assert EXPERIMENT_TAG in trim
