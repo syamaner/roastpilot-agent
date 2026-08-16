@@ -1012,6 +1012,19 @@ incident and acknowledgement gate are process-local: physical verification plus
 a controlled full agent restart remains the legacy recovery boundary and is not represented by an
 acknowledgement audit row. Restart recovery still never auto-resumes heat or fan.
 
+**16 Aug 2026 — #832 test/CI feedback-time completed.** Slice 1 (#833) removed the proven
+test-runtime hotspots; slice 2 parallelises ordinary Python tests with four work-stealing workers,
+keeps the 12 serial tests in `tests/test_packaging.py`, `tests/test_mcp_respawn_real_child.py`,
+`tests/test_milestone1_real_mcp.py`, and `tests/test_process_exit.py` because they respectively
+mutate the repository, own real-child/MCP lifecycle, or drive process groups, and shards the three
+real production-size parser boundaries in a stress matrix. The Package job owns the packaging tests;
+one coverage job combines every lane before normalisation and Codecov upload. Actions timing moved
+from the 940.57-second Python coverage / 17m20s `Checks` baseline to the slice-1 783.72-second /
+14m36s intermediate result; slice-2 exact-head hosted timing is recorded with the closing PR evidence.
+D104/D105 `pytest_sessionfinish` executor-join ownership is unchanged. This is cross-cutting
+process/CI governance, not a new epic story row; package, Web, Playwright, coverage, and branch
+protection authorities are unchanged.
+
 **18 Jul 2026 (later — D102 plant-model experiment + the discard-roast feature).** After #567
 parked, the operator's diagnosis that the system lacks RoR PROJECTION (only the pre-FC FC-ETA
 projects; post-FC is reactive) opened a new control-theoretic track: **D102 — a learned plant

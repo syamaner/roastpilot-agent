@@ -151,6 +151,10 @@ dev = [
   "pytest>=8.0",
   "pytest-asyncio>=1.0",
   "pytest-cov>=5.0",
+  # Bounded CI parallelism; ordinary tests use four work-stealing workers.
+  "pytest-xdist==3.8.0",
+  # Explicit dependency for the dedicated coverage-combine CI job.
+  "coverage>=7.6",
   "ruff>=0.8",
   # E11-S1 (#137): tests/test_packaging.py builds the real wheel via
   # `python -m build --wheel` to prove the SPA-bundling hook end to end. `build`
@@ -242,13 +246,14 @@ asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "slow: spawns a real subprocess / initialises a real MCP session (still hardware-free)",
-    "stress: production-size resource-bound regression: exercises a real production limit (bytes, counts, corpus) at its real value; slow by construction; ALWAYS runs in CI (in the full gate now, in a dedicated lane after slice 2); locally deselectable with `-m 'not stress'`.",
-    "serial: must not run concurrently with any other test: mutates a shared repository path, drives real process groups / a real MCP child, or depends on process-global state; runs in the serial lane after slice 2. Reason is stated at the marker site.",
+    "stress: production-size resource-bound regression: exercises a real production limit (bytes, counts, corpus) at its real value; slow by construction; ALWAYS runs in CI in the dedicated stress lane (three-entry matrix); locally deselectable with `-m 'not stress'`.",
+    "serial: must not run concurrently with any other test: mutates a shared repository path, drives real process groups / a real MCP child, or depends on process-global state; runs in the serial lane. Reason is stated at the marker site.",
 ]
 
 [tool.coverage.run]
 branch = true
 source = ["roastpilot_agent", "scripts", ".agents/skills/capture-agent-usage/scripts"]
+relative_files = true
 
 [tool.coverage.report]
 show_missing = true
