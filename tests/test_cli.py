@@ -1503,7 +1503,7 @@ def test_format_post_fc_loop_readout_both_enabled_two_loud_lines() -> None:
     lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
         enabled=True, ceiling_guard_enabled=True, ceiling_guard_temp_c=195.5
     )
-    assert len(lines) == 3
+    assert len(lines) == 4
     text = "\n".join(lines)
     assert text.count("⚠️") == 2
     assert "POST-FC RoR LOOP: ENABLED" in text
@@ -1511,6 +1511,7 @@ def test_format_post_fc_loop_readout_both_enabled_two_loud_lines() -> None:
     # The temperature shown is the resolved value, not a hardcoded default.
     assert "195.5 °C" in text
     assert "bidirectional heat recovery: disabled" in text
+    assert "recovery v2 projection: disabled" in text
 
 
 def test_format_post_fc_loop_readout_recovery_enabled_shows_cap() -> None:
@@ -1526,7 +1527,7 @@ def test_format_post_fc_loop_readout_recovery_enabled_shows_cap() -> None:
         recovery_enabled=True,
         recovery_headroom_percentage_points=15,
     )
-    assert len(lines) == 3
+    assert len(lines) == 4
     text = "\n".join(lines)
     assert text.count("⚠️") == 3
     assert "BOUNDED-BIDIRECTIONAL HEAT RECOVERY: ENABLED" in text
@@ -1534,6 +1535,7 @@ def test_format_post_fc_loop_readout_recovery_enabled_shows_cap() -> None:
     # The headroom cap shown is the resolved value, not a hardcoded default.
     assert "15" in text
     assert "bidirectional heat recovery: disabled" not in text
+    assert "recovery v2 projection: disabled" in text
 
 
 def test_format_post_fc_loop_readout_recovery_disabled_by_default() -> None:
@@ -1544,11 +1546,35 @@ def test_format_post_fc_loop_readout_recovery_disabled_by_default() -> None:
     lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
         enabled=False, ceiling_guard_enabled=False, ceiling_guard_temp_c=196.0
     )
-    assert len(lines) == 3
+    assert len(lines) == 4
     text = "\n".join(lines)
     assert "bidirectional heat recovery: disabled" in text
     assert "D88 never-add-heat-beyond-entry stands" in text
     assert "BOUNDED-BIDIRECTIONAL" not in text
+    assert "recovery v2 projection: disabled" in text
+
+
+def test_format_post_fc_loop_readout_v2_enabled_shows_all_resolved_knobs() -> None:
+    """The D162 banner reports the live v2 switch and all four tuning values."""
+    lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
+        enabled=True,
+        ceiling_guard_enabled=True,
+        ceiling_guard_temp_c=196.0,
+        recovery_enabled=True,
+        recovery_headroom_percentage_points=15,
+        recovery_projection_enabled=True,
+        recovery_projection_entry_horizon_pp=1.5,
+        recovery_projection_cutoff_horizon_pp=4.5,
+        recovery_projection_margin_c=2.5,
+        recovery_entry_step_pp=12,
+    )
+    text = "\n".join(lines)
+    assert len(lines) == 4
+    assert "RECOVERY V2 PROJECTION: ENABLED" in text
+    assert "entry=+1.5 pp" in text
+    assert "cutoff=+4.5 pp" in text
+    assert "margin=2.5 °C" in text
+    assert "fast-raise=+12 pp" in text
 
 
 @pytest.mark.usefixtures("no_serve")
@@ -1664,6 +1690,26 @@ def test_serve_live_banner_reflects_resolved_recovery_flag_and_cap(
         "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__RECOVERY_HEADROOM_PERCENTAGE_POINTS",
         "22",
     )
+    monkeypatch.setenv(
+        "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__RECOVERY_PROJECTION_ENABLED",
+        "true",
+    )
+    monkeypatch.setenv(
+        "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__RECOVERY_PROJECTION_ENTRY_HORIZON_PP",
+        "1.5",
+    )
+    monkeypatch.setenv(
+        "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__RECOVERY_PROJECTION_CUTOFF_HORIZON_PP",
+        "4.5",
+    )
+    monkeypatch.setenv(
+        "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__RECOVERY_PROJECTION_MARGIN_C",
+        "2.5",
+    )
+    monkeypatch.setenv(
+        "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__RECOVERY_ENTRY_STEP_PP",
+        "12",
+    )
 
     spa = tmp_path / "dist"
     spa.mkdir()
@@ -1702,6 +1748,11 @@ def test_serve_live_banner_reflects_resolved_recovery_flag_and_cap(
     assert "BOUNDED-BIDIRECTIONAL HEAT RECOVERY: ENABLED" in out
     assert "22" in out
     assert "bidirectional heat recovery: disabled" not in out
+    assert "RECOVERY V2 PROJECTION: ENABLED" in out
+    assert "entry=+1.5 pp" in out
+    assert "cutoff=+4.5 pp" in out
+    assert "margin=2.5 °C" in out
+    assert "fast-raise=+12 pp" in out
 
 
 @pytest.mark.asyncio

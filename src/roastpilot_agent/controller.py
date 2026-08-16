@@ -59,6 +59,7 @@ from roastpilot_agent.models import (
 from roastpilot_agent.post_fc_control import (
     PostFcControllerState,
     PostFcControlOutput,
+    PostFcProjectionInputs,
     PostFcRecoveryTrigger,
     PostFcRorController,
 )
@@ -103,6 +104,13 @@ AsyncSleep = Callable[[float], Awaitable[None]]
 #: for low-volume control diagnostics that must reach an operator but do not
 #: warrant a new server event kind (which would expand the FE event contract).
 _log = logging.getLogger(__name__)
+
+
+def _recovery_v2_cutoff_latch_label(horizon_pp: float) -> str:
+    """Render the shared bounded D162 cutoff-latch diagnostic label."""
+    return (
+        f"D162 recovery-v2 +{horizon_pp:g} pp cutoff latched; further recovery entry disabled. #708"
+    )
 
 
 # recording_origin_slug now lives in models.py (with RoastProfile) so the
@@ -1986,8 +1994,23 @@ class RoastController:
         # `gt=0` on the config model, and `elapsed` above is only used when it
         # already cleared the `>= control_interval_seconds` (itself > 0) gate.
         pre_compute_state = self._post_fc_controller.snapshot_state()
+        projection = PostFcProjectionInputs(
+            bean_temp_c=telemetry.bean_temp_c,
+            # The active run's profile is frozen at start; these are the same
+            # targets the deterministic drop path reads, never advisor values.
+            target_drop_temp_c=self._profile.target_drop_temp_c,
+            target_development_percent=self._profile.target_development_percent,
+            # These remain full-precision monotonic-clock projections.  The
+            # PostFcRorController snapshots/restores them with the tentative
+            # control step, so a rejected/suppressed/failed write cannot
+            # consume projection runway or clock monotonicity state.
+            development_elapsed_seconds=self._development_elapsed_seconds(),
+            charge_elapsed_seconds=self._charge_elapsed_seconds(),
+        )
         output = self._post_fc_controller.compute(
-            measured_ror_c_per_min=telemetry.bean_ror_c_per_min, dt_seconds=dt_seconds
+            measured_ror_c_per_min=telemetry.bean_ror_c_per_min,
+            dt_seconds=dt_seconds,
+            projection=projection,
         )
         # D96 (#559), PR #560 Codex findings (guard-eligible AND
         # deterministic-drop-eligible same-tick RAISES — round 1's P1 and
@@ -2210,12 +2233,12 @@ class RoastController:
             # actuation, so the next tick retries at the same elapsed-time
             # budget).
             if not heat_suppressed_this_tick:
-                self._post_fc_last_actuation_monotonic = now
-                # D96 slice 2 (#559): this `output` stands (kept, not
-                # restored) — stash it for `_build_advisor_context` (told ==
-                # enforced).
-                self._last_post_fc_output = output
-                self._accepted_post_fc_output = output
+                self._accept_post_fc_output(
+                    output=output,
+                    before=pre_compute_state,
+                    projection=projection,
+                    accepted_at=now,
+                )
             # D96 slice 2 (#559), Codex round-1 finding #1 precedent applied
             # here too: on a suppressed tick `_last_post_fc_output` is left
             # exactly as `_force_recovery_exit`/the top-of-tick machinery
@@ -2268,11 +2291,12 @@ class RoastController:
             # state (already advanced by the `compute` call above) stands,
             # and the cadence timer advances so the NEXT actuation is paced
             # from THIS confirmed instant.
-            self._post_fc_last_actuation_monotonic = now
-            # D96 slice 2 (#559): this `output` stands (kept, not restored) —
-            # stash it for `_build_advisor_context` (told == enforced).
-            self._last_post_fc_output = output
-            self._accepted_post_fc_output = output
+            self._accept_post_fc_output(
+                output=output,
+                before=pre_compute_state,
+                projection=projection,
+                accepted_at=now,
+            )
         elif not executed and not heat_suppressed_this_tick:
             # NOT executed — REJECTed (e.g. rate-limited) OR an actuator
             # failure: undo the tentative `compute` step entirely so the
@@ -2285,6 +2309,141 @@ class RoastController:
             self._post_fc_controller.restore_state(pre_compute_state)
             # D96 slice 2 (#559): `output` was NOT kept — do NOT stash it,
             # mirroring the PI state restore immediately above.
+
+    def _accept_post_fc_output(
+        self,
+        *,
+        output: PostFcControlOutput,
+        before: PostFcControllerState,
+        projection: PostFcProjectionInputs,
+        accepted_at: float,
+    ) -> None:
+        """Commit an accepted post-FC output and log v2 state transitions.
+
+        The caller invokes this only after an executed write or the deliberate
+        idempotent-held acceptance.  Keeping the recovery-v2 observability at
+        this boundary prevents a tentative compute, a safety rejection, a
+        same-tick drop suppression, or an actuator failure from creating an
+        operator-visible transition that never reached the roaster.
+
+        Args:
+            output: The output whose state is now authoritative.
+            before: Controller state immediately before computing ``output``.
+            projection: The full-precision live inputs used for ``output``.
+            accepted_at: Monotonic instant of the accepted control step.
+        """
+        self._post_fc_last_actuation_monotonic = accepted_at
+        self._last_post_fc_output = output
+        self._accepted_post_fc_output = output
+        self._log_recovery_v2_transition_if_accepted(
+            before=before,
+            after=self._post_fc_controller.snapshot_state(),
+            output=output,
+            projection=projection,
+        )
+
+    def _log_recovery_v2_transition_if_accepted(
+        self,
+        *,
+        before: PostFcControllerState,
+        after: PostFcControllerState,
+        output: PostFcControlOutput,
+        projection: PostFcProjectionInputs,
+    ) -> None:
+        """Log one accepted recovery-v2 transition with bounded diagnostics.
+
+        Args:
+            before: State before the accepted compute step.
+            after: Raw controller state after the accepted compute step.
+            output: The accepted output.
+            projection: The live values used for the accepted projection.
+        """
+        config = self._config.post_first_crack_control
+        if not config.recovery_projection_enabled:
+            return
+        if not before.recovery_active and after.recovery_active:
+            if after.recovery_trigger is PostFcRecoveryTrigger.PROJECTION:
+                if (  # pragma: no cover - valid entry has diagnostics
+                    output.projected_entry_temp_c is None
+                    or output.projection_entry_runway_seconds is None
+                    or projection.development_elapsed_seconds is None
+                ):
+                    _log.info("D162 recovery-v2 projection entered; diagnostics unavailable. #708")
+                else:
+                    _log.info(
+                        "D162 recovery-v2 projection entered: target=%.1f °C, projected=%.1f °C, "
+                        "shortfall=%.1f °C, runway=%.1f s, charge=%.1f s, development=%.1f s. #708",
+                        projection.target_drop_temp_c,
+                        output.projected_entry_temp_c,
+                        projection.target_drop_temp_c - output.projected_entry_temp_c,
+                        output.projection_entry_runway_seconds,
+                        projection.charge_elapsed_seconds,
+                        projection.development_elapsed_seconds,
+                    )
+                return
+            is_ror_entry = after.recovery_trigger is PostFcRecoveryTrigger.ROR_ERROR
+            if is_ror_entry:  # pragma: no branch - only projection/RoR entries
+                _log.info(
+                    "D162 recovery-v2 RoR entered: trigger=%s, heat=%d%%, ceiling=%d%%, "
+                    "fast_raise=%s. #708",
+                    after.recovery_trigger.value,
+                    output.heat_percent,
+                    output.effective_ceiling_percent,
+                    output.recovery_fast_raise_applied,
+                )
+                return
+        if (
+            before.recovery_active
+            and before.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+            and not after.recovery_active
+            and not after.recovery_cutoff_reached
+            and not output.projection_valid
+        ):
+            _log.info(
+                "D162 recovery-v2 active projection invalid; recovery releases "
+                "(heat=%d%%, ceiling=%d%%). #708",
+                output.heat_percent,
+                output.effective_ceiling_percent,
+            )
+            return
+        if not before.recovery_cutoff_reached and after.recovery_cutoff_reached:
+            cutoff_label = _recovery_v2_cutoff_latch_label(
+                config.recovery_projection_cutoff_horizon_pp
+            )
+            if (  # pragma: no cover - the cutoff latch requires a valid cutoff runway
+                output.projection_cutoff_runway_seconds is None
+            ):
+                _log.info("%s", cutoff_label)
+            else:
+                _log.info(
+                    "%s (target=%.1f °C, cutoff_runway=%.1f s, heat=%d%%).",
+                    cutoff_label,
+                    projection.target_drop_temp_c,
+                    output.projection_cutoff_runway_seconds,
+                    output.heat_percent,
+                )
+            return
+        if (
+            before.recovery_active
+            and before.recovery_trigger is PostFcRecoveryTrigger.PROJECTION
+            and not after.recovery_active
+            and not after.recovery_cutoff_reached
+            and output.projection_valid
+            and output.projection_cutoff_runway_seconds is not None
+            and output.projection_cutoff_runway_seconds > 0.0
+        ):
+            if (  # pragma: no cover - a valid on-target projection has a cutoff temperature
+                output.projected_cutoff_temp_c is None
+            ):
+                _log.info("D162 recovery-v2 projection on target; bounded glide begins. #708")
+            else:
+                _log.info(
+                    "D162 recovery-v2 projection on target; bounded glide begins: "
+                    "target=%.1f °C, projected=%.1f °C, cutoff_runway=%.1f s. #708",
+                    projection.target_drop_temp_c,
+                    output.projected_cutoff_temp_c,
+                    output.projection_cutoff_runway_seconds,
+                )
 
     async def _execute_deterministic_drop(self, reason: DropReason) -> bool:
         """Shared drop-execution sequence for every deterministic (non-advisor,

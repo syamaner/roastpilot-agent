@@ -716,12 +716,18 @@ def _format_post_fc_loop_readout(
     ceiling_guard_temp_c: float,
     recovery_enabled: bool = False,
     recovery_headroom_percentage_points: int = 0,
+    recovery_projection_enabled: bool = False,
+    recovery_projection_entry_horizon_pp: float = 2.0,
+    recovery_projection_cutoff_horizon_pp: float = 5.0,
+    recovery_projection_margin_c: float = 3.0,
+    recovery_entry_step_pp: int = 10,
 ) -> list[str]:
     """Render the operator-facing D88/D96 post-FC flag readouts (issues #460,
     #495, #559/PR #560 round 3).
 
     Prints the resolved ``controller.post_first_crack_control.enabled``,
-    ``ceiling_guard_drop_enabled``, AND ``recovery_enabled`` values as
+    ``ceiling_guard_drop_enabled``, ``recovery_enabled``, and recovery-v2
+    projection values as
     can't-miss console lines — as prominent as the mock-driver ``⚠️`` /
     advisor-experiment tag — so an operator running a baseline-vs-treatment
     A/B can *confirm* which roast is which before charging beans. A silent
@@ -757,6 +763,15 @@ def _format_post_fc_loop_readout(
             CAP, not just that recovery is on — the number that actually
             bounds how far above entry heat the loop may raise. Only
             rendered when ``recovery_enabled`` is ``True``.
+        recovery_projection_enabled: Whether the D162 runway-aware projection
+            trigger is enabled.
+        recovery_projection_entry_horizon_pp: Resolved DTR percentage-point
+            horizon where a projected miss may enter recovery.
+        recovery_projection_cutoff_horizon_pp: Resolved DTR percentage-point
+            horizon where recovery authority unconditionally releases.
+        recovery_projection_margin_c: Resolved projected-temperature shortfall
+            required for entry.
+        recovery_entry_step_pp: Resolved one-time fast-raise floor above entry.
 
     Returns:
         The console lines to print, in order.
@@ -786,6 +801,16 @@ def _format_post_fc_loop_readout(
         lines.append(
             "  bidirectional heat recovery: disabled (D88 never-add-heat-beyond-entry stands)"
         )
+    v2_values = (
+        f"entry=+{recovery_projection_entry_horizon_pp:g} pp, "
+        f"cutoff=+{recovery_projection_cutoff_horizon_pp:g} pp, "
+        f"margin={recovery_projection_margin_c:g} °C, "
+        f"fast-raise=+{recovery_entry_step_pp:d} pp"
+    )
+    if recovery_projection_enabled:
+        lines.append(f"⚠️  RECOVERY V2 PROJECTION: ENABLED (D162 — {v2_values})")
+    else:
+        lines.append(f"  recovery v2 projection: disabled (D162 — {v2_values})")
     return lines
 
 
@@ -930,6 +955,11 @@ async def _serve_live(
             ceiling_guard_temp_c=post_fc.ceiling_guard_temp_c,
             recovery_enabled=post_fc.recovery_enabled,
             recovery_headroom_percentage_points=post_fc.recovery_headroom_percentage_points,
+            recovery_projection_enabled=post_fc.recovery_projection_enabled,
+            recovery_projection_entry_horizon_pp=post_fc.recovery_projection_entry_horizon_pp,
+            recovery_projection_cutoff_horizon_pp=post_fc.recovery_projection_cutoff_horizon_pp,
+            recovery_projection_margin_c=post_fc.recovery_projection_margin_c,
+            recovery_entry_step_pp=post_fc.recovery_entry_step_pp,
         ):
             print(line)
 
