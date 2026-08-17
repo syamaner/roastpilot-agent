@@ -8140,16 +8140,15 @@ async def test_put_config_422_on_cross_field_violation(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("body", "offending_key"),
+    "body",
     [
-        ({"advisor": {"timeout_seconds": float("inf")}}, "timeout_seconds"),
+        {"advisor": {"timeout_seconds": float("inf")}},
         (
             {
                 "controller": {
                     "pre_first_crack_levers": {"late_maillard_trim": {"k_ror": float("inf")}}
                 }
-            },
-            "k_ror",
+            }
         ),
     ],
 )
@@ -8159,11 +8158,13 @@ async def test_put_config_422_and_does_not_persist_non_finite_values(
     monkeypatch: pytest.MonkeyPatch,
     _isolated_roastpilot_env: None,
     body: dict[str, object],
-    offending_key: str,
 ) -> None:
     """T7: merged PUT config rejects and never writes non-finite values."""
     config_path = tmp_path / "config.yaml"
     monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(config_path))
+    seeded = await client.put("/api/config", json={"advisor": {"model_slug": "openai/gpt-4o"}})
+    assert seeded.status_code == 200
+    original_bytes = config_path.read_bytes()
 
     response = await client.put(
         "/api/config",
@@ -8172,7 +8173,7 @@ async def test_put_config_422_and_does_not_persist_non_finite_values(
     )
 
     assert response.status_code == 422
-    assert not config_path.exists() or offending_key not in config_path.read_text(encoding="utf-8")
+    assert config_path.read_bytes() == original_bytes
 
 
 # --- GET /api/config/devices ---
