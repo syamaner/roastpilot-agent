@@ -6,10 +6,12 @@ import json
 from collections.abc import Mapping
 from email.message import Message
 from pathlib import Path
+from typing import cast
 from urllib.error import HTTPError, URLError
 
 import claude_review_approval as approval
 import pytest
+import yaml
 
 
 class FakeAPI:
@@ -2803,6 +2805,101 @@ def test_workflows_preserve_all_bridge_events_and_metadata_reviews() -> None:
     assert "github.event.pull_request.user.login != 'dependabot[bot]'" in reviewer
     assert "github.event.action != 'edited'" not in reviewer
     assert "github.event.changes.base.ref.from" not in reviewer
+
+
+_TRACK_PROGRESS_ALLOW_LIST = (
+    "${{ github.event.action == 'opened' ||\n"
+    "    github.event.action == 'synchronize' ||\n"
+    "    github.event.action == 'ready_for_review' ||\n"
+    "    github.event.action == 'reopened' }}"
+)
+
+
+def _mapping(value: object) -> dict[str, object]:
+    """Narrow an untyped parsed YAML mapping."""
+    assert isinstance(value, dict)
+    return cast(dict[str, object], value)
+
+
+def _reviewer_workflow() -> dict[str, object]:
+    """Load the reviewer workflow, normalizing PyYAML's bare `on:` key.
+
+    PyYAML's YAML-1.1 resolver reads a bare `on:` key as the boolean `True`,
+    not the string `"on"`; normalize before narrowing to a mapping.
+    """
+    root = Path(__file__).resolve().parents[1]
+    reviewer_path = root / ".github/workflows/claude-code-review.yml"
+    loaded = yaml.safe_load(reviewer_path.read_text(encoding="utf-8"))
+    assert isinstance(loaded, dict)
+    raw_workflow = cast(dict[object, object], loaded)
+    return _mapping(
+        {"on" if key is True else cast(str, key): value for key, value in raw_workflow.items()}
+    )
+
+
+def _claude_review_action_step(job: dict[str, object]) -> dict[str, object]:
+    """Return the claude-code-action step from the reviewer job."""
+    steps = job["steps"]
+    assert isinstance(steps, list)
+    for raw_step in cast(list[object], steps):
+        step = _mapping(raw_step)
+        if step.get("uses") == "anthropics/claude-code-action@v1":
+            return step
+    raise AssertionError("claude-code-action step not found")
+
+
+def test_track_progress_disabled_only_for_unsupported_pull_request_actions() -> None:
+    """#735: `track_progress` must fail closed for `edited` and unknown actions.
+
+    `edited` stays a fully reviewed trigger (#735 acceptance criterion 1) —
+    the reviewer must still run, only the unsupported progress-comment
+    tracking is disabled for it. This is a structural regression test: it
+    fails if tracking is re-enabled unconditionally, `edited` is dropped
+    from the trigger list, the action step becomes conditionally skipped, the
+    concurrency policy changes, or job permissions widen.
+    """
+    workflow = _reviewer_workflow()
+    jobs = _mapping(workflow["jobs"])
+    job = _mapping(jobs["claude-review"])
+
+    # Trigger list: `edited` present, executing a real review (not skipped).
+    on = _mapping(workflow["on"])
+    pull_request = _mapping(on["pull_request"])
+    assert pull_request["types"] == [
+        "opened",
+        "synchronize",
+        "ready_for_review",
+        "reopened",
+        "edited",
+    ]
+
+    # track_progress: exact fail-closed allow-list, edited absent from it.
+    step = _claude_review_action_step(job)
+    with_block = _mapping(step["with"])
+    track_progress = with_block["track_progress"]
+    assert isinstance(track_progress, str)
+    assert track_progress == _TRACK_PROGRESS_ALLOW_LIST
+    assert "edited" not in track_progress
+
+    # The action step itself is never conditionally skipped.
+    assert "if" not in step
+
+    # The job `if` remains only the Dependabot-author guard.
+    assert job["if"] == "${{ github.event.pull_request.user.login != 'dependabot[bot]' }}"
+
+    # Concurrency group and cancellation policy are unchanged.
+    concurrency = _mapping(workflow["concurrency"])
+    assert concurrency["group"] == "claude-review-${{ github.event.pull_request.number }}"
+    assert concurrency["cancel-in-progress"] is True
+
+    # Job permissions remain exactly this read-only + id-token set.
+    permissions = _mapping(job["permissions"])
+    assert permissions == {
+        "contents": "read",
+        "pull-requests": "read",
+        "issues": "read",
+        "id-token": "write",
+    }
 
 
 def test_missing_matching_inventory_uses_authoritative_incoming_event() -> None:

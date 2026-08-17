@@ -386,6 +386,15 @@ Dependabot PRs. Operate the gate as follows:
   evaluating job conditions; skipping that job could cancel and supersede the
   real review. Metadata edits do not dismiss current evidence or change
   identity. Dependabot exclusion follows PR authorship, not the editing actor.
+  **#735:** `claude-code-review.yml`'s `track_progress` input is enabled only
+  for the supported `opened`, `synchronize`, `ready_for_review`, and
+  `reopened` actions and disabled (fail-closed) for `edited` and any other
+  action, because the underlying action does not support progress-comment
+  tracking on `edited`. This does not skip the review: `edited` stays in the
+  trigger list and the action step is never conditionally skipped, so a
+  title/body/base metadata edit still runs a real inline review as described
+  above. Do not read a missing/failed progress comment on an `edited` run as
+  a failed review.
 - An ordinary base-tip advance does not invalidate approval by itself. Strict
   branch protection prevents the now-behind head from merging until it is
   updated; that head change dismisses approval and starts fresh review. Strict
