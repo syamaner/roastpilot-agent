@@ -8138,6 +8138,43 @@ async def test_put_config_422_on_cross_field_violation(
     assert r2.status_code == 422
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "offending_key"),
+    [
+        ({"advisor": {"timeout_seconds": float("inf")}}, "timeout_seconds"),
+        (
+            {
+                "controller": {
+                    "pre_first_crack_levers": {"late_maillard_trim": {"k_ror": float("inf")}}
+                }
+            },
+            "k_ror",
+        ),
+    ],
+)
+async def test_put_config_422_and_does_not_persist_non_finite_values(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+    body: dict[str, object],
+    offending_key: str,
+) -> None:
+    """T7: merged PUT config rejects and never writes non-finite values."""
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(config_path))
+
+    response = await client.put(
+        "/api/config",
+        content=json.dumps(body),
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert not config_path.exists() or offending_key not in config_path.read_text(encoding="utf-8")
+
+
 # --- GET /api/config/devices ---
 #
 # Both enumeration helpers use lazy imports (import inside the try block) so

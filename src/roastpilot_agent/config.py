@@ -7,12 +7,11 @@ deliberately conservative software ceilings pending supervised hardware
 validation at E12 (E12-S1).
 """
 
-import math
 from pathlib import Path
 from typing import Annotated, ClassVar, Literal
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .models import RoastPhase
@@ -237,6 +236,10 @@ FC_LATENCY_BUSTED_ADVISOR_ARMS: frozenset[tuple[str, str | None]] = frozenset(
 #: one — stay in lockstep with this one literal.
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
+# #769: every configuration model in the AppConfig tree assigns this; the
+# reflective tree test fails when one does not.
+FINITE_NUMERIC_MODEL_CONFIG: ConfigDict = ConfigDict(allow_inf_nan=False)
+
 
 class LateMaillardTrim(BaseModel):
     """Deterministic anticipatory heat-trim parameters, late Maillard → FC (D35 §3, #327).
@@ -290,6 +293,8 @@ class LateMaillardTrim(BaseModel):
     anti-pattern).  The latch still governs *engagement*; depth eases with the
     signal but the trim does not thrash on/off.
     """
+
+    model_config = FINITE_NUMERIC_MODEL_CONFIG
 
     #: Whether the anticipatory trim is active. ``False`` reverts to the pure
     #: #222 flat floor (heat 100 / fan 30 → FC) with no trim window — the
@@ -625,6 +630,8 @@ class PostFirstCrackControl(BaseModel):
     heat/fan are percentages.
     """
 
+    model_config = FINITE_NUMERIC_MODEL_CONFIG
+
     #: The master flag (``post_fc_ror_loop``). **``True`` as of the 12 Jul
     #: promotion** (D88/D89, operator-ratified on the 11 Jul validation
     #: roast + 9/10 tasting) — every new roast runs the deterministic taper
@@ -771,16 +778,12 @@ class PostFirstCrackControl(BaseModel):
     recovery_projection_enabled: bool = Field(default=False)
     #: Percentage points beyond the target DTR at which a projected shortfall
     #: may enter recovery.
-    recovery_projection_entry_horizon_pp: float = Field(
-        default=2.0, gt=0, le=20, allow_inf_nan=False
-    )
+    recovery_projection_entry_horizon_pp: float = Field(default=2.0, gt=0, le=20)
     #: Percentage points beyond the target DTR that end recovery authority for
     #: this post-FC engagement.
-    recovery_projection_cutoff_horizon_pp: float = Field(
-        default=5.0, gt=0, le=20, allow_inf_nan=False
-    )
+    recovery_projection_cutoff_horizon_pp: float = Field(default=5.0, gt=0, le=20)
     #: Minimum projected temperature shortfall (Celsius) required for entry.
-    recovery_projection_margin_c: float = Field(default=3.0, gt=0, allow_inf_nan=False)
+    recovery_projection_margin_c: float = Field(default=3.0, gt=0)
     #: One-time heat floor, in percentage points above engagement heat, applied
     #: whenever recovery enters while projection mode is enabled, including an
     #: entry confirmed by the ordinary RoR-error trigger.
@@ -1055,6 +1058,8 @@ class ReferenceCurve(BaseModel):
     that hardware validation.
     """
 
+    model_config = FINITE_NUMERIC_MODEL_CONFIG
+
     #: The master flag. ``False`` by default — no retrieval happens, and the
     #: advisor context's reference fields stay empty/None, exactly today's
     #: behaviour. Flip only after the hardware-validation gate above clears.
@@ -1081,6 +1086,8 @@ class PreFirstCrackLevers(BaseModel):
     All values are percentages (0–100); temperatures are out of scope here (the
     box ceilings live in :class:`SafetyLimits`).
     """
+
+    model_config = FINITE_NUMERIC_MODEL_CONFIG
 
     #: The deterministic heat the controller holds through preheat → FC. Default
     #: 100 — the operator's proven n8n pre-FC heat (steady high heat to drive the
@@ -1220,6 +1227,8 @@ class AmbientFanDoctrine(BaseModel):
     ``fan_ceiling_percent``. Told == enforced still holds structurally because
     the same resolved box feeds the context and safety evaluation.
     """
+
+    model_config = FINITE_NUMERIC_MODEL_CONFIG
 
     enabled: bool = False
     """Master flag for ambient context and destination-ceiling enforcement.
@@ -1402,6 +1411,8 @@ class ControllerConfig(BaseModel):
     (§ Hardware Characteristics — sensors update at ~1 Hz; faster polling
     reads unchanged values).
     """
+
+    model_config = FINITE_NUMERIC_MODEL_CONFIG
 
     tick_interval_seconds: float = Field(default=1.0, gt=0)
     advisory_min_temp_delta_c: float = Field(default=1.0, gt=0)
@@ -1589,14 +1600,6 @@ class ControllerConfig(BaseModel):
     # feeding it data are one deliberate act rather than a default.
     ambient_fan_doctrine: AmbientFanDoctrine = Field(default_factory=AmbientFanDoctrine)
 
-    @field_validator("max_stale_telemetry_seconds")
-    @classmethod
-    def _check_finite_staleness_bound(cls, value: float) -> float:
-        """Reject a non-finite bound that would disable stale-read detection."""
-        if not math.isfinite(value):
-            raise ValueError("max_stale_telemetry_seconds must be finite")
-        return value
-
     def advisory_interval_for(self, phase: RoastPhase) -> float | None:
         """Return the minimum-interval consult floor for ``phase`` in seconds.
 
@@ -1673,6 +1676,8 @@ class AdvisorConfig(BaseModel):
     pin one phase to a different model; under D35 only post-FC DEVELOPMENT
     consults the advisor, so that map has exactly one live slot today.
     """
+
+    model_config = FINITE_NUMERIC_MODEL_CONFIG
 
     provider: Literal["openai", "anthropic", "google", "ollama", "openai_compatible"] = (
         "openai_compatible"
@@ -1958,6 +1963,8 @@ class BeanSourcingConfig(BaseModel):
     configured nor sends an OpenRouter-prefixed slug to a native provider.
     """
 
+    model_config = FINITE_NUMERIC_MODEL_CONFIG
+
     fetch_timeout_seconds: float = Field(default=10.0, gt=0)
     """Bound on the vendor-page GET (connect + read). A product page is a
     normal web response; 10 s comfortably covers a slow vendor host without
@@ -2086,6 +2093,8 @@ class SafetyLimits(BaseModel):
       a new verdict in this story.
     """
 
+    model_config = FINITE_NUMERIC_MODEL_CONFIG
+
     max_bean_temp_c: float = Field(default=230.0, gt=0)
     max_env_temp_c: float = Field(default=240.0, gt=0)
     pre_t0_max_bean_temp_c: float = Field(default=200.0, gt=0)
@@ -2102,22 +2111,6 @@ class SafetyLimits(BaseModel):
     # is the *target* ceiling, the emergency-drop bound is the last-resort one.
     bitter_ceiling_temp_c: float = Field(default=196.0, gt=0)
     emergency_drop_temp_c: float = Field(default=198.0, gt=0)
-
-    @field_validator("max_bean_temp_c", "max_env_temp_c", "pre_t0_max_bean_temp_c")
-    @classmethod
-    def _check_finite_temperature_ceiling(cls, value: float) -> float:
-        """Reject a non-finite bound that would disable a temperature guard."""
-        if not math.isfinite(value):
-            raise ValueError("temperature safety ceilings must be finite")
-        return value
-
-    @field_validator("min_seconds_between_commands")
-    @classmethod
-    def _check_finite_command_interval(cls, value: float) -> float:
-        """Reject a non-finite interval that would suppress every command."""
-        if not math.isfinite(value):
-            raise ValueError("min_seconds_between_commands must be finite")
-        return value
 
     @model_validator(mode="after")
     def _check_drop_ceiling_order(self) -> "SafetyLimits":
@@ -2226,6 +2219,8 @@ class MCPDeviceConfig(BaseModel):
             (30.0 s) or the hand-authored yaml's value governs.
     """
 
+    model_config = FINITE_NUMERIC_MODEL_CONFIG
+
     serial_port: str | None = None
     roaster_driver: str | None = None
     audio_input_device: str | None = None
@@ -2289,6 +2284,8 @@ class MCPConfig(BaseModel):
       commanded-hot. 10 s clears the SDK's 2 s with margin.
     """
 
+    model_config = FINITE_NUMERIC_MODEL_CONFIG
+
     command: str = Field(default=DEFAULT_MCP_COMMAND, min_length=1)
     call_timeout_seconds: float = Field(default=5.0, gt=0)
     startup_timeout_seconds: float = Field(default=15.0, gt=0)
@@ -2344,6 +2341,8 @@ class LoggingConfig(BaseModel):
     defaults — mirroring the ``--db`` > ``ROASTPILOT_DB`` > default pattern.
     """
 
+    model_config = FINITE_NUMERIC_MODEL_CONFIG
+
     #: Master access-log mode: ``quiet`` (default), ``full``, or ``off``.
     http_access_log_mode: HttpAccessLogMode = "quiet"
     #: Route paths whose SUCCESSFUL (status < 400) requests are dropped in
@@ -2363,7 +2362,9 @@ class AppConfig(BaseSettings):
     e.g. ``ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS=0.5``.
     """
 
-    model_config = SettingsConfigDict(env_prefix="ROASTPILOT_", env_nested_delimiter="__")
+    model_config = SettingsConfigDict(
+        env_prefix="ROASTPILOT_", env_nested_delimiter="__", allow_inf_nan=False
+    )
 
     controller: ControllerConfig = Field(default_factory=ControllerConfig)
     advisor: AdvisorConfig = Field(default_factory=AdvisorConfig)
