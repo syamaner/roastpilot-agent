@@ -2,7 +2,7 @@
 
 ## Active Epic
 
-**17 Aug 2026 — #735 closed: `claude-code-review.yml` enables `track_progress`
+**17 Aug 2026 — #735 story-closing implementation complete: `claude-code-review.yml` enables `track_progress`
 only for `opened`/`synchronize`/`ready_for_review`/`reopened` and disables it
 (fail-closed) for `edited` and any other action, because the action does not
 support progress-comment tracking there; `edited` stays in the trigger list
