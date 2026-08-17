@@ -34,6 +34,18 @@ Format: one entry per anti-pattern.
 
 ---
 
+## Configuration floats must be finite by model config, not per-field validators
+*(fixed by #769, 17 Aug 2026)*
+
+- **Signature:** `rg -n 'class \w+\(BaseModel\)' src/roastpilot_agent/config.py`
+  finds a configuration model without `model_config = FINITE_NUMERIC_MODEL_CONFIG`, or
+  a float `Field((gt|ge|le|lt)=...)` in a model lacking that shared setting.
+- **Wrong / Right:** enumerate `math.isfinite` validators field by field / assign the
+  shared fail-closed model config to every AppConfig-tree model.
+- **Guarded by:** `test_app_config_tree_rejects_non_finite_floats_reflectively`.
+
+---
+
 ## Run-local clocks cannot order or identify persisted rows across a restart
 *(fixed by #787 slices 1–2, 15 Aug 2026)*
 
