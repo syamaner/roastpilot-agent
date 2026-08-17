@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import runpy
+import shlex
 import sys
 import tomllib
 import xml.etree.ElementTree as ElementTree
@@ -38,12 +39,39 @@ def _coverage_sources(config: dict[str, object]) -> tuple[str, ...]:
     return _strings(source)
 
 
-def _workflow_cov_values() -> tuple[str, ...]:
-    """Return the CI coverage roots from the pytest invocation."""
-    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    command = re.search(r"python -m pytest (?P<arguments>[^\n]+)", workflow)
-    assert command is not None
-    return tuple(re.findall(r"--cov=([^\s]+)", command.group("arguments")))
+def _workflow_cov_values() -> tuple[tuple[str, ...], ...]:
+    """Return coverage roots from every expanded CI pytest lane."""
+    workflow_path = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+    loaded = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    assert isinstance(loaded, dict)
+    raw_workflow = cast(dict[object, object], loaded)
+    workflow = _mapping(
+        {"on" if key is True else cast(str, key): value for key, value in raw_workflow.items()}
+    )
+    values: list[tuple[str, ...]] = []
+    for job in _mapping(workflow["jobs"]).values():
+        job_mapping = _mapping(job)
+        matrix_entries: list[dict[str, object]] = [{}]
+        strategy = job_mapping.get("strategy")
+        if strategy is not None:
+            matrix = _mapping(_mapping(strategy)["matrix"])
+            include = matrix.get("include")
+            if include is not None:
+                assert isinstance(include, list)
+                matrix_entries = [_mapping(entry) for entry in cast(list[object], include)]
+        steps = job_mapping.get("steps", [])
+        assert isinstance(steps, list)
+        for step in cast(list[object], steps):
+            run = _mapping(step).get("run")
+            if not isinstance(run, str) or not run.startswith("python -m pytest"):
+                continue
+            for matrix_entry in matrix_entries:
+                command = run
+                for key, value in matrix_entry.items():
+                    assert isinstance(value, str)
+                    command = command.replace(f"${{{{ matrix.{key} }}}}", value)
+                values.append(tuple(re.findall(r"--cov=([^\s]+)", command)))
+    return tuple(values)
 
 
 def _codecov() -> dict[str, object]:
@@ -67,22 +95,59 @@ def _paths(status: dict[str, object]) -> tuple[str, ...]:
 def test_coverage_sources_and_ci_values_are_exactly_in_parity() -> None:
     """Coverage configuration and CI must collect exactly the same roots."""
     sources = _coverage_sources(_pyproject())
-    ci_sources = _workflow_cov_values()
+    ci_sources_by_lane = _workflow_cov_values()
 
     assert sources == EXPECTED_SOURCES
-    assert ci_sources == sources
+    assert len(ci_sources_by_lane) >= 4
+    assert all(ci_sources == sources for ci_sources in ci_sources_by_lane)
 
 
 def test_ci_normalizes_coverage_filenames_before_codecov_upload() -> None:
     """CI rewrites local coverage paths before the Codecov action reads them."""
-    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    workflow_path = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+    loaded = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    assert isinstance(loaded, dict)
+    raw_workflow = cast(dict[object, object], loaded)
+    workflow = _mapping(
+        {"on" if key is True else cast(str, key): value for key, value in raw_workflow.items()}
+    )
+    jobs = _mapping(workflow["jobs"])
+    coverage_job = _mapping(jobs["coverage"])
+    coverage_steps = [_mapping(step) for step in cast(list[object], coverage_job["steps"])]
+    step_names = [step.get("name") for step in coverage_steps]
+    combine_index = step_names.index("Combine coverage data")
+    xml_index = step_names.index("Generate combined coverage XML")
+    normalize_index = step_names.index("Normalize coverage filenames for Codecov")
+    upload_index = step_names.index("Upload coverage to Codecov")
 
-    pytest_index = workflow.index("- name: Run tests with coverage")
-    normalize_index = workflow.index("- name: Normalize coverage filenames for Codecov")
-    upload_index = workflow.index("- name: Upload coverage to Codecov")
+    assert combine_index < xml_index < normalize_index < upload_index
+    normalize_step = coverage_steps[normalize_index]
+    assert normalize_step["run"] == "python scripts/tooling_coverage.py coverage.xml"
 
-    assert pytest_index < normalize_index < upload_index
-    assert "run: python scripts/tooling_coverage.py coverage.xml" in workflow
+    codecov_steps: list[tuple[str, dict[str, object]]] = []
+    pytest_runs: list[str] = []
+    for job_id, job in jobs.items():
+        for step in cast(list[object], _mapping(job)["steps"]):
+            step_mapping = _mapping(step)
+            if step_mapping.get("uses") == "codecov/codecov-action@v5":
+                codecov_steps.append((job_id, step_mapping))
+            run = step_mapping.get("run")
+            if isinstance(run, str) and run.startswith("python -m pytest"):
+                pytest_runs.append(run)
+    assert len(codecov_steps) == 1
+    codecov_job, codecov_step = codecov_steps[0]
+    assert codecov_job == "coverage"
+    codecov_with = _mapping(codecov_step["with"])
+    assert codecov_with["files"] == "./coverage.xml"
+    assert codecov_with["disable_search"] is True
+    assert pytest_runs and all(
+        "--cov-report=" in shlex.split(run)
+        and not any(
+            token.startswith("--cov-report=") and token != "--cov-report="
+            for token in shlex.split(run)
+        )
+        for run in pytest_runs
+    )
 
 
 def test_each_discovered_skill_root_is_registered_in_flattened_settings() -> None:

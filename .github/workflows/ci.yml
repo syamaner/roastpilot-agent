@@ -16,8 +16,8 @@ permissions:
   contents: read
 
 jobs:
-  checks:
-    name: Checks
+  quality:
+    name: Quality (lint, format, pyright, contract drift)
     runs-on: ubuntu-latest
 
     steps:
@@ -54,12 +54,6 @@ jobs:
         # interpreter. Locally, plain `python -m pyright` is correct.
         run: python -m pyright --pythonpath "${pythonLocation}/bin/python"
 
-      - name: Run tests with coverage
-        run: python -m pytest --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report=xml --cov-report=term-missing:skip-covered
-
-      - name: Normalize coverage filenames for Codecov
-        run: python scripts/tooling_coverage.py coverage.xml
-
       # Continuous server-drift auto-catch (#121): regenerate the SPA contract
       # surface from the real server models and fail if it differs from the
       # committed mirror. The in-sync pytest tests above already gate drift
@@ -78,15 +72,137 @@ jobs:
         if: always()
         run: python scripts/check_contract_drift.py
 
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-
       - name: Run CLI smoke checks
         run: |
           roastpilot-agent --help
           roastpilot-agent --version
+
+  pytest-ordinary:
+    name: Python tests (ordinary, xdist)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # The dev group installs coffee-roaster-mcp (the E9-S2 vertical slice
+      # spawns it in mock-driver mode), which depends on sounddevice — its
+      # import needs the PortAudio runtime even though mock mode never opens an
+      # audio device. Without it the bootstrap-safe child fails to start.
+      - name: Install system libraries (PortAudio for sounddevice)
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group dev
+
+      - name: Run ordinary tests with coverage
+        env:
+          COVERAGE_FILE: .coverage.ordinary
+        run: python -m pytest -n 4 --dist worksteal -m "not serial and not stress" --ignore=tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report=
+
+      - name: Upload ordinary coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-ordinary
+          path: .coverage.ordinary
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  pytest-serial:
+    name: Python tests (serial)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # The dev group installs coffee-roaster-mcp (the E9-S2 vertical slice
+      # spawns it in mock-driver mode), which depends on sounddevice — its
+      # import needs the PortAudio runtime even though mock mode never opens an
+      # audio device. Without it the bootstrap-safe child fails to start.
+      - name: Install system libraries (PortAudio for sounddevice)
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group dev
+
+      - name: Run serial tests with coverage
+        env:
+          COVERAGE_FILE: .coverage.serial
+        run: python -m pytest -m "serial and not stress" --ignore=tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report=
+
+      - name: Upload serial coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-serial
+          path: .coverage.serial
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  pytest-stress:
+    name: Python tests (stress ${{ matrix.case }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: opaque-event-boundary
+            nodeid: tests/test_capture_agent_usage.py::test_codex_opaque_event_boundary_is_exact
+          - case: opaque-total-accepts-exact
+            nodeid: tests/test_capture_agent_usage.py::test_codex_opaque_total_boundary_accepts_exact_limit
+          - case: opaque-total-rejects-one-over
+            nodeid: tests/test_capture_agent_usage.py::test_codex_opaque_total_boundary_rejects_one_over
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # The dev group installs coffee-roaster-mcp (the E9-S2 vertical slice
+      # spawns it in mock-driver mode), which depends on sounddevice — its
+      # import needs the PortAudio runtime even though mock mode never opens an
+      # audio device. Without it the bootstrap-safe child fails to start.
+      - name: Install system libraries (PortAudio for sounddevice)
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group dev
+
+      - name: Run stress test with coverage
+        env:
+          COVERAGE_FILE: .coverage.stress-${{ matrix.case }}
+        run: python -m pytest "${{ matrix.nodeid }}" --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report=
+
+      - name: Upload stress coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-stress-${{ matrix.case }}
+          path: .coverage.stress-${{ matrix.case }}
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
 
   # E11-S1 (#137): build the real wheel (Node must be present so the
   # hatch_build.py hook can `npm ci && npm run build` web/dist and force-include
@@ -107,12 +223,38 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      # The dev group installs coffee-roaster-mcp (the E9-S2 vertical slice
+      # spawns it in mock-driver mode), which depends on sounddevice — its
+      # import needs the PortAudio runtime even though mock mode never opens an
+      # audio device. Without it the bootstrap-safe child fails to start.
+      - name: Install system libraries (PortAudio for sounddevice)
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group dev
+
       - name: Set up Node (for the SPA build hook)
         uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: "npm"
           cache-dependency-path: web/package-lock.json
+
+      - name: Run packaging tests
+        env:
+          COVERAGE_FILE: .coverage.package
+        run: python -m pytest tests/test_packaging.py --cov=roastpilot_agent --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts --cov-report=
+
+      - name: Upload packaging coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-package
+          path: .coverage.package
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Build the wheel
         run: |
@@ -152,6 +294,75 @@ jobs:
           index_html="$(curl -sf http://127.0.0.1:18234/)"
           echo "$index_html" | grep -q '<div id="root">' \
             || { echo "SPA index.html not served from the packaged wheel"; exit 1; }
+
+  coverage:
+    name: Coverage (combine + normalize + upload)
+    runs-on: ubuntu-latest
+    needs: [pytest-ordinary, pytest-serial, pytest-stress, package]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install coverage
+        run: python -m pip install --upgrade pip && python -m pip install "coverage>=7.6"
+
+      - name: Download coverage data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          merge-multiple: true
+          path: .
+
+      - name: Combine coverage data
+        run: python -m coverage combine --keep .coverage.ordinary .coverage.serial .coverage.stress-opaque-event-boundary .coverage.stress-opaque-total-accepts-exact .coverage.stress-opaque-total-rejects-one-over .coverage.package
+
+      - name: Generate combined coverage XML
+        run: python -m coverage xml -o coverage.xml
+
+      - name: Report combined coverage
+        run: python -m coverage report --skip-covered
+
+      - name: Normalize coverage filenames for Codecov
+        run: python scripts/tooling_coverage.py coverage.xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          disable_search: true
+
+  checks:
+    name: Checks
+    if: always()
+    runs-on: ubuntu-latest
+    needs: [quality, pytest-ordinary, pytest-serial, pytest-stress, package, coverage]
+    steps:
+      - name: Require every Python quality gate to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          failed = {
+              name: details["result"]
+              for name, details in needs.items()
+              if details["result"] != "success"
+          }
+          if failed:
+              print(f"Required CI jobs did not succeed: {failed}")
+              sys.exit(1)
+          PY
 
   # The SPA (web/) lint + typecheck + unit/component tests on a normal runner.
   web:

@@ -81,11 +81,13 @@ python -m pip install -e . --group dev
 python -m pytest
 ```
 
-For a fast local loop, run `python -m pytest -m 'not stress and not slow'`.
-`stress` tests exercise real production resource limits, `slow` tests use real
-subprocesses or MCP sessions, and `serial` tests must not run concurrently with
-other tests. The full gate (`python -m pytest`, all markers) remains mandatory
-before handback and before opening a PR.
+CI uses a four-worker ordinary xdist lane, a serial lane, a three-entry stress
+matrix, and the Package job for `tests/test_packaging.py`; one coverage job combines
+their data. For a fast local parallel loop, run `python -m pytest -n 4 --dist
+worksteal -m 'not serial and not stress'`. `stress` tests exercise real production
+resource limits, `slow` tests use real subprocesses or MCP sessions, and `serial`
+tests are never run under `-n`. The full gate (`python -m pytest`, all markers,
+single process) remains mandatory before handback and before opening a PR.
 
 ### Lint And Format
 

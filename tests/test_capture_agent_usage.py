@@ -1867,9 +1867,8 @@ def test_codex_opaque_event_boundary_is_exact() -> None:
         parse_codex_stream(BytesIO(prefix + (b"x" * (exact_payload + 1)) + suffix))
 
 
-@pytest.mark.stress
-def test_codex_opaque_total_boundary_is_exact() -> None:
-    """The real aggregate opaque stream byte limit accepts exact and rejects one over."""
+def _opaque_total_boundary_parts() -> tuple[bytes, int]:
+    """Build one real aggregate-limit event and its exact repeat count."""
     prefix = b'{"type":"item.updated","payload":"'
     suffix = b'"}\n'
     event_bytes = 128 * 1024
@@ -1877,12 +1876,25 @@ def test_codex_opaque_total_boundary_is_exact() -> None:
     assert len(medium) == event_bytes
     repeats = MAX_CODEX_OPAQUE_TOTAL_BYTES // len(medium)
     assert repeats * len(medium) == MAX_CODEX_OPAQUE_TOTAL_BYTES
+    return medium, repeats
+
+
+@pytest.mark.stress
+def test_codex_opaque_total_boundary_accepts_exact_limit() -> None:
+    """The real aggregate opaque stream byte limit accepts its exact boundary."""
+    medium, repeats = _opaque_total_boundary_parts()
     assert (
         parse_codex_stream(
             _RepeatedEventStream(medium, repeats, _codex_terminal_event())
         ).input_tokens
         == 1
     )
+
+
+@pytest.mark.stress
+def test_codex_opaque_total_boundary_rejects_one_over() -> None:
+    """The real aggregate opaque stream byte limit rejects one event over."""
+    medium, repeats = _opaque_total_boundary_parts()
     with pytest.raises(CodexUsageParseError, match="opaque stream exceeds total byte limit"):
         parse_codex_stream(_RepeatedEventStream(medium, repeats + 1, _codex_terminal_event()))
 
