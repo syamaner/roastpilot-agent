@@ -1020,10 +1020,15 @@ mutate the repository, own real-child/MCP lifecycle, or drive process groups, an
 real production-size parser boundaries in a stress matrix. The Package job owns the packaging tests;
 one coverage job combines every lane before normalisation and Codecov upload. Actions timing moved
 from the 940.57-second Python coverage / 17m20s `Checks` baseline to the slice-1 783.72-second /
-14m36s intermediate result; slice-2 exact-head hosted timing is recorded with the closing PR evidence.
-D104/D105 `pytest_sessionfinish` executor-join ownership is unchanged. This is cross-cutting
-process/CI governance, not a new epic story row; package, Web, Playwright, coverage, and branch
-protection authorities are unchanged.
+14m36s intermediate result; CI run 31980963964 attempts 1/2/3 completed the slice-2 exact-head
+coverage critical path in 258s, 252s, and 265s respectively, from workflow start through combined
+upload. The worst result, 265s, is a 71.8% reduction from 940.57s; all three attempts were green on
+`e181981` with no timing/order flakes. If Codecov processes the report but the required status is
+missing, rerun the dedicated Coverage job by database job id with `gh run rerun --job <coverage job id>`;
+it reuses persisted lane artifacts and re-uploads the combined report, without a junk commit. D104/D105
+`pytest_sessionfinish` executor-join ownership is unchanged. This is cross-cutting process/CI governance,
+not a new epic story row; package, Web, Playwright, coverage, and branch protection authorities are
+unchanged.
 
 **18 Jul 2026 (later — D102 plant-model experiment + the discard-roast feature).** After #567
 parked, the operator's diagnosis that the system lacks RoR PROJECTION (only the pre-FC FC-ETA
