@@ -6,8 +6,12 @@ nesting), validation rejections, and the guidance-vs-safety-bound link.
 """
 
 import inspect
+import json
 import os
+import types
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Annotated, Any, Union, get_args, get_origin
 
 import pydantic
 import pytest
@@ -15,6 +19,7 @@ import pytest
 from roastpilot_agent.config import (
     DEFAULT_ADVISOR_MODEL,
     DEFAULT_MCP_AMBIENT_POLL_INTERVAL_SECONDS,
+    FINITE_NUMERIC_MODEL_CONFIG,
     HOTTOP_FAN_LEVEL_PP,
     OPENROUTER_BASE_URL,
     AdvisorConfig,
@@ -23,11 +28,16 @@ from roastpilot_agent.config import (
     BeanSourcingConfig,
     ControllerConfig,
     LateMaillardTrim,
+    LoggingConfig,
+    MCPConfig,
     MCPDeviceConfig,
     PostFirstCrackControl,
+    PreFirstCrackLevers,
+    ReferenceCurve,
     SafetyLimits,
 )
 from roastpilot_agent.models import RoastPhase
+from roastpilot_agent.store import FrozenRunConfig
 
 
 def _declared_le(model: type[pydantic.BaseModel], field: str) -> float:
@@ -337,6 +347,8 @@ def test_control_safety_intervals_require_finite_values(
         (ControllerConfig, {"tick_interval_seconds": -1.0}),
         (ControllerConfig, {"t0_debounce_ticks": 0}),
         (ControllerConfig, {"advisory_timeout_seconds": 0}),
+        (ControllerConfig, {"advisory_timeout_seconds": float("-inf")}),
+        (ControllerConfig, {"operator_timeout_seconds": float("-inf")}),
         (ControllerConfig, {"max_stale_telemetry_seconds": 0}),
         # #171: a negative phase consult floor is meaningless (0 = unthrottled).
         (ControllerConfig, {"advisory_min_interval_seconds": {RoastPhase.PREHEATING: -1.0}}),
@@ -358,6 +370,7 @@ def test_control_safety_intervals_require_finite_values(
         (SafetyLimits, {"overrun_safe_fan_percent": 101}),
         (SafetyLimits, {"pre_t0_overrun_severity": "explode"}),
         (SafetyLimits, {"min_seconds_between_commands": 0}),
+        (PostFirstCrackControl, {"taper_duration_seconds": float("-inf")}),
         # #294 (D35 §3): inverted drop ceilings — emergency-drop must sit above
         # the bitter ceiling, so a 200/198 pair is rejected (mirrors the
         # rejection proven in test_control_policy).
@@ -393,6 +406,212 @@ def test_app_config_defaults_without_env(monkeypatch: pytest.MonkeyPatch) -> Non
     assert config.advisor == AdvisorConfig()
     assert config.safety == SafetyLimits()
     assert config.bean_sourcing == BeanSourcingConfig()
+
+
+def _reachable_config_models(root: type[pydantic.BaseModel]) -> set[type[pydantic.BaseModel]]:
+    """Walk the AppConfig field tree to the nested configuration models."""
+    seen: set[type[pydantic.BaseModel]] = set()
+
+    def walk_annotation(annotation: object) -> None:
+        if isinstance(annotation, type) and issubclass(annotation, pydantic.BaseModel):
+            walk_model(annotation)
+            return
+        origin = get_origin(annotation)
+        if origin is Annotated:
+            walk_annotation(get_args(annotation)[0])
+        elif origin in {Union, types.UnionType, list, tuple, dict}:
+            for argument in get_args(annotation):
+                walk_annotation(argument)
+
+    def walk_model(model: type[pydantic.BaseModel]) -> None:
+        if model in seen:
+            return
+        seen.add(model)
+        for field in model.model_fields.values():
+            walk_annotation(field.rebuild_annotation())
+
+    walk_model(root)
+    return seen
+
+
+def _float_payload_kind(annotation: object) -> str | None:
+    """Classify supported float-bearing config field shapes for T1."""
+    if annotation is float:
+        return "scalar"
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        return _float_payload_kind(get_args(annotation)[0])
+    if origin in {Union, types.UnionType}:
+        kinds = {
+            kind
+            for argument in get_args(annotation)
+            if argument is not type(None)
+            if (kind := _float_payload_kind(argument)) is not None
+        }
+        if len(kinds) == 1:
+            return kinds.pop()
+    if origin in {dict, Mapping}:
+        value_kind = _float_payload_kind(get_args(annotation)[1])
+        if value_kind == "scalar":
+            return "mapping"
+    if "float" in repr(annotation):
+        pytest.fail(f"T1 does not understand float-bearing annotation {annotation!r}")
+    return None
+
+
+def test_app_config_tree_rejects_non_finite_floats_reflectively() -> None:
+    """T1: every reachable config model rejects non-finite numeric values."""
+    models = _reachable_config_models(AppConfig)
+    expected_floor = {
+        AppConfig,
+        ControllerConfig,
+        PreFirstCrackLevers,
+        LateMaillardTrim,
+        PostFirstCrackControl,
+        ReferenceCurve,
+        AmbientFanDoctrine,
+        AdvisorConfig,
+        SafetyLimits,
+        MCPConfig,
+        MCPDeviceConfig,
+        LoggingConfig,
+        BeanSourcingConfig,
+    }
+    assert expected_floor <= models
+    assert FINITE_NUMERIC_MODEL_CONFIG == {"allow_inf_nan": False}
+
+    float_fields: set[str] = set()
+    for model in models:
+        assert model.model_config.get("allow_inf_nan") is False, model.__name__
+        for name, field in model.model_fields.items():
+            kind = _float_payload_kind(field.rebuild_annotation())
+            if kind is None:
+                continue
+            float_fields.add(name)
+            for non_finite in (float("inf"), float("-inf"), float("nan")):
+                value: Any = (
+                    {RoastPhase.DEVELOPMENT: non_finite} if kind == "mapping" else non_finite
+                )
+                with pytest.raises(pydantic.ValidationError) as raised:
+                    model.model_validate({name: value})
+                assert any(
+                    error["type"] == "finite_number" and error["loc"][0] == name
+                    for error in raised.value.errors()
+                )
+    assert {
+        "tick_interval_seconds",
+        "kp_percent_per_ror",
+        "ki_percent_per_ror_second",
+        "k_ror",
+        "threshold_c",
+        "timeout_seconds",
+        "fetch_timeout_seconds",
+        "call_timeout_seconds",
+        "stop_timeout_seconds",
+        "ambient_poll_interval_seconds",
+        "advisory_min_interval_seconds",
+    } <= float_fields
+
+
+def test_finite_config_values_and_none_sentinels_are_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T2: finite values and documented None sentinels retain their behaviour."""
+    for key in list(os.environ):
+        if key.startswith("ROASTPILOT_"):
+            monkeypatch.delenv(key)
+    assert AppConfig() == AppConfig()
+    assert ControllerConfig(tick_interval_seconds=1e300).tick_interval_seconds == 1e300
+    assert (
+        ControllerConfig(
+            advisory_post_charge_turning_point_ror_c_per_min=-5.0
+        ).advisory_post_charge_turning_point_ror_c_per_min
+        == -5.0
+    )
+    assert (
+        ControllerConfig(
+            advisory_min_interval_seconds={RoastPhase.DEVELOPMENT: None}
+        ).advisory_min_interval_seconds[RoastPhase.DEVELOPMENT]
+        is None
+    )
+    assert MCPDeviceConfig(ambient_poll_interval_seconds=None).ambient_poll_interval_seconds is None
+    assert PostFirstCrackControl().recovery_projection_entry_horizon_pp == 2.0
+    assert (
+        PostFirstCrackControl(
+            recovery_projection_cutoff_horizon_pp=20
+        ).recovery_projection_cutoff_horizon_pp
+        == 20
+    )
+    with pytest.raises(pydantic.ValidationError):
+        PostFirstCrackControl(recovery_projection_entry_horizon_pp=21)
+    with pytest.raises(pydantic.ValidationError):
+        PostFirstCrackControl(recovery_projection_cutoff_horizon_pp=21)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"controller": {"tick_interval_seconds": float("inf")}},
+        {"controller": {"post_first_crack_control": {"kp_percent_per_ror": float("inf")}}},
+        {"controller": {"pre_first_crack_levers": {"late_maillard_trim": {"k_ror": float("nan")}}}},
+        {"mcp": {"stop_timeout_seconds": float("inf")}},
+        {"safety": {"bitter_ceiling_temp_c": float("-inf")}},
+        {"mcp_device": {"ambient_poll_interval_seconds": float("inf")}},
+    ],
+)
+def test_app_config_nested_payload_rejects_non_finite_numbers(payload: dict[str, object]) -> None:
+    """T3: ordinary nested Python payloads fail closed at the config boundary."""
+    with pytest.raises(pydantic.ValidationError) as raised:
+        AppConfig.model_validate(payload)
+    assert any(error["type"] == "finite_number" for error in raised.value.errors())
+
+
+@pytest.mark.parametrize("value", ["inf", "Infinity", "-inf", "nan", "1e999"])
+def test_app_config_environment_rejects_non_finite_primary_tick(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """T4: environment strings cannot bypass finite model validation."""
+    monkeypatch.setenv("ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS", value)
+    with pytest.raises(pydantic.ValidationError):
+        AppConfig()
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("ROASTPILOT_MCP__CALL_TIMEOUT_SECONDS", "inf"),
+        ("ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__KI_PERCENT_PER_ROR_SECOND", "inf"),
+        ("ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C", "inf"),
+        ("ROASTPILOT_CONTROLLER", '{"tick_interval_seconds": Infinity}'),
+    ],
+)
+def test_app_config_environment_rejects_non_finite_nested_values(
+    monkeypatch: pytest.MonkeyPatch, key: str, value: str
+) -> None:
+    """T4: nested and JSON environment config obeys the same finite boundary."""
+    monkeypatch.setenv(key, value)
+    with pytest.raises(pydantic.ValidationError):
+        AppConfig()
+
+
+def test_app_config_environment_accepts_finite_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """T4: a valid finite environment override remains configurable."""
+    monkeypatch.setenv("ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS", "0.5")
+    assert AppConfig().controller.tick_interval_seconds == 0.5
+
+
+def test_frozen_run_config_rejects_infinite_json() -> None:
+    """T8: recovery cannot deserialize a persisted non-finite frozen config."""
+    payload = {
+        "controller": {
+            **ControllerConfig().model_dump(mode="json"),
+            "tick_interval_seconds": float("inf"),
+        },
+        "safety": SafetyLimits().model_dump(mode="json"),
+    }
+    with pytest.raises(pydantic.ValidationError) as raised:
+        FrozenRunConfig.model_validate_json(json.dumps(payload))
+    assert any(error["type"] == "finite_number" for error in raised.value.errors())
 
 
 def test_bean_sourcing_config_defaults() -> None:

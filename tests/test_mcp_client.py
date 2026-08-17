@@ -593,6 +593,20 @@ def test_spawn_env_merges_overrides_over_parent(monkeypatch: pytest.MonkeyPatch)
     assert env["PATH"] == "/usr/bin"  # inherited, not dropped
 
 
+@pytest.mark.parametrize(
+    "field", ["call_timeout_seconds", "startup_timeout_seconds", "stop_timeout_seconds"]
+)
+@pytest.mark.parametrize("non_finite", [float("inf"), float("-inf"), float("nan")])
+def test_mcp_timeouts_reject_non_finite_values(field: str, non_finite: float) -> None:
+    """T6: process timeout bounds cannot be disabled with non-finite values."""
+    with pytest.raises(ValidationError) as raised:
+        MCPConfig.model_validate({field: non_finite})
+    assert any(
+        error["type"] == "finite_number" and error["loc"] == (field,)
+        for error in raised.value.errors()
+    )
+
+
 @pytest.mark.asyncio
 async def test_calls_are_timeout_bounded() -> None:
     """E4-S2 carry-forward: a hung call raises a typed timeout instead of
@@ -600,6 +614,16 @@ async def test_calls_are_timeout_bounded() -> None:
     process = MCPServerProcess(MCPConfig(call_timeout_seconds=0.05), session=HangingSession())
     with pytest.raises(MCPToolTimeoutError):
         await asyncio.wait_for(process.call_tool("emergency_stop", {}), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_unbounded_call_timeout_would_defeat_the_emergency_stop_bound() -> None:
+    """T6: model_construct demonstrates why finite config validation is required."""
+    process = MCPServerProcess(
+        MCPConfig.model_construct(call_timeout_seconds=float("inf")), session=HangingSession()
+    )
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(process.call_tool("emergency_stop", {}), timeout=0.2)
 
 
 @pytest.mark.asyncio

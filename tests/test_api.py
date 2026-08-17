@@ -8138,6 +8138,44 @@ async def test_put_config_422_on_cross_field_violation(
     assert r2.status_code == 422
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"advisor": {"timeout_seconds": float("inf")}},
+        (
+            {
+                "controller": {
+                    "pre_first_crack_levers": {"late_maillard_trim": {"k_ror": float("inf")}}
+                }
+            }
+        ),
+    ],
+)
+async def test_put_config_422_and_does_not_persist_non_finite_values(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+    body: dict[str, object],
+) -> None:
+    """T7: merged PUT config rejects and never writes non-finite values."""
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(config_path))
+    seeded = await client.put("/api/config", json={"advisor": {"model_slug": "openai/gpt-4o"}})
+    assert seeded.status_code == 200
+    original_bytes = config_path.read_bytes()
+
+    response = await client.put(
+        "/api/config",
+        content=json.dumps(body),
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert config_path.read_bytes() == original_bytes
+
+
 # --- GET /api/config/devices ---
 #
 # Both enumeration helpers use lazy imports (import inside the try block) so
