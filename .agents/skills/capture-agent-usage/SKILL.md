@@ -25,13 +25,14 @@ while normalized metadata and usage totals are recorded. The `role` field is
 caller-supplied attribution metadata, never agent selection; native named-agent dispatch
 remains required for implementation slices.
 
-Under D161, `run-native-claude` is the separate parent-only instrumentation path for an
-already-selected `engineer-be` or `engineer-fe` implementation slice. It launches that
-registered project agent with a parent-generated session ID and accepts Claude-owned
-plaintext transcript persistence under Claude's configured retention. After exit, the
-parent reads only that exact session's parent transcript, deduplicates numeric usage,
-rejects any subagent tree, and writes a complete verified metadata record. It never
-copies transcript content or a host path into the sink, output, fixture, or exception;
-cannot select `repair`, delete or rewrite Claude transcripts, or replace routing
-authority. The generic `run` path remains measurement/validation-only and retains its
+Under D163, `run-native-claude` is the separate parent-only instrumentation path for
+the committed roles `engineer-be`, `engineer-fe`, `mcp-contract-checker`,
+`planning-architect`, `pr-triage`, `product-auditor`, `qa`, `safety-reviewer`,
+`security-reviewer`, `sim-roast-runner`, and `story-planner`. It derives READ_ONLY or
+WRITE capability from the committed tools, launches with the committed effort, and
+accepts only Claude 2.1.233 metadata. It reads only the generated parent transcript,
+deduplicates numeric usage, rejects any subagent tree, and writes no transcript content
+or host path to the sink. `ui-reviewer` remains excluded because its Playwright MCP
+conflicts with empty-MCP capture; `repair` is excluded. The generic `run` path remains
+measurement/validation-only, has no routing authority, and retains its
 no-session-persistence boundary.

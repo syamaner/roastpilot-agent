@@ -1,7 +1,7 @@
 # Agent-usage parser fixtures
 
 These fixtures reproduce the event grammar observed from the installed CLIs on
-13 August 2026 while replacing identifiers, messages, model names, timings,
+18 August 2026 while replacing identifiers, messages, model names, timings,
 costs, and token counts with synthetic values.
 
 - `codex-0.147.0.jsonl` is derived from a parent-run `codex exec --json` capture,
@@ -15,6 +15,10 @@ costs, and token counts with synthetic values.
   attests empty `tools`, empty `mcp_servers`, and `permissionMode: plan`; it
   proves the closed event and terminal usage grammars remain unchanged while
   using wholly synthetic content.
+- `claude-2.1.233.jsonl`, `claude-2.1.233-native.jsonl`, and the
+  `claude-2.1.233-transcript/` family are the sole admitted frozen grammar for
+  generic and native capture. They are copied unchanged from the lead-supplied
+  sanitized fixture root; the 2.1.228 and 2.1.231 files remain rejection evidence.
 - `claude-2.1.231-native.jsonl` is a synthetic-conforming native-profile fixture
   with non-empty tools, `permissionMode: auto`, and a model field. It validates
   parser and launch-boundary logic only; it is not observed provenance and proves
