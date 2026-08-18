@@ -16,9 +16,9 @@ from capture_usage_models import (
 )
 
 CLAUDE_EVENT_TYPES = frozenset({"system", "user", "assistant", "rate_limit_event", "result"})
-"""Opaque event types observed unchanged in sanitized 2.1.228 and 2.1.231 fixtures."""
+"""Opaque event types observed in the frozen sanitized 2.1.233 fixture."""
 CLAUDE_SYSTEM_SUBTYPES = frozenset({"hook_started", "hook_response", "init"})
-"""System subtypes observed unchanged in sanitized 2.1.228 and 2.1.231 fixtures."""
+"""System subtypes observed in the frozen sanitized 2.1.233 fixture."""
 CLAUDE_RESULT_USAGE_KEYS = frozenset(
     {
         "input_tokens",
@@ -34,7 +34,7 @@ CLAUDE_RESULT_USAGE_KEYS = frozenset(
         "speed",
     }
 )
-"""Exact terminal usage keys observed unchanged in Claude Code 2.1.228 and 2.1.231."""
+"""Exact terminal usage keys observed in Claude Code 2.1.233."""
 CLAUDE_SUCCESS_SUBTYPE = "success"
 CLAUDE_FAILURE_SUBTYPES = frozenset(
     {
@@ -44,7 +44,7 @@ CLAUDE_FAILURE_SUBTYPES = frozenset(
         "error_during_execution",
     }
 )
-"""Closed failure subtypes observed unchanged in Claude Code 2.1.228 and 2.1.231."""
+"""Closed failure subtypes observed in Claude Code 2.1.233."""
 CLAUDE_MODEL_USAGE_KEYS = frozenset(
     {
         "inputTokens",
@@ -59,7 +59,7 @@ CLAUDE_MODEL_USAGE_KEYS = frozenset(
         "provider",
     }
 )
-"""Exact model usage keys observed unchanged in Claude Code 2.1.228 and 2.1.231."""
+"""Exact model usage keys observed in Claude Code 2.1.233."""
 CLAUDE_PERMISSION_MODES = frozenset({"default", "plan"})
 """Permission vocabularies observed in sanitized Claude init events."""
 
@@ -126,6 +126,8 @@ def _event_from_line(line: str) -> Mapping[str, Any]:
         subtype = event.get("subtype")
         if subtype not in CLAUDE_SYSTEM_SUBTYPES:
             raise ClaudeUsageParseError("unknown Claude system subtype")
+        if subtype == "init" and event.get("claude_code_version") != "2.1.233":
+            raise ClaudeUsageParseError("unverified Claude version")
     return event
 
 

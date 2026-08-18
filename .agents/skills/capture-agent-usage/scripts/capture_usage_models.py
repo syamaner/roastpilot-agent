@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator,
 AGENT_USAGE_SCHEMA_VERSION = 1
 """The append-only on-disk record schema version."""
 
-NATIVE_WORKER_USAGE_SCHEMA_VERSION = 2
+NATIVE_WORKER_USAGE_SCHEMA_VERSION = 3
 """D161 native-worker record schema, distinct from generic capture records."""
 
 SKILL_VERSION = "0.1.0"
@@ -84,6 +84,22 @@ class NativeClaudeRole(Enum):
 
     ENGINEER_BE = "engineer-be"
     ENGINEER_FE = "engineer-fe"
+    MCP_CONTRACT_CHECKER = "mcp-contract-checker"
+    PLANNING_ARCHITECT = "planning-architect"
+    PR_TRIAGE = "pr-triage"
+    PRODUCT_AUDITOR = "product-auditor"
+    QA = "qa"
+    SAFETY_REVIEWER = "safety-reviewer"
+    SECURITY_REVIEWER = "security-reviewer"
+    SIM_ROAST_RUNNER = "sim-roast-runner"
+    STORY_PLANNER = "story-planner"
+
+
+class RoleCapability(Enum):
+    """Closed capability inferred from committed native-role tools."""
+
+    WRITE = "WRITE"
+    READ_ONLY = "READ_ONLY"
 
 
 class EstimateBasis(Enum):
@@ -269,13 +285,14 @@ class NativeWorkerUsageRecord(CaptureModel):
     """
 
     record_type: Literal["NATIVE_WORKER_USAGE"] = "NATIVE_WORKER_USAGE"
-    schema_version: Literal[2] = NATIVE_WORKER_USAGE_SCHEMA_VERSION
+    schema_version: Literal[3] = NATIVE_WORKER_USAGE_SCHEMA_VERSION
     tool_version: SafeIdentifier = SKILL_VERSION
     captured_at: datetime
     task_id: SafeIdentifier
     slice_id: SafeIdentifier
     harness: Literal[HarnessFamily.CLAUDE] = HarnessFamily.CLAUDE
     native_role: NativeClaudeRole
+    role_capability: RoleCapability
     model: SafeIdentifier
     effort: SafeIdentifier
     repository: RepositoryName
@@ -330,6 +347,13 @@ class NativeWorkerUsageRecord(CaptureModel):
             or model_usage.output_tokens != self.output_tokens
         ):
             raise ValueError("native totals must equal parent model usage")
+        if (
+            self.role_capability is RoleCapability.READ_ONLY
+            and self.final_head_sha != self.base_sha
+        ):
+            raise ValueError("read-only native workers must retain the base head")
+        if self.role_capability is RoleCapability.WRITE and self.final_head_sha == self.base_sha:
+            raise ValueError("write native workers must create a descendant head")
         return self
 
 

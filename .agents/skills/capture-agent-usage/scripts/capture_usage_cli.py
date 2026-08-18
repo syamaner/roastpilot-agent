@@ -15,6 +15,7 @@ import threading
 import time
 from collections.abc import Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -52,6 +53,7 @@ from capture_usage_models import (
     NativeWorkerUsageRecord,
     OutcomeRecord,
     ParsedUsage,
+    RoleCapability,
     TaskUsageRecord,
     UsageRecord,
 )
@@ -74,7 +76,7 @@ _SEMVER = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 _SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _VERIFIED_HARNESS_VERSIONS = {
     HarnessFamily.CODEX: "0.147.0",
-    HarnessFamily.CLAUDE: "2.1.231",
+    HarnessFamily.CLAUDE: "2.1.233",
 }
 _GIT_TIMEOUT_SECONDS = 5
 _GIT_OUTPUT_LIMIT = 4096
@@ -439,8 +441,17 @@ def _validate_worktree_metadata(arguments: argparse.Namespace) -> None:
     arguments.base_sha = merge_base
 
 
-def _native_effort(role: NativeClaudeRole) -> str:
-    """Read the one committed effort frontmatter value for a native role."""
+@dataclass(frozen=True)
+class _NativeRolePin:
+    """Committed native role identity and capability attestation."""
+
+    model: str
+    effort: str
+    capability: RoleCapability
+
+
+def _native_role_pin(role: NativeClaudeRole) -> _NativeRolePin:
+    """Read the exact committed model, effort, and tools for one native role."""
     path = Path(".claude") / "agents" / f"{role.value}.md"
     content: str | None = None
     with suppress(CaptureUsageError, UnicodeDecodeError):
@@ -454,13 +465,34 @@ def _native_effort(role: NativeClaudeRole) -> str:
         end = lines.index("---", 1)
     except ValueError:
         raise CaptureUsageError("native agent frontmatter is invalid") from None
-    values = [line.removeprefix("effort: ") for line in lines[1:end] if line.startswith("effort: ")]
-    if len(values) != 1 or values[0] not in _SUPPORTED_EFFORTS:
+    frontmatter = lines[1:end]
+    values = {
+        key: [line.removeprefix(f"{key}: ") for line in frontmatter if line.startswith(f"{key}: ")]
+        for key in ("model", "effort", "tools")
+    }
+    if (
+        any(len(value) != 1 for value in values.values())
+        or values["effort"][0] not in _SUPPORTED_EFFORTS
+        or not re.fullmatch(r"claude-(?:sonnet|opus)-5", values["model"][0])
+    ):
         raise CaptureUsageError("native agent frontmatter is invalid")
-    return values[0]
+    tools = tuple(token.strip() for token in values["tools"][0].split(","))
+    allowed_tools = frozenset({"Read", "Grep", "Glob", "Bash", "Edit", "Write"})
+    if (
+        not tools
+        or len(set(tools)) != len(tools)
+        or any(tool not in allowed_tools for tool in tools)
+    ):
+        raise CaptureUsageError("native agent frontmatter is invalid")
+    capability = (
+        RoleCapability.WRITE if {"Edit", "Write"} & set(tools) else RoleCapability.READ_ONLY
+    )
+    return _NativeRolePin(values["model"][0], values["effort"][0], capability)
 
 
-def _validate_native_worktree(arguments: argparse.Namespace, *, post_exit: bool) -> str:
+def _validate_native_worktree(
+    arguments: argparse.Namespace, capability: RoleCapability, *, post_exit: bool
+) -> str:
     """Attest the native worker's exact repository, branch, and commit provenance."""
     origin_status, origin = _git_output(["remote", "get-url", "origin"])
     if (
@@ -494,6 +526,10 @@ def _validate_native_worktree(arguments: argparse.Namespace, *, post_exit: bool)
         if head != base:
             raise CaptureUsageError("native worktree attestation failed")
         arguments.base_sha = base
+        return head
+    if capability is RoleCapability.READ_ONLY:
+        if head != base:
+            raise CaptureUsageError("native worktree attestation failed")
         return head
     ancestry_status, _ = _git_output(["merge-base", "--is-ancestor", base, head])
     if ancestry_status != 0 or head == base:
@@ -580,7 +616,9 @@ def _launch_argv(
     return argv
 
 
-def _native_claude_argv(executable: str, role: NativeClaudeRole, session_id: str) -> list[str]:
+def _native_claude_argv(
+    executable: str, role: NativeClaudeRole, effort: str, session_id: str
+) -> list[str]:
     """Build the exact installed native-Claude worker argv."""
     return [
         executable,
@@ -596,10 +634,14 @@ def _native_claude_argv(executable: str, role: NativeClaudeRole, session_id: str
         '{"mcpServers":{}}',
         "--permission-mode",
         "auto",
+        "--effort",
+        effort,
     ]
 
 
-def _validate_native_metadata(arguments: argparse.Namespace, role: NativeClaudeRole) -> None:
+def _validate_native_metadata(
+    arguments: argparse.Namespace, role: NativeClaudeRole, pin: _NativeRolePin
+) -> None:
     """Validate caller metadata through the closed native record model before launch."""
     now = _utc_now()
     try:
@@ -608,12 +650,15 @@ def _validate_native_metadata(arguments: argparse.Namespace, role: NativeClaudeR
             task_id=arguments.task_id,
             slice_id=arguments.slice_id,
             native_role=role,
-            model="pending",
-            effort="pending",
+            role_capability=pin.capability,
+            model=pin.model,
+            effort=pin.effort,
             repository=arguments.repository,
             branch=arguments.branch,
             base_sha=arguments.base_sha,
-            final_head_sha=arguments.base_sha,
+            final_head_sha=(
+                arguments.base_sha if pin.capability is RoleCapability.READ_ONLY else "a" * 40
+            ),
             parent_task_id=arguments.parent_task_id,
             session_id="00000000-0000-4000-8000-000000000000",
             subagent_count=0,
@@ -630,7 +675,7 @@ def _validate_native_metadata(arguments: argparse.Namespace, role: NativeClaudeR
             output_tokens=0,
             claude_model_usage=(
                 ClaudeModelUsage(
-                    model="pending",
+                    model=pin.model,
                     input_tokens=0,
                     cached_input_tokens=0,
                     cache_creation_input_tokens=0,
@@ -646,7 +691,7 @@ def _validate_native_metadata(arguments: argparse.Namespace, role: NativeClaudeR
 def _native_record_from_usage(
     arguments: argparse.Namespace,
     role: NativeClaudeRole,
-    effort: str,
+    pin: _NativeRolePin,
     version: str,
     final_head_sha: str,
     exit_code: int,
@@ -660,8 +705,9 @@ def _native_record_from_usage(
         task_id=arguments.task_id,
         slice_id=arguments.slice_id,
         native_role=role,
+        role_capability=pin.capability,
         model=usage.model,
-        effort=effort,
+        effort=pin.effort,
         repository=arguments.repository,
         branch=arguments.branch,
         base_sha=arguments.base_sha,
@@ -687,9 +733,9 @@ def _native_record_from_usage(
 def run_native_claude_command(arguments: argparse.Namespace) -> int:
     """Launch one registered Claude implementation worker and append complete usage."""
     role = NativeClaudeRole(arguments.role)
-    _validate_native_metadata(arguments, role)
-    _validate_native_worktree(arguments, post_exit=False)
-    effort = _native_effort(role)
+    pin = _native_role_pin(role)
+    _validate_native_metadata(arguments, role, pin)
+    _validate_native_worktree(arguments, pin.capability, post_exit=False)
     if os.environ.get("CLAUDE_CONFIG_DIR") is not None:
         raise CaptureUsageError("native Claude config directory is not permitted")
     session_id = str(uuid4())
@@ -708,12 +754,12 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
         version = _harness_version(executable)
         if version != _VERIFIED_HARNESS_VERSIONS[HarnessFamily.CLAUDE]:
             raise CaptureUsageError("selected harness version is not verified")
-        _validate_native_worktree(arguments, post_exit=False)
+        _validate_native_worktree(arguments, pin.capability, post_exit=False)
         started_at = _utc_now()
         started_monotonic = time.monotonic()
         arguments.started_at = started_at
         process = subprocess.Popen(
-            _native_claude_argv(executable, role, session_id),
+            _native_claude_argv(executable, role, pin.effort, session_id),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -740,19 +786,21 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
                 Path.cwd(),
                 session_id,
                 role,
-                effort,
+                pin.effort,
                 started_at=started_at,
                 completed_at=completed_at,
             )
         except TranscriptError:
             raise CaptureUsageError("native Claude transcript is invalid") from None
-        final_head_sha = _validate_native_worktree(arguments, post_exit=True)
+        if usage.model != pin.model:
+            raise CaptureUsageError("native Claude transcript is invalid")
+        final_head_sha = _validate_native_worktree(arguments, pin.capability, post_exit=True)
         append_record(
             arguments.output,
             _native_record_from_usage(
                 arguments,
                 role,
-                effort,
+                pin,
                 version,
                 final_head_sha,
                 exit_code,
@@ -1093,7 +1141,9 @@ def build_parser() -> argparse.ArgumentParser:
     native = commands.add_parser(
         "run-native-claude", help="capture one registered Claude implementation worker"
     )
-    native.add_argument("--role", choices=("engineer-be", "engineer-fe"), required=True)
+    native.add_argument(
+        "--role", choices=tuple(role.value for role in NativeClaudeRole), required=True
+    )
     native.add_argument("--prompt-file", type=Path, required=True)
     native.add_argument("--task-id", required=True)
     native.add_argument("--slice-id", required=True)

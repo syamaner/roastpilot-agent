@@ -1,4 +1,4 @@
-"""Closed parser for one owned Claude 2.1.231 parent transcript."""
+"""Closed parser for one owned Claude 2.1.233 parent transcript."""
 
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ def _integer(value: object) -> int:
 
 
 def _project_name(cwd: Path) -> str:
-    """Encode a worktree path with Claude 2.1.231's fixed project grammar."""
+    """Encode a worktree path with Claude 2.1.233's fixed project grammar."""
     return "".join(
         character if character.isascii() and character.isalnum() else "-" for character in str(cwd)
     )
@@ -298,7 +298,7 @@ def parse_owned_transcript(
                 if (
                     not isinstance(message, dict)
                     or "agentId" in row
-                    or row.get("version") != "2.1.231"
+                    or row.get("version") != "2.1.233"
                     or row.get("effort") != effort
                 ):
                     raise TranscriptError("owned Claude transcript is invalid")
