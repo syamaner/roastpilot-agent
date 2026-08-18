@@ -45,6 +45,7 @@ from capture_usage_models import (
     NATIVE_WORKER_USAGE_SCHEMA_VERSION,
     SKILL_VERSION,
     USAGE_RECORD_ADAPTER,
+    VALIDATION_ENVIRONMENT_ROLES,
     CapacitySnapshotRecord,
     CapacitySource,
     CapacityStatus,
@@ -101,6 +102,27 @@ No caller input may select or override either value; the native argv, the
 committed-frontmatter guard, and the transcript permission-mode attestation
 all index this same closed mapping.
 """
+_VALIDATION_ENVIRONMENT_KEYS = frozenset(
+    {
+        "ROASTPILOT_VALIDATION_ROOT",
+        "ROASTPILOT_VALIDATION_PYTHON",
+        "ROASTPILOT_VALIDATION_TMP",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "PYTHONPYCACHEPREFIX",
+        "PYTHONDONTWRITEBYTECODE",
+        "RUFF_CACHE_DIR",
+        "COVERAGE_FILE",
+        "PIP_CACHE_DIR",
+        "PYTEST_ADDOPTS",
+    }
+)
+"""Closed environment-variable names bound only for a validation-role launch.
+
+Stripped from every native launch's inherited environment first, then
+reinstated with exactly these values only when the role is a member of
+:data:`~capture_usage_models.VALIDATION_ENVIRONMENT_ROLES` (D166, §2.4)."""
+_VALIDATION_DIRECTORY_MODE = 0o700
 
 
 class CaptureUsageError(ValueError):
@@ -576,6 +598,162 @@ def _validate_native_worktree(
     return head
 
 
+def _require_validation_directory(descriptor: int, *, expect_mode: int | None) -> None:
+    """Require an already-opened descriptor to name an owned directory.
+
+    Args:
+        descriptor: An open, no-follow directory descriptor.
+        expect_mode: The exact required permission bits, or ``None`` when mode
+            is intentionally unconstrained (the ``venv`` directory itself).
+
+    Raises:
+        OSError: If the descriptor is not a directory, is not owned by the
+            current effective user, or (when constrained) has the wrong mode.
+    """
+    status = os.fstat(descriptor)
+    if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.geteuid():
+        raise OSError("validation directory ownership or type is invalid")
+    if expect_mode is not None and stat.S_IMODE(status.st_mode) != expect_mode:
+        raise OSError("validation directory mode is invalid")
+
+
+def _validate_validation_root(raw: str) -> str:
+    """Validate one parent-provisioned external validation root without mutating it.
+
+    The root, its ``cache`` and ``tmp`` children, its ``venv`` directory, the
+    ``venv/pyvenv.cfg`` marker, and the ``venv/bin/python`` interpreter are all
+    attested by descriptor before any value derived from the path is trusted
+    (D166, §2.4). Every failure raises the single fixed, path-free error.
+
+    Args:
+        raw: The exact ``--validation-root`` argument value.
+
+    Returns:
+        The canonical resolved root path.
+
+    Raises:
+        CaptureUsageError: If the path grammar, location, ownership, mode, or
+            venv shape is invalid. The message never echoes the supplied path.
+    """
+    segments = raw.split("/")
+    if (
+        not raw
+        or not raw.startswith("/")
+        or segments[0] != ""
+        or any(segment in ("", "..") for segment in segments[1:])
+        or any(
+            character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F
+            for character in raw
+        )
+    ):
+        raise CaptureUsageError("validation environment is invalid")
+    try:
+        cwd_real = os.path.realpath(Path.cwd())
+        root_real = os.path.realpath(raw)
+        home_claude_real = os.path.realpath(Path.home() / ".claude")
+    except OSError:
+        raise CaptureUsageError("validation environment is invalid") from None
+    if (
+        Path(root_real).is_relative_to(Path(cwd_real))
+        or Path(cwd_real).is_relative_to(Path(root_real))
+        or Path(root_real).is_relative_to(Path(home_claude_real))
+    ):
+        raise CaptureUsageError("validation environment is invalid")
+    descriptors: list[int] = []
+    try:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        root_fd = os.open(raw, flags)
+        descriptors.append(root_fd)
+        _require_validation_directory(root_fd, expect_mode=_VALIDATION_DIRECTORY_MODE)
+        for name in ("cache", "tmp"):
+            child_fd = os.open(name, flags, dir_fd=root_fd)
+            descriptors.append(child_fd)
+            _require_validation_directory(child_fd, expect_mode=_VALIDATION_DIRECTORY_MODE)
+        venv_fd = os.open("venv", flags, dir_fd=root_fd)
+        descriptors.append(venv_fd)
+        _require_validation_directory(venv_fd, expect_mode=None)
+        cfg_fd = os.open("pyvenv.cfg", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=venv_fd)
+        descriptors.append(cfg_fd)
+        cfg_status = os.fstat(cfg_fd)
+        if (
+            not stat.S_ISREG(cfg_status.st_mode)
+            or cfg_status.st_uid != os.geteuid()
+            or cfg_status.st_nlink != 1
+        ):
+            raise OSError("validation venv marker is invalid")
+        interpreter_status = os.stat("bin/python", dir_fd=venv_fd)
+        if (
+            not stat.S_ISREG(interpreter_status.st_mode)
+            or not interpreter_status.st_mode & stat.S_IXUSR
+            or interpreter_status.st_size == 0
+        ):
+            raise OSError("validation venv interpreter is invalid")
+    except OSError:
+        raise CaptureUsageError("validation environment is invalid") from None
+    finally:
+        for descriptor in reversed(descriptors):
+            with suppress(OSError):
+                os.close(descriptor)
+    return root_real
+
+
+def _validation_environment_values(root: str) -> dict[str, str]:
+    """Build the closed validation-role environment map from one validated root.
+
+    Args:
+        root: The canonical resolved validation root.
+
+    Returns:
+        The exact eleven-key mapping of §2.4, every value derived only from
+        ``root``.
+    """
+    cache = os.path.join(root, "cache")
+    tmp = os.path.join(root, "tmp")
+    return {
+        "ROASTPILOT_VALIDATION_ROOT": root,
+        "ROASTPILOT_VALIDATION_PYTHON": os.path.join(root, "venv", "bin", "python"),
+        "ROASTPILOT_VALIDATION_TMP": tmp,
+        "TMPDIR": tmp,
+        "XDG_CACHE_HOME": cache,
+        "PYTHONPYCACHEPREFIX": os.path.join(cache, "pycache"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "RUFF_CACHE_DIR": os.path.join(cache, "ruff"),
+        "COVERAGE_FILE": os.path.join(tmp, "coverage"),
+        "PIP_CACHE_DIR": os.path.join(cache, "pip"),
+        "PYTEST_ADDOPTS": f"-o cache_dir={os.path.join(cache, 'pytest')}",
+    }
+
+
+def _resolve_native_environment(
+    role: NativeClaudeRole, validation_root: str | None
+) -> dict[str, str]:
+    """Validate ``--validation-root`` presence and shape, then build the child env.
+
+    Args:
+        role: The registered native role.
+        validation_root: The raw ``--validation-root`` argument value, or
+            ``None``.
+
+    Returns:
+        The exact environment mapping to pass as the native launch's ``env=``.
+
+    Raises:
+        CaptureUsageError: If a validation role is missing ``--validation-root``,
+            a non-validation role supplies one, or the supplied root is invalid.
+    """
+    requires_root = role in VALIDATION_ENVIRONMENT_ROLES
+    if requires_root != (validation_root is not None):
+        raise CaptureUsageError("validation environment is invalid")
+    environment = {
+        key: value for key, value in os.environ.items() if key not in _VALIDATION_ENVIRONMENT_KEYS
+    }
+    if validation_root is None:
+        return environment
+    root = _validate_validation_root(validation_root)
+    environment.update(_validation_environment_values(root))
+    return environment
+
+
 def _emit_handback(
     role: NativeClaudeRole,
     pin: _NativeRolePin,
@@ -810,6 +988,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
     """Launch one registered Claude implementation worker and append complete usage."""
     role = NativeClaudeRole(arguments.role)
     pin = _native_role_pin(role)
+    environment = _resolve_native_environment(role, arguments.validation_root)
     require_handback = pin.capability is RoleCapability.READ_ONLY
     _validate_native_metadata(arguments, role, pin)
     _validate_native_worktree(arguments, pin.capability, post_exit=False)
@@ -842,6 +1021,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
             stderr=subprocess.DEVNULL,
             shell=False,
             cwd=".",
+            env=environment,
             start_new_session=True,
         )
         deadline = _start_deadline(process, NATIVE_LAUNCH_TIMEOUT_SECONDS, timed_out)
@@ -1242,6 +1422,7 @@ def build_parser() -> argparse.ArgumentParser:
     native.add_argument("--repository", required=True)
     native.add_argument("--branch", required=True)
     native.add_argument("--base-sha", required=True)
+    native.add_argument("--validation-root", default=None)
     _add_output_option(native)
     native.set_defaults(handler=run_native_claude_command)
 

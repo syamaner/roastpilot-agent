@@ -1081,9 +1081,9 @@ class _NativeProcess:
 _NATIVE_SESSION_ID = "11111111-1111-4111-8111-111111111233"
 
 
-def _native_cli_args(role: str = "engineer-be") -> list[str]:
+def _native_cli_args(role: str = "engineer-be", *, validation_root: str | None = None) -> list[str]:
     """Return closed native command metadata for provider-free tests."""
-    return [
+    arguments = [
         "run-native-claude",
         "--role",
         role,
@@ -1102,6 +1102,9 @@ def _native_cli_args(role: str = "engineer-be") -> list[str]:
         "--base-sha",
         "4c1ac63",
     ]
+    if validation_root is not None:
+        arguments.extend(["--validation-root", validation_root])
+    return arguments
 
 
 def _native_transcript_bytes(session_id: str = _NATIVE_SESSION_ID) -> bytes:
@@ -5728,3 +5731,389 @@ def test_generic_run_argv_and_authority_still_pin_plan_mode() -> None:
         "--permission-mode" in generic and generic[generic.index("--permission-mode") + 1] == "plan"
     )
     assert frozenset({"plan"}) == usage_claude.CLAUDE_PERMISSION_MODES
+
+
+def _mkdir_exact(path: Path, mode: int) -> None:
+    """Create a directory with an exact permission bit-set, independent of umask."""
+    path.mkdir()
+    os.chmod(path, mode)
+
+
+def _build_validation_root(root: Path) -> Path:
+    """Build one fully valid parent-provisioned validation root at ``root``."""
+    _mkdir_exact(root, 0o700)
+    _mkdir_exact(root / "cache", 0o700)
+    _mkdir_exact(root / "tmp", 0o700)
+    venv = root / "venv"
+    venv.mkdir()
+    os.chmod(venv, 0o755)
+    (venv / "pyvenv.cfg").write_text("home = /usr\n")
+    bin_dir = venv / "bin"
+    bin_dir.mkdir()
+    interpreter = bin_dir / "python"
+    interpreter.write_bytes(b"#!/bin/sh\necho fake\n")
+    interpreter.chmod(0o755)
+    return root
+
+
+@pytest.mark.parametrize("role", list(NativeClaudeRole))
+def test_validation_root_presence_is_required_and_forbidden_correctly(
+    role: NativeClaudeRole, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """``--validation-root`` is required for exactly the three validation roles."""
+    requires_root = role in usage_cli.VALIDATION_ENVIRONMENT_ROLES
+    supplied = (
+        None
+        if requires_root
+        else str(_build_validation_root(tmp_path_factory.mktemp("base") / "root"))
+    )
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._resolve_native_environment(role, supplied)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validation_root_check_runs_before_provider_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A validation role missing ``--validation-root`` never reaches ``shutil.which``."""
+    _configure_native_launcher(tmp_path, monkeypatch)
+
+    def no_which(_name: str) -> str:
+        raise AssertionError("provider lookup")
+
+    monkeypatch.setattr(usage_cli.shutil, "which", no_which)
+    with pytest.raises(SystemExit, match="validation environment is invalid"):
+        main(_native_cli_args(role="qa"))
+
+
+def test_validation_environment_binds_exact_map_and_strips_for_others(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The closed 11-key map binds exactly under the root; other roles see none of it."""
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    for key in usage_cli._VALIDATION_ENVIRONMENT_KEYS:  # pyright: ignore[reportPrivateUsage]
+        monkeypatch.setenv(key, "SENTINEL_PRESET")
+    environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
+        NativeClaudeRole.QA, str(root)
+    )
+    resolved_root = os.path.realpath(root)
+    expected = {
+        "ROASTPILOT_VALIDATION_ROOT": resolved_root,
+        "ROASTPILOT_VALIDATION_PYTHON": os.path.join(resolved_root, "venv", "bin", "python"),
+        "ROASTPILOT_VALIDATION_TMP": os.path.join(resolved_root, "tmp"),
+        "TMPDIR": os.path.join(resolved_root, "tmp"),
+        "XDG_CACHE_HOME": os.path.join(resolved_root, "cache"),
+        "PYTHONPYCACHEPREFIX": os.path.join(resolved_root, "cache", "pycache"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "RUFF_CACHE_DIR": os.path.join(resolved_root, "cache", "ruff"),
+        "COVERAGE_FILE": os.path.join(resolved_root, "tmp", "coverage"),
+        "PIP_CACHE_DIR": os.path.join(resolved_root, "cache", "pip"),
+        "PYTEST_ADDOPTS": f"-o cache_dir={os.path.join(resolved_root, 'cache', 'pytest')}",
+    }
+    for key, value in expected.items():
+        assert environment[key] == value, key
+
+    non_validation = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
+        NativeClaudeRole.ENGINEER_BE, None
+    )
+    assert not (
+        set(non_validation) & usage_cli._VALIDATION_ENVIRONMENT_KEYS  # pyright: ignore[reportPrivateUsage]
+    )
+
+
+def test_validation_environment_never_touches_home_and_config_dir_still_rejects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """``HOME`` is untouched by the closed map; ``CLAUDE_CONFIG_DIR`` still rejects outright."""
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    monkeypatch.setenv("HOME", "/original/home")
+    environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
+        NativeClaudeRole.QA, str(root)
+    )
+    assert environment.get("HOME") == "/original/home"
+
+    _configure_native_launcher(tmp_path, monkeypatch)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "SENTINEL_CONFIG")
+    with pytest.raises(SystemExit, match="config directory is not permitted") as error:
+        main(_native_cli_args(role="qa", validation_root=str(root)))
+    assert "SENTINEL_CONFIG" not in str(error.value)
+
+
+def test_validation_root_rejects_relative_and_traversal_paths() -> None:
+    """Relative, traversing, double-slash, and trailing-slash paths all fail closed."""
+    for candidate in ("relative/path", "/abs/../escape", "/abs//double", "/abs/trailing/"):
+        with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+            usage_cli._validate_validation_root(candidate)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validation_root_rejects_symlinked_root(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A symlinked root component fails closed even when its target is otherwise valid."""
+    base = tmp_path_factory.mktemp("symlink-root")
+    real_root = _build_validation_root(base / "real")
+    linked = base / "linked"
+    linked.symlink_to(real_root)
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._validate_validation_root(str(linked))  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("component", ["root", "cache", "tmp"])
+def test_validation_root_rejects_wrong_directory_mode(
+    component: str, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """The root, ``cache``, and ``tmp`` must each be exactly mode 0700."""
+    base = tmp_path_factory.mktemp(f"wrong-mode-{component}")
+    root = _build_validation_root(base / "root")
+    target = root if component == "root" else root / component
+    os.chmod(target, 0o755)
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._validate_validation_root(str(root))  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validation_root_rejects_foreign_uid(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory not owned by the current effective user fails closed."""
+    base = tmp_path_factory.mktemp("foreign-uid")
+    root = _build_validation_root(base / "root")
+    real_fstat = os.fstat
+
+    def foreign_fstat(descriptor: int) -> os.stat_result:
+        status = real_fstat(descriptor)
+        fields = list(status)
+        fields[4] = status.st_uid + 1  # st_uid index
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "fstat", foreign_fstat)
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._validate_validation_root(str(root))  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validation_root_rejects_realpath_resolution_failure(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A realpath resolution failure for root, cwd, or home fails closed, never raising raw."""
+    base = tmp_path_factory.mktemp("realpath-failure")
+    root = _build_validation_root(base / "root")
+    real_realpath = os.path.realpath
+
+    def failing_realpath(path: str) -> str:
+        if path == str(root):
+            raise OSError("SENTINEL_REALPATH_FAILURE")
+        return real_realpath(path)
+
+    monkeypatch.setattr(os.path, "realpath", failing_realpath)
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid") as error:
+        usage_cli._validate_validation_root(str(root))  # pyright: ignore[reportPrivateUsage]
+    assert "SENTINEL_REALPATH_FAILURE" not in str(error.value)
+
+
+def test_validation_root_venv_mode_is_unconstrained(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """``venv``'s mode is deliberately unconstrained; the root's 0700 is the boundary."""
+    base = tmp_path_factory.mktemp("venv-mode")
+    root = _build_validation_root(base / "root")
+    os.chmod(root / "venv", 0o755)
+    resolved = usage_cli._validate_validation_root(str(root))  # pyright: ignore[reportPrivateUsage]
+    assert resolved == os.path.realpath(root)
+
+
+@pytest.mark.parametrize(
+    "mutate", ["missing-venv", "missing-cfg", "hardlinked-cfg", "non-exec-interpreter"]
+)
+def test_validation_root_rejects_malformed_venv_shape(
+    mutate: str, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A missing venv, missing marker, hardlinked marker, or non-exec interpreter fails closed."""
+    base = tmp_path_factory.mktemp(f"venv-shape-{mutate}")
+    root = _build_validation_root(base / "root")
+    if mutate == "missing-venv":
+        shutil.rmtree(root / "venv")
+    elif mutate == "missing-cfg":
+        (root / "venv" / "pyvenv.cfg").unlink()
+    elif mutate == "hardlinked-cfg":
+        (root / "venv" / "pyvenv.cfg").unlink()
+        target = base / "hardlink-target.cfg"
+        target.write_text("home = /usr\n")
+        os.link(target, root / "venv" / "pyvenv.cfg")
+    else:
+        (root / "venv" / "bin" / "python").chmod(0o644)
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._validate_validation_root(str(root))  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validation_root_accepts_symlinked_interpreter(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A ``venv/bin/python`` symlink to the base interpreter is the practical case, and passes."""
+    base = tmp_path_factory.mktemp("symlink-interp")
+    root = _build_validation_root(base / "root")
+    interpreter = root / "venv" / "bin" / "python"
+    interpreter.unlink()
+    real = base / "real-python"
+    real.write_bytes(b"#!/bin/sh\necho fake\n")
+    real.chmod(0o755)
+    interpreter.symlink_to(real)
+    resolved = usage_cli._validate_validation_root(str(root))  # pyright: ignore[reportPrivateUsage]
+    assert resolved == os.path.realpath(root)
+
+
+def test_validation_root_missing_is_rejected_and_not_created(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A nonexistent root is rejected, never implicitly created."""
+    base = tmp_path_factory.mktemp("missing-root")
+    missing = base / "does-not-exist"
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._validate_validation_root(str(missing))  # pyright: ignore[reportPrivateUsage]
+    assert not missing.exists()
+
+
+def test_validation_root_rejects_worktree_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A root equal to, inside, or containing the attested worktree fails closed both ways."""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    monkeypatch.chdir(worktree)
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._validate_validation_root(str(worktree))  # pyright: ignore[reportPrivateUsage]
+
+    inside = _build_validation_root(worktree / "nested-root")
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._validate_validation_root(str(inside))  # pyright: ignore[reportPrivateUsage]
+
+    outer = tmp_path_factory.mktemp("outer-root")
+    root = _build_validation_root(outer / "root")
+    nested_worktree = root / "nested-worktree"
+    nested_worktree.mkdir()
+    monkeypatch.chdir(nested_worktree)
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._validate_validation_root(str(root))  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validation_root_rejects_inside_claude_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A root located inside ``~/.claude`` fails closed."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    monkeypatch.chdir(worktree)
+    inside_claude = _build_validation_root(home / ".claude" / "root")
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._validate_validation_root(str(inside_claude))  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validation_root_is_never_mutated_by_capture_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A successful validation-role run leaves the root's listing and mtimes untouched."""
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    before = {str(path.relative_to(root)): path.stat().st_mtime_ns for path in root.rglob("*")}
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(project, observed, processes, transcript=_read_only_transcript_bytes("qa")),
+    )
+    assert main(_native_cli_args(role="qa", validation_root=str(root))) == 0
+    after = {str(path.relative_to(root)): path.stat().st_mtime_ns for path in root.rglob("*")}
+    assert before == after
+
+
+def test_validation_root_path_never_leaks_into_errors_or_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The root path never appears in an error, stdout metadata field, or record."""
+    sentinel_root = tmp_path_factory.mktemp("SENTINELROOTCOMPONENT")
+    root = _build_validation_root(sentinel_root / "root")
+    os.chmod(root, 0o755)
+    with pytest.raises(CaptureUsageError) as error:
+        usage_cli._validate_validation_root(str(root))  # pyright: ignore[reportPrivateUsage]
+    assert "SENTINELROOTCOMPONENT" not in str(error.value)
+
+    os.chmod(root, 0o700)
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project,
+            observed,
+            processes,
+            transcript=_read_only_transcript_bytes("qa", text="clean handback, no path"),
+        ),
+    )
+    assert main(_native_cli_args(role="qa", validation_root=str(root))) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out.splitlines()[0])
+    for key, value in payload.items():
+        if key == "text":
+            continue
+        assert "SENTINELROOTCOMPONENT" not in str(value)
+    raw_sink = Path(".agent-usage/usage.jsonl").read_text()
+    assert "SENTINELROOTCOMPONENT" not in raw_sink
+    assert "SENTINELROOTCOMPONENT" not in captured.err
+
+
+def test_validation_role_ignored_artifact_still_fails_post_exit_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A run dirtying the worktree with an ignored artifact still fails closed (no allowlist)."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch)
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    before_listing = set(tmp_path.rglob("*"))
+
+    def snapshot_attestation(
+        _arguments: argparse.Namespace, _capability: RoleCapability, *, post_exit: bool
+    ) -> str:
+        if post_exit and set(tmp_path.rglob("*")) != before_listing:
+            raise CaptureUsageError("native worktree attestation failed")
+        return "4c1ac63"
+
+    monkeypatch.setattr(usage_cli, "_validate_native_worktree", snapshot_attestation)
+    processes: list[_NativeProcess] = []
+
+    def dirtying_popen(argv: list[str], **kwargs: object) -> _NativeProcess:
+        observed.append((argv, kwargs))
+        if argv[-1] == "--version":
+            process = _NativeProcess(b"Claude Code 2.1.233\n")
+            processes.append(process)
+            return process
+        (project / f"{_NATIVE_SESSION_ID}.jsonl").write_bytes(_read_only_transcript_bytes("qa"))
+        (tmp_path / ".pytest_cache").mkdir()
+        process = _NativeProcess()
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", dirtying_popen)
+    with pytest.raises(SystemExit, match="native worktree attestation failed"):
+        main(_native_cli_args(role="qa", validation_root=str(root)))
+    assert not Path(".agent-usage/usage.jsonl").exists()
+
+
+def test_validation_environment_roles_are_read_only_bash_only_subset() -> None:
+    """The three validation roles are READ_ONLY, declare Bash, and never Edit/Write."""
+    assert {
+        role
+        for role in NativeClaudeRole
+        if usage_cli._native_role_pin(role).capability  # pyright: ignore[reportPrivateUsage]
+        is RoleCapability.READ_ONLY
+    } >= usage_cli.VALIDATION_ENVIRONMENT_ROLES
+    for role in usage_cli.VALIDATION_ENVIRONMENT_ROLES:
+        path = Path(".claude") / "agents" / f"{role.value}.md"
+        tools_line = next(
+            line for line in path.read_text().splitlines() if line.startswith("tools: ")
+        )
+        tools = {token.strip() for token in tools_line.removeprefix("tools: ").split(",")}
+        assert "Bash" in tools
+        assert not ({"Edit", "Write"} & tools)

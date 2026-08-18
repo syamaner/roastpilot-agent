@@ -116,6 +116,23 @@ class RoleCapability(Enum):
     READ_ONLY = "READ_ONLY"
 
 
+VALIDATION_ENVIRONMENT_ROLES = frozenset(
+    {
+        NativeClaudeRole.QA,
+        NativeClaudeRole.MCP_CONTRACT_CHECKER,
+        NativeClaudeRole.SIM_ROAST_RUNNER,
+    }
+)
+"""Roles requiring a parent-provisioned external validation environment (D166).
+
+These three READ_ONLY roles execute Python/pytest to do their jobs; a
+worktree-local ``.venv`` would fail the read-only pre-launch and post-exit
+attestation, so their gates run against an external per-run root instead
+(§2.4). ``--validation-root`` is required for exactly these roles and
+rejected for every other role.
+"""
+
+
 class EstimateBasis(Enum):
     """The provenance of a normalized estimated USD amount."""
 
