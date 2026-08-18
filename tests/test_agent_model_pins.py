@@ -104,16 +104,16 @@ def test_no_agent_uses_a_floating_alias(path: Path) -> None:
 
 
 _CANONICAL_PLANNING_SENTENCE = (
-        "- Planning: high-effort `claude-opus-5` roles `planning-architect` for complex,\n"
-        "  ambiguous, cross-repository, or safety-boundary design and `story-planner`\n"
-        "  for the mandatory implementation contract before every delegated slice. Both\n"
-        "  remain read-only."
+    "- Planning: high-effort `claude-opus-5` roles `planning-architect` for complex,\n"
+    "  ambiguous, cross-repository, or safety-boundary design and `story-planner`\n"
+    "  for the mandatory implementation contract before every delegated slice. Both\n"
+    "  remain read-only."
 )
 _CANONICAL_ASSURANCE_SENTENCE = (
-        "- Assurance: `qa`, `security-reviewer`, `ui-reviewer`,\n"
-        "  `mcp-contract-checker`, and `sim-roast-runner` retain their existing pins and\n"
-        "  lenses. `safety-reviewer` remains the mandatory `claude-opus-5`, `xhigh`\n"
-        "  safety floor."
+    "- Assurance: `qa`, `security-reviewer`, `ui-reviewer`,\n"
+    "  `mcp-contract-checker`, and `sim-roast-runner` retain their existing pins and\n"
+    "  lenses. `safety-reviewer` remains the mandatory `claude-opus-5`, `xhigh`\n"
+    "  safety floor."
 )
 
 
