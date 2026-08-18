@@ -20,6 +20,7 @@ TIMESTAMP_SKEW_SECONDS = 120
 _ALLOWED_TYPES = frozenset(
     {
         "agent-setting",
+        "ai-title",
         "assistant",
         "attachment",
         "last-prompt",
@@ -30,11 +31,12 @@ _ALLOWED_TYPES = frozenset(
 )
 """Row types observed across the four committed 2.1.233 transcript fixtures.
 
-``ai-title`` is not a member: it appears only in the rejected 2.1.231 evidence,
-never in a committed 2.1.233 fixture.
+``mode`` and ``ai-title`` are metadata-only rows with independently closed shapes.
 """
 _MODE_ROW_KEYS = frozenset({"type", "mode", "sessionId"})
 """Exact observed keys of the metadata-only ``mode`` row (story-planner.jsonl)."""
+_AI_TITLE_ROW_KEYS = frozenset({"type", "aiTitle", "sessionId"})
+"""Exact observed keys of the metadata-only ``ai-title`` row."""
 _USAGE_REQUIRED = frozenset(
     {"input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"}
 )
@@ -302,6 +304,18 @@ def parse_owned_transcript(
                     if row.get("agentSetting") != role.value:
                         raise TranscriptError("owned Claude transcript role is invalid")
                     agent_settings += 1
+                    continue
+                if row["type"] == "mode":
+                    if set(row) != _MODE_ROW_KEYS or row.get("mode") != "default":
+                        raise TranscriptError("owned Claude transcript is invalid")
+                    continue
+                if row["type"] == "ai-title":
+                    if (
+                        set(row) != _AI_TITLE_ROW_KEYS
+                        or not isinstance(row.get("aiTitle"), str)
+                        or not isinstance(row.get("sessionId"), str)
+                    ):
+                        raise TranscriptError("owned Claude transcript is invalid")
                     continue
                 if row["type"] != "assistant":
                     continue

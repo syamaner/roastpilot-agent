@@ -19,6 +19,8 @@ costs, and token counts with synthetic values.
   `claude-2.1.233-transcript/` family are the sole admitted frozen grammar for
   generic and native capture. They are copied unchanged from the lead-supplied
   sanitized fixture root; the 2.1.228 and 2.1.231 files remain rejection evidence.
+  `security-reviewer.jsonl` is a lead-supplied sanitized native fixture with an
+  exact-shape, metadata-only `ai-title` row; it retains no provider content or paths.
 - `claude-2.1.231-native.jsonl` is a synthetic-conforming native-profile fixture
   with non-empty tools, `permissionMode: auto`, and a model field. It validates
   parser and launch-boundary logic only; it is not observed provenance and proves

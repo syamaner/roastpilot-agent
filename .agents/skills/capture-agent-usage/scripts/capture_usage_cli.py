@@ -629,9 +629,13 @@ def _launch_argv(
 
 
 def _native_claude_argv(
-    executable: str, role: NativeClaudeRole, effort: str, session_id: str
+    executable: str,
+    role: NativeClaudeRole,
+    capability: RoleCapability,
+    effort: str,
+    session_id: str,
 ) -> list[str]:
-    """Build the exact installed native-Claude worker argv."""
+    """Build the exact capability-bound native-Claude worker argv."""
     return [
         executable,
         "--agent",
@@ -645,7 +649,7 @@ def _native_claude_argv(
         "--mcp-config",
         '{"mcpServers":{}}',
         "--permission-mode",
-        "auto",
+        "auto" if capability is RoleCapability.WRITE else "plan",
         "--effort",
         effort,
     ]
@@ -771,7 +775,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
         started_monotonic = time.monotonic()
         arguments.started_at = started_at
         process = subprocess.Popen(
-            _native_claude_argv(executable, role, pin.effort, session_id),
+            _native_claude_argv(executable, role, pin.capability, pin.effort, session_id),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

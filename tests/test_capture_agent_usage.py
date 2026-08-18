@@ -196,6 +196,13 @@ def test_owned_transcript_rejects_closed_mutations(
             "claude-opus-5",
             (2, 0, 31_282, 9),
         ),
+        (
+            "security-reviewer.jsonl",
+            NativeClaudeRole.SECURITY_REVIEWER,
+            "high",
+            "claude-sonnet-5",
+            (3, 11, 7, 13),
+        ),
     ],
 )
 def test_owned_transcript_parses_every_committed_2_1_233_role_fixture(
@@ -272,6 +279,58 @@ def test_owned_transcript_mode_row_admits_exact_shape_only(
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.parse_owned_transcript(
             tmp_path, session_id, NativeClaudeRole.STORY_PLANNER, "high"
+        )
+
+
+def _ai_title_add_extra_key(row: dict[str, object]) -> dict[str, object]:
+    """Add an unobserved metadata key to the closed ai-title row."""
+    return {**row, "extra": "SENTINEL"}
+
+
+def _ai_title_drop_title(row: dict[str, object]) -> dict[str, object]:
+    """Remove the required metadata title field."""
+    return {key: value for key, value in row.items() if key != "aiTitle"}
+
+
+def _ai_title_use_integer_title(row: dict[str, object]) -> dict[str, object]:
+    """Replace the title with a non-string value."""
+    return {**row, "aiTitle": 1}
+
+
+def _ai_title_use_integer_session(row: dict[str, object]) -> dict[str, object]:
+    """Replace the session binding with a non-string value."""
+    return {**row, "sessionId": 1}
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        _ai_title_add_extra_key,
+        _ai_title_drop_title,
+        _ai_title_use_integer_title,
+        _ai_title_use_integer_session,
+    ],
+)
+def test_owned_transcript_ai_title_row_admits_exact_shape_only(
+    mutator: Callable[[dict[str, object]], dict[str, object]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The observed ``ai-title`` row is metadata-only and closed to its exact shape."""
+    content = (FIXTURES / "claude-2.1.233-transcript" / "security-reviewer.jsonl").read_bytes()
+    lines = content.splitlines()
+    title_index = next(
+        index for index, line in enumerate(lines) if json.loads(line)["type"] == "ai-title"
+    )
+    title_row = json.loads(lines[title_index])
+    lines[title_index] = json.dumps(mutator(title_row)).encode()
+    mutated = b"\n".join(lines) + b"\n"
+    _, session_id = _install_owned_transcript(
+        tmp_path, monkeypatch, mutated, title_row["sessionId"]
+    )
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.SECURITY_REVIEWER, "high"
         )
 
 
@@ -719,7 +778,7 @@ def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
     session_id = "11111111-1111-4111-8111-111111111233"
     pin = usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
     argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
-        "claude", role, pin.effort, session_id
+        "claude", role, pin.capability, pin.effort, session_id
     )
     assert argv == [
         "claude",
@@ -734,7 +793,7 @@ def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
         "--mcp-config",
         '{"mcpServers":{}}',
         "--permission-mode",
-        "auto",
+        "auto" if pin.capability is RoleCapability.WRITE else "plan",
         "--effort",
         pin.effort,
     ]
@@ -1033,7 +1092,11 @@ def test_native_command_launches_exact_worker_and_records_immutable_transcript(
     assert len(observed) == 2
     argv, kwargs = observed[1]
     expected_argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
-        "claude", NativeClaudeRole.ENGINEER_BE, "high", _NATIVE_SESSION_ID
+        "claude",
+        NativeClaudeRole.ENGINEER_BE,
+        RoleCapability.WRITE,
+        "high",
+        _NATIVE_SESSION_ID,
     )
     assert argv == expected_argv
     assert kwargs["shell"] is False
@@ -1075,6 +1138,28 @@ def test_native_command_records_nonzero_complete_transcript_as_unsuccessful(
     record = USAGE_RECORD_ADAPTER.validate_json(Path(".agent-usage/usage.jsonl").read_text())
     assert isinstance(record, NativeWorkerUsageRecord)
     assert not record.success and record.exit_code == 2 and record.usage_complete
+
+
+def test_native_command_rejects_model_mismatch_without_sink_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A complete but differently pinned transcript never becomes an attributed record."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch)
+    mismatched = _native_transcript_bytes().replace(
+        b'"model":"claude-sonnet-5"', b'"model":"claude-opus-5"'
+    )
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(project, observed, processes, transcript=mismatched),
+    )
+
+    with pytest.raises(SystemExit, match="native Claude transcript is invalid"):
+        main(_native_cli_args())
+
+    assert len(observed) == 2
+    assert not Path(".agent-usage/usage.jsonl").exists()
 
 
 @pytest.mark.parametrize(
