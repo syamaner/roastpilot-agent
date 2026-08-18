@@ -83,7 +83,12 @@ def test_owned_transcript_counts_identical_assistant_usage_once(
     project.mkdir(parents=True)
     original = (FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl").read_bytes()
     lines = original.splitlines()
-    duplicated = b"\n".join((*lines[:3], lines[2], *lines[3:])) + b"\n"
+    duplicate = lines[2].replace(
+        b'"uuid":"11111111-1111-4111-8111-111111111235"',
+        b'"uuid":"11111111-1111-4111-8111-111111111237"',
+    )
+    assert duplicate != lines[2]
+    duplicated = b"\n".join((*lines[:3], duplicate, *lines[3:])) + b"\n"
     transcript = project / f"{session_id}.jsonl"
     transcript.write_bytes(duplicated)
     monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
@@ -98,6 +103,49 @@ def test_owned_transcript_counts_identical_assistant_usage_once(
     assert usage.cache_creation_input_tokens == 36_369
     assert usage.output_tokens == 9
     assert transcript.read_bytes() == duplicated
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    ["claude-2.1.231.jsonl", "claude-2.1.231-native.jsonl"],
+)
+def test_historical_2_1_231_stream_fixtures_reject_current_version(fixture: str) -> None:
+    """Current stream admission rejects each retained historical Claude version fixture."""
+    content = (FIXTURES / fixture).read_bytes()
+    with pytest.raises(ClaudeUsageParseError, match="unverified Claude version") as error:
+        parse_claude_stream(BytesIO(content), require_launch_authority=True)
+    assert "SYNTHETIC" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("fixture", "role", "session_id"),
+    [
+        (
+            "parent.jsonl",
+            NativeClaudeRole.ENGINEER_BE,
+            "11111111-1111-4111-8111-111111111111",
+        ),
+        (
+            "engineer-fe.jsonl",
+            NativeClaudeRole.ENGINEER_FE,
+            "88888888-8888-4888-8888-888888888888",
+        ),
+    ],
+)
+def test_historical_2_1_231_transcript_fixtures_reject_current_version(
+    fixture: str,
+    role: NativeClaudeRole,
+    session_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Current owned-transcript admission rejects both retained historical role fixtures."""
+    content = (FIXTURES / "claude-2.1.231-transcript" / fixture).read_bytes()
+    _, installed_session = _install_owned_transcript(tmp_path, monkeypatch, content, session_id)
+    with pytest.raises(usage_transcript.TranscriptError) as error:
+        usage_transcript.parse_owned_transcript(tmp_path, installed_session, role, "high")
+    assert str(error.value) == "owned Claude transcript is invalid"
+    assert "SYNTHETIC" not in str(error.value)
 
 
 def test_owned_transcript_accepts_repeated_matching_agent_setting(

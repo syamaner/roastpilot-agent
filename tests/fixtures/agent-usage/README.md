@@ -54,6 +54,8 @@ costs, and token counts with synthetic values.
   `engineer-fe.jsonl` is a synthetic-conforming role-binding variant with the
   observed `auto` permission-mode shape; it ensures both eligible native roles are
   exercised without claiming a separate frontend probe.
+  Its natural distinct-outer-UUID duplicate documents the historical case; the
+  admitted 2.1.233 synthetic test independently proves the live dedup invariant.
 
 No prompt, response, credential, environment value, repository path, or live
 session identifier is retained.
