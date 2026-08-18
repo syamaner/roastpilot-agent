@@ -2,6 +2,9 @@
 
 Status: Accepted; implemented for the subagent fleet; §15 evaluation still
 pending (revised 9 Aug 2026).
+**18 Aug 2026 supersession:** the live `planning-architect` and `story-planner`
+pins are `claude-opus-5` at `high` effort by direct operator authorization.
+Fable references below are historical topology narrative, not live role pins.
 Slice 1 (the read-only planning-architect and the operator output style) and
 Slice 2 (the ten existing roles re-pinned from `sonnet`/`opus` aliases to full
 model IDs with explicit effort, plus the matching `AGENTS.md` model-selection
@@ -84,8 +87,8 @@ The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
 | Role | Exact model | Default effort | Authority | Default tools |
 |---|---|---:|---|---|
 | Product PM / orchestrator (main session) | `claude-opus-5` recommended (the main-session model is a deliberate per-terminal operator choice — operator decision, 9 Aug 2026, see §5; set via the `model` setting or `--model claude-opus-5`; `default` is an alias, not a pin) | `high` | Scope, routing, adjudication, integration, escalation | Repository and coordination tools required by the task |
-| Planning architect (named subagent) | `claude-fable-5` | `high` | Advisory only | Read, Grep, Glob, Bash (no Edit/Write; read-only by convention, §7) |
-| Story planner / contract writer (named subagent) | `claude-fable-5` | `high` | Advisory only — writes the implementation contract required before any Codex-MCP delegation (D152) | Read, Grep, Glob (no shell, no Edit/Write; read-only by construction) |
+| Planning architect (named subagent) | `claude-opus-5` | `high` | Advisory only | Read, Grep, Glob, Bash (no Edit/Write; read-only by convention, §7) |
+| Story planner / contract writer (named subagent) | `claude-opus-5` | `high` | Advisory only — writes the implementation contract required before any Codex-MCP delegation (D152) | Read, Grep, Glob (no shell, no Edit/Write; read-only by construction) |
 | Backend/frontend implementer — default (contracted slices) | Codex-MCP (D152 — external family, own subscription; not a Claude pin) | n/a (Codex-side) | Writes only inside assigned scope | Codex's own MCP-side toolset |
 | Backend/frontend implementer — Claude fallback | `claude-sonnet-5` (`engineer-be`/`engineer-fe`) | `high` | Writes only inside assigned scope | Read, Grep, Glob, Bash, Edit, Write |
 | Mechanical contract/simulation checker | `claude-sonnet-5` | `medium` | Read-only verdict | Read, Grep, Glob, Bash |

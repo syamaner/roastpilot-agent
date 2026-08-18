@@ -2,7 +2,7 @@
 name: story-planner
 description: Turn a story into an implementation contract before any delegated PR slice — spec, behavioural and negative test list, per-guard mutation checks, class-sweep enumeration, PR plan per PR-Hygiene, implementer capability and reviewer routing, risk profile. Required by D158 for Codex or Claude implementation capacity; no contract, no delegation. Read-only by construction — no shell or write tools; the orchestrator supplies the story text and posts the contract.
 tools: Read, Grep, Glob
-model: claude-fable-5
+model: claude-opus-5
 effort: high
 permissionMode: plan
 ---

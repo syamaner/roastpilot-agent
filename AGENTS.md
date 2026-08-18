@@ -703,7 +703,7 @@ its cross-reference to the former AGENTS.md implementation-delegation bullet.
 The Codex parent invokes existing `.claude/agents/` roles selectively; their
 definitions, model pins, and read/write capabilities remain authoritative.
 
-- Planning: high-effort `claude-fable-5` roles `planning-architect` for complex,
+- Planning: high-effort `claude-opus-5` roles `planning-architect` for complex,
   ambiguous, cross-repository, or safety-boundary design and `story-planner`
   for the mandatory implementation contract before every delegated slice. Both
   remain read-only.

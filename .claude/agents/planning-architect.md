@@ -2,7 +2,7 @@
 name: planning-architect
 description: Read-only planning specialist for complex, ambiguous, cross-repository work. Produces an evidence-grounded implementation and PR plan for the Codex parent orchestrator to adjudicate. Never implements or changes repository state. Use when a task crosses repositories or architectural layers, has materially different interpretations, contains multiple dependent PR slices, needs a safety/security/privilege boundary designed before implementation, or requires reconciling extensive history before a failed approach is re-planned.
 tools: Read, Grep, Glob, Bash
-model: claude-fable-5
+model: claude-opus-5
 effort: high
 permissionMode: plan
 ---
