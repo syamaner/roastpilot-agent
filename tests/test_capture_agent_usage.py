@@ -97,9 +97,7 @@ def test_owned_transcript_counts_identical_assistant_usage_once(
     assert usage.cached_input_tokens == 0
     assert usage.cache_creation_input_tokens == 36_369
     assert usage.output_tokens == 9
-    assert (
-        transcript.read_bytes() == duplicated
-    )
+    assert transcript.read_bytes() == duplicated
 
 
 def test_owned_transcript_accepts_repeated_matching_agent_setting(
@@ -1898,15 +1896,14 @@ def test_claude_2_1_233_native_fixture_records_observed_stream_and_authority_rej
     assert usage.cache_creation_input_tokens == 100
     assert usage.output_tokens == 9
     assert usage.claude_model_usage is not None
-    assert [(item.model, item.input_tokens, item.output_tokens) for item in usage.claude_model_usage] == [
-        ("synthetic-native", 2, 9)
-    ]
+    assert [
+        (item.model, item.input_tokens, item.output_tokens) for item in usage.claude_model_usage
+    ] == [("synthetic-native", 2, 9)]
     serialized = usage.model_dump_json()
     for sentinel in ("message_synthetic_native", "request_synthetic_native", "00000000-"):
         assert sentinel not in serialized
-    with fixture.open("rb") as stream:
-        with pytest.raises(ClaudeAuthorityError, match="not attested"):
-            parse_claude_stream(stream, require_launch_authority=True)
+    with fixture.open("rb") as stream, pytest.raises(ClaudeAuthorityError, match="not attested"):
+        parse_claude_stream(stream, require_launch_authority=True)
 
 
 def test_claude_retired_stream_event_type_fails_closed() -> None:
