@@ -17,6 +17,18 @@ MAX_TRANSCRIPT_ROW_BYTES = 4 * 1024 * 1024
 MAX_TRANSCRIPT_ROWS = 500_000
 MAX_TRANSCRIPT_BYTES = 256 * 1024 * 1024
 TIMESTAMP_SKEW_SECONDS = 120
+MAX_HANDBACK_BYTES = 262_144
+"""256 KiB of UTF-8: larger than a full planner contract, far below the 4 MiB
+row cap, so this is the bound specific to a value that crosses the local
+provider-transcript store boundary to the launching parent (D166)."""
+HANDBACK_SCHEMA_VERSION = 1
+"""Schema version of the bounded READ_ONLY handback payload (D166, §2.3)."""
+_HANDBACK_BLOCK_TYPES = frozenset({"text", "thinking"})
+"""The only two terminal-assistant-row content block types this parser admits."""
+_HANDBACK_TEXT_BLOCK_KEYS = frozenset({"type", "text"})
+"""Exact observed key set of a ``text`` content block (lead-supplied 2.1.233 probe)."""
+_HANDBACK_STRIP_CHARACTERS = " \t\n\r\x0b\x0c"
+"""ASCII whitespace only, per the closed emptiness rule (§2.3 point 7)."""
 _ALLOWED_TYPES = frozenset(
     {
         "agent-setting",
@@ -69,6 +81,13 @@ class TranscriptUsage:
     cache_creation_input_tokens: int
     output_tokens: int
     model_usage: tuple[ClaudeModelUsage, ...]
+    handback_text: str | None = None
+    """The bounded READ_ONLY handback text, or ``None`` when not requested.
+
+    Populated only when the caller passes ``require_handback=True`` to
+    :func:`parse_owned_transcript`; otherwise no content block is ever read
+    (D166, §2.3 point 1).
+    """
 
 
 def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -243,6 +262,46 @@ def _timestamp(value: object) -> datetime:
     return parsed
 
 
+def _extract_handback(message: dict[str, Any]) -> str:
+    """Extract the bounded handback text from one terminal assistant message.
+
+    Args:
+        message: The ``message`` object of the terminal (file-order-last)
+            ``assistant`` row.
+
+    Returns:
+        The ordered, unmodified concatenation of every ``text`` block's text.
+
+    Raises:
+        TranscriptError: If the turn is incomplete, carries an unrecognized or
+            malformed content block, is empty after stripping ASCII
+            whitespace, or exceeds :data:`MAX_HANDBACK_BYTES` once encoded.
+    """
+    if message.get("stop_reason") != "end_turn":
+        raise TranscriptError("owned Claude transcript terminal turn is invalid")
+    content = message.get("content")
+    if not isinstance(content, list):
+        raise TranscriptError("owned Claude transcript terminal turn is invalid")
+    texts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            raise TranscriptError("owned Claude transcript terminal turn is invalid")
+        block_type = block.get("type")
+        if not isinstance(block_type, str) or block_type not in _HANDBACK_BLOCK_TYPES:
+            raise TranscriptError("owned Claude transcript terminal turn is invalid")
+        if block_type == "thinking":
+            continue
+        if set(block) != _HANDBACK_TEXT_BLOCK_KEYS or not isinstance(block.get("text"), str):
+            raise TranscriptError("owned Claude transcript terminal turn is invalid")
+        texts.append(block["text"])
+    handback = "".join(texts)
+    if not handback.strip(_HANDBACK_STRIP_CHARACTERS):
+        raise TranscriptError("owned Claude transcript terminal turn is invalid")
+    if len(handback.encode("utf-8")) > MAX_HANDBACK_BYTES:
+        raise TranscriptError("owned Claude transcript terminal turn is invalid")
+    return handback
+
+
 def parse_owned_transcript(
     cwd: Path,
     session_id: str,
@@ -250,6 +309,7 @@ def parse_owned_transcript(
     effort: str,
     *,
     expected_permission_mode: str,
+    require_handback: bool = False,
     started_at: datetime | None = None,
     completed_at: datetime | None = None,
 ) -> TranscriptUsage:
@@ -263,21 +323,25 @@ def parse_owned_transcript(
         expected_permission_mode: The single frozen permission-mode value
             (derived by the caller from the committed capability mapping) that
             every row's optional ``permissionMode`` key must equal exactly.
+        require_handback: Whether to extract and return the bounded terminal
+            handback text. When ``False`` (the default), no content block is
+            ever read.
         started_at: Optional run-start bound for assistant-row chronology skew.
         completed_at: Optional run-end bound for assistant-row chronology skew.
 
     Returns:
-        The closed, verified numeric usage extracted from the transcript.
+        The closed, verified numeric usage (and, when requested, handback text).
 
     Raises:
-        TranscriptError: If any row, identity, chronology, usage, or
-            permission-mode invariant is violated.
+        TranscriptError: If any row, identity, chronology, usage, permission-mode,
+            or terminal-turn invariant is violated.
     """
     descriptor = _transcript_fd(cwd, session_id)
     seen: dict[tuple[str, str | None, str], tuple[int, int, int, int]] = {}
     model: str | None = None
     agent_settings = 0
     last_timestamp: datetime | None = None
+    last_assistant_message: dict[str, Any] | None = None
     invalid = False
     try:
         with os.fdopen(descriptor, "rb") as stream:
@@ -351,6 +415,8 @@ def parse_owned_transcript(
                     or row.get("effort") != effort
                 ):
                     raise TranscriptError("owned Claude transcript is invalid")
+                if require_handback:
+                    last_assistant_message = message
                 message_id, row_model, usage = (
                     message.get("id"),
                     message.get("model"),
@@ -395,6 +461,17 @@ def parse_owned_transcript(
         raise TranscriptError("owned Claude transcript is invalid")
     if agent_settings == 0 or not seen or model is None:
         raise TranscriptError("owned Claude transcript is incomplete")
+    handback_text: str | None = None
+    if require_handback:
+        if last_assistant_message is None:
+            # Every successfully validated assistant row sets last_assistant_message
+            # before seen[key] is populated (above), so a non-empty seen (already
+            # required by the agent_settings/seen/model check above) guarantees this
+            # is set too; defensive invariant backstop, not reachable here.
+            raise TranscriptError(
+                "owned Claude transcript terminal turn is invalid"
+            )  # pragma: no cover
+        handback_text = _extract_handback(last_assistant_message)
     _require_no_subagents(cwd, session_id)
     totals = tuple(sum(item[index] for item in seen.values()) for index in range(4))
     return TranscriptUsage(
@@ -414,4 +491,5 @@ def parse_owned_transcript(
                 output_tokens=totals[3],
             ),
         ),
+        handback_text,
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -5172,6 +5173,469 @@ def _story_planner_rows(
 def _dump_rows(rows: list[dict[str, Any]]) -> bytes:
     """Serialize rows back to one newline-terminated JSONL transcript."""
     return b"\n".join(json.dumps(row).encode() for row in rows) + b"\n"
+
+
+_HANDBACK_UNSET = object()
+
+
+def _install_story_planner_transcript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    terminal_content: object = _HANDBACK_UNSET,
+    stop_reason: object = _HANDBACK_UNSET,
+    session_id: str = "71111111-1111-4111-8111-111111111111",
+) -> tuple[Path, str]:
+    """Install a READ_ONLY ``dontAsk`` transcript with a controllable terminal turn."""
+    rows = _story_planner_rows(session_id)
+    terminal_message = rows[-1]["message"]
+    if terminal_content is not _HANDBACK_UNSET:
+        terminal_message["content"] = terminal_content
+    if stop_reason is not _HANDBACK_UNSET:
+        terminal_message["stop_reason"] = stop_reason
+    _, installed_session_id = _install_owned_transcript(
+        tmp_path, monkeypatch, _dump_rows(rows), session_id
+    )
+    return tmp_path, installed_session_id
+
+
+def test_handback_extracts_ordered_text_blocks_and_skips_thinking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The handback is the ordered text-block concatenation; thinking never contributes."""
+    tmp_path, session_id = _install_story_planner_transcript(
+        tmp_path,
+        monkeypatch,
+        terminal_content=[
+            {"type": "thinking", "thinking": "SENTINEL_THINK_IN_TERMINAL", "signature": "s"},
+            {"type": "text", "text": "PART_ONE "},
+            {"type": "text", "text": "PART_TWO"},
+        ],
+    )
+    usage = usage_transcript.parse_owned_transcript(
+        tmp_path,
+        session_id,
+        NativeClaudeRole.STORY_PLANNER,
+        "high",
+        expected_permission_mode="dontAsk",
+        require_handback=True,
+    )
+    assert usage.handback_text == "PART_ONE PART_TWO"
+    assert "SENTINEL_THINK_IN_TERMINAL" not in (usage.handback_text or "")
+
+
+def test_handback_ignores_content_in_earlier_assistant_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the terminal assistant row's content ever reaches the handback."""
+    session_id = "71111111-1111-4111-8111-111111111112"
+    rows = _story_planner_rows(session_id)
+    rows[-2]["message"]["content"] = [{"type": "text", "text": "SENTINEL_EARLIER_ROW_TEXT"}]
+    _, installed = _install_owned_transcript(tmp_path, monkeypatch, _dump_rows(rows), session_id)
+    usage = usage_transcript.parse_owned_transcript(
+        tmp_path,
+        installed,
+        NativeClaudeRole.STORY_PLANNER,
+        "high",
+        expected_permission_mode="dontAsk",
+        require_handback=True,
+    )
+    assert "SENTINEL_EARLIER_ROW_TEXT" not in (usage.handback_text or "")
+
+
+@pytest.mark.parametrize("stop_reason", ["tool_use", "max_tokens", None, 5])
+def test_handback_requires_end_turn_terminal_stop_reason(
+    stop_reason: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any terminal stop reason other than the exact ``end_turn`` string fails closed."""
+    tmp_path, session_id = _install_story_planner_transcript(
+        tmp_path,
+        monkeypatch,
+        stop_reason=stop_reason,
+        session_id="71111111-1111-4111-8111-111111111113",
+    )
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path,
+            session_id,
+            NativeClaudeRole.STORY_PLANNER,
+            "high",
+            expected_permission_mode="dontAsk",
+            require_handback=True,
+        )
+
+
+def test_handback_rejects_tool_use_block_in_terminal_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal turn ending in a tool call produced no final answer and fails closed."""
+    tool_use_content: list[dict[str, object]] = [
+        {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}
+    ]
+    tmp_path, session_id = _install_story_planner_transcript(
+        tmp_path,
+        monkeypatch,
+        terminal_content=tool_use_content,
+        session_id="71111111-1111-4111-8111-111111111114",
+    )
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path,
+            session_id,
+            NativeClaudeRole.STORY_PLANNER,
+            "high",
+            expected_permission_mode="dontAsk",
+            require_handback=True,
+        )
+
+
+def test_handback_block_allowlist_is_closed_to_text_and_thinking_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A block outside the frozen ``{text, thinking}`` set never contributes, even if shaped
+    exactly like a valid text block otherwise (isolates the block-type allowlist guard)."""
+    disguised_content: list[dict[str, object]] = [
+        {"type": "tool_use", "text": "SHOULD_NEVER_BE_TREATED_AS_TEXT"}
+    ]
+    tmp_path, session_id = _install_story_planner_transcript(
+        tmp_path,
+        monkeypatch,
+        terminal_content=disguised_content,
+        session_id="71111111-1111-4111-8111-111111111119",
+    )
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path,
+            session_id,
+            NativeClaudeRole.STORY_PLANNER,
+            "high",
+            expected_permission_mode="dontAsk",
+            require_handback=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "terminal_content",
+    [
+        [],
+        [{"type": "text", "text": "   \t\n  "}],
+        "not-a-list",
+        ["not-a-dict-block"],
+    ],
+    ids=["empty-content", "whitespace-only-text", "non-list-content", "non-dict-block"],
+)
+def test_handback_rejects_empty_or_malformed_content(
+    terminal_content: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Empty content, whitespace-only text, and non-list content all fail closed."""
+    tmp_path, session_id = _install_story_planner_transcript(
+        tmp_path,
+        monkeypatch,
+        terminal_content=terminal_content,
+        session_id="71111111-1111-4111-8111-111111111115",
+    )
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path,
+            session_id,
+            NativeClaudeRole.STORY_PLANNER,
+            "high",
+            expected_permission_mode="dontAsk",
+            require_handback=True,
+        )
+
+
+def test_handback_rejects_oversize_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Handback text whose UTF-8 encoding exceeds the bound fails closed, never truncated."""
+    monkeypatch.setattr(usage_transcript, "MAX_HANDBACK_BYTES", 8)
+    tmp_path, session_id = _install_story_planner_transcript(
+        tmp_path,
+        monkeypatch,
+        terminal_content=[{"type": "text", "text": "0123456789"}],
+        session_id="71111111-1111-4111-8111-111111111116",
+    )
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path,
+            session_id,
+            NativeClaudeRole.STORY_PLANNER,
+            "high",
+            expected_permission_mode="dontAsk",
+            require_handback=True,
+        )
+
+
+def test_handback_rejects_text_block_with_unfrozen_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``text`` block carrying any key outside the frozen observed set fails closed."""
+    tmp_path, session_id = _install_story_planner_transcript(
+        tmp_path,
+        monkeypatch,
+        terminal_content=[{"type": "text", "text": "hi", "extra": "SENTINEL"}],
+        session_id="71111111-1111-4111-8111-111111111117",
+    )
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path,
+            session_id,
+            NativeClaudeRole.STORY_PLANNER,
+            "high",
+            expected_permission_mode="dontAsk",
+            require_handback=True,
+        )
+
+
+def test_handback_is_none_and_unread_when_not_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``require_handback=False`` never reads content, even malformed content (I3)."""
+    tmp_path, session_id = _install_story_planner_transcript(
+        tmp_path,
+        monkeypatch,
+        terminal_content="INVALID_NON_LIST_CONTENT_THAT_WOULD_FAIL_IF_READ",
+        session_id="71111111-1111-4111-8111-111111111118",
+    )
+    usage = usage_transcript.parse_owned_transcript(
+        tmp_path,
+        session_id,
+        NativeClaudeRole.STORY_PLANNER,
+        "high",
+        expected_permission_mode="dontAsk",
+    )
+    assert usage.handback_text is None
+
+
+def _configure_read_only_native_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, list[tuple[list[str], dict[str, object]]]]:
+    """Install a READ_ONLY-shaped native launcher whose post-exit head equals its base."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch)
+
+    def fixed_attestation(
+        _arguments: argparse.Namespace, _capability: RoleCapability, *, post_exit: bool
+    ) -> str:
+        del post_exit
+        return "4c1ac63"
+
+    monkeypatch.setattr(usage_cli, "_validate_native_worktree", fixed_attestation)
+    return project, observed
+
+
+_READ_ONLY_FIXTURE_BY_ROLE = {
+    "story-planner": "story-planner.jsonl",
+    "qa": "qa.jsonl",
+    "safety-reviewer": "safety-reviewer.jsonl",
+    "security-reviewer": "security-reviewer.jsonl",
+}
+
+
+def _read_only_transcript_bytes(
+    role_value: str,
+    *,
+    session_id: str = _NATIVE_SESSION_ID,
+    text: str = "SYNTHETIC_STORY_HANDOFF",
+) -> bytes:
+    """Return one committed READ_ONLY fixture rebound to one session with fixed text."""
+    fixture = _READ_ONLY_FIXTURE_BY_ROLE[role_value]
+    content = (FIXTURES / "claude-2.1.233-transcript" / fixture).read_bytes()
+    rows: list[dict[str, Any]] = [json.loads(line) for line in content.splitlines()]
+    original = rows[0]["sessionId"]
+    for row in rows:
+        if row.get("sessionId") == original:
+            row["sessionId"] = session_id
+    rows[-1]["message"]["content"] = [{"type": "text", "text": text}]
+    return _dump_rows(rows)
+
+
+def test_native_read_only_emits_bounded_handback_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A successful READ_ONLY run emits exactly one framed, integrity-checkable stdout line."""
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project,
+            observed,
+            processes,
+            transcript=_read_only_transcript_bytes("story-planner", text="SYNTHETIC_STORY_HANDOFF"),
+        ),
+    )
+    assert main(_native_cli_args(role="story-planner")) == 0
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert list(payload) == [
+        "handback_schema_version",
+        "tool_version",
+        "native_role",
+        "role_capability",
+        "session_id",
+        "task_id",
+        "slice_id",
+        "byte_length",
+        "sha256",
+        "text",
+    ]
+    assert payload["handback_schema_version"] == 1
+    assert payload["native_role"] == "story-planner"
+    assert payload["role_capability"] == "READ_ONLY"
+    assert payload["session_id"] == _NATIVE_SESSION_ID
+    assert payload["task_id"] == "816"
+    assert payload["slice_id"] == "native-1"
+    assert payload["text"] == "SYNTHETIC_STORY_HANDOFF"
+    encoded = payload["text"].encode("utf-8")
+    assert payload["byte_length"] == len(encoded)
+    assert payload["sha256"] == hashlib.sha256(encoded).hexdigest()
+
+
+def test_native_write_role_emits_nothing_to_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A successful WRITE run appends its record and writes nothing to stdout."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(project, observed, processes, transcript=_native_transcript_bytes()),
+    )
+    assert main(_native_cli_args()) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_native_read_only_no_emission_on_post_exit_attestation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A forced post-exit attestation failure leaves stdout empty and appends no record."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch)
+
+    def failing_attestation(
+        _arguments: argparse.Namespace, _capability: RoleCapability, *, post_exit: bool
+    ) -> str:
+        if post_exit:
+            raise CaptureUsageError("native worktree attestation failed")
+        return "4c1ac63"
+
+    monkeypatch.setattr(usage_cli, "_validate_native_worktree", failing_attestation)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project, observed, processes, transcript=_read_only_transcript_bytes("story-planner")
+        ),
+    )
+    with pytest.raises(SystemExit):
+        main(_native_cli_args(role="story-planner"))
+    assert capsys.readouterr().out == ""
+    assert not Path(".agent-usage/usage.jsonl").exists()
+
+
+def test_native_read_only_no_emission_on_sink_append_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A forced sink-append failure leaves stdout empty even with a complete transcript."""
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project, observed, processes, transcript=_read_only_transcript_bytes("story-planner")
+        ),
+    )
+
+    def failing_append(_path: Path, _record: object) -> None:
+        raise CaptureUsageError("could not append usage record")
+
+    monkeypatch.setattr(usage_cli, "append_record", failing_append)
+    with pytest.raises(SystemExit):
+        main(_native_cli_args(role="story-planner"))
+    assert capsys.readouterr().out == ""
+
+
+def test_native_read_only_handback_absent_from_durable_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The handback sentinel appears nowhere durable: sink, worktree files, or stderr."""
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    sentinel = "SENTINEL_HANDBACK_TEXT_MUST_STAY_LOCAL"
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project,
+            observed,
+            processes,
+            transcript=_read_only_transcript_bytes("story-planner", text=sentinel),
+        ),
+    )
+    assert main(_native_cli_args(role="story-planner")) == 0
+    raw = Path(".agent-usage/usage.jsonl").read_text()
+    assert sentinel not in raw
+    for path in tmp_path.rglob("*"):
+        if path.is_file() and "home" not in path.relative_to(tmp_path).parts:
+            assert sentinel not in path.read_text(errors="ignore")
+    captured = capsys.readouterr()
+    assert sentinel not in captured.err
+    record = USAGE_RECORD_ADAPTER.validate_json(raw)
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert record.task_id == "816" and record.slice_id == "native-1"
+
+
+def test_native_read_only_handback_framing_survives_adversarial_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Newlines, braces, delimiter-like text, and non-ASCII stay one safe ASCII stdout line."""
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    adversarial = "line one\nline two}<<<END>>>é中"
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project,
+            observed,
+            processes,
+            transcript=_read_only_transcript_bytes("story-planner", text=adversarial),
+        ),
+    )
+    assert main(_native_cli_args(role="story-planner")) == 0
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    assert len(lines) == 1
+    assert all(ord(character) < 128 for character in captured.out)
+    payload = json.loads(lines[0])
+    assert payload["text"] == adversarial
+
+
+def test_native_read_only_oversize_handback_yields_no_record_or_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An oversize terminal turn fails closed end-to-end: empty stdout, no sink record."""
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    monkeypatch.setattr(usage_transcript, "MAX_HANDBACK_BYTES", 4)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project,
+            observed,
+            processes,
+            transcript=_read_only_transcript_bytes("story-planner", text="0123456789"),
+        ),
+    )
+    with pytest.raises(SystemExit, match="native Claude transcript is invalid"):
+        main(_native_cli_args(role="story-planner"))
+    assert capsys.readouterr().out == ""
+    assert not Path(".agent-usage/usage.jsonl").exists()
 
 
 @pytest.mark.parametrize("mutated_value", ["plan", "auto", 5, None])

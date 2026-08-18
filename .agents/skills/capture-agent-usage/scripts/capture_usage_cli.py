@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -41,6 +43,7 @@ from capture_usage_models import (
     AGENT_USAGE_SCHEMA_VERSION,
     MAX_STREAM_BYTES,
     NATIVE_WORKER_USAGE_SCHEMA_VERSION,
+    SKILL_VERSION,
     USAGE_RECORD_ADAPTER,
     CapacitySnapshotRecord,
     CapacitySource,
@@ -58,6 +61,7 @@ from capture_usage_models import (
     UsageRecord,
 )
 from capture_usage_transcript import (
+    HANDBACK_SCHEMA_VERSION,
     TranscriptError,
     TranscriptUsage,
     parse_owned_transcript,
@@ -510,8 +514,7 @@ def _native_role_pin(role: NativeClaudeRole) -> _NativeRolePin:
         if line.startswith("permissionMode: ")
     ]
     if len(permission_mode_lines) > 1 or (
-        permission_mode_lines
-        and permission_mode_lines[0] != NATIVE_PERMISSION_MODES[capability]
+        permission_mode_lines and permission_mode_lines[0] != NATIVE_PERMISSION_MODES[capability]
     ):
         raise CaptureUsageError("native agent frontmatter is invalid")
     return _NativeRolePin(values["model"][0], values["effort"][0], capability)
@@ -571,6 +574,39 @@ def _validate_native_worktree(
     if ancestry_status != 0 or head == base:
         raise CaptureUsageError("native worktree attestation failed")
     return head
+
+
+def _emit_handback(
+    role: NativeClaudeRole,
+    pin: _NativeRolePin,
+    arguments: argparse.Namespace,
+    session_id: str,
+    text: str,
+) -> None:
+    """Emit exactly one framed, content-safe handback line to stdout (R1, R2).
+
+    Args:
+        role: The registered native role that produced the final response.
+        pin: The committed model/effort/capability pin for that role.
+        arguments: The parsed CLI namespace, read only for task/slice identifiers.
+        session_id: The exact bound session identifier.
+        text: The validated, non-empty, bounded terminal handback text.
+    """
+    encoded = text.encode("utf-8")
+    payload = {
+        "handback_schema_version": HANDBACK_SCHEMA_VERSION,
+        "tool_version": SKILL_VERSION,
+        "native_role": role.value,
+        "role_capability": pin.capability.value,
+        "session_id": session_id,
+        "task_id": arguments.task_id,
+        "slice_id": arguments.slice_id,
+        "byte_length": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "text": text,
+    }
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
 
 
 def _harness_version(executable: str) -> str:
@@ -774,6 +810,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
     """Launch one registered Claude implementation worker and append complete usage."""
     role = NativeClaudeRole(arguments.role)
     pin = _native_role_pin(role)
+    require_handback = pin.capability is RoleCapability.READ_ONLY
     _validate_native_metadata(arguments, role, pin)
     _validate_native_worktree(arguments, pin.capability, post_exit=False)
     if os.environ.get("CLAUDE_CONFIG_DIR") is not None:
@@ -828,6 +865,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
                 role,
                 pin.effort,
                 expected_permission_mode=NATIVE_PERMISSION_MODES[pin.capability],
+                require_handback=require_handback,
                 started_at=started_at,
                 completed_at=completed_at,
             )
@@ -835,6 +873,16 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
             raise CaptureUsageError("native Claude transcript is invalid") from None
         if usage.model != pin.model:
             raise CaptureUsageError("native Claude transcript is invalid")
+        if pin.capability is RoleCapability.WRITE and usage.handback_text is not None:
+            # require_handback is derived from pin.capability at this call site, so
+            # parse_owned_transcript(require_handback=False) always returns handback_text
+            # None for WRITE; this is a defensive invariant backstop, not reachable here.
+            raise CaptureUsageError("native Claude transcript is invalid")  # pragma: no cover
+        if require_handback and usage.handback_text is None:
+            # require_handback=True forces parse_owned_transcript to either return a
+            # non-None handback_text or raise TranscriptError (caught above); this is a
+            # defensive invariant backstop, not reachable here.
+            raise CaptureUsageError("native Claude transcript is invalid")  # pragma: no cover
         final_head_sha = _validate_native_worktree(arguments, pin.capability, post_exit=True)
         append_record(
             arguments.output,
@@ -850,6 +898,8 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
                 elapsed_ms,
             ),
         )
+        if usage.handback_text is not None:
+            _emit_handback(role, pin, arguments, usage.session_id, usage.handback_text)
         return 0
     except OSError:
         if writer is not None:
