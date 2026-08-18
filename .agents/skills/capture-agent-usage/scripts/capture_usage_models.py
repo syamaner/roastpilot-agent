@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Annotated, BinaryIO, Literal, TypeAlias
@@ -131,6 +133,106 @@ attestation, so their gates run against an external per-run root instead
 (§2.4). ``--validation-root`` is required for exactly these roles and
 rejected for every other role.
 """
+
+
+class ValidationCommandKind(Enum):
+    """Closed command-matching kind for one committed validation-role rule.
+
+    ``EXACT`` renders a provider allow-rule that matches only the byte-exact
+    command; ``PREFIX`` renders a rule matching that exact command followed
+    by any arguments (D168, §2.2). Plain ``Enum``, never string-compared.
+    """
+
+    EXACT = "EXACT"
+    PREFIX = "PREFIX"
+
+
+@dataclass(frozen=True)
+class ValidationCommand:
+    """One committed validation-role gate command template.
+
+    ``template`` uses exactly two placeholders, ``{python}`` and ``{tmp}``,
+    substituted only from the one already-validated resolved root every
+    other validation-environment consumer uses (D168, §2.2).
+    """
+
+    kind: ValidationCommandKind
+    template: str
+
+
+VALIDATION_ROLE_COMMANDS: dict[NativeClaudeRole, tuple[ValidationCommand, ...]] = {
+    NativeClaudeRole.QA: (
+        ValidationCommand(ValidationCommandKind.PREFIX, "{python} -m pytest"),
+        ValidationCommand(ValidationCommandKind.EXACT, "{python} -m pyright --pythonpath {python}"),
+        ValidationCommand(ValidationCommandKind.EXACT, "{python} -m ruff check ."),
+        ValidationCommand(ValidationCommandKind.EXACT, "{python} -m ruff format --check ."),
+    ),
+    NativeClaudeRole.MCP_CONTRACT_CHECKER: (
+        ValidationCommand(ValidationCommandKind.EXACT, "{python} -m pip show coffee-roaster-mcp"),
+        ValidationCommand(
+            ValidationCommandKind.EXACT,
+            "{python} -m pytest tests/test_mcp_client.py -q --basetemp {tmp}/pytest",
+        ),
+    ),
+    NativeClaudeRole.SIM_ROAST_RUNNER: (
+        ValidationCommand(
+            ValidationCommandKind.EXACT,
+            "{python} -m pytest tests/test_milestone1.py -q --basetemp {tmp}/pytest",
+        ),
+    ),
+}
+"""The single source of truth for validation-role gate commands (D168, §2.2).
+
+Keys equal :data:`VALIDATION_ENVIRONMENT_ROLES` exactly; no other role is
+present. Rendered two ways from this one table, never independently: as the
+exact per-run commands ``print-validation-commands`` prints into the
+lead-authored role brief, and as the ``--allowedTools`` rules bound to the
+native launch argv (§2.2, §2.6)."""
+
+
+def render_validation_commands(role: NativeClaudeRole, root: str) -> tuple[str, ...]:
+    """Render one role's exact gate commands against one validated root.
+
+    Performs no filesystem access itself; ``root`` must already be the
+    canonical resolved return value of the sole
+    :func:`~capture_usage_cli._validate_validation_root` call for this run.
+
+    Args:
+        role: The candidate native role.
+        root: The canonical resolved validation root.
+
+    Returns:
+        The ordered, rendered command strings for ``role``, or an empty
+        tuple when ``role`` is not a validation role.
+    """
+    commands = VALIDATION_ROLE_COMMANDS.get(role, ())
+    python = os.path.join(root, "venv", "bin", "python")
+    tmp = os.path.join(root, "tmp")
+    return tuple(command.template.format(python=python, tmp=tmp) for command in commands)
+
+
+def render_allowed_tools(role: NativeClaudeRole, root: str) -> tuple[str, ...]:
+    """Render one role's committed ``--allowedTools`` rules from the same table.
+
+    Never performs an independent substitution or validation; wraps exactly
+    the strings :func:`render_validation_commands` returns.
+
+    Args:
+        role: The candidate native role.
+        root: The canonical resolved validation root.
+
+    Returns:
+        The ordered ``Bash(...)`` rule strings for ``role`` — an ``EXACT``
+        entry renders ``Bash(<command>)`` and a ``PREFIX`` entry renders
+        ``Bash(<command>:*)`` — or an empty tuple when ``role`` is not a
+        validation role.
+    """
+    commands = VALIDATION_ROLE_COMMANDS.get(role, ())
+    rendered = render_validation_commands(role, root)
+    return tuple(
+        f"Bash({text}:*)" if command.kind is ValidationCommandKind.PREFIX else f"Bash({text})"
+        for command, text in zip(commands, rendered, strict=True)
+    )
 
 
 class EstimateBasis(Enum):

@@ -46,6 +46,7 @@ from capture_usage_models import (
     SKILL_VERSION,
     USAGE_RECORD_ADAPTER,
     VALIDATION_ENVIRONMENT_ROLES,
+    VALIDATION_ROLE_COMMANDS,
     CapacitySnapshotRecord,
     CapacitySource,
     CapacityStatus,
@@ -60,6 +61,8 @@ from capture_usage_models import (
     RoleCapability,
     TaskUsageRecord,
     UsageRecord,
+    render_allowed_tools,
+    render_validation_commands,
 )
 from capture_usage_transcript import (
     HANDBACK_SCHEMA_VERSION,
@@ -617,12 +620,14 @@ def _require_validation_directory(descriptor: int, *, expect_mode: int | None) -
         raise OSError("validation directory mode is invalid")
 
 
-_FORBIDDEN_VALIDATION_PATH_CHARACTERS = frozenset({"'", '"', "\\"})
-"""Characters rejected everywhere in a validation-root path (D167, §grammar).
+_VALIDATION_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
+"""The closed positive grammar for one validation-root path segment (D168).
 
-A quote or backslash could otherwise be interpreted specially by a later
-shell-adjacent consumer of the value; rejecting them here, in the one shared
-grammar predicate, keeps that closed regardless of consumer."""
+Replaces the D167 negative character predicate. A rendered rule is
+``Bash(<command containing this path>)``, so any provider allow-rule or
+shell metacharacter surviving inside the path could re-scope or truncate
+that rule (§2.5) — closing the grammar positively, rather than blocklisting
+characters, keeps it closed for every future rule-rendering consumer."""
 
 
 def _is_valid_validation_path(value: str) -> bool:
@@ -630,10 +635,15 @@ def _is_valid_validation_path(value: str) -> bool:
 
     Applied identically to the raw ``--validation-root`` argument and to its
     resolved ``os.path.realpath`` value before either is used for overlap,
-    descriptor, or argv purposes (D167). Rejects a non-absolute value, an
-    empty or ``..`` segment, and any whitespace, ASCII control character
-    (including DEL), single quote, double quote, or backslash anywhere in the
-    value.
+    descriptor, rule-rendering, or argv purposes (D167, tightened D168). A
+    closed positive per-segment grammar: every non-empty segment must match
+    ``^[A-Za-z0-9._-]{1,255}$`` and must not be ``.`` or ``..``. This is
+    strictly stronger than the prior negative predicate — it continues to
+    reject whitespace, ASCII control characters (including DEL), quotes,
+    backslashes, empty segments (double or trailing slash), and ``..``
+    traversal, and it additionally rejects every provider allow-rule and
+    shell metacharacter, for example ``( ) : * , ; & | $`` backtick
+    ``< > ! ? [ ] { } #`` and ``~``.
 
     Args:
         value: The candidate path, raw or resolved.
@@ -644,14 +654,13 @@ def _is_valid_validation_path(value: str) -> bool:
     if not value or not value.startswith("/"):
         return False
     segments = value.split("/")
-    if segments[0] != "" or any(segment in ("", "..") for segment in segments[1:]):
-        return False
-    return not any(
-        character.isspace()
-        or ord(character) < 0x20
-        or ord(character) == 0x7F
-        or character in _FORBIDDEN_VALIDATION_PATH_CHARACTERS
-        for character in value
+    if segments[0] != "":
+        # value.startswith("/") above guarantees split("/")[0] == ""; defensive
+        # invariant backstop, not reachable here.
+        return False  # pragma: no cover
+    return all(
+        segment not in (".", "..") and _VALIDATION_PATH_SEGMENT.fullmatch(segment) is not None
+        for segment in segments[1:]
     )
 
 
@@ -929,8 +938,13 @@ def _native_claude_argv(
     :func:`_validate_validation_root` call (never a raw, unvalidated path).
     For exactly the three roles in ``VALIDATION_ENVIRONMENT_ROLES`` this
     appends one ``--add-dir <validated_root>`` pair immediately before
-    ``--permission-mode`` (D167); every other role's argv is byte-identical
-    to the pre-D167 shape.
+    ``--permission-mode`` (D167), and a trailing ``--allowedTools`` option
+    carrying that role's committed rule tuple, rendered only from
+    ``validated_root`` through :func:`~capture_usage_models.render_allowed_tools`
+    (D168, §2.3). ``--allowedTools`` is placed last, after ``--effort``,
+    because the option is variadic: anything appended after it would be
+    consumed as an additional rule rather than as a new argv element. Every
+    other role's argv is byte-identical to the pre-D168 shape.
 
     Args:
         executable: The resolved ``claude`` executable path.
@@ -946,7 +960,8 @@ def _native_claude_argv(
 
     Raises:
         CaptureUsageError: If ``validated_root`` presence disagrees with
-            whether ``role`` is a validation role.
+            whether ``role`` is a validation role, or a validation role
+            renders no allow-list rules from ``validated_root``.
     """
     requires_root = role in VALIDATION_ENVIRONMENT_ROLES
     if requires_root != (validated_root is not None):
@@ -974,6 +989,12 @@ def _native_claude_argv(
             effort,
         ]
     )
+    if validated_root is not None:
+        rules = render_allowed_tools(role, validated_root)
+        if not rules:
+            raise CaptureUsageError("validation environment is invalid")
+        argv.append("--allowedTools")
+        argv.extend(rules)
     return argv
 
 
@@ -1444,6 +1465,49 @@ def snapshot_capacity(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def print_validation_commands_command(arguments: argparse.Namespace) -> int:
+    """Print one validation role's exact, byte-stable gate commands (parent-only).
+
+    Validates ``--validation-root`` exactly once through the shared
+    :func:`_validate_validation_root` call, then prints one deterministic
+    ``EXACT <command>`` or ``PREFIX <command-prefix>`` line per
+    :data:`~capture_usage_models.VALIDATION_ROLE_COMMANDS` entry for the
+    selected role, rendered through
+    :func:`~capture_usage_models.render_validation_commands` — the same
+    render function :func:`_native_claude_argv` uses to build the
+    ``--allowedTools`` rule tuple, so the printed commands and the bound
+    rules can never diverge (D168, §2.2, §2.6). Writes no sink record and
+    exposes no rule, tool, model, effort, or permission override; the parent
+    copies this output verbatim into the lead-authored role brief. All
+    output is built before anything is written, so a failure never emits
+    partial output.
+
+    Args:
+        arguments: The parsed CLI namespace.
+
+    Returns:
+        ``0`` on success.
+
+    Raises:
+        CaptureUsageError: If ``role`` is not a validation role, the root is
+            invalid, or the role renders no commands.
+    """
+    role = NativeClaudeRole(arguments.role)
+    if role not in VALIDATION_ENVIRONMENT_ROLES:
+        raise CaptureUsageError("validation environment is invalid")
+    root = _validate_validation_root(arguments.validation_root)
+    commands = VALIDATION_ROLE_COMMANDS.get(role, ())
+    rendered = render_validation_commands(role, root)
+    if not rendered:
+        raise CaptureUsageError("validation environment is invalid")
+    lines = [
+        f"{command.kind.value} {text}" for command, text in zip(commands, rendered, strict=True)
+    ]
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
 def _add_output_option(parser: argparse.ArgumentParser) -> None:
     """Add the shared relative output option to one subcommand parser."""
     parser.add_argument("--output", type=_sink_path, default=DEFAULT_SINK)
@@ -1516,6 +1580,16 @@ def build_parser() -> argparse.ArgumentParser:
     native.add_argument("--validation-root", default=None)
     _add_output_option(native)
     native.set_defaults(handler=run_native_claude_command)
+
+    print_validation = commands.add_parser(
+        "print-validation-commands",
+        help="print one validation role's exact gate commands (parent-only)",
+    )
+    print_validation.add_argument(
+        "--role", choices=tuple(role.value for role in NativeClaudeRole), required=True
+    )
+    print_validation.add_argument("--validation-root", required=True)
+    print_validation.set_defaults(handler=print_validation_commands_command)
 
     outcome = commands.add_parser("annotate-outcome", help="append closed task outcome metadata")
     outcome.add_argument("--task-id", required=True)
