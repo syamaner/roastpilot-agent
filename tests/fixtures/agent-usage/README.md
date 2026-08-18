@@ -15,10 +15,12 @@ costs, and token counts with synthetic values.
   attests empty `tools`, empty `mcp_servers`, and `permissionMode: plan`; it
   proves the closed event and terminal usage grammars remain unchanged while
   using wholly synthetic content.
-- `claude-2.1.233.jsonl`, `claude-2.1.233-native.jsonl`, and the
-  `claude-2.1.233-transcript/` family are the sole admitted frozen grammar for
-  generic and native capture. They are copied unchanged from the lead-supplied
-  sanitized fixture root; the 2.1.228 and 2.1.231 files remain rejection evidence.
+- `claude-2.1.233.jsonl` is the admitted frozen generic strict-launch grammar.
+  `claude-2.1.233-native.jsonl` is frozen observed native-stream/rejection
+  evidence for generic strict authority, and `claude-2.1.233-transcript/` is the
+  admitted native-capture grammar. These files are copied unchanged from the
+  lead-supplied sanitized fixture root; the 2.1.228 and 2.1.231 files remain
+  rejection evidence.
   `security-reviewer.jsonl` is a lead-supplied sanitized native fixture with an
   exact-shape, metadata-only `ai-title` row; it retains no provider content or paths.
 - `claude-2.1.231-native.jsonl` is a synthetic-conforming native-profile fixture

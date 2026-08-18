@@ -76,13 +76,16 @@ USAGE_RECORD_ADAPTER = cast(TypeAdapter[UsageRecord], _USAGE_RECORD_ADAPTER)
 def test_owned_transcript_counts_identical_assistant_usage_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The committed 2.1.233 fixture is read only at its exact expected path."""
+    """A byte-identical duplicate assistant usage is counted once without mutation."""
     session_id = "11111111-1111-4111-8111-111111111233"
     home = tmp_path / "home"
     project = home / ".claude" / "projects" / usage_transcript._project_name(tmp_path)  # pyright: ignore[reportPrivateUsage]
     project.mkdir(parents=True)
+    original = (FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl").read_bytes()
+    lines = original.splitlines()
+    duplicated = b"\n".join((*lines[:3], lines[2], *lines[3:])) + b"\n"
     transcript = project / f"{session_id}.jsonl"
-    transcript.write_bytes((FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl").read_bytes())
+    transcript.write_bytes(duplicated)
     monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
 
     usage = usage_transcript.parse_owned_transcript(
@@ -95,8 +98,7 @@ def test_owned_transcript_counts_identical_assistant_usage_once(
     assert usage.cache_creation_input_tokens == 36_369
     assert usage.output_tokens == 9
     assert (
-        transcript.read_bytes()
-        == (FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl").read_bytes()
+        transcript.read_bytes() == duplicated
     )
 
 
@@ -1873,6 +1875,38 @@ def test_claude_2_1_233_fixture_matches_frozen_grammar_without_content() -> None
     with pytest.raises(ClaudeUsageParseError) as exc_info:
         parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
     assert "SANITIZED_MESSAGE" not in str(exc_info.value)
+
+
+def test_claude_2_1_233_native_fixture_records_observed_stream_and_authority_rejection() -> None:
+    """Native stream evidence parses laxly and proves strict authority rejects pre-init hooks."""
+    fixture = FIXTURES / "claude-2.1.233-native.jsonl"
+    events = [json.loads(line) for line in fixture.read_text().splitlines()]
+    with fixture.open("rb") as stream:
+        usage = parse_claude_stream(stream, require_launch_authority=False)
+
+    assert {event["type"] for event in events} == CLAUDE_EVENT_TYPES
+    assert {
+        event["subtype"] for event in events if event["type"] == "system"
+    } == CLAUDE_SYSTEM_SUBTYPES
+    terminal = events[-1]
+    assert terminal["subtype"] == "success" and terminal["is_error"] is False
+    assert set(terminal["usage"]) == CLAUDE_RESULT_USAGE_KEYS
+    assert set(terminal["modelUsage"]) == {"synthetic-native"}
+    assert usage.claude_terminal_success is True
+    assert usage.input_tokens == 2
+    assert usage.cached_input_tokens == 50
+    assert usage.cache_creation_input_tokens == 100
+    assert usage.output_tokens == 9
+    assert usage.claude_model_usage is not None
+    assert [(item.model, item.input_tokens, item.output_tokens) for item in usage.claude_model_usage] == [
+        ("synthetic-native", 2, 9)
+    ]
+    serialized = usage.model_dump_json()
+    for sentinel in ("message_synthetic_native", "request_synthetic_native", "00000000-"):
+        assert sentinel not in serialized
+    with fixture.open("rb") as stream:
+        with pytest.raises(ClaudeAuthorityError, match="not attested"):
+            parse_claude_stream(stream, require_launch_authority=True)
 
 
 def test_claude_retired_stream_event_type_fails_closed() -> None:
