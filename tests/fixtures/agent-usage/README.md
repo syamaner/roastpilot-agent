@@ -21,6 +21,8 @@ costs, and token counts with synthetic values.
   admitted native-capture grammar. These files are copied unchanged from the
   lead-supplied sanitized fixture root; the 2.1.228 and 2.1.231 files remain
   rejection evidence.
+  The observed native stream parses in lax structural mode, but generic strict
+  launch authority rejects it because `hook_started`/`hook_response` precede `init`.
   `security-reviewer.jsonl` is a lead-supplied sanitized native fixture with an
   exact-shape, metadata-only `ai-title` row; it retains no provider content or paths.
 - `claude-2.1.231-native.jsonl` is a synthetic-conforming native-profile fixture
