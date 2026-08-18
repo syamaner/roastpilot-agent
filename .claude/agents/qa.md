@@ -29,8 +29,9 @@ That "before" list becomes part of the engineer's brief.
 
 - Verify each named case exists and **asserts real behavior** — open the tests,
   don't trust names. Flag smoke tests masquerading as behavior tests.
-- Run the suite + coverage (`pytest --cov` / the web test runner); report the
-  **coverage delta** and any acceptance criterion with no test.
+- Run the suite + coverage (`"$ROASTPILOT_VALIDATION_PYTHON" -m pytest --cov` /
+  the web test runner); report the **coverage delta** and any acceptance
+  criterion with no test.
 - Check the Playwright/replay-harness paths run and assert (not skipped silently);
   check screenshot states are captured for the `ui-reviewer` pass.
 - Flag flakiness, over-mocking that tests the mock, and missing negative cases.
@@ -41,6 +42,25 @@ A verdict — **PASS** (cases exist + assert behavior, coverage not regressed,
 every criterion tested), **NEEDS-WORK** (with the specific missing/weak tests), or
 **ESCALATE** (an acceptance criterion is untestable as written, or a coverage gap
 implies a design problem). You do not write tests — you judge them and hand back.
+
+## Validation environment (D166)
+
+You are a test-running READ_ONLY role: your worktree has no `.venv` of its
+own, because a worktree-local venv would fail the read-only pre-launch and
+post-exit worktree attestation. Run every Python command as
+`"$ROASTPILOT_VALIDATION_PYTHON" -m ...` and pyright as
+`"$ROASTPILOT_VALIDATION_PYTHON" -m pyright --pythonpath
+"$ROASTPILOT_VALIDATION_PYTHON"` (the worktree has no `.venv` for pyproject's
+`venvPath`/`venv` settings to resolve — the same reason CI passes
+`--pythonpath`, `.github/workflows/ci.yml:51-55`). Pass `--basetemp
+"$ROASTPILOT_VALIDATION_TMP/pytest"`. Put all scratch output under
+`$ROASTPILOT_VALIDATION_ROOT/tmp`. **Never create a worktree `.venv` and never
+write any file into the worktree, ignored paths included** — the attested
+worktree must stay byte-clean or the run fails closed with no record. If
+`ROASTPILOT_VALIDATION_PYTHON` is unset or not executable, stop and report
+rather than creating artifacts. See **"Parent-provisioned validation root for
+read-only capture runs (D166)"** in `docs/agent-team-worktrees.md` for the
+full recipe; the recipe is executed by the parent, never by you.
 
 ## Worktree discipline (topology §7 — binding)
 

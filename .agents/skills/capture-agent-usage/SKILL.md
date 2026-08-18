@@ -36,3 +36,10 @@ or host path to the sink. `ui-reviewer` remains excluded because its Playwright 
 conflicts with empty-MCP capture; `repair` is excluded. The generic `run` path remains
 measurement/validation-only, has no routing authority, and retains its
 no-session-persistence boundary.
+
+Under D166, every READ_ONLY role returns one bounded, transcript-validated final
+assistant response on stdout to the launching parent only — never to the sink, git,
+GitHub, fixtures, or any other durable file. `qa`, `mcp-contract-checker`, and
+`sim-roast-runner` additionally require a parent-provisioned external
+`--validation-root` for their Python/pytest gates, while the attested worktree must
+stay byte-clean throughout.

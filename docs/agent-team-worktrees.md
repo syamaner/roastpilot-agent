@@ -236,6 +236,64 @@ make a faithful dependency install structurally impossible. Their gate output is
 An implementer that cannot install must say so, never improvise with
 `--system-site-packages`.
 
+## Parent-provisioned validation root for read-only capture runs (D166)
+
+The `#738`/`#733` per-worktree `.venv` rule above continues to govern every
+**write-capable** worker worktree. It is **replaced**, not extended, for the
+three test-running READ_ONLY capture-launched roles — `qa`,
+`mcp-contract-checker`, and `sim-roast-runner` — because a worktree-local
+`.venv` would fail the READ_ONLY pre-launch `status --porcelain --ignored`
+attestation, and running pytest/ruff/pyright unavoidably creates
+`.pytest_cache`, `.coverage`, and `__pycache__` — ignored artifacts that would
+fail the READ_ONLY post-exit clean check just as surely. Those three roles
+therefore never get their own worktree `.venv`; they get a **parent-owned,
+per-run, external** validation root instead, bound into the child process
+through a closed `env=` map (`capture_usage_cli.py`, D166 §2.4) and never
+created, written to, or deleted by the capture tool itself.
+
+**Ownership and lifecycle.** The parent creates one fresh root per capture
+run — never shared between runs, which would leak state between tasks and
+break attribution — before launch, and removes it after the run. The root
+must live outside the attested worktree, so nothing it accumulates can ever
+reach the tree the attestation covers.
+
+**Recipe (executed by the parent, never by the worker):**
+
+```bash
+ROOT="$(mktemp -d)"; chmod 700 "$ROOT"
+mkdir -m 700 "$ROOT/cache" "$ROOT/tmp"
+python3.11 -m venv "$ROOT/venv"
+TMPDIR="$ROOT/tmp" PIP_CACHE_DIR="$ROOT/cache/pip" "$ROOT/venv/bin/python" -m pip install --upgrade pip
+cd <abs worktree> && TMPDIR="$ROOT/tmp" PIP_CACHE_DIR="$ROOT/cache/pip" "$ROOT/venv/bin/python" -m pip install -e . --group dev
+git -C <abs worktree> status --porcelain --ignored     # MUST be empty before launch
+```
+
+An **editable** install skips the SPA build hook (`pyproject.toml:222-223`),
+so no Node run and no `web/dist` write can touch the worktree, and pytest
+resolves the package from `pythonpath = ["src", "scripts",
+".agents/skills/capture-agent-usage/scripts"]` (`pyproject.toml:244`), so the
+external interpreter still exercises worktree source. **The post-provision
+clean check is mandatory:** if `git status --porcelain --ignored` is
+non-empty after provisioning, the parent re-provisions and never launches —
+the pre-launch attestation would fail closed anyway, so this is a fast local
+check, not a substitute for it.
+
+**pyright needs `--pythonpath` too**, for the same reason CI passes it
+(`.github/workflows/ci.yml:51-55`): with no worktree `.venv`, pyright has
+nothing for pyproject's `venvPath`/`venv` settings to resolve, so the role
+runs `"$ROASTPILOT_VALIDATION_PYTHON" -m pyright --pythonpath
+"$ROASTPILOT_VALIDATION_PYTHON"`.
+
+**Attestation is untouched.** `--validation-root` binds exactly
+`ROASTPILOT_VALIDATION_ROOT`, `ROASTPILOT_VALIDATION_PYTHON`,
+`ROASTPILOT_VALIDATION_TMP`, `TMPDIR`, `XDG_CACHE_HOME`,
+`PYTHONPYCACHEPREFIX`, `PYTHONDONTWRITEBYTECODE`, `RUFF_CACHE_DIR`,
+`COVERAGE_FILE`, `PIP_CACHE_DIR`, and `PYTEST_ADDOPTS` into the child process;
+it changes no origin, branch, head, or clean-tree check, and adds no
+allowlist or ignore-pattern anywhere. A role that dirties the attested
+worktree — tracked, untracked, or ignored — still fails closed with no record
+and no handback, exactly as before.
+
 ## Reviewers in a shared worktree (added 9 Jul 2026, after a live incident)
 
 During the 9 Jul batch a reviewer ran `git checkout -- <file>` in a teammate's
