@@ -249,10 +249,30 @@ def parse_owned_transcript(
     role: NativeClaudeRole,
     effort: str,
     *,
+    expected_permission_mode: str,
     started_at: datetime | None = None,
     completed_at: datetime | None = None,
 ) -> TranscriptUsage:
-    """Read one exact parent transcript without retaining content or host paths."""
+    """Read one exact parent transcript without retaining content or host paths.
+
+    Args:
+        cwd: The attested worktree whose Claude project directory is read.
+        session_id: The exact generated session identifier to bind.
+        role: The committed native role attested against ``agent-setting`` rows.
+        effort: The committed effort attested against every assistant row.
+        expected_permission_mode: The single frozen permission-mode value
+            (derived by the caller from the committed capability mapping) that
+            every row's optional ``permissionMode`` key must equal exactly.
+        started_at: Optional run-start bound for assistant-row chronology skew.
+        completed_at: Optional run-end bound for assistant-row chronology skew.
+
+    Returns:
+        The closed, verified numeric usage extracted from the transcript.
+
+    Raises:
+        TranscriptError: If any row, identity, chronology, usage, or
+            permission-mode invariant is violated.
+    """
     descriptor = _transcript_fd(cwd, session_id)
     seen: dict[tuple[str, str | None, str], tuple[int, int, int, int]] = {}
     model: str | None = None
@@ -280,7 +300,7 @@ def parse_owned_transcript(
                 ):
                     raise TranscriptError("owned Claude transcript is invalid")
                 if row["type"] == "mode":
-                    if set(row) != _MODE_ROW_KEYS or row.get("mode") != "default":
+                    if set(row) != _MODE_ROW_KEYS or row.get("mode") != "normal":
                         raise TranscriptError("owned Claude transcript is invalid")
                     continue
                 if row["type"] == "assistant":
@@ -313,6 +333,13 @@ def parse_owned_transcript(
                     ):
                         raise TranscriptError("owned Claude transcript is invalid")
                     continue
+                if "permissionMode" in row:
+                    row_permission_mode = row.get("permissionMode")
+                    if (
+                        not isinstance(row_permission_mode, str)
+                        or row_permission_mode != expected_permission_mode
+                    ):
+                        raise TranscriptError("owned Claude transcript permission mode is invalid")
                 if row["type"] != "assistant":
                     continue
                 message = row.get("message")

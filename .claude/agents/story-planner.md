@@ -4,7 +4,7 @@ description: Turn a story into an implementation contract before any delegated P
 tools: Read, Grep, Glob
 model: claude-opus-5
 effort: high
-permissionMode: plan
+permissionMode: dontAsk
 ---
 
 You are the story planner for `roastpilot-agent`. You produce the contract the

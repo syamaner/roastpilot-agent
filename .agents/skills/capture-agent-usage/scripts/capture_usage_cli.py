@@ -87,6 +87,16 @@ _PROTECTED_ATTRIBUTION_ROLES = frozenset({role.value for role in NativeClaudeRol
 protected value is a live :class:`NativeClaudeRole` member, so this set can
 never silently drop a role added to that enum.
 """
+NATIVE_PERMISSION_MODES: dict[RoleCapability, str] = {
+    RoleCapability.READ_ONLY: "dontAsk",
+    RoleCapability.WRITE: "auto",
+}
+"""The one frozen native permission-mode value per capability (D166, §2.2).
+
+No caller input may select or override either value; the native argv, the
+committed-frontmatter guard, and the transcript permission-mode attestation
+all index this same closed mapping.
+"""
 
 
 class CaptureUsageError(ValueError):
@@ -494,6 +504,16 @@ def _native_role_pin(role: NativeClaudeRole) -> _NativeRolePin:
     capability = (
         RoleCapability.WRITE if {"Edit", "Write"} & set(tools) else RoleCapability.READ_ONLY
     )
+    permission_mode_lines = [
+        line.removeprefix("permissionMode: ")
+        for line in frontmatter
+        if line.startswith("permissionMode: ")
+    ]
+    if len(permission_mode_lines) > 1 or (
+        permission_mode_lines
+        and permission_mode_lines[0] != NATIVE_PERMISSION_MODES[capability]
+    ):
+        raise CaptureUsageError("native agent frontmatter is invalid")
     return _NativeRolePin(values["model"][0], values["effort"][0], capability)
 
 
@@ -653,7 +673,7 @@ def _native_claude_argv(
         "--mcp-config",
         '{"mcpServers":{}}',
         "--permission-mode",
-        "auto" if capability is RoleCapability.WRITE else "plan",
+        NATIVE_PERMISSION_MODES[capability],
         "--effort",
         effort,
     ]
@@ -807,6 +827,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
                 session_id,
                 role,
                 pin.effort,
+                expected_permission_mode=NATIVE_PERMISSION_MODES[pin.capability],
                 started_at=started_at,
                 completed_at=completed_at,
             )

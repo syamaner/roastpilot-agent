@@ -18,7 +18,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO, NoReturn, cast
+from typing import Any, BinaryIO, NoReturn, cast
 from uuid import UUID
 
 import capture_usage_claude as usage_claude
@@ -94,7 +94,7 @@ def test_owned_transcript_counts_identical_assistant_usage_once(
     monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
 
     usage = usage_transcript.parse_owned_transcript(
-        tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high", expected_permission_mode="auto"
     )
 
     assert usage.usage_message_count == 1
@@ -143,7 +143,9 @@ def test_historical_2_1_231_transcript_fixtures_reject_current_version(
     content = (FIXTURES / "claude-2.1.231-transcript" / fixture).read_bytes()
     _, installed_session = _install_owned_transcript(tmp_path, monkeypatch, content, session_id)
     with pytest.raises(usage_transcript.TranscriptError) as error:
-        usage_transcript.parse_owned_transcript(tmp_path, installed_session, role, "high")
+        usage_transcript.parse_owned_transcript(
+            tmp_path, installed_session, role, "high", expected_permission_mode="auto"
+        )
     assert str(error.value) == "owned Claude transcript is invalid"
     assert "SYNTHETIC" not in str(error.value)
 
@@ -158,7 +160,7 @@ def test_owned_transcript_accepts_repeated_matching_agent_setting(
     transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, repeated)
 
     usage = usage_transcript.parse_owned_transcript(
-        tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+        tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high", expected_permission_mode="auto"
     )
 
     assert usage.usage_message_count == 1
@@ -203,7 +205,11 @@ def test_owned_transcript_rejects_closed_mutations(
     before = transcript.stat()
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.parse_owned_transcript(
-            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+            tmp_path,
+            session_id,
+            NativeClaudeRole.ENGINEER_BE,
+            "high",
+            expected_permission_mode="auto",
         )
     after = transcript.stat()
     assert (after.st_ino, after.st_mtime_ns, transcript.read_bytes()) == (
@@ -214,7 +220,7 @@ def test_owned_transcript_rejects_closed_mutations(
 
 
 @pytest.mark.parametrize(
-    ("fixture", "role", "effort", "model", "totals"),
+    ("fixture", "role", "effort", "model", "totals", "permission_mode", "message_count"),
     [
         (
             "parent.jsonl",
@@ -222,6 +228,8 @@ def test_owned_transcript_rejects_closed_mutations(
             "high",
             "claude-sonnet-5",
             (2, 0, 36_369, 9),
+            "auto",
+            1,
         ),
         (
             "engineer-fe.jsonl",
@@ -229,27 +237,44 @@ def test_owned_transcript_rejects_closed_mutations(
             "high",
             "claude-sonnet-5",
             (2, 6_289, 29_307, 9),
+            "auto",
+            1,
         ),
         (
             "story-planner.jsonl",
             NativeClaudeRole.STORY_PLANNER,
             "high",
             "claude-opus-5",
-            (12, 1_417_065, 288_420, 31_562),
+            (2, 6, 4, 8),
+            "dontAsk",
+            2,
         ),
         (
             "safety-reviewer.jsonl",
             NativeClaudeRole.SAFETY_REVIEWER,
             "xhigh",
             "claude-opus-5",
-            (2, 0, 31_282, 9),
+            (2, 6, 4, 8),
+            "dontAsk",
+            2,
         ),
         (
             "security-reviewer.jsonl",
             NativeClaudeRole.SECURITY_REVIEWER,
             "high",
             "claude-sonnet-5",
-            (3, 11, 7, 13),
+            (2, 6, 4, 8),
+            "dontAsk",
+            2,
+        ),
+        (
+            "qa.jsonl",
+            NativeClaudeRole.QA,
+            "high",
+            "claude-sonnet-5",
+            (2, 6, 4, 8),
+            "dontAsk",
+            2,
         ),
     ],
 )
@@ -259,6 +284,8 @@ def test_owned_transcript_parses_every_committed_2_1_233_role_fixture(
     effort: str,
     model: str,
     totals: tuple[int, int, int, int],
+    permission_mode: str,
+    message_count: int,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -266,9 +293,11 @@ def test_owned_transcript_parses_every_committed_2_1_233_role_fixture(
     content = (FIXTURES / "claude-2.1.233-transcript" / fixture).read_bytes()
     session_id = json.loads(content.splitlines()[0])["sessionId"]
     _, installed_session_id = _install_owned_transcript(tmp_path, monkeypatch, content, session_id)
-    usage = usage_transcript.parse_owned_transcript(tmp_path, installed_session_id, role, effort)
+    usage = usage_transcript.parse_owned_transcript(
+        tmp_path, installed_session_id, role, effort, expected_permission_mode=permission_mode
+    )
     assert usage.model == model
-    assert usage.usage_message_count == 1
+    assert usage.usage_message_count == message_count
     assert (
         usage.input_tokens,
         usage.cached_input_tokens,
@@ -332,7 +361,11 @@ def test_owned_transcript_mode_row_admits_exact_shape_only(
     _, session_id = _install_owned_transcript(tmp_path, monkeypatch, mutated, mode_row["sessionId"])
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.parse_owned_transcript(
-            tmp_path, session_id, NativeClaudeRole.STORY_PLANNER, "high"
+            tmp_path,
+            session_id,
+            NativeClaudeRole.STORY_PLANNER,
+            "high",
+            expected_permission_mode="dontAsk",
         )
 
 
@@ -384,7 +417,11 @@ def test_owned_transcript_ai_title_row_admits_exact_shape_only(
     )
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.parse_owned_transcript(
-            tmp_path, session_id, NativeClaudeRole.SECURITY_REVIEWER, "high"
+            tmp_path,
+            session_id,
+            NativeClaudeRole.SECURITY_REVIEWER,
+            "high",
+            expected_permission_mode="dontAsk",
         )
 
 
@@ -393,42 +430,50 @@ def test_native_transcript_binds_model_and_effort_to_the_pinned_role(
 ) -> None:
     """A transcript naming a wrong model family or a wrong effort fails closed."""
     planner_content = (FIXTURES / "claude-2.1.233-transcript" / "story-planner.jsonl").read_bytes()
+    planner_session_id = json.loads(planner_content.splitlines()[0])["sessionId"]
     planner_pin = usage_cli._native_role_pin(NativeClaudeRole.STORY_PLANNER)  # pyright: ignore[reportPrivateUsage]
     assert planner_pin.model == "claude-opus-5"
 
     fable_content = planner_content.replace(b'"model":"claude-opus-5"', b'"model":"claude-fable-5"')
     case = tmp_path / "planner"
     case.mkdir()
-    _, session_id = _install_owned_transcript(
-        case, monkeypatch, fable_content, "33333333-3333-4333-8333-333333333233"
-    )
+    _, session_id = _install_owned_transcript(case, monkeypatch, fable_content, planner_session_id)
     usage = usage_transcript.parse_owned_transcript(
-        case, session_id, NativeClaudeRole.STORY_PLANNER, planner_pin.effort
+        case,
+        session_id,
+        NativeClaudeRole.STORY_PLANNER,
+        planner_pin.effort,
+        expected_permission_mode="dontAsk",
     )
     assert usage.model == "claude-fable-5" != planner_pin.model
 
     safety_content = (FIXTURES / "claude-2.1.233-transcript" / "safety-reviewer.jsonl").read_bytes()
+    safety_session_id = json.loads(safety_content.splitlines()[0])["sessionId"]
     safety_pin = usage_cli._native_role_pin(NativeClaudeRole.SAFETY_REVIEWER)  # pyright: ignore[reportPrivateUsage]
     assert safety_pin.effort == "xhigh"
 
     downgraded = safety_content.replace(b'"effort":"xhigh"', b'"effort":"high"')
     case = tmp_path / "safety"
     case.mkdir()
-    _, session_id = _install_owned_transcript(
-        case, monkeypatch, downgraded, "44444444-4444-4444-8444-444444444233"
-    )
+    _, session_id = _install_owned_transcript(case, monkeypatch, downgraded, safety_session_id)
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.parse_owned_transcript(
-            case, session_id, NativeClaudeRole.SAFETY_REVIEWER, safety_pin.effort
+            case,
+            session_id,
+            NativeClaudeRole.SAFETY_REVIEWER,
+            safety_pin.effort,
+            expected_permission_mode="dontAsk",
         )
 
     case = tmp_path / "safety-matching"
     case.mkdir()
-    _, session_id = _install_owned_transcript(
-        case, monkeypatch, safety_content, "44444444-4444-4444-8444-444444444233"
-    )
+    _, session_id = _install_owned_transcript(case, monkeypatch, safety_content, safety_session_id)
     usage = usage_transcript.parse_owned_transcript(
-        case, session_id, NativeClaudeRole.SAFETY_REVIEWER, safety_pin.effort
+        case,
+        session_id,
+        NativeClaudeRole.SAFETY_REVIEWER,
+        safety_pin.effort,
+        expected_permission_mode="dontAsk",
     )
     assert usage.model == safety_pin.model == "claude-opus-5"
 
@@ -452,7 +497,11 @@ def test_owned_transcript_rejects_unsafe_exact_file_types(
         transcript.mkdir()
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.parse_owned_transcript(
-            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+            tmp_path,
+            session_id,
+            NativeClaudeRole.ENGINEER_BE,
+            "high",
+            expected_permission_mode="auto",
         )
 
 
@@ -466,7 +515,11 @@ def test_owned_transcript_rejects_subagents_and_lifecycle_skew(
     (session_tree / "subagents").mkdir(parents=True)
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.parse_owned_transcript(
-            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+            tmp_path,
+            session_id,
+            NativeClaudeRole.ENGINEER_BE,
+            "high",
+            expected_permission_mode="auto",
         )
     (session_tree / "subagents").rmdir()
     session_tree.rmdir()
@@ -478,6 +531,7 @@ def test_owned_transcript_rejects_subagents_and_lifecycle_skew(
             "high",
             started_at=datetime(2026, 8, 1, tzinfo=UTC),
             completed_at=datetime(2026, 8, 1, tzinfo=UTC),
+            expected_permission_mode="auto",
         )
 
 
@@ -679,7 +733,11 @@ def test_owned_transcript_rejects_jsonl_and_binding_boundaries(
     transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, mutator(content))
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.parse_owned_transcript(
-            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+            tmp_path,
+            session_id,
+            NativeClaudeRole.ENGINEER_BE,
+            "high",
+            expected_permission_mode="auto",
         )
     assert transcript.read_bytes() != b""
 
@@ -705,7 +763,11 @@ def test_owned_transcript_rejects_remaining_identity_and_usage_mutations(
         transcript, session_id = _install_owned_transcript(case, monkeypatch, variant)
         with pytest.raises(usage_transcript.TranscriptError):
             usage_transcript.parse_owned_transcript(
-                case, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+                case,
+                session_id,
+                NativeClaudeRole.ENGINEER_BE,
+                "high",
+                expected_permission_mode="auto",
             )
         assert transcript.read_bytes() == variant
         transcript.unlink()
@@ -727,7 +789,11 @@ def test_owned_transcript_rejects_assistant_root_agent_id_without_retaining_cont
     )
     with pytest.raises(usage_transcript.TranscriptError) as error:
         usage_transcript.parse_owned_transcript(
-            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+            tmp_path,
+            session_id,
+            NativeClaudeRole.ENGINEER_BE,
+            "high",
+            expected_permission_mode="auto",
         )
     assert str(error.value) == "owned Claude transcript is invalid"
     assert "SENTINEL_CHILD_ID" not in str(error.value)
@@ -759,7 +825,11 @@ def test_owned_transcript_errors_are_fixed_and_content_free(
         transcript.unlink()
     with pytest.raises(usage_transcript.TranscriptError) as error:
         usage_transcript.parse_owned_transcript(
-            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+            tmp_path,
+            session_id,
+            NativeClaudeRole.ENGINEER_BE,
+            "high",
+            expected_permission_mode="auto",
         )
     assert str(error.value) in {
         "owned Claude transcript is unavailable",
@@ -786,7 +856,11 @@ def test_owned_transcript_reader_never_mutates_its_exact_file(
     monkeypatch.setattr(shutil, "copyfile", deny_mutation)
     assert (
         usage_transcript.parse_owned_transcript(
-            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+            tmp_path,
+            session_id,
+            NativeClaudeRole.ENGINEER_BE,
+            "high",
+            expected_permission_mode="auto",
         ).usage_message_count
         == 1
     )
@@ -807,19 +881,31 @@ def test_owned_transcript_rejects_row_and_file_bounds(
     monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_ROWS", 1)
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.parse_owned_transcript(
-            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+            tmp_path,
+            session_id,
+            NativeClaudeRole.ENGINEER_BE,
+            "high",
+            expected_permission_mode="auto",
         )
     monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_ROWS", 500_000)
     monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_ROW_BYTES", 1)
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.parse_owned_transcript(
-            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+            tmp_path,
+            session_id,
+            NativeClaudeRole.ENGINEER_BE,
+            "high",
+            expected_permission_mode="auto",
         )
     monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_ROW_BYTES", 4 * 1024 * 1024)
     monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_BYTES", 1)
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.parse_owned_transcript(
-            tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
+            tmp_path,
+            session_id,
+            NativeClaudeRole.ENGINEER_BE,
+            "high",
+            expected_permission_mode="auto",
         )
     assert transcript.read_bytes() == content
 
@@ -847,7 +933,7 @@ def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
         "--mcp-config",
         '{"mcpServers":{}}',
         "--permission-mode",
-        "auto" if pin.capability is RoleCapability.WRITE else "plan",
+        "auto" if pin.capability is RoleCapability.WRITE else "dontAsk",
         "--effort",
         pin.effort,
     ]
@@ -5062,3 +5148,119 @@ def test_cli_fixed_error_mapping_severs_every_exception_chain(
     with pytest.raises(SystemExit, match=message) as error:
         main([])
     _assert_no_exception_chain_or_sentinel(error.value, "SENTINEL_MAIN_ERROR")
+
+
+# ---------------------------------------------------------------------------
+# D166 round-7 repair: native permission-mode freeze, the bounded READ_ONLY
+# handback channel, and the parent-provisioned external validation root.
+# ---------------------------------------------------------------------------
+
+
+def _story_planner_rows(
+    session_id: str, *, fixture: str = "story-planner.jsonl"
+) -> list[dict[str, Any]]:
+    """Load one committed READ_ONLY ``dontAsk`` fixture's rows bound to one session."""
+    content = (FIXTURES / "claude-2.1.233-transcript" / fixture).read_bytes()
+    rows: list[dict[str, Any]] = [json.loads(line) for line in content.splitlines()]
+    original = rows[0]["sessionId"]
+    for row in rows:
+        if row.get("sessionId") == original:
+            row["sessionId"] = session_id
+    return rows
+
+
+def _dump_rows(rows: list[dict[str, Any]]) -> bytes:
+    """Serialize rows back to one newline-terminated JSONL transcript."""
+    return b"\n".join(json.dumps(row).encode() for row in rows) + b"\n"
+
+
+@pytest.mark.parametrize("mutated_value", ["plan", "auto", 5, None])
+def test_transcript_permission_mode_attestation_rejects_mismatch(
+    mutated_value: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any row's ``permissionMode`` must equal the capability-derived expected value exactly."""
+    session_id = "72222222-2222-4222-8222-222222222222"
+    rows = _story_planner_rows(session_id)
+    for row in rows:
+        if row.get("type") == "user":
+            row["permissionMode"] = mutated_value
+    _, installed = _install_owned_transcript(tmp_path, monkeypatch, _dump_rows(rows), session_id)
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path,
+            installed,
+            NativeClaudeRole.STORY_PLANNER,
+            "high",
+            expected_permission_mode="dontAsk",
+        )
+
+
+def _frontmatter_with_permission_mode(
+    role_file: str, value: str | None, *, duplicate: bool = False
+) -> bytes:
+    """Return one role file's bytes with its ``permissionMode`` line replaced or injected."""
+    path = Path(".claude") / "agents" / role_file
+    text = path.read_bytes().decode()
+    lines = text.splitlines()
+    end = lines.index("---", 1)
+    frontmatter = [line for line in lines[1:end] if not line.startswith("permissionMode: ")]
+    if value is not None:
+        frontmatter.append(f"permissionMode: {value}")
+        if duplicate:
+            frontmatter.append(f"permissionMode: {value}")
+    new_lines = [lines[0], *frontmatter, "---", *lines[end + 1 :]]
+    return ("\n".join(new_lines) + "\n").encode()
+
+
+@pytest.mark.parametrize(
+    ("role_file", "role", "value", "duplicate"),
+    [
+        ("story-planner.md", NativeClaudeRole.STORY_PLANNER, "plan", False),
+        ("story-planner.md", NativeClaudeRole.STORY_PLANNER, "auto", False),
+        ("engineer-be.md", NativeClaudeRole.ENGINEER_BE, "dontAsk", False),
+        ("story-planner.md", NativeClaudeRole.STORY_PLANNER, "dontAsk", True),
+    ],
+    ids=["read-only-plan", "read-only-auto", "write-dontask", "duplicate-line"],
+)
+def test_native_role_frontmatter_permission_mode_rule_rejects(
+    role_file: str,
+    role: NativeClaudeRole,
+    value: str,
+    duplicate: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A frontmatter permissionMode mismatched to capability, or duplicated, fails closed."""
+    mutated = _frontmatter_with_permission_mode(role_file, value, duplicate=duplicate)
+
+    def mutated_input(_path: Path) -> bytes:
+        return mutated
+
+    monkeypatch.setattr(usage_cli, "_input_bytes", mutated_input)
+    with pytest.raises(CaptureUsageError, match="frontmatter is invalid"):
+        usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_permission_mode_frontmatter_key_is_exactly_the_two_planning_roles() -> None:
+    """Only the two Opus/high planning roles pin an explicit frontmatter ``permissionMode``."""
+    agents_dir = Path(__file__).resolve().parents[1] / ".claude" / "agents"
+    with_key: dict[str, str] = {}
+    for path in sorted(agents_dir.glob("*.md")):
+        lines = [
+            line for line in path.read_text().splitlines() if line.startswith("permissionMode: ")
+        ]
+        if lines:
+            assert len(lines) == 1
+            with_key[path.stem] = lines[0].removeprefix("permissionMode: ")
+    assert with_key == {"story-planner": "dontAsk", "planning-architect": "dontAsk"}
+
+
+def test_generic_run_argv_and_authority_still_pin_plan_mode() -> None:
+    """The generic ``run`` path stays on the unrelated, untouched ``plan`` boundary."""
+    generic = usage_cli._launch_argv(  # pyright: ignore[reportPrivateUsage]
+        HarnessFamily.CLAUDE, "claude", "model", "high"
+    )
+    assert "--tools" in generic and generic[generic.index("--tools") + 1] == ""
+    assert (
+        "--permission-mode" in generic and generic[generic.index("--permission-mode") + 1] == "plan"
+    )
+    assert frozenset({"plan"}) == usage_claude.CLAUDE_PERMISSION_MODES

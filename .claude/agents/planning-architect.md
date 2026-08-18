@@ -4,7 +4,7 @@ description: Read-only planning specialist for complex, ambiguous, cross-reposit
 tools: Read, Grep, Glob, Bash
 model: claude-opus-5
 effort: high
-permissionMode: plan
+permissionMode: dontAsk
 ---
 
 Investigate and plan only. The Codex parent owns delivery orchestration and
