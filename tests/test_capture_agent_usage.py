@@ -48,6 +48,7 @@ from capture_usage_models import (
     MAX_EVENT_BYTES,
     MAX_EVENT_COUNT,
     MAX_STREAM_BYTES,
+    NATIVE_ROLE_EXCLUSIONS,
     BoundedStreamError,
     CapacitySnapshotRecord,
     CapacitySource,
@@ -118,10 +119,12 @@ def test_owned_transcript_accepts_repeated_matching_agent_setting(
 
 
 def _install_owned_transcript(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    content: bytes,
+    session_id: str = "11111111-1111-4111-8111-111111111233",
 ) -> tuple[Path, str]:
     """Install a synthetic parent at its one accepted exact location."""
-    session_id = "11111111-1111-4111-8111-111111111233"
     home = tmp_path / "home"
     project = home / ".claude" / "projects" / usage_transcript._project_name(tmp_path)  # pyright: ignore[reportPrivateUsage]
     project.mkdir(parents=True)
@@ -160,6 +163,161 @@ def test_owned_transcript_rejects_closed_mutations(
         before.st_mtime_ns,
         mutated,
     )
+
+
+@pytest.mark.parametrize(
+    ("fixture", "role", "effort", "model", "totals"),
+    [
+        (
+            "parent.jsonl",
+            NativeClaudeRole.ENGINEER_BE,
+            "high",
+            "claude-sonnet-5",
+            (2, 0, 36_369, 9),
+        ),
+        (
+            "engineer-fe.jsonl",
+            NativeClaudeRole.ENGINEER_FE,
+            "high",
+            "claude-sonnet-5",
+            (2, 6_289, 29_307, 9),
+        ),
+        (
+            "story-planner.jsonl",
+            NativeClaudeRole.STORY_PLANNER,
+            "high",
+            "claude-opus-5",
+            (12, 1_417_065, 288_420, 31_562),
+        ),
+        (
+            "safety-reviewer.jsonl",
+            NativeClaudeRole.SAFETY_REVIEWER,
+            "xhigh",
+            "claude-opus-5",
+            (2, 0, 31_282, 9),
+        ),
+    ],
+)
+def test_owned_transcript_parses_every_committed_2_1_233_role_fixture(
+    fixture: str,
+    role: NativeClaudeRole,
+    effort: str,
+    model: str,
+    totals: tuple[int, int, int, int],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every committed 2.1.233 transcript fixture parses to its exact role and totals."""
+    content = (FIXTURES / "claude-2.1.233-transcript" / fixture).read_bytes()
+    session_id = json.loads(content.splitlines()[0])["sessionId"]
+    _, installed_session_id = _install_owned_transcript(tmp_path, monkeypatch, content, session_id)
+    usage = usage_transcript.parse_owned_transcript(tmp_path, installed_session_id, role, effort)
+    assert usage.model == model
+    assert usage.usage_message_count == 1
+    assert (
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.cache_creation_input_tokens,
+        usage.output_tokens,
+    ) == totals
+
+
+def _mode_row_add_extra_key(row: dict[str, object]) -> dict[str, object]:
+    """Add an unobserved key to the closed metadata-only ``mode`` row shape."""
+    return {**row, "extra": "SENTINEL"}
+
+
+def _mode_row_drop_mode_key(row: dict[str, object]) -> dict[str, object]:
+    """Drop the required ``mode`` key from the row."""
+    return {key: value for key, value in row.items() if key != "mode"}
+
+
+def _mode_row_use_integer_mode(row: dict[str, object]) -> dict[str, object]:
+    """Replace the required string ``mode`` value with a non-string value."""
+    return {**row, "mode": 1}
+
+
+def _mode_row_use_null_mode(row: dict[str, object]) -> dict[str, object]:
+    """Replace the required string ``mode`` value with ``null``."""
+    return {**row, "mode": None}
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        _mode_row_add_extra_key,
+        _mode_row_drop_mode_key,
+        _mode_row_use_integer_mode,
+        _mode_row_use_null_mode,
+    ],
+)
+def test_owned_transcript_mode_row_admits_exact_shape_only(
+    mutator: Callable[[dict[str, object]], dict[str, object]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The observed metadata-only ``mode`` row admits only its exact key/value shape."""
+    content = (FIXTURES / "claude-2.1.233-transcript" / "story-planner.jsonl").read_bytes()
+    lines = content.splitlines()
+    mode_index = next(
+        index for index, line in enumerate(lines) if json.loads(line)["type"] == "mode"
+    )
+    mode_row = json.loads(lines[mode_index])
+    assert set(mode_row) == {"type", "mode", "sessionId"}
+    assert isinstance(mode_row["mode"], str)
+
+    lines[mode_index] = json.dumps(mutator(mode_row)).encode()
+    mutated = b"\n".join(lines) + b"\n"
+    _, session_id = _install_owned_transcript(tmp_path, monkeypatch, mutated, mode_row["sessionId"])
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path, session_id, NativeClaudeRole.STORY_PLANNER, "high"
+        )
+
+
+def test_native_transcript_binds_model_and_effort_to_the_pinned_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transcript naming a wrong model family or a wrong effort fails closed."""
+    planner_content = (FIXTURES / "claude-2.1.233-transcript" / "story-planner.jsonl").read_bytes()
+    planner_pin = usage_cli._native_role_pin(NativeClaudeRole.STORY_PLANNER)  # pyright: ignore[reportPrivateUsage]
+    assert planner_pin.model == "claude-opus-5"
+
+    fable_content = planner_content.replace(b'"model":"claude-opus-5"', b'"model":"claude-fable-5"')
+    case = tmp_path / "planner"
+    case.mkdir()
+    _, session_id = _install_owned_transcript(
+        case, monkeypatch, fable_content, "33333333-3333-4333-8333-333333333233"
+    )
+    usage = usage_transcript.parse_owned_transcript(
+        case, session_id, NativeClaudeRole.STORY_PLANNER, planner_pin.effort
+    )
+    assert usage.model == "claude-fable-5" != planner_pin.model
+
+    safety_content = (FIXTURES / "claude-2.1.233-transcript" / "safety-reviewer.jsonl").read_bytes()
+    safety_pin = usage_cli._native_role_pin(NativeClaudeRole.SAFETY_REVIEWER)  # pyright: ignore[reportPrivateUsage]
+    assert safety_pin.effort == "xhigh"
+
+    downgraded = safety_content.replace(b'"effort":"xhigh"', b'"effort":"high"')
+    case = tmp_path / "safety"
+    case.mkdir()
+    _, session_id = _install_owned_transcript(
+        case, monkeypatch, downgraded, "44444444-4444-4444-8444-444444444233"
+    )
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            case, session_id, NativeClaudeRole.SAFETY_REVIEWER, safety_pin.effort
+        )
+
+    case = tmp_path / "safety-matching"
+    case.mkdir()
+    _, session_id = _install_owned_transcript(
+        case, monkeypatch, safety_content, "44444444-4444-4444-8444-444444444233"
+    )
+    usage = usage_transcript.parse_owned_transcript(
+        case, session_id, NativeClaudeRole.SAFETY_REVIEWER, safety_pin.effort
+    )
+    assert usage.model == safety_pin.model == "claude-opus-5"
 
 
 @pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo", "directory"])
@@ -385,6 +543,7 @@ def _transcript_mutators() -> tuple[Callable[[bytes], bytes], ...]:
         lambda value: value[:-1],
         lambda value: value.replace(b"\n", b"", 1),
         lambda value: value.replace(b'"type":"agent-setting"', b'"type":"unknown"', 1),
+        lambda value: value.replace(b'"type":"queue-operation"', b'"type":"ai-title"', 1),
         lambda value: value.replace(b'"sessionId":', b'"sessionId":"wrong", "sessionId":', 1),
         lambda value: value.replace(
             b'"sessionId":"11111111-1111-4111-8111-111111111233"', b'"sessionId":"wrong"', 1
@@ -627,6 +786,23 @@ def test_native_role_roster_pins_and_capabilities_match_committed_frontmatter() 
     for role in NativeClaudeRole:
         pin = usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
         assert (pin.model, pin.effort, pin.capability) == expected[role.value]
+
+
+def test_native_role_values_union_exclusions_equal_committed_agent_stems() -> None:
+    """Every committed `.claude/agents/*.md` role is either native-capable or excluded."""
+    agents_dir = Path(__file__).resolve().parents[1] / ".claude" / "agents"
+    stems = {path.stem for path in agents_dir.glob("*.md")}
+    native_values = {role.value for role in NativeClaudeRole}
+    assert native_values.isdisjoint(NATIVE_ROLE_EXCLUSIONS)
+    assert native_values | set(NATIVE_ROLE_EXCLUSIONS) == stems
+    assert NATIVE_ROLE_EXCLUSIONS == {
+        "ui-reviewer": (
+            "its Playwright MCP conflicts with the empty-MCP, empty-tools native"
+            " capture launch boundary"
+        )
+    }
+    for reason in NATIVE_ROLE_EXCLUSIONS.values():
+        assert isinstance(reason, str) and reason.strip()
 
 
 @pytest.mark.parametrize(
@@ -1067,8 +1243,6 @@ def test_native_precheck_rejects_ignored_bytecode_before_provider_lookup(
             return 0, "4c1ac63"
         if argv == ["rev-parse", "--verify", "4c1ac63^{commit}"]:
             return 0, "4c1ac63"
-        if argv == ["merge-base", "HEAD", "origin/main"]:
-            return 0, "4c1ac63"
         if argv == ["status", "--porcelain", "--ignored"]:
             return 0, "!! .claude/__pycache__/worker.pyc"
         raise AssertionError(argv)
@@ -1092,11 +1266,59 @@ def test_native_precheck_rejects_ignored_bytecode_before_provider_lookup(
         main(_native_cli_args())
 
 
-@pytest.mark.parametrize("failure", ["dirty", "missing-commit", "wrong-base"])
-def test_native_post_exit_attestation_rejects_each_final_provenance_break(
-    failure: str, monkeypatch: pytest.MonkeyPatch
+def test_native_worktree_attestation_binds_exact_launch_head_not_origin_main(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Final cleanliness, committed advance and exact merge base independently gate append."""
+    """A feature HEAD serialized ahead of `origin/main`'s merge base still attests.
+
+    Native worktree attestation binds the supplied base to the exact launch
+    ``HEAD``, never to ``merge-base(HEAD, origin/main)``: a worktree serialized
+    behind an advancing default branch would fail an ``origin/main``-equality
+    check even though its exact base is still correctly attested. The fake Git
+    double below raises if that call is ever made, so a mutation reintroducing
+    the merge-base equality requirement fails this test.
+    """
+    arguments = argparse.Namespace(
+        repository="syamaner/roastpilot-agent",
+        branch="feature/816-native-transcript-usage-1",
+        base_sha="7d60f41",
+    )
+
+    def fake_git(argv: list[str]) -> tuple[int, str]:
+        if argv == ["remote", "get-url", "origin"]:
+            return 0, "https://github.com/syamaner/roastpilot-agent.git"
+        if argv == ["branch", "--show-current"]:
+            return 0, arguments.branch
+        if argv == ["rev-parse", "HEAD"]:
+            return 0, "7d60f41"
+        if argv == ["rev-parse", "--verify", "7d60f41^{commit}"]:
+            return 0, "7d60f41"
+        if argv in (["status", "--porcelain", "--ignored"], ["status", "--porcelain"]):
+            return 0, ""
+        if argv == ["merge-base", "HEAD", "origin/main"]:
+            raise AssertionError(
+                "native worktree attestation must not query the origin/main merge base"
+            )
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(usage_cli, "_git_output", fake_git)
+
+    pre_exit_head = usage_cli._validate_native_worktree(  # pyright: ignore[reportPrivateUsage]
+        arguments, RoleCapability.READ_ONLY, post_exit=False
+    )
+    assert pre_exit_head == "7d60f41"
+    assert arguments.base_sha == "7d60f41"
+
+    post_exit_head = usage_cli._validate_native_worktree(  # pyright: ignore[reportPrivateUsage]
+        arguments, RoleCapability.READ_ONLY, post_exit=True
+    )
+    assert post_exit_head == "7d60f41"
+
+
+def test_native_pre_exit_attestation_rejects_base_head_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-exit attestation requires the supplied base to equal the exact launch HEAD."""
     arguments = argparse.Namespace(
         repository="syamaner/roastpilot-agent",
         branch="feature/816-native-transcript-usage-1",
@@ -1109,11 +1331,40 @@ def test_native_post_exit_attestation_rejects_each_final_provenance_break(
         if argv == ["branch", "--show-current"]:
             return 0, arguments.branch
         if argv == ["rev-parse", "HEAD"]:
-            return 0, "4c1ac63" if failure == "missing-commit" else "7d60f41"
+            return 0, "7d60f41"
         if argv == ["rev-parse", "--verify", "4c1ac63^{commit}"]:
             return 0, "4c1ac63"
-        if argv == ["merge-base", "HEAD", "origin/main"]:
-            return 0, "wrong-base" if failure == "wrong-base" else "4c1ac63"
+        if argv == ["status", "--porcelain", "--ignored"]:
+            return 0, ""
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(usage_cli, "_git_output", fake_git)
+    with pytest.raises(CaptureUsageError, match="native worktree attestation failed"):
+        usage_cli._validate_native_worktree(  # pyright: ignore[reportPrivateUsage]
+            arguments, RoleCapability.READ_ONLY, post_exit=False
+        )
+
+
+@pytest.mark.parametrize("failure", ["dirty", "missing-commit", "invalid-base", "wrong-branch"])
+def test_native_post_exit_attestation_rejects_each_final_provenance_break(
+    failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final cleanliness, committed advance, a valid base and exact branch independently gate."""
+    arguments = argparse.Namespace(
+        repository="syamaner/roastpilot-agent",
+        branch="feature/816-native-transcript-usage-1",
+        base_sha="4c1ac63",
+    )
+
+    def fake_git(argv: list[str]) -> tuple[int, str]:
+        if argv == ["remote", "get-url", "origin"]:
+            return 0, "https://github.com/syamaner/roastpilot-agent.git"
+        if argv == ["branch", "--show-current"]:
+            return 0, "wrong-branch" if failure == "wrong-branch" else arguments.branch
+        if argv == ["rev-parse", "HEAD"]:
+            return 0, "4c1ac63" if failure == "missing-commit" else "7d60f41"
+        if argv == ["rev-parse", "--verify", "4c1ac63^{commit}"]:
+            return (1, "") if failure == "invalid-base" else (0, "4c1ac63")
         if argv == ["status", "--porcelain"]:
             return 0, " M ignored" if failure == "dirty" else ""
         if argv[:2] == ["merge-base", "--is-ancestor"]:
@@ -1156,8 +1407,6 @@ def test_native_post_exit_capability_binds_final_head(
         if argv == ["rev-parse", "HEAD"]:
             return 0, head
         if argv == ["rev-parse", "--verify", "4c1ac63^{commit}"]:
-            return 0, "4c1ac63"
-        if argv == ["merge-base", "HEAD", "origin/main"]:
             return 0, "4c1ac63"
         if argv == ["status", "--porcelain"]:
             return 0, ""
@@ -1391,11 +1640,16 @@ def test_codex_fixture_extracts_terminal_usage_without_content() -> None:
 def test_claude_fixture_uses_whole_tree_terminal_model_usage() -> None:
     """Only per-model whole-tree totals survive conflicting messages and top-level usage."""
     historical = [
-        json.loads(line) for line in (FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()
+        event
+        for event in (
+            json.loads(line)
+            for line in (FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()
+        )
+        if event.get("type") != "user"
     ]
-    next(event for event in historical if event.get("subtype") == "init")["claude_code_version"] = (
-        "2.1.233"
-    )
+    init_event = next(event for event in historical if event.get("subtype") == "init")
+    init_event["claude_code_version"] = "2.1.233"
+    init_event["permissionMode"] = "plan"
     usage = parse_claude_stream(
         _stream("\n".join(json.dumps(event) for event in historical) + "\n"),
         require_launch_authority=False,
@@ -1438,10 +1692,7 @@ def test_claude_2_1_233_fixture_matches_frozen_grammar_without_content() -> None
         usage = parse_claude_stream(stream, require_launch_authority=True)
 
     assert {event["type"] for event in events} <= CLAUDE_EVENT_TYPES
-    assert (
-        frozenset({"system", "user", "assistant", "rate_limit_event", "result"})
-        == CLAUDE_EVENT_TYPES
-    )
+    assert frozenset({"system", "assistant", "rate_limit_event", "result"}) == CLAUDE_EVENT_TYPES
     assert {
         event["subtype"] for event in events if event["type"] == "system"
     } <= CLAUDE_SYSTEM_SUBTYPES
@@ -1465,6 +1716,39 @@ def test_claude_2_1_233_fixture_matches_frozen_grammar_without_content() -> None
     with pytest.raises(ClaudeUsageParseError) as exc_info:
         parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
     assert "SANITIZED_MESSAGE" not in str(exc_info.value)
+
+
+def test_claude_retired_stream_event_type_fails_closed() -> None:
+    """``user`` is retired: no supplied 2.1.233 fixture observes it as a stream event."""
+    with pytest.raises(ClaudeUsageParseError, match="unknown Claude event type"):
+        parse_claude_stream(_stream('{"type":"user"}\n'), require_launch_authority=False)
+
+
+def test_claude_retired_default_permission_mode_fails_closed() -> None:
+    """``default`` is retired: every supplied 2.1.233 init observes ``plan`` only."""
+    init = json.loads((FIXTURES / "claude-2.1.233.jsonl").read_text().splitlines()[0])
+    init["permissionMode"] = "default"
+    for strict in (False, True):
+        with pytest.raises(ClaudeAuthorityError, match="init authority is malformed"):
+            parse_claude_stream(_stream(json.dumps(init) + "\n"), require_launch_authority=strict)
+
+
+@pytest.mark.parametrize(
+    "subtype",
+    [
+        "error_max_turns",
+        "error_max_budget_usd",
+        "error_max_structured_output_retries",
+        "error_during_execution",
+    ],
+)
+def test_claude_retired_failure_subtypes_fail_closed(subtype: str) -> None:
+    """No admitted failure result subtype: none is proven by a supplied 2.1.233 fixture."""
+    terminal = json.loads((FIXTURES / "claude-2.1.233.jsonl").read_text().splitlines()[-1])
+    terminal["subtype"] = subtype
+    terminal["is_error"] = True
+    with pytest.raises(ClaudeUsageParseError, match="status is invalid"):
+        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
 
 
 def test_claude_launch_authority_attestation_fails_closed() -> None:
@@ -2286,17 +2570,13 @@ def test_claude_terminal_requires_observed_success_status(field: str, value: obj
         "error_during_execution",
     ],
 )
-def test_claude_observed_failure_statuses_retain_terminal_usage(subtype: str) -> None:
-    """Observed failure statuses still provide whole-tree terminal totals for failed runs."""
+def test_claude_2_1_228_failure_statuses_are_retired_rejection_evidence(subtype: str) -> None:
+    """The 2.1.228 failure subtypes are retired: no 2.1.233 fixture proves one is admitted."""
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     terminal["subtype"] = subtype
     terminal["is_error"] = True
-    assert (
-        parse_claude_stream(
-            _stream(json.dumps(terminal) + "\n"), require_launch_authority=False
-        ).input_tokens
-        == 16
-    )
+    with pytest.raises(ClaudeUsageParseError, match="status is invalid"):
+        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
 
 
 def test_claude_malformed_top_level_usage_and_non_finite_model_sum_fail_closed() -> None:
@@ -3255,19 +3535,16 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
     assert parsed["input_tokens"] == 1
 
     (tmp_path / ".agent-usage/usage.jsonl").unlink()
-    claude_terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     claude_init = (FIXTURES / "claude-2.1.233.jsonl").read_text().splitlines()[0]
+    claude_terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     claude_terminal["subtype"] = "error_max_turns"
     claude_terminal["is_error"] = True
-    result, record = run_for(
+    result, error = run_for(
         (claude_init + "\n" + json.dumps(claude_terminal) + "\n").encode(), 3, "claude"
     )
-    assert result == 0
-    parsed = json.loads(record)
-    assert not parsed["success"] and parsed["usage_complete"]
-    assert parsed["input_tokens"] == 16
+    assert result is None and "stream is invalid" in error
+    assert not (tmp_path / ".agent-usage/usage.jsonl").exists()
 
-    (tmp_path / ".agent-usage/usage.jsonl").unlink()
     success_terminal = json.loads((FIXTURES / "claude-2.1.233.jsonl").read_text().splitlines()[-1])
     result, record = run_for(
         (claude_init + "\n" + json.dumps(success_terminal) + "\n").encode(), 0, "claude"
@@ -3330,7 +3607,7 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
     result, error = run_for(
         (claude_init + "\n" + json.dumps(failure_terminal) + "\n").encode(), 0, "claude"
     )
-    assert result is None and "terminal status disagrees" in error
+    assert result is None and "stream is invalid" in error
     assert not (tmp_path / ".agent-usage/usage.jsonl").exists()
 
     result, record = run_for(b'{"type":"turn.started"}\n', 3)
@@ -4310,8 +4587,7 @@ def test_run_rejects_unsupported_effort_before_executable_lookup(
 @pytest.mark.parametrize(
     "role",
     [
-        "engineer-be",
-        "engineer-fe",
+        *(role.value for role in NativeClaudeRole),
         "repair",
         "Engineer-BE",
         "REPAIR",
@@ -4321,6 +4597,14 @@ def test_run_rejects_unsupported_effort_before_executable_lookup(
         "engineer--be",
         "repair-",
         "ENGINEER:_BE",
+        "Safety-Reviewer",
+        "SAFETY_REVIEWER",
+        "story_planner",
+        "Story:Planner",
+        "mcp.contract.checker",
+        "MCP-CONTRACT-CHECKER",
+        "Sim-Roast-Runner",
+        "PR_TRIAGE",
     ],
 )
 def test_run_rejects_protected_implementation_roles_before_lookup(
@@ -4363,7 +4647,18 @@ def test_run_rejects_protected_implementation_roles_before_lookup(
     assert not (tmp_path / ".agent-usage").exists()
 
 
-@pytest.mark.parametrize("role", ["measurement-pilot", "repair-audit", "engineer-be-audit"])
+@pytest.mark.parametrize(
+    "role",
+    [
+        "measurement-pilot",
+        "repair-audit",
+        "engineer-be-audit",
+        "qa-adjacent",
+        "story-planner-lite",
+        "safety-reviewer-summary",
+        "audit-mcp-contract-checker",
+    ],
+)
 def test_run_allows_neutral_or_near_miss_attribution_roles(role: str) -> None:
     """Only normalized exact protected role names are denied."""
     assert (

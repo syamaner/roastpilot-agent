@@ -209,9 +209,9 @@ without one is forbidden (fail-closed).
    attribution — with the handback disclosure asked in those same terms
    ("apart from the ratified contract and the lead's directives, did you obtain
    input from any model in any way?"). The discriminator is WHO PROCURED IT,
-   not which family produced it: you are a Fable model and this contract is
-   mandatory, so a family-scoped rule would fail closed on every compliant
-   delegation, including this one. **Carry it as the invariant; do NOT
+   not which family produced it: this rule binds this contract regardless of
+   which model family reads it, so a family-scoped rule would fail closed on
+   every compliant delegation, including this one. **Carry it as the invariant; do NOT
    render it in the contract as a list of prohibited activities.** Four review
    rounds each defeated an enumerated form by finding a structurally DIFFERENT
    route rather than another instance, which is the D154 signal to change the

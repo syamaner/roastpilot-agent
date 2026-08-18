@@ -20,14 +20,21 @@ TIMESTAMP_SKEW_SECONDS = 120
 _ALLOWED_TYPES = frozenset(
     {
         "agent-setting",
-        "ai-title",
         "assistant",
         "attachment",
         "last-prompt",
+        "mode",
         "queue-operation",
         "user",
     }
 )
+"""Row types observed across the four committed 2.1.233 transcript fixtures.
+
+``ai-title`` is not a member: it appears only in the rejected 2.1.231 evidence,
+never in a committed 2.1.233 fixture.
+"""
+_MODE_ROW_KEYS = frozenset({"type", "mode", "sessionId"})
+"""Exact observed keys of the metadata-only ``mode`` row (story-planner.jsonl)."""
 _USAGE_REQUIRED = frozenset(
     {"input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"}
 )
@@ -270,6 +277,10 @@ def parse_owned_transcript(
                     or row.get("sessionId") != session_id
                 ):
                     raise TranscriptError("owned Claude transcript is invalid")
+                if row["type"] == "mode":
+                    if set(row) != _MODE_ROW_KEYS or not isinstance(row["mode"], str):
+                        raise TranscriptError("owned Claude transcript is invalid")
+                    continue
                 if row["type"] == "assistant":
                     timestamp = _timestamp(row.get("timestamp"))
                     if last_timestamp is not None and timestamp < last_timestamp:

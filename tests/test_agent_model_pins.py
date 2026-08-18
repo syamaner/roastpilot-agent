@@ -103,6 +103,58 @@ def test_no_agent_uses_a_floating_alias(path: Path) -> None:
     assert model.startswith("claude-"), f"{path.stem}: model {model!r} is not a full ID"
 
 
+_MODEL_FAMILIES = frozenset({"opus", "sonnet", "fable", "haiku"})
+_SELF_IDENTIFICATION = re.compile(
+    r"you are an? (?:claude )?(opus|sonnet|fable|haiku) model", re.IGNORECASE
+)
+
+
+def _model_family(model: str) -> str:
+    """Return the family segment of a full ``claude-<family>-<version>`` pin."""
+    parts = model.split("-")
+    assert len(parts) == 3 and parts[0] == "claude" and parts[1] in _MODEL_FAMILIES, (
+        f"model {model!r} is not a recognized full pinned id"
+    )
+    return parts[1]
+
+
+def _self_identified_families(body: str) -> set[str]:
+    """Return every model family a role body claims to itself be, lowercased."""
+    return {match.group(1).lower() for match in _SELF_IDENTIFICATION.finditer(body)}
+
+
+def _body(path: Path) -> str:
+    """Return the agent file's prose body, after its YAML frontmatter block."""
+    text = path.read_text()
+    match = re.match(r"^---\n.*?\n---\n", text, re.S)
+    assert match, f"{path.name}: no YAML frontmatter"
+    return text[match.end() :]
+
+
+@pytest.mark.parametrize("path", _agent_files(), ids=lambda p: p.stem)
+def test_agent_body_never_self_identifies_as_an_inconsistent_model_family(path: Path) -> None:
+    """A role body must never claim a model family other than its own frontmatter pin.
+
+    The retired ``story-planner.md`` construction ("you are a Fable model") is
+    the motivating case: its frontmatter pins ``claude-opus-5``, so a body claim
+    of any OTHER family — including that exact retired sentence — must fail.
+    """
+    fm = _frontmatter(path)
+    pinned_family = _model_family(fm["model"])
+    claimed = _self_identified_families(_body(path))
+    assert claimed <= {pinned_family}, (
+        f"{path.stem}: body self-identifies as {sorted(claimed - {pinned_family})}, "
+        f"inconsistent with its frontmatter pin family {pinned_family!r}"
+    )
+
+
+def test_self_identification_guard_detects_the_retired_fable_construction() -> None:
+    """The guard helper itself must flag the exact retired construction if reintroduced."""
+    sentence = "you are a Fable model and this contract is mandatory"
+    assert _self_identified_families(sentence) == {"fable"}
+    assert not ({"fable"} <= {_model_family("claude-opus-5")})
+
+
 _CANONICAL_PLANNING_SENTENCE = (
     "- Planning: high-effort `claude-opus-5` roles `planning-architect` for complex,\n"
     "  ambiguous, cross-repository, or safety-boundary design and `story-planner`\n"

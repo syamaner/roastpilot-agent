@@ -95,6 +95,20 @@ class NativeClaudeRole(Enum):
     STORY_PLANNER = "story-planner"
 
 
+NATIVE_ROLE_EXCLUSIONS: dict[str, str] = {
+    "ui-reviewer": (
+        "its Playwright MCP conflicts with the empty-MCP, empty-tools native"
+        " capture launch boundary"
+    ),
+}
+"""Committed `.claude/agents/*.md` roles deliberately excluded from native capture.
+
+Every excluded role is documented with its exact reason rather than silently
+absent; :data:`NativeClaudeRole` values union this mapping's keys must equal the
+committed agent file stems exactly (tests/test_capture_agent_usage.py).
+"""
+
+
 class RoleCapability(Enum):
     """Closed capability inferred from committed native-role tools."""
 

@@ -80,6 +80,13 @@ _VERIFIED_HARNESS_VERSIONS = {
 }
 _GIT_TIMEOUT_SECONDS = 5
 _GIT_OUTPUT_LIMIT = 4096
+_PROTECTED_ATTRIBUTION_ROLES = frozenset({role.value for role in NativeClaudeRole}) | {"repair"}
+"""Every registered native-capable role plus `repair`, closed over D163 registration.
+
+`repair` has no `.claude/agents/*.md` file (it is Codex-only); every other
+protected value is a live :class:`NativeClaudeRole` member, so this set can
+never silently drop a role added to that enum.
+"""
 
 
 class CaptureUsageError(ValueError):
@@ -493,7 +500,15 @@ def _native_role_pin(role: NativeClaudeRole) -> _NativeRolePin:
 def _validate_native_worktree(
     arguments: argparse.Namespace, capability: RoleCapability, *, post_exit: bool
 ) -> str:
-    """Attest the native worker's exact repository, branch, and commit provenance."""
+    """Attest the native worker's exact repository, branch, and commit provenance.
+
+    The pre-exit call binds the supplied ``base_sha`` to the exact launch ``HEAD``
+    (never an ``origin/main`` merge-base, which a worktree serialized behind an
+    advancing default branch would fail to equal even though its exact base is
+    still attested). The post-exit call re-attests the same repository, branch,
+    and clean-tree invariants, then enforces the read-only unchanged-head or
+    write descendant-head invariant against that same attested base.
+    """
     origin_status, origin = _git_output(["remote", "get-url", "origin"])
     if (
         origin_status != 0
@@ -508,17 +523,14 @@ def _validate_native_worktree(
     branch_status, branch = _git_output(["branch", "--show-current"])
     head_status, head = _git_output(["rev-parse", "HEAD"])
     base_status, base = _git_output(["rev-parse", "--verify", f"{arguments.base_sha}^{{commit}}"])
-    merge_status, merge_base = _git_output(["merge-base", "HEAD", "origin/main"])
     status_args = ["status", "--porcelain"] if post_exit else ["status", "--porcelain", "--ignored"]
     clean_status, dirty = _git_output(status_args)
     if (
         branch_status != 0
         or head_status != 0
         or base_status != 0
-        or merge_status != 0
         or clean_status != 0
         or branch != arguments.branch
-        or merge_base != base
         or dirty
     ):
         raise CaptureUsageError("native worktree attestation failed")
@@ -999,7 +1011,7 @@ def run_command(arguments: argparse.Namespace) -> int:
 def _validate_run_metadata(arguments: argparse.Namespace) -> None:
     """Validate every caller-supplied record field before external launch."""
     normalized_role = re.sub(r"[._:-]+", "-", arguments.role.casefold()).rstrip("-")
-    if normalized_role in {"engineer-be", "engineer-fe", "repair"}:
+    if normalized_role in _PROTECTED_ATTRIBUTION_ROLES:
         raise CaptureUsageError("measurement capture role is not permitted")
     if arguments.effort is not None and arguments.effort not in _SUPPORTED_EFFORTS:
         raise CaptureUsageError("effort is not supported by the selected harness")
