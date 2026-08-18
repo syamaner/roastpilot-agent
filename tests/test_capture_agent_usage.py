@@ -25,6 +25,7 @@ from uuid import UUID
 import capture_usage_claude as usage_claude
 import capture_usage_cli as usage_cli
 import capture_usage_codex as usage_codex
+import capture_usage_models as usage_models
 import capture_usage_transcript as usage_transcript
 import pytest
 from capture_usage_claude import (
@@ -50,6 +51,7 @@ from capture_usage_models import (
     MAX_EVENT_COUNT,
     MAX_STREAM_BYTES,
     NATIVE_ROLE_EXCLUSIONS,
+    VALIDATION_ROLE_COMMANDS,
     BoundedStreamError,
     CapacitySnapshotRecord,
     CapacitySource,
@@ -62,7 +64,10 @@ from capture_usage_models import (
     RoleCapability,
     TaskUsageRecord,
     UsageRecord,
+    ValidationCommandKind,
     bounded_jsonl_lines,
+    render_allowed_tools,
+    render_validation_commands,
 )
 from capture_usage_models import (
     USAGE_RECORD_ADAPTER as _USAGE_RECORD_ADAPTER,  # pyright: ignore[reportUnknownVariableType]
@@ -104,6 +109,74 @@ def test_owned_transcript_counts_identical_assistant_usage_once(
     assert usage.cache_creation_input_tokens == 36_369
     assert usage.output_tokens == 9
     assert transcript.read_bytes() == duplicated
+
+
+def test_owned_transcript_tolerates_non_terminal_tool_activity_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T13: a tool_use/tool_result pair around a non-terminal row parses cleanly.
+
+    A byte-mutated committed fixture plants ``SENTINEL_TOOL_ACTIVITY`` in a
+    non-terminal assistant row's ``tool_use`` block and in an inserted
+    tool-result ``user`` row (an already-admitted row type). Parsing must
+    succeed, produce the expected usage totals, and the handback must be
+    drawn only from the terminal (file-order-last) assistant row's ``text``
+    blocks — the sentinel must appear nowhere in the returned handback text.
+    """
+    session_id = "11111111-1111-4111-8111-111111111233"
+    rows = _story_planner_rows(session_id, fixture="qa.jsonl")
+    assistant_indices = [index for index, row in enumerate(rows) if row["type"] == "assistant"]
+    assert len(assistant_indices) == 2
+    non_terminal_index, terminal_index = assistant_indices
+    assert non_terminal_index < terminal_index
+
+    non_terminal_row = rows[non_terminal_index]
+    non_terminal_row["message"]["content"] = [
+        {
+            "type": "tool_use",
+            "id": "toolu_sentinel",
+            "name": "Bash",
+            "input": {"command": "SENTINEL_TOOL_ACTIVITY"},
+        }
+    ]
+    tool_result_row = {
+        "parentUuid": non_terminal_row["uuid"],
+        "isSidechain": False,
+        "userType": "external",
+        "cwd": "",
+        "sessionId": session_id,
+        "version": "2.1.233",
+        "gitBranch": "",
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_sentinel",
+                    "content": "SENTINEL_TOOL_ACTIVITY",
+                }
+            ],
+        },
+        "uuid": "11111111-1111-4111-8111-111111199999",
+        "timestamp": "2026-08-18T00:00:01.500Z",
+    }
+    rows.insert(non_terminal_index + 1, tool_result_row)
+
+    transcript, _ = _install_owned_transcript(tmp_path, monkeypatch, _dump_rows(rows), session_id)
+
+    usage = usage_transcript.parse_owned_transcript(
+        tmp_path,
+        session_id,
+        NativeClaudeRole.QA,
+        "high",
+        expected_permission_mode="dontAsk",
+        require_handback=True,
+    )
+    assert usage.usage_message_count == 2
+    assert usage.handback_text == "SYNTHETIC_QA_HANDOFF"
+    assert usage.handback_text is not None and "SENTINEL_TOOL_ACTIVITY" not in usage.handback_text
+    assert transcript.read_bytes() == _dump_rows(rows)
 
 
 @pytest.mark.parametrize(
@@ -915,7 +988,11 @@ def test_owned_transcript_rejects_row_and_file_bounds(
 def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
     role: NativeClaudeRole,
 ) -> None:
-    """D161 session persistence is native-only and no native stdout grammar survives."""
+    """D161 session persistence is native-only and no native stdout grammar survives.
+
+    D168: also asserts the exact ``--allowedTools`` rule tuple, and that it is
+    the final argv element, for every validation role (T1, T2, T3, T6).
+    """
     session_id = "11111111-1111-4111-8111-111111111233"
     pin = usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
     validated_root = "/validated/root" if role in usage_cli.VALIDATION_ENVIRONMENT_ROLES else None
@@ -923,6 +1000,10 @@ def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
         "claude", role, pin.capability, pin.effort, session_id, validated_root
     )
     expected_middle = ["--add-dir", validated_root] if validated_root is not None else []
+    expected_rules = (
+        list(render_allowed_tools(role, validated_root)) if validated_root is not None else []
+    )
+    expected_tail = ["--allowedTools", *expected_rules] if expected_rules else []
     assert argv == [
         "claude",
         "--agent",
@@ -940,13 +1021,20 @@ def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
         "auto" if pin.capability is RoleCapability.WRITE else "dontAsk",
         "--effort",
         pin.effort,
+        *expected_tail,
     ]
     if validated_root is not None:
         assert argv[argv.index("--add-dir") + 2] == "--permission-mode"
+        assert "--allowedTools" in argv
+        assert argv[-1] == expected_rules[-1]
+        assert argv.index("--allowedTools") + 1 + len(expected_rules) == len(argv)
+    else:
+        assert "--allowedTools" not in argv
     assert "--no-session-persistence" not in argv and "--output-format" not in argv
     generic = usage_cli._launch_argv(HarnessFamily.CLAUDE, "claude", "model", "high")  # pyright: ignore[reportPrivateUsage]
     assert "--no-session-persistence" in generic
     assert "--add-dir" not in generic
+    assert "--allowedTools" not in generic
     generic_without_effort = usage_cli._launch_argv(  # pyright: ignore[reportPrivateUsage]
         HarnessFamily.CLAUDE, "claude", "model", None
     )
@@ -973,6 +1061,215 @@ def test_native_argv_rejects_root_role_mismatch() -> None:
             "high",
             session_id,
             None,
+        )
+
+
+def test_render_allowed_tools_is_exact_literal_per_role() -> None:
+    """T1: each validation role's rendered rule tuple equals the exact §2.2 literals."""
+    root = "/validated/root"
+    python = f"{root}/venv/bin/python"
+    tmp = f"{root}/tmp"
+    assert render_allowed_tools(NativeClaudeRole.QA, root) == (
+        f"Bash({python} -m pytest:*)",
+        f"Bash({python} -m pyright --pythonpath {python})",
+        f"Bash({python} -m ruff check .)",
+        f"Bash({python} -m ruff format --check .)",
+    )
+    assert render_allowed_tools(NativeClaudeRole.MCP_CONTRACT_CHECKER, root) == (
+        f"Bash({python} -m pip show coffee-roaster-mcp)",
+        f"Bash({python} -m pytest tests/test_mcp_client.py -q --basetemp {tmp}/pytest)",
+    )
+    assert render_allowed_tools(NativeClaudeRole.SIM_ROAST_RUNNER, root) == (
+        f"Bash({python} -m pytest tests/test_milestone1.py -q --basetemp {tmp}/pytest)",
+    )
+    assert render_validation_commands(NativeClaudeRole.QA, root) == (
+        f"{python} -m pytest",
+        f"{python} -m pyright --pythonpath {python}",
+        f"{python} -m ruff check .",
+        f"{python} -m ruff format --check .",
+    )
+
+
+_NON_VALIDATION_ROLES = [
+    role for role in NativeClaudeRole if role not in usage_cli.VALIDATION_ENVIRONMENT_ROLES
+]
+
+
+@pytest.mark.parametrize("role", _NON_VALIDATION_ROLES)
+def test_render_allowed_tools_empty_for_non_validation_roles(role: NativeClaudeRole) -> None:
+    """T2: every non-validation role renders no commands and no rules."""
+    assert render_validation_commands(role, "/validated/root") == ()
+    assert render_allowed_tools(role, "/validated/root") == ()
+
+
+def test_render_allowed_tools_uses_the_validated_resolved_root_not_the_raw_argument(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """T5: argv rules are rendered from the validated resolved root, never the raw one."""
+    base = tmp_path_factory.mktemp("render-symlink")
+    actual = base / "actual"
+    actual.mkdir()
+    root = _build_validation_root(actual / "root")
+    link = base / "link"
+    link.symlink_to(actual)
+    raw = str(link / "root")
+    resolved = usage_cli._validate_validation_root(raw)  # pyright: ignore[reportPrivateUsage]
+    assert resolved == os.path.realpath(root)
+    argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+        "claude",
+        NativeClaudeRole.QA,
+        RoleCapability.READ_ONLY,
+        "high",
+        "11111111-1111-4111-8111-111111111233",
+        resolved,
+    )
+    rules = argv[argv.index("--allowedTools") + 1 :]
+    assert all(str(link) not in rule for rule in rules)
+    assert any(resolved in rule for rule in rules)
+
+
+def test_validation_role_commands_table_is_a_closed_positive_grammar() -> None:
+    """T7: every template is well-formed and uses only the closed module set."""
+    allowed_modules = {"pytest", "pyright", "ruff", "pip"}
+    forbidden_fragments = ("(", ")", ";", "&", "|", "$", "`")
+    prefix_entries: list[tuple[NativeClaudeRole, usage_models.ValidationCommand]] = []
+    for role, commands in VALIDATION_ROLE_COMMANDS.items():
+        for command in commands:
+            assert command.template.startswith("{python} -m ")
+            module = command.template.removeprefix("{python} -m ").split(" ", 1)[0]
+            assert module in allowed_modules
+            if module == "pip":
+                assert command.template == "{python} -m pip show coffee-roaster-mcp"
+            if command.kind is ValidationCommandKind.PREFIX:
+                prefix_entries.append((role, command))
+            rendered = command.template.format(python="/r/venv/bin/python", tmp="/r/tmp")
+            assert rendered.count("*") == 0
+            for fragment in forbidden_fragments:
+                assert fragment not in rendered
+    expected_prefix_entry = (NativeClaudeRole.QA, VALIDATION_ROLE_COMMANDS[NativeClaudeRole.QA][0])
+    assert prefix_entries == [expected_prefix_entry]
+    for role, commands in VALIDATION_ROLE_COMMANDS.items():
+        rules = render_allowed_tools(role, "/r")
+        # Exactly one rendered rule per table entry — no bare or extra rule.
+        assert len(rules) == len(commands)
+        for command, rule in zip(commands, rules, strict=True):
+            assert rule.startswith("Bash(") and rule.endswith(")")
+            inner = rule.removeprefix("Bash(").removesuffix(")")
+            assert inner != "*"
+            assert inner.startswith("/r/venv/bin/python -m ")
+            assert inner.count("*") <= 1
+            if command.kind is ValidationCommandKind.PREFIX:
+                assert inner.endswith(":*")
+                assert inner.count(":*") == 1
+            else:
+                assert not inner.endswith(":*")
+                assert "*" not in inner
+
+
+def test_validation_role_commands_table_keys_equal_validation_environment_roles() -> None:
+    """T8: the table's keys are exactly the three validation roles, no more, no fewer."""
+    assert set(VALIDATION_ROLE_COMMANDS) == usage_cli.VALIDATION_ENVIRONMENT_ROLES
+    for role in VALIDATION_ROLE_COMMANDS:
+        pin = usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
+        assert pin.capability is RoleCapability.READ_ONLY
+        path = Path(".claude") / "agents" / f"{role.value}.md"
+        tools_line = next(
+            line for line in path.read_text().splitlines() if line.startswith("tools: ")
+        )
+        tools = {token.strip() for token in tools_line.removeprefix("tools: ").split(",")}
+        assert "Bash" in tools
+        assert not ({"Edit", "Write"} & tools)
+
+
+def test_native_claude_argv_never_revalidates_the_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """T9: the argv builder performs no second root validation — it trusts its input."""
+
+    def fail(_raw: str) -> str:
+        raise AssertionError("argv builder must not re-validate the root")
+
+    monkeypatch.setattr(usage_cli, "_validate_validation_root", fail)
+    argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+        "claude",
+        NativeClaudeRole.QA,
+        RoleCapability.READ_ONLY,
+        "high",
+        "11111111-1111-4111-8111-111111111233",
+        "/validated/root",
+    )
+    assert "--allowedTools" in argv
+
+
+@pytest.mark.parametrize(
+    "flag", ["--allowed-tools", "--allowedTools", "--tools", "--permission-mode", "--add-dir"]
+)
+def test_no_caller_permission_surface_options_exist_on_native(
+    flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T10: no permission-surface option is caller-facing on ``run-native-claude``."""
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args([*_native_cli_args(role="qa"), flag, "value"])
+    assert f"unrecognized arguments: {flag}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "flag", ["--allowed-tools", "--allowedTools", "--tools", "--permission-mode", "--add-dir"]
+)
+def test_no_caller_permission_surface_options_exist_on_run(
+    flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T10: no permission-surface option is caller-facing on the generic ``run`` command."""
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args(
+            [
+                "run",
+                "--harness",
+                "claude",
+                "--prompt-file",
+                "prompt",
+                "--task-id",
+                "816",
+                "--slice-id",
+                "s1",
+                "--role",
+                "measurement",
+                "--model",
+                "model",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/816",
+                "--base-sha",
+                "4c1ac63",
+                "--head-sha",
+                "7d60f41",
+                flag,
+                "value",
+            ]
+        )
+    assert f"unrecognized arguments: {flag}" in capsys.readouterr().err
+
+
+def test_native_argv_rejects_empty_rendered_rule_tuple_before_provider_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T11: an empty rendered rule tuple fails closed and never touches ``shutil.which``."""
+
+    def empty_render(_role: NativeClaudeRole, _root: str) -> tuple[str, ...]:
+        return ()
+
+    def no_which(_name: str) -> str:
+        raise AssertionError("provider lookup")
+
+    monkeypatch.setattr(usage_cli, "render_allowed_tools", empty_render)
+    monkeypatch.setattr(usage_cli.shutil, "which", no_which)
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+            "claude",
+            NativeClaudeRole.QA,
+            RoleCapability.READ_ONLY,
+            "high",
+            "11111111-1111-4111-8111-111111111233",
+            "/validated/root",
         )
 
 
@@ -5941,6 +6238,85 @@ def test_validation_path_predicate_rejects_forbidden_characters(forbidden: str) 
         usage_cli._validate_validation_root(forbidden)  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.parametrize(
+    "forbidden",
+    [
+        "/abs/has)paren",
+        "/abs/has(paren",
+        "/abs/has:colon",
+        "/abs/has*star",
+        "/abs/has,comma",
+        "/abs/has;semi",
+        "/abs/has&amp",
+        "/abs/has|pipe",
+        "/abs/has$dollar",
+        "/abs/has`tick",
+        "/abs/has<lt",
+        "/abs/has>gt",
+        "/abs/has!bang",
+        "/abs/has?question",
+        "/abs/has[bracket",
+        "/abs/has]bracket",
+        "/abs/has{brace",
+        "/abs/has}brace",
+        "/abs/has#hash",
+        "/abs/has~tilde",
+    ],
+)
+def test_validation_path_predicate_rejects_rule_grammar_and_shell_metacharacters(
+    forbidden: str,
+) -> None:
+    """T12: the closed positive grammar rejects every rule/shell metacharacter.
+
+    A rendered rule is ``Bash(<command containing this path>)``; any of these
+    characters surviving inside the path could re-scope or truncate that rule
+    (§2.5), so the closed positive segment grammar must reject every one of
+    them even though the D167 negative predicate did not.
+    """
+    assert not usage_cli._is_valid_validation_path(forbidden)  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._validate_validation_root(forbidden)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validation_path_predicate_rejects_reserved_dot_segments() -> None:
+    """T12: a bare ``.`` or ``..`` segment is rejected even though both match the charset."""
+    assert not usage_cli._is_valid_validation_path("/abs/./root")  # pyright: ignore[reportPrivateUsage]
+    assert not usage_cli._is_valid_validation_path("/abs/../root")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validation_root_resolved_form_with_rule_metacharacter_renders_no_rule(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """T12a: a resolved root containing ``)`` is rejected before any rule is rendered.
+
+    The forbidden character sits on an ancestor reached only through a clean
+    symlink (mirroring the existing resolved-form test above), proving the
+    rule grammar cannot be escaped by routing a rule-breaking character
+    through the resolved path rather than the raw one.
+    """
+    base = tmp_path_factory.mktemp("resolved-paren")
+    forbidden_ancestor = base / "has)paren"
+    (forbidden_ancestor / "nested").mkdir(parents=True)
+    actual_root = _build_validation_root(forbidden_ancestor / "nested" / "root")
+    link = base / "clean-link"
+    link.symlink_to(forbidden_ancestor)
+    raw = str(link / "nested" / "root")
+    assert usage_cli._is_valid_validation_path(raw)  # pyright: ignore[reportPrivateUsage]
+    resolved = os.path.realpath(raw)
+    assert resolved == os.path.realpath(actual_root)
+    assert not usage_cli._is_valid_validation_path(resolved)  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._validate_validation_root(raw)  # pyright: ignore[reportPrivateUsage]
+    # The single upstream validation (proven above) is the only gate: the full
+    # pipeline call that would otherwise feed a validated root into argv
+    # construction fails here too, so no rule is ever rendered from the
+    # rejected resolved path.
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
+            NativeClaudeRole.QA, raw
+        )
+
+
 def test_validation_path_predicate_applies_to_raw_and_resolved_forms(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
@@ -6178,6 +6554,41 @@ def test_native_launch_validates_root_exactly_once_and_binds_add_dir(
     assert worker_argv[add_dir_index + 2] == "--permission-mode"
 
 
+def test_native_launch_allowed_tools_rules_use_the_resolved_root_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """T5 (full pipeline): a symlinked ``--validation-root`` never leaks into rendered rules.
+
+    Complements the direct-call T5 test: this one exercises the real
+    ``run_native_claude_command`` call site, proving the caller passes the
+    validated *resolved* root into :func:`_native_claude_argv`, not the raw
+    ``--validation-root`` argument (M12).
+    """
+    base = tmp_path_factory.mktemp("e2e-symlink-root")
+    actual = base / "actual"
+    actual.mkdir()
+    root = _build_validation_root(actual / "root")
+    link = base / "link"
+    link.symlink_to(actual)
+    raw_root = link / "root"
+
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(project, observed, processes, transcript=_read_only_transcript_bytes("qa")),
+    )
+    assert main(_native_cli_args(role="qa", validation_root=str(raw_root))) == 0
+
+    worker_argv = observed[1][0]
+    resolved_root = os.path.realpath(root)
+    rules = worker_argv[worker_argv.index("--allowedTools") + 1 :]
+    assert rules
+    assert all(str(link) not in rule for rule in rules)
+    assert any(resolved_root in rule for rule in rules)
+
+
 def test_native_launch_add_dir_absent_for_write_role(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -6329,3 +6740,212 @@ def test_provisioning_docs_set_bytecode_variables_on_both_pip_commands() -> None
     for line in pip_lines:
         assert "PYTHONPYCACHEPREFIX=" in line
         assert "PYTHONDONTWRITEBYTECODE=1" in line
+
+
+# ---------------------------------------------------------------------------
+# D168 round-9 repair: committed per-role validation --allowedTools allow-list,
+# the closed positive path grammar, and the single-source-of-truth command
+# renderer shared by the argv builder and ``print-validation-commands``.
+# ---------------------------------------------------------------------------
+
+_VALIDATION_ROLE_FILES = (
+    Path(".claude") / "agents" / "qa.md",
+    Path(".claude") / "agents" / "mcp-contract-checker.md",
+    Path(".claude") / "agents" / "sim-roast-runner.md",
+)
+
+
+def test_print_validation_commands_matches_the_argv_rule_table(
+    tmp_path_factory: pytest.TempPathFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T14: ``print-validation-commands`` output equals the table wrapped into ``--allowedTools``.
+
+    Proves the single source of truth: the printed lines and the argv rules
+    can never diverge because both are rendered from
+    :data:`VALIDATION_ROLE_COMMANDS` through the same
+    :func:`render_validation_commands` call.
+    """
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    resolved_root = os.path.realpath(root)
+    for role in usage_cli.VALIDATION_ENVIRONMENT_ROLES:
+        exit_code = main(
+            ["print-validation-commands", "--role", role.value, "--validation-root", str(root)]
+        )
+        assert exit_code == 0
+        printed = capsys.readouterr().out.splitlines()
+        expected_rendered = render_validation_commands(role, resolved_root)
+        expected_lines = [
+            f"{command.kind.value} {text}"
+            for command, text in zip(VALIDATION_ROLE_COMMANDS[role], expected_rendered, strict=True)
+        ]
+        assert printed == expected_lines
+
+        rules = render_allowed_tools(role, resolved_root)
+        stripped: list[str] = []
+        for command, rule in zip(VALIDATION_ROLE_COMMANDS[role], rules, strict=True):
+            inner = rule.removeprefix("Bash(").removesuffix(")")
+            if command.kind is ValidationCommandKind.PREFIX:
+                assert inner.endswith(":*")
+                inner = inner.removesuffix(":*")
+            stripped.append(inner)
+        assert tuple(stripped) == expected_rendered
+
+
+def test_print_validation_commands_rejects_non_validation_role_before_output(
+    tmp_path_factory: pytest.TempPathFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T14: a non-validation role fails closed with no partial stdout."""
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    with pytest.raises(SystemExit, match="validation environment is invalid"):
+        main(
+            [
+                "print-validation-commands",
+                "--role",
+                "engineer-be",
+                "--validation-root",
+                str(root),
+            ]
+        )
+    assert capsys.readouterr().out == ""
+
+
+def test_print_validation_commands_rejects_invalid_root_before_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """T14: an invalid root fails closed with no partial stdout."""
+    with pytest.raises(SystemExit, match="validation environment is invalid"):
+        main(
+            [
+                "print-validation-commands",
+                "--role",
+                "qa",
+                "--validation-root",
+                "relative/path",
+            ]
+        )
+    assert capsys.readouterr().out == ""
+
+
+def test_print_validation_commands_rejects_empty_rendered_tuple_before_output(
+    tmp_path_factory: pytest.TempPathFactory,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T14: an empty rendered tuple for a validation role fails closed, no partial stdout.
+
+    Defensive symmetry with the argv builder's own empty-tuple guard (T11):
+    this is the same backstop reachable only if the shared render function
+    were ever mutated to return nothing for a role the table still lists.
+    """
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+
+    def empty_render(_role: NativeClaudeRole, _root: str) -> tuple[str, ...]:
+        return ()
+
+    monkeypatch.setattr(usage_cli, "render_validation_commands", empty_render)
+    with pytest.raises(SystemExit, match="validation environment is invalid"):
+        main(
+            [
+                "print-validation-commands",
+                "--role",
+                "qa",
+                "--validation-root",
+                str(root),
+            ]
+        )
+    assert capsys.readouterr().out == ""
+
+
+def test_no_caller_surface_on_print_validation_commands(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``print-validation-commands`` exposes no rule, tool, model, effort, or mode override."""
+    for flag in ("--allowed-tools", "--allowedTools", "--tools", "--permission-mode", "--model"):
+        with pytest.raises(SystemExit):
+            usage_cli.build_parser().parse_args(
+                [
+                    "print-validation-commands",
+                    "--role",
+                    "qa",
+                    "--validation-root",
+                    "/validated/root",
+                    flag,
+                    "value",
+                ]
+            )
+        assert f"unrecognized arguments: {flag}" in capsys.readouterr().err
+
+
+def test_validation_role_files_never_use_command_position_static_paths() -> None:
+    """T15: no role file names a static command-position interpreter or env-var path.
+
+    The round-8 live failure proved ``$ROASTPILOT_VALIDATION_*`` command text
+    does not match an absolute-path provider allow rule under ``dontAsk``; the
+    fix is that every role file requires the parent-supplied exact
+    ``print-validation-commands`` output instead. The D154 routed-control
+    ``## Worktree discipline`` block is shared byte-for-byte across every
+    READ_ONLY role (``tests/test_agent_worktree_controls.py``) and is
+    intentionally left unedited here; its generic, non-runnable
+    ``.venv/bin/python -m …`` prose is explicitly superseded, within this
+    role's own Validation environment section, for these three roles.
+    """
+    forbidden_command_fragments = (
+        '"$ROASTPILOT_VALIDATION_PYTHON" -m',
+        "$ROASTPILOT_VALIDATION_PYTHON -m",
+        '"$ROASTPILOT_VALIDATION_TMP"',
+        "`python -m",
+    )
+    for path in _VALIDATION_ROLE_FILES:
+        text = path.read_text()
+        for fragment in forbidden_command_fragments:
+            assert fragment not in text, (path, fragment)
+        assert "print-validation-commands" in text
+        assert "governs" in text and "write-capable workers only" in text
+
+
+def test_validation_role_files_never_instruct_python_c_pip_install_or_worktree_venv() -> None:
+    """T16: no role file contains an interpreter one-liner, pip install, or venv creation."""
+    for path in _VALIDATION_ROLE_FILES:
+        text = path.read_text()
+        assert "python -c" not in text
+        assert "pip install" not in text
+        assert "-m venv" not in text
+
+
+def test_runbook_and_skill_and_agents_row_point_to_print_validation_commands() -> None:
+    """T17: the runbook, SKILL.md, and the AGENTS.md row cite the single interface.
+
+    None of the three duplicates the seven dynamic per-role command strings —
+    only ``print-validation-commands`` (run by the parent) can render them,
+    because they depend on the per-run root.
+    """
+    root = Path(__file__).resolve().parents[1]
+    runbook = (root / "docs" / "agent-team-worktrees.md").read_text()
+    skill = (root / ".agents" / "skills" / "capture-agent-usage" / "SKILL.md").read_text()
+    agents = (root / "AGENTS.md").read_text()
+    for text in (runbook, skill, agents):
+        assert "print-validation-commands" in text
+        assert "dontAsk" in text or "denied" in text
+    assert "D168" in runbook
+    assert "D168" in skill
+    assert "D168" in agents
+    # None of the three documents hardcodes a rendered command against a
+    # concrete filesystem root (that would duplicate the per-run table);
+    # the runbook's own bash provisioning recipe legitimately uses a real
+    # `venv/bin/python` invocation to build the environment, which is
+    # distinct from a rendered gate command.
+    for text in (skill, agents):
+        assert "tests/test_mcp_client.py" not in text
+        assert "tests/test_milestone1.py" not in text
+
+
+def test_validation_environment_roles_include_only_bash_capable_read_only_roles() -> None:
+    """T8: table membership matches the committed frontmatter capability, both directions."""
+    for role in NativeClaudeRole:
+        pin = usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
+        in_table = role in VALIDATION_ROLE_COMMANDS
+        if role in usage_cli.VALIDATION_ENVIRONMENT_ROLES:
+            assert in_table
+            assert pin.capability is RoleCapability.READ_ONLY
+        else:
+            assert not in_table
