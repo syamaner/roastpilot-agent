@@ -617,13 +617,53 @@ def _require_validation_directory(descriptor: int, *, expect_mode: int | None) -
         raise OSError("validation directory mode is invalid")
 
 
+_FORBIDDEN_VALIDATION_PATH_CHARACTERS = frozenset({"'", '"', "\\"})
+"""Characters rejected everywhere in a validation-root path (D167, §grammar).
+
+A quote or backslash could otherwise be interpreted specially by a later
+shell-adjacent consumer of the value; rejecting them here, in the one shared
+grammar predicate, keeps that closed regardless of consumer."""
+
+
+def _is_valid_validation_path(value: str) -> bool:
+    """Return whether ``value`` is a well-formed absolute validation-root path.
+
+    Applied identically to the raw ``--validation-root`` argument and to its
+    resolved ``os.path.realpath`` value before either is used for overlap,
+    descriptor, or argv purposes (D167). Rejects a non-absolute value, an
+    empty or ``..`` segment, and any whitespace, ASCII control character
+    (including DEL), single quote, double quote, or backslash anywhere in the
+    value.
+
+    Args:
+        value: The candidate path, raw or resolved.
+
+    Returns:
+        ``True`` only when the value satisfies the closed grammar.
+    """
+    if not value or not value.startswith("/"):
+        return False
+    segments = value.split("/")
+    if segments[0] != "" or any(segment in ("", "..") for segment in segments[1:]):
+        return False
+    return not any(
+        character.isspace()
+        or ord(character) < 0x20
+        or ord(character) == 0x7F
+        or character in _FORBIDDEN_VALIDATION_PATH_CHARACTERS
+        for character in value
+    )
+
+
 def _validate_validation_root(raw: str) -> str:
     """Validate one parent-provisioned external validation root without mutating it.
 
     The root, its ``cache`` and ``tmp`` children, its ``venv`` directory, the
     ``venv/pyvenv.cfg`` marker, and the ``venv/bin/python`` interpreter are all
     attested by descriptor before any value derived from the path is trusted
-    (D166, §2.4). Every failure raises the single fixed, path-free error.
+    (D166, §2.4). The closed grammar predicate runs on both the raw and the
+    resolved path (D167). Every failure raises the single fixed, path-free
+    error.
 
     Args:
         raw: The exact ``--validation-root`` argument value.
@@ -635,17 +675,7 @@ def _validate_validation_root(raw: str) -> str:
         CaptureUsageError: If the path grammar, location, ownership, mode, or
             venv shape is invalid. The message never echoes the supplied path.
     """
-    segments = raw.split("/")
-    if (
-        not raw
-        or not raw.startswith("/")
-        or segments[0] != ""
-        or any(segment in ("", "..") for segment in segments[1:])
-        or any(
-            character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F
-            for character in raw
-        )
-    ):
+    if not _is_valid_validation_path(raw):
         raise CaptureUsageError("validation environment is invalid")
     try:
         cwd_real = os.path.realpath(Path.cwd())
@@ -653,6 +683,8 @@ def _validate_validation_root(raw: str) -> str:
         home_claude_real = os.path.realpath(Path.home() / ".claude")
     except OSError:
         raise CaptureUsageError("validation environment is invalid") from None
+    if not _is_valid_validation_path(root_real):
+        raise CaptureUsageError("validation environment is invalid")
     if (
         Path(root_real).is_relative_to(Path(cwd_real))
         or Path(cwd_real).is_relative_to(Path(root_real))
@@ -724,9 +756,25 @@ def _validation_environment_values(root: str) -> dict[str, str]:
     }
 
 
+@dataclass(frozen=True)
+class _NativeLaunchEnvironment:
+    """Frozen native launch environment and the one validated root, if any.
+
+    Both fields are derived from exactly one :func:`_validate_validation_root`
+    call (D167): ``environment`` is the stripped, conditionally-repopulated
+    child environment, and ``validated_root`` is ``None`` for a non-validation
+    role or the canonical resolved root for a validation role. Carrying the
+    two together closes the gap where an argv builder that only received the
+    environment would have had to re-derive or re-validate the root itself.
+    """
+
+    environment: dict[str, str]
+    validated_root: str | None
+
+
 def _resolve_native_environment(
     role: NativeClaudeRole, validation_root: str | None
-) -> dict[str, str]:
+) -> _NativeLaunchEnvironment:
     """Validate ``--validation-root`` presence and shape, then build the child env.
 
     Args:
@@ -735,7 +783,8 @@ def _resolve_native_environment(
             ``None``.
 
     Returns:
-        The exact environment mapping to pass as the native launch's ``env=``.
+        The frozen environment-and-root value for this launch, built from
+        exactly one root validation.
 
     Raises:
         CaptureUsageError: If a validation role is missing ``--validation-root``,
@@ -748,10 +797,10 @@ def _resolve_native_environment(
         key: value for key, value in os.environ.items() if key not in _VALIDATION_ENVIRONMENT_KEYS
     }
     if validation_root is None:
-        return environment
+        return _NativeLaunchEnvironment(environment=environment, validated_root=None)
     root = _validate_validation_root(validation_root)
     environment.update(_validation_environment_values(root))
-    return environment
+    return _NativeLaunchEnvironment(environment=environment, validated_root=root)
 
 
 def _emit_handback(
@@ -872,9 +921,37 @@ def _native_claude_argv(
     capability: RoleCapability,
     effort: str,
     session_id: str,
+    validated_root: str | None,
 ) -> list[str]:
-    """Build the exact capability-bound native-Claude worker argv."""
-    return [
+    """Build the exact capability-bound native-Claude worker argv.
+
+    ``validated_root`` must already be the return value of one
+    :func:`_validate_validation_root` call (never a raw, unvalidated path).
+    For exactly the three roles in ``VALIDATION_ENVIRONMENT_ROLES`` this
+    appends one ``--add-dir <validated_root>`` pair immediately before
+    ``--permission-mode`` (D167); every other role's argv is byte-identical
+    to the pre-D167 shape.
+
+    Args:
+        executable: The resolved ``claude`` executable path.
+        role: The registered native role.
+        capability: The role's derived READ_ONLY/WRITE capability.
+        effort: The role's committed reasoning effort.
+        session_id: The bound session identifier.
+        validated_root: The canonical resolved validation root for the three
+            validation roles, or ``None`` for every other role.
+
+    Returns:
+        The exact native launch argv.
+
+    Raises:
+        CaptureUsageError: If ``validated_root`` presence disagrees with
+            whether ``role`` is a validation role.
+    """
+    requires_root = role in VALIDATION_ENVIRONMENT_ROLES
+    if requires_root != (validated_root is not None):
+        raise CaptureUsageError("validation environment is invalid")
+    argv = [
         executable,
         "--agent",
         role.value,
@@ -886,11 +963,18 @@ def _native_claude_argv(
         "--strict-mcp-config",
         "--mcp-config",
         '{"mcpServers":{}}',
-        "--permission-mode",
-        NATIVE_PERMISSION_MODES[capability],
-        "--effort",
-        effort,
     ]
+    if validated_root is not None:
+        argv.extend(["--add-dir", validated_root])
+    argv.extend(
+        [
+            "--permission-mode",
+            NATIVE_PERMISSION_MODES[capability],
+            "--effort",
+            effort,
+        ]
+    )
+    return argv
 
 
 def _validate_native_metadata(
@@ -988,7 +1072,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
     """Launch one registered Claude implementation worker and append complete usage."""
     role = NativeClaudeRole(arguments.role)
     pin = _native_role_pin(role)
-    environment = _resolve_native_environment(role, arguments.validation_root)
+    launch_environment = _resolve_native_environment(role, arguments.validation_root)
     require_handback = pin.capability is RoleCapability.READ_ONLY
     _validate_native_metadata(arguments, role, pin)
     _validate_native_worktree(arguments, pin.capability, post_exit=False)
@@ -1015,13 +1099,20 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
         started_monotonic = time.monotonic()
         arguments.started_at = started_at
         process = subprocess.Popen(
-            _native_claude_argv(executable, role, pin.capability, pin.effort, session_id),
+            _native_claude_argv(
+                executable,
+                role,
+                pin.capability,
+                pin.effort,
+                session_id,
+                launch_environment.validated_root,
+            ),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             shell=False,
             cwd=".",
-            env=environment,
+            env=launch_environment.environment,
             start_new_session=True,
         )
         deadline = _start_deadline(process, NATIVE_LAUNCH_TIMEOUT_SECONDS, timed_out)

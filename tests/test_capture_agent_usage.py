@@ -918,9 +918,11 @@ def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
     """D161 session persistence is native-only and no native stdout grammar survives."""
     session_id = "11111111-1111-4111-8111-111111111233"
     pin = usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
+    validated_root = "/validated/root" if role in usage_cli.VALIDATION_ENVIRONMENT_ROLES else None
     argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
-        "claude", role, pin.capability, pin.effort, session_id
+        "claude", role, pin.capability, pin.effort, session_id, validated_root
     )
+    expected_middle = ["--add-dir", validated_root] if validated_root is not None else []
     assert argv == [
         "claude",
         "--agent",
@@ -933,18 +935,89 @@ def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
         "--strict-mcp-config",
         "--mcp-config",
         '{"mcpServers":{}}',
+        *expected_middle,
         "--permission-mode",
         "auto" if pin.capability is RoleCapability.WRITE else "dontAsk",
         "--effort",
         pin.effort,
     ]
+    if validated_root is not None:
+        assert argv[argv.index("--add-dir") + 2] == "--permission-mode"
     assert "--no-session-persistence" not in argv and "--output-format" not in argv
     generic = usage_cli._launch_argv(HarnessFamily.CLAUDE, "claude", "model", "high")  # pyright: ignore[reportPrivateUsage]
     assert "--no-session-persistence" in generic
+    assert "--add-dir" not in generic
     generic_without_effort = usage_cli._launch_argv(  # pyright: ignore[reportPrivateUsage]
         HarnessFamily.CLAUDE, "claude", "model", None
     )
     assert "--effort" not in generic_without_effort
+
+
+def test_native_argv_rejects_root_role_mismatch() -> None:
+    """D167's argv builder rejects a validated root for a non-validation role and vice versa."""
+    session_id = "11111111-1111-4111-8111-111111111233"
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+            "claude",
+            NativeClaudeRole.ENGINEER_BE,
+            RoleCapability.WRITE,
+            "high",
+            session_id,
+            "/validated/root",
+        )
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+            "claude",
+            NativeClaudeRole.QA,
+            RoleCapability.READ_ONLY,
+            "high",
+            session_id,
+            None,
+        )
+
+
+def test_no_caller_add_dir_option_exists(capsys: pytest.CaptureFixture[str]) -> None:
+    """The closed CLI grammar exposes no ``--add-dir`` option on any subcommand.
+
+    Every other required argument is supplied so the failure is specifically
+    an unrecognized ``--add-dir``, not an unrelated missing-argument error
+    that would pass even if a caller-facing ``--add-dir`` option existed.
+    """
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args(
+            [*_native_cli_args(role="qa"), "--add-dir", "/somewhere"]
+        )
+    assert "unrecognized arguments: --add-dir" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args(
+            [
+                "run",
+                "--harness",
+                "claude",
+                "--prompt-file",
+                "prompt",
+                "--task-id",
+                "816",
+                "--slice-id",
+                "s1",
+                "--role",
+                "measurement",
+                "--model",
+                "model",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/816",
+                "--base-sha",
+                "4c1ac63",
+                "--head-sha",
+                "7d60f41",
+                "--add-dir",
+                "/somewhere",
+            ]
+        )
+    assert "unrecognized arguments: --add-dir" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -1241,6 +1314,7 @@ def test_native_command_launches_exact_worker_and_records_immutable_transcript(
         RoleCapability.WRITE,
         "high",
         _NATIVE_SESSION_ID,
+        None,
     )
     assert argv == expected_argv
     assert kwargs["shell"] is False
@@ -5792,10 +5866,12 @@ def test_validation_environment_binds_exact_map_and_strips_for_others(
     root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
     for key in usage_cli._VALIDATION_ENVIRONMENT_KEYS:  # pyright: ignore[reportPrivateUsage]
         monkeypatch.setenv(key, "SENTINEL_PRESET")
-    environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
+    launch_environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
         NativeClaudeRole.QA, str(root)
     )
+    environment = launch_environment.environment
     resolved_root = os.path.realpath(root)
+    assert launch_environment.validated_root == resolved_root
     expected = {
         "ROASTPILOT_VALIDATION_ROOT": resolved_root,
         "ROASTPILOT_VALIDATION_PYTHON": os.path.join(resolved_root, "venv", "bin", "python"),
@@ -5815,8 +5891,9 @@ def test_validation_environment_binds_exact_map_and_strips_for_others(
     non_validation = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
         NativeClaudeRole.ENGINEER_BE, None
     )
+    assert non_validation.validated_root is None
     assert not (
-        set(non_validation) & usage_cli._VALIDATION_ENVIRONMENT_KEYS  # pyright: ignore[reportPrivateUsage]
+        set(non_validation.environment) & usage_cli._VALIDATION_ENVIRONMENT_KEYS  # pyright: ignore[reportPrivateUsage]
     )
 
 
@@ -5826,10 +5903,10 @@ def test_validation_environment_never_touches_home_and_config_dir_still_rejects(
     """``HOME`` is untouched by the closed map; ``CLAUDE_CONFIG_DIR`` still rejects outright."""
     root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
     monkeypatch.setenv("HOME", "/original/home")
-    environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
+    launch_environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
         NativeClaudeRole.QA, str(root)
     )
-    assert environment.get("HOME") == "/original/home"
+    assert launch_environment.environment.get("HOME") == "/original/home"
 
     _configure_native_launcher(tmp_path, monkeypatch)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "SENTINEL_CONFIG")
@@ -5843,6 +5920,69 @@ def test_validation_root_rejects_relative_and_traversal_paths() -> None:
     for candidate in ("relative/path", "/abs/../escape", "/abs//double", "/abs/trailing/"):
         with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
             usage_cli._validate_validation_root(candidate)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    [
+        "/abs/has space",
+        "/abs/has\ttab",
+        "/abs/has\nnewline",
+        "/abs/has\x7fdel",
+        "/abs/has'quote",
+        '/abs/has"quote',
+        "/abs/has\\backslash",
+    ],
+)
+def test_validation_path_predicate_rejects_forbidden_characters(forbidden: str) -> None:
+    """D167's shared grammar predicate rejects whitespace, control, quote, and backslash."""
+    assert not usage_cli._is_valid_validation_path(forbidden)  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._validate_validation_root(forbidden)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validation_path_predicate_applies_to_raw_and_resolved_forms(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A clean raw path resolving through an ancestor symlink to a forbidden path fails closed.
+
+    The symlink sits on an ANCESTOR of the root, not the root's own last path
+    component: opening ``raw`` with ``O_NOFOLLOW`` only inspects the final
+    component, which is a real (non-symlink) directory, so that open alone
+    would succeed. Only the shared grammar predicate re-applied to the
+    resolved path (D167) catches the forbidden character the ancestor symlink
+    resolves through.
+    """
+    base = tmp_path_factory.mktemp("resolved-forbidden")
+    forbidden_ancestor = base / "has'quote"
+    (forbidden_ancestor / "nested").mkdir(parents=True)
+    actual_root = _build_validation_root(forbidden_ancestor / "nested" / "root")
+    link = base / "clean-link"
+    link.symlink_to(forbidden_ancestor)
+    raw = str(link / "nested" / "root")
+    assert usage_cli._is_valid_validation_path(raw)  # pyright: ignore[reportPrivateUsage]
+    resolved = os.path.realpath(raw)
+    assert resolved == os.path.realpath(actual_root)
+    assert not usage_cli._is_valid_validation_path(resolved)  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._validate_validation_root(raw)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validation_root_accepts_clean_intermediate_ancestor_symlink(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A clean intermediate-ancestor symlink is the documented accepted residual, not the root."""
+    base = tmp_path_factory.mktemp("ancestor-symlink")
+    actual = base / "actual"
+    actual.mkdir()
+    root = _build_validation_root(actual / "root")
+    link = base / "link"
+    link.symlink_to(actual)
+    via_ancestor_symlink = link / "root"
+    resolved = usage_cli._validate_validation_root(  # pyright: ignore[reportPrivateUsage]
+        str(via_ancestor_symlink)
+    )
+    assert resolved == os.path.realpath(root)
 
 
 def test_validation_root_rejects_symlinked_root(
@@ -6008,6 +6148,67 @@ def test_validation_root_rejects_inside_claude_home(
         usage_cli._validate_validation_root(str(inside_claude))  # pyright: ignore[reportPrivateUsage]
 
 
+def test_native_launch_validates_root_exactly_once_and_binds_add_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """One root validation supplies both the env root and the argv ``--add-dir`` root."""
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(project, observed, processes, transcript=_read_only_transcript_bytes("qa")),
+    )
+    real_validate = usage_cli._validate_validation_root  # pyright: ignore[reportPrivateUsage]
+    calls: list[str] = []
+
+    def counting_validate(raw: str) -> str:
+        calls.append(raw)
+        return real_validate(raw)
+
+    monkeypatch.setattr(usage_cli, "_validate_validation_root", counting_validate)
+    assert main(_native_cli_args(role="qa", validation_root=str(root))) == 0
+    assert calls == [str(root)]
+
+    worker_argv = observed[1][0]
+    resolved_root = os.path.realpath(root)
+    add_dir_index = worker_argv.index("--add-dir")
+    assert worker_argv[add_dir_index + 1] == resolved_root
+    assert worker_argv[add_dir_index + 2] == "--permission-mode"
+
+
+def test_native_launch_add_dir_absent_for_write_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A WRITE (non-validation) native launch's argv never carries ``--add-dir``."""
+    project, observed = _configure_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(project, observed, processes, transcript=_native_transcript_bytes()),
+    )
+    assert main(_native_cli_args(role="engineer-be")) == 0
+    worker_argv = observed[1][0]
+    assert "--add-dir" not in worker_argv
+
+
+def test_validation_environment_key_set_has_exactly_eleven_members(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The closed key set is exactly eleven names; a WRITE launch strips every one."""
+    keys = usage_cli._VALIDATION_ENVIRONMENT_KEYS  # pyright: ignore[reportPrivateUsage]
+    assert len(keys) == 11
+    for key in keys:
+        monkeypatch.setenv(key, "SENTINEL_PRESET")
+    launch_environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
+        NativeClaudeRole.ENGINEER_BE, None
+    )
+    assert launch_environment.validated_root is None
+    assert not (set(launch_environment.environment) & keys)
+
+
 def test_validation_root_is_never_mutated_by_capture_tool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
@@ -6117,3 +6318,14 @@ def test_validation_environment_roles_are_read_only_bash_only_subset() -> None:
         tools = {token.strip() for token in tools_line.removeprefix("tools: ").split(",")}
         assert "Bash" in tools
         assert not ({"Edit", "Write"} & tools)
+
+
+def test_provisioning_docs_set_bytecode_variables_on_both_pip_commands() -> None:
+    """Both provisioning ``pip install`` recipe lines set both bytecode-containment vars."""
+    doc = Path(__file__).resolve().parents[1] / "docs" / "agent-team-worktrees.md"
+    lines = doc.read_text().splitlines()
+    pip_lines = [line for line in lines if 'venv/bin/python" -m pip install' in line]
+    assert len(pip_lines) == 2
+    for line in pip_lines:
+        assert "PYTHONPYCACHEPREFIX=" in line
+        assert "PYTHONDONTWRITEBYTECODE=1" in line

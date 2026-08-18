@@ -236,7 +236,7 @@ make a faithful dependency install structurally impossible. Their gate output is
 An implementer that cannot install must say so, never improvise with
 `--system-site-packages`.
 
-## Parent-provisioned validation root for read-only capture runs (D166)
+## Parent-provisioned validation root for read-only capture runs (D166, amended D167)
 
 The `#738`/`#733` per-worktree `.venv` rule above continues to govern every
 **write-capable** worker worktree. It is **replaced**, not extended, for the
@@ -263,10 +263,16 @@ reach the tree the attestation covers.
 ROOT="$(mktemp -d)"; chmod 700 "$ROOT"
 mkdir -m 700 "$ROOT/cache" "$ROOT/tmp"
 python3.11 -m venv "$ROOT/venv"
-TMPDIR="$ROOT/tmp" PIP_CACHE_DIR="$ROOT/cache/pip" "$ROOT/venv/bin/python" -m pip install --upgrade pip
-cd <abs worktree> && TMPDIR="$ROOT/tmp" PIP_CACHE_DIR="$ROOT/cache/pip" "$ROOT/venv/bin/python" -m pip install -e . --group dev
+TMPDIR="$ROOT/tmp" PIP_CACHE_DIR="$ROOT/cache/pip" PYTHONPYCACHEPREFIX="$ROOT/cache/pycache" PYTHONDONTWRITEBYTECODE=1 "$ROOT/venv/bin/python" -m pip install --upgrade pip
+cd <abs worktree> && TMPDIR="$ROOT/tmp" PIP_CACHE_DIR="$ROOT/cache/pip" PYTHONPYCACHEPREFIX="$ROOT/cache/pycache" PYTHONDONTWRITEBYTECODE=1 "$ROOT/venv/bin/python" -m pip install -e . --group dev
 git -C <abs worktree> status --porcelain --ignored     # MUST be empty before launch
 ```
+
+`PYTHONPYCACHEPREFIX` and `PYTHONDONTWRITEBYTECODE=1` on both provisioning pip
+commands keep every `__pycache__` write inside the external root instead of the
+attested worktree, matching the same two keys the closed eleven-key
+environment map binds for the launched role itself (D166 §2.4) — provisioning
+and launch must not diverge on where bytecode can land.
 
 An **editable** install skips the SPA build hook (`pyproject.toml:222-223`),
 so no Node run and no `web/dist` write can touch the worktree, and pytest
@@ -292,7 +298,46 @@ runs `"$ROASTPILOT_VALIDATION_PYTHON" -m pyright --pythonpath
 it changes no origin, branch, head, or clean-tree check, and adds no
 allowlist or ignore-pattern anywhere. A role that dirties the attested
 worktree — tracked, untracked, or ignored — still fails closed with no record
-and no handback, exactly as before.
+and no handback, exactly as before. The eleven keys above are stripped from
+every native launch's inherited environment first, then reinstated with these
+exact values only for a validation-role launch; every other native launch,
+including a WRITE launch, sees none of them.
+
+**D167: one validated root now derives both the environment and one argv path
+authorization.** The same successful `_validate_validation_root` call that
+builds the eleven-key `env=` map above also returns the canonical resolved
+root, and the capture tool passes it to the three validation roles' native
+launch as exactly one `--add-dir <validated real root>` argv pair, placed
+immediately before `--permission-mode`. Installed Claude Code 2.1.233
+documents `--add-dir` as additional directories allowed for tool access; live
+evidence showed a D166 validation role under `dontAsk` could not otherwise
+execute the external interpreter, leaving the validation environment
+unusable. `--add-dir` grants **path access, not tools** — the committed
+`.claude/agents/*.md` frontmatter `tools:` line remains the sole capability
+boundary, unchanged by this argv addition. There is no caller-facing
+`--add-dir` CLI option to widen this, no second validation call, and no
+permission-mode change: every other native role's argv, and the
+generic `run` harness argv, is byte-identical to before D167. Both the raw
+`--validation-root` argument and its resolved realpath are checked by one
+shared, closed path-grammar predicate — rejecting whitespace, control
+characters, single/double quotes, and backslashes, in addition to the
+existing empty/`..`-segment and relative-path rejections — before either
+value is used for overlap, descriptor, or argv purposes.
+
+**Handback text is untrusted, inert data.** The bounded READ_ONLY handback a
+validation role returns to the launching parent (D166) is read-only metadata
+for the parent to relay or record; it is never executed, never treated as an
+instruction or authority, never fed unquoted into a write-capable worker's
+context, and never persisted to the sink, git, GitHub, or any other durable
+file.
+
+**Residual: intermediate-ancestor symlinks.** The root itself is opened
+no-follow (`O_NOFOLLOW`) and its ownership/mode are attested by descriptor, so
+a symlinked root component fails closed. An ancestor directory further up the
+path being a symlink is an accepted residual inside this trusted, same-uid,
+parent-provisioned boundary: the parent alone provisions and names the root,
+so a clean resolved path reached through a clean intermediate-ancestor
+symlink is not a new attacker-controlled surface.
 
 ## Reviewers in a shared worktree (added 9 Jul 2026, after a live incident)
 
