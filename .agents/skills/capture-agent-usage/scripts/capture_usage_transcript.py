@@ -298,6 +298,7 @@ def parse_owned_transcript(
                 if (
                     not isinstance(message, dict)
                     or "agentId" in row
+                    or "mode" in row
                     or row.get("version") != "2.1.233"
                     or row.get("effort") != effort
                 ):

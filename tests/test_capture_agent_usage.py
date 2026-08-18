@@ -57,6 +57,7 @@ from capture_usage_models import (
     NativeClaudeRole,
     NativeWorkerUsageRecord,
     ParsedUsage,
+    RoleCapability,
     TaskUsageRecord,
     UsageRecord,
     bounded_jsonl_lines,
@@ -74,27 +75,27 @@ USAGE_RECORD_ADAPTER = cast(TypeAdapter[UsageRecord], _USAGE_RECORD_ADAPTER)
 def test_owned_transcript_counts_identical_assistant_usage_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The committed 2.1.231 fixture is read only at its exact expected path."""
-    session_id = "11111111-1111-4111-8111-111111111111"
+    """The committed 2.1.233 fixture is read only at its exact expected path."""
+    session_id = "11111111-1111-4111-8111-111111111233"
     home = tmp_path / "home"
     project = home / ".claude" / "projects" / usage_transcript._project_name(tmp_path)  # pyright: ignore[reportPrivateUsage]
     project.mkdir(parents=True)
     transcript = project / f"{session_id}.jsonl"
-    transcript.write_bytes((FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes())
+    transcript.write_bytes((FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl").read_bytes())
     monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
 
     usage = usage_transcript.parse_owned_transcript(
         tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
     )
 
-    assert usage.usage_message_count == 2
-    assert usage.input_tokens == 4
-    assert usage.cached_input_tokens == 30
-    assert usage.cache_creation_input_tokens == 35
-    assert usage.output_tokens == 11
+    assert usage.usage_message_count == 1
+    assert usage.input_tokens == 2
+    assert usage.cached_input_tokens == 0
+    assert usage.cache_creation_input_tokens == 36_369
+    assert usage.output_tokens == 9
     assert (
         transcript.read_bytes()
-        == (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+        == (FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl").read_bytes()
     )
 
 
@@ -102,7 +103,7 @@ def test_owned_transcript_accepts_repeated_matching_agent_setting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Claude may repeat the same parent-role attestation during one session."""
-    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    content = (FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl").read_bytes()
     lines = content.splitlines()
     repeated = b"\n".join((*lines[:2], lines[0], *lines[2:])) + b"\n"
     transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, repeated)
@@ -111,7 +112,7 @@ def test_owned_transcript_accepts_repeated_matching_agent_setting(
         tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
     )
 
-    assert usage.usage_message_count == 2
+    assert usage.usage_message_count == 1
     assert usage.model == "claude-sonnet-5"
     assert transcript.read_bytes() == repeated
 
@@ -120,7 +121,7 @@ def _install_owned_transcript(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
 ) -> tuple[Path, str]:
     """Install a synthetic parent at its one accepted exact location."""
-    session_id = "11111111-1111-4111-8111-111111111111"
+    session_id = "11111111-1111-4111-8111-111111111233"
     home = tmp_path / "home"
     project = home / ".claude" / "projects" / usage_transcript._project_name(tmp_path)  # pyright: ignore[reportPrivateUsage]
     project.mkdir(parents=True)
@@ -134,18 +135,18 @@ def _install_owned_transcript(
     "old,new",
     [
         (b'"agentSetting":"engineer-be"', b'"agentSetting":"engineer-fe"'),
-        (b'"version":"2.1.231"', b'"version":"2.1.999"'),
+        (b'"version":"2.1.233"', b'"version":"2.1.999"'),
         (b'"effort":"high"', b'"effort":"low"'),
         (b'"input_tokens":2', b'"input_tokens":true'),
         (b'"input_tokens":2', b'"input_tokens":-1'),
-        (b'"output_tokens":7', b'"extra_usage":1,"output_tokens":7'),
+        (b'"output_tokens":9', b'"extra_usage":1,"output_tokens":9'),
     ],
 )
 def test_owned_transcript_rejects_closed_mutations(
     old: bytes, new: bytes, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Identity and accounting schema drift is rejected without transcript mutation."""
-    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    content = (FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl").read_bytes()
     mutated = content.replace(old, new)
     transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, mutated)
     before = transcript.stat()
@@ -188,7 +189,7 @@ def test_owned_transcript_rejects_subagents_and_lifecycle_skew(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Leaf authority and the 120-second run binding are mandatory."""
-    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    content = (FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl").read_bytes()
     transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, content)
     session_tree = transcript.with_suffix("")
     (session_tree / "subagents").mkdir(parents=True)
@@ -255,7 +256,7 @@ def test_preflight_rejects_unsafe_or_missing_resolver_components(
     monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.reject_existing_owned_session(
-            tmp_path, "11111111-1111-4111-8111-111111111111"
+            tmp_path, "11111111-1111-4111-8111-111111111233"
         )
 
 
@@ -267,6 +268,7 @@ def _native_record_payload() -> dict[str, object]:
         "task_id": "816",
         "slice_id": "native",
         "native_role": "engineer-be",
+        "role_capability": "WRITE",
         "model": "claude-sonnet-5",
         "effort": "high",
         "repository": "syamaner/roastpilot-agent",
@@ -274,7 +276,7 @@ def _native_record_payload() -> dict[str, object]:
         "base_sha": "4c1ac63",
         "final_head_sha": "7d60f41",
         "parent_task_id": "parent",
-        "session_id": "11111111-1111-4111-8111-111111111111",
+        "session_id": "11111111-1111-4111-8111-111111111233",
         "subagent_count": 0,
         "usage_message_count": 1,
         "started_at": now,
@@ -282,7 +284,7 @@ def _native_record_payload() -> dict[str, object]:
         "elapsed_ms": 0,
         "exit_code": 0,
         "success": True,
-        "harness_version": "2.1.231",
+        "harness_version": "2.1.233",
         "input_tokens": 2,
         "cached_input_tokens": 3,
         "cache_creation_input_tokens": 4,
@@ -317,18 +319,41 @@ def test_native_record_rejects_incomplete_or_inconsistent_truth(field: str, valu
         NativeWorkerUsageRecord.model_validate(payload)
 
 
-def test_native_record_uses_distinct_schema_v2_and_adapter_roundtrips() -> None:
-    """D161 records cannot be mistaken for the generic v1 append-only record shape."""
+def test_native_record_uses_distinct_schema_v3_and_adapter_roundtrips() -> None:
+    """D163 records cannot be mistaken for the generic v1 append-only record shape."""
     record = NativeWorkerUsageRecord.model_validate(_native_record_payload())
     serialized = json.loads(record.model_dump_json())
-    assert serialized["schema_version"] == 2
+    assert serialized["schema_version"] == 3
     roundtrip = USAGE_RECORD_ADAPTER.validate_json(record.model_dump_json())
-    assert isinstance(roundtrip, NativeWorkerUsageRecord) and roundtrip.schema_version == 2
+    assert isinstance(roundtrip, NativeWorkerUsageRecord) and roundtrip.schema_version == 3
     prior_shape = dict(serialized)
-    prior_shape["schema_version"] = 1
+    prior_shape["schema_version"] = 2
     with pytest.raises(ValidationError):
         NativeWorkerUsageRecord.model_validate(prior_shape)
+    missing_capability = dict(serialized)
+    del missing_capability["role_capability"]
+    with pytest.raises(ValidationError):
+        NativeWorkerUsageRecord.model_validate(missing_capability)
     assert _task_record().schema_version == 1
+
+
+def test_native_record_capability_enforces_read_only_and_write_provenance() -> None:
+    """Schema v3 encodes the distinct final-head invariants for each capability."""
+    read_only = _native_record_payload()
+    read_only["role_capability"] = "READ_ONLY"
+    read_only["final_head_sha"] = read_only["base_sha"]
+    assert (
+        NativeWorkerUsageRecord.model_validate(read_only).role_capability
+        is RoleCapability.READ_ONLY
+    )
+    read_only["final_head_sha"] = "7d60f41"
+    with pytest.raises(ValidationError):
+        NativeWorkerUsageRecord.model_validate(read_only)
+
+    write = _native_record_payload()
+    write["final_head_sha"] = write["base_sha"]
+    with pytest.raises(ValidationError):
+        NativeWorkerUsageRecord.model_validate(write)
 
 
 def test_schema_version_cli_reports_generic_and_native_worker_families(
@@ -338,7 +363,7 @@ def test_schema_version_cli_reports_generic_and_native_worker_families(
     with pytest.raises(SystemExit) as result:
         main(["--schema-version"])
     assert result.value.code == 0
-    assert capsys.readouterr().out == "generic=1 native-worker=2\n"
+    assert capsys.readouterr().out == "generic=1 native-worker=3\n"
 
 
 def test_native_cli_exposes_no_caller_session_id() -> None:
@@ -347,6 +372,11 @@ def test_native_cli_exposes_no_caller_session_id() -> None:
         usage_cli.build_parser().parse_args(
             ["run-native-claude", "--role", "engineer-be", "--session-id", "caller"]
         )
+    for override in ("--model", "--effort"):
+        with pytest.raises(SystemExit):
+            usage_cli.build_parser().parse_args(
+                ["run-native-claude", "--role", "engineer-be", override, "caller"]
+            )
 
 
 def _transcript_mutators() -> tuple[Callable[[bytes], bytes], ...]:
@@ -357,11 +387,13 @@ def _transcript_mutators() -> tuple[Callable[[bytes], bytes], ...]:
         lambda value: value.replace(b'"type":"agent-setting"', b'"type":"unknown"', 1),
         lambda value: value.replace(b'"sessionId":', b'"sessionId":"wrong", "sessionId":', 1),
         lambda value: value.replace(
-            b'"sessionId":"11111111-1111-4111-8111-111111111111"', b'"sessionId":"wrong"', 1
+            b'"sessionId":"11111111-1111-4111-8111-111111111233"', b'"sessionId":"wrong"', 1
         ),
-        lambda value: value + b"\n",
         lambda value: value.replace(
-            b'"parentUuid":"22222222-2222-4222-8222-222222222222"', b'"parentUuid":7', 1
+            b'"effort":"high"', b'"mode":"metadata-only","effort":"high"', 1
+        ),
+        lambda value: value.replace(
+            b'"parentUuid":"11111111-1111-4111-8111-111111111234"', b'"parentUuid":7', 1
         ),
     )
 
@@ -371,7 +403,7 @@ def test_owned_transcript_rejects_jsonl_and_binding_boundaries(
     mutator: Callable[[bytes], bytes], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Malformed JSONL, duplicate keys, blank rows and malformed parent identity fail closed."""
-    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    content = (FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl").read_bytes()
     transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, mutator(content))
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.parse_owned_transcript(
@@ -383,18 +415,17 @@ def test_owned_transcript_rejects_jsonl_and_binding_boundaries(
 def test_owned_transcript_rejects_remaining_identity_and_usage_mutations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The exact parent binds a setting, session, model, effort, time and nonempty totals."""
-    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    """The exact parent binds a setting, session, effort, time and nonempty totals."""
+    content = (FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl").read_bytes()
     lines = content.splitlines()
     conflicting = list(lines)
-    conflicting[3] = conflicting[3].replace(b'"output_tokens":7', b'"output_tokens":8')
+    conflicting[2] = conflicting[2].replace(b'"output_tokens":9', b'"output_tokens":8')
     variants = (
         b"\n".join(lines[1:]) + b"\n",
-        content.replace(b'"model":"claude-sonnet-5"', b'"model":"wrong-model"', 1),
-        content.replace(b'"timestamp":"2026-01-01T00:00:01.000Z"', b'"timestamp":"invalid"', 1),
+        content.replace(b'"timestamp":"2026-08-18T00:00:01.000Z"', b'"timestamp":"invalid"', 1),
         content.replace(b'"usage":{"input_tokens":2', b'"usage":{}', 1),
         b"\n".join(lines[:2]) + b"\n",
-        b"\n".join(conflicting) + b"\n",
+        b"\n".join((*lines, conflicting[2])) + b"\n",
     )
     for index, variant in enumerate(variants):
         case = tmp_path / str(index)
@@ -412,11 +443,11 @@ def test_owned_transcript_rejects_assistant_root_agent_id_without_retaining_cont
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A parent transcript cannot claim a child-agent identity at the assistant root."""
-    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    content = (FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl").read_bytes()
     lines = content.splitlines()
     lines[2] = lines[2].replace(
-        b'"version":"2.1.231"',
-        b'"agentId":"SENTINEL_CHILD_ID","version":"2.1.231"',
+        b'"version":"2.1.233"',
+        b'"agentId":"SENTINEL_CHILD_ID","version":"2.1.233"',
         1,
     )
     transcript, session_id = _install_owned_transcript(
@@ -438,11 +469,11 @@ def test_owned_transcript_rejects_assistant_root_agent_id_without_retaining_cont
     [
         (
             b'{"type":"assistant","secret":"SENTINEL_TRANSCRIPT_JSON"}\n',
-            "11111111-1111-4111-8111-111111111111",
+            "11111111-1111-4111-8111-111111111233",
         ),
         (
             b'{"type":"assistant","secret":"SENTINEL_TRANSCRIPT_UTF8\xff"}\n',
-            "11111111-1111-4111-8111-111111111111",
+            "11111111-1111-4111-8111-111111111233",
         ),
         (b"", "SENTINEL_TRANSCRIPT_PATH"),
     ],
@@ -471,7 +502,7 @@ def test_owned_transcript_reader_never_mutates_its_exact_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The reader has no write, create, delete, rename or copy capability on transcripts."""
-    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    content = (FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl").read_bytes()
     transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, content)
     before = transcript.stat()
 
@@ -485,7 +516,7 @@ def test_owned_transcript_reader_never_mutates_its_exact_file(
         usage_transcript.parse_owned_transcript(
             tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high"
         ).usage_message_count
-        == 2
+        == 1
     )
     after = transcript.stat()
     assert (after.st_ino, after.st_mtime_ns, transcript.read_bytes()) == (
@@ -499,7 +530,7 @@ def test_owned_transcript_rejects_row_and_file_bounds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The exact parser independently applies row, file and row-count limits."""
-    content = (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl").read_bytes()
+    content = (FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl").read_bytes()
     transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, content)
     monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_ROWS", 1)
     with pytest.raises(usage_transcript.TranscriptError):
@@ -526,8 +557,11 @@ def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
     role: NativeClaudeRole,
 ) -> None:
     """D161 session persistence is native-only and no native stdout grammar survives."""
-    session_id = "11111111-1111-4111-8111-111111111111"
-    argv = usage_cli._native_claude_argv("claude", role, session_id)  # pyright: ignore[reportPrivateUsage]
+    session_id = "11111111-1111-4111-8111-111111111233"
+    pin = usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
+    argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+        "claude", role, pin.effort, session_id
+    )
     assert argv == [
         "claude",
         "--agent",
@@ -542,13 +576,21 @@ def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
         '{"mcpServers":{}}',
         "--permission-mode",
         "auto",
+        "--effort",
+        pin.effort,
     ]
     assert "--no-session-persistence" not in argv and "--output-format" not in argv
     generic = usage_cli._launch_argv(HarnessFamily.CLAUDE, "claude", "model", "high")  # pyright: ignore[reportPrivateUsage]
     assert "--no-session-persistence" in generic
+    generic_without_effort = usage_cli._launch_argv(  # pyright: ignore[reportPrivateUsage]
+        HarnessFamily.CLAUDE, "claude", "model", None
+    )
+    assert "--effort" not in generic_without_effort
 
 
-@pytest.mark.parametrize("role", ["repair", "engineer-be ", "Engineer-BE", "engineer_be", "x"])
+@pytest.mark.parametrize(
+    "role", ["ui-reviewer", "repair", "engineer-be ", "Engineer-BE", "engineer_be", "x"]
+)
 def test_native_roles_reject_before_provider_lookup(
     role: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -564,6 +606,49 @@ def test_native_roles_reject_before_provider_lookup(
     )
     with pytest.raises(SystemExit):
         usage_cli.build_parser().parse_args(["run-native-claude", "--role", role])
+
+
+def test_native_role_roster_pins_and_capabilities_match_committed_frontmatter() -> None:
+    """D163 admits exactly the committed native roster with derived capabilities."""
+    expected = {
+        "engineer-be": ("claude-sonnet-5", "high", RoleCapability.WRITE),
+        "engineer-fe": ("claude-sonnet-5", "high", RoleCapability.WRITE),
+        "mcp-contract-checker": ("claude-sonnet-5", "medium", RoleCapability.READ_ONLY),
+        "planning-architect": ("claude-opus-5", "high", RoleCapability.READ_ONLY),
+        "pr-triage": ("claude-sonnet-5", "high", RoleCapability.READ_ONLY),
+        "product-auditor": ("claude-sonnet-5", "high", RoleCapability.READ_ONLY),
+        "qa": ("claude-sonnet-5", "high", RoleCapability.READ_ONLY),
+        "safety-reviewer": ("claude-opus-5", "xhigh", RoleCapability.READ_ONLY),
+        "security-reviewer": ("claude-sonnet-5", "high", RoleCapability.READ_ONLY),
+        "sim-roast-runner": ("claude-sonnet-5", "medium", RoleCapability.READ_ONLY),
+        "story-planner": ("claude-opus-5", "high", RoleCapability.READ_ONLY),
+    }
+    assert tuple(role.value for role in NativeClaudeRole) == tuple(expected)
+    for role in NativeClaudeRole:
+        pin = usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
+        assert (pin.model, pin.effort, pin.capability) == expected[role.value]
+
+
+@pytest.mark.parametrize(
+    ("target", "replacement"),
+    [
+        (b"model: claude-sonnet-5", b"model: claude-fable-5"),
+        (b"effort: high", b"effort: unsupported"),
+        (b"tools: Read, Grep, Glob, Bash, Edit, Write", b"tools: Read, Grep, Glob, Edit, Edit"),
+    ],
+)
+def test_native_role_frontmatter_mutations_fail_closed(
+    target: bytes, replacement: bytes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Malformed native role model, effort, or tools never widens capture admission."""
+    content = Path(".claude/agents/engineer-be.md").read_bytes().replace(target, replacement)
+
+    def mutated_input(_path: Path) -> bytes:
+        return content
+
+    monkeypatch.setattr(usage_cli, "_input_bytes", mutated_input)
+    with pytest.raises(CaptureUsageError, match="frontmatter is invalid"):
+        usage_cli._native_role_pin(NativeClaudeRole.ENGINEER_BE)  # pyright: ignore[reportPrivateUsage]
 
 
 class _NativeInput:
@@ -617,7 +702,7 @@ class _NativeProcess:
         raise AssertionError("completed process must not be killed")
 
 
-_NATIVE_SESSION_ID = "11111111-1111-4111-8111-111111111111"
+_NATIVE_SESSION_ID = "11111111-1111-4111-8111-111111111233"
 
 
 def _native_cli_args(role: str = "engineer-be") -> list[str]:
@@ -646,9 +731,9 @@ def _native_cli_args(role: str = "engineer-be") -> list[str]:
 def _native_transcript_bytes(session_id: str = _NATIVE_SESSION_ID) -> bytes:
     """Return the closed parent fixture bound to one generated session."""
     return (
-        (FIXTURES / "claude-2.1.231-transcript" / "parent.jsonl")
+        (FIXTURES / "claude-2.1.233-transcript" / "parent.jsonl")
         .read_bytes()
-        .replace(b"11111111-1111-4111-8111-111111111111", session_id.encode())
+        .replace(b"11111111-1111-4111-8111-111111111233", session_id.encode())
     )
 
 
@@ -661,22 +746,29 @@ def _configure_native_launcher(
     project = home / ".claude" / "projects" / usage_transcript._project_name(tmp_path)  # pyright: ignore[reportPrivateUsage]
     project.mkdir(parents=True)
 
-    def fixed_effort(_role: NativeClaudeRole) -> str:
-        return "high"
-
     def fixed_executable(_family: HarnessFamily) -> str:
         return "claude"
 
-    def fixed_attestation(_arguments: argparse.Namespace, *, post_exit: bool) -> str:
+    def fixed_attestation(
+        _arguments: argparse.Namespace, _capability: RoleCapability, *, post_exit: bool
+    ) -> str:
         return "7d60f41" if post_exit else "4c1ac63"
 
     monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
     if fixed_session:
         monkeypatch.setattr(usage_cli, "uuid4", lambda: _NATIVE_SESSION_ID)
-    monkeypatch.setattr(usage_cli, "_native_effort", fixed_effort)
+    agent_dir = Path(__file__).resolve().parents[1] / ".claude" / "agents"
+    real_input_bytes = usage_cli._input_bytes  # pyright: ignore[reportPrivateUsage]
+
+    def read_input(path: Path) -> bytes:
+        if path.parent == Path(".claude") / "agents":
+            return (agent_dir / path.name).read_bytes()
+        return real_input_bytes(path)
+
+    monkeypatch.setattr(usage_cli, "_input_bytes", read_input)
     monkeypatch.setattr(usage_cli, "_resolved_executable", fixed_executable)
     monkeypatch.setattr(usage_cli, "_validate_native_worktree", fixed_attestation)
-    monkeypatch.setattr(usage_cli, "_utc_now", lambda: datetime(2026, 1, 1, tzinfo=UTC))
+    monkeypatch.setattr(usage_cli, "_utc_now", lambda: datetime(2026, 8, 18, tzinfo=UTC))
     Path("prompt").write_bytes(b"SENTINEL_NATIVE_PROMPT")
     return project, []
 
@@ -695,7 +787,7 @@ def _native_popen(
     def fake(argv: list[str], **kwargs: object) -> _NativeProcess:
         observed.append((argv, kwargs))
         if argv[-1] == "--version":
-            process = _NativeProcess(b"Claude Code 2.1.231\\n")
+            process = _NativeProcess(b"Claude Code 2.1.233\\n")
             processes.append(process)
             return process
         if transcript is not None:
@@ -722,7 +814,7 @@ def test_native_command_generates_distinct_real_uuid_sessions_per_invocation(
     def fake(argv: list[str], **kwargs: object) -> _NativeProcess:
         observed.append((argv, kwargs))
         if argv[-1] == "--version":
-            return _NativeProcess(b"Claude Code 2.1.231\n")
+            return _NativeProcess(b"Claude Code 2.1.233\n")
         session_id = argv[argv.index("--session-id") + 1]
         (project / f"{session_id}.jsonl").write_bytes(_native_transcript_bytes(session_id))
         return _NativeProcess()
@@ -765,7 +857,7 @@ def test_native_command_launches_exact_worker_and_records_immutable_transcript(
     assert len(observed) == 2
     argv, kwargs = observed[1]
     expected_argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
-        "claude", NativeClaudeRole.ENGINEER_BE, _NATIVE_SESSION_ID
+        "claude", NativeClaudeRole.ENGINEER_BE, "high", _NATIVE_SESSION_ID
     )
     assert argv == expected_argv
     assert kwargs["shell"] is False
@@ -819,7 +911,9 @@ def test_native_command_fails_closed_at_transcript_launch_boundaries(
     """Version, delivery, deadline, final provenance and absent transcript append nothing."""
     project, observed = _configure_native_launcher(tmp_path, monkeypatch)
 
-    def attestation(_arguments: argparse.Namespace, *, post_exit: bool) -> str:
+    def attestation(
+        _arguments: argparse.Namespace, _capability: RoleCapability, *, post_exit: bool
+    ) -> str:
         if post_exit and failure in {"post-dirty", "post-missing", "post-wrong-base"}:
             raise CaptureUsageError("native worktree attestation failed")
         return "7d60f41" if post_exit else "4c1ac63"
@@ -828,7 +922,7 @@ def test_native_command_fails_closed_at_transcript_launch_boundaries(
         observed.append((argv, kwargs))
         if argv[-1] == "--version":
             version = (
-                b"Claude Code 2.1.999\\n" if failure == "version" else b"Claude Code 2.1.231\\n"
+                b"Claude Code 2.1.999\\n" if failure == "version" else b"Claude Code 2.1.233\\n"
             )
             return _NativeProcess(version)
         if failure != "transcript":
@@ -948,7 +1042,11 @@ def test_native_cli_script_suppresses_bytecode_only_when_executed(
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        del sys.modules[spec.name]
     assert sys.dont_write_bytecode is before
     monkeypatch.delitem(sys.modules, "capture_usage_cli_import_probe", raising=False)
 
@@ -976,6 +1074,11 @@ def test_native_precheck_rejects_ignored_bytecode_before_provider_lookup(
         raise AssertionError(argv)
 
     monkeypatch.setattr(usage_cli, "_git_output", fake_git)
+
+    def valid_frontmatter(_path: Path) -> bytes:
+        return b"---\nmodel: claude-sonnet-5\neffort: high\ntools: Edit\n---\n"
+
+    monkeypatch.setattr(usage_cli, "_input_bytes", valid_frontmatter)
 
     def no_provider(_family: HarnessFamily) -> str:
         raise AssertionError("provider lookup")
@@ -1019,7 +1122,62 @@ def test_native_post_exit_attestation_rejects_each_final_provenance_break(
 
     monkeypatch.setattr(usage_cli, "_git_output", fake_git)
     with pytest.raises(CaptureUsageError, match="native worktree attestation failed"):
-        usage_cli._validate_native_worktree(arguments, post_exit=True)  # pyright: ignore[reportPrivateUsage]
+        usage_cli._validate_native_worktree(  # pyright: ignore[reportPrivateUsage]
+            arguments,
+            RoleCapability.WRITE,
+            post_exit=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("capability", "head", "accepted"),
+    [
+        (RoleCapability.READ_ONLY, "4c1ac63", True),
+        (RoleCapability.READ_ONLY, "7d60f41", False),
+        (RoleCapability.WRITE, "7d60f41", True),
+        (RoleCapability.WRITE, "4c1ac63", False),
+    ],
+)
+def test_native_post_exit_capability_binds_final_head(
+    capability: RoleCapability, head: str, accepted: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Read-only roles retain base HEAD; write roles must commit a base descendant."""
+    arguments = argparse.Namespace(
+        repository="syamaner/roastpilot-agent",
+        branch="feature/816-native-transcript-usage-1",
+        base_sha="4c1ac63",
+    )
+
+    def fake_git(argv: list[str]) -> tuple[int, str]:
+        if argv == ["remote", "get-url", "origin"]:
+            return 0, "https://github.com/syamaner/roastpilot-agent.git"
+        if argv == ["branch", "--show-current"]:
+            return 0, arguments.branch
+        if argv == ["rev-parse", "HEAD"]:
+            return 0, head
+        if argv == ["rev-parse", "--verify", "4c1ac63^{commit}"]:
+            return 0, "4c1ac63"
+        if argv == ["merge-base", "HEAD", "origin/main"]:
+            return 0, "4c1ac63"
+        if argv == ["status", "--porcelain"]:
+            return 0, ""
+        if argv[:2] == ["merge-base", "--is-ancestor"]:
+            return 0, ""
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(usage_cli, "_git_output", fake_git)
+    if accepted:
+        assert (
+            usage_cli._validate_native_worktree(  # pyright: ignore[reportPrivateUsage]
+                arguments, capability, post_exit=True
+            )
+            == head
+        )
+    else:
+        with pytest.raises(CaptureUsageError, match="native worktree attestation failed"):
+            usage_cli._validate_native_worktree(  # pyright: ignore[reportPrivateUsage]
+                arguments, capability, post_exit=True
+            )
 
 
 @pytest.fixture(autouse=True)
@@ -1232,8 +1390,16 @@ def test_codex_fixture_extracts_terminal_usage_without_content() -> None:
 
 def test_claude_fixture_uses_whole_tree_terminal_model_usage() -> None:
     """Only per-model whole-tree totals survive conflicting messages and top-level usage."""
-    with (FIXTURES / "claude-2.1.228.jsonl").open("rb") as stream:
-        usage = parse_claude_stream(stream, require_launch_authority=False)
+    historical = [
+        json.loads(line) for line in (FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()
+    ]
+    next(event for event in historical if event.get("subtype") == "init")["claude_code_version"] = (
+        "2.1.233"
+    )
+    usage = parse_claude_stream(
+        _stream("\n".join(json.dumps(event) for event in historical) + "\n"),
+        require_launch_authority=False,
+    )
 
     assert usage.input_tokens == 16
     assert usage.cached_input_tokens == 20
@@ -1264,9 +1430,9 @@ def test_claude_fixture_uses_whole_tree_terminal_model_usage() -> None:
     assert "SANITIZED_TOOL_RESULT" not in usage.model_dump_json()
 
 
-def test_claude_2_1_231_fixture_matches_frozen_grammar_without_content() -> None:
+def test_claude_2_1_233_fixture_matches_frozen_grammar_without_content() -> None:
     """The admitted Claude fixture changes neither grammar nor retained content."""
-    fixture = FIXTURES / "claude-2.1.231.jsonl"
+    fixture = FIXTURES / "claude-2.1.233.jsonl"
     events = [json.loads(line) for line in fixture.read_text().splitlines()]
     with fixture.open("rb") as stream:
         usage = parse_claude_stream(stream, require_launch_authority=True)
@@ -1286,11 +1452,11 @@ def test_claude_2_1_231_fixture_matches_frozen_grammar_without_content() -> None
         set(model_usage) == CLAUDE_MODEL_USAGE_KEYS
         for model_usage in terminal["modelUsage"].values()
     )
-    assert usage.input_tokens == 5
-    assert usage.cached_input_tokens == 11
-    assert usage.cache_creation_input_tokens == 13
-    assert usage.output_tokens == 7
-    assert usage.estimated_usd == pytest.approx(0.017)
+    assert usage.input_tokens == 2
+    assert usage.cached_input_tokens == 3_289
+    assert usage.cache_creation_input_tokens == 3_441
+    assert usage.output_tokens == 9
+    assert usage.estimated_usd == pytest.approx(0.0223677)
     serialized = usage.model_dump_json()
     for sentinel in ("SANITIZED_MESSAGE", "SANITIZED_RESULT", "request_0", "message_0"):
         assert sentinel not in serialized
@@ -1304,7 +1470,7 @@ def test_claude_2_1_231_fixture_matches_frozen_grammar_without_content() -> None
 def test_claude_launch_authority_attestation_fails_closed() -> None:
     """Only the live Claude path admits one exact empty-tools init before result."""
     events = [
-        json.loads(line) for line in (FIXTURES / "claude-2.1.231.jsonl").read_text().splitlines()
+        json.loads(line) for line in (FIXTURES / "claude-2.1.233.jsonl").read_text().splitlines()
     ]
     init = events[0]
     terminal = events[-1]
@@ -1334,9 +1500,9 @@ def test_claude_launch_authority_attestation_fails_closed() -> None:
         "uuid",
     ]
     legacy = (FIXTURES / "claude-2.1.228.jsonl").read_bytes()
-    assert parse_claude_stream(BytesIO(legacy), require_launch_authority=False).input_tokens == 16
-    with pytest.raises(ClaudeAuthorityError):
-        parse_claude_stream(BytesIO(legacy), require_launch_authority=True)
+    for strict in (False, True):
+        with pytest.raises(ClaudeUsageParseError, match="unverified Claude version"):
+            parse_claude_stream(BytesIO(legacy), require_launch_authority=strict)
 
     for field, value in (("tools", ["SENTINEL_TOOL"]), ("mcp_servers", ["SENTINEL_MCP"])):
         drifted = {**init, field: value}
@@ -1383,7 +1549,7 @@ def test_claude_launch_authority_attestation_fails_closed() -> None:
         parse_claude_stream(
             _stream(json.dumps(terminal) + "\n"), require_launch_authority=False
         ).input_tokens
-        == 5
+        == 2
     )
     with pytest.raises(ClaudeAuthorityError):
         parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=True)
@@ -1408,7 +1574,7 @@ def test_claude_launch_authority_attestation_fails_closed() -> None:
             parse_claude_stream(
                 BytesIO(stream.getvalue()), require_launch_authority=False
             ).input_tokens
-            == 5
+            == 2
         )
 
 
@@ -1418,10 +1584,10 @@ def test_parse_claude_prints_only_normalized_usage(
     """The inspection command validates lax init grammar without retaining authority data."""
     monkeypatch.chdir(tmp_path)
     stream = tmp_path / "claude.jsonl"
-    stream.write_bytes((FIXTURES / "claude-2.1.231.jsonl").read_bytes())
+    stream.write_bytes((FIXTURES / "claude-2.1.233.jsonl").read_bytes())
     assert main(["parse-claude", str(stream)]) == 0
     output = capsys.readouterr().out
-    assert '"input_tokens":5' in output
+    assert '"input_tokens":2' in output
     for key in ("tools", "mcp_servers", "permissionMode", "session_id"):
         assert key not in output
 
@@ -1430,7 +1596,7 @@ def test_parse_claude_prints_only_normalized_usage(
     ("command", "fixture"),
     [
         ("parse-codex", "codex-0.147.0.jsonl"),
-        ("parse-claude", "claude-2.1.231.jsonl"),
+        ("parse-claude", "claude-2.1.233.jsonl"),
     ],
 )
 def test_detached_parse_commands_cannot_create_native_worker_usage_sink(
@@ -1453,7 +1619,7 @@ def test_parse_claude_authority_error_is_fixed_and_creates_no_sink(
     """A drifted init exits through the Claude authority boundary without retaining input."""
     monkeypatch.chdir(tmp_path)
     events = [
-        json.loads(line) for line in (FIXTURES / "claude-2.1.231.jsonl").read_text().splitlines()
+        json.loads(line) for line in (FIXTURES / "claude-2.1.233.jsonl").read_text().splitlines()
     ]
     events[0]["permissionMode"] = "SENTINEL_DRIFT"
     stream = tmp_path / "claude-drifted.jsonl"
@@ -3040,7 +3206,7 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
     def run_for(output: bytes, code: int, harness: str = "codex") -> tuple[int | None, str]:
         def fake_popen(argv: list[str], **_: object) -> Process:
             if argv[-1] == "--version":
-                version = "0.147.0" if harness == "codex" else "2.1.231"
+                version = "0.147.0" if harness == "codex" else "2.1.233"
                 return Process(f"{harness} {version}\n".encode(), 0)
             return Process(output, code)
 
@@ -3090,7 +3256,7 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
 
     (tmp_path / ".agent-usage/usage.jsonl").unlink()
     claude_terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
-    claude_init = (FIXTURES / "claude-2.1.231.jsonl").read_text().splitlines()[0]
+    claude_init = (FIXTURES / "claude-2.1.233.jsonl").read_text().splitlines()[0]
     claude_terminal["subtype"] = "error_max_turns"
     claude_terminal["is_error"] = True
     result, record = run_for(
@@ -3102,7 +3268,7 @@ def test_run_failed_exit_outcomes_and_parser_drift_do_not_misrecord(
     assert parsed["input_tokens"] == 16
 
     (tmp_path / ".agent-usage/usage.jsonl").unlink()
-    success_terminal = json.loads((FIXTURES / "claude-2.1.231.jsonl").read_text().splitlines()[-1])
+    success_terminal = json.loads((FIXTURES / "claude-2.1.233.jsonl").read_text().splitlines()[-1])
     result, record = run_for(
         (claude_init + "\n" + json.dumps(success_terminal) + "\n").encode(), 0, "claude"
     )
@@ -3332,7 +3498,9 @@ def test_invalid_version_never_spawns_a_run(
         ("codex", "0.148.0"),
         ("claude", "2.1.228"),
         ("claude", "2.1.230"),
+        ("claude", "2.1.231"),
         ("claude", "2.1.232"),
+        ("claude", "2.1.234"),
     ],
 )
 def test_run_rejects_unverified_family_version_before_harness_launch(
