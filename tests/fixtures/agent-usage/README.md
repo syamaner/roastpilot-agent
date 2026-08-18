@@ -23,8 +23,9 @@ costs, and token counts with synthetic values.
   rejection evidence.
   The observed native stream parses in lax structural mode, but generic strict
   launch authority rejects it because `hook_started`/`hook_response` precede `init`.
-  `security-reviewer.jsonl` is a lead-supplied sanitized native fixture with an
-  exact-shape, metadata-only `ai-title` row; it retains no provider content or paths.
+  `security-reviewer.jsonl` retains its exact-shape, metadata-only `ai-title` row
+  (carried forward unchanged from the prior probe evidence, §D166 note below); it
+  retains no provider content or paths.
 - `claude-2.1.231-native.jsonl` is a synthetic-conforming native-profile fixture
   with non-empty tools, `permissionMode: auto`, and a model field. It validates
   parser and launch-boundary logic only; it is not observed provenance and proves
@@ -56,6 +57,29 @@ costs, and token counts with synthetic values.
   exercised without claiming a separate frontend probe.
   Its natural distinct-outer-UUID duplicate documents the historical case; the
   admitted 2.1.233 synthetic test independently proves the live dedup invariant.
+
+## D166 round-7 repair: regenerated READ_ONLY `dontAsk` fixtures (18 Aug 2026)
+
+`claude-2.1.233-transcript/story-planner.jsonl`, `safety-reviewer.jsonl`, and
+`security-reviewer.jsonl` are regenerated, and `qa.jsonl` is new, to carry the
+`dontAsk` permission-mode grammar and a terminal assistant turn with a
+`thinking` block followed by a `text` block. The `permissionMode: "dontAsk"`
+user-row field, the `promptSource: "sdk"` field, the `{"type":"mode","mode":
+"normal"}` row, the terminal `stop_reason: "end_turn"`, and the exact
+`thinking`/`text` content-block key sets are lead-supplied, bounded,
+parent-owned probe evidence from a Claude Code 2.1.233 Opus/high
+`story-planner` run and a Bash-capable Sonnet/high `pr-triage` run on an idle
+non-roasting host. Every identifier, timestamp, and token count is synthetic.
+**Every `text` block's content is a synthetic sanitised placeholder authored by
+the lead — never a real model response** (A4); `qa.jsonl` is test data for the
+parser and launcher stub only and does not claim a live `--validation-root`
+run (that path is proved by the local mutation/behavioural tests plus a
+separate parent-owned post-implementation live proof, never by this fixture).
+`security-reviewer.jsonl`'s pre-existing `ai-title` row is carried forward
+unchanged from the fixture it replaces (its shape and grammar are outside this
+round's changes) with only its `sessionId` binding updated to match the
+regenerated session. `parent.jsonl` and `engineer-fe.jsonl` (WRITE roles
+already on the frozen `auto` mode) are unchanged by this round.
 
 No prompt, response, credential, environment value, repository path, or live
 session identifier is retained.
