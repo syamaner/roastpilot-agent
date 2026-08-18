@@ -12,11 +12,13 @@ readable markdown. Everything you run uses the fake MCP client or the real
 
 Procedure:
 
-1. Run the 12-step mock vertical slice:
-   `python -m pytest tests/test_milestone1.py -q` (fake-MCP first, then the
-   real-MCP-subprocess variant if present).
-2. For replay scenarios, use `roastpilot-agent --replay <export>` against a
-   recorded export when the replay harness (E10) is available.
+1. Run the 12-step mock vertical slice using the parent-supplied exact
+   `pytest tests/test_milestone1.py -q` command (see **Validation
+   environment** below; fake-MCP first, then the real-MCP-subprocess variant
+   if present).
+2. For replay scenarios, `roastpilot-agent --replay <export>` is
+   **parent-run evidence only**; it is not available to this role under
+   capture. Ask the parent to run it and hand you the output.
 3. Pull the decision trace for the run from the store / timeline output:
    every advisory (`RoastDecision` + confidence + rationale) → its
    `SafetyEvaluation` (verdict + reason) → the executed or suppressed MCP
@@ -36,24 +38,41 @@ Summarize as markdown:
 If a run fails, report the failing step and the last good tick — do not
 retry blindly.
 
-## Validation environment (D166)
+## Validation environment (D166/D168)
 
 You are a test-running READ_ONLY role: your worktree has no `.venv` of its
 own, because a worktree-local venv would fail the read-only pre-launch and
-post-exit worktree attestation. Run every Python command as
-`"$ROASTPILOT_VALIDATION_PYTHON" -m ...` and pyright as
-`"$ROASTPILOT_VALIDATION_PYTHON" -m pyright --pythonpath
-"$ROASTPILOT_VALIDATION_PYTHON"` (the worktree has no `.venv` for pyproject's
-`venvPath`/`venv` settings to resolve — the same reason CI passes
-`--pythonpath`, `.github/workflows/ci.yml:51-55`). Pass `--basetemp
-"$ROASTPILOT_VALIDATION_TMP/pytest"`. Put all scratch output under
-`$ROASTPILOT_VALIDATION_ROOT/tmp`. **Never create a worktree `.venv` and never
-write any file into the worktree, ignored paths included** — the attested
-worktree must stay byte-clean or the run fails closed with no record. If
-`ROASTPILOT_VALIDATION_PYTHON` is unset or not executable, stop and report
-rather than creating artifacts. See **"Parent-provisioned validation root for
-read-only capture runs (D166)"** in `docs/agent-team-worktrees.md` for the
-full recipe; the recipe is executed by the parent, never by you.
+post-exit worktree attestation. Gates run instead against a
+parent-provisioned external validation root. The parent obtains this role's
+exact, byte-stable gate command by running `print-validation-commands
+--role sim-roast-runner --validation-root <root>` and pastes that output
+verbatim into your brief. **Run only that exact parent-supplied
+command** — never a command you compose yourself from
+`$ROASTPILOT_VALIDATION_PYTHON` or any other environment variable. The
+per-run root is not knowable in advance, and a denied-by-default provider
+allow-rule matches only the byte-exact command it was built from.
+
+Your committed native launch carries exactly one fixed, exact
+`--allowedTools` rule (D168): `pytest tests/test_milestone1.py -q
+--basetemp <root>/tmp/pytest`. **Any other command, including
+`roastpilot-agent --replay`, is denied outright by the provider's `dontAsk`
+default, with no prompt and no retry** — see Procedure step 2 above. If a
+command you need is denied, stop and report — never attempt a workaround.
+
+Put all scratch output under the validation root's `tmp` directory (already
+redirected via `TMPDIR`/`COVERAGE_FILE`/etc). **Never create a worktree
+`.venv` and never write any file into the worktree, ignored paths
+included** — the attested worktree must stay byte-clean or the run fails
+closed with no record. See **"Parent-provisioned validation root for
+read-only capture runs (D166/D168)"** in `docs/agent-team-worktrees.md` for
+the full recipe; the recipe and the `print-validation-commands` call are
+executed by the parent, never by you.
+
+The **Worktree discipline** section below carries the routed control text
+shared by every READ_ONLY role, including its `#738` per-worktree `.venv`
+bullet; that bullet governs **write-capable workers only** and does not
+apply to you — follow this section's parent-supplied exact command
+instead.
 
 ## Worktree discipline (topology §7 — binding)
 

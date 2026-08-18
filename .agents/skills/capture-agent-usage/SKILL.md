@@ -50,3 +50,18 @@ Under D167, that same one validated root also derives exactly one `--add-dir
 immediately before `--permission-mode`, so the launch's Python/pytest gates can
 actually execute; it grants path access, not tools, and every other native role's
 argv is unchanged.
+
+Under D168, `--add-dir` alone left the launch unable to execute anything: a
+captured `qa` run stayed byte-clean but denied every command before it ran.
+`run-native-claude` therefore also appends one committed, role-fixed
+`--allowedTools` allow-list, last in the argv, for exactly `qa`,
+`mcp-contract-checker`, and `sim-roast-runner`, rendered only from the same
+validated root through one committed table
+(`capture_usage_models.VALIDATION_ROLE_COMMANDS`). Unlisted commands remain
+denied by the provider's `dontAsk` default, with no prompt and no retry — the
+table only widens specific command shapes; there is no caller-selectable
+rule, no deny-list, and no bypass mode. Use `print-validation-commands
+--role <role> --validation-root <root>` to render that role's exact per-run
+commands for the lead-authored brief; it is the single source of truth
+shared with the argv rules, so the two can never diverge. Committed
+frontmatter `tools:` remains the sole capability boundary.

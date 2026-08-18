@@ -236,7 +236,7 @@ make a faithful dependency install structurally impossible. Their gate output is
 An implementer that cannot install must say so, never improvise with
 `--system-site-packages`.
 
-## Parent-provisioned validation root for read-only capture runs (D166, amended D167)
+## Parent-provisioned validation root for read-only capture runs (D166, amended D167, D168)
 
 The `#738`/`#733` per-worktree `.venv` rule above continues to govern every
 **write-capable** worker worktree. It is **replaced**, not extended, for the
@@ -286,9 +286,9 @@ check, not a substitute for it.
 
 **pyright needs `--pythonpath` too**, for the same reason CI passes it
 (`.github/workflows/ci.yml:51-55`): with no worktree `.venv`, pyright has
-nothing for pyproject's `venvPath`/`venv` settings to resolve, so the role
-runs `"$ROASTPILOT_VALIDATION_PYTHON" -m pyright --pythonpath
-"$ROASTPILOT_VALIDATION_PYTHON"`.
+nothing for pyproject's `venvPath`/`venv` settings to resolve, so `qa`'s
+committed pyright gate (D168 below) resolves `--pythonpath` against the same
+external interpreter it invokes.
 
 **Attestation is untouched.** `--validation-root` binds exactly
 `ROASTPILOT_VALIDATION_ROOT`, `ROASTPILOT_VALIDATION_PYTHON`,
@@ -338,6 +338,30 @@ path being a symlink is an accepted residual inside this trusted, same-uid,
 parent-provisioned boundary: the parent alone provisions and names the root,
 so a clean resolved path reached through a clean intermediate-ancestor
 symlink is not a new attacker-controlled surface.
+
+**D168: `--add-dir` alone left the validation environment unusable — a
+captured `qa` launch stayed byte-clean but denied every Python/pytest/Ruff/
+Pyright command before execution, because path access is not execution
+permission.** The fix is one committed, role-fixed `--allowedTools` allow-list
+for exactly `qa`, `mcp-contract-checker`, and `sim-roast-runner`, rendered
+only from the same already-validated resolved root and appended last in the
+native argv (variadic, so nothing may follow it). Unlisted commands remain
+**denied by the provider's `dontAsk` default, with no prompt and no retry** —
+the allow-list only widens specific command shapes; it adds no deny-list and
+no bypass mode. The parent is the **sole interface** to this role's exact
+gate commands: it runs `print-validation-commands --role <role>
+--validation-root <root>` (`capture_usage_cli.py`) and pastes that verbatim
+output into the role's brief. This runbook intentionally does not restate
+those seven dynamic command strings — they depend on the per-run root and
+only `print-validation-commands` can render them correctly, from the same
+table that builds the argv rules. Exactly one rule (`qa`'s `pytest` gate) is
+a *prefix* rule; it admits arbitrary pytest arguments and the execution of
+committed test code. This is an accepted, explicitly-scoped residual — **a
+discipline and attestation boundary, not an OS sandbox** — contained by
+parent-authored prompts, the per-run `0700` external root, the redirected
+cache/temp/coverage destinations above, and the unchanged byte-clean,
+unchanged-head post-exit attestation that still yields no record and no
+handback if anything lands in the worktree.
 
 ## Reviewers in a shared worktree (added 9 Jul 2026, after a live incident)
 

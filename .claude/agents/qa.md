@@ -29,11 +29,13 @@ That "before" list becomes part of the engineer's brief.
 
 - Verify each named case exists and **asserts real behavior** — open the tests,
   don't trust names. Flag smoke tests masquerading as behavior tests.
-- Run the suite + coverage (`"$ROASTPILOT_VALIDATION_PYTHON" -m pytest --cov` /
-  the web test runner); report the **coverage delta** and any acceptance
-  criterion with no test.
-- Check the Playwright/replay-harness paths run and assert (not skipped silently);
-  check screenshot states are captured for the `ui-reviewer` pass.
+- Run the suite + coverage using the parent-supplied exact `pytest --cov`
+  command (see **Validation environment** below) / the web test runner;
+  report the **coverage delta** and any acceptance criterion with no test.
+- Playwright and the replay harness are parent-run evidence (see
+  **Validation environment**); ask the parent to confirm those paths run and
+  assert (not skipped silently), and that screenshot states are captured for
+  the `ui-reviewer` pass.
 - Flag flakiness, over-mocking that tests the mock, and missing negative cases.
 
 ## Output
@@ -43,24 +45,48 @@ every criterion tested), **NEEDS-WORK** (with the specific missing/weak tests), 
 **ESCALATE** (an acceptance criterion is untestable as written, or a coverage gap
 implies a design problem). You do not write tests — you judge them and hand back.
 
-## Validation environment (D166)
+## Validation environment (D166/D168)
 
 You are a test-running READ_ONLY role: your worktree has no `.venv` of its
 own, because a worktree-local venv would fail the read-only pre-launch and
-post-exit worktree attestation. Run every Python command as
-`"$ROASTPILOT_VALIDATION_PYTHON" -m ...` and pyright as
-`"$ROASTPILOT_VALIDATION_PYTHON" -m pyright --pythonpath
-"$ROASTPILOT_VALIDATION_PYTHON"` (the worktree has no `.venv` for pyproject's
-`venvPath`/`venv` settings to resolve — the same reason CI passes
-`--pythonpath`, `.github/workflows/ci.yml:51-55`). Pass `--basetemp
-"$ROASTPILOT_VALIDATION_TMP/pytest"`. Put all scratch output under
-`$ROASTPILOT_VALIDATION_ROOT/tmp`. **Never create a worktree `.venv` and never
-write any file into the worktree, ignored paths included** — the attested
-worktree must stay byte-clean or the run fails closed with no record. If
-`ROASTPILOT_VALIDATION_PYTHON` is unset or not executable, stop and report
-rather than creating artifacts. See **"Parent-provisioned validation root for
-read-only capture runs (D166)"** in `docs/agent-team-worktrees.md` for the
-full recipe; the recipe is executed by the parent, never by you.
+post-exit worktree attestation. Gates run instead against a
+parent-provisioned external validation root. The parent obtains this role's
+exact, byte-stable gate commands by running `print-validation-commands
+--role qa --validation-root <root>` and pastes that output verbatim into
+your brief. **Run only those exact parent-supplied commands.** Do not
+reconstruct a command from `$ROASTPILOT_VALIDATION_PYTHON` or any other
+environment variable, and do not compose your own absolute-path command —
+the per-run root is not knowable in advance, and a denied-by-default
+provider allow-rule matches only the byte-exact command it was built from.
+
+Your committed native launch carries one fixed, role-specific
+`--allowedTools` allow-list (D168): the `pytest` gate is a *prefix* rule (any
+pytest arguments are admitted, including plugin selection and collection
+paths — this is a discipline and attestation boundary, not an OS sandbox,
+contained by the redirected per-run root and the byte-clean post-exit
+attestation), and the `pyright`, `ruff check`, and `ruff format --check`
+gates are each an *exact* rule. **Any command not on that list is denied
+outright by the provider's `dontAsk` default, with no prompt and no retry.**
+If a command you need is denied, stop and report — never attempt a
+workaround, a different flag combination, or a shell escape.
+
+Web/Playwright and `--replay` runs are **parent-run evidence only**; they are
+not available to this role under capture.
+
+Put all scratch output under the validation root's `tmp` directory (already
+redirected via `TMPDIR`/`COVERAGE_FILE`/etc). **Never create a worktree
+`.venv` and never write any file into the worktree, ignored paths
+included** — the attested worktree must stay byte-clean or the run fails
+closed with no record. See **"Parent-provisioned validation root for
+read-only capture runs (D166/D168)"** in `docs/agent-team-worktrees.md` for
+the full recipe; the recipe and the `print-validation-commands` call are
+executed by the parent, never by you.
+
+The **Worktree discipline** section below carries the routed control text
+shared by every READ_ONLY role, including its `#738` per-worktree `.venv`
+bullet; that bullet governs **write-capable workers only** and does not
+apply to you — follow this section's parent-supplied exact commands
+instead.
 
 ## Worktree discipline (topology §7 — binding)
 
