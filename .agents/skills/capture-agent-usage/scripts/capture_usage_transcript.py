@@ -29,7 +29,7 @@ _ALLOWED_TYPES = frozenset(
         "user",
     }
 )
-"""Row types observed across the four committed 2.1.233 transcript fixtures.
+"""Row types observed across the five committed 2.1.233 transcript fixtures.
 
 ``mode`` and ``ai-title`` are metadata-only rows with independently closed shapes.
 """
@@ -280,7 +280,7 @@ def parse_owned_transcript(
                 ):
                     raise TranscriptError("owned Claude transcript is invalid")
                 if row["type"] == "mode":
-                    if set(row) != _MODE_ROW_KEYS or not isinstance(row["mode"], str):
+                    if set(row) != _MODE_ROW_KEYS or row.get("mode") != "default":
                         raise TranscriptError("owned Claude transcript is invalid")
                     continue
                 if row["type"] == "assistant":

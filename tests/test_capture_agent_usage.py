@@ -249,6 +249,11 @@ def _mode_row_use_null_mode(row: dict[str, object]) -> dict[str, object]:
     return {**row, "mode": None}
 
 
+def _mode_row_use_unobserved_string(row: dict[str, object]) -> dict[str, object]:
+    """Replace the exact observed mode value with another string."""
+    return {**row, "mode": "plan"}
+
+
 @pytest.mark.parametrize(
     "mutator",
     [
@@ -256,6 +261,7 @@ def _mode_row_use_null_mode(row: dict[str, object]) -> dict[str, object]:
         _mode_row_drop_mode_key,
         _mode_row_use_integer_mode,
         _mode_row_use_null_mode,
+        _mode_row_use_unobserved_string,
     ],
 )
 def test_owned_transcript_mode_row_admits_exact_shape_only(
