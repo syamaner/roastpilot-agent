@@ -1499,7 +1499,7 @@ def test_native_post_exit_capability_binds_final_head(
             return 0, head
         if argv == ["rev-parse", "--verify", "4c1ac63^{commit}"]:
             return 0, "4c1ac63"
-        if argv == ["status", "--porcelain"]:
+        if argv in (["status", "--porcelain"], ["status", "--porcelain", "--ignored"]):
             return 0, ""
         if argv[:2] == ["merge-base", "--is-ancestor"]:
             return 0, ""
@@ -1518,6 +1518,72 @@ def test_native_post_exit_capability_binds_final_head(
             usage_cli._validate_native_worktree(  # pyright: ignore[reportPrivateUsage]
                 arguments, capability, post_exit=True
             )
+
+
+def test_read_only_post_exit_attestation_rejects_ignored_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Read-only workers must leave neither tracked nor ignored worktree artifacts."""
+    arguments = argparse.Namespace(
+        repository="syamaner/roastpilot-agent",
+        branch="feature/816-native-transcript-usage-1",
+        base_sha="4c1ac63",
+    )
+
+    def fake_git(argv: list[str]) -> tuple[int, str]:
+        if argv == ["remote", "get-url", "origin"]:
+            return 0, "https://github.com/syamaner/roastpilot-agent.git"
+        if argv == ["branch", "--show-current"]:
+            return 0, arguments.branch
+        if argv == ["rev-parse", "HEAD"]:
+            return 0, "4c1ac63"
+        if argv == ["rev-parse", "--verify", "4c1ac63^{commit}"]:
+            return 0, "4c1ac63"
+        if argv == ["status", "--porcelain", "--ignored"]:
+            return 0, "!! .claude/__pycache__/worker.pyc"
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(usage_cli, "_git_output", fake_git)
+    with pytest.raises(CaptureUsageError, match="native worktree attestation failed"):
+        usage_cli._validate_native_worktree(  # pyright: ignore[reportPrivateUsage]
+            arguments, RoleCapability.READ_ONLY, post_exit=True
+        )
+
+
+def test_write_post_exit_attestation_keeps_ordinary_clean_tree_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Write workers retain the ratified ordinary status check while requiring a descendant."""
+    arguments = argparse.Namespace(
+        repository="syamaner/roastpilot-agent",
+        branch="feature/816-native-transcript-usage-1",
+        base_sha="4c1ac63",
+    )
+
+    def fake_git(argv: list[str]) -> tuple[int, str]:
+        if argv == ["remote", "get-url", "origin"]:
+            return 0, "https://github.com/syamaner/roastpilot-agent.git"
+        if argv == ["branch", "--show-current"]:
+            return 0, arguments.branch
+        if argv == ["rev-parse", "HEAD"]:
+            return 0, "7d60f41"
+        if argv == ["rev-parse", "--verify", "4c1ac63^{commit}"]:
+            return 0, "4c1ac63"
+        if argv == ["status", "--porcelain"]:
+            return 0, ""
+        if argv == ["status", "--porcelain", "--ignored"]:
+            raise AssertionError("WRITE post-exit must not inspect ignored artifacts")
+        if argv == ["merge-base", "--is-ancestor", "4c1ac63", "7d60f41"]:
+            return 0, ""
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(usage_cli, "_git_output", fake_git)
+    assert (
+        usage_cli._validate_native_worktree(  # pyright: ignore[reportPrivateUsage]
+            arguments, RoleCapability.WRITE, post_exit=True
+        )
+        == "7d60f41"
+    )
 
 
 @pytest.fixture(autouse=True)

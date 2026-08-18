@@ -523,7 +523,11 @@ def _validate_native_worktree(
     branch_status, branch = _git_output(["branch", "--show-current"])
     head_status, head = _git_output(["rev-parse", "HEAD"])
     base_status, base = _git_output(["rev-parse", "--verify", f"{arguments.base_sha}^{{commit}}"])
-    status_args = ["status", "--porcelain"] if post_exit else ["status", "--porcelain", "--ignored"]
+    status_args = (
+        ["status", "--porcelain"]
+        if post_exit and capability is RoleCapability.WRITE
+        else ["status", "--porcelain", "--ignored"]
+    )
     clean_status, dirty = _git_output(status_args)
     if (
         branch_status != 0
