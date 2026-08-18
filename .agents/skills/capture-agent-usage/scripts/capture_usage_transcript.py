@@ -305,10 +305,6 @@ def parse_owned_transcript(
                         raise TranscriptError("owned Claude transcript role is invalid")
                     agent_settings += 1
                     continue
-                if row["type"] == "mode":
-                    if set(row) != _MODE_ROW_KEYS or row.get("mode") != "default":
-                        raise TranscriptError("owned Claude transcript is invalid")
-                    continue
                 if row["type"] == "ai-title":
                     if (
                         set(row) != _AI_TITLE_ROW_KEYS
