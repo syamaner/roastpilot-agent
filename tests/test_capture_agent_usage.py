@@ -483,6 +483,89 @@ def test_native_codex_rejects_out_of_order_or_repeated_task_events(tmp_path: Pat
             usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
 
 
+def test_native_codex_streams_two_mebibyte_content_event_at_exact_boundary(tmp_path: Path) -> None:
+    """A realistic 0.147.0 content-bearing response is parsed and discarded at the cap."""
+    root_meta = {
+        "ordinal": 0,
+        "timestamp": "discarded",
+        "type": "session_meta",
+        "payload": {
+            "base_instructions": "discarded",
+            "cli_version": "0.147.0",
+            "context_window": 1,
+            "cwd": "discarded",
+            "git": {"branch": "main", "commit_hash": "a" * 40, "repository_url": "discarded"},
+            "history_mode": "discarded",
+            "id": "root-811",
+            "model_provider": "discarded",
+            "originator": "codex-tui",
+            "session_id": "discarded",
+            "source": "cli",
+            "thread_source": "user",
+            "timestamp": "discarded",
+        },
+    }
+    response_payload: dict[str, object] = {
+        "type": "message",
+        "content": "",
+        "id": "discarded",
+        "internal_chat_message_metadata_passthrough": {},
+        "role": "assistant",
+    }
+    response: dict[str, object] = {
+        "ordinal": 1,
+        "timestamp": "discarded",
+        "type": "response_item",
+        "payload": response_payload,
+    }
+    empty = json.dumps(response, separators=(",", ":")).encode() + b"\n"
+    response_payload["content"] = "S" * (usage_native_codex.MAX_EVENT_BYTES - len(empty))
+    exact = json.dumps(response, separators=(",", ":")).encode() + b"\n"
+    assert len(exact) == usage_native_codex.MAX_EVENT_BYTES
+    binding = {
+        "parent_thread_id": "parent-811",
+        "role": "engineer-be",
+        "agent_path": "/root/native-codex-capture",
+        "effort": "high",
+    }
+    rollout = tmp_path / "large.jsonl"
+    rollout.write_bytes(json.dumps(root_meta, separators=(",", ":")).encode() + b"\n" + exact)
+    with rollout.open("rb") as stream:
+        _session, totals, _parent, matches = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
+            stream.fileno(), binding
+        )
+    assert totals == (0, 0, 0, 0, 0, 0) and matches is False
+
+    one_over = tmp_path / "one-over.jsonl"
+    one_over.write_bytes(
+        json.dumps(root_meta, separators=(",", ":")).encode() + b"\n" + exact[:-1] + b"S\n"
+    )
+    with one_over.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_bounded_reader_rejects_partial_and_count_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bounded reader rejects an unterminated final event and count excess pre-parse."""
+    binding = {
+        "parent_thread_id": "parent-811",
+        "role": "engineer-be",
+        "agent_path": "/root/native-codex-capture",
+        "effort": "high",
+    }
+    partial = tmp_path / "partial.jsonl"
+    partial.write_bytes(b'{"ordinal":0}')
+    with partial.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setattr(usage_native_codex, "MAX_PROVIDER_LINES", 1)
+    overflow = tmp_path / "overflow.jsonl"
+    overflow.write_bytes(b"{}\n{}\n")
+    with overflow.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_native_codex_root_overlap_uses_held_directory_identities(tmp_path: Path) -> None:
     """Only equal or nested held roots fail; shared filesystem ancestors are allowed."""
     nested = tmp_path / "nested"

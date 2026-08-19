@@ -28,7 +28,9 @@ MAX_PROVIDER_DEPTH = 8
 MAX_PROVIDER_FILE_BYTES = 8 * 1024 * 1024
 MAX_PROVIDER_TOTAL_BYTES = 128 * 1024 * 1024
 MAX_PROVIDER_LINES = 100_000
-MAX_EVENT_BYTES = 256 * 1024
+# Observed Codex 0.147.0 tool-output event: 1,006,736 bytes.  Keep this fixed
+# two-MiB bound below the separate eight-MiB rollout-file cap.
+MAX_EVENT_BYTES = 2 * 1024 * 1024
 _CONFIG_NAME = ".codex/config.toml"
 _ROLE_EXPECTATIONS: dict[NativeCodexRole, tuple[str, str]] = {
     NativeCodexRole.ENGINEER_BE: ("agents/engineer-be.toml", "high"),
@@ -456,7 +458,12 @@ def _parse_rollout(
     is_subagent = False
     totals: tuple[int, int, int, int, int, int] | None = None
     with os.fdopen(os.dup(fd), "rb") as stream:
-        for number, raw in enumerate(stream, 1):
+        number = 0
+        while True:
+            raw = stream.readline(MAX_EVENT_BYTES + 1)
+            if raw == b"":
+                break
+            number += 1
             if number > MAX_PROVIDER_LINES or len(raw) > MAX_EVENT_BYTES or not raw.endswith(b"\n"):
                 _fail()
             event = _json(raw)
