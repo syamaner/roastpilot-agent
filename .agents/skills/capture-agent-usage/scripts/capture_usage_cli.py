@@ -135,6 +135,8 @@ _EVIDENCE_ENVIRONMENT_KEYS = frozenset({EVIDENCE_ROOT_ENVIRONMENT_KEY})
 _ALL_BOUND_ROOT_ENVIRONMENT_KEYS = ALL_BOUND_ROOT_ENVIRONMENT_KEYS
 _VALIDATION_DIRECTORY_MODE = 0o700
 _FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+_GENERATED_AT_MAX_LEN = 40
+"""Conservative bound on the ``generated_at`` field before attempting to parse it."""
 """Closed 40-lowercase-hex full commit sha grammar (D169, §2.3, §2.4)."""
 _SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 """Closed 64-lowercase-hex SHA-256 digest grammar (D169, §2.4)."""
@@ -968,12 +970,17 @@ def _validate_evidence_manifest_schema(
     if not isinstance(base_sha, str) or _FULL_SHA_PATTERN.fullmatch(base_sha) is None:
         raise CaptureUsageError("evidence bundle is invalid")
     generated_at = data.get("generated_at")
-    if not isinstance(generated_at, str):
+    if not isinstance(generated_at, str) or len(generated_at) > _GENERATED_AT_MAX_LEN:
         raise CaptureUsageError("evidence bundle is invalid")
     try:
-        parsed = datetime.fromisoformat(generated_at.replace("Z", "+00:00")).astimezone(UTC)
+        parsed = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
     except ValueError:
         raise CaptureUsageError("evidence bundle is invalid") from None
+    # Reject a timezone-naive value and any non-zero UTC offset explicitly rather
+    # than silently normalizing it: `generated_at` must already be RFC3339 UTC
+    # (a `Z` or `+00:00` form), never an offset that requires conversion.
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise CaptureUsageError("evidence bundle is invalid")
     if parsed > _utc_now() + timedelta(seconds=TIMESTAMP_SKEW_SECONDS):
         raise CaptureUsageError("evidence bundle is invalid")
     files = data.get("files")

@@ -56,11 +56,13 @@ from capture_usage_models import (
     EVIDENCE_MAX_FILE_BYTES,
     EVIDENCE_MAX_TOTAL_BYTES,
     EVIDENCE_PAYLOAD_FILES,
+    EVIDENCE_ROOT_ENVIRONMENT_KEY,
     EVIDENCE_SCHEMA_VERSION,
     MAX_EVENT_BYTES,
     MAX_EVENT_COUNT,
     MAX_STREAM_BYTES,
     NATIVE_ROLE_EXCLUSIONS,
+    PLAN_ROOT_ENVIRONMENT_KEY,
     VALIDATION_ENVIRONMENT_ROLES,
     VALIDATION_ROLE_COMMANDS,
     BoundedStreamError,
@@ -7347,6 +7349,52 @@ def test_plan_root_binds_add_dir_and_no_allowed_tools(
     assert "--allowedTools" not in argv
 
 
+def test_plan_environment_binds_exact_key_and_strips_evidence_and_validation_keys(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PLAN-kind launch binds exactly ``ROASTPILOT_PLAN_ROOT`` and strips the rest.
+
+    Exercises the actual :func:`usage_cli._resolve_native_environment` result
+    (not the constants alone), including a *stale* inherited
+    ``ROASTPILOT_PLAN_ROOT`` value that must be overwritten by the freshly
+    resolved root, and a stale ``ROASTPILOT_EVIDENCE_ROOT`` plus every
+    validation key that must be stripped outright.
+    """
+    root = _build_plan_root(tmp_path_factory.mktemp("plan-base") / "root")
+    sha = "2" * 40
+    monkeypatch.setattr(usage_cli, "_git_output", _fixed_plan_git(str(root), sha))
+    monkeypatch.setenv(PLAN_ROOT_ENVIRONMENT_KEY, "STALE_PLAN_SENTINEL")
+    monkeypatch.setenv(EVIDENCE_ROOT_ENVIRONMENT_KEY, "STALE_EVIDENCE_SENTINEL")
+    for key in usage_cli._VALIDATION_ENVIRONMENT_KEYS:  # pyright: ignore[reportPrivateUsage]
+        monkeypatch.setenv(key, "STALE_VALIDATION_SENTINEL")
+
+    launch_environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
+        NativeClaudeRole.STORY_PLANNER,
+        _request(plan_root=str(root), plan_sha=sha),
+        attested_head="0" * 40,
+    )
+    resolved_root = os.path.realpath(root)
+    assert launch_environment.bound_root is not None
+    assert launch_environment.bound_root.kind is BoundRootKind.PLAN
+    assert launch_environment.bound_root.path == resolved_root
+
+    environment = launch_environment.environment
+    assert environment[PLAN_ROOT_ENVIRONMENT_KEY] == resolved_root
+    assert EVIDENCE_ROOT_ENVIRONMENT_KEY not in environment
+    assert not (
+        set(environment) & usage_cli._VALIDATION_ENVIRONMENT_KEYS  # pyright: ignore[reportPrivateUsage]
+    )
+
+    # A role with no admitting policy sees the key stripped too, including the
+    # stale value this test just set above.
+    other_role_environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
+        NativeClaudeRole.ENGINEER_BE, _request(), attested_head="0" * 40
+    )
+    assert other_role_environment.bound_root is None
+    assert PLAN_ROOT_ENVIRONMENT_KEY not in other_role_environment.environment
+    assert EVIDENCE_ROOT_ENVIRONMENT_KEY not in other_role_environment.environment
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -7646,6 +7694,50 @@ def test_evidence_bundle_binds_add_dir_and_no_allowed_tools(
     bound.reattest()
 
 
+def test_evidence_environment_binds_exact_key_and_strips_plan_and_validation_keys(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An EVIDENCE-kind launch binds exactly ``ROASTPILOT_EVIDENCE_ROOT`` and strips the rest.
+
+    Exercises the actual :func:`usage_cli._resolve_native_environment` result
+    (not the constants alone), including a *stale* inherited
+    ``ROASTPILOT_EVIDENCE_ROOT`` value that must be overwritten by the freshly
+    resolved root, and a stale ``ROASTPILOT_PLAN_ROOT`` plus every validation
+    key that must be stripped outright.
+    """
+    root = _build_evidence_bundle(tmp_path_factory.mktemp("evidence-env") / "root")
+    monkeypatch.setenv(EVIDENCE_ROOT_ENVIRONMENT_KEY, "STALE_EVIDENCE_SENTINEL")
+    monkeypatch.setenv(PLAN_ROOT_ENVIRONMENT_KEY, "STALE_PLAN_SENTINEL")
+    for key in usage_cli._VALIDATION_ENVIRONMENT_KEYS:  # pyright: ignore[reportPrivateUsage]
+        monkeypatch.setenv(key, "STALE_VALIDATION_SENTINEL")
+
+    launch_environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
+        NativeClaudeRole.PR_TRIAGE,
+        _request(evidence_root=str(root), evidence_pr=837),
+        attested_head=_EVIDENCE_HEAD,
+    )
+    resolved_root = os.path.realpath(root)
+    assert launch_environment.bound_root is not None
+    assert launch_environment.bound_root.kind is BoundRootKind.EVIDENCE
+    assert launch_environment.bound_root.path == resolved_root
+
+    environment = launch_environment.environment
+    assert environment[EVIDENCE_ROOT_ENVIRONMENT_KEY] == resolved_root
+    assert PLAN_ROOT_ENVIRONMENT_KEY not in environment
+    assert not (
+        set(environment) & usage_cli._VALIDATION_ENVIRONMENT_KEYS  # pyright: ignore[reportPrivateUsage]
+    )
+
+    # A role with no admitting policy sees the key stripped too, including the
+    # stale value this test just set above.
+    other_role_environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
+        NativeClaudeRole.ENGINEER_BE, _request(), attested_head=_EVIDENCE_HEAD
+    )
+    assert other_role_environment.bound_root is None
+    assert EVIDENCE_ROOT_ENVIRONMENT_KEY not in other_role_environment.environment
+    assert PLAN_ROOT_ENVIRONMENT_KEY not in other_role_environment.environment
+
+
 def test_evidence_bundle_rejects_missing_pr() -> None:
     """The evidence-pr grammar rejects an absent companion at the deep-validation layer too."""
     with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
@@ -7759,6 +7851,74 @@ def test_evidence_bundle_rejects_future_generated_at(
         usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
             str(root), 837, attested_head=_EVIDENCE_HEAD
         )
+
+
+@pytest.mark.parametrize(
+    "generated_at",
+    [
+        "2025-01-01T00:00:00",
+        "2025-01-01T00:00:00.000000",
+    ],
+    ids=["naive-seconds", "naive-microseconds"],
+)
+def test_evidence_bundle_rejects_naive_generated_at(
+    generated_at: str, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A timezone-naive ``generated_at`` fails closed rather than being treated as UTC."""
+    root = _build_evidence_bundle(
+        tmp_path_factory.mktemp("evidence-naive-generated-at") / "root",
+        generated_at=generated_at,
+    )
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
+
+
+@pytest.mark.parametrize(
+    "generated_at",
+    [
+        "2025-01-01T00:00:00+02:00",
+        "2025-01-01T00:00:00-05:00",
+        "2025-01-01T00:00:00+00:30",
+    ],
+    ids=["positive-offset", "negative-offset", "non-hour-offset"],
+)
+def test_evidence_bundle_rejects_non_zero_offset_generated_at(
+    generated_at: str, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A non-zero UTC offset fails closed instead of being silently normalized."""
+    root = _build_evidence_bundle(
+        tmp_path_factory.mktemp("evidence-offset-generated-at") / "root",
+        generated_at=generated_at,
+    )
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
+
+
+@pytest.mark.parametrize(
+    "generated_at",
+    [
+        "2025-01-01T00:00:00Z",
+        "2025-01-01T00:00:00+00:00",
+        "2025-01-01T00:00:00.123456+00:00",
+    ],
+    ids=["zulu", "explicit-zero-offset", "zero-offset-microseconds"],
+)
+def test_evidence_bundle_accepts_rfc3339_utc_generated_at(
+    generated_at: str, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """``Z`` and explicit ``+00:00`` RFC3339 UTC forms remain valid."""
+    root = _build_evidence_bundle(
+        tmp_path_factory.mktemp("evidence-utc-generated-at") / "root",
+        generated_at=generated_at,
+    )
+    bound = usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+        str(root), 837, attested_head=_EVIDENCE_HEAD
+    )
+    assert bound.kind is BoundRootKind.EVIDENCE
 
 
 def test_evidence_bundle_rejects_unknown_and_duplicate_manifest_keys(

@@ -1,7 +1,7 @@
 ---
 name: pr-triage
 description: Independently adjudicate a PR's review feedback — decide which comments to address now, defer, or reject, and whether the PR is mergeable. Use before merging any PR, especially agent-team PRs where the author must not triage its own review (D23, AGENTS.md merge policy).
-tools: Read, Grep, Glob, Bash
+tools: Read, Grep, Glob
 model: claude-sonnet-5
 effort: high
 ---
@@ -75,31 +75,30 @@ defers have issues, rejects have reasons) or `BLOCK` (with the blocking items).
 You do not merge and you do not write production code — you adjudicate and hand
 back.
 
-The **Worktree discipline** section below carries the routed control text
-shared by every READ_ONLY role, including its `#738` per-worktree `.venv`
-bullet; that bullet governs **write-capable workers only** and does not apply
-to you — under capture your PR evidence comes from the bundle above, not a
-worktree-local venv, and you run no gate commands yourself.
+## Worktree discipline (topology §7) — does not apply to this role
 
-## Worktree discipline (topology §7 — binding)
+Every role file in this repository inherits or shares the same
+worktree-discipline boilerplate. **None of it applies to `pr-triage`, in any
+invocation.** This role's `tools` frontmatter above is exactly `Read, Grep,
+Glob` — there is no `Bash` — so it has no ability to run `git`, spawn a
+`.venv/bin/python` gate command, or execute any other shell command. Concretely,
+none of the following ever apply to this role, no matter what a shared runbook
+or another role's file says:
 
-- Verify the worktree provisioned by the lead for this task at the sha under
-  review, never the shared checkout; self-locate every command against its
-  absolute path because cwd resets between Bash calls.
-  **Fail closed when no provisioned worktree is named:** stop and ask the lead
-  to provision one; a read-only role cannot create its own worktree. Use a
-  shared tree only on explicit lead
-  direction under **"Reviewers in a shared worktree"** in
-  **`docs/agent-team-worktrees.md`**, with its safety commit in place, and state
-  in the verdict which tree you reviewed and on whose direction.
-- Never run tree-mutating git commands — **`git checkout --`**, **`git restore`**,
-  **`git stash`**, **`git reset`**, **`git clean`**, or anything else that rewrites
-  a working tree or index — in a tree you do not own.
-- For mutation testing, snapshot the target to the scratchpad by file copy (`cp`)
-  before editing and restore by copying the snapshot back — never by git.
-- Verify committed-tree claims with **`git show`** `HEAD:path`, never against the
-  working tree.
-- Run Python gates with the provisioned worktree's `.venv/bin/python -m …` and a
-  per-run `--basetemp`, following **"Per-worktree gate environment (venv,
-  pyright, pytest) — added Aug 2026 (#738, #733)"** in the runbook above. The
-  full recipe and fail-closed assertions live there.
+- No provisioning, verifying, entering, or self-locating against a worktree —
+  there is no cwd to reset and no worktree to be in.
+- No `git` command of any kind — not `git checkout --`/`restore`/`stash`/
+  `reset`/`clean`, not `git show HEAD:path`, not any read-only `git` query
+  either.
+- No `.venv/bin/python -m …` gate command, `--basetemp`, or any other test/
+  lint/typecheck invocation.
+- No mutation-testing snapshot/restore-by-`cp` workflow — this role never
+  edits or mutates anything.
+
+Instead, this role verifies PR identity solely from the bound manifest's
+`pull_request` and `head_sha` fields (see Inputs above) and reads only the
+parent-built evidence bundle at the lead-stated absolute path, plus ordinary
+repository files it needs for context (`AGENTS.md`, relevant plan decisions),
+using `Read`/`Grep`/`Glob` only. It has no `gh`, no network, no credentials,
+and no dual-mode "live `gh` when the bundle is thin" fallback, in every
+invocation without exception.
