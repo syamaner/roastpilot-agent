@@ -7901,7 +7901,6 @@ def test_evidence_bundle_rejects_pr_json_identity_mismatch(
         usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
             str(root), 837, attested_head=_EVIDENCE_HEAD
         )
-    bound.reattest()
 
 
 def test_evidence_environment_binds_exact_key_and_strips_plan_and_validation_keys(
@@ -8517,9 +8516,13 @@ def test_evidence_bundle_reattest_passes_when_untouched(
     bound.reattest()
 
 
-def test_evidence_bundle_payloads_never_parsed(tmp_path_factory: pytest.TempPathFactory) -> None:
-    """T16: valid-hash non-JSON payloads still bind — integrity, never semantics (I4)."""
-    overrides = {name: b"not json at all, just bytes" for name in EVIDENCE_PAYLOAD_FILES}
+def test_evidence_bundle_non_identity_payloads_remain_opaque(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """T16: only ``pr.json`` is semantic; the other seven payloads remain opaque bytes."""
+    overrides = {
+        name: b"not json at all, just bytes" for name in EVIDENCE_PAYLOAD_FILES if name != "pr.json"
+    }
     root = _build_evidence_bundle(
         tmp_path_factory.mktemp("evidence-non-json") / "root", payload_overrides=overrides
     )
