@@ -791,12 +791,15 @@ def supervise_native_codex(arguments: Any) -> int:
     if not all(_safe_identifier(value) for value in values) or not _safe_identifier(parent):
         _fail()
     role = NativeCodexRole(arguments.role)
-    usage = _open_root(arguments.usage_root, private=True)
-    provider = _open_root(os.path.expanduser("~/.codex/sessions"), private=False)
-    worktree = _open_root(os.getcwd(), private=False)
-    started = datetime.now(UTC)
-    started_monotonic = time.monotonic()
+    usage: _Root | None = None
+    provider: _Root | None = None
+    worktree: _Root | None = None
     try:
+        usage = _open_root(arguments.usage_root, private=True)
+        provider = _open_root(os.path.expanduser("~/.codex/sessions"), private=False)
+        worktree = _open_root(os.getcwd(), private=False)
+        started = datetime.now(UTC)
+        started_monotonic = time.monotonic()
         _reject_root_overlap(usage, provider, worktree)
         launch = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=False
@@ -897,6 +900,7 @@ def supervise_native_codex(arguments: Any) -> int:
         sys.stdout.flush()
         return 0
     finally:
-        os.close(provider.descriptor)
-        os.close(usage.descriptor)
-        os.close(worktree.descriptor)
+        for root in (worktree, provider, usage):
+            if root is not None:
+                with suppress(OSError):
+                    os.close(root.descriptor)

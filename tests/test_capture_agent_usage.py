@@ -751,6 +751,74 @@ def test_native_codex_terminal_framing_is_nonblocking_and_single_use(
             usage_native_codex._terminal_line()  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.parametrize("failure_call", [2, 3])
+def test_native_codex_supervisor_closes_roots_when_acquisition_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_call: int
+) -> None:
+    """Provider/worktree acquisition failures close every previously held root."""
+    held: list[int] = []
+    calls = 0
+
+    def open_root(_raw: str, *, private: bool) -> usage_native_codex._Root:  # pyright: ignore[reportPrivateUsage]
+        nonlocal calls
+        del private
+        calls += 1
+        if calls == failure_call:
+            raise usage_native_codex.NativeCodexCaptureError("native Codex capture is invalid")
+        descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        held.append(descriptor)
+        state = os.fstat(descriptor)
+        return usage_native_codex._Root(descriptor, state.st_dev, state.st_ino)  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setattr(usage_native_codex, "_open_root", open_root)
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent-811")
+    arguments = SimpleNamespace(
+        task_id="task-811",
+        slice_id="slice-811",
+        parent_task_id="parent-811",
+        task_name="leaf-811",
+        role="engineer-be",
+        usage_root=str(tmp_path),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/x",
+        base_sha="a" * 40,
+        output="usage.jsonl",
+    )
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex.supervise_native_codex(arguments)
+    for descriptor in held:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_native_codex_supervisor_rejects_codex_home_before_root_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CODEX_HOME overrides are rejected before any provider root lookup."""
+    monkeypatch.setenv("CODEX_HOME", "override")
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent-811")
+
+    def unexpected_open(_raw: str, *, private: bool) -> NoReturn:
+        del private
+        pytest.fail("opened")
+
+    monkeypatch.setattr(usage_native_codex, "_open_root", unexpected_open)
+    arguments = SimpleNamespace(
+        task_id="task",
+        slice_id="slice",
+        parent_task_id="parent",
+        task_name="leaf",
+        role="engineer-be",
+        usage_root=str(tmp_path),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/x",
+        base_sha="a" * 40,
+        output="usage.jsonl",
+    )
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex.supervise_native_codex(arguments)
+
+
 @pytest.mark.parametrize(
     ("role", "status"),
     [
