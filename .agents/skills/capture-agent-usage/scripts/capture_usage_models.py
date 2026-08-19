@@ -17,6 +17,9 @@ AGENT_USAGE_SCHEMA_VERSION = 1
 NATIVE_WORKER_USAGE_SCHEMA_VERSION = 3
 """D161 native-worker record schema, distinct from generic capture records."""
 
+NATIVE_CODEX_USAGE_SCHEMA_VERSION = 1
+"""Parent-to-registered-Codex-leaf record schema version."""
+
 SKILL_VERSION = "0.1.0"
 """The version of the capture skill's normalized record grammar."""
 
@@ -93,6 +96,22 @@ class NativeClaudeRole(Enum):
     QA = "qa"
     SIM_ROAST_RUNNER = "sim-roast-runner"
     STORY_PLANNER = "story-planner"
+
+
+class NativeCodexRole(Enum):
+    """The only registered Codex leaves admitted to native capture."""
+
+    ENGINEER_BE = "engineer-be"
+    ENGINEER_FE = "engineer-fe"
+    REPAIR = "repair"
+
+
+class NativeCodexTaskStatus(Enum):
+    """Closed parent-observed terminal task status."""
+
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 NATIVE_ROLE_EXCLUSIONS: dict[str, str] = {
@@ -657,6 +676,60 @@ class NativeWorkerUsageRecord(CaptureModel):
         return self
 
 
+class NativeCodexUsageRecord(CaptureModel):
+    """One metadata-only result from a registered Codex leaf lifecycle."""
+
+    record_type: Literal["NATIVE_CODEX_USAGE"] = "NATIVE_CODEX_USAGE"
+    schema_version: Literal[1] = NATIVE_CODEX_USAGE_SCHEMA_VERSION
+    tool_version: SafeIdentifier = SKILL_VERSION
+    captured_at: datetime
+    task_id: SafeIdentifier
+    slice_id: SafeIdentifier
+    parent_task_id: SafeIdentifier
+    task_name: SafeIdentifier
+    native_role: NativeCodexRole
+    role_capability: Literal[RoleCapability.WRITE] = RoleCapability.WRITE
+    model: Literal["gpt-5.6-terra"] = "gpt-5.6-terra"
+    effort: SafeIdentifier
+    repository: RepositoryName
+    branch: GitReference
+    base_sha: GitSha
+    launch_head_sha: GitSha
+    final_head_sha: GitSha
+    parent_thread_id: SafeIdentifier
+    leaf_session_id: SafeIdentifier
+    topology_depth: Literal[1] = 1
+    harness_version: Literal["0.147.0"] = "0.147.0"
+    exit_code: int
+    task_status: NativeCodexTaskStatus
+    success: bool
+    input_tokens: TokenCount
+    cached_input_tokens: TokenCount
+    cache_write_input_tokens: TokenCount
+    output_tokens: TokenCount
+    reasoning_output_tokens: TokenCount
+    total_tokens: TokenCount
+    whole_tree_verified: bool
+
+    @field_validator("role_capability", mode="before")
+    @classmethod
+    def normalize_serialized_write_capability(cls, value: object) -> object:
+        """Round-trip the one persisted Enum value without widening capability."""
+        return RoleCapability.WRITE if value == RoleCapability.WRITE.value else value
+
+    @model_validator(mode="after")
+    def validate_native_codex_usage(self) -> NativeCodexUsageRecord:
+        """Require Git and task outcomes to agree with the closed lifecycle."""
+        if self.success:
+            if self.task_status is not NativeCodexTaskStatus.SUCCESS or self.exit_code != 0:
+                raise ValueError("successful native Codex record has contradictory task status")
+            if self.final_head_sha == self.base_sha:
+                raise ValueError("successful native Codex record requires a descendant head")
+        elif self.task_status is NativeCodexTaskStatus.SUCCESS or self.exit_code == 0:
+            raise ValueError("failed native Codex record has contradictory task status")
+        return self
+
+
 class CapacitySnapshotRecord(CaptureModel):
     """A qualitative capacity observation without raw readings or percentages."""
 
@@ -707,7 +780,11 @@ class OutcomeRecord(CaptureModel):
 
 
 UsageRecord: TypeAlias = (
-    TaskUsageRecord | NativeWorkerUsageRecord | CapacitySnapshotRecord | OutcomeRecord
+    TaskUsageRecord
+    | NativeWorkerUsageRecord
+    | NativeCodexUsageRecord
+    | CapacitySnapshotRecord
+    | OutcomeRecord
 )
 """The closed append-only record union."""
 

@@ -30,6 +30,7 @@ import capture_usage_claude as usage_claude
 import capture_usage_cli as usage_cli
 import capture_usage_codex as usage_codex
 import capture_usage_models as usage_models
+import capture_usage_native_codex as usage_native_codex
 import capture_usage_transcript as usage_transcript
 import pytest
 from capture_usage_claude import (
@@ -75,6 +76,9 @@ from capture_usage_models import (
     EstimateBasis,
     HarnessFamily,
     NativeClaudeRole,
+    NativeCodexRole,
+    NativeCodexTaskStatus,
+    NativeCodexUsageRecord,
     NativeWorkerUsageRecord,
     ParsedUsage,
     RoleCapability,
@@ -93,6 +97,118 @@ from pydantic import TypeAdapter, ValidationError
 _REAL_VALIDATE_WORKTREE_METADATA = usage_cli._validate_worktree_metadata  # pyright: ignore[reportPrivateUsage]
 FIXTURES = Path(__file__).parent / "fixtures" / "agent-usage"
 USAGE_RECORD_ADAPTER = cast(TypeAdapter[UsageRecord], _USAGE_RECORD_ADAPTER)
+
+
+def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
+    """Native Codex records never claim success without a descendant result."""
+    payload: dict[str, object] = {
+        "captured_at": datetime.now(UTC),
+        "task_id": "task-811",
+        "slice_id": "native-codex-capture",
+        "parent_task_id": "parent-811",
+        "task_name": "native-codex-capture",
+        "native_role": NativeCodexRole.ENGINEER_BE,
+        "effort": "high",
+        "repository": "syamaner/roastpilot-agent",
+        "branch": "feature/811-native-codex-capture",
+        "base_sha": "a" * 40,
+        "launch_head_sha": "a" * 40,
+        "final_head_sha": "b" * 40,
+        "parent_thread_id": "thread-811",
+        "leaf_session_id": "leaf-811",
+        "exit_code": 0,
+        "task_status": NativeCodexTaskStatus.SUCCESS,
+        "success": True,
+        "input_tokens": 1,
+        "cached_input_tokens": 2,
+        "cache_write_input_tokens": 3,
+        "output_tokens": 4,
+        "reasoning_output_tokens": 5,
+        "total_tokens": 6,
+        "whole_tree_verified": True,
+    }
+    record = NativeCodexUsageRecord.model_validate(payload)
+    assert USAGE_RECORD_ADAPTER.validate_json(record.model_dump_json()) == record
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate({**payload, "final_head_sha": "a" * 40})
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate(
+            {**payload, "success": False, "task_status": NativeCodexTaskStatus.SUCCESS}
+        )
+
+
+def test_native_codex_registration_closure_matches_committed_project_files() -> None:
+    """All and only committed named Codex leaves carry the fixed capture pins."""
+    expected = {
+        NativeCodexRole.ENGINEER_BE: "high",
+        NativeCodexRole.ENGINEER_FE: "high",
+        NativeCodexRole.REPAIR: "medium",
+    }
+    for role, effort in expected.items():
+        _config_hash, _role_hash, observed_effort, canonical = usage_native_codex._registered_role(  # pyright: ignore[reportPrivateUsage]
+            role
+        )
+        assert observed_effort == effort
+        assert canonical == role.value
+
+
+def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -> None:
+    """The native rollout parser keeps the final cumulative total instead of summing events."""
+    manifest: dict[str, object] = {
+        "parent_thread_id": "parent-811",
+        "role": "engineer-be",
+        "launch_head_sha": "a" * 40,
+        "branch": "feature/811-native-codex-capture",
+    }
+    meta = {
+        "type": "session_meta",
+        "payload": {
+            "id": "leaf-811",
+            "originator": "codex-tui",
+            "cli_version": "0.147.0",
+            "source": {
+                "subagent": {
+                    "thread_spawn": {
+                        "parent_thread_id": "parent-811",
+                        "depth": 1,
+                        "agent_path": "engineer-be",
+                        "agent_nickname": "engineer-be",
+                        "agent_role": "engineer-be",
+                    }
+                }
+            },
+            "git": {"commit_hash": "a" * 40, "branch": "feature/811-native-codex-capture"},
+        },
+    }
+    context = {"type": "turn_context", "payload": {"model": "gpt-5.6-terra", "effort": "high"}}
+
+    def event(total: int) -> dict[str, object]:
+        return {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": total,
+                        "cached_input_tokens": 2,
+                        "cache_write_input_tokens": 3,
+                        "output_tokens": 4,
+                        "reasoning_output_tokens": 5,
+                        "total_tokens": total + 14,
+                    }
+                },
+            },
+        }
+
+    rollout = tmp_path / "leaf.jsonl"
+    rollout.write_text(
+        "".join(json.dumps(item) + "\n" for item in (meta, context, event(1), event(9)))
+    )
+    session, totals, _child = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
+        rollout, manifest
+    )
+    assert session == "leaf-811"
+    assert totals == (9, 2, 3, 4, 5, 23)
 
 
 def test_owned_transcript_counts_identical_assistant_usage_once(
@@ -2201,6 +2317,7 @@ def test_native_cli_script_suppresses_bytecode_only_when_executed(
         "capture_usage_models.py",
         "capture_usage_claude.py",
         "capture_usage_codex.py",
+        "capture_usage_native_codex.py",
         "capture_usage_transcript.py",
     ):
         shutil.copy2(source.parent / name, scripts / name)
