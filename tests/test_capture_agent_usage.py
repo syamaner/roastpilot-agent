@@ -525,6 +525,111 @@ def test_native_codex_rejects_out_of_order_or_repeated_task_events(tmp_path: Pat
             usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
 
 
+def test_native_codex_rejects_decreasing_cumulative_token_totals(tmp_path: Path) -> None:
+    """A later cumulative token snapshot may never decrease any token category."""
+    binding = {
+        "parent_thread_id": "parent",
+        "role": "engineer-be",
+        "agent_path": "/root/leaf",
+        "effort": "high",
+    }
+    meta = {
+        "type": "session_meta",
+        "payload": {
+            "id": "leaf",
+            "agent_nickname": "nick",
+            "agent_path": "/root/leaf",
+            "agent_role": "engineer-be",
+            "base_instructions": "x",
+            "cli_version": "0.147.0",
+            "context_window": 1,
+            "cwd": "x",
+            "git": {"branch": "x", "commit_hash": "a", "repository_url": "x"},
+            "history_mode": "x",
+            "model_provider": "x",
+            "multi_agent_version": "x",
+            "originator": "codex-tui",
+            "parent_thread_id": "parent",
+            "session_id": "x",
+            "source": {
+                "subagent": {
+                    "thread_spawn": {
+                        "parent_thread_id": "parent",
+                        "depth": 1,
+                        "agent_path": "/root/leaf",
+                        "agent_nickname": "nick",
+                        "agent_role": "engineer-be",
+                    }
+                }
+            },
+            "thread_source": "subagent",
+            "timestamp": "x",
+        },
+    }
+    context_payload: dict[str, object] = {
+        key: "x"
+        for key in usage_native_codex._TURN_CONTEXT_KEYS  # pyright: ignore[reportPrivateUsage]
+    }
+    context_payload.update(
+        {
+            "model": "gpt-5.6-terra",
+            "effort": "high",
+            "realtime_active": False,
+            "workspace_roots": [],
+        }
+    )
+    context: dict[str, object] = {"type": "turn_context", "payload": context_payload}
+
+    def totals(value: int) -> dict[str, object]:
+        return {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {},
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                    "model_context_window": 1,
+                    "total_token_usage": {
+                        "input_tokens": value,
+                        "cached_input_tokens": 1,
+                        "cache_write_input_tokens": 1,
+                        "output_tokens": 1,
+                        "reasoning_output_tokens": 1,
+                        "total_tokens": value + 4,
+                    },
+                },
+            },
+        }
+
+    started = {
+        "type": "event_msg",
+        "payload": {
+            "type": "task_started",
+            "collaboration_mode_kind": "x",
+            "model_context_window": 1,
+            "started_at": "x",
+            "turn_id": "x",
+        },
+    }
+    events = [meta, started, context, totals(2), totals(1)]
+    rollout = tmp_path / "decreasing.jsonl"
+    rollout.write_text(
+        "".join(
+            json.dumps({"ordinal": index, "timestamp": "x", **event}) + "\n"
+            for index, event in enumerate(events)
+        )
+    )
+    with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_native_codex_streams_two_mebibyte_content_event_at_exact_boundary(tmp_path: Path) -> None:
     """A realistic 0.147.0 content-bearing response is parsed and discarded at the cap."""
     root_meta = {
