@@ -34,6 +34,7 @@ MAX_PROVIDER_LINES = 100_000
 # two-MiB bound below the separate eight-MiB rollout-file cap.
 MAX_EVENT_BYTES = 2 * 1024 * 1024
 MAX_JSON_NESTING = 64
+MAX_COMMITTED_FILE_BYTES = 64 * 1024
 _CONFIG_NAME = ".codex/config.toml"
 _ROLE_EXPECTATIONS: dict[NativeCodexRole, tuple[str, str]] = {
     NativeCodexRole.ENGINEER_BE: ("agents/engineer-be.toml", "high"),
@@ -216,6 +217,7 @@ def _safe_identifier(value: object) -> bool:
 
 def _open_root(raw: str, *, private: bool) -> _Root:
     """Open an owned root without following the final pathname component."""
+    fd: int | None = None
     try:
         if not os.path.isabs(raw):
             _fail()
@@ -231,13 +233,21 @@ def _open_root(raw: str, *, private: bool) -> _Root:
         status = os.fstat(fd)
         if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.geteuid():
             os.close(fd)
+            fd = None
             _fail()
         if private and stat.S_IMODE(status.st_mode) != 0o700:
             os.close(fd)
+            fd = None
             _fail()
-        return _Root(fd, status.st_dev, status.st_ino)
+        result = _Root(fd, status.st_dev, status.st_ino)
+        fd = None
+        return result
     except OSError:
         _fail()
+    finally:
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
 
 
 def _read_relative(root: _Root, parts: tuple[str, ...]) -> bytes:
@@ -262,7 +272,10 @@ def _read_relative(root: _Root, parts: tuple[str, ...]) -> bytes:
             ):
                 _fail()
             with os.fdopen(file_descriptor, "rb", closefd=False) as file_handle:
-                return file_handle.read()
+                content = file_handle.read(MAX_COMMITTED_FILE_BYTES + 1)
+                if len(content) > MAX_COMMITTED_FILE_BYTES:
+                    _fail()
+                return content
         finally:
             os.close(file_descriptor)
     except OSError:
@@ -754,13 +767,19 @@ def _terminal_line() -> bytes:
 
 
 def _descendant(base: str, head: str) -> bool:
-    return (
-        base != head
-        and subprocess.run(
-            ["git", "merge-base", "--is-ancestor", base, head], check=False
-        ).returncode
-        == 0
-    )
+    if base == head:
+        return False
+    try:
+        return (
+            subprocess.run(
+                ["git", "merge-base", "--is-ancestor", base, head],
+                check=False,
+                timeout=5,
+            ).returncode
+            == 0
+        )
+    except (OSError, subprocess.SubprocessError):
+        _fail()
 
 
 def supervise_native_codex(arguments: Any) -> int:

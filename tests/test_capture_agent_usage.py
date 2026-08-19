@@ -581,6 +581,76 @@ def test_native_codex_json_depth_fails_closed() -> None:
         usage_native_codex._json(deep)  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.parametrize(
+    ("repository", "branch", "base", "responses", "accepts"),
+    [
+        ("wrong/repo", "feature/x", "a" * 40, [], False),
+        ("syamaner/roastpilot-agent", "-bad", "a" * 40, [], False),
+        ("syamaner/roastpilot-agent", "feature/x", "A" * 40, [], False),
+        (
+            "syamaner/roastpilot-agent",
+            "feature/x",
+            "a" * 40,
+            [
+                "https://github.com/syamaner/roastpilot-agent.git",
+                "a" * 40,
+                "feature/x",
+                "",
+                "a" * 40,
+            ],
+            True,
+        ),
+    ],
+)
+def test_native_codex_git_identity_validates_inputs_and_git_state(
+    monkeypatch: pytest.MonkeyPatch,
+    repository: str,
+    branch: str,
+    base: str,
+    responses: list[str],
+    accepts: bool,
+) -> None:
+    """Git identity fails closed before and during every attestation check."""
+    values = iter(responses)
+    monkeypatch.setattr(usage_native_codex, "_git", lambda _args: next(values))  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    if accepts:
+        assert usage_native_codex._git_identity(repository, branch, base, final=False) == base  # pyright: ignore[reportPrivateUsage]
+    else:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._git_identity(repository, branch, base, final=False)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_descendant_fails_closed_on_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Git timeout or execution error cannot become a successful descendant proof."""
+
+    def timeout(*_args: object, **_kwargs: object) -> NoReturn:
+        raise subprocess.TimeoutExpired("git", 5)
+
+    monkeypatch.setattr(usage_native_codex.subprocess, "run", timeout)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._descendant("a" * 40, "b" * 40)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_descriptor_reads_reject_symlinks_and_size(tmp_path: Path) -> None:
+    """Committed config reads stay beneath the held root and never exceed 64 KiB."""
+    root = tmp_path / "root"
+    config = root / ".codex" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_bytes(b"x" * (usage_native_codex.MAX_COMMITTED_FILE_BYTES + 1))
+    held = usage_native_codex._open_root(str(root), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._read_relative(held, (".codex", "config.toml"))  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(held.descriptor)
+    link = tmp_path / "link"
+    link.symlink_to(root, target_is_directory=True)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._open_root(str(link), private=False)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_native_codex_root_overlap_uses_held_directory_identities(tmp_path: Path) -> None:
     """Only equal or nested held roots fail; shared filesystem ancestors are allowed."""
     nested = tmp_path / "nested"
