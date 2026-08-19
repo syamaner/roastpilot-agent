@@ -151,12 +151,18 @@ def test_native_codex_registration_closure_matches_committed_project_files() -> 
         NativeCodexRole.ENGINEER_FE: "high",
         NativeCodexRole.REPAIR: "medium",
     }
-    for role, effort in expected.items():
-        _config_hash, _role_hash, observed_effort, canonical = usage_native_codex._registered_role(  # pyright: ignore[reportPrivateUsage]
-            role
-        )
-        assert observed_effort == effort
-        assert canonical == role.value
+    root = usage_native_codex._open_root(str(Path.cwd()), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        for role, effort in expected.items():
+            _config_hash, _role_hash, observed_effort, canonical = (
+                usage_native_codex._registered_role(  # pyright: ignore[reportPrivateUsage]
+                    root, role
+                )
+            )
+            assert observed_effort == effort
+            assert canonical == role.value
+    finally:
+        os.close(root.descriptor)
 
 
 def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -> None:
@@ -566,6 +572,15 @@ def test_native_codex_bounded_reader_rejects_partial_and_count_overflow(
         usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
 
 
+def test_native_codex_json_depth_fails_closed() -> None:
+    """Deep JSON maps to the fixed capture error without recursive parsing."""
+    deep = (b"[" * (usage_native_codex.MAX_JSON_NESTING + 1)) + (
+        b"]" * (usage_native_codex.MAX_JSON_NESTING + 1)
+    )
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._json(deep)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_native_codex_root_overlap_uses_held_directory_identities(tmp_path: Path) -> None:
     """Only equal or nested held roots fail; shared filesystem ancestors are allowed."""
     nested = tmp_path / "nested"
@@ -720,7 +735,10 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
             return "child-811", (0, 0, 0, 0, 0, 0), "leaf-811", False
         return "leaf-811", (1, 2, 3, 4, 5, 6), "", True
 
-    def registered_role(member: NativeCodexRole) -> tuple[str, str, str, str]:
+    def registered_role(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        member: NativeCodexRole,
+    ) -> tuple[str, str, str, str]:
         return (
             "a" * 64,
             "b" * 64,

@@ -715,6 +715,8 @@ class NativeCodexUsageRecord(CaptureModel):
     output_tokens: TokenCount
     reasoning_output_tokens: TokenCount
     total_tokens: TokenCount
+    # True proves every newly-created rollout was scanned and none named this
+    # leaf as parent; zero ``subagent_count`` is the corresponding evidence.
     whole_tree_verified: bool
     subagent_count: int
 

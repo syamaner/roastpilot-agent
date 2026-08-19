@@ -10,9 +10,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
+import time
 import tomllib
 from collections.abc import Iterator
 from contextlib import suppress
@@ -31,6 +33,7 @@ MAX_PROVIDER_LINES = 100_000
 # Observed Codex 0.147.0 tool-output event: 1,006,736 bytes.  Keep this fixed
 # two-MiB bound below the separate eight-MiB rollout-file cap.
 MAX_EVENT_BYTES = 2 * 1024 * 1024
+MAX_JSON_NESTING = 64
 _CONFIG_NAME = ".codex/config.toml"
 _ROLE_EXPECTATIONS: dict[NativeCodexRole, tuple[str, str]] = {
     NativeCodexRole.ENGINEER_BE: ("agents/engineer-be.toml", "high"),
@@ -216,14 +219,15 @@ def _open_root(raw: str, *, private: bool) -> _Root:
     try:
         if not os.path.isabs(raw):
             _fail()
-        current = os.path.sep
+        fd = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         for part in raw.split(os.path.sep)[1:]:
             if not part:
                 continue
-            current = os.path.join(current, part)
-            if stat.S_ISLNK(os.lstat(current).st_mode):
-                _fail()
-        fd = os.open(raw, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            child = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd
+            )
+            os.close(fd)
+            fd = child
         status = os.fstat(fd)
         if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.geteuid():
             os.close(fd)
@@ -234,6 +238,38 @@ def _open_root(raw: str, *, private: bool) -> _Root:
         return _Root(fd, status.st_dev, status.st_ino)
     except OSError:
         _fail()
+
+
+def _read_relative(root: _Root, parts: tuple[str, ...]) -> bytes:
+    """Read one regular file through held root-relative no-follow descriptors."""
+    descriptor = os.dup(root.descriptor)
+    try:
+        for part in parts[:-1]:
+            child = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=descriptor
+            )
+            os.close(descriptor)
+            descriptor = child
+        file_descriptor = os.open(
+            parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=descriptor
+        )
+        try:
+            status = os.fstat(file_descriptor)
+            if (
+                not stat.S_ISREG(status.st_mode)
+                or status.st_uid != os.geteuid()
+                or status.st_nlink != 1
+            ):
+                _fail()
+            with os.fdopen(file_descriptor, "rb", closefd=False) as file_handle:
+                return file_handle.read()
+        finally:
+            os.close(file_descriptor)
+    except OSError:
+        _fail()
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
 
 
 def _assert_root(root: _Root, *, private: bool = False) -> None:
@@ -325,7 +361,13 @@ def _git(args: list[str]) -> str:
 
 
 def _git_identity(repository: str, branch: str, base: str, *, final: bool) -> str:
-    if repository != "syamaner/roastpilot-agent":
+    if (
+        repository != "syamaner/roastpilot-agent"
+        or not re.fullmatch(r"[0-9a-f]{40}", base)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", branch)
+        or branch.startswith("-")
+        or ".." in branch
+    ):
         _fail()
     if _git(["remote", "get-url", "origin"]) not in {
         "https://github.com/syamaner/roastpilot-agent.git",
@@ -342,11 +384,10 @@ def _git_identity(repository: str, branch: str, base: str, *, final: bool) -> st
     return head
 
 
-def _registered_role(role: NativeCodexRole) -> tuple[str, str, str, str]:
+def _registered_role(root: _Root, role: NativeCodexRole) -> tuple[str, str, str, str]:
     """Parse and attest the complete registered-Codex role closure."""
     try:
-        with open(_CONFIG_NAME, "rb") as config_file:
-            config_bytes = config_file.read()
+        config_bytes = _read_relative(root, (".codex", "config.toml"))
         config = tomllib.loads(config_bytes.decode("utf-8"))
         agents = config.get("agents")
         if not isinstance(agents, dict) or agents.get("enabled") is not True:
@@ -367,8 +408,7 @@ def _registered_role(role: NativeCodexRole) -> tuple[str, str, str, str]:
             or registration["config_file"] != relpath
         ):
             _fail()
-        with open(os.path.join(".codex", relpath), "rb") as role_file:
-            role_bytes = role_file.read()
+        role_bytes = _read_relative(root, (".codex", *tuple(relpath.split("/"))))
         definition = tomllib.loads(role_bytes.decode("utf-8"))
         if (
             set(definition)
@@ -400,12 +440,35 @@ def _json(raw: bytes) -> dict[str, Any]:
             value[key] = item
         return value
 
+    depth = 0
+    quoted = escaped = False
+    for byte in raw:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif byte == ord("\\"):
+                escaped = True
+            elif byte == ord('"'):
+                quoted = False
+            continue
+        if byte == ord('"'):
+            quoted = True
+        elif byte in {ord("{"), ord("[")}:
+            depth += 1
+            if depth > MAX_JSON_NESTING:
+                _fail()
+        elif byte in {ord("}"), ord("]")}:
+            depth -= 1
+            if depth < 0:
+                _fail()
+    if quoted or escaped or depth:
+        _fail()
     try:
         value = json.loads(raw, object_pairs_hook=unique)
         if not isinstance(value, dict):
             _fail()
         return value
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         _fail()
 
 
@@ -554,8 +617,8 @@ def _parse_rollout(
                 seen_context = True
             elif kind == "event_msg":
                 if (
-                    set(payload) != _EVENT_KEYS[payload["type"]]
-                    or payload["type"] not in _EVENT_TYPES
+                    payload.get("type") not in _EVENT_TYPES
+                    or set(payload) != _EVENT_KEYS[payload["type"]]
                 ):
                     _fail()
                 if payload["type"] == "token_count":
@@ -713,12 +776,13 @@ def supervise_native_codex(arguments: Any) -> int:
     provider = _open_root(os.path.expanduser("~/.codex/sessions"), private=False)
     worktree = _open_root(os.getcwd(), private=False)
     started = datetime.now(UTC)
+    started_monotonic = time.monotonic()
     try:
         _reject_root_overlap(usage, provider, worktree)
         launch = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=False
         )
-        config_sha, role_sha, effort, canonical = _registered_role(role)
+        config_sha, role_sha, effort, canonical = _registered_role(worktree, role)
         before = _inventory(provider)
         binding = {
             "parent_thread_id": parent,
@@ -791,7 +855,7 @@ def supervise_native_codex(arguments: Any) -> int:
             success=success,
             started_at=started,
             completed_at=completed,
-            elapsed_ms=max(0, int((completed - started).total_seconds() * 1000)),
+            elapsed_ms=max(0, int((time.monotonic() - started_monotonic) * 1000)),
             input_tokens=totals[0],
             cached_input_tokens=totals[1],
             cache_write_input_tokens=totals[2],
