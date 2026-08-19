@@ -7313,8 +7313,9 @@ def test_print_validation_commands_matches_the_argv_rule_table(
         ]
         tokens: tuple[str, ...] = ()
         if role is NativeClaudeRole.QA:
-            tokens = ("tests/",)
-            args.extend(["--pytest-arg", tokens[0]])
+            tokens = ("tests/", "--cov=src", "--cov-branch", "--cov-report=term-missing")
+            for token in tokens:
+                args.append(f"--pytest-arg={token}")
         exit_code = main(args)
         assert exit_code == 0
         printed = capsys.readouterr().out.splitlines()
@@ -7405,8 +7406,10 @@ def test_print_validation_commands_rejects_empty_rendered_tuple_before_output(
                 "qa",
                 "--validation-root",
                 str(root),
-                "--pytest-arg",
-                "tests/",
+                "--pytest-arg=tests/",
+                "--pytest-arg=--cov=src",
+                "--pytest-arg=--cov-branch",
+                "--pytest-arg=--cov-report=term-missing",
             ]
         )
     assert capsys.readouterr().out == ""
@@ -9163,8 +9166,9 @@ def test_print_validation_commands_allow_then_run_blocks(
         ]
         tokens: tuple[str, ...] = ()
         if role is NativeClaudeRole.QA:
-            tokens = ("tests/",)
-            args.extend(["--pytest-arg", tokens[0]])
+            tokens = ("tests/", "--cov=src", "--cov-branch", "--cov-report=term-missing")
+            for token in tokens:
+                args.append(f"--pytest-arg={token}")
         exit_code = main(args)
         assert exit_code == 0
         printed = capsys.readouterr().out.splitlines()
@@ -9191,10 +9195,19 @@ def test_print_validation_commands_pytest_arg_renders_quoted_covered_run_line(
     """T19: tokens with space, quote, ``$``, ``;``, and a glob each round-trip through shlex."""
     root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
     resolved_root = os.path.realpath(root)
-    tokens = ["tests/has space.py", "it's", "$HOME", ";rm -rf", "tests/*.py"]
+    tokens = [
+        "tests/has space.py",
+        "--cov=.agents/skills/capture-agent-usage/scripts",
+        "--cov-branch",
+        "--cov-report=term-missing",
+        "it's",
+        "$HOME",
+        ";rm -rf",
+        "tests/*.py",
+    ]
     args = ["print-validation-commands", "--role", "qa", "--validation-root", str(root)]
     for token in tokens:
-        args.extend(["--pytest-arg", token])
+        args.append(f"--pytest-arg={token}")
     assert main(args) == 0
     printed = capsys.readouterr().out.splitlines()
     prefix = render_validation_commands(NativeClaudeRole.QA, resolved_root)[0]
@@ -9277,6 +9290,33 @@ def test_print_validation_commands_qa_rejects_flags_without_test_selector(
     assert capsys.readouterr().out == ""
 
 
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        ["tests/test_capture_agent_usage.py"],
+        [
+            "tests/test_capture_agent_usage.py",
+            "--cov=",
+            "--cov-branch",
+            "--cov-report=term-missing",
+        ],
+        ["tests/test_capture_agent_usage.py", "--cov=src", "--cov-report=term-missing"],
+        ["tests/test_capture_agent_usage.py", "--cov=src", "--cov-branch"],
+    ],
+)
+def test_print_validation_commands_qa_rejects_incomplete_coverage_contract(
+    tokens: list[str], tmp_path_factory: pytest.TempPathFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """QA never emits a RUN line unless selector and all required coverage tokens are present."""
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    args = ["print-validation-commands", "--role", "qa", "--validation-root", str(root)]
+    for token in tokens:
+        args.append(f"--pytest-arg={token}")
+    with pytest.raises(SystemExit, match="validation environment is invalid"):
+        main(args)
+    assert capsys.readouterr().out == ""
+
+
 @pytest.mark.parametrize("role", ["mcp-contract-checker", "sim-roast-runner"])
 def test_print_validation_commands_rejects_pytest_arg_for_non_prefix_role(
     role: str, tmp_path_factory: pytest.TempPathFactory, capsys: pytest.CaptureFixture[str]
@@ -9291,8 +9331,10 @@ def test_print_validation_commands_rejects_pytest_arg_for_non_prefix_role(
                 role,
                 "--validation-root",
                 str(root),
-                "--pytest-arg",
-                "tests/",
+                "--pytest-arg=tests/",
+                "--pytest-arg=--cov=src",
+                "--pytest-arg=--cov-branch",
+                "--pytest-arg=--cov-report=term-missing",
             ]
         )
     assert capsys.readouterr().out == ""
@@ -9435,8 +9477,10 @@ def test_print_validation_commands_validates_root_exactly_once(
                 "qa",
                 "--validation-root",
                 str(root),
-                "--pytest-arg",
-                "tests/",
+                "--pytest-arg=tests/",
+                "--pytest-arg=--cov=src",
+                "--pytest-arg=--cov-branch",
+                "--pytest-arg=--cov-report=term-missing",
             ]
         )
         == 0

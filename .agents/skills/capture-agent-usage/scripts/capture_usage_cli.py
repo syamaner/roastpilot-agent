@@ -2195,6 +2195,18 @@ def _has_pytest_selector(tokens: tuple[str, ...]) -> bool:
     return any(token == "tests" or token.startswith("tests/") for token in tokens)
 
 
+def _has_qa_coverage_contract(tokens: tuple[str, ...]) -> bool:
+    """Return whether QA tokens carry the required selector and branch coverage evidence."""
+    return (
+        _has_pytest_selector(tokens)
+        and any(
+            token.startswith("--cov=") and token.removeprefix("--cov=").strip() for token in tokens
+        )
+        and "--cov-branch" in tokens
+        and "--cov-report=term-missing" in tokens
+    )
+
+
 def _shlex_split(value: str) -> list[str]:
     """Split one shell-quoted command string, converting malformed input to the fixed error."""
     try:
@@ -2257,7 +2269,7 @@ def print_validation_commands_command(arguments: argparse.Namespace) -> int:
 
     Raises:
         CaptureUsageError: If ``role`` is not a validation role, the root is
-            invalid, the role renders no commands, QA omits a repository test selector,
+            invalid, the role renders no commands, QA omits its required test and coverage tokens,
             ``--pytest-arg`` is supplied for a role with no ``PREFIX`` entry,
             more than 32 tokens are supplied, or the mechanical ``RUN``
             coverage proof fails for any entry.
@@ -2269,7 +2281,7 @@ def print_validation_commands_command(arguments: argparse.Namespace) -> int:
     if len(tokens) > _MAX_PYTEST_ARG_TOKENS:
         raise CaptureUsageError("validation environment is invalid")
     commands = VALIDATION_ROLE_COMMANDS.get(role, ())
-    if role is NativeClaudeRole.QA and not _has_pytest_selector(tokens):
+    if role is NativeClaudeRole.QA and not _has_qa_coverage_contract(tokens):
         raise CaptureUsageError("validation environment is invalid")
     if tokens and not any(command.kind is ValidationCommandKind.PREFIX for command in commands):
         raise CaptureUsageError("validation environment is invalid")
