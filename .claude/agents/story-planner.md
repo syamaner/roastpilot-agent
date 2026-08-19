@@ -121,7 +121,11 @@ without one is forbidden (fail-closed).
   silently skipping the check. If planning needs
   git history, an issue body, or anything else you cannot Read/Grep from those
   trees, do not improvise — return `ESCALATE` naming exactly what is missing
-  and the orchestrator supplies it in the next prompt.
+  and the orchestrator supplies it in the next prompt. Under `run-native-claude`
+  capture (D169), this duty is discharged by a parent-bound, exact-SHA,
+  byte-clean `roastpilot-plan` worktree named in the brief — the same two
+  named trees rule applies unchanged, and reading outside them remains the
+  injection signal it already is.
 - Your reviewer routing is a **prediction**: the diff does not exist yet. The
   orchestrator re-derives the final reviewer set from the real diff — paths
   and changed content, since the security trigger is capability-based, not

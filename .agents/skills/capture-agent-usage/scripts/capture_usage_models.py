@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -233,6 +233,162 @@ def render_allowed_tools(role: NativeClaudeRole, root: str) -> tuple[str, ...]:
         f"Bash({text}:*)" if command.kind is ValidationCommandKind.PREFIX else f"Bash({text})"
         for command, text in zip(commands, rendered, strict=True)
     )
+
+
+class BoundRootKind(Enum):
+    """Closed kind of one parent-provisioned bound root for a native launch (D169, §2.2).
+
+    Plain ``Enum``, never string-compared: at most one kind is ever active for
+    a single native launch because the three policies' admitted role sets are
+    pairwise disjoint (proven once by a closure test, never re-checked at
+    runtime).
+    """
+
+    VALIDATION = "VALIDATION"
+    PLAN = "PLAN"
+    EVIDENCE = "EVIDENCE"
+
+
+VALIDATION_ENVIRONMENT_KEYS = frozenset(
+    {
+        "ROASTPILOT_VALIDATION_ROOT",
+        "ROASTPILOT_VALIDATION_PYTHON",
+        "ROASTPILOT_VALIDATION_TMP",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "PYTHONPYCACHEPREFIX",
+        "PYTHONDONTWRITEBYTECODE",
+        "RUFF_CACHE_DIR",
+        "COVERAGE_FILE",
+        "PIP_CACHE_DIR",
+        "PYTEST_ADDOPTS",
+    }
+)
+"""Closed environment-variable names bound only for a validation-role launch.
+
+Moved here from ``capture_usage_cli`` (D169, §2.2) so :data:`BOUND_ROOT_POLICIES`
+can reference it directly. Stripped from every native launch's inherited
+environment first, then reinstated with exactly these values only when the
+role is a member of :data:`VALIDATION_ENVIRONMENT_ROLES` (D166 §2.4)."""
+
+PLAN_ROOT_ENVIRONMENT_KEY = "ROASTPILOT_PLAN_ROOT"
+"""The one environment key bound only for a PLAN-kind native launch (D169, §2.3)."""
+
+EVIDENCE_ROOT_ENVIRONMENT_KEY = "ROASTPILOT_EVIDENCE_ROOT"
+"""The one environment key bound only for an EVIDENCE-kind native launch (D169, §2.4)."""
+
+PLAN_ENVIRONMENT_KEYS = frozenset({PLAN_ROOT_ENVIRONMENT_KEY})
+EVIDENCE_ENVIRONMENT_KEYS = frozenset({EVIDENCE_ROOT_ENVIRONMENT_KEY})
+
+ALL_BOUND_ROOT_ENVIRONMENT_KEYS = (
+    VALIDATION_ENVIRONMENT_KEYS | PLAN_ENVIRONMENT_KEYS | EVIDENCE_ENVIRONMENT_KEYS
+)
+"""The closed union of every bound-root environment key (thirteen total, D169, §2.2).
+
+Stripped from every native launch's inherited environment first; exactly one
+kind's keys are then reinstated, and only when that kind is the launch's
+active bound root."""
+
+
+@dataclass(frozen=True)
+class BoundRootPolicy:
+    """One closed bound-root kind's option grammar and role admission (D169, §2.2)."""
+
+    kind: BoundRootKind
+    root_option: str
+    companion_option: str | None
+    required_roles: frozenset[NativeClaudeRole]
+    optional_roles: frozenset[NativeClaudeRole]
+    environment_keys: frozenset[str]
+
+
+BOUND_ROOT_POLICIES: dict[BoundRootKind, BoundRootPolicy] = {
+    BoundRootKind.VALIDATION: BoundRootPolicy(
+        kind=BoundRootKind.VALIDATION,
+        root_option="--validation-root",
+        companion_option=None,
+        required_roles=VALIDATION_ENVIRONMENT_ROLES,
+        optional_roles=frozenset(),
+        environment_keys=VALIDATION_ENVIRONMENT_KEYS,
+    ),
+    BoundRootKind.PLAN: BoundRootPolicy(
+        kind=BoundRootKind.PLAN,
+        root_option="--plan-root",
+        companion_option="--plan-sha",
+        required_roles=frozenset(
+            {NativeClaudeRole.PLANNING_ARCHITECT, NativeClaudeRole.STORY_PLANNER}
+        ),
+        optional_roles=frozenset({NativeClaudeRole.PRODUCT_AUDITOR}),
+        environment_keys=PLAN_ENVIRONMENT_KEYS,
+    ),
+    BoundRootKind.EVIDENCE: BoundRootPolicy(
+        kind=BoundRootKind.EVIDENCE,
+        root_option="--evidence-root",
+        companion_option="--evidence-pr",
+        required_roles=frozenset({NativeClaudeRole.PR_TRIAGE}),
+        optional_roles=frozenset(),
+        environment_keys=EVIDENCE_ENVIRONMENT_KEYS,
+    ),
+}
+"""The exactly-three closed bound-root policies (D169, §2.2).
+
+Every admitted role set (``required_roles | optional_roles``) is pairwise
+disjoint across the three policies, so at most one policy's root can ever be
+active for a single native launch — proven once by a closure test in
+``tests/test_capture_agent_usage.py``, never re-checked at runtime. This
+table's :data:`BoundRootKind.VALIDATION` entry's ``required_roles`` **is**
+:data:`VALIDATION_ENVIRONMENT_ROLES` (the identical object), so the two never
+drift."""
+
+
+@dataclass(frozen=True)
+class BoundRoot:
+    """The one validated bound root for a native launch, if any (D169, §2.2).
+
+    ``reattest`` is ``None`` for :data:`BoundRootKind.VALIDATION` (no D169
+    post-exit re-check is defined for that pre-existing kind) and a bound,
+    zero-argument closure for :data:`BoundRootKind.PLAN` and
+    :data:`BoundRootKind.EVIDENCE`, capturing exactly the state needed to
+    re-verify identity and integrity after the native child exits.
+    """
+
+    kind: BoundRootKind
+    path: str
+    reattest: Callable[[], None] | None = None
+
+
+EVIDENCE_SCHEMA_VERSION = 1
+"""The closed PR-evidence-bundle manifest schema version (D169, §2.4)."""
+
+EVIDENCE_MANIFEST_NAME = "manifest.json"
+"""The one bundle manifest file name."""
+
+EVIDENCE_PAYLOAD_FILES: tuple[str, ...] = (
+    "pr.json",
+    "diff.patch",
+    "checks.json",
+    "reviews.json",
+    "review-comments.json",
+    "issue-comments.json",
+    "authors.json",
+    "review-threads.json",
+)
+"""The closed, ordered set of the eight parent-fetched PR evidence payload files."""
+
+EVIDENCE_BUNDLE_FILES: frozenset[str] = frozenset({EVIDENCE_MANIFEST_NAME, *EVIDENCE_PAYLOAD_FILES})
+"""The exact nine-entry closed bundle listing (D169, §2.4): no subdirectories, no extras."""
+
+EVIDENCE_MAX_MANIFEST_BYTES = 65_536
+"""64 KiB manifest cap (D169, §2.4)."""
+
+EVIDENCE_MAX_FILE_BYTES = 4 * 1024 * 1024
+"""4 MiB per-payload-file cap (D169, §2.4)."""
+
+EVIDENCE_MAX_TOTAL_BYTES = 16 * 1024 * 1024
+"""16 MiB aggregate payload cap (D169, §2.4)."""
+
+EVIDENCE_CHUNK_BYTES = 65_536
+"""Bounded streaming chunk size for payload hashing (D169, §2.4)."""
 
 
 class EstimateBasis(Enum):

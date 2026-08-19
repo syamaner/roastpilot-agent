@@ -53,11 +53,15 @@ post-exit worktree attestation. Gates run instead against a
 parent-provisioned external validation root. The parent obtains this role's
 exact, byte-stable gate commands by running `print-validation-commands
 --role qa --validation-root <root>` and pastes that output verbatim into
-your brief. **Run only those exact parent-supplied commands.** Do not
-reconstruct a command from `$ROASTPILOT_VALIDATION_PYTHON` or any other
-environment variable, and do not compose your own absolute-path command —
-the per-run root is not knowable in advance, and a denied-by-default
-provider allow-rule matches only the byte-exact command it was built from.
+your brief (D169: the output is `ALLOW` authorization-descriptor lines
+followed by `RUN` command lines). **Execute only the lines beginning `RUN `,
+with that four-byte token stripped, byte-exactly.** `ALLOW EXACT`/`ALLOW
+PREFIX` lines describe what the provider will admit — they are never
+themselves executable and must never be run as written. Do not reconstruct a
+command from `$ROASTPILOT_VALIDATION_PYTHON` or any other environment
+variable, and do not compose your own absolute-path command — the per-run
+root is not knowable in advance, and a denied-by-default provider allow-rule
+matches only the byte-exact command it was built from.
 
 Your committed native launch carries one fixed, role-specific
 `--allowedTools` allow-list (D168): the `pytest` gate is a *prefix* rule (any

@@ -363,6 +363,79 @@ cache/temp/coverage destinations above, and the unchanged byte-clean,
 unchanged-head post-exit attestation that still yields no record and no
 handback if anything lands in the worktree.
 
+## Parent-provisioned bound roots for read-only capture runs (D169)
+
+D166–D168 above cover exactly one bound-root kind, `--validation-root`, for
+the three test-running roles. D169 generalizes the same abstraction to two
+more closed role sets that need a readable root but never a command rule:
+`--plan-root`/`--plan-sha` for `planning-architect` and `story-planner`
+(required) and `product-auditor` (optional pair), and
+`--evidence-root`/`--evidence-pr` for `pr-triage`. All three kinds share one
+closed grammar, one disjointness rule, and one `0700`, current-euid,
+no-follow descriptor open; at most one bound root is ever active for a given
+native launch, because the three kinds' admitted role sets are pairwise
+disjoint. Neither the plan root nor the evidence bundle renders any
+`--allowedTools` rule: those roles read with `Read`/`Grep`/`Glob`, which need
+path access, not command permission.
+
+**Plan-root recipe (executed by the parent, never by the worker):**
+
+```bash
+git worktree add --detach <root> <sha>   # from a clean, up-to-date roastpilot-plan clone
+chmod 700 <root>
+git -C <root> status --porcelain --ignored     # MUST be empty before launch
+```
+
+The root must resolve to its own `git rev-parse --show-toplevel`, its origin
+must be `roastpilot-plan` (not `roastpilot-agent`), and its `HEAD` must equal
+the exact supplied `--plan-sha` (full 40-lowercase-hex; abbreviations are
+rejected). The tool re-runs the same identity checks, plus a
+`(st_dev, st_ino)` equality check on the root itself, after the native child
+exits — a commit landing, a file changing, or an ignored file appearing
+between launch and exit all fail closed with no record and no handback.
+
+**Evidence-bundle recipe (executed by the parent, never by the worker):**
+
+```bash
+mkdir -m 700 <root>
+gh pr view <n> --json ... > <root>/pr.json
+gh pr diff <n> > <root>/diff.patch
+gh pr checks <n> --json ... > <root>/checks.json
+gh api repos/{owner}/{repo}/pulls/<n>/reviews > <root>/reviews.json
+gh api repos/{owner}/{repo}/pulls/<n>/comments > <root>/review-comments.json
+gh api repos/{owner}/{repo}/issues/<n>/comments > <root>/issue-comments.json
+gh api repos/{owner}/{repo}/pulls/<n> --jq '...' > <root>/authors.json
+gh api graphql -f query='...' > <root>/review-threads.json
+chmod 400 <root>/*.json <root>/diff.patch
+# write manifest.json: evidence_schema_version, repository, pull_request,
+# head_sha (exact attested launch HEAD), base_sha, generated_at, and a
+# files map of {sha256, bytes} for the eight payload files above
+chmod 400 <root>/manifest.json
+chmod 700 <root>
+```
+
+The bundle is flat: exactly the nine names above, no subdirectories, each a
+regular file owned by the parent's euid with `st_nlink == 1` and mode exactly
+`0400`. The tool never parses a payload file's content — it only verifies the
+manifest's declared `sha256`/`bytes` against what it streams (per-file cap 4
+MiB, aggregate cap 16 MiB), and that `pull_request` and `head_sha` equal the
+supplied `--evidence-pr` and the exact attested launch HEAD. `pr-triage`
+adjudicates the untrusted PR/review/issue text inside the bundle; it never
+invokes `gh`, never has network access, and never sees a credential. The tool
+re-verifies listing, modes, `(st_dev, st_ino)`, the manifest bytes, and all
+eight digests after the native child exits; any drift fails closed with no
+record and no handback.
+
+**Ownership and lifecycle.** As with the validation root, the parent creates
+one fresh root per run, never shared between runs, and removes it after the
+run. The capture tool never creates, writes to, or deletes either root.
+
+**The brief states the `ALLOW`/`RUN` distinction (§ below), not just bound
+roots.** `print-validation-commands` now prints `ALLOW EXACT <command>` /
+`ALLOW PREFIX <command-prefix>` authorization-descriptor lines followed by
+one concrete `RUN <command>` line per gate — a validation role executes only
+the `RUN ` lines, byte-exactly, never the `ALLOW` lines.
+
 ## Reviewers in a shared worktree (added 9 Jul 2026, after a live incident)
 
 During the 9 Jul batch a reviewer ran `git checkout -- <file>` in a teammate's

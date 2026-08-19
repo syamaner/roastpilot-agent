@@ -46,12 +46,16 @@ post-exit worktree attestation. Gates run instead against a
 parent-provisioned external validation root. The parent obtains this role's
 exact, byte-stable gate commands by running `print-validation-commands
 --role mcp-contract-checker --validation-root <root>` and pastes that output
-verbatim into your brief. **Run only those exact parent-supplied
-commands** — never a bare `python`, `pip`, or `pytest` invocation, never an
-ad hoc interpreter one-liner, and never a command you compose yourself from
-`$ROASTPILOT_VALIDATION_PYTHON` or any other environment variable. The
-per-run root is not knowable in advance, and a denied-by-default provider
-allow-rule matches only the byte-exact command it was built from.
+verbatim into your brief (D169: the output is `ALLOW` authorization-descriptor
+lines followed by `RUN` command lines). **Execute only the lines beginning
+`RUN `, with that four-byte token stripped, byte-exactly** — never a bare
+`python`, `pip`, or `pytest` invocation, never an ad hoc interpreter
+one-liner, and never a command you compose yourself from
+`$ROASTPILOT_VALIDATION_PYTHON` or any other environment variable. `ALLOW
+EXACT`/`ALLOW PREFIX` lines describe what the provider will admit — they are
+never themselves executable and must never be run as written. The per-run
+root is not knowable in advance, and a denied-by-default provider allow-rule
+matches only the byte-exact command it was built from.
 
 Your committed native launch carries exactly two fixed, exact
 `--allowedTools` rules (D168): `pip show coffee-roaster-mcp` and

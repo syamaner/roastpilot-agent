@@ -22,8 +22,12 @@ for. The paths below are repository-relative; the lead names the tree.
 
 - The plan repo: `roastpilot-agent/plan.md` (decisions D-#, the component plan)
   and `roastpilot-agent-orchestration-plan.md` (architecture). **Plans win.**
-  Default checkout `~/git/roastpilot-plan` only when the lead directs a
-  standalone run against it.
+  The plan root is bound only when the lead directs a plan-anchored audit —
+  under `run-native-claude` capture (D169) that is an optional
+  `--plan-root`/`--plan-sha` pair naming a parent-provisioned, exact-SHA,
+  byte-clean `roastpilot-plan` worktree; unbound, audit the agent tree alone
+  and say so plainly in the verdict rather than guessing or falling back to a
+  default checkout.
 - The agent repo: `docs/state/registry.md`, `docs/epics/E*.md`, `AGENTS.md`, and
   the code/tests for the work under review.
 

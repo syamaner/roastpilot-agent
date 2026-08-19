@@ -46,11 +46,15 @@ post-exit worktree attestation. Gates run instead against a
 parent-provisioned external validation root. The parent obtains this role's
 exact, byte-stable gate command by running `print-validation-commands
 --role sim-roast-runner --validation-root <root>` and pastes that output
-verbatim into your brief. **Run only that exact parent-supplied
-command** — never a command you compose yourself from
+verbatim into your brief (D169: the output is an `ALLOW`
+authorization-descriptor line followed by a `RUN` command line). **Execute
+only the line beginning `RUN `, with that four-byte token stripped,
+byte-exactly** — never a command you compose yourself from
 `$ROASTPILOT_VALIDATION_PYTHON` or any other environment variable. The
-per-run root is not knowable in advance, and a denied-by-default provider
-allow-rule matches only the byte-exact command it was built from.
+`ALLOW EXACT` line describes what the provider will admit — it is never
+itself executable and must never be run as written. The per-run root is not
+knowable in advance, and a denied-by-default provider allow-rule matches
+only the byte-exact command it was built from.
 
 Your committed native launch carries exactly one fixed, exact
 `--allowedTools` rule (D168): `pytest tests/test_milestone1.py -q

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -15,10 +16,10 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, NoReturn, TypeVar
@@ -41,12 +42,28 @@ from capture_usage_codex import (
 )
 from capture_usage_models import (
     AGENT_USAGE_SCHEMA_VERSION,
+    ALL_BOUND_ROOT_ENVIRONMENT_KEYS,
+    BOUND_ROOT_POLICIES,
+    EVIDENCE_BUNDLE_FILES,
+    EVIDENCE_CHUNK_BYTES,
+    EVIDENCE_MANIFEST_NAME,
+    EVIDENCE_MAX_FILE_BYTES,
+    EVIDENCE_MAX_MANIFEST_BYTES,
+    EVIDENCE_MAX_TOTAL_BYTES,
+    EVIDENCE_PAYLOAD_FILES,
+    EVIDENCE_ROOT_ENVIRONMENT_KEY,
+    EVIDENCE_SCHEMA_VERSION,
     MAX_STREAM_BYTES,
     NATIVE_WORKER_USAGE_SCHEMA_VERSION,
+    PLAN_ROOT_ENVIRONMENT_KEY,
     SKILL_VERSION,
     USAGE_RECORD_ADAPTER,
+    VALIDATION_ENVIRONMENT_KEYS,
     VALIDATION_ENVIRONMENT_ROLES,
     VALIDATION_ROLE_COMMANDS,
+    BoundRoot,
+    BoundRootKind,
+    BoundRootPolicy,
     CapacitySnapshotRecord,
     CapacitySource,
     CapacityStatus,
@@ -61,11 +78,13 @@ from capture_usage_models import (
     RoleCapability,
     TaskUsageRecord,
     UsageRecord,
+    ValidationCommandKind,
     render_allowed_tools,
     render_validation_commands,
 )
 from capture_usage_transcript import (
     HANDBACK_SCHEMA_VERSION,
+    TIMESTAMP_SKEW_SECONDS,
     TranscriptError,
     TranscriptUsage,
     parse_owned_transcript,
@@ -105,27 +124,29 @@ No caller input may select or override either value; the native argv, the
 committed-frontmatter guard, and the transcript permission-mode attestation
 all index this same closed mapping.
 """
-_VALIDATION_ENVIRONMENT_KEYS = frozenset(
+_VALIDATION_ENVIRONMENT_KEYS = VALIDATION_ENVIRONMENT_KEYS
+"""Local alias of the model-owned closed key set (D169, §2.2), kept for the
+existing private-attribute test surface (``usage_cli._VALIDATION_ENVIRONMENT_KEYS``).
+Stripped from every native launch's inherited environment first, then
+reinstated with exactly these values only when the role's active bound root
+is :data:`~capture_usage_models.BoundRootKind.VALIDATION` (D166, §2.4)."""
+_PLAN_ENVIRONMENT_KEYS = frozenset({PLAN_ROOT_ENVIRONMENT_KEY})
+_EVIDENCE_ENVIRONMENT_KEYS = frozenset({EVIDENCE_ROOT_ENVIRONMENT_KEY})
+_ALL_BOUND_ROOT_ENVIRONMENT_KEYS = ALL_BOUND_ROOT_ENVIRONMENT_KEYS
+_VALIDATION_DIRECTORY_MODE = 0o700
+_FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+"""Closed 40-lowercase-hex full commit sha grammar (D169, §2.3, §2.4)."""
+_SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+"""Closed 64-lowercase-hex SHA-256 digest grammar (D169, §2.4)."""
+_EVIDENCE_FILE_MODE = 0o400
+"""The exact required mode for every one of the nine evidence bundle entries."""
+_PLAN_ORIGIN_URLS = frozenset(
     {
-        "ROASTPILOT_VALIDATION_ROOT",
-        "ROASTPILOT_VALIDATION_PYTHON",
-        "ROASTPILOT_VALIDATION_TMP",
-        "TMPDIR",
-        "XDG_CACHE_HOME",
-        "PYTHONPYCACHEPREFIX",
-        "PYTHONDONTWRITEBYTECODE",
-        "RUFF_CACHE_DIR",
-        "COVERAGE_FILE",
-        "PIP_CACHE_DIR",
-        "PYTEST_ADDOPTS",
+        "https://github.com/syamaner/roastpilot-plan.git",
+        "git@github.com:syamaner/roastpilot-plan.git",
     }
 )
-"""Closed environment-variable names bound only for a validation-role launch.
-
-Stripped from every native launch's inherited environment first, then
-reinstated with exactly these values only when the role is a member of
-:data:`~capture_usage_models.VALIDATION_ENVIRONMENT_ROLES` (D166, §2.4)."""
-_VALIDATION_DIRECTORY_MODE = 0o700
+"""The closed plan-repo origin allowlist (D169, §2.3)."""
 
 
 class CaptureUsageError(ValueError):
@@ -621,22 +642,26 @@ def _require_validation_directory(descriptor: int, *, expect_mode: int | None) -
 
 
 _VALIDATION_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
-"""The closed positive grammar for one validation-root path segment (D168).
+"""The closed positive grammar for one bound-root path segment (D168, generalized D169).
 
-Replaces the D167 negative character predicate. A rendered rule is
-``Bash(<command containing this path>)``, so any provider allow-rule or
-shell metacharacter surviving inside the path could re-scope or truncate
+Replaces the D167 negative character predicate. A rendered validation-role
+rule is ``Bash(<command containing this path>)``, so any provider allow-rule
+or shell metacharacter surviving inside the path could re-scope or truncate
 that rule (§2.5) — closing the grammar positively, rather than blocklisting
-characters, keeps it closed for every future rule-rendering consumer."""
+characters, keeps it closed for every future rule-rendering consumer, and the
+same closed grammar now gates the PLAN and EVIDENCE roots too, which are
+never rule-rendered but share the same disjointness and descriptor-open
+requirements."""
 
 
-def _is_valid_validation_path(value: str) -> bool:
-    """Return whether ``value`` is a well-formed absolute validation-root path.
+def _is_valid_bound_root_path(value: str) -> bool:
+    """Return whether ``value`` is a well-formed absolute bound-root path.
 
-    Applied identically to the raw ``--validation-root`` argument and to its
-    resolved ``os.path.realpath`` value before either is used for overlap,
-    descriptor, rule-rendering, or argv purposes (D167, tightened D168). A
-    closed positive per-segment grammar: every non-empty segment must match
+    Applied identically to the raw ``--validation-root``/``--plan-root``/
+    ``--evidence-root`` argument and to its resolved ``os.path.realpath``
+    value before either is used for overlap, descriptor, rule-rendering, or
+    argv purposes (D167, tightened D168, generalized D169 §2.2). A closed
+    positive per-segment grammar: every non-empty segment must match
     ``^[A-Za-z0-9._-]{1,255}$`` and must not be ``.`` or ``..``. This is
     strictly stronger than the prior negative predicate — it continues to
     reject whitespace, ASCII control characters (including DEL), quotes,
@@ -664,15 +689,67 @@ def _is_valid_validation_path(value: str) -> bool:
     )
 
 
+def _validate_bound_root_shape(raw: str, *, error_message: str) -> str:
+    """Validate the shared closed bound-root grammar, disjointness, and shape (D169, §2.2).
+
+    Every :class:`~capture_usage_models.BoundRootKind` shares this core: the
+    closed positive path grammar on both the raw and resolved forms,
+    disjointness from the current worktree and from ``~/.claude``, and a
+    no-follow descriptor open proving directory type, current-euid ownership,
+    and exactly mode ``0700``. Kind-specific checks (validation ``venv``
+    shape, plan git identity, evidence bundle listing) run only after this
+    shared shape passes.
+
+    Args:
+        raw: The exact caller-supplied root argument value.
+        error_message: The one fixed, path-free error for this bound-root kind.
+
+    Returns:
+        The canonical resolved root path.
+
+    Raises:
+        CaptureUsageError: If the grammar, location, ownership, or mode is
+            invalid. The message never echoes the supplied path.
+    """
+    if not _is_valid_bound_root_path(raw):
+        raise CaptureUsageError(error_message)
+    try:
+        cwd_real = os.path.realpath(Path.cwd())
+        root_real = os.path.realpath(raw)
+        home_claude_real = os.path.realpath(Path.home() / ".claude")
+    except OSError:
+        raise CaptureUsageError(error_message) from None
+    if not _is_valid_bound_root_path(root_real):
+        raise CaptureUsageError(error_message)
+    if (
+        Path(root_real).is_relative_to(Path(cwd_real))
+        or Path(cwd_real).is_relative_to(Path(root_real))
+        or Path(root_real).is_relative_to(Path(home_claude_real))
+    ):
+        raise CaptureUsageError(error_message)
+    try:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        descriptor = os.open(raw, flags)
+    except OSError:
+        raise CaptureUsageError(error_message) from None
+    try:
+        _require_validation_directory(descriptor, expect_mode=_VALIDATION_DIRECTORY_MODE)
+    except OSError:
+        raise CaptureUsageError(error_message) from None
+    finally:
+        os.close(descriptor)
+    return root_real
+
+
 def _validate_validation_root(raw: str) -> str:
     """Validate one parent-provisioned external validation root without mutating it.
 
     The root, its ``cache`` and ``tmp`` children, its ``venv`` directory, the
     ``venv/pyvenv.cfg`` marker, and the ``venv/bin/python`` interpreter are all
     attested by descriptor before any value derived from the path is trusted
-    (D166, §2.4). The closed grammar predicate runs on both the raw and the
-    resolved path (D167). Every failure raises the single fixed, path-free
-    error.
+    (D166, §2.4). The shared closed grammar and shape core
+    (:func:`_validate_bound_root_shape`) runs first (D167, generalized D169).
+    Every failure raises the single fixed, path-free error.
 
     Args:
         raw: The exact ``--validation-root`` argument value.
@@ -684,22 +761,7 @@ def _validate_validation_root(raw: str) -> str:
         CaptureUsageError: If the path grammar, location, ownership, mode, or
             venv shape is invalid. The message never echoes the supplied path.
     """
-    if not _is_valid_validation_path(raw):
-        raise CaptureUsageError("validation environment is invalid")
-    try:
-        cwd_real = os.path.realpath(Path.cwd())
-        root_real = os.path.realpath(raw)
-        home_claude_real = os.path.realpath(Path.home() / ".claude")
-    except OSError:
-        raise CaptureUsageError("validation environment is invalid") from None
-    if not _is_valid_validation_path(root_real):
-        raise CaptureUsageError("validation environment is invalid")
-    if (
-        Path(root_real).is_relative_to(Path(cwd_real))
-        or Path(cwd_real).is_relative_to(Path(root_real))
-        or Path(root_real).is_relative_to(Path(home_claude_real))
-    ):
-        raise CaptureUsageError("validation environment is invalid")
+    root_real = _validate_bound_root_shape(raw, error_message="validation environment is invalid")
     descriptors: list[int] = []
     try:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -765,51 +827,481 @@ def _validation_environment_values(root: str) -> dict[str, str]:
     }
 
 
-@dataclass(frozen=True)
-class _NativeLaunchEnvironment:
-    """Frozen native launch environment and the one validated root, if any.
+def _plan_identity_checks(root: str, sha: str) -> None:
+    """Run the five git-based plan-root identity checks (D169, §2.3).
 
-    Both fields are derived from exactly one :func:`_validate_validation_root`
-    call (D167): ``environment`` is the stripped, conditionally-repopulated
-    child environment, and ``validated_root`` is ``None`` for a non-validation
-    role or the canonical resolved root for a validation role. Carrying the
-    two together closes the gap where an argv builder that only received the
-    environment would have had to re-derive or re-validate the root itself.
+    Args:
+        root: The canonical resolved plan-root path.
+        sha: The exact 40-lowercase-hex ``--plan-sha`` value.
+
+    Raises:
+        CaptureUsageError: If any identity check fails, git is unavailable, or
+            the worktree is not byte-clean including ignored paths. The
+            message never echoes the root, the sha, or git output.
     """
+    try:
+        toplevel_status, toplevel = _git_output(["-C", root, "rev-parse", "--show-toplevel"])
+        origin_status, origin = _git_output(["-C", root, "remote", "get-url", "origin"])
+        head_status, head = _git_output(["-C", root, "rev-parse", "HEAD"])
+        verify_status, verified = _git_output(
+            ["-C", root, "rev-parse", "--verify", f"{sha}^{{commit}}"]
+        )
+        status_status, status = _git_output(["-C", root, "status", "--porcelain", "--ignored"])
+    except CaptureUsageError:
+        raise CaptureUsageError("plan root is invalid") from None
+    try:
+        toplevel_real = os.path.realpath(toplevel) if toplevel_status == 0 else None
+    except OSError:
+        raise CaptureUsageError("plan root is invalid") from None
+    if (
+        toplevel_status != 0
+        or toplevel_real != root
+        or origin_status != 0
+        or origin not in _PLAN_ORIGIN_URLS
+        or head_status != 0
+        or verify_status != 0
+        or head != verified
+        or status_status != 0
+        or status
+    ):
+        raise CaptureUsageError("plan root is invalid")
 
-    environment: dict[str, str]
-    validated_root: str | None
+
+def _plan_root_device_inode(root: str) -> tuple[int, int]:
+    """Return the plan root's ``(st_dev, st_ino)`` pair for post-exit drift detection."""
+    try:
+        status = os.stat(root)
+    except OSError:
+        raise CaptureUsageError("plan root is invalid") from None
+    return status.st_dev, status.st_ino
 
 
-def _resolve_native_environment(
-    role: NativeClaudeRole, validation_root: str | None
-) -> _NativeLaunchEnvironment:
-    """Validate ``--validation-root`` presence and shape, then build the child env.
+def _validate_plan_root(raw: str, sha: str | None) -> BoundRoot:
+    """Validate one parent-provisioned exact-sha byte-clean plan worktree (D169, §2.3).
+
+    Args:
+        raw: The exact ``--plan-root`` argument value.
+        sha: The exact ``--plan-sha`` argument value.
+
+    Returns:
+        The bound :data:`~capture_usage_models.BoundRootKind.PLAN` root, with
+        a ``reattest`` closure that re-runs identity plus inode/device
+        equality after the native child exits.
+
+    Raises:
+        CaptureUsageError: If the sha grammar, root shape, or git identity is
+            invalid. The message never echoes the root or the sha.
+    """
+    if sha is None or not _FULL_SHA_PATTERN.fullmatch(sha):
+        raise CaptureUsageError("plan root is invalid")
+    root_real = _validate_bound_root_shape(raw, error_message="plan root is invalid")
+    _plan_identity_checks(root_real, sha)
+    before = _plan_root_device_inode(root_real)
+
+    def reattest() -> None:
+        _plan_identity_checks(root_real, sha)
+        if _plan_root_device_inode(root_real) != before:
+            raise CaptureUsageError("plan root is invalid")
+
+    return BoundRoot(kind=BoundRootKind.PLAN, path=root_real, reattest=reattest)
+
+
+def _reject_duplicate_manifest_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject a JSON object (at any nesting depth) carrying a duplicate key."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise CaptureUsageError("evidence bundle is invalid")
+        result[key] = value
+    return result
+
+
+def _validate_evidence_manifest_schema(
+    data: object, pr: int, attested_head: str
+) -> dict[str, dict[str, object]]:
+    """Validate the closed evidence manifest grammar (D169, §2.4).
+
+    Args:
+        data: The parsed manifest JSON value.
+        pr: The exact ``--evidence-pr`` value the manifest must match.
+        attested_head: The pre-launch attested launch ``HEAD`` the manifest's
+            ``head_sha`` must match.
+
+    Returns:
+        The validated ``files`` mapping, keyed by the eight payload names.
+
+    Raises:
+        CaptureUsageError: If any manifest field is missing, malformed, or
+            mismatched.
+    """
+    expected_keys = {
+        "evidence_schema_version",
+        "repository",
+        "pull_request",
+        "head_sha",
+        "base_sha",
+        "generated_at",
+        "files",
+    }
+    if not isinstance(data, dict) or set(data) != expected_keys:
+        raise CaptureUsageError("evidence bundle is invalid")
+    if data.get("evidence_schema_version") != EVIDENCE_SCHEMA_VERSION:
+        raise CaptureUsageError("evidence bundle is invalid")
+    if data.get("repository") != "syamaner/roastpilot-agent":
+        raise CaptureUsageError("evidence bundle is invalid")
+    pull_request = data.get("pull_request")
+    if (
+        not isinstance(pull_request, int)
+        or isinstance(pull_request, bool)
+        or pull_request <= 0
+        or pull_request != pr
+    ):
+        raise CaptureUsageError("evidence bundle is invalid")
+    head_sha = data.get("head_sha")
+    if (
+        not isinstance(head_sha, str)
+        or _FULL_SHA_PATTERN.fullmatch(head_sha) is None
+        or head_sha != attested_head
+    ):
+        raise CaptureUsageError("evidence bundle is invalid")
+    base_sha = data.get("base_sha")
+    if not isinstance(base_sha, str) or _FULL_SHA_PATTERN.fullmatch(base_sha) is None:
+        raise CaptureUsageError("evidence bundle is invalid")
+    generated_at = data.get("generated_at")
+    if not isinstance(generated_at, str):
+        raise CaptureUsageError("evidence bundle is invalid")
+    try:
+        parsed = datetime.fromisoformat(generated_at.replace("Z", "+00:00")).astimezone(UTC)
+    except ValueError:
+        raise CaptureUsageError("evidence bundle is invalid") from None
+    if parsed > _utc_now() + timedelta(seconds=TIMESTAMP_SKEW_SECONDS):
+        raise CaptureUsageError("evidence bundle is invalid")
+    files = data.get("files")
+    if not isinstance(files, dict) or set(files) != set(EVIDENCE_PAYLOAD_FILES):
+        raise CaptureUsageError("evidence bundle is invalid")
+    validated_files: dict[str, dict[str, object]] = {}
+    for name, entry in files.items():
+        if not isinstance(entry, dict) or set(entry) != {"sha256", "bytes"}:
+            raise CaptureUsageError("evidence bundle is invalid")
+        digest = entry.get("sha256")
+        size = entry.get("bytes")
+        if not isinstance(digest, str) or _SHA256_HEX_PATTERN.fullmatch(digest) is None:
+            raise CaptureUsageError("evidence bundle is invalid")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise CaptureUsageError("evidence bundle is invalid")
+        validated_files[name] = {"sha256": digest, "bytes": size}
+    return validated_files
+
+
+def _evidence_listing(root_fd: int) -> frozenset[str]:
+    """Return the exact nine-entry bundle listing, rejecting any drift from it."""
+    try:
+        names = os.listdir(root_fd)
+    except OSError:
+        raise CaptureUsageError("evidence bundle is invalid") from None
+    listing = frozenset(names)
+    if listing != EVIDENCE_BUNDLE_FILES:
+        raise CaptureUsageError("evidence bundle is invalid")
+    return listing
+
+
+def _open_evidence_entry(root_fd: int, name: str) -> int:
+    """Open and attest one bundle entry: regular, owned, single-linked, mode 0400."""
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd)
+    except OSError:
+        raise CaptureUsageError("evidence bundle is invalid") from None
+    try:
+        status = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_uid != os.geteuid()
+            or status.st_nlink != 1
+            or stat.S_IMODE(status.st_mode) != _EVIDENCE_FILE_MODE
+        ):
+            raise CaptureUsageError("evidence bundle is invalid")
+    except CaptureUsageError:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _read_bounded_evidence_file(descriptor: int, maximum: int) -> bytes:
+    """Read one already-opened, no-follow entry, bounded by ``maximum`` bytes."""
+    try:
+        with os.fdopen(descriptor, "rb") as stream:
+            data = stream.read(maximum + 1)
+    except OSError:
+        raise CaptureUsageError("evidence bundle is invalid") from None
+    if len(data) > maximum:
+        raise CaptureUsageError("evidence bundle is invalid")
+    return data
+
+
+def _hash_evidence_payload(descriptor: int, *, remaining_budget: int) -> tuple[str, int]:
+    """Stream one payload file in bounded chunks, enforcing per-file and aggregate caps."""
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with os.fdopen(descriptor, "rb") as stream:
+            while True:
+                chunk = stream.read(EVIDENCE_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > EVIDENCE_MAX_FILE_BYTES or total > remaining_budget:
+                    raise CaptureUsageError("evidence bundle is invalid")
+                digest.update(chunk)
+    except OSError:
+        raise CaptureUsageError("evidence bundle is invalid") from None
+    return digest.hexdigest(), total
+
+
+@dataclass(frozen=True)
+class _EvidenceSnapshot:
+    """The comparable pre/post state of one evidence bundle (D169, §2.4)."""
+
+    listing: frozenset[str]
+    device_inode: tuple[int, int]
+    manifest_bytes: bytes
+    digests: tuple[tuple[str, str, int], ...]
+
+
+def _evidence_bundle_state(root: str, pr: int, attested_head: str) -> _EvidenceSnapshot:
+    """Fully validate structure, manifest grammar, and payload integrity; return a snapshot.
+
+    Args:
+        root: The canonical resolved, already shape-validated evidence root.
+        pr: The exact ``--evidence-pr`` value.
+        attested_head: The pre-launch attested launch ``HEAD``.
+
+    Returns:
+        A comparable snapshot used both to accept the bundle pre-launch and to
+        detect any drift post-exit.
+
+    Raises:
+        CaptureUsageError: If any structural, manifest, or integrity check
+            fails. The message never echoes the root, a digest, or a payload
+            byte.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        root_fd = os.open(root, flags)
+    except OSError:
+        raise CaptureUsageError("evidence bundle is invalid") from None
+    try:
+        root_status = os.fstat(root_fd)
+        if not stat.S_ISDIR(root_status.st_mode) or root_status.st_uid != os.geteuid():
+            raise CaptureUsageError("evidence bundle is invalid")
+        device_inode = (root_status.st_dev, root_status.st_ino)
+        listing = _evidence_listing(root_fd)
+        manifest_descriptor = _open_evidence_entry(root_fd, EVIDENCE_MANIFEST_NAME)
+        manifest_bytes = _read_bounded_evidence_file(
+            manifest_descriptor, EVIDENCE_MAX_MANIFEST_BYTES
+        )
+        try:
+            manifest = json.loads(manifest_bytes, object_pairs_hook=_reject_duplicate_manifest_keys)
+        except json.JSONDecodeError:
+            raise CaptureUsageError("evidence bundle is invalid") from None
+        files = _validate_evidence_manifest_schema(manifest, pr, attested_head)
+        remaining_budget = EVIDENCE_MAX_TOTAL_BYTES
+        digests: list[tuple[str, str, int]] = []
+        for name in EVIDENCE_PAYLOAD_FILES:
+            descriptor = _open_evidence_entry(root_fd, name)
+            digest, size = _hash_evidence_payload(descriptor, remaining_budget=remaining_budget)
+            remaining_budget -= size
+            expected = files[name]
+            if digest != expected["sha256"] or size != expected["bytes"]:
+                raise CaptureUsageError("evidence bundle is invalid")
+            digests.append((name, digest, size))
+    finally:
+        os.close(root_fd)
+    return _EvidenceSnapshot(listing, device_inode, manifest_bytes, tuple(digests))
+
+
+def _validate_evidence_bundle(raw: str, pr: int | None, *, attested_head: str) -> BoundRoot:
+    """Validate one parent-built, hash-verified PR evidence bundle (D169, §2.4).
+
+    Args:
+        raw: The exact ``--evidence-root`` argument value.
+        pr: The exact ``--evidence-pr`` argument value.
+        attested_head: The pre-launch attested launch ``HEAD``.
+
+    Returns:
+        The bound :data:`~capture_usage_models.BoundRootKind.EVIDENCE` root,
+        with a ``reattest`` closure that re-validates the full bundle state
+        after the native child exits.
+
+    Raises:
+        CaptureUsageError: If the root shape, listing, manifest, or integrity
+            is invalid. The message never echoes the root, a digest, or a
+            payload byte.
+    """
+    if pr is None:
+        raise CaptureUsageError("evidence bundle is invalid")
+    root_real = _validate_bound_root_shape(raw, error_message="evidence bundle is invalid")
+    before = _evidence_bundle_state(root_real, pr, attested_head)
+
+    def reattest() -> None:
+        after = _evidence_bundle_state(root_real, pr, attested_head)
+        if after != before:
+            raise CaptureUsageError("evidence bundle is invalid")
+
+    return BoundRoot(kind=BoundRootKind.EVIDENCE, path=root_real, reattest=reattest)
+
+
+@dataclass(frozen=True)
+class _BoundRootRequest:
+    """The raw caller-supplied root/companion values for one native launch (D169, §2.2)."""
+
+    validation_root: str | None
+    plan_root: str | None
+    plan_sha: str | None
+    evidence_root: str | None
+    evidence_pr: int | None
+
+
+_PolicyValueGetter = Callable[[_BoundRootRequest], tuple[object | None, object | None]]
+_POLICY_VALUES: dict[BoundRootKind, _PolicyValueGetter] = {
+    BoundRootKind.VALIDATION: lambda request: (request.validation_root, None),
+    BoundRootKind.PLAN: lambda request: (request.plan_root, request.plan_sha),
+    BoundRootKind.EVIDENCE: lambda request: (request.evidence_root, request.evidence_pr),
+}
+"""Closed per-kind accessor for the raw root/companion CLI values (D169, §2.2)."""
+
+
+def _admitting_policy(role: NativeClaudeRole) -> BoundRootPolicy | None:
+    """Return the one policy admitting ``role`` as required or optional, if any.
+
+    Every admitted role set is pairwise disjoint across the three policies
+    (closure-tested), so at most one policy ever admits a given role.
+    """
+    for policy in BOUND_ROOT_POLICIES.values():
+        if role in policy.required_roles or role in policy.optional_roles:
+            return policy
+    return None
+
+
+def _bound_root_presence(
+    role: NativeClaudeRole, request: _BoundRootRequest
+) -> BoundRootKind | None:
+    """Validate presence/pairing for every policy against ``role`` (D169, §2.2).
 
     Args:
         role: The registered native role.
-        validation_root: The raw ``--validation-root`` argument value, or
-            ``None``.
+        request: The raw caller-supplied root/companion values.
+
+    Returns:
+        The one active bound-root kind, or ``None`` when no root is supplied
+        (always valid for a role with no required policy).
+
+    Raises:
+        CaptureUsageError: If a required pair is missing, a pair is supplied
+            for a role no policy admits, or a root is supplied without its
+            required companion (or vice versa) for any role.
+    """
+    active: BoundRootKind | None = None
+    for policy in BOUND_ROOT_POLICIES.values():
+        root_value, companion_value = _POLICY_VALUES[policy.kind](request)
+        has_root = root_value is not None
+        if policy.companion_option is None:
+            present = has_root
+        else:
+            has_companion = companion_value is not None
+            if has_root != has_companion:
+                raise CaptureUsageError("validation environment is invalid")
+            present = has_root and has_companion
+        if role in policy.required_roles:
+            if not present:
+                raise CaptureUsageError("validation environment is invalid")
+        elif role in policy.optional_roles:
+            pass
+        elif present:
+            raise CaptureUsageError("validation environment is invalid")
+        if present:
+            active = policy.kind
+    return active
+
+
+def _resolve_bound_root(
+    role: NativeClaudeRole, request: _BoundRootRequest, *, attested_head: str
+) -> BoundRoot | None:
+    """Validate presence, then dispatch to the one active kind's deep validation (D169, §2.2).
+
+    Args:
+        role: The registered native role.
+        request: The raw caller-supplied root/companion values.
+        attested_head: The pre-launch attested launch ``HEAD``, used only by
+            the EVIDENCE kind's manifest ``head_sha`` check.
+
+    Returns:
+        The one bound root for this launch, or ``None`` when none applies.
+    """
+    active = _bound_root_presence(role, request)
+    if active is None:
+        return None
+    if active is BoundRootKind.VALIDATION:
+        assert request.validation_root is not None
+        path = _validate_validation_root(request.validation_root)
+        return BoundRoot(kind=BoundRootKind.VALIDATION, path=path, reattest=None)
+    if active is BoundRootKind.PLAN:
+        assert request.plan_root is not None
+        return _validate_plan_root(request.plan_root, request.plan_sha)
+    assert request.evidence_root is not None
+    return _validate_evidence_bundle(
+        request.evidence_root, request.evidence_pr, attested_head=attested_head
+    )
+
+
+@dataclass(frozen=True)
+class _NativeLaunchEnvironment:
+    """Frozen native launch environment and the one bound root, if any (D169, §2.2).
+
+    Both fields are derived from exactly one :func:`_resolve_bound_root` call:
+    ``environment`` is the stripped, conditionally-repopulated child
+    environment, and ``bound_root`` is ``None`` when no root applies to this
+    launch or the one validated :class:`~capture_usage_models.BoundRoot`
+    otherwise. Carrying the two together closes the gap where an argv builder
+    that only received the environment would have had to re-derive or
+    re-validate the root itself.
+    """
+
+    environment: dict[str, str]
+    bound_root: BoundRoot | None
+
+
+def _resolve_native_environment(
+    role: NativeClaudeRole, request: _BoundRootRequest, *, attested_head: str
+) -> _NativeLaunchEnvironment:
+    """Validate bound-root presence and shape, then build the closed child env.
+
+    Args:
+        role: The registered native role.
+        request: The raw caller-supplied root/companion values.
+        attested_head: The pre-launch attested launch ``HEAD``.
 
     Returns:
         The frozen environment-and-root value for this launch, built from
         exactly one root validation.
 
     Raises:
-        CaptureUsageError: If a validation role is missing ``--validation-root``,
-            a non-validation role supplies one, or the supplied root is invalid.
+        CaptureUsageError: If a required pair is missing or mismatched for
+            ``role``, or the supplied root/bundle is invalid.
     """
-    requires_root = role in VALIDATION_ENVIRONMENT_ROLES
-    if requires_root != (validation_root is not None):
-        raise CaptureUsageError("validation environment is invalid")
+    bound_root = _resolve_bound_root(role, request, attested_head=attested_head)
     environment = {
-        key: value for key, value in os.environ.items() if key not in _VALIDATION_ENVIRONMENT_KEYS
+        key: value
+        for key, value in os.environ.items()
+        if key not in _ALL_BOUND_ROOT_ENVIRONMENT_KEYS
     }
-    if validation_root is None:
-        return _NativeLaunchEnvironment(environment=environment, validated_root=None)
-    root = _validate_validation_root(validation_root)
-    environment.update(_validation_environment_values(root))
-    return _NativeLaunchEnvironment(environment=environment, validated_root=root)
+    if bound_root is not None:
+        if bound_root.kind is BoundRootKind.VALIDATION:
+            environment.update(_validation_environment_values(bound_root.path))
+        elif bound_root.kind is BoundRootKind.PLAN:
+            environment[PLAN_ROOT_ENVIRONMENT_KEY] = bound_root.path
+        else:
+            environment[EVIDENCE_ROOT_ENVIRONMENT_KEY] = bound_root.path
+    return _NativeLaunchEnvironment(environment=environment, bound_root=bound_root)
 
 
 def _emit_handback(
@@ -930,21 +1422,27 @@ def _native_claude_argv(
     capability: RoleCapability,
     effort: str,
     session_id: str,
-    validated_root: str | None,
+    bound_root: BoundRoot | None,
 ) -> list[str]:
     """Build the exact capability-bound native-Claude worker argv.
 
-    ``validated_root`` must already be the return value of one
-    :func:`_validate_validation_root` call (never a raw, unvalidated path).
-    For exactly the three roles in ``VALIDATION_ENVIRONMENT_ROLES`` this
-    appends one ``--add-dir <validated_root>`` pair immediately before
-    ``--permission-mode`` (D167), and a trailing ``--allowedTools`` option
-    carrying that role's committed rule tuple, rendered only from
-    ``validated_root`` through :func:`~capture_usage_models.render_allowed_tools`
-    (D168, §2.3). ``--allowedTools`` is placed last, after ``--effort``,
-    because the option is variadic: anything appended after it would be
-    consumed as an additional rule rather than as a new argv element. Every
-    other role's argv is byte-identical to the pre-D168 shape.
+    ``bound_root`` must already be the return value of one
+    :func:`_resolve_bound_root` call (never a raw, unvalidated path). For any
+    role admitted by a bound-root policy, this appends one
+    ``--add-dir <bound_root.path>`` pair immediately before
+    ``--permission-mode`` (D167, generalized D169 §2.2), and — only when
+    ``bound_root.kind`` is
+    :data:`~capture_usage_models.BoundRootKind.VALIDATION` — a trailing
+    ``--allowedTools`` option carrying that role's committed rule tuple,
+    rendered only from ``bound_root.path`` through
+    :func:`~capture_usage_models.render_allowed_tools` (D168, §2.3). A PLAN or
+    EVIDENCE bound root never renders ``--allowedTools``: those roles read
+    with ``Read``/``Grep``/``Glob``, which need path access, not command
+    permission (D169, §2.3 I3). ``--allowedTools`` is placed last, after
+    ``--effort``, because the option is variadic: anything appended after it
+    would be consumed as an additional rule rather than as a new argv
+    element. Every non-admitted role's argv is byte-identical to the pre-D167
+    shape.
 
     Args:
         executable: The resolved ``claude`` executable path.
@@ -952,19 +1450,22 @@ def _native_claude_argv(
         capability: The role's derived READ_ONLY/WRITE capability.
         effort: The role's committed reasoning effort.
         session_id: The bound session identifier.
-        validated_root: The canonical resolved validation root for the three
-            validation roles, or ``None`` for every other role.
+        bound_root: The one validated bound root for this launch, or ``None``.
 
     Returns:
         The exact native launch argv.
 
     Raises:
-        CaptureUsageError: If ``validated_root`` presence disagrees with
-            whether ``role`` is a validation role, or a validation role
-            renders no allow-list rules from ``validated_root``.
+        CaptureUsageError: If ``bound_root`` presence or kind disagrees with
+            the policy that admits ``role``, or a VALIDATION role renders no
+            allow-list rules from ``bound_root.path``.
     """
-    requires_root = role in VALIDATION_ENVIRONMENT_ROLES
-    if requires_root != (validated_root is not None):
+    policy = _admitting_policy(role)
+    required = policy is not None and role in policy.required_roles
+    if bound_root is None:
+        if required:
+            raise CaptureUsageError("validation environment is invalid")
+    elif policy is None or bound_root.kind is not policy.kind:
         raise CaptureUsageError("validation environment is invalid")
     argv = [
         executable,
@@ -979,8 +1480,8 @@ def _native_claude_argv(
         "--mcp-config",
         '{"mcpServers":{}}',
     ]
-    if validated_root is not None:
-        argv.extend(["--add-dir", validated_root])
+    if bound_root is not None:
+        argv.extend(["--add-dir", bound_root.path])
     argv.extend(
         [
             "--permission-mode",
@@ -989,8 +1490,8 @@ def _native_claude_argv(
             effort,
         ]
     )
-    if validated_root is not None:
-        rules = render_allowed_tools(role, validated_root)
+    if bound_root is not None and bound_root.kind is BoundRootKind.VALIDATION:
+        rules = render_allowed_tools(role, bound_root.path)
         if not rules:
             raise CaptureUsageError("validation environment is invalid")
         argv.append("--allowedTools")
@@ -1089,14 +1590,27 @@ def _native_record_from_usage(
     )
 
 
+def _bound_root_request(arguments: argparse.Namespace) -> _BoundRootRequest:
+    """Build the raw bound-root request from the parsed ``run-native-claude`` namespace."""
+    return _BoundRootRequest(
+        validation_root=arguments.validation_root,
+        plan_root=arguments.plan_root,
+        plan_sha=arguments.plan_sha,
+        evidence_root=arguments.evidence_root,
+        evidence_pr=arguments.evidence_pr,
+    )
+
+
 def run_native_claude_command(arguments: argparse.Namespace) -> int:
     """Launch one registered Claude implementation worker and append complete usage."""
     role = NativeClaudeRole(arguments.role)
     pin = _native_role_pin(role)
-    launch_environment = _resolve_native_environment(role, arguments.validation_root)
     require_handback = pin.capability is RoleCapability.READ_ONLY
     _validate_native_metadata(arguments, role, pin)
-    _validate_native_worktree(arguments, pin.capability, post_exit=False)
+    attested_head = _validate_native_worktree(arguments, pin.capability, post_exit=False)
+    launch_environment = _resolve_native_environment(
+        role, _bound_root_request(arguments), attested_head=attested_head
+    )
     if os.environ.get("CLAUDE_CONFIG_DIR") is not None:
         raise CaptureUsageError("native Claude config directory is not permitted")
     session_id = str(uuid4())
@@ -1126,7 +1640,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
                 pin.capability,
                 pin.effort,
                 session_id,
-                launch_environment.validated_root,
+                launch_environment.bound_root,
             ),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
@@ -1176,6 +1690,9 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
             # defensive invariant backstop, not reachable here.
             raise CaptureUsageError("native Claude transcript is invalid")  # pragma: no cover
         final_head_sha = _validate_native_worktree(arguments, pin.capability, post_exit=True)
+        bound_root = launch_environment.bound_root
+        if bound_root is not None and bound_root.reattest is not None:
+            bound_root.reattest()
         append_record(
             arguments.output,
             _native_record_from_usage(
@@ -1411,6 +1928,17 @@ def _validate_run_metadata(arguments: argparse.Namespace) -> None:
     )
 
 
+def _evidence_pr(value: str) -> int:
+    """Parse one closed positive-integer ``--evidence-pr`` value (D169, §2.4)."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("evidence PR number must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("evidence PR number must be a positive integer")
+    return parsed
+
+
 def _finding_count(value: str) -> tuple[FindingLens, FindingSeverity, int]:
     """Parse one closed ``LENS:SEVERITY:COUNT`` outcome option."""
     lens, separator, remainder = value.partition(":")
@@ -1465,14 +1993,70 @@ def snapshot_capacity(arguments: argparse.Namespace) -> int:
     return 0
 
 
+_MAX_PYTEST_ARG_TOKENS = 32
+_MAX_PYTEST_ARG_TOKEN_BYTES = 256
+
+
+def _pytest_arg_token(value: str) -> str:
+    """Parse one closed ``--pytest-arg`` token (D169, §2.5).
+
+    The grammar exists only for line framing and bounding, never for
+    capability: the underlying pytest prefix rule already admits arbitrary
+    pytest arguments (the accepted D168 residual). Only newline, carriage
+    return, and NUL are rejected, plus the per-token byte cap.
+    """
+    if "\n" in value or "\r" in value or "\x00" in value:
+        raise argparse.ArgumentTypeError("pytest argument token contains a forbidden byte")
+    if len(value.encode("utf-8")) > _MAX_PYTEST_ARG_TOKEN_BYTES:
+        raise argparse.ArgumentTypeError("pytest argument token exceeds the byte cap")
+    return value
+
+
+def _shlex_split(value: str) -> list[str]:
+    """Split one shell-quoted command string, converting malformed input to the fixed error."""
+    try:
+        return shlex.split(value)
+    except ValueError:
+        raise CaptureUsageError("validation environment is invalid") from None
+
+
+def _render_prefix_run_command(prefix: str, tokens: tuple[str, ...]) -> str:
+    """Render one concrete, mechanically-covered ``RUN`` command for a PREFIX rule.
+
+    Args:
+        prefix: The table-rendered prefix command.
+        tokens: Zero or more caller-supplied ``--pytest-arg`` tokens, in order.
+
+    Returns:
+        ``prefix`` alone when ``tokens`` is empty, else ``prefix`` followed by
+        the shell-quoted tokens.
+
+    Raises:
+        CaptureUsageError: If the rendered command does not round-trip through
+            ``shlex.split`` as exactly the prefix tokens followed by the
+            supplied tokens, or does not begin with the literal prefix text.
+    """
+    run_command = prefix if not tokens else prefix + " " + " ".join(shlex.quote(t) for t in tokens)
+    if _shlex_split(run_command) != [*_shlex_split(prefix), *tokens]:
+        raise CaptureUsageError("validation environment is invalid")
+    if run_command != prefix and not run_command.startswith(prefix + " "):
+        # run_command is always built as exactly prefix, or prefix + " " + quoted
+        # tokens, above — it is therefore always either equal to prefix or literally
+        # prefixed by "prefix "; this is a defensive invariant backstop that the
+        # round-trip check above would already have caught, not reachable here.
+        raise CaptureUsageError("validation environment is invalid")  # pragma: no cover
+    return run_command
+
+
 def print_validation_commands_command(arguments: argparse.Namespace) -> int:
-    """Print one validation role's exact, byte-stable gate commands (parent-only).
+    """Print one validation role's ``ALLOW``/``RUN`` gate command lines (parent-only).
 
     Validates ``--validation-root`` exactly once through the shared
-    :func:`_validate_validation_root` call, then prints one deterministic
-    ``EXACT <command>`` or ``PREFIX <command-prefix>`` line per
-    :data:`~capture_usage_models.VALIDATION_ROLE_COMMANDS` entry for the
-    selected role, rendered through
+    :func:`_validate_validation_root` call, then prints one ``ALLOW EXACT
+    <command>`` or ``ALLOW PREFIX <command-prefix>`` authorization-descriptor
+    line per :data:`~capture_usage_models.VALIDATION_ROLE_COMMANDS` entry for
+    the selected role, followed by one concrete, runnable ``RUN <command>``
+    line per entry (D169, §2.5). Every command is rendered through
     :func:`~capture_usage_models.render_validation_commands` — the same
     render function :func:`_native_claude_argv` uses to build the
     ``--allowedTools`` rule tuple, so the printed commands and the bound
@@ -1490,20 +2074,33 @@ def print_validation_commands_command(arguments: argparse.Namespace) -> int:
 
     Raises:
         CaptureUsageError: If ``role`` is not a validation role, the root is
-            invalid, or the role renders no commands.
+            invalid, the role renders no commands, ``--pytest-arg`` is
+            supplied for a role with no ``PREFIX`` entry, more than 32
+            tokens are supplied, or the mechanical ``RUN`` coverage proof
+            fails for any entry.
     """
     role = NativeClaudeRole(arguments.role)
     if role not in VALIDATION_ENVIRONMENT_ROLES:
         raise CaptureUsageError("validation environment is invalid")
-    root = _validate_validation_root(arguments.validation_root)
+    tokens: tuple[str, ...] = tuple(arguments.pytest_arg or ())
+    if len(tokens) > _MAX_PYTEST_ARG_TOKENS:
+        raise CaptureUsageError("validation environment is invalid")
     commands = VALIDATION_ROLE_COMMANDS.get(role, ())
+    if tokens and not any(command.kind is ValidationCommandKind.PREFIX for command in commands):
+        raise CaptureUsageError("validation environment is invalid")
+    root = _validate_validation_root(arguments.validation_root)
     rendered = render_validation_commands(role, root)
     if not rendered:
         raise CaptureUsageError("validation environment is invalid")
-    lines = [
-        f"{command.kind.value} {text}" for command, text in zip(commands, rendered, strict=True)
-    ]
-    sys.stdout.write("\n".join(lines) + "\n")
+    allow_lines: list[str] = []
+    run_lines: list[str] = []
+    for command, text in zip(commands, rendered, strict=True):
+        allow_lines.append(f"ALLOW {command.kind.value} {text}")
+        if command.kind is ValidationCommandKind.EXACT:
+            run_lines.append(f"RUN {text}")
+        else:
+            run_lines.append(f"RUN {_render_prefix_run_command(text, tokens)}")
+    sys.stdout.write("\n".join([*allow_lines, *run_lines]) + "\n")
     sys.stdout.flush()
     return 0
 
@@ -1578,6 +2175,10 @@ def build_parser() -> argparse.ArgumentParser:
     native.add_argument("--branch", required=True)
     native.add_argument("--base-sha", required=True)
     native.add_argument("--validation-root", default=None)
+    native.add_argument("--plan-root", default=None)
+    native.add_argument("--plan-sha", default=None)
+    native.add_argument("--evidence-root", default=None)
+    native.add_argument("--evidence-pr", type=_evidence_pr, default=None)
     _add_output_option(native)
     native.set_defaults(handler=run_native_claude_command)
 
@@ -1589,6 +2190,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--role", choices=tuple(role.value for role in NativeClaudeRole), required=True
     )
     print_validation.add_argument("--validation-root", required=True)
+    print_validation.add_argument(
+        "--pytest-arg", type=_pytest_arg_token, action="append", default=None
+    )
     print_validation.set_defaults(handler=print_validation_commands_command)
 
     outcome = commands.add_parser("annotate-outcome", help="append closed task outcome metadata")

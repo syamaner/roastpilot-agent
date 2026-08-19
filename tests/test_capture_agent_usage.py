@@ -6,8 +6,11 @@ import argparse
 import hashlib
 import importlib.util
 import inspect
+import itertools
 import json
 import os
+import re
+import shlex
 import shutil
 import signal
 import stat
@@ -47,12 +50,22 @@ from capture_usage_codex import (
     parse_codex_stream,
 )
 from capture_usage_models import (
+    BOUND_ROOT_POLICIES,
+    EVIDENCE_BUNDLE_FILES,
+    EVIDENCE_MANIFEST_NAME,
+    EVIDENCE_MAX_FILE_BYTES,
+    EVIDENCE_MAX_TOTAL_BYTES,
+    EVIDENCE_PAYLOAD_FILES,
+    EVIDENCE_SCHEMA_VERSION,
     MAX_EVENT_BYTES,
     MAX_EVENT_COUNT,
     MAX_STREAM_BYTES,
     NATIVE_ROLE_EXCLUSIONS,
+    VALIDATION_ENVIRONMENT_ROLES,
     VALIDATION_ROLE_COMMANDS,
     BoundedStreamError,
+    BoundRoot,
+    BoundRootKind,
     CapacitySnapshotRecord,
     CapacitySource,
     CapacityStatus,
@@ -995,13 +1008,28 @@ def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
     """
     session_id = "11111111-1111-4111-8111-111111111233"
     pin = usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
-    validated_root = "/validated/root" if role in usage_cli.VALIDATION_ENVIRONMENT_ROLES else None
-    argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
-        "claude", role, pin.capability, pin.effort, session_id, validated_root
+    fake_root_by_kind = {
+        BoundRootKind.VALIDATION: "/validated/root",
+        BoundRootKind.PLAN: "/plan/root",
+        BoundRootKind.EVIDENCE: "/evidence/root",
+    }
+    required_kind = next(
+        (kind for kind, policy in BOUND_ROOT_POLICIES.items() if role in policy.required_roles),
+        None,
     )
-    expected_middle = ["--add-dir", validated_root] if validated_root is not None else []
+    bound_root = (
+        BoundRoot(required_kind, fake_root_by_kind[required_kind])
+        if required_kind is not None
+        else None
+    )
+    argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+        "claude", role, pin.capability, pin.effort, session_id, bound_root
+    )
+    expected_middle = ["--add-dir", bound_root.path] if bound_root is not None else []
     expected_rules = (
-        list(render_allowed_tools(role, validated_root)) if validated_root is not None else []
+        list(render_allowed_tools(role, bound_root.path))
+        if bound_root is not None and bound_root.kind is BoundRootKind.VALIDATION
+        else []
     )
     expected_tail = ["--allowedTools", *expected_rules] if expected_rules else []
     assert argv == [
@@ -1023,13 +1051,15 @@ def test_native_argv_is_exact_and_generic_measurement_stays_ephemeral(
         pin.effort,
         *expected_tail,
     ]
-    if validated_root is not None:
+    if bound_root is not None and bound_root.kind is BoundRootKind.VALIDATION:
         assert argv[argv.index("--add-dir") + 2] == "--permission-mode"
         assert "--allowedTools" in argv
         assert argv[-1] == expected_rules[-1]
         assert argv.index("--allowedTools") + 1 + len(expected_rules) == len(argv)
     else:
         assert "--allowedTools" not in argv
+        if bound_root is not None:
+            assert argv[argv.index("--add-dir") + 2] == "--permission-mode"
     assert "--no-session-persistence" not in argv and "--output-format" not in argv
     generic = usage_cli._launch_argv(HarnessFamily.CLAUDE, "claude", "model", "high")  # pyright: ignore[reportPrivateUsage]
     assert "--no-session-persistence" in generic
@@ -1051,7 +1081,7 @@ def test_native_argv_rejects_root_role_mismatch() -> None:
             RoleCapability.WRITE,
             "high",
             session_id,
-            "/validated/root",
+            BoundRoot(BoundRootKind.VALIDATION, "/validated/root"),
         )
     with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
         usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
@@ -1061,6 +1091,15 @@ def test_native_argv_rejects_root_role_mismatch() -> None:
             "high",
             session_id,
             None,
+        )
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+            "claude",
+            NativeClaudeRole.QA,
+            RoleCapability.READ_ONLY,
+            "high",
+            session_id,
+            BoundRoot(BoundRootKind.PLAN, "/plan/root"),
         )
 
 
@@ -1121,7 +1160,7 @@ def test_render_allowed_tools_uses_the_validated_resolved_root_not_the_raw_argum
         RoleCapability.READ_ONLY,
         "high",
         "11111111-1111-4111-8111-111111111233",
-        resolved,
+        BoundRoot(BoundRootKind.VALIDATION, resolved),
     )
     rules = argv[argv.index("--allowedTools") + 1 :]
     assert all(str(link) not in rule for rule in rules)
@@ -1194,7 +1233,7 @@ def test_native_claude_argv_never_revalidates_the_root(monkeypatch: pytest.Monke
         RoleCapability.READ_ONLY,
         "high",
         "11111111-1111-4111-8111-111111111233",
-        "/validated/root",
+        BoundRoot(BoundRootKind.VALIDATION, "/validated/root"),
     )
     assert "--allowedTools" in argv
 
@@ -1269,7 +1308,7 @@ def test_native_argv_rejects_empty_rendered_rule_tuple_before_provider_lookup(
             RoleCapability.READ_ONLY,
             "high",
             "11111111-1111-4111-8111-111111111233",
-            "/validated/root",
+            BoundRoot(BoundRootKind.VALIDATION, "/validated/root"),
         )
 
 
@@ -1451,7 +1490,16 @@ class _NativeProcess:
 _NATIVE_SESSION_ID = "11111111-1111-4111-8111-111111111233"
 
 
-def _native_cli_args(role: str = "engineer-be", *, validation_root: str | None = None) -> list[str]:
+def _native_cli_args(
+    role: str = "engineer-be",
+    *,
+    validation_root: str | None = None,
+    plan_root: str | None = None,
+    plan_sha: str | None = None,
+    evidence_root: str | None = None,
+    evidence_pr: int | None = None,
+    base_sha: str = "4c1ac63",
+) -> list[str]:
     """Return closed native command metadata for provider-free tests."""
     arguments = [
         "run-native-claude",
@@ -1470,11 +1518,37 @@ def _native_cli_args(role: str = "engineer-be", *, validation_root: str | None =
         "--branch",
         "feature/816-native-transcript-usage-1",
         "--base-sha",
-        "4c1ac63",
+        base_sha,
     ]
     if validation_root is not None:
         arguments.extend(["--validation-root", validation_root])
+    if plan_root is not None:
+        arguments.extend(["--plan-root", plan_root])
+    if plan_sha is not None:
+        arguments.extend(["--plan-sha", plan_sha])
+    if evidence_root is not None:
+        arguments.extend(["--evidence-root", evidence_root])
+    if evidence_pr is not None:
+        arguments.extend(["--evidence-pr", str(evidence_pr)])
     return arguments
+
+
+def _request(
+    *,
+    validation_root: str | None = None,
+    plan_root: str | None = None,
+    plan_sha: str | None = None,
+    evidence_root: str | None = None,
+    evidence_pr: int | None = None,
+) -> usage_cli._BoundRootRequest:  # pyright: ignore[reportPrivateUsage]
+    """Build a closed bound-root request for direct-call presence/resolution tests."""
+    return usage_cli._BoundRootRequest(  # pyright: ignore[reportPrivateUsage]
+        validation_root=validation_root,
+        plan_root=plan_root,
+        plan_sha=plan_sha,
+        evidence_root=evidence_root,
+        evidence_pr=evidence_pr,
+    )
 
 
 def _native_transcript_bytes(session_id: str = _NATIVE_SESSION_ID) -> bytes:
@@ -5796,6 +5870,21 @@ def _configure_read_only_native_launcher(
     return project, observed
 
 
+_STUB_PLAN_ROOT = "/plan/root"
+_STUB_PLAN_SHA = "1" * 40
+
+
+def _stub_plan_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bypass real plan-root git validation for tests unrelated to D169 plan behavior."""
+
+    def fixed_validate_plan_root(raw: str, sha: str | None) -> BoundRoot:
+        assert raw == _STUB_PLAN_ROOT
+        assert sha == _STUB_PLAN_SHA
+        return BoundRoot(kind=BoundRootKind.PLAN, path=_STUB_PLAN_ROOT, reattest=lambda: None)
+
+    monkeypatch.setattr(usage_cli, "_validate_plan_root", fixed_validate_plan_root)
+
+
 _READ_ONLY_FIXTURE_BY_ROLE = {
     "story-planner": "story-planner.jsonl",
     "qa": "qa.jsonl",
@@ -5822,11 +5911,39 @@ def _read_only_transcript_bytes(
     return _dump_rows(rows)
 
 
+def _read_only_transcript_bytes_rebranded(
+    source_role: str,
+    target_role: str,
+    *,
+    session_id: str = _NATIVE_SESSION_ID,
+    text: str = "SYNTHETIC_STORY_HANDOFF",
+) -> bytes:
+    """Rebrand a committed same-model/effort fixture's ``agentSetting`` to another role.
+
+    Used only for roles with no committed transcript fixture (e.g. ``pr-triage``,
+    D169) that share a model/effort pin with an existing fixture's role — adds
+    no new fixture file (§3.8), just a runtime field substitution identical in
+    spirit to the existing session-id and terminal-text rebind above.
+    """
+    fixture = _READ_ONLY_FIXTURE_BY_ROLE[source_role]
+    content = (FIXTURES / "claude-2.1.233-transcript" / fixture).read_bytes()
+    rows: list[dict[str, Any]] = [json.loads(line) for line in content.splitlines()]
+    original = rows[0]["sessionId"]
+    for row in rows:
+        if row.get("sessionId") == original:
+            row["sessionId"] = session_id
+        if row.get("type") == "agent-setting" and row.get("agentSetting") == source_role:
+            row["agentSetting"] = target_role
+    rows[-1]["message"]["content"] = [{"type": "text", "text": text}]
+    return _dump_rows(rows)
+
+
 def test_native_read_only_emits_bounded_handback_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A successful READ_ONLY run emits exactly one framed, integrity-checkable stdout line."""
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
     monkeypatch.setattr(
         usage_cli.subprocess,
@@ -5838,7 +5955,14 @@ def test_native_read_only_emits_bounded_handback_line(
             transcript=_read_only_transcript_bytes("story-planner", text="SYNTHETIC_STORY_HANDOFF"),
         ),
     )
-    assert main(_native_cli_args(role="story-planner")) == 0
+    assert (
+        main(
+            _native_cli_args(
+                role="story-planner", plan_root=_STUB_PLAN_ROOT, plan_sha=_STUB_PLAN_SHA
+            )
+        )
+        == 0
+    )
     captured = capsys.readouterr()
     lines = captured.out.splitlines()
     assert len(lines) == 1
@@ -5896,6 +6020,7 @@ def test_native_read_only_no_emission_on_post_exit_attestation_failure(
         return "4c1ac63"
 
     monkeypatch.setattr(usage_cli, "_validate_native_worktree", failing_attestation)
+    _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
     monkeypatch.setattr(
         usage_cli.subprocess,
@@ -5904,8 +6029,12 @@ def test_native_read_only_no_emission_on_post_exit_attestation_failure(
             project, observed, processes, transcript=_read_only_transcript_bytes("story-planner")
         ),
     )
-    with pytest.raises(SystemExit):
-        main(_native_cli_args(role="story-planner"))
+    with pytest.raises(SystemExit, match="native worktree attestation failed"):
+        main(
+            _native_cli_args(
+                role="story-planner", plan_root=_STUB_PLAN_ROOT, plan_sha=_STUB_PLAN_SHA
+            )
+        )
     assert capsys.readouterr().out == ""
     assert not Path(".agent-usage/usage.jsonl").exists()
 
@@ -5915,6 +6044,7 @@ def test_native_read_only_no_emission_on_sink_append_failure(
 ) -> None:
     """A forced sink-append failure leaves stdout empty even with a complete transcript."""
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
     monkeypatch.setattr(
         usage_cli.subprocess,
@@ -5928,8 +6058,12 @@ def test_native_read_only_no_emission_on_sink_append_failure(
         raise CaptureUsageError("could not append usage record")
 
     monkeypatch.setattr(usage_cli, "append_record", failing_append)
-    with pytest.raises(SystemExit):
-        main(_native_cli_args(role="story-planner"))
+    with pytest.raises(SystemExit, match="could not append usage record"):
+        main(
+            _native_cli_args(
+                role="story-planner", plan_root=_STUB_PLAN_ROOT, plan_sha=_STUB_PLAN_SHA
+            )
+        )
     assert capsys.readouterr().out == ""
 
 
@@ -5938,6 +6072,7 @@ def test_native_read_only_handback_absent_from_durable_state(
 ) -> None:
     """The handback sentinel appears nowhere durable: sink, worktree files, or stderr."""
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
     sentinel = "SENTINEL_HANDBACK_TEXT_MUST_STAY_LOCAL"
     monkeypatch.setattr(
@@ -5950,7 +6085,14 @@ def test_native_read_only_handback_absent_from_durable_state(
             transcript=_read_only_transcript_bytes("story-planner", text=sentinel),
         ),
     )
-    assert main(_native_cli_args(role="story-planner")) == 0
+    assert (
+        main(
+            _native_cli_args(
+                role="story-planner", plan_root=_STUB_PLAN_ROOT, plan_sha=_STUB_PLAN_SHA
+            )
+        )
+        == 0
+    )
     raw = Path(".agent-usage/usage.jsonl").read_text()
     assert sentinel not in raw
     for path in tmp_path.rglob("*"):
@@ -5968,6 +6110,7 @@ def test_native_read_only_handback_framing_survives_adversarial_text(
 ) -> None:
     """Newlines, braces, delimiter-like text, and non-ASCII stay one safe ASCII stdout line."""
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    _stub_plan_root(monkeypatch)
     processes: list[_NativeProcess] = []
     adversarial = "line one\nline two}<<<END>>>é中"
     monkeypatch.setattr(
@@ -5980,7 +6123,14 @@ def test_native_read_only_handback_framing_survives_adversarial_text(
             transcript=_read_only_transcript_bytes("story-planner", text=adversarial),
         ),
     )
-    assert main(_native_cli_args(role="story-planner")) == 0
+    assert (
+        main(
+            _native_cli_args(
+                role="story-planner", plan_root=_STUB_PLAN_ROOT, plan_sha=_STUB_PLAN_SHA
+            )
+        )
+        == 0
+    )
     captured = capsys.readouterr()
     lines = captured.out.splitlines()
     assert len(lines) == 1
@@ -5994,6 +6144,7 @@ def test_native_read_only_oversize_handback_yields_no_record_or_stdout(
 ) -> None:
     """An oversize terminal turn fails closed end-to-end: empty stdout, no sink record."""
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    _stub_plan_root(monkeypatch)
     monkeypatch.setattr(usage_transcript, "MAX_HANDBACK_BYTES", 4)
     processes: list[_NativeProcess] = []
     monkeypatch.setattr(
@@ -6007,7 +6158,11 @@ def test_native_read_only_oversize_handback_yields_no_record_or_stdout(
         ),
     )
     with pytest.raises(SystemExit, match="native Claude transcript is invalid"):
-        main(_native_cli_args(role="story-planner"))
+        main(
+            _native_cli_args(
+                role="story-planner", plan_root=_STUB_PLAN_ROOT, plan_sha=_STUB_PLAN_SHA
+            )
+        )
     assert capsys.readouterr().out == ""
     assert not Path(".agent-usage/usage.jsonl").exists()
 
@@ -6139,7 +6294,9 @@ def test_validation_root_presence_is_required_and_forbidden_correctly(
         else str(_build_validation_root(tmp_path_factory.mktemp("base") / "root"))
     )
     with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
-        usage_cli._resolve_native_environment(role, supplied)  # pyright: ignore[reportPrivateUsage]
+        usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
+            role, _request(validation_root=supplied), attested_head="0" * 40
+        )
 
 
 def test_validation_root_check_runs_before_provider_lookup(
@@ -6164,11 +6321,13 @@ def test_validation_environment_binds_exact_map_and_strips_for_others(
     for key in usage_cli._VALIDATION_ENVIRONMENT_KEYS:  # pyright: ignore[reportPrivateUsage]
         monkeypatch.setenv(key, "SENTINEL_PRESET")
     launch_environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
-        NativeClaudeRole.QA, str(root)
+        NativeClaudeRole.QA, _request(validation_root=str(root)), attested_head="0" * 40
     )
     environment = launch_environment.environment
     resolved_root = os.path.realpath(root)
-    assert launch_environment.validated_root == resolved_root
+    assert launch_environment.bound_root is not None
+    assert launch_environment.bound_root.kind is BoundRootKind.VALIDATION
+    assert launch_environment.bound_root.path == resolved_root
     expected = {
         "ROASTPILOT_VALIDATION_ROOT": resolved_root,
         "ROASTPILOT_VALIDATION_PYTHON": os.path.join(resolved_root, "venv", "bin", "python"),
@@ -6186,9 +6345,9 @@ def test_validation_environment_binds_exact_map_and_strips_for_others(
         assert environment[key] == value, key
 
     non_validation = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
-        NativeClaudeRole.ENGINEER_BE, None
+        NativeClaudeRole.ENGINEER_BE, _request(), attested_head="0" * 40
     )
-    assert non_validation.validated_root is None
+    assert non_validation.bound_root is None
     assert not (
         set(non_validation.environment) & usage_cli._VALIDATION_ENVIRONMENT_KEYS  # pyright: ignore[reportPrivateUsage]
     )
@@ -6201,7 +6360,7 @@ def test_validation_environment_never_touches_home_and_config_dir_still_rejects(
     root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
     monkeypatch.setenv("HOME", "/original/home")
     launch_environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
-        NativeClaudeRole.QA, str(root)
+        NativeClaudeRole.QA, _request(validation_root=str(root)), attested_head="0" * 40
     )
     assert launch_environment.environment.get("HOME") == "/original/home"
 
@@ -6233,7 +6392,7 @@ def test_validation_root_rejects_relative_and_traversal_paths() -> None:
 )
 def test_validation_path_predicate_rejects_forbidden_characters(forbidden: str) -> None:
     """D167's shared grammar predicate rejects whitespace, control, quote, and backslash."""
-    assert not usage_cli._is_valid_validation_path(forbidden)  # pyright: ignore[reportPrivateUsage]
+    assert not usage_cli._is_valid_bound_root_path(forbidden)  # pyright: ignore[reportPrivateUsage]
     with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
         usage_cli._validate_validation_root(forbidden)  # pyright: ignore[reportPrivateUsage]
 
@@ -6273,15 +6432,15 @@ def test_validation_path_predicate_rejects_rule_grammar_and_shell_metacharacters
     (§2.5), so the closed positive segment grammar must reject every one of
     them even though the D167 negative predicate did not.
     """
-    assert not usage_cli._is_valid_validation_path(forbidden)  # pyright: ignore[reportPrivateUsage]
+    assert not usage_cli._is_valid_bound_root_path(forbidden)  # pyright: ignore[reportPrivateUsage]
     with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
         usage_cli._validate_validation_root(forbidden)  # pyright: ignore[reportPrivateUsage]
 
 
 def test_validation_path_predicate_rejects_reserved_dot_segments() -> None:
     """T12: a bare ``.`` or ``..`` segment is rejected even though both match the charset."""
-    assert not usage_cli._is_valid_validation_path("/abs/./root")  # pyright: ignore[reportPrivateUsage]
-    assert not usage_cli._is_valid_validation_path("/abs/../root")  # pyright: ignore[reportPrivateUsage]
+    assert not usage_cli._is_valid_bound_root_path("/abs/./root")  # pyright: ignore[reportPrivateUsage]
+    assert not usage_cli._is_valid_bound_root_path("/abs/../root")  # pyright: ignore[reportPrivateUsage]
 
 
 def test_validation_root_resolved_form_with_rule_metacharacter_renders_no_rule(
@@ -6301,10 +6460,10 @@ def test_validation_root_resolved_form_with_rule_metacharacter_renders_no_rule(
     link = base / "clean-link"
     link.symlink_to(forbidden_ancestor)
     raw = str(link / "nested" / "root")
-    assert usage_cli._is_valid_validation_path(raw)  # pyright: ignore[reportPrivateUsage]
+    assert usage_cli._is_valid_bound_root_path(raw)  # pyright: ignore[reportPrivateUsage]
     resolved = os.path.realpath(raw)
     assert resolved == os.path.realpath(actual_root)
-    assert not usage_cli._is_valid_validation_path(resolved)  # pyright: ignore[reportPrivateUsage]
+    assert not usage_cli._is_valid_bound_root_path(resolved)  # pyright: ignore[reportPrivateUsage]
     with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
         usage_cli._validate_validation_root(raw)  # pyright: ignore[reportPrivateUsage]
     # The single upstream validation (proven above) is the only gate: the full
@@ -6313,7 +6472,7 @@ def test_validation_root_resolved_form_with_rule_metacharacter_renders_no_rule(
     # rejected resolved path.
     with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
         usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
-            NativeClaudeRole.QA, raw
+            NativeClaudeRole.QA, _request(validation_root=raw), attested_head="0" * 40
         )
 
 
@@ -6336,10 +6495,10 @@ def test_validation_path_predicate_applies_to_raw_and_resolved_forms(
     link = base / "clean-link"
     link.symlink_to(forbidden_ancestor)
     raw = str(link / "nested" / "root")
-    assert usage_cli._is_valid_validation_path(raw)  # pyright: ignore[reportPrivateUsage]
+    assert usage_cli._is_valid_bound_root_path(raw)  # pyright: ignore[reportPrivateUsage]
     resolved = os.path.realpath(raw)
     assert resolved == os.path.realpath(actual_root)
-    assert not usage_cli._is_valid_validation_path(resolved)  # pyright: ignore[reportPrivateUsage]
+    assert not usage_cli._is_valid_bound_root_path(resolved)  # pyright: ignore[reportPrivateUsage]
     with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
         usage_cli._validate_validation_root(raw)  # pyright: ignore[reportPrivateUsage]
 
@@ -6614,9 +6773,9 @@ def test_validation_environment_key_set_has_exactly_eleven_members(
     for key in keys:
         monkeypatch.setenv(key, "SENTINEL_PRESET")
     launch_environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
-        NativeClaudeRole.ENGINEER_BE, None
+        NativeClaudeRole.ENGINEER_BE, _request(), attested_head="0" * 40
     )
-    assert launch_environment.validated_root is None
+    assert launch_environment.bound_root is None
     assert not (set(launch_environment.environment) & keys)
 
 
@@ -6774,11 +6933,13 @@ def test_print_validation_commands_matches_the_argv_rule_table(
         assert exit_code == 0
         printed = capsys.readouterr().out.splitlines()
         expected_rendered = render_validation_commands(role, resolved_root)
-        expected_lines = [
-            f"{command.kind.value} {text}"
+        allow_lines = [
+            f"ALLOW {command.kind.value} {text}"
             for command, text in zip(VALIDATION_ROLE_COMMANDS[role], expected_rendered, strict=True)
         ]
-        assert printed == expected_lines
+        run_lines = [f"RUN {text}" for text in expected_rendered]
+        assert printed == [*allow_lines, *run_lines]
+        assert printed.index(run_lines[0]) == len(allow_lines)
 
         rules = render_allowed_tools(role, resolved_root)
         stripped: list[str] = []
@@ -6949,3 +7110,1582 @@ def test_validation_environment_roles_include_only_bash_capable_read_only_roles(
             assert pin.capability is RoleCapability.READ_ONLY
         else:
             assert not in_table
+
+
+# ---------------------------------------------------------------------------
+# D169 round-10 repair: generalized bound-root abstraction (VALIDATION / PLAN /
+# EVIDENCE), plan-root and evidence-bundle validation, and the
+# print-validation-commands ALLOW/RUN grammar.
+# ---------------------------------------------------------------------------
+
+_PLAN_REQUIRED_ROLES = {NativeClaudeRole.PLANNING_ARCHITECT, NativeClaudeRole.STORY_PLANNER}
+_PLAN_OPTIONAL_ROLES = {NativeClaudeRole.PRODUCT_AUDITOR}
+_EVIDENCE_REQUIRED_ROLES = {NativeClaudeRole.PR_TRIAGE}
+
+
+def test_bound_root_policy_closure_invariants() -> None:
+    """T3: required/optional never overlap per policy; the three admitted sets are disjoint."""
+    assert set(BOUND_ROOT_POLICIES) == {
+        BoundRootKind.VALIDATION,
+        BoundRootKind.PLAN,
+        BoundRootKind.EVIDENCE,
+    }
+    admitted_sets: list[frozenset[NativeClaudeRole]] = []
+    for policy in BOUND_ROOT_POLICIES.values():
+        assert not (policy.required_roles & policy.optional_roles)
+        admitted_sets.append(policy.required_roles | policy.optional_roles)
+    for first, second in itertools.combinations(admitted_sets, 2):
+        assert not (first & second)
+    validation_policy = BOUND_ROOT_POLICIES[BoundRootKind.VALIDATION]
+    assert validation_policy.required_roles is VALIDATION_ENVIRONMENT_ROLES
+    assert validation_policy.optional_roles == frozenset()
+    plan_policy = BOUND_ROOT_POLICIES[BoundRootKind.PLAN]
+    assert plan_policy.required_roles == frozenset(_PLAN_REQUIRED_ROLES)
+    assert plan_policy.optional_roles == frozenset(_PLAN_OPTIONAL_ROLES)
+    evidence_policy = BOUND_ROOT_POLICIES[BoundRootKind.EVIDENCE]
+    assert evidence_policy.required_roles == frozenset(_EVIDENCE_REQUIRED_ROLES)
+    assert evidence_policy.optional_roles == frozenset()
+    for role in NativeClaudeRole:
+        assert isinstance(role, NativeClaudeRole)
+
+
+def test_bound_root_admitted_roles_derive_read_only_from_frontmatter() -> None:
+    """T4: every PLAN/EVIDENCE-admitted role is READ_ONLY per committed frontmatter."""
+    for role in (*_PLAN_REQUIRED_ROLES, *_PLAN_OPTIONAL_ROLES, *_EVIDENCE_REQUIRED_ROLES):
+        pin = usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
+        assert pin.capability is RoleCapability.READ_ONLY
+
+
+@pytest.mark.parametrize("role", list(NativeClaudeRole))
+def test_bound_root_presence_matrix(
+    role: NativeClaudeRole, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """T1: presence is required for exactly the required roles, forbidden for non-admitted ones."""
+    validation_root = str(_build_validation_root(tmp_path_factory.mktemp("base") / "root"))
+    plan_root, plan_sha = "/plan/root", "1" * 40
+    evidence_root, evidence_pr = "/evidence/root", 1
+
+    def presence(
+        *,
+        validation_root: str | None = None,
+        plan_root: str | None = None,
+        plan_sha: str | None = None,
+        evidence_root: str | None = None,
+        evidence_pr: int | None = None,
+    ) -> BoundRootKind | None:
+        return usage_cli._bound_root_presence(  # pyright: ignore[reportPrivateUsage]
+            role,
+            _request(
+                validation_root=validation_root,
+                plan_root=plan_root,
+                plan_sha=plan_sha,
+                evidence_root=evidence_root,
+                evidence_pr=evidence_pr,
+            ),
+        )
+
+    if role in VALIDATION_ENVIRONMENT_ROLES:
+        with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+            presence()
+        assert presence(validation_root=validation_root) is BoundRootKind.VALIDATION
+    else:
+        with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+            presence(validation_root=validation_root)
+
+    if role in _PLAN_REQUIRED_ROLES:
+        with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+            presence()
+        assert presence(plan_root=plan_root, plan_sha=plan_sha) is BoundRootKind.PLAN
+    elif role in _PLAN_OPTIONAL_ROLES:
+        assert presence() is None
+        assert presence(plan_root=plan_root, plan_sha=plan_sha) is BoundRootKind.PLAN
+    else:
+        with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+            presence(plan_root=plan_root, plan_sha=plan_sha)
+
+    if role in _EVIDENCE_REQUIRED_ROLES:
+        with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+            presence()
+        assert (
+            presence(evidence_root=evidence_root, evidence_pr=evidence_pr) is BoundRootKind.EVIDENCE
+        )
+    else:
+        with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+            presence(evidence_root=evidence_root, evidence_pr=evidence_pr)
+
+    if role not in (
+        VALIDATION_ENVIRONMENT_ROLES
+        | _PLAN_REQUIRED_ROLES
+        | _PLAN_OPTIONAL_ROLES
+        | _EVIDENCE_REQUIRED_ROLES
+    ):
+        assert presence() is None
+
+
+@pytest.mark.parametrize(
+    "role", [NativeClaudeRole.STORY_PLANNER, NativeClaudeRole.PRODUCT_AUDITOR, NativeClaudeRole.QA]
+)
+def test_bound_root_presence_rejects_root_without_companion(role: NativeClaudeRole) -> None:
+    """T2: a root without its required companion (or vice versa) rejects for every role."""
+
+    def presence(
+        *,
+        plan_root: str | None = None,
+        plan_sha: str | None = None,
+        evidence_root: str | None = None,
+        evidence_pr: int | None = None,
+    ) -> BoundRootKind | None:
+        return usage_cli._bound_root_presence(  # pyright: ignore[reportPrivateUsage]
+            role,
+            _request(
+                plan_root=plan_root,
+                plan_sha=plan_sha,
+                evidence_root=evidence_root,
+                evidence_pr=evidence_pr,
+            ),
+        )
+
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        presence(plan_root="/plan/root")
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        presence(plan_sha="1" * 40)
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        presence(evidence_root="/evidence/root")
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        presence(evidence_pr=1)
+
+
+def test_bound_root_presence_runs_before_provider_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T5: a missing required plan-root pair never reaches ``shutil.which``."""
+    _configure_native_launcher(tmp_path, monkeypatch)
+
+    def no_which(_name: str) -> str:
+        raise AssertionError("provider lookup")
+
+    monkeypatch.setattr(usage_cli.shutil, "which", no_which)
+    with pytest.raises(SystemExit, match="validation environment is invalid"):
+        main(_native_cli_args(role="story-planner"))
+
+
+def test_bound_root_at_most_one_admitted_per_role() -> None:
+    """Consequence of closure (§2.2): every role is admitted by at most one policy."""
+    for role in NativeClaudeRole:
+        admitting = [
+            kind
+            for kind, policy in BOUND_ROOT_POLICIES.items()
+            if role in policy.required_roles or role in policy.optional_roles
+        ]
+        assert len(admitting) <= 1
+
+
+# --- PLAN kind -------------------------------------------------------------
+
+_PLAN_ORIGIN = "https://github.com/syamaner/roastpilot-plan.git"
+
+
+def _build_plan_root(root: Path) -> Path:
+    """Build one fully valid parent-provisioned plan-root shape at ``root`` (D169, §2.3)."""
+    _mkdir_exact(root, 0o700)
+    return root
+
+
+def _fixed_plan_git(
+    root: str,
+    sha: str,
+    *,
+    toplevel: str | None = None,
+    origin: str = _PLAN_ORIGIN,
+    head: str | None = None,
+    verify_status: int = 0,
+    status: str = "",
+) -> Callable[[list[str]], tuple[int, str]]:
+    """Return a deterministic ``_git_output`` double for one plan-root identity sequence."""
+    toplevel = root if toplevel is None else toplevel
+    head = sha if head is None else head
+
+    def fake_git(argv: list[str]) -> tuple[int, str]:
+        assert argv[:2] == ["-C", root], argv
+        rest = argv[2:]
+        if rest == ["rev-parse", "--show-toplevel"]:
+            return 0, toplevel
+        if rest == ["remote", "get-url", "origin"]:
+            return 0, origin
+        if rest == ["rev-parse", "HEAD"]:
+            return 0, head
+        if rest == ["rev-parse", "--verify", f"{sha}^{{commit}}"]:
+            return (verify_status, sha if verify_status == 0 else "")
+        if rest == ["status", "--porcelain", "--ignored"]:
+            return 0, status
+        raise AssertionError(argv)
+
+    return fake_git
+
+
+def test_plan_root_binds_add_dir_and_no_allowed_tools(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T6: a valid plan root binds; one ``--add-dir`` immediately before ``--permission-mode``."""
+    root = _build_plan_root(tmp_path_factory.mktemp("plan-base") / "root")
+    sha = "1" * 40
+    monkeypatch.setattr(usage_cli, "_git_output", _fixed_plan_git(str(root), sha))
+    bound = usage_cli._validate_plan_root(str(root), sha)  # pyright: ignore[reportPrivateUsage]
+    assert bound.kind is BoundRootKind.PLAN
+    assert bound.path == os.path.realpath(root)
+    assert bound.reattest is not None
+    argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+        "claude",
+        NativeClaudeRole.STORY_PLANNER,
+        RoleCapability.READ_ONLY,
+        "high",
+        "11111111-1111-4111-8111-111111111233",
+        bound,
+    )
+    assert argv[argv.index("--add-dir") + 1] == bound.path
+    assert argv[argv.index("--add-dir") + 2] == "--permission-mode"
+    assert "--allowedTools" not in argv
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        "wrong-origin",
+        "sha-not-head",
+        "non-40-hex-sha",
+        "dirty-tracked",
+        "untracked",
+        "ignored",
+        "toplevel-mismatch",
+        "root-mode",
+        "foreign-uid",
+        "symlinked-root",
+        "root-inside-cwd",
+        "cwd-inside-root",
+        "root-inside-claude-home",
+        "git-unavailable",
+    ],
+)
+def test_plan_root_rejects_every_identity_break(
+    mutate: str,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """T7: every plan-root identity, shape, or cleanliness break fails closed."""
+    sha = "1" * 40
+    if mutate in ("root-inside-cwd", "cwd-inside-root", "root-inside-claude-home"):
+        monkeypatch.chdir(tmp_path)
+    base = tmp_path_factory.mktemp(f"plan-reject-{mutate}")
+    root = _build_plan_root(base / "root")
+    if mutate == "root-mode":
+        os.chmod(root, 0o755)
+    if mutate == "foreign-uid":
+        real_fstat = os.fstat
+
+        def foreign_fstat(descriptor: int) -> os.stat_result:
+            status = real_fstat(descriptor)
+            fields = list(status)
+            fields[4] = status.st_uid + 1
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(os, "fstat", foreign_fstat)
+    if mutate == "symlinked-root":
+        linked = base / "linked"
+        linked.symlink_to(root)
+        root = linked
+    if mutate == "root-inside-cwd":
+        root = _build_plan_root(tmp_path / "nested-root")
+    if mutate == "cwd-inside-root":
+        monkeypatch.chdir(_mkdir_and_return(root / "nested-cwd"))
+    if mutate == "root-inside-claude-home":
+        home = tmp_path / "home"
+        (home / ".claude").mkdir(parents=True)
+        monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
+        root = _build_plan_root(home / ".claude" / "plan-root")
+
+    origin = (
+        "https://github.com/syamaner/roastpilot-agent.git"
+        if mutate == "wrong-origin"
+        else _PLAN_ORIGIN
+    )
+    head = "2" * 40 if mutate == "sha-not-head" else None
+    resolved_root = os.path.realpath(root)
+    toplevel = str(base / "somewhere-else") if mutate == "toplevel-mismatch" else None
+    status = {
+        "dirty-tracked": " M tracked-file.md",
+        "untracked": "?? new-file.md",
+        "ignored": "!! .venv/",
+    }.get(mutate, "")
+
+    if mutate == "git-unavailable":
+
+        def unavailable(_argv: list[str]) -> tuple[int, str]:
+            raise CaptureUsageError("Git worktree metadata is unavailable")
+
+        monkeypatch.setattr(usage_cli, "_git_output", unavailable)
+    else:
+        monkeypatch.setattr(
+            usage_cli,
+            "_git_output",
+            _fixed_plan_git(
+                resolved_root, sha, toplevel=toplevel, origin=origin, head=head, status=status
+            ),
+        )
+
+    use_sha = "abc123" if mutate == "non-40-hex-sha" else sha
+    with pytest.raises(CaptureUsageError, match="plan root is invalid"):
+        usage_cli._validate_plan_root(str(root), use_sha)  # pyright: ignore[reportPrivateUsage]
+
+
+def _mkdir_and_return(path: Path) -> Path:
+    """Create and return a directory, for inline chained construction."""
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_plan_root_rejects_missing_or_none_sha() -> None:
+    """The plan-sha grammar rejects an absent companion at the deep-validation layer too."""
+    with pytest.raises(CaptureUsageError, match="plan root is invalid"):
+        usage_cli._validate_plan_root("/plan/root", None)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_plan_root_rejects_unresolvable_toplevel(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``git rev-parse --show-toplevel`` output that cannot be resolved fails closed.
+
+    Calls :func:`_plan_identity_checks` directly (bypassing the earlier shape
+    validation's own, unrelated ``realpath`` calls) to isolate this branch.
+    """
+    root = _build_plan_root(tmp_path_factory.mktemp("plan-bad-toplevel") / "root")
+    sha = "1" * 40
+    resolved = os.path.realpath(root)
+
+    def failing_realpath(_path: str) -> str:
+        raise OSError("SENTINEL_TOPLEVEL_REALPATH_FAILURE")
+
+    monkeypatch.setattr(usage_cli, "_git_output", _fixed_plan_git(resolved, sha))
+    monkeypatch.setattr(os.path, "realpath", failing_realpath)
+    with pytest.raises(CaptureUsageError, match="plan root is invalid") as error:
+        usage_cli._plan_identity_checks(resolved, sha)  # pyright: ignore[reportPrivateUsage]
+    assert "SENTINEL_TOPLEVEL_REALPATH_FAILURE" not in str(error.value)
+
+
+def test_plan_root_contents_modes_unconstrained(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T8: plan-root file/directory modes inside the root are never constrained."""
+    root = _build_plan_root(tmp_path_factory.mktemp("plan-contents") / "root")
+    (root / "plan.md").write_text("content")
+    os.chmod(root / "plan.md", 0o644)
+    nested = root / "sub"
+    nested.mkdir()
+    os.chmod(nested, 0o755)
+    sha = "1" * 40
+    resolved = os.path.realpath(root)
+    monkeypatch.setattr(usage_cli, "_git_output", _fixed_plan_git(resolved, sha))
+    bound = usage_cli._validate_plan_root(str(root), sha)  # pyright: ignore[reportPrivateUsage]
+    assert bound.path == resolved
+
+
+@pytest.mark.parametrize(
+    "mutate", ["commit-landed", "file-dirtied", "ignored-file-appeared", "root-replaced"]
+)
+def test_plan_root_post_exit_drift_rejects(
+    mutate: str, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T9: any plan-root drift between launch and exit fails closed (M12)."""
+    root = _build_plan_root(tmp_path_factory.mktemp("plan-post-exit") / "root")
+    sha = "1" * 40
+    resolved = os.path.realpath(root)
+    calls = {"n": 0}
+    dirty_status = {
+        "commit-landed": "",
+        "file-dirtied": " M tracked-file.md",
+        "ignored-file-appeared": "!! .venv/",
+        "root-replaced": "",
+    }[mutate]
+    dirty_head = "2" * 40 if mutate == "commit-landed" else sha
+
+    def fake_git(argv: list[str]) -> tuple[int, str]:
+        calls["n"] += 1
+        if calls["n"] <= 5:
+            return _fixed_plan_git(resolved, sha)(argv)
+        return _fixed_plan_git(resolved, sha, head=dirty_head, status=dirty_status)(argv)
+
+    monkeypatch.setattr(usage_cli, "_git_output", fake_git)
+    bound = usage_cli._validate_plan_root(str(root), sha)  # pyright: ignore[reportPrivateUsage]
+    if mutate == "root-replaced":
+        shutil.rmtree(root)
+        _build_plan_root(root)
+    assert bound.reattest is not None
+    with pytest.raises(CaptureUsageError, match="plan root is invalid"):
+        bound.reattest()
+
+
+def test_plan_root_reattest_passes_when_untouched(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T9 (negative control): an untouched plan root's reattest succeeds."""
+    root = _build_plan_root(tmp_path_factory.mktemp("plan-clean-reattest") / "root")
+    sha = "1" * 40
+    resolved = os.path.realpath(root)
+    monkeypatch.setattr(usage_cli, "_git_output", _fixed_plan_git(resolved, sha))
+    bound = usage_cli._validate_plan_root(str(root), sha)  # pyright: ignore[reportPrivateUsage]
+    assert bound.reattest is not None
+    bound.reattest()
+
+
+def test_plan_root_device_inode_rejects_stat_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``os.stat`` failure while capturing the plan root's inode fails closed."""
+
+    def failing_stat(_path: str) -> os.stat_result:
+        raise OSError("SENTINEL_STAT_FAILURE")
+
+    monkeypatch.setattr(os, "stat", failing_stat)
+    with pytest.raises(CaptureUsageError, match="plan root is invalid") as error:
+        usage_cli._plan_root_device_inode("/plan/root")  # pyright: ignore[reportPrivateUsage]
+    assert "SENTINEL_STAT_FAILURE" not in str(error.value)
+
+
+def test_plan_root_never_mutated_by_capture_tool(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T10: validating a plan root never writes to it."""
+    root = _build_plan_root(tmp_path_factory.mktemp("plan-immutable") / "root")
+    (root / "plan.md").write_text("content")
+    before = {str(p.relative_to(root)): p.stat().st_mtime_ns for p in root.rglob("*")}
+    sha = "1" * 40
+    resolved = os.path.realpath(root)
+    monkeypatch.setattr(usage_cli, "_git_output", _fixed_plan_git(resolved, sha))
+    usage_cli._validate_plan_root(str(root), sha)  # pyright: ignore[reportPrivateUsage]
+    after = {str(p.relative_to(root)): p.stat().st_mtime_ns for p in root.rglob("*")}
+    assert before == after
+
+
+# --- EVIDENCE kind -----------------------------------------------------------
+
+_EVIDENCE_HEAD = "a" * 40
+_EVIDENCE_BASE = "b" * 40
+_EVIDENCE_PAST_TIMESTAMP = "2025-01-01T00:00:00+00:00"
+
+
+def _build_evidence_bundle(
+    root: Path,
+    *,
+    pr: int = 837,
+    head_sha: str = _EVIDENCE_HEAD,
+    base_sha: str = _EVIDENCE_BASE,
+    generated_at: str = _EVIDENCE_PAST_TIMESTAMP,
+    payload_overrides: dict[str, bytes] | None = None,
+    manifest_overrides: dict[str, object] | None = None,
+    files_overrides: dict[str, dict[str, object]] | None = None,
+    file_mode: int = 0o400,
+    skip_files: frozenset[str] = frozenset(),
+    extra_files: dict[str, bytes] | None = None,
+) -> Path:
+    """Build one fully valid parent-built PR evidence bundle at ``root`` (D169, §2.4)."""
+    _mkdir_exact(root, 0o700)
+    overrides = payload_overrides or {}
+    files_entry: dict[str, object] = {}
+    for name in EVIDENCE_PAYLOAD_FILES:
+        if name in skip_files:
+            continue
+        data = overrides.get(name, f'{{"{name}": true}}'.encode())
+        target = root / name
+        target.write_bytes(data)
+        target.chmod(file_mode)
+        files_entry[name] = {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+    if files_overrides:
+        files_entry.update(files_overrides)
+    manifest: dict[str, object] = {
+        "evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
+        "repository": "syamaner/roastpilot-agent",
+        "pull_request": pr,
+        "head_sha": head_sha,
+        "base_sha": base_sha,
+        "generated_at": generated_at,
+        "files": files_entry,
+    }
+    if manifest_overrides:
+        manifest.update(manifest_overrides)
+    manifest_bytes = json.dumps(manifest).encode()
+    manifest_path = root / EVIDENCE_MANIFEST_NAME
+    manifest_path.write_bytes(manifest_bytes)
+    manifest_path.chmod(file_mode)
+    if extra_files:
+        for name, data in extra_files.items():
+            (root / name).write_bytes(data)
+            (root / name).chmod(file_mode)
+    return root
+
+
+def test_evidence_bundle_binds_add_dir_and_no_allowed_tools(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """T11: a well-formed bundle binds; one ``--add-dir``, no ``--allowedTools``."""
+    root = _build_evidence_bundle(tmp_path_factory.mktemp("evidence-happy") / "root")
+    bound = usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+        str(root), 837, attested_head=_EVIDENCE_HEAD
+    )
+    assert bound.kind is BoundRootKind.EVIDENCE
+    assert bound.path == os.path.realpath(root)
+    assert bound.reattest is not None
+    argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
+        "claude",
+        NativeClaudeRole.PR_TRIAGE,
+        RoleCapability.READ_ONLY,
+        "high",
+        "11111111-1111-4111-8111-111111111233",
+        bound,
+    )
+    assert argv[argv.index("--add-dir") + 1] == bound.path
+    assert argv[argv.index("--add-dir") + 2] == "--permission-mode"
+    assert "--allowedTools" not in argv
+    bound.reattest()
+
+
+def test_evidence_bundle_rejects_missing_pr() -> None:
+    """The evidence-pr grammar rejects an absent companion at the deep-validation layer too."""
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            "/evidence/root", None, attested_head=_EVIDENCE_HEAD
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        "extra-file",
+        "missing-file",
+        "subdirectory",
+        "symlinked-payload",
+        "hardlinked-payload",
+        "wrong-file-mode",
+        "wrong-dir-mode",
+        "foreign-uid-payload",
+    ],
+)
+def test_evidence_bundle_structural_rejections(
+    mutate: str, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T12: every structural bundle break fails closed before manifest parsing."""
+    base = tmp_path_factory.mktemp(f"evidence-structural-{mutate}")
+    root = _build_evidence_bundle(base / "root")
+    if mutate == "extra-file":
+        (root / "extra.json").write_bytes(b"{}")
+        (root / "extra.json").chmod(0o400)
+    elif mutate == "missing-file":
+        (root / "authors.json").unlink()
+    elif mutate == "subdirectory":
+        (root / "authors.json").unlink()
+        (root / "authors.json").mkdir()
+    elif mutate == "symlinked-payload":
+        real = root / "authors.json"
+        content = real.read_bytes()
+        real.unlink()
+        target = base / "real-authors.json"
+        target.write_bytes(content)
+        target.chmod(0o400)
+        (root / "authors.json").symlink_to(target)
+    elif mutate == "hardlinked-payload":
+        target = base / "hardlink-target.json"
+        os.link(root / "authors.json", target)
+    elif mutate == "wrong-file-mode":
+        os.chmod(root / "authors.json", 0o600)
+    elif mutate == "wrong-dir-mode":
+        os.chmod(root, 0o755)
+    elif mutate == "foreign-uid-payload":
+        real_fstat = os.fstat
+
+        def foreign_fstat(descriptor: int) -> os.stat_result:
+            status = real_fstat(descriptor)
+            fields = list(status)
+            fields[4] = status.st_uid + 1
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(os, "fstat", foreign_fstat)
+
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
+
+
+@pytest.mark.parametrize(
+    "manifest_overrides",
+    [
+        {"evidence_schema_version": 2},
+        {"repository": "syamaner/roastpilot-plan"},
+        {"pull_request": 999},
+        {"head_sha": "c" * 40},
+        {"head_sha": "not-hex"},
+        {"base_sha": "not-hex"},
+        {"generated_at": "not-a-timestamp"},
+    ],
+    ids=[
+        "wrong-version",
+        "wrong-repository",
+        "pr-mismatch",
+        "head-sha-mismatch",
+        "head-sha-non-hex",
+        "base-sha-non-hex",
+        "malformed-generated-at",
+    ],
+)
+def test_evidence_bundle_manifest_field_rejections(
+    manifest_overrides: dict[str, object], tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """T13: each malformed or mismatched manifest field fails closed."""
+    root = _build_evidence_bundle(
+        tmp_path_factory.mktemp("evidence-manifest") / "root", manifest_overrides=manifest_overrides
+    )
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
+
+
+def test_evidence_bundle_rejects_future_generated_at(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """T13: a manifest timestamp beyond the 120-second skew fails closed."""
+    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+    root = _build_evidence_bundle(
+        tmp_path_factory.mktemp("evidence-future") / "root", generated_at=future
+    )
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
+
+
+def test_evidence_bundle_rejects_unknown_and_duplicate_manifest_keys(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """T13: an unknown or duplicated top-level manifest key fails closed."""
+    root = _build_evidence_bundle(tmp_path_factory.mktemp("evidence-unknown-key") / "root")
+    manifest_path = root / EVIDENCE_MANIFEST_NAME
+    manifest_path.chmod(0o600)
+    manifest_path.write_bytes(b'{"evidence_schema_version": 1, "unexpected_field": true}')
+    manifest_path.chmod(0o400)
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
+
+    duplicate_root = tmp_path_factory.mktemp("evidence-dup-key") / "root"
+    _mkdir_exact(duplicate_root, 0o700)
+    for name in EVIDENCE_PAYLOAD_FILES:
+        (duplicate_root / name).write_bytes(b"{}")
+        (duplicate_root / name).chmod(0o400)
+    dup_manifest = duplicate_root / EVIDENCE_MANIFEST_NAME
+    dup_manifest.write_bytes(b'{"evidence_schema_version": 1, "evidence_schema_version": 1}')
+    dup_manifest.chmod(0o400)
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(duplicate_root), 837, attested_head=_EVIDENCE_HEAD
+        )
+
+
+def test_evidence_bundle_rejects_wrong_files_keyset(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """T13: a ``files`` map missing or adding a payload key fails closed."""
+    root = _build_evidence_bundle(tmp_path_factory.mktemp("evidence-files-keyset") / "root")
+    manifest_path = root / EVIDENCE_MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_bytes())
+    del manifest["files"]["authors.json"]
+    manifest_path.chmod(0o600)
+    manifest_path.write_bytes(json.dumps(manifest).encode())
+    manifest_path.chmod(0o400)
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
+
+
+def _overwrite_manifest(root: Path, manifest: dict[str, object]) -> None:
+    """Overwrite ``root``'s manifest with an arbitrary dict, preserving the 0400 mode."""
+    manifest_path = root / EVIDENCE_MANIFEST_NAME
+    manifest_path.chmod(0o600)
+    manifest_path.write_bytes(json.dumps(manifest).encode())
+    manifest_path.chmod(0o400)
+
+
+def _valid_manifest(root: Path) -> dict[str, object]:
+    """Return the currently-written manifest dict for ``root``, for field-level mutation."""
+    return json.loads((root / EVIDENCE_MANIFEST_NAME).read_bytes())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("generated_at", 12345),
+        ("head_sha", "not-hex"),
+    ],
+)
+def test_evidence_bundle_rejects_non_string_or_non_hex_top_level_fields(
+    field: str, value: object, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """T13: a non-string ``generated_at`` and a non-hex ``head_sha`` both fail closed."""
+    root = _build_evidence_bundle(tmp_path_factory.mktemp(f"evidence-{field}") / "root")
+    manifest = _valid_manifest(root)
+    manifest[field] = value
+    _overwrite_manifest(root, manifest)
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutate_entry", "entry"),
+    [
+        ("not-a-dict", "not-a-dict"),
+        ("extra-key", {"sha256": "a" * 64, "bytes": 1, "extra": True}),
+        ("non-hex-digest", {"sha256": "not-hex", "bytes": 1}),
+        ("non-int-bytes", {"sha256": "a" * 64, "bytes": "1"}),
+        ("negative-bytes", {"sha256": "a" * 64, "bytes": -1}),
+        ("bool-bytes", {"sha256": "a" * 64, "bytes": True}),
+    ],
+)
+def test_evidence_bundle_rejects_malformed_per_file_manifest_entries(
+    mutate_entry: str, entry: object, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """T13: every malformed per-file manifest entry shape fails closed."""
+    root = _build_evidence_bundle(
+        tmp_path_factory.mktemp(f"evidence-entry-{mutate_entry}") / "root"
+    )
+    manifest = _valid_manifest(root)
+    files = manifest["files"]
+    assert isinstance(files, dict)
+    files["authors.json"] = entry
+    _overwrite_manifest(root, manifest)
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
+
+
+def test_evidence_bundle_rejects_manifest_json_syntax_error(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """T13: a manifest with invalid JSON syntax (not just a duplicate key) fails closed."""
+    root = _build_evidence_bundle(tmp_path_factory.mktemp("evidence-json-syntax") / "root")
+    manifest_path = root / EVIDENCE_MANIFEST_NAME
+    manifest_path.chmod(0o600)
+    manifest_path.write_bytes(b"{not valid json at all")
+    manifest_path.chmod(0o400)
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
+
+
+def test_evidence_bundle_rejects_oversize_manifest(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """T13/structural: a manifest exceeding the 64 KiB cap fails closed before parsing."""
+    root = _build_evidence_bundle(tmp_path_factory.mktemp("evidence-oversize-manifest") / "root")
+    manifest_path = root / EVIDENCE_MANIFEST_NAME
+    manifest_path.chmod(0o600)
+    manifest_path.write_bytes(b" " + b"x" * (usage_models.EVIDENCE_MAX_MANIFEST_BYTES + 1))
+    manifest_path.chmod(0o400)
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
+
+
+def test_evidence_listing_rejects_listdir_failure(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``os.listdir`` failure on the bundle root fails closed via the fixed error."""
+    root_fd = os.open(
+        str(tmp_path_factory.mktemp("evidence-listdir-fd") / "unused"), os.O_CREAT | os.O_RDONLY
+    )
+    os.close(root_fd)
+
+    def failing_listdir(_descriptor: object) -> list[str]:
+        raise OSError("SENTINEL_LISTDIR_FAILURE")
+
+    monkeypatch.setattr(usage_cli.os, "listdir", failing_listdir)
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid") as error:
+        usage_cli._evidence_listing(0)  # pyright: ignore[reportPrivateUsage]
+    assert "SENTINEL_LISTDIR_FAILURE" not in str(error.value)
+
+
+def test_read_bounded_evidence_file_rejects_read_failure(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read failure on an already-opened bundle entry fails closed via the fixed error."""
+    target = tmp_path_factory.mktemp("evidence-read-failure") / "file.json"
+    target.write_bytes(b"{}")
+    descriptor = os.open(str(target), os.O_RDONLY)
+
+    class FailingStream:
+        def read(self, _size: int) -> bytes:
+            raise OSError("SENTINEL_READ_FAILURE")
+
+        def __enter__(self) -> FailingStream:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            os.close(descriptor)
+
+    def fake_fdopen(_fd: int, _mode: str) -> FailingStream:
+        return FailingStream()
+
+    monkeypatch.setattr(usage_cli.os, "fdopen", fake_fdopen)
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid") as error:
+        usage_cli._read_bounded_evidence_file(descriptor, 100)  # pyright: ignore[reportPrivateUsage]
+    assert "SENTINEL_READ_FAILURE" not in str(error.value)
+
+
+def test_hash_evidence_payload_rejects_read_failure(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read failure while streaming a payload fails closed via the fixed error."""
+    target = tmp_path_factory.mktemp("evidence-hash-failure") / "file.json"
+    target.write_bytes(b"{}")
+    descriptor = os.open(str(target), os.O_RDONLY)
+
+    class FailingStream:
+        def read(self, _size: int) -> bytes:
+            raise OSError("SENTINEL_HASH_READ_FAILURE")
+
+        def __enter__(self) -> FailingStream:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            os.close(descriptor)
+
+    def fake_fdopen(_fd: int, _mode: str) -> FailingStream:
+        return FailingStream()
+
+    monkeypatch.setattr(usage_cli.os, "fdopen", fake_fdopen)
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid") as error:
+        usage_cli._hash_evidence_payload(  # pyright: ignore[reportPrivateUsage]
+            descriptor, remaining_budget=1000
+        )
+    assert "SENTINEL_HASH_READ_FAILURE" not in str(error.value)
+
+
+def test_evidence_bundle_state_rejects_root_open_failure() -> None:
+    """A root that cannot be opened fails closed via the fixed error, called directly."""
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._evidence_bundle_state(  # pyright: ignore[reportPrivateUsage]
+            "/does/not/exist/at/all", 837, _EVIDENCE_HEAD
+        )
+
+
+def test_evidence_bundle_state_rejects_foreign_uid_root(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_evidence_bundle_state``'s own root ownership re-check fails closed on a foreign uid.
+
+    Calls the function directly (bypassing the earlier shape validation, which
+    would trip on the same monkeypatched ``fstat`` first) to isolate this
+    redundant, defense-in-depth check.
+    """
+    root = _build_evidence_bundle(tmp_path_factory.mktemp("evidence-foreign-uid-state") / "root")
+    real_fstat = os.fstat
+
+    def foreign_fstat(descriptor: int) -> os.stat_result:
+        status = real_fstat(descriptor)
+        fields = list(status)
+        fields[4] = status.st_uid + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "fstat", foreign_fstat)
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._evidence_bundle_state(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, _EVIDENCE_HEAD
+        )
+
+
+def test_evidence_bundle_reattest_catches_root_replaced_with_identical_content(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """T15: a root replaced at the same path with byte-identical content still fails closed.
+
+    Every structural, manifest, and integrity check passes against the
+    identical rebuilt content, so only the outer snapshot's ``(st_dev,
+    st_ino)`` inequality catches this — the one path that reaches the
+    reattest closure's own comparison rather than raising inside
+    ``_evidence_bundle_state`` itself.
+    """
+    root = _build_evidence_bundle(tmp_path_factory.mktemp("evidence-root-replaced") / "root")
+    bound = usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+        str(root), 837, attested_head=_EVIDENCE_HEAD
+    )
+    shutil.rmtree(root)
+    _build_evidence_bundle(root)
+    assert bound.reattest is not None
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        bound.reattest()
+
+
+@pytest.mark.parametrize(
+    "mutate", ["flipped-byte", "wrong-declared-size", "over-file-cap", "over-aggregate-cap"]
+)
+def test_evidence_bundle_integrity_rejections(
+    mutate: str, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """T14: every integrity break — digest, size, per-file cap, aggregate cap — fails closed."""
+    base = tmp_path_factory.mktemp(f"evidence-integrity-{mutate}")
+    root = _build_evidence_bundle(base / "root")
+    if mutate == "flipped-byte":
+        target = root / "authors.json"
+        os.chmod(target, 0o600)
+        target.write_bytes(b'{"authors": false}')
+        os.chmod(target, 0o400)
+        with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+            usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+                str(root), 837, attested_head=_EVIDENCE_HEAD
+            )
+        return
+    if mutate == "wrong-declared-size":
+        manifest_path = root / EVIDENCE_MANIFEST_NAME
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest["files"]["authors.json"]["bytes"] += 1
+        os.chmod(manifest_path, 0o600)
+        manifest_path.write_bytes(json.dumps(manifest).encode())
+        os.chmod(manifest_path, 0o400)
+        with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+            usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+                str(root), 837, attested_head=_EVIDENCE_HEAD
+            )
+        return
+    if mutate == "over-file-cap":
+        oversize = b"x" * (EVIDENCE_MAX_FILE_BYTES + 1)
+        root = _build_evidence_bundle(
+            tmp_path_factory.mktemp("evidence-over-file") / "root",
+            payload_overrides={"authors.json": oversize},
+        )
+        with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+            usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+                str(root), 837, attested_head=_EVIDENCE_HEAD
+            )
+        return
+    # over-aggregate-cap: eight files each just under the per-file cap.
+    per_file = (EVIDENCE_MAX_TOTAL_BYTES // 8) + 1024
+    overrides = {name: (b"y" * per_file) for name in EVIDENCE_PAYLOAD_FILES}
+    root = _build_evidence_bundle(
+        tmp_path_factory.mktemp("evidence-over-aggregate") / "root", payload_overrides=overrides
+    )
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
+
+
+@pytest.mark.parametrize("mutate", ["payload-modified", "payload-deleted", "extra-file-added"])
+def test_evidence_bundle_post_exit_tamper_rejects(
+    mutate: str, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """T15: any post-exit bundle tamper fails closed with no record or handback."""
+    root = _build_evidence_bundle(tmp_path_factory.mktemp(f"evidence-tamper-{mutate}") / "root")
+    bound = usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+        str(root), 837, attested_head=_EVIDENCE_HEAD
+    )
+    if mutate == "payload-modified":
+        os.chmod(root / "authors.json", 0o600)
+        (root / "authors.json").write_bytes(b'{"authors": false}')
+        os.chmod(root / "authors.json", 0o400)
+    elif mutate == "payload-deleted":
+        os.chmod(root, 0o700)
+        (root / "authors.json").unlink()
+    else:
+        (root / "extra.json").write_bytes(b"{}")
+        (root / "extra.json").chmod(0o400)
+    assert bound.reattest is not None
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        bound.reattest()
+
+
+def test_evidence_bundle_reattest_passes_when_untouched(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """T15 (negative control): an untouched bundle's reattest succeeds."""
+    root = _build_evidence_bundle(tmp_path_factory.mktemp("evidence-clean-reattest") / "root")
+    bound = usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+        str(root), 837, attested_head=_EVIDENCE_HEAD
+    )
+    assert bound.reattest is not None
+    bound.reattest()
+
+
+def test_evidence_bundle_payloads_never_parsed(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """T16: valid-hash non-JSON payloads still bind — integrity, never semantics (I4)."""
+    overrides = {name: b"not json at all, just bytes" for name in EVIDENCE_PAYLOAD_FILES}
+    root = _build_evidence_bundle(
+        tmp_path_factory.mktemp("evidence-non-json") / "root", payload_overrides=overrides
+    )
+    bound = usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+        str(root), 837, attested_head=_EVIDENCE_HEAD
+    )
+    assert bound.kind is BoundRootKind.EVIDENCE
+
+
+def test_evidence_bundle_never_leaks_into_errors_or_output(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """T17: no path, digest, PR number, or payload byte reaches an exception or its chain."""
+    sentinel_root = tmp_path_factory.mktemp("SENTINELEVIDENCEROOT")
+    payload = b"SENTINEL_PAYLOAD_BYTE_CONTENT"
+    root = _build_evidence_bundle(
+        sentinel_root / "root", payload_overrides={"authors.json": payload}
+    )
+    os.chmod(root / "authors.json", 0o600)
+    (root / "authors.json").write_bytes(payload + b"TAMPERED")
+    os.chmod(root / "authors.json", 0o400)
+    with pytest.raises(CaptureUsageError) as error:
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
+    message = str(error.value)
+    assert "SENTINELEVIDENCEROOT" not in message
+    assert "SENTINEL_PAYLOAD_BYTE_CONTENT" not in message
+    assert "837" not in message
+    assert _EVIDENCE_HEAD not in message
+    cause = error.value.__cause__
+    assert cause is None or "SENTINELEVIDENCEROOT" not in str(cause)
+
+
+# --- End-to-end pipeline wiring (story-planner / pr-triage / product-auditor) ---
+
+
+def test_native_launch_binds_plan_root_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A ``story-planner`` capture run binds the plan root, reattests, and appends a record."""
+    plan_root = _build_plan_root(tmp_path_factory.mktemp("plan-e2e") / "root")
+    plan_sha = "1" * 40
+    resolved_plan_root = os.path.realpath(plan_root)
+    monkeypatch.setattr(usage_cli, "_git_output", _fixed_plan_git(resolved_plan_root, plan_sha))
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project, observed, processes, transcript=_read_only_transcript_bytes("story-planner")
+        ),
+    )
+    assert (
+        main(_native_cli_args(role="story-planner", plan_root=str(plan_root), plan_sha=plan_sha))
+        == 0
+    )
+    worker_argv = observed[1][0]
+    assert worker_argv[worker_argv.index("--add-dir") + 1] == resolved_plan_root
+    assert "--allowedTools" not in worker_argv
+    raw = Path(".agent-usage/usage.jsonl").read_text()
+    record = USAGE_RECORD_ADAPTER.validate_json(raw)
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert record.native_role is NativeClaudeRole.STORY_PLANNER
+
+
+def test_native_launch_binds_evidence_bundle_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A ``pr-triage`` capture run binds the evidence bundle, reattests, and appends a record."""
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+
+    def fixed_attestation(
+        _arguments: argparse.Namespace, _capability: RoleCapability, *, post_exit: bool
+    ) -> str:
+        del post_exit
+        return _EVIDENCE_HEAD
+
+    monkeypatch.setattr(usage_cli, "_validate_native_worktree", fixed_attestation)
+    evidence_root = _build_evidence_bundle(tmp_path_factory.mktemp("evidence-e2e") / "root")
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project,
+            observed,
+            processes,
+            transcript=_read_only_transcript_bytes_rebranded("security-reviewer", "pr-triage"),
+        ),
+    )
+    assert (
+        main(
+            _native_cli_args(
+                role="pr-triage",
+                evidence_root=str(evidence_root),
+                evidence_pr=837,
+                base_sha=_EVIDENCE_HEAD,
+            )
+        )
+        == 0
+    )
+    worker_argv = observed[1][0]
+    assert worker_argv[worker_argv.index("--add-dir") + 1] == os.path.realpath(evidence_root)
+    assert "--allowedTools" not in worker_argv
+    raw = Path(".agent-usage/usage.jsonl").read_text()
+    record = USAGE_RECORD_ADAPTER.validate_json(raw)
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert record.native_role is NativeClaudeRole.PR_TRIAGE
+
+
+def test_native_launch_product_auditor_optional_plan_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """T8 (roster): ``product-auditor`` captures cleanly with and without the plan pair."""
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project,
+            observed,
+            processes,
+            transcript=_read_only_transcript_bytes_rebranded(
+                "security-reviewer", "product-auditor"
+            ),
+        ),
+    )
+    assert main(_native_cli_args(role="product-auditor")) == 0
+    unbound_argv = observed[1][0]
+    assert "--add-dir" not in unbound_argv
+    assert "--allowedTools" not in unbound_argv
+
+
+def test_native_launch_product_auditor_with_plan_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """T8 (roster): a bound ``product-auditor`` plan pair produces exactly one ``--add-dir``."""
+    plan_root = _build_plan_root(tmp_path_factory.mktemp("auditor-plan") / "root")
+    plan_sha = "1" * 40
+    resolved_plan_root = os.path.realpath(plan_root)
+    monkeypatch.setattr(usage_cli, "_git_output", _fixed_plan_git(resolved_plan_root, plan_sha))
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project,
+            observed,
+            processes,
+            transcript=_read_only_transcript_bytes_rebranded(
+                "security-reviewer", "product-auditor"
+            ),
+        ),
+    )
+    assert (
+        main(_native_cli_args(role="product-auditor", plan_root=str(plan_root), plan_sha=plan_sha))
+        == 0
+    )
+    bound_argv = observed[1][0]
+    assert bound_argv[bound_argv.index("--add-dir") + 1] == resolved_plan_root
+    assert "--allowedTools" not in bound_argv
+
+
+def test_negative_proof_plan_root_rejected_for_qa(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """L10(a): ``--plan-root`` supplied to a role that does not admit it rejects pre-launch."""
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._resolve_bound_root(  # pyright: ignore[reportPrivateUsage]
+            NativeClaudeRole.QA,
+            _request(plan_root="/plan/root", plan_sha="1" * 40),
+            attested_head="0" * 40,
+        )
+
+
+def test_negative_proof_evidence_root_rejected_for_story_planner() -> None:
+    """L10(b): ``--evidence-root`` supplied to a role that does not admit it rejects."""
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._resolve_bound_root(  # pyright: ignore[reportPrivateUsage]
+            NativeClaudeRole.STORY_PLANNER,
+            _request(evidence_root="/evidence/root", evidence_pr=1),
+            attested_head="0" * 40,
+        )
+
+
+def test_regression_unbound_read_only_role_has_no_add_dir_or_allowed_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T22/L11: an unbound READ_ONLY role's argv carries no ``--add-dir``/``--allowedTools``."""
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project, observed, processes, transcript=_read_only_transcript_bytes("safety-reviewer")
+        ),
+    )
+    assert main(_native_cli_args(role="safety-reviewer")) == 0
+    worker_argv = observed[1][0]
+    assert "--add-dir" not in worker_argv
+    assert "--allowedTools" not in worker_argv
+
+
+# --- print-validation-commands: ALLOW / RUN grammar (D169, §2.5) -----------
+
+
+def test_print_validation_commands_allow_then_run_blocks(
+    tmp_path_factory: pytest.TempPathFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T18: output is exactly the ``ALLOW`` block then the ``RUN`` block; every RUN is covered."""
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    resolved_root = os.path.realpath(root)
+    for role in usage_cli.VALIDATION_ENVIRONMENT_ROLES:
+        exit_code = main(
+            ["print-validation-commands", "--role", role.value, "--validation-root", str(root)]
+        )
+        assert exit_code == 0
+        printed = capsys.readouterr().out.splitlines()
+        rendered = render_validation_commands(role, resolved_root)
+        commands = VALIDATION_ROLE_COMMANDS[role]
+        allow_lines = [
+            f"ALLOW {command.kind.value} {text}"
+            for command, text in zip(commands, rendered, strict=True)
+        ]
+        run_lines = [f"RUN {text}" for text in rendered]
+        assert printed == [*allow_lines, *run_lines]
+        assert all(line.startswith("ALLOW ") for line in printed[: len(allow_lines)])
+        assert all(line.startswith("RUN ") for line in printed[len(allow_lines) :])
+
+
+def test_print_validation_commands_pytest_arg_renders_quoted_covered_run_line(
+    tmp_path_factory: pytest.TempPathFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T19: tokens with space, quote, ``$``, ``;``, and a glob each round-trip through shlex."""
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    resolved_root = os.path.realpath(root)
+    tokens = ["tests/has space.py", "it's", "$HOME", ";rm -rf", "tests/*.py"]
+    args = ["print-validation-commands", "--role", "qa", "--validation-root", str(root)]
+    for token in tokens:
+        args.extend(["--pytest-arg", token])
+    assert main(args) == 0
+    printed = capsys.readouterr().out.splitlines()
+    prefix = render_validation_commands(NativeClaudeRole.QA, resolved_root)[0]
+    run_line = next(line for line in printed if line.startswith("RUN " + prefix))
+    run_command = run_line.removeprefix("RUN ")
+    assert shlex.split(run_command) == [*shlex.split(prefix), *tokens]
+    assert run_command.startswith(prefix + " ")
+
+
+def test_print_validation_commands_omitting_tokens_still_emits_bare_covered_run_line(
+    tmp_path_factory: pytest.TempPathFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T19: omitting ``--pytest-arg`` still emits exactly one bare, covered ``RUN`` line."""
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    resolved_root = os.path.realpath(root)
+    assert main(["print-validation-commands", "--role", "qa", "--validation-root", str(root)]) == 0
+    printed = capsys.readouterr().out.splitlines()
+    prefix = render_validation_commands(NativeClaudeRole.QA, resolved_root)[0]
+    assert f"RUN {prefix}" in printed
+
+
+@pytest.mark.parametrize("role", ["mcp-contract-checker", "sim-roast-runner"])
+def test_print_validation_commands_rejects_pytest_arg_for_non_prefix_role(
+    role: str, tmp_path_factory: pytest.TempPathFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T20: ``--pytest-arg`` for a role with no ``PREFIX`` entry rejects with no output."""
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    with pytest.raises(SystemExit, match="validation environment is invalid"):
+        main(
+            [
+                "print-validation-commands",
+                "--role",
+                role,
+                "--validation-root",
+                str(root),
+                "--pytest-arg",
+                "tests/",
+            ]
+        )
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("forbidden", ["has\nnewline", "has\rcarriage", "has\x00nul"])
+def test_print_validation_commands_rejects_forbidden_pytest_arg_bytes(
+    forbidden: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T20: a token containing a forbidden byte rejects with no output, before any handler runs."""
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args(
+            [
+                "print-validation-commands",
+                "--role",
+                "qa",
+                "--validation-root",
+                "/validated/root",
+                "--pytest-arg",
+                forbidden,
+            ]
+        )
+    assert capsys.readouterr().out == ""
+
+
+def test_print_validation_commands_rejects_33_tokens(
+    tmp_path_factory: pytest.TempPathFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T20: 33 tokens (one over the 32-token cap) rejects with no output."""
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    args = ["print-validation-commands", "--role", "qa", "--validation-root", str(root)]
+    for index in range(33):
+        args.extend(["--pytest-arg", f"t{index}"])
+    with pytest.raises(SystemExit, match="validation environment is invalid"):
+        main(args)
+    assert capsys.readouterr().out == ""
+
+
+def test_print_validation_commands_rejects_257_byte_token(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """T20: a 257-byte token rejects with no output, before any handler runs."""
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args(
+            [
+                "print-validation-commands",
+                "--role",
+                "qa",
+                "--validation-root",
+                "/validated/root",
+                "--pytest-arg",
+                "x" * 257,
+            ]
+        )
+    assert capsys.readouterr().out == ""
+
+
+def test_evidence_pr_option_rejects_non_numeric_value(capsys: pytest.CaptureFixture[str]) -> None:
+    """The ``--evidence-pr`` type function rejects a non-numeric value before any handler runs."""
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args(
+            [*_native_cli_args(role="pr-triage"), "--evidence-pr", "not-a-number"]
+        )
+    assert "positive integer" in capsys.readouterr().err.lower()
+
+
+def test_evidence_pr_option_rejects_zero_and_negative_values() -> None:
+    """The ``--evidence-pr`` type function rejects zero and negative integers."""
+    for value in ("0", "-1"):
+        with pytest.raises(argparse.ArgumentTypeError, match="positive integer"):
+            usage_cli._evidence_pr(value)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_render_prefix_run_command_rejects_broken_coverage_proof() -> None:
+    """M22: a malformed prefix that ``shlex.split`` cannot round-trip fails closed."""
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._render_prefix_run_command(  # pyright: ignore[reportPrivateUsage]
+            "python -m pytest 'unterminated", ("tests/",)
+        )
+
+
+def test_print_validation_commands_rejects_broken_coverage_proof(
+    tmp_path_factory: pytest.TempPathFactory,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T20/M22: defeated shell-quoting that breaks the round-trip rejects with no output."""
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+
+    def identity_quote(value: str) -> str:
+        return value
+
+    monkeypatch.setattr(usage_cli.shlex, "quote", identity_quote)
+    with pytest.raises(SystemExit, match="validation environment is invalid"):
+        main(
+            [
+                "print-validation-commands",
+                "--role",
+                "qa",
+                "--validation-root",
+                str(root),
+                "--pytest-arg",
+                "has space",
+            ]
+        )
+    assert capsys.readouterr().out == ""
+
+
+def test_print_validation_commands_validates_root_exactly_once(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T21: one invocation performs exactly one root validation."""
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    real_validate = usage_cli._validate_validation_root  # pyright: ignore[reportPrivateUsage]
+    calls: list[str] = []
+
+    def counting_validate(raw: str) -> str:
+        calls.append(raw)
+        return real_validate(raw)
+
+    monkeypatch.setattr(usage_cli, "_validate_validation_root", counting_validate)
+    assert main(["print-validation-commands", "--role", "qa", "--validation-root", str(root)]) == 0
+    assert calls == [str(root)]
+
+
+# --- Role/doc content guards and class sweeps (T34-T37, §4) ----------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_AGENT_FILES = tuple(sorted((_REPO_ROOT / ".claude" / "agents").glob("*.md")))
+_CREDENTIALED_TOOL_PATTERN = re.compile(r"gh (pr|api|issue|run|search)|curl |wget ")
+
+
+def test_no_agent_file_instructs_gh_curl_or_wget_invocation() -> None:
+    """T34/class-sweep#1: no role file instructs `gh`/`curl`/`wget` (the story-planner
+    prohibition of `gh issue view --comments` is an explicit non-instruction and is
+    asserted present instead)."""
+    matches: list[tuple[str, str]] = []
+    for path in _AGENT_FILES:
+        text = path.read_text()
+        for line in text.splitlines():
+            if _CREDENTIALED_TOOL_PATTERN.search(line) and "gh issue view --comments" not in line:
+                matches.append((path.name, line.strip()))
+    assert matches == []
+    story_planner = (_REPO_ROOT / ".claude" / "agents" / "story-planner.md").read_text()
+    assert "gh issue view --comments" in story_planner
+
+
+def test_pr_triage_names_bundle_files_and_no_gh_rule() -> None:
+    """T35: ``pr-triage.md`` names the nine files, the no-`gh` rule, and BLOCK-on-missing-datum."""
+    text = (_REPO_ROOT / ".claude" / "agents" / "pr-triage.md").read_text()
+    for name in EVIDENCE_BUNDLE_FILES:
+        assert name in text
+    assert "no `gh`" in text or "no `gh`, no network" in text
+    assert "untrusted data" in text
+    assert "BLOCK" in text
+    assert "gh " not in text.replace("gh issue view --comments", "")
+
+
+def test_plan_roles_have_no_default_checkout_command_position() -> None:
+    """T36: planning-architect/story-planner/product-auditor name no default checkout."""
+    for stem in ("planning-architect", "story-planner", "product-auditor"):
+        text = (_REPO_ROOT / ".claude" / "agents" / f"{stem}.md").read_text()
+        for match in re.finditer("roastpilot-plan", text):
+            window = text[max(0, match.start() - 120) : match.end() + 120]
+            # Only an explicit negation ("is **not** ...") or a description of the
+            # parent-bound worktree may surround the historical default path.
+            assert "not" in window or "parent" in window, window
+        lowered = text.lower()
+        assert "plan root" in lowered or "roastpilot-plan` worktree" in lowered
+
+
+def test_validation_role_files_instruct_run_line_execution() -> None:
+    """T37: qa/mcp-contract-checker/sim-roast-runner instruct executing only `RUN ` lines."""
+    for path in _VALIDATION_ROLE_FILES:
+        text = path.read_text()
+        assert "RUN " in text
+        assert "ALLOW" in text
+        assert "never" in text and "executable" in text
+
+
+def test_bound_root_literal_sweep_matches_only_expected_sites() -> None:
+    """Class-sweep#3: every bound-root/add-dir literal is a policy, argv, doc, or test site."""
+    pattern = re.compile(
+        r"--add-dir|--validation-root|--plan-root|--evidence-root|"
+        r"ROASTPILOT_(VALIDATION|PLAN|EVIDENCE)"
+    )
+    allowed_roots = (
+        _REPO_ROOT / ".agents" / "skills",
+        _REPO_ROOT / ".claude" / "agents",
+        _REPO_ROOT / "docs",
+        _REPO_ROOT / "tests",
+        _REPO_ROOT / "AGENTS.md",
+    )
+    searched = (
+        *(_REPO_ROOT / ".agents" / "skills").rglob("*.py"),
+        *(_REPO_ROOT / ".agents" / "skills").rglob("*.md"),
+        *(_REPO_ROOT / ".claude" / "agents").rglob("*.md"),
+        *(_REPO_ROOT / "docs").rglob("*.md"),
+        Path(__file__),
+        _REPO_ROOT / "AGENTS.md",
+    )
+    for path in searched:
+        if not pattern.search(path.read_text()):
+            continue
+        assert any(
+            path == root or (root.is_dir() and root in path.parents) for root in allowed_roots
+        ), path
+
+
+def test_argv_construction_sweep_single_site() -> None:
+    """Class-sweep#4: exactly one construction site builds ``--add-dir``/``--allowedTools``."""
+    cli_text = (
+        _REPO_ROOT
+        / ".agents"
+        / "skills"
+        / "capture-agent-usage"
+        / "scripts"
+        / "capture_usage_cli.py"
+    ).read_text()
+    assert cli_text.count('"--add-dir"') == 1
+    assert cli_text.count('"--allowedTools"') == 1
+    generic_argv_index = cli_text.index("def _launch_argv(")
+    native_argv_index = cli_text.index("def _native_claude_argv(")
+    assert generic_argv_index < native_argv_index
+    generic_body = cli_text[generic_argv_index:native_argv_index]
+    assert "--add-dir" not in generic_body
+    assert "--allowedTools" not in generic_body
+
+
+def test_descriptor_command_rendering_sweep() -> None:
+    """Class-sweep#5: ALLOW/RUN/EXACT/PREFIX literals are confined to rendering, docs, tests."""
+    cli_text = (
+        _REPO_ROOT
+        / ".agents"
+        / "skills"
+        / "capture-agent-usage"
+        / "scripts"
+        / "capture_usage_cli.py"
+    ).read_text()
+    assert 'f"ALLOW {command.kind.value} {text}"' in cli_text
+    assert 'f"RUN {text}"' in cli_text
+
+
+def test_content_egress_sweep_adds_no_new_write_site() -> None:
+    """Retained sweep: content-egress sites are the pre-existing set plus bounded reads only."""
+    scripts_dir = _REPO_ROOT / ".agents" / "skills" / "capture-agent-usage" / "scripts"
+    cli_text = (scripts_dir / "capture_usage_cli.py").read_text()
+    # The new evidence-bundle reader must never write a payload byte anywhere.
+    assert "sys.stdout.write" in cli_text
+    write_call_count = cli_text.count("sys.stdout.write(")
+    # print-validation-commands and the handback emitter are the only stdout writers.
+    assert write_call_count == 2
+
+
+def test_schema_version_literal_sweep_stays_at_three() -> None:
+    """Retained sweep: no ``Literal[4]`` or bumped schema constant anywhere in the scripts."""
+    scripts_dir = _REPO_ROOT / ".agents" / "skills" / "capture-agent-usage" / "scripts"
+    for path in scripts_dir.glob("*.py"):
+        text = path.read_text()
+        assert "Literal[4]" not in text
+    assert usage_models.NATIVE_WORKER_USAGE_SCHEMA_VERSION == 3
+
+
+def test_gitignore_rule_and_no_production_import_sweep_unchanged() -> None:
+    """Retained sweep: exactly one `.agent-usage/` gitignore rule; no production import.
+
+    ``scripts/tooling_coverage.py`` is a pre-existing, untouched dev-tooling
+    coverage-source path string (not a production runtime import) and is
+    excluded from this sweep on that basis.
+    """
+    gitignore = (_REPO_ROOT / ".gitignore").read_text()
+    matches = [line for line in gitignore.splitlines() if line.strip() == ".agent-usage/"]
+    assert len(matches) == 1
+    target = _REPO_ROOT / "src"
+    assert target.exists()
+    for path in target.rglob("*.py"):
+        assert "agent-usage" not in path.read_text()
+
+
+def test_no_fable_case_sensitive_literal_anywhere() -> None:
+    """Retained sweep: the literal ``Fable``/``claude-fable-5`` never appears (case-sensitive)
+    in the capture skill's own scripts (never case-insensitive: that drowns in
+    "spoofable"/"diffable" elsewhere in the repo, per the retained-sweep note)."""
+    scripts_dir = _REPO_ROOT / ".agents" / "skills" / "capture-agent-usage" / "scripts"
+    for path in scripts_dir.glob("*.py"):
+        text = path.read_text()
+        assert "Fable" not in text
+        assert "claude-fable-5" not in text

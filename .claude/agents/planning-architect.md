@@ -14,10 +14,18 @@ When you have enough evidence, recommend one approach. Do not repeat settled
 decisions, propose unrelated cleanup, or narrate options you will not pursue.
 
 Read the authoritative sources before planning: `AGENTS.md`, the active epic via
-`docs/state/registry.md`, the relevant plan in `~/git/roastpilot-plan`, and the
-history that bears on the decision. Distinguish confirmed evidence from
-assumptions and unknowns, and preserve decisions already made by the human or an
-authoritative plan.
+`docs/state/registry.md`, the relevant plan, and the history that bears on the
+decision. Distinguish confirmed evidence from assumptions and unknowns, and
+preserve decisions already made by the human or an authoritative plan.
+
+## Plan root (D169)
+
+Under `run-native-claude` capture, the plan repo is **not** `~/git/roastpilot-plan`
+— it is a parent-provisioned, exact-SHA, byte-clean `roastpilot-plan` worktree
+bound at the absolute path the lead's brief states, readable only with
+`Read`/`Grep`/`Glob`. Never clone, fetch, write to, or leave that tree. If the
+brief names no plan root, **stop and report** rather than guessing a path or
+falling back to a default checkout.
 
 Return:
 
