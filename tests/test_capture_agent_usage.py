@@ -1440,6 +1440,32 @@ def test_native_role_frontmatter_mutations_fail_closed(
         usage_cli._native_role_pin(NativeClaudeRole.ENGINEER_BE)  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.parametrize(
+    "role",
+    [
+        NativeClaudeRole.PR_TRIAGE,
+        NativeClaudeRole.SAFETY_REVIEWER,
+        NativeClaudeRole.SECURITY_REVIEWER,
+        NativeClaudeRole.STORY_PLANNER,
+    ],
+)
+def test_shell_free_native_roles_reject_bash_frontmatter_drift(
+    role: NativeClaudeRole, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A future role-file edit cannot silently grant Bash to shell-free assurance."""
+    path = Path(".claude") / "agents" / f"{role.value}.md"
+    content = path.read_bytes().replace(
+        b"tools: Read, Grep, Glob\n", b"tools: Read, Grep, Glob, Bash\n", 1
+    )
+
+    def mutated_input(_path: Path) -> bytes:
+        return content
+
+    monkeypatch.setattr(usage_cli, "_input_bytes", mutated_input)
+    with pytest.raises(CaptureUsageError, match="frontmatter is invalid"):
+        usage_cli._native_role_pin(role)  # pyright: ignore[reportPrivateUsage]
+
+
 class _NativeInput:
     """Minimal writable stdin retaining bytes only for provider-free assertions."""
 
@@ -7635,6 +7661,38 @@ def test_plan_environment_binds_exact_key_and_strips_evidence_and_validation_key
     assert other_role_environment.bound_root is None
     assert PLAN_ROOT_ENVIRONMENT_KEY not in other_role_environment.environment
     assert EVIDENCE_ROOT_ENVIRONMENT_KEY not in other_role_environment.environment
+
+
+def test_native_environment_inherits_only_closed_non_secret_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parent credentials and injection variables never reach a native child."""
+    inherited = {
+        "PATH": "/safe/bin",
+        "HOME": "/safe/home",
+        "LANG": "en_GB.UTF-8",
+    }
+    credentials = {
+        "GH_TOKEN": "gh-secret",
+        "GITHUB_TOKEN": "github-secret",
+        "ANTHROPIC_API_KEY": "anthropic-secret",
+        "AWS_SECRET_ACCESS_KEY": "aws-secret",
+        "DATABASE_URL": "database-secret",
+        "HTTPS_PROXY": "https://user:secret@proxy.example",
+        "NODE_OPTIONS": "--require=/tmp/injected.js",
+        "SSH_AUTH_SOCK": "/tmp/agent.sock",
+    }
+    for key, value in {**inherited, **credentials}.items():
+        monkeypatch.setenv(key, value)
+
+    launch_environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
+        NativeClaudeRole.SAFETY_REVIEWER, _request(), attested_head="0" * 40
+    )
+
+    assert launch_environment.bound_root is None
+    assert inherited.items() <= launch_environment.environment.items()
+    assert not (set(credentials) & set(launch_environment.environment))
+    assert set(launch_environment.environment) <= usage_cli._NATIVE_SAFE_INHERITED_ENVIRONMENT_KEYS  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.parametrize(

@@ -42,7 +42,6 @@ from capture_usage_codex import (
 )
 from capture_usage_models import (
     AGENT_USAGE_SCHEMA_VERSION,
-    ALL_BOUND_ROOT_ENVIRONMENT_KEYS,
     BOUND_ROOT_POLICIES,
     EVIDENCE_BUNDLE_FILES,
     EVIDENCE_CHUNK_BYTES,
@@ -132,7 +131,44 @@ reinstated with exactly these values only when the role's active bound root
 is :data:`~capture_usage_models.BoundRootKind.VALIDATION` (D166, §2.4)."""
 _PLAN_ENVIRONMENT_KEYS = frozenset({PLAN_ROOT_ENVIRONMENT_KEY})
 _EVIDENCE_ENVIRONMENT_KEYS = frozenset({EVIDENCE_ROOT_ENVIRONMENT_KEY})
-_ALL_BOUND_ROOT_ENVIRONMENT_KEYS = ALL_BOUND_ROOT_ENVIRONMENT_KEYS
+_NATIVE_SAFE_INHERITED_ENVIRONMENT_KEYS = frozenset(
+    {
+        "COLORTERM",
+        "FORCE_COLOR",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LOGNAME",
+        "NODE_EXTRA_CA_CERTS",
+        "NO_COLOR",
+        "PATH",
+        "SHELL",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "TZ",
+        "USER",
+    }
+)
+"""Closed non-secret parent environment admitted to native Claude children.
+
+Provider authentication remains Claude-owned under ``HOME``; arbitrary parent
+tokens, credential helpers, proxy credentials, cloud variables, and shell
+injection variables are never inherited. Bound-root values are added separately
+from validated parent inputs below.
+"""
+_NATIVE_BASH_FORBIDDEN_ROLES = frozenset(
+    {
+        NativeClaudeRole.PR_TRIAGE,
+        NativeClaudeRole.SAFETY_REVIEWER,
+        NativeClaudeRole.SECURITY_REVIEWER,
+        NativeClaudeRole.STORY_PLANNER,
+    }
+)
+"""Native roles whose committed contract is evidence-only and shell-free."""
 _VALIDATION_DIRECTORY_MODE = 0o700
 _FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 """Closed 40-lowercase-hex full commit sha grammar (D169, §2.3, §2.4)."""
@@ -562,6 +598,7 @@ def _native_role_pin(role: NativeClaudeRole) -> _NativeRolePin:
         not tools
         or len(set(tools)) != len(tools)
         or any(tool not in allowed_tools for tool in tools)
+        or (role in _NATIVE_BASH_FORBIDDEN_ROLES and "Bash" in tools)
     ):
         raise CaptureUsageError("native agent frontmatter is invalid")
     capability = (
@@ -1367,7 +1404,7 @@ def _resolve_native_environment(
     environment = {
         key: value
         for key, value in os.environ.items()
-        if key not in _ALL_BOUND_ROOT_ENVIRONMENT_KEYS
+        if key in _NATIVE_SAFE_INHERITED_ENVIRONMENT_KEYS
     }
     if bound_root is not None:
         if bound_root.kind is BoundRootKind.VALIDATION:
