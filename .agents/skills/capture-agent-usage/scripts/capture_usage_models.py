@@ -318,9 +318,13 @@ BOUND_ROOT_POLICIES: dict[BoundRootKind, BoundRootPolicy] = {
         root_option="--plan-root",
         companion_option="--plan-sha",
         required_roles=frozenset(
-            {NativeClaudeRole.PLANNING_ARCHITECT, NativeClaudeRole.STORY_PLANNER}
+            {
+                NativeClaudeRole.PLANNING_ARCHITECT,
+                NativeClaudeRole.PRODUCT_AUDITOR,
+                NativeClaudeRole.STORY_PLANNER,
+            }
         ),
-        optional_roles=frozenset({NativeClaudeRole.PRODUCT_AUDITOR}),
+        optional_roles=frozenset(),
         environment_keys=PLAN_ENVIRONMENT_KEYS,
     ),
     BoundRootKind.EVIDENCE: BoundRootPolicy(

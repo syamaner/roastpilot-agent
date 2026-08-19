@@ -372,7 +372,7 @@ D166–D168 above cover exactly one bound-root kind, `--validation-root`, for
 the three test-running roles. D169 generalizes the same abstraction to two
 more closed role sets that need a readable root but never a command rule:
 `--plan-root`/`--plan-sha` for `planning-architect` and `story-planner`
-(required) and `product-auditor` (optional pair), and
+(required), `product-auditor` (required), and
 `--evidence-root`/`--evidence-pr` for `pr-triage`. All three kinds share one
 closed grammar, one disjointness rule, and one `0700`, current-euid,
 no-follow descriptor open; at most one bound root is ever active for a given
@@ -380,6 +380,18 @@ native launch, because the three kinds' admitted role sets are pairwise
 disjoint. Neither the plan root nor the evidence bundle renders any
 `--allowedTools` rule: those roles read with `Read`/`Grep`/`Glob`, which need
 path access, not command permission.
+
+Every native launch also requires a separate parent-provisioned
+`--usage-root`. Create it outside the attested worktree and outside the active
+validation, plan, or evidence root, with current-euid ownership and mode
+exactly `0700`. Native capture holds a no-follow descriptor for the whole run,
+reattests that the path still names the same inode/device after the child
+exits, then appends the still-relative `.agent-usage/...` output beneath the
+held descriptor. It never sends the usage-root path to Claude. This keeps the
+worktree byte-clean while retaining the closed output-leaf grammar; absolute,
+traversing, symlinked, overlapping, replaced, wrong-owner, and wrong-mode roots
+fail closed. A parent may reuse one private usage root for sequential native
+runs, but never shares it across users or concurrent untrusted processes.
 
 Native `safety-reviewer` and `security-reviewer` runs are also deliberately
 evidence-only, but require no extra root: both inspect the already-attested
@@ -410,19 +422,43 @@ rejected). The tool re-runs the same identity checks, plus a
 exits — a commit landing, a file changing, or an ignored file appearing
 between launch and exit all fail closed with no record and no handback.
 
-**Evidence-bundle recipe (executed by the parent, never by the worker):**
+**Evidence-bundle recipe (executed by the parent, never by the worker):** Build
+this immediately before launching `pr-triage`; `generated_at` is accepted only
+through the exact ten-minute age boundary at launch (the existing future-skew
+check also remains). REST arrays and GraphQL connections must be fully
+paginated and flattened; a first page is not complete evidence.
 
 ```bash
 mkdir -m 700 <root>
 gh pr view <n> --json number,headRefOid,baseRefOid > <root>/identity-before.json
-gh pr view <n> --json number,headRefOid,baseRefOid,... > <root>/pr.json
+gh pr view <n> --json number,headRefOid,baseRefOid,author,authorAssociation,... > <root>/pr.json
 gh pr diff <n> > <root>/diff.patch
 gh pr checks <n> --json ... > <root>/checks.json
-gh api repos/{owner}/{repo}/pulls/<n>/reviews > <root>/reviews.json
-gh api repos/{owner}/{repo}/pulls/<n>/comments > <root>/review-comments.json
-gh api repos/{owner}/{repo}/issues/<n>/comments > <root>/issue-comments.json
-gh api repos/{owner}/{repo}/pulls/<n> --jq '...' > <root>/authors.json
-gh api graphql -f query='...' > <root>/review-threads.json
+gh api --paginate --slurp repos/{owner}/{repo}/pulls/<n>/reviews | jq 'add' > <root>/reviews.json
+gh api --paginate --slurp repos/{owner}/{repo}/pulls/<n>/comments | jq 'add' > <root>/review-comments.json
+gh api --paginate --slurp repos/{owner}/{repo}/issues/<n>/comments | jq 'add' > <root>/issue-comments.json
+gh api graphql --paginate --slurp -F owner='{owner}' -F repo='{repo}' -F number=<n> \
+  -f query='query($owner:String!,$repo:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100,after:$endCursor){nodes{isResolved comments(first:100){nodes{author{login} authorAssociation body} pageInfo{hasNextPage} totalCount}} pageInfo{hasNextPage endCursor}}}}}' \
+  | jq 'if any(.[].data.repository.pullRequest.reviewThreads.nodes[];
+               .comments.pageInfo.hasNextPage)
+        then error("review-thread comments require nested pagination")
+        else [.[].data.repository.pullRequest.reviewThreads.nodes[]] end' \
+  > <root>/review-threads.json
+jq -n --slurpfile pr <root>/pr.json --slurpfile reviews <root>/reviews.json \
+  --slurpfile review_comments <root>/review-comments.json \
+  --slurpfile issue_comments <root>/issue-comments.json \
+  --slurpfile threads <root>/review-threads.json \
+  'def ident($login;$association):
+     if (($login|type)!="string" or ($login|length)==0 or
+         ($association|type)!="string" or ($association|length)==0)
+     then error("missing API author identity")
+     else {login:$login,author_association:$association} end;
+   [ident($pr[0].author.login;$pr[0].authorAssociation),
+    ($reviews[0][]|ident(.user.login;.author_association)),
+    ($review_comments[0][]|ident(.user.login;.author_association)),
+    ($issue_comments[0][]|ident(.user.login;.author_association)),
+    ($threads[0][]|.comments.nodes[]|ident(.author.login;.authorAssociation))]
+   | unique_by([.login,.author_association])' > <root>/authors.json
 gh pr view <n> --json number,headRefOid,baseRefOid > <root>/identity-after.json
 # reject collection unless identity-before.json and identity-after.json match exactly;
 # manifest.json records that number, headRefOid, and baseRefOid, then remove both bracket files
@@ -436,7 +472,12 @@ chmod 700 <root>
 
 The `number`, `headRefOid`, and `baseRefOid` members are mandatory and are
 semantically checked against the manifest; additional `pr.json` metadata is
-retained as untrusted review context for `pr-triage`.
+retained as untrusted review context for `pr-triage`. `authors.json` is a
+deduplicated API-derived identity inventory, never a body-text inference;
+missing login or `author_association` in any contributing object blocks bundle
+construction. If a GraphQL nested connection ever exceeds its requested page
+size, extend the parent collector to paginate it too rather than accepting a
+partial bundle.
 
 The bundle is flat: exactly the nine names above, no subdirectories, each a
 regular file owned by the parent's euid with `st_nlink == 1` and mode exactly
@@ -448,11 +489,16 @@ adjudicates the untrusted PR/review/issue text inside the bundle; it never
 invokes `gh`, never has network access, and never sees a credential. The tool
 re-verifies listing, modes, `(st_dev, st_ino)`, the manifest bytes, and all
 eight digests after the native child exits; any drift fails closed with no
-record and no handback.
+record and no handback. After the handback, re-read the live PR head, checks,
+review inventory, and unresolved-thread inventory before replying, resolving,
+or merging. The bundle proves the launch input, not that GitHub stayed
+unchanged while the offline review ran.
 
-**Ownership and lifecycle.** As with the validation root, the parent creates
-one fresh root per run, never shared between runs, and removes it after the
-run. The capture tool never creates, writes to, or deletes either root.
+**Ownership and lifecycle.** The parent creates one fresh validation, plan, or
+evidence root per run and removes it afterward; capture never writes those
+bound roots. The separately supplied usage root is the only root capture
+writes, and only below its `.agent-usage` descendant through the held
+descriptor.
 
 **The brief states the `ALLOW`/`RUN` distinction (§ below), not just bound
 roots.** `print-validation-commands` now prints `ALLOW EXACT <command>` /

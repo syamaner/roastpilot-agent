@@ -37,6 +37,16 @@ conflicts with empty-MCP capture; `repair` is excluded. The generic `run` path r
 measurement/validation-only, has no routing authority, and retains its
 no-session-persistence boundary.
 
+Every `run-native-claude` launch requires a parent-provisioned external
+`--usage-root`. It must already exist, be owned by the current euid, have mode
+exactly `0700`, be disjoint from the attested worktree and any active validation,
+plan, or evidence root, and remain the same directory through post-exit
+reattestation. The relative `--output` grammar remains confined beneath
+`.agent-usage`; native capture resolves that leaf through the held external-root
+descriptor, never writes it into the attested worktree, and never exposes the
+usage root or sink path to Claude. Generic `run` and annotation commands retain
+their existing worktree-relative sink behavior.
+
 Under D166, every READ_ONLY role returns one bounded, transcript-validated final
 assistant response on stdout to the launching parent only — never to the sink, git,
 GitHub, fixtures, or any other durable file. `qa`, `mcp-contract-checker`, and
@@ -68,8 +78,8 @@ frontmatter `tools:` remains the sole capability boundary.
 
 Under D169, the same closed root abstraction generalizes to two more closed
 role sets that need a readable root but never a command rule:
-`--plan-root`/`--plan-sha` (required for `planning-architect` and
-`story-planner`, optional-as-a-pair for `product-auditor`) and
+`--plan-root`/`--plan-sha` (required for `planning-architect`,
+`story-planner`, and `product-auditor`) and
 `--evidence-root`/`--evidence-pr` (required for `pr-triage`). Each of the
 three kinds admits a disjoint role set, so at most one bound root is ever
 active per launch; the plan root is a parent-provisioned, exact-SHA,
@@ -81,7 +91,19 @@ Neither kind renders `--allowedTools`: both roles read with
 EXACT`/`ALLOW PREFIX` authorization-descriptor lines followed by one
 concrete `RUN <command>` line per gate (with an optional repeatable
 `--pytest-arg TOKEN` shell-quoted into the `qa` `pytest` gate's `RUN` line);
-a validation role executes only the `RUN ` lines, byte-exactly.
+a validation role executes only the `RUN ` lines, byte-exactly. QA requires
+at least one explicit `--pytest-arg`; an empty argument list is rejected so
+the parent can never authorize a bare, repository-wide pytest invocation by
+accident.
+
+Build a PR evidence bundle immediately before native `pr-triage`. Its
+`generated_at` may be at most ten minutes old at launch (future skew remains
+rejected), and every paginated REST/GraphQL collection must be flattened into
+the closed payload files. Build `authors.json` only from API identity fields
+across the PR, reviews, all comment collections, and review-thread comments;
+missing login or association data blocks the run. After handback, the parent
+must re-read live PR head, checks, review inventory, and unresolved-thread
+inventory before acting; the offline bundle is not post-review merge authority.
 
 `safety-reviewer` and `security-reviewer` are deliberately evidence-only under
 native capture. They have `Read`/`Grep`/`Glob`, no Bash, no validation root,

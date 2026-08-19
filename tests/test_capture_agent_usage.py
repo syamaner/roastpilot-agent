@@ -1518,6 +1518,7 @@ class _NativeProcess:
 
 
 _NATIVE_SESSION_ID = "11111111-1111-4111-8111-111111111233"
+_STUB_USAGE_ROOT = "/usage/root"
 
 
 def _native_cli_args(
@@ -1528,6 +1529,7 @@ def _native_cli_args(
     plan_sha: str | None = None,
     evidence_root: str | None = None,
     evidence_pr: int | None = None,
+    usage_root: str = _STUB_USAGE_ROOT,
     base_sha: str = "4c1ac63",
 ) -> list[str]:
     """Return closed native command metadata for provider-free tests."""
@@ -1549,6 +1551,8 @@ def _native_cli_args(
         "feature/816-native-transcript-usage-1",
         "--base-sha",
         base_sha,
+        "--usage-root",
+        usage_root,
     ]
     if validation_root is not None:
         arguments.extend(["--validation-root", validation_root])
@@ -1591,7 +1595,11 @@ def _native_transcript_bytes(session_id: str = _NATIVE_SESSION_ID) -> bytes:
 
 
 def _configure_native_launcher(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fixed_session: bool = True
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fixed_session: bool = True,
+    stub_usage_root: bool = True,
 ) -> tuple[Path, list[tuple[list[str], dict[str, object]]]]:
     """Install a private Claude parent location and fixed launcher dependencies."""
     monkeypatch.chdir(tmp_path)
@@ -1622,6 +1630,16 @@ def _configure_native_launcher(
     monkeypatch.setattr(usage_cli, "_resolved_executable", fixed_executable)
     monkeypatch.setattr(usage_cli, "_validate_native_worktree", fixed_attestation)
     monkeypatch.setattr(usage_cli, "_utc_now", lambda: datetime(2026, 8, 18, tzinfo=UTC))
+    if stub_usage_root:
+
+        def fixed_usage_root(raw: str, _bound_root: BoundRoot | None) -> usage_cli._UsageRoot:  # pyright: ignore[reportPrivateUsage]
+            assert raw == _STUB_USAGE_ROOT
+            descriptor = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            return usage_cli._UsageRoot(  # pyright: ignore[reportPrivateUsage]
+                path=str(tmp_path), descriptor=descriptor
+            )
+
+        monkeypatch.setattr(usage_cli, "_validate_usage_root", fixed_usage_root)
     Path("prompt").write_bytes(b"SENTINEL_NATIVE_PROMPT")
     return project, []
 
@@ -1655,8 +1673,12 @@ def _native_popen(
 def test_native_command_generates_distinct_real_uuid_sessions_per_invocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each native launch owns a new UUIDv4, preventing transcript/preflight aliasing."""
-    project, observed = _configure_native_launcher(tmp_path, monkeypatch, fixed_session=False)
+    """Two native launches use distinct sessions and one external byte-clean usage root."""
+    usage_root = tmp_path.parent / f"{tmp_path.name}-usage"
+    _mkdir_exact(usage_root, 0o700)
+    project, observed = _configure_native_launcher(
+        tmp_path, monkeypatch, fixed_session=False, stub_usage_root=False
+    )
     preflight_sessions: list[str] = []
     real_preflight = usage_transcript.reject_existing_owned_session
 
@@ -1674,8 +1696,8 @@ def test_native_command_generates_distinct_real_uuid_sessions_per_invocation(
 
     monkeypatch.setattr(usage_cli, "reject_existing_owned_session", spy_preflight)
     monkeypatch.setattr(usage_cli.subprocess, "Popen", fake)
-    assert main(_native_cli_args()) == 0
-    assert main(_native_cli_args()) == 0
+    assert main(_native_cli_args(usage_root=str(usage_root))) == 0
+    assert main(_native_cli_args(usage_root=str(usage_root))) == 0
 
     worker_sessions = [
         argv[argv.index("--session-id") + 1] for argv, _ in observed if "--session-id" in argv
@@ -1685,11 +1707,93 @@ def test_native_command_generates_distinct_real_uuid_sessions_per_invocation(
     assert all(UUID(session_id).version == 4 for session_id in worker_sessions)
     records = [
         USAGE_RECORD_ADAPTER.validate_json(line)
-        for line in Path(".agent-usage/usage.jsonl").read_text().splitlines()
+        for line in (usage_root / ".agent-usage" / "usage.jsonl").read_text().splitlines()
     ]
     assert [
         record.session_id for record in records if isinstance(record, NativeWorkerUsageRecord)
     ] == worker_sessions
+    assert not Path(".agent-usage").exists()
+    worker_launches = [(argv, kwargs) for argv, kwargs in observed if "--session-id" in argv]
+    assert all(str(usage_root) not in repr((argv, kwargs)) for argv, kwargs in worker_launches)
+
+
+def test_usage_root_rejects_unsafe_shapes_and_active_root_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native usage roots fail closed on mode, ownership, symlink, and bound-root overlap."""
+    monkeypatch.chdir(tmp_path)
+    external = tmp_path.parent / f"{tmp_path.name}-usage-shapes"
+    _mkdir_exact(external, 0o700)
+    bound_child = external / "bound-child"
+    _mkdir_exact(bound_child, 0o700)
+
+    bound = BoundRoot(kind=BoundRootKind.PLAN, path=str(external), reattest=None)
+    with pytest.raises(CaptureUsageError, match="usage root is invalid"):
+        usage_cli._validate_usage_root(  # pyright: ignore[reportPrivateUsage]
+            str(bound_child), bound
+        )
+    child_bound = BoundRoot(kind=BoundRootKind.PLAN, path=str(bound_child), reattest=None)
+    with pytest.raises(CaptureUsageError, match="usage root is invalid"):
+        usage_cli._validate_usage_root(str(external), child_bound)  # pyright: ignore[reportPrivateUsage]
+
+    inside_worktree = tmp_path / "usage"
+    _mkdir_exact(inside_worktree, 0o700)
+    with pytest.raises(CaptureUsageError, match="usage root is invalid"):
+        usage_cli._validate_usage_root(  # pyright: ignore[reportPrivateUsage]
+            str(inside_worktree), None
+        )
+
+    wrong_mode = tmp_path.parent / f"{tmp_path.name}-usage-mode"
+    _mkdir_exact(wrong_mode, 0o755)
+    with pytest.raises(CaptureUsageError, match="usage root is invalid"):
+        usage_cli._validate_usage_root(  # pyright: ignore[reportPrivateUsage]
+            str(wrong_mode), None
+        )
+
+    symlink = tmp_path.parent / f"{tmp_path.name}-usage-link"
+    symlink.symlink_to(external)
+    with pytest.raises(CaptureUsageError, match="usage root is invalid"):
+        usage_cli._validate_usage_root(str(symlink), None)  # pyright: ignore[reportPrivateUsage]
+
+    real_geteuid = os.geteuid
+    monkeypatch.setattr(os, "geteuid", lambda: real_geteuid() + 1)
+    with pytest.raises(CaptureUsageError, match="usage root is invalid"):
+        usage_cli._validate_usage_root(str(external), None)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_usage_root_rejects_path_replacement_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A usage-root inode replacement between launch and append fails closed."""
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path.parent / f"{tmp_path.name}-usage-replace"
+    moved = tmp_path.parent / f"{tmp_path.name}-usage-original"
+    _mkdir_exact(root, 0o700)
+    usage_root = usage_cli._validate_usage_root(  # pyright: ignore[reportPrivateUsage]
+        str(root), None
+    )
+    try:
+        root.rename(moved)
+        _mkdir_exact(root, 0o700)
+        with pytest.raises(CaptureUsageError, match="usage root is invalid"):
+            usage_cli._reattest_usage_root(usage_root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(usage_root.descriptor)
+
+
+def test_native_parser_requires_usage_root_and_keeps_output_relative() -> None:
+    """Native launch requires an external root but retains the confined relative leaf grammar."""
+    args = _native_cli_args()
+    index = args.index("--usage-root")
+    del args[index : index + 2]
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args(args)
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args([*_native_cli_args(), "--output", "/tmp/usage.jsonl"])
+    with pytest.raises(SystemExit):
+        usage_cli.build_parser().parse_args(
+            [*_native_cli_args(), "--output", ".agent-usage/../escape.jsonl"]
+        )
 
 
 def test_native_command_launches_exact_worker_and_records_immutable_transcript(
@@ -6271,7 +6375,8 @@ def test_native_read_only_no_emission_on_sink_append_failure(
         ),
     )
 
-    def failing_append(_path: Path, _record: object) -> None:
+    def failing_append(_path: Path, _record: object, *, root_descriptor: int | None = None) -> None:
+        del root_descriptor
         raise CaptureUsageError("could not append usage record")
 
     monkeypatch.setattr(usage_cli, "append_record", failing_append)
@@ -7164,9 +7269,18 @@ def test_print_validation_commands_matches_the_argv_rule_table(
     root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
     resolved_root = os.path.realpath(root)
     for role in usage_cli.VALIDATION_ENVIRONMENT_ROLES:
-        exit_code = main(
-            ["print-validation-commands", "--role", role.value, "--validation-root", str(root)]
-        )
+        args = [
+            "print-validation-commands",
+            "--role",
+            role.value,
+            "--validation-root",
+            str(root),
+        ]
+        tokens: tuple[str, ...] = ()
+        if role is NativeClaudeRole.QA:
+            tokens = ("tests/",)
+            args.extend(["--pytest-arg", tokens[0]])
+        exit_code = main(args)
         assert exit_code == 0
         printed = capsys.readouterr().out.splitlines()
         expected_rendered = render_validation_commands(role, resolved_root)
@@ -7174,7 +7288,12 @@ def test_print_validation_commands_matches_the_argv_rule_table(
             f"ALLOW {command.kind.value} {text}"
             for command, text in zip(VALIDATION_ROLE_COMMANDS[role], expected_rendered, strict=True)
         ]
-        run_lines = [f"RUN {text}" for text in expected_rendered]
+        run_lines = [
+            f"RUN {usage_cli._render_prefix_run_command(text, tokens)}"  # pyright: ignore[reportPrivateUsage]
+            if command.kind is ValidationCommandKind.PREFIX
+            else f"RUN {text}"
+            for command, text in zip(VALIDATION_ROLE_COMMANDS[role], expected_rendered, strict=True)
+        ]
         assert printed == [*allow_lines, *run_lines]
         assert printed.index(run_lines[0]) == len(allow_lines)
 
@@ -7219,6 +7338,8 @@ def test_print_validation_commands_rejects_invalid_root_before_output(
                 "qa",
                 "--validation-root",
                 "relative/path",
+                "--pytest-arg",
+                "tests/",
             ]
         )
     assert capsys.readouterr().out == ""
@@ -7249,6 +7370,8 @@ def test_print_validation_commands_rejects_empty_rendered_tuple_before_output(
                 "qa",
                 "--validation-root",
                 str(root),
+                "--pytest-arg",
+                "tests/",
             ]
         )
     assert capsys.readouterr().out == ""
@@ -7379,6 +7502,37 @@ def test_runbook_and_skill_and_agents_row_point_to_print_validation_commands() -
         assert "tests/test_milestone1.py" not in text
 
 
+def test_native_review_contracts_fail_closed_on_missing_parent_evidence() -> None:
+    """Product and simulation reviewers require complete parent evidence under capture."""
+    root = Path(__file__).resolve().parents[1]
+    product = " ".join((root / ".claude/agents/product-auditor.md").read_text().split())
+    simulation = " ".join((root / ".claude/agents/sim-roast-runner.md").read_text().split())
+    assert "`--plan-root`/`--plan-sha` pair is mandatory" in product
+    assert "complete exit-status-backed, exact-head gate and coverage evidence" in product
+    assert "no admitted native Bash gate" in product
+    assert "fail closed when that evidence is absent or partial" in product
+    assert "parent-supplied exact-head decision-trace evidence" in simulation
+    assert "complete trace rather than a prose summary" in simulation
+    assert "Fail closed when required trace evidence is absent or partial" in simulation
+
+
+def test_native_usage_and_evidence_collection_contracts_are_documented() -> None:
+    """Runbook and skill retain the external sink, freshness, and pagination boundaries."""
+    root = Path(__file__).resolve().parents[1]
+    runbook = (root / "docs/agent-team-worktrees.md").read_text()
+    skill = (root / ".agents/skills/capture-agent-usage/SKILL.md").read_text()
+    for text in (runbook, skill):
+        assert "--usage-root" in text
+        assert "ten minutes" in text or "ten-minute" in text
+        assert "authors.json" in text
+        assert "review-thread" in text
+    assert runbook.count("gh api --paginate --slurp") == 3
+    assert "gh api graphql --paginate --slurp" in runbook
+    assert "missing API author identity" in runbook
+    assert "unique_by([.login,.author_association])" in runbook
+    assert "re-read the live PR head, checks" in runbook
+
+
 def test_validation_environment_roles_include_only_bash_capable_read_only_roles() -> None:
     """T8: table membership matches the committed frontmatter capability, both directions."""
     for role in NativeClaudeRole:
@@ -7397,8 +7551,12 @@ def test_validation_environment_roles_include_only_bash_capable_read_only_roles(
 # print-validation-commands ALLOW/RUN grammar.
 # ---------------------------------------------------------------------------
 
-_PLAN_REQUIRED_ROLES = {NativeClaudeRole.PLANNING_ARCHITECT, NativeClaudeRole.STORY_PLANNER}
-_PLAN_OPTIONAL_ROLES = {NativeClaudeRole.PRODUCT_AUDITOR}
+_PLAN_REQUIRED_ROLES = {
+    NativeClaudeRole.PLANNING_ARCHITECT,
+    NativeClaudeRole.PRODUCT_AUDITOR,
+    NativeClaudeRole.STORY_PLANNER,
+}
+_PLAN_OPTIONAL_ROLES: set[NativeClaudeRole] = set()
 _EVIDENCE_REQUIRED_ROLES = {NativeClaudeRole.PR_TRIAGE}
 
 
@@ -7923,7 +8081,6 @@ def test_plan_root_never_mutated_by_capture_tool(
 
 _EVIDENCE_HEAD = "a" * 40
 _EVIDENCE_BASE = "b" * 40
-_EVIDENCE_PAST_TIMESTAMP = "2025-01-01T00:00:00+00:00"
 
 
 def _build_evidence_bundle(
@@ -7932,7 +8089,7 @@ def _build_evidence_bundle(
     pr: int = 837,
     head_sha: str = _EVIDENCE_HEAD,
     base_sha: str = _EVIDENCE_BASE,
-    generated_at: str = _EVIDENCE_PAST_TIMESTAMP,
+    generated_at: str | None = None,
     payload_overrides: dict[str, bytes] | None = None,
     manifest_overrides: dict[str, object] | None = None,
     files_overrides: dict[str, dict[str, object]] | None = None,
@@ -7967,7 +8124,7 @@ def _build_evidence_bundle(
         "pull_request": pr,
         "head_sha": head_sha,
         "base_sha": base_sha,
-        "generated_at": generated_at,
+        "generated_at": generated_at or usage_cli._utc_now().isoformat(),  # pyright: ignore[reportPrivateUsage]
         "files": files_entry,
     }
     if manifest_overrides:
@@ -8283,9 +8440,12 @@ def test_evidence_bundle_rejects_non_zero_offset_generated_at(
     ids=["zulu", "explicit-zero-offset", "zero-offset-microseconds"],
 )
 def test_evidence_bundle_accepts_rfc3339_utc_generated_at(
-    generated_at: str, tmp_path_factory: pytest.TempPathFactory
+    generated_at: str,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``Z`` and explicit ``+00:00`` RFC3339 UTC forms remain valid."""
+    monkeypatch.setattr(usage_cli, "_utc_now", lambda: datetime(2025, 1, 1, 0, 5, tzinfo=UTC))
     root = _build_evidence_bundle(
         tmp_path_factory.mktemp("evidence-utc-generated-at") / "root",
         generated_at=generated_at,
@@ -8294,6 +8454,36 @@ def test_evidence_bundle_accepts_rfc3339_utc_generated_at(
         str(root), 837, attested_head=_EVIDENCE_HEAD
     )
     assert bound.kind is BoundRootKind.EVIDENCE
+
+
+@pytest.mark.parametrize(
+    ("age_seconds", "accepted"),
+    [(600, True), (601, False)],
+    ids=["exact-ten-minute-boundary", "one-second-too-old"],
+)
+def test_evidence_bundle_enforces_conservative_max_age(
+    age_seconds: int,
+    accepted: bool,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bundle is valid through exactly ten minutes and stale one second later."""
+    now = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(usage_cli, "_utc_now", lambda: now)
+    generated_at = (now - timedelta(seconds=age_seconds)).isoformat()
+    root = _build_evidence_bundle(
+        tmp_path_factory.mktemp("evidence-age") / "root", generated_at=generated_at
+    )
+    if accepted:
+        bound = usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
+        assert bound.kind is BoundRootKind.EVIDENCE
+    else:
+        with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+            usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+                str(root), 837, attested_head=_EVIDENCE_HEAD
+            )
 
 
 @pytest.mark.parametrize(
@@ -8801,10 +8991,11 @@ def test_native_launch_binds_evidence_bundle_end_to_end(
     assert record.native_role is NativeClaudeRole.PR_TRIAGE
 
 
-def test_native_launch_product_auditor_optional_plan_root(
+def test_native_launch_product_auditor_rejects_missing_plan_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
-    """T8 (roster): ``product-auditor`` captures cleanly with and without the plan pair."""
+    """T8 (roster): ``product-auditor`` fails closed without its required plan pair."""
+    del tmp_path_factory
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
     processes: list[_NativeProcess] = []
     monkeypatch.setattr(
@@ -8819,10 +9010,9 @@ def test_native_launch_product_auditor_optional_plan_root(
             ),
         ),
     )
-    assert main(_native_cli_args(role="product-auditor")) == 0
-    unbound_argv = observed[1][0]
-    assert "--add-dir" not in unbound_argv
-    assert "--allowedTools" not in unbound_argv
+    with pytest.raises(SystemExit, match="validation environment is invalid"):
+        main(_native_cli_args(role="product-auditor"))
+    assert observed == []
 
 
 def test_native_launch_product_auditor_with_plan_root(
@@ -8905,9 +9095,18 @@ def test_print_validation_commands_allow_then_run_blocks(
     root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
     resolved_root = os.path.realpath(root)
     for role in usage_cli.VALIDATION_ENVIRONMENT_ROLES:
-        exit_code = main(
-            ["print-validation-commands", "--role", role.value, "--validation-root", str(root)]
-        )
+        args = [
+            "print-validation-commands",
+            "--role",
+            role.value,
+            "--validation-root",
+            str(root),
+        ]
+        tokens: tuple[str, ...] = ()
+        if role is NativeClaudeRole.QA:
+            tokens = ("tests/",)
+            args.extend(["--pytest-arg", tokens[0]])
+        exit_code = main(args)
         assert exit_code == 0
         printed = capsys.readouterr().out.splitlines()
         rendered = render_validation_commands(role, resolved_root)
@@ -8916,7 +9115,12 @@ def test_print_validation_commands_allow_then_run_blocks(
             f"ALLOW {command.kind.value} {text}"
             for command, text in zip(commands, rendered, strict=True)
         ]
-        run_lines = [f"RUN {text}" for text in rendered]
+        run_lines = [
+            f"RUN {usage_cli._render_prefix_run_command(text, tokens)}"  # pyright: ignore[reportPrivateUsage]
+            if command.kind is ValidationCommandKind.PREFIX
+            else f"RUN {text}"
+            for command, text in zip(commands, rendered, strict=True)
+        ]
         assert printed == [*allow_lines, *run_lines]
         assert all(line.startswith("ALLOW ") for line in printed[: len(allow_lines)])
         assert all(line.startswith("RUN ") for line in printed[len(allow_lines) :])
@@ -8941,16 +9145,35 @@ def test_print_validation_commands_pytest_arg_renders_quoted_covered_run_line(
     assert run_command.startswith(prefix + " ")
 
 
-def test_print_validation_commands_omitting_tokens_still_emits_bare_covered_run_line(
+def test_print_validation_commands_accepts_explicit_coverage_capable_qa_args(
     tmp_path_factory: pytest.TempPathFactory, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """T19: omitting ``--pytest-arg`` still emits exactly one bare, covered ``RUN`` line."""
+    """QA accepts a non-empty focused test target with branch-capable coverage flags."""
     root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
-    resolved_root = os.path.realpath(root)
-    assert main(["print-validation-commands", "--role", "qa", "--validation-root", str(root)]) == 0
-    printed = capsys.readouterr().out.splitlines()
-    prefix = render_validation_commands(NativeClaudeRole.QA, resolved_root)[0]
-    assert f"RUN {prefix}" in printed
+    tokens = [
+        "tests/test_capture_agent_usage.py",
+        "--cov=.agents/skills/capture-agent-usage/scripts",
+        "--cov-branch",
+        "--cov-report=term-missing",
+    ]
+    args = ["print-validation-commands", "--role", "qa", "--validation-root", str(root)]
+    for token in tokens:
+        args.append(f"--pytest-arg={token}")
+    assert main(args) == 0
+    run_line = next(
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("RUN ")
+    )
+    assert shlex.split(run_line.removeprefix("RUN "))[-len(tokens) :] == tokens
+
+
+def test_print_validation_commands_qa_rejects_omitted_tokens_without_output(
+    tmp_path_factory: pytest.TempPathFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T19: QA rejects an empty pytest target rather than emitting bare pytest."""
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    with pytest.raises(SystemExit, match="validation environment is invalid"):
+        main(["print-validation-commands", "--role", "qa", "--validation-root", str(root)])
+    assert capsys.readouterr().out == ""
 
 
 @pytest.mark.parametrize("role", ["mcp-contract-checker", "sim-roast-runner"])
@@ -9090,7 +9313,20 @@ def test_print_validation_commands_validates_root_exactly_once(
         return real_validate(raw)
 
     monkeypatch.setattr(usage_cli, "_validate_validation_root", counting_validate)
-    assert main(["print-validation-commands", "--role", "qa", "--validation-root", str(root)]) == 0
+    assert (
+        main(
+            [
+                "print-validation-commands",
+                "--role",
+                "qa",
+                "--validation-root",
+                str(root),
+                "--pytest-arg",
+                "tests/",
+            ]
+        )
+        == 0
+    )
     assert calls == [str(root)]
 
 

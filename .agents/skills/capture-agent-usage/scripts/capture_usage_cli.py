@@ -174,6 +174,8 @@ _FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 """Closed 40-lowercase-hex full commit sha grammar (D169, §2.3, §2.4)."""
 _GENERATED_AT_MAX_LEN = 40
 """Conservative bound on the ``generated_at`` field before attempting to parse it."""
+_EVIDENCE_MAX_AGE_SECONDS = 600
+"""Maximum conservative age of a PR evidence bundle at native launch."""
 _GENERATED_AT_UTC_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|\+00:00)$"
 )
@@ -236,8 +238,8 @@ def _is_confined_sink_path(path: Path) -> bool:
     )
 
 
-def _open_sink_parent(path: Path) -> tuple[int, str]:
-    """Open or create the relative sink parent without following symlinks."""
+def _open_sink_parent(path: Path, *, root_descriptor: int | None = None) -> tuple[int, str]:
+    """Open or create the relative sink parent beneath cwd or a held root."""
     if (
         not hasattr(os, "O_DIRECTORY")
         or not hasattr(os, "O_NOFOLLOW")
@@ -249,7 +251,7 @@ def _open_sink_parent(path: Path) -> tuple[int, str]:
         raise CaptureUsageError("sink path must name a file")
 
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    descriptor = os.open(".", flags)
+    descriptor = os.open(".", flags) if root_descriptor is None else os.dup(root_descriptor)
     try:
         for component in path.parts[:-1]:
             try:
@@ -271,12 +273,14 @@ def _open_sink_parent(path: Path) -> tuple[int, str]:
     return descriptor, path.name
 
 
-def append_record(path: Path, record: UsageRecord) -> None:
+def append_record(path: Path, record: UsageRecord, *, root_descriptor: int | None = None) -> None:
     """Validate and append one record through a private, no-follow JSONL sink.
 
     Args:
         path: The relative output sink selected by the closed CLI grammar.
         record: A normalized closed-schema record to validate before appending.
+        root_descriptor: Optional held native usage-root descriptor. Generic
+            capture omits it and retains the worktree-relative behavior.
 
     Raises:
         CaptureUsageError: If the sink is unsafe or cannot be securely opened.
@@ -287,7 +291,7 @@ def append_record(path: Path, record: UsageRecord) -> None:
     parent_descriptor: int | None = None
     descriptor: int | None = None
     try:
-        parent_descriptor, filename = _open_sink_parent(path)
+        parent_descriptor, filename = _open_sink_parent(path, root_descriptor=root_descriptor)
         descriptor = os.open(
             filename,
             os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
@@ -1053,7 +1057,10 @@ def _validate_evidence_manifest_schema(
     # guard above is ever loosened.
     if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
         raise CaptureUsageError("evidence bundle is invalid")
-    if parsed > _utc_now() + timedelta(seconds=TIMESTAMP_SKEW_SECONDS):
+    now = _utc_now()
+    if parsed > now + timedelta(seconds=TIMESTAMP_SKEW_SECONDS):
+        raise CaptureUsageError("evidence bundle is invalid")
+    if parsed < now - timedelta(seconds=_EVIDENCE_MAX_AGE_SECONDS):
         raise CaptureUsageError("evidence bundle is invalid")
     files = data.get("files")
     if not isinstance(files, dict) or set(files) != set(EVIDENCE_PAYLOAD_FILES):
@@ -1381,6 +1388,39 @@ class _NativeLaunchEnvironment:
 
     environment: dict[str, str]
     bound_root: BoundRoot | None
+
+
+@dataclass(frozen=True)
+class _UsageRoot:
+    """Parent-owned external sink root held for one native launch."""
+
+    path: str
+    descriptor: int
+
+
+def _validate_usage_root(raw: str, bound_root: BoundRoot | None) -> _UsageRoot:
+    """Validate and hold the required external native usage root.
+
+    The root shares the closed absolute-path, ownership, mode, no-follow, and
+    worktree/Claude disjointness checks used by bound roots. It must also be
+    disjoint in both directions from the launch's active validation, plan, or
+    evidence root. The path is never added to the child argv or environment.
+    """
+    root = _validate_bound_root_shape(raw, error_message="usage root is invalid")
+    if bound_root is not None and (
+        Path(root).is_relative_to(Path(bound_root.path))
+        or Path(bound_root.path).is_relative_to(Path(root))
+    ):
+        raise CaptureUsageError("usage root is invalid")
+    descriptor = _open_bound_root_descriptor(root, error_message="usage root is invalid")
+    return _UsageRoot(path=root, descriptor=descriptor)
+
+
+def _reattest_usage_root(usage_root: _UsageRoot) -> None:
+    """Require the usage-root path to still name the held directory."""
+    _reattest_bound_root_path(
+        usage_root.descriptor, usage_root.path, error_message="usage root is invalid"
+    )
 
 
 def _resolve_native_environment(
@@ -1732,6 +1772,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
     _validate_native_metadata(arguments, role, pin)
     attested_head = _validate_native_worktree(arguments, pin.capability, post_exit=False)
     launch_environment: _NativeLaunchEnvironment | None = None
+    usage_root: _UsageRoot | None = None
     process: subprocess.Popen[bytes] | None = None
     deadline: threading.Timer | None = None
     timed_out = threading.Event()
@@ -1741,6 +1782,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
         launch_environment = _resolve_native_environment(
             role, _bound_root_request(arguments), attested_head=attested_head
         )
+        usage_root = _validate_usage_root(arguments.usage_root, launch_environment.bound_root)
         if os.environ.get("CLAUDE_CONFIG_DIR") is not None:
             raise CaptureUsageError("native Claude config directory is not permitted")
         session_id = str(uuid4())
@@ -1817,6 +1859,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
         bound_root = launch_environment.bound_root
         if bound_root is not None and bound_root.reattest is not None:
             bound_root.reattest()
+        _reattest_usage_root(usage_root)
         append_record(
             arguments.output,
             _native_record_from_usage(
@@ -1830,6 +1873,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
                 completed_at,
                 elapsed_ms,
             ),
+            root_descriptor=usage_root.descriptor,
         )
         if exit_code == 0 and usage.handback_text is not None:
             _emit_handback(role, pin, arguments, usage.session_id, usage.handback_text)
@@ -1851,6 +1895,9 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
                 _close_stdin(process)
             _stop_process(process)
         _close_bound_root(launch_environment)
+        if usage_root is not None:
+            with suppress(OSError):
+                os.close(usage_root.descriptor)
 
 
 def _record_from_usage(
@@ -2199,10 +2246,10 @@ def print_validation_commands_command(arguments: argparse.Namespace) -> int:
 
     Raises:
         CaptureUsageError: If ``role`` is not a validation role, the root is
-            invalid, the role renders no commands, ``--pytest-arg`` is
-            supplied for a role with no ``PREFIX`` entry, more than 32
-            tokens are supplied, or the mechanical ``RUN`` coverage proof
-            fails for any entry.
+            invalid, the role renders no commands, QA omits ``--pytest-arg``,
+            ``--pytest-arg`` is supplied for a role with no ``PREFIX`` entry,
+            more than 32 tokens are supplied, or the mechanical ``RUN``
+            coverage proof fails for any entry.
     """
     role = NativeClaudeRole(arguments.role)
     if role not in VALIDATION_ENVIRONMENT_ROLES:
@@ -2211,6 +2258,8 @@ def print_validation_commands_command(arguments: argparse.Namespace) -> int:
     if len(tokens) > _MAX_PYTEST_ARG_TOKENS:
         raise CaptureUsageError("validation environment is invalid")
     commands = VALIDATION_ROLE_COMMANDS.get(role, ())
+    if role is NativeClaudeRole.QA and not tokens:
+        raise CaptureUsageError("validation environment is invalid")
     if tokens and not any(command.kind is ValidationCommandKind.PREFIX for command in commands):
         raise CaptureUsageError("validation environment is invalid")
     root = _validate_validation_root(arguments.validation_root)
@@ -2304,6 +2353,7 @@ def build_parser() -> argparse.ArgumentParser:
     native.add_argument("--plan-sha", default=None)
     native.add_argument("--evidence-root", default=None)
     native.add_argument("--evidence-pr", type=_evidence_pr, default=None)
+    native.add_argument("--usage-root", required=True)
     _add_output_option(native)
     native.set_defaults(handler=run_native_claude_command)
 

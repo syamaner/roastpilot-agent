@@ -23,10 +23,15 @@ Procedure:
 2. For replay scenarios, `roastpilot-agent --replay <export>` is
    **parent-run evidence only**; it is not available to this role under
    capture. Ask the parent to run it and hand you the output.
-3. Pull the decision trace for the run from the store / timeline output:
-   every advisory (`RoastDecision` + confidence + rationale) → its
-   `SafetyEvaluation` (verdict + reason) → the executed or suppressed MCP
-   command.
+3. Under native capture, consume the parent-supplied exact-head decision-trace
+   evidence for the run: every advisory (`RoastDecision` + confidence +
+   rationale) → its `SafetyEvaluation` (verdict + reason) → the executed or
+   suppressed MCP command. The evidence must name the scenario and reviewed
+   head, and must include the complete trace rather than a prose summary. Fail
+   closed when required trace evidence is absent or partial; do not compose a
+   store, timeline, replay, or other command to replace it. Outside native
+   capture, pull the trace from the store / timeline output only when the
+   caller and available tools permit it.
 
 Summarize as markdown:
 
