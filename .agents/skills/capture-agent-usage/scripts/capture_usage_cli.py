@@ -93,8 +93,8 @@ from capture_usage_transcript import (
 
 DEFAULT_SINK = Path(".agent-usage/usage.jsonl")
 SINK_ROOT = ".agent-usage"
-MAX_PROMPT_BYTES = 65_536
-"""Prompt cap limits one explicitly-authorized stdin payload to 64 KiB."""
+MAX_PROMPT_BYTES = 1_048_576
+"""Prompt cap admits a bounded exact review patch while rejecting bulk input."""
 LAUNCH_TIMEOUT_SECONDS = 3600
 NATIVE_LAUNCH_TIMEOUT_SECONDS = 14_400
 VERSION_TIMEOUT_SECONDS = 5

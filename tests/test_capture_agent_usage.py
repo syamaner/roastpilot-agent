@@ -5482,6 +5482,21 @@ def test_prompt_cap_and_read_failure_reject_before_spawn_without_echoing_content
     monkeypatch.setattr(usage_cli.os, "fdopen", real_fdopen)
 
 
+def test_prompt_cap_accepts_exactly_one_mebibyte_and_rejects_one_byte_more(
+    tmp_path: Path,
+) -> None:
+    """Exact review evidence fits, while the next byte still fails closed."""
+    assert usage_cli.MAX_PROMPT_BYTES == 1_048_576
+    exact = tmp_path / "exact-prompt"
+    exact.write_bytes(b"x" * usage_cli.MAX_PROMPT_BYTES)
+    assert len(usage_cli._prompt_bytes(exact)) == usage_cli.MAX_PROMPT_BYTES  # pyright: ignore[reportPrivateUsage]
+
+    oversized = tmp_path / "oversized-prompt"
+    oversized.write_bytes(b"x" * (usage_cli.MAX_PROMPT_BYTES + 1))
+    with pytest.raises(CaptureUsageError, match="prompt file cannot be safely opened"):
+        usage_cli._prompt_bytes(oversized)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_run_rejects_unsupported_effort_before_executable_lookup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
