@@ -700,9 +700,13 @@ class NativeCodexUsageRecord(CaptureModel):
     leaf_session_id: SafeIdentifier
     topology_depth: Literal[1] = 1
     harness_version: Literal["0.147.0"] = "0.147.0"
-    exit_code: int
+    # Native collaboration reports a task terminal state, not a shell exit code.
+    exit_code: None = None
     task_status: NativeCodexTaskStatus
     success: bool
+    started_at: datetime
+    completed_at: datetime
+    elapsed_ms: TokenCount
     input_tokens: TokenCount
     cached_input_tokens: TokenCount
     cache_write_input_tokens: TokenCount
@@ -721,12 +725,14 @@ class NativeCodexUsageRecord(CaptureModel):
     def validate_native_codex_usage(self) -> NativeCodexUsageRecord:
         """Require Git and task outcomes to agree with the closed lifecycle."""
         if self.success:
-            if self.task_status is not NativeCodexTaskStatus.SUCCESS or self.exit_code != 0:
+            if self.task_status is not NativeCodexTaskStatus.SUCCESS:
                 raise ValueError("successful native Codex record has contradictory task status")
             if self.final_head_sha == self.base_sha:
                 raise ValueError("successful native Codex record requires a descendant head")
-        elif self.task_status is NativeCodexTaskStatus.SUCCESS or self.exit_code == 0:
+        elif self.task_status is NativeCodexTaskStatus.SUCCESS:
             raise ValueError("failed native Codex record has contradictory task status")
+        if self.completed_at < self.started_at:
+            raise ValueError("native Codex timestamps are contradictory")
         return self
 
 

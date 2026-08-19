@@ -25,15 +25,16 @@ while normalized metadata and usage totals are recorded. The `role` field is
 caller-supplied attribution metadata, never agent selection; native named-agent dispatch
 remains required for implementation slices.
 
-`prepare-native-codex` and `finalize-native-codex` are the separate parent-only
-metadata path for native registered Codex dispatch. They admit only
+`supervise-native-codex` is the long-lived parent-only metadata path for native
+registered Codex dispatch. It emits one opaque READY binding, holds provider and
+usage-root descriptors while the parent performs named-role dispatch, then accepts
+exactly one terminal task status and emits a metadata-only result. It admits only
 `engineer-be`, `engineer-fe`, and `repair`; generic `codex exec` is never a
-registered-role launch. Prepare must run before named-role dispatch with the
-parent `CODEX_THREAD_ID`; finalize consumes that one pre-binding after exit,
-reads only a newly-created provider rollout under the standard provider root,
-and records no provider bytes or paths. Both commands require the same owned
-external `--usage-root`; `CODEX_HOME` overrides and replayed bindings fail
-closed. The parent, not this utility, owns native dispatch.
+registered-role launch. The supervisor must run before named-role dispatch with
+the parent `CODEX_THREAD_ID`, reads only newly-created provider rollouts under the
+standard provider root, and records no provider bytes or paths. It requires an
+owned external `--usage-root`; replay, EOF, duplicate status, and `CODEX_HOME`
+overrides fail closed. The parent, not this utility, owns native dispatch.
 
 Under D163, `run-native-claude` is the separate parent-only instrumentation path for
 the committed roles `engineer-be`, `engineer-fe`, `mcp-contract-checker`,

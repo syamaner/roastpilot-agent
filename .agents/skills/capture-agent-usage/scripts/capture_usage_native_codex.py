@@ -1,11 +1,8 @@
-# ruff: noqa: E501
-"""Fail-closed metadata capture for registered Codex leaf rollouts.
+"""Fail-closed, long-lived metadata capture for registered Codex leaves.
 
-This module deliberately does not launch a worker.  The top-level Codex parent
-calls :func:`prepare_native_codex` immediately before its named-role dispatch,
-then calls :func:`finalize_native_codex` after that child exits.  Keeping the
-provider launch outside this utility prevents a generic ``codex exec`` command
-from being mistaken for registered-agent dispatch.
+The parent starts ``supervise-native-codex`` before dispatching its named leaf.
+This process keeps descriptor-relative bindings open, writes one READY frame,
+then accepts exactly one terminal task status on stdin.  It never launches Codex.
 """
 
 from __future__ import annotations
@@ -15,29 +12,45 @@ import json
 import os
 import stat
 import subprocess
-from contextlib import suppress
+import sys
+import tomllib
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from capture_usage_models import (
-    NativeCodexRole,
-    NativeCodexTaskStatus,
-    NativeCodexUsageRecord,
-)
+from capture_usage_models import NativeCodexRole, NativeCodexTaskStatus, NativeCodexUsageRecord
 
 MAX_PROVIDER_FILES = 4096
 MAX_PROVIDER_DEPTH = 8
-MAX_PROVIDER_FILE_BYTES = 2_097_152
-MAX_PROVIDER_TOTAL_BYTES = 16_777_216
-MAX_PROVIDER_LINES = 20_000
+MAX_PROVIDER_FILE_BYTES = 8 * 1024 * 1024
+MAX_PROVIDER_TOTAL_BYTES = 128 * 1024 * 1024
+MAX_PROVIDER_LINES = 100_000
+MAX_EVENT_BYTES = 256 * 1024
 _CONFIG_NAME = ".codex/config.toml"
 _ROLE_EXPECTATIONS: dict[NativeCodexRole, tuple[str, str]] = {
     NativeCodexRole.ENGINEER_BE: ("agents/engineer-be.toml", "high"),
     NativeCodexRole.ENGINEER_FE: ("agents/engineer-fe.toml", "high"),
     NativeCodexRole.REPAIR: ("agents/repair.toml", "medium"),
+}
+_ROOT_TYPES = {
+    "session_meta",
+    "turn_context",
+    "event_msg",
+    "response_item",
+    "inter_agent_communication_metadata",
+    "world_state",
+}
+_EVENT_TYPES = {"task_started", "token_count", "item_completed", "task_complete"}
+_RESPONSE_TYPES = {
+    "reasoning",
+    "message",
+    "agent_message",
+    "function_call",
+    "function_call_output",
+    "custom_tool_call",
+    "custom_tool_call_output",
 }
 
 
@@ -47,7 +60,7 @@ class NativeCodexCaptureError(ValueError):
 
 @dataclass(frozen=True)
 class _Root:
-    """An owned private directory identity retained for one lifecycle step."""
+    """One held directory descriptor and stable identity."""
 
     descriptor: int
     device: int
@@ -55,92 +68,111 @@ class _Root:
 
 
 def _fail() -> None:
-    """Raise the one fixed native-Codex capture error."""
     raise NativeCodexCaptureError("native Codex capture is invalid")
 
 
-def _safe_identifier(value: str) -> bool:
-    """Return whether a caller value is compatible with the persisted grammar."""
+def _safe_identifier(value: object) -> bool:
     return (
-        bool(value)
+        isinstance(value, str)
+        and bool(value)
         and len(value) <= 128
-        and all(
-            character.isascii() and (character.isalnum() or character in "._:-")
-            for character in value
-        )
+        and all(char.isascii() and (char.isalnum() or char in "._:-") for char in value)
     )
 
 
-def _open_private_root(raw: str) -> _Root:
-    """Open an external, owned, exact-0700 root without following links."""
+def _open_root(raw: str, *, private: bool) -> _Root:
+    """Open an owned root without following the final pathname component."""
     try:
-        path = Path(raw)
-        if not path.is_absolute() or path.is_symlink():
+        if not os.path.isabs(raw):
             _fail()
-        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        status = os.fstat(descriptor)
-        if (
-            not stat.S_ISDIR(status.st_mode)
-            or status.st_uid != os.geteuid()
-            or stat.S_IMODE(status.st_mode) != 0o700
-        ):
-            os.close(descriptor)
+        fd = os.open(raw, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        status = os.fstat(fd)
+        if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.geteuid():
+            os.close(fd)
             _fail()
-        return _Root(descriptor, status.st_dev, status.st_ino)
-    except (OSError, ValueError):
+        if private and stat.S_IMODE(status.st_mode) != 0o700:
+            os.close(fd)
+            _fail()
+        return _Root(fd, status.st_dev, status.st_ino)
+    except OSError:
         _fail()
 
 
-def _reattest_root(root: _Root) -> None:
-    """Require an open root descriptor to retain its original directory identity."""
+def _assert_root(root: _Root, *, private: bool = False) -> None:
     try:
         status = os.fstat(root.descriptor)
         if (
             not stat.S_ISDIR(status.st_mode)
             or status.st_uid != os.geteuid()
-            or stat.S_IMODE(status.st_mode) != 0o700
             or (status.st_dev, status.st_ino) != (root.device, root.inode)
+            or (private and stat.S_IMODE(status.st_mode) != 0o700)
         ):
             _fail()
     except OSError:
         _fail()
 
 
-def _read_fd(descriptor: int, name: str) -> bytes:
-    """Read one small regular no-follow child through an already-held root."""
-    try:
-        child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
-        try:  # noqa: SIM105 - the next operation needs the same held descriptor
-            status = os.fstat(child)
-            if (
-                not stat.S_ISREG(status.st_mode)
-                or status.st_nlink != 1
-                or status.st_uid != os.geteuid()
-                or status.st_size > MAX_PROVIDER_FILE_BYTES
-            ):
+def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
+    """Yield every regular rollout through no-follow directory descriptors."""
+
+    def descend(
+        directory: int, prefix: str, depth: int
+    ) -> Iterator[tuple[str, int, os.stat_result]]:
+        if depth > MAX_PROVIDER_DEPTH:
+            _fail()
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            _fail()
+        for name in names:
+            if name in {".", ".."} or "/" in name:
                 _fail()
-            chunks: list[bytes] = []
-            while True:
-                chunk = os.read(child, 65_536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                if sum(len(item) for item in chunks) > MAX_PROVIDER_FILE_BYTES:
+            try:
+                child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            except OSError:
+                _fail()
+            status = os.fstat(child)
+            relative = f"{prefix}/{name}" if prefix else name
+            if stat.S_ISDIR(status.st_mode):
+                if status.st_uid != os.geteuid() or status.st_nlink < 2:
+                    os.close(child)
                     _fail()
-            return b"".join(chunks)
+                yield from descend(child, relative, depth + 1)
+                os.close(child)
+            elif stat.S_ISREG(status.st_mode):
+                if (
+                    not name.endswith(".jsonl")
+                    or status.st_uid != os.geteuid()
+                    or status.st_nlink != 1
+                ):
+                    os.close(child)
+                    _fail()
+                yield relative, child, status
+            else:
+                os.close(child)
+                _fail()
+
+    yield from descend(os.dup(root.descriptor), "", 0)
+
+
+def _inventory(root: _Root) -> dict[str, tuple[int, int]]:
+    """Snapshot immutable provider rollout identities, not mutable file sizes."""
+    result: dict[str, tuple[int, int]] = {}
+    total = 0
+    for name, fd, status in _walk(root):
+        try:
+            if status.st_size > MAX_PROVIDER_FILE_BYTES:
+                _fail()
+            total += status.st_size
+            result[name] = (status.st_dev, status.st_ino)
+            if len(result) > MAX_PROVIDER_FILES or total > MAX_PROVIDER_TOTAL_BYTES:
+                _fail()
         finally:
-            os.close(child)
-    except OSError:
-        _fail()
-
-
-def _sha256(data: bytes) -> str:
-    """Return a hex digest without retaining source bytes in a record."""
-    return hashlib.sha256(data).hexdigest()
+            os.close(fd)
+    return result
 
 
 def _git(args: list[str]) -> str:
-    """Read one bounded Git identity result without accepting command failure."""
     try:
         result = subprocess.run(
             ["git", *args], check=False, capture_output=True, text=True, timeout=5
@@ -153,519 +185,350 @@ def _git(args: list[str]) -> str:
 
 
 def _git_identity(repository: str, branch: str, base: str, *, final: bool) -> str:
-    """Attest the local repository independently at prepare and finalize."""
     if repository != "syamaner/roastpilot-agent":
         _fail()
-    origin = _git(["remote", "get-url", "origin"])
-    if origin not in {
+    if _git(["remote", "get-url", "origin"]) not in {
         "https://github.com/syamaner/roastpilot-agent.git",
         "git@github.com:syamaner/roastpilot-agent.git",
     }:
         _fail()
-    observed_branch = _git(["branch", "--show-current"])
     head = _git(["rev-parse", "HEAD"])
-    resolved_base = _git(["rev-parse", "--verify", f"{base}^{{commit}}"])
-    dirty = _git(["status", "--porcelain"])
-    if observed_branch != branch or dirty or resolved_base != base:
+    if _git(["branch", "--show-current"]) != branch or _git(["status", "--porcelain"]):
         _fail()
-    if not final and head != base:
+    if _git(["rev-parse", "--verify", f"{base}^{{commit}}"]) != base or (
+        not final and head != base
+    ):
         _fail()
     return head
 
 
 def _registered_role(role: NativeCodexRole) -> tuple[str, str, str, str]:
-    """Hash and validate the exact committed Codex registration closure."""
+    """Parse and attest the complete registered-Codex role closure."""
     try:
-        config = Path(_CONFIG_NAME).read_bytes()
-        if b"[agents]" not in config or b"enabled = true" not in config:
+        with open(_CONFIG_NAME, "rb") as config_file:
+            config_bytes = config_file.read()
+        config = tomllib.loads(config_bytes.decode("utf-8"))
+        agents = config.get("agents")
+        if not isinstance(agents, dict) or agents.get("enabled") is not True:
             _fail()
-        expected_names = {member.value for member in NativeCodexRole}
-        found_names = {
-            line.split("]", 1)[0].removeprefix("[agents.")
-            for line in config.decode("utf-8", "strict").splitlines()
-            if line.startswith("[agents.") and line.endswith("]")
-        }
-        if found_names != expected_names:
+        expected = {member.value for member in NativeCodexRole}
+        if (
+            set(config) != {"project_doc_max_bytes", "agents"}
+            or set(agents) != {"enabled", "max_concurrent_threads_per_session", *expected}
+            or agents["max_concurrent_threads_per_session"] != 3
+        ):
             _fail()
         relpath, effort = _ROLE_EXPECTATIONS[role]
-        if f'config_file = "{relpath}"'.encode() not in config:
-            _fail()
-        role_bytes = (Path(".codex") / relpath).read_bytes()
-        text = role_bytes.decode("utf-8", "strict")
+        registration = agents.get(role.value)
         if (
-            'model = "gpt-5.6-terra"' not in text
-            or f'model_reasoning_effort = "{effort}"' not in text
-            or "[agents]\nenabled = false" not in text
+            not isinstance(registration, dict)
+            or set(registration) != {"description", "config_file"}
+            or not isinstance(registration["description"], str)
+            or registration["config_file"] != relpath
         ):
             _fail()
-        return _sha256(config), _sha256(role_bytes), effort, role.value
-    except (OSError, UnicodeDecodeError):
-        _fail()
-
-
-def _provider_root() -> Path:
-    """Return the fixed provider-owned sessions root, rejecting overrides."""
-    if "CODEX_HOME" in os.environ:
-        _fail()
-    root = Path.home() / ".codex" / "sessions"
-    try:
-        status = os.lstat(root)
+        with open(os.path.join(".codex", relpath), "rb") as role_file:
+            role_bytes = role_file.read()
+        definition = tomllib.loads(role_bytes.decode("utf-8"))
         if (
-            not stat.S_ISDIR(status.st_mode)
-            or stat.S_ISLNK(status.st_mode)
-            or status.st_uid != os.geteuid()
+            set(definition)
+            != {"model", "model_reasoning_effort", "developer_instructions", "agents"}
+            or definition.get("model") != "gpt-5.6-terra"
+            or definition.get("model_reasoning_effort") != effort
+            or definition.get("agents") != {"enabled": False}
+            or not isinstance(definition.get("developer_instructions"), str)
+            or "invoke Claude Code or any other model" not in definition["developer_instructions"]
         ):
             _fail()
-    except OSError:
+        # The committed role boundary itself proves a leaf cannot invoke Claude.
+        return (
+            hashlib.sha256(config_bytes).hexdigest(),
+            hashlib.sha256(role_bytes).hexdigest(),
+            effort,
+            role.value,
+        )
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         _fail()
-    return root
 
 
-def _provider_inventory() -> dict[str, tuple[int, int, int, int]]:
-    """Fully enumerate bounded regular provider rollouts using opaque identities only."""
-    root = _provider_root()
-    inventory: dict[str, tuple[int, int, int, int]] = {}
-    total = 0
-    try:
-        for current, directories, files in os.walk(root, topdown=True, followlinks=False):
-            relative = Path(current).relative_to(root)
-            if len(relative.parts) > MAX_PROVIDER_DEPTH:
+def _json(raw: bytes) -> dict[str, Any]:
+    def unique(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in items:
+            if key in value:
                 _fail()
-            for directory in directories:
-                status = os.lstat(Path(current) / directory)
-                if (
-                    stat.S_ISLNK(status.st_mode)
-                    or not stat.S_ISDIR(status.st_mode)
-                    or status.st_uid != os.geteuid()
-                ):
-                    _fail()
-            for filename in files:
-                candidate = Path(current) / filename
-                status = os.lstat(candidate)
-                if (
-                    candidate.suffix != ".jsonl"
-                    or stat.S_ISLNK(status.st_mode)
-                    or not stat.S_ISREG(status.st_mode)
-                    or status.st_nlink != 1
-                    or status.st_uid != os.geteuid()
-                    or status.st_size > MAX_PROVIDER_FILE_BYTES
-                ):
-                    _fail()
-                total += status.st_size
-                key = _sha256(str(relative / filename).encode("utf-8"))
-                inventory[key] = (status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns)
-                if len(inventory) > MAX_PROVIDER_FILES or total > MAX_PROVIDER_TOTAL_BYTES:
-                    _fail()
-    except OSError:
-        _fail()
-    return inventory
-
-
-def _manifest_dir(root: _Root) -> int:
-    """Open the private manifest directory, creating it once beneath the sink root."""
-    try:
-        first = os.open(
-            ".agent-usage", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root.descriptor
-        )
-    except FileNotFoundError:
-        os.mkdir(".agent-usage", 0o700, dir_fd=root.descriptor)
-        first = os.open(
-            ".agent-usage", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root.descriptor
-        )
-    try:
-        with suppress(FileExistsError):
-            os.mkdir("native-codex", 0o700, dir_fd=first)
-        second = os.open("native-codex", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=first)
-    finally:
-        os.close(first)
-    status = os.fstat(second)
-    if (
-        not stat.S_ISDIR(status.st_mode)
-        or status.st_uid != os.geteuid()
-        or stat.S_IMODE(status.st_mode) != 0o700
-    ):
-        os.close(second)
-        _fail()
-    return second
-
-
-def _write_exclusive(directory: int, name: str, payload: dict[str, object]) -> None:
-    """Write one exclusive private JSON manifest without embedding filesystem paths."""
-    try:
-        fd = os.open(
-            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory
-        )
-        try:
-            os.write(fd, json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-            os.fsync(fd)
-            os.fchmod(fd, 0o600)
-        finally:
-            os.close(fd)
-    except OSError:
-        _fail()
-
-
-def _read_manifest(directory: int, name: str) -> dict[str, object]:
-    """Load one strict metadata-only manifest while rejecting unsafe storage."""
-    try:
-        data = _read_fd(directory, name)
-        value = json.loads(data)
-        if not isinstance(value, dict) or set(value) != {
-            "base_sha",
-            "branch",
-            "config_sha256",
-            "inventory",
-            "launch_head_sha",
-            "parent_task_id",
-            "parent_thread_id",
-            "repository",
-            "role",
-            "role_sha256",
-            "slice_id",
-            "task_id",
-            "task_name",
-        }:
-            _fail()
+            value[key] = item
         return value
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        _fail()
-
-
-def prepare_native_codex(arguments: Any) -> str:
-    """Pre-bind a registered named leaf before the parent dispatches it.
-
-    Args:
-        arguments: Parsed closed CLI arguments supplied only by the parent.
-
-    Returns:
-        Opaque manifest identifier to carry across the named-role dispatch.
-    """
-    values = (arguments.task_id, arguments.slice_id, arguments.parent_task_id, arguments.task_name)
-    parent = os.environ.get("CODEX_THREAD_ID")
-    if not all(
-        isinstance(value, str) and _safe_identifier(value) for value in values
-    ) or not _safe_identifier(parent or ""):
-        _fail()
-    role = NativeCodexRole(arguments.role)
-    root = _open_private_root(arguments.usage_root)
-    try:
-        launch = _git_identity(
-            arguments.repository, arguments.branch, arguments.base_sha, final=False
-        )
-        config_hash, role_hash, _effort, _canonical = _registered_role(role)
-        inventory = _provider_inventory()
-        manifest_id = str(uuid4())
-        directory = _manifest_dir(root)
-        try:
-            _write_exclusive(
-                directory,
-                f"{manifest_id}.json",
-                {
-                    "task_id": arguments.task_id,
-                    "slice_id": arguments.slice_id,
-                    "parent_task_id": arguments.parent_task_id,
-                    "task_name": arguments.task_name,
-                    "parent_thread_id": parent,
-                    "role": role.value,
-                    "repository": arguments.repository,
-                    "branch": arguments.branch,
-                    "base_sha": arguments.base_sha,
-                    "launch_head_sha": launch,
-                    "config_sha256": config_hash,
-                    "role_sha256": role_hash,
-                    "inventory": {key: list(value) for key, value in inventory.items()},
-                },
-            )
-        finally:
-            os.close(directory)
-        return manifest_id
-    finally:
-        os.close(root.descriptor)
-
-
-def _json_line(raw: bytes) -> dict[str, Any]:
-    """Decode one provider event while rejecting duplicate keys and non-object roots."""
-
-    def no_duplicates(items: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, value in items:
-            if key in result:
-                _fail()
-            result[key] = value
-        return result
 
     try:
-        value = json.loads(raw, object_pairs_hook=no_duplicates)
+        value = json.loads(raw, object_pairs_hook=unique)
         if not isinstance(value, dict):
             _fail()
         return value
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError):
         _fail()
 
 
-def _string(mapping: dict[str, Any], key: str) -> str:
-    """Read one bounded identifier-like provider string without echoing it."""
-    value = mapping.get(key)
-    if not isinstance(value, str) or len(value) > 128:
+def _string(value: Any) -> str:
+    if not _safe_identifier(value):
         _fail()
     return value
 
 
-def _tokens(value: Any) -> tuple[int, int, int, int, int, int]:
-    """Validate the one exact cumulative usage grammar."""
-    if not isinstance(value, dict) or set(value) != {
-        "input_tokens",
-        "cached_input_tokens",
-        "cache_write_input_tokens",
-        "output_tokens",
-        "reasoning_output_tokens",
-        "total_tokens",
-    }:
+def _agent_path(value: Any) -> str:
+    """Validate the canonical, parent-derived native agent path."""
+    if not isinstance(value, str) or len(value) > 256 or not value.startswith("/root/"):
         _fail()
-    result: list[int] = []
-    for key in (
+    if not _safe_identifier(value.removeprefix("/root/")):
+        _fail()
+    return value
+
+
+def _totals(value: Any) -> tuple[int, int, int, int, int, int]:
+    keys = (
         "input_tokens",
         "cached_input_tokens",
         "cache_write_input_tokens",
         "output_tokens",
         "reasoning_output_tokens",
         "total_tokens",
-    ):
-        item = value[key]
-        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
-            _fail()
-        result.append(item)
-    return tuple(result)  # type: ignore[return-value]
+    )
+    if not isinstance(value, dict) or set(value) != set(keys):
+        _fail()
+    result = tuple(value[key] for key in keys)
+    if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in result):
+        _fail()
+    return result  # type: ignore[return-value]
 
 
 def _parse_rollout(
-    path: Path, manifest: dict[str, object]
-) -> tuple[str, tuple[int, int, int, int, int, int], bool]:
-    """Validate one newly-created leaf rollout and return normalized terminal facts."""
-    try:
-        status = os.lstat(path)
-        if (
-            stat.S_ISLNK(status.st_mode)
-            or not stat.S_ISREG(status.st_mode)
-            or status.st_nlink != 1
-            or status.st_uid != os.geteuid()
-            or status.st_size > MAX_PROVIDER_FILE_BYTES
-        ):
-            _fail()
-        seen_meta = seen_context = False
-        session_id: str | None = None
-        totals: tuple[int, int, int, int, int, int] | None = None
-        child_seen = False
-        with path.open("rb") as stream:
-            for number, raw in enumerate(stream, start=1):
-                if number > MAX_PROVIDER_LINES or len(raw) > 65_536 or not raw.endswith(b"\n"):
-                    _fail()
-                event = _json_line(raw)
-                if (
-                    set(event) != {"type", "payload"}
-                    or not isinstance(event["type"], str)
-                    or not isinstance(event["payload"], dict)
-                ):
-                    _fail()
-                kind, payload = event["type"], event["payload"]
-                if kind == "session_meta":
-                    if seen_meta or seen_context or totals is not None:
-                        _fail()
-                    source = payload.get("source")
-                    git = payload.get("git")
-                    if (
-                        not isinstance(source, dict)
-                        or not isinstance(git, dict)
-                        or set(source) != {"subagent"}
-                    ):
-                        _fail()
-                    subagent = source["subagent"]
-                    if not isinstance(subagent, dict) or set(subagent) != {"thread_spawn"}:
-                        _fail()
-                    spawn = subagent["thread_spawn"]
-                    if not isinstance(spawn, dict) or set(spawn) != {
-                        "parent_thread_id",
-                        "depth",
-                        "agent_path",
-                        "agent_nickname",
-                        "agent_role",
-                    }:
-                        _fail()
-                    if (
-                        _string(spawn, "parent_thread_id") != manifest["parent_thread_id"]
-                        or spawn.get("depth") != 1
-                        or _string(spawn, "agent_path") != manifest["role"]
-                        or _string(spawn, "agent_nickname") != manifest["role"]
-                        or _string(spawn, "agent_role") != manifest["role"]
-                    ):
-                        _fail()
-                    if (
-                        _string(payload, "id") == ""
-                        or _string(payload, "originator") != "codex-tui"
-                        or _string(payload, "cli_version") != "0.147.0"
-                        or _string(git, "commit_hash") != manifest["launch_head_sha"]
-                        or _string(git, "branch") != manifest["branch"]
-                    ):
-                        _fail()
-                    session_id = _string(payload, "id")
-                    seen_meta = True
-                elif kind == "turn_context":
-                    if (
-                        not seen_meta
-                        or seen_context
-                        or totals is not None
-                        or not isinstance(payload, dict)
-                    ):
-                        _fail()
-                    effort = "high" if manifest["role"] != "repair" else "medium"
-                    if (
-                        set(payload) != {"model", "effort"}
-                        or _string(payload, "model") != "gpt-5.6-terra"
-                        or _string(payload, "effort") != effort
-                    ):
-                        _fail()
-                    seen_context = True
-                elif kind == "event_msg":
-                    if (
-                        not seen_context
-                        or not isinstance(payload, dict)
-                        or set(payload) != {"type", "info"}
-                        or payload.get("type") != "token_count"
-                        or not isinstance(payload.get("info"), dict)
-                        or set(payload["info"]) != {"total_token_usage"}
-                    ):
-                        _fail()
-                    current = _tokens(payload["info"]["total_token_usage"])
-                    if totals is not None and any(
-                        later < earlier for earlier, later in zip(totals, current, strict=True)
-                    ):
-                        _fail()
-                    totals = current
-                else:
-                    _fail()
-        if not seen_meta or not seen_context or session_id is None or totals is None:
-            _fail()
-        return session_id, totals, child_seen
-    except OSError:
-        _fail()
-
-
-def _new_rollout(manifest: dict[str, object]) -> Path:
-    """Require exactly one provider rollout not present in the pre-dispatch inventory."""
-    before = manifest["inventory"]
-    if not isinstance(before, dict):
-        _fail()
-    root = _provider_root()
-    candidates: list[Path] = []
-    for current, _directories, files in os.walk(root, topdown=True, followlinks=False):
-        for filename in files:
-            candidate = Path(current) / filename
-            if candidate.suffix != ".jsonl":
-                continue
-            status = os.lstat(candidate)
-            key = _sha256(str(candidate.relative_to(root)).encode("utf-8"))
-            identity = [status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns]
-            if before.get(key) != identity:
-                candidates.append(candidate)
-    if len(candidates) != 1:
-        _fail()
-    return candidates[0]
-
-
-def _no_child_rollout(leaf_session_id: str) -> bool:
-    """Return true only after a bounded complete scan proves no rollout is its child."""
-    root = _provider_root()
-    count = 0
-    for current, _directories, files in os.walk(root, topdown=True, followlinks=False):
-        for filename in files:
-            if not filename.endswith(".jsonl"):
-                continue
-            count += 1
-            if count > MAX_PROVIDER_FILES:
+    fd: int, binding: dict[str, str]
+) -> tuple[str, tuple[int, int, int, int, int, int], str, bool]:
+    """Stream and validate the admitted 0.147.0 metadata grammar only."""
+    seen_meta = seen_context = seen_complete = False
+    session = ""
+    parent_thread = ""
+    matches = False
+    totals: tuple[int, int, int, int, int, int] | None = None
+    with os.fdopen(os.dup(fd), "rb") as stream:
+        for number, raw in enumerate(stream, 1):
+            if number > MAX_PROVIDER_LINES or len(raw) > MAX_EVENT_BYTES or not raw.endswith(b"\n"):
                 _fail()
-            path = Path(current) / filename
-            try:
-                data = path.read_bytes()
-                if len(data) > MAX_PROVIDER_FILE_BYTES:
-                    _fail()
-            except OSError:
-                _fail()
-            for raw in data.splitlines():
-                event = _json_line(raw)
-                if event.get("type") == "session_meta" and isinstance(event.get("payload"), dict):
-                    source = event["payload"].get("source")
-                    if (
-                        isinstance(source, dict)
-                        and isinstance(source.get("subagent"), dict)
-                        and isinstance(source["subagent"].get("thread_spawn"), dict)
-                        and source["subagent"]["thread_spawn"].get("parent_thread_id")
-                        == leaf_session_id
-                    ):
-                        return False
-    return True
-
-
-def finalize_native_codex(arguments: Any) -> tuple[NativeCodexUsageRecord, _Root, int, str]:
-    """Finalize exactly one prepared binding after a named registered leaf exits.
-
-    The caller must append the returned record through its existing protected
-    sink and then call :func:`complete_native_codex`; a failure leaves the
-    manifest in a non-replayable ``.finalizing`` state.
-    """
-    if not _safe_identifier(arguments.manifest_id) or arguments.manifest_id.count("-") != 4:
-        _fail()
-    root = _open_private_root(arguments.usage_root)
-    directory = _manifest_dir(root)
-    name = f"{arguments.manifest_id}.json"
-    pending = f"{arguments.manifest_id}.finalizing"
-    try:
-        os.rename(name, pending, src_dir_fd=directory, dst_dir_fd=directory)
-        manifest = _read_manifest(directory, pending)
-        role = NativeCodexRole(str(manifest["role"]))
-        config_hash, role_hash, effort, _canonical = _registered_role(role)
-        if config_hash != manifest["config_sha256"] or role_hash != manifest["role_sha256"]:
-            _fail()
-        rollout = _new_rollout(manifest)
-        session, totals, _child = _parse_rollout(rollout, manifest)
-        final_head = _git_identity(
-            str(manifest["repository"]),
-            str(manifest["branch"]),
-            str(manifest["base_sha"]),
-            final=True,
-        )
-        status = NativeCodexTaskStatus(arguments.task_status)
-        success = status is NativeCodexTaskStatus.SUCCESS and arguments.exit_code == 0
-        if status is NativeCodexTaskStatus.SUCCESS and not success:
-            _fail()
-        if success:
+            event = _json(raw)
             if (
-                final_head == manifest["base_sha"]
-                or _git(["merge-base", "--is-ancestor", str(manifest["base_sha"]), final_head])
-                != ""
+                set(event) != {"type", "payload"}
+                or event["type"] not in _ROOT_TYPES
+                or not isinstance(event["payload"], dict)
             ):
                 _fail()
-        elif final_head != manifest["base_sha"]:
+            kind, payload = event["type"], event["payload"]
+            if kind == "session_meta":
+                if seen_meta or seen_context:
+                    _fail()
+                source, git = payload.get("source"), payload.get("git")
+                if (
+                    not isinstance(source, dict)
+                    or not isinstance(git, dict)
+                    or set(source) != {"subagent"}
+                    or set(source["subagent"]) != {"thread_spawn"}
+                ):
+                    _fail()
+                spawn = source["subagent"]["thread_spawn"]
+                if not isinstance(spawn, dict) or set(spawn) != {
+                    "parent_thread_id",
+                    "depth",
+                    "agent_path",
+                    "agent_nickname",
+                    "agent_role",
+                }:
+                    _fail()
+                parent_thread = _string(spawn["parent_thread_id"])
+                agent_path = _agent_path(spawn["agent_path"])
+                agent_role = _string(spawn["agent_role"])
+                if not _safe_identifier(spawn["agent_nickname"]):
+                    _fail()
+                matches = (
+                    parent_thread == binding["parent_thread_id"]
+                    and spawn["depth"] == 1
+                    and agent_path == binding["agent_path"]
+                    and agent_role == binding["role"]
+                )
+                if (
+                    _string(payload.get("id")) == ""
+                    or payload.get("originator") != "codex-tui"
+                    or payload.get("cli_version") != "0.147.0"
+                ):
+                    _fail()
+                session = _string(payload["id"])
+                seen_meta = True
+            elif kind == "turn_context":
+                if (
+                    not seen_meta
+                    or seen_context
+                    or payload.get("model") != "gpt-5.6-terra"
+                    or payload.get("effort") != binding["effort"]
+                    or len(payload) != 19
+                ):
+                    _fail()
+                seen_context = True
+            elif kind == "event_msg":
+                if (
+                    not seen_context
+                    or set(payload) != {"type", "info"}
+                    or payload["type"] not in _EVENT_TYPES
+                ):
+                    _fail()
+                if payload["type"] == "token_count":
+                    info = payload["info"]
+                    if not isinstance(info, dict) or set(info) != {
+                        "last_token_usage",
+                        "model_context_window",
+                        "total_token_usage",
+                    }:
+                        _fail()
+                    current = _totals(info["total_token_usage"])
+                    if totals and any(new < old for old, new in zip(totals, current, strict=True)):
+                        _fail()
+                    totals = current
+                elif payload["type"] == "task_complete":
+                    seen_complete = True
+            elif kind == "response_item":
+                subtype = payload.get("type")
+                if subtype not in _RESPONSE_TYPES:
+                    _fail()
+            elif kind in {"inter_agent_communication_metadata", "world_state"}:
+                if not payload:
+                    _fail()
+    if not seen_meta or not seen_context or not seen_complete or totals is None:
+        _fail()
+    return session, totals, parent_thread, matches
+
+
+def _new_rollouts(
+    root: _Root, before: dict[str, tuple[int, int]]
+) -> list[tuple[str, int, os.stat_result]]:
+    result: list[tuple[str, int, os.stat_result]] = []
+    total = 0
+    for name, fd, status in _walk(root):
+        if status.st_size > MAX_PROVIDER_FILE_BYTES:
+            os.close(fd)
             _fail()
-        whole = _no_child_rollout(session)
+        total += status.st_size
+        if total > MAX_PROVIDER_TOTAL_BYTES:
+            os.close(fd)
+            _fail()
+        if before.get(name) != (status.st_dev, status.st_ino):
+            result.append((name, fd, status))
+        else:
+            os.close(fd)
+    if len(result) > MAX_PROVIDER_FILES:
+        _fail()
+    return result
+
+
+def _descendant(base: str, head: str) -> bool:
+    return (
+        base != head
+        and subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base, head], check=False
+        ).returncode
+        == 0
+    )
+
+
+def supervise_native_codex(arguments: Any) -> int:
+    """Run one parent-owned READY/status/result protocol without launching a child."""
+    if "CODEX_HOME" in os.environ:
+        _fail()
+    values = (arguments.task_id, arguments.slice_id, arguments.parent_task_id, arguments.task_name)
+    parent = os.environ.get("CODEX_THREAD_ID")
+    if not all(_safe_identifier(value) for value in values) or not _safe_identifier(parent):
+        _fail()
+    role = NativeCodexRole(arguments.role)
+    usage = _open_root(arguments.usage_root, private=True)
+    provider = _open_root(os.path.expanduser("~/.codex/sessions"), private=False)
+    started = datetime.now(UTC)
+    try:
+        if os.path.commonpath(
+            [os.path.realpath(arguments.usage_root), os.path.realpath(os.getcwd())]
+        ) in {os.path.realpath(arguments.usage_root), os.path.realpath(os.getcwd())}:
+            _fail()
+        launch = _git_identity(
+            arguments.repository, arguments.branch, arguments.base_sha, final=False
+        )
+        config_sha, role_sha, effort, canonical = _registered_role(role)
+        before = _inventory(provider)
+        binding = {
+            "parent_thread_id": parent,
+            "role": canonical,
+            "agent_path": f"/root/{arguments.task_name}",
+            "effort": effort,
+        }
+        ready = {"type": "READY", "binding_id": str(uuid4())}
+        sys.stdout.write(json.dumps(ready, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        line = sys.stdin.buffer.readline(MAX_EVENT_BYTES)
+        if not line or not line.endswith(b"\n") or sys.stdin.buffer.readline(1):
+            _fail()
+        terminal = _json(line)
+        if (
+            set(terminal) != {"type", "binding_id", "task_status"}
+            or terminal["type"] != "TERMINAL"
+            or terminal["binding_id"] != ready["binding_id"]
+        ):
+            _fail()
+        status = NativeCodexTaskStatus(terminal["task_status"])
+        _assert_root(provider)
+        candidates = _new_rollouts(provider, before)
+        matched: list[tuple[int, str, tuple[int, int, int, int, int, int]]] = []
+        child_parents: list[str] = []
+        for _name, fd, _stat in candidates:
+            try:
+                session, totals, spawned_from, matches = _parse_rollout(fd, binding)
+                child_parents.append(spawned_from)
+                if matches:
+                    matched.append((fd, session, totals))
+                else:
+                    os.close(fd)
+            except NativeCodexCaptureError:
+                os.close(fd)
+                raise
+        if len(matched) != 1:
+            _fail()
+        selected_fd, leaf, totals = matched[0]
+        os.close(selected_fd)
+        # Every new rollout was fully parsed; a spawned child is therefore visible.
+        whole = leaf not in child_parents
+        final = _git_identity(
+            arguments.repository, arguments.branch, arguments.base_sha, final=True
+        )
+        success = status is NativeCodexTaskStatus.SUCCESS
+        if (success and not _descendant(arguments.base_sha, final)) or (
+            not success and final != arguments.base_sha
+        ):
+            _fail()
+        completed = datetime.now(UTC)
         record = NativeCodexUsageRecord(
-            captured_at=datetime.now(UTC),
-            task_id=str(manifest["task_id"]),
-            slice_id=str(manifest["slice_id"]),
-            parent_task_id=str(manifest["parent_task_id"]),
-            task_name=str(manifest["task_name"]),
+            captured_at=completed,
+            task_id=arguments.task_id,
+            slice_id=arguments.slice_id,
+            parent_task_id=arguments.parent_task_id,
+            task_name=arguments.task_name,
             native_role=role,
-            model="gpt-5.6-terra",
             effort=effort,
-            repository=str(manifest["repository"]),
-            branch=str(manifest["branch"]),
-            base_sha=str(manifest["base_sha"]),
-            launch_head_sha=str(manifest["launch_head_sha"]),
-            final_head_sha=final_head,
-            parent_thread_id=str(manifest["parent_thread_id"]),
-            leaf_session_id=session,
-            exit_code=arguments.exit_code,
+            repository=arguments.repository,
+            branch=arguments.branch,
+            base_sha=arguments.base_sha,
+            launch_head_sha=launch,
+            final_head_sha=final,
+            parent_thread_id=parent,
+            leaf_session_id=leaf,
+            exit_code=None,
             task_status=status,
             success=success,
+            started_at=started,
+            completed_at=completed,
+            elapsed_ms=max(0, int((completed - started).total_seconds() * 1000)),
             input_tokens=totals[0],
             cached_input_tokens=totals[1],
             cache_write_input_tokens=totals[2],
@@ -674,26 +537,18 @@ def finalize_native_codex(arguments: Any) -> tuple[NativeCodexUsageRecord, _Root
             total_tokens=totals[5],
             whole_tree_verified=whole,
         )
-        _reattest_root(root)
-        return record, root, directory, pending
-    except Exception:
-        os.close(directory)
-        os.close(root.descriptor)
-        raise
+        from capture_usage_cli import append_record  # local avoids import cycle
 
-
-def complete_native_codex(root: _Root, directory: int, pending: str) -> None:
-    """Mark an appended native record final, permanently rejecting replay."""
-    try:
-        _reattest_root(root)
-        os.rename(
-            pending,
-            pending.removesuffix(".finalizing") + ".finalized",
-            src_dir_fd=directory,
-            dst_dir_fd=directory,
+        append_record(arguments.output, record, root_descriptor=usage.descriptor)
+        sys.stdout.write(
+            json.dumps(
+                {"type": "RESULT", "binding_id": ready["binding_id"], "success": success},
+                separators=(",", ":"),
+            )
+            + "\n"
         )
-    except OSError:
-        _fail()
+        sys.stdout.flush()
+        return 0
     finally:
-        os.close(directory)
-        os.close(root.descriptor)
+        os.close(provider.descriptor)
+        os.close(usage.descriptor)

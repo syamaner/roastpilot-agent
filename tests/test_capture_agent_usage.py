@@ -116,9 +116,12 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
         "final_head_sha": "b" * 40,
         "parent_thread_id": "thread-811",
         "leaf_session_id": "leaf-811",
-        "exit_code": 0,
+        "exit_code": None,
         "task_status": NativeCodexTaskStatus.SUCCESS,
         "success": True,
+        "started_at": datetime.now(UTC),
+        "completed_at": datetime.now(UTC),
+        "elapsed_ms": 0,
         "input_tokens": 1,
         "cached_input_tokens": 2,
         "cache_write_input_tokens": 3,
@@ -154,11 +157,11 @@ def test_native_codex_registration_closure_matches_committed_project_files() -> 
 
 def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -> None:
     """The native rollout parser keeps the final cumulative total instead of summing events."""
-    manifest: dict[str, object] = {
+    manifest: dict[str, str] = {
         "parent_thread_id": "parent-811",
         "role": "engineer-be",
-        "launch_head_sha": "a" * 40,
-        "branch": "feature/811-native-codex-capture",
+        "agent_path": "/root/native-codex-capture",
+        "effort": "high",
     }
     meta = {
         "type": "session_meta",
@@ -171,16 +174,23 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -
                     "thread_spawn": {
                         "parent_thread_id": "parent-811",
                         "depth": 1,
-                        "agent_path": "engineer-be",
-                        "agent_nickname": "engineer-be",
+                        "agent_path": "/root/native-codex-capture",
+                        "agent_nickname": "worker-811",
                         "agent_role": "engineer-be",
                     }
                 }
             },
-            "git": {"commit_hash": "a" * 40, "branch": "feature/811-native-codex-capture"},
+            "git": {"commit_hash": "a" * 40, "branch": "main"},
         },
     }
-    context = {"type": "turn_context", "payload": {"model": "gpt-5.6-terra", "effort": "high"}}
+    context = {
+        "type": "turn_context",
+        "payload": {
+            "model": "gpt-5.6-terra",
+            "effort": "high",
+            **{f"key{index}": index for index in range(17)},
+        },
+    }
 
     def event(total: int) -> dict[str, object]:
         return {
@@ -188,6 +198,15 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -
             "payload": {
                 "type": "token_count",
                 "info": {
+                    "last_token_usage": {
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                    "model_context_window": 1,
                     "total_token_usage": {
                         "input_tokens": total,
                         "cached_input_tokens": 2,
@@ -195,19 +214,30 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -
                         "output_tokens": 4,
                         "reasoning_output_tokens": 5,
                         "total_tokens": total + 14,
-                    }
+                    },
                 },
             },
         }
 
+    events = cast(
+        list[dict[str, object]],
+        [
+            meta,
+            context,
+            {"type": "event_msg", "payload": {"type": "task_started", "info": {}}},
+            event(1),
+            event(9),
+            {"type": "event_msg", "payload": {"type": "task_complete", "info": {}}},
+        ],
+    )
     rollout = tmp_path / "leaf.jsonl"
-    rollout.write_text(
-        "".join(json.dumps(item) + "\n" for item in (meta, context, event(1), event(9)))
-    )
-    session, totals, _child = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
-        rollout, manifest
-    )
+    rollout.write_text("".join(json.dumps(item) + "\n" for item in events))
+    with rollout.open("rb") as stream:
+        session, totals, _parent, matches = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
+            stream.fileno(), manifest
+        )
     assert session == "leaf-811"
+    assert matches is True
     assert totals == (9, 2, 3, 4, 5, 23)
 
 

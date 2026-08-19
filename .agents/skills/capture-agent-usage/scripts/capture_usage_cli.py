@@ -73,7 +73,6 @@ from capture_usage_models import (
     HarnessFamily,
     NativeClaudeRole,
     NativeCodexRole,
-    NativeCodexTaskStatus,
     NativeWorkerUsageRecord,
     OutcomeRecord,
     ParsedUsage,
@@ -86,9 +85,7 @@ from capture_usage_models import (
 )
 from capture_usage_native_codex import (
     NativeCodexCaptureError,
-    complete_native_codex,
-    finalize_native_codex,
-    prepare_native_codex,
+    supervise_native_codex,
 )
 from capture_usage_transcript import (
     HANDBACK_SCHEMA_VERSION,
@@ -2336,24 +2333,9 @@ def _add_output_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", type=_sink_path, default=DEFAULT_SINK)
 
 
-def prepare_native_codex_command(arguments: argparse.Namespace) -> int:
-    """Create one pre-dispatch binding for a registered native Codex leaf."""
-    manifest_id = prepare_native_codex(arguments)
-    print(manifest_id)
-    return 0
-
-
-def finalize_native_codex_command(arguments: argparse.Namespace) -> int:
-    """Append one finalized native Codex record from its pre-dispatch binding."""
-    record, root, directory, pending = finalize_native_codex(arguments)
-    try:
-        append_record(arguments.output, record, root_descriptor=root.descriptor)
-    except Exception:
-        os.close(directory)
-        os.close(root.descriptor)
-        raise
-    complete_native_codex(root, directory, pending)
-    return 0
+def supervise_native_codex_command(arguments: argparse.Namespace) -> int:
+    """Hold native-Codex bindings while the parent dispatches its named leaf."""
+    return supervise_native_codex(arguments)
 
 
 EnumMember = TypeVar("EnumMember")
@@ -2429,36 +2411,22 @@ def build_parser() -> argparse.ArgumentParser:
     _add_output_option(native)
     native.set_defaults(handler=run_native_claude_command)
 
-    native_codex_prepare = commands.add_parser(
-        "prepare-native-codex", help="pre-bind one registered Codex leaf before dispatch"
+    native_codex = commands.add_parser(
+        "supervise-native-codex", help="supervise one registered Codex leaf lifecycle"
     )
-    native_codex_prepare.add_argument(
+    native_codex.add_argument(
         "--role", choices=tuple(role.value for role in NativeCodexRole), required=True
     )
-    native_codex_prepare.add_argument("--task-id", required=True)
-    native_codex_prepare.add_argument("--slice-id", required=True)
-    native_codex_prepare.add_argument("--parent-task-id", required=True)
-    native_codex_prepare.add_argument("--task-name", required=True)
-    native_codex_prepare.add_argument("--repository", required=True)
-    native_codex_prepare.add_argument("--branch", required=True)
-    native_codex_prepare.add_argument("--base-sha", required=True)
-    native_codex_prepare.add_argument("--usage-root", required=True)
-    _add_output_option(native_codex_prepare)
-    native_codex_prepare.set_defaults(handler=prepare_native_codex_command)
-
-    native_codex_finalize = commands.add_parser(
-        "finalize-native-codex", help="finalize one registered Codex leaf binding"
-    )
-    native_codex_finalize.add_argument("--manifest-id", required=True)
-    native_codex_finalize.add_argument("--usage-root", required=True)
-    native_codex_finalize.add_argument("--exit-code", type=int, required=True)
-    native_codex_finalize.add_argument(
-        "--task-status",
-        choices=tuple(status.value for status in NativeCodexTaskStatus),
-        required=True,
-    )
-    _add_output_option(native_codex_finalize)
-    native_codex_finalize.set_defaults(handler=finalize_native_codex_command)
+    native_codex.add_argument("--task-id", required=True)
+    native_codex.add_argument("--slice-id", required=True)
+    native_codex.add_argument("--parent-task-id", required=True)
+    native_codex.add_argument("--task-name", required=True)
+    native_codex.add_argument("--repository", required=True)
+    native_codex.add_argument("--branch", required=True)
+    native_codex.add_argument("--base-sha", required=True)
+    native_codex.add_argument("--usage-root", required=True)
+    _add_output_option(native_codex)
+    native_codex.set_defaults(handler=supervise_native_codex_command)
 
     print_validation = commands.add_parser(
         "print-validation-commands",
