@@ -86,7 +86,10 @@ a validation role executes only the `RUN ` lines, byte-exactly.
 `safety-reviewer` and `security-reviewer` are deliberately evidence-only under
 native capture. They have `Read`/`Grep`/`Glob`, no Bash, no validation root,
 and no `--allowedTools`. The parent-authored brief must name the exact
-worktree/head and supply the exact-head diff scope plus exit-status-backed
-deterministic gate evidence; either role fails closed when that evidence is
+worktree/head and supply exit-status-backed exact-head/byte-clean attestation,
+the exact-head diff scope, deterministic gate evidence, and every named skip
+with its reason. A safety diff affecting transitions, verdict handling, or a
+command path also requires a parent-owned negative-control mutation that makes
+the relevant test fail. Either role fails closed when required evidence is
 missing. This keeps mandatory assurance available without widening native
 shell, network, or credential authority.

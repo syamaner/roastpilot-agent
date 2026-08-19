@@ -7265,10 +7265,19 @@ def test_native_safety_and_security_reviewers_are_evidence_only() -> None:
     agents = Path(__file__).resolve().parents[1] / ".claude" / "agents"
     for name in ("safety-reviewer", "security-reviewer"):
         text = (agents / f"{name}.md").read_text()
+        normalized = " ".join(text.split())
+        pin = usage_cli._native_role_pin(  # pyright: ignore[reportPrivateUsage]
+            NativeClaudeRole(name)
+        )
+        assert pin.tools == ("Read", "Grep", "Glob")
         assert "tools: Read, Grep, Glob\n" in text
         assert "tools: Read, Grep, Glob, Bash" not in text
         assert "Parent-supplied review evidence" in text
-        assert "Do not run shell commands" in text
+        assert "Do not run shell commands" in normalized
+        assert "Fail closed" in normalized
+        assert "exact-head and byte-clean worktree attestation" in text
+        assert "name every skip" in text
+    assert "negative control" in (agents / "safety-reviewer.md").read_text()
     assert (
         "python -m pytest tests/test_controller.py tests/test_safety.py -q"
         not in (agents / "safety-reviewer.md").read_text()
@@ -7897,6 +7906,47 @@ def test_evidence_bundle_binds_add_dir_and_no_allowed_tools(
     assert argv[argv.index("--add-dir") + 1] == bound.path
     assert argv[argv.index("--add-dir") + 2] == "--permission-mode"
     assert "--allowedTools" not in argv
+
+
+def test_evidence_bundle_pr_json_allows_additional_untrusted_metadata(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Identity is mandatory while useful PR metadata remains available to triage."""
+    payload = json.dumps(
+        {
+            "number": 837,
+            "headRefOid": _EVIDENCE_HEAD,
+            "baseRefOid": _EVIDENCE_BASE,
+            "title": "untrusted PR title",
+            "body": "untrusted PR body",
+        }
+    ).encode()
+    root = _build_evidence_bundle(
+        tmp_path_factory.mktemp("evidence-pr-metadata") / "root",
+        payload_overrides={"pr.json": payload},
+    )
+    bound = usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+        str(root), 837, attested_head=_EVIDENCE_HEAD
+    )
+    assert bound.kind is BoundRootKind.EVIDENCE
+
+
+def test_evidence_bundle_rejects_boolean_pr_number(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """JSON ``true`` never aliases integer PR number 1."""
+    payload = json.dumps(
+        {"number": True, "headRefOid": _EVIDENCE_HEAD, "baseRefOid": _EVIDENCE_BASE}
+    ).encode()
+    root = _build_evidence_bundle(
+        tmp_path_factory.mktemp("evidence-pr-bool") / "root",
+        pr=1,
+        payload_overrides={"pr.json": payload},
+    )
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 1, attested_head=_EVIDENCE_HEAD
+        )
 
 
 @pytest.mark.parametrize(

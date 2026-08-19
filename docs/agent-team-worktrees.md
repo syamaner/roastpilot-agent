@@ -382,10 +382,14 @@ Native `safety-reviewer` and `security-reviewer` runs are also deliberately
 evidence-only, but require no extra root: both inspect the already-attested
 implementation worktree with `Read`/`Grep`/`Glob` and have no Bash or
 `--allowedTools`. Their parent-authored briefs must name the exact worktree and
-head, summarize the exact-head diff scope/touched files, and include
-exit-status-backed deterministic gate evidence. Missing evidence is a
-fail-closed reviewer handback, never permission to compose or retry a shell
-command. This is the operator-approved no-new-permission Option A boundary.
+head, include exit-status-backed exact-head/byte-clean attestation, summarize
+the exact-head diff scope/touched files, and include deterministic gate
+evidence with every skip named and justified. A safety diff affecting
+transitions, verdict handling, or a command path also requires a parent-owned
+negative-control mutation that makes the relevant test fail. Missing evidence
+is a fail-closed reviewer handback, never permission to compose or retry a
+shell command. This is the operator-approved no-new-permission Option A
+boundary.
 
 **Plan-root recipe (executed by the parent, never by the worker):**
 
@@ -426,6 +430,10 @@ chmod 400 <root>/*.json <root>/diff.patch
 chmod 400 <root>/manifest.json
 chmod 700 <root>
 ```
+
+The `number`, `headRefOid`, and `baseRefOid` members are mandatory and are
+semantically checked against the manifest; additional `pr.json` metadata is
+retained as untrusted review context for `pr-triage`.
 
 The bundle is flat: exactly the nine names above, no subdirectories, each a
 regular file owned by the parent's euid with `st_nlink == 1` and mode exactly
@@ -468,6 +476,11 @@ the author). Two binding rules fell out:
    working tree.
    Mutation tests are encouraged — they caught real test gaps all night — but
    the revert mechanism must be file-scoped, never git-scoped.
+
+Under native evidence-only review, the parent owns every mutation and supplies
+the exit-backed negative-control result in the brief. The reviewer never uses
+`cp` or composes a shell command; the protocol above applies only where the
+invoked role actually has the necessary command authority.
 
 ---
 

@@ -15,10 +15,14 @@ proven safe.
 
 The lead brief must name the exact worktree and commit under review, summarize
 the exact-head diff scope, and provide exit-status-backed evidence for the
-deterministic safety/controller test gate. Fail closed and ask the lead for any
-missing datum. Do not run shell commands: this native role deliberately has
-only `Read`, `Grep`, and `Glob`. Use those tools to inspect the named current
-files and tests; deterministic command execution remains parent-owned.
+exact-head and byte-clean worktree attestation plus the deterministic
+safety/controller test gate. The gate evidence must name every skip and its
+reason. When a diff touches a transition table, verdict handling, or a command
+path, also require one parent-run negative control whose deliberate mutation
+makes the relevant test fail. Fail closed and ask the lead for any missing
+datum. Do not run shell commands: this native role deliberately has only
+`Read`, `Grep`, and `Glob`. Use those tools to inspect the named current files
+and tests; deterministic command execution and mutation remain parent-owned.
 
 Check every one of these, with file/line evidence:
 

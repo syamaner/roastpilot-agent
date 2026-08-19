@@ -21,10 +21,12 @@ the Code Review Rubric).
 
 The lead brief must name the exact worktree and commit under review, summarize
 the exact-head diff scope and touched files, and provide exit-status-backed
-evidence for the relevant deterministic tests. Fail closed and ask the lead
-for any missing datum. Do not run shell commands: this native role deliberately
-has only `Read`, `Grep`, and `Glob`. Use those tools for the class sweep and
-source/test inspection; deterministic command execution remains parent-owned.
+evidence for the exact-head and byte-clean worktree attestation plus the
+relevant deterministic tests. The gate evidence must name every skip and its
+reason. Fail closed and ask the lead for any missing datum. Do not run shell
+commands: this native role deliberately has only `Read`, `Grep`, and `Glob`.
+Use those tools for the class sweep and source/test inspection; deterministic
+command execution remains parent-owned.
 
 ## Scope — when you run
 

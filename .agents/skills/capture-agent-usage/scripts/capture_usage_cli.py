@@ -526,6 +526,7 @@ class _NativeRolePin:
 
     model: str
     effort: str
+    tools: tuple[str, ...]
     capability: RoleCapability
 
 
@@ -575,7 +576,7 @@ def _native_role_pin(role: NativeClaudeRole) -> _NativeRolePin:
         permission_mode_lines and permission_mode_lines[0] != NATIVE_PERMISSION_MODES[capability]
     ):
         raise CaptureUsageError("native agent frontmatter is invalid")
-    return _NativeRolePin(values["model"][0], values["effort"][0], capability)
+    return _NativeRolePin(values["model"][0], values["effort"][0], tools, capability)
 
 
 def _validate_native_worktree(
@@ -1041,10 +1042,12 @@ def _validate_evidence_pr_identity(
         data = json.loads(payload, object_pairs_hook=_reject_duplicate_manifest_keys)
     except json.JSONDecodeError:
         raise CaptureUsageError("evidence bundle is invalid") from None
+    if not isinstance(data, dict):
+        raise CaptureUsageError("evidence bundle is invalid")
+    number = data.get("number")
     if (
-        not isinstance(data, dict)
-        or set(data) != {"number", "headRefOid", "baseRefOid"}
-        or data.get("number") != pr
+        isinstance(number, bool)
+        or number != pr
         or data.get("headRefOid") != head_sha
         or not isinstance(base_sha, str)
         or data.get("baseRefOid") != base_sha
