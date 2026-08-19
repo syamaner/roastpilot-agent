@@ -270,7 +270,7 @@ git -C <abs worktree> status --porcelain --ignored     # MUST be empty before la
 
 `PYTHONPYCACHEPREFIX` and `PYTHONDONTWRITEBYTECODE=1` on both provisioning pip
 commands keep every `__pycache__` write inside the external root instead of the
-attested worktree, matching the same two keys the closed eleven-key
+attested worktree, matching the same two keys the closed twelve-key
 environment map binds for the launched role itself (D166 §2.4) — provisioning
 and launch must not diverge on where bytecode can land.
 
@@ -294,18 +294,21 @@ external interpreter it invokes.
 `ROASTPILOT_VALIDATION_ROOT`, `ROASTPILOT_VALIDATION_PYTHON`,
 `ROASTPILOT_VALIDATION_TMP`, `TMPDIR`, `XDG_CACHE_HOME`,
 `PYTHONPYCACHEPREFIX`, `PYTHONDONTWRITEBYTECODE`, `RUFF_CACHE_DIR`,
-`COVERAGE_FILE`, `PIP_CACHE_DIR`, and `PYTEST_ADDOPTS` into the child process;
+`COVERAGE_FILE`, `COFFEE_ROAST_LOG_DIR`, `PIP_CACHE_DIR`, and `PYTEST_ADDOPTS`
+into the child process;
 it changes no origin, branch, head, or clean-tree check, and adds no
 allowlist or ignore-pattern anywhere. A role that dirties the attested
 worktree — tracked, untracked, or ignored — still fails closed with no record
-and no handback, exactly as before. The eleven keys above are stripped from
-every native launch's inherited environment first, then reinstated with these
-exact values only for a validation-role launch; every other native launch,
-including a WRITE launch, sees none of them.
+and no handback, exactly as before. `COFFEE_ROAST_LOG_DIR` redirects the
+declared `coffee-roaster-mcp` dependency's current-working-directory-relative
+`logs/` default into the attested external root. The twelve keys above are
+stripped from every native launch's inherited environment first, then
+reinstated with these exact values only for a validation-role launch; every
+other native launch, including a WRITE launch, sees none of them.
 
 **D167: one validated root now derives both the environment and one argv path
 authorization.** The same successful `_validate_validation_root` call that
-builds the eleven-key `env=` map above also returns the canonical resolved
+builds the twelve-key `env=` map above also returns the canonical resolved
 root, and the capture tool passes it to the three validation roles' native
 launch as exactly one `--add-dir <validated real root>` argv pair, placed
 immediately before `--permission-mode`. Installed Claude Code 2.1.233

@@ -6544,7 +6544,7 @@ def test_validation_root_check_runs_before_provider_lookup(
 def test_validation_environment_binds_exact_map_and_strips_for_others(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The closed 11-key map binds exactly under the root; other roles see none of it."""
+    """The closed 12-key map binds exactly under the root; other roles see none of it."""
     root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
     for key in usage_cli._VALIDATION_ENVIRONMENT_KEYS:  # pyright: ignore[reportPrivateUsage]
         monkeypatch.setenv(key, "SENTINEL_PRESET")
@@ -6566,6 +6566,7 @@ def test_validation_environment_binds_exact_map_and_strips_for_others(
         "PYTHONDONTWRITEBYTECODE": "1",
         "RUFF_CACHE_DIR": os.path.join(resolved_root, "cache", "ruff"),
         "COVERAGE_FILE": os.path.join(resolved_root, "tmp", "coverage"),
+        "COFFEE_ROAST_LOG_DIR": os.path.join(resolved_root, "tmp", "coffee-roast-logs"),
         "PIP_CACHE_DIR": os.path.join(resolved_root, "cache", "pip"),
         "PYTEST_ADDOPTS": f"-o cache_dir={os.path.join(resolved_root, 'cache', 'pytest')}",
     }
@@ -6992,12 +6993,12 @@ def test_native_launch_add_dir_absent_for_write_role(
     assert "--add-dir" not in worker_argv
 
 
-def test_validation_environment_key_set_has_exactly_eleven_members(
+def test_validation_environment_key_set_has_exactly_twelve_members(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The closed key set is exactly eleven names; a WRITE launch strips every one."""
+    """The closed key set is exactly twelve names; a WRITE launch strips every one."""
     keys = usage_cli._VALIDATION_ENVIRONMENT_KEYS  # pyright: ignore[reportPrivateUsage]
-    assert len(keys) == 11
+    assert len(keys) == 12
     for key in keys:
         monkeypatch.setenv(key, "SENTINEL_PRESET")
     launch_environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]

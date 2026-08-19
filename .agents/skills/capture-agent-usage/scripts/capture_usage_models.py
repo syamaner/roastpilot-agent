@@ -261,6 +261,7 @@ VALIDATION_ENVIRONMENT_KEYS = frozenset(
         "PYTHONDONTWRITEBYTECODE",
         "RUFF_CACHE_DIR",
         "COVERAGE_FILE",
+        "COFFEE_ROAST_LOG_DIR",
         "PIP_CACHE_DIR",
         "PYTEST_ADDOPTS",
     }

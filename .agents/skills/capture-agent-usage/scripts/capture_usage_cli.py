@@ -858,7 +858,7 @@ def _validation_environment_values(root: str) -> dict[str, str]:
         root: The canonical resolved validation root.
 
     Returns:
-        The exact eleven-key mapping of §2.4, every value derived only from
+        The exact twelve-key mapping of §2.4, every value derived only from
         ``root``.
     """
     cache = os.path.join(root, "cache")
@@ -873,6 +873,7 @@ def _validation_environment_values(root: str) -> dict[str, str]:
         "PYTHONDONTWRITEBYTECODE": "1",
         "RUFF_CACHE_DIR": os.path.join(cache, "ruff"),
         "COVERAGE_FILE": os.path.join(tmp, "coverage"),
+        "COFFEE_ROAST_LOG_DIR": os.path.join(tmp, "coffee-roast-logs"),
         "PIP_CACHE_DIR": os.path.join(cache, "pip"),
         "PYTEST_ADDOPTS": f"-o cache_dir={os.path.join(cache, 'pytest')}",
     }
