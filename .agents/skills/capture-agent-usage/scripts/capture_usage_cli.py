@@ -925,11 +925,16 @@ def _plan_identity_checks(root: str, sha: str) -> None:
 
 def _open_bound_root_descriptor(root: str, *, error_message: str) -> int:
     """Open one bound root for its full native-launch lifetime."""
+    descriptor: int | None = None
     try:
         descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         _require_validation_directory(descriptor, expect_mode=_VALIDATION_DIRECTORY_MODE)
     except OSError:
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
         raise CaptureUsageError(error_message) from None
+    assert descriptor is not None
     return descriptor
 
 
@@ -2177,11 +2182,16 @@ def _pytest_arg_token(value: str) -> str:
     pytest arguments (the accepted D168 residual). Only newline, carriage
     return, and NUL are rejected, plus the per-token byte cap.
     """
-    if "\n" in value or "\r" in value or "\x00" in value:
+    if not value.strip() or "\n" in value or "\r" in value or "\x00" in value:
         raise argparse.ArgumentTypeError("pytest argument token contains a forbidden byte")
     if len(value.encode("utf-8")) > _MAX_PYTEST_ARG_TOKEN_BYTES:
         raise argparse.ArgumentTypeError("pytest argument token exceeds the byte cap")
     return value
+
+
+def _has_pytest_selector(tokens: tuple[str, ...]) -> bool:
+    """Return whether parent-supplied QA arguments select repository tests explicitly."""
+    return any(token == "tests" or token.startswith("tests/") for token in tokens)
 
 
 def _shlex_split(value: str) -> list[str]:
@@ -2246,7 +2256,7 @@ def print_validation_commands_command(arguments: argparse.Namespace) -> int:
 
     Raises:
         CaptureUsageError: If ``role`` is not a validation role, the root is
-            invalid, the role renders no commands, QA omits ``--pytest-arg``,
+            invalid, the role renders no commands, QA omits a repository test selector,
             ``--pytest-arg`` is supplied for a role with no ``PREFIX`` entry,
             more than 32 tokens are supplied, or the mechanical ``RUN``
             coverage proof fails for any entry.
@@ -2258,7 +2268,7 @@ def print_validation_commands_command(arguments: argparse.Namespace) -> int:
     if len(tokens) > _MAX_PYTEST_ARG_TOKENS:
         raise CaptureUsageError("validation environment is invalid")
     commands = VALIDATION_ROLE_COMMANDS.get(role, ())
-    if role is NativeClaudeRole.QA and not tokens:
+    if role is NativeClaudeRole.QA and not _has_pytest_selector(tokens):
         raise CaptureUsageError("validation environment is invalid")
     if tokens and not any(command.kind is ValidationCommandKind.PREFIX for command in commands):
         raise CaptureUsageError("validation environment is invalid")

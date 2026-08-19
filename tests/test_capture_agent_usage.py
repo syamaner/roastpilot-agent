@@ -2133,6 +2133,41 @@ def test_open_bound_root_descriptor_maps_path_failures_without_leakage(
     assert "SENTINEL_ROOT" not in str(error.value)
 
 
+def test_open_bound_root_descriptor_closes_after_directory_validation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A descriptor opened before directory validation fails is not leaked."""
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+    def opened_descriptor(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        del path, flags, mode, dir_fd
+        return descriptor
+
+    monkeypatch.setattr(usage_cli.os, "open", opened_descriptor)
+
+    def failing_directory_check(_descriptor: int, *, expect_mode: int | None) -> None:
+        del expect_mode
+        raise OSError("directory invalid")
+
+    monkeypatch.setattr(usage_cli, "_require_validation_directory", failing_directory_check)
+    try:
+        with pytest.raises(CaptureUsageError, match="plan root is invalid"):
+            usage_cli._open_bound_root_descriptor(  # pyright: ignore[reportPrivateUsage]
+                str(tmp_path), error_message="plan root is invalid"
+            )
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
+
+
 @pytest.mark.parametrize("error_message", ["plan root is invalid", "evidence bundle is invalid"])
 def test_reattest_bound_root_maps_held_descriptor_fstat_failures_without_leakage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_message: str
@@ -9173,6 +9208,48 @@ def test_print_validation_commands_qa_rejects_omitted_tokens_without_output(
     root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
     with pytest.raises(SystemExit, match="validation environment is invalid"):
         main(["print-validation-commands", "--role", "qa", "--validation-root", str(root)])
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("token", ["", "   "])
+def test_print_validation_commands_qa_rejects_empty_or_whitespace_token(
+    token: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """QA rejects empty framing tokens before root validation or output."""
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "print-validation-commands",
+                "--role",
+                "qa",
+                "--validation-root",
+                "/validated/root",
+                "--pytest-arg",
+                token,
+            ]
+        )
+    captured = capsys.readouterr()
+    assert "pytest argument token contains a forbidden byte" in captured.err
+    assert captured.out == ""
+
+
+def test_print_validation_commands_qa_rejects_flags_without_test_selector(
+    tmp_path_factory: pytest.TempPathFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """QA coverage flags do not substitute for an explicit repository test selector."""
+    root = _build_validation_root(tmp_path_factory.mktemp("base") / "root")
+    with pytest.raises(SystemExit, match="validation environment is invalid"):
+        main(
+            [
+                "print-validation-commands",
+                "--role",
+                "qa",
+                "--validation-root",
+                str(root),
+                "--pytest-arg=--cov=src",
+                "--pytest-arg=--cov-report=term-missing",
+            ]
+        )
     assert capsys.readouterr().out == ""
 
 
