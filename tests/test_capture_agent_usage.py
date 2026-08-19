@@ -722,6 +722,17 @@ def test_native_codex_json_depth_fails_closed() -> None:
         usage_native_codex._json(deep)  # pyright: ignore[reportPrivateUsage]
 
 
+def test_native_codex_json_recursion_error_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A parser recursion failure maps to the fixed metadata-safe error."""
+
+    def recurse(*_args: object, **_kwargs: object) -> NoReturn:
+        raise RecursionError
+
+    monkeypatch.setattr(usage_native_codex.json, "loads", recurse)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._json(b"{}")  # pyright: ignore[reportPrivateUsage]
+
+
 def test_native_codex_cli_round_trip_and_fixed_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """The closed supervisor CLI grammar maps capture failures to one safe exit."""
     arguments = usage_cli.build_parser().parse_args(
@@ -816,6 +827,7 @@ def test_native_codex_walk_rejects_over_depth_tree(tmp_path: Path) -> None:
     [
         ("wrong/repo", "feature/x", "a" * 40, [], False),
         ("syamaner/roastpilot-agent", "-bad", "a" * 40, [], False),
+        ("syamaner/roastpilot-agent", "feature/x..evil", "a" * 40, [], False),
         ("syamaner/roastpilot-agent", "feature/x", "A" * 40, [], False),
         (
             "syamaner/roastpilot-agent",
@@ -879,6 +891,11 @@ def test_native_codex_descriptor_reads_reject_symlinks_and_size(tmp_path: Path) 
     link.symlink_to(root, target_is_directory=True)
     with pytest.raises(usage_native_codex.NativeCodexCaptureError):
         usage_native_codex._open_root(str(link), private=False)  # pyright: ignore[reportPrivateUsage]
+    intermediate = tmp_path / "intermediate"
+    intermediate.mkdir()
+    (intermediate / "jump").symlink_to(root, target_is_directory=True)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._open_root(str(intermediate / "jump" / ".codex"), private=False)  # pyright: ignore[reportPrivateUsage]
 
 
 def test_native_codex_root_overlap_uses_held_directory_identities(tmp_path: Path) -> None:
