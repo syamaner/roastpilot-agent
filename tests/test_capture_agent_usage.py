@@ -619,6 +619,17 @@ def test_native_codex_rejects_decreasing_cumulative_token_totals(tmp_path: Path)
         },
     }
     events = [meta, started, context, totals(2), totals(1)]
+    unknown_event = totals(2)
+    unknown_event["payload"] = {**unknown_event["payload"], "type": "unknown"}  # type: ignore[index]
+    unknown = tmp_path / "unknown.jsonl"
+    unknown.write_text(
+        "".join(
+            json.dumps({"ordinal": index, "timestamp": "x", **event}) + "\n"
+            for index, event in enumerate([meta, started, context, unknown_event])
+        )
+    )
+    with unknown.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
     rollout = tmp_path / "decreasing.jsonl"
     rollout.write_text(
         "".join(
@@ -1164,6 +1175,18 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     )
     monkeypatch.setattr(usage_native_codex, "_descendant", lambda _base, _head: True)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "uuid4", lambda: "binding-811")
+    wall = datetime.now(UTC)
+
+    class FixedDateTime:
+        """Wall time stays valid while elapsed time comes only from monotonic time."""
+
+        @staticmethod
+        def now(_timezone: object) -> datetime:
+            return wall
+
+    ticks = iter((10.0, 10.125))
+    monkeypatch.setattr(usage_native_codex, "datetime", FixedDateTime)
+    monkeypatch.setattr(usage_native_codex.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(
         usage_native_codex,
         "_terminal_line",
@@ -1195,6 +1218,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     assert record.native_role is role
     assert record.task_status is status
     assert record.success is (status is NativeCodexTaskStatus.SUCCESS)
+    assert record.elapsed_ms == 125
     assert record.subagent_count == (1 if role is NativeCodexRole.REPAIR else 0)
     assert record.whole_tree_verified is (role is not NativeCodexRole.REPAIR)
     assert record.config_sha256 == "a" * 64 and record.role_sha256 == "b" * 64
