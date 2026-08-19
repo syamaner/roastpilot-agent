@@ -86,9 +86,10 @@ _EVIDENCE_ONLY_DISCIPLINE_BLOCK = """## Worktree discipline (topology §7 — bi
 - The named worktree must be the current attested launch cwd. If it is absent,
   different, or cannot be inspected with the available tools, fail closed and
   ask the lead to relaunch from the correct worktree.
-- Treat the lead-supplied exact patch bytes and exit-status-backed evidence as
-  the only authority for git, gate, and mutation claims. Never infer a clean
-  diff, passing test, or successful negative control from current-file contents.
+- Treat the lead-supplied exact scope inventory, full-patch digest/size, and
+  exit-status-backed evidence as the only authority for git, gate, and mutation
+  claims. Never infer a clean diff, passing test, or successful negative control
+  from current-file contents.
 """
 
 _ADVERSARIAL_BLOCKS = (

@@ -20,14 +20,15 @@ the Code Review Rubric).
 ## Parent-supplied review evidence
 
 The lead brief must name the exact worktree and commit under review and contain
-the exact unified-patch bytes from the bound implementation base through that
-head (a prose diff summary or touched-file list is not evidence). It must also
-provide exit-status-backed evidence for the exact-head and byte-clean worktree
-attestation plus the relevant deterministic tests. The gate evidence must name
-every skip and its reason. Fail closed and ask the lead for any missing datum.
-Do not run shell commands: this native role deliberately has only `Read`,
-`Grep`, and `Glob`. Use those tools for the class sweep and source/test
-inspection; deterministic command execution remains parent-owned.
+the exact git-generated name-status inventory, the complete patch's SHA-256 and
+byte count, and every review-relevant exact-head file that you must read fully
+with the available tools. A prose diff summary or touched-file list alone is not
+evidence. It must also provide exit-status-backed evidence for the exact-head
+and byte-clean worktree attestation plus the relevant deterministic tests. The
+gate evidence must name every skip and its reason. Fail closed and ask the lead
+for any missing datum. Do not run shell commands: this native role deliberately
+has only `Read`, `Grep`, and `Glob`. Read every named current file and use the
+tools for the class sweep; deterministic command execution remains parent-owned.
 
 The final verdict must restate the reviewed head SHA, the deterministic gate's
 exit status, and every named skip and reason. An omission is a fail-closed
@@ -116,6 +117,7 @@ a clean pass is a valid result, not a reason to invent findings.
 - The named worktree must be the current attested launch cwd. If it is absent,
   different, or cannot be inspected with the available tools, fail closed and
   ask the lead to relaunch from the correct worktree.
-- Treat the lead-supplied exact patch bytes and exit-status-backed evidence as
-  the only authority for git, gate, and mutation claims. Never infer a clean
-  diff, passing test, or successful negative control from current-file contents.
+- Treat the lead-supplied exact scope inventory, full-patch digest/size, and
+  exit-status-backed evidence as the only authority for git, gate, and mutation
+  claims. Never infer a clean diff, passing test, or successful negative control
+  from current-file contents.

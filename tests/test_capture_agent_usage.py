@@ -5482,11 +5482,11 @@ def test_prompt_cap_and_read_failure_reject_before_spawn_without_echoing_content
     monkeypatch.setattr(usage_cli.os, "fdopen", real_fdopen)
 
 
-def test_prompt_cap_accepts_exactly_one_mebibyte_and_rejects_one_byte_more(
+def test_prompt_cap_accepts_exactly_64_kib_and_rejects_one_byte_more(
     tmp_path: Path,
 ) -> None:
-    """Exact review evidence fits, while the next byte still fails closed."""
-    assert usage_cli.MAX_PROMPT_BYTES == 1_048_576
+    """The bounded review brief fits, while the next byte still fails closed."""
+    assert usage_cli.MAX_PROMPT_BYTES == 65_536
     exact = tmp_path / "exact-prompt"
     exact.write_bytes(b"x" * usage_cli.MAX_PROMPT_BYTES)
     assert len(usage_cli._prompt_bytes(exact)) == usage_cli.MAX_PROMPT_BYTES  # pyright: ignore[reportPrivateUsage]
@@ -7291,7 +7291,8 @@ def test_native_safety_and_security_reviewers_are_evidence_only() -> None:
         assert "Do not run shell commands" in normalized
         assert "Fail closed" in normalized
         assert "exact-head and byte-clean worktree attestation" in normalized
-        assert "exact unified-patch bytes" in normalized
+        assert "exact git-generated name-status inventory" in normalized
+        assert "complete patch's SHA-256 and byte count" in normalized
         assert "prose diff summary" in normalized
         assert "name every skip" in normalized
         assert "final verdict must restate the reviewed head SHA" in normalized
