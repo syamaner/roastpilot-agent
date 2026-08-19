@@ -737,6 +737,7 @@ def _validate_bound_root_shape(raw: str, *, error_message: str) -> str:
         Path(root_real).is_relative_to(Path(cwd_real))
         or Path(cwd_real).is_relative_to(Path(root_real))
         or Path(root_real).is_relative_to(Path(home_claude_real))
+        or Path(home_claude_real).is_relative_to(Path(root_real))
     ):
         raise CaptureUsageError(error_message)
     try:
@@ -888,6 +889,31 @@ def _plan_root_device_inode(root: str) -> tuple[int, int]:
     return status.st_dev, status.st_ino
 
 
+def _open_bound_root_descriptor(root: str, *, error_message: str) -> int:
+    """Open one bound root for its full native-launch lifetime."""
+    try:
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        _require_validation_directory(descriptor, expect_mode=_VALIDATION_DIRECTORY_MODE)
+    except OSError:
+        raise CaptureUsageError(error_message) from None
+    return descriptor
+
+
+def _reattest_bound_root_path(descriptor: int, root: str, *, error_message: str) -> None:
+    """Prove the current root path still names the originally held directory."""
+    try:
+        original = os.fstat(descriptor)
+        current_descriptor = _open_bound_root_descriptor(root, error_message=error_message)
+    except OSError:
+        raise CaptureUsageError(error_message) from None
+    try:
+        current = os.fstat(current_descriptor)
+        if (original.st_dev, original.st_ino) != (current.st_dev, current.st_ino):
+            raise CaptureUsageError(error_message)
+    finally:
+        os.close(current_descriptor)
+
+
 def _validate_plan_root(raw: str, sha: str | None) -> BoundRoot:
     """Validate one parent-provisioned exact-sha byte-clean plan worktree (D169, §2.3).
 
@@ -908,14 +934,15 @@ def _validate_plan_root(raw: str, sha: str | None) -> BoundRoot:
         raise CaptureUsageError("plan root is invalid")
     root_real = _validate_bound_root_shape(raw, error_message="plan root is invalid")
     _plan_identity_checks(root_real, sha)
-    before = _plan_root_device_inode(root_real)
+    descriptor = _open_bound_root_descriptor(root_real, error_message="plan root is invalid")
 
     def reattest() -> None:
+        _reattest_bound_root_path(descriptor, root_real, error_message="plan root is invalid")
         _plan_identity_checks(root_real, sha)
-        if _plan_root_device_inode(root_real) != before:
-            raise CaptureUsageError("plan root is invalid")
 
-    return BoundRoot(kind=BoundRootKind.PLAN, path=root_real, reattest=reattest)
+    return BoundRoot(
+        kind=BoundRootKind.PLAN, path=root_real, reattest=reattest, descriptor=descriptor
+    )
 
 
 def _reject_duplicate_manifest_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -1089,7 +1116,9 @@ class _EvidenceSnapshot:
     digests: tuple[tuple[str, str, int], ...]
 
 
-def _evidence_bundle_state(root: str, pr: int, attested_head: str) -> _EvidenceSnapshot:
+def _evidence_bundle_state(
+    root: str, pr: int, attested_head: str, *, held_descriptor: int | None = None
+) -> _EvidenceSnapshot:
     """Fully validate structure, manifest grammar, and payload integrity; return a snapshot.
 
     Args:
@@ -1108,7 +1137,7 @@ def _evidence_bundle_state(root: str, pr: int, attested_head: str) -> _EvidenceS
     """
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
-        root_fd = os.open(root, flags)
+        root_fd = os.open(root, flags) if held_descriptor is None else os.dup(held_descriptor)
     except OSError:
         raise CaptureUsageError("evidence bundle is invalid") from None
     try:
@@ -1162,14 +1191,22 @@ def _validate_evidence_bundle(raw: str, pr: int | None, *, attested_head: str) -
     if pr is None:
         raise CaptureUsageError("evidence bundle is invalid")
     root_real = _validate_bound_root_shape(raw, error_message="evidence bundle is invalid")
-    before = _evidence_bundle_state(root_real, pr, attested_head)
+    descriptor = _open_bound_root_descriptor(root_real, error_message="evidence bundle is invalid")
+    try:
+        before = _evidence_bundle_state(root_real, pr, attested_head, held_descriptor=descriptor)
+    except CaptureUsageError:
+        os.close(descriptor)
+        raise
 
     def reattest() -> None:
-        after = _evidence_bundle_state(root_real, pr, attested_head)
+        _reattest_bound_root_path(descriptor, root_real, error_message="evidence bundle is invalid")
+        after = _evidence_bundle_state(root_real, pr, attested_head, held_descriptor=descriptor)
         if after != before:
             raise CaptureUsageError("evidence bundle is invalid")
 
-    return BoundRoot(kind=BoundRootKind.EVIDENCE, path=root_real, reattest=reattest)
+    return BoundRoot(
+        kind=BoundRootKind.EVIDENCE, path=root_real, reattest=reattest, descriptor=descriptor
+    )
 
 
 @dataclass(frozen=True)
@@ -1729,7 +1766,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
                 elapsed_ms,
             ),
         )
-        if usage.handback_text is not None:
+        if exit_code == 0 and usage.handback_text is not None:
             _emit_handback(role, pin, arguments, usage.session_id, usage.handback_text)
         return 0
     except OSError:
@@ -1748,6 +1785,10 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
             with suppress(OSError, ValueError):
                 _close_stdin(process)
             _stop_process(process)
+        bound_root = launch_environment.bound_root
+        if bound_root is not None and bound_root.descriptor is not None:
+            with suppress(OSError):
+                os.close(bound_root.descriptor)
 
 
 def _record_from_usage(

@@ -355,6 +355,7 @@ class BoundRoot:
     kind: BoundRootKind
     path: str
     reattest: Callable[[], None] | None = None
+    descriptor: int | None = None
 
 
 EVIDENCE_SCHEMA_VERSION = 1

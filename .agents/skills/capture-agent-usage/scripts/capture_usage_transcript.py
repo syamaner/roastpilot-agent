@@ -342,6 +342,7 @@ def parse_owned_transcript(
     agent_settings = 0
     last_timestamp: datetime | None = None
     last_assistant_message: dict[str, Any] | None = None
+    permission_mode_seen = False
     invalid = False
     try:
         with os.fdopen(descriptor, "rb") as stream:
@@ -363,6 +364,14 @@ def parse_owned_transcript(
                     or row.get("sessionId") != session_id
                 ):
                     raise TranscriptError("owned Claude transcript is invalid")
+                if "permissionMode" in row:
+                    row_permission_mode = row.get("permissionMode")
+                    if (
+                        not isinstance(row_permission_mode, str)
+                        or row_permission_mode != expected_permission_mode
+                    ):
+                        raise TranscriptError("owned Claude transcript permission mode is invalid")
+                    permission_mode_seen = True
                 if row["type"] == "mode":
                     if set(row) != _MODE_ROW_KEYS or row.get("mode") != "normal":
                         raise TranscriptError("owned Claude transcript is invalid")
@@ -397,13 +406,6 @@ def parse_owned_transcript(
                     ):
                         raise TranscriptError("owned Claude transcript is invalid")
                     continue
-                if "permissionMode" in row:
-                    row_permission_mode = row.get("permissionMode")
-                    if (
-                        not isinstance(row_permission_mode, str)
-                        or row_permission_mode != expected_permission_mode
-                    ):
-                        raise TranscriptError("owned Claude transcript permission mode is invalid")
                 if row["type"] != "assistant":
                     continue
                 message = row.get("message")
@@ -459,7 +461,7 @@ def parse_owned_transcript(
         invalid = True
     if invalid:
         raise TranscriptError("owned Claude transcript is invalid")
-    if agent_settings == 0 or not seen or model is None:
+    if agent_settings == 0 or not seen or model is None or not permission_mode_seen:
         raise TranscriptError("owned Claude transcript is incomplete")
     handback_text: str | None = None
     if require_handback:

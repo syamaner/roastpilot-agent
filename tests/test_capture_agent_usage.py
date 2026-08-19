@@ -1731,6 +1731,38 @@ def test_native_command_records_nonzero_complete_transcript_as_unsuccessful(
     assert not record.success and record.exit_code == 2 and record.usage_complete
 
 
+def test_read_only_nonzero_exit_records_failure_without_handback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A failed READ_ONLY child retains metadata but cannot emit a success handback."""
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    _stub_plan_root(monkeypatch)
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project,
+            observed,
+            processes,
+            code=2,
+            transcript=_read_only_transcript_bytes("story-planner"),
+        ),
+    )
+    assert (
+        main(
+            _native_cli_args(
+                role="story-planner", plan_root=_STUB_PLAN_ROOT, plan_sha=_STUB_PLAN_SHA
+            )
+        )
+        == 0
+    )
+    assert capsys.readouterr().out == ""
+    record = USAGE_RECORD_ADAPTER.validate_json(Path(".agent-usage/usage.jsonl").read_text())
+    assert isinstance(record, NativeWorkerUsageRecord)
+    assert not record.success and record.exit_code == 2
+
+
 def test_native_command_rejects_model_mismatch_without_sink_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -6190,6 +6222,25 @@ def test_transcript_permission_mode_attestation_rejects_mismatch(
         )
 
 
+def test_transcript_permission_mode_attestation_rejects_omission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transcript with no observed capability-derived permission mode fails closed."""
+    session_id = "72222222-2222-4222-8222-222222222223"
+    rows = _story_planner_rows(session_id)
+    for row in rows:
+        row.pop("permissionMode", None)
+    _, installed = _install_owned_transcript(tmp_path, monkeypatch, _dump_rows(rows), session_id)
+    with pytest.raises(usage_transcript.TranscriptError):
+        usage_transcript.parse_owned_transcript(
+            tmp_path,
+            installed,
+            NativeClaudeRole.STORY_PLANNER,
+            "high",
+            expected_permission_mode="dontAsk",
+        )
+
+
 def _frontmatter_with_permission_mode(
     role_file: str, value: str | None, *, duplicate: bool = False
 ) -> bytes:
@@ -7411,6 +7462,7 @@ def test_plan_environment_binds_exact_key_and_strips_evidence_and_validation_key
         "root-inside-cwd",
         "cwd-inside-root",
         "root-inside-claude-home",
+        "root-contains-claude-home",
         "git-unavailable",
     ],
 )
@@ -7422,7 +7474,12 @@ def test_plan_root_rejects_every_identity_break(
 ) -> None:
     """T7: every plan-root identity, shape, or cleanliness break fails closed."""
     sha = "1" * 40
-    if mutate in ("root-inside-cwd", "cwd-inside-root", "root-inside-claude-home"):
+    if mutate in (
+        "root-inside-cwd",
+        "cwd-inside-root",
+        "root-inside-claude-home",
+        "root-contains-claude-home",
+    ):
         monkeypatch.chdir(tmp_path)
     base = tmp_path_factory.mktemp(f"plan-reject-{mutate}")
     root = _build_plan_root(base / "root")
@@ -7451,6 +7508,10 @@ def test_plan_root_rejects_every_identity_break(
         (home / ".claude").mkdir(parents=True)
         monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
         root = _build_plan_root(home / ".claude" / "plan-root")
+    if mutate == "root-contains-claude-home":
+        home = root / "home"
+        (home / ".claude").mkdir(parents=True)
+        monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
 
     origin = (
         "https://github.com/syamaner/roastpilot-agent.git"
