@@ -461,11 +461,15 @@ def _parse_rollout(
                 _fail()
             event = _json(raw)
             if (
-                set(event) != {"type", "payload"}
+                set(event) != {"ordinal", "payload", "timestamp", "type"}
                 or event["type"] not in _ROOT_TYPES
                 or not isinstance(event["payload"], dict)
+                or isinstance(event["ordinal"], bool)
+                or not isinstance(event["ordinal"], int)
+                or event["ordinal"] < 0
             ):
                 _fail()
+            _opaque_text(event["timestamp"])
             kind, payload = event["type"], event["payload"]
             if kind == "session_meta":
                 if seen_meta or seen_context:
@@ -524,6 +528,8 @@ def _parse_rollout(
                     _fail()
                 session = _string(payload["id"])
                 seen_meta = True
+            elif not seen_meta:
+                _fail()
             elif kind == "turn_context":
                 if (
                     not seen_meta
@@ -541,8 +547,7 @@ def _parse_rollout(
                 seen_context = True
             elif kind == "event_msg":
                 if (
-                    (is_subagent and not seen_context)
-                    or set(payload) != _EVENT_KEYS[payload["type"]]
+                    set(payload) != _EVENT_KEYS[payload["type"]]
                     or payload["type"] not in _EVENT_TYPES
                 ):
                     _fail()

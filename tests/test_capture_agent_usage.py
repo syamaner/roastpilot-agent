@@ -260,7 +260,6 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -
         list[dict[str, object]],
         [
             meta,
-            context,
             {
                 "type": "event_msg",
                 "payload": {
@@ -271,7 +270,6 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -
                     "turn_id": "discarded",
                 },
             },
-            event(1),
             {
                 "type": "response_item",
                 "payload": {
@@ -294,6 +292,9 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -
                     "name": "discarded",
                 },
             },
+            {"type": "world_state", "payload": {"full": False, "state": {}}},
+            context,
+            event(1),
             event(9),
             {
                 "type": "event_msg",
@@ -307,10 +308,26 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -
                     "turn_id": "discarded",
                 },
             },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "completed_at_ms": 1,
+                    "item": {},
+                    "started_at_ms": 0,
+                    "thread_id": "discarded",
+                    "turn_id": "discarded",
+                },
+            },
         ],
     )
     rollout = tmp_path / "leaf.jsonl"
-    rollout.write_text("".join(json.dumps(item) + "\n" for item in events))
+    rollout.write_text(
+        "".join(
+            json.dumps({"ordinal": index, "timestamp": "discarded", **item}) + "\n"
+            for index, item in enumerate(events)
+        )
+    )
     with rollout.open("rb") as stream:
         session, totals, _parent, matches = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
             stream.fileno(), manifest
@@ -336,7 +353,14 @@ def test_native_codex_rollout_rejects_drifting_observed_root_schema(tmp_path: Pa
     """An added 0.147.0 root payload key fails closed before recording anything."""
     rollout = tmp_path / "drift.jsonl"
     rollout.write_text(
-        json.dumps({"type": "world_state", "payload": {"full": False, "state": {}, "extra": 1}})
+        json.dumps(
+            {
+                "ordinal": 0,
+                "timestamp": "discarded",
+                "type": "world_state",
+                "payload": {"full": False, "state": {}, "extra": 1},
+            }
+        )
         + "\n"
     )
     binding = {
@@ -357,6 +381,8 @@ def test_native_codex_parses_unrelated_root_session_without_leaf_requirements(
     rollout.write_text(
         json.dumps(
             {
+                "ordinal": 0,
+                "timestamp": "discarded",
                 "type": "session_meta",
                 "payload": {
                     "base_instructions": "SECRET_PROMPT",
@@ -444,7 +470,12 @@ def test_native_codex_rejects_out_of_order_or_repeated_task_events(tmp_path: Pat
     }
     for index, events in enumerate(((meta, complete), (meta, started, started)), 1):
         rollout = tmp_path / f"ordered-{index}.jsonl"
-        rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+        rollout.write_text(
+            "".join(
+                json.dumps({"ordinal": ordinal, "timestamp": "discarded", **event}) + "\n"
+                for ordinal, event in enumerate(events)
+            )
+        )
         with (
             rollout.open("rb") as stream,
             pytest.raises(usage_native_codex.NativeCodexCaptureError),
