@@ -691,6 +691,8 @@ class NativeCodexUsageRecord(CaptureModel):
     role_capability: Literal[RoleCapability.WRITE] = RoleCapability.WRITE
     model: Literal["gpt-5.6-terra"] = "gpt-5.6-terra"
     effort: SafeIdentifier
+    config_sha256: str
+    role_sha256: str
     repository: RepositoryName
     branch: GitReference
     base_sha: GitSha
@@ -714,6 +716,7 @@ class NativeCodexUsageRecord(CaptureModel):
     reasoning_output_tokens: TokenCount
     total_tokens: TokenCount
     whole_tree_verified: bool
+    subagent_count: int
 
     @field_validator("role_capability", mode="before")
     @classmethod
@@ -733,6 +736,15 @@ class NativeCodexUsageRecord(CaptureModel):
             raise ValueError("failed native Codex record has contradictory task status")
         if self.completed_at < self.started_at:
             raise ValueError("native Codex timestamps are contradictory")
+        if not all(
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+            for value in (self.config_sha256, self.role_sha256)
+        ):
+            raise ValueError("native Codex role hashes must be SHA-256")
+        if self.subagent_count < 0 or (self.whole_tree_verified and self.subagent_count != 0):
+            raise ValueError("native Codex topology proof is contradictory")
         return self
 
 

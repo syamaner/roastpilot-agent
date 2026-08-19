@@ -23,6 +23,7 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, BinaryIO, NoReturn, cast
 from uuid import UUID
 
@@ -109,6 +110,8 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
         "task_name": "native-codex-capture",
         "native_role": NativeCodexRole.ENGINEER_BE,
         "effort": "high",
+        "config_sha256": "c" * 64,
+        "role_sha256": "d" * 64,
         "repository": "syamaner/roastpilot-agent",
         "branch": "feature/811-native-codex-capture",
         "base_sha": "a" * 40,
@@ -129,6 +132,7 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
         "reasoning_output_tokens": 5,
         "total_tokens": 6,
         "whole_tree_verified": True,
+        "subagent_count": 0,
     }
     record = NativeCodexUsageRecord.model_validate(payload)
     assert USAGE_RECORD_ADAPTER.validate_json(record.model_dump_json()) == record
@@ -167,8 +171,21 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -
         "type": "session_meta",
         "payload": {
             "id": "leaf-811",
+            "agent_nickname": "worker-811",
+            "agent_path": "/root/native-codex-capture",
+            "agent_role": "engineer-be",
+            "base_instructions": "discarded",
             "originator": "codex-tui",
             "cli_version": "0.147.0",
+            "context_window": 1,
+            "cwd": "discarded",
+            "history_mode": "discarded",
+            "model_provider": "discarded",
+            "multi_agent_version": "discarded",
+            "parent_thread_id": "parent-811",
+            "session_id": "discarded",
+            "thread_source": "subagent",
+            "timestamp": "discarded",
             "source": {
                 "subagent": {
                     "thread_spawn": {
@@ -180,15 +197,34 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -
                     }
                 }
             },
-            "git": {"commit_hash": "a" * 40, "branch": "main"},
+            "git": {
+                "commit_hash": "a" * 40,
+                "branch": "main",
+                "repository_url": "discarded",
+            },
         },
     }
-    context = {
+    context: dict[str, object] = {
         "type": "turn_context",
         "payload": {
             "model": "gpt-5.6-terra",
             "effort": "high",
-            **{f"key{index}": index for index in range(17)},
+            "approval_policy": "discarded",
+            "approvals_reviewer": "discarded",
+            "collaboration_mode": "discarded",
+            "comp_hash": "discarded",
+            "current_date": "discarded",
+            "cwd": "discarded",
+            "file_system_sandbox_policy": "discarded",
+            "multi_agent_version": "discarded",
+            "permission_profile": "discarded",
+            "personality": "discarded",
+            "realtime_active": False,
+            "sandbox_policy": "discarded",
+            "summary": "discarded",
+            "timezone": "discarded",
+            "turn_id": "discarded",
+            "workspace_roots": [],
         },
     }
 
@@ -197,6 +233,7 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -
             "type": "event_msg",
             "payload": {
                 "type": "token_count",
+                "rate_limits": {},
                 "info": {
                     "last_token_usage": {
                         "input_tokens": 0,
@@ -224,10 +261,52 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -
         [
             meta,
             context,
-            {"type": "event_msg", "payload": {"type": "task_started", "info": {}}},
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "collaboration_mode_kind": "discarded",
+                    "model_context_window": 1,
+                    "started_at": "discarded",
+                    "turn_id": "discarded",
+                },
+            },
             event(1),
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": "discarded",
+                    "content": "SECRET_PROMPT_OR_RESPONSE",
+                    "internal_chat_message_metadata_passthrough": {},
+                    "role": "assistant",
+                    "phase": "final",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "id": "discarded",
+                    "call_id": "discarded",
+                    "arguments": "SECRET_TOOL_INPUT",
+                    "internal_chat_message_metadata_passthrough": {},
+                    "name": "discarded",
+                },
+            },
             event(9),
-            {"type": "event_msg", "payload": {"type": "task_complete", "info": {}}},
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "completed_at": "discarded",
+                    "duration_ms": 1,
+                    "last_agent_message": "discarded",
+                    "started_at": "discarded",
+                    "time_to_first_token_ms": 1,
+                    "turn_id": "discarded",
+                },
+            },
         ],
     )
     rollout = tmp_path / "leaf.jsonl"
@@ -239,6 +318,279 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -
     assert session == "leaf-811"
     assert matches is True
     assert totals == (9, 2, 3, 4, 5, 23)
+
+
+def test_native_codex_inventory_does_not_read_or_size_existing_rollouts(tmp_path: Path) -> None:
+    """A pre-existing large provider session is retained as an identity only."""
+    existing = tmp_path / "existing.jsonl"
+    existing.write_bytes(b"x" * (usage_native_codex.MAX_PROVIDER_FILE_BYTES + 1))
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        inventory = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+    assert inventory == {"existing.jsonl": (existing.stat().st_dev, existing.stat().st_ino)}
+
+
+def test_native_codex_rollout_rejects_drifting_observed_root_schema(tmp_path: Path) -> None:
+    """An added 0.147.0 root payload key fails closed before recording anything."""
+    rollout = tmp_path / "drift.jsonl"
+    rollout.write_text(
+        json.dumps({"type": "world_state", "payload": {"full": False, "state": {}, "extra": 1}})
+        + "\n"
+    )
+    binding = {
+        "parent_thread_id": "parent-811",
+        "role": "engineer-be",
+        "agent_path": "/root/native-codex-capture",
+        "effort": "high",
+    }
+    with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_parses_unrelated_root_session_without_leaf_requirements(
+    tmp_path: Path,
+) -> None:
+    """A concurrent root rollout is schema-scanned but cannot impersonate a leaf."""
+    rollout = tmp_path / "root.jsonl"
+    rollout.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {
+                    "base_instructions": "SECRET_PROMPT",
+                    "cli_version": "0.147.0",
+                    "context_window": 1,
+                    "cwd": "/secret/path",
+                    "git": {
+                        "branch": "main",
+                        "commit_hash": "a" * 40,
+                        "repository_url": "SECRET_URL",
+                    },
+                    "history_mode": "discarded",
+                    "id": "root-811",
+                    "model_provider": "discarded",
+                    "originator": "codex-tui",
+                    "session_id": "discarded",
+                    "source": "cli",
+                    "thread_source": "user",
+                    "timestamp": "discarded",
+                },
+            }
+        )
+        + "\n"
+    )
+    binding = {
+        "parent_thread_id": "parent-811",
+        "role": "engineer-be",
+        "agent_path": "/root/native-codex-capture",
+        "effort": "high",
+    }
+    with rollout.open("rb") as stream:
+        session, totals, parent, matches = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
+            stream.fileno(), binding
+        )
+    assert (session, totals, parent, matches) == ("root-811", (0, 0, 0, 0, 0, 0), "", False)
+
+
+def test_native_codex_root_overlap_uses_held_directory_identities(tmp_path: Path) -> None:
+    """Only equal or nested held roots fail; shared filesystem ancestors are allowed."""
+    nested = tmp_path / "nested"
+    sibling = tmp_path / "sibling"
+    other = tmp_path / "other"
+    nested.mkdir()
+    sibling.mkdir()
+    other.mkdir()
+    parent = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    child = usage_native_codex._open_root(str(nested), private=False)  # pyright: ignore[reportPrivateUsage]
+    sibling_root = usage_native_codex._open_root(str(sibling), private=False)  # pyright: ignore[reportPrivateUsage]
+    other_root = usage_native_codex._open_root(str(other), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        usage_native_codex._reject_root_overlap(child, sibling_root, other_root)  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._reject_root_overlap(parent, child)  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._reject_root_overlap(child, parent)  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._reject_root_overlap(parent, parent)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(parent.descriptor)
+        os.close(child.descriptor)
+        os.close(sibling_root.descriptor)
+        os.close(other_root.descriptor)
+
+
+def test_native_codex_record_persists_exact_registration_hashes() -> None:
+    """Native Codex records reject non-SHA registration bindings and bad topology proofs."""
+    payload: dict[str, object] = {
+        "captured_at": datetime.now(UTC),
+        "task_id": "task-811",
+        "slice_id": "native-codex-capture",
+        "parent_task_id": "parent-811",
+        "task_name": "native-codex-capture",
+        "native_role": NativeCodexRole.REPAIR,
+        "effort": "medium",
+        "config_sha256": "a" * 64,
+        "role_sha256": "b" * 64,
+        "repository": "syamaner/roastpilot-agent",
+        "branch": "feature/811-native-codex-capture",
+        "base_sha": "a" * 40,
+        "launch_head_sha": "a" * 40,
+        "final_head_sha": "b" * 40,
+        "parent_thread_id": "thread-811",
+        "leaf_session_id": "leaf-811",
+        "task_status": NativeCodexTaskStatus.SUCCESS,
+        "success": True,
+        "started_at": datetime.now(UTC),
+        "completed_at": datetime.now(UTC),
+        "elapsed_ms": 0,
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 0,
+        "whole_tree_verified": True,
+        "subagent_count": 0,
+    }
+    assert NativeCodexUsageRecord.model_validate(payload).config_sha256 == "a" * 64
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate({**payload, "role_sha256": "not-a-hash"})
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate({**payload, "subagent_count": 1})
+
+
+@pytest.mark.parametrize(
+    ("role", "status"),
+    [
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.SUCCESS),
+        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.FAILED),
+        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED),
+    ],
+)
+def test_native_codex_supervisor_records_registered_role_terminal_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: NativeCodexRole,
+    status: NativeCodexTaskStatus,
+) -> None:
+    """The supervisor records each registered role without retaining provider content."""
+    import capture_usage_cli as native_cli
+
+    roots: list[usage_native_codex._Root] = []  # pyright: ignore[reportPrivateUsage]
+    for name in ("usage", "provider", "worktree"):
+        directory = tmp_path / name
+        directory.mkdir()
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        state = os.fstat(descriptor)
+        roots.append(usage_native_codex._Root(descriptor, state.st_dev, state.st_ino))  # pyright: ignore[reportPrivateUsage]
+
+    def open_root(_raw: str, *, private: bool) -> usage_native_codex._Root:  # pyright: ignore[reportPrivateUsage]
+        del private
+        return roots.pop(0)
+
+    def assert_root(_root: usage_native_codex._Root) -> None:  # pyright: ignore[reportPrivateUsage]
+        return None
+
+    def reject_overlap(*_roots: usage_native_codex._Root) -> None:  # pyright: ignore[reportPrivateUsage]
+        return None
+
+    def inventory(_root: usage_native_codex._Root) -> dict[str, tuple[int, int]]:  # pyright: ignore[reportPrivateUsage]
+        return {}
+
+    def new_rollouts(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _before: dict[str, tuple[int, int]],  # pyright: ignore[reportPrivateUsage]
+    ) -> list[tuple[str, int, os.stat_result]]:
+        entries = [("leaf.jsonl", 99, os.stat_result((0,) * 10))]
+        if role is NativeCodexRole.REPAIR:
+            entries.append(("child.jsonl", 98, os.stat_result((0,) * 10)))
+        return entries
+
+    def parse_rollout(
+        _fd: int, _binding: dict[str, str]
+    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool]:
+        if _fd == 98:
+            return "child-811", (0, 0, 0, 0, 0, 0), "leaf-811", False
+        return "leaf-811", (1, 2, 3, 4, 5, 6), "", True
+
+    def registered_role(member: NativeCodexRole) -> tuple[str, str, str, str]:
+        return (
+            "a" * 64,
+            "b" * 64,
+            "medium" if member is NativeCodexRole.REPAIR else "high",
+            member.value,
+        )
+
+    def git_identity(_repository: str, _branch: str, _base: str, *, final: bool) -> str:
+        return "b" * 40 if final and status is NativeCodexTaskStatus.SUCCESS else "a" * 40
+
+    def append(_output: object, record: NativeCodexUsageRecord, **_kwargs: object) -> None:
+        captured.append(record)
+
+    monkeypatch.setattr(usage_native_codex, "_open_root", open_root)
+    monkeypatch.setattr(usage_native_codex, "_assert_root", assert_root)
+    monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", reject_overlap)
+    monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_new_rollouts",
+        new_rollouts,
+    )
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_parse_rollout",
+        parse_rollout,
+    )
+    monkeypatch.setattr(usage_native_codex.os, "close", lambda _fd: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_registered_role",
+        registered_role,
+    )
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_git_identity",
+        git_identity,
+    )
+    monkeypatch.setattr(usage_native_codex, "_descendant", lambda _base, _head: True)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "uuid4", lambda: "binding-811")
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_terminal_line",
+        lambda: (
+            json.dumps(
+                {"type": "TERMINAL", "binding_id": "binding-811", "task_status": status.value}
+            ).encode()
+            + b"\n"
+        ),
+    )
+    captured: list[NativeCodexUsageRecord] = []
+    monkeypatch.setattr(native_cli, "append_record", append)
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent-811")
+    arguments = SimpleNamespace(
+        task_id="task-811",
+        slice_id="slice-811",
+        parent_task_id="parent-task-811",
+        task_name="native-codex-capture",
+        role=role.value,
+        usage_root=str(tmp_path / "usage"),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/811-native-codex-capture",
+        base_sha="a" * 40,
+        output="usage.jsonl",
+    )
+    assert usage_native_codex.supervise_native_codex(arguments) == 0
+    assert len(captured) == 1
+    record = captured[0]
+    assert record.native_role is role
+    assert record.task_status is status
+    assert record.success is (status is NativeCodexTaskStatus.SUCCESS)
+    assert record.subagent_count == (1 if role is NativeCodexRole.REPAIR else 0)
+    assert record.whole_tree_verified is (role is not NativeCodexRole.REPAIR)
+    assert record.config_sha256 == "a" * 64 and record.role_sha256 == "b" * 64
+    assert "SECRET" not in record.model_dump_json()
 
 
 def test_owned_transcript_counts_identical_assistant_usage_once(

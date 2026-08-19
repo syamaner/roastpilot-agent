@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tomllib
 from collections.abc import Iterator
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -52,6 +53,134 @@ _RESPONSE_TYPES = {
     "custom_tool_call",
     "custom_tool_call_output",
 }
+_SUBAGENT_SESSION_META_KEYS = {
+    "agent_nickname",
+    "agent_path",
+    "agent_role",
+    "base_instructions",
+    "cli_version",
+    "context_window",
+    "cwd",
+    "git",
+    "history_mode",
+    "id",
+    "model_provider",
+    "multi_agent_version",
+    "originator",
+    "parent_thread_id",
+    "session_id",
+    "source",
+    "thread_source",
+    "timestamp",
+}
+_ROOT_SESSION_META_KEYS = {
+    "base_instructions",
+    "cli_version",
+    "context_window",
+    "cwd",
+    "git",
+    "history_mode",
+    "id",
+    "model_provider",
+    "originator",
+    "session_id",
+    "source",
+    "thread_source",
+    "timestamp",
+}
+_GIT_KEYS = {"branch", "commit_hash", "repository_url"}
+_TURN_CONTEXT_KEYS = {
+    "approval_policy",
+    "approvals_reviewer",
+    "collaboration_mode",
+    "comp_hash",
+    "current_date",
+    "cwd",
+    "effort",
+    "file_system_sandbox_policy",
+    "model",
+    "multi_agent_version",
+    "permission_profile",
+    "personality",
+    "realtime_active",
+    "sandbox_policy",
+    "summary",
+    "timezone",
+    "turn_id",
+    "workspace_roots",
+}
+_EVENT_KEYS = {
+    "task_started": {
+        "collaboration_mode_kind",
+        "model_context_window",
+        "started_at",
+        "turn_id",
+        "type",
+    },
+    "task_complete": {
+        "completed_at",
+        "duration_ms",
+        "last_agent_message",
+        "started_at",
+        "time_to_first_token_ms",
+        "turn_id",
+        "type",
+    },
+    "item_completed": {"completed_at_ms", "item", "started_at_ms", "thread_id", "turn_id", "type"},
+    "token_count": {"info", "rate_limits", "type"},
+}
+_RESPONSE_ITEM_KEYS: dict[str, tuple[set[str], ...]] = {
+    "function_call": (
+        {
+            "arguments",
+            "call_id",
+            "id",
+            "internal_chat_message_metadata_passthrough",
+            "name",
+            "type",
+        },
+    ),
+    "agent_message": (
+        {
+            "author",
+            "content",
+            "id",
+            "internal_chat_message_metadata_passthrough",
+            "recipient",
+            "type",
+        },
+    ),
+    "custom_tool_call": (
+        {
+            "call_id",
+            "id",
+            "input",
+            "internal_chat_message_metadata_passthrough",
+            "name",
+            "status",
+            "type",
+        },
+    ),
+    "custom_tool_call_output": (
+        {"call_id", "id", "internal_chat_message_metadata_passthrough", "output", "type"},
+    ),
+    "function_call_output": (
+        {"call_id", "id", "internal_chat_message_metadata_passthrough", "output", "type"},
+    ),
+    "message": (
+        {"content", "id", "internal_chat_message_metadata_passthrough", "role", "type"},
+        {"content", "id", "internal_chat_message_metadata_passthrough", "phase", "role", "type"},
+    ),
+    "reasoning": (
+        {
+            "encrypted_content",
+            "id",
+            "internal_chat_message_metadata_passthrough",
+            "summary",
+            "type",
+        },
+    ),
+}
 
 
 class NativeCodexCaptureError(ValueError):
@@ -85,6 +214,13 @@ def _open_root(raw: str, *, private: bool) -> _Root:
     try:
         if not os.path.isabs(raw):
             _fail()
+        current = os.path.sep
+        for part in raw.split(os.path.sep)[1:]:
+            if not part:
+                continue
+            current = os.path.join(current, part)
+            if stat.S_ISLNK(os.lstat(current).st_mode):
+                _fail()
         fd = os.open(raw, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         status = os.fstat(fd)
         if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.geteuid():
@@ -133,13 +269,7 @@ def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
                 _fail()
             status = os.fstat(child)
             relative = f"{prefix}/{name}" if prefix else name
-            if stat.S_ISDIR(status.st_mode):
-                if status.st_uid != os.geteuid() or status.st_nlink < 2:
-                    os.close(child)
-                    _fail()
-                yield from descend(child, relative, depth + 1)
-                os.close(child)
-            elif stat.S_ISREG(status.st_mode):
+            if stat.S_ISREG(status.st_mode):
                 if (
                     not name.endswith(".jsonl")
                     or status.st_uid != os.geteuid()
@@ -148,24 +278,32 @@ def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
                     os.close(child)
                     _fail()
                 yield relative, child, status
-            else:
+                continue
+            try:
+                if (
+                    not stat.S_ISDIR(status.st_mode)
+                    or status.st_uid != os.geteuid()
+                    or status.st_nlink < 2
+                ):
+                    _fail()
+                yield from descend(child, relative, depth + 1)
+            finally:
                 os.close(child)
-                _fail()
 
-    yield from descend(os.dup(root.descriptor), "", 0)
+    duplicate = os.dup(root.descriptor)
+    try:
+        yield from descend(duplicate, "", 0)
+    finally:
+        os.close(duplicate)
 
 
 def _inventory(root: _Root) -> dict[str, tuple[int, int]]:
     """Snapshot immutable provider rollout identities, not mutable file sizes."""
     result: dict[str, tuple[int, int]] = {}
-    total = 0
     for name, fd, status in _walk(root):
         try:
-            if status.st_size > MAX_PROVIDER_FILE_BYTES:
-                _fail()
-            total += status.st_size
             result[name] = (status.st_dev, status.st_ino)
-            if len(result) > MAX_PROVIDER_FILES or total > MAX_PROVIDER_TOTAL_BYTES:
+            if len(result) > MAX_PROVIDER_FILES:
                 _fail()
         finally:
             os.close(fd)
@@ -284,6 +422,12 @@ def _agent_path(value: Any) -> str:
     return value
 
 
+def _opaque_text(value: Any) -> None:
+    """Bound an unretained provider text field without interpreting its contents."""
+    if not isinstance(value, str) or len(value) > MAX_EVENT_BYTES:
+        _fail()
+
+
 def _totals(value: Any) -> tuple[int, int, int, int, int, int]:
     keys = (
         "input_tokens",
@@ -309,6 +453,7 @@ def _parse_rollout(
     session = ""
     parent_thread = ""
     matches = False
+    is_subagent = False
     totals: tuple[int, int, int, int, int, int] | None = None
     with os.fdopen(os.dup(fd), "rb") as stream:
         for number, raw in enumerate(stream, 1):
@@ -326,33 +471,51 @@ def _parse_rollout(
                 if seen_meta or seen_context:
                     _fail()
                 source, git = payload.get("source"), payload.get("git")
-                if (
-                    not isinstance(source, dict)
-                    or not isinstance(git, dict)
-                    or set(source) != {"subagent"}
-                    or set(source["subagent"]) != {"thread_spawn"}
-                ):
+                if not isinstance(git, dict) or set(git) != _GIT_KEYS:
                     _fail()
-                spawn = source["subagent"]["thread_spawn"]
-                if not isinstance(spawn, dict) or set(spawn) != {
-                    "parent_thread_id",
-                    "depth",
-                    "agent_path",
-                    "agent_nickname",
-                    "agent_role",
-                }:
+                if set(payload) == _ROOT_SESSION_META_KEYS:
+                    if source != "cli" or payload["thread_source"] != "user":
+                        _fail()
+                elif set(payload) == _SUBAGENT_SESSION_META_KEYS:
+                    if not isinstance(source, dict) or set(source) != {"subagent"}:
+                        _fail()
+                    source_subagent = source["subagent"]
+                    if not isinstance(source_subagent, dict) or set(source_subagent) != {
+                        "thread_spawn"
+                    }:
+                        _fail()
+                    spawn = source_subagent["thread_spawn"]
+                    if not isinstance(spawn, dict):
+                        _fail()
+                    if set(spawn) != {
+                        "parent_thread_id",
+                        "depth",
+                        "agent_path",
+                        "agent_nickname",
+                        "agent_role",
+                    }:
+                        _fail()
+                    parent_thread = _string(spawn["parent_thread_id"])
+                    agent_path = _agent_path(spawn["agent_path"])
+                    agent_role = _string(spawn["agent_role"])
+                    nickname = _string(spawn["agent_nickname"])
+                    if (
+                        payload["agent_path"] != agent_path
+                        or payload["agent_role"] != agent_role
+                        or payload["parent_thread_id"] != parent_thread
+                        or payload["agent_nickname"] != nickname
+                        or payload["thread_source"] != "subagent"
+                    ):
+                        _fail()
+                    is_subagent = True
+                    matches = (
+                        parent_thread == binding["parent_thread_id"]
+                        and spawn["depth"] == 1
+                        and agent_path == binding["agent_path"]
+                        and agent_role == binding["role"]
+                    )
+                else:
                     _fail()
-                parent_thread = _string(spawn["parent_thread_id"])
-                agent_path = _agent_path(spawn["agent_path"])
-                agent_role = _string(spawn["agent_role"])
-                if not _safe_identifier(spawn["agent_nickname"]):
-                    _fail()
-                matches = (
-                    parent_thread == binding["parent_thread_id"]
-                    and spawn["depth"] == 1
-                    and agent_path == binding["agent_path"]
-                    and agent_role == binding["role"]
-                )
                 if (
                     _string(payload.get("id")) == ""
                     or payload.get("originator") != "codex-tui"
@@ -365,16 +528,21 @@ def _parse_rollout(
                 if (
                     not seen_meta
                     or seen_context
-                    or payload.get("model") != "gpt-5.6-terra"
-                    or payload.get("effort") != binding["effort"]
-                    or len(payload) != 19
+                    or set(payload) != _TURN_CONTEXT_KEYS
+                    or (
+                        is_subagent
+                        and (
+                            payload.get("model") != "gpt-5.6-terra"
+                            or payload.get("effort") != binding["effort"]
+                        )
+                    )
                 ):
                     _fail()
                 seen_context = True
             elif kind == "event_msg":
                 if (
-                    not seen_context
-                    or set(payload) != {"type", "info"}
+                    (is_subagent and not seen_context)
+                    or set(payload) != _EVENT_KEYS[payload["type"]]
                     or payload["type"] not in _EVENT_TYPES
                 ):
                     _fail()
@@ -394,14 +562,19 @@ def _parse_rollout(
                     seen_complete = True
             elif kind == "response_item":
                 subtype = payload.get("type")
-                if subtype not in _RESPONSE_TYPES:
+                if (
+                    subtype not in _RESPONSE_TYPES
+                    or set(payload) not in _RESPONSE_ITEM_KEYS[subtype]
+                ):
                     _fail()
-            elif kind in {"inter_agent_communication_metadata", "world_state"}:
-                if not payload:
+            elif kind == "inter_agent_communication_metadata":
+                if set(payload) != {"trigger_turn"}:
                     _fail()
-    if not seen_meta or not seen_context or not seen_complete or totals is None:
+            elif kind == "world_state" and set(payload) != {"full", "state"}:
+                _fail()
+    if not seen_meta or (is_subagent and (not seen_context or not seen_complete or totals is None)):
         _fail()
-    return session, totals, parent_thread, matches
+    return session, totals or (0, 0, 0, 0, 0, 0), parent_thread, matches
 
 
 def _new_rollouts(
@@ -409,21 +582,92 @@ def _new_rollouts(
 ) -> list[tuple[str, int, os.stat_result]]:
     result: list[tuple[str, int, os.stat_result]] = []
     total = 0
-    for name, fd, status in _walk(root):
-        if status.st_size > MAX_PROVIDER_FILE_BYTES:
-            os.close(fd)
-            _fail()
-        total += status.st_size
-        if total > MAX_PROVIDER_TOTAL_BYTES:
-            os.close(fd)
-            _fail()
-        if before.get(name) != (status.st_dev, status.st_ino):
+    try:
+        for name, fd, status in _walk(root):
+            if before.get(name) == (status.st_dev, status.st_ino):
+                os.close(fd)
+                continue
+            if status.st_size > MAX_PROVIDER_FILE_BYTES:
+                os.close(fd)
+                _fail()
+            total += status.st_size
+            if total > MAX_PROVIDER_TOTAL_BYTES:
+                os.close(fd)
+                _fail()
             result.append((name, fd, status))
-        else:
-            os.close(fd)
-    if len(result) > MAX_PROVIDER_FILES:
-        _fail()
+            if len(result) > MAX_PROVIDER_FILES:
+                _fail()
+    except BaseException:
+        for _name, fd, _status in result:
+            with suppress(OSError):
+                os.close(fd)
+        raise
     return result
+
+
+def _ancestor_identities(root: _Root) -> set[tuple[int, int]]:
+    """Return held descriptor ancestors without trusting mutable path strings."""
+    result: set[tuple[int, int]] = set()
+    descriptor = os.dup(root.descriptor)
+    try:
+        while True:
+            current = os.fstat(descriptor)
+            identity = (current.st_dev, current.st_ino)
+            if identity in result:
+                return result
+            result.add(identity)
+            parent = os.open(
+                "..",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=descriptor,
+            )
+            try:
+                parent_status = os.fstat(parent)
+            except OSError:
+                os.close(parent)
+                raise
+            finally:
+                os.close(descriptor)
+            if (parent_status.st_dev, parent_status.st_ino) == identity:
+                os.close(parent)
+                return result
+            descriptor = parent
+    except OSError:
+        _fail()
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
+
+
+def _reject_root_overlap(*roots: _Root) -> None:
+    """Reject equal, ancestor, and descendant roots using held identities."""
+    ancestors = [_ancestor_identities(root) for root in roots]
+    identities = [(root.device, root.inode) for root in roots]
+    for index, identity in enumerate(identities):
+        for other_index in range(index + 1, len(identities)):
+            if identity in ancestors[other_index] or identities[other_index] in ancestors[index]:
+                _fail()
+
+
+def _terminal_line() -> bytes:
+    """Read exactly one already-framed terminal line without waiting for EOF."""
+    line = sys.stdin.buffer.readline(MAX_EVENT_BYTES + 1)
+    if not line or len(line) > MAX_EVENT_BYTES or not line.endswith(b"\n"):
+        _fail()
+    descriptor = sys.stdin.fileno()
+    try:
+        os.set_blocking(descriptor, False)
+        try:
+            if os.read(descriptor, 1):
+                _fail()
+        except BlockingIOError:
+            pass
+    except OSError:
+        _fail()
+    finally:
+        with suppress(OSError):
+            os.set_blocking(descriptor, True)
+    return line
 
 
 def _descendant(base: str, head: str) -> bool:
@@ -447,12 +691,10 @@ def supervise_native_codex(arguments: Any) -> int:
     role = NativeCodexRole(arguments.role)
     usage = _open_root(arguments.usage_root, private=True)
     provider = _open_root(os.path.expanduser("~/.codex/sessions"), private=False)
+    worktree = _open_root(os.getcwd(), private=False)
     started = datetime.now(UTC)
     try:
-        if os.path.commonpath(
-            [os.path.realpath(arguments.usage_root), os.path.realpath(os.getcwd())]
-        ) in {os.path.realpath(arguments.usage_root), os.path.realpath(os.getcwd())}:
-            _fail()
+        _reject_root_overlap(usage, provider, worktree)
         launch = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=False
         )
@@ -467,9 +709,7 @@ def supervise_native_codex(arguments: Any) -> int:
         ready = {"type": "READY", "binding_id": str(uuid4())}
         sys.stdout.write(json.dumps(ready, separators=(",", ":")) + "\n")
         sys.stdout.flush()
-        line = sys.stdin.buffer.readline(MAX_EVENT_BYTES)
-        if not line or not line.endswith(b"\n") or sys.stdin.buffer.readline(1):
-            _fail()
+        line = _terminal_line()
         terminal = _json(line)
         if (
             set(terminal) != {"type", "binding_id", "task_status"}
@@ -498,7 +738,8 @@ def supervise_native_codex(arguments: Any) -> int:
         selected_fd, leaf, totals = matched[0]
         os.close(selected_fd)
         # Every new rollout was fully parsed; a spawned child is therefore visible.
-        whole = leaf not in child_parents
+        subagent_count = sum(parent_id == leaf for parent_id in child_parents)
+        whole = subagent_count == 0
         final = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=True
         )
@@ -515,6 +756,8 @@ def supervise_native_codex(arguments: Any) -> int:
             parent_task_id=arguments.parent_task_id,
             task_name=arguments.task_name,
             native_role=role,
+            config_sha256=config_sha,
+            role_sha256=role_sha,
             effort=effort,
             repository=arguments.repository,
             branch=arguments.branch,
@@ -536,6 +779,7 @@ def supervise_native_codex(arguments: Any) -> int:
             reasoning_output_tokens=totals[4],
             total_tokens=totals[5],
             whole_tree_verified=whole,
+            subagent_count=subagent_count,
         )
         from capture_usage_cli import append_record  # local avoids import cycle
 
@@ -552,3 +796,4 @@ def supervise_native_codex(arguments: Any) -> int:
     finally:
         os.close(provider.descriptor)
         os.close(usage.descriptor)
+        os.close(worktree.descriptor)
