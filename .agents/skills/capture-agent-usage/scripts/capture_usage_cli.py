@@ -1033,6 +1033,23 @@ def _validate_evidence_manifest_schema(
     return validated_files
 
 
+def _validate_evidence_pr_identity(payload: bytes, pr: int, head_sha: str, base_sha: object) -> None:
+    """Require the offline ``pr.json`` identity to agree with its manifest."""
+    try:
+        data = json.loads(payload, object_pairs_hook=_reject_duplicate_manifest_keys)
+    except json.JSONDecodeError:
+        raise CaptureUsageError("evidence bundle is invalid") from None
+    if (
+        not isinstance(data, dict)
+        or set(data) != {"number", "headRefOid", "baseRefOid"}
+        or data.get("number") != pr
+        or data.get("headRefOid") != head_sha
+        or not isinstance(base_sha, str)
+        or data.get("baseRefOid") != base_sha
+    ):
+        raise CaptureUsageError("evidence bundle is invalid")
+
+
 def _evidence_listing(root_fd: int) -> frozenset[str]:
     """Return the exact nine-entry bundle listing, rejecting any drift from it."""
     try:
@@ -1146,6 +1163,9 @@ def _evidence_bundle_state(
         except json.JSONDecodeError:
             raise CaptureUsageError("evidence bundle is invalid") from None
         files = _validate_evidence_manifest_schema(manifest, pr, attested_head)
+        pr_descriptor = _open_evidence_entry(root_fd, "pr.json")
+        pr_payload = _read_bounded_evidence_file(pr_descriptor, EVIDENCE_MAX_FILE_BYTES)
+        _validate_evidence_pr_identity(pr_payload, pr, attested_head, manifest["base_sha"])
         remaining_budget = EVIDENCE_MAX_TOTAL_BYTES
         digests: list[tuple[str, str, int]] = []
         for name in EVIDENCE_PAYLOAD_FILES:

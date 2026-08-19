@@ -7822,7 +7822,14 @@ def _build_evidence_bundle(
     for name in EVIDENCE_PAYLOAD_FILES:
         if name in skip_files:
             continue
-        data = overrides.get(name, f'{{"{name}": true}}'.encode())
+        data = overrides.get(
+            name,
+            (
+                json.dumps({"number": pr, "headRefOid": head_sha, "baseRefOid": base_sha}).encode()
+                if name == "pr.json"
+                else f'{{"{name}": true}}'.encode()
+            ),
+        )
         target = root / name
         target.write_bytes(data)
         target.chmod(file_mode)
@@ -7873,6 +7880,27 @@ def test_evidence_bundle_binds_add_dir_and_no_allowed_tools(
     assert argv[argv.index("--add-dir") + 1] == bound.path
     assert argv[argv.index("--add-dir") + 2] == "--permission-mode"
     assert "--allowedTools" not in argv
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"number":838,"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","baseRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}',
+        b'{"number":837,"headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","baseRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}',
+    ],
+)
+def test_evidence_bundle_rejects_pr_json_identity_mismatch(
+    payload: bytes, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """The retained offline PR payload must agree with manifest PR/head/base identity."""
+    root = _build_evidence_bundle(
+        tmp_path_factory.mktemp("evidence-pr-identity") / "root",
+        payload_overrides={"pr.json": payload},
+    )
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
     bound.reattest()
 
 

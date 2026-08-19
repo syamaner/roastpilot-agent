@@ -398,7 +398,8 @@ between launch and exit all fail closed with no record and no handback.
 
 ```bash
 mkdir -m 700 <root>
-gh pr view <n> --json ... > <root>/pr.json
+gh pr view <n> --json number,headRefOid,baseRefOid > <root>/identity-before.json
+gh pr view <n> --json number,headRefOid,baseRefOid,... > <root>/pr.json
 gh pr diff <n> > <root>/diff.patch
 gh pr checks <n> --json ... > <root>/checks.json
 gh api repos/{owner}/{repo}/pulls/<n>/reviews > <root>/reviews.json
@@ -406,6 +407,9 @@ gh api repos/{owner}/{repo}/pulls/<n>/comments > <root>/review-comments.json
 gh api repos/{owner}/{repo}/issues/<n>/comments > <root>/issue-comments.json
 gh api repos/{owner}/{repo}/pulls/<n> --jq '...' > <root>/authors.json
 gh api graphql -f query='...' > <root>/review-threads.json
+gh pr view <n> --json number,headRefOid,baseRefOid > <root>/identity-after.json
+# reject collection unless identity-before.json and identity-after.json match exactly;
+# manifest.json records that number, headRefOid, and baseRefOid, then remove both bracket files
 chmod 400 <root>/*.json <root>/diff.patch
 # write manifest.json: evidence_schema_version, repository, pull_request,
 # head_sha (exact attested launch HEAD), base_sha, generated_at, and a
