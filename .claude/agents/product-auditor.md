@@ -22,8 +22,10 @@ for. The paths below are repository-relative; the lead names the tree.
 
 - The plan repo: `roastpilot-agent/plan.md` (decisions D-#, the component plan)
   and `roastpilot-agent-orchestration-plan.md` (architecture). **Plans win.**
-  Default checkout `~/git/roastpilot-plan` only when the lead directs a
-  standalone run against it.
+  Under `run-native-claude` capture (D169), the
+  `--plan-root`/`--plan-sha` pair is mandatory and names a
+  parent-provisioned, exact-SHA, byte-clean `roastpilot-plan` worktree. Fail
+  closed when it is absent; never guess or fall back to a default checkout.
 - The agent repo: `docs/state/registry.md`, `docs/epics/E*.md`, `AGENTS.md`, and
   the code/tests for the work under review.
 
@@ -39,8 +41,12 @@ omit the provenance line rather than forcing it into a finding.
    through safety; restart → operator_recovery_required; Celsius; typed enums; SPA
    never calls MCP): held? Re-derive from the repo — **do not trust the
    implementer's self-report** (independent posture; default to "gap" when unsure).
-   Run the gates yourself when validating code (`ruff`, `pyright`, `pytest`, or the
-   web equivalents) — read-only execution only.
+   Under native capture, consume the parent's complete exit-status-backed,
+   exact-head gate and coverage evidence, including every command, result,
+   skip, coverage total, and changed-line/branch result. You have no admitted
+   native Bash gate and must fail closed when that evidence is absent or
+   partial. Outside native capture, run read-only gates yourself when the
+   caller and available tools permit it.
 2. **Verify plan↔code↔plan consistency.** Flag dropped requirements, an
    undefined "done", and any drift between the registry/epic tables, the plan
    decisions, and the actual code/GitHub state.

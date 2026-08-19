@@ -15,10 +15,15 @@ from capture_usage_models import (
     bounded_jsonl_lines,
 )
 
-CLAUDE_EVENT_TYPES = frozenset({"system", "user", "assistant", "rate_limit_event", "result"})
-"""Opaque event types observed unchanged in sanitized 2.1.228 and 2.1.231 fixtures."""
+CLAUDE_EVENT_TYPES = frozenset({"system", "assistant", "rate_limit_event", "result"})
+"""Opaque event types observed in the frozen sanitized 2.1.233 fixtures.
+
+``user`` is not a member: no supplied 2.1.233 fixture (generic or native)
+observes it, so it is retired rather than carried forward from the rejected
+2.1.228/2.1.231 evidence.
+"""
 CLAUDE_SYSTEM_SUBTYPES = frozenset({"hook_started", "hook_response", "init"})
-"""System subtypes observed unchanged in sanitized 2.1.228 and 2.1.231 fixtures."""
+"""System subtypes observed in the frozen sanitized 2.1.233 fixture."""
 CLAUDE_RESULT_USAGE_KEYS = frozenset(
     {
         "input_tokens",
@@ -34,17 +39,19 @@ CLAUDE_RESULT_USAGE_KEYS = frozenset(
         "speed",
     }
 )
-"""Exact terminal usage keys observed unchanged in Claude Code 2.1.228 and 2.1.231."""
+"""Exact terminal usage keys observed in Claude Code 2.1.233."""
 CLAUDE_SUCCESS_SUBTYPE = "success"
-CLAUDE_FAILURE_SUBTYPES = frozenset(
-    {
-        "error_max_turns",
-        "error_max_budget_usd",
-        "error_max_structured_output_retries",
-        "error_during_execution",
-    }
-)
-"""Closed failure subtypes observed unchanged in Claude Code 2.1.228 and 2.1.231."""
+CLAUDE_FAILURE_SUBTYPES: frozenset[str] = frozenset()
+"""No admitted failure result subtype: no supplied 2.1.233 fixture proves one.
+
+Every committed 2.1.233 fixture's terminal ``result`` event carries
+``subtype: "success"`` with ``is_error: false``; a failed generic-harness run
+is instead surfaced through the missing-terminal fallback in
+:func:`parse_claude_stream`, and a failed native worker is surfaced through
+the owned transcript path in ``capture_usage_transcript``, neither of which
+depends on this set. Widening it again requires a newly observed 2.1.233
+fixture, not evidence carried forward from the rejected 2.1.228 grammar.
+"""
 CLAUDE_MODEL_USAGE_KEYS = frozenset(
     {
         "inputTokens",
@@ -59,9 +66,13 @@ CLAUDE_MODEL_USAGE_KEYS = frozenset(
         "provider",
     }
 )
-"""Exact model usage keys observed unchanged in Claude Code 2.1.228 and 2.1.231."""
-CLAUDE_PERMISSION_MODES = frozenset({"default", "plan"})
-"""Permission vocabularies observed in sanitized Claude init events."""
+"""Exact model usage keys observed in Claude Code 2.1.233."""
+CLAUDE_PERMISSION_MODES = frozenset({"plan"})
+"""Permission vocabularies observed in sanitized Claude init events.
+
+``default`` is not a member: no supplied 2.1.233 fixture observes it, and the
+launch-authority boundary requires ``plan`` regardless.
+"""
 
 
 class ClaudeUsageParseError(ValueError):
@@ -126,6 +137,8 @@ def _event_from_line(line: str) -> Mapping[str, Any]:
         subtype = event.get("subtype")
         if subtype not in CLAUDE_SYSTEM_SUBTYPES:
             raise ClaudeUsageParseError("unknown Claude system subtype")
+        if subtype == "init" and event.get("claude_code_version") != "2.1.233":
+            raise ClaudeUsageParseError("unverified Claude version")
     return event
 
 

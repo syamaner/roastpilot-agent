@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import os
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Annotated, BinaryIO, Literal, TypeAlias
@@ -12,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator,
 AGENT_USAGE_SCHEMA_VERSION = 1
 """The append-only on-disk record schema version."""
 
-NATIVE_WORKER_USAGE_SCHEMA_VERSION = 2
+NATIVE_WORKER_USAGE_SCHEMA_VERSION = 3
 """D161 native-worker record schema, distinct from generic capture records."""
 
 SKILL_VERSION = "0.1.0"
@@ -84,6 +86,320 @@ class NativeClaudeRole(Enum):
 
     ENGINEER_BE = "engineer-be"
     ENGINEER_FE = "engineer-fe"
+    MCP_CONTRACT_CHECKER = "mcp-contract-checker"
+    PLANNING_ARCHITECT = "planning-architect"
+    PR_TRIAGE = "pr-triage"
+    PRODUCT_AUDITOR = "product-auditor"
+    QA = "qa"
+    SIM_ROAST_RUNNER = "sim-roast-runner"
+    STORY_PLANNER = "story-planner"
+
+
+NATIVE_ROLE_EXCLUSIONS: dict[str, str] = {
+    "safety-reviewer": (
+        "its mandatory whole-diff safety review requires ordinary-role Bash/git access"
+    ),
+    "security-reviewer": (
+        "its mandatory whole-diff security review requires ordinary-role Bash/git access"
+    ),
+    "ui-reviewer": (
+        "its Playwright MCP conflicts with the empty-MCP, empty-tools native"
+        " capture launch boundary"
+    ),
+}
+"""Committed `.claude/agents/*.md` roles deliberately excluded from native capture.
+
+Every excluded role is documented with its exact reason rather than silently
+absent; :data:`NativeClaudeRole` values union this mapping's keys must equal the
+committed agent file stems exactly (tests/test_capture_agent_usage.py).
+"""
+
+
+class RoleCapability(Enum):
+    """Closed capability inferred from committed native-role tools."""
+
+    WRITE = "WRITE"
+    READ_ONLY = "READ_ONLY"
+
+
+VALIDATION_ENVIRONMENT_ROLES = frozenset(
+    {
+        NativeClaudeRole.QA,
+        NativeClaudeRole.MCP_CONTRACT_CHECKER,
+        NativeClaudeRole.SIM_ROAST_RUNNER,
+    }
+)
+"""Roles requiring a parent-provisioned external validation environment (D166).
+
+These three READ_ONLY roles execute Python/pytest to do their jobs; a
+worktree-local ``.venv`` would fail the read-only pre-launch and post-exit
+attestation, so their gates run against an external per-run root instead
+(§2.4). ``--validation-root`` is required for exactly these roles and
+rejected for every other role.
+"""
+
+
+class ValidationCommandKind(Enum):
+    """Closed command-matching kind for one committed validation-role rule.
+
+    ``EXACT`` renders a provider allow-rule that matches only the byte-exact
+    command; ``PREFIX`` renders a rule matching that exact command followed
+    by any arguments (D168, §2.2). Plain ``Enum``, never string-compared.
+    """
+
+    EXACT = "EXACT"
+    PREFIX = "PREFIX"
+
+
+@dataclass(frozen=True)
+class ValidationCommand:
+    """One committed validation-role gate command template.
+
+    ``template`` uses exactly two placeholders, ``{python}`` and ``{tmp}``,
+    substituted only from the one already-validated resolved root every
+    other validation-environment consumer uses (D168, §2.2).
+    """
+
+    kind: ValidationCommandKind
+    template: str
+
+
+VALIDATION_ROLE_COMMANDS: dict[NativeClaudeRole, tuple[ValidationCommand, ...]] = {
+    NativeClaudeRole.QA: (
+        ValidationCommand(ValidationCommandKind.PREFIX, "{python} -m pytest"),
+        ValidationCommand(ValidationCommandKind.EXACT, "{python} -m pyright --pythonpath {python}"),
+        ValidationCommand(ValidationCommandKind.EXACT, "{python} -m ruff check ."),
+        ValidationCommand(ValidationCommandKind.EXACT, "{python} -m ruff format --check ."),
+    ),
+    NativeClaudeRole.MCP_CONTRACT_CHECKER: (
+        ValidationCommand(ValidationCommandKind.EXACT, "{python} -m pip show coffee-roaster-mcp"),
+        ValidationCommand(
+            ValidationCommandKind.EXACT,
+            "{python} -m pytest tests/test_mcp_client.py -q --basetemp {tmp}/pytest",
+        ),
+    ),
+    NativeClaudeRole.SIM_ROAST_RUNNER: (
+        ValidationCommand(
+            ValidationCommandKind.EXACT,
+            "{python} -m pytest tests/test_milestone1.py "
+            "tests/test_milestone1_real_mcp.py -q --basetemp {tmp}/pytest",
+        ),
+    ),
+}
+"""The single source of truth for validation-role gate commands (D168, §2.2).
+
+Keys equal :data:`VALIDATION_ENVIRONMENT_ROLES` exactly; no other role is
+present. Rendered two ways from this one table, never independently: as the
+exact per-run commands ``print-validation-commands`` prints into the
+lead-authored role brief, and as the ``--allowedTools`` rules bound to the
+native launch argv (§2.2, §2.6)."""
+
+
+def render_validation_commands(role: NativeClaudeRole, root: str) -> tuple[str, ...]:
+    """Render one role's exact gate commands against one validated root.
+
+    Performs no filesystem access itself; ``root`` must already be the
+    canonical resolved return value of the sole
+    :func:`~capture_usage_cli._validate_validation_root` call for this run.
+
+    Args:
+        role: The candidate native role.
+        root: The canonical resolved validation root.
+
+    Returns:
+        The ordered, rendered command strings for ``role``, or an empty
+        tuple when ``role`` is not a validation role.
+    """
+    commands = VALIDATION_ROLE_COMMANDS.get(role, ())
+    python = os.path.join(root, "venv", "bin", "python")
+    tmp = os.path.join(root, "tmp")
+    return tuple(command.template.format(python=python, tmp=tmp) for command in commands)
+
+
+def render_allowed_tools(role: NativeClaudeRole, root: str) -> tuple[str, ...]:
+    """Render one role's committed ``--allowedTools`` rules from the same table.
+
+    Never performs an independent substitution or validation; wraps exactly
+    the strings :func:`render_validation_commands` returns.
+
+    Args:
+        role: The candidate native role.
+        root: The canonical resolved validation root.
+
+    Returns:
+        The ordered ``Bash(...)`` rule strings for ``role`` — an ``EXACT``
+        entry renders ``Bash(<command>)`` and a ``PREFIX`` entry renders
+        ``Bash(<command>:*)`` — or an empty tuple when ``role`` is not a
+        validation role.
+    """
+    commands = VALIDATION_ROLE_COMMANDS.get(role, ())
+    rendered = render_validation_commands(role, root)
+    return tuple(
+        f"Bash({text}:*)" if command.kind is ValidationCommandKind.PREFIX else f"Bash({text})"
+        for command, text in zip(commands, rendered, strict=True)
+    )
+
+
+class BoundRootKind(Enum):
+    """Closed kind of one parent-provisioned bound root for a native launch (D169, §2.2).
+
+    Plain ``Enum``, never string-compared: at most one kind is ever active for
+    a single native launch because the three policies' admitted role sets are
+    pairwise disjoint (proven once by a closure test, never re-checked at
+    runtime).
+    """
+
+    VALIDATION = "VALIDATION"
+    PLAN = "PLAN"
+    EVIDENCE = "EVIDENCE"
+
+
+VALIDATION_ENVIRONMENT_KEYS = frozenset(
+    {
+        "ROASTPILOT_VALIDATION_ROOT",
+        "ROASTPILOT_VALIDATION_PYTHON",
+        "ROASTPILOT_VALIDATION_TMP",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "PYTHONPYCACHEPREFIX",
+        "PYTHONDONTWRITEBYTECODE",
+        "RUFF_CACHE_DIR",
+        "COVERAGE_FILE",
+        "COFFEE_ROAST_LOG_DIR",
+        "PIP_CACHE_DIR",
+        "PYTEST_ADDOPTS",
+    }
+)
+"""Closed environment-variable names bound only for a validation-role launch.
+
+Moved here from ``capture_usage_cli`` (D169, §2.2) so :data:`BOUND_ROOT_POLICIES`
+can reference it directly. Stripped from every native launch's inherited
+environment first, then reinstated with exactly these values only when the
+role is a member of :data:`VALIDATION_ENVIRONMENT_ROLES` (D166 §2.4)."""
+
+PLAN_ROOT_ENVIRONMENT_KEY = "ROASTPILOT_PLAN_ROOT"
+"""The one environment key bound only for a PLAN-kind native launch (D169, §2.3)."""
+
+EVIDENCE_ROOT_ENVIRONMENT_KEY = "ROASTPILOT_EVIDENCE_ROOT"
+"""The one environment key bound only for an EVIDENCE-kind native launch (D169, §2.4)."""
+
+PLAN_ENVIRONMENT_KEYS = frozenset({PLAN_ROOT_ENVIRONMENT_KEY})
+EVIDENCE_ENVIRONMENT_KEYS = frozenset({EVIDENCE_ROOT_ENVIRONMENT_KEY})
+
+ALL_BOUND_ROOT_ENVIRONMENT_KEYS = (
+    VALIDATION_ENVIRONMENT_KEYS | PLAN_ENVIRONMENT_KEYS | EVIDENCE_ENVIRONMENT_KEYS
+)
+"""The closed union of every bound-root environment key (thirteen total, D169, §2.2).
+
+Stripped from every native launch's inherited environment first; exactly one
+kind's keys are then reinstated, and only when that kind is the launch's
+active bound root."""
+
+
+@dataclass(frozen=True)
+class BoundRootPolicy:
+    """One closed bound-root kind's option grammar and role admission (D169, §2.2)."""
+
+    kind: BoundRootKind
+    root_option: str
+    companion_option: str | None
+    required_roles: frozenset[NativeClaudeRole]
+    optional_roles: frozenset[NativeClaudeRole]
+    environment_keys: frozenset[str]
+
+
+BOUND_ROOT_POLICIES: dict[BoundRootKind, BoundRootPolicy] = {
+    BoundRootKind.VALIDATION: BoundRootPolicy(
+        kind=BoundRootKind.VALIDATION,
+        root_option="--validation-root",
+        companion_option=None,
+        required_roles=VALIDATION_ENVIRONMENT_ROLES,
+        optional_roles=frozenset(),
+        environment_keys=VALIDATION_ENVIRONMENT_KEYS,
+    ),
+    BoundRootKind.PLAN: BoundRootPolicy(
+        kind=BoundRootKind.PLAN,
+        root_option="--plan-root",
+        companion_option="--plan-sha",
+        required_roles=frozenset(
+            {
+                NativeClaudeRole.PLANNING_ARCHITECT,
+                NativeClaudeRole.PRODUCT_AUDITOR,
+                NativeClaudeRole.STORY_PLANNER,
+            }
+        ),
+        optional_roles=frozenset(),
+        environment_keys=PLAN_ENVIRONMENT_KEYS,
+    ),
+    BoundRootKind.EVIDENCE: BoundRootPolicy(
+        kind=BoundRootKind.EVIDENCE,
+        root_option="--evidence-root",
+        companion_option="--evidence-pr",
+        required_roles=frozenset({NativeClaudeRole.PR_TRIAGE}),
+        optional_roles=frozenset(),
+        environment_keys=EVIDENCE_ENVIRONMENT_KEYS,
+    ),
+}
+"""The exactly-three closed bound-root policies (D169, §2.2).
+
+Every admitted role set (``required_roles | optional_roles``) is pairwise
+disjoint across the three policies, so at most one policy's root can ever be
+active for a single native launch — proven once by a closure test in
+``tests/test_capture_agent_usage.py``, never re-checked at runtime. This
+table's :data:`BoundRootKind.VALIDATION` entry's ``required_roles`` **is**
+:data:`VALIDATION_ENVIRONMENT_ROLES` (the identical object), so the two never
+drift."""
+
+
+@dataclass(frozen=True)
+class BoundRoot:
+    """The one validated bound root for a native launch, if any (D169, §2.2).
+
+    ``reattest`` is ``None`` for :data:`BoundRootKind.VALIDATION` (no D169
+    post-exit re-check is defined for that pre-existing kind) and a bound,
+    zero-argument closure for :data:`BoundRootKind.PLAN` and
+    :data:`BoundRootKind.EVIDENCE`, capturing exactly the state needed to
+    re-verify identity and integrity after the native child exits.
+    """
+
+    kind: BoundRootKind
+    path: str
+    reattest: Callable[[], None] | None = None
+    descriptor: int | None = None
+
+
+EVIDENCE_SCHEMA_VERSION = 1
+"""The closed PR-evidence-bundle manifest schema version (D169, §2.4)."""
+
+EVIDENCE_MANIFEST_NAME = "manifest.json"
+"""The one bundle manifest file name."""
+
+EVIDENCE_PAYLOAD_FILES: tuple[str, ...] = (
+    "pr.json",
+    "diff.patch",
+    "checks.json",
+    "reviews.json",
+    "review-comments.json",
+    "issue-comments.json",
+    "authors.json",
+    "review-threads.json",
+)
+"""The closed, ordered set of the eight parent-fetched PR evidence payload files."""
+
+EVIDENCE_BUNDLE_FILES: frozenset[str] = frozenset({EVIDENCE_MANIFEST_NAME, *EVIDENCE_PAYLOAD_FILES})
+"""The exact nine-entry closed bundle listing (D169, §2.4): no subdirectories, no extras."""
+
+EVIDENCE_MAX_MANIFEST_BYTES = 65_536
+"""64 KiB manifest cap (D169, §2.4)."""
+
+EVIDENCE_MAX_FILE_BYTES = 4 * 1024 * 1024
+"""4 MiB per-payload-file cap (D169, §2.4)."""
+
+EVIDENCE_MAX_TOTAL_BYTES = 16 * 1024 * 1024
+"""16 MiB aggregate payload cap (D169, §2.4)."""
+
+EVIDENCE_CHUNK_BYTES = 65_536
+"""Bounded streaming chunk size for payload hashing (D169, §2.4)."""
 
 
 class EstimateBasis(Enum):
@@ -269,13 +585,14 @@ class NativeWorkerUsageRecord(CaptureModel):
     """
 
     record_type: Literal["NATIVE_WORKER_USAGE"] = "NATIVE_WORKER_USAGE"
-    schema_version: Literal[2] = NATIVE_WORKER_USAGE_SCHEMA_VERSION
+    schema_version: Literal[3] = NATIVE_WORKER_USAGE_SCHEMA_VERSION
     tool_version: SafeIdentifier = SKILL_VERSION
     captured_at: datetime
     task_id: SafeIdentifier
     slice_id: SafeIdentifier
     harness: Literal[HarnessFamily.CLAUDE] = HarnessFamily.CLAUDE
     native_role: NativeClaudeRole
+    role_capability: RoleCapability
     model: SafeIdentifier
     effort: SafeIdentifier
     repository: RepositoryName
@@ -330,6 +647,13 @@ class NativeWorkerUsageRecord(CaptureModel):
             or model_usage.output_tokens != self.output_tokens
         ):
             raise ValueError("native totals must equal parent model usage")
+        if (
+            self.role_capability is RoleCapability.READ_ONLY
+            and self.final_head_sha != self.base_sha
+        ):
+            raise ValueError("read-only native workers must retain the base head")
+        if self.role_capability is RoleCapability.WRITE and self.final_head_sha == self.base_sha:
+            raise ValueError("write native workers must create a descendant head")
         return self
 
 

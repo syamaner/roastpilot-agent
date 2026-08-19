@@ -1,6 +1,6 @@
-"""Guard the ratified worktree controls in every Bash-capable role prompt.
+"""Guard the ratified worktree controls in every applicable role prompt.
 
-This proves each Bash-capable role carries its ratified control text verbatim, not
+This proves each applicable role carries its ratified control text verbatim, not
 comprehension or compliance; the lead-side provisioning duty (§8 item 6) remains the
 unguardable other half. Faithful rewording deliberately fails: each block is a routed
 control with one authoritative copy here, so a change is made once in this test and
@@ -77,6 +77,19 @@ _WRITING_DISCIPLINE_BLOCK = """## Worktree discipline (topology §7 — binding)
   pyright, pytest) — added Aug 2026 (#738, #733)"** in
   **`docs/agent-team-worktrees.md`**. The full recipe and fail-closed assertions
   live there.
+"""
+
+_EVIDENCE_ONLY_DISCIPLINE_BLOCK = """## Worktree discipline (topology §7 — binding)
+
+- This evidence-only role executes no shell command and performs no write. Use
+  only `Read`, `Grep`, and `Glob` to inspect the lead-named exact-head worktree.
+- The named worktree must be the current attested launch cwd. If it is absent,
+  different, or cannot be inspected with the available tools, fail closed and
+  ask the lead to relaunch from the correct worktree.
+- Treat the lead-supplied exact scope inventory, full-patch digest/size, and
+  exit-status-backed evidence as the only authority for git, gate, and mutation
+  claims. Never infer a clean diff, passing test, or successful negative control
+  from current-file contents.
 """
 
 _ADVERSARIAL_BLOCKS = (
@@ -206,19 +219,22 @@ def _canonical_block_mismatch(text: str, expected: str, source: str) -> str | No
 
 def _expected_variant(tools: set[str]) -> str:
     """Select the canonical block from write capability, never from a role list."""
+    if "Bash" not in tools:
+        return _EVIDENCE_ONLY_DISCIPLINE_BLOCK
     if tools.intersection({"Edit", "Write"}):
         return _WRITING_DISCIPLINE_BLOCK
     return _READ_ONLY_DISCIPLINE_BLOCK
 
 
 @pytest.mark.parametrize("path", _agent_files(), ids=lambda path: path.stem)
-def test_bash_capable_roles_carry_worktree_controls(path: Path) -> None:
-    """Every shell-capable role must carry its canonical routed-control variant."""
+def test_applicable_roles_carry_worktree_controls(path: Path) -> None:
+    """Every Bash role and shell-less binding role carries its canonical control."""
     tools = _tools(path)
-    if "Bash" not in tools:
+    text = path.read_text()
+    if "Bash" not in tools and "## Worktree discipline (topology §7 — binding)" not in text:
         return
 
-    mismatch = _canonical_block_mismatch(path.read_text(), _expected_variant(tools), path.name)
+    mismatch = _canonical_block_mismatch(text, _expected_variant(tools), path.name)
     assert mismatch is None, mismatch
 
 

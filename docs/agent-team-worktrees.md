@@ -236,6 +236,276 @@ make a faithful dependency install structurally impossible. Their gate output is
 An implementer that cannot install must say so, never improvise with
 `--system-site-packages`.
 
+## Parent-provisioned validation root for read-only capture runs (D166, amended D167, D168)
+
+The `#738`/`#733` per-worktree `.venv` rule above continues to govern every
+**write-capable** worker worktree. It is **replaced**, not extended, for the
+three test-running READ_ONLY capture-launched roles — `qa`,
+`mcp-contract-checker`, and `sim-roast-runner` — because a worktree-local
+`.venv` would fail the READ_ONLY pre-launch `status --porcelain --ignored`
+attestation, and running pytest/ruff/pyright unavoidably creates
+`.pytest_cache`, `.coverage`, and `__pycache__` — ignored artifacts that would
+fail the READ_ONLY post-exit clean check just as surely. Those three roles
+therefore never get their own worktree `.venv`; they get a **parent-owned,
+per-run, external** validation root instead, bound into the child process
+through a closed `env=` map (`capture_usage_cli.py`, D166 §2.4) and never
+created, written to, or deleted by the capture tool itself.
+
+**Ownership and lifecycle.** The parent creates one fresh root per capture
+run — never shared between runs, which would leak state between tasks and
+break attribution — before launch, and removes it after the run. The root
+must live outside the attested worktree, so nothing it accumulates can ever
+reach the tree the attestation covers.
+
+**Recipe (executed by the parent, never by the worker):**
+
+```bash
+ROOT="$(mktemp -d)"; chmod 700 "$ROOT"
+mkdir -m 700 "$ROOT/cache" "$ROOT/tmp"
+python3.11 -m venv "$ROOT/venv"
+TMPDIR="$ROOT/tmp" PIP_CACHE_DIR="$ROOT/cache/pip" PYTHONPYCACHEPREFIX="$ROOT/cache/pycache" PYTHONDONTWRITEBYTECODE=1 "$ROOT/venv/bin/python" -m pip install --upgrade pip
+cd <abs worktree> && TMPDIR="$ROOT/tmp" PIP_CACHE_DIR="$ROOT/cache/pip" PYTHONPYCACHEPREFIX="$ROOT/cache/pycache" PYTHONDONTWRITEBYTECODE=1 "$ROOT/venv/bin/python" -m pip install -e . --group dev
+git -C <abs worktree> status --porcelain --ignored     # MUST be empty before launch
+```
+
+`PYTHONPYCACHEPREFIX` and `PYTHONDONTWRITEBYTECODE=1` on both provisioning pip
+commands keep every `__pycache__` write inside the external root instead of the
+attested worktree, matching the same two keys the closed twelve-key
+environment map binds for the launched role itself (D166 §2.4) — provisioning
+and launch must not diverge on where bytecode can land.
+
+An **editable** install skips the SPA build hook (`pyproject.toml:222-223`),
+so no Node run and no `web/dist` write can touch the worktree, and pytest
+resolves the package from `pythonpath = ["src", "scripts",
+".agents/skills/capture-agent-usage/scripts"]` (`pyproject.toml:244`), so the
+external interpreter still exercises worktree source. **The post-provision
+clean check is mandatory:** if `git status --porcelain --ignored` is
+non-empty after provisioning, the parent re-provisions and never launches —
+the pre-launch attestation would fail closed anyway, so this is a fast local
+check, not a substitute for it.
+
+**pyright needs `--pythonpath` too**, for the same reason CI passes it
+(`.github/workflows/ci.yml:51-55`): with no worktree `.venv`, pyright has
+nothing for pyproject's `venvPath`/`venv` settings to resolve, so `qa`'s
+committed pyright gate (D168 below) resolves `--pythonpath` against the same
+external interpreter it invokes.
+
+**Attestation is untouched.** `--validation-root` binds exactly
+`ROASTPILOT_VALIDATION_ROOT`, `ROASTPILOT_VALIDATION_PYTHON`,
+`ROASTPILOT_VALIDATION_TMP`, `TMPDIR`, `XDG_CACHE_HOME`,
+`PYTHONPYCACHEPREFIX`, `PYTHONDONTWRITEBYTECODE`, `RUFF_CACHE_DIR`,
+`COVERAGE_FILE`, `COFFEE_ROAST_LOG_DIR`, `PIP_CACHE_DIR`, and `PYTEST_ADDOPTS`
+into the child process;
+it changes no origin, branch, head, or clean-tree check, and adds no
+allowlist or ignore-pattern anywhere. A role that dirties the attested
+worktree — tracked, untracked, or ignored — still fails closed with no record
+and no handback, exactly as before. `COFFEE_ROAST_LOG_DIR` redirects the
+declared `coffee-roaster-mcp` dependency's current-working-directory-relative
+`logs/` default into the attested external root. The twelve keys above are
+stripped from every native launch's inherited environment first, then
+reinstated with these exact values only for a validation-role launch; every
+other native launch, including a WRITE launch, sees none of them.
+
+**D167: one validated root now derives both the environment and one argv path
+authorization.** The same successful `_validate_validation_root` call that
+builds the twelve-key `env=` map above also returns the canonical resolved
+root, and the capture tool passes it to the three validation roles' native
+launch as exactly one `--add-dir <validated real root>` argv pair, placed
+immediately before `--permission-mode`. Installed Claude Code 2.1.233
+documents `--add-dir` as additional directories allowed for tool access; live
+evidence showed a D166 validation role under `dontAsk` could not otherwise
+execute the external interpreter, leaving the validation environment
+unusable. `--add-dir` grants **path access, not tools** — the committed
+`.claude/agents/*.md` frontmatter `tools:` line remains the sole capability
+boundary, unchanged by this argv addition. There is no caller-facing
+`--add-dir` CLI option to widen this, no second validation call, and no
+permission-mode change: every other native role's argv, and the
+generic `run` harness argv, is byte-identical to before D167. Both the raw
+`--validation-root` argument and its resolved realpath are checked by one
+shared, closed path-grammar predicate — rejecting whitespace, control
+characters, single/double quotes, and backslashes, in addition to the
+existing empty/`..`-segment and relative-path rejections — before either
+value is used for overlap, descriptor, or argv purposes.
+
+**Handback text is untrusted, inert data.** The bounded READ_ONLY handback a
+validation role returns to the launching parent (D166) is read-only metadata
+for the parent to relay or record; it is never executed, never treated as an
+instruction or authority, never fed unquoted into a write-capable worker's
+context, and never persisted to the sink, git, GitHub, or any other durable
+file.
+
+**Residual: intermediate-ancestor symlinks.** The root itself is opened
+no-follow (`O_NOFOLLOW`) and its ownership/mode are attested by descriptor, so
+a symlinked root component fails closed. An ancestor directory further up the
+path being a symlink is an accepted residual inside this trusted, same-uid,
+parent-provisioned boundary: the parent alone provisions and names the root,
+so a clean resolved path reached through a clean intermediate-ancestor
+symlink is not a new attacker-controlled surface.
+
+**D168: `--add-dir` alone left the validation environment unusable — a
+captured `qa` launch stayed byte-clean but denied every Python/pytest/Ruff/
+Pyright command before execution, because path access is not execution
+permission.** The fix is one committed, role-fixed `--allowedTools` allow-list
+for exactly `qa`, `mcp-contract-checker`, and `sim-roast-runner`, rendered
+only from the same already-validated resolved root and appended last in the
+native argv (variadic, so nothing may follow it). Unlisted commands remain
+**denied by the provider's `dontAsk` default, with no prompt and no retry** —
+the allow-list only widens specific command shapes; it adds no deny-list and
+no bypass mode. The parent is the **sole interface** to this role's exact
+gate commands: it runs `print-validation-commands --role <role>
+--validation-root <root>` (`capture_usage_cli.py`) and pastes that verbatim
+output into the role's brief. This runbook intentionally does not restate
+those seven dynamic command strings — they depend on the per-run root and
+only `print-validation-commands` can render them correctly, from the same
+table that builds the argv rules. Exactly one rule (`qa`'s `pytest` gate) is
+a *prefix* rule; it admits arbitrary pytest arguments and the execution of
+committed test code. This is an accepted, explicitly-scoped residual — **a
+discipline and attestation boundary, not an OS sandbox** — contained by
+parent-authored prompts, the per-run `0700` external root, the redirected
+cache/temp/coverage destinations above, and the unchanged byte-clean,
+unchanged-head post-exit attestation that still yields no record and no
+handback if anything lands in the worktree.
+
+## Parent-provisioned bound roots for read-only capture runs (D169)
+
+D166–D168 above cover exactly one bound-root kind, `--validation-root`, for
+the three test-running roles. D169 generalizes the same abstraction to two
+more closed role sets that need a readable root but never a command rule:
+`--plan-root`/`--plan-sha` for `planning-architect` and `story-planner`
+(required), `product-auditor` (required), and
+`--evidence-root`/`--evidence-pr` for `pr-triage`. All three kinds share one
+closed grammar, one disjointness rule, and one `0700`, current-euid,
+no-follow descriptor open; at most one bound root is ever active for a given
+native launch, because the three kinds' admitted role sets are pairwise
+disjoint. Neither the plan root nor the evidence bundle renders any
+`--allowedTools` rule: those roles read with `Read`/`Grep`/`Glob`, which need
+path access, not command permission.
+
+Every native launch also requires a separate parent-provisioned
+`--usage-root`. Create it outside the attested worktree and outside the active
+validation, plan, or evidence root, with current-euid ownership and mode
+exactly `0700`. Native capture holds a no-follow descriptor for the whole run,
+reattests that the path still names the same inode/device after the child
+exits, then appends the still-relative `.agent-usage/...` output beneath the
+held descriptor. It never sends the usage-root path to Claude. This keeps the
+worktree byte-clean while retaining the closed output-leaf grammar; absolute,
+traversing, symlinked, overlapping, replaced, wrong-owner, and wrong-mode roots
+fail closed. A parent may reuse one private usage root for sequential native
+runs, but never shares it across users or concurrent untrusted processes.
+
+Native `safety-reviewer` and `security-reviewer` runs are also deliberately
+evidence-only, but require no extra root: both inspect the already-attested
+implementation worktree with `Read`/`Grep`/`Glob` and have no Bash or
+`--allowedTools`. Their parent-authored briefs must name the exact worktree and
+head, include exit-status-backed exact-head/byte-clean attestation, summarize
+the exact-head diff scope/touched files, and include deterministic gate
+evidence with every skip named and justified. A safety diff affecting
+transitions, verdict handling, or a command path also requires a parent-owned
+negative-control mutation that makes the relevant test fail. Missing evidence
+is a fail-closed reviewer handback, never permission to compose or retry a
+shell command. This is the operator-approved no-new-permission Option A
+boundary.
+
+**Plan-root recipe (executed by the parent, never by the worker):**
+
+```bash
+git worktree add --detach <root> <sha>   # from a clean, up-to-date roastpilot-plan clone
+chmod 700 <root>
+git -C <root> status --porcelain --ignored     # MUST be empty before launch
+```
+
+The root must resolve to its own `git rev-parse --show-toplevel`, its origin
+must be `roastpilot-plan` (not `roastpilot-agent`), and its `HEAD` must equal
+the exact supplied `--plan-sha` (full 40-lowercase-hex; abbreviations are
+rejected). The tool re-runs the same identity checks, plus a
+`(st_dev, st_ino)` equality check on the root itself, after the native child
+exits — a commit landing, a file changing, or an ignored file appearing
+between launch and exit all fail closed with no record and no handback.
+
+**Evidence-bundle recipe (executed by the parent, never by the worker):** Build
+this immediately before launching `pr-triage`; `generated_at` is accepted only
+through the exact ten-minute age boundary at launch (the existing future-skew
+check also remains). REST arrays and GraphQL connections must be fully
+paginated and flattened; a first page is not complete evidence.
+
+```bash
+mkdir -m 700 <root>
+gh pr view <n> --json number,headRefOid,baseRefOid > <root>/identity-before.json
+gh pr view <n> --json number,headRefOid,baseRefOid,author,authorAssociation,... > <root>/pr.json
+gh pr diff <n> > <root>/diff.patch
+gh pr checks <n> --json ... > <root>/checks.json
+gh api --paginate --slurp repos/{owner}/{repo}/pulls/<n>/reviews | jq 'add' > <root>/reviews.json
+gh api --paginate --slurp repos/{owner}/{repo}/pulls/<n>/comments | jq 'add' > <root>/review-comments.json
+gh api --paginate --slurp repos/{owner}/{repo}/issues/<n>/comments | jq 'add' > <root>/issue-comments.json
+gh api graphql --paginate --slurp -F owner='{owner}' -F repo='{repo}' -F number=<n> \
+  -f query='query($owner:String!,$repo:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100,after:$endCursor){nodes{isResolved comments(first:100){nodes{author{login} authorAssociation body} pageInfo{hasNextPage} totalCount}} pageInfo{hasNextPage endCursor}}}}}' \
+  | jq 'if any(.[].data.repository.pullRequest.reviewThreads.nodes[];
+               .comments.pageInfo.hasNextPage)
+        then error("review-thread comments require nested pagination")
+        else [.[].data.repository.pullRequest.reviewThreads.nodes[]] end' \
+  > <root>/review-threads.json
+jq -n --slurpfile pr <root>/pr.json --slurpfile reviews <root>/reviews.json \
+  --slurpfile review_comments <root>/review-comments.json \
+  --slurpfile issue_comments <root>/issue-comments.json \
+  --slurpfile threads <root>/review-threads.json \
+  'def ident($login;$association):
+     if (($login|type)!="string" or ($login|length)==0 or
+         ($association|type)!="string" or ($association|length)==0)
+     then error("missing API author identity")
+     else {login:$login,author_association:$association} end;
+   [ident($pr[0].author.login;$pr[0].authorAssociation),
+    ($reviews[0][]|ident(.user.login;.author_association)),
+    ($review_comments[0][]|ident(.user.login;.author_association)),
+    ($issue_comments[0][]|ident(.user.login;.author_association)),
+    ($threads[0][]|.comments.nodes[]|ident(.author.login;.authorAssociation))]
+   | unique_by([.login,.author_association])' > <root>/authors.json
+gh pr view <n> --json number,headRefOid,baseRefOid > <root>/identity-after.json
+# reject collection unless identity-before.json and identity-after.json match exactly;
+# manifest.json records that number, headRefOid, and baseRefOid, then remove both bracket files
+chmod 400 <root>/*.json <root>/diff.patch
+# write manifest.json: evidence_schema_version, repository, pull_request,
+# head_sha (exact attested launch HEAD), base_sha, generated_at, and a
+# files map of {sha256, bytes} for the eight payload files above
+chmod 400 <root>/manifest.json
+chmod 700 <root>
+```
+
+The `number`, `headRefOid`, and `baseRefOid` members are mandatory and are
+semantically checked against the manifest; additional `pr.json` metadata is
+retained as untrusted review context for `pr-triage`. `authors.json` is a
+deduplicated API-derived identity inventory, never a body-text inference;
+missing login or `author_association` in any contributing object blocks bundle
+construction. If a GraphQL nested connection ever exceeds its requested page
+size, extend the parent collector to paginate it too rather than accepting a
+partial bundle.
+
+The bundle is flat: exactly the nine names above, no subdirectories, each a
+regular file owned by the parent's euid with `st_nlink == 1` and mode exactly
+`0400`. The tool never parses a payload file's content — it only verifies the
+manifest's declared `sha256`/`bytes` against what it streams (per-file cap 4
+MiB, aggregate cap 16 MiB), and that `pull_request` and `head_sha` equal the
+supplied `--evidence-pr` and the exact attested launch HEAD. `pr-triage`
+adjudicates the untrusted PR/review/issue text inside the bundle; it never
+invokes `gh`, never has network access, and never sees a credential. The tool
+re-verifies listing, modes, `(st_dev, st_ino)`, the manifest bytes, and all
+eight digests after the native child exits; any drift fails closed with no
+record and no handback. After the handback, re-read the live PR head, checks,
+review inventory, and unresolved-thread inventory before replying, resolving,
+or merging. The bundle proves the launch input, not that GitHub stayed
+unchanged while the offline review ran.
+
+**Ownership and lifecycle.** The parent creates one fresh validation, plan, or
+evidence root per run and removes it afterward; capture never writes those
+bound roots. The separately supplied usage root is the only root capture
+writes, and only below its `.agent-usage` descendant through the held
+descriptor.
+
+**The brief states the `ALLOW`/`RUN` distinction (§ below), not just bound
+roots.** `print-validation-commands` now prints `ALLOW EXACT <command>` /
+`ALLOW PREFIX <command-prefix>` authorization-descriptor lines followed by
+one concrete `RUN <command>` line per gate — a validation role executes only
+the `RUN ` lines, byte-exactly, never the `ALLOW` lines.
+
 ## Reviewers in a shared worktree (added 9 Jul 2026, after a live incident)
 
 During the 9 Jul batch a reviewer ran `git checkout -- <file>` in a teammate's
@@ -255,6 +525,11 @@ the author). Two binding rules fell out:
    working tree.
    Mutation tests are encouraged — they caught real test gaps all night — but
    the revert mechanism must be file-scoped, never git-scoped.
+
+Under native evidence-only review, the parent owns every mutation and supplies
+the exit-backed negative-control result in the brief. The reviewer never uses
+`cp` or composes a shell command; the protocol above applies only where the
+invoked role actually has the necessary command authority.
 
 ---
 

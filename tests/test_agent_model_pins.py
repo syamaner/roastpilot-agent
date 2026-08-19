@@ -41,8 +41,8 @@ _EXPECTED: dict[str, tuple[str, str]] = {
     "security-reviewer": ("claude-sonnet-5", "high"),
     "ui-reviewer": ("claude-sonnet-5", "high"),
     "safety-reviewer": ("claude-opus-5", "xhigh"),
-    "planning-architect": ("claude-fable-5", "high"),
-    "story-planner": ("claude-fable-5", "high"),
+    "planning-architect": ("claude-opus-5", "high"),
+    "story-planner": ("claude-opus-5", "high"),
 }
 _ALIASES = {"sonnet", "opus", "fable", "haiku", "best", "default"}
 _EXPECTED_CODEX: dict[str, tuple[str, str]] = {
@@ -103,42 +103,102 @@ def test_no_agent_uses_a_floating_alias(path: Path) -> None:
     assert model.startswith("claude-"), f"{path.stem}: model {model!r} is not a full ID"
 
 
-def test_agents_md_prose_names_the_full_ids() -> None:
-    """AGENTS.md prose must name the pinned IDs and the two special role associations."""
+_MODEL_FAMILIES = frozenset({"opus", "sonnet", "fable", "haiku"})
+_SELF_IDENTIFICATION = re.compile(
+    r"you are an? (?:claude )?(opus|sonnet|fable|haiku) model", re.IGNORECASE
+)
+
+
+def _model_family(model: str) -> str:
+    """Return the family segment of a full ``claude-<family>-<version>`` pin."""
+    parts = model.split("-")
+    assert len(parts) == 3 and parts[0] == "claude" and parts[1] in _MODEL_FAMILIES, (
+        f"model {model!r} is not a recognized full pinned id"
+    )
+    return parts[1]
+
+
+def _self_identified_families(body: str) -> set[str]:
+    """Return every model family a role body claims to itself be, lowercased."""
+    return {match.group(1).lower() for match in _SELF_IDENTIFICATION.finditer(body)}
+
+
+def _body(path: Path) -> str:
+    """Return the agent file's prose body, after its YAML frontmatter block."""
+    text = path.read_text()
+    match = re.match(r"^---\n.*?\n---\n", text, re.S)
+    assert match, f"{path.name}: no YAML frontmatter"
+    return text[match.end() :]
+
+
+@pytest.mark.parametrize("path", _agent_files(), ids=lambda p: p.stem)
+def test_agent_body_never_self_identifies_as_an_inconsistent_model_family(path: Path) -> None:
+    """A role body must never claim a model family other than its own frontmatter pin.
+
+    The retired ``story-planner.md`` construction ("you are a Fable model") is
+    the motivating case: its frontmatter pins ``claude-opus-5``, so a body claim
+    of any OTHER family — including that exact retired sentence — must fail.
+    """
+    fm = _frontmatter(path)
+    pinned_family = _model_family(fm["model"])
+    claimed = _self_identified_families(_body(path))
+    assert claimed <= {pinned_family}, (
+        f"{path.stem}: body self-identifies as {sorted(claimed - {pinned_family})}, "
+        f"inconsistent with its frontmatter pin family {pinned_family!r}"
+    )
+
+
+def test_self_identification_guard_detects_the_retired_fable_construction() -> None:
+    """The guard helper itself must flag the exact retired construction if reintroduced."""
+    sentence = "you are a Fable model and this contract is mandatory"
+    assert _self_identified_families(sentence) == {"fable"}
+    assert not ({"fable"} <= {_model_family("claude-opus-5")})
+
+
+_CANONICAL_PLANNING_SENTENCE = (
+    "- Planning: high-effort `claude-opus-5` roles `planning-architect` for complex,\n"
+    "  ambiguous, cross-repository, or safety-boundary design and `story-planner`\n"
+    "  for the mandatory implementation contract before every delegated slice. Both\n"
+    "  remain read-only."
+)
+_CANONICAL_ASSURANCE_SENTENCE = (
+    "- Assurance: `qa`, `security-reviewer`, `ui-reviewer`,\n"
+    "  `mcp-contract-checker`, and `sim-roast-runner` retain their existing pins and\n"
+    "  lenses. `safety-reviewer` remains the mandatory `claude-opus-5`, `xhigh`\n"
+    "  safety floor."
+)
+
+
+def _assert_live_planning_and_assurance_pins(agents_md: str) -> None:
+    """Require the complete canonical live-pin prose rather than nearby identifiers."""
+    assert agents_md.count(_CANONICAL_PLANNING_SENTENCE) == 1
+    assert agents_md.count(_CANONICAL_ASSURANCE_SENTENCE) == 1
+    assert "claude-fable-5" not in agents_md
+
+
+def test_agents_md_prose_uses_canonical_planning_and_assurance_sentences() -> None:
+    """Live planning and safety pin prose must be exact and free of Fable drift."""
     agents_md = (_REPO / "AGENTS.md").read_text()
     for full_id in {m for m, _ in _EXPECTED.values()}:
         assert full_id in agents_md, f"AGENTS.md does not mention the pinned id {full_id}"
-    # Bind the two roles whose model/effort differ from the Sonnet-high default, so
-    # the prose can't drift from the pins for them.
-    assert re.search(r"claude-opus-5.{0,24}xhigh", agents_md, re.S), (
-        "AGENTS.md must document safety-reviewer as claude-opus-5 at xhigh effort"
-    )
-    assert re.search(r"claude-fable-5(?:(?!claude-)[\s\S]){0,400}planning-architect", agents_md), (
-        "AGENTS.md must associate planning-architect with the claude-fable-5 pin "
-        "with no other model ID intervening — a bare mention check is satisfiable "
-        "by the other Fable role's text"
-    )
-    # Bind story-planner to the Fable pin the same way: the two-Fable-roles
-    # sentence must associate the full ID with the role, not merely mention both
-    # somewhere — otherwise re-pinning story-planner alone in prose stays green
-    # because planning-architect already satisfies the mention checks.
-    assert re.search(r"claude-fable-5(?:(?!claude-)[\s\S]){0,400}story-planner", agents_md), (
-        "AGENTS.md must associate story-planner with the claude-fable-5 pin (D152) "
-        "with no other model ID intervening"
-    )
-    # Converse guard: the association checks above pass on the shared
-    # two-Fable-roles sentence even if a LATER clause re-pins one role (e.g.
-    # "story-planner (model: claude-opus-5)"). Forbid any non-Fable model ID
-    # in the window straight after either role's name, anywhere in the prose.
-    for role in ("planning-architect", "story-planner"):
-        drift = re.search(
-            rf"{role}(?:(?!claude-)[\s\S]){{0,80}}claude-(?!fable-5)[a-z0-9.-]+",
-            agents_md,
-        )
-        found = drift.group(0) if drift else ""
-        assert drift is None, (
-            f"{role} appears re-associated with a non-Fable model in AGENTS.md prose: {found!r}"
-        )
+    _assert_live_planning_and_assurance_pins(agents_md)
+
+
+@pytest.mark.parametrize(
+    "decoy",
+    [
+        ("claude-opus-5", "claude-fable-5"),
+        ("`xhigh`", "`high`"),
+    ],
+)
+def test_agents_md_canonical_pin_guard_rejects_planning_and_safety_decoys(
+    decoy: tuple[str, str],
+) -> None:
+    """A nearby or downgraded planning/safety pin cannot satisfy the prose guard."""
+    agents_md = (_REPO / "AGENTS.md").read_text()
+    source, replacement = decoy
+    with pytest.raises(AssertionError):
+        _assert_live_planning_and_assurance_pins(agents_md.replace(source, replacement, 1))
 
 
 def test_topology_reference_table_rows_match_the_map() -> None:
@@ -155,8 +215,8 @@ def test_topology_reference_table_rows_match_the_map() -> None:
         return rf"[^\n|]*\|[^\n|]*`{model}`[^\n|]*\|[^\n|]*`{effort}`"
 
     rows = [
-        (r"\| Planning architect" + cells("claude-fable-5", "high"), "planning-architect"),
-        (r"\| Story planner" + cells("claude-fable-5", "high"), "story-planner"),
+        (r"\| Planning architect" + cells("claude-opus-5", "high"), "planning-architect"),
+        (r"\| Story planner" + cells("claude-opus-5", "high"), "story-planner"),
         (r"\| Safety/critical" + cells("claude-opus-5", "xhigh"), "safety reviewer"),
         (r"Claude fallback" + cells("claude-sonnet-5", "high"), "fallback implementer"),
         (r"\| Mechanical contract" + cells("claude-sonnet-5", "medium"), "mechanical checker"),

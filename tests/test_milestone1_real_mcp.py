@@ -12,11 +12,14 @@ The mock driver simulates its own temperature curve (it does not inject scripted
 frames), so the run is driven the way a real roast is: a context-aware advisor
 ramps heat then cuts it to engineer the charge-temperature drop the server's
 auto-T0 detector needs, first crack is the operator override (audio detection is
-disabled), and drop/stop-cooling are operator actions. Deterministic: the mock
-advances exactly one virtual second per state read.
+disabled), and drop/stop-cooling are operator actions. The test binds the
+interpreter-local console script, matching production's preferred resolution
+and rejecting a foreign PATH install. Deterministic: the mock advances exactly
+one virtual second per state read.
 """
 
-import shutil
+import os
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -30,8 +33,13 @@ from roastpilot_agent.advisor import (
     RoastDecision,
 )
 from roastpilot_agent.api import RoastService
-from roastpilot_agent.config import AppConfig, ControllerConfig, MCPConfig
-from roastpilot_agent.mcp_client import MCPServerProcess, RoasterControlAdapter, RoasterMCPClient
+from roastpilot_agent.config import DEFAULT_MCP_COMMAND, AppConfig, ControllerConfig, MCPConfig
+from roastpilot_agent.mcp_client import (
+    MCPServerProcess,
+    RoasterControlAdapter,
+    RoasterMCPClient,
+    resolve_mcp_command,
+)
 from roastpilot_agent.models import (
     AdvisorHealth,
     AdvisorHealthStatus,
@@ -44,11 +52,22 @@ from roastpilot_agent.models import (
 from roastpilot_agent.store import RoastStore
 from tests.conftest import FakeClock
 
+_RESOLVED_MCP_COMMAND = resolve_mcp_command(DEFAULT_MCP_COMMAND)
+_MCP_COMMAND = Path(_RESOLVED_MCP_COMMAND)
+_INTERPRETER_BIN_DIR = Path(sys.executable).parent.resolve()
+
 pytestmark = [
     pytest.mark.serial(reason="drives a real MCP child and verifies process teardown"),
     pytest.mark.skipif(
-        shutil.which("coffee-roaster-mcp") is None,
-        reason="coffee-roaster-mcp not installed (the E9-S2 real-subprocess slice)",
+        not (
+            _MCP_COMMAND.is_file()
+            and os.access(_MCP_COMMAND, os.X_OK)
+            and _MCP_COMMAND.parent.resolve() == _INTERPRETER_BIN_DIR
+        ),
+        reason=(
+            "default coffee-roaster-mcp does not resolve to the executable beside this "
+            "interpreter (the E9-S2 real-subprocess slice)"
+        ),
     ),
 ]
 
@@ -134,9 +153,14 @@ async def test_vertical_slice_against_real_mcp_subprocess(
     The MCP child is started and stopped within this one coroutine: the stdio
     transport's anyio cancel scope must be entered and exited in the same task,
     so it cannot live in a setup/teardown fixture."""
+    assert resolve_mcp_command(DEFAULT_MCP_COMMAND) == str(_MCP_COMMAND)
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(_CONFIG_YAML, encoding="utf-8")
-    real_mcp = MCPServerProcess(MCPConfig(env={"COFFEE_ROASTER_MCP_CONFIG": str(config_path)}))
+    real_mcp = MCPServerProcess(
+        MCPConfig(
+            env={"COFFEE_ROASTER_MCP_CONFIG": str(config_path)},
+        )
+    )
     await real_mcp.start()
     try:
         await _drive_slice(real_mcp, store)
