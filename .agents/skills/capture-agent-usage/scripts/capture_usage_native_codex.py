@@ -449,7 +449,7 @@ def _parse_rollout(
     fd: int, binding: dict[str, str]
 ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool]:
     """Stream and validate the admitted 0.147.0 metadata grammar only."""
-    seen_meta = seen_context = seen_complete = False
+    seen_meta = seen_context = seen_started = seen_complete = False
     session = ""
     parent_thread = ""
     matches = False
@@ -547,6 +547,8 @@ def _parse_rollout(
                 ):
                     _fail()
                 if payload["type"] == "token_count":
+                    if not seen_started or seen_complete:
+                        _fail()
                     info = payload["info"]
                     if not isinstance(info, dict) or set(info) != {
                         "last_token_usage",
@@ -558,7 +560,13 @@ def _parse_rollout(
                     if totals and any(new < old for old, new in zip(totals, current, strict=True)):
                         _fail()
                     totals = current
+                elif payload["type"] == "task_started":
+                    if seen_started or seen_complete:
+                        _fail()
+                    seen_started = True
                 elif payload["type"] == "task_complete":
+                    if not seen_started or seen_complete:
+                        _fail()
                     seen_complete = True
             elif kind == "response_item":
                 subtype = payload.get("type")

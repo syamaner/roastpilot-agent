@@ -394,6 +394,64 @@ def test_native_codex_parses_unrelated_root_session_without_leaf_requirements(
     assert (session, totals, parent, matches) == ("root-811", (0, 0, 0, 0, 0, 0), "", False)
 
 
+def test_native_codex_rejects_out_of_order_or_repeated_task_events(tmp_path: Path) -> None:
+    """A fully scanned rollout cannot reorder or repeat task lifecycle markers."""
+    meta = {
+        "type": "session_meta",
+        "payload": {
+            "base_instructions": "discarded",
+            "cli_version": "0.147.0",
+            "context_window": 1,
+            "cwd": "discarded",
+            "git": {"branch": "main", "commit_hash": "a" * 40, "repository_url": "discarded"},
+            "history_mode": "discarded",
+            "id": "root-811",
+            "model_provider": "discarded",
+            "originator": "codex-tui",
+            "session_id": "discarded",
+            "source": "cli",
+            "thread_source": "user",
+            "timestamp": "discarded",
+        },
+    }
+    started = {
+        "type": "event_msg",
+        "payload": {
+            "type": "task_started",
+            "collaboration_mode_kind": "discarded",
+            "model_context_window": 1,
+            "started_at": "discarded",
+            "turn_id": "discarded",
+        },
+    }
+    complete = {
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "completed_at": "discarded",
+            "duration_ms": 1,
+            "last_agent_message": "discarded",
+            "started_at": "discarded",
+            "time_to_first_token_ms": 1,
+            "turn_id": "discarded",
+        },
+    }
+    binding = {
+        "parent_thread_id": "parent-811",
+        "role": "engineer-be",
+        "agent_path": "/root/native-codex-capture",
+        "effort": "high",
+    }
+    for index, events in enumerate(((meta, complete), (meta, started, started)), 1):
+        rollout = tmp_path / f"ordered-{index}.jsonl"
+        rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+        with (
+            rollout.open("rb") as stream,
+            pytest.raises(usage_native_codex.NativeCodexCaptureError),
+        ):
+            usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_native_codex_root_overlap_uses_held_directory_identities(tmp_path: Path) -> None:
     """Only equal or nested held roots fail; shared filesystem ancestors are allowed."""
     nested = tmp_path / "nested"
@@ -459,6 +517,39 @@ def test_native_codex_record_persists_exact_registration_hashes() -> None:
         NativeCodexUsageRecord.model_validate({**payload, "role_sha256": "not-a-hash"})
     with pytest.raises(ValidationError):
         NativeCodexUsageRecord.model_validate({**payload, "subagent_count": 1})
+
+
+@pytest.mark.parametrize(
+    ("framed", "extra", "accepts"),
+    [
+        (b'{"type":"TERMINAL"}\n', b"", True),
+        (b'{"type":"TERMINAL"}', b"", False),
+        (b'{"type":"TERMINAL"}\n', b'{"type":"TERMINAL"}\n', False),
+    ],
+)
+def test_native_codex_terminal_framing_is_nonblocking_and_single_use(
+    monkeypatch: pytest.MonkeyPatch, framed: bytes, extra: bytes, accepts: bool
+) -> None:
+    """The supervisor accepts one newline-framed terminal record without EOF."""
+    fake_stdin = SimpleNamespace(buffer=BytesIO(framed), fileno=lambda: 811)
+    monkeypatch.setattr(usage_native_codex.sys, "stdin", fake_stdin)
+
+    def set_blocking(_fd: int, _value: bool) -> None:
+        return None
+
+    monkeypatch.setattr(usage_native_codex.os, "set_blocking", set_blocking)
+
+    def read_extra(_fd: int, _size: int) -> bytes:
+        if extra:
+            return extra[:1]
+        raise BlockingIOError
+
+    monkeypatch.setattr(usage_native_codex.os, "read", read_extra)
+    if accepts:
+        assert usage_native_codex._terminal_line() == framed  # pyright: ignore[reportPrivateUsage]
+    else:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._terminal_line()  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.parametrize(
