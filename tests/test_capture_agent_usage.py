@@ -1937,11 +1937,12 @@ def test_held_plan_descriptor_closes_after_successful_read_only_run(
     """The held root survives reattestation but closes after a successful READ_ONLY record."""
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
     descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    expected_inode = os.fstat(descriptor).st_ino
     reattested = False
 
     def reattest() -> None:
         nonlocal reattested
-        assert os.fstat(descriptor).st_ino == os.fstat(descriptor).st_ino
+        assert os.fstat(descriptor).st_ino == expected_inode
         reattested = True
 
     bound = BoundRoot(
@@ -1979,6 +1980,49 @@ def test_held_plan_descriptor_closes_after_successful_read_only_run(
         assert reattested
         with pytest.raises(OSError):
             os.fstat(descriptor)
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
+
+
+@pytest.mark.parametrize("error_message", ["plan root is invalid", "evidence bundle is invalid"])
+def test_open_bound_root_descriptor_maps_path_failures_without_leakage(
+    monkeypatch: pytest.MonkeyPatch, error_message: str
+) -> None:
+    """PLAN/EVIDENCE path-open failures keep their fixed path-free error."""
+
+    def failing_open(*_args: object, **_kwargs: object) -> int:
+        raise OSError("SENTINEL_ROOT_OPEN_FAILURE")
+
+    monkeypatch.setattr(usage_cli.os, "open", failing_open)
+    with pytest.raises(CaptureUsageError, match=error_message) as error:
+        usage_cli._open_bound_root_descriptor(  # pyright: ignore[reportPrivateUsage]
+            "/SENTINEL_ROOT_PATH", error_message=error_message
+        )
+    assert "SENTINEL_ROOT" not in str(error.value)
+
+
+@pytest.mark.parametrize("error_message", ["plan root is invalid", "evidence bundle is invalid"])
+def test_reattest_bound_root_maps_held_descriptor_fstat_failures_without_leakage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_message: str
+) -> None:
+    """PLAN/EVIDENCE held-descriptor failures fail closed without leaking filesystem details."""
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    real_fstat = usage_cli.os.fstat
+
+    def failing_held_fstat(candidate: int) -> os.stat_result:
+        if candidate == descriptor:
+            raise OSError("SENTINEL_HELD_FSTAT_FAILURE")
+        return real_fstat(candidate)
+
+    monkeypatch.setattr(usage_cli.os, "fstat", failing_held_fstat)
+    try:
+        with pytest.raises(CaptureUsageError, match=error_message) as error:
+            usage_cli._reattest_bound_root_path(  # pyright: ignore[reportPrivateUsage]
+                descriptor, str(tmp_path), error_message=error_message
+            )
+        assert "SENTINEL_HELD_FSTAT_FAILURE" not in str(error.value)
+        assert str(tmp_path) not in str(error.value)
     finally:
         with suppress(OSError):
             os.close(descriptor)
