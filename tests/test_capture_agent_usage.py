@@ -691,6 +691,21 @@ def test_native_codex_walk_rejects_symlink_non_json_and_depth(tmp_path: Path) ->
         os.close(root.descriptor)
 
 
+def test_native_codex_walk_rejects_over_depth_tree(tmp_path: Path) -> None:
+    """Traversal closes and rejects trees deeper than the closed provider bound."""
+    current = tmp_path
+    for index in range(usage_native_codex.MAX_PROVIDER_DEPTH + 1):
+        current = current / f"d{index}"
+        current.mkdir()
+    (current / "rollout.jsonl").write_text("x")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            list(usage_native_codex._walk(root))  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
 @pytest.mark.parametrize(
     ("repository", "branch", "base", "responses", "accepts"),
     [
