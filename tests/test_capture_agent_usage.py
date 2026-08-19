@@ -8798,14 +8798,7 @@ def test_evidence_bundle_state_rejects_foreign_uid_root(
 def test_evidence_bundle_reattest_catches_root_replaced_with_identical_content(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
-    """T15: a root replaced at the same path with byte-identical content still fails closed.
-
-    Every structural, manifest, and integrity check passes against the
-    identical rebuilt content, so only the outer snapshot's ``(st_dev,
-    st_ino)`` inequality catches this — the one path that reaches the
-    reattest closure's own comparison rather than raising inside
-    ``_evidence_bundle_state`` itself.
-    """
+    """T15: a byte-identical root replacement fails identity attestation."""
     root = _build_evidence_bundle(tmp_path_factory.mktemp("evidence-root-replaced") / "root")
     bound = usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
         str(root), 837, attested_head=_EVIDENCE_HEAD
@@ -8813,6 +8806,37 @@ def test_evidence_bundle_reattest_catches_root_replaced_with_identical_content(
     shutil.rmtree(root)
     _build_evidence_bundle(root)
     assert bound.reattest is not None
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        bound.reattest()
+
+
+def test_evidence_bundle_reattest_rejects_content_consistent_snapshot_change(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """T15: reattestation rejects a changed, otherwise valid bundle through its held descriptor."""
+    root = _build_evidence_bundle(tmp_path_factory.mktemp("evidence-snapshot-change") / "root")
+    bound = usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+        str(root), 837, attested_head=_EVIDENCE_HEAD
+    )
+    payload_path = root / "authors.json"
+    manifest_path = root / EVIDENCE_MANIFEST_NAME
+    replacement = b'{"authors.json": "changed"}'
+    payload_path.chmod(0o600)
+    payload_path.write_bytes(replacement)
+    payload_path.chmod(0o400)
+    manifest_path.chmod(0o600)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["files"]["authors.json"] = {
+        "sha256": hashlib.sha256(replacement).hexdigest(),
+        "bytes": len(replacement),
+    }
+    manifest_path.write_text(json.dumps(manifest))
+    manifest_path.chmod(0o400)
+    assert bound.reattest is not None
+    assert bound.descriptor is not None
+    usage_cli._evidence_bundle_state(  # pyright: ignore[reportPrivateUsage]
+        str(root), 837, _EVIDENCE_HEAD, held_descriptor=bound.descriptor
+    )
     with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
         bound.reattest()
 
@@ -9342,11 +9366,18 @@ def test_evidence_pr_option_rejects_zero_and_negative_values() -> None:
             usage_cli._evidence_pr(value)  # pyright: ignore[reportPrivateUsage]
 
 
-def test_render_prefix_run_command_rejects_broken_coverage_proof() -> None:
-    """M22: a malformed prefix that ``shlex.split`` cannot round-trip fails closed."""
+def test_render_prefix_run_command_rejects_broken_coverage_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M22: a quote mutation reaches and defeats the renderer round-trip proof."""
+
+    def identity_quote(value: str) -> str:
+        return value
+
+    monkeypatch.setattr(usage_cli.shlex, "quote", identity_quote)
     with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
         usage_cli._render_prefix_run_command(  # pyright: ignore[reportPrivateUsage]
-            "python -m pytest 'unterminated", ("tests/",)
+            "python -m pytest", ("tests/has space.py",)
         )
 
 
@@ -9371,7 +9402,7 @@ def test_print_validation_commands_rejects_broken_coverage_proof(
                 "--validation-root",
                 str(root),
                 "--pytest-arg",
-                "has space",
+                "tests/has space.py",
             ]
         )
     assert capsys.readouterr().out == ""

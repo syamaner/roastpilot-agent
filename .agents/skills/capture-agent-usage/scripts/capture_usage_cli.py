@@ -1054,14 +1054,15 @@ def _validate_evidence_manifest_schema(
         raise CaptureUsageError("evidence bundle is invalid")
     try:
         parsed = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
-    except ValueError:
-        raise CaptureUsageError("evidence bundle is invalid") from None
+    except ValueError:  # pragma: no cover - closed RFC3339 grammar has already matched
+        raise CaptureUsageError("evidence bundle is invalid") from None  # pragma: no cover
     # Defense in depth: the pattern above already closes the grammar to
     # `Z`/`+00:00` RFC3339 UTC forms, but keep the semantic checks so a
     # tzinfo-less or non-zero-offset value fails closed even if the syntactic
     # guard above is ever loosened.
-    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
-        raise CaptureUsageError("evidence bundle is invalid")
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):  # pragma: no cover
+        # Closed grammar admits only aware UTC values.
+        raise CaptureUsageError("evidence bundle is invalid")  # pragma: no cover
     now = _utc_now()
     if parsed > now + timedelta(seconds=TIMESTAMP_SKEW_SECONDS):
         raise CaptureUsageError("evidence bundle is invalid")
