@@ -340,24 +340,6 @@ def test_owned_transcript_rejects_closed_mutations(
             2,
         ),
         (
-            "safety-reviewer.jsonl",
-            NativeClaudeRole.SAFETY_REVIEWER,
-            "xhigh",
-            "claude-opus-5",
-            (2, 6, 4, 8),
-            "dontAsk",
-            2,
-        ),
-        (
-            "security-reviewer.jsonl",
-            NativeClaudeRole.SECURITY_REVIEWER,
-            "high",
-            "claude-sonnet-5",
-            (2, 6, 4, 8),
-            "dontAsk",
-            2,
-        ),
-        (
             "qa.jsonl",
             NativeClaudeRole.QA,
             "high",
@@ -495,6 +477,7 @@ def test_owned_transcript_ai_title_row_admits_exact_shape_only(
 ) -> None:
     """The observed ``ai-title`` row is metadata-only and closed to its exact shape."""
     content = (FIXTURES / "claude-2.1.233-transcript" / "security-reviewer.jsonl").read_bytes()
+    content = content.replace(b'"agentSetting":"security-reviewer"', b'"agentSetting":"qa"')
     lines = content.splitlines()
     title_index = next(
         index for index, line in enumerate(lines) if json.loads(line)["type"] == "ai-title"
@@ -509,7 +492,7 @@ def test_owned_transcript_ai_title_row_admits_exact_shape_only(
         usage_transcript.parse_owned_transcript(
             tmp_path,
             session_id,
-            NativeClaudeRole.SECURITY_REVIEWER,
+            NativeClaudeRole.QA,
             "high",
             expected_permission_mode="dontAsk",
         )
@@ -537,35 +520,35 @@ def test_native_transcript_binds_model_and_effort_to_the_pinned_role(
     )
     assert usage.model == "claude-fable-5" != planner_pin.model
 
-    safety_content = (FIXTURES / "claude-2.1.233-transcript" / "safety-reviewer.jsonl").read_bytes()
-    safety_session_id = json.loads(safety_content.splitlines()[0])["sessionId"]
-    safety_pin = usage_cli._native_role_pin(NativeClaudeRole.SAFETY_REVIEWER)  # pyright: ignore[reportPrivateUsage]
-    assert safety_pin.effort == "xhigh"
+    qa_content = (FIXTURES / "claude-2.1.233-transcript" / "qa.jsonl").read_bytes()
+    qa_session_id = json.loads(qa_content.splitlines()[0])["sessionId"]
+    qa_pin = usage_cli._native_role_pin(NativeClaudeRole.QA)  # pyright: ignore[reportPrivateUsage]
+    assert qa_pin.effort == "high"
 
-    downgraded = safety_content.replace(b'"effort":"xhigh"', b'"effort":"high"')
-    case = tmp_path / "safety"
+    changed_effort = qa_content.replace(b'"effort":"high"', b'"effort":"xhigh"')
+    case = tmp_path / "qa"
     case.mkdir()
-    _, session_id = _install_owned_transcript(case, monkeypatch, downgraded, safety_session_id)
+    _, session_id = _install_owned_transcript(case, monkeypatch, changed_effort, qa_session_id)
     with pytest.raises(usage_transcript.TranscriptError):
         usage_transcript.parse_owned_transcript(
             case,
             session_id,
-            NativeClaudeRole.SAFETY_REVIEWER,
-            safety_pin.effort,
+            NativeClaudeRole.QA,
+            qa_pin.effort,
             expected_permission_mode="dontAsk",
         )
 
-    case = tmp_path / "safety-matching"
+    case = tmp_path / "qa-matching"
     case.mkdir()
-    _, session_id = _install_owned_transcript(case, monkeypatch, safety_content, safety_session_id)
+    _, session_id = _install_owned_transcript(case, monkeypatch, qa_content, qa_session_id)
     usage = usage_transcript.parse_owned_transcript(
         case,
         session_id,
-        NativeClaudeRole.SAFETY_REVIEWER,
-        safety_pin.effort,
+        NativeClaudeRole.QA,
+        qa_pin.effort,
         expected_permission_mode="dontAsk",
     )
-    assert usage.model == safety_pin.model == "claude-opus-5"
+    assert usage.model == qa_pin.model == "claude-sonnet-5"
 
 
 @pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo", "directory"])
@@ -1361,7 +1344,17 @@ def test_no_caller_add_dir_option_exists(capsys: pytest.CaptureFixture[str]) -> 
 
 
 @pytest.mark.parametrize(
-    "role", ["ui-reviewer", "repair", "engineer-be ", "Engineer-BE", "engineer_be", "x"]
+    "role",
+    [
+        "safety-reviewer",
+        "security-reviewer",
+        "ui-reviewer",
+        "repair",
+        "engineer-be ",
+        "Engineer-BE",
+        "engineer_be",
+        "x",
+    ],
 )
 def test_native_roles_reject_before_provider_lookup(
     role: str, monkeypatch: pytest.MonkeyPatch
@@ -1390,8 +1383,6 @@ def test_native_role_roster_pins_and_capabilities_match_committed_frontmatter() 
         "pr-triage": ("claude-sonnet-5", "high", RoleCapability.READ_ONLY),
         "product-auditor": ("claude-sonnet-5", "high", RoleCapability.READ_ONLY),
         "qa": ("claude-sonnet-5", "high", RoleCapability.READ_ONLY),
-        "safety-reviewer": ("claude-opus-5", "xhigh", RoleCapability.READ_ONLY),
-        "security-reviewer": ("claude-sonnet-5", "high", RoleCapability.READ_ONLY),
         "sim-roast-runner": ("claude-sonnet-5", "medium", RoleCapability.READ_ONLY),
         "story-planner": ("claude-opus-5", "high", RoleCapability.READ_ONLY),
     }
@@ -1409,10 +1400,16 @@ def test_native_role_values_union_exclusions_equal_committed_agent_stems() -> No
     assert native_values.isdisjoint(NATIVE_ROLE_EXCLUSIONS)
     assert native_values | set(NATIVE_ROLE_EXCLUSIONS) == stems
     assert NATIVE_ROLE_EXCLUSIONS == {
+        "safety-reviewer": (
+            "its mandatory whole-diff safety review requires ordinary-role Bash/git access"
+        ),
+        "security-reviewer": (
+            "its mandatory whole-diff security review requires ordinary-role Bash/git access"
+        ),
         "ui-reviewer": (
             "its Playwright MCP conflicts with the empty-MCP, empty-tools native"
             " capture launch boundary"
-        )
+        ),
     }
     for reason in NATIVE_ROLE_EXCLUSIONS.values():
         assert isinstance(reason, str) and reason.strip()
@@ -1444,8 +1441,6 @@ def test_native_role_frontmatter_mutations_fail_closed(
     "role",
     [
         NativeClaudeRole.PR_TRIAGE,
-        NativeClaudeRole.SAFETY_REVIEWER,
-        NativeClaudeRole.SECURITY_REVIEWER,
         NativeClaudeRole.STORY_PLANNER,
     ],
 )
@@ -5715,6 +5710,7 @@ def test_run_rejects_unsupported_effort_before_executable_lookup(
     "role",
     [
         *(role.value for role in NativeClaudeRole),
+        *NATIVE_ROLE_EXCLUSIONS,
         "repair",
         "Engineer-BE",
         "REPAIR",
@@ -7471,36 +7467,20 @@ def test_validation_role_files_never_instruct_python_c_pip_install_or_worktree_v
         assert "-m venv" not in text
 
 
-def test_native_safety_and_security_reviewers_are_evidence_only() -> None:
-    """Option A keeps mandatory assurance review free of native shell authority."""
+def test_safety_and_security_reviewers_use_ordinary_role_path() -> None:
+    """Option B excludes whole-diff assurance roles from native capture."""
     agents = Path(__file__).resolve().parents[1] / ".claude" / "agents"
+    native_values = {role.value for role in NativeClaudeRole}
     for name in ("safety-reviewer", "security-reviewer"):
         text = (agents / f"{name}.md").read_text()
-        normalized = " ".join(text.split())
-        pin = usage_cli._native_role_pin(  # pyright: ignore[reportPrivateUsage]
-            NativeClaudeRole(name)
-        )
-        assert pin.tools == ("Read", "Grep", "Glob")
-        assert "tools: Read, Grep, Glob\n" in text
-        assert "tools: Read, Grep, Glob, Bash" not in text
-        assert "Parent-supplied review evidence" in text
-        assert "Do not run shell commands" in normalized
-        assert "Fail closed" in normalized
-        assert "exact-head and byte-clean worktree attestation" in normalized
-        assert "exact git-generated name-status inventory" in normalized
-        assert "complete patch's SHA-256 and byte count" in normalized
-        assert "prose diff summary" in normalized
-        assert "name every skip" in normalized
-        assert "final verdict must restate the reviewed head SHA" in normalized
-        assert "current attested launch cwd" in normalized
-    safety_normalized = " ".join((agents / "safety-reviewer.md").read_text().split())
-    assert "negative control" in safety_normalized
-    assert "negative-control outcome" in safety_normalized
+        assert name not in native_values
+        assert name in NATIVE_ROLE_EXCLUSIONS
+        assert "tools: Read, Grep, Glob, Bash" in text
     assert (
         "python -m pytest tests/test_controller.py tests/test_safety.py -q"
-        not in (agents / "safety-reviewer.md").read_text()
+        in (agents / "safety-reviewer.md").read_text()
     )
-    assert "git diff origin/main...HEAD" not in (agents / "security-reviewer.md").read_text()
+    assert "git diff origin/main...HEAD" in (agents / "security-reviewer.md").read_text()
 
 
 def test_sim_roast_runner_rejects_a_skipped_real_mcp_lane() -> None:
@@ -7891,7 +7871,7 @@ def test_native_environment_inherits_only_closed_non_secret_keys(
         monkeypatch.setenv(key, value)
 
     launch_environment = usage_cli._resolve_native_environment(  # pyright: ignore[reportPrivateUsage]
-        NativeClaudeRole.SAFETY_REVIEWER, _request(), attested_head="0" * 40
+        NativeClaudeRole.ENGINEER_BE, _request(), attested_head="0" * 40
     )
 
     assert launch_environment.bound_root is None
@@ -8934,6 +8914,25 @@ def test_evidence_bundle_reattest_passes_when_untouched(
     bound.reattest()
 
 
+def test_evidence_bundle_reattest_does_not_reapply_launch_freshness(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unchanged bundle admitted near expiry remains valid after a long review."""
+    launch_time = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
+    current_time = launch_time
+    monkeypatch.setattr(usage_cli, "_utc_now", lambda: current_time)
+    root = _build_evidence_bundle(
+        tmp_path_factory.mktemp("evidence-review-duration") / "root",
+        generated_at=(launch_time - timedelta(seconds=599)).isoformat(),
+    )
+    bound = usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+        str(root), 837, attested_head=_EVIDENCE_HEAD
+    )
+    current_time = launch_time + timedelta(minutes=20)
+    assert bound.reattest is not None
+    bound.reattest()
+
+
 def test_evidence_bundle_non_identity_payloads_remain_opaque(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
@@ -9128,10 +9127,10 @@ def test_negative_proof_evidence_root_rejected_for_story_planner() -> None:
         )
 
 
-def test_regression_unbound_read_only_role_has_no_add_dir_or_allowed_tools(
+def test_excluded_assurance_role_never_reaches_native_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T22/L11: an unbound READ_ONLY role's argv carries no ``--add-dir``/``--allowedTools``."""
+    """T22/L11: an excluded assurance role cannot reach native launch argv."""
     project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
     processes: list[_NativeProcess] = []
     monkeypatch.setattr(
@@ -9141,10 +9140,10 @@ def test_regression_unbound_read_only_role_has_no_add_dir_or_allowed_tools(
             project, observed, processes, transcript=_read_only_transcript_bytes("safety-reviewer")
         ),
     )
-    assert main(_native_cli_args(role="safety-reviewer")) == 0
-    worker_argv = observed[1][0]
-    assert "--add-dir" not in worker_argv
-    assert "--allowedTools" not in worker_argv
+    with pytest.raises(SystemExit):
+        main(_native_cli_args(role="safety-reviewer"))
+    assert observed == []
+    assert processes == []
 
 
 # --- print-validation-commands: ALLOW / RUN grammar (D169, §2.5) -----------

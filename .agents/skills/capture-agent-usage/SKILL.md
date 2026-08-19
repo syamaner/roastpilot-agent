@@ -27,15 +27,17 @@ remains required for implementation slices.
 
 Under D163, `run-native-claude` is the separate parent-only instrumentation path for
 the committed roles `engineer-be`, `engineer-fe`, `mcp-contract-checker`,
-`planning-architect`, `pr-triage`, `product-auditor`, `qa`, `safety-reviewer`,
-`security-reviewer`, `sim-roast-runner`, and `story-planner`. It derives READ_ONLY or
+`planning-architect`, `pr-triage`, `product-auditor`, `qa`,
+`sim-roast-runner`, and `story-planner`. It derives READ_ONLY or
 WRITE capability from the committed tools, launches with the committed effort, and
 accepts only Claude 2.1.233 metadata. It reads only the generated parent transcript,
 deduplicates numeric usage, rejects any subagent tree, and writes no transcript content
-or host path to the sink. `ui-reviewer` remains excluded because its Playwright MCP
-conflicts with empty-MCP capture; `repair` is excluded. The generic `run` path remains
-measurement/validation-only, has no routing authority, and retains its
-no-session-persistence boundary.
+or host path to the sink. `safety-reviewer` and `security-reviewer` are excluded
+because their mandatory whole-diff assurance requires the ordinary role path's
+Bash/git inspection of both sides of the patch. `ui-reviewer` remains excluded
+because its Playwright MCP conflicts with empty-MCP capture; `repair` is excluded.
+The generic `run` path remains measurement/validation-only, has no routing
+authority, and retains its no-session-persistence boundary.
 
 Every `run-native-claude` launch requires a parent-provisioned external
 `--usage-root`. It must already exist, be owned by the current euid, have mode
@@ -107,13 +109,8 @@ missing login or association data blocks the run. After handback, the parent
 must re-read live PR head, checks, review inventory, and unresolved-thread
 inventory before acting; the offline bundle is not post-review merge authority.
 
-`safety-reviewer` and `security-reviewer` are deliberately evidence-only under
-native capture. They have `Read`/`Grep`/`Glob`, no Bash, no validation root,
-and no `--allowedTools`. The parent-authored brief must name the exact
-worktree/head and supply exit-status-backed exact-head/byte-clean attestation,
-the exact-head diff scope, deterministic gate evidence, and every named skip
-with its reason. A safety diff affecting transitions, verdict handling, or a
-command path also requires a parent-owned negative-control mutation that makes
-the relevant test fail. Either role fails closed when required evidence is
-missing. This keeps mandatory assurance available without widening native
-shell, network, or credential authority.
+`safety-reviewer` and `security-reviewer` never enter `run-native-claude`.
+Invoke each through its ordinary committed Claude role so its existing Bash/git
+authority can inspect the exact merge-base patch, including deleted and replaced
+bytes. Their provider-owned plaintext transcripts remain local and untracked;
+native capture does not emit a metadata record for these excluded launches.

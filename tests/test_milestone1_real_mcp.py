@@ -52,8 +52,9 @@ from roastpilot_agent.models import (
 from roastpilot_agent.store import RoastStore
 from tests.conftest import FakeClock
 
-_MCP_COMMAND = Path(sys.executable).with_name(f"{DEFAULT_MCP_COMMAND}{Path(sys.executable).suffix}")
 _RESOLVED_MCP_COMMAND = resolve_mcp_command(DEFAULT_MCP_COMMAND)
+_MCP_COMMAND = Path(_RESOLVED_MCP_COMMAND)
+_INTERPRETER_BIN_DIR = Path(sys.executable).parent.resolve()
 
 pytestmark = [
     pytest.mark.serial(reason="drives a real MCP child and verifies process teardown"),
@@ -61,7 +62,7 @@ pytestmark = [
         not (
             _MCP_COMMAND.is_file()
             and os.access(_MCP_COMMAND, os.X_OK)
-            and str(_MCP_COMMAND) == _RESOLVED_MCP_COMMAND
+            and _MCP_COMMAND.parent.resolve() == _INTERPRETER_BIN_DIR
         ),
         reason=(
             "default coffee-roaster-mcp does not resolve to the executable beside this "

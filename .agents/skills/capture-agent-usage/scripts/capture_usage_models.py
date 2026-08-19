@@ -91,13 +91,17 @@ class NativeClaudeRole(Enum):
     PR_TRIAGE = "pr-triage"
     PRODUCT_AUDITOR = "product-auditor"
     QA = "qa"
-    SAFETY_REVIEWER = "safety-reviewer"
-    SECURITY_REVIEWER = "security-reviewer"
     SIM_ROAST_RUNNER = "sim-roast-runner"
     STORY_PLANNER = "story-planner"
 
 
 NATIVE_ROLE_EXCLUSIONS: dict[str, str] = {
+    "safety-reviewer": (
+        "its mandatory whole-diff safety review requires ordinary-role Bash/git access"
+    ),
+    "security-reviewer": (
+        "its mandatory whole-diff security review requires ordinary-role Bash/git access"
+    ),
     "ui-reviewer": (
         "its Playwright MCP conflicts with the empty-MCP, empty-tools native"
         " capture launch boundary"

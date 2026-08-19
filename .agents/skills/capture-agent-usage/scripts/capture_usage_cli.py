@@ -53,6 +53,7 @@ from capture_usage_models import (
     EVIDENCE_ROOT_ENVIRONMENT_KEY,
     EVIDENCE_SCHEMA_VERSION,
     MAX_STREAM_BYTES,
+    NATIVE_ROLE_EXCLUSIONS,
     NATIVE_WORKER_USAGE_SCHEMA_VERSION,
     PLAN_ROOT_ENVIRONMENT_KEY,
     SKILL_VERSION,
@@ -106,12 +107,17 @@ _VERIFIED_HARNESS_VERSIONS = {
 }
 _GIT_TIMEOUT_SECONDS = 5
 _GIT_OUTPUT_LIMIT = 4096
-_PROTECTED_ATTRIBUTION_ROLES = frozenset({role.value for role in NativeClaudeRole}) | {"repair"}
-"""Every registered native-capable role plus `repair`, closed over D163 registration.
+_PROTECTED_ATTRIBUTION_ROLES = (
+    frozenset({role.value for role in NativeClaudeRole})
+    | frozenset(NATIVE_ROLE_EXCLUSIONS)
+    | {"repair"}
+)
+"""Every committed Claude role plus `repair`, closed over D163 registration.
 
 `repair` has no `.claude/agents/*.md` file (it is Codex-only); every other
-protected value is a live :class:`NativeClaudeRole` member, so this set can
-never silently drop a role added to that enum.
+protected value is either a live :class:`NativeClaudeRole` member or an
+explicit native exclusion, so generic measurement cannot become role-selection
+authority when a committed role moves between those sets.
 """
 NATIVE_PERMISSION_MODES: dict[RoleCapability, str] = {
     RoleCapability.READ_ONLY: "dontAsk",
@@ -163,8 +169,6 @@ from validated parent inputs below.
 _NATIVE_BASH_FORBIDDEN_ROLES = frozenset(
     {
         NativeClaudeRole.PR_TRIAGE,
-        NativeClaudeRole.SAFETY_REVIEWER,
-        NativeClaudeRole.SECURITY_REVIEWER,
         NativeClaudeRole.STORY_PLANNER,
     }
 )
@@ -995,7 +999,7 @@ def _reject_duplicate_manifest_keys(pairs: list[tuple[str, object]]) -> dict[str
 
 
 def _validate_evidence_manifest_schema(
-    data: object, pr: int, attested_head: str
+    data: object, pr: int, attested_head: str, *, enforce_freshness: bool
 ) -> dict[str, dict[str, object]]:
     """Validate the closed evidence manifest grammar (D169, §2.4).
 
@@ -1004,6 +1008,7 @@ def _validate_evidence_manifest_schema(
         pr: The exact ``--evidence-pr`` value the manifest must match.
         attested_head: The pre-launch attested launch ``HEAD`` the manifest's
             ``head_sha`` must match.
+        enforce_freshness: Whether to enforce the launch-time timestamp window.
 
     Returns:
         The validated ``files`` mapping, keyed by the eight payload names.
@@ -1063,11 +1068,12 @@ def _validate_evidence_manifest_schema(
     if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):  # pragma: no cover
         # Closed grammar admits only aware UTC values.
         raise CaptureUsageError("evidence bundle is invalid")  # pragma: no cover
-    now = _utc_now()
-    if parsed > now + timedelta(seconds=TIMESTAMP_SKEW_SECONDS):
-        raise CaptureUsageError("evidence bundle is invalid")
-    if parsed < now - timedelta(seconds=_EVIDENCE_MAX_AGE_SECONDS):
-        raise CaptureUsageError("evidence bundle is invalid")
+    if enforce_freshness:
+        now = _utc_now()
+        if parsed > now + timedelta(seconds=TIMESTAMP_SKEW_SECONDS):
+            raise CaptureUsageError("evidence bundle is invalid")
+        if parsed < now - timedelta(seconds=_EVIDENCE_MAX_AGE_SECONDS):
+            raise CaptureUsageError("evidence bundle is invalid")
     files = data.get("files")
     if not isinstance(files, dict) or set(files) != set(EVIDENCE_PAYLOAD_FILES):
         raise CaptureUsageError("evidence bundle is invalid")
@@ -1181,7 +1187,12 @@ class _EvidenceSnapshot:
 
 
 def _evidence_bundle_state(
-    root: str, pr: int, attested_head: str, *, held_descriptor: int | None = None
+    root: str,
+    pr: int,
+    attested_head: str,
+    *,
+    held_descriptor: int | None = None,
+    enforce_freshness: bool = True,
 ) -> _EvidenceSnapshot:
     """Fully validate structure, manifest grammar, and payload integrity; return a snapshot.
 
@@ -1189,6 +1200,8 @@ def _evidence_bundle_state(
         root: The canonical resolved, already shape-validated evidence root.
         pr: The exact ``--evidence-pr`` value.
         attested_head: The pre-launch attested launch ``HEAD``.
+        held_descriptor: Optional already-held descriptor for reattestation.
+        enforce_freshness: Whether to enforce the launch-time timestamp window.
 
     Returns:
         A comparable snapshot used both to accept the bundle pre-launch and to
@@ -1218,7 +1231,9 @@ def _evidence_bundle_state(
             manifest = json.loads(manifest_bytes, object_pairs_hook=_reject_duplicate_manifest_keys)
         except json.JSONDecodeError:
             raise CaptureUsageError("evidence bundle is invalid") from None
-        files = _validate_evidence_manifest_schema(manifest, pr, attested_head)
+        files = _validate_evidence_manifest_schema(
+            manifest, pr, attested_head, enforce_freshness=enforce_freshness
+        )
         pr_descriptor = _open_evidence_entry(root_fd, "pr.json")
         pr_payload = _read_bounded_evidence_file(pr_descriptor, EVIDENCE_MAX_FILE_BYTES)
         _validate_evidence_pr_identity(pr_payload, pr, attested_head, manifest["base_sha"])
@@ -1267,7 +1282,13 @@ def _validate_evidence_bundle(raw: str, pr: int | None, *, attested_head: str) -
 
     def reattest() -> None:
         _reattest_bound_root_path(descriptor, root_real, error_message="evidence bundle is invalid")
-        after = _evidence_bundle_state(root_real, pr, attested_head, held_descriptor=descriptor)
+        after = _evidence_bundle_state(
+            root_real,
+            pr,
+            attested_head,
+            held_descriptor=descriptor,
+            enforce_freshness=False,
+        )
         if after != before:
             raise CaptureUsageError("evidence bundle is invalid")
 
