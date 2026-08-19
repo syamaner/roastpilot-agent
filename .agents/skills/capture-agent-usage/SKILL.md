@@ -92,9 +92,11 @@ EXACT`/`ALLOW PREFIX` authorization-descriptor lines followed by one
 concrete `RUN <command>` line per gate (with an optional repeatable
 `--pytest-arg TOKEN` shell-quoted into the `qa` `pytest` gate's `RUN` line);
 a validation role executes only the `RUN ` lines, byte-exactly. QA requires
-at least one explicit `--pytest-arg`; an empty argument list is rejected so
-the parent can never authorize a bare, repository-wide pytest invocation by
-accident.
+four parent-supplied tokens: an explicit `tests` or `tests/...` selector, a
+non-empty `--cov=<source>`, exact `--cov-branch`, and exact
+`--cov-report=term-missing`. Incomplete or empty token sets reject before any
+output, so the parent cannot authorize a bare or coverage-incomplete pytest
+invocation by accident.
 
 Build a PR evidence bundle immediately before native `pr-triage`. Its
 `generated_at` may be at most ten minutes old at launch (future skew remains
