@@ -4368,6 +4368,7 @@ def test_git_output_rejects_oversized_or_invalid_utf8_response(
         usage_cli._git_output(["status", "--porcelain"])  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.serial(reason="drives a real TERM-ignoring process group")
 def test_git_output_timeout_kills_term_ignoring_process_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4401,8 +4402,11 @@ def test_git_output_timeout_kills_term_ignoring_process_group(
             os.kill(pid, 0)
         except ProcessLookupError:
             break
-        proc_stat = Path(f"/proc/{pid}/stat")
-        if not proc_stat.exists() or proc_stat.read_text().split()[2] == "Z":
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().split()[2]
+        except FileNotFoundError:
+            break
+        if state == "Z":
             break
         time.sleep(0.01)
     else:
@@ -5322,6 +5326,7 @@ def test_run_timeout_kills_and_reaps_term_ignoring_child_without_a_record(
     assert not (tmp_path / ".agent-usage").exists()
 
 
+@pytest.mark.serial(reason="drives a real stdout-inheriting process group")
 def test_timeout_kills_real_stdout_inheriting_descendant_without_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5407,8 +5412,11 @@ def test_timeout_kills_real_stdout_inheriting_descendant_without_record(
             os.kill(descendant, 0)
         except ProcessLookupError:
             break
-        proc_stat = Path(f"/proc/{descendant}/stat")
-        if not proc_stat.exists() or proc_stat.read_text().split()[2] == "Z":
+        try:
+            state = Path(f"/proc/{descendant}/stat").read_text().split()[2]
+        except FileNotFoundError:
+            break
+        if state == "Z":
             break
         time.sleep(0.01)
     else:
