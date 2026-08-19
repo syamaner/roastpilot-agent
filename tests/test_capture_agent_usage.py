@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -1893,6 +1894,94 @@ def test_native_config_directory_rejects_before_provider_lookup(
     with pytest.raises(SystemExit, match="config directory is not permitted") as error:
         main(_native_cli_args())
     assert "SENTINEL_CONFIG" not in str(error.value)
+
+
+def test_held_plan_descriptor_closes_after_pre_provider_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resolved PLAN descriptor closes even when config preflight rejects before launch."""
+    _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    bound = BoundRoot(kind=BoundRootKind.PLAN, path=str(tmp_path), descriptor=descriptor)
+    launched = False
+
+    def resolved(*_args: object, **_kwargs: object) -> usage_cli._NativeLaunchEnvironment:  # pyright: ignore[reportPrivateUsage]
+        return usage_cli._NativeLaunchEnvironment(environment={}, bound_root=bound)  # pyright: ignore[reportPrivateUsage]
+
+    def no_provider(_family: HarnessFamily) -> str:
+        nonlocal launched
+        launched = True
+        return "claude"
+
+    monkeypatch.setattr(usage_cli, "_resolve_native_environment", resolved)
+    monkeypatch.setattr(usage_cli, "_resolved_executable", no_provider)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "SENTINEL_CONFIG")
+    try:
+        with pytest.raises(SystemExit, match="config directory is not permitted"):
+            main(
+                _native_cli_args(
+                    role="story-planner", plan_root=_STUB_PLAN_ROOT, plan_sha=_STUB_PLAN_SHA
+                )
+            )
+        assert not launched
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
+
+
+def test_held_plan_descriptor_closes_after_successful_read_only_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The held root survives reattestation but closes after a successful READ_ONLY record."""
+    project, observed = _configure_read_only_native_launcher(tmp_path, monkeypatch)
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    reattested = False
+
+    def reattest() -> None:
+        nonlocal reattested
+        assert os.fstat(descriptor).st_ino == os.fstat(descriptor).st_ino
+        reattested = True
+
+    bound = BoundRoot(
+        kind=BoundRootKind.PLAN, path=str(tmp_path), reattest=reattest, descriptor=descriptor
+    )
+
+    def resolved(*_args: object, **_kwargs: object) -> usage_cli._NativeLaunchEnvironment:  # pyright: ignore[reportPrivateUsage]
+        return usage_cli._NativeLaunchEnvironment(environment={}, bound_root=bound)  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setattr(
+        usage_cli,
+        "_resolve_native_environment",
+        resolved,
+    )
+    processes: list[_NativeProcess] = []
+    monkeypatch.setattr(
+        usage_cli.subprocess,
+        "Popen",
+        _native_popen(
+            project,
+            observed,
+            processes,
+            transcript=_read_only_transcript_bytes("story-planner"),
+        ),
+    )
+    try:
+        assert (
+            main(
+                _native_cli_args(
+                    role="story-planner", plan_root=_STUB_PLAN_ROOT, plan_sha=_STUB_PLAN_SHA
+                )
+            )
+            == 0
+        )
+        assert reattested
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
 
 
 def test_native_cli_script_suppresses_bytecode_only_when_executed(
