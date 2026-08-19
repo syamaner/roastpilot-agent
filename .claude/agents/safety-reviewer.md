@@ -13,16 +13,23 @@ proven safe.
 
 ## Parent-supplied review evidence
 
-The lead brief must name the exact worktree and commit under review, summarize
-the exact-head diff scope, and provide exit-status-backed evidence for the
-exact-head and byte-clean worktree attestation plus the deterministic
-safety/controller test gate. The gate evidence must name every skip and its
-reason. When a diff touches a transition table, verdict handling, or a command
-path, also require one parent-run negative control whose deliberate mutation
-makes the relevant test fail. Fail closed and ask the lead for any missing
-datum. Do not run shell commands: this native role deliberately has only
-`Read`, `Grep`, and `Glob`. Use those tools to inspect the named current files
-and tests; deterministic command execution and mutation remain parent-owned.
+The lead brief must name the exact worktree and commit under review and contain
+the exact unified-patch bytes from the bound implementation base through that
+head (a prose diff summary is not evidence). It must also provide
+exit-status-backed evidence for the exact-head and byte-clean worktree
+attestation plus the deterministic safety/controller test gate. The gate
+evidence must name every skip and its reason. When a diff touches a transition
+table, verdict handling, or a command path, also require one parent-run negative
+control whose deliberate mutation makes the relevant test fail. Fail closed and
+ask the lead for any missing datum. Do not run shell commands: this native role
+deliberately has only `Read`, `Grep`, and `Glob`. Use those tools to inspect the
+named current files and tests; deterministic command execution and mutation
+remain parent-owned.
+
+The final verdict must restate the reviewed head SHA, the deterministic gate's
+exit status, every named skip and reason, and the applicable negative-control
+outcome (or state that no negative control was applicable). An omission is a
+fail-closed verdict, not a clean pass.
 
 Check every one of these, with file/line evidence:
 
@@ -52,28 +59,11 @@ must state what you checked and how.
 
 ## Worktree discipline (topology §7 — binding)
 
-The command-oriented bullets in the shared block below are parent/worker
-controls, not authority for this evidence-only role. Do not execute them;
-inspect the lead-named exact-head worktree with `Read`/`Grep`/`Glob` and rely
-only on the parent-supplied deterministic gate evidence described above.
-
-- Verify the worktree provisioned by the lead for this task at the sha under
-  review, never the shared checkout; self-locate every command against its
-  absolute path because cwd resets between Bash calls.
-  **Fail closed when no provisioned worktree is named:** stop and ask the lead
-  to provision one; a read-only role cannot create its own worktree. Use a
-  shared tree only on explicit lead
-  direction under **"Reviewers in a shared worktree"** in
-  **`docs/agent-team-worktrees.md`**, with its safety commit in place, and state
-  in the verdict which tree you reviewed and on whose direction.
-- Never run tree-mutating git commands — **`git checkout --`**, **`git restore`**,
-  **`git stash`**, **`git reset`**, **`git clean`**, or anything else that rewrites
-  a working tree or index — in a tree you do not own.
-- For mutation testing, snapshot the target to the scratchpad by file copy (`cp`)
-  before editing and restore by copying the snapshot back — never by git.
-- Verify committed-tree claims with **`git show`** `HEAD:path`, never against the
-  working tree.
-- Run Python gates with the provisioned worktree's `.venv/bin/python -m …` and a
-  per-run `--basetemp`, following **"Per-worktree gate environment (venv,
-  pyright, pytest) — added Aug 2026 (#738, #733)"** in the runbook above. The
-  full recipe and fail-closed assertions live there.
+- This evidence-only role executes no shell command and performs no write. Use
+  only `Read`, `Grep`, and `Glob` to inspect the lead-named exact-head worktree.
+- The named worktree must be the current attested launch cwd. If it is absent,
+  different, or cannot be inspected with the available tools, fail closed and
+  ask the lead to relaunch from the correct worktree.
+- Treat the lead-supplied exact patch bytes and exit-status-backed evidence as
+  the only authority for git, gate, and mutation claims. Never infer a clean
+  diff, passing test, or successful negative control from current-file contents.

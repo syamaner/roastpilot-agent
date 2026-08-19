@@ -33,8 +33,13 @@ from roastpilot_agent.advisor import (
     RoastDecision,
 )
 from roastpilot_agent.api import RoastService
-from roastpilot_agent.config import AppConfig, ControllerConfig, MCPConfig
-from roastpilot_agent.mcp_client import MCPServerProcess, RoasterControlAdapter, RoasterMCPClient
+from roastpilot_agent.config import DEFAULT_MCP_COMMAND, AppConfig, ControllerConfig, MCPConfig
+from roastpilot_agent.mcp_client import (
+    MCPServerProcess,
+    RoasterControlAdapter,
+    RoasterMCPClient,
+    resolve_mcp_command,
+)
 from roastpilot_agent.models import (
     AdvisorHealth,
     AdvisorHealthStatus,
@@ -47,14 +52,20 @@ from roastpilot_agent.models import (
 from roastpilot_agent.store import RoastStore
 from tests.conftest import FakeClock
 
-_MCP_COMMAND = Path(sys.executable).with_name("coffee-roaster-mcp")
+_MCP_COMMAND = Path(sys.executable).with_name(f"{DEFAULT_MCP_COMMAND}{Path(sys.executable).suffix}")
+_RESOLVED_MCP_COMMAND = resolve_mcp_command(DEFAULT_MCP_COMMAND)
 
 pytestmark = [
     pytest.mark.serial(reason="drives a real MCP child and verifies process teardown"),
     pytest.mark.skipif(
-        not (_MCP_COMMAND.is_file() and os.access(_MCP_COMMAND, os.X_OK)),
+        not (
+            _MCP_COMMAND.is_file()
+            and os.access(_MCP_COMMAND, os.X_OK)
+            and str(_MCP_COMMAND) == _RESOLVED_MCP_COMMAND
+        ),
         reason=(
-            "interpreter-local coffee-roaster-mcp not installed (the E9-S2 real-subprocess slice)"
+            "default coffee-roaster-mcp does not resolve to the executable beside this "
+            "interpreter (the E9-S2 real-subprocess slice)"
         ),
     ),
 ]
@@ -141,11 +152,11 @@ async def test_vertical_slice_against_real_mcp_subprocess(
     The MCP child is started and stopped within this one coroutine: the stdio
     transport's anyio cancel scope must be entered and exited in the same task,
     so it cannot live in a setup/teardown fixture."""
+    assert resolve_mcp_command(DEFAULT_MCP_COMMAND) == str(_MCP_COMMAND)
     config_path = tmp_path / "coffee-roaster-mcp.yaml"
     config_path.write_text(_CONFIG_YAML, encoding="utf-8")
     real_mcp = MCPServerProcess(
         MCPConfig(
-            command=str(_MCP_COMMAND),
             env={"COFFEE_ROASTER_MCP_CONFIG": str(config_path)},
         )
     )

@@ -16,7 +16,10 @@ Procedure:
    the parent-supplied exact pytest command (see **Validation environment**
    below). The command names both `tests/test_milestone1.py` and
    `tests/test_milestone1_real_mcp.py`; neither lane is optional when the
-   committed real-MCP file is present.
+   committed real-MCP file is present. Report pytest's pass/skip counts
+   verbatim. Any skip attributed to `tests/test_milestone1_real_mcp.py` is a
+   gate failure, even when pytest exits zero; stop and report it rather than
+   issuing a clean simulation verdict.
 2. For replay scenarios, `roastpilot-agent --replay <export>` is
    **parent-run evidence only**; it is not available to this role under
    capture. Ask the parent to run it and hand you the output.

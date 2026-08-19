@@ -7275,14 +7275,30 @@ def test_native_safety_and_security_reviewers_are_evidence_only() -> None:
         assert "Parent-supplied review evidence" in text
         assert "Do not run shell commands" in normalized
         assert "Fail closed" in normalized
-        assert "exact-head and byte-clean worktree attestation" in text
-        assert "name every skip" in text
-    assert "negative control" in (agents / "safety-reviewer.md").read_text()
+        assert "exact-head and byte-clean worktree attestation" in normalized
+        assert "exact unified-patch bytes" in normalized
+        assert "prose diff summary" in normalized
+        assert "name every skip" in normalized
+        assert "final verdict must restate the reviewed head SHA" in normalized
+        assert "current attested launch cwd" in normalized
+    safety_normalized = " ".join((agents / "safety-reviewer.md").read_text().split())
+    assert "negative control" in safety_normalized
+    assert "negative-control outcome" in safety_normalized
     assert (
         "python -m pytest tests/test_controller.py tests/test_safety.py -q"
         not in (agents / "safety-reviewer.md").read_text()
     )
     assert "git diff origin/main...HEAD" not in (agents / "security-reviewer.md").read_text()
+
+
+def test_sim_roast_runner_rejects_a_skipped_real_mcp_lane() -> None:
+    """The mandatory production MCP subprocess lane cannot pass via pytest skip."""
+    text = (
+        Path(__file__).resolve().parents[1] / ".claude" / "agents" / "sim-roast-runner.md"
+    ).read_text()
+    normalized = " ".join(text.split())
+    assert "Report pytest's pass/skip counts verbatim" in normalized
+    assert "tests/test_milestone1_real_mcp.py` is a gate failure" in normalized
 
 
 def test_runbook_and_skill_and_agents_row_point_to_print_validation_commands() -> None:
