@@ -165,6 +165,42 @@ def test_native_codex_registration_closure_matches_committed_project_files() -> 
         os.close(root.descriptor)
 
 
+@pytest.mark.parametrize(
+    "case",
+    ["top_disabled", "model", "effort", "leaf_enabled", "extra", "wrong_path", "no_model_boundary"],
+)
+def test_native_codex_registered_role_rejects_tampered_authority(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Every registered-role authority field is closed and fail-closed on drift."""
+    config = Path(".codex/config.toml").read_bytes()
+    role = Path(".codex/agents/engineer-be.toml").read_bytes()
+    if case == "top_disabled":
+        config = config.replace(b"enabled = true", b"enabled = false", 1)
+    elif case == "wrong_path":
+        config = config.replace(b"agents/engineer-be.toml", b"agents/wrong.toml", 1)
+    elif case == "model":
+        role = role.replace(b"gpt-5.6-terra", b"gpt-5.6-other")
+    elif case == "effort":
+        role = role.replace(b'model_reasoning_effort = "high"', b'model_reasoning_effort = "low"')
+    elif case == "leaf_enabled":
+        role = role.replace(b"enabled = false", b"enabled = true")
+    elif case == "extra":
+        role += b"extra = true\n"
+    elif case == "no_model_boundary":
+        role = role.replace(b"invoke Claude Code or any other model", b"invoke provider")
+    else:  # pragma: no cover - parametrization is closed above.
+        raise AssertionError(case)
+
+    def read(_root: object, parts: tuple[str, ...]) -> bytes:
+        return config if parts[-1] == "config.toml" else role
+
+    monkeypatch.setattr(usage_native_codex, "_read_relative", read)
+    root = usage_native_codex._Root(-1, 0, 0)  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._registered_role(root, NativeCodexRole.ENGINEER_BE)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -> None:
     """The native rollout parser keeps the final cumulative total instead of summing events."""
     manifest: dict[str, str] = {
@@ -952,6 +988,77 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     assert record.whole_tree_verified is (role is not NativeCodexRole.REPAIR)
     assert record.config_sha256 == "a" * 64 and record.role_sha256 == "b" * 64
     assert "SECRET" not in record.model_dump_json()
+
+
+@pytest.mark.parametrize("match_count", [0, 2])
+def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, match_count: int
+) -> None:
+    """Zero or duplicate registered-leaf rollouts never append a usage record."""
+    import capture_usage_cli as native_cli
+
+    roots: list[usage_native_codex._Root] = []  # pyright: ignore[reportPrivateUsage]
+    for name in ("usage", "provider", "worktree"):
+        directory = tmp_path / name
+        directory.mkdir()
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        state = os.fstat(descriptor)
+        roots.append(usage_native_codex._Root(descriptor, state.st_dev, state.st_ino))  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(usage_native_codex, "_open_root", lambda _raw, private: roots.pop(0))  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", lambda *_roots: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_registered_role",
+        cast(Any, lambda _root, _role: ("a" * 64, "b" * 64, "high", "engineer-be")),  # pyright: ignore[reportUnknownLambdaType]
+    )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_inventory", lambda _root: {})  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_assert_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_new_rollouts",
+        cast(
+            Any,
+            lambda _root, _before: [  # pyright: ignore[reportUnknownLambdaType]
+                ("a.jsonl", 90 + index, os.stat_result((0,) * 10))
+                for index in range(max(1, match_count))
+            ],
+        ),
+    )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_parse_rollout",
+        cast(Any, lambda _fd, _binding: ("leaf", (0, 0, 0, 0, 0, 0), "", _fd < 90 + match_count)),  # pyright: ignore[reportUnknownLambdaType]
+    )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex.os, "close", lambda _fd: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_terminal_line",
+        lambda: b'{"type":"TERMINAL","binding_id":"binding","task_status":"FAILED"}\n',
+    )
+    monkeypatch.setattr(usage_native_codex, "uuid4", lambda: "binding")
+    appended: list[object] = []
+    monkeypatch.setattr(
+        native_cli,
+        "append_record",
+        cast(Any, lambda *_args, **_kwargs: appended.append(object())),  # pyright: ignore[reportUnknownLambdaType]
+    )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent")
+    arguments = SimpleNamespace(
+        task_id="task",
+        slice_id="slice",
+        parent_task_id="parent",
+        task_name="leaf",
+        role="engineer-be",
+        usage_root=str(tmp_path / "usage"),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/x",
+        base_sha="a" * 40,
+        output="usage.jsonl",
+    )
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex.supervise_native_codex(arguments)
+    assert not appended
 
 
 def test_owned_transcript_counts_identical_assistant_usage_once(
