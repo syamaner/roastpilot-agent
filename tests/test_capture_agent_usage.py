@@ -617,6 +617,80 @@ def test_native_codex_json_depth_fails_closed() -> None:
         usage_native_codex._json(deep)  # pyright: ignore[reportPrivateUsage]
 
 
+def test_native_codex_cli_round_trip_and_fixed_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The closed supervisor CLI grammar maps capture failures to one safe exit."""
+    arguments = usage_cli.build_parser().parse_args(
+        [
+            "supervise-native-codex",
+            "--role",
+            "engineer-be",
+            "--task-id",
+            "task",
+            "--slice-id",
+            "slice",
+            "--parent-task-id",
+            "parent",
+            "--task-name",
+            "leaf",
+            "--repository",
+            "syamaner/roastpilot-agent",
+            "--branch",
+            "feature/x",
+            "--base-sha",
+            "a" * 40,
+            "--usage-root",
+            "/private/tmp/usage",
+        ]
+    )
+    assert arguments.role == "engineer-be" and arguments.task_name == "leaf"
+
+    def fail(_arguments: argparse.Namespace) -> int:
+        raise usage_native_codex.NativeCodexCaptureError("SECRET")
+
+    monkeypatch.setattr(usage_cli, "supervise_native_codex", fail)
+    with pytest.raises(SystemExit) as error:
+        usage_cli.main(
+            [
+                "supervise-native-codex",
+                "--role",
+                "engineer-be",
+                "--task-id",
+                "task",
+                "--slice-id",
+                "slice",
+                "--parent-task-id",
+                "parent",
+                "--task-name",
+                "leaf",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/x",
+                "--base-sha",
+                "a" * 40,
+                "--usage-root",
+                "/private/tmp/usage",
+            ]
+        )
+    assert error.value.code == "capture-agent-usage: native Codex capture is invalid"
+
+
+def test_native_codex_walk_rejects_symlink_non_json_and_depth(tmp_path: Path) -> None:
+    """Provider traversal accepts only bounded-depth owned JSONL regular files."""
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        (tmp_path / "bad.txt").write_text("x")
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            list(usage_native_codex._walk(root))  # pyright: ignore[reportPrivateUsage]
+        (tmp_path / "bad.txt").unlink()
+        (tmp_path / "target.jsonl").write_text("x")
+        (tmp_path / "link.jsonl").symlink_to(tmp_path / "target.jsonl")
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            list(usage_native_codex._walk(root))  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
 @pytest.mark.parametrize(
     ("repository", "branch", "base", "responses", "accepts"),
     [
