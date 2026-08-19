@@ -12,10 +12,11 @@ readable markdown. Everything you run uses the fake MCP client or the real
 
 Procedure:
 
-1. Run the 12-step mock vertical slice using the parent-supplied exact
-   `pytest tests/test_milestone1.py -q` command (see **Validation
-   environment** below; fake-MCP first, then the real-MCP-subprocess variant
-   if present).
+1. Run the fake-MCP and real-MCP-subprocess milestone slices together using
+   the parent-supplied exact pytest command (see **Validation environment**
+   below). The command names both `tests/test_milestone1.py` and
+   `tests/test_milestone1_real_mcp.py`; neither lane is optional when the
+   committed real-MCP file is present.
 2. For replay scenarios, `roastpilot-agent --replay <export>` is
    **parent-run evidence only**; it is not available to this role under
    capture. Ask the parent to run it and hand you the output.
@@ -57,8 +58,9 @@ knowable in advance, and a denied-by-default provider allow-rule matches
 only the byte-exact command it was built from.
 
 Your committed native launch carries exactly one fixed, exact
-`--allowedTools` rule (D168): `pytest tests/test_milestone1.py -q
---basetemp <root>/tmp/pytest`. **Any other command, including
+`--allowedTools` rule (D168): one pytest invocation containing both
+`tests/test_milestone1.py` and `tests/test_milestone1_real_mcp.py`, followed
+by `-q --basetemp <root>/tmp/pytest`. **Any other command, including
 `roastpilot-agent --replay`, is denied outright by the provider's `dontAsk`
 default, with no prompt and no retry** — see Procedure step 2 above. If a
 command you need is denied, stop and report — never attempt a workaround.

@@ -378,6 +378,15 @@ disjoint. Neither the plan root nor the evidence bundle renders any
 `--allowedTools` rule: those roles read with `Read`/`Grep`/`Glob`, which need
 path access, not command permission.
 
+Native `safety-reviewer` and `security-reviewer` runs are also deliberately
+evidence-only, but require no extra root: both inspect the already-attested
+implementation worktree with `Read`/`Grep`/`Glob` and have no Bash or
+`--allowedTools`. Their parent-authored briefs must name the exact worktree and
+head, summarize the exact-head diff scope/touched files, and include
+exit-status-backed deterministic gate evidence. Missing evidence is a
+fail-closed reviewer handback, never permission to compose or retry a shell
+command. This is the operator-approved no-new-permission Option A boundary.
+
 **Plan-root recipe (executed by the parent, never by the worker):**
 
 ```bash

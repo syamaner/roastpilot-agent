@@ -1122,7 +1122,8 @@ def test_render_allowed_tools_is_exact_literal_per_role() -> None:
         f"Bash({python} -m pytest tests/test_mcp_client.py -q --basetemp {tmp}/pytest)",
     )
     assert render_allowed_tools(NativeClaudeRole.SIM_ROAST_RUNNER, root) == (
-        f"Bash({python} -m pytest tests/test_milestone1.py -q --basetemp {tmp}/pytest)",
+        f"Bash({python} -m pytest tests/test_milestone1.py "
+        f"tests/test_milestone1_real_mcp.py -q --basetemp {tmp}/pytest)",
     )
     assert render_validation_commands(NativeClaudeRole.QA, root) == (
         f"{python} -m pytest",
@@ -7257,6 +7258,22 @@ def test_validation_role_files_never_instruct_python_c_pip_install_or_worktree_v
         assert "python -c" not in text
         assert "pip install" not in text
         assert "-m venv" not in text
+
+
+def test_native_safety_and_security_reviewers_are_evidence_only() -> None:
+    """Option A keeps mandatory assurance review free of native shell authority."""
+    agents = Path(__file__).resolve().parents[1] / ".claude" / "agents"
+    for name in ("safety-reviewer", "security-reviewer"):
+        text = (agents / f"{name}.md").read_text()
+        assert "tools: Read, Grep, Glob\n" in text
+        assert "tools: Read, Grep, Glob, Bash" not in text
+        assert "Parent-supplied review evidence" in text
+        assert "Do not run shell commands" in text
+    assert (
+        "python -m pytest tests/test_controller.py tests/test_safety.py -q"
+        not in (agents / "safety-reviewer.md").read_text()
+    )
+    assert "git diff origin/main...HEAD" not in (agents / "security-reviewer.md").read_text()
 
 
 def test_runbook_and_skill_and_agents_row_point_to_print_validation_commands() -> None:

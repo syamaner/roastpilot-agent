@@ -82,3 +82,11 @@ EXACT`/`ALLOW PREFIX` authorization-descriptor lines followed by one
 concrete `RUN <command>` line per gate (with an optional repeatable
 `--pytest-arg TOKEN` shell-quoted into the `qa` `pytest` gate's `RUN` line);
 a validation role executes only the `RUN ` lines, byte-exactly.
+
+`safety-reviewer` and `security-reviewer` are deliberately evidence-only under
+native capture. They have `Read`/`Grep`/`Glob`, no Bash, no validation root,
+and no `--allowedTools`. The parent-authored brief must name the exact
+worktree/head and supply the exact-head diff scope plus exit-status-backed
+deterministic gate evidence; either role fails closed when that evidence is
+missing. This keeps mandatory assurance available without widening native
+shell, network, or credential authority.

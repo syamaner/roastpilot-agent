@@ -177,7 +177,8 @@ VALIDATION_ROLE_COMMANDS: dict[NativeClaudeRole, tuple[ValidationCommand, ...]] 
     NativeClaudeRole.SIM_ROAST_RUNNER: (
         ValidationCommand(
             ValidationCommandKind.EXACT,
-            "{python} -m pytest tests/test_milestone1.py -q --basetemp {tmp}/pytest",
+            "{python} -m pytest tests/test_milestone1.py "
+            "tests/test_milestone1_real_mcp.py -q --basetemp {tmp}/pytest",
         ),
     ),
 }

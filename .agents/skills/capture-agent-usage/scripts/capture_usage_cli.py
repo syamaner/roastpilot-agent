@@ -1033,7 +1033,9 @@ def _validate_evidence_manifest_schema(
     return validated_files
 
 
-def _validate_evidence_pr_identity(payload: bytes, pr: int, head_sha: str, base_sha: object) -> None:
+def _validate_evidence_pr_identity(
+    payload: bytes, pr: int, head_sha: str, base_sha: object
+) -> None:
     """Require the offline ``pr.json`` identity to agree with its manifest."""
     try:
         data = json.loads(payload, object_pairs_hook=_reject_duplicate_manifest_keys)
