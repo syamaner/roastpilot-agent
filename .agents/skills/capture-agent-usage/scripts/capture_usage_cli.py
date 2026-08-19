@@ -135,9 +135,19 @@ _EVIDENCE_ENVIRONMENT_KEYS = frozenset({EVIDENCE_ROOT_ENVIRONMENT_KEY})
 _ALL_BOUND_ROOT_ENVIRONMENT_KEYS = ALL_BOUND_ROOT_ENVIRONMENT_KEYS
 _VALIDATION_DIRECTORY_MODE = 0o700
 _FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+"""Closed 40-lowercase-hex full commit sha grammar (D169, §2.3, §2.4)."""
 _GENERATED_AT_MAX_LEN = 40
 """Conservative bound on the ``generated_at`` field before attempting to parse it."""
-"""Closed 40-lowercase-hex full commit sha grammar (D169, §2.3, §2.4)."""
+_GENERATED_AT_UTC_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|\+00:00)$"
+)
+"""Closed RFC3339 UTC ``generated_at`` grammar: an uppercase ``T`` date-time
+separator, optional 1-6 digit fractional seconds, then exactly a ``Z`` or a
+``+00:00`` offset. Anchored and applied *before* :func:`datetime.fromisoformat`
+so that a space separator, a compact/basic (no ``-``/``:``) date-time, the
+RFC3339 unknown-local-offset ``-00:00`` token, or any other syntax
+``fromisoformat`` alone would accept is rejected outright rather than reaching
+semantic parsing."""
 _SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 """Closed 64-lowercase-hex SHA-256 digest grammar (D169, §2.4)."""
 _EVIDENCE_FILE_MODE = 0o400
@@ -970,15 +980,20 @@ def _validate_evidence_manifest_schema(
     if not isinstance(base_sha, str) or _FULL_SHA_PATTERN.fullmatch(base_sha) is None:
         raise CaptureUsageError("evidence bundle is invalid")
     generated_at = data.get("generated_at")
-    if not isinstance(generated_at, str) or len(generated_at) > _GENERATED_AT_MAX_LEN:
+    if (
+        not isinstance(generated_at, str)
+        or len(generated_at) > _GENERATED_AT_MAX_LEN
+        or _GENERATED_AT_UTC_PATTERN.fullmatch(generated_at) is None
+    ):
         raise CaptureUsageError("evidence bundle is invalid")
     try:
         parsed = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
     except ValueError:
         raise CaptureUsageError("evidence bundle is invalid") from None
-    # Reject a timezone-naive value and any non-zero UTC offset explicitly rather
-    # than silently normalizing it: `generated_at` must already be RFC3339 UTC
-    # (a `Z` or `+00:00` form), never an offset that requires conversion.
+    # Defense in depth: the pattern above already closes the grammar to
+    # `Z`/`+00:00` RFC3339 UTC forms, but keep the semantic checks so a
+    # tzinfo-less or non-zero-offset value fails closed even if the syntactic
+    # guard above is ever loosened.
     if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
         raise CaptureUsageError("evidence bundle is invalid")
     if parsed > _utc_now() + timedelta(seconds=TIMESTAMP_SKEW_SECONDS):

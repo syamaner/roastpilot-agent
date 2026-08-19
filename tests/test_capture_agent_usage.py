@@ -7921,6 +7921,35 @@ def test_evidence_bundle_accepts_rfc3339_utc_generated_at(
     assert bound.kind is BoundRootKind.EVIDENCE
 
 
+@pytest.mark.parametrize(
+    "generated_at",
+    [
+        "2025-01-01 00:00:00+00:00",
+        "20250101T000000Z",
+        "2025-01-01T00:00:00-00:00",
+    ],
+    ids=["space-separator", "compact-basic", "unknown-local-offset"],
+)
+def test_evidence_bundle_rejects_non_rfc3339_shapes_generated_at(
+    generated_at: str, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A syntactically-ISO-8601 but non-RFC3339-UTC shape fails closed.
+
+    ``datetime.fromisoformat`` alone accepts a space separator, a
+    compact/basic (no ``-``/``:``) date-time, and the RFC3339
+    unknown-local-offset ``-00:00`` token; the closed positive grammar guard
+    must reject all three before semantic parsing is ever reached.
+    """
+    root = _build_evidence_bundle(
+        tmp_path_factory.mktemp("evidence-non-rfc3339-generated-at") / "root",
+        generated_at=generated_at,
+    )
+    with pytest.raises(CaptureUsageError, match="evidence bundle is invalid"):
+        usage_cli._validate_evidence_bundle(  # pyright: ignore[reportPrivateUsage]
+            str(root), 837, attested_head=_EVIDENCE_HEAD
+        )
+
+
 def test_evidence_bundle_rejects_unknown_and_duplicate_manifest_keys(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
