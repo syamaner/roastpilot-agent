@@ -9366,6 +9366,12 @@ def test_evidence_pr_option_rejects_zero_and_negative_values() -> None:
             usage_cli._evidence_pr(value)  # pyright: ignore[reportPrivateUsage]
 
 
+def test_shlex_split_rejects_malformed_quoted_input() -> None:
+    """The defensive shell splitter converts malformed quoting to the fixed error."""
+    with pytest.raises(CaptureUsageError, match="validation environment is invalid"):
+        usage_cli._shlex_split("unterminated 'quote")  # pyright: ignore[reportPrivateUsage]
+
+
 def test_render_prefix_run_command_rejects_broken_coverage_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
