@@ -19,7 +19,6 @@ import dataclasses
 import importlib.metadata
 import json
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -1349,10 +1348,22 @@ async def test_run_model_over_corpus_elapsed_s_excludes_reserve_work(
     computation + pending-entry write must never land inside the timed
     region. A deliberately slow reserve stub must not move ``elapsed_s``."""
 
+    class _LogicalClock:
+        """Mutable deterministic clock for the timed-region boundary."""
+
+        now = 0.0
+
+        def monotonic(self) -> float:
+            """Return current logical time without consulting the scheduler."""
+            return self.now
+
+    clock = _LogicalClock()
+
     def _slow_reserve(page: bo.CorpusPage, price: bo.RosterModel, **_: object) -> float:
-        time.sleep(0.5)
+        clock.now += 0.5
         return 0.01
 
+    monkeypatch.setattr(bo, "time", clock)
     monkeypatch.setattr(bo, "_page_cost_reserve", _slow_reserve)
     model = _model_returning({"name": "X", "country": "Ecuador"})
     price = bo.RosterModel("m1", 1.0, 1.0, "x")
@@ -1366,7 +1377,7 @@ async def test_run_model_over_corpus_elapsed_s_excludes_reserve_work(
         ledger=ledger,
     )
     assert run.pages[0].elapsed_s is not None
-    assert run.pages[0].elapsed_s < 0.3  # well under the reserve stub's 0.5s sleep
+    assert run.pages[0].elapsed_s == 0.0
 
 
 @pytest.mark.asyncio
