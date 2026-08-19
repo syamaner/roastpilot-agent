@@ -7646,18 +7646,6 @@ def test_plan_root_reattest_passes_when_untouched(
     bound.reattest()
 
 
-def test_plan_root_device_inode_rejects_stat_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A ``os.stat`` failure while capturing the plan root's inode fails closed."""
-
-    def failing_stat(_path: str) -> os.stat_result:
-        raise OSError("SENTINEL_STAT_FAILURE")
-
-    monkeypatch.setattr(os, "stat", failing_stat)
-    with pytest.raises(CaptureUsageError, match="plan root is invalid") as error:
-        usage_cli._plan_root_device_inode("/plan/root")  # pyright: ignore[reportPrivateUsage]
-    assert "SENTINEL_STAT_FAILURE" not in str(error.value)
-
-
 def test_plan_root_never_mutated_by_capture_tool(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:

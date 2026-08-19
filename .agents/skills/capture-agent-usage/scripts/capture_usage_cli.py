@@ -880,15 +880,6 @@ def _plan_identity_checks(root: str, sha: str) -> None:
         raise CaptureUsageError("plan root is invalid")
 
 
-def _plan_root_device_inode(root: str) -> tuple[int, int]:
-    """Return the plan root's ``(st_dev, st_ino)`` pair for post-exit drift detection."""
-    try:
-        status = os.stat(root)
-    except OSError:
-        raise CaptureUsageError("plan root is invalid") from None
-    return status.st_dev, status.st_ino
-
-
 def _open_bound_root_descriptor(root: str, *, error_message: str) -> int:
     """Open one bound root for its full native-launch lifetime."""
     try:
@@ -1660,6 +1651,16 @@ def _bound_root_request(arguments: argparse.Namespace) -> _BoundRootRequest:
     )
 
 
+def _close_bound_root(launch_environment: _NativeLaunchEnvironment | None) -> None:
+    """Close a held PLAN/EVIDENCE descriptor after its final reattestation."""
+    if launch_environment is None:
+        return
+    bound_root = launch_environment.bound_root
+    if bound_root is not None and bound_root.descriptor is not None:
+        with suppress(OSError):
+            os.close(bound_root.descriptor)
+
+
 def run_native_claude_command(arguments: argparse.Namespace) -> int:
     """Launch one registered Claude implementation worker and append complete usage."""
     role = NativeClaudeRole(arguments.role)
@@ -1667,23 +1668,24 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
     require_handback = pin.capability is RoleCapability.READ_ONLY
     _validate_native_metadata(arguments, role, pin)
     attested_head = _validate_native_worktree(arguments, pin.capability, post_exit=False)
-    launch_environment = _resolve_native_environment(
-        role, _bound_root_request(arguments), attested_head=attested_head
-    )
-    if os.environ.get("CLAUDE_CONFIG_DIR") is not None:
-        raise CaptureUsageError("native Claude config directory is not permitted")
-    session_id = str(uuid4())
-    try:
-        reject_existing_owned_session(Path.cwd(), session_id)
-    except TranscriptError:
-        raise CaptureUsageError("native Claude session path is invalid") from None
-    prompt = _prompt_bytes(arguments.prompt_file)
+    launch_environment: _NativeLaunchEnvironment | None = None
     process: subprocess.Popen[bytes] | None = None
     deadline: threading.Timer | None = None
     timed_out = threading.Event()
     writer: threading.Thread | None = None
     writer_result = [False]
     try:
+        launch_environment = _resolve_native_environment(
+            role, _bound_root_request(arguments), attested_head=attested_head
+        )
+        if os.environ.get("CLAUDE_CONFIG_DIR") is not None:
+            raise CaptureUsageError("native Claude config directory is not permitted")
+        session_id = str(uuid4())
+        try:
+            reject_existing_owned_session(Path.cwd(), session_id)
+        except TranscriptError:
+            raise CaptureUsageError("native Claude session path is invalid") from None
+        prompt = _prompt_bytes(arguments.prompt_file)
         executable = _resolved_executable(HarnessFamily.CLAUDE)
         version = _harness_version(executable)
         if version != _VERIFIED_HARNESS_VERSIONS[HarnessFamily.CLAUDE]:
@@ -1785,10 +1787,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
             with suppress(OSError, ValueError):
                 _close_stdin(process)
             _stop_process(process)
-        bound_root = launch_environment.bound_root
-        if bound_root is not None and bound_root.descriptor is not None:
-            with suppress(OSError):
-                os.close(bound_root.descriptor)
+        _close_bound_root(launch_environment)
 
 
 def _record_from_usage(
