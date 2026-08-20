@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pwd
 import re
 import stat
 import subprocess
@@ -904,7 +905,13 @@ def _reattest_usage_root(root: _Root) -> None:
 
 def _provider_home() -> str:
     """Return the only provider-state homes admitted to native capture."""
-    default = os.path.abspath(os.path.expanduser("~/.codex"))
+    try:
+        account_home = pwd.getpwuid(os.geteuid()).pw_dir
+    except (KeyError, OSError):
+        _fail()
+    if not isinstance(account_home, str) or not os.path.isabs(account_home):
+        _fail()
+    default = os.path.abspath(os.path.join(account_home, ".codex"))
     supplied = os.environ.get("CODEX_HOME")
     if supplied is None:
         return default

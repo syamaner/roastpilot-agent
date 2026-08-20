@@ -9,6 +9,7 @@ import inspect
 import itertools
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -1074,6 +1075,113 @@ def test_native_codex_usage_root_reattest_rejects_replacement(tmp_path: Path) ->
         os.close(held.descriptor)
 
 
+def test_native_codex_supervisor_usage_root_replacement_appends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement immediately before append emits neither a record nor RESULT frame."""
+    import capture_usage_cli as native_cli
+
+    usage = tmp_path / "usage"
+    replacement = tmp_path / "replacement"
+    provider_home = tmp_path / "provider-home"
+    worktree = tmp_path / "worktree"
+    usage.mkdir(mode=0o700)
+    replacement.mkdir(mode=0o700)
+    (provider_home / "sessions").mkdir(parents=True)
+    worktree.mkdir()
+    os.chmod(usage, 0o700)
+    os.chmod(replacement, 0o700)
+    candidate = tmp_path / "leaf.jsonl"
+    candidate.write_bytes(b"{}\n")
+
+    class Frames:
+        def __init__(self) -> None:
+            self.values: list[str] = []
+
+        def write(self, value: str) -> int:
+            self.values.append(value)
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    frames = Frames()
+    appended: list[object] = []
+    original_reattest = usage_native_codex._reattest_usage_root  # pyright: ignore[reportPrivateUsage]
+
+    def replace_then_reattest(root: usage_native_codex._Root) -> None:  # pyright: ignore[reportPrivateUsage]
+        os.rename(usage, tmp_path / "old-usage")
+        os.rename(replacement, usage)
+        original_reattest(root)
+
+    def registered_role(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _role: NativeCodexRole,
+    ) -> tuple[str, str, str, str]:
+        return "a" * 64, "b" * 64, "high", "engineer-be"
+
+    def git_identity(_repository: str, _branch: str, _base: str, *, final: bool) -> str:
+        del final
+        return "a" * 40
+
+    def inventory(_root: usage_native_codex._Root) -> dict[str, tuple[int, int]]:  # pyright: ignore[reportPrivateUsage]
+        return {}
+
+    def metadata(_fd: int, _binding: dict[str, str]) -> usage_native_codex._CandidateMetadata:  # pyright: ignore[reportPrivateUsage]
+        return usage_native_codex._CandidateMetadata(True, None)  # pyright: ignore[reportPrivateUsage]
+
+    def parse(
+        _fd: int, _binding: dict[str, str]
+    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool]:
+        return "leaf", (0, 0, 0, 0, 0, 0), "", True
+
+    def new_rollouts(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _before: dict[str, tuple[int, int]],
+    ) -> list[tuple[str, int, os.stat_result]]:
+        return [("leaf.jsonl", os.open(candidate, os.O_RDONLY), os.stat(candidate))]
+
+    def append(*_args: object, **_kwargs: object) -> None:
+        appended.append(object())
+
+    monkeypatch.chdir(worktree)
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent")
+    monkeypatch.setattr(usage_native_codex, "_provider_home", lambda: str(provider_home))
+    monkeypatch.setattr(usage_native_codex.sys, "stdout", frames)
+    monkeypatch.setattr(usage_native_codex, "_registered_role", registered_role)
+    monkeypatch.setattr(usage_native_codex, "_git_identity", git_identity)
+    monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
+    monkeypatch.setattr(usage_native_codex, "_candidate_metadata", metadata)
+    monkeypatch.setattr(usage_native_codex, "_parse_rollout", parse)
+    monkeypatch.setattr(usage_native_codex, "_new_rollouts", new_rollouts)
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_terminal_line",
+        lambda: b'{"type":"TERMINAL","binding_id":"binding","task_status":"FAILED"}\n',
+    )
+    monkeypatch.setattr(usage_native_codex, "uuid4", lambda: "binding")
+    monkeypatch.setattr(usage_native_codex, "_reattest_usage_root", replace_then_reattest)
+    monkeypatch.setattr(native_cli, "append_record", append)
+    arguments = SimpleNamespace(
+        task_id="task",
+        slice_id="slice",
+        parent_task_id="parent",
+        task_name="leaf",
+        role="engineer-be",
+        usage_root=str(usage),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/test",
+        base_sha="a" * 40,
+        output="usage.jsonl",
+    )
+    with pytest.raises(
+        usage_native_codex.NativeCodexCaptureError, match="native Codex capture is invalid"
+    ):
+        usage_native_codex.supervise_native_codex(arguments)
+    assert appended == []
+    assert [json.loads(frame)["type"] for frame in frames.values] == ["READY"]
+
+
 def test_native_codex_descriptor_reads_reject_symlinks_and_size(tmp_path: Path) -> None:
     """Committed config reads stay beneath the held root and never exceed 64 KiB."""
     root = tmp_path / "root"
@@ -1288,15 +1396,26 @@ def test_native_codex_provider_home_is_closed_to_default_or_platform(
 ) -> None:
     """Provider state accepts only the canonical user home or the platform home."""
     monkeypatch.delenv("CODEX_HOME", raising=False)
-    default = os.path.abspath(os.path.expanduser("~/.codex"))
+    default = os.path.abspath(os.path.join(pwd.getpwuid(os.geteuid()).pw_dir, ".codex"))
     assert usage_native_codex._provider_home() == default  # pyright: ignore[reportPrivateUsage]
-    monkeypatch.setenv("CODEX_HOME", os.path.expanduser("~/.codex"))
+    monkeypatch.setenv("CODEX_HOME", default)
     assert usage_native_codex._provider_home() == default  # pyright: ignore[reportPrivateUsage]
     monkeypatch.setenv("CODEX_HOME", "/opt/codex")
     assert usage_native_codex._provider_home() == "/opt/codex"  # pyright: ignore[reportPrivateUsage]
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     with pytest.raises(usage_native_codex.NativeCodexCaptureError):
         usage_native_codex._provider_home()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_provider_home_ignores_home_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ambient HOME override cannot redirect provider evidence discovery."""
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "attacker-home"))
+    assert usage_native_codex._provider_home() == os.path.abspath(  # pyright: ignore[reportPrivateUsage]
+        os.path.join(pwd.getpwuid(os.geteuid()).pw_dir, ".codex")
+    )
 
 
 @pytest.mark.parametrize(
