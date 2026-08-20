@@ -201,7 +201,19 @@ def test_native_codex_registered_role_rejects_tampered_authority(
         usage_native_codex._registered_role(root, NativeCodexRole.ENGINEER_BE)  # pyright: ignore[reportPrivateUsage]
 
 
-def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("depth", "raises", "expected_match"),
+    [
+        (1, False, True),
+        (True, True, False),
+        (1.0, True, False),
+        (0, False, False),
+        (2, False, False),
+    ],
+)
+def test_native_codex_rollout_uses_final_cumulative_total_once(
+    tmp_path: Path, depth: object, raises: bool, expected_match: bool
+) -> None:
     """The native rollout parser keeps the final cumulative total instead of summing events."""
     manifest: dict[str, str] = {
         "parent_thread_id": "parent-811",
@@ -232,7 +244,7 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -
                 "subagent": {
                     "thread_spawn": {
                         "parent_thread_id": "parent-811",
-                        "depth": 1,
+                        "depth": depth,
                         "agent_path": "/root/native-codex-capture",
                         "agent_nickname": "worker-811",
                         "agent_role": "engineer-be",
@@ -371,11 +383,15 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(tmp_path: Path) -
         )
     )
     with rollout.open("rb") as stream:
+        if raises:
+            with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+                usage_native_codex._parse_rollout(stream.fileno(), manifest)  # pyright: ignore[reportPrivateUsage]
+            return
         session, totals, _parent, matches = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
             stream.fileno(), manifest
         )
     assert session == "leaf-811"
-    assert matches is True
+    assert matches is expected_match
     assert totals == (9, 2, 3, 4, 5, 23)
 
 
@@ -1294,6 +1310,99 @@ def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
     with pytest.raises(usage_native_codex.NativeCodexCaptureError):
         usage_native_codex.supervise_native_codex(arguments)
     assert not appended
+
+
+@pytest.mark.parametrize("failure", ["duplicate", "later_parse_error"])
+def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Every opened candidate descriptor closes once when selection cannot complete."""
+    import capture_usage_cli as native_cli
+
+    roots: list[usage_native_codex._Root] = []  # pyright: ignore[reportPrivateUsage]
+    for name in ("usage", "provider", "worktree"):
+        directory = tmp_path / name
+        directory.mkdir()
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        state = os.fstat(descriptor)
+        roots.append(usage_native_codex._Root(descriptor, state.st_dev, state.st_ino))  # pyright: ignore[reportPrivateUsage]
+    candidates: list[int] = []
+    for name in ("first.jsonl", "second.jsonl"):
+        candidate = tmp_path / name
+        candidate.write_bytes(b"{}\n")
+        candidates.append(os.open(candidate, os.O_RDONLY | os.O_CLOEXEC))
+
+    def open_root(_raw: str, *, private: bool) -> usage_native_codex._Root:  # pyright: ignore[reportPrivateUsage]
+        del private
+        return roots.pop(0)
+
+    def new_rollouts(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _before: dict[str, tuple[int, int]],
+    ) -> list[tuple[str, int, os.stat_result]]:
+        return [
+            ("first.jsonl", candidates[0], os.stat_result((0,) * 10)),
+            ("second.jsonl", candidates[1], os.stat_result((0,) * 10)),
+        ]
+
+    def parse_rollout(
+        descriptor: int, _binding: dict[str, str]
+    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool]:
+        if failure == "later_parse_error" and descriptor == candidates[1]:
+            raise usage_native_codex.NativeCodexCaptureError("invalid rollout")
+        return "leaf", (0, 0, 0, 0, 0, 0), "", True
+
+    def registered_role(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        member: NativeCodexRole,
+    ) -> tuple[str, str, str, str]:
+        return "a" * 64, "b" * 64, "high", member.value
+
+    closed: list[int] = []
+    original_close = os.close
+
+    def close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    appended: list[NativeCodexUsageRecord] = []
+
+    def append(_output: object, record: NativeCodexUsageRecord, **_kwargs: object) -> None:
+        appended.append(record)
+
+    monkeypatch.setattr(usage_native_codex, "_open_root", open_root)
+    monkeypatch.setattr(usage_native_codex, "_assert_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", lambda *_roots: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_inventory", lambda _root: {})  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_new_rollouts", new_rollouts)
+    monkeypatch.setattr(usage_native_codex, "_parse_rollout", parse_rollout)
+    monkeypatch.setattr(usage_native_codex, "_registered_role", registered_role)
+    monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_terminal_line",
+        lambda: b'{"type":"TERMINAL","binding_id":"binding","task_status":"FAILED"}\n',
+    )
+    monkeypatch.setattr(usage_native_codex, "uuid4", lambda: "binding")
+    monkeypatch.setattr(usage_native_codex.os, "close", close)
+    monkeypatch.setattr(native_cli, "append_record", append)
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent")
+    arguments = SimpleNamespace(
+        task_id="task",
+        slice_id="slice",
+        parent_task_id="parent",
+        task_name="leaf",
+        role="engineer-be",
+        usage_root=str(tmp_path / "usage"),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/x",
+        base_sha="a" * 40,
+        output="usage.jsonl",
+    )
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex.supervise_native_codex(arguments)
+    assert appended == []
+    assert all(closed.count(descriptor) == 1 for descriptor in candidates)
 
 
 def test_owned_transcript_counts_identical_assistant_usage_once(
