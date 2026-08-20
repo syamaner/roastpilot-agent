@@ -914,10 +914,13 @@ def _assert_checkout_directories(root: _Root) -> None:
                 status = os.stat(entry.name, dir_fd=directory, follow_symlinks=False)
                 relative = f"{prefix}/{entry.name}" if prefix else entry.name
                 if stat.S_ISLNK(status.st_mode):
-                    if (
-                        status.st_uid != os.geteuid()
-                        or prefix != ".venv/bin"
-                        or not re.fullmatch(r"python(?:3(?:\.\d+)?)?", entry.name)
+                    linux_lib64 = prefix == ".venv" and entry.name == "lib64"
+                    if status.st_uid != os.geteuid() or (
+                        not linux_lib64
+                        and (
+                            prefix != ".venv/bin"
+                            or not re.fullmatch(r"python(?:3(?:\.\d+)?)?", entry.name)
+                        )
                     ):
                         _fail()
                     target = os.readlink(entry.name, dir_fd=directory)
@@ -926,8 +929,14 @@ def _assert_checkout_directories(root: _Root) -> None:
                         not target
                         or "\x00" in target
                         or len(target.encode("utf-8")) > MAX_GIT_ADMIN_FILE_BYTES
-                        or not re.fullmatch(r"python(?:3(?:\.\d+)?)?", target_name)
-                        or (not os.path.isabs(target) and "/" in target)
+                        or (linux_lib64 and target != "lib")
+                        or (
+                            not linux_lib64
+                            and (
+                                not re.fullmatch(r"python(?:3(?:\.\d+)?)?", target_name)
+                                or (not os.path.isabs(target) and "/" in target)
+                            )
+                        )
                     ):
                         _fail()
                     continue

@@ -729,6 +729,13 @@ class NativeCodexUsageRecord(CaptureModel):
     @model_validator(mode="after")
     def validate_native_codex_usage(self) -> NativeCodexUsageRecord:
         """Require Git and task outcomes to agree with the closed lifecycle."""
+        expected_effort = {
+            NativeCodexRole.ENGINEER_BE: "high",
+            NativeCodexRole.ENGINEER_FE: "high",
+            NativeCodexRole.REPAIR: "medium",
+        }[self.native_role]
+        if self.effort != expected_effort:
+            raise ValueError("native Codex role effort is contradictory")
         if self.success:
             if self.task_status is not NativeCodexTaskStatus.SUCCESS:
                 raise ValueError("successful native Codex record has contradictory task status")
