@@ -692,6 +692,7 @@ def _parse_rollout(
 
 def _candidate_binding(fd: int, binding: dict[str, str]) -> bool | None:
     """Classify a first metadata row without rejecting an active unrelated rollout."""
+    raw = b""
     try:
         with os.fdopen(os.dup(fd), "rb") as stream:
             raw = stream.readline(MAX_EVENT_BYTES + 1)
@@ -723,7 +724,9 @@ def _candidate_binding(fd: int, binding: dict[str, str]) -> bool | None:
             and spawn.get("agent_role") == binding["role"]
         )
     except NativeCodexCaptureError:
-        return None
+        # A malformed row that already claims every bound identity must be rejected by
+        # the full parser, rather than being mistaken for unrelated active activity.
+        return all(value.encode("utf-8") in raw for value in binding.values())
     except OSError:
         # A descriptor race remains fail-closed when the full parser reopens it.
         return True
