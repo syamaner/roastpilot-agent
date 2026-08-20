@@ -520,6 +520,8 @@ def _git_identity(repository: str, branch: str, base: str, *, final: bool) -> st
     if _git(["branch", "--show-current"]) != branch or _git(status_args):
         _fail()
     _assert_index_clean()
+    if _git(["rev-parse", "HEAD"]) != head:
+        _fail()
     if _git(["rev-parse", "--verify", f"{base}^{{commit}}"]) != base or (
         not final and head != base
     ):
@@ -558,6 +560,7 @@ def _checkout_directory(descriptor: int) -> None:
 def _assert_checkout(root: _Root) -> None:
     """Attest every tracked file and containing directory through held descriptors."""
     _assert_worktree_root(root)
+    _assert_checkout_directories(root)
     paths = _git(["ls-files", "-z"]).split("\0")
     if not paths or paths.pop() != "" or len(paths) > MAX_CHECKOUT_ENTRIES:
         _fail()
@@ -600,6 +603,57 @@ def _assert_checkout(root: _Root) -> None:
         finally:
             with suppress(OSError):
                 os.close(descriptor)
+
+
+def _assert_checkout_directories(root: _Root) -> None:
+    """Inspect every checkout directory except Git's separately attested administration."""
+    entries_seen = 0
+
+    def descend(directory: int, depth: int) -> None:
+        nonlocal entries_seen
+        if depth > MAX_CHECKOUT_DEPTH:
+            _fail()
+        _checkout_directory(directory)
+        scandir_descriptor = os.dup(directory)
+        iterator: os.ScandirIterator[str] | None = None
+        try:
+            iterator = os.scandir(scandir_descriptor)
+            for entry in iterator:
+                if entry.name in {".", ".."}:
+                    _fail()
+                if depth == 0 and entry.name == ".git":
+                    continue
+                entries_seen += 1
+                if entries_seen > MAX_CHECKOUT_ENTRIES:
+                    _fail()
+                status = os.stat(entry.name, dir_fd=directory, follow_symlinks=False)
+                if stat.S_ISLNK(status.st_mode):
+                    _fail()
+                if not stat.S_ISDIR(status.st_mode):
+                    continue
+                child = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory,
+                )
+                try:
+                    descend(child, depth + 1)
+                finally:
+                    os.close(child)
+        except OSError:
+            _fail()
+        finally:
+            if iterator is not None:
+                with suppress(OSError):
+                    iterator.close()
+            with suppress(OSError):
+                _close(scandir_descriptor)
+
+    descriptor = os.dup(root.descriptor)
+    try:
+        descend(descriptor, 0)
+    finally:
+        os.close(descriptor)
 
 
 def _attested_origin() -> str:
@@ -1159,6 +1213,28 @@ def _new_rollouts(
     return result
 
 
+def _assert_selected_rollout(
+    root: _Root, descriptor: int, generation: tuple[int, int, int], size: int
+) -> None:
+    """Require selected usage evidence to remain the exact parsed provider file."""
+    try:
+        status = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_uid != os.geteuid()
+            or status.st_nlink != 1
+            or stat.S_IMODE(status.st_mode) & 0o022
+            or _generation(status) != generation
+            or status.st_size != size
+        ):
+            _fail()
+    except OSError:
+        _fail()
+    _reattest_provider_root(root)
+    if generation not in _inventory(root):
+        _fail()
+
+
 def _ancestor_identities(root: _Root) -> set[tuple[int, int]]:
     """Return held descriptor ancestors without trusting mutable path strings."""
     result: set[tuple[int, int]] = set()
@@ -1337,12 +1413,16 @@ def supervise_native_codex(arguments: Any) -> int:
     usage: _Root | None = None
     provider: _Root | None = None
     worktree: _Root | None = None
+    selected_fd: int | None = None
+    selected_generation: tuple[int, int, int] | None = None
+    selected_size = 0
     try:
         usage = _open_root(arguments.usage_root, private=True)
         provider = _open_root(os.path.join(codex_home, "sessions"), private=False)
         worktree = _open_root(os.getcwd(), private=False)
         _reject_root_overlap(usage, provider, worktree)
         _assert_worktree_root(worktree)
+        _assert_checkout(worktree)
         launch = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=False
         )
@@ -1360,13 +1440,13 @@ def supervise_native_codex(arguments: Any) -> int:
             "branch": arguments.branch,
             "instruction_sha256": _ROLE_INSTRUCTION_SHA256[role],
         }
+        _assert_checkout(worktree)
         if (
             _git_identity(arguments.repository, arguments.branch, arguments.base_sha, final=False)
             != launch
             or _attested_origin() != origin
         ):
             _fail()
-        _assert_checkout(worktree)
         ready = {"type": "READY", "binding_id": str(uuid4())}
         started = datetime.now(UTC)
         started_monotonic = time.monotonic()
@@ -1412,6 +1492,11 @@ def supervise_native_codex(arguments: Any) -> int:
             if len(matched) != 1:
                 _fail()
             selected_fd, leaf, totals = matched[0]
+            selected_status = next(
+                status for fd, status, _metadata in classified if fd == selected_fd
+            )
+            selected_generation = _generation(selected_status)
+            selected_size = selected_status.st_size
             for fd, _stat, metadata in classified:
                 if fd == selected_fd:
                     continue
@@ -1444,6 +1529,8 @@ def supervise_native_codex(arguments: Any) -> int:
             whole = fully_scanned and subagent_count == 0
         finally:
             for held_fd, _stat, _metadata in classified:
+                if held_fd == selected_fd:
+                    continue
                 with suppress(OSError):
                     _close(held_fd)
         _reattest_worktree_root(worktree)
@@ -1490,6 +1577,9 @@ def supervise_native_codex(arguments: Any) -> int:
         )
         from capture_usage_cli import append_record  # local avoids import cycle
 
+        if selected_fd is None or selected_generation is None:
+            _fail()
+        _assert_selected_rollout(provider, selected_fd, selected_generation, selected_size)
         _reattest_usage_root(usage)
         append_record(arguments.output, record, root_descriptor=usage.descriptor)
         sys.stdout.write(
@@ -1502,6 +1592,9 @@ def supervise_native_codex(arguments: Any) -> int:
         sys.stdout.flush()
         return 0
     finally:
+        if selected_fd is not None:
+            with suppress(OSError):
+                _close(selected_fd)
         for root in (worktree, provider, usage):
             if root is not None:
                 with suppress(OSError):
