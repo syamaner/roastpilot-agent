@@ -963,6 +963,12 @@ def supervise_native_codex(arguments: Any) -> int:
                     continue
                 try:
                     _session, _child_totals, spawned_from, _matches = _parse_rollout(fd, binding)
+                    try:
+                        observed_total += os.fstat(fd).st_size
+                    except OSError:
+                        observed_total += _stat.st_size
+                    if observed_total > MAX_PROVIDER_TOTAL_BYTES:
+                        _fail()
                     if spawned_from != leaf:
                         _fail()
                     subagent_count += 1

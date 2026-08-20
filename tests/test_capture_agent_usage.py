@@ -1676,6 +1676,206 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         assert forbidden not in serialized
 
 
+@pytest.mark.parametrize(
+    ("topology", "order", "expected_children", "expected_whole"),
+    [
+        ("sibling", "before", 0, True),
+        ("sibling", "after", 0, True),
+        ("child", "before", 1, False),
+        ("child", "after", 1, False),
+        ("incomplete-child", "before", 0, False),
+        ("incomplete-child", "after", 0, False),
+    ],
+)
+def test_native_codex_supervisor_real_rollout_topology_classification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    topology: str,
+    order: str,
+    expected_children: int,
+    expected_whole: bool,
+) -> None:
+    """Real descriptors classify ordered siblings, children, and incomplete children."""
+    worktree = tmp_path / "worktree"
+    provider = tmp_path / "codex" / "sessions"
+    usage = tmp_path / "usage"
+    worktree.mkdir()
+    provider.mkdir(parents=True)
+    usage.mkdir(mode=0o700)
+    os.chmod(usage, 0o700)
+
+    def write_rollout(path: Path, session: str, parent: str, depth: int, *, complete: bool) -> None:
+        meta: dict[str, object] = {
+            "id": session,
+            "agent_nickname": "worker",
+            "agent_path": "/root/native-codex-capture",
+            "agent_role": "engineer-be",
+            "base_instructions": "opaque",
+            "cli_version": "0.147.0",
+            "context_window": 1,
+            "cwd": "opaque",
+            "git": {"branch": "main", "commit_hash": "a" * 40, "repository_url": "opaque"},
+            "history_mode": "opaque",
+            "model_provider": "opaque",
+            "multi_agent_version": "opaque",
+            "originator": "codex-tui",
+            "parent_thread_id": parent,
+            "session_id": "opaque",
+            "source": {
+                "subagent": {
+                    "thread_spawn": {
+                        "parent_thread_id": parent,
+                        "depth": depth,
+                        "agent_path": "/root/native-codex-capture",
+                        "agent_nickname": "worker",
+                        "agent_role": "engineer-be",
+                    }
+                }
+            },
+            "thread_source": "subagent",
+            "timestamp": "opaque",
+        }
+        events: list[dict[str, object]] = [{"type": "session_meta", "payload": meta}]
+        if complete:
+            context: dict[str, object] = {
+                key: "opaque"
+                for key in usage_native_codex._TURN_CONTEXT_KEYS  # pyright: ignore[reportPrivateUsage]
+            }
+            context.update(
+                {
+                    "model": "gpt-5.6-terra",
+                    "effort": "high",
+                    "realtime_active": False,
+                    "workspace_roots": [],
+                }
+            )
+            totals = {
+                key: 0
+                for key in (
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "cache_write_input_tokens",
+                    "output_tokens",
+                    "reasoning_output_tokens",
+                    "total_tokens",
+                )
+            }
+            events.extend(
+                [
+                    {"type": "turn_context", "payload": context},
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_started",
+                            "collaboration_mode_kind": "opaque",
+                            "model_context_window": 1,
+                            "started_at": "opaque",
+                            "turn_id": "opaque",
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": totals,
+                                "model_context_window": 1,
+                                "total_token_usage": totals,
+                            },
+                            "rate_limits": {},
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_complete",
+                            "completed_at": "opaque",
+                            "duration_ms": 1,
+                            "last_agent_message": "opaque",
+                            "started_at": "opaque",
+                            "time_to_first_token_ms": 1,
+                            "turn_id": "opaque",
+                        },
+                    },
+                ]
+            )
+        path.write_text(
+            "".join(
+                json.dumps({"ordinal": number, "timestamp": "opaque", **event}) + "\n"
+                for number, event in enumerate(events)
+            )
+        )
+
+    class Frames:
+        def __init__(self) -> None:
+            self.values: list[str] = []
+
+        def write(self, value: str) -> int:
+            self.values.append(value)
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    frames = Frames()
+
+    def terminal() -> bytes:
+        write_rollout(provider / "leaf.jsonl", "leaf-811", "parent-811", 1, complete=True)
+        if topology == "sibling":
+            write_rollout(provider / "other.jsonl", "other-811", "other-parent", 1, complete=True)
+        else:
+            write_rollout(
+                provider / "other.jsonl", "child-811", "leaf-811", 2, complete=topology == "child"
+            )
+        if order == "before":
+            os.rename(provider / "leaf.jsonl", provider / "z-leaf.jsonl")
+            os.rename(provider / "other.jsonl", provider / "a-other.jsonl")
+        ready = json.loads(frames.values[-1])
+        return (
+            json.dumps(
+                {"type": "TERMINAL", "binding_id": ready["binding_id"], "task_status": "FAILED"}
+            ).encode()
+            + b"\n"
+        )
+
+    monkeypatch.chdir(worktree)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent-811")
+    monkeypatch.setattr(usage_native_codex.sys, "stdout", frames)
+    monkeypatch.setattr(usage_native_codex, "_terminal_line", terminal)
+    monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+
+    def registered_role(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _role: NativeCodexRole,
+    ) -> tuple[str, str, str, str]:
+        return "a" * 64, "b" * 64, "high", "engineer-be"
+
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_registered_role",
+        registered_role,
+    )
+    arguments = SimpleNamespace(
+        task_id="task",
+        slice_id="slice",
+        parent_task_id="parent",
+        task_name="native-codex-capture",
+        role="engineer-be",
+        usage_root=str(usage),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/test",
+        base_sha="a" * 40,
+        output=Path(".agent-usage/usage.jsonl"),
+    )
+    assert usage_native_codex.supervise_native_codex(arguments) == 0
+    record = NativeCodexUsageRecord.model_validate_json(
+        (usage / ".agent-usage" / "usage.jsonl").read_text()
+    )
+    assert record.subagent_count == expected_children
+    assert record.whole_tree_verified is expected_whole
+
+
 @pytest.mark.parametrize("match_count", [0, 2])
 def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, match_count: int
