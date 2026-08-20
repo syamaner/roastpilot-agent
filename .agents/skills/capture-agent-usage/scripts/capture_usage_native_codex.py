@@ -2168,7 +2168,7 @@ def supervise_native_codex(arguments: Any) -> int:
                         fully_scanned = False
                     continue
                 try:
-                    _session, _child_totals, spawned_from, _matches, consumed = _parse_rollout(
+                    _session, _child_totals, _spawned_from, _matches, consumed = _parse_rollout(
                         fd, binding
                     )
                     observed_total += consumed
@@ -2179,11 +2179,8 @@ def supervise_native_codex(arguments: Any) -> int:
                     # child. Capture remains useful, but whole-tree proof is withheld.
                     fully_scanned = False
                 else:
-                    if spawned_from != leaf:
-                        fully_scanned = False
-                        continue
-                    # A parsed child is proof the registered leaf escaped its
-                    # committed depth-one/no-subagent boundary.
+                    # A fully parsed candidate routed here either proves a child or
+                    # contradicts its first-row parent binding; both are fail-closed.
                     _fail()
             _reattest_provider_root(provider)
             # Reconcile by retained descriptors, not a second unbound snapshot: an

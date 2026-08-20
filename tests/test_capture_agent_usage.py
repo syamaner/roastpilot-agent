@@ -3154,14 +3154,15 @@ def test_native_codex_provider_home_ignores_home_override(
 
 
 @pytest.mark.parametrize(
-    ("role", "status", "proven_child"),
+    ("role", "status", "child_parent"),
     [
-        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.SUCCESS, False),
-        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.FAILED, False),
-        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED, False),
-        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, True),
-        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.CANCELLED, True),
-        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.SUCCESS, True),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.SUCCESS, None),
+        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.FAILED, None),
+        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED, None),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "leaf-811"),
+        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.CANCELLED, "leaf-811"),
+        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.SUCCESS, "leaf-811"),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "other-leaf"),
     ],
 )
 def test_native_codex_supervisor_records_registered_role_terminal_outcome(
@@ -3169,7 +3170,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     monkeypatch: pytest.MonkeyPatch,
     role: NativeCodexRole,
     status: NativeCodexTaskStatus,
-    proven_child: bool,
+    child_parent: str | None,
 ) -> None:
     """The supervisor records each registered role without retaining provider content."""
     import capture_usage_cli as native_cli
@@ -3205,7 +3206,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         _before: set[tuple[int, int, int]],
     ) -> list[tuple[str, int, os.stat_result]]:
         entries = [("leaf.jsonl", 99, os.stat_result((0,) * 10))]
-        if proven_child:
+        if child_parent is not None:
             entries.append(("child.jsonl", 98, os.stat_result((0,) * 10)))
         return entries
 
@@ -3217,7 +3218,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
             parsed_after_terminal = True
             time.monotonic()
         if _fd == 98:
-            return "child-811", (0, 0, 0, 0, 0, 0), "leaf-811", False, 0
+            return "child-811", (0, 0, 0, 0, 0, 0), cast(str, child_parent), False, 0
         return "leaf-811", (2, 2, 3, 5, 5, 7), "", True, 0
 
     def registered_role(
@@ -3304,6 +3305,22 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     monkeypatch.setattr(usage_native_codex, "datetime", FixedDateTime)
     monkeypatch.setattr(usage_native_codex.time, "monotonic", lambda: next(ticks))
 
+    class Frames:
+        """Record the supervisor protocol without relying on process-global capture."""
+
+        def __init__(self) -> None:
+            self.values: list[str] = []
+
+        def write(self, value: str) -> int:
+            self.values.append(value)
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    frames = Frames()
+    monkeypatch.setattr(usage_native_codex.sys, "stdout", frames)
+
     def terminal_line() -> bytes:
         nonlocal wall
         wall = initial_wall - timedelta(days=1)
@@ -3330,10 +3347,11 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         base_sha="a" * 40,
         output="usage.jsonl",
     )
-    if proven_child:
+    if child_parent is not None:
         with pytest.raises(usage_native_codex.NativeCodexCaptureError):
             usage_native_codex.supervise_native_codex(arguments)
         assert captured == []
+        assert [json.loads(frame)["type"] for frame in frames.values] == ["READY"]
         return
     assert usage_native_codex.supervise_native_codex(arguments) == 0
     assert len(captured) == 1
