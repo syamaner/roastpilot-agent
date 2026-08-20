@@ -903,6 +903,9 @@ def supervise_native_codex(arguments: Any) -> int:
                         fully_scanned = False
                         os.close(fd)
                         continue
+                    if candidate is False:
+                        os.close(fd)
+                        continue
                     session, totals, spawned_from, matches = _parse_rollout(fd, binding)
                     try:
                         observed_total += os.fstat(fd).st_size

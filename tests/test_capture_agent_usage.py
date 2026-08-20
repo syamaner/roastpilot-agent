@@ -1441,8 +1441,29 @@ def test_native_codex_supervisor_real_registered_lifecycle(
     base = git("rev-parse", "HEAD")
 
     def rollout() -> None:
-        # A simultaneous unrelated session is still active and cannot be fully scanned.
-        (provider / "active-unrelated.jsonl").write_bytes(b'{"partial":')
+        # A well-formed but differently bound active session is conclusively unrelated.
+        (provider / "active-unrelated.jsonl").write_text(
+            json.dumps(
+                {
+                    "ordinal": 0,
+                    "timestamp": "x",
+                    "type": "session_meta",
+                    "payload": {
+                        "source": {
+                            "subagent": {
+                                "thread_spawn": {
+                                    "depth": 1,
+                                    "parent_thread_id": "other",
+                                    "agent_path": "/root/other",
+                                    "agent_role": "engineer-fe",
+                                }
+                            }
+                        }
+                    },
+                }
+            )
+            + "\n"
+        )
         meta: dict[str, object] = {
             "type": "session_meta",
             "payload": {
@@ -1623,7 +1644,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
     assert record.native_role is role
     assert record.task_status is status
     assert record.success is (status is NativeCodexTaskStatus.SUCCESS)
-    assert record.whole_tree_verified is False
+    assert record.whole_tree_verified is True
     assert record.subagent_count == 0
     assert record.base_sha == record.launch_head_sha == base
     assert record.final_head_sha == git("rev-parse", "HEAD")
