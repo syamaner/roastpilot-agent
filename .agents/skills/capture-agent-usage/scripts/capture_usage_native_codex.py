@@ -250,6 +250,43 @@ class _GitAdministration:
     common_directory: _Root | None
 
 
+@dataclass(frozen=True)
+class _InventoryEntry:
+    """One pre-READY rollout descriptor and the generation it bound."""
+
+    name: str
+    descriptor: int
+    device: int
+    inode: int
+    generation: tuple[int, int, int]
+    size: int
+
+
+@dataclass
+class _Inventory:
+    """Descriptor-owning pre-READY provider inventory."""
+
+    entries: dict[tuple[int, int, int], _InventoryEntry]
+
+    def __len__(self) -> int:
+        """Return the number of bound pre-READY rollout generations."""
+        return len(self.entries)
+
+    def __iter__(self) -> Iterator[tuple[int, int, int]]:
+        """Iterate bound generations for compatibility with set-like callers."""
+        return iter(self.entries)
+
+    def __eq__(self, other: object) -> bool:
+        """Compare by generation only; descriptors intentionally remain private."""
+        return set(self.entries) == other
+
+    def close(self) -> None:
+        """Close every retained provider descriptor exactly once."""
+        for entry in self.entries.values():
+            with suppress(OSError):
+                _close(entry.descriptor)
+
+
 def _fail() -> None:
     raise NativeCodexCaptureError("native Codex capture is invalid")
 
@@ -450,18 +487,36 @@ def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
         os.close(duplicate)
 
 
-def _inventory(root: _Root) -> set[tuple[int, int, int]]:
-    """Snapshot rollout generations without retaining mutable provider paths."""
+def _inventory(root: _Root) -> _Inventory:
+    """Bind every pre-READY rollout descriptor until final reconciliation."""
     _provider_directory(root.descriptor, expected=(root.device, root.inode))
-    result: set[tuple[int, int, int]] = set()
-    for _name, fd, status in _walk(root):
-        try:
-            result.add(_generation(status))
-            if len(result) > MAX_PROVIDER_FILES:
+    result: dict[tuple[int, int, int], _InventoryEntry] = {}
+    try:
+        for name, fd, status in _walk(root):
+            generation = _generation(status)
+            if generation in result or len(result) >= MAX_PROVIDER_FILES:
+                os.close(fd)
                 _fail()
-        finally:
-            os.close(fd)
-    return result
+            result[generation] = _InventoryEntry(
+                name, fd, status.st_dev, status.st_ino, generation, status.st_size
+            )
+    except BaseException:
+        _Inventory(result).close()
+        raise
+    return _Inventory(result)
+
+
+def _inventory_generations(
+    inventory: _Inventory | set[tuple[int, int, int]],
+) -> set[tuple[int, int, int]]:
+    """Return generations from real or test-double inventories."""
+    return set(inventory)
+
+
+def _close_inventory(inventory: _Inventory | set[tuple[int, int, int]]) -> None:
+    """Close only descriptors owned by a production inventory."""
+    if isinstance(inventory, _Inventory):
+        inventory.close()
 
 
 def _git(args: list[str]) -> str:
@@ -1533,15 +1588,16 @@ def _candidate_metadata(fd: int, binding: dict[str, str]) -> _CandidateMetadata:
 
 
 def _new_rollouts(
-    root: _Root, before: set[tuple[int, int, int]]
+    root: _Root, before: _Inventory | set[tuple[int, int, int]]
 ) -> list[tuple[str, int, os.stat_result]]:
     result: list[tuple[str, int, os.stat_result]] = []
     total = 0
-    before_inodes = {(device, inode) for device, inode, _ctime_ns in before}
+    before_generations = _inventory_generations(before)
+    before_inodes = {(device, inode) for device, inode, _ctime_ns in before_generations}
     try:
         for name, fd, status in _walk(root):
             generation = _generation(status)
-            if generation in before or (status.st_dev, status.st_ino) in before_inodes:
+            if generation in before_generations or (status.st_dev, status.st_ino) in before_inodes:
                 os.close(fd)
                 continue
             if status.st_size > MAX_PROVIDER_FILE_BYTES:
@@ -1562,12 +1618,62 @@ def _new_rollouts(
     return result
 
 
+def _reconcile_rollouts(
+    root: _Root,
+    before: _Inventory | set[tuple[int, int, int]],
+    candidates: list[tuple[str, int, os.stat_result]],
+) -> None:
+    """Prove pre-READY bindings and post-READY generations survived unchanged.
+
+    A parent rollout is allowed to append after READY, so its retained descriptor
+    checks device/inode and liveness rather than ctime or size.  The final path
+    must nevertheless resolve through the provider tree to that same safe inode.
+    The selected leaf is handled separately and remains size-immutable.
+    """
+    expected_new = {(name, _generation(status)) for name, _fd, status in candidates}
+    observed: dict[str, os.stat_result] = {}
+    try:
+        for name, fd, status in _walk(root):
+            try:
+                observed[name] = status
+            finally:
+                os.close(fd)
+        if isinstance(before, _Inventory):
+            for entry in before.entries.values():
+                held = os.fstat(entry.descriptor)
+                path_status = observed.get(entry.name)
+                if (
+                    not stat.S_ISREG(held.st_mode)
+                    or held.st_uid != os.geteuid()
+                    or held.st_nlink <= 0
+                    or (held.st_dev, held.st_ino) != (entry.device, entry.inode)
+                    or path_status is None
+                    or not stat.S_ISREG(path_status.st_mode)
+                    or path_status.st_uid != os.geteuid()
+                    or path_status.st_nlink <= 0
+                    or (path_status.st_dev, path_status.st_ino) != (entry.device, entry.inode)
+                ):
+                    _fail()
+        observed_new = {
+            (name, _generation(status))
+            for name, status in observed.items()
+            if _generation(status) not in _inventory_generations(before)
+            and (status.st_dev, status.st_ino)
+            not in {(device, inode) for device, inode, _ctime in _inventory_generations(before)}
+        }
+        if observed_new != expected_new:
+            _fail()
+    except OSError:
+        _fail()
+
+
 def _assert_selected_rollout(
     root: _Root,
     descriptor: int,
     generation: tuple[int, int, int],
     size: int,
     expected_inventory: set[tuple[int, int, int]],
+    name: str | None = None,
 ) -> None:
     """Require selected usage evidence to remain the exact parsed provider file."""
     try:
@@ -1583,6 +1689,25 @@ def _assert_selected_rollout(
             _fail()
     except OSError:
         _fail()
+    if name is not None:
+        found = False
+        try:
+            for current_name, current_fd, current_status in _walk(root):
+                try:
+                    if current_name == name:
+                        found = True
+                        if (
+                            _generation(current_status) != generation
+                            or current_status.st_size != size
+                            or current_status.st_nlink <= 0
+                        ):
+                            _fail()
+                finally:
+                    os.close(current_fd)
+            if not found:
+                _fail()
+        except OSError:
+            _fail()
     _reattest_provider_root(root)
     if _inventory(root) != expected_inventory:
         _fail()
@@ -1770,6 +1895,8 @@ def supervise_native_codex(arguments: Any) -> int:
     selected_fd: int | None = None
     selected_generation: tuple[int, int, int] | None = None
     selected_size = 0
+    selected_name: str | None = None
+    before: _Inventory | set[tuple[int, int, int]] | None = None
     try:
         usage = _open_root(arguments.usage_root, private=True)
         provider = _open_root(os.path.join(codex_home, "sessions"), private=False)
@@ -1825,7 +1952,7 @@ def supervise_native_codex(arguments: Any) -> int:
         _assert_root(provider)
         candidates = _new_rollouts(provider, before)
         classified: list[tuple[int, os.stat_result, _CandidateMetadata]] = []
-        matched: list[tuple[int, str, tuple[int, int, int, int, int, int]]] = []
+        matched: list[tuple[str, int, str, tuple[int, int, int, int, int, int]]] = []
         observed_total = 0
         fully_scanned = True
         subagent_count = 0
@@ -1847,12 +1974,12 @@ def supervise_native_codex(arguments: Any) -> int:
                         _fail()
                     if not matches:
                         _fail()
-                    matched.append((fd, session, totals))
+                    matched.append((_name, fd, session, totals))
                 except NativeCodexCaptureError:
                     raise
             if len(matched) != 1:
                 _fail()
-            selected_fd, leaf, totals = matched[0]
+            selected_name, selected_fd, leaf, totals = matched[0]
             selected_status = next(
                 status for fd, status, _metadata in classified if fd == selected_fd
             )
@@ -1880,14 +2007,40 @@ def supervise_native_codex(arguments: Any) -> int:
                     # child. Capture remains useful, but whole-tree proof is withheld.
                     fully_scanned = False
             _reattest_provider_root(provider)
-            closing = _inventory(provider)
-            scanned = {_generation(status) for _fd, status, _metadata in classified}
-            # The closing descriptor-relative inventory must be exactly the post-READY
-            # rollout set that was scanned plus the pre-READY snapshot. Any late
-            # creation, unlink, or replacement fails before a record can be persisted.
-            expected_inventory = before | scanned
-            if closing != expected_inventory:
-                _fail()
+            # Reconcile by retained descriptors, not a second unbound snapshot: an
+            # already-existing parent rollout may append after READY, but it may not
+            # be replaced, unlinked, or rebound to another provider-tree path.
+            expected_inventory = _inventory_generations(before) | {
+                _generation(status) for _fd, status, _metadata in classified
+            }
+            if isinstance(before, _Inventory):
+                _reconcile_rollouts(provider, before, candidates)
+                # Bracket persistence with two complete descriptor-owning scans.
+                # The retained pre-READY descriptors remain authoritative for
+                # replacement detection; these scans reject a rollout arriving
+                # after reconciliation but before record persistence.
+                for _attempt in range(2):
+                    closing = _inventory(provider)
+                    try:
+                        if _inventory_generations(closing) != expected_inventory:
+                            _fail()
+                    finally:
+                        _close_inventory(closing)
+            else:
+                # Existing test doubles model only generation sets. Production always
+                # reaches the descriptor-owning branch above.
+                closing = _inventory(provider)
+                try:
+                    if _inventory_generations(closing) != expected_inventory:
+                        _fail()
+                finally:
+                    _close_inventory(closing)
+                final_test_double_inventory = _inventory(provider)
+                try:
+                    if _inventory_generations(final_test_double_inventory) != expected_inventory:
+                        _fail()
+                finally:
+                    _close_inventory(final_test_double_inventory)
             whole = fully_scanned and subagent_count == 0
         finally:
             for held_fd, _stat, _metadata in classified:
@@ -1948,6 +2101,7 @@ def supervise_native_codex(arguments: Any) -> int:
             selected_generation,
             selected_size,
             expected_inventory,
+            selected_name,
         )
         _reattest_usage_root(usage)
         append_record(arguments.output, record, root_descriptor=usage.descriptor)
@@ -1961,6 +2115,8 @@ def supervise_native_codex(arguments: Any) -> int:
         sys.stdout.flush()
         return 0
     finally:
+        if before is not None:
+            _close_inventory(before)
         if selected_fd is not None:
             with suppress(OSError):
                 _close(selected_fd)

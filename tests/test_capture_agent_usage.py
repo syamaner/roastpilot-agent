@@ -706,6 +706,101 @@ def test_native_codex_new_rollouts_rejects_reused_pre_ready_inode_generation(
         os.close(root.descriptor)
 
 
+def test_native_codex_retained_pre_ready_descriptor_allows_parent_growth(tmp_path: Path) -> None:
+    """A pre-READY parent rollout may append without losing its bound inode."""
+    parent = tmp_path / "parent.jsonl"
+    parent.write_bytes(b"{}\n")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    before = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with parent.open("ab") as stream:
+            stream.write(b"{}\n")
+        usage_native_codex._reconcile_rollouts(root, before, [])  # pyright: ignore[reportPrivateUsage]
+    finally:
+        before.close()
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize("mutation", ["replace", "unlink"])
+def test_native_codex_retained_pre_ready_descriptor_rejects_rebinding(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Pre-READY files cannot be replaced or disappear after READY."""
+    parent = tmp_path / "parent.jsonl"
+    parent.write_bytes(b"{}\n")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    before = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    try:
+        parent.unlink()
+        if mutation == "replace":
+            parent.write_bytes(b"{}\n")
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._reconcile_rollouts(root, before, [])  # pyright: ignore[reportPrivateUsage]
+    finally:
+        before.close()
+        os.close(root.descriptor)
+
+
+def test_native_codex_reconciliation_rejects_late_rollout(tmp_path: Path) -> None:
+    """A rollout not observed in the post-READY candidate scan fails closed."""
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    before = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    candidate = tmp_path / "leaf.jsonl"
+    candidate.write_bytes(b"{}\n")
+    candidates = usage_native_codex._new_rollouts(root, before)  # pyright: ignore[reportPrivateUsage]
+    try:
+        (tmp_path / "late.jsonl").write_bytes(b"{}\n")
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._reconcile_rollouts(root, before, candidates)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        for _name, descriptor, _status in candidates:
+            os.close(descriptor)
+        before.close()
+        os.close(root.descriptor)
+
+
+def test_native_codex_git_administration_tree_accepts_large_safe_nested_file(
+    tmp_path: Path,
+) -> None:
+    """The direct administrative walk admits safe files larger than 64 KiB."""
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "large").write_bytes(b"x" * (65_537))
+    for path in (tmp_path, nested):
+        os.chmod(path, 0o755)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        usage_native_codex._assert_git_administration_tree(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize("kind", ["writable-file", "writable-dir", "symlink", "fifo"])
+def test_native_codex_git_administration_tree_rejects_unsafe_nested_entry(
+    tmp_path: Path, kind: str
+) -> None:
+    """The direct Git-admin walk rejects writable, linked, and special entries."""
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    target = nested / "entry"
+    if kind == "writable-dir":
+        target.mkdir()
+        os.chmod(target, 0o775)
+    elif kind == "symlink":
+        target.symlink_to(tmp_path / "missing")
+    elif kind == "fifo":
+        os.mkfifo(target)
+    else:
+        target.write_bytes(b"x")
+        os.chmod(target, 0o664)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_git_administration_tree(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
 def test_native_codex_walk_counts_all_provider_entries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2916,7 +3011,9 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         original_inventory = usage_native_codex._inventory  # pyright: ignore[reportPrivateUsage]
         inventory_calls = 0
 
-        def inventory(root: usage_native_codex._Root) -> set[tuple[int, int, int]]:  # pyright: ignore[reportPrivateUsage]
+        def inventory(
+            root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        ) -> usage_native_codex._Inventory | set[tuple[int, int, int]]:  # pyright: ignore[reportPrivateUsage]
             nonlocal inventory_calls
             inventory_calls += 1
             result = original_inventory(root)
@@ -3297,7 +3394,9 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
     original_inventory = usage_native_codex._inventory  # pyright: ignore[reportPrivateUsage]
     inventory_calls = 0
 
-    def inventory(root: usage_native_codex._Root) -> set[tuple[int, int, int]]:  # pyright: ignore[reportPrivateUsage]
+    def inventory(
+        root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+    ) -> usage_native_codex._Inventory | set[tuple[int, int, int]]:  # pyright: ignore[reportPrivateUsage]
         nonlocal inventory_calls
         inventory_calls += 1
         if inventory_calls == 2:
