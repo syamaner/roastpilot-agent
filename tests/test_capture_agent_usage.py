@@ -1101,6 +1101,71 @@ def test_native_codex_rejects_mismatched_or_nontext_session_identifiers(
         usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
 
 
+def test_native_codex_rejects_task_started_before_turn_context(tmp_path: Path) -> None:
+    """A valid provider context becomes invalid only when it follows task start."""
+    meta: dict[str, object] = {
+        "type": "session_meta",
+        "payload": {
+            "base_instructions": "discarded",
+            "cli_version": "0.147.0",
+            "context_window": 1,
+            "cwd": "discarded",
+            "git": {"branch": "main", "commit_hash": "a" * 40, "repository_url": "discarded"},
+            "history_mode": "discarded",
+            "id": "root-811",
+            "model_provider": "discarded",
+            "originator": "codex-tui",
+            "session_id": "root-811",
+            "source": "cli",
+            "thread_source": "user",
+            "timestamp": "discarded",
+        },
+    }
+    context_payload: dict[str, object] = {
+        key: "discarded"
+        for key in usage_native_codex._TURN_CONTEXT_KEYS  # pyright: ignore[reportPrivateUsage]
+    }
+    context_payload.update(
+        {
+            "model": "gpt-5.6-terra",
+            "effort": "high",
+            "realtime_active": False,
+            "workspace_roots": [],
+        }
+    )
+    context: dict[str, object] = {"type": "turn_context", "payload": context_payload}
+    started: dict[str, object] = {
+        "type": "event_msg",
+        "payload": {
+            "type": "task_started",
+            "collaboration_mode_kind": "discarded",
+            "model_context_window": 1,
+            "started_at": "discarded",
+            "turn_id": "discarded",
+        },
+    }
+
+    def write(name: str, events: tuple[dict[str, object], ...]) -> Path:
+        rollout = tmp_path / name
+        rollout.write_text(
+            "".join(
+                json.dumps({"ordinal": ordinal, "timestamp": "discarded", **event}) + "\n"
+                for ordinal, event in enumerate(events)
+            )
+        )
+        return rollout
+
+    ordered = write("ordered.jsonl", (meta, context, started))
+    with ordered.open("rb") as stream:
+        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+    malformed = write("context-after-start.jsonl", (meta, started, context))
+    with (
+        malformed.open("rb") as stream,
+        pytest.raises(usage_native_codex.NativeCodexCaptureError),
+    ):
+        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+
+
 def test_native_codex_rejects_out_of_order_or_repeated_task_events(tmp_path: Path) -> None:
     """A fully scanned rollout cannot reorder or repeat task lifecycle markers."""
     meta = {
@@ -1664,6 +1729,8 @@ def _native_codex_npm_bin_repository(
         executable.parent.mkdir(parents=True)
         if target_kind == "symlink":
             executable.symlink_to("actual.js")
+        elif target_kind == "directory":
+            executable.mkdir()
         elif target_kind == "fifo":
             os.mkfifo(executable)
         else:
@@ -1718,6 +1785,14 @@ def _native_codex_npm_bin_repository(
             "writable",
             False,
             id="writable-target",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "../semver/bin/semver.js",
+            "web/node_modules/pkg/node_modules/semver/bin/semver.js",
+            "directory",
+            False,
+            id="directory-target",
         ),
         pytest.param(
             "web/node_modules/pkg/node_modules/.bin/semver",
