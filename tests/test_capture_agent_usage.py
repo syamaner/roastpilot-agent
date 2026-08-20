@@ -1028,6 +1028,21 @@ def test_native_codex_terminal_framing_is_nonblocking_and_single_use(
             usage_native_codex._terminal_line()  # pyright: ignore[reportPrivateUsage]
 
 
+def test_native_codex_terminal_rejects_two_frames_from_one_unbuffered_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One kernel read containing two terminal frames is never accepted."""
+    reader, writer = os.pipe()
+    try:
+        os.write(writer, b'{"type":"TERMINAL"}\n{"type":"TERMINAL"}\n')
+        monkeypatch.setattr(usage_native_codex.sys, "stdin", SimpleNamespace(fileno=lambda: reader))
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._terminal_line()  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(writer)
+        os.close(reader)
+
+
 @pytest.mark.parametrize("failure_call", [2, 3])
 def test_native_codex_supervisor_closes_roots_when_acquisition_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_call: int

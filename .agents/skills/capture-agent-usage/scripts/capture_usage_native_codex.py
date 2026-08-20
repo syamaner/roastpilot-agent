@@ -808,7 +808,12 @@ def _terminal_line() -> bytes:
     """Read exactly one already-framed terminal line without waiting for EOF."""
     descriptor = sys.stdin.fileno()
     line = os.read(descriptor, MAX_EVENT_BYTES + 1)
-    if not line or len(line) > MAX_EVENT_BYTES or not line.endswith(b"\n"):
+    if (
+        not line
+        or len(line) > MAX_EVENT_BYTES
+        or not line.endswith(b"\n")
+        or line.count(b"\n") != 1
+    ):
         _fail()
     try:
         os.set_blocking(descriptor, False)
