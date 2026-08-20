@@ -1012,10 +1012,13 @@ def test_native_codex_terminal_framing_is_nonblocking_and_single_use(
 
     monkeypatch.setattr(usage_native_codex.os, "set_blocking", set_blocking)
 
+    reads = iter((framed, extra[:1] if extra else BlockingIOError()))
+
     def read_extra(_fd: int, _size: int) -> bytes:
-        if extra:
-            return extra[:1]
-        raise BlockingIOError
+        value = next(reads)
+        if isinstance(value, BlockingIOError):
+            raise value
+        return value
 
     monkeypatch.setattr(usage_native_codex.os, "read", read_extra)
     if accepts:
@@ -1258,10 +1261,11 @@ def test_native_codex_supervisor_real_registered_lifecycle(
 ) -> None:
     """A real registered-role lifecycle persists only its closed metadata record."""
     repository = tmp_path / "repository"
-    provider = tmp_path / "provider-sessions"
+    codex_home = tmp_path / "codex-home"
+    provider = codex_home / "sessions"
     usage = tmp_path / "usage"
     repository.mkdir()
-    provider.mkdir()
+    provider.mkdir(parents=True)
     usage.mkdir(mode=0o700)
     os.chmod(usage, 0o700)
     shutil.copytree(Path(".codex"), repository / ".codex")
@@ -1440,7 +1444,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         )
 
     def expanduser(_path: str) -> str:
-        return str(provider)
+        return str(codex_home)
 
     monkeypatch.chdir(repository)
     monkeypatch.setenv("CODEX_THREAD_ID", "parent-811")

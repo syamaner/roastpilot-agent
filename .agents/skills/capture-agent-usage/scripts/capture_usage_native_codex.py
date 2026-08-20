@@ -40,6 +40,11 @@ _ROLE_EXPECTATIONS: dict[NativeCodexRole, tuple[str, str]] = {
     NativeCodexRole.ENGINEER_FE: ("agents/engineer-fe.toml", "high"),
     NativeCodexRole.REPAIR: ("agents/repair.toml", "medium"),
 }
+_ROLE_SHA256: dict[NativeCodexRole, str] = {
+    NativeCodexRole.ENGINEER_BE: "bcad195fce15322e489cc836d3b846953994fd136f442fff6c338f69c490d74f",
+    NativeCodexRole.ENGINEER_FE: "4da74886a9c5e4b7cad4b6e7ed858f0f7e596f76189bd07240b77e9cd5c13831",
+    NativeCodexRole.REPAIR: "4671a9d8b84b500208f2b603e81f255d64d678fc11ebbf4982b7bf8ddca0fa7d",
+}
 _ROOT_TYPES = {
     "session_meta",
     "turn_context",
@@ -387,7 +392,8 @@ def _git_identity(repository: str, branch: str, base: str, *, final: bool) -> st
     }:
         _fail()
     head = _git(["rev-parse", "HEAD"])
-    if _git(["branch", "--show-current"]) != branch or _git(["status", "--porcelain"]):
+    status_args = ["status", "--porcelain", "--ignored"] if not final else ["status", "--porcelain"]
+    if _git(["branch", "--show-current"]) != branch or _git(status_args):
         _fail()
     if _git(["rev-parse", "--verify", f"{base}^{{commit}}"]) != base or (
         not final and head != base
@@ -429,7 +435,7 @@ def _registered_role(root: _Root, role: NativeCodexRole) -> tuple[str, str, str,
             or definition.get("model_reasoning_effort") != effort
             or definition.get("agents") != {"enabled": False}
             or not isinstance(definition.get("developer_instructions"), str)
-            or "invoke Claude Code or any other model" not in definition["developer_instructions"]
+            or hashlib.sha256(role_bytes).hexdigest() != _ROLE_SHA256[role]
         ):
             _fail()
         # The committed role boundary itself proves a leaf cannot invoke Claude.
@@ -534,16 +540,24 @@ def _parse_rollout(
     totals: tuple[int, int, int, int, int, int] | None = None
     with os.fdopen(os.dup(fd), "rb") as stream:
         number = 0
+        read_bytes = 0
         while True:
             raw = stream.readline(MAX_EVENT_BYTES + 1)
             if raw == b"":
                 break
             number += 1
-            if number > MAX_PROVIDER_LINES or len(raw) > MAX_EVENT_BYTES or not raw.endswith(b"\n"):
+            read_bytes += len(raw)
+            if (
+                number > MAX_PROVIDER_LINES
+                or read_bytes > MAX_PROVIDER_FILE_BYTES
+                or len(raw) > MAX_EVENT_BYTES
+                or not raw.endswith(b"\n")
+            ):
                 _fail()
             event = _json(raw)
             if (
                 set(event) != {"ordinal", "payload", "timestamp", "type"}
+                or not isinstance(event["type"], str)
                 or event["type"] not in _ROOT_TYPES
                 or not isinstance(event["payload"], dict)
                 or isinstance(event["ordinal"], bool)
@@ -631,7 +645,8 @@ def _parse_rollout(
                 seen_context = True
             elif kind == "event_msg":
                 if (
-                    payload.get("type") not in _EVENT_TYPES
+                    not isinstance(payload.get("type"), str)
+                    or payload["type"] not in _EVENT_TYPES
                     or set(payload) != _EVENT_KEYS[payload["type"]]
                 ):
                     _fail()
@@ -660,7 +675,8 @@ def _parse_rollout(
             elif kind == "response_item":
                 subtype = payload.get("type")
                 if (
-                    subtype not in _RESPONSE_TYPES
+                    not isinstance(subtype, str)
+                    or subtype not in _RESPONSE_TYPES
                     or set(payload) not in _RESPONSE_ITEM_KEYS[subtype]
                 ):
                     _fail()
@@ -672,6 +688,45 @@ def _parse_rollout(
     if not seen_meta or (is_subagent and (not seen_context or not seen_complete or totals is None)):
         _fail()
     return session, totals or (0, 0, 0, 0, 0, 0), parent_thread, matches
+
+
+def _candidate_binding(fd: int, binding: dict[str, str]) -> bool | None:
+    """Classify a first metadata row without rejecting an active unrelated rollout."""
+    try:
+        with os.fdopen(os.dup(fd), "rb") as stream:
+            raw = stream.readline(MAX_EVENT_BYTES + 1)
+        os.lseek(fd, 0, os.SEEK_SET)
+        if len(raw) > MAX_EVENT_BYTES or not raw.endswith(b"\n"):
+            return None
+        event = _json(raw)
+        if (
+            set(event) != {"ordinal", "payload", "timestamp", "type"}
+            or event.get("type") != "session_meta"
+            or not isinstance(event.get("payload"), dict)
+        ):
+            return None
+        payload = event["payload"]
+        source = payload.get("source")
+        if not isinstance(source, dict):
+            return False
+        spawn = (
+            source.get("subagent", {}).get("thread_spawn")
+            if isinstance(source.get("subagent"), dict)
+            else None
+        )
+        if not isinstance(spawn, dict):
+            return False
+        return (
+            type(spawn.get("depth")) is int
+            and spawn.get("parent_thread_id") == binding["parent_thread_id"]
+            and spawn.get("agent_path") == binding["agent_path"]
+            and spawn.get("agent_role") == binding["role"]
+        )
+    except NativeCodexCaptureError:
+        return None
+    except OSError:
+        # A descriptor race remains fail-closed when the full parser reopens it.
+        return True
 
 
 def _new_rollouts(
@@ -748,10 +803,10 @@ def _reject_root_overlap(*roots: _Root) -> None:
 
 def _terminal_line() -> bytes:
     """Read exactly one already-framed terminal line without waiting for EOF."""
-    line = sys.stdin.buffer.readline(MAX_EVENT_BYTES + 1)
+    descriptor = sys.stdin.fileno()
+    line = os.read(descriptor, MAX_EVENT_BYTES + 1)
     if not line or len(line) > MAX_EVENT_BYTES or not line.endswith(b"\n"):
         _fail()
-    descriptor = sys.stdin.fileno()
     try:
         os.set_blocking(descriptor, False)
         try:
@@ -785,19 +840,20 @@ def _descendant(base: str, head: str) -> bool:
 
 def supervise_native_codex(arguments: Any) -> int:
     """Run one parent-owned READY/status/result protocol without launching a child."""
-    if "CODEX_HOME" in os.environ:
-        _fail()
     values = (arguments.task_id, arguments.slice_id, arguments.parent_task_id, arguments.task_name)
     parent = os.environ.get("CODEX_THREAD_ID")
     if not all(_safe_identifier(value) for value in values) or not _safe_identifier(parent):
         _fail()
     role = NativeCodexRole(arguments.role)
+    codex_home = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
+    if not isinstance(codex_home, str) or not os.path.isabs(codex_home):
+        _fail()
     usage: _Root | None = None
     provider: _Root | None = None
     worktree: _Root | None = None
     try:
         usage = _open_root(arguments.usage_root, private=True)
-        provider = _open_root(os.path.expanduser("~/.codex/sessions"), private=False)
+        provider = _open_root(os.path.join(codex_home, "sessions"), private=False)
         worktree = _open_root(os.getcwd(), private=False)
         started = datetime.now(UTC)
         started_monotonic = time.monotonic()
@@ -829,10 +885,24 @@ def supervise_native_codex(arguments: Any) -> int:
         candidates = _new_rollouts(provider, before)
         matched: list[tuple[int, str, tuple[int, int, int, int, int, int]]] = []
         child_parents: list[str] = []
+        observed_total = 0
+        fully_scanned = True
         try:
             for _name, fd, _stat in candidates:
                 try:
+                    candidate = _candidate_binding(fd, binding)
+                    if candidate is None:
+                        fully_scanned = False
+                        os.close(fd)
+                        continue
                     session, totals, spawned_from, matches = _parse_rollout(fd, binding)
+                    try:
+                        observed_total += os.fstat(fd).st_size
+                    except OSError:
+                        # Test doubles and already-closed unrelated candidates have no live size.
+                        observed_total += _stat.st_size
+                    if observed_total > MAX_PROVIDER_TOTAL_BYTES:
+                        _fail()
                     child_parents.append(spawned_from)
                     if matches:
                         matched.append((fd, session, totals))
@@ -852,7 +922,7 @@ def supervise_native_codex(arguments: Any) -> int:
                     os.close(held_fd)
         # Every new rollout was fully parsed; a spawned child is therefore visible.
         subagent_count = sum(parent_id == leaf for parent_id in child_parents)
-        whole = subagent_count == 0
+        whole = fully_scanned and subagent_count == 0
         final = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=True
         )
