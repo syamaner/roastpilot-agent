@@ -1374,15 +1374,111 @@ def test_native_codex_git_commands_disable_ambient_fsmonitor(
 ) -> None:
     """Every native supervisor Git invocation disables repository fsmonitor hooks."""
     commands: list[list[str]] = []
+    real_popen = subprocess.Popen
 
-    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    def popen(command: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
         commands.append(command)
-        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        return cast(
+            "subprocess.Popen[bytes]", real_popen([sys.executable, "-c", "print('ok')"], **kwargs)
+        )
 
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(usage_native_codex.subprocess, "Popen", popen)
     monkeypatch.setattr(usage_native_codex.subprocess, "run", run)
-    assert usage_native_codex._git(["status", "--porcelain"]) == ""  # pyright: ignore[reportPrivateUsage]
+    assert usage_native_codex._git(["status", "--porcelain"]) == "ok"  # pyright: ignore[reportPrivateUsage]
     assert usage_native_codex._descendant("a" * 40, "b" * 40) is True  # pyright: ignore[reportPrivateUsage]
     assert all(command[:3] == ["git", "-c", "core.fsmonitor=false"] for command in commands)
+
+
+def test_native_codex_git_streams_bounded_success_and_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Live Git pipe draining returns small output and never exposes failed diagnostics."""
+    real_popen = subprocess.Popen
+    processes: list[subprocess.Popen[bytes]] = []
+    scripts = iter(
+        (
+            "import os; os.write(1, b'clean\\n')",
+            "import os; os.write(2, b'SECRET_GIT_DIAGNOSTIC'); raise SystemExit(1)",
+        )
+    )
+
+    def popen(_command: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        process = cast(
+            "subprocess.Popen[bytes]", real_popen([sys.executable, "-c", next(scripts)], **kwargs)
+        )
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(usage_native_codex.subprocess, "Popen", popen)
+    assert usage_native_codex._git(["status", "--porcelain"]) == "clean"  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._git(["status", "--porcelain"])  # pyright: ignore[reportPrivateUsage]
+    assert all(process.poll() is not None for process in processes)
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
+@pytest.mark.parametrize("descriptor", [1, 2])
+def test_native_codex_git_terminates_on_live_output_overflow(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], descriptor: int
+) -> None:
+    """Neither Git stream can be materialized beyond the fixed live-output cap."""
+    real_popen = subprocess.Popen
+    processes: list[subprocess.Popen[bytes]] = []
+
+    def popen(_command: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        process = cast(
+            "subprocess.Popen[bytes]",
+            real_popen(
+                [
+                    sys.executable,
+                    "-c",
+                    f"import os, time; os.write({descriptor}, b'x' * 8192); time.sleep(2)",
+                ],
+                **kwargs,
+            ),
+        )
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(usage_native_codex.subprocess, "Popen", popen)
+    started = time.monotonic()
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._git(["status", "--porcelain"])  # pyright: ignore[reportPrivateUsage]
+    assert time.monotonic() - started < 1
+    assert processes[0].poll() is not None
+    assert processes[0].stdout is not None and processes[0].stdout.closed
+    assert processes[0].stderr is not None and processes[0].stderr.closed
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
+def test_native_codex_git_terminates_on_timeout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A silent Git child is terminated and reaped at the fixed timeout boundary."""
+    real_popen = subprocess.Popen
+    processes: list[subprocess.Popen[bytes]] = []
+
+    def popen(_command: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        process = cast(
+            "subprocess.Popen[bytes]",
+            real_popen([sys.executable, "-c", "import time; time.sleep(2)"], **kwargs),
+        )
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(usage_native_codex, "GIT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(usage_native_codex.subprocess, "Popen", popen)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._git(["status", "--porcelain"])  # pyright: ignore[reportPrivateUsage]
+    assert processes[0].poll() is not None
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
 
 
 @pytest.mark.parametrize("returncode", [0, 1])

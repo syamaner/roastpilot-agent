@@ -12,6 +12,7 @@ import json
 import os
 import pwd
 import re
+import selectors
 import stat
 import subprocess
 import sys
@@ -38,6 +39,8 @@ MAX_EVENT_BYTES = 2 * 1024 * 1024
 _GIT_ENV = {"PATH": os.defpath, "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1"}
 MAX_JSON_NESTING = 64
 MAX_COMMITTED_FILE_BYTES = 64 * 1024
+MAX_GIT_OUTPUT_BYTES = 4096
+GIT_TIMEOUT_SECONDS = 5
 _ROLE_EXPECTATIONS: dict[NativeCodexRole, tuple[str, str]] = {
     NativeCodexRole.ENGINEER_BE: ("agents/engineer-be.toml", "high"),
     NativeCodexRole.ENGINEER_FE: ("agents/engineer-fe.toml", "high"),
@@ -391,20 +394,61 @@ def _inventory(root: _Root) -> set[tuple[int, int]]:
 
 
 def _git(args: list[str]) -> str:
+    """Run Git with bounded live pipe draining and no provider diagnostics."""
+    process: subprocess.Popen[bytes] | None = None
+    selector: selectors.BaseSelector | None = None
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             ["git", "-c", "core.fsmonitor=false", *args],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=_GIT_ENV,
         )
-        if result.returncode != 0 or len(result.stdout) > 4096:
+        if process.stdout is None or process.stderr is None:
             _fail()
-        return result.stdout.strip()
-    except (OSError, subprocess.SubprocessError):
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        stdout = bytearray()
+        stderr = bytearray()
+        deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _fail()
+            for key, _events in selector.select(remaining):
+                chunk = os.read(key.fd, MAX_GIT_OUTPUT_BYTES + 1)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                target = stdout if key.data == "stdout" else stderr
+                target.extend(chunk)
+                if len(target) > MAX_GIT_OUTPUT_BYTES:
+                    _fail()
+        if process.wait(timeout=max(0, deadline - time.monotonic())) != 0:
+            _fail()
+        return stdout.decode("utf-8").strip()
+    except (OSError, UnicodeDecodeError, subprocess.SubprocessError):
         _fail()
+    finally:
+        if selector is not None:
+            selector.close()
+        if process is not None:
+            if process.poll() is None:
+                with suppress(OSError):
+                    process.terminate()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    with suppress(OSError):
+                        process.kill()
+                    with suppress(subprocess.SubprocessError):
+                        process.wait(timeout=1)
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    with suppress(OSError):
+                        stream.close()
 
 
 def _git_identity(repository: str, branch: str, base: str, *, final: bool) -> str:
