@@ -48,6 +48,7 @@ MAX_GIT_OUTPUT_BYTES = 64 * 1024
 GIT_TIMEOUT_SECONDS = 5
 MAX_CHECKOUT_ENTRIES = 4096
 MAX_CHECKOUT_DEPTH = 16
+MAX_GIT_ADMIN_FILE_BYTES = 4096
 _ROLE_EXPECTATIONS: dict[NativeCodexRole, tuple[str, str]] = {
     NativeCodexRole.ENGINEER_BE: ("agents/engineer-be.toml", "high"),
     NativeCodexRole.ENGINEER_FE: ("agents/engineer-fe.toml", "high"),
@@ -223,6 +224,28 @@ class _Root:
     device: int
     inode: int
     path: str = ""
+
+
+@dataclass(frozen=True)
+class _GitFile:
+    """One held Git-administration regular file and its immutable attestation."""
+
+    descriptor: int
+    device: int
+    inode: int
+    ctime_ns: int
+    size: int
+    digest: str
+
+
+@dataclass(frozen=True)
+class _GitAdministration:
+    """Held Git administrative identities for a normal or linked worktree."""
+
+    dotgit_file: _GitFile | None
+    git_directory: _Root
+    common_file: _GitFile | None
+    common_directory: _Root | None
 
 
 def _fail() -> None:
@@ -555,6 +578,186 @@ def _checkout_directory(descriptor: int) -> None:
             _fail()
     except OSError:
         _fail()
+
+
+def _git_administration_directory(descriptor: int) -> None:
+    """Require one owned, non-writable Git administrative directory."""
+    _checkout_directory(descriptor)
+
+
+def _open_git_file(directory: int, name: str) -> tuple[_GitFile, bytes]:
+    """Open and attest a bounded Git administrative file without following links."""
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=directory,
+        )
+        initial = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(initial.st_mode)
+            or initial.st_uid != os.geteuid()
+            or initial.st_nlink != 1
+            or stat.S_IMODE(initial.st_mode) & 0o022
+            or initial.st_size > MAX_GIT_ADMIN_FILE_BYTES
+        ):
+            _fail()
+        content = os.read(descriptor, MAX_GIT_ADMIN_FILE_BYTES + 1)
+        final = os.fstat(descriptor)
+        if (
+            len(content) > MAX_GIT_ADMIN_FILE_BYTES
+            or _generation(initial) != _generation(final)
+            or initial.st_size != final.st_size
+        ):
+            _fail()
+        result = _GitFile(
+            descriptor,
+            initial.st_dev,
+            initial.st_ino,
+            initial.st_ctime_ns,
+            initial.st_size,
+            hashlib.sha256(content).hexdigest(),
+        )
+        descriptor = None
+        return result, content
+    except OSError:
+        _fail()
+    finally:
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
+
+
+def _git_directory_path(content: bytes, base: str, *, marker: bytes) -> str:
+    """Decode one closed Git path-pointer file without retaining its contents."""
+    if not content.endswith(b"\n") or content.count(b"\n") != 1 or not content.startswith(marker):
+        _fail()
+    raw = content[len(marker) : -1]
+    try:
+        value = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        _fail()
+    if not value or "\x00" in value:
+        _fail()
+    return os.path.abspath(value if os.path.isabs(value) else os.path.join(base, value))
+
+
+def _open_git_administration(worktree: _Root) -> _GitAdministration:
+    """Hold the safe normal or linked-worktree Git administration topology."""
+    dotgit_descriptor: int | None = None
+    dotgit_file: _GitFile | None = None
+    git_directory: _Root | None = None
+    common_file: _GitFile | None = None
+    common_directory: _Root | None = None
+    try:
+        dotgit_descriptor = os.open(
+            ".git",
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=worktree.descriptor,
+        )
+        status = os.fstat(dotgit_descriptor)
+        if stat.S_ISDIR(status.st_mode):
+            _git_administration_directory(dotgit_descriptor)
+            git_directory = _Root(
+                dotgit_descriptor,
+                status.st_dev,
+                status.st_ino,
+                os.path.join(worktree.path, ".git"),
+            )
+            dotgit_descriptor = None
+            result = _GitAdministration(None, git_directory, None, None)
+            git_directory = None
+            return result
+        os.close(dotgit_descriptor)
+        dotgit_descriptor = None
+        dotgit_file, dotgit_content = _open_git_file(worktree.descriptor, ".git")
+        git_directory = _open_root(
+            _git_directory_path(dotgit_content, worktree.path, marker=b"gitdir: "), private=False
+        )
+        _git_administration_directory(git_directory.descriptor)
+        common_file, common_content = _open_git_file(git_directory.descriptor, "commondir")
+        common_directory = _open_root(
+            _git_directory_path(common_content, git_directory.path, marker=b""), private=False
+        )
+        _git_administration_directory(common_directory.descriptor)
+        result = _GitAdministration(dotgit_file, git_directory, common_file, common_directory)
+        dotgit_file = None
+        git_directory = None
+        common_file = None
+        common_directory = None
+        return result
+    except OSError:
+        _fail()
+    finally:
+        if dotgit_descriptor is not None:
+            with suppress(OSError):
+                os.close(dotgit_descriptor)
+        for descriptor in (dotgit_file, common_file):
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor.descriptor)
+        for root in (git_directory, common_directory):
+            if root is not None:
+                with suppress(OSError):
+                    os.close(root.descriptor)
+
+
+def _same_git_file(left: _GitFile | None, right: _GitFile | None) -> bool:
+    """Compare Git administration file identity and bounded exact bytes by digest."""
+    if left is None or right is None:
+        return left is right
+    return (
+        left.device,
+        left.inode,
+        left.ctime_ns,
+        left.size,
+        left.digest,
+    ) == (
+        right.device,
+        right.inode,
+        right.ctime_ns,
+        right.size,
+        right.digest,
+    )
+
+
+def _assert_git_administration(worktree: _Root, expected: _GitAdministration) -> None:
+    """Require the canonical Git administration topology to retain its held identities."""
+    current: _GitAdministration | None = None
+    try:
+        current = _open_git_administration(worktree)
+        if (
+            not _same_git_file(current.dotgit_file, expected.dotgit_file)
+            or (current.git_directory.device, current.git_directory.inode)
+            != (expected.git_directory.device, expected.git_directory.inode)
+            or not _same_git_file(current.common_file, expected.common_file)
+            or (
+                (current.common_directory is None) != (expected.common_directory is None)
+                or (
+                    current.common_directory is not None
+                    and expected.common_directory is not None
+                    and (current.common_directory.device, current.common_directory.inode)
+                    != (expected.common_directory.device, expected.common_directory.inode)
+                )
+            )
+        ):
+            _fail()
+    finally:
+        if current is not None:
+            _close_git_administration(current)
+
+
+def _close_git_administration(administration: _GitAdministration) -> None:
+    """Close the descriptors retained for Git-administration identity proof."""
+    for file in (administration.dotgit_file, administration.common_file):
+        if file is not None:
+            with suppress(OSError):
+                os.close(file.descriptor)
+    for root in (administration.git_directory, administration.common_directory):
+        if root is not None:
+            with suppress(OSError):
+                os.close(root.descriptor)
 
 
 def _assert_checkout(root: _Root) -> None:
@@ -1214,7 +1417,11 @@ def _new_rollouts(
 
 
 def _assert_selected_rollout(
-    root: _Root, descriptor: int, generation: tuple[int, int, int], size: int
+    root: _Root,
+    descriptor: int,
+    generation: tuple[int, int, int],
+    size: int,
+    expected_inventory: set[tuple[int, int, int]],
 ) -> None:
     """Require selected usage evidence to remain the exact parsed provider file."""
     try:
@@ -1231,7 +1438,7 @@ def _assert_selected_rollout(
     except OSError:
         _fail()
     _reattest_provider_root(root)
-    if generation not in _inventory(root):
+    if _inventory(root) != expected_inventory:
         _fail()
 
 
@@ -1413,6 +1620,7 @@ def supervise_native_codex(arguments: Any) -> int:
     usage: _Root | None = None
     provider: _Root | None = None
     worktree: _Root | None = None
+    git_administration: _GitAdministration | None = None
     selected_fd: int | None = None
     selected_generation: tuple[int, int, int] | None = None
     selected_size = 0
@@ -1422,6 +1630,7 @@ def supervise_native_codex(arguments: Any) -> int:
         worktree = _open_root(os.getcwd(), private=False)
         _reject_root_overlap(usage, provider, worktree)
         _assert_worktree_root(worktree)
+        git_administration = _open_git_administration(worktree)
         _assert_checkout(worktree)
         launch = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=False
@@ -1441,6 +1650,7 @@ def supervise_native_codex(arguments: Any) -> int:
             "instruction_sha256": _ROLE_INSTRUCTION_SHA256[role],
         }
         _assert_checkout(worktree)
+        _assert_git_administration(worktree, git_administration)
         if (
             _git_identity(arguments.repository, arguments.branch, arguments.base_sha, final=False)
             != launch
@@ -1473,6 +1683,7 @@ def supervise_native_codex(arguments: Any) -> int:
         fully_scanned = True
         subagent_count = 0
         whole = False
+        expected_inventory: set[tuple[int, int, int]] = set()
         try:
             for _name, fd, _stat in candidates:
                 try:
@@ -1522,10 +1733,11 @@ def supervise_native_codex(arguments: Any) -> int:
             closing = _inventory(provider)
             scanned = {_generation(status) for _fd, status, _metadata in classified}
             # The closing descriptor-relative inventory must be exactly the post-READY
-            # rollout set that was scanned.  Any late creation, unlink, or replacement
-            # leaves topology incomplete rather than overclaiming whole-tree proof.
-            if closing - before != scanned:
-                fully_scanned = False
+            # rollout set that was scanned plus the pre-READY snapshot. Any late
+            # creation, unlink, or replacement fails before a record can be persisted.
+            expected_inventory = before | scanned
+            if closing != expected_inventory:
+                _fail()
             whole = fully_scanned and subagent_count == 0
         finally:
             for held_fd, _stat, _metadata in classified:
@@ -1535,6 +1747,7 @@ def supervise_native_codex(arguments: Any) -> int:
                     _close(held_fd)
         _reattest_worktree_root(worktree)
         _assert_checkout(worktree)
+        _assert_git_administration(worktree, git_administration)
         final = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=True
         )
@@ -1579,7 +1792,13 @@ def supervise_native_codex(arguments: Any) -> int:
 
         if selected_fd is None or selected_generation is None:
             _fail()
-        _assert_selected_rollout(provider, selected_fd, selected_generation, selected_size)
+        _assert_selected_rollout(
+            provider,
+            selected_fd,
+            selected_generation,
+            selected_size,
+            expected_inventory,
+        )
         _reattest_usage_root(usage)
         append_record(arguments.output, record, root_descriptor=usage.descriptor)
         sys.stdout.write(
@@ -1595,6 +1814,8 @@ def supervise_native_codex(arguments: Any) -> int:
         if selected_fd is not None:
             with suppress(OSError):
                 _close(selected_fd)
+        if git_administration is not None:
+            _close_git_administration(git_administration)
         for root in (worktree, provider, usage):
             if root is not None:
                 with suppress(OSError):

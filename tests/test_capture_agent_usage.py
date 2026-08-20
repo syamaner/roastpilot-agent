@@ -100,6 +100,36 @@ from pydantic import TypeAdapter, ValidationError
 _REAL_VALIDATE_WORKTREE_METADATA = usage_cli._validate_worktree_metadata  # pyright: ignore[reportPrivateUsage]
 
 
+def _stub_native_codex_git_administration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bypass Git-admin I/O in supervisor units that deliberately use synthetic roots."""
+    administration = usage_native_codex._GitAdministration(  # pyright: ignore[reportPrivateUsage]
+        None,
+        usage_native_codex._Root(-1, 0, 0),  # pyright: ignore[reportPrivateUsage]
+        None,
+        None,
+    )
+
+    def open_administration(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+    ) -> usage_native_codex._GitAdministration:  # pyright: ignore[reportPrivateUsage]
+        return administration
+
+    def assert_administration(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _administration: usage_native_codex._GitAdministration,  # pyright: ignore[reportPrivateUsage]
+    ) -> None:
+        return None
+
+    def close_administration(
+        _administration: usage_native_codex._GitAdministration,  # pyright: ignore[reportPrivateUsage]
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(usage_native_codex, "_open_git_administration", open_administration)
+    monkeypatch.setattr(usage_native_codex, "_assert_git_administration", assert_administration)
+    monkeypatch.setattr(usage_native_codex, "_close_git_administration", close_administration)
+
+
 def _native_leaf_boundary(worktree: Path, effort: str) -> dict[str, object]:
     """Build the closed 0.147 managed authority shape for real native rollouts."""
     path = str(worktree)
@@ -1371,6 +1401,90 @@ def test_native_codex_checkout_directory_walk_bounds_all_entries(
         os.close(root.descriptor)
 
 
+def test_native_codex_git_administration_accepts_normal_and_linked_worktrees(
+    tmp_path: Path,
+) -> None:
+    """Normal and linked-worktree Git layouts retain safe held identities."""
+    normal = tmp_path / "normal"
+    normal.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=normal, check=True, capture_output=True)
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    git_directory = tmp_path / "git-directory"
+    common_directory = tmp_path / "common-directory"
+    git_directory.mkdir()
+    common_directory.mkdir()
+    (linked / ".git").write_text(f"gitdir: {git_directory}\n")
+    common_relative = os.path.relpath(common_directory, git_directory)
+    (git_directory / "commondir").write_text(f"{common_relative}\n")
+
+    for worktree in (normal, linked):
+        root = usage_native_codex._open_root(str(worktree), private=False)  # pyright: ignore[reportPrivateUsage]
+        administration: usage_native_codex._GitAdministration | None = None  # pyright: ignore[reportPrivateUsage]
+        try:
+            administration = usage_native_codex._open_git_administration(root)  # pyright: ignore[reportPrivateUsage]
+            usage_native_codex._assert_git_administration(root, administration)  # pyright: ignore[reportPrivateUsage]
+        finally:
+            if administration is not None:
+                usage_native_codex._close_git_administration(administration)  # pyright: ignore[reportPrivateUsage]
+            os.close(root.descriptor)
+
+
+@pytest.mark.parametrize("mutation", ["git-directory-mode", "git-directory-replace"])
+def test_native_codex_git_administration_rejects_normal_layout_drift(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Normal .git directories cannot become writable or be replaced after launch."""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=worktree, check=True, capture_output=True)
+    root = usage_native_codex._open_root(str(worktree), private=False)  # pyright: ignore[reportPrivateUsage]
+    administration = usage_native_codex._open_git_administration(root)  # pyright: ignore[reportPrivateUsage]
+    try:
+        dotgit = worktree / ".git"
+        if mutation == "git-directory-mode":
+            os.chmod(dotgit, 0o775)
+        else:
+            os.rename(dotgit, tmp_path / "old-git")
+            dotgit.mkdir()
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_git_administration(root, administration)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        usage_native_codex._close_git_administration(administration)  # pyright: ignore[reportPrivateUsage]
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize("mutation", ["dotgit-mode", "common-directory-mode", "dotgit-drift"])
+def test_native_codex_git_administration_rejects_linked_worktree_drift(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Linked .git pointers and common directories remain owned and immutable."""
+    worktree = tmp_path / "worktree"
+    git_directory = tmp_path / "git-directory"
+    common_directory = tmp_path / "common-directory"
+    worktree.mkdir()
+    git_directory.mkdir()
+    common_directory.mkdir()
+    dotgit = worktree / ".git"
+    dotgit.write_text(f"gitdir: {git_directory}\n")
+    common_relative = os.path.relpath(common_directory, git_directory)
+    (git_directory / "commondir").write_text(f"{common_relative}\n")
+    root = usage_native_codex._open_root(str(worktree), private=False)  # pyright: ignore[reportPrivateUsage]
+    administration = usage_native_codex._open_git_administration(root)  # pyright: ignore[reportPrivateUsage]
+    try:
+        if mutation == "dotgit-mode":
+            os.chmod(dotgit, 0o664)
+        elif mutation == "common-directory-mode":
+            os.chmod(common_directory, 0o775)
+        else:
+            dotgit.write_text(f"gitdir: {tmp_path / 'other'}\n")
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_git_administration(root, administration)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        usage_native_codex._close_git_administration(administration)  # pyright: ignore[reportPrivateUsage]
+        os.close(root.descriptor)
+
+
 @pytest.mark.parametrize("mutation", ["grow", "truncate", "replace", "unlink"])
 def test_native_codex_selected_rollout_requires_unchanged_generation(
     tmp_path: Path, mutation: str
@@ -1390,6 +1504,7 @@ def test_native_codex_selected_rollout_requires_unchanged_generation(
             descriptor,
             generation,
             status.st_size,
+            {generation},
         )
         if mutation == "grow":
             rollout.write_bytes(b"{}\n{}\n")
@@ -1406,6 +1521,7 @@ def test_native_codex_selected_rollout_requires_unchanged_generation(
                 descriptor,
                 generation,
                 status.st_size,
+                {generation},
             )
     finally:
         os.close(descriptor)
@@ -2011,6 +2127,7 @@ def test_native_codex_supervisor_usage_root_replacement_appends_nothing(
     monkeypatch.setattr(usage_native_codex, "_registered_role", registered_role)
     monkeypatch.setattr(usage_native_codex, "_git_identity", git_identity)
     monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    _stub_native_codex_git_administration(monkeypatch)
     monkeypatch.setattr(
         usage_native_codex,
         "_attested_origin",
@@ -2428,6 +2545,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         git_identity,
     )
     monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    _stub_native_codex_git_administration(monkeypatch)
     monkeypatch.setattr(
         usage_native_codex,
         "_attested_origin",
@@ -2818,6 +2936,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         ("race-child", "after", 0, False, None),
         ("race-sibling", "after", 0, False, None),
         ("race-replacement", "after", 0, False, None),
+        ("late-closing-child", "after", 0, False, None),
         ("sibling", "after", 0, False, "cwd"),
         ("sibling", "after", 0, False, "context_cwd"),
         ("sibling", "after", 0, False, "turn_id"),
@@ -3082,7 +3201,12 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                 "matching-depth-wrong-int": 2,
             }[topology]
             write_rollout(provider / "other.jsonl", "other-811", "parent-811", depth, complete=True)
-        elif topology not in {"race-child", "race-sibling", "race-replacement"}:
+        elif topology not in {
+            "race-child",
+            "race-sibling",
+            "race-replacement",
+            "late-closing-child",
+        }:
             write_rollout(
                 provider / "other.jsonl", "child-811", "leaf-811", 2, complete=topology == "child"
             )
@@ -3108,6 +3232,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
     monkeypatch.setattr(usage_native_codex, "_terminal_line", terminal)
     monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    _stub_native_codex_git_administration(monkeypatch)
     monkeypatch.setattr(
         usage_native_codex,
         "_attested_origin",
@@ -3138,6 +3263,8 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                 os.rename(replacement, worktree)
             elif mismatch == "worktree_mode_drift":
                 os.chmod(worktree, 0o770)
+        elif inventory_calls == 3 and topology == "late-closing-child":
+            write_rollout(provider / "late-child.jsonl", "child-811", "leaf-811", 2, complete=True)
         return original_inventory(root)
 
     monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
@@ -3165,7 +3292,12 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         base_sha="a" * 40,
         output=Path(".agent-usage/usage.jsonl"),
     )
-    if mismatch is not None or topology == "race-replacement":
+    if mismatch is not None or topology in {
+        "race-child",
+        "race-sibling",
+        "race-replacement",
+        "late-closing-child",
+    }:
         with pytest.raises(
             usage_native_codex.NativeCodexCaptureError, match="native Codex capture is invalid"
         ):
@@ -3199,12 +3331,13 @@ def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
     monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", lambda *_roots: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    _stub_native_codex_git_administration(monkeypatch)
     monkeypatch.setattr(
         usage_native_codex,
         "_registered_role",
         cast(Any, lambda _root, _role: ("a" * 64, "b" * 64, "high", "engineer-be")),  # pyright: ignore[reportUnknownLambdaType]
     )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
-    monkeypatch.setattr(usage_native_codex, "_inventory", lambda _root: {})  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_inventory", lambda _root: set())  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_assert_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
         usage_native_codex,
@@ -3225,6 +3358,7 @@ def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
 
     monkeypatch.setattr(usage_native_codex, "_parse_rollout", parse_rollout)
     monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    _stub_native_codex_git_administration(monkeypatch)
     monkeypatch.setattr(usage_native_codex, "_close", lambda _fd: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
         usage_native_codex,
@@ -3300,6 +3434,7 @@ def test_native_codex_supervisor_rejects_aggregate_actual_candidate_growth(
     monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", lambda *_roots: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    _stub_native_codex_git_administration(monkeypatch)
     monkeypatch.setattr(
         usage_native_codex,
         "_attested_origin",
@@ -3310,7 +3445,7 @@ def test_native_codex_supervisor_rejects_aggregate_actual_candidate_growth(
         "_registered_role",
         registered,
     )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
-    monkeypatch.setattr(usage_native_codex, "_inventory", lambda _root: {})  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_inventory", lambda _root: set())  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
         usage_native_codex,
         "_new_rollouts",
@@ -3406,7 +3541,7 @@ def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
     monkeypatch.setattr(usage_native_codex, "_open_root", open_root)
     monkeypatch.setattr(usage_native_codex, "_assert_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", lambda *_roots: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
-    monkeypatch.setattr(usage_native_codex, "_inventory", lambda _root: {})  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_inventory", lambda _root: set())  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_new_rollouts", new_rollouts)
     monkeypatch.setattr(
         usage_native_codex,
@@ -3417,6 +3552,7 @@ def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
     monkeypatch.setattr(usage_native_codex, "_registered_role", registered_role)
     monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    _stub_native_codex_git_administration(monkeypatch)
     monkeypatch.setattr(
         usage_native_codex,
         "_attested_origin",
