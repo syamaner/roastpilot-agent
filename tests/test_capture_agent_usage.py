@@ -2915,11 +2915,10 @@ def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
         return "a" * 64, "b" * 64, "high", member.value
 
     closed: list[int] = []
-    original_close = os.close
 
     def close(descriptor: int) -> None:
+        """Record supervisor-owned candidate cleanup without closing shared fds."""
         closed.append(descriptor)
-        original_close(descriptor)
 
     appended: list[NativeCodexUsageRecord] = []
 
@@ -2955,10 +2954,15 @@ def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
         base_sha="a" * 40,
         output="usage.jsonl",
     )
-    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex.supervise_native_codex(arguments)
-    assert appended == []
-    assert all(closed.count(descriptor) == 1 for descriptor in candidates)
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex.supervise_native_codex(arguments)
+        assert appended == []
+        assert all(closed.count(descriptor) == 1 for descriptor in candidates)
+    finally:
+        for descriptor in candidates:
+            with suppress(OSError):
+                os.close(descriptor)
 
 
 def test_owned_transcript_counts_identical_assistant_usage_once(
