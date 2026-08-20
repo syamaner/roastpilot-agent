@@ -1753,6 +1753,7 @@ def _reconcile_rollouts(
     root: _Root,
     before: _Inventory | set[tuple[int, int, int]],
     candidates: list[tuple[str, int, os.stat_result]],
+    relaxed_descriptors: frozenset[int] = frozenset(),
 ) -> None:
     """Prove pre-READY bindings and post-READY generations survived unchanged.
 
@@ -1761,7 +1762,7 @@ def _reconcile_rollouts(
     must nevertheless resolve through the provider tree to that same safe inode.
     The selected leaf is handled separately and remains size-immutable.
     """
-    expected_new = {(name, _generation(status)) for name, _fd, status in candidates}
+    expected_names = {name for name, _fd, _status in candidates}
     observed: dict[str, os.stat_result] = {}
     final_inventory: _Inventory | set[tuple[int, int, int]] | None = None
     try:
@@ -1787,14 +1788,36 @@ def _reconcile_rollouts(
                 ):
                     _fail()
         observed_new = {
-            (name, _generation(status))
+            name: status
             for name, status in observed.items()
             if _generation(status) not in _inventory_generations(before)
             and (status.st_dev, status.st_ino)
             not in {(device, inode) for device, inode, _ctime in _inventory_generations(before)}
         }
-        if observed_new != expected_new:
+        if set(observed_new) != expected_names:
             _fail()
+        for name, descriptor, initial in candidates:
+            current = observed_new[name]
+            if descriptor not in relaxed_descriptors:
+                if _generation(current) != _generation(initial):
+                    _fail()
+                continue
+            held = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(held.st_mode)
+                or held.st_uid != os.geteuid()
+                or held.st_nlink <= 0
+                or stat.S_IMODE(held.st_mode) & 0o022
+                or (held.st_dev, held.st_ino) != (initial.st_dev, initial.st_ino)
+                or held.st_size < initial.st_size
+                or not stat.S_ISREG(current.st_mode)
+                or current.st_uid != os.geteuid()
+                or current.st_nlink <= 0
+                or stat.S_IMODE(current.st_mode) & 0o022
+                or (current.st_dev, current.st_ino) != (initial.st_dev, initial.st_ino)
+                or current.st_size < initial.st_size
+            ):
+                _fail()
     except OSError:
         _fail()
     finally:
@@ -1811,6 +1834,7 @@ def _assert_selected_rollout(
     name: str | None = None,
     before: _Inventory | set[tuple[int, int, int]] | None = None,
     candidates: list[tuple[str, int, os.stat_result]] | None = None,
+    relaxed_descriptors: frozenset[int] = frozenset(),
 ) -> None:
     """Require selected usage evidence to remain the exact parsed provider file."""
     try:
@@ -1847,7 +1871,7 @@ def _assert_selected_rollout(
             _fail()
     _reattest_provider_root(root)
     if before is not None and candidates is not None:
-        _reconcile_rollouts(root, before, candidates)
+        _reconcile_rollouts(root, before, candidates, relaxed_descriptors)
         return
     final_inventory = _inventory(root)
     try:
@@ -2040,6 +2064,7 @@ def supervise_native_codex(arguments: Any) -> int:
     selected_generation: tuple[int, int, int] | None = None
     selected_size = 0
     selected_name: str | None = None
+    relaxed_descriptors: set[int] = set()
     before: _Inventory | set[tuple[int, int, int]] | None = None
     try:
         usage = _open_root(arguments.usage_root, private=True)
@@ -2132,6 +2157,12 @@ def supervise_native_codex(arguments: Any) -> int:
             for fd, _stat, metadata in classified:
                 if fd == selected_fd:
                     continue
+                if (
+                    metadata.bound_leaf is False
+                    and metadata.parent_thread_id is not None
+                    and metadata.parent_thread_id != leaf
+                ):
+                    relaxed_descriptors.add(fd)
                 if metadata.parent_thread_id != leaf:
                     if metadata.bound_leaf is None:
                         fully_scanned = False
@@ -2161,8 +2192,8 @@ def supervise_native_codex(arguments: Any) -> int:
                 # Bracket persistence with identity-aware complete scans. A
                 # pre-READY parent may grow, but cannot disappear, rename, or
                 # rebind; every post-READY candidate is generation-exact.
-                _reconcile_rollouts(provider, before, candidates)
-                _reconcile_rollouts(provider, before, candidates)
+                _reconcile_rollouts(provider, before, candidates, frozenset(relaxed_descriptors))
+                _reconcile_rollouts(provider, before, candidates, frozenset(relaxed_descriptors))
             else:
                 # Existing test doubles model only generation sets. Production always
                 # reaches the descriptor-owning branch above.
@@ -2181,7 +2212,7 @@ def supervise_native_codex(arguments: Any) -> int:
             whole = fully_scanned and subagent_count == 0
         finally:
             for held_fd, _stat, _metadata in classified:
-                if held_fd == selected_fd:
+                if held_fd == selected_fd or held_fd in relaxed_descriptors:
                     continue
                 with suppress(OSError):
                     _close(held_fd)
@@ -2241,6 +2272,7 @@ def supervise_native_codex(arguments: Any) -> int:
             selected_name,
             before,
             candidates,
+            frozenset(relaxed_descriptors),
         )
         _reattest_usage_root(usage)
         append_record(arguments.output, record, root_descriptor=usage.descriptor)
@@ -2259,6 +2291,10 @@ def supervise_native_codex(arguments: Any) -> int:
         if selected_fd is not None:
             with suppress(OSError):
                 _close(selected_fd)
+        for descriptor in relaxed_descriptors:
+            if descriptor != selected_fd:
+                with suppress(OSError):
+                    _close(descriptor)
         if git_administration is not None:
             _close_git_administration(git_administration)
         for root in (worktree, provider, usage):

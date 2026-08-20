@@ -793,6 +793,61 @@ def test_native_codex_reconciliation_rejects_late_rollout(tmp_path: Path) -> Non
         os.close(root.descriptor)
 
 
+@pytest.mark.parametrize(
+    ("mutation", "relaxed", "accepts"),
+    [
+        ("append", True, True),
+        ("selected-growth", False, False),
+        ("possible-child-growth", False, False),
+        ("replace", True, False),
+        ("rename", True, False),
+        ("unlink", True, False),
+        ("unsafe-mode", True, False),
+        ("late", True, False),
+    ],
+)
+def test_native_codex_reconciliation_relaxes_only_bound_unrelated_rollouts(
+    tmp_path: Path, mutation: str, relaxed: bool, accepts: bool
+) -> None:
+    """Only a positively unrelated retained rollout may append after candidate scan."""
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    before = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    rollout = tmp_path / "unrelated.jsonl"
+    rollout.write_bytes(b"{}\n")
+    candidates = usage_native_codex._new_rollouts(root, before)  # pyright: ignore[reportPrivateUsage]
+    try:
+        _name, descriptor, _status = candidates[0]
+        if mutation in {"append", "selected-growth", "possible-child-growth"}:
+            with rollout.open("ab") as stream:
+                stream.write(b"{}\n")
+        elif mutation == "replace":
+            rollout.unlink()
+            rollout.write_bytes(b"{}\n")
+        elif mutation == "rename":
+            rollout.rename(tmp_path / "renamed.jsonl")
+        elif mutation == "unlink":
+            rollout.unlink()
+        elif mutation == "unsafe-mode":
+            os.chmod(rollout, 0o666)
+        else:
+            (tmp_path / "late.jsonl").write_bytes(b"{}\n")
+        relaxed_descriptors = frozenset({descriptor}) if relaxed else frozenset[int]()
+        if accepts:
+            usage_native_codex._reconcile_rollouts(  # pyright: ignore[reportPrivateUsage]
+                root, before, candidates, relaxed_descriptors
+            )
+        else:
+            with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+                usage_native_codex._reconcile_rollouts(  # pyright: ignore[reportPrivateUsage]
+                    root, before, candidates, relaxed_descriptors
+                )
+    finally:
+        for _name, descriptor, _status in candidates:
+            os.close(descriptor)
+        before.close()
+        os.close(root.descriptor)
+
+
 def test_native_codex_git_administration_tree_accepts_large_safe_nested_file(
     tmp_path: Path,
 ) -> None:
@@ -3622,6 +3677,8 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         ("race-replacement", "after", 0, False, None),
         ("late-closing-child", "after", 0, False, None),
         ("parent-growth", "after", 0, True, None),
+        ("sibling-growth", "after", 0, True, None),
+        ("child-growth", "after", 0, False, None),
         ("sibling", "after", 0, False, "cwd"),
         ("sibling", "after", 0, False, "context_cwd"),
         ("sibling", "after", 0, False, "turn_id"),
@@ -3866,7 +3923,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         if topology == "parent-growth":
             with (provider / "parent.jsonl").open("ab") as stream:
                 stream.write(b'{"opaque":"growth"}\n')
-        if topology == "sibling":
+        if topology in {"sibling", "sibling-growth"}:
             write_rollout(provider / "other.jsonl", "other-811", "other-parent", 1, complete=True)
         elif topology == "malformed-sibling":
             (provider / "other.jsonl").write_text('{"malformed":"candidate"}\n')
@@ -3949,6 +4006,9 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                 write_rollout(
                     provider / "leaf.jsonl", "replacement-811", "parent-811", 1, complete=True
                 )
+            elif topology == "sibling-growth" or topology == "child-growth":
+                with (provider / "other.jsonl").open("ab") as stream:
+                    stream.write(b'{"opaque":"growth"}\n')
             elif mismatch == "worktree_replacement":
                 os.rename(worktree, tmp_path / "old-worktree")
                 os.rename(replacement, worktree)
@@ -3996,6 +4056,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         "race-sibling",
         "race-replacement",
         "late-closing-child",
+        "child-growth",
     }:
         with pytest.raises(
             usage_native_codex.NativeCodexCaptureError, match="native Codex capture is invalid"
