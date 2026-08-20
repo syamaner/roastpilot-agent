@@ -1658,6 +1658,94 @@ def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
     assert not appended
 
 
+def test_native_codex_supervisor_rejects_aggregate_actual_candidate_growth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Post-inventory candidate bytes are summed from held descriptors, not stale stats."""
+    import capture_usage_cli as native_cli
+
+    roots: list[usage_native_codex._Root] = []  # pyright: ignore[reportPrivateUsage]
+    for name in ("usage", "provider", "worktree"):
+        path = tmp_path / name
+        path.mkdir()
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        state = os.fstat(descriptor)
+        roots.append(usage_native_codex._Root(descriptor, state.st_dev, state.st_ino))  # pyright: ignore[reportPrivateUsage]
+    candidates: list[int] = []
+    for name in ("one.jsonl", "two.jsonl"):
+        path = tmp_path / name
+        path.write_bytes(b"grown")
+        candidates.append(os.open(path, os.O_RDONLY | os.O_CLOEXEC))
+
+    def registered(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        role: NativeCodexRole,
+    ) -> tuple[str, str, str, str]:
+        return "a" * 64, "b" * 64, "high", role.value
+
+    def new_rollouts(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _before: dict[str, tuple[int, int]],
+    ) -> list[tuple[str, int, os.stat_result]]:
+        return [
+            ("one", candidates[0], os.stat_result((0,) * 10)),
+            ("two", candidates[1], os.stat_result((0,) * 10)),
+        ]
+
+    def parse(
+        _fd: int, _binding: dict[str, str]
+    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool]:
+        return "leaf", (0, 0, 0, 0, 0, 0), "", _fd == candidates[0]
+
+    def fail_append(*_args: object, **_kwargs: object) -> NoReturn:
+        pytest.fail("append")
+
+    monkeypatch.setattr(usage_native_codex, "MAX_PROVIDER_TOTAL_BYTES", 7)
+    monkeypatch.setattr(usage_native_codex, "_open_root", lambda _raw, private: roots.pop(0))  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_assert_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", lambda *_roots: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_registered_role",
+        registered,
+    )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_inventory", lambda _root: {})  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_new_rollouts",
+        new_rollouts,
+    )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_candidate_binding", lambda _fd, _binding: True)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_parse_rollout",
+        parse,
+    )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_terminal_line",
+        lambda: b'{"type":"TERMINAL","binding_id":"binding","task_status":"FAILED"}\n',
+    )
+    monkeypatch.setattr(usage_native_codex, "uuid4", lambda: "binding")
+    monkeypatch.setattr(native_cli, "append_record", fail_append)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent")
+    arguments = SimpleNamespace(
+        task_id="task",
+        slice_id="slice",
+        parent_task_id="parent",
+        task_name="leaf",
+        role="engineer-be",
+        usage_root=str(tmp_path / "usage"),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/x",
+        base_sha="a" * 40,
+        output="usage.jsonl",
+    )
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex.supervise_native_codex(arguments)
+
+
 @pytest.mark.parametrize("failure", ["duplicate", "later_parse_error"])
 def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
