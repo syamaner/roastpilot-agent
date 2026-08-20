@@ -173,6 +173,26 @@ def test_native_codex_registration_closure_matches_committed_project_files() -> 
         os.close(root.descriptor)
 
 
+@pytest.mark.parametrize("value", [0, 1, 131071])
+def test_native_codex_registration_requires_committed_project_doc_limit(
+    tmp_path: Path, value: int
+) -> None:
+    """Any project-doc byte-limit drift blocks native role attestation before READY."""
+    shutil.copytree(".codex", tmp_path / ".codex")
+    config = tmp_path / ".codex" / "config.toml"
+    config.write_text(
+        config.read_text().replace(
+            "project_doc_max_bytes = 131072", f"project_doc_max_bytes = {value}"
+        )
+    )
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._registered_role(root, NativeCodexRole.ENGINEER_BE)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
 @pytest.mark.parametrize(
     "case",
     ["top_disabled", "model", "effort", "leaf_enabled", "extra", "wrong_path", "no_model_boundary"],
@@ -451,6 +471,20 @@ def test_native_codex_walk_counts_all_provider_entries(
         (tmp_path / "three").mkdir()
         with pytest.raises(usage_native_codex.NativeCodexCaptureError):
             usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_walk_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    """A provider FIFO is opened nonblocking then rejected by the closed type grammar."""
+    fifo = tmp_path / "rollout.jsonl"
+    os.mkfifo(fifo)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        started = time.monotonic()
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+        assert time.monotonic() - started < 1
     finally:
         os.close(root.descriptor)
 
@@ -1106,6 +1140,45 @@ def test_native_codex_attested_origin_rejects_mismatch(monkeypatch: pytest.Monke
     monkeypatch.setattr(usage_native_codex, "_git", lambda _args: "https://example.test/other.git")  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     with pytest.raises(usage_native_codex.NativeCodexCaptureError):
         usage_native_codex._attested_origin()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_git_attestation_ignores_hostile_repository_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GIT_DIR/GIT_WORK_TREE cannot redirect native attestation away from its worktree."""
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    for repository in (first, second):
+        repository.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "feature/test"], cwd=repository, check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "capture@example.test"], cwd=repository, check=True
+        )
+        subprocess.run(["git", "config", "user.name", "Capture"], cwd=repository, check=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://github.com/syamaner/roastpilot-agent.git"],
+            cwd=repository,
+            check=True,
+        )
+        (repository / "tracked.txt").write_text(repository.name)
+        subprocess.run(["git", "add", "."], cwd=repository, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True
+        )
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=first, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    monkeypatch.chdir(first)
+    monkeypatch.setenv("GIT_DIR", str(second / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(second))
+    assert (
+        usage_native_codex._git_identity(  # pyright: ignore[reportPrivateUsage]
+            "syamaner/roastpilot-agent", "feature/test", base, final=False
+        )
+        == base
+    )  # pyright: ignore[reportPrivateUsage]
 
 
 def test_native_codex_git_commands_disable_ambient_fsmonitor(

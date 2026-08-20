@@ -35,6 +35,7 @@ MAX_PROVIDER_LINES = 100_000
 # Observed Codex 0.147.0 tool-output event: 1,006,736 bytes.  Keep this fixed
 # two-MiB bound below the separate eight-MiB rollout-file cap.
 MAX_EVENT_BYTES = 2 * 1024 * 1024
+_GIT_ENV = {"PATH": os.defpath, "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1"}
 MAX_JSON_NESTING = 64
 MAX_COMMITTED_FILE_BYTES = 64 * 1024
 _ROLE_EXPECTATIONS: dict[NativeCodexRole, tuple[str, str]] = {
@@ -333,7 +334,9 @@ def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
                     _fail()
                 try:
                     child = os.open(
-                        name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory
+                        name,
+                        os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=directory,
                     )
                 except OSError:
                     _fail()
@@ -390,6 +393,7 @@ def _git(args: list[str]) -> str:
             capture_output=True,
             text=True,
             timeout=5,
+            env=_GIT_ENV,
         )
         if result.returncode != 0 or len(result.stdout) > 4096:
             _fail()
@@ -445,6 +449,7 @@ def _registered_role(root: _Root, role: NativeCodexRole) -> tuple[str, str, str,
         expected = {member.value for member in NativeCodexRole}
         if (
             set(config) != {"project_doc_max_bytes", "agents"}
+            or config["project_doc_max_bytes"] != 131072
             or set(agents) != {"enabled", "max_concurrent_threads_per_session", *expected}
             or agents["max_concurrent_threads_per_session"] != 3
         ):
@@ -918,6 +923,7 @@ def _descendant(base: str, head: str) -> bool:
                 timeout=5,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=_GIT_ENV,
             ).returncode
             == 0
         )
