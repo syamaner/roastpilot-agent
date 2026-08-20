@@ -1561,6 +1561,55 @@ def test_native_codex_checkout_directory_walk_bounds_all_entries(
         os.close(root.descriptor)
 
 
+def test_native_codex_checkout_directory_walk_admits_dependency_scale_entries(
+    tmp_path: Path,
+) -> None:
+    """The checkout walk admits a dependency tree above the former 4,096-entry cap."""
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    for index in range(4097):
+        (generated / f"entry-{index}").touch()
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_checkout_directory_walk_entry_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bounded checkout walk accepts its exact entry cap and rejects one over."""
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(usage_native_codex, "MAX_CHECKOUT_ENTRIES", 2)
+    try:
+        (tmp_path / "one").touch()
+        (tmp_path / "two").touch()
+        usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+        (tmp_path / "three").touch()
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_checkout_directory_walk_depth_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The checkout walk accepts its exact depth cap and rejects one nested level over."""
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(usage_native_codex, "MAX_CHECKOUT_DEPTH", 2)
+    try:
+        exact = tmp_path / "one" / "two"
+        exact.mkdir(parents=True)
+        usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+        (exact / "three").mkdir()
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
 def test_native_codex_checkout_attestation_accepts_standard_leaf_venv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
