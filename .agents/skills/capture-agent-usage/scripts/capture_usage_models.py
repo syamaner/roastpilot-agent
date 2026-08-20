@@ -801,7 +801,7 @@ class NativeCodexUsageRecord(CaptureModel):
             or self.role_sha256 != NATIVE_CODEX_ROLE_SHA256[self.native_role]
         ):
             raise ValueError("native Codex registration hashes are contradictory")
-        if self.subagent_count < 0 or (self.whole_tree_verified and self.subagent_count != 0):
+        if self.subagent_count != 0:
             raise ValueError("native Codex topology proof is contradictory")
         return self
 

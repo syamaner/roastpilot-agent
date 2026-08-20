@@ -244,6 +244,10 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
         NativeCodexUsageRecord.model_validate(
             {**payload, "success": False, "task_status": NativeCodexTaskStatus.SUCCESS}
         )
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate(
+            {**payload, "whole_tree_verified": False, "subagent_count": 1}
+        )
     for elapsed in (1,):
         with pytest.raises(ValidationError):
             NativeCodexUsageRecord.model_validate({**payload, "elapsed_ms": elapsed})
