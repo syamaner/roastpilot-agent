@@ -247,6 +247,15 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
     ):
         with pytest.raises(ValidationError):
             NativeCodexUsageRecord.model_validate({**payload, field: value})
+    for field in ("base_sha", "launch_head_sha", "final_head_sha"):
+        for value in ("a" * 39, "A" * 40, "g" * 40):
+            with pytest.raises(ValidationError):
+                NativeCodexUsageRecord.model_validate({**payload, field: value})
+    for branch in ("-feature", "feature/../x", "feature:811", "feature\n811"):
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate({**payload, "branch": branch})
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate({**payload, "launch_head_sha": "b" * 40})
     with pytest.raises(ValidationError):
         NativeCodexUsageRecord.model_validate(
             {
@@ -1624,6 +1633,11 @@ def test_native_codex_checkout_attestation_accepts_standard_leaf_venv(
     monkeypatch.chdir(repository)
     try:
         usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+        venv_config = repository / ".venv" / "pyvenv.cfg"
+        os.chmod(venv_config, 0o664)
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+        os.chmod(venv_config, 0o644)
         os.mkfifo(repository / ".venv" / "unsafe")
         with pytest.raises(usage_native_codex.NativeCodexCaptureError):
             usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
