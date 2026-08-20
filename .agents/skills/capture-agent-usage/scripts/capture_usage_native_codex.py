@@ -204,6 +204,7 @@ class _Root:
     descriptor: int
     device: int
     inode: int
+    path: str = ""
 
 
 def _fail() -> None:
@@ -225,8 +226,9 @@ def _open_root(raw: str, *, private: bool) -> _Root:
     try:
         if not os.path.isabs(raw):
             _fail()
+        canonical = os.path.abspath(raw)
         fd = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        for part in raw.split(os.path.sep)[1:]:
+        for part in canonical.split(os.path.sep)[1:]:
             if not part:
                 continue
             child = os.open(
@@ -243,7 +245,7 @@ def _open_root(raw: str, *, private: bool) -> _Root:
             os.close(fd)
             fd = None
             _fail()
-        result = _Root(fd, status.st_dev, status.st_ino)
+        result = _Root(fd, status.st_dev, status.st_ino, canonical)
         fd = None
         return result
     except OSError:
@@ -368,7 +370,11 @@ def _inventory(root: _Root) -> dict[str, tuple[int, int]]:
 def _git(args: list[str]) -> str:
     try:
         result = subprocess.run(
-            ["git", *args], check=False, capture_output=True, text=True, timeout=5
+            ["git", "-c", "core.fsmonitor=false", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if result.returncode != 0 or len(result.stdout) > 4096:
             _fail()
@@ -872,7 +878,7 @@ def _descendant(base: str, head: str) -> bool:
     try:
         return (
             subprocess.run(
-                ["git", "merge-base", "--is-ancestor", base, head],
+                ["git", "-c", "core.fsmonitor=false", "merge-base", "--is-ancestor", base, head],
                 check=False,
                 timeout=5,
             ).returncode
@@ -882,6 +888,34 @@ def _descendant(base: str, head: str) -> bool:
         _fail()
 
 
+def _reattest_usage_root(root: _Root) -> None:
+    """Require the canonical usage-root path to retain the held identity."""
+    if not root.path:
+        _fail()
+    current: _Root | None = None
+    try:
+        current = _open_root(root.path, private=True)
+        if (current.device, current.inode) != (root.device, root.inode):
+            _fail()
+    finally:
+        if current is not None:
+            os.close(current.descriptor)
+
+
+def _provider_home() -> str:
+    """Return the only provider-state homes admitted to native capture."""
+    default = os.path.abspath(os.path.expanduser("~/.codex"))
+    supplied = os.environ.get("CODEX_HOME")
+    if supplied is None:
+        return default
+    if not os.path.isabs(supplied):
+        _fail()
+    canonical = os.path.abspath(supplied)
+    if canonical in {default, "/opt/codex"}:
+        return canonical
+    _fail()
+
+
 def supervise_native_codex(arguments: Any) -> int:
     """Run one parent-owned READY/status/result protocol without launching a child."""
     values = (arguments.task_id, arguments.slice_id, arguments.parent_task_id, arguments.task_name)
@@ -889,9 +923,7 @@ def supervise_native_codex(arguments: Any) -> int:
     if not all(_safe_identifier(value) for value in values) or not _safe_identifier(parent):
         _fail()
     role = NativeCodexRole(arguments.role)
-    codex_home = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
-    if not isinstance(codex_home, str) or not os.path.isabs(codex_home):
-        _fail()
+    codex_home = _provider_home()
     usage: _Root | None = None
     provider: _Root | None = None
     worktree: _Root | None = None
@@ -985,9 +1017,9 @@ def supervise_native_codex(arguments: Any) -> int:
             arguments.repository, arguments.branch, arguments.base_sha, final=True
         )
         success = status is NativeCodexTaskStatus.SUCCESS
-        if (success and not _descendant(arguments.base_sha, final)) or (
-            not success and final != arguments.base_sha
-        ):
+        if not _descendant(arguments.base_sha, final) and final != arguments.base_sha:
+            _fail()
+        if success and final == arguments.base_sha:
             _fail()
         completed = datetime.now(UTC)
         record = NativeCodexUsageRecord(
@@ -1024,6 +1056,7 @@ def supervise_native_codex(arguments: Any) -> int:
         )
         from capture_usage_cli import append_record  # local avoids import cycle
 
+        _reattest_usage_root(usage)
         append_record(arguments.output, record, root_descriptor=usage.descriptor)
         sys.stdout.write(
             json.dumps(

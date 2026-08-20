@@ -1038,6 +1038,42 @@ def test_native_codex_descendant_fails_closed_on_provider_error(
         usage_native_codex._descendant("a" * 40, "b" * 40)  # pyright: ignore[reportPrivateUsage]
 
 
+def test_native_codex_git_commands_disable_ambient_fsmonitor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every native supervisor Git invocation disables repository fsmonitor hooks."""
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(usage_native_codex.subprocess, "run", run)
+    assert usage_native_codex._git(["status", "--porcelain"]) == ""  # pyright: ignore[reportPrivateUsage]
+    assert usage_native_codex._descendant("a" * 40, "b" * 40) is True  # pyright: ignore[reportPrivateUsage]
+    assert all(command[:3] == ["git", "-c", "core.fsmonitor=false"] for command in commands)
+
+
+def test_native_codex_usage_root_reattest_rejects_replacement(tmp_path: Path) -> None:
+    """A renamed/replaced usage root cannot receive a native capture record."""
+    usage = tmp_path / "usage"
+    replacement = tmp_path / "replacement"
+    usage.mkdir(mode=0o700)
+    replacement.mkdir(mode=0o700)
+    os.chmod(usage, 0o700)
+    os.chmod(replacement, 0o700)
+    held = usage_native_codex._open_root(str(usage), private=True)  # pyright: ignore[reportPrivateUsage]
+    try:
+        os.rename(usage, tmp_path / "old-usage")
+        os.rename(replacement, usage)
+        with pytest.raises(
+            usage_native_codex.NativeCodexCaptureError, match="native Codex capture is invalid"
+        ):
+            usage_native_codex._reattest_usage_root(held)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(held.descriptor)
+
+
 def test_native_codex_descriptor_reads_reject_symlinks_and_size(tmp_path: Path) -> None:
     """Committed config reads stay beneath the held root and never exceed 64 KiB."""
     root = tmp_path / "root"
@@ -1247,6 +1283,22 @@ def test_native_codex_supervisor_rejects_codex_home_before_root_access(
         usage_native_codex.supervise_native_codex(arguments)
 
 
+def test_native_codex_provider_home_is_closed_to_default_or_platform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Provider state accepts only the canonical user home or the platform home."""
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    default = os.path.abspath(os.path.expanduser("~/.codex"))
+    assert usage_native_codex._provider_home() == default  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setenv("CODEX_HOME", os.path.expanduser("~/.codex"))
+    assert usage_native_codex._provider_home() == default  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setenv("CODEX_HOME", "/opt/codex")
+    assert usage_native_codex._provider_home() == "/opt/codex"  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._provider_home()  # pyright: ignore[reportPrivateUsage]
+
+
 @pytest.mark.parametrize(
     ("role", "status", "child_first"),
     [
@@ -1324,6 +1376,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
 
     monkeypatch.setattr(usage_native_codex, "_open_root", open_root)
     monkeypatch.setattr(usage_native_codex, "_assert_root", assert_root)
+    monkeypatch.setattr(usage_native_codex, "_reattest_usage_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", reject_overlap)
     monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
     monkeypatch.setattr(
@@ -1622,7 +1675,11 @@ def test_native_codex_supervisor_real_registered_lifecycle(
 
     def terminal() -> bytes:
         rollout()
-        if status is NativeCodexTaskStatus.SUCCESS:
+        if status is not NativeCodexTaskStatus.SUCCESS:
+            (repository / f"{status.value.lower()}-result.txt").write_text("descendant\n")
+            git("add", f"{status.value.lower()}-result.txt")
+            git("commit", "-m", f"fixture {status.value.lower()} result")
+        else:
             (repository / "result.txt").write_text("descendant\n")
             git("add", "result.txt")
             git("commit", "-m", "fixture result")
@@ -1637,6 +1694,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
     monkeypatch.chdir(repository)
     monkeypatch.setenv("CODEX_THREAD_ID", "parent-811")
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(usage_native_codex, "_provider_home", lambda: str(codex_home))
     monkeypatch.setattr(usage_native_codex.sys, "stdout", captured_stdout)
     monkeypatch.setattr(usage_native_codex, "_terminal_line", terminal)
     arguments = SimpleNamespace(
@@ -1841,6 +1899,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
     monkeypatch.chdir(worktree)
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     monkeypatch.setenv("CODEX_THREAD_ID", "parent-811")
+    monkeypatch.setattr(usage_native_codex, "_provider_home", lambda: str(tmp_path / "codex"))
     monkeypatch.setattr(usage_native_codex.sys, "stdout", frames)
     monkeypatch.setattr(usage_native_codex, "_terminal_line", terminal)
     monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
@@ -2794,7 +2853,7 @@ def test_schema_version_cli_reports_generic_and_native_worker_families(
     with pytest.raises(SystemExit) as result:
         main(["--schema-version"])
     assert result.value.code == 0
-    assert capsys.readouterr().out == "generic=1 native-worker=3\n"
+    assert capsys.readouterr().out == "generic=1 native-worker=3 native-codex=1\n"
 
 
 def test_native_cli_exposes_no_caller_session_id() -> None:

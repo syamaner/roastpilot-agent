@@ -2357,7 +2357,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="version",
         version=(
             f"generic={AGENT_USAGE_SCHEMA_VERSION} "
-            f"native-worker={NATIVE_WORKER_USAGE_SCHEMA_VERSION}"
+            f"native-worker={NATIVE_WORKER_USAGE_SCHEMA_VERSION} native-codex=1"
         ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
