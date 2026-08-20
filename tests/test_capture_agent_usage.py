@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -978,6 +979,42 @@ def test_native_codex_launch_rejects_ignored_only_worktree(monkeypatch: pytest.M
         usage_native_codex._git_identity("syamaner/roastpilot-agent", "main", "a" * 40, final=False)  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.parametrize("final", [False, True])
+def test_native_codex_git_identity_forces_all_untracked_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, final: bool
+) -> None:
+    """A local status setting cannot hide untracked material from either attestation."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    for arguments in (
+        ["git", "init", "-b", "main"],
+        ["git", "config", "user.email", "capture@example.test"],
+        ["git", "config", "user.name", "Capture"],
+        ["git", "remote", "add", "origin", "https://github.com/syamaner/roastpilot-agent.git"],
+    ):
+        subprocess.run(arguments, cwd=repository, check=True, capture_output=True)
+    (repository / "tracked.txt").write_text("tracked\n")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True
+    )
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "config", "status.showUntrackedFiles", "no"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+    (repository / "hidden-untracked.txt").write_text("must be visible\n")
+    monkeypatch.chdir(repository)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._git_identity(  # pyright: ignore[reportPrivateUsage]
+            "syamaner/roastpilot-agent", "main", base, final=final
+        )
+
+
 def test_native_codex_cli_round_trip_and_fixed_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """The closed supervisor CLI grammar maps capture failures to one safe exit."""
     arguments = usage_cli.build_parser().parse_args(
@@ -1764,11 +1801,12 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
 
 
 @pytest.mark.parametrize(
-    ("role", "status"),
+    ("role", "status", "instructions"),
     [
-        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.SUCCESS),
-        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.FAILED),
-        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.SUCCESS, "exact"),
+        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.FAILED, "exact"),
+        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED, "exact"),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "stale"),
     ],
 )
 def test_native_codex_supervisor_real_registered_lifecycle(
@@ -1777,6 +1815,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
     capsys: pytest.CaptureFixture[str],
     role: NativeCodexRole,
     status: NativeCodexTaskStatus,
+    instructions: str,
 ) -> None:
     """A real registered-role lifecycle persists only its closed metadata record."""
     repository = tmp_path / "repository"
@@ -1807,6 +1846,9 @@ def test_native_codex_supervisor_real_registered_lifecycle(
     git("add", ".")
     git("commit", "-m", "fixture base")
     base = git("rev-parse", "HEAD")
+    exact_instructions = tomllib.loads(
+        (repository / ".codex" / "agents" / f"{role.value}.toml").read_text()
+    )["developer_instructions"]
 
     def rollout() -> None:
         # A well-formed but differently bound active session is conclusively unrelated.
@@ -1839,7 +1881,9 @@ def test_native_codex_supervisor_real_registered_lifecycle(
                 "agent_nickname": "worker-811",
                 "agent_path": "/root/native-codex-capture",
                 "agent_role": role.value,
-                "base_instructions": "SECRET_PROVIDER_PROMPT",
+                "base_instructions": (
+                    exact_instructions if instructions == "exact" else "SECRET_PROVIDER_PROMPT"
+                ),
                 "originator": "codex-tui",
                 "cli_version": "0.147.0",
                 "context_window": 1,
@@ -2007,6 +2051,13 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         base_sha=base,
         output=Path(".agent-usage/usage.jsonl"),
     )
+    if instructions == "stale":
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex.supervise_native_codex(arguments)
+        assert not (usage / ".agent-usage" / "usage.jsonl").exists()
+        assert [json.loads(frame)["type"] for frame in captured_stdout.frames] == ["READY"]
+        assert "SECRET_PROVIDER_PROMPT" not in capsys.readouterr().out
+        return
     assert usage_native_codex.supervise_native_codex(arguments) == 0
     assert capsys.readouterr().out == ""
     frames = [json.loads(frame) for frame in captured_stdout.frames]
@@ -2064,6 +2115,9 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
     provider.mkdir(parents=True)
     usage.mkdir(mode=0o700)
     os.chmod(usage, 0o700)
+    exact_instructions = tomllib.loads(
+        (Path(".codex") / "agents" / "engineer-be.toml").read_text()
+    )["developer_instructions"]
 
     def write_rollout(path: Path, session: str, parent: str, depth: int, *, complete: bool) -> None:
         meta: dict[str, object] = {
@@ -2071,7 +2125,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
             "agent_nickname": "worker",
             "agent_path": "/root/native-codex-capture",
             "agent_role": "engineer-be",
-            "base_instructions": "opaque",
+            "base_instructions": exact_instructions,
             "cli_version": "0.147.0",
             "context_window": 1,
             "cwd": str(worktree),

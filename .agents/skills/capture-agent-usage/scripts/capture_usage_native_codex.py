@@ -48,6 +48,11 @@ _ROLE_SHA256: dict[NativeCodexRole, str] = {
     NativeCodexRole.ENGINEER_FE: "4da74886a9c5e4b7cad4b6e7ed858f0f7e596f76189bd07240b77e9cd5c13831",
     NativeCodexRole.REPAIR: "4671a9d8b84b500208f2b603e81f255d64d678fc11ebbf4982b7bf8ddca0fa7d",
 }
+_ROLE_INSTRUCTION_SHA256: dict[NativeCodexRole, str] = {
+    NativeCodexRole.ENGINEER_BE: "6634afea8938b1472e4677806262365bb5e23278a636d5c8ae7be0a8a04ba07c",
+    NativeCodexRole.ENGINEER_FE: "886daaae2ca56ba26d63d2e8b9824c06c389e6c4ab765de7719d9bfce7461f8e",
+    NativeCodexRole.REPAIR: "8df164d5d3bab1e4f1553a3daea6b302888c252c80cbe4e6f91ac2ec277533d1",
+}
 _ROOT_TYPES = {
     "session_meta",
     "turn_context",
@@ -417,7 +422,11 @@ def _git_identity(repository: str, branch: str, base: str, *, final: bool) -> st
     }:
         _fail()
     head = _git(["rev-parse", "HEAD"])
-    status_args = ["status", "--porcelain", "--ignored"] if not final else ["status", "--porcelain"]
+    status_args = (
+        ["status", "--porcelain", "--untracked-files=all", "--ignored"]
+        if not final
+        else ["status", "--porcelain", "--untracked-files=all"]
+    )
     if _git(["branch", "--show-current"]) != branch or _git(status_args):
         _fail()
     if _git(["rev-parse", "--verify", f"{base}^{{commit}}"]) != base or (
@@ -473,6 +482,10 @@ def _registered_role(root: _Root, role: NativeCodexRole) -> tuple[str, str, str,
             or definition.get("agents") != {"enabled": False}
             or not isinstance(definition.get("developer_instructions"), str)
             or hashlib.sha256(role_bytes).hexdigest() != _ROLE_SHA256[role]
+            or (
+                hashlib.sha256(definition["developer_instructions"].encode("utf-8")).hexdigest()
+                != _ROLE_INSTRUCTION_SHA256[role]
+            )
         ):
             _fail()
         # The committed role boundary itself proves a leaf cannot invoke Claude.
@@ -531,6 +544,16 @@ def _string(value: Any) -> str:
     if not _safe_identifier(value):
         _fail()
     return value
+
+
+def _instruction_digest(value: Any) -> str:
+    """Return a bounded fingerprint without retaining provider instructions."""
+    if not isinstance(value, str):
+        _fail()
+    encoded = value.encode("utf-8")
+    if len(encoded) > MAX_COMMITTED_FILE_BYTES:
+        _fail()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _agent_path(value: Any) -> str:
@@ -660,6 +683,15 @@ def _parse_rollout(
                         or (key == "repository_url" and git["repository_url"] != expected)
                         for key, expected in binding.items()
                         if key in {"worktree_path", "launch_head", "branch", "repository_url"}
+                    ):
+                        matches = False
+                    if (
+                        matches
+                        and "instruction_sha256" in binding
+                        and (
+                            _instruction_digest(payload["base_instructions"])
+                            != binding["instruction_sha256"]
+                        )
                     ):
                         matches = False
                 else:
@@ -995,6 +1027,7 @@ def supervise_native_codex(arguments: Any) -> int:
             "launch_head": launch,
             "repository_url": _attested_origin(),
             "branch": arguments.branch,
+            "instruction_sha256": _ROLE_INSTRUCTION_SHA256[role],
         }
         ready = {"type": "READY", "binding_id": str(uuid4())}
         started = datetime.now(UTC)
