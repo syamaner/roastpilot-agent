@@ -222,6 +222,11 @@ def _fail() -> None:
     raise NativeCodexCaptureError("native Codex capture is invalid")
 
 
+def _close(descriptor: int) -> None:
+    """Close one owned descriptor through a module-local test seam."""
+    os.close(descriptor)
+
+
 def _safe_identifier(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -355,6 +360,7 @@ def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
                         not name.endswith(".jsonl")
                         or status.st_uid != os.geteuid()
                         or status.st_nlink != 1
+                        or stat.S_IMODE(status.st_mode) & 0o022
                     ):
                         os.close(child)
                         _fail()
@@ -707,6 +713,17 @@ def _parse_rollout(
     is_subagent = False
     totals: tuple[int, int, int, int, int, int] | None = None
     turn_id: str | None = None
+    try:
+        status = os.fstat(fd)
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_uid != os.geteuid()
+            or status.st_nlink != 1
+            or stat.S_IMODE(status.st_mode) & 0o022
+        ):
+            _fail()
+    except OSError:
+        _fail()
     with os.fdopen(os.dup(fd), "rb") as stream:
         number = 0
         read_bytes = 0
@@ -1207,6 +1224,8 @@ def supervise_native_codex(arguments: Any) -> int:
         matched: list[tuple[int, str, tuple[int, int, int, int, int, int]]] = []
         observed_total = 0
         fully_scanned = True
+        subagent_count = 0
+        whole = False
         try:
             for _name, fd, _stat in candidates:
                 try:
@@ -1229,7 +1248,6 @@ def supervise_native_codex(arguments: Any) -> int:
             if len(matched) != 1:
                 _fail()
             selected_fd, leaf, totals = matched[0]
-            subagent_count = 0
             for fd, _stat, metadata in classified:
                 if fd == selected_fd:
                     continue
@@ -1252,19 +1270,19 @@ def supervise_native_codex(arguments: Any) -> int:
                     # A malformed or incomplete rollout that names the leaf might be a
                     # child. Capture remains useful, but whole-tree proof is withheld.
                     fully_scanned = False
+            _assert_root(provider)
+            closing = _inventory(provider)
+            scanned = {(status.st_dev, status.st_ino) for _fd, status, _metadata in classified}
+            # The closing descriptor-relative inventory must be exactly the post-READY
+            # rollout set that was scanned.  Any late creation, unlink, or replacement
+            # leaves topology incomplete rather than overclaiming whole-tree proof.
+            if closing - before != scanned:
+                fully_scanned = False
+            whole = fully_scanned and subagent_count == 0
         finally:
             for held_fd, _stat, _metadata in classified:
                 with suppress(OSError):
-                    os.close(held_fd)
-        _assert_root(provider)
-        closing = _inventory(provider)
-        scanned = {(status.st_dev, status.st_ino) for _fd, status, _metadata in classified}
-        # The closing descriptor-relative inventory must be exactly the post-READY
-        # rollout set that was scanned.  Any late creation, unlink, or replacement
-        # leaves topology incomplete rather than overclaiming whole-tree proof.
-        if closing - before != scanned:
-            fully_scanned = False
-        whole = fully_scanned and subagent_count == 0
+                    _close(held_fd)
         _reattest_worktree_root(worktree)
         final = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=True

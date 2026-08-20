@@ -541,6 +541,50 @@ def test_native_codex_inventory_does_not_read_or_size_existing_rollouts(tmp_path
     assert inventory == {(existing.stat().st_dev, existing.stat().st_ino)}
 
 
+@pytest.mark.parametrize("mode", [0o620, 0o666])
+def test_native_codex_provider_walk_rejects_writable_rollout_files(
+    tmp_path: Path, mode: int
+) -> None:
+    """Provider rollout files may not grant group or world write access."""
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("{}\n")
+    os.chmod(rollout, mode)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_provider_walk_accepts_owner_read_write_rollout_file(tmp_path: Path) -> None:
+    """The observed provider-owned 0644 rollout mode remains admitted."""
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("{}\n")
+    os.chmod(rollout, 0o644)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        assert len(usage_native_codex._inventory(root)) == 1  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_parser_rejects_writable_rollout_before_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A writable rollout descriptor fails before parser content handling."""
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("{}\n")
+    os.chmod(rollout, 0o620)
+
+    def unexpected_json(_raw: bytes) -> object:
+        pytest.fail("writable rollout reached content parsing")
+
+    monkeypatch.setattr(usage_native_codex, "_json", unexpected_json)
+    with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+
+
 def test_native_codex_inventory_rejects_renamed_pre_ready_inode(tmp_path: Path) -> None:
     """Renaming an old rollout after READY cannot turn its inode into new evidence."""
     existing = tmp_path / "existing.jsonl"
@@ -1960,6 +2004,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     monkeypatch.setattr(usage_native_codex, "_open_root", open_root)
     monkeypatch.setattr(usage_native_codex, "_assert_root", assert_root)
     monkeypatch.setattr(usage_native_codex, "_reattest_usage_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_reattest_worktree_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", reject_overlap)
     monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
     monkeypatch.setattr(
@@ -1985,7 +2030,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         "_candidate_metadata",
         candidate_metadata,
     )
-    monkeypatch.setattr(usage_native_codex.os, "close", lambda _fd: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_close", lambda _fd: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
         usage_native_codex,
         "_registered_role",
@@ -1995,6 +2040,11 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         usage_native_codex,
         "_git_identity",
         git_identity,
+    )
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_attested_origin",
+        lambda: "https://github.com/syamaner/roastpilot-agent.git",
     )
     monkeypatch.setattr(usage_native_codex, "_descendant", lambda _base, _head: True)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "uuid4", lambda: "binding-811")
@@ -2699,7 +2749,7 @@ def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
         "_parse_rollout",
         cast(Any, lambda _fd, _binding: ("leaf", (0, 0, 0, 0, 0, 0), "", _fd < 90 + match_count)),  # pyright: ignore[reportUnknownLambdaType]
     )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
-    monkeypatch.setattr(usage_native_codex.os, "close", lambda _fd: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_close", lambda _fd: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
         usage_native_codex,
         "_terminal_line",
@@ -2890,7 +2940,7 @@ def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
         lambda: b'{"type":"TERMINAL","binding_id":"binding","task_status":"FAILED"}\n',
     )
     monkeypatch.setattr(usage_native_codex, "uuid4", lambda: "binding")
-    monkeypatch.setattr(usage_native_codex.os, "close", close)
+    monkeypatch.setattr(usage_native_codex, "_close", close)
     monkeypatch.setattr(native_cli, "append_record", append)
     monkeypatch.setenv("CODEX_THREAD_ID", "parent")
     arguments = SimpleNamespace(
