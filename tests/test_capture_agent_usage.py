@@ -2872,7 +2872,7 @@ def test_native_codex_supervisor_rejects_aggregate_actual_candidate_growth(
 def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    """Every opened candidate descriptor closes once when selection cannot complete."""
+    """Every classified candidate descriptor closes once when selection cannot complete."""
     import capture_usage_cli as native_cli
 
     roots: list[usage_native_codex._Root] = []  # pyright: ignore[reportPrivateUsage]
@@ -2882,11 +2882,7 @@ def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
         descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         state = os.fstat(descriptor)
         roots.append(usage_native_codex._Root(descriptor, state.st_dev, state.st_ino))  # pyright: ignore[reportPrivateUsage]
-    candidates: list[int] = []
-    for name in ("first.jsonl", "second.jsonl"):
-        candidate = tmp_path / name
-        candidate.write_bytes(b"{}\n")
-        candidates.append(os.open(candidate, os.O_RDONLY | os.O_CLOEXEC))
+    candidates = [811_001, 811_002]
 
     def open_root(_raw: str, *, private: bool) -> usage_native_codex._Root:  # pyright: ignore[reportPrivateUsage]
         del private
@@ -2930,6 +2926,11 @@ def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
     monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", lambda *_roots: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_inventory", lambda _root: {})  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_new_rollouts", new_rollouts)
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_candidate_metadata",
+        lambda _fd, _binding: usage_native_codex._CandidateMetadata(True, None),  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType,reportPrivateUsage]
+    )
     monkeypatch.setattr(usage_native_codex, "_parse_rollout", parse_rollout)
     monkeypatch.setattr(usage_native_codex, "_registered_role", registered_role)
     monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
@@ -2954,15 +2955,10 @@ def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
         base_sha="a" * 40,
         output="usage.jsonl",
     )
-    try:
-        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-            usage_native_codex.supervise_native_codex(arguments)
-        assert appended == []
-        assert all(closed.count(descriptor) == 1 for descriptor in candidates)
-    finally:
-        for descriptor in candidates:
-            with suppress(OSError):
-                os.close(descriptor)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex.supervise_native_codex(arguments)
+    assert appended == []
+    assert all(closed.count(descriptor) == 1 for descriptor in candidates)
 
 
 def test_owned_transcript_counts_identical_assistant_usage_once(
