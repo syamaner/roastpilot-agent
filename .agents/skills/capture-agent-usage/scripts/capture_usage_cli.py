@@ -53,6 +53,7 @@ from capture_usage_models import (
     EVIDENCE_ROOT_ENVIRONMENT_KEY,
     EVIDENCE_SCHEMA_VERSION,
     MAX_STREAM_BYTES,
+    NATIVE_CODEX_USAGE_SCHEMA_VERSION,
     NATIVE_ROLE_EXCLUSIONS,
     NATIVE_WORKER_USAGE_SCHEMA_VERSION,
     PLAN_ROOT_ENVIRONMENT_KEY,
@@ -2357,7 +2358,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="version",
         version=(
             f"generic={AGENT_USAGE_SCHEMA_VERSION} "
-            f"native-worker={NATIVE_WORKER_USAGE_SCHEMA_VERSION} native-codex=1"
+            f"native-worker={NATIVE_WORKER_USAGE_SCHEMA_VERSION} "
+            f"native-codex={NATIVE_CODEX_USAGE_SCHEMA_VERSION}"
         ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
