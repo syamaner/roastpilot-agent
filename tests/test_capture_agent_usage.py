@@ -801,6 +801,55 @@ def test_native_codex_git_administration_tree_rejects_unsafe_nested_entry(
         os.close(root.descriptor)
 
 
+def test_native_codex_git_administration_tree_rejects_exact_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The direct walk rejects entry and depth counts beyond their exact caps."""
+    (tmp_path / "one").write_bytes(b"x")
+    (tmp_path / "two").write_bytes(b"x")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        monkeypatch.setattr(usage_native_codex, "MAX_GIT_ADMIN_ENTRIES", 1)
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_git_administration_tree(root)  # pyright: ignore[reportPrivateUsage]
+        (tmp_path / "two").unlink()
+        nested = tmp_path / "nested"
+        nested.mkdir()
+        monkeypatch.setattr(usage_native_codex, "MAX_GIT_ADMIN_ENTRIES", 8)
+        monkeypatch.setattr(usage_native_codex, "MAX_GIT_ADMIN_DEPTH", 0)
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_git_administration_tree(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_git_administration_tree_rejects_stat_open_toctou(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement between no-follow stat and open is rejected by descriptor identity."""
+    entry = tmp_path / "entry"
+    entry.write_bytes(b"one")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    original_stat = usage_native_codex.os.stat
+    changed = False
+
+    def replace_after_stat(*args: Any, **kwargs: Any) -> os.stat_result:
+        nonlocal changed
+        result = original_stat(*args, **kwargs)
+        if not changed and args and args[0] == "entry":
+            changed = True
+            entry.unlink()
+            entry.write_bytes(b"replacement")
+        return result
+
+    try:
+        monkeypatch.setattr(usage_native_codex.os, "stat", replace_after_stat)
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_git_administration_tree(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
 def test_native_codex_walk_counts_all_provider_entries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3090,6 +3139,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         ("race-sibling", "after", 0, False, None),
         ("race-replacement", "after", 0, False, None),
         ("late-closing-child", "after", 0, False, None),
+        ("parent-growth", "after", 0, True, None),
         ("sibling", "after", 0, False, "cwd"),
         ("sibling", "after", 0, False, "context_cwd"),
         ("sibling", "after", 0, False, "turn_id"),
@@ -3331,6 +3381,9 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
 
     def terminal() -> bytes:
         write_rollout(provider / "leaf.jsonl", "leaf-811", "parent-811", 1, complete=True)
+        if topology == "parent-growth":
+            with (provider / "parent.jsonl").open("ab") as stream:
+                stream.write(b'{"opaque":"growth"}\n')
         if topology == "sibling":
             write_rollout(provider / "other.jsonl", "other-811", "other-parent", 1, complete=True)
         elif topology == "malformed-sibling":
@@ -3359,6 +3412,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
             "race-sibling",
             "race-replacement",
             "late-closing-child",
+            "parent-growth",
         }:
             write_rollout(
                 provider / "other.jsonl", "child-811", "leaf-811", 2, complete=topology == "child"
@@ -3423,6 +3477,9 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         return original_inventory(root)
 
     monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
+
+    if topology == "parent-growth":
+        write_rollout(provider / "parent.jsonl", "parent-811", "outer-parent", 1, complete=True)
 
     def registered_role(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]

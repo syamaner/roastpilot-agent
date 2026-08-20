@@ -1632,12 +1632,13 @@ def _reconcile_rollouts(
     """
     expected_new = {(name, _generation(status)) for name, _fd, status in candidates}
     observed: dict[str, os.stat_result] = {}
+    final_inventory: _Inventory | set[tuple[int, int, int]] | None = None
     try:
-        for name, fd, status in _walk(root):
-            try:
-                observed[name] = status
-            finally:
-                os.close(fd)
+        final_inventory = _inventory(root)
+        if not isinstance(final_inventory, _Inventory):
+            _fail()
+        for entry in final_inventory.entries.values():
+            observed[entry.name] = os.fstat(entry.descriptor)
         if isinstance(before, _Inventory):
             for entry in before.entries.values():
                 held = os.fstat(entry.descriptor)
@@ -1665,6 +1666,9 @@ def _reconcile_rollouts(
             _fail()
     except OSError:
         _fail()
+    finally:
+        if final_inventory is not None:
+            _close_inventory(final_inventory)
 
 
 def _assert_selected_rollout(
@@ -1674,6 +1678,8 @@ def _assert_selected_rollout(
     size: int,
     expected_inventory: set[tuple[int, int, int]],
     name: str | None = None,
+    before: _Inventory | set[tuple[int, int, int]] | None = None,
+    candidates: list[tuple[str, int, os.stat_result]] | None = None,
 ) -> None:
     """Require selected usage evidence to remain the exact parsed provider file."""
     try:
@@ -1709,8 +1715,15 @@ def _assert_selected_rollout(
         except OSError:
             _fail()
     _reattest_provider_root(root)
-    if _inventory(root) != expected_inventory:
-        _fail()
+    if before is not None and candidates is not None:
+        _reconcile_rollouts(root, before, candidates)
+        return
+    final_inventory = _inventory(root)
+    try:
+        if _inventory_generations(final_inventory) != expected_inventory:
+            _fail()
+    finally:
+        _close_inventory(final_inventory)
 
 
 def _ancestor_identities(root: _Root) -> set[tuple[int, int]]:
@@ -2014,18 +2027,11 @@ def supervise_native_codex(arguments: Any) -> int:
                 _generation(status) for _fd, status, _metadata in classified
             }
             if isinstance(before, _Inventory):
+                # Bracket persistence with identity-aware complete scans. A
+                # pre-READY parent may grow, but cannot disappear, rename, or
+                # rebind; every post-READY candidate is generation-exact.
                 _reconcile_rollouts(provider, before, candidates)
-                # Bracket persistence with two complete descriptor-owning scans.
-                # The retained pre-READY descriptors remain authoritative for
-                # replacement detection; these scans reject a rollout arriving
-                # after reconciliation but before record persistence.
-                for _attempt in range(2):
-                    closing = _inventory(provider)
-                    try:
-                        if _inventory_generations(closing) != expected_inventory:
-                            _fail()
-                    finally:
-                        _close_inventory(closing)
+                _reconcile_rollouts(provider, before, candidates)
             else:
                 # Existing test doubles model only generation sets. Production always
                 # reaches the descriptor-owning branch above.
@@ -2102,6 +2108,8 @@ def supervise_native_codex(arguments: Any) -> int:
             selected_size,
             expected_inventory,
             selected_name,
+            before,
+            candidates,
         )
         _reattest_usage_root(usage)
         append_record(arguments.output, record, root_descriptor=usage.descriptor)
