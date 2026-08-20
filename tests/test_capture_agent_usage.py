@@ -321,7 +321,7 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(
             "cwd": "discarded",
             "history_mode": "discarded",
             "model_provider": "discarded",
-            "multi_agent_version": "discarded",
+            "multi_agent_version": "v2",
             "parent_thread_id": "parent-811",
             "session_id": "leaf-811",
             "thread_source": "subagent",
@@ -356,7 +356,7 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(
             "current_date": "discarded",
             "cwd": "discarded",
             "file_system_sandbox_policy": "discarded",
-            "multi_agent_version": "discarded",
+            "multi_agent_version": "v2",
             "permission_profile": "discarded",
             "personality": "discarded",
             "realtime_active": False,
@@ -987,7 +987,7 @@ def test_native_codex_rejects_decreasing_cumulative_token_totals(tmp_path: Path)
             "git": {"branch": "x", "commit_hash": "a", "repository_url": "x"},
             "history_mode": "x",
             "model_provider": "x",
-            "multi_agent_version": "x",
+            "multi_agent_version": "v2",
             "originator": "codex-tui",
             "parent_thread_id": "parent",
             "session_id": "leaf",
@@ -1014,6 +1014,7 @@ def test_native_codex_rejects_decreasing_cumulative_token_totals(tmp_path: Path)
         {
             "model": "gpt-5.6-terra",
             "effort": "high",
+            "multi_agent_version": "v2",
             "realtime_active": False,
             "workspace_roots": [],
         }
@@ -2329,7 +2330,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
                 "cwd": str(repository),
                 "history_mode": "discarded",
                 "model_provider": "discarded",
-                "multi_agent_version": "discarded",
+                "multi_agent_version": "v2",
                 "parent_thread_id": "parent-811",
                 "session_id": "leaf-811",
                 "thread_source": "subagent",
@@ -2364,7 +2365,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
                 "current_date": "discarded",
                 "cwd": str(repository),
                 "file_system_sandbox_policy": "discarded",
-                "multi_agent_version": "discarded",
+                "multi_agent_version": "v2",
                 "permission_profile": "discarded",
                 "personality": "discarded",
                 "realtime_active": False,
@@ -2571,6 +2572,12 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         ("sibling", "after", 0, False, "workspace_roots"),
         ("sibling", "after", 0, False, "file_system_sandbox_policy"),
         ("sibling", "after", 0, False, "permission_profile"),
+        ("sibling", "after", 0, False, "session_multi_agent_v1"),
+        ("sibling", "after", 0, False, "session_multi_agent_arbitrary"),
+        ("sibling", "after", 0, False, "session_multi_agent_non_string"),
+        ("sibling", "after", 0, False, "context_multi_agent_v1"),
+        ("sibling", "after", 0, False, "context_multi_agent_arbitrary"),
+        ("sibling", "after", 0, False, "context_multi_agent_non_string"),
         ("sibling", "after", 0, False, "worktree_replacement"),
         ("sibling", "after", 0, False, "worktree_mode_drift"),
         ("sibling", "after", 0, False, "provider_replacement"),
@@ -2623,7 +2630,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
             },
             "history_mode": "opaque",
             "model_provider": "opaque",
-            "multi_agent_version": "opaque",
+            "multi_agent_version": "v2",
             "originator": "codex-tui",
             "parent_thread_id": parent,
             "session_id": session,
@@ -2644,6 +2651,12 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         if session == "leaf-811" and mismatch is not None:
             if mismatch == "cwd":
                 meta["cwd"] = "untrusted"
+            elif mismatch.startswith("session_multi_agent_"):
+                meta["multi_agent_version"] = {
+                    "session_multi_agent_v1": "v1",
+                    "session_multi_agent_arbitrary": "unexpected",
+                    "session_multi_agent_non_string": [],
+                }[mismatch]
             elif mismatch not in {
                 "context_cwd",
                 "turn_id",
@@ -2652,6 +2665,12 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                 "workspace_roots",
                 "file_system_sandbox_policy",
                 "permission_profile",
+                "session_multi_agent_v1",
+                "session_multi_agent_arbitrary",
+                "session_multi_agent_non_string",
+                "context_multi_agent_v1",
+                "context_multi_agent_arbitrary",
+                "context_multi_agent_non_string",
                 "worktree_replacement",
                 "worktree_mode_drift",
                 "provider_replacement",
@@ -2668,6 +2687,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                 {
                     "model": "gpt-5.6-terra",
                     "effort": "high",
+                    "multi_agent_version": "v2",
                     "cwd": str(worktree),
                     "realtime_active": False,
                     "workspace_roots": [],
@@ -2684,6 +2704,16 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                 context["file_system_sandbox_policy"] = {"kind": "unrestricted"}
             if session == "leaf-811" and mismatch == "permission_profile":
                 context["permission_profile"] = {"type": "unmanaged"}
+            if (
+                session == "leaf-811"
+                and mismatch is not None
+                and mismatch.startswith("context_multi_agent_")
+            ):
+                context["multi_agent_version"] = {
+                    "context_multi_agent_v1": "v1",
+                    "context_multi_agent_arbitrary": "unexpected",
+                    "context_multi_agent_non_string": [],
+                }[mismatch]
             totals = {
                 key: 0
                 for key in (

@@ -817,6 +817,7 @@ def _parse_rollout(
                         or payload["parent_thread_id"] != parent_thread
                         or payload["agent_nickname"] != nickname
                         or payload["thread_source"] != "subagent"
+                        or payload["multi_agent_version"] != "v2"
                     ):
                         _fail()
                     is_subagent = True
@@ -867,6 +868,7 @@ def _parse_rollout(
                         and (
                             payload.get("model") != "gpt-5.6-terra"
                             or payload.get("effort") != binding["effort"]
+                            or payload.get("multi_agent_version") != "v2"
                             or (
                                 "worktree_path" in binding
                                 and payload.get("cwd") != binding["worktree_path"]
