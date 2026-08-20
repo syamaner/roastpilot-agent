@@ -1366,6 +1366,44 @@ def test_native_codex_walk_rejects_over_depth_tree(tmp_path: Path) -> None:
         os.close(root.descriptor)
 
 
+@pytest.mark.parametrize("invalid", [False, True])
+def test_native_codex_walk_explicitly_closes_scandir_duplicates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: bool
+) -> None:
+    """Nested traversal closes every descriptor duplicated for scandir, even on failure."""
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / ("invalid.txt" if invalid else "rollout.jsonl")).write_text("{}\n")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    scanned: list[int] = []
+    closed: list[int] = []
+    real_scandir = os.scandir
+    real_close = os.close
+
+    def scandir(descriptor: int) -> Any:
+        scanned.append(descriptor)
+        return cast(Any, real_scandir(descriptor))
+
+    def close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(usage_native_codex.os, "scandir", scandir)
+    monkeypatch.setattr(usage_native_codex, "_close", close)
+    try:
+        if invalid:
+            with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+                list(usage_native_codex._walk(root))  # pyright: ignore[reportPrivateUsage]
+        else:
+            rollouts = list(usage_native_codex._walk(root))  # pyright: ignore[reportPrivateUsage]
+            for _name, descriptor, _status in rollouts:
+                os.close(descriptor)
+    finally:
+        os.close(root.descriptor)
+    assert len(scanned) == 2
+    assert all(descriptor in closed for descriptor in scanned)
+
+
 @pytest.mark.parametrize(
     ("repository", "branch", "base", "responses", "accepts"),
     [
@@ -1417,6 +1455,46 @@ def test_native_codex_descendant_fails_closed_on_provider_error(
     monkeypatch.setattr(usage_native_codex.subprocess, "run", timeout)
     with pytest.raises(usage_native_codex.NativeCodexCaptureError):
         usage_native_codex._descendant("a" * 40, "b" * 40)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_descendant_ignores_replace_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replacement objects cannot make an unrelated final head appear descended."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def git(*arguments: str) -> str:
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-b", "main")
+    git("config", "user.email", "capture@example.test")
+    git("config", "user.name", "Capture")
+    (repository / "base.txt").write_text("base\n")
+    git("add", "base.txt")
+    git("commit", "-m", "base")
+    base = git("rev-parse", "HEAD")
+    (repository / "descendant.txt").write_text("descendant\n")
+    git("add", "descendant.txt")
+    git("commit", "-m", "descendant")
+    descendant = git("rev-parse", "HEAD")
+    git("checkout", "--orphan", "unrelated")
+    git("rm", "-rf", ".")
+    (repository / "unrelated.txt").write_text("unrelated\n")
+    git("add", "unrelated.txt")
+    git("commit", "-m", "unrelated")
+    unrelated = git("rev-parse", "HEAD")
+    git("replace", unrelated, descendant)
+    monkeypatch.chdir(repository)
+
+    assert usage_native_codex._descendant(base, descendant) is True  # pyright: ignore[reportPrivateUsage]
+    assert usage_native_codex._descendant(descendant, unrelated) is False  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.parametrize(
@@ -1502,6 +1580,7 @@ def test_native_codex_git_commands_disable_ambient_fsmonitor(
     assert usage_native_codex._git(["status", "--porcelain"]) == "ok"  # pyright: ignore[reportPrivateUsage]
     assert usage_native_codex._descendant("a" * 40, "b" * 40) is True  # pyright: ignore[reportPrivateUsage]
     assert all(command[:3] == ["git", "-c", "core.fsmonitor=false"] for command in commands)
+    assert usage_native_codex._GIT_ENV["GIT_NO_REPLACE_OBJECTS"] == "1"  # pyright: ignore[reportPrivateUsage]
 
 
 def test_native_codex_git_streams_bounded_success_and_error(

@@ -36,7 +36,12 @@ MAX_PROVIDER_LINES = 100_000
 # Observed Codex 0.147.0 tool-output event: 1,006,736 bytes.  Keep this fixed
 # two-MiB bound below the separate eight-MiB rollout-file cap.
 MAX_EVENT_BYTES = 2 * 1024 * 1024
-_GIT_ENV = {"PATH": os.defpath, "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1"}
+_GIT_ENV = {
+    "PATH": os.defpath,
+    "LC_ALL": "C",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+}
 MAX_JSON_NESTING = 64
 MAX_COMMITTED_FILE_BYTES = 64 * 1024
 MAX_GIT_OUTPUT_BYTES = 4096
@@ -354,12 +359,14 @@ def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
         if depth > MAX_PROVIDER_DEPTH:
             _fail()
         _provider_directory(directory)
+        scandir_descriptor = -1
+        iterator: os.ScandirIterator[str] | None = None
         try:
-            # scandir owns and closes an fd argument, so retain this traversal fd.
-            iterator = os.scandir(os.dup(directory))
-        except OSError:
-            _fail()
-        try:
+            # Keep ownership of the duplicated descriptor explicit.  CPython currently
+            # closes descriptor arguments from ScandirIterator.close(), but that is not
+            # an attestation boundary this traversal relies upon.
+            scandir_descriptor = os.dup(directory)
+            iterator = os.scandir(scandir_descriptor)
             for entry in iterator:
                 entries_seen += 1
                 if entries_seen > MAX_PROVIDER_ENTRIES:
@@ -399,8 +406,15 @@ def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
                     yield from descend(child, relative, depth + 1)
                 finally:
                     os.close(child)
+        except OSError:
+            _fail()
         finally:
-            iterator.close()
+            if iterator is not None:
+                with suppress(OSError):
+                    iterator.close()
+            if scandir_descriptor >= 0:
+                with suppress(OSError):
+                    _close(scandir_descriptor)
 
     duplicate = os.dup(root.descriptor)
     try:
