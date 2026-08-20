@@ -423,6 +423,17 @@ def _git_identity(repository: str, branch: str, base: str, *, final: bool) -> st
     return head
 
 
+def _attested_origin() -> str:
+    """Return the exact accepted origin spelling for rollout provenance binding."""
+    origin = _git(["remote", "get-url", "origin"])
+    if origin not in {
+        "https://github.com/syamaner/roastpilot-agent.git",
+        "git@github.com:syamaner/roastpilot-agent.git",
+    }:
+        _fail()
+    return origin
+
+
 def _registered_role(root: _Root, role: NativeCodexRole) -> tuple[str, str, str, str]:
     """Parse and attest the complete registered-Codex role closure."""
     try:
@@ -976,7 +987,7 @@ def supervise_native_codex(arguments: Any) -> int:
             "effort": effort,
             "worktree_path": worktree.path,
             "launch_head": launch,
-            "repository_url": "https://github.com/syamaner/roastpilot-agent.git",
+            "repository_url": _attested_origin(),
             "branch": arguments.branch,
         }
         ready = {"type": "READY", "binding_id": str(uuid4())}

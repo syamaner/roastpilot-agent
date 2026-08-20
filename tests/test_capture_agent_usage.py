@@ -143,6 +143,13 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
         NativeCodexUsageRecord.model_validate(
             {**payload, "success": False, "task_status": NativeCodexTaskStatus.SUCCESS}
         )
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate(
+            {
+                **payload,
+                "completed_at": cast(datetime, payload["started_at"]) - timedelta(milliseconds=1),
+            }
+        )
 
 
 def test_native_codex_registration_closure_matches_committed_project_files() -> None:
@@ -1079,6 +1086,28 @@ def test_native_codex_descendant_fails_closed_on_provider_error(
         usage_native_codex._descendant("a" * 40, "b" * 40)  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://github.com/syamaner/roastpilot-agent.git",
+        "git@github.com:syamaner/roastpilot-agent.git",
+    ],
+)
+def test_native_codex_attested_origin_preserves_exact_accepted_form(
+    monkeypatch: pytest.MonkeyPatch, origin: str
+) -> None:
+    """HTTPS and SSH origin spellings bind provenance exactly as attested."""
+    monkeypatch.setattr(usage_native_codex, "_git", lambda _args: origin)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    assert usage_native_codex._attested_origin() == origin  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_attested_origin_rejects_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unaccepted origin cannot become rollout provenance."""
+    monkeypatch.setattr(usage_native_codex, "_git", lambda _args: "https://example.test/other.git")  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._attested_origin()  # pyright: ignore[reportPrivateUsage]
+
+
 def test_native_codex_git_commands_disable_ambient_fsmonitor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1210,6 +1239,11 @@ def test_native_codex_supervisor_usage_root_replacement_appends_nothing(
     monkeypatch.setattr(usage_native_codex.sys, "stdout", frames)
     monkeypatch.setattr(usage_native_codex, "_registered_role", registered_role)
     monkeypatch.setattr(usage_native_codex, "_git_identity", git_identity)
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_attested_origin",
+        lambda: "https://github.com/syamaner/roastpilot-agent.git",
+    )
     monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
     monkeypatch.setattr(usage_native_codex, "_candidate_metadata", metadata)
     monkeypatch.setattr(usage_native_codex, "_parse_rollout", parse)
@@ -2109,6 +2143,11 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
     monkeypatch.setattr(usage_native_codex.sys, "stdout", frames)
     monkeypatch.setattr(usage_native_codex, "_terminal_line", terminal)
     monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_attested_origin",
+        lambda: "https://github.com/syamaner/roastpilot-agent.git",
+    )
 
     def registered_role(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
