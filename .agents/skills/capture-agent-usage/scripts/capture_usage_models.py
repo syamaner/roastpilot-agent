@@ -736,8 +736,6 @@ class NativeCodexUsageRecord(CaptureModel):
                 raise ValueError("successful native Codex record requires a descendant head")
         elif self.task_status is NativeCodexTaskStatus.SUCCESS:
             raise ValueError("failed native Codex record has contradictory task status")
-        if self.completed_at < self.started_at:
-            raise ValueError("native Codex timestamps are contradictory")
         if not all(
             isinstance(value, str)
             and len(value) == 64

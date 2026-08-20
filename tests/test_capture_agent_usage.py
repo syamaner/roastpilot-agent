@@ -431,6 +431,15 @@ def test_native_codex_walk_counts_all_provider_entries(
         monkeypatch.setattr(usage_native_codex, "MAX_PROVIDER_ENTRIES", 2)
         for name in ("one", "two"):
             (tmp_path / name).mkdir()
+
+        def materialized_listdir(_path: object = None) -> NoReturn:
+            pytest.fail("materialized provider traversal")
+
+        monkeypatch.setattr(
+            usage_native_codex.os,
+            "listdir",
+            materialized_listdir,
+        )
         assert usage_native_codex._inventory(root) == set()  # pyright: ignore[reportPrivateUsage]
         (tmp_path / "three").mkdir()
         with pytest.raises(usage_native_codex.NativeCodexCaptureError):
@@ -1086,6 +1095,26 @@ def test_native_codex_git_commands_disable_ambient_fsmonitor(
     assert all(command[:3] == ["git", "-c", "core.fsmonitor=false"] for command in commands)
 
 
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_native_codex_descendant_suppresses_git_trace_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    returncode: int,
+) -> None:
+    """A traced Git descendant check never inherits diagnostic output streams."""
+    monkeypatch.setenv("GIT_TRACE_SETUP", "1")
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        assert kwargs["stdout"] is subprocess.DEVNULL
+        assert kwargs["stderr"] is subprocess.DEVNULL
+        return subprocess.CompletedProcess(command, returncode, stdout=b"path", stderr=b"trace")
+
+    monkeypatch.setattr(usage_native_codex.subprocess, "run", run)
+    assert usage_native_codex._descendant("a" * 40, "b" * 40) is (returncode == 0)  # pyright: ignore[reportPrivateUsage]
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
 def test_native_codex_usage_root_reattest_rejects_replacement(tmp_path: Path) -> None:
     """A renamed/replaced usage root cannot receive a native capture record."""
     usage = tmp_path / "usage"
@@ -1503,6 +1532,10 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     def parse_rollout(
         _fd: int, _binding: dict[str, str]
     ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool]:
+        nonlocal parsed_after_terminal
+        if not parsed_after_terminal:
+            parsed_after_terminal = True
+            time.monotonic()
         if _fd == 98:
             return "child-811", (0, 0, 0, 0, 0, 0), "leaf-811", False
         return "leaf-811", (1, 2, 3, 4, 5, 6), "", True
@@ -1511,6 +1544,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
         member: NativeCodexRole,
     ) -> tuple[str, str, str, str]:
+        time.monotonic()
         return (
             "a" * 64,
             "b" * 64,
@@ -1565,7 +1599,9 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     )
     monkeypatch.setattr(usage_native_codex, "_descendant", lambda _base, _head: True)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "uuid4", lambda: "binding-811")
-    wall = datetime.now(UTC)
+    initial_wall = datetime.now(UTC)
+    wall = initial_wall
+    parsed_after_terminal = False
 
     class FixedDateTime:
         """Wall time stays valid while elapsed time comes only from monotonic time."""
@@ -1574,19 +1610,21 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         def now(_timezone: object) -> datetime:
             return wall
 
-    ticks = iter((10.0, 10.125))
+    ticks = iter((1.0, 100.0, 100.125, 1000.0))
     monkeypatch.setattr(usage_native_codex, "datetime", FixedDateTime)
     monkeypatch.setattr(usage_native_codex.time, "monotonic", lambda: next(ticks))
-    monkeypatch.setattr(
-        usage_native_codex,
-        "_terminal_line",
-        lambda: (
+
+    def terminal_line() -> bytes:
+        nonlocal wall
+        wall = initial_wall - timedelta(days=1)
+        return (
             json.dumps(
                 {"type": "TERMINAL", "binding_id": "binding-811", "task_status": status.value}
             ).encode()
             + b"\n"
-        ),
-    )
+        )
+
+    monkeypatch.setattr(usage_native_codex, "_terminal_line", terminal_line)
     captured: list[NativeCodexUsageRecord] = []
     monkeypatch.setattr(native_cli, "append_record", append)
     monkeypatch.setenv("CODEX_THREAD_ID", "parent-811")
@@ -1609,6 +1647,8 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     assert record.task_status is status
     assert record.success is (status is NativeCodexTaskStatus.SUCCESS)
     assert record.elapsed_ms == 125
+    assert record.started_at == initial_wall
+    assert record.completed_at == initial_wall - timedelta(days=1)
     assert record.subagent_count == (1 if role is NativeCodexRole.REPAIR else 0)
     assert record.whole_tree_verified is (role is not NativeCodexRole.REPAIR)
     assert record.config_sha256 == "a" * 64 and record.role_sha256 == "b" * 64
@@ -1885,14 +1925,18 @@ def test_native_codex_supervisor_real_registered_lifecycle(
 
 
 @pytest.mark.parametrize(
-    ("topology", "order", "expected_children", "expected_whole"),
+    ("topology", "order", "expected_children", "expected_whole", "mismatch"),
     [
-        ("sibling", "before", 0, True),
-        ("sibling", "after", 0, True),
-        ("child", "before", 1, False),
-        ("child", "after", 1, False),
-        ("incomplete-child", "before", 0, False),
-        ("incomplete-child", "after", 0, False),
+        ("sibling", "before", 0, True, None),
+        ("sibling", "after", 0, True, None),
+        ("child", "before", 1, False, None),
+        ("child", "after", 1, False, None),
+        ("incomplete-child", "before", 0, False, None),
+        ("incomplete-child", "after", 0, False, None),
+        ("sibling", "after", 0, False, "cwd"),
+        ("sibling", "after", 0, False, "repository_url"),
+        ("sibling", "after", 0, False, "branch"),
+        ("sibling", "after", 0, False, "commit_hash"),
     ],
 )
 def test_native_codex_supervisor_real_rollout_topology_classification(
@@ -1902,6 +1946,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
     order: str,
     expected_children: int,
     expected_whole: bool,
+    mismatch: str | None,
 ) -> None:
     """Real descriptors classify ordered siblings, children, and incomplete children."""
     worktree = tmp_path / "worktree"
@@ -1947,6 +1992,12 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
             "thread_source": "subagent",
             "timestamp": "opaque",
         }
+        if session == "leaf-811" and mismatch is not None:
+            if mismatch == "cwd":
+                meta["cwd"] = "untrusted"
+            else:
+                git = cast(dict[str, str], meta["git"])
+                git[mismatch] = "untrusted"
         events: list[dict[str, object]] = [{"type": "session_meta", "payload": meta}]
         if complete:
             context: dict[str, object] = {
@@ -2081,6 +2132,14 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         base_sha="a" * 40,
         output=Path(".agent-usage/usage.jsonl"),
     )
+    if mismatch is not None:
+        with pytest.raises(
+            usage_native_codex.NativeCodexCaptureError, match="native Codex capture is invalid"
+        ):
+            usage_native_codex.supervise_native_codex(arguments)
+        assert not (usage / ".agent-usage" / "usage.jsonl").exists()
+        assert [json.loads(frame)["type"] for frame in frames.values] == ["READY"]
+        return
     assert usage_native_codex.supervise_native_codex(arguments) == 0
     record = NativeCodexUsageRecord.model_validate_json(
         (usage / ".agent-usage" / "usage.jsonl").read_text()
