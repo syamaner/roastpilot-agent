@@ -35,7 +35,6 @@ MAX_PROVIDER_LINES = 100_000
 MAX_EVENT_BYTES = 2 * 1024 * 1024
 MAX_JSON_NESTING = 64
 MAX_COMMITTED_FILE_BYTES = 64 * 1024
-_CONFIG_NAME = ".codex/config.toml"
 _ROLE_EXPECTATIONS: dict[NativeCodexRole, tuple[str, str]] = {
     NativeCodexRole.ENGINEER_BE: ("agents/engineer-be.toml", "high"),
     NativeCodexRole.ENGINEER_FE: ("agents/engineer-fe.toml", "high"),
@@ -582,6 +581,8 @@ def _parse_rollout(
                         "agent_role",
                     }:
                         _fail()
+                    if type(spawn["depth"]) is not int:
+                        _fail()
                     parent_thread = _string(spawn["parent_thread_id"])
                     agent_path = _agent_path(spawn["agent_path"])
                     agent_role = _string(spawn["agent_role"])
@@ -828,21 +829,27 @@ def supervise_native_codex(arguments: Any) -> int:
         candidates = _new_rollouts(provider, before)
         matched: list[tuple[int, str, tuple[int, int, int, int, int, int]]] = []
         child_parents: list[str] = []
-        for _name, fd, _stat in candidates:
-            try:
-                session, totals, spawned_from, matches = _parse_rollout(fd, binding)
-                child_parents.append(spawned_from)
-                if matches:
-                    matched.append((fd, session, totals))
-                else:
+        try:
+            for _name, fd, _stat in candidates:
+                try:
+                    session, totals, spawned_from, matches = _parse_rollout(fd, binding)
+                    child_parents.append(spawned_from)
+                    if matches:
+                        matched.append((fd, session, totals))
+                    else:
+                        os.close(fd)
+                except NativeCodexCaptureError:
                     os.close(fd)
-            except NativeCodexCaptureError:
-                os.close(fd)
-                raise
-        if len(matched) != 1:
-            _fail()
-        selected_fd, leaf, totals = matched[0]
-        os.close(selected_fd)
+                    raise
+            if len(matched) != 1:
+                _fail()
+            selected_fd, leaf, totals = matched[0]
+            os.close(selected_fd)
+            matched.clear()
+        finally:
+            for held_fd, _session, _totals in matched:
+                with suppress(OSError):
+                    os.close(held_fd)
         # Every new rollout was fully parsed; a spawned child is therefore visible.
         subagent_count = sum(parent_id == leaf for parent_id in child_parents)
         whole = subagent_count == 0
