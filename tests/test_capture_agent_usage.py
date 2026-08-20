@@ -329,11 +329,11 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(
                     "model_context_window": 1,
                     "total_token_usage": {
                         "input_tokens": total,
-                        "cached_input_tokens": 2,
+                        "cached_input_tokens": min(total, 2),
                         "cache_write_input_tokens": 3,
                         "output_tokens": 4,
-                        "reasoning_output_tokens": 5,
-                        "total_tokens": total + 14,
+                        "reasoning_output_tokens": 4,
+                        "total_tokens": total + 4,
                     },
                 },
             },
@@ -421,7 +421,55 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(
         )
     assert session == "leaf-811"
     assert matches is expected_match
-    assert totals == (9, 2, 3, 4, 5, 23)
+    assert totals == (9, 2, 3, 4, 4, 13)
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {
+            "input_tokens": 9,
+            "cached_input_tokens": 1,
+            "cache_write_input_tokens": 3,
+            "output_tokens": 4,
+            "reasoning_output_tokens": 5,
+            "total_tokens": 13,
+        },
+        {
+            "input_tokens": 9,
+            "cached_input_tokens": 10,
+            "cache_write_input_tokens": 3,
+            "output_tokens": 4,
+            "reasoning_output_tokens": 3,
+            "total_tokens": 13,
+        },
+        {
+            "input_tokens": 9,
+            "cached_input_tokens": 2,
+            "cache_write_input_tokens": 3,
+            "output_tokens": 4,
+            "reasoning_output_tokens": 5,
+            "total_tokens": 14,
+        },
+    ],
+)
+def test_native_codex_rejects_contradictory_provider_token_totals(usage: dict[str, int]) -> None:
+    """0.147 totals retain only the provider's non-overlapping token aggregate."""
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._totals(usage)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_accepts_provider_token_total_boundaries() -> None:
+    """Cached input and reasoning may equal their containing input/output categories."""
+    usage = {
+        "input_tokens": 9,
+        "cached_input_tokens": 9,
+        "cache_write_input_tokens": 3,
+        "output_tokens": 4,
+        "reasoning_output_tokens": 4,
+        "total_tokens": 13,
+    }
+    assert usage_native_codex._totals(usage) == (9, 9, 3, 4, 4, 13)  # pyright: ignore[reportPrivateUsage]
 
 
 def test_native_codex_inventory_does_not_read_or_size_existing_rollouts(tmp_path: Path) -> None:
@@ -1369,8 +1417,12 @@ def test_native_codex_supervisor_usage_root_replacement_appends_nothing(
         del final
         return "a" * 40
 
-    def inventory(_root: usage_native_codex._Root) -> dict[str, tuple[int, int]]:  # pyright: ignore[reportPrivateUsage]
-        return {}
+    inventory_calls = 0
+
+    def inventory(_root: usage_native_codex._Root) -> set[tuple[int, int]]:  # pyright: ignore[reportPrivateUsage]
+        nonlocal inventory_calls
+        inventory_calls += 1
+        return set() if inventory_calls == 1 else {(0, 0)}
 
     def metadata(_fd: int, _binding: dict[str, str]) -> usage_native_codex._CandidateMetadata:  # pyright: ignore[reportPrivateUsage]
         return usage_native_codex._CandidateMetadata(True, None)  # pyright: ignore[reportPrivateUsage]
@@ -1705,12 +1757,16 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     def reject_overlap(*_roots: usage_native_codex._Root) -> None:  # pyright: ignore[reportPrivateUsage]
         return None
 
-    def inventory(_root: usage_native_codex._Root) -> dict[str, tuple[int, int]]:  # pyright: ignore[reportPrivateUsage]
-        return {}
+    inventory_calls = 0
+
+    def inventory(_root: usage_native_codex._Root) -> set[tuple[int, int]]:  # pyright: ignore[reportPrivateUsage]
+        nonlocal inventory_calls
+        inventory_calls += 1
+        return set() if inventory_calls == 1 else {(0, 0)}
 
     def new_rollouts(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
-        _before: dict[str, tuple[int, int]],  # pyright: ignore[reportPrivateUsage]
+        _before: set[tuple[int, int]],
     ) -> list[tuple[str, int, os.stat_result]]:
         entries = [("leaf.jsonl", 99, os.stat_result((0,) * 10))]
         if role is NativeCodexRole.REPAIR:
@@ -1984,11 +2040,11 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         }
         total_usage = {
             "input_tokens": 1,
-            "cached_input_tokens": 2,
+            "cached_input_tokens": 1,
             "cache_write_input_tokens": 3,
             "output_tokens": 4,
-            "reasoning_output_tokens": 5,
-            "total_tokens": 15,
+            "reasoning_output_tokens": 4,
+            "total_tokens": 5,
         }
         events: list[dict[str, object]] = [
             meta,
@@ -2140,6 +2196,9 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         ("incomplete-child", "after", 0, False, None),
         ("malformed-sibling", "before", 0, False, None),
         ("malformed-sibling", "after", 0, False, None),
+        ("race-child", "after", 0, False, None),
+        ("race-sibling", "after", 0, False, None),
+        ("race-replacement", "after", 0, False, None),
         ("sibling", "after", 0, False, "cwd"),
         ("sibling", "after", 0, False, "context_cwd"),
         ("sibling", "after", 0, False, "repository_url"),
@@ -2302,7 +2361,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
             write_rollout(provider / "other.jsonl", "other-811", "other-parent", 1, complete=True)
         elif topology == "malformed-sibling":
             (provider / "other.jsonl").write_text('{"malformed":"candidate"}\n')
-        else:
+        elif topology not in {"race-child", "race-sibling", "race-replacement"}:
             write_rollout(
                 provider / "other.jsonl", "child-811", "leaf-811", 2, complete=topology == "child"
             )
@@ -2329,6 +2388,29 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         "_attested_origin",
         lambda: "https://github.com/syamaner/roastpilot-agent.git",
     )
+    original_inventory = usage_native_codex._inventory  # pyright: ignore[reportPrivateUsage]
+    inventory_calls = 0
+
+    def inventory(root: usage_native_codex._Root) -> set[tuple[int, int]]:  # pyright: ignore[reportPrivateUsage]
+        nonlocal inventory_calls
+        inventory_calls += 1
+        if inventory_calls == 2:
+            if topology == "race-child":
+                write_rollout(
+                    provider / "late-child.jsonl", "child-811", "leaf-811", 2, complete=True
+                )
+            elif topology == "race-sibling":
+                write_rollout(
+                    provider / "late-sibling.jsonl", "other-811", "other-parent", 1, complete=True
+                )
+            elif topology == "race-replacement":
+                os.unlink(provider / "leaf.jsonl")
+                write_rollout(
+                    provider / "leaf.jsonl", "replacement-811", "parent-811", 1, complete=True
+                )
+        return original_inventory(root)
+
+    monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
 
     def registered_role(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]

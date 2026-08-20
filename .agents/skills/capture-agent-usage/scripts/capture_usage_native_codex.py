@@ -585,6 +585,13 @@ def _totals(value: Any) -> tuple[int, int, int, int, int, int]:
     result = tuple(value[key] for key in keys)
     if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in result):
         _fail()
+    input_tokens, cached_input, _cache_write, output_tokens, reasoning_output, total = result
+    if (
+        cached_input > input_tokens
+        or reasoning_output > output_tokens
+        or total != input_tokens + output_tokens
+    ):
+        _fail()
     return result  # type: ignore[return-value]
 
 
@@ -1107,6 +1114,14 @@ def supervise_native_codex(arguments: Any) -> int:
             for held_fd, _stat, _metadata in classified:
                 with suppress(OSError):
                     os.close(held_fd)
+        _assert_root(provider)
+        closing = _inventory(provider)
+        scanned = {(status.st_dev, status.st_ino) for _fd, status, _metadata in classified}
+        # The closing descriptor-relative inventory must be exactly the post-READY
+        # rollout set that was scanned.  Any late creation, unlink, or replacement
+        # leaves topology incomplete rather than overclaiming whole-tree proof.
+        if closing - before != scanned:
+            fully_scanned = False
         whole = fully_scanned and subagent_count == 0
         final = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=True
