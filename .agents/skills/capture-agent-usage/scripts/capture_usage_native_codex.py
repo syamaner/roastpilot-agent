@@ -732,6 +732,42 @@ def _candidate_binding(fd: int, binding: dict[str, str]) -> bool | None:
         return True
 
 
+@dataclass(frozen=True)
+class _CandidateMetadata:
+    """Bounded first-row classification retained while selecting a leaf."""
+
+    bound_leaf: bool | None
+    parent_thread_id: str | None
+
+
+def _candidate_metadata(fd: int, binding: dict[str, str]) -> _CandidateMetadata:
+    """Read only first-row identity needed for the closed two-pass selection."""
+    bound_leaf = _candidate_binding(fd, binding)
+    try:
+        with os.fdopen(os.dup(fd), "rb") as stream:
+            raw = stream.readline(MAX_EVENT_BYTES + 1)
+        os.lseek(fd, 0, os.SEEK_SET)
+        if len(raw) > MAX_EVENT_BYTES or not raw.endswith(b"\n"):
+            return _CandidateMetadata(bound_leaf, None)
+        event = _json(raw)
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            return _CandidateMetadata(bound_leaf, None)
+        source = payload.get("source")
+        if not isinstance(source, dict):
+            return _CandidateMetadata(bound_leaf, None)
+        subagent = source.get("subagent")
+        if not isinstance(subagent, dict):
+            return _CandidateMetadata(bound_leaf, None)
+        spawn = subagent.get("thread_spawn")
+        if not isinstance(spawn, dict):
+            return _CandidateMetadata(bound_leaf, None)
+        parent = spawn.get("parent_thread_id")
+        return _CandidateMetadata(bound_leaf, parent if _safe_identifier(parent) else None)
+    except (NativeCodexCaptureError, OSError):
+        return _CandidateMetadata(bound_leaf, None)
+
+
 def _new_rollouts(
     root: _Root, before: dict[str, tuple[int, int]]
 ) -> list[tuple[str, int, os.stat_result]]:
@@ -891,22 +927,18 @@ def supervise_native_codex(arguments: Any) -> int:
         status = NativeCodexTaskStatus(terminal["task_status"])
         _assert_root(provider)
         candidates = _new_rollouts(provider, before)
+        classified: list[tuple[int, os.stat_result, _CandidateMetadata]] = []
         matched: list[tuple[int, str, tuple[int, int, int, int, int, int]]] = []
-        child_parents: list[str] = []
         observed_total = 0
         fully_scanned = True
         try:
             for _name, fd, _stat in candidates:
                 try:
-                    candidate = _candidate_binding(fd, binding)
-                    if candidate is None:
-                        fully_scanned = False
-                        os.close(fd)
+                    metadata = _candidate_metadata(fd, binding)
+                    classified.append((fd, _stat, metadata))
+                    if metadata.bound_leaf is not True:
                         continue
-                    if candidate is False:
-                        os.close(fd)
-                        continue
-                    session, totals, spawned_from, matches = _parse_rollout(fd, binding)
+                    session, totals, _spawned_from, matches = _parse_rollout(fd, binding)
                     try:
                         observed_total += os.fstat(fd).st_size
                     except OSError:
@@ -914,25 +946,34 @@ def supervise_native_codex(arguments: Any) -> int:
                         observed_total += _stat.st_size
                     if observed_total > MAX_PROVIDER_TOTAL_BYTES:
                         _fail()
-                    child_parents.append(spawned_from)
                     if matches:
                         matched.append((fd, session, totals))
-                    else:
-                        os.close(fd)
                 except NativeCodexCaptureError:
-                    os.close(fd)
                     raise
             if len(matched) != 1:
                 _fail()
             selected_fd, leaf, totals = matched[0]
-            os.close(selected_fd)
-            matched.clear()
+            subagent_count = 0
+            for fd, _stat, metadata in classified:
+                if fd == selected_fd:
+                    continue
+                if metadata.parent_thread_id != leaf:
+                    if metadata.bound_leaf is None:
+                        fully_scanned = False
+                    continue
+                try:
+                    _session, _child_totals, spawned_from, _matches = _parse_rollout(fd, binding)
+                    if spawned_from != leaf:
+                        _fail()
+                    subagent_count += 1
+                except NativeCodexCaptureError:
+                    # A malformed or incomplete rollout that names the leaf might be a
+                    # child. Capture remains useful, but whole-tree proof is withheld.
+                    fully_scanned = False
         finally:
-            for held_fd, _session, _totals in matched:
+            for held_fd, _stat, _metadata in classified:
                 with suppress(OSError):
                     os.close(held_fd)
-        # Every new rollout was fully parsed; a spawned child is therefore visible.
-        subagent_count = sum(parent_id == leaf for parent_id in child_parents)
         whole = fully_scanned and subagent_count == 0
         final = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=True

@@ -1248,11 +1248,12 @@ def test_native_codex_supervisor_rejects_codex_home_before_root_access(
 
 
 @pytest.mark.parametrize(
-    ("role", "status"),
+    ("role", "status", "child_first"),
     [
-        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.SUCCESS),
-        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.FAILED),
-        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.SUCCESS, False),
+        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.FAILED, False),
+        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED, False),
+        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED, True),
     ],
 )
 def test_native_codex_supervisor_records_registered_role_terminal_outcome(
@@ -1260,6 +1261,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     monkeypatch: pytest.MonkeyPatch,
     role: NativeCodexRole,
     status: NativeCodexTaskStatus,
+    child_first: bool,
 ) -> None:
     """The supervisor records each registered role without retaining provider content."""
     import capture_usage_cli as native_cli
@@ -1292,6 +1294,8 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         entries = [("leaf.jsonl", 99, os.stat_result((0,) * 10))]
         if role is NativeCodexRole.REPAIR:
             entries.append(("child.jsonl", 98, os.stat_result((0,) * 10)))
+            if child_first:
+                entries.reverse()
         return entries
 
     def parse_rollout(
@@ -1331,6 +1335,19 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         usage_native_codex,
         "_parse_rollout",
         parse_rollout,
+    )
+
+    def candidate_metadata(
+        descriptor: int, _binding: dict[str, str]
+    ) -> usage_native_codex._CandidateMetadata:  # pyright: ignore[reportPrivateUsage]
+        return usage_native_codex._CandidateMetadata(  # pyright: ignore[reportPrivateUsage]
+            descriptor == 99, "leaf-811" if descriptor == 98 else None
+        )
+
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_candidate_metadata",
+        candidate_metadata,
     )
     monkeypatch.setattr(usage_native_codex.os, "close", lambda _fd: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
