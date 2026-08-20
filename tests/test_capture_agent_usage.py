@@ -445,6 +445,46 @@ def test_native_codex_parser_rejects_non_string_root_discriminator(
         usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.parametrize("value", [["token_count"], {"type": "token_count"}])
+def test_native_codex_parser_rejects_non_string_nested_discriminator(
+    tmp_path: Path, value: object
+) -> None:
+    """Nested event discriminators never reach dictionary lookup with non-text values."""
+    rollout = tmp_path / "nested.jsonl"
+    meta = {
+        "base_instructions": "x",
+        "cli_version": "0.147.0",
+        "context_window": 1,
+        "cwd": "x",
+        "git": {"branch": "x", "commit_hash": "x", "repository_url": "x"},
+        "history_mode": "x",
+        "id": "root",
+        "model_provider": "x",
+        "originator": "codex-tui",
+        "session_id": "x",
+        "source": "cli",
+        "thread_source": "user",
+        "timestamp": "x",
+    }
+    rollout.write_text(
+        json.dumps(
+            {"ordinal": 0, "timestamp": "discarded", "type": "session_meta", "payload": meta}
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "ordinal": 1,
+                "timestamp": "discarded",
+                "type": "event_msg",
+                "payload": {"type": value},
+            }
+        )
+        + "\n"
+    )
+    with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+
+
 def test_native_codex_parser_enforces_actual_bytes_after_initial_stat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
