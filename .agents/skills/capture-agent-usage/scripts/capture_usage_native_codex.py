@@ -49,7 +49,7 @@ GIT_TIMEOUT_SECONDS = 5
 MAX_CHECKOUT_ENTRIES = 4096
 MAX_CHECKOUT_DEPTH = 16
 MAX_GIT_ADMIN_FILE_BYTES = 4096
-MAX_GIT_ADMIN_ENTRIES = 4096
+MAX_GIT_ADMIN_ENTRIES = 8192
 MAX_GIT_ADMIN_DEPTH = 16
 _ROLE_EXPECTATIONS: dict[NativeCodexRole, tuple[str, str]] = {
     NativeCodexRole.ENGINEER_BE: ("agents/engineer-be.toml", "high"),
@@ -760,7 +760,6 @@ def _assert_git_administration_tree(root: _Root) -> None:
                     or status.st_uid != os.geteuid()
                     or status.st_nlink != 1
                     or stat.S_IMODE(status.st_mode) & 0o022
-                    or status.st_size > MAX_COMMITTED_FILE_BYTES
                 ):
                     _fail()
                 child = os.open(
@@ -915,13 +914,20 @@ def _assert_checkout_directories(root: _Root) -> None:
                 status = os.stat(entry.name, dir_fd=directory, follow_symlinks=False)
                 relative = f"{prefix}/{entry.name}" if prefix else entry.name
                 if stat.S_ISLNK(status.st_mode):
-                    if not relative.startswith(".venv/"):
+                    if (
+                        status.st_uid != os.geteuid()
+                        or prefix != ".venv/bin"
+                        or not re.fullmatch(r"python(?:3(?:\.\d+)?)?", entry.name)
+                    ):
                         _fail()
                     target = os.readlink(entry.name, dir_fd=directory)
+                    target_name = os.path.basename(target)
                     if (
                         not target
                         or "\x00" in target
-                        or len(target.encode("utf-8")) > MAX_COMMITTED_FILE_BYTES
+                        or len(target.encode("utf-8")) > MAX_GIT_ADMIN_FILE_BYTES
+                        or not re.fullmatch(r"python(?:3(?:\.\d+)?)?", target_name)
+                        or (not os.path.isabs(target) and "/" in target)
                     ):
                         _fail()
                     continue
