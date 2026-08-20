@@ -973,12 +973,16 @@ def _candidate_binding(fd: int, binding: dict[str, str]) -> bool | None:
         )
         if not isinstance(spawn, dict):
             return None
-        return (
-            type(spawn.get("depth")) is int
-            and spawn.get("parent_thread_id") == binding["parent_thread_id"]
+        matches_identity = (
+            spawn.get("parent_thread_id") == binding["parent_thread_id"]
             and spawn.get("agent_path") == binding["agent_path"]
             and spawn.get("agent_role") == binding["role"]
         )
+        if not matches_identity:
+            return False
+        if type(spawn.get("depth")) is int and spawn["depth"] == 1:
+            return True
+        return None
     except NativeCodexCaptureError:
         # A newline-terminated malformed row cannot be proved unrelated from fragments.
         # Retain it as indeterminate so a selected sibling withholds whole-tree proof.
@@ -1102,11 +1106,28 @@ def _reject_root_overlap(*roots: _Root) -> None:
                 _fail()
 
 
+def _assert_worktree_root(root: _Root) -> None:
+    """Require the held assigned worktree to remain owned and non-writable."""
+    try:
+        status = os.fstat(root.descriptor)
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or status.st_uid != os.geteuid()
+            or (status.st_dev, status.st_ino) != (root.device, root.inode)
+            or stat.S_IMODE(status.st_mode) & 0o022
+        ):
+            _fail()
+    except OSError:
+        _fail()
+
+
 def _reattest_worktree_root(root: _Root) -> None:
     """Require the canonical worktree path to still resolve to its held directory."""
     reopened: _Root | None = None
     try:
+        _assert_worktree_root(root)
         reopened = _open_root(root.path, private=False)
+        _assert_worktree_root(reopened)
         if (reopened.device, reopened.inode) != (root.device, root.inode):
             _fail()
     finally:
@@ -1224,6 +1245,7 @@ def supervise_native_codex(arguments: Any) -> int:
         provider = _open_root(os.path.join(codex_home, "sessions"), private=False)
         worktree = _open_root(os.getcwd(), private=False)
         _reject_root_overlap(usage, provider, worktree)
+        _assert_worktree_root(worktree)
         launch = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=False
         )

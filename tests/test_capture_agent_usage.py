@@ -1652,6 +1652,32 @@ def test_native_codex_provider_root_reattest_accepts_stable_and_rejects_replacem
         os.close(held.descriptor)
 
 
+@pytest.mark.parametrize("mode", [0o700, 0o755])
+def test_native_codex_worktree_root_accepts_owned_non_writable_modes(
+    tmp_path: Path, mode: int
+) -> None:
+    """The assigned worktree admits private and standard non-writable directory modes."""
+    os.chmod(tmp_path, mode)
+    held = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        usage_native_codex._assert_worktree_root(held)  # pyright: ignore[reportPrivateUsage]
+        usage_native_codex._reattest_worktree_root(held)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(held.descriptor)
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o777])
+def test_native_codex_worktree_root_rejects_writable_modes(tmp_path: Path, mode: int) -> None:
+    """Group- or world-writable assigned worktrees fail before attribution."""
+    os.chmod(tmp_path, mode)
+    held = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_worktree_root(held)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(held.descriptor)
+
+
 def test_native_codex_supervisor_usage_root_replacement_appends_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2219,6 +2245,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED, "exact"),
         (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "stale"),
         (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "pre_ready_drift"),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "writable_worktree"),
     ],
 )
 def test_native_codex_supervisor_real_registered_lifecycle(
@@ -2469,6 +2496,8 @@ def test_native_codex_supervisor_real_registered_lifecycle(
             return result
 
         monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
+    if instructions == "writable_worktree":
+        os.chmod(repository, 0o770)
     arguments = SimpleNamespace(
         task_id="task-811",
         slice_id="slice-811",
@@ -2481,12 +2510,12 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         base_sha=base,
         output=Path(".agent-usage/usage.jsonl"),
     )
-    if instructions in {"stale", "pre_ready_drift"}:
+    if instructions in {"stale", "pre_ready_drift", "writable_worktree"}:
         with pytest.raises(usage_native_codex.NativeCodexCaptureError):
             usage_native_codex.supervise_native_codex(arguments)
         assert not (usage / ".agent-usage" / "usage.jsonl").exists()
         assert [json.loads(frame)["type"] for frame in captured_stdout.frames] == (
-            [] if instructions == "pre_ready_drift" else ["READY"]
+            [] if instructions in {"pre_ready_drift", "writable_worktree"} else ["READY"]
         )
         assert "SECRET_PROVIDER_PROMPT" not in capsys.readouterr().out
         return
@@ -2528,6 +2557,9 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         ("malformed-sibling", "after", 0, False, None),
         ("malformed-source", "before", 0, False, None),
         ("malformed-source", "after", 0, False, None),
+        ("matching-depth-bool", "after", 0, False, None),
+        ("matching-depth-float", "after", 0, False, None),
+        ("matching-depth-wrong-int", "after", 0, False, None),
         ("race-child", "after", 0, False, None),
         ("race-sibling", "after", 0, False, None),
         ("race-replacement", "after", 0, False, None),
@@ -2540,6 +2572,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         ("sibling", "after", 0, False, "file_system_sandbox_policy"),
         ("sibling", "after", 0, False, "permission_profile"),
         ("sibling", "after", 0, False, "worktree_replacement"),
+        ("sibling", "after", 0, False, "worktree_mode_drift"),
         ("sibling", "after", 0, False, "provider_replacement"),
         ("sibling", "after", 0, False, "repository_url"),
         ("sibling", "after", 0, False, "branch"),
@@ -2571,7 +2604,9 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         (Path(".codex") / "agents" / "engineer-be.toml").read_text()
     )["developer_instructions"]
 
-    def write_rollout(path: Path, session: str, parent: str, depth: int, *, complete: bool) -> None:
+    def write_rollout(
+        path: Path, session: str, parent: str, depth: object, *, complete: bool
+    ) -> None:
         meta: dict[str, object] = {
             "id": session,
             "agent_nickname": "worker",
@@ -2618,6 +2653,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                 "file_system_sandbox_policy",
                 "permission_profile",
                 "worktree_replacement",
+                "worktree_mode_drift",
                 "provider_replacement",
             }:
                 git = cast(dict[str, str], meta["git"])
@@ -2742,6 +2778,13 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                 )
                 + "\n"
             )
+        elif topology.startswith("matching-depth-"):
+            depth: object = {
+                "matching-depth-bool": True,
+                "matching-depth-float": 1.0,
+                "matching-depth-wrong-int": 2,
+            }[topology]
+            write_rollout(provider / "other.jsonl", "other-811", "parent-811", depth, complete=True)
         elif topology not in {"race-child", "race-sibling", "race-replacement"}:
             write_rollout(
                 provider / "other.jsonl", "child-811", "leaf-811", 2, complete=topology == "child"
@@ -2795,6 +2838,8 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
             elif mismatch == "worktree_replacement":
                 os.rename(worktree, tmp_path / "old-worktree")
                 os.rename(replacement, worktree)
+            elif mismatch == "worktree_mode_drift":
+                os.chmod(worktree, 0o770)
         return original_inventory(root)
 
     monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
