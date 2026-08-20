@@ -446,6 +446,7 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(
         list[dict[str, object]],
         [
             meta,
+            context,
             {
                 "type": "event_msg",
                 "payload": {
@@ -479,7 +480,6 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(
                 },
             },
             {"type": "world_state", "payload": {"full": False, "state": {}}},
-            context,
             event(1),
             event(9),
             {
@@ -3169,6 +3169,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         }
         events: list[dict[str, object]] = [
             meta,
+            context,
             {
                 "type": "event_msg",
                 "payload": {
@@ -3190,7 +3191,6 @@ def test_native_codex_supervisor_real_registered_lifecycle(
                 },
             },
             {"type": "world_state", "payload": {"full": False, "state": {}}},
-            context,
             {
                 "type": "event_msg",
                 "payload": {
