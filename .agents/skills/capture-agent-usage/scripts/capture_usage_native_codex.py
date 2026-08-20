@@ -996,11 +996,13 @@ def _assert_checkout_directories(root: _Root) -> None:
                         _fail()
                     continue
                 if not stat.S_ISDIR(status.st_mode):
+                    permits_venv_group_write = relative.startswith(".venv/")
                     if (
                         not stat.S_ISREG(status.st_mode)
                         or status.st_uid != os.geteuid()
                         or status.st_nlink != 1
-                        or stat.S_IMODE(status.st_mode) & 0o022
+                        or stat.S_IMODE(status.st_mode) & 0o002
+                        or (not permits_venv_group_write and stat.S_IMODE(status.st_mode) & 0o020)
                     ):
                         _fail()
                     child = os.open(

@@ -1575,7 +1575,34 @@ def test_native_codex_checkout_attestation_accepts_standard_leaf_venv(
     monkeypatch.chdir(repository)
     try:
         usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+        venv_config = repository / ".venv" / "pyvenv.cfg"
+        os.chmod(venv_config, 0o664)
+        usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+        os.chmod(venv_config, 0o666)
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+        os.chmod(venv_config, 0o664)
         os.mkfifo(repository / ".venv" / "unsafe")
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_checkout_attestation_rejects_group_writable_non_venv_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The venv-only group-write exception never widens ordinary checkout files."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    tracked = repository / "tracked.txt"
+    tracked.write_text("tracked\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    os.chmod(tracked, 0o664)
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.chdir(repository)
+    try:
         with pytest.raises(usage_native_codex.NativeCodexCaptureError):
             usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
     finally:
