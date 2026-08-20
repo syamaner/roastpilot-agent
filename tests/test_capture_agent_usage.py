@@ -1582,46 +1582,139 @@ def test_native_codex_checkout_attestation_accepts_standard_leaf_venv(
         os.close(root.descriptor)
 
 
-def test_native_codex_checkout_attestation_accepts_safe_npm_bin_symlink(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A standard top-level npm executable link remains admissible after READY."""
+def _native_codex_npm_bin_repository(
+    tmp_path: Path,
+    *,
+    link_path: str,
+    target: str,
+    target_path: str | None,
+    target_kind: str,
+) -> Path:
+    """Create one real checkout with a synthetic npm executable link."""
     repository = tmp_path / "repository"
     repository.mkdir()
     subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
     (repository / "tracked.txt").write_text("tracked\n")
     subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
-    executable = repository / "web" / "node_modules" / "vite" / "bin" / "vite.js"
-    executable.parent.mkdir(parents=True)
-    executable.write_text("#!/usr/bin/env node\n")
-    bin_directory = repository / "web" / "node_modules" / ".bin"
-    bin_directory.mkdir()
-    (bin_directory / "vite").symlink_to("../vite/bin/vite.js")
-    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
-    monkeypatch.chdir(repository)
-    try:
-        usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
-    finally:
-        os.close(root.descriptor)
+    if target_path is not None:
+        executable = repository / target_path
+        executable.parent.mkdir(parents=True)
+        if target_kind == "symlink":
+            executable.symlink_to("actual.js")
+        elif target_kind == "fifo":
+            os.mkfifo(executable)
+        else:
+            executable.write_text("#!/usr/bin/env node\n")
+            if target_kind == "writable":
+                os.chmod(executable, 0o664)
+    link = repository / link_path
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+    return repository
 
 
-def test_native_codex_checkout_attestation_rejects_escaping_npm_bin_symlink(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("link_path", "target", "target_path", "target_kind", "accepted"),
+    [
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "../semver/bin/semver.js",
+            "web/node_modules/pkg/node_modules/semver/bin/semver.js",
+            "regular",
+            True,
+            id="nested-valid",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "/outside",
+            None,
+            "regular",
+            False,
+            id="absolute-target",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "../missing/bin/semver.js",
+            None,
+            "regular",
+            False,
+            id="missing-target",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "../semver/bin/semver.js",
+            "web/node_modules/pkg/node_modules/semver/bin/semver.js",
+            "symlink",
+            False,
+            id="symlink-target",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "../semver/bin/semver.js",
+            "web/node_modules/pkg/node_modules/semver/bin/semver.js",
+            "writable",
+            False,
+            id="writable-target",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "../semver/bin/semver.js",
+            "web/node_modules/pkg/node_modules/semver/bin/semver.js",
+            "fifo",
+            False,
+            id="fifo-target",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/not-bin-semver",
+            "semver/bin/semver.js",
+            "web/node_modules/pkg/node_modules/semver/bin/semver.js",
+            "regular",
+            False,
+            id="link-outside-bin",
+        ),
+        pytest.param(
+            "node_modules/.bin/semver",
+            "../semver/bin/semver.js",
+            "node_modules/semver/bin/semver.js",
+            "regular",
+            False,
+            id="bin-outside-web-node-modules",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "../../../../../outside",
+            None,
+            "regular",
+            False,
+            id="lexical-escape",
+        ),
+    ],
+)
+def test_native_codex_checkout_attestation_npm_bin_symlink_resolver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    link_path: str,
+    target: str,
+    target_path: str | None,
+    target_kind: str,
+    accepted: bool,
 ) -> None:
-    """An npm executable link whose lexical target escapes node_modules fails closed."""
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
-    (repository / "tracked.txt").write_text("tracked\n")
-    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
-    bin_directory = repository / "web" / "node_modules" / ".bin"
-    bin_directory.mkdir(parents=True)
-    (bin_directory / "vite").symlink_to("../../../../outside")
+    """Only descriptor-safe npm executable links within web node_modules are admissible."""
+    repository = _native_codex_npm_bin_repository(
+        tmp_path,
+        link_path=link_path,
+        target=target,
+        target_path=target_path,
+        target_kind=target_kind,
+    )
     root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
     monkeypatch.chdir(repository)
     try:
-        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        if accepted:
             usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+        else:
+            with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+                usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
     finally:
         os.close(root.descriptor)
 
