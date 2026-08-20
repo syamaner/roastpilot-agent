@@ -1609,34 +1609,6 @@ def test_native_codex_checkout_attestation_rejects_group_writable_non_venv_file(
         os.close(root.descriptor)
 
 
-def test_native_codex_checkout_attestation_allows_only_venv_interpreter_hardlinks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Only standard .venv/bin interpreter filenames may retain an owner hardlink."""
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
-    (repository / "tracked.txt").write_text("tracked\n")
-    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
-    venv.EnvBuilder(with_pip=False).create(repository / ".venv")
-    source = tmp_path / "python-source"
-    source.write_text("python\n")
-    interpreter = repository / ".venv" / "bin" / "python3.11"
-    interpreter.unlink(missing_ok=True)
-    os.link(source, interpreter)
-    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
-    monkeypatch.chdir(repository)
-    try:
-        usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
-        config = repository / ".venv" / "pyvenv.cfg"
-        config.unlink()
-        os.link(source, config)
-        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
-    finally:
-        os.close(root.descriptor)
-
-
 def test_native_codex_checkout_attestation_rejects_unsafe_non_venv_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -997,14 +997,10 @@ def _assert_checkout_directories(root: _Root) -> None:
                     continue
                 if not stat.S_ISDIR(status.st_mode):
                     permits_venv_group_write = relative.startswith(".venv/")
-                    permits_venv_interpreter_hardlink = (
-                        prefix == ".venv/bin"
-                        and re.fullmatch(r"python(?:3(?:\.\d+)?)?", entry.name) is not None
-                    )
                     if (
                         not stat.S_ISREG(status.st_mode)
                         or status.st_uid != os.geteuid()
-                        or (not permits_venv_interpreter_hardlink and status.st_nlink != 1)
+                        or status.st_nlink != 1
                         or stat.S_IMODE(status.st_mode) & 0o002
                         or (not permits_venv_group_write and stat.S_IMODE(status.st_mode) & 0o020)
                     ):
