@@ -98,6 +98,63 @@ from capture_usage_models import (
 from pydantic import TypeAdapter, ValidationError
 
 _REAL_VALIDATE_WORKTREE_METADATA = usage_cli._validate_worktree_metadata  # pyright: ignore[reportPrivateUsage]
+
+
+def _native_leaf_boundary(worktree: Path, effort: str) -> dict[str, object]:
+    """Build the closed 0.147 managed authority shape for real native rollouts."""
+    path = str(worktree)
+    filesystem: dict[str, object] = {
+        "kind": "restricted",
+        "entries": [
+            {"path": {"type": "special", "value": {"kind": "root"}}, "access": "read"},
+            {"path": {"type": "path", "path": path}, "access": "write"},
+            {"path": {"type": "special", "value": {"kind": "slash_tmp"}}, "access": "write"},
+            {"path": {"type": "special", "value": {"kind": "tmpdir"}}, "access": "write"},
+            {
+                "path": {"type": "path", "path": str(worktree / ".git")},
+                "access": "read",
+                "missing_path_behavior": "skip",
+            },
+            {
+                "path": {"type": "path", "path": str(worktree / ".agents")},
+                "access": "read",
+                "missing_path_behavior": "skip",
+            },
+            {
+                "path": {"type": "path", "path": str(worktree / ".codex")},
+                "access": "read",
+                "missing_path_behavior": "skip",
+            },
+        ],
+    }
+    return {
+        "workspace_roots": [path],
+        "sandbox_policy": {
+            "type": "workspace-write",
+            "network_access": False,
+            "exclude_tmpdir_env_var": False,
+            "exclude_slash_tmp": False,
+        },
+        "file_system_sandbox_policy": filesystem,
+        "permission_profile": {
+            "type": "managed",
+            "file_system": filesystem,
+            "network": "restricted",
+        },
+        "approval_policy": "on-request",
+        "approvals_reviewer": "auto_review",
+        "realtime_active": False,
+        "collaboration_mode": {
+            "mode": "default",
+            "settings": {
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": effort,
+                "developer_instructions": None,
+            },
+        },
+    }
+
+
 FIXTURES = Path(__file__).parent / "fixtures" / "agent-usage"
 USAGE_RECORD_ADAPTER = cast(TypeAdapter[UsageRecord], _USAGE_RECORD_ADAPTER)
 
@@ -2038,6 +2095,11 @@ def test_native_codex_supervisor_real_registered_lifecycle(
                 "workspace_roots": [],
             },
         }
+        cast(dict[str, object], context["payload"]).update(
+            _native_leaf_boundary(
+                repository, "medium" if role is NativeCodexRole.REPAIR else "high"
+            )
+        )
         total_usage = {
             "input_tokens": 1,
             "cached_input_tokens": 1,
@@ -2196,11 +2258,20 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         ("incomplete-child", "after", 0, False, None),
         ("malformed-sibling", "before", 0, False, None),
         ("malformed-sibling", "after", 0, False, None),
+        ("malformed-source", "before", 0, False, None),
+        ("malformed-source", "after", 0, False, None),
         ("race-child", "after", 0, False, None),
         ("race-sibling", "after", 0, False, None),
         ("race-replacement", "after", 0, False, None),
         ("sibling", "after", 0, False, "cwd"),
         ("sibling", "after", 0, False, "context_cwd"),
+        ("sibling", "after", 0, False, "turn_id"),
+        ("sibling", "after", 0, False, "turn_id_type"),
+        ("sibling", "after", 0, False, "sandbox_policy"),
+        ("sibling", "after", 0, False, "workspace_roots"),
+        ("sibling", "after", 0, False, "file_system_sandbox_policy"),
+        ("sibling", "after", 0, False, "permission_profile"),
+        ("sibling", "after", 0, False, "worktree_replacement"),
         ("sibling", "after", 0, False, "repository_url"),
         ("sibling", "after", 0, False, "branch"),
         ("sibling", "after", 0, False, "commit_hash"),
@@ -2220,6 +2291,8 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
     provider = tmp_path / "codex" / "sessions"
     usage = tmp_path / "usage"
     worktree.mkdir()
+    replacement = tmp_path / "replacement-worktree"
+    replacement.mkdir()
     provider.mkdir(parents=True)
     usage.mkdir(mode=0o700)
     os.chmod(usage, 0o700)
@@ -2265,7 +2338,16 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         if session == "leaf-811" and mismatch is not None:
             if mismatch == "cwd":
                 meta["cwd"] = "untrusted"
-            elif mismatch != "context_cwd":
+            elif mismatch not in {
+                "context_cwd",
+                "turn_id",
+                "turn_id_type",
+                "sandbox_policy",
+                "workspace_roots",
+                "file_system_sandbox_policy",
+                "permission_profile",
+                "worktree_replacement",
+            }:
                 git = cast(dict[str, str], meta["git"])
                 git[mismatch] = "untrusted"
         events: list[dict[str, object]] = [{"type": "session_meta", "payload": meta}]
@@ -2283,8 +2365,17 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                     "workspace_roots": [],
                 }
             )
+            context.update(_native_leaf_boundary(worktree, "high"))
             if session == "leaf-811" and mismatch == "context_cwd":
                 context["cwd"] = "untrusted"
+            if session == "leaf-811" and mismatch == "sandbox_policy":
+                context["sandbox_policy"] = {"type": "dangerously-unrestricted"}
+            if session == "leaf-811" and mismatch == "workspace_roots":
+                context["workspace_roots"] = [str(worktree), "/external"]
+            if session == "leaf-811" and mismatch == "file_system_sandbox_policy":
+                context["file_system_sandbox_policy"] = {"kind": "unrestricted"}
+            if session == "leaf-811" and mismatch == "permission_profile":
+                context["permission_profile"] = {"type": "unmanaged"}
             totals = {
                 key: 0
                 for key in (
@@ -2306,7 +2397,13 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                             "collaboration_mode_kind": "opaque",
                             "model_context_window": 1,
                             "started_at": "opaque",
-                            "turn_id": "opaque",
+                            "turn_id": (
+                                []
+                                if session == "leaf-811" and mismatch == "turn_id_type"
+                                else "drift"
+                                if session == "leaf-811" and mismatch == "turn_id"
+                                else "opaque"
+                            ),
                         },
                     },
                     {
@@ -2361,6 +2458,18 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
             write_rollout(provider / "other.jsonl", "other-811", "other-parent", 1, complete=True)
         elif topology == "malformed-sibling":
             (provider / "other.jsonl").write_text('{"malformed":"candidate"}\n')
+        elif topology == "malformed-source":
+            (provider / "other.jsonl").write_text(
+                json.dumps(
+                    {
+                        "ordinal": 0,
+                        "timestamp": "opaque",
+                        "type": "session_meta",
+                        "payload": {"parent_thread_id": "leaf-811", "source": []},
+                    }
+                )
+                + "\n"
+            )
         elif topology not in {"race-child", "race-sibling", "race-replacement"}:
             write_rollout(
                 provider / "other.jsonl", "child-811", "leaf-811", 2, complete=topology == "child"
@@ -2408,6 +2517,9 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                 write_rollout(
                     provider / "leaf.jsonl", "replacement-811", "parent-811", 1, complete=True
                 )
+            elif mismatch == "worktree_replacement":
+                os.rename(worktree, tmp_path / "old-worktree")
+                os.rename(replacement, worktree)
         return original_inventory(root)
 
     monkeypatch.setattr(usage_native_codex, "_inventory", inventory)

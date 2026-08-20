@@ -595,6 +595,63 @@ def _totals(value: Any) -> tuple[int, int, int, int, int, int]:
     return result  # type: ignore[return-value]
 
 
+def _leaf_launch_boundary(payload: dict[str, Any], binding: dict[str, str]) -> None:
+    """Validate the exact 0.147.0 managed leaf authority without retaining paths."""
+    worktree = binding.get("worktree_path")
+    if worktree is None:
+        return
+    filesystem = {
+        "kind": "restricted",
+        "entries": [
+            {"path": {"type": "special", "value": {"kind": "root"}}, "access": "read"},
+            {"path": {"type": "path", "path": worktree}, "access": "write"},
+            {"path": {"type": "special", "value": {"kind": "slash_tmp"}}, "access": "write"},
+            {"path": {"type": "special", "value": {"kind": "tmpdir"}}, "access": "write"},
+            {
+                "path": {"type": "path", "path": os.path.join(worktree, ".git")},
+                "access": "read",
+                "missing_path_behavior": "skip",
+            },
+            {
+                "path": {"type": "path", "path": os.path.join(worktree, ".agents")},
+                "access": "read",
+                "missing_path_behavior": "skip",
+            },
+            {
+                "path": {"type": "path", "path": os.path.join(worktree, ".codex")},
+                "access": "read",
+                "missing_path_behavior": "skip",
+            },
+        ],
+    }
+    if (
+        payload.get("workspace_roots") != [worktree]
+        or payload.get("sandbox_policy")
+        != {
+            "type": "workspace-write",
+            "network_access": False,
+            "exclude_tmpdir_env_var": False,
+            "exclude_slash_tmp": False,
+        }
+        or payload.get("file_system_sandbox_policy") != filesystem
+        or payload.get("permission_profile")
+        != {"type": "managed", "file_system": filesystem, "network": "restricted"}
+        or payload.get("approval_policy") != "on-request"
+        or payload.get("approvals_reviewer") != "auto_review"
+        or payload.get("realtime_active") is not False
+        or payload.get("collaboration_mode")
+        != {
+            "mode": "default",
+            "settings": {
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": binding["effort"],
+                "developer_instructions": None,
+            },
+        }
+    ):
+        _fail()
+
+
 def _parse_rollout(
     fd: int, binding: dict[str, str]
 ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool]:
@@ -605,6 +662,7 @@ def _parse_rollout(
     matches = False
     is_subagent = False
     totals: tuple[int, int, int, int, int, int] | None = None
+    turn_id: str | None = None
     with os.fdopen(os.dup(fd), "rb") as stream:
         number = 0
         read_bytes = 0
@@ -732,6 +790,12 @@ def _parse_rollout(
                     )
                 ):
                     _fail()
+                context_turn_id = _string(payload["turn_id"])
+                if turn_id is not None and turn_id != context_turn_id:
+                    _fail()
+                turn_id = context_turn_id
+                if is_subagent:
+                    _leaf_launch_boundary(payload, binding)
                 seen_context = True
             elif kind == "event_msg":
                 if (
@@ -755,13 +819,30 @@ def _parse_rollout(
                         _fail()
                     totals = current
                 elif payload["type"] == "task_started":
-                    if seen_started or seen_complete:
+                    event_turn_id = _string(payload["turn_id"])
+                    if (
+                        seen_started
+                        or seen_complete
+                        or (turn_id is not None and turn_id != event_turn_id)
+                    ):
                         _fail()
+                    turn_id = event_turn_id
                     seen_started = True
                 elif payload["type"] == "task_complete":
-                    if not seen_started or seen_complete:
+                    event_turn_id = _string(payload["turn_id"])
+                    if (
+                        not seen_started
+                        or seen_complete
+                        or (turn_id is not None and turn_id != event_turn_id)
+                    ):
                         _fail()
+                    turn_id = event_turn_id
                     seen_complete = True
+                elif payload["type"] == "item_completed":
+                    event_turn_id = _string(payload["turn_id"])
+                    if turn_id is not None and turn_id != event_turn_id:
+                        _fail()
+                    turn_id = event_turn_id
             elif kind == "response_item":
                 subtype = payload.get("type")
                 if (
@@ -799,14 +880,14 @@ def _candidate_binding(fd: int, binding: dict[str, str]) -> bool | None:
         payload = event["payload"]
         source = payload.get("source")
         if not isinstance(source, dict):
-            return False
+            return None
         spawn = (
             source.get("subagent", {}).get("thread_spawn")
             if isinstance(source.get("subagent"), dict)
             else None
         )
         if not isinstance(spawn, dict):
-            return False
+            return None
         return (
             type(spawn.get("depth")) is int
             and spawn.get("parent_thread_id") == binding["parent_thread_id"]
@@ -843,17 +924,21 @@ def _candidate_metadata(fd: int, binding: dict[str, str]) -> _CandidateMetadata:
         payload = event.get("payload")
         if not isinstance(payload, dict):
             return _CandidateMetadata(bound_leaf, None)
+        top_parent = payload.get("parent_thread_id")
+        retained_parent = top_parent if _safe_identifier(top_parent) else None
         source = payload.get("source")
         if not isinstance(source, dict):
-            return _CandidateMetadata(bound_leaf, None)
+            return _CandidateMetadata(None, retained_parent)
         subagent = source.get("subagent")
         if not isinstance(subagent, dict):
-            return _CandidateMetadata(bound_leaf, None)
+            return _CandidateMetadata(None, retained_parent)
         spawn = subagent.get("thread_spawn")
         if not isinstance(spawn, dict):
-            return _CandidateMetadata(bound_leaf, None)
+            return _CandidateMetadata(None, retained_parent)
         parent = spawn.get("parent_thread_id")
-        return _CandidateMetadata(bound_leaf, parent if _safe_identifier(parent) else None)
+        return _CandidateMetadata(
+            bound_leaf, parent if _safe_identifier(parent) else retained_parent
+        )
     except (NativeCodexCaptureError, OSError):
         return _CandidateMetadata(bound_leaf, None)
 
@@ -928,6 +1013,19 @@ def _reject_root_overlap(*roots: _Root) -> None:
         for other_index in range(index + 1, len(identities)):
             if identity in ancestors[other_index] or identities[other_index] in ancestors[index]:
                 _fail()
+
+
+def _reattest_worktree_root(root: _Root) -> None:
+    """Require the canonical worktree path to still resolve to its held directory."""
+    reopened: _Root | None = None
+    try:
+        reopened = _open_root(root.path, private=False)
+        if (reopened.device, reopened.inode) != (root.device, root.inode):
+            _fail()
+    finally:
+        if reopened is not None:
+            with suppress(OSError):
+                os.close(reopened.descriptor)
 
 
 def _terminal_line() -> bytes:
@@ -1123,6 +1221,7 @@ def supervise_native_codex(arguments: Any) -> int:
         if closing - before != scanned:
             fully_scanned = False
         whole = fully_scanned and subagent_count == 0
+        _reattest_worktree_root(worktree)
         final = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=True
         )
