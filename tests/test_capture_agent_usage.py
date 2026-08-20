@@ -1648,7 +1648,8 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     assert record.success is (status is NativeCodexTaskStatus.SUCCESS)
     assert record.elapsed_ms == 125
     assert record.started_at == initial_wall
-    assert record.completed_at == initial_wall - timedelta(days=1)
+    assert record.completed_at == initial_wall + timedelta(milliseconds=125)
+    assert record.completed_at - record.started_at == timedelta(milliseconds=125)
     assert record.subagent_count == (1 if role is NativeCodexRole.REPAIR else 0)
     assert record.whole_tree_verified is (role is not NativeCodexRole.REPAIR)
     assert record.config_sha256 == "a" * 64 and record.role_sha256 == "b" * 64

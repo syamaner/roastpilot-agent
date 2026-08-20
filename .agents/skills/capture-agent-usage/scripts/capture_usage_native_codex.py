@@ -20,7 +20,7 @@ import tomllib
 from collections.abc import Iterator
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -993,8 +993,10 @@ def supervise_native_codex(arguments: Any) -> int:
         ):
             _fail()
         status = NativeCodexTaskStatus(terminal["task_status"])
-        completed = datetime.now(UTC)
         elapsed_ms = max(0, int((time.monotonic() - started_monotonic) * 1000))
+        # Wall time may regress while the parent waits; retain a coherent audit
+        # interval derived solely from the READY-to-terminal monotonic duration.
+        completed = started + timedelta(milliseconds=elapsed_ms)
         _assert_root(provider)
         candidates = _new_rollouts(provider, before)
         classified: list[tuple[int, os.stat_result, _CandidateMetadata]] = []
