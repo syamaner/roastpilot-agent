@@ -21,6 +21,17 @@ NATIVE_WORKER_USAGE_SCHEMA_VERSION = 3
 NATIVE_CODEX_USAGE_SCHEMA_VERSION = 1
 """Parent-to-registered-Codex-leaf record schema version."""
 
+NATIVE_CODEX_REPOSITORY = "syamaner/roastpilot-agent"
+"""The sole repository admitted by the persisted native Codex schema."""
+
+NATIVE_CODEX_ACCEPTED_ORIGINS = frozenset(
+    {
+        f"https://github.com/{NATIVE_CODEX_REPOSITORY}.git",
+        f"git@github.com:{NATIVE_CODEX_REPOSITORY}.git",
+    }
+)
+"""Exact accepted Git origin spellings for native Codex provenance."""
+
 NATIVE_CODEX_CONFIG_SHA256 = "11ceba3a199d28682671dbcb548f6c1c0c63817df9b34c931c685a85f1aa5395"
 """SHA-256 of the complete committed registered-Codex configuration."""
 
@@ -755,6 +766,8 @@ class NativeCodexUsageRecord(CaptureModel):
         }[self.native_role]
         if self.effort != expected_effort:
             raise ValueError("native Codex role effort is contradictory")
+        if self.repository != NATIVE_CODEX_REPOSITORY:
+            raise ValueError("native Codex repository is contradictory")
         if (
             any(
                 not re.fullmatch(r"[0-9a-f]{40}", value)

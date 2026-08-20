@@ -68,6 +68,7 @@ from capture_usage_models import (
     MAX_EVENT_COUNT,
     MAX_STREAM_BYTES,
     NATIVE_CODEX_CONFIG_SHA256,
+    NATIVE_CODEX_REPOSITORY,
     NATIVE_CODEX_ROLE_SHA256,
     NATIVE_ROLE_EXCLUSIONS,
     PLAN_ROOT_ENVIRONMENT_KEY,
@@ -213,7 +214,7 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
         "effort": "high",
         "config_sha256": NATIVE_CODEX_CONFIG_SHA256,
         "role_sha256": NATIVE_CODEX_ROLE_SHA256[NativeCodexRole.ENGINEER_BE],
-        "repository": "syamaner/roastpilot-agent",
+        "repository": NATIVE_CODEX_REPOSITORY,
         "branch": "feature/811-native-codex-capture",
         "base_sha": "a" * 40,
         "launch_head_sha": "a" * 40,
@@ -258,9 +259,12 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
     for field, value in (
         ("config_sha256", "0" * 64),
         ("role_sha256", "0" * 64),
+        ("repository", "syamaner/roastpilot-plan"),
     ):
         with pytest.raises(ValidationError):
             NativeCodexUsageRecord.model_validate({**payload, field: value})
+        with pytest.raises(ValidationError):
+            USAGE_RECORD_ADAPTER.validate_python({**payload, field: value})
     for field, value in (
         ("cached_input_tokens", 6),
         ("reasoning_output_tokens", 7),
@@ -1732,13 +1736,14 @@ def test_native_codex_checkout_attestation_accepts_standard_leaf_venv(
 
 
 @pytest.mark.parametrize(
-    ("target_kind", "mode", "accepts"),
+    ("target_kind", "mode", "link_name", "version_info", "encoding", "accepts"),
     [
-        ("trusted", 0o755, True),
-        ("other", 0o755, False),
-        ("trusted", 0o775, False),
-        ("trusted", 0o757, False),
-        ("missing", 0o755, False),
+        ("trusted", 0o755, "python3.11", None, None, True),
+        ("trusted", 0o755, "𝜋thon", (3, 14, 4), "utf-8", True),
+        ("other", 0o755, "python3.11", None, None, False),
+        ("trusted", 0o775, "python3.11", None, None, False),
+        ("trusted", 0o757, "python3.11", None, None, False),
+        ("missing", 0o755, "python3.11", None, None, False),
     ],
 )
 def test_native_codex_checkout_attestation_binds_absolute_venv_interpreter(
@@ -1746,6 +1751,9 @@ def test_native_codex_checkout_attestation_binds_absolute_venv_interpreter(
     monkeypatch: pytest.MonkeyPatch,
     target_kind: str,
     mode: int,
+    link_name: str,
+    version_info: tuple[int, int, int] | None,
+    encoding: str | None,
     accepts: bool,
 ) -> None:
     """Absolute venv interpreter links bind only to the trusted base executable inode."""
@@ -1762,8 +1770,11 @@ def test_native_codex_checkout_attestation_binds_absolute_venv_interpreter(
         "other": str(other),
         "missing": str(tmp_path / "python3.12"),
     }[target_kind]
-    (repository / ".venv" / "bin" / "python3.11").symlink_to(target)
+    (repository / ".venv" / "bin" / link_name).symlink_to(target)
     monkeypatch.setattr(usage_native_codex.sys, "_base_executable", str(trusted), raising=False)
+    if version_info is not None and encoding is not None:
+        monkeypatch.setattr(usage_native_codex.sys, "version_info", version_info)
+        monkeypatch.setattr(usage_native_codex.sys, "getfilesystemencoding", lambda: encoding)
     root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
     try:
         if accepts:
@@ -1771,6 +1782,65 @@ def test_native_codex_checkout_attestation_binds_absolute_venv_interpreter(
         else:
             with pytest.raises(usage_native_codex.NativeCodexCaptureError):
                 usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize(
+    ("link_name", "version_info", "encoding", "accepts"),
+    [
+        ("𝜋thon", (3, 14, 4), "utf-8", True),
+        ("𝜋thon", (3, 11, 14), "utf-8", False),
+        ("𝜋thon", (3, 14, 4), "ascii", False),
+        ("πthon", (3, 14, 4), "utf-8", False),
+        ("𝜋thon3", (3, 14, 4), "utf-8", False),
+        ("python𝜋", (3, 14, 4), "utf-8", False),
+    ],
+)
+def test_native_codex_checkout_attestation_admits_only_exact_unicode_venv_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    link_name: str,
+    version_info: tuple[int, int, int],
+    encoding: str,
+    accepts: bool,
+) -> None:
+    """Only Python 3.14's exact ``𝜋thon`` interpreter alias is admitted."""
+    repository = tmp_path / "repository"
+    interpreter = repository / ".venv" / "bin" / "python3.14"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("#!/bin/sh\n")
+    interpreter.chmod(0o755)
+    (interpreter.parent / link_name).symlink_to("python3.14")
+    monkeypatch.setattr(usage_native_codex.sys, "version_info", version_info)
+    monkeypatch.setattr(usage_native_codex.sys, "getfilesystemencoding", lambda: encoding)
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        if accepts:
+            usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+        else:
+            with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+                usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or sys.version_info[:2] != (3, 14) or sys.getfilesystemencoding() != "utf-8",
+    reason="requires the Python 3.14 POSIX venv layout",
+)
+def test_native_codex_checkout_attestation_accepts_current_python314_venv_alias(
+    tmp_path: Path,
+) -> None:
+    """The current Python 3.14 POSIX venv's emitted ``𝜋thon`` alias remains accepted."""
+    repository = tmp_path / "repository"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(repository / ".venv")
+    alias = repository / ".venv" / "bin" / "𝜋thon"
+    if not alias.is_symlink():
+        pytest.skip("Python 3.14 venv did not emit the UTF-8 interpreter alias")
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
     finally:
         os.close(root.descriptor)
 

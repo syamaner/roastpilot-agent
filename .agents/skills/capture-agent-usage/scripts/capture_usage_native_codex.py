@@ -26,7 +26,9 @@ from typing import Any
 from uuid import uuid4
 
 from capture_usage_models import (
+    NATIVE_CODEX_ACCEPTED_ORIGINS,
     NATIVE_CODEX_CONFIG_SHA256,
+    NATIVE_CODEX_REPOSITORY,
     NATIVE_CODEX_ROLE_INSTRUCTION_SHA256,
     NATIVE_CODEX_ROLE_SHA256,
     NativeCodexRole,
@@ -64,6 +66,7 @@ _ROLE_EXPECTATIONS: dict[NativeCodexRole, tuple[str, str]] = {
     NativeCodexRole.ENGINEER_FE: ("agents/engineer-fe.toml", "high"),
     NativeCodexRole.REPAIR: ("agents/repair.toml", "medium"),
 }
+_ASCII_PYTHON_VENV_LINK_NAME = re.compile(r"python(?:3(?:\.\d+)?)?")
 _ROOT_TYPES = {
     "session_meta",
     "turn_context",
@@ -82,6 +85,17 @@ _RESPONSE_TYPES = {
     "custom_tool_call",
     "custom_tool_call_output",
 }
+
+
+def _python_venv_link_name(name: str) -> bool:
+    """Accept only standard Python interpreter aliases for this runtime's venv layout."""
+    return bool(_ASCII_PYTHON_VENV_LINK_NAME.fullmatch(name)) or (
+        name == "𝜋thon"
+        and sys.version_info[:2] == (3, 14)
+        and sys.getfilesystemencoding() == "utf-8"
+    )
+
+
 _SUBAGENT_SESSION_META_KEYS = {
     "agent_nickname",
     "agent_path",
@@ -577,17 +591,14 @@ def _git(args: list[str]) -> str:
 
 def _git_identity(repository: str, branch: str, base: str, *, final: bool) -> str:
     if (
-        repository != "syamaner/roastpilot-agent"
+        repository != NATIVE_CODEX_REPOSITORY
         or not re.fullmatch(r"[0-9a-f]{40}", base)
         or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", branch)
         or branch.startswith("-")
         or ".." in branch
     ):
         _fail()
-    if _git(["remote", "get-url", "origin"]) not in {
-        "https://github.com/syamaner/roastpilot-agent.git",
-        "git@github.com:syamaner/roastpilot-agent.git",
-    }:
+    if _git(["remote", "get-url", "origin"]) not in NATIVE_CODEX_ACCEPTED_ORIGINS:
         _fail()
     head = _git(["rev-parse", "HEAD"])
     status_args = (
@@ -1064,8 +1075,7 @@ def _assert_checkout_directories(root: _Root) -> None:
                 if stat.S_ISLNK(status.st_mode):
                     linux_lib64 = prefix == ".venv" and entry.name == "lib64"
                     if not linux_lib64 and (
-                        prefix != ".venv/bin"
-                        or not re.fullmatch(r"python(?:3(?:\.\d+)?)?", entry.name)
+                        prefix != ".venv/bin" or not _python_venv_link_name(entry.name)
                     ):
                         _assert_npm_bin_symlink(root, directory, relative, entry.name, status)
                         continue
@@ -1081,7 +1091,7 @@ def _assert_checkout_directories(root: _Root) -> None:
                         or (
                             not linux_lib64
                             and (
-                                not re.fullmatch(r"python(?:3(?:\.\d+)?)?", target_name)
+                                not _python_venv_link_name(target_name)
                                 or (not os.path.isabs(target) and "/" in target)
                             )
                         )
@@ -1166,10 +1176,7 @@ def _assert_checkout_directories(root: _Root) -> None:
 def _attested_origin() -> str:
     """Return the exact accepted origin spelling for rollout provenance binding."""
     origin = _git(["remote", "get-url", "origin"])
-    if origin not in {
-        "https://github.com/syamaner/roastpilot-agent.git",
-        "git@github.com:syamaner/roastpilot-agent.git",
-    }:
+    if origin not in NATIVE_CODEX_ACCEPTED_ORIGINS:
         _fail()
     return origin
 
