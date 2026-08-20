@@ -1570,7 +1570,7 @@ def test_native_codex_checkout_attestation_accepts_standard_leaf_venv(
     subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
     (repository / "tracked.txt").write_text("tracked\n")
     subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
-    venv.EnvBuilder(with_pip=False).create(repository / ".venv")
+    venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(repository / ".venv")
     root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
     monkeypatch.chdir(repository)
     try:
