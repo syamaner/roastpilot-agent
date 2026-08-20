@@ -1241,6 +1241,247 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     assert "SECRET" not in record.model_dump_json()
 
 
+@pytest.mark.parametrize(
+    ("role", "status"),
+    [
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.SUCCESS),
+        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.FAILED),
+        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED),
+    ],
+)
+def test_native_codex_supervisor_real_registered_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    role: NativeCodexRole,
+    status: NativeCodexTaskStatus,
+) -> None:
+    """A real registered-role lifecycle persists only its closed metadata record."""
+    repository = tmp_path / "repository"
+    provider = tmp_path / "provider-sessions"
+    usage = tmp_path / "usage"
+    repository.mkdir()
+    provider.mkdir()
+    usage.mkdir(mode=0o700)
+    os.chmod(usage, 0o700)
+    shutil.copytree(Path(".codex"), repository / ".codex")
+    (repository / "README.md").write_text("native Codex lifecycle fixture\n")
+
+    def git(*arguments: str) -> str:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "-b", "feature/811-native-codex-capture")
+    git("config", "user.email", "capture@example.test")
+    git("config", "user.name", "Native Codex Capture")
+    git("remote", "add", "origin", "https://github.com/syamaner/roastpilot-agent.git")
+    git("add", ".")
+    git("commit", "-m", "fixture base")
+    base = git("rev-parse", "HEAD")
+
+    def rollout() -> None:
+        meta: dict[str, object] = {
+            "type": "session_meta",
+            "payload": {
+                "id": "leaf-811",
+                "agent_nickname": "worker-811",
+                "agent_path": "/root/native-codex-capture",
+                "agent_role": role.value,
+                "base_instructions": "SECRET_PROVIDER_PROMPT",
+                "originator": "codex-tui",
+                "cli_version": "0.147.0",
+                "context_window": 1,
+                "cwd": "/host/provider/path",
+                "history_mode": "discarded",
+                "model_provider": "discarded",
+                "multi_agent_version": "discarded",
+                "parent_thread_id": "parent-811",
+                "session_id": "discarded",
+                "thread_source": "subagent",
+                "timestamp": "discarded",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "parent-811",
+                            "depth": 1,
+                            "agent_path": "/root/native-codex-capture",
+                            "agent_nickname": "worker-811",
+                            "agent_role": role.value,
+                        }
+                    }
+                },
+                "git": {
+                    "commit_hash": base,
+                    "branch": "feature/811-native-codex-capture",
+                    "repository_url": "SECRET_PROVIDER_URL",
+                },
+            },
+        }
+        context: dict[str, object] = {
+            "type": "turn_context",
+            "payload": {
+                "model": "gpt-5.6-terra",
+                "effort": "medium" if role is NativeCodexRole.REPAIR else "high",
+                "approval_policy": "discarded",
+                "approvals_reviewer": "discarded",
+                "collaboration_mode": "discarded",
+                "comp_hash": "discarded",
+                "current_date": "discarded",
+                "cwd": "/host/provider/path",
+                "file_system_sandbox_policy": "discarded",
+                "multi_agent_version": "discarded",
+                "permission_profile": "discarded",
+                "personality": "discarded",
+                "realtime_active": False,
+                "sandbox_policy": "discarded",
+                "summary": "SECRET_PROVIDER_SUMMARY",
+                "timezone": "discarded",
+                "turn_id": "discarded",
+                "workspace_roots": [],
+            },
+        }
+        total_usage = {
+            "input_tokens": 1,
+            "cached_input_tokens": 2,
+            "cache_write_input_tokens": 3,
+            "output_tokens": 4,
+            "reasoning_output_tokens": 5,
+            "total_tokens": 15,
+        }
+        events: list[dict[str, object]] = [
+            meta,
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "collaboration_mode_kind": "discarded",
+                    "model_context_window": 1,
+                    "started_at": "discarded",
+                    "turn_id": "discarded",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "content": "SECRET_PROVIDER_RESPONSE",
+                    "id": "discarded",
+                    "internal_chat_message_metadata_passthrough": {},
+                    "role": "assistant",
+                },
+            },
+            {"type": "world_state", "payload": {"full": False, "state": {}}},
+            context,
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {key: 0 for key in total_usage},
+                        "model_context_window": 1,
+                        "total_token_usage": total_usage,
+                    },
+                    "rate_limits": {},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "completed_at": "discarded",
+                    "duration_ms": 1,
+                    "last_agent_message": "SECRET_PROVIDER_RESPONSE",
+                    "started_at": "discarded",
+                    "time_to_first_token_ms": 1,
+                    "turn_id": "discarded",
+                },
+            },
+        ]
+        (provider / "leaf.jsonl").write_text(
+            "".join(
+                json.dumps({"ordinal": number, "timestamp": "discarded", **event}) + "\n"
+                for number, event in enumerate(events)
+            )
+        )
+
+    class CapturedStdout:
+        """Minimal text stream exposing the READY frame to the terminal hook."""
+
+        def __init__(self) -> None:
+            self.frames: list[str] = []
+
+        def write(self, value: str) -> int:
+            self.frames.append(value)
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    captured_stdout = CapturedStdout()
+
+    def terminal() -> bytes:
+        rollout()
+        if status is NativeCodexTaskStatus.SUCCESS:
+            (repository / "result.txt").write_text("descendant\n")
+            git("add", "result.txt")
+            git("commit", "-m", "fixture result")
+        ready = json.loads(captured_stdout.frames[-1])
+        return (
+            json.dumps(
+                {"type": "TERMINAL", "binding_id": ready["binding_id"], "task_status": status.value}
+            ).encode()
+            + b"\n"
+        )
+
+    def expanduser(_path: str) -> str:
+        return str(provider)
+
+    monkeypatch.chdir(repository)
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent-811")
+    monkeypatch.setattr(usage_native_codex.os.path, "expanduser", expanduser)
+    monkeypatch.setattr(usage_native_codex.sys, "stdout", captured_stdout)
+    monkeypatch.setattr(usage_native_codex, "_terminal_line", terminal)
+    arguments = SimpleNamespace(
+        task_id="task-811",
+        slice_id="slice-811",
+        parent_task_id="parent-task-811",
+        task_name="native-codex-capture",
+        role=role.value,
+        usage_root=str(usage),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/811-native-codex-capture",
+        base_sha=base,
+        output=Path(".agent-usage/usage.jsonl"),
+    )
+    assert usage_native_codex.supervise_native_codex(arguments) == 0
+    assert capsys.readouterr().out == ""
+    frames = [json.loads(frame) for frame in captured_stdout.frames]
+    assert [frame["type"] for frame in frames] == ["READY", "RESULT"]
+    assert frames[1]["success"] is (status is NativeCodexTaskStatus.SUCCESS)
+    serialized = (usage / ".agent-usage" / "usage.jsonl").read_text()
+    record = NativeCodexUsageRecord.model_validate_json(serialized)
+    assert record.native_role is role
+    assert record.task_status is status
+    assert record.success is (status is NativeCodexTaskStatus.SUCCESS)
+    assert record.base_sha == record.launch_head_sha == base
+    assert record.final_head_sha == git("rev-parse", "HEAD")
+    assert (
+        record.config_sha256
+        == hashlib.sha256((repository / ".codex/config.toml").read_bytes()).hexdigest()
+    )
+    role_path = repository / ".codex" / "agents" / f"{role.value}.toml"
+    assert record.role_sha256 == hashlib.sha256(role_path.read_bytes()).hexdigest()
+    assert record.model_dump_json() == serialized.rstrip()
+    for forbidden in ("SECRET_PROVIDER", str(provider), "/host/provider/path"):
+        assert forbidden not in serialized
+
+
 @pytest.mark.parametrize("match_count", [0, 2])
 def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, match_count: int
