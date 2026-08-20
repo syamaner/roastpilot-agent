@@ -368,17 +368,22 @@ def test_native_codex_registered_role_rejects_tampered_authority(
 
 
 @pytest.mark.parametrize(
-    ("depth", "raises", "expected_match"),
+    ("depth", "ordinal_case", "raises", "expected_match"),
     [
-        (1, False, True),
-        (True, True, False),
-        (1.0, True, False),
-        (0, False, False),
-        (2, False, False),
+        (1, "contiguous", False, True),
+        (True, "contiguous", True, False),
+        (1.0, "contiguous", True, False),
+        (0, "contiguous", False, False),
+        (2, "contiguous", False, False),
+        (1, "first-nonzero", True, False),
+        (1, "gap", True, False),
+        (1, "duplicate", True, False),
+        (1, "regression", True, False),
+        (1, "removed-final-token", True, False),
     ],
 )
 def test_native_codex_rollout_uses_final_cumulative_total_once(
-    tmp_path: Path, depth: object, raises: bool, expected_match: bool
+    tmp_path: Path, depth: object, ordinal_case: str, raises: bool, expected_match: bool
 ) -> None:
     """The native rollout parser keeps the final cumulative total instead of summing events."""
     manifest: dict[str, str] = {
@@ -541,11 +546,23 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(
             },
         ],
     )
+    ordinals = list(range(len(events)))
+    if ordinal_case == "first-nonzero":
+        ordinals[0] = 1
+    elif ordinal_case == "gap":
+        ordinals[4] = 5
+    elif ordinal_case == "duplicate":
+        ordinals[4] = 3
+    elif ordinal_case == "regression":
+        ordinals[5] = 3
+    elif ordinal_case == "removed-final-token":
+        events.pop(7)
+        ordinals.pop(7)
     rollout = tmp_path / "leaf.jsonl"
     rollout.write_text(
         "".join(
-            json.dumps({"ordinal": index, "timestamp": "discarded", **item}) + "\n"
-            for index, item in enumerate(events)
+            json.dumps({"ordinal": ordinal, "timestamp": "discarded", **item}) + "\n"
+            for ordinal, item in zip(ordinals, events, strict=True)
         )
     )
     with rollout.open("rb") as stream:

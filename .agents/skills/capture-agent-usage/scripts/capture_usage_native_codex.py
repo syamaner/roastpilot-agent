@@ -1411,6 +1411,7 @@ def _parse_rollout(
         _fail()
     with os.fdopen(os.dup(fd), "rb") as stream:
         number = 0
+        expected_ordinal = 0
         read_bytes = 0
         while True:
             raw = stream.readline(MAX_EVENT_BYTES + 1)
@@ -1433,9 +1434,10 @@ def _parse_rollout(
                 or not isinstance(event["payload"], dict)
                 or isinstance(event["ordinal"], bool)
                 or not isinstance(event["ordinal"], int)
-                or event["ordinal"] < 0
+                or event["ordinal"] != expected_ordinal
             ):
                 _fail()
+            expected_ordinal += 1
             _opaque_text(event["timestamp"])
             kind, payload = event["type"], event["payload"]
             if kind == "session_meta":
