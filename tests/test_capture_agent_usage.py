@@ -2936,6 +2936,11 @@ def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
     monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
         usage_native_codex,
+        "_attested_origin",
+        lambda: "https://github.com/syamaner/roastpilot-agent.git",
+    )
+    monkeypatch.setattr(
+        usage_native_codex,
         "_terminal_line",
         lambda: b'{"type":"TERMINAL","binding_id":"binding","task_status":"FAILED"}\n',
     )
