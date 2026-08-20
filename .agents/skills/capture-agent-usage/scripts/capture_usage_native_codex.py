@@ -1115,6 +1115,20 @@ def _reattest_worktree_root(root: _Root) -> None:
                 os.close(reopened.descriptor)
 
 
+def _reattest_provider_root(root: _Root) -> None:
+    """Require the canonical provider sessions path to retain its held identity."""
+    if not root.path:
+        _fail()
+    reopened: _Root | None = None
+    try:
+        reopened = _open_root(root.path, private=False)
+        _provider_directory(reopened.descriptor, expected=(root.device, root.inode))
+    finally:
+        if reopened is not None:
+            with suppress(OSError):
+                os.close(reopened.descriptor)
+
+
 def _terminal_line() -> bytes:
     """Read exactly one terminal line and require an already-observed EOF."""
     descriptor = sys.stdin.fileno()
@@ -1215,6 +1229,7 @@ def supervise_native_codex(arguments: Any) -> int:
         )
         config_sha, role_sha, effort, canonical = _registered_role(worktree, role)
         before = _inventory(provider)
+        origin = _attested_origin()
         binding = {
             "parent_thread_id": parent,
             "role": canonical,
@@ -1222,10 +1237,16 @@ def supervise_native_codex(arguments: Any) -> int:
             "effort": effort,
             "worktree_path": worktree.path,
             "launch_head": launch,
-            "repository_url": _attested_origin(),
+            "repository_url": origin,
             "branch": arguments.branch,
             "instruction_sha256": _ROLE_INSTRUCTION_SHA256[role],
         }
+        if (
+            _git_identity(arguments.repository, arguments.branch, arguments.base_sha, final=False)
+            != launch
+            or _attested_origin() != origin
+        ):
+            _fail()
         ready = {"type": "READY", "binding_id": str(uuid4())}
         started = datetime.now(UTC)
         started_monotonic = time.monotonic()
@@ -1291,7 +1312,7 @@ def supervise_native_codex(arguments: Any) -> int:
                     # A malformed or incomplete rollout that names the leaf might be a
                     # child. Capture remains useful, but whole-tree proof is withheld.
                     fully_scanned = False
-            _assert_root(provider)
+            _reattest_provider_root(provider)
             closing = _inventory(provider)
             scanned = {_generation(status) for _fd, status, _metadata in classified}
             # The closing descriptor-relative inventory must be exactly the post-READY

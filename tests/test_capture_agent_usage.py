@@ -1631,6 +1631,27 @@ def test_native_codex_usage_root_reattest_rejects_replacement(tmp_path: Path) ->
         os.close(held.descriptor)
 
 
+def test_native_codex_provider_root_reattest_accepts_stable_and_rejects_replacement(
+    tmp_path: Path,
+) -> None:
+    """Closing topology proof remains bound to the canonical held provider root."""
+    provider = tmp_path / "sessions"
+    replacement = tmp_path / "replacement"
+    provider.mkdir()
+    replacement.mkdir()
+    os.chmod(provider, 0o755)
+    os.chmod(replacement, 0o755)
+    held = usage_native_codex._open_root(str(provider), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        usage_native_codex._reattest_provider_root(held)  # pyright: ignore[reportPrivateUsage]
+        os.rename(provider, tmp_path / "old-sessions")
+        os.rename(replacement, provider)
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._reattest_provider_root(held)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(held.descriptor)
+
+
 def test_native_codex_supervisor_usage_root_replacement_appends_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2089,6 +2110,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     monkeypatch.setattr(usage_native_codex, "_assert_root", assert_root)
     monkeypatch.setattr(usage_native_codex, "_reattest_usage_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_reattest_worktree_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_reattest_provider_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", reject_overlap)
     monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
     monkeypatch.setattr(
@@ -2196,6 +2218,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.FAILED, "exact"),
         (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED, "exact"),
         (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "stale"),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "pre_ready_drift"),
     ],
 )
 def test_native_codex_supervisor_real_registered_lifecycle(
@@ -2433,6 +2456,19 @@ def test_native_codex_supervisor_real_registered_lifecycle(
     monkeypatch.setattr(usage_native_codex, "_provider_home", lambda: str(codex_home))
     monkeypatch.setattr(usage_native_codex.sys, "stdout", captured_stdout)
     monkeypatch.setattr(usage_native_codex, "_terminal_line", terminal)
+    if instructions == "pre_ready_drift":
+        original_inventory = usage_native_codex._inventory  # pyright: ignore[reportPrivateUsage]
+        inventory_calls = 0
+
+        def inventory(root: usage_native_codex._Root) -> set[tuple[int, int, int]]:  # pyright: ignore[reportPrivateUsage]
+            nonlocal inventory_calls
+            inventory_calls += 1
+            result = original_inventory(root)
+            if inventory_calls == 1:
+                (repository / "pre-ready-drift.txt").write_text("untracked drift\n")
+            return result
+
+        monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
     arguments = SimpleNamespace(
         task_id="task-811",
         slice_id="slice-811",
@@ -2445,11 +2481,13 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         base_sha=base,
         output=Path(".agent-usage/usage.jsonl"),
     )
-    if instructions == "stale":
+    if instructions in {"stale", "pre_ready_drift"}:
         with pytest.raises(usage_native_codex.NativeCodexCaptureError):
             usage_native_codex.supervise_native_codex(arguments)
         assert not (usage / ".agent-usage" / "usage.jsonl").exists()
-        assert [json.loads(frame)["type"] for frame in captured_stdout.frames] == ["READY"]
+        assert [json.loads(frame)["type"] for frame in captured_stdout.frames] == (
+            [] if instructions == "pre_ready_drift" else ["READY"]
+        )
         assert "SECRET_PROVIDER_PROMPT" not in capsys.readouterr().out
         return
     assert usage_native_codex.supervise_native_codex(arguments) == 0
@@ -2502,6 +2540,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         ("sibling", "after", 0, False, "file_system_sandbox_policy"),
         ("sibling", "after", 0, False, "permission_profile"),
         ("sibling", "after", 0, False, "worktree_replacement"),
+        ("sibling", "after", 0, False, "provider_replacement"),
         ("sibling", "after", 0, False, "repository_url"),
         ("sibling", "after", 0, False, "branch"),
         ("sibling", "after", 0, False, "commit_hash"),
@@ -2524,6 +2563,8 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
     replacement = tmp_path / "replacement-worktree"
     replacement.mkdir()
     provider.mkdir(parents=True)
+    provider_replacement = tmp_path / "replacement-provider"
+    provider_replacement.mkdir()
     usage.mkdir(mode=0o700)
     os.chmod(usage, 0o700)
     exact_instructions = tomllib.loads(
@@ -2577,6 +2618,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                 "file_system_sandbox_policy",
                 "permission_profile",
                 "worktree_replacement",
+                "provider_replacement",
             }:
                 git = cast(dict[str, str], meta["git"])
                 git[mismatch] = "untrusted"
@@ -2704,6 +2746,9 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
             write_rollout(
                 provider / "other.jsonl", "child-811", "leaf-811", 2, complete=topology == "child"
             )
+        if mismatch == "provider_replacement":
+            os.rename(provider, tmp_path / "old-provider")
+            os.rename(provider_replacement, provider)
         if order == "before":
             os.rename(provider / "leaf.jsonl", provider / "z-leaf.jsonl")
             os.rename(provider / "other.jsonl", provider / "a-other.jsonl")
