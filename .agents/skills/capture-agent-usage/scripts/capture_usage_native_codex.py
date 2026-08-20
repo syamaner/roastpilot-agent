@@ -27,6 +27,7 @@ from uuid import uuid4
 from capture_usage_models import NativeCodexRole, NativeCodexTaskStatus, NativeCodexUsageRecord
 
 MAX_PROVIDER_FILES = 4096
+MAX_PROVIDER_ENTRIES = 4096
 MAX_PROVIDER_DEPTH = 8
 MAX_PROVIDER_FILE_BYTES = 8 * 1024 * 1024
 MAX_PROVIDER_TOTAL_BYTES = 128 * 1024 * 1024
@@ -309,44 +310,57 @@ def _assert_root(root: _Root, *, private: bool = False) -> None:
 def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
     """Yield every regular rollout through no-follow directory descriptors."""
 
+    entries_seen = 0
+
     def descend(
         directory: int, prefix: str, depth: int
     ) -> Iterator[tuple[str, int, os.stat_result]]:
+        nonlocal entries_seen
         if depth > MAX_PROVIDER_DEPTH:
             _fail()
         try:
-            names = os.listdir(directory)
+            # scandir owns and closes an fd argument, so retain this traversal fd.
+            iterator = os.scandir(os.dup(directory))
         except OSError:
             _fail()
-        for name in names:
-            if name in {".", ".."} or "/" in name:
-                _fail()
-            try:
-                child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
-            except OSError:
-                _fail()
-            status = os.fstat(child)
-            relative = f"{prefix}/{name}" if prefix else name
-            if stat.S_ISREG(status.st_mode):
-                if (
-                    not name.endswith(".jsonl")
-                    or status.st_uid != os.geteuid()
-                    or status.st_nlink != 1
-                ):
+        try:
+            for entry in iterator:
+                entries_seen += 1
+                if entries_seen > MAX_PROVIDER_ENTRIES:
+                    _fail()
+                name = entry.name
+                if name in {".", ".."} or "/" in name:
+                    _fail()
+                try:
+                    child = os.open(
+                        name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory
+                    )
+                except OSError:
+                    _fail()
+                status = os.fstat(child)
+                relative = f"{prefix}/{name}" if prefix else name
+                if stat.S_ISREG(status.st_mode):
+                    if (
+                        not name.endswith(".jsonl")
+                        or status.st_uid != os.geteuid()
+                        or status.st_nlink != 1
+                    ):
+                        os.close(child)
+                        _fail()
+                    yield relative, child, status
+                    continue
+                try:
+                    if (
+                        not stat.S_ISDIR(status.st_mode)
+                        or status.st_uid != os.geteuid()
+                        or status.st_nlink < 2
+                    ):
+                        _fail()
+                    yield from descend(child, relative, depth + 1)
+                finally:
                     os.close(child)
-                    _fail()
-                yield relative, child, status
-                continue
-            try:
-                if (
-                    not stat.S_ISDIR(status.st_mode)
-                    or status.st_uid != os.geteuid()
-                    or status.st_nlink < 2
-                ):
-                    _fail()
-                yield from descend(child, relative, depth + 1)
-            finally:
-                os.close(child)
+        finally:
+            iterator.close()
 
     duplicate = os.dup(root.descriptor)
     try:
@@ -355,12 +369,12 @@ def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
         os.close(duplicate)
 
 
-def _inventory(root: _Root) -> dict[str, tuple[int, int]]:
+def _inventory(root: _Root) -> set[tuple[int, int]]:
     """Snapshot immutable provider rollout identities, not mutable file sizes."""
-    result: dict[str, tuple[int, int]] = {}
-    for name, fd, status in _walk(root):
+    result: set[tuple[int, int]] = set()
+    for _name, fd, status in _walk(root):
         try:
-            result[name] = (status.st_dev, status.st_ino)
+            result.add((status.st_dev, status.st_ino))
             if len(result) > MAX_PROVIDER_FILES:
                 _fail()
         finally:
@@ -623,6 +637,15 @@ def _parse_rollout(
                         and agent_path == binding["agent_path"]
                         and agent_role == binding["role"]
                     )
+                    if matches and any(
+                        (key == "worktree_path" and payload["cwd"] != expected)
+                        or (key == "launch_head" and git["commit_hash"] != expected)
+                        or (key == "branch" and git["branch"] != expected)
+                        or (key == "repository_url" and git["repository_url"] != expected)
+                        for key, expected in binding.items()
+                        if key in {"worktree_path", "launch_head", "branch", "repository_url"}
+                    ):
+                        matches = False
                 else:
                     _fail()
                 if (
@@ -776,13 +799,13 @@ def _candidate_metadata(fd: int, binding: dict[str, str]) -> _CandidateMetadata:
 
 
 def _new_rollouts(
-    root: _Root, before: dict[str, tuple[int, int]]
+    root: _Root, before: set[tuple[int, int]]
 ) -> list[tuple[str, int, os.stat_result]]:
     result: list[tuple[str, int, os.stat_result]] = []
     total = 0
     try:
         for name, fd, status in _walk(root):
-            if before.get(name) == (status.st_dev, status.st_ino):
+            if (status.st_dev, status.st_ino) in before:
                 os.close(fd)
                 continue
             if status.st_size > MAX_PROVIDER_FILE_BYTES:
@@ -882,6 +905,8 @@ def _descendant(base: str, head: str) -> bool:
                 ["git", "-c", "core.fsmonitor=false", "merge-base", "--is-ancestor", base, head],
                 check=False,
                 timeout=5,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             ).returncode
             == 0
         )
@@ -938,8 +963,6 @@ def supervise_native_codex(arguments: Any) -> int:
         usage = _open_root(arguments.usage_root, private=True)
         provider = _open_root(os.path.join(codex_home, "sessions"), private=False)
         worktree = _open_root(os.getcwd(), private=False)
-        started = datetime.now(UTC)
-        started_monotonic = time.monotonic()
         _reject_root_overlap(usage, provider, worktree)
         launch = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=False
@@ -951,8 +974,14 @@ def supervise_native_codex(arguments: Any) -> int:
             "role": canonical,
             "agent_path": f"/root/{arguments.task_name}",
             "effort": effort,
+            "worktree_path": worktree.path,
+            "launch_head": launch,
+            "repository_url": "https://github.com/syamaner/roastpilot-agent.git",
+            "branch": arguments.branch,
         }
         ready = {"type": "READY", "binding_id": str(uuid4())}
+        started = datetime.now(UTC)
+        started_monotonic = time.monotonic()
         sys.stdout.write(json.dumps(ready, separators=(",", ":")) + "\n")
         sys.stdout.flush()
         line = _terminal_line()
@@ -964,6 +993,8 @@ def supervise_native_codex(arguments: Any) -> int:
         ):
             _fail()
         status = NativeCodexTaskStatus(terminal["task_status"])
+        completed = datetime.now(UTC)
+        elapsed_ms = max(0, int((time.monotonic() - started_monotonic) * 1000))
         _assert_root(provider)
         candidates = _new_rollouts(provider, before)
         classified: list[tuple[int, os.stat_result, _CandidateMetadata]] = []
@@ -1028,7 +1059,6 @@ def supervise_native_codex(arguments: Any) -> int:
             _fail()
         if success and final == arguments.base_sha:
             _fail()
-        completed = datetime.now(UTC)
         record = NativeCodexUsageRecord(
             captured_at=completed,
             task_id=arguments.task_id,
@@ -1051,7 +1081,7 @@ def supervise_native_codex(arguments: Any) -> int:
             success=success,
             started_at=started,
             completed_at=completed,
-            elapsed_ms=max(0, int((time.monotonic() - started_monotonic) * 1000)),
+            elapsed_ms=elapsed_ms,
             input_tokens=totals[0],
             cached_input_tokens=totals[1],
             cache_write_input_tokens=totals[2],

@@ -405,7 +405,38 @@ def test_native_codex_inventory_does_not_read_or_size_existing_rollouts(tmp_path
         inventory = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
     finally:
         os.close(root.descriptor)
-    assert inventory == {"existing.jsonl": (existing.stat().st_dev, existing.stat().st_ino)}
+    assert inventory == {(existing.stat().st_dev, existing.stat().st_ino)}
+
+
+def test_native_codex_inventory_rejects_renamed_pre_ready_inode(tmp_path: Path) -> None:
+    """Renaming an old rollout after READY cannot turn its inode into new evidence."""
+    existing = tmp_path / "existing.jsonl"
+    existing.write_text("{}\n")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        before = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+        os.rename(existing, tmp_path / "renamed.jsonl")
+        candidates = usage_native_codex._new_rollouts(root, before)  # pyright: ignore[reportPrivateUsage]
+        assert candidates == []
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_walk_counts_all_provider_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Empty directories consume the same bounded provider-entry budget as rollouts."""
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        monkeypatch.setattr(usage_native_codex, "MAX_PROVIDER_ENTRIES", 2)
+        for name in ("one", "two"):
+            (tmp_path / name).mkdir()
+        assert usage_native_codex._inventory(root) == set()  # pyright: ignore[reportPrivateUsage]
+        (tmp_path / "three").mkdir()
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
 
 
 def test_native_codex_rollout_rejects_drifting_observed_root_schema(tmp_path: Path) -> None:
@@ -1664,7 +1695,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
                 "originator": "codex-tui",
                 "cli_version": "0.147.0",
                 "context_window": 1,
-                "cwd": "/host/provider/path",
+                "cwd": str(repository),
                 "history_mode": "discarded",
                 "model_provider": "discarded",
                 "multi_agent_version": "discarded",
@@ -1686,7 +1717,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
                 "git": {
                     "commit_hash": base,
                     "branch": "feature/811-native-codex-capture",
-                    "repository_url": "SECRET_PROVIDER_URL",
+                    "repository_url": "https://github.com/syamaner/roastpilot-agent.git",
                 },
             },
         }
@@ -1890,8 +1921,12 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
             "base_instructions": "opaque",
             "cli_version": "0.147.0",
             "context_window": 1,
-            "cwd": "opaque",
-            "git": {"branch": "main", "commit_hash": "a" * 40, "repository_url": "opaque"},
+            "cwd": str(worktree),
+            "git": {
+                "branch": "feature/test",
+                "commit_hash": "a" * 40,
+                "repository_url": "https://github.com/syamaner/roastpilot-agent.git",
+            },
             "history_mode": "opaque",
             "model_provider": "opaque",
             "multi_agent_version": "opaque",
