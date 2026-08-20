@@ -845,6 +845,57 @@ def test_native_codex_json_recursion_error_fails_closed(monkeypatch: pytest.Monk
         usage_native_codex._json(b"{}")  # pyright: ignore[reportPrivateUsage]
 
 
+def test_native_codex_cli_maps_nested_discriminator_error_without_leakage(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Supervisor parser failures reach the CLI as one fixed metadata-safe error."""
+
+    def fail(_arguments: object) -> NoReturn:
+        raise usage_native_codex.NativeCodexCaptureError("/host/SECRET trace")
+
+    monkeypatch.setattr(usage_cli, "supervise_native_codex", fail)
+    with pytest.raises(SystemExit, match="native Codex capture is invalid") as error:
+        main(
+            [
+                "supervise-native-codex",
+                "--role",
+                "engineer-be",
+                "--task-id",
+                "x",
+                "--slice-id",
+                "x",
+                "--parent-task-id",
+                "x",
+                "--task-name",
+                "x",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "main",
+                "--base-sha",
+                "a" * 40,
+                "--usage-root",
+                "/tmp/x",
+            ]
+        )
+    assert "SECRET" not in str(error.value) and "Traceback" not in str(error.value)
+    assert capsys.readouterr().err == ""
+
+
+def test_native_codex_launch_rejects_ignored_only_worktree(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Launch identity includes ignored files, while final attestation remains ordinary clean."""
+    values = iter(
+        ("https://github.com/syamaner/roastpilot-agent.git", "a" * 40, "main", "ignored-file")
+    )
+
+    def git(_args: list[str]) -> str:
+        return next(values)
+
+    monkeypatch.setattr(usage_native_codex, "_git", git)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._git_identity("syamaner/roastpilot-agent", "main", "a" * 40, final=False)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_native_codex_cli_round_trip_and_fixed_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """The closed supervisor CLI grammar maps capture failures to one safe exit."""
     arguments = usage_cli.build_parser().parse_args(
