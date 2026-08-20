@@ -2174,13 +2174,17 @@ def supervise_native_codex(arguments: Any) -> int:
                     observed_total += consumed
                     if observed_total > MAX_PROVIDER_TOTAL_BYTES:
                         _fail()
-                    if spawned_from != leaf:
-                        _fail()
-                    subagent_count += 1
                 except NativeCodexCaptureError:
                     # A malformed or incomplete rollout that names the leaf might be a
                     # child. Capture remains useful, but whole-tree proof is withheld.
                     fully_scanned = False
+                else:
+                    if spawned_from != leaf:
+                        fully_scanned = False
+                        continue
+                    # A parsed child is proof the registered leaf escaped its
+                    # committed depth-one/no-subagent boundary.
+                    _fail()
             _reattest_provider_root(provider)
             # Reconcile by retained descriptors, not a second unbound snapshot: an
             # already-existing parent rollout may append after READY, but it may not

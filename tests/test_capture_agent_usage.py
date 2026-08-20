@@ -3154,12 +3154,14 @@ def test_native_codex_provider_home_ignores_home_override(
 
 
 @pytest.mark.parametrize(
-    ("role", "status", "child_first"),
+    ("role", "status", "proven_child"),
     [
         (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.SUCCESS, False),
         (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.FAILED, False),
         (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED, False),
-        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED, True),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, True),
+        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.CANCELLED, True),
+        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.SUCCESS, True),
     ],
 )
 def test_native_codex_supervisor_records_registered_role_terminal_outcome(
@@ -3167,7 +3169,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     monkeypatch: pytest.MonkeyPatch,
     role: NativeCodexRole,
     status: NativeCodexTaskStatus,
-    child_first: bool,
+    proven_child: bool,
 ) -> None:
     """The supervisor records each registered role without retaining provider content."""
     import capture_usage_cli as native_cli
@@ -3203,10 +3205,8 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         _before: set[tuple[int, int, int]],
     ) -> list[tuple[str, int, os.stat_result]]:
         entries = [("leaf.jsonl", 99, os.stat_result((0,) * 10))]
-        if role is NativeCodexRole.REPAIR:
+        if proven_child:
             entries.append(("child.jsonl", 98, os.stat_result((0,) * 10)))
-            if child_first:
-                entries.reverse()
         return entries
 
     def parse_rollout(
@@ -3330,6 +3330,11 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         base_sha="a" * 40,
         output="usage.jsonl",
     )
+    if proven_child:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex.supervise_native_codex(arguments)
+        assert captured == []
+        return
     assert usage_native_codex.supervise_native_codex(arguments) == 0
     assert len(captured) == 1
     record = captured[0]
@@ -3340,8 +3345,8 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     assert record.started_at == initial_wall
     assert record.completed_at == initial_wall + timedelta(milliseconds=125)
     assert record.completed_at - record.started_at == timedelta(milliseconds=125)
-    assert record.subagent_count == (1 if role is NativeCodexRole.REPAIR else 0)
-    assert record.whole_tree_verified is (role is not NativeCodexRole.REPAIR)
+    assert record.subagent_count == 0
+    assert record.whole_tree_verified is True
     assert record.config_sha256 == NATIVE_CODEX_CONFIG_SHA256
     assert record.role_sha256 == NATIVE_CODEX_ROLE_SHA256[role]
     assert "SECRET" not in record.model_dump_json()
@@ -4056,6 +4061,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         "race-sibling",
         "race-replacement",
         "late-closing-child",
+        "child",
         "child-growth",
     }:
         with pytest.raises(
