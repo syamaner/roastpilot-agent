@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -736,6 +737,17 @@ class NativeCodexUsageRecord(CaptureModel):
         }[self.native_role]
         if self.effort != expected_effort:
             raise ValueError("native Codex role effort is contradictory")
+        if (
+            any(
+                not re.fullmatch(r"[0-9a-f]{40}", value)
+                for value in (self.base_sha, self.launch_head_sha, self.final_head_sha)
+            )
+            or self.launch_head_sha != self.base_sha
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", self.branch)
+            or ".." in self.branch
+            or self.branch.startswith("-")
+        ):
+            raise ValueError("native Codex Git bindings are contradictory")
         if self.success:
             if self.task_status is not NativeCodexTaskStatus.SUCCESS:
                 raise ValueError("successful native Codex record has contradictory task status")

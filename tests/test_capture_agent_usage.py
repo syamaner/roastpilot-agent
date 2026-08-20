@@ -1575,13 +1575,6 @@ def test_native_codex_checkout_attestation_accepts_standard_leaf_venv(
     monkeypatch.chdir(repository)
     try:
         usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
-        venv_config = repository / ".venv" / "pyvenv.cfg"
-        os.chmod(venv_config, 0o664)
-        usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
-        os.chmod(venv_config, 0o666)
-        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
-        os.chmod(venv_config, 0o664)
         os.mkfifo(repository / ".venv" / "unsafe")
         with pytest.raises(usage_native_codex.NativeCodexCaptureError):
             usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]

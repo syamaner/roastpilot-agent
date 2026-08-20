@@ -46,8 +46,8 @@ MAX_JSON_NESTING = 64
 MAX_COMMITTED_FILE_BYTES = 64 * 1024
 MAX_GIT_OUTPUT_BYTES = 64 * 1024
 GIT_TIMEOUT_SECONDS = 5
-MAX_CHECKOUT_ENTRIES = 4096
-MAX_CHECKOUT_DEPTH = 16
+MAX_CHECKOUT_ENTRIES = 262_144
+MAX_CHECKOUT_DEPTH = 32
 MAX_GIT_ADMIN_FILE_BYTES = 4096
 MAX_GIT_ADMIN_ENTRIES = 8192
 MAX_GIT_ADMIN_DEPTH = 16
@@ -996,13 +996,11 @@ def _assert_checkout_directories(root: _Root) -> None:
                         _fail()
                     continue
                 if not stat.S_ISDIR(status.st_mode):
-                    permits_venv_group_write = relative.startswith(".venv/")
                     if (
                         not stat.S_ISREG(status.st_mode)
                         or status.st_uid != os.geteuid()
                         or status.st_nlink != 1
-                        or stat.S_IMODE(status.st_mode) & 0o002
-                        or (not permits_venv_group_write and stat.S_IMODE(status.st_mode) & 0o020)
+                        or stat.S_IMODE(status.st_mode) & 0o022
                     ):
                         _fail()
                     child = os.open(
@@ -1398,6 +1396,7 @@ def _parse_rollout(
                 if (
                     not seen_meta
                     or seen_context
+                    or seen_started
                     or seen_complete
                     or set(payload) != _TURN_CONTEXT_KEYS
                     or (
