@@ -431,6 +431,51 @@ def test_native_codex_rollout_rejects_drifting_observed_root_schema(tmp_path: Pa
         usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.parametrize("discriminator", [["event_msg"], {"type": "event_msg"}])
+def test_native_codex_parser_rejects_non_string_root_discriminator(
+    tmp_path: Path, discriminator: object
+) -> None:
+    """Untrusted root discriminators fail with the fixed content-free error."""
+    rollout = tmp_path / "bad.jsonl"
+    rollout.write_text(
+        json.dumps({"ordinal": 0, "timestamp": "PATH_SECRET", "type": discriminator, "payload": {}})
+        + "\n"
+    )
+    with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_parser_enforces_actual_bytes_after_initial_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parser read accounting rejects data that outgrows its earlier discovery stat."""
+    rollout = tmp_path / "grown.jsonl"
+    rollout.write_bytes(b'{"parent-811":"/root/leaf:engineer-be"}\n')
+    monkeypatch.setattr(usage_native_codex, "MAX_PROVIDER_FILE_BYTES", 1)
+    with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
+            stream.fileno(), {"parent": "parent-811", "path": "/root/leaf", "role": "engineer-be"}
+        )
+
+
+def test_native_codex_malformed_matching_candidate_is_not_treated_as_unrelated(
+    tmp_path: Path,
+) -> None:
+    """A malformed first row claiming the bound identity remains a matching candidate."""
+    rollout = tmp_path / "matching.jsonl"
+    binding = {
+        "parent_thread_id": "parent-811",
+        "agent_path": "/root/leaf",
+        "role": "engineer-be",
+        "effort": "high",
+    }
+    rollout.write_text("{" + " ".join(binding.values()) + "\n")
+    with rollout.open("rb") as stream:
+        assert usage_native_codex._candidate_binding(stream.fileno(), binding) is True  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_native_codex_parses_unrelated_root_session_without_leaf_requirements(
     tmp_path: Path,
 ) -> None:
