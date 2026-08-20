@@ -67,6 +67,8 @@ from capture_usage_models import (
     MAX_EVENT_BYTES,
     MAX_EVENT_COUNT,
     MAX_STREAM_BYTES,
+    NATIVE_CODEX_CONFIG_SHA256,
+    NATIVE_CODEX_ROLE_SHA256,
     NATIVE_ROLE_EXCLUSIONS,
     PLAN_ROOT_ENVIRONMENT_KEY,
     VALIDATION_ENVIRONMENT_ROLES,
@@ -200,6 +202,7 @@ USAGE_RECORD_ADAPTER = cast(TypeAdapter[UsageRecord], _USAGE_RECORD_ADAPTER)
 
 def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
     """Native Codex records never claim success without a descendant result."""
+    started = datetime.now(UTC)
     payload: dict[str, object] = {
         "captured_at": datetime.now(UTC),
         "task_id": "task-811",
@@ -208,8 +211,8 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
         "task_name": "native-codex-capture",
         "native_role": NativeCodexRole.ENGINEER_BE,
         "effort": "high",
-        "config_sha256": "c" * 64,
-        "role_sha256": "d" * 64,
+        "config_sha256": NATIVE_CODEX_CONFIG_SHA256,
+        "role_sha256": NATIVE_CODEX_ROLE_SHA256[NativeCodexRole.ENGINEER_BE],
         "repository": "syamaner/roastpilot-agent",
         "branch": "feature/811-native-codex-capture",
         "base_sha": "a" * 40,
@@ -220,8 +223,8 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
         "exit_code": None,
         "task_status": NativeCodexTaskStatus.SUCCESS,
         "success": True,
-        "started_at": datetime.now(UTC),
-        "completed_at": datetime.now(UTC),
+        "started_at": started,
+        "completed_at": started,
         "elapsed_ms": 0,
         "input_tokens": 5,
         "cached_input_tokens": 2,
@@ -240,6 +243,24 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
         NativeCodexUsageRecord.model_validate(
             {**payload, "success": False, "task_status": NativeCodexTaskStatus.SUCCESS}
         )
+    for elapsed in (1,):
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate({**payload, "elapsed_ms": elapsed})
+    for offset in (1, -1):
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate(
+                {
+                    **payload,
+                    "completed_at": started + timedelta(milliseconds=offset),
+                    "elapsed_ms": 0,
+                }
+            )
+    for field, value in (
+        ("config_sha256", "0" * 64),
+        ("role_sha256", "0" * 64),
+    ):
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate({**payload, field: value})
     for field, value in (
         ("cached_input_tokens", 6),
         ("reasoning_output_tokens", 7),
@@ -1710,6 +1731,94 @@ def test_native_codex_checkout_attestation_accepts_standard_leaf_venv(
         os.close(root.descriptor)
 
 
+@pytest.mark.parametrize(
+    ("target_kind", "mode", "accepts"),
+    [
+        ("trusted", 0o755, True),
+        ("other", 0o755, False),
+        ("trusted", 0o775, False),
+        ("trusted", 0o757, False),
+        ("missing", 0o755, False),
+    ],
+)
+def test_native_codex_checkout_attestation_binds_absolute_venv_interpreter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_kind: str,
+    mode: int,
+    accepts: bool,
+) -> None:
+    """Absolute venv interpreter links bind only to the trusted base executable inode."""
+    repository = tmp_path / "repository"
+    (repository / ".venv" / "bin").mkdir(parents=True)
+    trusted = tmp_path / "python3.14"
+    trusted.write_text("#!/bin/sh\n")
+    trusted.chmod(mode)
+    other = tmp_path / "python3.13"
+    other.write_text("#!/bin/sh\n")
+    other.chmod(0o755)
+    target = {
+        "trusted": str(trusted),
+        "other": str(other),
+        "missing": str(tmp_path / "python3.12"),
+    }[target_kind]
+    (repository / ".venv" / "bin" / "python3.11").symlink_to(target)
+    monkeypatch.setattr(usage_native_codex.sys, "_base_executable", str(trusted), raising=False)
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        if accepts:
+            usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+        else:
+            with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+                usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize(
+    ("top_parent", "nested_parent"),
+    [("leaf-session", "other-session"), ("other-session", "leaf-session")],
+)
+def test_native_codex_candidate_metadata_withholds_contradictory_parents(
+    tmp_path: Path, top_parent: str, nested_parent: str
+) -> None:
+    """Conflicting top-level and spawn parents remain indeterminate topology evidence."""
+    rollout = tmp_path / "candidate.jsonl"
+    rollout.write_text(
+        json.dumps(
+            {
+                "ordinal": 0,
+                "timestamp": "2026-08-20T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "parent_thread_id": top_parent,
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {
+                                "parent_thread_id": nested_parent,
+                                "agent_path": "/root/task",
+                                "agent_role": "engineer-be",
+                                "depth": 1,
+                            }
+                        }
+                    },
+                },
+            }
+        )
+        + "\n"
+    )
+    descriptor = os.open(rollout, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        metadata = usage_native_codex._candidate_metadata(  # pyright: ignore[reportPrivateUsage]
+            descriptor,
+            {"parent_thread_id": "parent", "agent_path": "/root/task", "role": "engineer-be"},
+        )
+    finally:
+        os.close(descriptor)
+    assert metadata.bound_leaf is None
+    assert metadata.parent_thread_id is None
+
+
 def _native_codex_npm_bin_repository(
     tmp_path: Path,
     *,
@@ -2584,7 +2693,12 @@ def test_native_codex_supervisor_usage_root_replacement_appends_nothing(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
         _role: NativeCodexRole,
     ) -> tuple[str, str, str, str]:
-        return "a" * 64, "b" * 64, "high", "engineer-be"
+        return (
+            NATIVE_CODEX_CONFIG_SHA256,
+            NATIVE_CODEX_ROLE_SHA256[NativeCodexRole.ENGINEER_BE],
+            "high",
+            "engineer-be",
+        )
 
     def git_identity(_repository: str, _branch: str, _base: str, *, final: bool) -> str:
         del final
@@ -2712,6 +2826,7 @@ def test_native_codex_root_overlap_uses_held_directory_identities(tmp_path: Path
 
 def test_native_codex_record_persists_exact_registration_hashes() -> None:
     """Native Codex records reject non-SHA registration bindings and bad topology proofs."""
+    started = datetime.now(UTC)
     payload: dict[str, object] = {
         "captured_at": datetime.now(UTC),
         "task_id": "task-811",
@@ -2720,8 +2835,8 @@ def test_native_codex_record_persists_exact_registration_hashes() -> None:
         "task_name": "native-codex-capture",
         "native_role": NativeCodexRole.REPAIR,
         "effort": "medium",
-        "config_sha256": "a" * 64,
-        "role_sha256": "b" * 64,
+        "config_sha256": NATIVE_CODEX_CONFIG_SHA256,
+        "role_sha256": NATIVE_CODEX_ROLE_SHA256[NativeCodexRole.REPAIR],
         "repository": "syamaner/roastpilot-agent",
         "branch": "feature/811-native-codex-capture",
         "base_sha": "a" * 40,
@@ -2731,8 +2846,8 @@ def test_native_codex_record_persists_exact_registration_hashes() -> None:
         "leaf_session_id": "leaf-811",
         "task_status": NativeCodexTaskStatus.SUCCESS,
         "success": True,
-        "started_at": datetime.now(UTC),
-        "completed_at": datetime.now(UTC),
+        "started_at": started,
+        "completed_at": started,
         "elapsed_ms": 0,
         "input_tokens": 0,
         "cached_input_tokens": 0,
@@ -2743,7 +2858,8 @@ def test_native_codex_record_persists_exact_registration_hashes() -> None:
         "whole_tree_verified": True,
         "subagent_count": 0,
     }
-    assert NativeCodexUsageRecord.model_validate(payload).config_sha256 == "a" * 64
+    record = NativeCodexUsageRecord.model_validate(payload)
+    assert record.config_sha256 == NATIVE_CODEX_CONFIG_SHA256
     with pytest.raises(ValidationError):
         NativeCodexUsageRecord.model_validate({**payload, "role_sha256": "not-a-hash"})
     with pytest.raises(ValidationError):
@@ -2985,8 +3101,8 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     ) -> tuple[str, str, str, str]:
         time.monotonic()
         return (
-            "a" * 64,
-            "b" * 64,
+            NATIVE_CODEX_CONFIG_SHA256,
+            NATIVE_CODEX_ROLE_SHA256[member],
             "medium" if member is NativeCodexRole.REPAIR else "high",
             member.value,
         )
@@ -3101,7 +3217,8 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     assert record.completed_at - record.started_at == timedelta(milliseconds=125)
     assert record.subagent_count == (1 if role is NativeCodexRole.REPAIR else 0)
     assert record.whole_tree_verified is (role is not NativeCodexRole.REPAIR)
-    assert record.config_sha256 == "a" * 64 and record.role_sha256 == "b" * 64
+    assert record.config_sha256 == NATIVE_CODEX_CONFIG_SHA256
+    assert record.role_sha256 == NATIVE_CODEX_ROLE_SHA256[role]
     assert "SECRET" not in record.model_dump_json()
 
 
@@ -3780,7 +3897,12 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
         _role: NativeCodexRole,
     ) -> tuple[str, str, str, str]:
-        return "a" * 64, "b" * 64, "high", "engineer-be"
+        return (
+            NATIVE_CODEX_CONFIG_SHA256,
+            NATIVE_CODEX_ROLE_SHA256[NativeCodexRole.ENGINEER_BE],
+            "high",
+            "engineer-be",
+        )
 
     monkeypatch.setattr(
         usage_native_codex,
@@ -3839,11 +3961,19 @@ def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
     monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     _stub_native_codex_git_administration(monkeypatch)
-    monkeypatch.setattr(
-        usage_native_codex,
-        "_registered_role",
-        cast(Any, lambda _root, _role: ("a" * 64, "b" * 64, "high", "engineer-be")),  # pyright: ignore[reportUnknownLambdaType]
-    )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+
+    def registered_role(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _role: NativeCodexRole,
+    ) -> tuple[str, str, str, str]:
+        return (
+            NATIVE_CODEX_CONFIG_SHA256,
+            NATIVE_CODEX_ROLE_SHA256[NativeCodexRole.ENGINEER_BE],
+            "high",
+            "engineer-be",
+        )
+
+    monkeypatch.setattr(usage_native_codex, "_registered_role", registered_role)
     monkeypatch.setattr(usage_native_codex, "_inventory", lambda _root: set())  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_assert_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
@@ -3916,7 +4046,7 @@ def test_native_codex_supervisor_rejects_aggregate_actual_candidate_growth(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
         role: NativeCodexRole,
     ) -> tuple[str, str, str, str]:
-        return "a" * 64, "b" * 64, "high", role.value
+        return NATIVE_CODEX_CONFIG_SHA256, NATIVE_CODEX_ROLE_SHA256[role], "high", role.value
 
     def new_rollouts(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
@@ -4032,7 +4162,12 @@ def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
         member: NativeCodexRole,
     ) -> tuple[str, str, str, str]:
-        return "a" * 64, "b" * 64, "high", member.value
+        return (
+            NATIVE_CODEX_CONFIG_SHA256,
+            NATIVE_CODEX_ROLE_SHA256[member],
+            "high",
+            member.value,
+        )
 
     closed: list[int] = []
 

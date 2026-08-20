@@ -25,7 +25,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
-from capture_usage_models import NativeCodexRole, NativeCodexTaskStatus, NativeCodexUsageRecord
+from capture_usage_models import (
+    NATIVE_CODEX_CONFIG_SHA256,
+    NATIVE_CODEX_ROLE_INSTRUCTION_SHA256,
+    NATIVE_CODEX_ROLE_SHA256,
+    NativeCodexRole,
+    NativeCodexTaskStatus,
+    NativeCodexUsageRecord,
+)
 
 MAX_PROVIDER_FILES = 4096
 MAX_PROVIDER_ENTRIES = 4096
@@ -56,16 +63,6 @@ _ROLE_EXPECTATIONS: dict[NativeCodexRole, tuple[str, str]] = {
     NativeCodexRole.ENGINEER_BE: ("agents/engineer-be.toml", "high"),
     NativeCodexRole.ENGINEER_FE: ("agents/engineer-fe.toml", "high"),
     NativeCodexRole.REPAIR: ("agents/repair.toml", "medium"),
-}
-_ROLE_SHA256: dict[NativeCodexRole, str] = {
-    NativeCodexRole.ENGINEER_BE: "bcad195fce15322e489cc836d3b846953994fd136f442fff6c338f69c490d74f",
-    NativeCodexRole.ENGINEER_FE: "4da74886a9c5e4b7cad4b6e7ed858f0f7e596f76189bd07240b77e9cd5c13831",
-    NativeCodexRole.REPAIR: "4671a9d8b84b500208f2b603e81f255d64d678fc11ebbf4982b7bf8ddca0fa7d",
-}
-_ROLE_INSTRUCTION_SHA256: dict[NativeCodexRole, str] = {
-    NativeCodexRole.ENGINEER_BE: "6634afea8938b1472e4677806262365bb5e23278a636d5c8ae7be0a8a04ba07c",
-    NativeCodexRole.ENGINEER_FE: "886daaae2ca56ba26d63d2e8b9824c06c389e6c4ab765de7719d9bfce7461f8e",
-    NativeCodexRole.REPAIR: "8df164d5d3bab1e4f1553a3daea6b302888c252c80cbe4e6f91ac2ec277533d1",
 }
 _ROOT_TYPES = {
     "session_meta",
@@ -1090,6 +1087,33 @@ def _assert_checkout_directories(root: _Root) -> None:
                         )
                     ):
                         _fail()
+                    if not linux_lib64 and os.path.isabs(target):
+                        base_executable = getattr(sys, "_base_executable", None)
+                        if (
+                            not isinstance(base_executable, str)
+                            or not base_executable
+                            or "\x00" in base_executable
+                            or not os.path.isabs(base_executable)
+                        ):
+                            base_executable = sys.executable
+                        try:
+                            target_status = os.stat(target, follow_symlinks=True)
+                            base_status = os.stat(base_executable, follow_symlinks=True)
+                            current_link = os.stat(
+                                entry.name, dir_fd=directory, follow_symlinks=False
+                            )
+                        except OSError:
+                            _fail()
+                        if (
+                            not stat.S_ISREG(target_status.st_mode)
+                            or target_status.st_uid not in {os.geteuid(), 0}
+                            or stat.S_IMODE(target_status.st_mode) & 0o022
+                            or (target_status.st_dev, target_status.st_ino)
+                            != (base_status.st_dev, base_status.st_ino)
+                            or _generation(current_link) != _generation(status)
+                            or current_link.st_size != status.st_size
+                        ):
+                            _fail()
                     continue
                 if not stat.S_ISDIR(status.st_mode):
                     if (
@@ -1162,6 +1186,7 @@ def _registered_role(root: _Root, role: NativeCodexRole) -> tuple[str, str, str,
         if (
             set(config) != {"project_doc_max_bytes", "agents"}
             or config["project_doc_max_bytes"] != 131072
+            or hashlib.sha256(config_bytes).hexdigest() != NATIVE_CODEX_CONFIG_SHA256
             or set(agents) != {"enabled", "max_concurrent_threads_per_session", *expected}
             or agents["max_concurrent_threads_per_session"] != 3
         ):
@@ -1184,10 +1209,10 @@ def _registered_role(root: _Root, role: NativeCodexRole) -> tuple[str, str, str,
             or definition.get("model_reasoning_effort") != effort
             or definition.get("agents") != {"enabled": False}
             or not isinstance(definition.get("developer_instructions"), str)
-            or hashlib.sha256(role_bytes).hexdigest() != _ROLE_SHA256[role]
+            or hashlib.sha256(role_bytes).hexdigest() != NATIVE_CODEX_ROLE_SHA256[role]
             or (
                 hashlib.sha256(definition["developer_instructions"].encode("utf-8")).hexdigest()
-                != _ROLE_INSTRUCTION_SHA256[role]
+                != NATIVE_CODEX_ROLE_INSTRUCTION_SHA256[role]
             )
         ):
             _fail()
@@ -1665,6 +1690,8 @@ def _candidate_metadata(fd: int, binding: dict[str, str]) -> _CandidateMetadata:
         if not isinstance(spawn, dict):
             return _CandidateMetadata(None, retained_parent, len(raw))
         parent = spawn.get("parent_thread_id")
+        if retained_parent is not None and _safe_identifier(parent) and retained_parent != parent:
+            return _CandidateMetadata(None, None, len(raw))
         matches_identity = (
             parent == binding["parent_thread_id"]
             and spawn.get("agent_path") == binding["agent_path"]
@@ -2031,7 +2058,7 @@ def supervise_native_codex(arguments: Any) -> int:
             "launch_head": launch,
             "repository_url": origin,
             "branch": arguments.branch,
-            "instruction_sha256": _ROLE_INSTRUCTION_SHA256[role],
+            "instruction_sha256": NATIVE_CODEX_ROLE_INSTRUCTION_SHA256[role],
         }
         _assert_checkout(worktree)
         _assert_git_administration(worktree, git_administration)

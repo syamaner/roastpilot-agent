@@ -6,7 +6,7 @@ import os
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Annotated, BinaryIO, Literal, TypeAlias
 
@@ -20,6 +20,9 @@ NATIVE_WORKER_USAGE_SCHEMA_VERSION = 3
 
 NATIVE_CODEX_USAGE_SCHEMA_VERSION = 1
 """Parent-to-registered-Codex-leaf record schema version."""
+
+NATIVE_CODEX_CONFIG_SHA256 = "11ceba3a199d28682671dbcb548f6c1c0c63817df9b34c931c685a85f1aa5395"
+"""SHA-256 of the complete committed registered-Codex configuration."""
 
 SKILL_VERSION = "0.1.0"
 """The version of the capture skill's normalized record grammar."""
@@ -105,6 +108,21 @@ class NativeCodexRole(Enum):
     ENGINEER_BE = "engineer-be"
     ENGINEER_FE = "engineer-fe"
     REPAIR = "repair"
+
+
+NATIVE_CODEX_ROLE_SHA256: dict[NativeCodexRole, str] = {
+    NativeCodexRole.ENGINEER_BE: "bcad195fce15322e489cc836d3b846953994fd136f442fff6c338f69c490d74f",
+    NativeCodexRole.ENGINEER_FE: "4da74886a9c5e4b7cad4b6e7ed858f0f7e596f76189bd07240b77e9cd5c13831",
+    NativeCodexRole.REPAIR: "4671a9d8b84b500208f2b603e81f255d64d678fc11ebbf4982b7bf8ddca0fa7d",
+}
+"""Exact SHA-256 bindings for the committed registered-Codex role definitions."""
+
+NATIVE_CODEX_ROLE_INSTRUCTION_SHA256: dict[NativeCodexRole, str] = {
+    NativeCodexRole.ENGINEER_BE: "6634afea8938b1472e4677806262365bb5e23278a636d5c8ae7be0a8a04ba07c",
+    NativeCodexRole.ENGINEER_FE: "886daaae2ca56ba26d63d2e8b9824c06c389e6c4ab765de7719d9bfce7461f8e",
+    NativeCodexRole.REPAIR: "8df164d5d3bab1e4f1553a3daea6b302888c252c80cbe4e6f91ac2ec277533d1",
+}
+"""Exact SHA-256 bindings for committed leaf instruction text."""
 
 
 class NativeCodexTaskStatus(Enum):
@@ -757,19 +775,19 @@ class NativeCodexUsageRecord(CaptureModel):
             raise ValueError("failed native Codex record has contradictory task status")
         if self.completed_at < self.started_at:
             raise ValueError("native Codex timestamps are contradictory")
+        if self.completed_at - self.started_at != timedelta(milliseconds=self.elapsed_ms):
+            raise ValueError("native Codex elapsed time is contradictory")
         if self.cached_input_tokens > self.input_tokens:
             raise ValueError("native Codex cached input exceeds input tokens")
         if self.reasoning_output_tokens > self.output_tokens:
             raise ValueError("native Codex reasoning output exceeds output tokens")
         if self.total_tokens != self.input_tokens + self.output_tokens:
             raise ValueError("native Codex total tokens are contradictory")
-        if not all(
-            isinstance(value, str)
-            and len(value) == 64
-            and all(character in "0123456789abcdef" for character in value)
-            for value in (self.config_sha256, self.role_sha256)
+        if (
+            self.config_sha256 != NATIVE_CODEX_CONFIG_SHA256
+            or self.role_sha256 != NATIVE_CODEX_ROLE_SHA256[self.native_role]
         ):
-            raise ValueError("native Codex role hashes must be SHA-256")
+            raise ValueError("native Codex registration hashes are contradictory")
         if self.subagent_count < 0 or (self.whole_tree_verified and self.subagent_count != 0):
             raise ValueError("native Codex topology proof is contradictory")
         return self
