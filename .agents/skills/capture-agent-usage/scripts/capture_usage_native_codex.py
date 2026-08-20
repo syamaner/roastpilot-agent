@@ -44,8 +44,10 @@ _GIT_ENV = {
 }
 MAX_JSON_NESTING = 64
 MAX_COMMITTED_FILE_BYTES = 64 * 1024
-MAX_GIT_OUTPUT_BYTES = 4096
+MAX_GIT_OUTPUT_BYTES = 64 * 1024
 GIT_TIMEOUT_SECONDS = 5
+MAX_CHECKOUT_ENTRIES = 4096
+MAX_CHECKOUT_DEPTH = 16
 _ROLE_EXPECTATIONS: dict[NativeCodexRole, tuple[str, str]] = {
     NativeCodexRole.ENGINEER_BE: ("agents/engineer-be.toml", "high"),
     NativeCodexRole.ENGINEER_FE: ("agents/engineer-fe.toml", "high"),
@@ -517,11 +519,87 @@ def _git_identity(repository: str, branch: str, base: str, *, final: bool) -> st
     )
     if _git(["branch", "--show-current"]) != branch or _git(status_args):
         _fail()
+    _assert_index_clean()
     if _git(["rev-parse", "--verify", f"{base}^{{commit}}"]) != base or (
         not final and head != base
     ):
         _fail()
     return head
+
+
+def _assert_index_clean() -> None:
+    """Reject index flags that can hide tracked checkout changes."""
+    rows = _git(["ls-files", "-v", "-t", "-z"]).split("\0")
+    if not rows or rows.pop() != "" or len(rows) > MAX_CHECKOUT_ENTRIES:
+        _fail()
+    for row in rows:
+        if len(row) < 3 or row[1] != " ":
+            _fail()
+        marker = row[0]
+        if marker in {"h", "s", "S"}:
+            _fail()
+
+
+def _checkout_directory(descriptor: int) -> None:
+    """Require one owned, non-writable tracked-checkout directory."""
+    try:
+        status = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or status.st_uid != os.geteuid()
+            or status.st_nlink < 2
+            or stat.S_IMODE(status.st_mode) & 0o022
+        ):
+            _fail()
+    except OSError:
+        _fail()
+
+
+def _assert_checkout(root: _Root) -> None:
+    """Attest every tracked file and containing directory through held descriptors."""
+    _assert_worktree_root(root)
+    paths = _git(["ls-files", "-z"]).split("\0")
+    if not paths or paths.pop() != "" or len(paths) > MAX_CHECKOUT_ENTRIES:
+        _fail()
+    for path in paths:
+        parts = path.split("/")
+        if (
+            not path
+            or len(parts) > MAX_CHECKOUT_DEPTH
+            or any(not part or part in {".", ".."} for part in parts)
+        ):
+            _fail()
+        descriptor = os.dup(root.descriptor)
+        try:
+            _checkout_directory(descriptor)
+            for part in parts[:-1]:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=descriptor,
+                )
+                os.close(descriptor)
+                descriptor = child
+                _checkout_directory(descriptor)
+            file_descriptor = os.open(
+                parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=descriptor
+            )
+            try:
+                status = os.fstat(file_descriptor)
+                if (
+                    not stat.S_ISREG(status.st_mode)
+                    or status.st_uid != os.geteuid()
+                    or status.st_nlink != 1
+                    or stat.S_IMODE(status.st_mode) & 0o022
+                ):
+                    _fail()
+            finally:
+                os.close(file_descriptor)
+        except OSError:
+            _fail()
+        finally:
+            with suppress(OSError):
+                os.close(descriptor)
 
 
 def _attested_origin() -> str:
@@ -832,6 +910,7 @@ def _parse_rollout(
                         or payload["agent_nickname"] != nickname
                         or payload["thread_source"] != "subagent"
                         or payload["multi_agent_version"] != "v2"
+                        or payload["model_provider"] != "openai"
                     ):
                         _fail()
                     is_subagent = True
@@ -876,6 +955,7 @@ def _parse_rollout(
                 if (
                     not seen_meta
                     or seen_context
+                    or seen_complete
                     or set(payload) != _TURN_CONTEXT_KEYS
                     or (
                         is_subagent
@@ -933,6 +1013,7 @@ def _parse_rollout(
                     event_turn_id = _string(payload["turn_id"])
                     if (
                         not seen_started
+                        or not seen_context
                         or seen_complete
                         or (turn_id is not None and turn_id != event_turn_id)
                     ):
@@ -1285,6 +1366,7 @@ def supervise_native_codex(arguments: Any) -> int:
             or _attested_origin() != origin
         ):
             _fail()
+        _assert_checkout(worktree)
         ready = {"type": "READY", "binding_id": str(uuid4())}
         started = datetime.now(UTC)
         started_monotonic = time.monotonic()
@@ -1322,8 +1404,9 @@ def supervise_native_codex(arguments: Any) -> int:
                     observed_total += consumed
                     if observed_total > MAX_PROVIDER_TOTAL_BYTES:
                         _fail()
-                    if matches:
-                        matched.append((fd, session, totals))
+                    if not matches:
+                        _fail()
+                    matched.append((fd, session, totals))
                 except NativeCodexCaptureError:
                     raise
             if len(matched) != 1:
@@ -1364,6 +1447,7 @@ def supervise_native_codex(arguments: Any) -> int:
                 with suppress(OSError):
                     _close(held_fd)
         _reattest_worktree_root(worktree)
+        _assert_checkout(worktree)
         final = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=True
         )

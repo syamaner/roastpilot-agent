@@ -320,7 +320,7 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(
             "context_window": 1,
             "cwd": "discarded",
             "history_mode": "discarded",
-            "model_provider": "discarded",
+            "model_provider": "openai",
             "multi_agent_version": "v2",
             "parent_thread_id": "parent-811",
             "session_id": "leaf-811",
@@ -986,7 +986,7 @@ def test_native_codex_rejects_decreasing_cumulative_token_totals(tmp_path: Path)
             "cwd": "x",
             "git": {"branch": "x", "commit_hash": "a", "repository_url": "x"},
             "history_mode": "x",
-            "model_provider": "x",
+            "model_provider": "openai",
             "multi_agent_version": "v2",
             "originator": "codex-tui",
             "parent_thread_id": "parent",
@@ -1277,6 +1277,55 @@ def test_native_codex_git_identity_forces_all_untracked_files(
         )
 
 
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_native_codex_index_attestation_rejects_hidden_tracked_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    """Assume-unchanged and skip-worktree entries cannot hide checkout changes."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "capture@example.test"], cwd=repository, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Capture"], cwd=repository, check=True)
+    tracked = repository / "tracked.txt"
+    tracked.write_text("tracked\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True
+    )
+    monkeypatch.chdir(repository)
+
+    usage_native_codex._assert_index_clean()  # pyright: ignore[reportPrivateUsage]
+    subprocess.run(["git", "update-index", flag, "tracked.txt"], cwd=repository, check=True)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._assert_index_clean()  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("target", ["file", "directory"])
+def test_native_codex_checkout_attestation_rejects_writable_tracked_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """Tracked files and nested directories remain owned and non-writable at handback."""
+    repository = tmp_path / "repository"
+    nested = repository / "nested"
+    nested.mkdir(parents=True)
+    tracked = nested / "tracked.txt"
+    tracked.write_text("tracked\n")
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(["git", "add", "nested/tracked.txt"], cwd=repository, check=True)
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.chdir(repository)
+    try:
+        usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+        os.chmod(tracked if target == "file" else nested, 0o664 if target == "file" else 0o775)
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
 def test_native_codex_cli_round_trip_and_fixed_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """The closed supervisor CLI grammar maps capture failures to one safe exit."""
     arguments = usage_cli.build_parser().parse_args(
@@ -1420,6 +1469,7 @@ def test_native_codex_walk_explicitly_closes_scandir_duplicates(
                 "a" * 40,
                 "feature/x",
                 "",
+                "H tracked.txt\0",
                 "a" * 40,
             ],
             True,
@@ -1619,6 +1669,7 @@ def test_native_codex_git_terminates_on_live_output_overflow(
     """Neither Git stream can be materialized beyond the fixed live-output cap."""
     real_popen = subprocess.Popen
     processes: list[subprocess.Popen[bytes]] = []
+    overflow = usage_native_codex.MAX_GIT_OUTPUT_BYTES + 1  # pyright: ignore[reportPrivateUsage]
 
     def popen(_command: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
         process = cast(
@@ -1627,7 +1678,7 @@ def test_native_codex_git_terminates_on_live_output_overflow(
                 [
                     sys.executable,
                     "-c",
-                    f"import os, time; os.write({descriptor}, b'x' * 8192); time.sleep(2)",
+                    f"import os, time; os.write({descriptor}, b'x' * {overflow}); time.sleep(2)",
                 ],
                 **kwargs,
             ),
@@ -1838,6 +1889,7 @@ def test_native_codex_supervisor_usage_root_replacement_appends_nothing(
     monkeypatch.setattr(usage_native_codex.sys, "stdout", frames)
     monkeypatch.setattr(usage_native_codex, "_registered_role", registered_role)
     monkeypatch.setattr(usage_native_codex, "_git_identity", git_identity)
+    monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
         usage_native_codex,
         "_attested_origin",
@@ -2253,6 +2305,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         "_git_identity",
         git_identity,
     )
+    monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
         usage_native_codex,
         "_attested_origin",
@@ -2408,7 +2461,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
                 "context_window": 1,
                 "cwd": str(repository),
                 "history_mode": "discarded",
-                "model_provider": "discarded",
+                "model_provider": "openai",
                 "multi_agent_version": "v2",
                 "parent_thread_id": "parent-811",
                 "session_id": "leaf-811",
@@ -2657,6 +2710,9 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         ("sibling", "after", 0, False, "context_multi_agent_v1"),
         ("sibling", "after", 0, False, "context_multi_agent_arbitrary"),
         ("sibling", "after", 0, False, "context_multi_agent_non_string"),
+        ("sibling", "after", 0, False, "model_provider_wrong"),
+        ("sibling", "after", 0, False, "model_provider_non_string"),
+        ("sibling", "after", 0, False, "context_after_complete"),
         ("sibling", "after", 0, False, "worktree_replacement"),
         ("sibling", "after", 0, False, "worktree_mode_drift"),
         ("sibling", "after", 0, False, "provider_replacement"),
@@ -2708,7 +2764,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                 "repository_url": "https://github.com/syamaner/roastpilot-agent.git",
             },
             "history_mode": "opaque",
-            "model_provider": "opaque",
+            "model_provider": "openai",
             "multi_agent_version": "v2",
             "originator": "codex-tui",
             "parent_thread_id": parent,
@@ -2736,6 +2792,11 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                     "session_multi_agent_arbitrary": "unexpected",
                     "session_multi_agent_non_string": [],
                 }[mismatch]
+            elif mismatch.startswith("model_provider_"):
+                meta["model_provider"] = {
+                    "model_provider_wrong": "other",
+                    "model_provider_non_string": [],
+                }[mismatch]
             elif mismatch not in {
                 "context_cwd",
                 "turn_id",
@@ -2750,6 +2811,9 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                 "context_multi_agent_v1",
                 "context_multi_agent_arbitrary",
                 "context_multi_agent_non_string",
+                "model_provider_wrong",
+                "model_provider_non_string",
+                "context_after_complete",
                 "worktree_replacement",
                 "worktree_mode_drift",
                 "provider_replacement",
@@ -2849,6 +2913,8 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                     },
                 ]
             )
+            if session == "leaf-811" and mismatch == "context_after_complete":
+                events.append(events.pop(1))
         path.write_text(
             "".join(
                 json.dumps({"ordinal": number, "timestamp": "opaque", **event}) + "\n"
@@ -2919,6 +2985,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
     monkeypatch.setattr(usage_native_codex.sys, "stdout", frames)
     monkeypatch.setattr(usage_native_codex, "_terminal_line", terminal)
     monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
         usage_native_codex,
         "_attested_origin",
@@ -2996,7 +3063,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
 def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, match_count: int
 ) -> None:
-    """Zero or duplicate registered-leaf rollouts never append a usage record."""
+    """A contradictory duplicate first-row binding never appends a usage record."""
     import capture_usage_cli as native_cli
 
     roots: list[usage_native_codex._Root] = []  # pyright: ignore[reportPrivateUsage]
@@ -3009,6 +3076,7 @@ def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
     monkeypatch.setattr(usage_native_codex, "_open_root", lambda _raw, private: roots.pop(0))  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", lambda *_roots: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
         usage_native_codex,
         "_registered_role",
@@ -3031,9 +3099,10 @@ def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
     def parse_rollout(
         descriptor: int, _binding: dict[str, str]
     ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
-        return "leaf", (0, 0, 0, 0, 0, 0), "", descriptor < 90 + match_count, 0
+        return "leaf", (0, 0, 0, 0, 0, 0), "", descriptor == 90, 0
 
     monkeypatch.setattr(usage_native_codex, "_parse_rollout", parse_rollout)
+    monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_close", lambda _fd: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
         usage_native_codex,
@@ -3108,6 +3177,7 @@ def test_native_codex_supervisor_rejects_aggregate_actual_candidate_growth(
     monkeypatch.setattr(usage_native_codex, "_assert_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", lambda *_roots: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
         usage_native_codex,
         "_attested_origin",
@@ -3224,6 +3294,7 @@ def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
     monkeypatch.setattr(usage_native_codex, "_parse_rollout", parse_rollout)
     monkeypatch.setattr(usage_native_codex, "_registered_role", registered_role)
     monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
         usage_native_codex,
         "_attested_origin",
