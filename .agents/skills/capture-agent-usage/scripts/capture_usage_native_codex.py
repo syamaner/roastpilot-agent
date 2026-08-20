@@ -321,6 +321,27 @@ def _assert_root(root: _Root, *, private: bool = False) -> None:
         _fail()
 
 
+def _provider_directory(descriptor: int, *, expected: tuple[int, int] | None = None) -> None:
+    """Require one provider-owned, non-writable directory descriptor."""
+    try:
+        status = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or status.st_uid != os.geteuid()
+            or status.st_nlink < 2
+            or stat.S_IMODE(status.st_mode) & 0o022
+            or (expected is not None and (status.st_dev, status.st_ino) != expected)
+        ):
+            _fail()
+    except OSError:
+        _fail()
+
+
+def _generation(status: os.stat_result) -> tuple[int, int, int]:
+    """Return the immutable-enough rollout generation identity for one scan."""
+    return status.st_dev, status.st_ino, status.st_ctime_ns
+
+
 def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
     """Yield every regular rollout through no-follow directory descriptors."""
 
@@ -332,6 +353,7 @@ def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
         nonlocal entries_seen
         if depth > MAX_PROVIDER_DEPTH:
             _fail()
+        _provider_directory(directory)
         try:
             # scandir owns and closes an fd argument, so retain this traversal fd.
             iterator = os.scandir(os.dup(directory))
@@ -371,6 +393,7 @@ def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
                         not stat.S_ISDIR(status.st_mode)
                         or status.st_uid != os.geteuid()
                         or status.st_nlink < 2
+                        or stat.S_IMODE(status.st_mode) & 0o022
                     ):
                         _fail()
                     yield from descend(child, relative, depth + 1)
@@ -386,12 +409,13 @@ def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
         os.close(duplicate)
 
 
-def _inventory(root: _Root) -> set[tuple[int, int]]:
-    """Snapshot immutable provider rollout identities, not mutable file sizes."""
-    result: set[tuple[int, int]] = set()
+def _inventory(root: _Root) -> set[tuple[int, int, int]]:
+    """Snapshot rollout generations without retaining mutable provider paths."""
+    _provider_directory(root.descriptor, expected=(root.device, root.inode))
+    result: set[tuple[int, int, int]] = set()
     for _name, fd, status in _walk(root):
         try:
-            result.add((status.st_dev, status.st_ino))
+            result.add(_generation(status))
             if len(result) > MAX_PROVIDER_FILES:
                 _fail()
         finally:
@@ -704,7 +728,7 @@ def _leaf_launch_boundary(payload: dict[str, Any], binding: dict[str, str]) -> N
 
 def _parse_rollout(
     fd: int, binding: dict[str, str]
-) -> tuple[str, tuple[int, int, int, int, int, int], str, bool]:
+) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
     """Stream and validate the admitted 0.147.0 metadata grammar only."""
     seen_meta = seen_context = seen_started = seen_complete = False
     session = ""
@@ -919,7 +943,7 @@ def _parse_rollout(
                 _fail()
     if not seen_meta or (is_subagent and (not seen_context or not seen_complete or totals is None)):
         _fail()
-    return session, totals or (0, 0, 0, 0, 0, 0), parent_thread, matches
+    return session, totals or (0, 0, 0, 0, 0, 0), parent_thread, matches, read_bytes
 
 
 def _candidate_binding(fd: int, binding: dict[str, str]) -> bool | None:
@@ -1005,13 +1029,15 @@ def _candidate_metadata(fd: int, binding: dict[str, str]) -> _CandidateMetadata:
 
 
 def _new_rollouts(
-    root: _Root, before: set[tuple[int, int]]
+    root: _Root, before: set[tuple[int, int, int]]
 ) -> list[tuple[str, int, os.stat_result]]:
     result: list[tuple[str, int, os.stat_result]] = []
     total = 0
+    before_inodes = {(device, inode) for device, inode, _ctime_ns in before}
     try:
         for name, fd, status in _walk(root):
-            if (status.st_dev, status.st_ino) in before:
+            generation = _generation(status)
+            if generation in before or (status.st_dev, status.st_ino) in before_inodes:
                 os.close(fd)
                 continue
             if status.st_size > MAX_PROVIDER_FILE_BYTES:
@@ -1090,7 +1116,7 @@ def _reattest_worktree_root(root: _Root) -> None:
 
 
 def _terminal_line() -> bytes:
-    """Read exactly one already-framed terminal line without waiting for EOF."""
+    """Read exactly one terminal line and require an already-observed EOF."""
     descriptor = sys.stdin.fileno()
     line = os.read(descriptor, MAX_EVENT_BYTES + 1)
     if (
@@ -1103,10 +1129,10 @@ def _terminal_line() -> bytes:
     try:
         os.set_blocking(descriptor, False)
         try:
-            if os.read(descriptor, 1):
+            if os.read(descriptor, 1) != b"":
                 _fail()
         except BlockingIOError:
-            pass
+            _fail()
     except OSError:
         _fail()
     finally:
@@ -1233,12 +1259,8 @@ def supervise_native_codex(arguments: Any) -> int:
                     classified.append((fd, _stat, metadata))
                     if metadata.bound_leaf is not True:
                         continue
-                    session, totals, _spawned_from, matches = _parse_rollout(fd, binding)
-                    try:
-                        observed_total += os.fstat(fd).st_size
-                    except OSError:
-                        # Test doubles and already-closed unrelated candidates have no live size.
-                        observed_total += _stat.st_size
+                    session, totals, _spawned_from, matches, consumed = _parse_rollout(fd, binding)
+                    observed_total += consumed
                     if observed_total > MAX_PROVIDER_TOTAL_BYTES:
                         _fail()
                     if matches:
@@ -1256,11 +1278,10 @@ def supervise_native_codex(arguments: Any) -> int:
                         fully_scanned = False
                     continue
                 try:
-                    _session, _child_totals, spawned_from, _matches = _parse_rollout(fd, binding)
-                    try:
-                        observed_total += os.fstat(fd).st_size
-                    except OSError:
-                        observed_total += _stat.st_size
+                    _session, _child_totals, spawned_from, _matches, consumed = _parse_rollout(
+                        fd, binding
+                    )
+                    observed_total += consumed
                     if observed_total > MAX_PROVIDER_TOTAL_BYTES:
                         _fail()
                     if spawned_from != leaf:
@@ -1272,7 +1293,7 @@ def supervise_native_codex(arguments: Any) -> int:
                     fully_scanned = False
             _assert_root(provider)
             closing = _inventory(provider)
-            scanned = {(status.st_dev, status.st_ino) for _fd, status, _metadata in classified}
+            scanned = {_generation(status) for _fd, status, _metadata in classified}
             # The closing descriptor-relative inventory must be exactly the post-READY
             # rollout set that was scanned.  Any late creation, unlink, or replacement
             # leaves topology incomplete rather than overclaiming whole-tree proof.

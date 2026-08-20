@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
@@ -473,12 +473,13 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(
             with pytest.raises(usage_native_codex.NativeCodexCaptureError):
                 usage_native_codex._parse_rollout(stream.fileno(), manifest)  # pyright: ignore[reportPrivateUsage]
             return
-        session, totals, _parent, matches = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
+        session, totals, _parent, matches, consumed = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
             stream.fileno(), manifest
         )
     assert session == "leaf-811"
     assert matches is expected_match
     assert totals == (9, 2, 3, 4, 4, 13)
+    assert consumed == rollout.stat().st_size
 
 
 @pytest.mark.parametrize(
@@ -538,7 +539,8 @@ def test_native_codex_inventory_does_not_read_or_size_existing_rollouts(tmp_path
         inventory = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
     finally:
         os.close(root.descriptor)
-    assert inventory == {(existing.stat().st_dev, existing.stat().st_ino)}
+    status = existing.stat()
+    assert inventory == {(status.st_dev, status.st_ino, status.st_ctime_ns)}
 
 
 @pytest.mark.parametrize("mode", [0o620, 0o666])
@@ -561,6 +563,44 @@ def test_native_codex_provider_walk_accepts_owner_read_write_rollout_file(tmp_pa
     """The observed provider-owned 0644 rollout mode remains admitted."""
     rollout = tmp_path / "rollout.jsonl"
     rollout.write_text("{}\n")
+    os.chmod(rollout, 0o644)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        assert len(usage_native_codex._inventory(root)) == 1  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize(
+    ("target", "mode"), [("root", 0o777), ("root", 0o770), ("nested", 0o777), ("nested", 0o770)]
+)
+def test_native_codex_provider_walk_rejects_writable_directories(
+    tmp_path: Path, target: str, mode: int
+) -> None:
+    """Provider sessions directories cannot grant group or world write access."""
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "rollout.jsonl").write_text("{}\n")
+    os.chmod(tmp_path, 0o755)
+    os.chmod(tmp_path if target == "root" else nested, mode)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_provider_walk_accepts_safe_root_and_nested_directories(
+    tmp_path: Path,
+) -> None:
+    """Provider-owned 0755 sessions roots and nested directories remain admitted."""
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    rollout = nested / "rollout.jsonl"
+    rollout.write_text("{}\n")
+    for path in (tmp_path, nested):
+        os.chmod(path, 0o755)
     os.chmod(rollout, 0o644)
     root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
     try:
@@ -595,6 +635,27 @@ def test_native_codex_inventory_rejects_renamed_pre_ready_inode(tmp_path: Path) 
         os.rename(existing, tmp_path / "renamed.jsonl")
         candidates = usage_native_codex._new_rollouts(root, before)  # pyright: ignore[reportPrivateUsage]
         assert candidates == []
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_new_rollouts_rejects_reused_pre_ready_inode_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A changed generation on a pre-READY inode cannot become fresh evidence."""
+    rollout = tmp_path / "replacement.jsonl"
+    rollout.write_text("{}\n")
+    descriptor = os.open(rollout, os.O_RDONLY | os.O_CLOEXEC)
+    status = os.fstat(descriptor)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+
+    def walk(_root: usage_native_codex._Root) -> Iterator[tuple[str, int, os.stat_result]]:  # pyright: ignore[reportPrivateUsage]
+        yield "replacement.jsonl", descriptor, status
+
+    monkeypatch.setattr(usage_native_codex, "_walk", walk)
+    try:
+        before = {(status.st_dev, status.st_ino, max(0, status.st_ctime_ns - 1))}
+        assert usage_native_codex._new_rollouts(root, before) == []  # pyright: ignore[reportPrivateUsage]
     finally:
         os.close(root.descriptor)
 
@@ -789,7 +850,7 @@ def test_native_codex_parses_unrelated_root_session_without_leaf_requirements(
         "effort": "high",
     }
     with rollout.open("rb") as stream:
-        session, totals, parent, matches = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
+        session, totals, parent, matches, _consumed = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
             stream.fileno(), binding
         )
     assert (session, totals, parent, matches) == ("root-811", (0, 0, 0, 0, 0, 0), "", False)
@@ -1068,10 +1129,15 @@ def test_native_codex_streams_two_mebibyte_content_event_at_exact_boundary(tmp_p
     rollout = tmp_path / "large.jsonl"
     rollout.write_bytes(json.dumps(root_meta, separators=(",", ":")).encode() + b"\n" + exact)
     with rollout.open("rb") as stream:
-        _session, totals, _parent, matches = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
+        _session, totals, _parent, matches, consumed = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
             stream.fileno(), binding
         )
     assert totals == (0, 0, 0, 0, 0, 0) and matches is False
+    assert consumed == rollout.stat().st_size
+    rollout.write_bytes(b"")
+    assert consumed > rollout.stat().st_size
+    rollout.write_bytes(b"G" * (consumed + 1))
+    assert consumed < rollout.stat().st_size
 
     one_over = tmp_path / "one-over.jsonl"
     one_over.write_bytes(
@@ -1615,19 +1681,20 @@ def test_native_codex_supervisor_usage_root_replacement_appends_nothing(
         return "a" * 40
 
     inventory_calls = 0
+    candidate_generation = usage_native_codex._generation(os.stat_result((0,) * 10))  # pyright: ignore[reportPrivateUsage]
 
-    def inventory(_root: usage_native_codex._Root) -> set[tuple[int, int]]:  # pyright: ignore[reportPrivateUsage]
+    def inventory(_root: usage_native_codex._Root) -> set[tuple[int, int, int]]:  # pyright: ignore[reportPrivateUsage]
         nonlocal inventory_calls
         inventory_calls += 1
-        return set() if inventory_calls == 1 else {(0, 0)}
+        return set() if inventory_calls == 1 else {candidate_generation}
 
     def metadata(_fd: int, _binding: dict[str, str]) -> usage_native_codex._CandidateMetadata:  # pyright: ignore[reportPrivateUsage]
         return usage_native_codex._CandidateMetadata(True, None)  # pyright: ignore[reportPrivateUsage]
 
     def parse(
         _fd: int, _binding: dict[str, str]
-    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool]:
-        return "leaf", (0, 0, 0, 0, 0, 0), "", True
+    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
+        return "leaf", (0, 0, 0, 0, 0, 0), "", True, 0
 
     def new_rollouts(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
@@ -1775,14 +1842,15 @@ def test_native_codex_record_persists_exact_registration_hashes() -> None:
     ("framed", "extra", "accepts"),
     [
         (b'{"type":"TERMINAL"}\n', b"", True),
-        (b'{"type":"TERMINAL"}', b"", False),
+        (b'{"type":"TERMINAL"}', None, False),
+        (b'{"type":"TERMINAL"}\n', None, False),
         (b'{"type":"TERMINAL"}\n', b'{"type":"TERMINAL"}\n', False),
     ],
 )
 def test_native_codex_terminal_framing_is_nonblocking_and_single_use(
-    monkeypatch: pytest.MonkeyPatch, framed: bytes, extra: bytes, accepts: bool
+    monkeypatch: pytest.MonkeyPatch, framed: bytes, extra: bytes | None, accepts: bool
 ) -> None:
-    """The supervisor accepts one newline-framed terminal record without EOF."""
+    """The supervisor accepts exactly one newline-framed terminal record followed by EOF."""
     fake_stdin = SimpleNamespace(buffer=BytesIO(framed), fileno=lambda: 811)
     monkeypatch.setattr(usage_native_codex.sys, "stdin", fake_stdin)
 
@@ -1791,12 +1859,12 @@ def test_native_codex_terminal_framing_is_nonblocking_and_single_use(
 
     monkeypatch.setattr(usage_native_codex.os, "set_blocking", set_blocking)
 
-    reads = iter((framed, extra[:1] if extra else BlockingIOError()))
+    reads = iter((framed, extra))
 
     def read_extra(_fd: int, _size: int) -> bytes:
         value = next(reads)
-        if isinstance(value, BlockingIOError):
-            raise value
+        if value is None:
+            raise BlockingIOError()
         return value
 
     monkeypatch.setattr(usage_native_codex.os, "read", read_extra)
@@ -1814,6 +1882,21 @@ def test_native_codex_terminal_rejects_two_frames_from_one_unbuffered_write(
     reader, writer = os.pipe()
     try:
         os.write(writer, b'{"type":"TERMINAL"}\n{"type":"TERMINAL"}\n')
+        monkeypatch.setattr(usage_native_codex.sys, "stdin", SimpleNamespace(fileno=lambda: reader))
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._terminal_line()  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(writer)
+        os.close(reader)
+
+
+def test_native_codex_terminal_rejects_open_writer_without_delayed_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An open writer without EOF cannot leave delayed terminal data admissible."""
+    reader, writer = os.pipe()
+    try:
+        os.write(writer, b'{"type":"TERMINAL"}\n')
         monkeypatch.setattr(usage_native_codex.sys, "stdin", SimpleNamespace(fileno=lambda: reader))
         with pytest.raises(usage_native_codex.NativeCodexCaptureError):
             usage_native_codex._terminal_line()  # pyright: ignore[reportPrivateUsage]
@@ -1955,15 +2038,16 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         return None
 
     inventory_calls = 0
+    candidate_generation = usage_native_codex._generation(os.stat_result((0,) * 10))  # pyright: ignore[reportPrivateUsage]
 
-    def inventory(_root: usage_native_codex._Root) -> set[tuple[int, int]]:  # pyright: ignore[reportPrivateUsage]
+    def inventory(_root: usage_native_codex._Root) -> set[tuple[int, int, int]]:  # pyright: ignore[reportPrivateUsage]
         nonlocal inventory_calls
         inventory_calls += 1
-        return set() if inventory_calls == 1 else {(0, 0)}
+        return set() if inventory_calls == 1 else {candidate_generation}
 
     def new_rollouts(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
-        _before: set[tuple[int, int]],
+        _before: set[tuple[int, int, int]],
     ) -> list[tuple[str, int, os.stat_result]]:
         entries = [("leaf.jsonl", 99, os.stat_result((0,) * 10))]
         if role is NativeCodexRole.REPAIR:
@@ -1974,14 +2058,14 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
 
     def parse_rollout(
         _fd: int, _binding: dict[str, str]
-    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool]:
+    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
         nonlocal parsed_after_terminal
         if not parsed_after_terminal:
             parsed_after_terminal = True
             time.monotonic()
         if _fd == 98:
-            return "child-811", (0, 0, 0, 0, 0, 0), "leaf-811", False
-        return "leaf-811", (1, 2, 3, 4, 5, 6), "", True
+            return "child-811", (0, 0, 0, 0, 0, 0), "leaf-811", False, 0
+        return "leaf-811", (1, 2, 3, 4, 5, 6), "", True, 0
 
     def registered_role(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
@@ -2646,7 +2730,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
     original_inventory = usage_native_codex._inventory  # pyright: ignore[reportPrivateUsage]
     inventory_calls = 0
 
-    def inventory(root: usage_native_codex._Root) -> set[tuple[int, int]]:  # pyright: ignore[reportPrivateUsage]
+    def inventory(root: usage_native_codex._Root) -> set[tuple[int, int, int]]:  # pyright: ignore[reportPrivateUsage]
         nonlocal inventory_calls
         inventory_calls += 1
         if inventory_calls == 2:
@@ -2744,11 +2828,13 @@ def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
             ],
         ),
     )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
-    monkeypatch.setattr(
-        usage_native_codex,
-        "_parse_rollout",
-        cast(Any, lambda _fd, _binding: ("leaf", (0, 0, 0, 0, 0, 0), "", _fd < 90 + match_count)),  # pyright: ignore[reportUnknownLambdaType]
-    )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+
+    def parse_rollout(
+        descriptor: int, _binding: dict[str, str]
+    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
+        return "leaf", (0, 0, 0, 0, 0, 0), "", descriptor < 90 + match_count, 0
+
+    monkeypatch.setattr(usage_native_codex, "_parse_rollout", parse_rollout)
     monkeypatch.setattr(usage_native_codex, "_close", lambda _fd: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
         usage_native_codex,
@@ -2783,7 +2869,7 @@ def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
 def test_native_codex_supervisor_rejects_aggregate_actual_candidate_growth(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Post-inventory candidate bytes are summed from held descriptors, not stale stats."""
+    """All parsed candidate byte counts contribute to the immutable aggregate cap."""
     import capture_usage_cli as native_cli
 
     roots: list[usage_native_codex._Root] = []  # pyright: ignore[reportPrivateUsage]
@@ -2793,11 +2879,7 @@ def test_native_codex_supervisor_rejects_aggregate_actual_candidate_growth(
         descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         state = os.fstat(descriptor)
         roots.append(usage_native_codex._Root(descriptor, state.st_dev, state.st_ino))  # pyright: ignore[reportPrivateUsage]
-    candidates: list[int] = []
-    for name in ("one.jsonl", "two.jsonl"):
-        path = tmp_path / name
-        path.write_bytes(b"grown")
-        candidates.append(os.open(path, os.O_RDONLY | os.O_CLOEXEC))
+    candidates = [811_101, 811_102]
 
     def registered(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
@@ -2816,8 +2898,8 @@ def test_native_codex_supervisor_rejects_aggregate_actual_candidate_growth(
 
     def parse(
         _fd: int, _binding: dict[str, str]
-    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool]:
-        return "leaf", (0, 0, 0, 0, 0, 0), "", _fd == candidates[0]
+    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
+        return "leaf", (0, 0, 0, 0, 0, 0), "", _fd == candidates[0], 4
 
     def fail_append(*_args: object, **_kwargs: object) -> NoReturn:
         pytest.fail("append")
@@ -2829,6 +2911,11 @@ def test_native_codex_supervisor_rejects_aggregate_actual_candidate_growth(
     monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(
         usage_native_codex,
+        "_attested_origin",
+        lambda: "https://github.com/syamaner/roastpilot-agent.git",
+    )
+    monkeypatch.setattr(
+        usage_native_codex,
         "_registered_role",
         registered,
     )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
@@ -2838,7 +2925,11 @@ def test_native_codex_supervisor_rejects_aggregate_actual_candidate_growth(
         "_new_rollouts",
         new_rollouts,
     )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
-    monkeypatch.setattr(usage_native_codex, "_candidate_binding", lambda _fd, _binding: True)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_candidate_metadata",
+        lambda _fd, _binding: usage_native_codex._CandidateMetadata(True, None),  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType,reportPrivateUsage]
+    )
     monkeypatch.setattr(
         usage_native_codex,
         "_parse_rollout",
@@ -2899,10 +2990,10 @@ def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
 
     def parse_rollout(
         descriptor: int, _binding: dict[str, str]
-    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool]:
+    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
         if failure == "later_parse_error" and descriptor == candidates[1]:
             raise usage_native_codex.NativeCodexCaptureError("invalid rollout")
-        return "leaf", (0, 0, 0, 0, 0, 0), "", True
+        return "leaf", (0, 0, 0, 0, 0, 0), "", True, 0
 
     def registered_role(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
