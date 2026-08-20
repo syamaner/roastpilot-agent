@@ -696,13 +696,14 @@ def _parse_rollout(
                         matches = False
                 else:
                     _fail()
+                session = _string(payload.get("id"))
                 if (
-                    _string(payload.get("id")) == ""
+                    session == ""
+                    or _string(payload.get("session_id")) != session
                     or payload.get("originator") != "codex-tui"
                     or payload.get("cli_version") != "0.147.0"
                 ):
                     _fail()
-                session = _string(payload["id"])
                 seen_meta = True
             elif not seen_meta:
                 _fail()
@@ -716,6 +717,10 @@ def _parse_rollout(
                         and (
                             payload.get("model") != "gpt-5.6-terra"
                             or payload.get("effort") != binding["effort"]
+                            or (
+                                "worktree_path" in binding
+                                and payload.get("cwd") != binding["worktree_path"]
+                            )
                         )
                     )
                 ):
@@ -802,9 +807,9 @@ def _candidate_binding(fd: int, binding: dict[str, str]) -> bool | None:
             and spawn.get("agent_role") == binding["role"]
         )
     except NativeCodexCaptureError:
-        # A malformed row that already claims every bound identity must be rejected by
-        # the full parser, rather than being mistaken for unrelated active activity.
-        return all(value.encode("utf-8") in raw for value in binding.values())
+        # A newline-terminated malformed row cannot be proved unrelated from fragments.
+        # Retain it as indeterminate so a selected sibling withholds whole-tree proof.
+        return None
     except OSError:
         # A descriptor race remains fail-closed when the full parser reopens it.
         return True

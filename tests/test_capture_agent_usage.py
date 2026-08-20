@@ -266,7 +266,7 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(
             "model_provider": "discarded",
             "multi_agent_version": "discarded",
             "parent_thread_id": "parent-811",
-            "session_id": "discarded",
+            "session_id": "leaf-811",
             "thread_source": "subagent",
             "timestamp": "discarded",
             "source": {
@@ -544,7 +544,7 @@ def test_native_codex_parser_rejects_non_string_nested_discriminator(
         "id": "root",
         "model_provider": "x",
         "originator": "codex-tui",
-        "session_id": "x",
+        "session_id": "root",
         "source": "cli",
         "thread_source": "user",
         "timestamp": "x",
@@ -581,10 +581,10 @@ def test_native_codex_parser_enforces_actual_bytes_after_initial_stat(
         )
 
 
-def test_native_codex_malformed_matching_candidate_is_not_treated_as_unrelated(
+def test_native_codex_malformed_candidate_withholds_whole_tree_proof(
     tmp_path: Path,
 ) -> None:
-    """A malformed first row claiming the bound identity remains a matching candidate."""
+    """A malformed first row is indeterminate rather than falsely unrelated."""
     rollout = tmp_path / "matching.jsonl"
     binding = {
         "parent_thread_id": "parent-811",
@@ -594,7 +594,7 @@ def test_native_codex_malformed_matching_candidate_is_not_treated_as_unrelated(
     }
     rollout.write_text("{" + " ".join(binding.values()) + "\n")
     with rollout.open("rb") as stream:
-        assert usage_native_codex._candidate_binding(stream.fileno(), binding) is True  # pyright: ignore[reportPrivateUsage]
+        assert usage_native_codex._candidate_binding(stream.fileno(), binding) is None  # pyright: ignore[reportPrivateUsage]
         with pytest.raises(usage_native_codex.NativeCodexCaptureError):
             usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
 
@@ -624,7 +624,7 @@ def test_native_codex_parses_unrelated_root_session_without_leaf_requirements(
                     "id": "root-811",
                     "model_provider": "discarded",
                     "originator": "codex-tui",
-                    "session_id": "discarded",
+                    "session_id": "root-811",
                     "source": "cli",
                     "thread_source": "user",
                     "timestamp": "discarded",
@@ -646,6 +646,52 @@ def test_native_codex_parses_unrelated_root_session_without_leaf_requirements(
     assert (session, totals, parent, matches) == ("root-811", (0, 0, 0, 0, 0, 0), "", False)
 
 
+@pytest.mark.parametrize(
+    ("identifier", "session_id"),
+    [
+        ("root-811", "other-811"),
+        (["root-811"], "root-811"),
+        ("root-811", {"session": "root-811"}),
+    ],
+)
+def test_native_codex_rejects_mismatched_or_nontext_session_identifiers(
+    tmp_path: Path, identifier: object, session_id: object
+) -> None:
+    """Session metadata cannot split the recorded and topology session identities."""
+    rollout = tmp_path / "bad-session.jsonl"
+    rollout.write_text(
+        json.dumps(
+            {
+                "ordinal": 0,
+                "timestamp": "discarded",
+                "type": "session_meta",
+                "payload": {
+                    "base_instructions": "discarded",
+                    "cli_version": "0.147.0",
+                    "context_window": 1,
+                    "cwd": "discarded",
+                    "git": {
+                        "branch": "main",
+                        "commit_hash": "a" * 40,
+                        "repository_url": "discarded",
+                    },
+                    "history_mode": "discarded",
+                    "id": identifier,
+                    "model_provider": "discarded",
+                    "originator": "codex-tui",
+                    "session_id": session_id,
+                    "source": "cli",
+                    "thread_source": "user",
+                    "timestamp": "discarded",
+                },
+            }
+        )
+        + "\n"
+    )
+    with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+
+
 def test_native_codex_rejects_out_of_order_or_repeated_task_events(tmp_path: Path) -> None:
     """A fully scanned rollout cannot reorder or repeat task lifecycle markers."""
     meta = {
@@ -660,7 +706,7 @@ def test_native_codex_rejects_out_of_order_or_repeated_task_events(tmp_path: Pat
             "id": "root-811",
             "model_provider": "discarded",
             "originator": "codex-tui",
-            "session_id": "discarded",
+            "session_id": "root-811",
             "source": "cli",
             "thread_source": "user",
             "timestamp": "discarded",
@@ -734,7 +780,7 @@ def test_native_codex_rejects_decreasing_cumulative_token_totals(tmp_path: Path)
             "multi_agent_version": "x",
             "originator": "codex-tui",
             "parent_thread_id": "parent",
-            "session_id": "x",
+            "session_id": "leaf",
             "source": {
                 "subagent": {
                     "thread_spawn": {
@@ -841,7 +887,7 @@ def test_native_codex_streams_two_mebibyte_content_event_at_exact_boundary(tmp_p
             "id": "root-811",
             "model_provider": "discarded",
             "originator": "codex-tui",
-            "session_id": "discarded",
+            "session_id": "root-811",
             "source": "cli",
             "thread_source": "user",
             "timestamp": "discarded",
@@ -1892,7 +1938,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
                 "model_provider": "discarded",
                 "multi_agent_version": "discarded",
                 "parent_thread_id": "parent-811",
-                "session_id": "discarded",
+                "session_id": "leaf-811",
                 "thread_source": "subagent",
                 "timestamp": "discarded",
                 "source": {
@@ -1923,7 +1969,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
                 "collaboration_mode": "discarded",
                 "comp_hash": "discarded",
                 "current_date": "discarded",
-                "cwd": "/host/provider/path",
+                "cwd": str(repository),
                 "file_system_sandbox_policy": "discarded",
                 "multi_agent_version": "discarded",
                 "permission_profile": "discarded",
@@ -2092,7 +2138,10 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         ("child", "after", 1, False, None),
         ("incomplete-child", "before", 0, False, None),
         ("incomplete-child", "after", 0, False, None),
+        ("malformed-sibling", "before", 0, False, None),
+        ("malformed-sibling", "after", 0, False, None),
         ("sibling", "after", 0, False, "cwd"),
+        ("sibling", "after", 0, False, "context_cwd"),
         ("sibling", "after", 0, False, "repository_url"),
         ("sibling", "after", 0, False, "branch"),
         ("sibling", "after", 0, False, "commit_hash"),
@@ -2139,7 +2188,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
             "multi_agent_version": "opaque",
             "originator": "codex-tui",
             "parent_thread_id": parent,
-            "session_id": "opaque",
+            "session_id": session,
             "source": {
                 "subagent": {
                     "thread_spawn": {
@@ -2157,7 +2206,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         if session == "leaf-811" and mismatch is not None:
             if mismatch == "cwd":
                 meta["cwd"] = "untrusted"
-            else:
+            elif mismatch != "context_cwd":
                 git = cast(dict[str, str], meta["git"])
                 git[mismatch] = "untrusted"
         events: list[dict[str, object]] = [{"type": "session_meta", "payload": meta}]
@@ -2170,10 +2219,13 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                 {
                     "model": "gpt-5.6-terra",
                     "effort": "high",
+                    "cwd": str(worktree),
                     "realtime_active": False,
                     "workspace_roots": [],
                 }
             )
+            if session == "leaf-811" and mismatch == "context_cwd":
+                context["cwd"] = "untrusted"
             totals = {
                 key: 0
                 for key in (
@@ -2248,6 +2300,8 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         write_rollout(provider / "leaf.jsonl", "leaf-811", "parent-811", 1, complete=True)
         if topology == "sibling":
             write_rollout(provider / "other.jsonl", "other-811", "other-parent", 1, complete=True)
+        elif topology == "malformed-sibling":
+            (provider / "other.jsonl").write_text('{"malformed":"candidate"}\n')
         else:
             write_rollout(
                 provider / "other.jsonl", "child-811", "leaf-811", 2, complete=topology == "child"
