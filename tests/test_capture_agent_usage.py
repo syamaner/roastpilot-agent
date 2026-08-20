@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import tomllib
+import venv
 from collections.abc import Callable, Iterator
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -125,8 +126,16 @@ def _stub_native_codex_git_administration(monkeypatch: pytest.MonkeyPatch) -> No
     ) -> None:
         return None
 
+    def assert_administration_trees(
+        _administration: usage_native_codex._GitAdministration,  # pyright: ignore[reportPrivateUsage]
+    ) -> None:
+        return None
+
     monkeypatch.setattr(usage_native_codex, "_open_git_administration", open_administration)
     monkeypatch.setattr(usage_native_codex, "_assert_git_administration", assert_administration)
+    monkeypatch.setattr(
+        usage_native_codex, "_assert_git_administration_trees", assert_administration_trees
+    )
     monkeypatch.setattr(usage_native_codex, "_close_git_administration", close_administration)
 
 
@@ -214,12 +223,12 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
         "started_at": datetime.now(UTC),
         "completed_at": datetime.now(UTC),
         "elapsed_ms": 0,
-        "input_tokens": 1,
+        "input_tokens": 5,
         "cached_input_tokens": 2,
         "cache_write_input_tokens": 3,
-        "output_tokens": 4,
+        "output_tokens": 6,
         "reasoning_output_tokens": 5,
-        "total_tokens": 6,
+        "total_tokens": 11,
         "whole_tree_verified": True,
         "subagent_count": 0,
     }
@@ -231,6 +240,13 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
         NativeCodexUsageRecord.model_validate(
             {**payload, "success": False, "task_status": NativeCodexTaskStatus.SUCCESS}
         )
+    for field, value in (
+        ("cached_input_tokens", 6),
+        ("reasoning_output_tokens", 7),
+        ("total_tokens", 12),
+    ):
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate({**payload, field: value})
     with pytest.raises(ValidationError):
         NativeCodexUsageRecord.model_validate(
             {
@@ -1401,6 +1417,46 @@ def test_native_codex_checkout_directory_walk_bounds_all_entries(
         os.close(root.descriptor)
 
 
+def test_native_codex_checkout_attestation_accepts_standard_leaf_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A standard leaf-owned .venv may contain interpreter symlinks after READY."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    (repository / "tracked.txt").write_text("tracked\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    venv.EnvBuilder(with_pip=False).create(repository / ".venv")
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.chdir(repository)
+    try:
+        usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+        os.mkfifo(repository / ".venv" / "unsafe")
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_checkout_attestation_rejects_unsafe_non_venv_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only inert interpreter links inside .venv receive the narrow exception."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    (repository / "tracked.txt").write_text("tracked\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    (repository / "unsafe").symlink_to("/tmp")
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.chdir(repository)
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
 def test_native_codex_git_administration_accepts_normal_and_linked_worktrees(
     tmp_path: Path,
 ) -> None:
@@ -2482,7 +2538,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
             time.monotonic()
         if _fd == 98:
             return "child-811", (0, 0, 0, 0, 0, 0), "leaf-811", False, 0
-        return "leaf-811", (1, 2, 3, 4, 5, 6), "", True, 0
+        return "leaf-811", (2, 2, 3, 5, 5, 7), "", True, 0
 
     def registered_role(
         _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]

@@ -738,6 +738,12 @@ class NativeCodexUsageRecord(CaptureModel):
             raise ValueError("failed native Codex record has contradictory task status")
         if self.completed_at < self.started_at:
             raise ValueError("native Codex timestamps are contradictory")
+        if self.cached_input_tokens > self.input_tokens:
+            raise ValueError("native Codex cached input exceeds input tokens")
+        if self.reasoning_output_tokens > self.output_tokens:
+            raise ValueError("native Codex reasoning output exceeds output tokens")
+        if self.total_tokens != self.input_tokens + self.output_tokens:
+            raise ValueError("native Codex total tokens are contradictory")
         if not all(
             isinstance(value, str)
             and len(value) == 64

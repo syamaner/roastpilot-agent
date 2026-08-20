@@ -49,6 +49,8 @@ GIT_TIMEOUT_SECONDS = 5
 MAX_CHECKOUT_ENTRIES = 4096
 MAX_CHECKOUT_DEPTH = 16
 MAX_GIT_ADMIN_FILE_BYTES = 4096
+MAX_GIT_ADMIN_ENTRIES = 4096
+MAX_GIT_ADMIN_DEPTH = 16
 _ROLE_EXPECTATIONS: dict[NativeCodexRole, tuple[str, str]] = {
     NativeCodexRole.ENGINEER_BE: ("agents/engineer-be.toml", "high"),
     NativeCodexRole.ENGINEER_FE: ("agents/engineer-fe.toml", "high"),
@@ -722,11 +724,92 @@ def _same_git_file(left: _GitFile | None, right: _GitFile | None) -> bool:
     )
 
 
+def _assert_git_administration_tree(root: _Root) -> None:
+    """Walk one Git administrative tree through bounded no-follow descriptors."""
+    entries_seen = 0
+
+    def descend(directory: int, depth: int) -> None:
+        nonlocal entries_seen
+        if depth > MAX_GIT_ADMIN_DEPTH:
+            _fail()
+        _git_administration_directory(directory)
+        scandir_descriptor = os.dup(directory)
+        iterator: os.ScandirIterator[str] | None = None
+        try:
+            iterator = os.scandir(scandir_descriptor)
+            for entry in iterator:
+                entries_seen += 1
+                if entries_seen > MAX_GIT_ADMIN_ENTRIES or entry.name in {".", ".."}:
+                    _fail()
+                status = os.stat(entry.name, dir_fd=directory, follow_symlinks=False)
+                if stat.S_ISLNK(status.st_mode):
+                    _fail()
+                if stat.S_ISDIR(status.st_mode):
+                    child = os.open(
+                        entry.name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=directory,
+                    )
+                    try:
+                        descend(child, depth + 1)
+                    finally:
+                        os.close(child)
+                    continue
+                if (
+                    not stat.S_ISREG(status.st_mode)
+                    or status.st_uid != os.geteuid()
+                    or status.st_nlink != 1
+                    or stat.S_IMODE(status.st_mode) & 0o022
+                    or status.st_size > MAX_COMMITTED_FILE_BYTES
+                ):
+                    _fail()
+                child = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory,
+                )
+                try:
+                    current = os.fstat(child)
+                    if (
+                        _generation(current) != _generation(status)
+                        or current.st_size != status.st_size
+                    ):
+                        _fail()
+                finally:
+                    os.close(child)
+        except OSError:
+            _fail()
+        finally:
+            if iterator is not None:
+                with suppress(OSError):
+                    iterator.close()
+            with suppress(OSError):
+                _close(scandir_descriptor)
+
+    descriptor = os.dup(root.descriptor)
+    try:
+        descend(descriptor, 0)
+    finally:
+        os.close(descriptor)
+
+
+def _assert_git_administration_trees(administration: _GitAdministration) -> None:
+    """Attest each distinct Git administration root exactly once."""
+    roots = (administration.git_directory, administration.common_directory)
+    seen: set[tuple[int, int]] = set()
+    for root in roots:
+        if root is None or (root.device, root.inode) in seen:
+            continue
+        seen.add((root.device, root.inode))
+        _assert_git_administration_tree(root)
+
+
 def _assert_git_administration(worktree: _Root, expected: _GitAdministration) -> None:
     """Require the canonical Git administration topology to retain its held identities."""
     current: _GitAdministration | None = None
     try:
         current = _open_git_administration(worktree)
+        _assert_git_administration_trees(current)
         if (
             not _same_git_file(current.dotgit_file, expected.dotgit_file)
             or (current.git_directory.device, current.git_directory.inode)
@@ -812,7 +895,7 @@ def _assert_checkout_directories(root: _Root) -> None:
     """Inspect every checkout directory except Git's separately attested administration."""
     entries_seen = 0
 
-    def descend(directory: int, depth: int) -> None:
+    def descend(directory: int, prefix: str, depth: int) -> None:
         nonlocal entries_seen
         if depth > MAX_CHECKOUT_DEPTH:
             _fail()
@@ -830,9 +913,40 @@ def _assert_checkout_directories(root: _Root) -> None:
                 if entries_seen > MAX_CHECKOUT_ENTRIES:
                     _fail()
                 status = os.stat(entry.name, dir_fd=directory, follow_symlinks=False)
+                relative = f"{prefix}/{entry.name}" if prefix else entry.name
                 if stat.S_ISLNK(status.st_mode):
-                    _fail()
+                    if not relative.startswith(".venv/"):
+                        _fail()
+                    target = os.readlink(entry.name, dir_fd=directory)
+                    if (
+                        not target
+                        or "\x00" in target
+                        or len(target.encode("utf-8")) > MAX_COMMITTED_FILE_BYTES
+                    ):
+                        _fail()
+                    continue
                 if not stat.S_ISDIR(status.st_mode):
+                    if (
+                        not stat.S_ISREG(status.st_mode)
+                        or status.st_uid != os.geteuid()
+                        or status.st_nlink != 1
+                        or stat.S_IMODE(status.st_mode) & 0o022
+                    ):
+                        _fail()
+                    child = os.open(
+                        entry.name,
+                        os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=directory,
+                    )
+                    try:
+                        current = os.fstat(child)
+                        if (
+                            _generation(current) != _generation(status)
+                            or current.st_size != status.st_size
+                        ):
+                            _fail()
+                    finally:
+                        os.close(child)
                     continue
                 child = os.open(
                     entry.name,
@@ -840,7 +954,7 @@ def _assert_checkout_directories(root: _Root) -> None:
                     dir_fd=directory,
                 )
                 try:
-                    descend(child, depth + 1)
+                    descend(child, relative, depth + 1)
                 finally:
                     os.close(child)
         except OSError:
@@ -854,7 +968,7 @@ def _assert_checkout_directories(root: _Root) -> None:
 
     descriptor = os.dup(root.descriptor)
     try:
-        descend(descriptor, 0)
+        descend(descriptor, "", 0)
     finally:
         os.close(descriptor)
 
@@ -1352,38 +1466,55 @@ class _CandidateMetadata:
 
     bound_leaf: bool | None
     parent_thread_id: str | None
+    consumed: int = 0
 
 
 def _candidate_metadata(fd: int, binding: dict[str, str]) -> _CandidateMetadata:
     """Read only first-row identity needed for the closed two-pass selection."""
-    bound_leaf = _candidate_binding(fd, binding)
+    raw = b""
     try:
         with os.fdopen(os.dup(fd), "rb") as stream:
             raw = stream.readline(MAX_EVENT_BYTES + 1)
         os.lseek(fd, 0, os.SEEK_SET)
         if len(raw) > MAX_EVENT_BYTES or not raw.endswith(b"\n"):
-            return _CandidateMetadata(bound_leaf, None)
+            return _CandidateMetadata(None, None, len(raw))
         event = _json(raw)
-        payload = event.get("payload")
-        if not isinstance(payload, dict):
-            return _CandidateMetadata(bound_leaf, None)
+        if (
+            set(event) != {"ordinal", "payload", "timestamp", "type"}
+            or event.get("type") != "session_meta"
+            or not isinstance(event.get("payload"), dict)
+        ):
+            return _CandidateMetadata(None, None, len(raw))
+        payload = event["payload"]
         top_parent = payload.get("parent_thread_id")
         retained_parent = top_parent if _safe_identifier(top_parent) else None
         source = payload.get("source")
         if not isinstance(source, dict):
-            return _CandidateMetadata(None, retained_parent)
+            return _CandidateMetadata(None, retained_parent, len(raw))
         subagent = source.get("subagent")
         if not isinstance(subagent, dict):
-            return _CandidateMetadata(None, retained_parent)
+            return _CandidateMetadata(None, retained_parent, len(raw))
         spawn = subagent.get("thread_spawn")
         if not isinstance(spawn, dict):
-            return _CandidateMetadata(None, retained_parent)
+            return _CandidateMetadata(None, retained_parent, len(raw))
         parent = spawn.get("parent_thread_id")
+        matches_identity = (
+            parent == binding["parent_thread_id"]
+            and spawn.get("agent_path") == binding["agent_path"]
+            and spawn.get("agent_role") == binding["role"]
+        )
+        bound_leaf: bool | None
+        if not matches_identity:
+            bound_leaf = False
+        elif type(spawn.get("depth")) is int and spawn["depth"] == 1:
+            bound_leaf = True
+        else:
+            bound_leaf = None
         return _CandidateMetadata(
-            bound_leaf, parent if _safe_identifier(parent) else retained_parent
+            bound_leaf, parent if _safe_identifier(parent) else retained_parent, len(raw)
         )
     except (NativeCodexCaptureError, OSError):
-        return _CandidateMetadata(bound_leaf, None)
+        return _CandidateMetadata(None, None, len(raw))
 
 
 def _new_rollouts(
@@ -1631,6 +1762,7 @@ def supervise_native_codex(arguments: Any) -> int:
         _reject_root_overlap(usage, provider, worktree)
         _assert_worktree_root(worktree)
         git_administration = _open_git_administration(worktree)
+        _assert_git_administration_trees(git_administration)
         _assert_checkout(worktree)
         launch = _git_identity(
             arguments.repository, arguments.branch, arguments.base_sha, final=False
@@ -1689,6 +1821,9 @@ def supervise_native_codex(arguments: Any) -> int:
                 try:
                     metadata = _candidate_metadata(fd, binding)
                     classified.append((fd, _stat, metadata))
+                    observed_total += metadata.consumed
+                    if observed_total > MAX_PROVIDER_TOTAL_BYTES:
+                        _fail()
                     if metadata.bound_leaf is not True:
                         continue
                     session, totals, _spawned_from, matches, consumed = _parse_rollout(fd, binding)
