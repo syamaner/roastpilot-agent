@@ -1582,6 +1582,50 @@ def test_native_codex_checkout_attestation_accepts_standard_leaf_venv(
         os.close(root.descriptor)
 
 
+def test_native_codex_checkout_attestation_accepts_safe_npm_bin_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A standard top-level npm executable link remains admissible after READY."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    (repository / "tracked.txt").write_text("tracked\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    executable = repository / "web" / "node_modules" / "vite" / "bin" / "vite.js"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/usr/bin/env node\n")
+    bin_directory = repository / "web" / "node_modules" / ".bin"
+    bin_directory.mkdir()
+    (bin_directory / "vite").symlink_to("../vite/bin/vite.js")
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.chdir(repository)
+    try:
+        usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_checkout_attestation_rejects_escaping_npm_bin_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An npm executable link whose lexical target escapes node_modules fails closed."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    (repository / "tracked.txt").write_text("tracked\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    bin_directory = repository / "web" / "node_modules" / ".bin"
+    bin_directory.mkdir(parents=True)
+    (bin_directory / "vite").symlink_to("../../../../outside")
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.chdir(repository)
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
 def test_native_codex_checkout_attestation_rejects_group_writable_non_venv_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

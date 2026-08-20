@@ -48,6 +48,7 @@ MAX_GIT_OUTPUT_BYTES = 64 * 1024
 GIT_TIMEOUT_SECONDS = 5
 MAX_CHECKOUT_ENTRIES = 262_144
 MAX_CHECKOUT_DEPTH = 32
+MAX_NPM_BIN_TARGET_BYTES = 4096
 MAX_GIT_ADMIN_FILE_BYTES = 4096
 MAX_GIT_ADMIN_ENTRIES = 8192
 MAX_GIT_ADMIN_DEPTH = 16
@@ -945,6 +946,101 @@ def _assert_checkout(root: _Root) -> None:
                 os.close(descriptor)
 
 
+def _assert_npm_bin_symlink(
+    root: _Root, directory: int, relative: str, name: str, status: os.stat_result
+) -> None:
+    """Attest one narrowly admitted npm executable symlink without resolving host paths."""
+    parts = tuple(relative.split("/"))
+    if (
+        status.st_uid != os.geteuid()
+        or len(parts) < 4
+        or len(parts) > MAX_CHECKOUT_DEPTH
+        or parts[:2] != ("web", "node_modules")
+        or parts[-2] != ".bin"
+        or not parts[-1]
+        or any(not part or part in {".", ".."} for part in parts)
+    ):
+        _fail()
+    try:
+        target = os.readlink(name, dir_fd=directory)
+        encoded_target = target.encode("utf-8")
+        current_link = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except (OSError, UnicodeError):
+        _fail()
+    if (
+        not target
+        or "\x00" in target
+        or target.startswith("/")
+        or len(encoded_target) > MAX_NPM_BIN_TARGET_BYTES
+        or not stat.S_ISLNK(current_link.st_mode)
+        or current_link.st_uid != os.geteuid()
+        or _generation(current_link) != _generation(status)
+        or current_link.st_size != status.st_size
+    ):
+        _fail()
+    target_parts = tuple(target.split("/"))
+    if len(target_parts) > MAX_CHECKOUT_DEPTH or any(not part for part in target_parts):
+        _fail()
+    normalized = list(parts[:-1])
+    for part in target_parts:
+        if part == ".":
+            continue
+        if part == "..":
+            if not normalized:
+                _fail()
+            normalized.pop()
+            continue
+        normalized.append(part)
+        if len(normalized) > MAX_CHECKOUT_DEPTH:
+            _fail()
+    if len(normalized) < 3 or tuple(normalized[:2]) != ("web", "node_modules"):
+        _fail()
+
+    descriptor = os.dup(root.descriptor)
+    try:
+        root_status = os.fstat(descriptor)
+        if (root_status.st_dev, root_status.st_ino) != (root.device, root.inode):
+            _fail()
+        _checkout_directory(descriptor)
+        for part in normalized[:-1]:
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+            _checkout_directory(descriptor)
+        target_name = normalized[-1]
+        initial = os.stat(target_name, dir_fd=descriptor, follow_symlinks=False)
+        child = os.open(
+            target_name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=descriptor,
+        )
+        try:
+            current = os.fstat(child)
+            final = os.stat(target_name, dir_fd=descriptor, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_uid != os.geteuid()
+                or current.st_nlink != 1
+                or stat.S_IMODE(current.st_mode) & 0o022
+                or _generation(initial) != _generation(current)
+                or initial.st_size != current.st_size
+                or _generation(final) != _generation(current)
+                or final.st_size != current.st_size
+            ):
+                _fail()
+        finally:
+            os.close(child)
+    except OSError:
+        _fail()
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
+
+
 def _assert_checkout_directories(root: _Root) -> None:
     """Inspect every checkout directory except Git's separately attested administration."""
     entries_seen = 0
@@ -970,13 +1066,13 @@ def _assert_checkout_directories(root: _Root) -> None:
                 relative = f"{prefix}/{entry.name}" if prefix else entry.name
                 if stat.S_ISLNK(status.st_mode):
                     linux_lib64 = prefix == ".venv" and entry.name == "lib64"
-                    if status.st_uid != os.geteuid() or (
-                        not linux_lib64
-                        and (
-                            prefix != ".venv/bin"
-                            or not re.fullmatch(r"python(?:3(?:\.\d+)?)?", entry.name)
-                        )
+                    if not linux_lib64 and (
+                        prefix != ".venv/bin"
+                        or not re.fullmatch(r"python(?:3(?:\.\d+)?)?", entry.name)
                     ):
+                        _assert_npm_bin_symlink(root, directory, relative, entry.name, status)
+                        continue
+                    if status.st_uid != os.geteuid():
                         _fail()
                     target = os.readlink(entry.name, dir_fd=directory)
                     target_name = os.path.basename(target)
