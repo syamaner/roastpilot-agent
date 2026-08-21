@@ -166,4 +166,14 @@ describe("RoastRating (#566: read-only headline + edit affordance)", () => {
     render(<RoastRating runId="r1" rating={3} notes={null} />, { wrapper: wrapper() });
     expectStarGlyphsText(screen.getByTestId("rating-headline"), "★★★☆☆");
   });
+
+  it("passes an out-of-range persisted rating (7) straight through to StarGlyphs, which saturates it to ★★★★★ — the caller must not pre-clamp an out-of-range value to zero (that would be a second, inconsistent normalization boundary vs RoastTastings' own direct pass-through)", () => {
+    render(<RoastRating runId="r1" rating={7} notes={null} />, { wrapper: wrapper() });
+    const headline = screen.getByTestId("rating-headline");
+    expectStarGlyphsText(headline, "★★★★★");
+    expect(within(headline).getByTestId("star-glyphs")).toHaveAttribute(
+      "aria-label",
+      "5 of 5 stars",
+    );
+  });
 });

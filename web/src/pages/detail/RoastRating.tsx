@@ -196,7 +196,7 @@ export function RoastRating({ runId, rating, notes, className }: RoastRatingProp
             <p className="text-sm text-muted-foreground">Not yet rated.</p>
           ) : (
             <>
-              <StarGlyphs rating={clampStars(rating) ?? 0} className="text-2xl leading-none text-roast-caution" />
+              <StarGlyphs rating={rating} className="text-2xl leading-none text-roast-caution" />
               {notes !== null && notes !== "" && (
                 <p className="text-sm text-foreground">{notes}</p>
               )}
