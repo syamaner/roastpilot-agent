@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -87,6 +87,61 @@ describe("RoastTastings", () => {
 
     await waitFor(() => expect(screen.getByTestId("tasting-entry-2")).toBeInTheDocument());
     expect(screen.getByTestId("tasting-entry-2")).toHaveTextContent("medium-fine, 22g/380g");
+  });
+
+  describe("#794: entry stars render via StarGlyphs, which cannot be crashed by a malformed stored value", () => {
+    function entryWithStars(id: number, stars: number) {
+      return {
+        id,
+        tasted_at_utc: null,
+        recorded_at_utc: "2026-07-12T18:05:00+00:00",
+        stars,
+        notes: null,
+        brew_method: null,
+        grind_note: null,
+        attributes: [],
+        defects: [],
+      };
+    }
+
+    it("renders a well-formed 3-star entry as ★★★☆☆", async () => {
+      vi.spyOn(api, "tastings").mockResolvedValue({
+        run_id: "r1",
+        tastings: [entryWithStars(10, 3)],
+      });
+      render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+
+      const entry = await screen.findByTestId("tasting-entry-10");
+      expect(within(entry).getByTestId("star-glyphs").textContent).toBe("★★★☆☆");
+    });
+
+    it("clamps a malformed stored stars value of 6 to 5 filled stars instead of throwing a negative-repeat RangeError and unmounting the list", async () => {
+      vi.spyOn(api, "tastings").mockResolvedValue({
+        run_id: "r1",
+        tastings: [entryWithStars(11, 6)],
+      });
+      render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+
+      const entry = await screen.findByTestId("tasting-entry-11");
+      expect(within(entry).getByTestId("star-glyphs").textContent).toBe("★★★★★");
+      // The list container survived rendering the malformed entry — the old
+      // `"★".repeat(5 - entry.stars)` code threw a `RangeError` for stars > 5
+      // (a negative `repeat` count), which would have thrown during render
+      // and left this list unmounted entirely.
+      expect(screen.getByTestId("tasting-entries")).toBeInTheDocument();
+    });
+
+    it("clamps a malformed stored stars value of 0 to 0 filled stars instead of throwing", async () => {
+      vi.spyOn(api, "tastings").mockResolvedValue({
+        run_id: "r1",
+        tastings: [entryWithStars(12, 0)],
+      });
+      render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+
+      const entry = await screen.findByTestId("tasting-entry-12");
+      expect(within(entry).getByTestId("star-glyphs").textContent).toBe("☆☆☆☆☆");
+      expect(screen.getByTestId("tasting-entries")).toBeInTheDocument();
+    });
   });
 
   it("saves a stars-only entry (every other field optional)", async () => {

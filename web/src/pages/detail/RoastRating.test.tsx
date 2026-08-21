@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -14,6 +14,13 @@ function wrapper() {
   );
 }
 
+/** Asserts the EXACT `StarGlyphs` text (not a substring match — a naive
+ *  `toHaveTextContent("★★★★")` also passes for "★★★★☆", so this reads the
+ *  glyph run's own `textContent` directly and compares it for equality). */
+function expectStarGlyphsText(container: HTMLElement, expected: string): void {
+  expect(within(container).getByTestId("star-glyphs").textContent).toBe(expected);
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   // Defensive: this file only READS the module-scoped partial-failure lock
@@ -26,7 +33,7 @@ describe("RoastRating (#566: read-only headline + edit affordance)", () => {
   it("renders a read-only headline from the persisted rating and notes, with no edit form visible", () => {
     render(<RoastRating runId="r1" rating={4} notes="bright" />, { wrapper: wrapper() });
     const headline = screen.getByTestId("rating-headline");
-    expect(headline).toHaveTextContent("★★★★");
+    expectStarGlyphsText(headline, "★★★★☆");
     expect(headline).toHaveTextContent("bright");
     expect(screen.queryByTestId("star-4")).not.toBeInTheDocument();
     expect(screen.queryByTestId("rating-notes")).not.toBeInTheDocument();
@@ -88,8 +95,9 @@ describe("RoastRating (#566: read-only headline + edit affordance)", () => {
     fireEvent.click(screen.getByTestId("rating-cancel"));
 
     expect(screen.queryByTestId("star-1")).not.toBeInTheDocument();
-    expect(screen.getByTestId("rating-headline")).toHaveTextContent("★★★★");
-    expect(screen.getByTestId("rating-headline")).toHaveTextContent("bright");
+    const headline = screen.getByTestId("rating-headline");
+    expectStarGlyphsText(headline, "★★★★☆");
+    expect(headline).toHaveTextContent("bright");
   });
 
   it("surfaces a save error and stays in edit mode (draft not lost)", async () => {
@@ -149,7 +157,23 @@ describe("RoastRating (#566: read-only headline + edit affordance)", () => {
     rerender(<RoastRating runId="r1" rating={5} notes="from a tasting" />);
 
     expect(screen.queryByTestId("star-3")).not.toBeInTheDocument();
-    expect(screen.getByTestId("rating-headline")).toHaveTextContent("★★★★★");
-    expect(screen.getByTestId("rating-headline")).toHaveTextContent("from a tasting");
+    const headline = screen.getByTestId("rating-headline");
+    expectStarGlyphsText(headline, "★★★★★");
+    expect(headline).toHaveTextContent("from a tasting");
+  });
+
+  it("renders exactly ★★★☆☆ for a rating of 3", () => {
+    render(<RoastRating runId="r1" rating={3} notes={null} />, { wrapper: wrapper() });
+    expectStarGlyphsText(screen.getByTestId("rating-headline"), "★★★☆☆");
+  });
+
+  it("passes an out-of-range persisted rating (7) straight through to StarGlyphs, which saturates it to ★★★★★ — the caller must not pre-clamp an out-of-range value to zero (that would be a second, inconsistent normalization boundary vs RoastTastings' own direct pass-through)", () => {
+    render(<RoastRating runId="r1" rating={7} notes={null} />, { wrapper: wrapper() });
+    const headline = screen.getByTestId("rating-headline");
+    expectStarGlyphsText(headline, "★★★★★");
+    expect(within(headline).getByTestId("star-glyphs")).toHaveAttribute(
+      "aria-label",
+      "5 of 5 stars",
+    );
   });
 });
