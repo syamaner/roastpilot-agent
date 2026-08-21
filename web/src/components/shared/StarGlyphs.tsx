@@ -3,14 +3,18 @@
  *
  * Shared component exception (contract-authorized): `RoastRating`'s
  * read-only headline and `RoastTastings`' read-only entry stars both
- * hand-rolled the SAME `"★".repeat(n) + "☆".repeat(5 - n)` pattern with no
- * clamp on the input — `TastingEntry` fed a raw persisted `entry.stars`
- * straight into `"★".repeat(5 - entry.stars)`, so any malformed stored value
- * above 5 threw a `RangeError` (negative `repeat` count) and unmounted the
- * whole tasting list. `StarGlyphs` centralizes the derivation with a
- * fail-closed clamp so no caller can repeat that hazard: a non-finite input
- * (`NaN`/`Infinity`/`-Infinity`) fails closed to 0 filled stars, and any
- * other value is rounded then clamped to the 0–5 range before rendering.
+ * hand-rolled the SAME `"★".repeat(n) + "★".repeat(5 - n)` pattern with no
+ * clamp on the input — both runs used the IDENTICAL `★` glyph, with the
+ * "empty" run visually distinguished only by a dimmed `text-muted-
+ * foreground/40` colour/opacity wrapper, never a distinct outline glyph.
+ * `TastingEntry` fed a raw persisted `entry.stars` straight into
+ * `"★".repeat(5 - entry.stars)`, so any malformed stored value above 5 made
+ * that second `repeat` count negative, throwing a `RangeError` and
+ * unmounting the whole tasting list. `StarGlyphs` centralizes the
+ * derivation with a fail-closed clamp so no caller can repeat that hazard: a
+ * non-finite input (`NaN`/`Infinity`/`-Infinity`) fails closed to 0 filled
+ * stars, and any other value is rounded then clamped to the 0–5 range before
+ * rendering.
  *
  * Deliberately minimal: one text run (no inner `<span>`, no opacity/color
  * distinction between filled and empty glyphs, no alpha-modifier class) —
