@@ -53,6 +53,7 @@ from capture_usage_models import (
     EVIDENCE_ROOT_ENVIRONMENT_KEY,
     EVIDENCE_SCHEMA_VERSION,
     MAX_STREAM_BYTES,
+    NATIVE_CODEX_USAGE_SCHEMA_VERSION,
     NATIVE_ROLE_EXCLUSIONS,
     NATIVE_WORKER_USAGE_SCHEMA_VERSION,
     PLAN_ROOT_ENVIRONMENT_KEY,
@@ -72,6 +73,7 @@ from capture_usage_models import (
     FindingSeverity,
     HarnessFamily,
     NativeClaudeRole,
+    NativeCodexRole,
     NativeWorkerUsageRecord,
     OutcomeRecord,
     ParsedUsage,
@@ -81,6 +83,10 @@ from capture_usage_models import (
     ValidationCommandKind,
     render_allowed_tools,
     render_validation_commands,
+)
+from capture_usage_native_codex import (
+    NativeCodexCaptureError,
+    supervise_native_codex,
 )
 from capture_usage_transcript import (
     HANDBACK_SCHEMA_VERSION,
@@ -2328,6 +2334,11 @@ def _add_output_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", type=_sink_path, default=DEFAULT_SINK)
 
 
+def supervise_native_codex_command(arguments: argparse.Namespace) -> int:
+    """Hold native-Codex bindings while the parent dispatches its named leaf."""
+    return supervise_native_codex(arguments)
+
+
 EnumMember = TypeVar("EnumMember")
 
 
@@ -2347,7 +2358,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="version",
         version=(
             f"generic={AGENT_USAGE_SCHEMA_VERSION} "
-            f"native-worker={NATIVE_WORKER_USAGE_SCHEMA_VERSION}"
+            f"native-worker={NATIVE_WORKER_USAGE_SCHEMA_VERSION} "
+            f"native-codex={NATIVE_CODEX_USAGE_SCHEMA_VERSION}"
         ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
@@ -2400,6 +2412,23 @@ def build_parser() -> argparse.ArgumentParser:
     native.add_argument("--usage-root", required=True)
     _add_output_option(native)
     native.set_defaults(handler=run_native_claude_command)
+
+    native_codex = commands.add_parser(
+        "supervise-native-codex", help="supervise one registered Codex leaf lifecycle"
+    )
+    native_codex.add_argument(
+        "--role", choices=tuple(role.value for role in NativeCodexRole), required=True
+    )
+    native_codex.add_argument("--task-id", required=True)
+    native_codex.add_argument("--slice-id", required=True)
+    native_codex.add_argument("--parent-task-id", required=True)
+    native_codex.add_argument("--task-name", required=True)
+    native_codex.add_argument("--repository", required=True)
+    native_codex.add_argument("--branch", required=True)
+    native_codex.add_argument("--base-sha", required=True)
+    native_codex.add_argument("--usage-root", required=True)
+    _add_output_option(native_codex)
+    native_codex.set_defaults(handler=supervise_native_codex_command)
 
     print_validation = commands.add_parser(
         "print-validation-commands",
@@ -2458,6 +2487,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         failure = str(exc)
     except CodexUsageParseError:
         failure = "Codex usage stream is invalid"
+    except NativeCodexCaptureError:
+        failure = "native Codex capture is invalid"
     except ClaudeAuthorityError:
         failure = "Claude launch authority is not attested"
     except ClaudeUsageParseError:

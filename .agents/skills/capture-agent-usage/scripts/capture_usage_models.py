@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Annotated, BinaryIO, Literal, TypeAlias
 
@@ -16,6 +17,23 @@ AGENT_USAGE_SCHEMA_VERSION = 1
 
 NATIVE_WORKER_USAGE_SCHEMA_VERSION = 3
 """D161 native-worker record schema, distinct from generic capture records."""
+
+NATIVE_CODEX_USAGE_SCHEMA_VERSION = 1
+"""Parent-to-registered-Codex-leaf record schema version."""
+
+NATIVE_CODEX_REPOSITORY = "syamaner/roastpilot-agent"
+"""The sole repository admitted by the persisted native Codex schema."""
+
+NATIVE_CODEX_ACCEPTED_ORIGINS = frozenset(
+    {
+        f"https://github.com/{NATIVE_CODEX_REPOSITORY}.git",
+        f"git@github.com:{NATIVE_CODEX_REPOSITORY}.git",
+    }
+)
+"""Exact accepted Git origin spellings for native Codex provenance."""
+
+NATIVE_CODEX_CONFIG_SHA256 = "11ceba3a199d28682671dbcb548f6c1c0c63817df9b34c931c685a85f1aa5395"
+"""SHA-256 of the complete committed registered-Codex configuration."""
 
 SKILL_VERSION = "0.1.0"
 """The version of the capture skill's normalized record grammar."""
@@ -93,6 +111,37 @@ class NativeClaudeRole(Enum):
     QA = "qa"
     SIM_ROAST_RUNNER = "sim-roast-runner"
     STORY_PLANNER = "story-planner"
+
+
+class NativeCodexRole(Enum):
+    """The only registered Codex leaves admitted to native capture."""
+
+    ENGINEER_BE = "engineer-be"
+    ENGINEER_FE = "engineer-fe"
+    REPAIR = "repair"
+
+
+NATIVE_CODEX_ROLE_SHA256: dict[NativeCodexRole, str] = {
+    NativeCodexRole.ENGINEER_BE: "bcad195fce15322e489cc836d3b846953994fd136f442fff6c338f69c490d74f",
+    NativeCodexRole.ENGINEER_FE: "4da74886a9c5e4b7cad4b6e7ed858f0f7e596f76189bd07240b77e9cd5c13831",
+    NativeCodexRole.REPAIR: "4671a9d8b84b500208f2b603e81f255d64d678fc11ebbf4982b7bf8ddca0fa7d",
+}
+"""Exact SHA-256 bindings for the committed registered-Codex role definitions."""
+
+NATIVE_CODEX_ROLE_INSTRUCTION_SHA256: dict[NativeCodexRole, str] = {
+    NativeCodexRole.ENGINEER_BE: "6634afea8938b1472e4677806262365bb5e23278a636d5c8ae7be0a8a04ba07c",
+    NativeCodexRole.ENGINEER_FE: "886daaae2ca56ba26d63d2e8b9824c06c389e6c4ab765de7719d9bfce7461f8e",
+    NativeCodexRole.REPAIR: "8df164d5d3bab1e4f1553a3daea6b302888c252c80cbe4e6f91ac2ec277533d1",
+}
+"""Exact SHA-256 bindings for committed leaf instruction text."""
+
+
+class NativeCodexTaskStatus(Enum):
+    """Closed parent-observed terminal task status."""
+
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 NATIVE_ROLE_EXCLUSIONS: dict[str, str] = {
@@ -657,6 +706,141 @@ class NativeWorkerUsageRecord(CaptureModel):
         return self
 
 
+class NativeCodexUsageRecord(CaptureModel):
+    """One metadata-only result from a registered Codex leaf lifecycle."""
+
+    record_type: Literal["NATIVE_CODEX_USAGE"] = "NATIVE_CODEX_USAGE"
+    schema_version: Literal[1] = NATIVE_CODEX_USAGE_SCHEMA_VERSION
+    tool_version: SafeIdentifier = SKILL_VERSION
+    captured_at: datetime
+    task_id: SafeIdentifier
+    slice_id: SafeIdentifier
+    parent_task_id: SafeIdentifier
+    task_name: SafeIdentifier
+    native_role: NativeCodexRole
+    role_capability: Literal[RoleCapability.WRITE] = RoleCapability.WRITE
+    model: Literal["gpt-5.6-terra"] = "gpt-5.6-terra"
+    effort: SafeIdentifier
+    config_sha256: str
+    role_sha256: str
+    repository: RepositoryName
+    branch: GitReference
+    base_sha: GitSha
+    launch_head_sha: GitSha
+    final_head_sha: GitSha
+    parent_thread_id: SafeIdentifier
+    leaf_session_id: SafeIdentifier
+    topology_depth: Literal[1] = 1
+    harness_version: Literal["0.147.0"] = "0.147.0"
+    # Native collaboration reports a task terminal state, not a shell exit code.
+    exit_code: None = None
+    task_status: NativeCodexTaskStatus
+    success: bool
+    started_at: datetime
+    completed_at: datetime
+    elapsed_ms: TokenCount
+    input_tokens: TokenCount
+    cached_input_tokens: TokenCount
+    cache_write_input_tokens: TokenCount
+    output_tokens: TokenCount
+    reasoning_output_tokens: TokenCount
+    total_tokens: TokenCount
+    # True proves every newly-created rollout was scanned and none named this
+    # leaf as parent; zero ``subagent_count`` is the corresponding evidence.
+    whole_tree_verified: bool
+    subagent_count: int
+
+    @field_validator("success", "whole_tree_verified", mode="before")
+    @classmethod
+    def require_native_boolean(cls, value: object) -> object:
+        """Reject coercion at persisted native-Codex boolean boundaries."""
+        if type(value) is not bool:
+            raise ValueError("native Codex boolean fields must be JSON booleans")
+        return value
+
+    @field_validator(
+        "schema_version",
+        "topology_depth",
+        "elapsed_ms",
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+        "subagent_count",
+        mode="before",
+    )
+    @classmethod
+    def require_native_integer(cls, value: object) -> object:
+        """Reject coercion at persisted native-Codex integer/count boundaries."""
+        if type(value) is not int:
+            raise ValueError("native Codex integer fields must be JSON integers")
+        return value
+
+    @field_validator("role_capability", mode="before")
+    @classmethod
+    def normalize_serialized_write_capability(cls, value: object) -> object:
+        """Round-trip the one persisted Enum value without widening capability."""
+        return RoleCapability.WRITE if value == RoleCapability.WRITE.value else value
+
+    @model_validator(mode="after")
+    def validate_native_codex_usage(self) -> NativeCodexUsageRecord:
+        """Require Git and task outcomes to agree with the closed lifecycle."""
+        expected_effort = {
+            NativeCodexRole.ENGINEER_BE: "high",
+            NativeCodexRole.ENGINEER_FE: "high",
+            NativeCodexRole.REPAIR: "medium",
+        }[self.native_role]
+        if self.effort != expected_effort:
+            raise ValueError("native Codex role effort is contradictory")
+        if self.repository != NATIVE_CODEX_REPOSITORY:
+            raise ValueError("native Codex repository is contradictory")
+        if (
+            any(
+                not re.fullmatch(r"[0-9a-f]{40}", value)
+                for value in (self.base_sha, self.launch_head_sha, self.final_head_sha)
+            )
+            or self.launch_head_sha != self.base_sha
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", self.branch)
+            or ".." in self.branch
+            or self.branch.startswith("-")
+        ):
+            raise ValueError("native Codex Git bindings are contradictory")
+        if self.success:
+            if self.task_status is not NativeCodexTaskStatus.SUCCESS:
+                raise ValueError("successful native Codex record has contradictory task status")
+            if self.final_head_sha == self.base_sha:
+                raise ValueError("successful native Codex record requires a descendant head")
+        elif self.task_status is NativeCodexTaskStatus.SUCCESS:
+            raise ValueError("failed native Codex record has contradictory task status")
+        if any(
+            value.tzinfo is None or value.utcoffset() is None
+            for value in (self.captured_at, self.started_at, self.completed_at)
+        ):
+            raise ValueError("native Codex timestamps must be timezone-aware")
+        if self.captured_at != self.completed_at:
+            raise ValueError("native Codex capture time must equal completion")
+        if self.completed_at < self.started_at:
+            raise ValueError("native Codex timestamps are contradictory")
+        if self.completed_at - self.started_at != timedelta(milliseconds=self.elapsed_ms):
+            raise ValueError("native Codex elapsed time is contradictory")
+        if self.cached_input_tokens > self.input_tokens:
+            raise ValueError("native Codex cached input exceeds input tokens")
+        if self.reasoning_output_tokens > self.output_tokens:
+            raise ValueError("native Codex reasoning output exceeds output tokens")
+        if self.total_tokens != self.input_tokens + self.output_tokens:
+            raise ValueError("native Codex total tokens are contradictory")
+        if (
+            self.config_sha256 != NATIVE_CODEX_CONFIG_SHA256
+            or self.role_sha256 != NATIVE_CODEX_ROLE_SHA256[self.native_role]
+        ):
+            raise ValueError("native Codex registration hashes are contradictory")
+        if self.subagent_count != 0:
+            raise ValueError("native Codex topology proof is contradictory")
+        return self
+
+
 class CapacitySnapshotRecord(CaptureModel):
     """A qualitative capacity observation without raw readings or percentages."""
 
@@ -707,7 +891,11 @@ class OutcomeRecord(CaptureModel):
 
 
 UsageRecord: TypeAlias = (
-    TaskUsageRecord | NativeWorkerUsageRecord | CapacitySnapshotRecord | OutcomeRecord
+    TaskUsageRecord
+    | NativeWorkerUsageRecord
+    | NativeCodexUsageRecord
+    | CapacitySnapshotRecord
+    | OutcomeRecord
 )
 """The closed append-only record union."""
 

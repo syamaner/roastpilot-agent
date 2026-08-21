@@ -120,10 +120,16 @@ dependencies = [
 #   provider="anthropic"  -> pip install roastpilot-agent[anthropic]
 #   provider="google"     -> pip install roastpilot-agent[google]
 [project.optional-dependencies]
-anthropic = ["pydantic-ai-slim[anthropic]>=1.0,<2"]
+anthropic = [
+  "pydantic-ai-slim[anthropic]>=1.0,<2",
+  # Anthropic 1.x expects httpx2.AsyncClient; supported PydanticAI 1.x passes
+  # httpx.AsyncClient from HTTPX 0.28 to its native provider integration.
+  "anthropic<1"
+]
 google = ["pydantic-ai-slim[google]>=1.0,<2"]
 all-providers = [
   "pydantic-ai-slim[anthropic]>=1.0,<2",
+  "anthropic<1",
   "pydantic-ai-slim[google]>=1.0,<2"
 ]
 
@@ -165,6 +171,7 @@ dev = [
   # Native-provider SDKs so the full build_model factory (every provider
   # value) is exercised in CI, while the runtime install stays lean.
   "pydantic-ai-slim[anthropic]>=1.0,<2",
+  "anthropic<1",
   "pydantic-ai-slim[google]>=1.0,<2",
   # The real MCP server, spawned as a stdio child in mock-driver mode for the
   # E9-S2 vertical slice (D6). Pinned to the 0.1.7 surface the mcp_client

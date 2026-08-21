@@ -9,6 +9,7 @@ import inspect
 import itertools
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -18,11 +19,14 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+import tomllib
+import venv
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, BinaryIO, NoReturn, cast
 from uuid import UUID
 
@@ -30,6 +34,7 @@ import capture_usage_claude as usage_claude
 import capture_usage_cli as usage_cli
 import capture_usage_codex as usage_codex
 import capture_usage_models as usage_models
+import capture_usage_native_codex as usage_native_codex
 import capture_usage_transcript as usage_transcript
 import pytest
 from capture_usage_claude import (
@@ -62,6 +67,9 @@ from capture_usage_models import (
     MAX_EVENT_BYTES,
     MAX_EVENT_COUNT,
     MAX_STREAM_BYTES,
+    NATIVE_CODEX_CONFIG_SHA256,
+    NATIVE_CODEX_REPOSITORY,
+    NATIVE_CODEX_ROLE_SHA256,
     NATIVE_ROLE_EXCLUSIONS,
     PLAN_ROOT_ENVIRONMENT_KEY,
     VALIDATION_ENVIRONMENT_ROLES,
@@ -75,6 +83,9 @@ from capture_usage_models import (
     EstimateBasis,
     HarnessFamily,
     NativeClaudeRole,
+    NativeCodexRole,
+    NativeCodexTaskStatus,
+    NativeCodexUsageRecord,
     NativeWorkerUsageRecord,
     ParsedUsage,
     RoleCapability,
@@ -91,8 +102,4680 @@ from capture_usage_models import (
 from pydantic import TypeAdapter, ValidationError
 
 _REAL_VALIDATE_WORKTREE_METADATA = usage_cli._validate_worktree_metadata  # pyright: ignore[reportPrivateUsage]
+
+
+def _stub_native_codex_git_administration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bypass Git-admin I/O in supervisor units that deliberately use synthetic roots."""
+    administration = usage_native_codex._GitAdministration(  # pyright: ignore[reportPrivateUsage]
+        None,
+        usage_native_codex._Root(-1, 0, 0),  # pyright: ignore[reportPrivateUsage]
+        None,
+        None,
+    )
+
+    def open_administration(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+    ) -> usage_native_codex._GitAdministration:  # pyright: ignore[reportPrivateUsage]
+        return administration
+
+    def assert_administration(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _administration: usage_native_codex._GitAdministration,  # pyright: ignore[reportPrivateUsage]
+    ) -> None:
+        return None
+
+    def close_administration(
+        _administration: usage_native_codex._GitAdministration,  # pyright: ignore[reportPrivateUsage]
+    ) -> None:
+        return None
+
+    def assert_administration_trees(
+        _administration: usage_native_codex._GitAdministration,  # pyright: ignore[reportPrivateUsage]
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(usage_native_codex, "_open_git_administration", open_administration)
+    monkeypatch.setattr(usage_native_codex, "_assert_git_administration", assert_administration)
+    monkeypatch.setattr(
+        usage_native_codex, "_assert_git_administration_trees", assert_administration_trees
+    )
+    monkeypatch.setattr(usage_native_codex, "_close_git_administration", close_administration)
+
+
+def _native_leaf_boundary(worktree: Path, effort: str) -> dict[str, object]:
+    """Build the closed 0.147 managed authority shape for real native rollouts."""
+    path = str(worktree)
+    filesystem: dict[str, object] = {
+        "kind": "restricted",
+        "entries": [
+            {"path": {"type": "special", "value": {"kind": "root"}}, "access": "read"},
+            {"path": {"type": "path", "path": path}, "access": "write"},
+            {"path": {"type": "special", "value": {"kind": "slash_tmp"}}, "access": "write"},
+            {"path": {"type": "special", "value": {"kind": "tmpdir"}}, "access": "write"},
+            {
+                "path": {"type": "path", "path": str(worktree / ".git")},
+                "access": "read",
+                "missing_path_behavior": "skip",
+            },
+            {
+                "path": {"type": "path", "path": str(worktree / ".agents")},
+                "access": "read",
+                "missing_path_behavior": "skip",
+            },
+            {
+                "path": {"type": "path", "path": str(worktree / ".codex")},
+                "access": "read",
+                "missing_path_behavior": "skip",
+            },
+        ],
+    }
+    return {
+        "workspace_roots": [path],
+        "sandbox_policy": {
+            "type": "workspace-write",
+            "network_access": False,
+            "exclude_tmpdir_env_var": False,
+            "exclude_slash_tmp": False,
+        },
+        "file_system_sandbox_policy": filesystem,
+        "permission_profile": {
+            "type": "managed",
+            "file_system": filesystem,
+            "network": "restricted",
+        },
+        "approval_policy": "on-request",
+        "approvals_reviewer": "auto_review",
+        "realtime_active": False,
+        "collaboration_mode": {
+            "mode": "default",
+            "settings": {
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": effort,
+                "developer_instructions": None,
+            },
+        },
+    }
+
+
 FIXTURES = Path(__file__).parent / "fixtures" / "agent-usage"
 USAGE_RECORD_ADAPTER = cast(TypeAdapter[UsageRecord], _USAGE_RECORD_ADAPTER)
+
+
+def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
+    """Native Codex records never claim success without a descendant result."""
+    started = datetime.now(UTC)
+    payload: dict[str, object] = {
+        "captured_at": started,
+        "task_id": "task-811",
+        "slice_id": "native-codex-capture",
+        "parent_task_id": "parent-811",
+        "task_name": "native-codex-capture",
+        "native_role": NativeCodexRole.ENGINEER_BE,
+        "effort": "high",
+        "config_sha256": NATIVE_CODEX_CONFIG_SHA256,
+        "role_sha256": NATIVE_CODEX_ROLE_SHA256[NativeCodexRole.ENGINEER_BE],
+        "repository": NATIVE_CODEX_REPOSITORY,
+        "branch": "feature/811-native-codex-capture",
+        "base_sha": "a" * 40,
+        "launch_head_sha": "a" * 40,
+        "final_head_sha": "b" * 40,
+        "parent_thread_id": "thread-811",
+        "leaf_session_id": "leaf-811",
+        "exit_code": None,
+        "task_status": NativeCodexTaskStatus.SUCCESS,
+        "success": True,
+        "started_at": started,
+        "completed_at": started,
+        "elapsed_ms": 0,
+        "input_tokens": 5,
+        "cached_input_tokens": 2,
+        "cache_write_input_tokens": 3,
+        "output_tokens": 6,
+        "reasoning_output_tokens": 5,
+        "total_tokens": 11,
+        "whole_tree_verified": True,
+        "subagent_count": 0,
+    }
+    record = NativeCodexUsageRecord.model_validate(payload)
+    assert USAGE_RECORD_ADAPTER.validate_json(record.model_dump_json()) == record
+    for field in ("captured_at", "started_at", "completed_at"):
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate({**payload, field: started.replace(tzinfo=None)})
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate({**payload, field: "2026-08-21T12:00:00"})
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate(
+            {**payload, "captured_at": started + timedelta(milliseconds=1)}
+        )
+    for field, value in (
+        ("success", "true"),
+        ("whole_tree_verified", 1),
+        ("schema_version", "1"),
+        ("topology_depth", True),
+        ("elapsed_ms", 0.0),
+        ("input_tokens", True),
+        ("cached_input_tokens", "2"),
+        ("cache_write_input_tokens", 3.0),
+        ("output_tokens", "6"),
+        ("reasoning_output_tokens", False),
+        ("total_tokens", 11.0),
+        ("subagent_count", "0"),
+    ):
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate({**payload, field: value})
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate({**payload, "final_head_sha": "a" * 40})
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate(
+            {**payload, "success": False, "task_status": NativeCodexTaskStatus.SUCCESS}
+        )
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate(
+            {**payload, "whole_tree_verified": False, "subagent_count": 1}
+        )
+    for elapsed in (1,):
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate({**payload, "elapsed_ms": elapsed})
+    for offset in (1, -1):
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate(
+                {
+                    **payload,
+                    "completed_at": started + timedelta(milliseconds=offset),
+                    "elapsed_ms": 0,
+                }
+            )
+    for field, value in (
+        ("config_sha256", "0" * 64),
+        ("role_sha256", "0" * 64),
+        ("repository", "syamaner/roastpilot-plan"),
+    ):
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate({**payload, field: value})
+        with pytest.raises(ValidationError):
+            USAGE_RECORD_ADAPTER.validate_python({**payload, field: value})
+    for field, value in (
+        ("cached_input_tokens", 6),
+        ("reasoning_output_tokens", 7),
+        ("total_tokens", 12),
+    ):
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate({**payload, field: value})
+    for field in ("base_sha", "launch_head_sha", "final_head_sha"):
+        for value in ("a" * 39, "A" * 40, "g" * 40):
+            with pytest.raises(ValidationError):
+                NativeCodexUsageRecord.model_validate({**payload, field: value})
+    for branch in ("-feature", "feature/../x", "feature:811", "feature\n811"):
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate({**payload, "branch": branch})
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate({**payload, "launch_head_sha": "b" * 40})
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate(
+            {
+                **payload,
+                "completed_at": cast(datetime, payload["started_at"]) - timedelta(milliseconds=1),
+            }
+        )
+
+
+def test_native_codex_registration_closure_matches_committed_project_files() -> None:
+    """All and only committed named Codex leaves carry the fixed capture pins."""
+    expected = {
+        NativeCodexRole.ENGINEER_BE: "high",
+        NativeCodexRole.ENGINEER_FE: "high",
+        NativeCodexRole.REPAIR: "medium",
+    }
+    root = usage_native_codex._open_root(str(Path.cwd()), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        for role, effort in expected.items():
+            _config_hash, _role_hash, observed_effort, canonical = (
+                usage_native_codex._registered_role(  # pyright: ignore[reportPrivateUsage]
+                    root, role
+                )
+            )
+            assert observed_effort == effort
+            assert canonical == role.value
+    finally:
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize("value", [0, 1, 131071])
+def test_native_codex_registration_requires_committed_project_doc_limit(
+    tmp_path: Path, value: int
+) -> None:
+    """Any project-doc byte-limit drift blocks native role attestation before READY."""
+    shutil.copytree(".codex", tmp_path / ".codex")
+    config = tmp_path / ".codex" / "config.toml"
+    config.write_text(
+        config.read_text().replace(
+            "project_doc_max_bytes = 131072", f"project_doc_max_bytes = {value}"
+        )
+    )
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._registered_role(root, NativeCodexRole.ENGINEER_BE)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["top_disabled", "model", "effort", "leaf_enabled", "extra", "wrong_path", "no_model_boundary"],
+)
+def test_native_codex_registered_role_rejects_tampered_authority(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Every registered-role authority field is closed and fail-closed on drift."""
+    config = Path(".codex/config.toml").read_bytes()
+    role = Path(".codex/agents/engineer-be.toml").read_bytes()
+    if case == "top_disabled":
+        config = config.replace(b"enabled = true", b"enabled = false", 1)
+    elif case == "wrong_path":
+        config = config.replace(b"agents/engineer-be.toml", b"agents/wrong.toml", 1)
+    elif case == "model":
+        role = role.replace(b"gpt-5.6-terra", b"gpt-5.6-other")
+    elif case == "effort":
+        role = role.replace(b'model_reasoning_effort = "high"', b'model_reasoning_effort = "low"')
+    elif case == "leaf_enabled":
+        role = role.replace(b"enabled = false", b"enabled = true")
+    elif case == "extra":
+        role += b"extra = true\n"
+    elif case == "no_model_boundary":
+        role = role.replace(b"invoke Claude Code or any other model", b"invoke provider")
+    else:  # pragma: no cover - parametrization is closed above.
+        raise AssertionError(case)
+
+    def read(_root: object, parts: tuple[str, ...]) -> bytes:
+        return config if parts[-1] == "config.toml" else role
+
+    monkeypatch.setattr(usage_native_codex, "_read_relative", read)
+    root = usage_native_codex._Root(-1, 0, 0)  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._registered_role(root, NativeCodexRole.ENGINEER_BE)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    ("depth", "ordinal_case", "raises", "expected_match"),
+    [
+        (1, "contiguous", False, True),
+        (True, "contiguous", True, False),
+        (1.0, "contiguous", True, False),
+        (0, "contiguous", False, False),
+        (2, "contiguous", False, False),
+        (1, "first-nonzero", True, False),
+        (1, "gap", True, False),
+        (1, "duplicate", True, False),
+        (1, "regression", True, False),
+        (1, "removed-final-token", True, False),
+    ],
+)
+def test_native_codex_rollout_uses_final_cumulative_total_once(
+    tmp_path: Path, depth: object, ordinal_case: str, raises: bool, expected_match: bool
+) -> None:
+    """The native rollout parser keeps the final cumulative total instead of summing events."""
+    manifest: dict[str, str] = {
+        "parent_thread_id": "parent-811",
+        "role": "engineer-be",
+        "agent_path": "/root/native-codex-capture",
+        "effort": "high",
+    }
+    meta = {
+        "type": "session_meta",
+        "payload": {
+            "id": "leaf-811",
+            "agent_nickname": "worker-811",
+            "agent_path": "/root/native-codex-capture",
+            "agent_role": "engineer-be",
+            "base_instructions": "discarded",
+            "originator": "codex-tui",
+            "cli_version": "0.147.0",
+            "context_window": 1,
+            "cwd": "discarded",
+            "history_mode": "discarded",
+            "model_provider": "openai",
+            "multi_agent_version": "v2",
+            "parent_thread_id": "parent-811",
+            "session_id": "leaf-811",
+            "thread_source": "subagent",
+            "timestamp": "discarded",
+            "source": {
+                "subagent": {
+                    "thread_spawn": {
+                        "parent_thread_id": "parent-811",
+                        "depth": depth,
+                        "agent_path": "/root/native-codex-capture",
+                        "agent_nickname": "worker-811",
+                        "agent_role": "engineer-be",
+                    }
+                }
+            },
+            "git": {
+                "commit_hash": "a" * 40,
+                "branch": "main",
+                "repository_url": "discarded",
+            },
+        },
+    }
+    context: dict[str, object] = {
+        "type": "turn_context",
+        "payload": {
+            "model": "gpt-5.6-terra",
+            "effort": "high",
+            "approval_policy": "discarded",
+            "approvals_reviewer": "discarded",
+            "collaboration_mode": "discarded",
+            "comp_hash": "discarded",
+            "current_date": "discarded",
+            "cwd": "discarded",
+            "file_system_sandbox_policy": "discarded",
+            "multi_agent_version": "v2",
+            "permission_profile": "discarded",
+            "personality": "discarded",
+            "realtime_active": False,
+            "sandbox_policy": "discarded",
+            "summary": "discarded",
+            "timezone": "discarded",
+            "turn_id": "discarded",
+            "workspace_roots": [],
+        },
+    }
+
+    def event(total: int) -> dict[str, object]:
+        return {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {},
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                    "model_context_window": 1,
+                    "total_token_usage": {
+                        "input_tokens": total,
+                        "cached_input_tokens": min(total, 2),
+                        "cache_write_input_tokens": 3,
+                        "output_tokens": 4,
+                        "reasoning_output_tokens": 4,
+                        "total_tokens": total + 4,
+                    },
+                },
+            },
+        }
+
+    events = cast(
+        list[dict[str, object]],
+        [
+            meta,
+            context,
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "collaboration_mode_kind": "discarded",
+                    "model_context_window": 1,
+                    "started_at": "discarded",
+                    "turn_id": "discarded",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": "discarded",
+                    "content": "SECRET_PROMPT_OR_RESPONSE",
+                    "internal_chat_message_metadata_passthrough": {},
+                    "role": "assistant",
+                    "phase": "final",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "id": "discarded",
+                    "call_id": "discarded",
+                    "arguments": "SECRET_TOOL_INPUT",
+                    "internal_chat_message_metadata_passthrough": {},
+                    "name": "discarded",
+                },
+            },
+            {"type": "world_state", "payload": {"full": False, "state": {}}},
+            event(1),
+            event(9),
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "completed_at": "discarded",
+                    "duration_ms": 1,
+                    "last_agent_message": "discarded",
+                    "started_at": "discarded",
+                    "time_to_first_token_ms": 1,
+                    "turn_id": "discarded",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "completed_at_ms": 1,
+                    "item": {},
+                    "started_at_ms": 0,
+                    "thread_id": "discarded",
+                    "turn_id": "discarded",
+                },
+            },
+        ],
+    )
+    ordinals = list(range(len(events)))
+    if ordinal_case == "first-nonzero":
+        ordinals[0] = 1
+    elif ordinal_case == "gap":
+        ordinals[4] = 5
+    elif ordinal_case == "duplicate":
+        ordinals[4] = 3
+    elif ordinal_case == "regression":
+        ordinals[5] = 3
+    elif ordinal_case == "removed-final-token":
+        events.pop(7)
+        ordinals.pop(7)
+    rollout = tmp_path / "leaf.jsonl"
+    rollout.write_text(
+        "".join(
+            json.dumps({"ordinal": ordinal, "timestamp": "discarded", **item}) + "\n"
+            for ordinal, item in zip(ordinals, events, strict=True)
+        )
+    )
+    with rollout.open("rb") as stream:
+        if raises:
+            with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+                usage_native_codex._parse_rollout(stream.fileno(), manifest)  # pyright: ignore[reportPrivateUsage]
+            return
+        session, totals, _parent, matches, consumed = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
+            stream.fileno(), manifest
+        )
+    assert session == "leaf-811"
+    assert matches is expected_match
+    assert totals == (9, 2, 3, 4, 4, 13)
+    assert consumed == rollout.stat().st_size
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {
+            "input_tokens": 9,
+            "cached_input_tokens": 1,
+            "cache_write_input_tokens": 3,
+            "output_tokens": 4,
+            "reasoning_output_tokens": 5,
+            "total_tokens": 13,
+        },
+        {
+            "input_tokens": 9,
+            "cached_input_tokens": 10,
+            "cache_write_input_tokens": 3,
+            "output_tokens": 4,
+            "reasoning_output_tokens": 3,
+            "total_tokens": 13,
+        },
+        {
+            "input_tokens": 9,
+            "cached_input_tokens": 2,
+            "cache_write_input_tokens": 3,
+            "output_tokens": 4,
+            "reasoning_output_tokens": 5,
+            "total_tokens": 14,
+        },
+    ],
+)
+def test_native_codex_rejects_contradictory_provider_token_totals(usage: dict[str, int]) -> None:
+    """0.147 totals retain only the provider's non-overlapping token aggregate."""
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._totals(usage)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_accepts_provider_token_total_boundaries() -> None:
+    """Cached input and reasoning may equal their containing input/output categories."""
+    usage = {
+        "input_tokens": 9,
+        "cached_input_tokens": 9,
+        "cache_write_input_tokens": 3,
+        "output_tokens": 4,
+        "reasoning_output_tokens": 4,
+        "total_tokens": 13,
+    }
+    assert usage_native_codex._totals(usage) == (9, 9, 3, 4, 4, 13)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_inventory_does_not_read_or_size_existing_rollouts(tmp_path: Path) -> None:
+    """A pre-existing large provider session is retained as an identity only."""
+    existing = tmp_path / "existing.jsonl"
+    existing.write_bytes(b"x" * (usage_native_codex.MAX_PROVIDER_FILE_BYTES + 1))
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        inventory = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+    status = existing.stat()
+    assert inventory == {(status.st_dev, status.st_ino, status.st_ctime_ns)}
+
+
+def test_native_codex_inventory_closes_large_historical_rollouts_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full historical snapshot retains attestations, not one file descriptor per row."""
+    historical_count = 128
+    for index in range(historical_count):
+        (tmp_path / f"history-{index}.jsonl").write_text("{}\n")
+    monkeypatch.setattr(usage_native_codex, "MAX_PROVIDER_FILES", historical_count)
+    monkeypatch.setattr(usage_native_codex, "MAX_PROVIDER_ENTRIES", historical_count)
+    closed: list[int] = []
+    real_close = usage_native_codex._close  # pyright: ignore[reportPrivateUsage]
+
+    def close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(usage_native_codex, "_close", close)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        inventory = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+    assert len(inventory) == historical_count
+    assert len(closed) >= historical_count
+    assert all(not hasattr(entry, "descriptor") for entry in inventory.entries.values())
+
+
+@pytest.mark.parametrize("mode", [0o620, 0o666])
+def test_native_codex_provider_walk_rejects_writable_rollout_files(
+    tmp_path: Path, mode: int
+) -> None:
+    """Provider rollout files may not grant group or world write access."""
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("{}\n")
+    os.chmod(rollout, mode)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_provider_walk_accepts_owner_read_write_rollout_file(tmp_path: Path) -> None:
+    """The observed provider-owned 0644 rollout mode remains admitted."""
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("{}\n")
+    os.chmod(rollout, 0o644)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        assert len(usage_native_codex._inventory(root)) == 1  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize(
+    ("target", "mode"), [("root", 0o777), ("root", 0o770), ("nested", 0o777), ("nested", 0o770)]
+)
+def test_native_codex_provider_walk_rejects_writable_directories(
+    tmp_path: Path, target: str, mode: int
+) -> None:
+    """Provider sessions directories cannot grant group or world write access."""
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "rollout.jsonl").write_text("{}\n")
+    os.chmod(tmp_path, 0o755)
+    os.chmod(tmp_path if target == "root" else nested, mode)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_provider_walk_accepts_safe_root_and_nested_directories(
+    tmp_path: Path,
+) -> None:
+    """Provider-owned 0755 sessions roots and nested directories remain admitted."""
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    rollout = nested / "rollout.jsonl"
+    rollout.write_text("{}\n")
+    for path in (tmp_path, nested):
+        os.chmod(path, 0o755)
+    os.chmod(rollout, 0o644)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        assert len(usage_native_codex._inventory(root)) == 1  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_parser_rejects_writable_rollout_before_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A writable rollout descriptor fails before parser content handling."""
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("{}\n")
+    os.chmod(rollout, 0o620)
+
+    def unexpected_json(_raw: bytes) -> object:
+        pytest.fail("writable rollout reached content parsing")
+
+    monkeypatch.setattr(usage_native_codex, "_json", unexpected_json)
+    with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_inventory_rejects_renamed_pre_ready_inode(tmp_path: Path) -> None:
+    """Renaming an old rollout after READY cannot turn its inode into new evidence."""
+    existing = tmp_path / "existing.jsonl"
+    existing.write_text("{}\n")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        before = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+        os.rename(existing, tmp_path / "renamed.jsonl")
+        candidates = usage_native_codex._new_rollouts(root, before)  # pyright: ignore[reportPrivateUsage]
+        assert candidates == []
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_new_rollouts_rejects_reused_pre_ready_inode_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A changed generation on a pre-READY inode cannot become fresh evidence."""
+    rollout = tmp_path / "replacement.jsonl"
+    rollout.write_text("{}\n")
+    descriptor = os.open(rollout, os.O_RDONLY | os.O_CLOEXEC)
+    status = os.fstat(descriptor)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+
+    def walk(_root: usage_native_codex._Root) -> Iterator[tuple[str, int, os.stat_result]]:  # pyright: ignore[reportPrivateUsage]
+        yield "replacement.jsonl", descriptor, status
+
+    monkeypatch.setattr(usage_native_codex, "_walk", walk)
+    try:
+        before = {(status.st_dev, status.st_ino, max(0, status.st_ctime_ns - 1))}
+        assert usage_native_codex._new_rollouts(root, before) == []  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_retained_pre_ready_descriptor_allows_parent_growth(tmp_path: Path) -> None:
+    """A pre-READY parent rollout may append without losing its bound inode."""
+    parent = tmp_path / "parent.jsonl"
+    parent.write_bytes(b"{}\n")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    before = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with parent.open("ab") as stream:
+            stream.write(b"{}\n")
+        usage_native_codex._reconcile_rollouts(root, before, [])  # pyright: ignore[reportPrivateUsage]
+    finally:
+        before.close()
+        os.close(root.descriptor)
+
+
+def test_native_codex_pre_ready_snapshot_rejects_same_size_generation_drift(tmp_path: Path) -> None:
+    """A historical rollout cannot change generation without append-only growth."""
+    parent = tmp_path / "parent.jsonl"
+    parent.write_bytes(b"{}\n")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    before = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with parent.open("ab") as stream:
+            stream.write(b"x")
+        parent.write_bytes(b"{}\n")
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._reconcile_rollouts(root, before, [])  # pyright: ignore[reportPrivateUsage]
+    finally:
+        before.close()
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize("mutation", ["replace", "rename", "unlink"])
+def test_native_codex_pre_ready_snapshot_rejects_rebinding(tmp_path: Path, mutation: str) -> None:
+    """Pre-READY files cannot be replaced or disappear after READY."""
+    parent = tmp_path / "parent.jsonl"
+    parent.write_bytes(b"{}\n")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    before = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    try:
+        if mutation == "rename":
+            parent.rename(tmp_path / "renamed.jsonl")
+        else:
+            parent.unlink()
+        if mutation == "replace":
+            parent.write_bytes(b"{}\n")
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._reconcile_rollouts(root, before, [])  # pyright: ignore[reportPrivateUsage]
+    finally:
+        before.close()
+        os.close(root.descriptor)
+
+
+def test_native_codex_reconciliation_rejects_late_rollout(tmp_path: Path) -> None:
+    """A rollout not observed in the post-READY candidate scan fails closed."""
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    before = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    candidate = tmp_path / "leaf.jsonl"
+    candidate.write_bytes(b"{}\n")
+    candidates = usage_native_codex._new_rollouts(root, before)  # pyright: ignore[reportPrivateUsage]
+    try:
+        (tmp_path / "late.jsonl").write_bytes(b"{}\n")
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._reconcile_rollouts(root, before, candidates)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        for _name, descriptor, _status in candidates:
+            os.close(descriptor)
+        before.close()
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "relaxed", "accepts"),
+    [
+        ("append", True, True),
+        ("selected-growth", False, False),
+        ("possible-child-growth", False, False),
+        ("replace", True, False),
+        ("rename", True, False),
+        ("unlink", True, False),
+        ("unsafe-mode", True, False),
+        ("late", True, False),
+    ],
+)
+def test_native_codex_reconciliation_relaxes_only_bound_unrelated_rollouts(
+    tmp_path: Path, mutation: str, relaxed: bool, accepts: bool
+) -> None:
+    """Only a positively unrelated retained rollout may append after candidate scan."""
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    before = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    rollout = tmp_path / "unrelated.jsonl"
+    rollout.write_bytes(b"{}\n")
+    candidates = usage_native_codex._new_rollouts(root, before)  # pyright: ignore[reportPrivateUsage]
+    try:
+        _name, descriptor, _status = candidates[0]
+        if mutation in {"append", "selected-growth", "possible-child-growth"}:
+            with rollout.open("ab") as stream:
+                stream.write(b"{}\n")
+        elif mutation == "replace":
+            rollout.unlink()
+            rollout.write_bytes(b"{}\n")
+        elif mutation == "rename":
+            rollout.rename(tmp_path / "renamed.jsonl")
+        elif mutation == "unlink":
+            rollout.unlink()
+        elif mutation == "unsafe-mode":
+            os.chmod(rollout, 0o666)
+        else:
+            (tmp_path / "late.jsonl").write_bytes(b"{}\n")
+        relaxed_descriptors = frozenset({descriptor}) if relaxed else frozenset[int]()
+        if accepts:
+            usage_native_codex._reconcile_rollouts(  # pyright: ignore[reportPrivateUsage]
+                root, before, candidates, relaxed_descriptors
+            )
+        else:
+            with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+                usage_native_codex._reconcile_rollouts(  # pyright: ignore[reportPrivateUsage]
+                    root, before, candidates, relaxed_descriptors
+                )
+    finally:
+        for _name, descriptor, _status in candidates:
+            os.close(descriptor)
+        before.close()
+        os.close(root.descriptor)
+
+
+def test_native_codex_git_administration_tree_accepts_large_safe_nested_file(
+    tmp_path: Path,
+) -> None:
+    """The direct administrative walk admits safe files larger than 64 KiB."""
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "large").write_bytes(b"x" * (65_537))
+    for path in (tmp_path, nested):
+        os.chmod(path, 0o755)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        usage_native_codex._assert_git_administration_tree(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize("kind", ["writable-file", "writable-dir", "symlink", "fifo"])
+def test_native_codex_git_administration_tree_rejects_unsafe_nested_entry(
+    tmp_path: Path, kind: str
+) -> None:
+    """The direct Git-admin walk rejects writable, linked, and special entries."""
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    target = nested / "entry"
+    if kind == "writable-dir":
+        target.mkdir()
+        os.chmod(target, 0o775)
+    elif kind == "symlink":
+        target.symlink_to(tmp_path / "missing")
+    elif kind == "fifo":
+        os.mkfifo(target)
+    else:
+        target.write_bytes(b"x")
+        os.chmod(target, 0o664)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_git_administration_tree(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_git_administration_tree_rejects_exact_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The direct walk rejects entry and depth counts beyond their exact caps."""
+    (tmp_path / "one").write_bytes(b"x")
+    (tmp_path / "two").write_bytes(b"x")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        monkeypatch.setattr(usage_native_codex, "MAX_GIT_ADMIN_ENTRIES", 1)
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_git_administration_tree(root)  # pyright: ignore[reportPrivateUsage]
+        (tmp_path / "two").unlink()
+        nested = tmp_path / "nested"
+        nested.mkdir()
+        monkeypatch.setattr(usage_native_codex, "MAX_GIT_ADMIN_ENTRIES", 8)
+        monkeypatch.setattr(usage_native_codex, "MAX_GIT_ADMIN_DEPTH", 0)
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_git_administration_tree(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_git_administration_tree_rejects_stat_open_toctou(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement between no-follow stat and open is rejected by descriptor identity."""
+    entry = tmp_path / "entry"
+    entry.write_bytes(b"one")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    original_stat = usage_native_codex.os.stat
+    changed = False
+
+    def replace_after_stat(*args: Any, **kwargs: Any) -> os.stat_result:
+        nonlocal changed
+        result = original_stat(*args, **kwargs)
+        if not changed and args and args[0] == "entry":
+            changed = True
+            entry.unlink()
+            entry.write_bytes(b"replacement")
+        return result
+
+    try:
+        monkeypatch.setattr(usage_native_codex.os, "stat", replace_after_stat)
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_git_administration_tree(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_walk_counts_all_provider_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Empty directories consume the same bounded provider-entry budget as rollouts."""
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        monkeypatch.setattr(usage_native_codex, "MAX_PROVIDER_ENTRIES", 2)
+        for name in ("one", "two"):
+            (tmp_path / name).mkdir()
+
+        def materialized_listdir(_path: object = None) -> NoReturn:
+            pytest.fail("materialized provider traversal")
+
+        monkeypatch.setattr(
+            usage_native_codex.os,
+            "listdir",
+            materialized_listdir,
+        )
+        assert usage_native_codex._inventory(root) == set()  # pyright: ignore[reportPrivateUsage]
+        (tmp_path / "three").mkdir()
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_walk_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    """A provider FIFO is opened nonblocking then rejected by the closed type grammar."""
+    fifo = tmp_path / "rollout.jsonl"
+    os.mkfifo(fifo)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        started = time.monotonic()
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+        assert time.monotonic() - started < 1
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_rollout_rejects_drifting_observed_root_schema(tmp_path: Path) -> None:
+    """An added 0.147.0 root payload key fails closed before recording anything."""
+    rollout = tmp_path / "drift.jsonl"
+    rollout.write_text(
+        json.dumps(
+            {
+                "ordinal": 0,
+                "timestamp": "discarded",
+                "type": "world_state",
+                "payload": {"full": False, "state": {}, "extra": 1},
+            }
+        )
+        + "\n"
+    )
+    binding = {
+        "parent_thread_id": "parent-811",
+        "role": "engineer-be",
+        "agent_path": "/root/native-codex-capture",
+        "effort": "high",
+    }
+    with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("discriminator", [["event_msg"], {"type": "event_msg"}])
+def test_native_codex_parser_rejects_non_string_root_discriminator(
+    tmp_path: Path, discriminator: object
+) -> None:
+    """Untrusted root discriminators fail with the fixed content-free error."""
+    rollout = tmp_path / "bad.jsonl"
+    rollout.write_text(
+        json.dumps({"ordinal": 0, "timestamp": "PATH_SECRET", "type": discriminator, "payload": {}})
+        + "\n"
+    )
+    with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("value", [["token_count"], {"type": "token_count"}])
+def test_native_codex_parser_rejects_non_string_nested_discriminator(
+    tmp_path: Path, value: object
+) -> None:
+    """Nested event discriminators never reach dictionary lookup with non-text values."""
+    rollout = tmp_path / "nested.jsonl"
+    meta = {
+        "base_instructions": "x",
+        "cli_version": "0.147.0",
+        "context_window": 1,
+        "cwd": "x",
+        "git": {"branch": "x", "commit_hash": "x", "repository_url": "x"},
+        "history_mode": "x",
+        "id": "root",
+        "model_provider": "x",
+        "originator": "codex-tui",
+        "session_id": "root",
+        "source": "cli",
+        "thread_source": "user",
+        "timestamp": "x",
+    }
+    rollout.write_text(
+        json.dumps(
+            {"ordinal": 0, "timestamp": "discarded", "type": "session_meta", "payload": meta}
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "ordinal": 1,
+                "timestamp": "discarded",
+                "type": "event_msg",
+                "payload": {"type": value},
+            }
+        )
+        + "\n"
+    )
+    with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_parser_enforces_actual_bytes_after_initial_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parser read accounting rejects data that outgrows its earlier discovery stat."""
+    rollout = tmp_path / "grown.jsonl"
+    rollout.write_bytes(b'{"parent-811":"/root/leaf:engineer-be"}\n')
+    monkeypatch.setattr(usage_native_codex, "MAX_PROVIDER_FILE_BYTES", 1)
+    with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
+            stream.fileno(), {"parent": "parent-811", "path": "/root/leaf", "role": "engineer-be"}
+        )
+
+
+def test_native_codex_malformed_candidate_withholds_whole_tree_proof(
+    tmp_path: Path,
+) -> None:
+    """A malformed first row is indeterminate rather than falsely unrelated."""
+    rollout = tmp_path / "matching.jsonl"
+    binding = {
+        "parent_thread_id": "parent-811",
+        "agent_path": "/root/leaf",
+        "role": "engineer-be",
+        "effort": "high",
+    }
+    rollout.write_text("{" + " ".join(binding.values()) + "\n")
+    with rollout.open("rb") as stream:
+        assert usage_native_codex._candidate_binding(stream.fileno(), binding) is None  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_parses_unrelated_root_session_without_leaf_requirements(
+    tmp_path: Path,
+) -> None:
+    """A concurrent root rollout is schema-scanned but cannot impersonate a leaf."""
+    rollout = tmp_path / "root.jsonl"
+    rollout.write_text(
+        json.dumps(
+            {
+                "ordinal": 0,
+                "timestamp": "discarded",
+                "type": "session_meta",
+                "payload": {
+                    "base_instructions": "SECRET_PROMPT",
+                    "cli_version": "0.147.0",
+                    "context_window": 1,
+                    "cwd": "/secret/path",
+                    "git": {
+                        "branch": "main",
+                        "commit_hash": "a" * 40,
+                        "repository_url": "SECRET_URL",
+                    },
+                    "history_mode": "discarded",
+                    "id": "root-811",
+                    "model_provider": "discarded",
+                    "originator": "codex-tui",
+                    "session_id": "root-811",
+                    "source": "cli",
+                    "thread_source": "user",
+                    "timestamp": "discarded",
+                },
+            }
+        )
+        + "\n"
+    )
+    binding = {
+        "parent_thread_id": "parent-811",
+        "role": "engineer-be",
+        "agent_path": "/root/native-codex-capture",
+        "effort": "high",
+    }
+    with rollout.open("rb") as stream:
+        session, totals, parent, matches, _consumed = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
+            stream.fileno(), binding
+        )
+    assert (session, totals, parent, matches) == ("root-811", (0, 0, 0, 0, 0, 0), "", False)
+
+
+@pytest.mark.parametrize(
+    ("identifier", "session_id"),
+    [
+        ("root-811", "other-811"),
+        (["root-811"], "root-811"),
+        ("root-811", {"session": "root-811"}),
+    ],
+)
+def test_native_codex_rejects_mismatched_or_nontext_session_identifiers(
+    tmp_path: Path, identifier: object, session_id: object
+) -> None:
+    """Session metadata cannot split the recorded and topology session identities."""
+    rollout = tmp_path / "bad-session.jsonl"
+    rollout.write_text(
+        json.dumps(
+            {
+                "ordinal": 0,
+                "timestamp": "discarded",
+                "type": "session_meta",
+                "payload": {
+                    "base_instructions": "discarded",
+                    "cli_version": "0.147.0",
+                    "context_window": 1,
+                    "cwd": "discarded",
+                    "git": {
+                        "branch": "main",
+                        "commit_hash": "a" * 40,
+                        "repository_url": "discarded",
+                    },
+                    "history_mode": "discarded",
+                    "id": identifier,
+                    "model_provider": "discarded",
+                    "originator": "codex-tui",
+                    "session_id": session_id,
+                    "source": "cli",
+                    "thread_source": "user",
+                    "timestamp": "discarded",
+                },
+            }
+        )
+        + "\n"
+    )
+    with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_rejects_task_started_before_turn_context(tmp_path: Path) -> None:
+    """A valid provider context becomes invalid only when it follows task start."""
+    meta: dict[str, object] = {
+        "type": "session_meta",
+        "payload": {
+            "base_instructions": "discarded",
+            "cli_version": "0.147.0",
+            "context_window": 1,
+            "cwd": "discarded",
+            "git": {"branch": "main", "commit_hash": "a" * 40, "repository_url": "discarded"},
+            "history_mode": "discarded",
+            "id": "root-811",
+            "model_provider": "discarded",
+            "originator": "codex-tui",
+            "session_id": "root-811",
+            "source": "cli",
+            "thread_source": "user",
+            "timestamp": "discarded",
+        },
+    }
+    context_payload: dict[str, object] = {
+        key: "discarded"
+        for key in usage_native_codex._TURN_CONTEXT_KEYS  # pyright: ignore[reportPrivateUsage]
+    }
+    context_payload.update(
+        {
+            "model": "gpt-5.6-terra",
+            "effort": "high",
+            "realtime_active": False,
+            "workspace_roots": [],
+        }
+    )
+    context: dict[str, object] = {"type": "turn_context", "payload": context_payload}
+    started: dict[str, object] = {
+        "type": "event_msg",
+        "payload": {
+            "type": "task_started",
+            "collaboration_mode_kind": "discarded",
+            "model_context_window": 1,
+            "started_at": "discarded",
+            "turn_id": "discarded",
+        },
+    }
+
+    def write(name: str, events: tuple[dict[str, object], ...]) -> Path:
+        rollout = tmp_path / name
+        rollout.write_text(
+            "".join(
+                json.dumps({"ordinal": ordinal, "timestamp": "discarded", **event}) + "\n"
+                for ordinal, event in enumerate(events)
+            )
+        )
+        return rollout
+
+    ordered = write("ordered.jsonl", (meta, context, started))
+    with ordered.open("rb") as stream:
+        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+    malformed = write("context-after-start.jsonl", (meta, started, context))
+    with (
+        malformed.open("rb") as stream,
+        pytest.raises(usage_native_codex.NativeCodexCaptureError),
+    ):
+        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_rejects_out_of_order_or_repeated_task_events(tmp_path: Path) -> None:
+    """A fully scanned rollout cannot reorder or repeat task lifecycle markers."""
+    meta = {
+        "type": "session_meta",
+        "payload": {
+            "base_instructions": "discarded",
+            "cli_version": "0.147.0",
+            "context_window": 1,
+            "cwd": "discarded",
+            "git": {"branch": "main", "commit_hash": "a" * 40, "repository_url": "discarded"},
+            "history_mode": "discarded",
+            "id": "root-811",
+            "model_provider": "discarded",
+            "originator": "codex-tui",
+            "session_id": "root-811",
+            "source": "cli",
+            "thread_source": "user",
+            "timestamp": "discarded",
+        },
+    }
+    started: dict[str, object] = {
+        "type": "event_msg",
+        "payload": {
+            "type": "task_started",
+            "collaboration_mode_kind": "discarded",
+            "model_context_window": 1,
+            "started_at": "discarded",
+            "turn_id": "discarded",
+        },
+    }
+    complete = {
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "completed_at": "discarded",
+            "duration_ms": 1,
+            "last_agent_message": "discarded",
+            "started_at": "discarded",
+            "time_to_first_token_ms": 1,
+            "turn_id": "discarded",
+        },
+    }
+    binding = {
+        "parent_thread_id": "parent-811",
+        "role": "engineer-be",
+        "agent_path": "/root/native-codex-capture",
+        "effort": "high",
+    }
+    for index, events in enumerate(((meta, complete), (meta, started, started)), 1):
+        rollout = tmp_path / f"ordered-{index}.jsonl"
+        rollout.write_text(
+            "".join(
+                json.dumps({"ordinal": ordinal, "timestamp": "discarded", **event}) + "\n"
+                for ordinal, event in enumerate(events)
+            )
+        )
+        with (
+            rollout.open("rb") as stream,
+            pytest.raises(usage_native_codex.NativeCodexCaptureError),
+        ):
+            usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    ("position", "accepts"),
+    [("within", True), ("before-start", False), ("after-complete", False)],
+)
+def test_native_codex_response_items_require_active_task_window(
+    tmp_path: Path, position: str, accepts: bool
+) -> None:
+    """Response items are admitted only between task start and completion."""
+    meta: dict[str, object] = {
+        "type": "session_meta",
+        "payload": {
+            "base_instructions": "discarded",
+            "cli_version": "0.147.0",
+            "context_window": 1,
+            "cwd": "discarded",
+            "git": {"branch": "main", "commit_hash": "a" * 40, "repository_url": "discarded"},
+            "history_mode": "discarded",
+            "id": "root-811",
+            "model_provider": "discarded",
+            "originator": "codex-tui",
+            "session_id": "root-811",
+            "source": "cli",
+            "thread_source": "user",
+            "timestamp": "discarded",
+        },
+    }
+    context_payload: dict[str, object] = {
+        key: "discarded"
+        for key in usage_native_codex._TURN_CONTEXT_KEYS  # pyright: ignore[reportPrivateUsage]
+    }
+    context_payload.update(
+        {
+            "model": "gpt-5.6-terra",
+            "effort": "high",
+            "realtime_active": False,
+            "workspace_roots": [],
+            "turn_id": "turn-811",
+        }
+    )
+    context: dict[str, object] = {"type": "turn_context", "payload": context_payload}
+    started: dict[str, object] = {
+        "type": "event_msg",
+        "payload": {
+            "type": "task_started",
+            "collaboration_mode_kind": "discarded",
+            "model_context_window": 1,
+            "started_at": "discarded",
+            "turn_id": "turn-811",
+        },
+    }
+    totals: dict[str, object] = {
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "model_context_window": 1,
+                "total_token_usage": {
+                    "input_tokens": 1,
+                    "cached_input_tokens": 0,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 1,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 2,
+                },
+            },
+            "rate_limits": {},
+        },
+    }
+    complete: dict[str, object] = {
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "completed_at": "discarded",
+            "duration_ms": 1,
+            "last_agent_message": "discarded",
+            "started_at": "discarded",
+            "time_to_first_token_ms": 1,
+            "turn_id": "turn-811",
+        },
+    }
+    response: dict[str, object] = {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "content": "discarded",
+            "id": "discarded",
+            "internal_chat_message_metadata_passthrough": {},
+            "role": "assistant",
+        },
+    }
+    event_options: dict[str, tuple[dict[str, object], ...]] = {
+        "within": (meta, context, started, response, totals, complete),
+        "before-start": (meta, context, response, started, totals, complete),
+        "after-complete": (meta, context, started, totals, complete, response),
+    }
+    events = event_options[position]
+    rollout = tmp_path / f"{position}.jsonl"
+    rollout.write_text(
+        "".join(
+            json.dumps({"ordinal": ordinal, "timestamp": "discarded", **event}) + "\n"
+            for ordinal, event in enumerate(events)
+        )
+    )
+    with rollout.open("rb") as stream:
+        if accepts:
+            usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+        else:
+            with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+                usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_rejects_decreasing_cumulative_token_totals(tmp_path: Path) -> None:
+    """A later cumulative token snapshot may never decrease any token category."""
+    binding = {
+        "parent_thread_id": "parent",
+        "role": "engineer-be",
+        "agent_path": "/root/leaf",
+        "effort": "high",
+    }
+    meta = {
+        "type": "session_meta",
+        "payload": {
+            "id": "leaf",
+            "agent_nickname": "nick",
+            "agent_path": "/root/leaf",
+            "agent_role": "engineer-be",
+            "base_instructions": "x",
+            "cli_version": "0.147.0",
+            "context_window": 1,
+            "cwd": "x",
+            "git": {"branch": "x", "commit_hash": "a", "repository_url": "x"},
+            "history_mode": "x",
+            "model_provider": "openai",
+            "multi_agent_version": "v2",
+            "originator": "codex-tui",
+            "parent_thread_id": "parent",
+            "session_id": "leaf",
+            "source": {
+                "subagent": {
+                    "thread_spawn": {
+                        "parent_thread_id": "parent",
+                        "depth": 1,
+                        "agent_path": "/root/leaf",
+                        "agent_nickname": "nick",
+                        "agent_role": "engineer-be",
+                    }
+                }
+            },
+            "thread_source": "subagent",
+            "timestamp": "x",
+        },
+    }
+    context_payload: dict[str, object] = {
+        key: "x"
+        for key in usage_native_codex._TURN_CONTEXT_KEYS  # pyright: ignore[reportPrivateUsage]
+    }
+    context_payload.update(
+        {
+            "model": "gpt-5.6-terra",
+            "effort": "high",
+            "multi_agent_version": "v2",
+            "realtime_active": False,
+            "workspace_roots": [],
+        }
+    )
+    context: dict[str, object] = {"type": "turn_context", "payload": context_payload}
+
+    def totals(value: int) -> dict[str, object]:
+        return {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {},
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                    "model_context_window": 1,
+                    "total_token_usage": {
+                        "input_tokens": value,
+                        "cached_input_tokens": 1,
+                        "cache_write_input_tokens": 1,
+                        "output_tokens": 1,
+                        "reasoning_output_tokens": 1,
+                        "total_tokens": value + 1,
+                    },
+                },
+            },
+        }
+
+    started = {
+        "type": "event_msg",
+        "payload": {
+            "type": "task_started",
+            "collaboration_mode_kind": "x",
+            "model_context_window": 1,
+            "started_at": "x",
+            "turn_id": "x",
+        },
+    }
+    events = [meta, context, started, totals(2), totals(1)]
+    unknown_event = totals(2)
+    unknown_event["payload"] = {**unknown_event["payload"], "type": "unknown"}  # type: ignore[index]
+    unknown = tmp_path / "unknown.jsonl"
+    unknown.write_text(
+        "".join(
+            json.dumps({"ordinal": index, "timestamp": "x", **event}) + "\n"
+            for index, event in enumerate([meta, context, started, unknown_event])
+        )
+    )
+    with unknown.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+    rollout = tmp_path / "decreasing.jsonl"
+    rollout.write_text(
+        "".join(
+            json.dumps({"ordinal": index, "timestamp": "x", **event}) + "\n"
+            for index, event in enumerate(events)
+        )
+    )
+    with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_streams_two_mebibyte_content_event_at_exact_boundary(tmp_path: Path) -> None:
+    """A realistic 0.147.0 content-bearing response is parsed and discarded at the cap."""
+    root_meta = {
+        "ordinal": 0,
+        "timestamp": "discarded",
+        "type": "session_meta",
+        "payload": {
+            "base_instructions": "discarded",
+            "cli_version": "0.147.0",
+            "context_window": 1,
+            "cwd": "discarded",
+            "git": {"branch": "main", "commit_hash": "a" * 40, "repository_url": "discarded"},
+            "history_mode": "discarded",
+            "id": "root-811",
+            "model_provider": "discarded",
+            "originator": "codex-tui",
+            "session_id": "root-811",
+            "source": "cli",
+            "thread_source": "user",
+            "timestamp": "discarded",
+        },
+    }
+    context_payload: dict[str, object] = {
+        key: "discarded"
+        for key in usage_native_codex._TURN_CONTEXT_KEYS  # pyright: ignore[reportPrivateUsage]
+    }
+    context_payload.update(
+        {
+            "model": "gpt-5.6-terra",
+            "effort": "high",
+            "realtime_active": False,
+            "workspace_roots": [],
+        }
+    )
+    context: dict[str, object] = {
+        "ordinal": 1,
+        "timestamp": "discarded",
+        "type": "turn_context",
+        "payload": context_payload,
+    }
+    started: dict[str, object] = {
+        "ordinal": 2,
+        "timestamp": "discarded",
+        "type": "event_msg",
+        "payload": {
+            "type": "task_started",
+            "collaboration_mode_kind": "discarded",
+            "model_context_window": 1,
+            "started_at": "discarded",
+            "turn_id": "discarded",
+        },
+    }
+    response_payload: dict[str, object] = {
+        "type": "message",
+        "content": "",
+        "id": "discarded",
+        "internal_chat_message_metadata_passthrough": {},
+        "role": "assistant",
+    }
+    response: dict[str, object] = {
+        "ordinal": 3,
+        "timestamp": "discarded",
+        "type": "response_item",
+        "payload": response_payload,
+    }
+    empty = json.dumps(response, separators=(",", ":")).encode() + b"\n"
+    response_payload["content"] = "S" * (usage_native_codex.MAX_EVENT_BYTES - len(empty))
+    exact = json.dumps(response, separators=(",", ":")).encode() + b"\n"
+    assert len(exact) == usage_native_codex.MAX_EVENT_BYTES
+    binding = {
+        "parent_thread_id": "parent-811",
+        "role": "engineer-be",
+        "agent_path": "/root/native-codex-capture",
+        "effort": "high",
+    }
+    rollout = tmp_path / "large.jsonl"
+    preamble = b"".join(
+        json.dumps(event, separators=(",", ":")).encode() + b"\n"
+        for event in (root_meta, context, started)
+    )
+    rollout.write_bytes(preamble + exact)
+    with rollout.open("rb") as stream:
+        _session, totals, _parent, matches, consumed = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
+            stream.fileno(), binding
+        )
+    assert totals == (0, 0, 0, 0, 0, 0) and matches is False
+    assert consumed == rollout.stat().st_size
+    rollout.write_bytes(b"")
+    assert consumed > rollout.stat().st_size
+    rollout.write_bytes(b"G" * (consumed + 1))
+    assert consumed < rollout.stat().st_size
+
+    one_over = tmp_path / "one-over.jsonl"
+    one_over.write_bytes(preamble + exact[:-1] + b"S\n")
+    with one_over.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_bounded_reader_rejects_partial_and_count_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bounded reader rejects an unterminated final event and count excess pre-parse."""
+    binding = {
+        "parent_thread_id": "parent-811",
+        "role": "engineer-be",
+        "agent_path": "/root/native-codex-capture",
+        "effort": "high",
+    }
+    partial = tmp_path / "partial.jsonl"
+    partial.write_bytes(b'{"ordinal":0}')
+    with partial.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setattr(usage_native_codex, "MAX_PROVIDER_LINES", 1)
+    overflow = tmp_path / "overflow.jsonl"
+    overflow.write_bytes(b"{}\n{}\n")
+    with overflow.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_json_depth_fails_closed() -> None:
+    """Deep JSON maps to the fixed capture error without recursive parsing."""
+    deep = (b"[" * (usage_native_codex.MAX_JSON_NESTING + 1)) + (
+        b"]" * (usage_native_codex.MAX_JSON_NESTING + 1)
+    )
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._json(deep)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_json_recursion_error_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A parser recursion failure maps to the fixed metadata-safe error."""
+
+    def recurse(*_args: object, **_kwargs: object) -> NoReturn:
+        raise RecursionError
+
+    monkeypatch.setattr(usage_native_codex.json, "loads", recurse)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._json(b"{}")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_cli_maps_nested_discriminator_error_without_leakage(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Supervisor parser failures reach the CLI as one fixed metadata-safe error."""
+
+    def fail(_arguments: object) -> NoReturn:
+        raise usage_native_codex.NativeCodexCaptureError("/host/SECRET trace")
+
+    monkeypatch.setattr(usage_cli, "supervise_native_codex", fail)
+    with pytest.raises(SystemExit, match="native Codex capture is invalid") as error:
+        main(
+            [
+                "supervise-native-codex",
+                "--role",
+                "engineer-be",
+                "--task-id",
+                "x",
+                "--slice-id",
+                "x",
+                "--parent-task-id",
+                "x",
+                "--task-name",
+                "x",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "main",
+                "--base-sha",
+                "a" * 40,
+                "--usage-root",
+                "/tmp/x",
+            ]
+        )
+    assert "SECRET" not in str(error.value) and "Traceback" not in str(error.value)
+    assert capsys.readouterr().err == ""
+
+
+def test_native_codex_launch_rejects_ignored_only_worktree(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Launch identity includes ignored files, while final attestation remains ordinary clean."""
+    values = iter(
+        ("https://github.com/syamaner/roastpilot-agent.git", "a" * 40, "main", "ignored-file")
+    )
+
+    def git(_args: list[str]) -> str:
+        return next(values)
+
+    monkeypatch.setattr(usage_native_codex, "_git", git)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._git_identity("syamaner/roastpilot-agent", "main", "a" * 40, final=False)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("final", [False, True])
+def test_native_codex_git_identity_forces_all_untracked_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, final: bool
+) -> None:
+    """A local status setting cannot hide untracked material from either attestation."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    for arguments in (
+        ["git", "init", "-b", "main"],
+        ["git", "config", "user.email", "capture@example.test"],
+        ["git", "config", "user.name", "Capture"],
+        ["git", "remote", "add", "origin", "https://github.com/syamaner/roastpilot-agent.git"],
+    ):
+        subprocess.run(arguments, cwd=repository, check=True, capture_output=True)
+    (repository / "tracked.txt").write_text("tracked\n")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True
+    )
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "config", "status.showUntrackedFiles", "no"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+    (repository / "hidden-untracked.txt").write_text("must be visible\n")
+    monkeypatch.chdir(repository)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._git_identity(  # pyright: ignore[reportPrivateUsage]
+            "syamaner/roastpilot-agent", "main", base, final=final
+        )
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_native_codex_index_attestation_rejects_hidden_tracked_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    """Assume-unchanged and skip-worktree entries cannot hide checkout changes."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "capture@example.test"], cwd=repository, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Capture"], cwd=repository, check=True)
+    tracked = repository / "tracked.txt"
+    tracked.write_text("tracked\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True
+    )
+    monkeypatch.chdir(repository)
+
+    usage_native_codex._assert_index_clean()  # pyright: ignore[reportPrivateUsage]
+    subprocess.run(["git", "update-index", flag, "tracked.txt"], cwd=repository, check=True)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._assert_index_clean()  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("target", ["file", "directory"])
+def test_native_codex_checkout_attestation_rejects_writable_tracked_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """Tracked files and nested directories remain owned and non-writable at handback."""
+    repository = tmp_path / "repository"
+    nested = repository / "nested"
+    nested.mkdir(parents=True)
+    tracked = nested / "tracked.txt"
+    tracked.write_text("tracked\n")
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(["git", "add", "nested/tracked.txt"], cwd=repository, check=True)
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.chdir(repository)
+    try:
+        usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+        os.chmod(tracked if target == "file" else nested, 0o664 if target == "file" else 0o775)
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize("kind", ["ignored", "untracked"])
+def test_native_codex_checkout_attestation_covers_empty_untracked_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """Empty ignored and untracked directories receive the same descriptor-safe check."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    (repository / "tracked.txt").write_text("tracked\n")
+    if kind == "ignored":
+        (repository / ".gitignore").write_text("ignored/\n")
+    nested = repository / kind / "empty" / "nested"
+    nested.mkdir(parents=True)
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.chdir(repository)
+    try:
+        usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+        os.chmod(nested, 0o775)
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_checkout_directory_walk_bounds_all_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The checkout directory walk counts untracked directory entries too."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    (repository / "tracked.txt").write_text("tracked\n")
+    (repository / "untracked").mkdir()
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.chdir(repository)
+    monkeypatch.setattr(usage_native_codex, "MAX_CHECKOUT_ENTRIES", 1)
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_checkout_directory_walk_admits_dependency_scale_entries(
+    tmp_path: Path,
+) -> None:
+    """The checkout walk admits a dependency tree above the former 4,096-entry cap."""
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    for index in range(4097):
+        (generated / f"entry-{index}").touch()
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_checkout_directory_walk_entry_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bounded checkout walk accepts its exact entry cap and rejects one over."""
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(usage_native_codex, "MAX_CHECKOUT_ENTRIES", 2)
+    try:
+        (tmp_path / "one").touch()
+        (tmp_path / "two").touch()
+        usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+        (tmp_path / "three").touch()
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_checkout_directory_walk_depth_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The checkout walk accepts its exact depth cap and rejects one nested level over."""
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(usage_native_codex, "MAX_CHECKOUT_DEPTH", 2)
+    try:
+        exact = tmp_path / "one" / "two"
+        exact.mkdir(parents=True)
+        usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+        (exact / "three").mkdir()
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_checkout_attestation_accepts_standard_leaf_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A standard leaf-owned .venv may contain interpreter symlinks after READY."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    (repository / "tracked.txt").write_text("tracked\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    previous_umask = os.umask(0o022)
+    try:
+        venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(repository / ".venv")
+    finally:
+        os.umask(previous_umask)
+    venv_root = repository / ".venv"
+    for directory, directories, files in os.walk(venv_root, followlinks=False):
+        for name in (".", *directories, *files):
+            path = Path(directory) / name
+            status = path.lstat()
+            if status.st_uid != os.geteuid():
+                pytest.fail("venv fixture contains an unowned node")
+            if stat.S_ISDIR(status.st_mode):
+                os.chmod(path, 0o755, follow_symlinks=False)
+            elif stat.S_ISREG(status.st_mode):
+                os.chmod(path, 0o644, follow_symlinks=False)
+    absolute_interpreter = next(
+        (
+            path
+            for path in (venv_root / "bin").iterdir()
+            if path.is_symlink()
+            and re.fullmatch(r"python(?:3(?:\.\d+)?)?", path.name)
+            and os.path.isabs(os.readlink(path))
+        ),
+        None,
+    )
+    if absolute_interpreter is None:
+        pytest.fail("standard venv lacks an absolute interpreter symlink")
+    interpreter_target = tmp_path / f"python{sys.version_info.major}.{sys.version_info.minor}"
+    interpreter_target.write_bytes(b"fixture interpreter\n")
+    interpreter_target.chmod(0o755)
+    absolute_interpreter.unlink()
+    absolute_interpreter.symlink_to(interpreter_target)
+    monkeypatch.setattr(
+        usage_native_codex.sys, "_base_executable", str(interpreter_target), raising=False
+    )
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.chdir(repository)
+    try:
+        usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+        venv_config = repository / ".venv" / "pyvenv.cfg"
+        os.chmod(venv_config, 0o664)
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+        os.chmod(venv_config, 0o644)
+        os.mkfifo(repository / ".venv" / "unsafe")
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize(
+    ("target_kind", "mode", "link_name", "version_info", "encoding", "accepts"),
+    [
+        ("trusted", 0o755, "python3.11", None, None, True),
+        ("trusted", 0o755, "𝜋thon", (3, 14, 4), "utf-8", True),
+        ("other", 0o755, "python3.11", None, None, False),
+        ("trusted", 0o775, "python3.11", None, None, False),
+        ("trusted", 0o757, "python3.11", None, None, False),
+        ("missing", 0o755, "python3.11", None, None, False),
+    ],
+)
+def test_native_codex_checkout_attestation_binds_absolute_venv_interpreter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_kind: str,
+    mode: int,
+    link_name: str,
+    version_info: tuple[int, int, int] | None,
+    encoding: str | None,
+    accepts: bool,
+) -> None:
+    """Absolute venv interpreter links bind only to the trusted base executable inode."""
+    repository = tmp_path / "repository"
+    (repository / ".venv" / "bin").mkdir(parents=True)
+    trusted = tmp_path / "python3.14"
+    trusted.write_text("#!/bin/sh\n")
+    trusted.chmod(mode)
+    other = tmp_path / "python3.13"
+    other.write_text("#!/bin/sh\n")
+    other.chmod(0o755)
+    target = {
+        "trusted": str(trusted),
+        "other": str(other),
+        "missing": str(tmp_path / "python3.12"),
+    }[target_kind]
+    (repository / ".venv" / "bin" / link_name).symlink_to(target)
+    monkeypatch.setattr(usage_native_codex.sys, "_base_executable", str(trusted), raising=False)
+    if version_info is not None and encoding is not None:
+        monkeypatch.setattr(usage_native_codex.sys, "version_info", version_info)
+        monkeypatch.setattr(usage_native_codex.sys, "getfilesystemencoding", lambda: encoding)
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        if accepts:
+            usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+        else:
+            with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+                usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize(
+    ("link_name", "version_info", "encoding", "accepts"),
+    [
+        ("𝜋thon", (3, 14, 4), "utf-8", True),
+        ("𝜋thon", (3, 11, 14), "utf-8", False),
+        ("𝜋thon", (3, 14, 4), "ascii", False),
+        ("πthon", (3, 14, 4), "utf-8", False),
+        ("𝜋thon3", (3, 14, 4), "utf-8", False),
+        ("python𝜋", (3, 14, 4), "utf-8", False),
+    ],
+)
+def test_native_codex_checkout_attestation_admits_only_exact_unicode_venv_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    link_name: str,
+    version_info: tuple[int, int, int],
+    encoding: str,
+    accepts: bool,
+) -> None:
+    """Only Python 3.14's exact ``𝜋thon`` interpreter alias is admitted."""
+    repository = tmp_path / "repository"
+    interpreter = repository / ".venv" / "bin" / "python3.14"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("#!/bin/sh\n")
+    interpreter.chmod(0o755)
+    (interpreter.parent / link_name).symlink_to("python3.14")
+    monkeypatch.setattr(usage_native_codex.sys, "version_info", version_info)
+    monkeypatch.setattr(usage_native_codex.sys, "getfilesystemencoding", lambda: encoding)
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        if accepts:
+            usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+        else:
+            with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+                usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or sys.version_info[:2] != (3, 14) or sys.getfilesystemencoding() != "utf-8",
+    reason="requires the Python 3.14 POSIX venv layout",
+)
+def test_native_codex_checkout_attestation_accepts_current_python314_venv_alias(
+    tmp_path: Path,
+) -> None:
+    """The current Python 3.14 POSIX venv's emitted ``𝜋thon`` alias remains accepted."""
+    repository = tmp_path / "repository"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(repository / ".venv")
+    alias = repository / ".venv" / "bin" / "𝜋thon"
+    if not alias.is_symlink():
+        pytest.skip("Python 3.14 venv did not emit the UTF-8 interpreter alias")
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        usage_native_codex._assert_checkout_directories(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize(
+    ("top_parent", "nested_parent"),
+    [("leaf-session", "other-session"), ("other-session", "leaf-session")],
+)
+def test_native_codex_candidate_metadata_withholds_contradictory_parents(
+    tmp_path: Path, top_parent: str, nested_parent: str
+) -> None:
+    """Conflicting top-level and spawn parents remain indeterminate topology evidence."""
+    rollout = tmp_path / "candidate.jsonl"
+    rollout.write_text(
+        json.dumps(
+            {
+                "ordinal": 0,
+                "timestamp": "2026-08-20T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "parent_thread_id": top_parent,
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {
+                                "parent_thread_id": nested_parent,
+                                "agent_path": "/root/task",
+                                "agent_role": "engineer-be",
+                                "depth": 1,
+                            }
+                        }
+                    },
+                },
+            }
+        )
+        + "\n"
+    )
+    descriptor = os.open(rollout, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        metadata = usage_native_codex._candidate_metadata(  # pyright: ignore[reportPrivateUsage]
+            descriptor,
+            {"parent_thread_id": "parent", "agent_path": "/root/task", "role": "engineer-be"},
+        )
+    finally:
+        os.close(descriptor)
+    assert metadata.bound_leaf is None
+    assert metadata.parent_thread_id is None
+
+
+def _native_codex_npm_bin_repository(
+    tmp_path: Path,
+    *,
+    link_path: str,
+    target: str,
+    target_path: str | None,
+    target_kind: str,
+) -> Path:
+    """Create one real checkout with a synthetic npm executable link."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    (repository / "tracked.txt").write_text("tracked\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    if target_path is not None:
+        executable = repository / target_path
+        executable.parent.mkdir(parents=True)
+        if target_kind == "symlink":
+            executable.symlink_to("actual.js")
+        elif target_kind == "directory":
+            executable.mkdir()
+        elif target_kind == "fifo":
+            os.mkfifo(executable)
+        else:
+            executable.write_text("#!/usr/bin/env node\n")
+            if target_kind == "writable":
+                os.chmod(executable, 0o664)
+    link = repository / link_path
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+    return repository
+
+
+@pytest.mark.parametrize(
+    ("link_path", "target", "target_path", "target_kind", "accepted"),
+    [
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "../semver/bin/semver.js",
+            "web/node_modules/pkg/node_modules/semver/bin/semver.js",
+            "regular",
+            True,
+            id="nested-valid",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "/outside",
+            None,
+            "regular",
+            False,
+            id="absolute-target",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "../missing/bin/semver.js",
+            None,
+            "regular",
+            False,
+            id="missing-target",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "../semver/bin/semver.js",
+            "web/node_modules/pkg/node_modules/semver/bin/semver.js",
+            "symlink",
+            False,
+            id="symlink-target",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "../semver/bin/semver.js",
+            "web/node_modules/pkg/node_modules/semver/bin/semver.js",
+            "writable",
+            False,
+            id="writable-target",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "../semver/bin/semver.js",
+            "web/node_modules/pkg/node_modules/semver/bin/semver.js",
+            "directory",
+            False,
+            id="directory-target",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "../semver/bin/semver.js",
+            "web/node_modules/pkg/node_modules/semver/bin/semver.js",
+            "fifo",
+            False,
+            id="fifo-target",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/not-bin-semver",
+            "semver/bin/semver.js",
+            "web/node_modules/pkg/node_modules/semver/bin/semver.js",
+            "regular",
+            False,
+            id="link-outside-bin",
+        ),
+        pytest.param(
+            "node_modules/.bin/semver",
+            "../semver/bin/semver.js",
+            "node_modules/semver/bin/semver.js",
+            "regular",
+            False,
+            id="bin-outside-web-node-modules",
+        ),
+        pytest.param(
+            "web/node_modules/pkg/node_modules/.bin/semver",
+            "../../../../../outside",
+            None,
+            "regular",
+            False,
+            id="lexical-escape",
+        ),
+    ],
+)
+def test_native_codex_checkout_attestation_npm_bin_symlink_resolver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    link_path: str,
+    target: str,
+    target_path: str | None,
+    target_kind: str,
+    accepted: bool,
+) -> None:
+    """Only descriptor-safe npm executable links within web node_modules are admissible."""
+    repository = _native_codex_npm_bin_repository(
+        tmp_path,
+        link_path=link_path,
+        target=target,
+        target_path=target_path,
+        target_kind=target_kind,
+    )
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.chdir(repository)
+    try:
+        if accepted:
+            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+        else:
+            with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+                usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_checkout_attestation_rejects_group_writable_non_venv_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The venv-only group-write exception never widens ordinary checkout files."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    tracked = repository / "tracked.txt"
+    tracked.write_text("tracked\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    os.chmod(tracked, 0o664)
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.chdir(repository)
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_checkout_attestation_rejects_unsafe_non_venv_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only inert interpreter links inside .venv receive the narrow exception."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    (repository / "tracked.txt").write_text("tracked\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    (repository / "unsafe").symlink_to("/tmp")
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.chdir(repository)
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_checkout(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_git_administration_accepts_normal_and_linked_worktrees(
+    tmp_path: Path,
+) -> None:
+    """Normal and linked-worktree Git layouts retain safe held identities."""
+    normal = tmp_path / "normal"
+    normal.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=normal, check=True, capture_output=True)
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    git_directory = tmp_path / "git-directory"
+    common_directory = tmp_path / "common-directory"
+    git_directory.mkdir()
+    common_directory.mkdir()
+    (linked / ".git").write_text(f"gitdir: {git_directory}\n")
+    common_relative = os.path.relpath(common_directory, git_directory)
+    (git_directory / "commondir").write_text(f"{common_relative}\n")
+
+    for worktree in (normal, linked):
+        root = usage_native_codex._open_root(str(worktree), private=False)  # pyright: ignore[reportPrivateUsage]
+        administration: usage_native_codex._GitAdministration | None = None  # pyright: ignore[reportPrivateUsage]
+        try:
+            administration = usage_native_codex._open_git_administration(root)  # pyright: ignore[reportPrivateUsage]
+            usage_native_codex._assert_git_administration(root, administration)  # pyright: ignore[reportPrivateUsage]
+        finally:
+            if administration is not None:
+                usage_native_codex._close_git_administration(administration)  # pyright: ignore[reportPrivateUsage]
+            os.close(root.descriptor)
+
+
+def test_native_codex_git_administration_retries_transient_shared_common_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A concurrent linked-worktree update must settle before shared admin passes."""
+    git_directory = usage_native_codex._Root(10, 1, 1)  # pyright: ignore[reportPrivateUsage]
+    common_directory = usage_native_codex._Root(11, 1, 2)  # pyright: ignore[reportPrivateUsage]
+    administration = usage_native_codex._GitAdministration(  # pyright: ignore[reportPrivateUsage]
+        None, git_directory, None, common_directory
+    )
+    common_attempts = 0
+
+    def scan(root: usage_native_codex._Root) -> None:  # pyright: ignore[reportPrivateUsage]
+        nonlocal common_attempts
+        if root == common_directory:
+            common_attempts += 1
+            if common_attempts == 1:
+                raise usage_native_codex.NativeCodexCaptureError("transient")
+
+    monkeypatch.setattr(usage_native_codex, "_assert_git_administration_tree", scan)
+    usage_native_codex._assert_git_administration_trees(administration)  # pyright: ignore[reportPrivateUsage]
+    assert common_attempts == 3
+
+
+def test_native_codex_git_administration_rejects_persistent_shared_common_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shared admin tree which never stabilizes remains fail-closed."""
+    git_directory = usage_native_codex._Root(10, 1, 1)  # pyright: ignore[reportPrivateUsage]
+    common_directory = usage_native_codex._Root(11, 1, 2)  # pyright: ignore[reportPrivateUsage]
+    administration = usage_native_codex._GitAdministration(  # pyright: ignore[reportPrivateUsage]
+        None, git_directory, None, common_directory
+    )
+    common_attempts = 0
+
+    def scan(root: usage_native_codex._Root) -> None:  # pyright: ignore[reportPrivateUsage]
+        nonlocal common_attempts
+        if root == common_directory:
+            common_attempts += 1
+            raise usage_native_codex.NativeCodexCaptureError("persistent")
+
+    monkeypatch.setattr(usage_native_codex, "_assert_git_administration_tree", scan)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._assert_git_administration_trees(administration)  # pyright: ignore[reportPrivateUsage]
+    assert common_attempts == usage_native_codex.GIT_ADMIN_SHARED_SCAN_ATTEMPTS  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("mutation", ["git-directory-mode", "git-directory-replace"])
+def test_native_codex_git_administration_rejects_normal_layout_drift(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Normal .git directories cannot become writable or be replaced after launch."""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=worktree, check=True, capture_output=True)
+    root = usage_native_codex._open_root(str(worktree), private=False)  # pyright: ignore[reportPrivateUsage]
+    administration = usage_native_codex._open_git_administration(root)  # pyright: ignore[reportPrivateUsage]
+    try:
+        dotgit = worktree / ".git"
+        if mutation == "git-directory-mode":
+            os.chmod(dotgit, 0o775)
+        else:
+            os.rename(dotgit, tmp_path / "old-git")
+            dotgit.mkdir()
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_git_administration(root, administration)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        usage_native_codex._close_git_administration(administration)  # pyright: ignore[reportPrivateUsage]
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize("mutation", ["dotgit-mode", "common-directory-mode", "dotgit-drift"])
+def test_native_codex_git_administration_rejects_linked_worktree_drift(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Linked .git pointers and common directories remain owned and immutable."""
+    worktree = tmp_path / "worktree"
+    git_directory = tmp_path / "git-directory"
+    common_directory = tmp_path / "common-directory"
+    worktree.mkdir()
+    git_directory.mkdir()
+    common_directory.mkdir()
+    dotgit = worktree / ".git"
+    dotgit.write_text(f"gitdir: {git_directory}\n")
+    common_relative = os.path.relpath(common_directory, git_directory)
+    (git_directory / "commondir").write_text(f"{common_relative}\n")
+    root = usage_native_codex._open_root(str(worktree), private=False)  # pyright: ignore[reportPrivateUsage]
+    administration = usage_native_codex._open_git_administration(root)  # pyright: ignore[reportPrivateUsage]
+    try:
+        if mutation == "dotgit-mode":
+            os.chmod(dotgit, 0o664)
+        elif mutation == "common-directory-mode":
+            os.chmod(common_directory, 0o775)
+        else:
+            dotgit.write_text(f"gitdir: {tmp_path / 'other'}\n")
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_git_administration(root, administration)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        usage_native_codex._close_git_administration(administration)  # pyright: ignore[reportPrivateUsage]
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize("mutation", ["grow", "truncate", "replace", "unlink"])
+def test_native_codex_selected_rollout_requires_unchanged_generation(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Selected provider evidence cannot change after parse while capture is finalizing."""
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    rollout = sessions / "leaf.jsonl"
+    rollout.write_bytes(b"{}\n")
+    root = usage_native_codex._open_root(str(sessions), private=False)  # pyright: ignore[reportPrivateUsage]
+    descriptor = os.open(rollout, os.O_RDONLY | os.O_CLOEXEC)
+    status = os.fstat(descriptor)
+    generation = usage_native_codex._generation(status)  # pyright: ignore[reportPrivateUsage]
+    try:
+        usage_native_codex._assert_selected_rollout(  # pyright: ignore[reportPrivateUsage]
+            root,
+            descriptor,
+            generation,
+            status.st_size,
+            {generation},
+        )
+        if mutation == "grow":
+            rollout.write_bytes(b"{}\n{}\n")
+        elif mutation == "truncate":
+            rollout.write_bytes(b"")
+        elif mutation == "replace":
+            rollout.unlink()
+            rollout.write_bytes(b"{}\n")
+        else:
+            rollout.unlink()
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_selected_rollout(  # pyright: ignore[reportPrivateUsage]
+                root,
+                descriptor,
+                generation,
+                status.st_size,
+                {generation},
+            )
+    finally:
+        os.close(descriptor)
+        os.close(root.descriptor)
+
+
+def test_native_codex_cli_round_trip_and_fixed_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The closed supervisor CLI grammar maps capture failures to one safe exit."""
+    arguments = usage_cli.build_parser().parse_args(
+        [
+            "supervise-native-codex",
+            "--role",
+            "engineer-be",
+            "--task-id",
+            "task",
+            "--slice-id",
+            "slice",
+            "--parent-task-id",
+            "parent",
+            "--task-name",
+            "leaf",
+            "--repository",
+            "syamaner/roastpilot-agent",
+            "--branch",
+            "feature/x",
+            "--base-sha",
+            "a" * 40,
+            "--usage-root",
+            "/private/tmp/usage",
+        ]
+    )
+    assert arguments.role == "engineer-be" and arguments.task_name == "leaf"
+
+    def fail(_arguments: argparse.Namespace) -> int:
+        raise usage_native_codex.NativeCodexCaptureError("SECRET")
+
+    monkeypatch.setattr(usage_cli, "supervise_native_codex", fail)
+    with pytest.raises(SystemExit) as error:
+        usage_cli.main(
+            [
+                "supervise-native-codex",
+                "--role",
+                "engineer-be",
+                "--task-id",
+                "task",
+                "--slice-id",
+                "slice",
+                "--parent-task-id",
+                "parent",
+                "--task-name",
+                "leaf",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/x",
+                "--base-sha",
+                "a" * 40,
+                "--usage-root",
+                "/private/tmp/usage",
+            ]
+        )
+    assert error.value.code == "capture-agent-usage: native Codex capture is invalid"
+
+
+def test_native_codex_walk_rejects_symlink_non_json_and_depth(tmp_path: Path) -> None:
+    """Provider traversal accepts only bounded-depth owned JSONL regular files."""
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        (tmp_path / "bad.txt").write_text("x")
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            list(usage_native_codex._walk(root))  # pyright: ignore[reportPrivateUsage]
+        (tmp_path / "bad.txt").unlink()
+        (tmp_path / "target.jsonl").write_text("x")
+        (tmp_path / "link.jsonl").symlink_to(tmp_path / "target.jsonl")
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            list(usage_native_codex._walk(root))  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_walk_rejects_over_depth_tree(tmp_path: Path) -> None:
+    """Traversal closes and rejects trees deeper than the closed provider bound."""
+    current = tmp_path
+    for index in range(usage_native_codex.MAX_PROVIDER_DEPTH + 1):
+        current = current / f"d{index}"
+        current.mkdir()
+    (current / "rollout.jsonl").write_text("x")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            list(usage_native_codex._walk(root))  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_native_codex_walk_explicitly_closes_scandir_duplicates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: bool
+) -> None:
+    """Nested traversal closes every descriptor duplicated for scandir, even on failure."""
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / ("invalid.txt" if invalid else "rollout.jsonl")).write_text("{}\n")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    scanned: list[int] = []
+    closed: list[int] = []
+    real_scandir = os.scandir
+    real_close = os.close
+
+    def scandir(descriptor: int) -> Any:
+        scanned.append(descriptor)
+        return cast(Any, real_scandir(descriptor))
+
+    def close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(usage_native_codex.os, "scandir", scandir)
+    monkeypatch.setattr(usage_native_codex, "_close", close)
+    try:
+        if invalid:
+            with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+                list(usage_native_codex._walk(root))  # pyright: ignore[reportPrivateUsage]
+        else:
+            rollouts = list(usage_native_codex._walk(root))  # pyright: ignore[reportPrivateUsage]
+            for _name, descriptor, _status in rollouts:
+                os.close(descriptor)
+    finally:
+        os.close(root.descriptor)
+    assert len(scanned) == 2
+    assert all(descriptor in closed for descriptor in scanned)
+
+
+@pytest.mark.parametrize(
+    ("repository", "branch", "base", "responses", "accepts"),
+    [
+        ("wrong/repo", "feature/x", "a" * 40, [], False),
+        ("syamaner/roastpilot-agent", "-bad", "a" * 40, [], False),
+        ("syamaner/roastpilot-agent", "feature/x..evil", "a" * 40, [], False),
+        ("syamaner/roastpilot-agent", "feature/x", "A" * 40, [], False),
+        (
+            "syamaner/roastpilot-agent",
+            "feature/x",
+            "a" * 40,
+            [
+                "https://github.com/syamaner/roastpilot-agent.git",
+                "a" * 40,
+                "feature/x",
+                "",
+                "H tracked.txt\0",
+                "a" * 40,
+                "a" * 40,
+            ],
+            True,
+        ),
+    ],
+)
+def test_native_codex_git_identity_validates_inputs_and_git_state(
+    monkeypatch: pytest.MonkeyPatch,
+    repository: str,
+    branch: str,
+    base: str,
+    responses: list[str],
+    accepts: bool,
+) -> None:
+    """Git identity fails closed before and during every attestation check."""
+    values = iter(responses)
+    monkeypatch.setattr(usage_native_codex, "_git", lambda _args: next(values))  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    if accepts:
+        assert usage_native_codex._git_identity(repository, branch, base, final=False) == base  # pyright: ignore[reportPrivateUsage]
+    else:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._git_identity(repository, branch, base, final=False)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("final", [False, True])
+@pytest.mark.parametrize("moved", [False, True])
+def test_native_codex_git_identity_rechecks_head_after_attestation(
+    monkeypatch: pytest.MonkeyPatch, final: bool, moved: bool
+) -> None:
+    """Launch and final identity attestations reject a HEAD movement after checks."""
+    base = "a" * 40
+    head = "b" * 40 if final else base
+    values = iter(
+        (
+            "https://github.com/syamaner/roastpilot-agent.git",
+            head,
+            "feature/test",
+            "",
+            "H tracked.txt\0",
+            "c" * 40 if moved else head,
+            base,
+        )
+    )
+    monkeypatch.setattr(usage_native_codex, "_git", lambda _args: next(values))  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    if moved:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._git_identity(  # pyright: ignore[reportPrivateUsage]
+                "syamaner/roastpilot-agent", "feature/test", base, final=final
+            )
+    else:
+        assert (
+            usage_native_codex._git_identity(  # pyright: ignore[reportPrivateUsage]
+                "syamaner/roastpilot-agent", "feature/test", base, final=final
+            )
+            == head
+        )
+
+
+def test_native_codex_descendant_fails_closed_on_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Git timeout or execution error cannot become a successful descendant proof."""
+
+    def timeout(*_args: object, **_kwargs: object) -> NoReturn:
+        raise subprocess.TimeoutExpired("git", 5)
+
+    monkeypatch.setattr(usage_native_codex.subprocess, "run", timeout)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._descendant("a" * 40, "b" * 40)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_descendant_ignores_replace_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replacement objects cannot make an unrelated final head appear descended."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def git(*arguments: str) -> str:
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-b", "main")
+    git("config", "user.email", "capture@example.test")
+    git("config", "user.name", "Capture")
+    (repository / "base.txt").write_text("base\n")
+    git("add", "base.txt")
+    git("commit", "-m", "base")
+    base = git("rev-parse", "HEAD")
+    (repository / "descendant.txt").write_text("descendant\n")
+    git("add", "descendant.txt")
+    git("commit", "-m", "descendant")
+    descendant = git("rev-parse", "HEAD")
+    git("checkout", "--orphan", "unrelated")
+    git("rm", "-rf", ".")
+    (repository / "unrelated.txt").write_text("unrelated\n")
+    git("add", "unrelated.txt")
+    git("commit", "-m", "unrelated")
+    unrelated = git("rev-parse", "HEAD")
+    git("replace", unrelated, descendant)
+    monkeypatch.chdir(repository)
+
+    assert usage_native_codex._descendant(base, descendant) is True  # pyright: ignore[reportPrivateUsage]
+    assert usage_native_codex._descendant(descendant, unrelated) is False  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://github.com/syamaner/roastpilot-agent.git",
+        "git@github.com:syamaner/roastpilot-agent.git",
+    ],
+)
+def test_native_codex_attested_origin_preserves_exact_accepted_form(
+    monkeypatch: pytest.MonkeyPatch, origin: str
+) -> None:
+    """HTTPS and SSH origin spellings bind provenance exactly as attested."""
+    monkeypatch.setattr(usage_native_codex, "_git", lambda _args: origin)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    assert usage_native_codex._attested_origin() == origin  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_attested_origin_rejects_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unaccepted origin cannot become rollout provenance."""
+    monkeypatch.setattr(usage_native_codex, "_git", lambda _args: "https://example.test/other.git")  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._attested_origin()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_git_attestation_ignores_hostile_repository_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GIT_DIR/GIT_WORK_TREE cannot redirect native attestation away from its worktree."""
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    for repository in (first, second):
+        repository.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "feature/test"], cwd=repository, check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "capture@example.test"], cwd=repository, check=True
+        )
+        subprocess.run(["git", "config", "user.name", "Capture"], cwd=repository, check=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://github.com/syamaner/roastpilot-agent.git"],
+            cwd=repository,
+            check=True,
+        )
+        (repository / "tracked.txt").write_text(repository.name)
+        subprocess.run(["git", "add", "."], cwd=repository, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True
+        )
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=first, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    monkeypatch.chdir(first)
+    monkeypatch.setenv("GIT_DIR", str(second / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(second))
+    assert (
+        usage_native_codex._git_identity(  # pyright: ignore[reportPrivateUsage]
+            "syamaner/roastpilot-agent", "feature/test", base, final=False
+        )
+        == base
+    )  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_git_attestation_binds_held_worktree_over_core_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repository-local core.worktree cannot redirect held native Git queries."""
+    repository = tmp_path / "repository"
+    redirected = tmp_path / "redirected"
+    repository.mkdir()
+    redirected.mkdir()
+    for command in (
+        ["git", "init", "-b", "feature/test"],
+        ["git", "config", "user.email", "capture@example.test"],
+        ["git", "config", "user.name", "Capture"],
+        ["git", "remote", "add", "origin", "https://github.com/syamaner/roastpilot-agent.git"],
+    ):
+        subprocess.run(command, cwd=repository, check=True, capture_output=True)
+    (repository / "tracked.txt").write_text("held worktree\n")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True
+    )
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "config", "core.worktree", str(redirected)],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.chdir(redirected)
+    try:
+        assert (
+            usage_native_codex._git_identity(  # pyright: ignore[reportPrivateUsage]
+                "syamaner/roastpilot-agent",
+                "feature/test",
+                base,
+                final=False,
+                worktree=root,
+            )
+            == base
+        )
+    finally:
+        os.close(root.descriptor)
+
+
+def test_native_codex_git_commands_disable_ambient_fsmonitor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every native supervisor Git invocation disables repository fsmonitor hooks."""
+    commands: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def popen(command: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        commands.append(command)
+        return cast(
+            "subprocess.Popen[bytes]", real_popen([sys.executable, "-c", "print('ok')"], **kwargs)
+        )
+
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(usage_native_codex.subprocess, "Popen", popen)
+    monkeypatch.setattr(usage_native_codex.subprocess, "run", run)
+    assert usage_native_codex._git(["status", "--porcelain"]) == "ok"  # pyright: ignore[reportPrivateUsage]
+    assert usage_native_codex._descendant("a" * 40, "b" * 40) is True  # pyright: ignore[reportPrivateUsage]
+    assert all(command[:3] == ["git", "-c", "core.fsmonitor=false"] for command in commands)
+    assert usage_native_codex._GIT_ENV["GIT_NO_REPLACE_OBJECTS"] == "1"  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_git_streams_bounded_success_and_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Live Git pipe draining returns small output and never exposes failed diagnostics."""
+    real_popen = subprocess.Popen
+    processes: list[subprocess.Popen[bytes]] = []
+    scripts = iter(
+        (
+            "import os; os.write(1, b'clean\\n')",
+            "import os; os.write(2, b'SECRET_GIT_DIAGNOSTIC'); raise SystemExit(1)",
+        )
+    )
+
+    def popen(_command: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        process = cast(
+            "subprocess.Popen[bytes]", real_popen([sys.executable, "-c", next(scripts)], **kwargs)
+        )
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(usage_native_codex.subprocess, "Popen", popen)
+    assert usage_native_codex._git(["status", "--porcelain"]) == "clean"  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._git(["status", "--porcelain"])  # pyright: ignore[reportPrivateUsage]
+    assert all(process.poll() is not None for process in processes)
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
+@pytest.mark.parametrize("descriptor", [1, 2])
+def test_native_codex_git_terminates_on_live_output_overflow(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], descriptor: int
+) -> None:
+    """Neither Git stream can be materialized beyond the fixed live-output cap."""
+    real_popen = subprocess.Popen
+    processes: list[subprocess.Popen[bytes]] = []
+    overflow = usage_native_codex.MAX_GIT_OUTPUT_BYTES + 1  # pyright: ignore[reportPrivateUsage]
+
+    def popen(_command: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        process = cast(
+            "subprocess.Popen[bytes]",
+            real_popen(
+                [
+                    sys.executable,
+                    "-c",
+                    f"import os, time; os.write({descriptor}, b'x' * {overflow}); time.sleep(2)",
+                ],
+                **kwargs,
+            ),
+        )
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(usage_native_codex.subprocess, "Popen", popen)
+    started = time.monotonic()
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._git(["status", "--porcelain"])  # pyright: ignore[reportPrivateUsage]
+    assert time.monotonic() - started < 1
+    assert processes[0].poll() is not None
+    assert processes[0].stdout is not None and processes[0].stdout.closed
+    assert processes[0].stderr is not None and processes[0].stderr.closed
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
+def test_native_codex_git_terminates_on_timeout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A silent Git child is terminated and reaped at the fixed timeout boundary."""
+    real_popen = subprocess.Popen
+    processes: list[subprocess.Popen[bytes]] = []
+
+    def popen(_command: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        process = cast(
+            "subprocess.Popen[bytes]",
+            real_popen([sys.executable, "-c", "import time; time.sleep(2)"], **kwargs),
+        )
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(usage_native_codex, "GIT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(usage_native_codex.subprocess, "Popen", popen)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._git(["status", "--porcelain"])  # pyright: ignore[reportPrivateUsage]
+    assert processes[0].poll() is not None
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_native_codex_descendant_suppresses_git_trace_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    returncode: int,
+) -> None:
+    """A traced Git descendant check never inherits diagnostic output streams."""
+    monkeypatch.setenv("GIT_TRACE_SETUP", "1")
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        assert kwargs["stdout"] is subprocess.DEVNULL
+        assert kwargs["stderr"] is subprocess.DEVNULL
+        return subprocess.CompletedProcess(command, returncode, stdout=b"path", stderr=b"trace")
+
+    monkeypatch.setattr(usage_native_codex.subprocess, "run", run)
+    assert usage_native_codex._descendant("a" * 40, "b" * 40) is (returncode == 0)  # pyright: ignore[reportPrivateUsage]
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
+def test_native_codex_usage_root_reattest_rejects_replacement(tmp_path: Path) -> None:
+    """A renamed/replaced usage root cannot receive a native capture record."""
+    usage = tmp_path / "usage"
+    replacement = tmp_path / "replacement"
+    usage.mkdir(mode=0o700)
+    replacement.mkdir(mode=0o700)
+    os.chmod(usage, 0o700)
+    os.chmod(replacement, 0o700)
+    held = usage_native_codex._open_root(str(usage), private=True)  # pyright: ignore[reportPrivateUsage]
+    try:
+        os.rename(usage, tmp_path / "old-usage")
+        os.rename(replacement, usage)
+        with pytest.raises(
+            usage_native_codex.NativeCodexCaptureError, match="native Codex capture is invalid"
+        ):
+            usage_native_codex._reattest_usage_root(held)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(held.descriptor)
+
+
+def test_native_codex_provider_root_reattest_accepts_stable_and_rejects_replacement(
+    tmp_path: Path,
+) -> None:
+    """Closing topology proof remains bound to the canonical held provider root."""
+    provider = tmp_path / "sessions"
+    replacement = tmp_path / "replacement"
+    provider.mkdir()
+    replacement.mkdir()
+    os.chmod(provider, 0o755)
+    os.chmod(replacement, 0o755)
+    held = usage_native_codex._open_root(str(provider), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        usage_native_codex._reattest_provider_root(held)  # pyright: ignore[reportPrivateUsage]
+        os.rename(provider, tmp_path / "old-sessions")
+        os.rename(replacement, provider)
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._reattest_provider_root(held)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(held.descriptor)
+
+
+@pytest.mark.parametrize("mode", [0o700, 0o755])
+def test_native_codex_worktree_root_accepts_owned_non_writable_modes(
+    tmp_path: Path, mode: int
+) -> None:
+    """The assigned worktree admits private and standard non-writable directory modes."""
+    os.chmod(tmp_path, mode)
+    held = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        usage_native_codex._assert_worktree_root(held)  # pyright: ignore[reportPrivateUsage]
+        usage_native_codex._reattest_worktree_root(held)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(held.descriptor)
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o777])
+def test_native_codex_worktree_root_rejects_writable_modes(tmp_path: Path, mode: int) -> None:
+    """Group- or world-writable assigned worktrees fail before attribution."""
+    os.chmod(tmp_path, mode)
+    held = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._assert_worktree_root(held)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(held.descriptor)
+
+
+def test_native_codex_supervisor_usage_root_replacement_appends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement immediately before append emits neither a record nor RESULT frame."""
+    import capture_usage_cli as native_cli
+
+    usage = tmp_path / "usage"
+    replacement = tmp_path / "replacement"
+    provider_home = tmp_path / "provider-home"
+    worktree = tmp_path / "worktree"
+    usage.mkdir(mode=0o700)
+    replacement.mkdir(mode=0o700)
+    (provider_home / "sessions").mkdir(parents=True)
+    worktree.mkdir()
+    os.chmod(usage, 0o700)
+    os.chmod(replacement, 0o700)
+    candidate = tmp_path / "leaf.jsonl"
+    candidate.write_bytes(b"{}\n")
+
+    class Frames:
+        def __init__(self) -> None:
+            self.values: list[str] = []
+
+        def write(self, value: str) -> int:
+            self.values.append(value)
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    frames = Frames()
+    appended: list[object] = []
+    original_reattest = usage_native_codex._reattest_usage_root  # pyright: ignore[reportPrivateUsage]
+
+    def replace_then_reattest(root: usage_native_codex._Root) -> None:  # pyright: ignore[reportPrivateUsage]
+        os.rename(usage, tmp_path / "old-usage")
+        os.rename(replacement, usage)
+        original_reattest(root)
+
+    def registered_role(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _role: NativeCodexRole,
+    ) -> tuple[str, str, str, str]:
+        return (
+            NATIVE_CODEX_CONFIG_SHA256,
+            NATIVE_CODEX_ROLE_SHA256[NativeCodexRole.ENGINEER_BE],
+            "high",
+            "engineer-be",
+        )
+
+    def git_identity(_repository: str, _branch: str, _base: str, *, final: bool) -> str:
+        del final
+        return "a" * 40
+
+    inventory_calls = 0
+    candidate_generation = usage_native_codex._generation(os.stat_result((0,) * 10))  # pyright: ignore[reportPrivateUsage]
+
+    def inventory(_root: usage_native_codex._Root) -> set[tuple[int, int, int]]:  # pyright: ignore[reportPrivateUsage]
+        nonlocal inventory_calls
+        inventory_calls += 1
+        return set() if inventory_calls == 1 else {candidate_generation}
+
+    def metadata(_fd: int, _binding: dict[str, str]) -> usage_native_codex._CandidateMetadata:  # pyright: ignore[reportPrivateUsage]
+        return usage_native_codex._CandidateMetadata(True, None)  # pyright: ignore[reportPrivateUsage]
+
+    def parse(
+        _fd: int, _binding: dict[str, str]
+    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
+        return "leaf", (0, 0, 0, 0, 0, 0), "", True, 0
+
+    def new_rollouts(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _before: dict[str, tuple[int, int]],
+    ) -> list[tuple[str, int, os.stat_result]]:
+        return [("leaf.jsonl", os.open(candidate, os.O_RDONLY), os.stat(candidate))]
+
+    def append(*_args: object, **_kwargs: object) -> None:
+        appended.append(object())
+
+    monkeypatch.chdir(worktree)
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent")
+    monkeypatch.setattr(usage_native_codex, "_provider_home", lambda: str(provider_home))
+    monkeypatch.setattr(usage_native_codex.sys, "stdout", frames)
+    monkeypatch.setattr(usage_native_codex, "_registered_role", registered_role)
+    monkeypatch.setattr(usage_native_codex, "_git_identity", git_identity)
+    monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    _stub_native_codex_git_administration(monkeypatch)
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_attested_origin",
+        lambda: "https://github.com/syamaner/roastpilot-agent.git",
+    )
+    monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
+    monkeypatch.setattr(usage_native_codex, "_candidate_metadata", metadata)
+    monkeypatch.setattr(usage_native_codex, "_parse_rollout", parse)
+    monkeypatch.setattr(usage_native_codex, "_new_rollouts", new_rollouts)
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_terminal_line",
+        lambda: b'{"type":"TERMINAL","binding_id":"binding","task_status":"FAILED"}\n',
+    )
+    monkeypatch.setattr(usage_native_codex, "uuid4", lambda: "binding")
+    monkeypatch.setattr(usage_native_codex, "_reattest_usage_root", replace_then_reattest)
+    monkeypatch.setattr(native_cli, "append_record", append)
+    arguments = SimpleNamespace(
+        task_id="task",
+        slice_id="slice",
+        parent_task_id="parent",
+        task_name="leaf",
+        role="engineer-be",
+        usage_root=str(usage),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/test",
+        base_sha="a" * 40,
+        output="usage.jsonl",
+    )
+    with pytest.raises(
+        usage_native_codex.NativeCodexCaptureError, match="native Codex capture is invalid"
+    ):
+        usage_native_codex.supervise_native_codex(arguments)
+    assert appended == []
+    assert [json.loads(frame)["type"] for frame in frames.values] == ["READY"]
+
+
+def test_native_codex_descriptor_reads_reject_symlinks_and_size(tmp_path: Path) -> None:
+    """Committed config reads stay beneath the held root and never exceed 64 KiB."""
+    root = tmp_path / "root"
+    config = root / ".codex" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_bytes(b"x" * (usage_native_codex.MAX_COMMITTED_FILE_BYTES + 1))
+    held = usage_native_codex._open_root(str(root), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._read_relative(held, (".codex", "config.toml"))  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(held.descriptor)
+    link = tmp_path / "link"
+    link.symlink_to(root, target_is_directory=True)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._open_root(str(link), private=False)  # pyright: ignore[reportPrivateUsage]
+    intermediate = tmp_path / "intermediate"
+    intermediate.mkdir()
+    (intermediate / "jump").symlink_to(root, target_is_directory=True)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._open_root(str(intermediate / "jump" / ".codex"), private=False)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_root_overlap_uses_held_directory_identities(tmp_path: Path) -> None:
+    """Only equal or nested held roots fail; shared filesystem ancestors are allowed."""
+    nested = tmp_path / "nested"
+    sibling = tmp_path / "sibling"
+    other = tmp_path / "other"
+    nested.mkdir()
+    sibling.mkdir()
+    other.mkdir()
+    parent = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    child = usage_native_codex._open_root(str(nested), private=False)  # pyright: ignore[reportPrivateUsage]
+    sibling_root = usage_native_codex._open_root(str(sibling), private=False)  # pyright: ignore[reportPrivateUsage]
+    other_root = usage_native_codex._open_root(str(other), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        usage_native_codex._reject_root_overlap(child, sibling_root, other_root)  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._reject_root_overlap(parent, child)  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._reject_root_overlap(child, parent)  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._reject_root_overlap(parent, parent)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(parent.descriptor)
+        os.close(child.descriptor)
+        os.close(sibling_root.descriptor)
+        os.close(other_root.descriptor)
+
+
+def test_native_codex_record_persists_exact_registration_hashes() -> None:
+    """Native Codex records reject non-SHA registration bindings and bad topology proofs."""
+    started = datetime.now(UTC)
+    payload: dict[str, object] = {
+        "captured_at": started,
+        "task_id": "task-811",
+        "slice_id": "native-codex-capture",
+        "parent_task_id": "parent-811",
+        "task_name": "native-codex-capture",
+        "native_role": NativeCodexRole.REPAIR,
+        "effort": "medium",
+        "config_sha256": NATIVE_CODEX_CONFIG_SHA256,
+        "role_sha256": NATIVE_CODEX_ROLE_SHA256[NativeCodexRole.REPAIR],
+        "repository": "syamaner/roastpilot-agent",
+        "branch": "feature/811-native-codex-capture",
+        "base_sha": "a" * 40,
+        "launch_head_sha": "a" * 40,
+        "final_head_sha": "b" * 40,
+        "parent_thread_id": "thread-811",
+        "leaf_session_id": "leaf-811",
+        "task_status": NativeCodexTaskStatus.SUCCESS,
+        "success": True,
+        "started_at": started,
+        "completed_at": started,
+        "elapsed_ms": 0,
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 0,
+        "whole_tree_verified": True,
+        "subagent_count": 0,
+    }
+    record = NativeCodexUsageRecord.model_validate(payload)
+    assert record.config_sha256 == NATIVE_CODEX_CONFIG_SHA256
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate({**payload, "role_sha256": "not-a-hash"})
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate({**payload, "subagent_count": 1})
+
+
+@pytest.mark.parametrize(
+    ("framed", "extra", "accepts"),
+    [
+        (b'{"type":"TERMINAL"}\n', b"", True),
+        (b'{"type":"TERMINAL"}', None, False),
+        (b'{"type":"TERMINAL"}\n', None, False),
+        (b'{"type":"TERMINAL"}\n', b'{"type":"TERMINAL"}\n', False),
+    ],
+)
+def test_native_codex_terminal_framing_is_nonblocking_and_single_use(
+    monkeypatch: pytest.MonkeyPatch, framed: bytes, extra: bytes | None, accepts: bool
+) -> None:
+    """The supervisor accepts exactly one newline-framed terminal record followed by EOF."""
+    fake_stdin = SimpleNamespace(buffer=BytesIO(framed), fileno=lambda: 811)
+    monkeypatch.setattr(usage_native_codex.sys, "stdin", fake_stdin)
+
+    def set_blocking(_fd: int, _value: bool) -> None:
+        return None
+
+    monkeypatch.setattr(usage_native_codex.os, "set_blocking", set_blocking)
+
+    reads = iter((framed, extra))
+
+    def read_extra(_fd: int, _size: int) -> bytes:
+        value = next(reads)
+        if value is None:
+            raise BlockingIOError()
+        return value
+
+    monkeypatch.setattr(usage_native_codex.os, "read", read_extra)
+    if accepts:
+        assert usage_native_codex._terminal_line() == framed  # pyright: ignore[reportPrivateUsage]
+    else:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._terminal_line()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_terminal_rejects_two_frames_from_one_unbuffered_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One kernel read containing two terminal frames is never accepted."""
+    reader, writer = os.pipe()
+    try:
+        os.write(writer, b'{"type":"TERMINAL"}\n{"type":"TERMINAL"}\n')
+        monkeypatch.setattr(usage_native_codex.sys, "stdin", SimpleNamespace(fileno=lambda: reader))
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._terminal_line()  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(writer)
+        os.close(reader)
+
+
+def test_native_codex_terminal_rejects_open_writer_without_delayed_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An open writer without EOF cannot leave delayed terminal data admissible."""
+    reader, writer = os.pipe()
+    try:
+        os.write(writer, b'{"type":"TERMINAL"}\n')
+        monkeypatch.setattr(usage_native_codex.sys, "stdin", SimpleNamespace(fileno=lambda: reader))
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._terminal_line()  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(writer)
+        os.close(reader)
+
+
+@pytest.mark.parametrize("failure_call", [2, 3])
+def test_native_codex_supervisor_closes_roots_when_acquisition_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_call: int
+) -> None:
+    """Provider/worktree acquisition failures close every previously held root."""
+    held: list[int] = []
+    calls = 0
+
+    def open_root(_raw: str, *, private: bool) -> usage_native_codex._Root:  # pyright: ignore[reportPrivateUsage]
+        nonlocal calls
+        del private
+        calls += 1
+        if calls == failure_call:
+            raise usage_native_codex.NativeCodexCaptureError("native Codex capture is invalid")
+        descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        held.append(descriptor)
+        state = os.fstat(descriptor)
+        return usage_native_codex._Root(descriptor, state.st_dev, state.st_ino)  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setattr(usage_native_codex, "_open_root", open_root)
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent-811")
+    arguments = SimpleNamespace(
+        task_id="task-811",
+        slice_id="slice-811",
+        parent_task_id="parent-811",
+        task_name="leaf-811",
+        role="engineer-be",
+        usage_root=str(tmp_path),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/x",
+        base_sha="a" * 40,
+        output="usage.jsonl",
+    )
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex.supervise_native_codex(arguments)
+    for descriptor in held:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_native_codex_supervisor_rejects_codex_home_before_root_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CODEX_HOME overrides are rejected before any provider root lookup."""
+    monkeypatch.setenv("CODEX_HOME", "override")
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent-811")
+
+    def unexpected_open(_raw: str, *, private: bool) -> NoReturn:
+        del private
+        pytest.fail("opened")
+
+    monkeypatch.setattr(usage_native_codex, "_open_root", unexpected_open)
+    arguments = SimpleNamespace(
+        task_id="task",
+        slice_id="slice",
+        parent_task_id="parent",
+        task_name="leaf",
+        role="engineer-be",
+        usage_root=str(tmp_path),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/x",
+        base_sha="a" * 40,
+        output="usage.jsonl",
+    )
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex.supervise_native_codex(arguments)
+
+
+def test_native_codex_provider_home_is_closed_to_default_or_platform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Provider state accepts only the canonical user home or the platform home."""
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    default = os.path.abspath(os.path.join(pwd.getpwuid(os.geteuid()).pw_dir, ".codex"))
+    assert usage_native_codex._provider_home() == default  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setenv("CODEX_HOME", default)
+    assert usage_native_codex._provider_home() == default  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setenv("CODEX_HOME", "/opt/codex")
+    assert usage_native_codex._provider_home() == "/opt/codex"  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._provider_home()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_provider_home_ignores_home_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ambient HOME override cannot redirect provider evidence discovery."""
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "attacker-home"))
+    assert usage_native_codex._provider_home() == os.path.abspath(  # pyright: ignore[reportPrivateUsage]
+        os.path.join(pwd.getpwuid(os.geteuid()).pw_dir, ".codex")
+    )
+
+
+@pytest.mark.parametrize(
+    ("role", "status", "child_parent"),
+    [
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.SUCCESS, None),
+        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.FAILED, None),
+        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED, None),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "leaf-811"),
+        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.CANCELLED, "leaf-811"),
+        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.SUCCESS, "leaf-811"),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "other-leaf"),
+    ],
+)
+def test_native_codex_supervisor_records_registered_role_terminal_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: NativeCodexRole,
+    status: NativeCodexTaskStatus,
+    child_parent: str | None,
+) -> None:
+    """The supervisor records each registered role without retaining provider content."""
+    import capture_usage_cli as native_cli
+
+    roots: list[usage_native_codex._Root] = []  # pyright: ignore[reportPrivateUsage]
+    for name in ("usage", "provider", "worktree"):
+        directory = tmp_path / name
+        directory.mkdir()
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        state = os.fstat(descriptor)
+        roots.append(usage_native_codex._Root(descriptor, state.st_dev, state.st_ino))  # pyright: ignore[reportPrivateUsage]
+
+    def open_root(_raw: str, *, private: bool) -> usage_native_codex._Root:  # pyright: ignore[reportPrivateUsage]
+        del private
+        return roots.pop(0)
+
+    def assert_root(_root: usage_native_codex._Root) -> None:  # pyright: ignore[reportPrivateUsage]
+        return None
+
+    def reject_overlap(*_roots: usage_native_codex._Root) -> None:  # pyright: ignore[reportPrivateUsage]
+        return None
+
+    inventory_calls = 0
+    candidate_generation = usage_native_codex._generation(os.stat_result((0,) * 10))  # pyright: ignore[reportPrivateUsage]
+
+    def inventory(_root: usage_native_codex._Root) -> set[tuple[int, int, int]]:  # pyright: ignore[reportPrivateUsage]
+        nonlocal inventory_calls
+        inventory_calls += 1
+        return set() if inventory_calls == 1 else {candidate_generation}
+
+    def new_rollouts(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _before: set[tuple[int, int, int]],
+    ) -> list[tuple[str, int, os.stat_result]]:
+        entries = [("leaf.jsonl", 99, os.stat_result((0,) * 10))]
+        if child_parent is not None:
+            entries.append(("child.jsonl", 98, os.stat_result((0,) * 10)))
+        return entries
+
+    def parse_rollout(
+        _fd: int, _binding: dict[str, str]
+    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
+        nonlocal parsed_after_terminal
+        if not parsed_after_terminal:
+            parsed_after_terminal = True
+            time.monotonic()
+        if _fd == 98:
+            return "child-811", (0, 0, 0, 0, 0, 0), cast(str, child_parent), False, 0
+        return "leaf-811", (2, 2, 3, 5, 5, 7), "", True, 0
+
+    def registered_role(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        member: NativeCodexRole,
+    ) -> tuple[str, str, str, str]:
+        time.monotonic()
+        return (
+            NATIVE_CODEX_CONFIG_SHA256,
+            NATIVE_CODEX_ROLE_SHA256[member],
+            "medium" if member is NativeCodexRole.REPAIR else "high",
+            member.value,
+        )
+
+    def git_identity(_repository: str, _branch: str, _base: str, *, final: bool) -> str:
+        return "b" * 40 if final and status is NativeCodexTaskStatus.SUCCESS else "a" * 40
+
+    def append(_output: object, record: NativeCodexUsageRecord, **_kwargs: object) -> None:
+        captured.append(record)
+
+    monkeypatch.setattr(usage_native_codex, "_open_root", open_root)
+    monkeypatch.setattr(usage_native_codex, "_assert_root", assert_root)
+    monkeypatch.setattr(usage_native_codex, "_reattest_usage_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_reattest_worktree_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_reattest_provider_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", reject_overlap)
+    monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_new_rollouts",
+        new_rollouts,
+    )
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_parse_rollout",
+        parse_rollout,
+    )
+    monkeypatch.setattr(usage_native_codex, "_assert_selected_rollout", lambda *_args: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+
+    def candidate_metadata(
+        descriptor: int, _binding: dict[str, str]
+    ) -> usage_native_codex._CandidateMetadata:  # pyright: ignore[reportPrivateUsage]
+        return usage_native_codex._CandidateMetadata(  # pyright: ignore[reportPrivateUsage]
+            descriptor == 99, "leaf-811" if descriptor == 98 else None
+        )
+
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_candidate_metadata",
+        candidate_metadata,
+    )
+    monkeypatch.setattr(usage_native_codex, "_close", lambda _fd: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_registered_role",
+        registered_role,
+    )
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_git_identity",
+        git_identity,
+    )
+    monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    _stub_native_codex_git_administration(monkeypatch)
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_attested_origin",
+        lambda: "https://github.com/syamaner/roastpilot-agent.git",
+    )
+    monkeypatch.setattr(usage_native_codex, "_descendant", lambda _base, _head: True)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "uuid4", lambda: "binding-811")
+    initial_wall = datetime.now(UTC)
+    wall = initial_wall
+    parsed_after_terminal = False
+
+    class FixedDateTime:
+        """Wall time stays valid while elapsed time comes only from monotonic time."""
+
+        @staticmethod
+        def now(_timezone: object) -> datetime:
+            return wall
+
+    ticks = iter((1.0, 100.0, 100.125, 1000.0))
+    monkeypatch.setattr(usage_native_codex, "datetime", FixedDateTime)
+    monkeypatch.setattr(usage_native_codex.time, "monotonic", lambda: next(ticks))
+
+    class Frames:
+        """Record the supervisor protocol without relying on process-global capture."""
+
+        def __init__(self) -> None:
+            self.values: list[str] = []
+
+        def write(self, value: str) -> int:
+            self.values.append(value)
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    frames = Frames()
+    monkeypatch.setattr(usage_native_codex.sys, "stdout", frames)
+
+    def terminal_line() -> bytes:
+        nonlocal wall
+        wall = initial_wall - timedelta(days=1)
+        return (
+            json.dumps(
+                {"type": "TERMINAL", "binding_id": "binding-811", "task_status": status.value}
+            ).encode()
+            + b"\n"
+        )
+
+    monkeypatch.setattr(usage_native_codex, "_terminal_line", terminal_line)
+    captured: list[NativeCodexUsageRecord] = []
+    monkeypatch.setattr(native_cli, "append_record", append)
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent-811")
+    arguments = SimpleNamespace(
+        task_id="task-811",
+        slice_id="slice-811",
+        parent_task_id="parent-task-811",
+        task_name="native-codex-capture",
+        role=role.value,
+        usage_root=str(tmp_path / "usage"),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/811-native-codex-capture",
+        base_sha="a" * 40,
+        output="usage.jsonl",
+    )
+    if child_parent is not None:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex.supervise_native_codex(arguments)
+        assert captured == []
+        assert [json.loads(frame)["type"] for frame in frames.values] == ["READY"]
+        return
+    assert usage_native_codex.supervise_native_codex(arguments) == 0
+    assert len(captured) == 1
+    record = captured[0]
+    assert record.native_role is role
+    assert record.task_status is status
+    assert record.success is (status is NativeCodexTaskStatus.SUCCESS)
+    assert record.elapsed_ms == 125
+    assert record.started_at == initial_wall
+    assert record.completed_at == initial_wall + timedelta(milliseconds=125)
+    assert record.completed_at - record.started_at == timedelta(milliseconds=125)
+    assert record.subagent_count == 0
+    assert record.whole_tree_verified is True
+    assert record.config_sha256 == NATIVE_CODEX_CONFIG_SHA256
+    assert record.role_sha256 == NATIVE_CODEX_ROLE_SHA256[role]
+    assert "SECRET" not in record.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("role", "status", "instructions"),
+    [
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.SUCCESS, "exact"),
+        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.FAILED, "exact"),
+        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED, "exact"),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "stale"),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "pre_ready_drift"),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "writable_worktree"),
+    ],
+)
+def test_native_codex_supervisor_real_registered_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    role: NativeCodexRole,
+    status: NativeCodexTaskStatus,
+    instructions: str,
+) -> None:
+    """A real registered-role lifecycle persists only its closed metadata record."""
+    repository = tmp_path / "repository"
+    codex_home = tmp_path / "codex-home"
+    provider = codex_home / "sessions"
+    usage = tmp_path / "usage"
+    repository.mkdir()
+    provider.mkdir(parents=True)
+    usage.mkdir(mode=0o700)
+    os.chmod(usage, 0o700)
+    shutil.copytree(Path(".codex"), repository / ".codex")
+    (repository / "README.md").write_text("native Codex lifecycle fixture\n")
+
+    def git(*arguments: str) -> str:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "-b", "feature/811-native-codex-capture")
+    git("config", "user.email", "capture@example.test")
+    git("config", "user.name", "Native Codex Capture")
+    git("remote", "add", "origin", "https://github.com/syamaner/roastpilot-agent.git")
+    git("add", ".")
+    git("commit", "-m", "fixture base")
+    base = git("rev-parse", "HEAD")
+    exact_instructions = tomllib.loads(
+        (repository / ".codex" / "agents" / f"{role.value}.toml").read_text()
+    )["developer_instructions"]
+
+    def rollout() -> None:
+        # A well-formed but differently bound active session is conclusively unrelated.
+        (provider / "active-unrelated.jsonl").write_text(
+            json.dumps(
+                {
+                    "ordinal": 0,
+                    "timestamp": "x",
+                    "type": "session_meta",
+                    "payload": {
+                        "source": {
+                            "subagent": {
+                                "thread_spawn": {
+                                    "depth": 1,
+                                    "parent_thread_id": "other",
+                                    "agent_path": "/root/other",
+                                    "agent_role": "engineer-fe",
+                                }
+                            }
+                        }
+                    },
+                }
+            )
+            + "\n"
+        )
+        meta: dict[str, object] = {
+            "type": "session_meta",
+            "payload": {
+                "id": "leaf-811",
+                "agent_nickname": "worker-811",
+                "agent_path": "/root/native-codex-capture",
+                "agent_role": role.value,
+                "base_instructions": (
+                    exact_instructions if instructions == "exact" else "SECRET_PROVIDER_PROMPT"
+                ),
+                "originator": "codex-tui",
+                "cli_version": "0.147.0",
+                "context_window": 1,
+                "cwd": str(repository),
+                "history_mode": "discarded",
+                "model_provider": "openai",
+                "multi_agent_version": "v2",
+                "parent_thread_id": "parent-811",
+                "session_id": "leaf-811",
+                "thread_source": "subagent",
+                "timestamp": "discarded",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "parent-811",
+                            "depth": 1,
+                            "agent_path": "/root/native-codex-capture",
+                            "agent_nickname": "worker-811",
+                            "agent_role": role.value,
+                        }
+                    }
+                },
+                "git": {
+                    "commit_hash": base,
+                    "branch": "feature/811-native-codex-capture",
+                    "repository_url": "https://github.com/syamaner/roastpilot-agent.git",
+                },
+            },
+        }
+        context: dict[str, object] = {
+            "type": "turn_context",
+            "payload": {
+                "model": "gpt-5.6-terra",
+                "effort": "medium" if role is NativeCodexRole.REPAIR else "high",
+                "approval_policy": "discarded",
+                "approvals_reviewer": "discarded",
+                "collaboration_mode": "discarded",
+                "comp_hash": "discarded",
+                "current_date": "discarded",
+                "cwd": str(repository),
+                "file_system_sandbox_policy": "discarded",
+                "multi_agent_version": "v2",
+                "permission_profile": "discarded",
+                "personality": "discarded",
+                "realtime_active": False,
+                "sandbox_policy": "discarded",
+                "summary": "SECRET_PROVIDER_SUMMARY",
+                "timezone": "discarded",
+                "turn_id": "discarded",
+                "workspace_roots": [],
+            },
+        }
+        cast(dict[str, object], context["payload"]).update(
+            _native_leaf_boundary(
+                repository, "medium" if role is NativeCodexRole.REPAIR else "high"
+            )
+        )
+        total_usage = {
+            "input_tokens": 1,
+            "cached_input_tokens": 1,
+            "cache_write_input_tokens": 3,
+            "output_tokens": 4,
+            "reasoning_output_tokens": 4,
+            "total_tokens": 5,
+        }
+        events: list[dict[str, object]] = [
+            meta,
+            context,
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "collaboration_mode_kind": "discarded",
+                    "model_context_window": 1,
+                    "started_at": "discarded",
+                    "turn_id": "discarded",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "content": "SECRET_PROVIDER_RESPONSE",
+                    "id": "discarded",
+                    "internal_chat_message_metadata_passthrough": {},
+                    "role": "assistant",
+                },
+            },
+            {"type": "world_state", "payload": {"full": False, "state": {}}},
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {key: 0 for key in total_usage},
+                        "model_context_window": 1,
+                        "total_token_usage": total_usage,
+                    },
+                    "rate_limits": {},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "completed_at": "discarded",
+                    "duration_ms": 1,
+                    "last_agent_message": "SECRET_PROVIDER_RESPONSE",
+                    "started_at": "discarded",
+                    "time_to_first_token_ms": 1,
+                    "turn_id": "discarded",
+                },
+            },
+        ]
+        (provider / "leaf.jsonl").write_text(
+            "".join(
+                json.dumps({"ordinal": number, "timestamp": "discarded", **event}) + "\n"
+                for number, event in enumerate(events)
+            )
+        )
+
+    class CapturedStdout:
+        """Minimal text stream exposing the READY frame to the terminal hook."""
+
+        def __init__(self) -> None:
+            self.frames: list[str] = []
+
+        def write(self, value: str) -> int:
+            self.frames.append(value)
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    captured_stdout = CapturedStdout()
+
+    def terminal() -> bytes:
+        rollout()
+        if status is not NativeCodexTaskStatus.SUCCESS:
+            (repository / f"{status.value.lower()}-result.txt").write_text("descendant\n")
+            git("add", f"{status.value.lower()}-result.txt")
+            git("commit", "-m", f"fixture {status.value.lower()} result")
+        else:
+            (repository / "result.txt").write_text("descendant\n")
+            git("add", "result.txt")
+            git("commit", "-m", "fixture result")
+        ready = json.loads(captured_stdout.frames[-1])
+        return (
+            json.dumps(
+                {"type": "TERMINAL", "binding_id": ready["binding_id"], "task_status": status.value}
+            ).encode()
+            + b"\n"
+        )
+
+    monkeypatch.chdir(repository)
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent-811")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(usage_native_codex, "_provider_home", lambda: str(codex_home))
+    monkeypatch.setattr(usage_native_codex.sys, "stdout", captured_stdout)
+    monkeypatch.setattr(usage_native_codex, "_terminal_line", terminal)
+    if instructions == "pre_ready_drift":
+        original_inventory = usage_native_codex._inventory  # pyright: ignore[reportPrivateUsage]
+        inventory_calls = 0
+
+        def inventory(
+            root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        ) -> usage_native_codex._Inventory | set[tuple[int, int, int]]:  # pyright: ignore[reportPrivateUsage]
+            nonlocal inventory_calls
+            inventory_calls += 1
+            result = original_inventory(root)
+            if inventory_calls == 1:
+                (repository / "pre-ready-drift.txt").write_text("untracked drift\n")
+            return result
+
+        monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
+    if instructions == "writable_worktree":
+        os.chmod(repository, 0o770)
+    arguments = SimpleNamespace(
+        task_id="task-811",
+        slice_id="slice-811",
+        parent_task_id="parent-task-811",
+        task_name="native-codex-capture",
+        role=role.value,
+        usage_root=str(usage),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/811-native-codex-capture",
+        base_sha=base,
+        output=Path(".agent-usage/usage.jsonl"),
+    )
+    if instructions in {"stale", "pre_ready_drift", "writable_worktree"}:
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex.supervise_native_codex(arguments)
+        assert not (usage / ".agent-usage" / "usage.jsonl").exists()
+        assert [json.loads(frame)["type"] for frame in captured_stdout.frames] == (
+            [] if instructions in {"pre_ready_drift", "writable_worktree"} else ["READY"]
+        )
+        assert "SECRET_PROVIDER_PROMPT" not in capsys.readouterr().out
+        return
+    assert usage_native_codex.supervise_native_codex(arguments) == 0
+    assert capsys.readouterr().out == ""
+    frames = [json.loads(frame) for frame in captured_stdout.frames]
+    assert [frame["type"] for frame in frames] == ["READY", "RESULT"]
+    assert frames[1]["success"] is (status is NativeCodexTaskStatus.SUCCESS)
+    serialized = (usage / ".agent-usage" / "usage.jsonl").read_text()
+    record = NativeCodexUsageRecord.model_validate_json(serialized)
+    assert record.native_role is role
+    assert record.task_status is status
+    assert record.success is (status is NativeCodexTaskStatus.SUCCESS)
+    assert record.whole_tree_verified is True
+    assert record.subagent_count == 0
+    assert record.base_sha == record.launch_head_sha == base
+    assert record.final_head_sha == git("rev-parse", "HEAD")
+    assert (
+        record.config_sha256
+        == hashlib.sha256((repository / ".codex/config.toml").read_bytes()).hexdigest()
+    )
+    role_path = repository / ".codex" / "agents" / f"{role.value}.toml"
+    assert record.role_sha256 == hashlib.sha256(role_path.read_bytes()).hexdigest()
+    assert record.model_dump_json() == serialized.rstrip()
+    for forbidden in ("SECRET_PROVIDER", str(provider), "/host/provider/path"):
+        assert forbidden not in serialized
+
+
+@pytest.mark.parametrize(
+    ("topology", "order", "expected_children", "expected_whole", "mismatch"),
+    [
+        ("sibling", "before", 0, True, None),
+        ("sibling", "after", 0, True, None),
+        ("child", "before", 1, False, None),
+        ("child", "after", 1, False, None),
+        ("incomplete-child", "before", 1, False, None),
+        ("incomplete-child", "after", 1, False, None),
+        ("malformed-sibling", "before", 0, False, None),
+        ("malformed-sibling", "after", 0, False, None),
+        ("malformed-source", "before", 1, False, None),
+        ("malformed-source", "after", 1, False, None),
+        ("matching-depth-bool", "after", 0, False, None),
+        ("matching-depth-float", "after", 0, False, None),
+        ("matching-depth-wrong-int", "after", 0, False, None),
+        ("malformed-sibling-success", "after", 0, False, None),
+        ("race-child", "after", 0, False, None),
+        ("race-sibling", "after", 0, False, None),
+        ("race-replacement", "after", 0, False, None),
+        ("late-closing-child", "after", 0, False, None),
+        ("parent-growth", "after", 0, True, None),
+        ("sibling-growth", "after", 0, True, None),
+        ("child-growth", "after", 0, False, None),
+        ("sibling", "after", 0, False, "cwd"),
+        ("sibling", "after", 0, False, "context_cwd"),
+        ("sibling", "after", 0, False, "turn_id"),
+        ("sibling", "after", 0, False, "turn_id_type"),
+        ("sibling", "after", 0, False, "sandbox_policy"),
+        ("sibling", "after", 0, False, "workspace_roots"),
+        ("sibling", "after", 0, False, "file_system_sandbox_policy"),
+        ("sibling", "after", 0, False, "permission_profile"),
+        ("sibling", "after", 0, False, "session_multi_agent_v1"),
+        ("sibling", "after", 0, False, "session_multi_agent_arbitrary"),
+        ("sibling", "after", 0, False, "session_multi_agent_non_string"),
+        ("sibling", "after", 0, False, "context_multi_agent_v1"),
+        ("sibling", "after", 0, False, "context_multi_agent_arbitrary"),
+        ("sibling", "after", 0, False, "context_multi_agent_non_string"),
+        ("sibling", "after", 0, False, "model_provider_wrong"),
+        ("sibling", "after", 0, False, "model_provider_non_string"),
+        ("sibling", "after", 0, False, "context_after_complete"),
+        ("sibling", "after", 0, False, "worktree_replacement"),
+        ("sibling", "after", 0, False, "worktree_mode_drift"),
+        ("sibling", "after", 0, False, "provider_replacement"),
+        ("sibling", "after", 0, False, "repository_url"),
+        ("sibling", "after", 0, False, "branch"),
+        ("sibling", "after", 0, False, "commit_hash"),
+    ],
+)
+def test_native_codex_supervisor_real_rollout_topology_classification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    topology: str,
+    order: str,
+    expected_children: int,
+    expected_whole: bool,
+    mismatch: str | None,
+) -> None:
+    """Real descriptors classify ordered siblings, children, and incomplete children."""
+    worktree = tmp_path / "worktree"
+    provider = tmp_path / "codex" / "sessions"
+    usage = tmp_path / "usage"
+    worktree.mkdir()
+    replacement = tmp_path / "replacement-worktree"
+    replacement.mkdir()
+    provider.mkdir(parents=True)
+    provider_replacement = tmp_path / "replacement-provider"
+    provider_replacement.mkdir()
+    usage.mkdir(mode=0o700)
+    os.chmod(usage, 0o700)
+    exact_instructions = tomllib.loads(
+        (Path(".codex") / "agents" / "engineer-be.toml").read_text()
+    )["developer_instructions"]
+
+    def write_rollout(
+        path: Path, session: str, parent: str, depth: object, *, complete: bool
+    ) -> None:
+        meta: dict[str, object] = {
+            "id": session,
+            "agent_nickname": "worker",
+            "agent_path": "/root/native-codex-capture",
+            "agent_role": "engineer-be",
+            "base_instructions": exact_instructions,
+            "cli_version": "0.147.0",
+            "context_window": 1,
+            "cwd": str(worktree),
+            "git": {
+                "branch": "feature/test",
+                "commit_hash": "a" * 40,
+                "repository_url": "https://github.com/syamaner/roastpilot-agent.git",
+            },
+            "history_mode": "opaque",
+            "model_provider": "openai",
+            "multi_agent_version": "v2",
+            "originator": "codex-tui",
+            "parent_thread_id": parent,
+            "session_id": session,
+            "source": {
+                "subagent": {
+                    "thread_spawn": {
+                        "parent_thread_id": parent,
+                        "depth": depth,
+                        "agent_path": "/root/native-codex-capture",
+                        "agent_nickname": "worker",
+                        "agent_role": "engineer-be",
+                    }
+                }
+            },
+            "thread_source": "subagent",
+            "timestamp": "opaque",
+        }
+        if session == "leaf-811" and mismatch is not None:
+            if mismatch == "cwd":
+                meta["cwd"] = "untrusted"
+            elif mismatch.startswith("session_multi_agent_"):
+                meta["multi_agent_version"] = {
+                    "session_multi_agent_v1": "v1",
+                    "session_multi_agent_arbitrary": "unexpected",
+                    "session_multi_agent_non_string": [],
+                }[mismatch]
+            elif mismatch.startswith("model_provider_"):
+                meta["model_provider"] = {
+                    "model_provider_wrong": "other",
+                    "model_provider_non_string": [],
+                }[mismatch]
+            elif mismatch not in {
+                "context_cwd",
+                "turn_id",
+                "turn_id_type",
+                "sandbox_policy",
+                "workspace_roots",
+                "file_system_sandbox_policy",
+                "permission_profile",
+                "session_multi_agent_v1",
+                "session_multi_agent_arbitrary",
+                "session_multi_agent_non_string",
+                "context_multi_agent_v1",
+                "context_multi_agent_arbitrary",
+                "context_multi_agent_non_string",
+                "model_provider_wrong",
+                "model_provider_non_string",
+                "context_after_complete",
+                "worktree_replacement",
+                "worktree_mode_drift",
+                "provider_replacement",
+            }:
+                git = cast(dict[str, str], meta["git"])
+                git[mismatch] = "untrusted"
+        events: list[dict[str, object]] = [{"type": "session_meta", "payload": meta}]
+        if complete:
+            context: dict[str, object] = {
+                key: "opaque"
+                for key in usage_native_codex._TURN_CONTEXT_KEYS  # pyright: ignore[reportPrivateUsage]
+            }
+            context.update(
+                {
+                    "model": "gpt-5.6-terra",
+                    "effort": "high",
+                    "multi_agent_version": "v2",
+                    "cwd": str(worktree),
+                    "realtime_active": False,
+                    "workspace_roots": [],
+                }
+            )
+            context.update(_native_leaf_boundary(worktree, "high"))
+            if session == "leaf-811" and mismatch == "context_cwd":
+                context["cwd"] = "untrusted"
+            if session == "leaf-811" and mismatch == "sandbox_policy":
+                context["sandbox_policy"] = {"type": "dangerously-unrestricted"}
+            if session == "leaf-811" and mismatch == "workspace_roots":
+                context["workspace_roots"] = [str(worktree), "/external"]
+            if session == "leaf-811" and mismatch == "file_system_sandbox_policy":
+                context["file_system_sandbox_policy"] = {"kind": "unrestricted"}
+            if session == "leaf-811" and mismatch == "permission_profile":
+                context["permission_profile"] = {"type": "unmanaged"}
+            if (
+                session == "leaf-811"
+                and mismatch is not None
+                and mismatch.startswith("context_multi_agent_")
+            ):
+                context["multi_agent_version"] = {
+                    "context_multi_agent_v1": "v1",
+                    "context_multi_agent_arbitrary": "unexpected",
+                    "context_multi_agent_non_string": [],
+                }[mismatch]
+            totals = {
+                key: 0
+                for key in (
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "cache_write_input_tokens",
+                    "output_tokens",
+                    "reasoning_output_tokens",
+                    "total_tokens",
+                )
+            }
+            events.extend(
+                [
+                    {"type": "turn_context", "payload": context},
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_started",
+                            "collaboration_mode_kind": "opaque",
+                            "model_context_window": 1,
+                            "started_at": "opaque",
+                            "turn_id": (
+                                []
+                                if session == "leaf-811" and mismatch == "turn_id_type"
+                                else "drift"
+                                if session == "leaf-811" and mismatch == "turn_id"
+                                else "opaque"
+                            ),
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": totals,
+                                "model_context_window": 1,
+                                "total_token_usage": totals,
+                            },
+                            "rate_limits": {},
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_complete",
+                            "completed_at": "opaque",
+                            "duration_ms": 1,
+                            "last_agent_message": "opaque",
+                            "started_at": "opaque",
+                            "time_to_first_token_ms": 1,
+                            "turn_id": "opaque",
+                        },
+                    },
+                ]
+            )
+            if session == "leaf-811" and mismatch == "context_after_complete":
+                events.append(events.pop(1))
+        path.write_text(
+            "".join(
+                json.dumps({"ordinal": number, "timestamp": "opaque", **event}) + "\n"
+                for number, event in enumerate(events)
+            )
+        )
+
+    class Frames:
+        def __init__(self) -> None:
+            self.values: list[str] = []
+
+        def write(self, value: str) -> int:
+            self.values.append(value)
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    frames = Frames()
+
+    def terminal() -> bytes:
+        write_rollout(provider / "leaf.jsonl", "leaf-811", "parent-811", 1, complete=True)
+        if topology == "parent-growth":
+            with (provider / "parent.jsonl").open("ab") as stream:
+                stream.write(b'{"opaque":"growth"}\n')
+        if topology in {"sibling", "sibling-growth"}:
+            write_rollout(provider / "other.jsonl", "other-811", "other-parent", 1, complete=True)
+        elif topology in {"malformed-sibling", "malformed-sibling-success"}:
+            (provider / "other.jsonl").write_text('{"malformed":"candidate"}\n')
+        elif topology == "malformed-source":
+            (provider / "other.jsonl").write_text(
+                json.dumps(
+                    {
+                        "ordinal": 0,
+                        "timestamp": "opaque",
+                        "type": "session_meta",
+                        "payload": {"parent_thread_id": "leaf-811", "source": []},
+                    }
+                )
+                + "\n"
+            )
+        elif topology.startswith("matching-depth-"):
+            depth: object = {
+                "matching-depth-bool": True,
+                "matching-depth-float": 1.0,
+                "matching-depth-wrong-int": 2,
+            }[topology]
+            write_rollout(provider / "other.jsonl", "other-811", "parent-811", depth, complete=True)
+        elif topology not in {
+            "race-child",
+            "race-sibling",
+            "race-replacement",
+            "late-closing-child",
+            "parent-growth",
+        }:
+            write_rollout(
+                provider / "other.jsonl", "child-811", "leaf-811", 2, complete=topology == "child"
+            )
+        if mismatch == "provider_replacement":
+            os.rename(provider, tmp_path / "old-provider")
+            os.rename(provider_replacement, provider)
+        if order == "before":
+            os.rename(provider / "leaf.jsonl", provider / "z-leaf.jsonl")
+            os.rename(provider / "other.jsonl", provider / "a-other.jsonl")
+        ready = json.loads(frames.values[-1])
+        return (
+            json.dumps(
+                {
+                    "type": "TERMINAL",
+                    "binding_id": ready["binding_id"],
+                    "task_status": (
+                        "SUCCESS" if topology == "malformed-sibling-success" else "FAILED"
+                    ),
+                }
+            ).encode()
+            + b"\n"
+        )
+
+    monkeypatch.chdir(worktree)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent-811")
+    monkeypatch.setattr(usage_native_codex, "_provider_home", lambda: str(tmp_path / "codex"))
+    monkeypatch.setattr(usage_native_codex.sys, "stdout", frames)
+    monkeypatch.setattr(usage_native_codex, "_terminal_line", terminal)
+
+    def git_identity(
+        _repository: str,
+        _branch: str,
+        _base: str,
+        *,
+        final: bool,
+        worktree: object | None = None,
+    ) -> str:
+        return "b" * 40 if final and topology == "malformed-sibling-success" else "a" * 40
+
+    monkeypatch.setattr(usage_native_codex, "_git_identity", git_identity)
+    monkeypatch.setattr(usage_native_codex, "_descendant", lambda _base, _head: True)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    _stub_native_codex_git_administration(monkeypatch)
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_attested_origin",
+        lambda: "https://github.com/syamaner/roastpilot-agent.git",
+    )
+    original_inventory = usage_native_codex._inventory  # pyright: ignore[reportPrivateUsage]
+    inventory_calls = 0
+
+    def inventory(
+        root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+    ) -> usage_native_codex._Inventory | set[tuple[int, int, int]]:  # pyright: ignore[reportPrivateUsage]
+        nonlocal inventory_calls
+        inventory_calls += 1
+        if inventory_calls == 2:
+            if topology == "race-child":
+                write_rollout(
+                    provider / "late-child.jsonl", "child-811", "leaf-811", 2, complete=True
+                )
+            elif topology == "race-sibling":
+                write_rollout(
+                    provider / "late-sibling.jsonl", "other-811", "other-parent", 1, complete=True
+                )
+            elif topology == "race-replacement":
+                os.unlink(provider / "leaf.jsonl")
+                write_rollout(
+                    provider / "leaf.jsonl", "replacement-811", "parent-811", 1, complete=True
+                )
+            elif topology == "sibling-growth" or topology == "child-growth":
+                with (provider / "other.jsonl").open("ab") as stream:
+                    stream.write(b'{"opaque":"growth"}\n')
+            elif mismatch == "worktree_replacement":
+                os.rename(worktree, tmp_path / "old-worktree")
+                os.rename(replacement, worktree)
+            elif mismatch == "worktree_mode_drift":
+                os.chmod(worktree, 0o770)
+        elif inventory_calls == 3 and topology == "late-closing-child":
+            write_rollout(provider / "late-child.jsonl", "child-811", "leaf-811", 2, complete=True)
+        return original_inventory(root)
+
+    monkeypatch.setattr(usage_native_codex, "_inventory", inventory)
+
+    if topology == "parent-growth":
+        write_rollout(provider / "parent.jsonl", "parent-811", "outer-parent", 1, complete=True)
+
+    def registered_role(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _role: NativeCodexRole,
+    ) -> tuple[str, str, str, str]:
+        return (
+            NATIVE_CODEX_CONFIG_SHA256,
+            NATIVE_CODEX_ROLE_SHA256[NativeCodexRole.ENGINEER_BE],
+            "high",
+            "engineer-be",
+        )
+
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_registered_role",
+        registered_role,
+    )
+    arguments = SimpleNamespace(
+        task_id="task",
+        slice_id="slice",
+        parent_task_id="parent",
+        task_name="native-codex-capture",
+        role="engineer-be",
+        usage_root=str(usage),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/test",
+        base_sha="a" * 40,
+        output=Path(".agent-usage/usage.jsonl"),
+    )
+    if mismatch is not None or topology in {
+        "race-child",
+        "race-sibling",
+        "race-replacement",
+        "late-closing-child",
+        "child",
+        "child-growth",
+        "matching-depth-bool",
+        "matching-depth-float",
+        "matching-depth-wrong-int",
+        "incomplete-child",
+        "malformed-source",
+    }:
+        with pytest.raises(
+            usage_native_codex.NativeCodexCaptureError, match="native Codex capture is invalid"
+        ):
+            usage_native_codex.supervise_native_codex(arguments)
+        assert not (usage / ".agent-usage" / "usage.jsonl").exists()
+        assert [json.loads(frame)["type"] for frame in frames.values] == ["READY"]
+        return
+    assert usage_native_codex.supervise_native_codex(arguments) == 0
+    record = NativeCodexUsageRecord.model_validate_json(
+        (usage / ".agent-usage" / "usage.jsonl").read_text()
+    )
+    assert record.subagent_count == expected_children
+    assert record.whole_tree_verified is expected_whole
+    if topology == "malformed-sibling-success":
+        assert record.success is True
+
+
+@pytest.mark.parametrize("match_count", [0, 2])
+def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, match_count: int
+) -> None:
+    """A contradictory duplicate first-row binding never appends a usage record."""
+    import capture_usage_cli as native_cli
+
+    roots: list[usage_native_codex._Root] = []  # pyright: ignore[reportPrivateUsage]
+    for name in ("usage", "provider", "worktree"):
+        directory = tmp_path / name
+        directory.mkdir()
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        state = os.fstat(descriptor)
+        roots.append(usage_native_codex._Root(descriptor, state.st_dev, state.st_ino))  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(usage_native_codex, "_open_root", lambda _raw, private: roots.pop(0))  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", lambda *_roots: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    _stub_native_codex_git_administration(monkeypatch)
+
+    def registered_role(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _role: NativeCodexRole,
+    ) -> tuple[str, str, str, str]:
+        return (
+            NATIVE_CODEX_CONFIG_SHA256,
+            NATIVE_CODEX_ROLE_SHA256[NativeCodexRole.ENGINEER_BE],
+            "high",
+            "engineer-be",
+        )
+
+    monkeypatch.setattr(usage_native_codex, "_registered_role", registered_role)
+    monkeypatch.setattr(usage_native_codex, "_inventory", lambda _root: set())  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_assert_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_new_rollouts",
+        cast(
+            Any,
+            lambda _root, _before: [  # pyright: ignore[reportUnknownLambdaType]
+                ("a.jsonl", 90 + index, os.stat_result((0,) * 10))
+                for index in range(max(1, match_count))
+            ],
+        ),
+    )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+
+    def parse_rollout(
+        descriptor: int, _binding: dict[str, str]
+    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
+        return "leaf", (0, 0, 0, 0, 0, 0), "", descriptor == 90, 0
+
+    monkeypatch.setattr(usage_native_codex, "_parse_rollout", parse_rollout)
+    monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    _stub_native_codex_git_administration(monkeypatch)
+    monkeypatch.setattr(usage_native_codex, "_close", lambda _fd: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_terminal_line",
+        lambda: b'{"type":"TERMINAL","binding_id":"binding","task_status":"FAILED"}\n',
+    )
+    monkeypatch.setattr(usage_native_codex, "uuid4", lambda: "binding")
+    appended: list[object] = []
+    monkeypatch.setattr(
+        native_cli,
+        "append_record",
+        cast(Any, lambda *_args, **_kwargs: appended.append(object())),  # pyright: ignore[reportUnknownLambdaType]
+    )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent")
+    arguments = SimpleNamespace(
+        task_id="task",
+        slice_id="slice",
+        parent_task_id="parent",
+        task_name="leaf",
+        role="engineer-be",
+        usage_root=str(tmp_path / "usage"),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/x",
+        base_sha="a" * 40,
+        output="usage.jsonl",
+    )
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex.supervise_native_codex(arguments)
+    assert not appended
+
+
+def test_native_codex_supervisor_rejects_aggregate_actual_candidate_growth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All parsed candidate byte counts contribute to the immutable aggregate cap."""
+    import capture_usage_cli as native_cli
+
+    roots: list[usage_native_codex._Root] = []  # pyright: ignore[reportPrivateUsage]
+    for name in ("usage", "provider", "worktree"):
+        path = tmp_path / name
+        path.mkdir()
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        state = os.fstat(descriptor)
+        roots.append(usage_native_codex._Root(descriptor, state.st_dev, state.st_ino))  # pyright: ignore[reportPrivateUsage]
+    candidates = [811_101, 811_102]
+
+    def registered(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        role: NativeCodexRole,
+    ) -> tuple[str, str, str, str]:
+        return NATIVE_CODEX_CONFIG_SHA256, NATIVE_CODEX_ROLE_SHA256[role], "high", role.value
+
+    def new_rollouts(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _before: dict[str, tuple[int, int]],
+    ) -> list[tuple[str, int, os.stat_result]]:
+        return [
+            ("one", candidates[0], os.stat_result((0,) * 10)),
+            ("two", candidates[1], os.stat_result((0,) * 10)),
+        ]
+
+    def parse(
+        _fd: int, _binding: dict[str, str]
+    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
+        return "leaf", (0, 0, 0, 0, 0, 0), "", _fd == candidates[0], 4
+
+    def fail_append(*_args: object, **_kwargs: object) -> NoReturn:
+        pytest.fail("append")
+
+    monkeypatch.setattr(usage_native_codex, "MAX_PROVIDER_TOTAL_BYTES", 7)
+    monkeypatch.setattr(usage_native_codex, "_open_root", lambda _raw, private: roots.pop(0))  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_assert_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", lambda *_roots: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    _stub_native_codex_git_administration(monkeypatch)
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_attested_origin",
+        lambda: "https://github.com/syamaner/roastpilot-agent.git",
+    )
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_registered_role",
+        registered,
+    )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_inventory", lambda _root: set())  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_new_rollouts",
+        new_rollouts,
+    )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_candidate_metadata",
+        lambda _fd, _binding: usage_native_codex._CandidateMetadata(True, None),  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType,reportPrivateUsage]
+    )
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_parse_rollout",
+        parse,
+    )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_terminal_line",
+        lambda: b'{"type":"TERMINAL","binding_id":"binding","task_status":"FAILED"}\n',
+    )
+    monkeypatch.setattr(usage_native_codex, "uuid4", lambda: "binding")
+    monkeypatch.setattr(native_cli, "append_record", fail_append)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent")
+    arguments = SimpleNamespace(
+        task_id="task",
+        slice_id="slice",
+        parent_task_id="parent",
+        task_name="leaf",
+        role="engineer-be",
+        usage_root=str(tmp_path / "usage"),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/x",
+        base_sha="a" * 40,
+        output="usage.jsonl",
+    )
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex.supervise_native_codex(arguments)
+
+
+@pytest.mark.parametrize("failure", ["duplicate", "later_parse_error"])
+def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Every classified candidate descriptor closes once when selection cannot complete."""
+    import capture_usage_cli as native_cli
+
+    roots: list[usage_native_codex._Root] = []  # pyright: ignore[reportPrivateUsage]
+    for name in ("usage", "provider", "worktree"):
+        directory = tmp_path / name
+        directory.mkdir()
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        state = os.fstat(descriptor)
+        roots.append(usage_native_codex._Root(descriptor, state.st_dev, state.st_ino))  # pyright: ignore[reportPrivateUsage]
+    candidates = [811_001, 811_002]
+
+    def open_root(_raw: str, *, private: bool) -> usage_native_codex._Root:  # pyright: ignore[reportPrivateUsage]
+        del private
+        return roots.pop(0)
+
+    def new_rollouts(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        _before: dict[str, tuple[int, int]],
+    ) -> list[tuple[str, int, os.stat_result]]:
+        return [
+            ("first.jsonl", candidates[0], os.stat_result((0,) * 10)),
+            ("second.jsonl", candidates[1], os.stat_result((0,) * 10)),
+        ]
+
+    def parse_rollout(
+        descriptor: int, _binding: dict[str, str]
+    ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
+        if failure == "later_parse_error" and descriptor == candidates[1]:
+            raise usage_native_codex.NativeCodexCaptureError("invalid rollout")
+        return "leaf", (0, 0, 0, 0, 0, 0), "", True, 0
+
+    def registered_role(
+        _root: usage_native_codex._Root,  # pyright: ignore[reportPrivateUsage]
+        member: NativeCodexRole,
+    ) -> tuple[str, str, str, str]:
+        return (
+            NATIVE_CODEX_CONFIG_SHA256,
+            NATIVE_CODEX_ROLE_SHA256[member],
+            "high",
+            member.value,
+        )
+
+    closed: list[int] = []
+
+    def close(descriptor: int) -> None:
+        """Record supervisor-owned candidate cleanup without closing shared fds."""
+        closed.append(descriptor)
+
+    appended: list[NativeCodexUsageRecord] = []
+
+    def append(_output: object, record: NativeCodexUsageRecord, **_kwargs: object) -> None:
+        appended.append(record)
+
+    monkeypatch.setattr(usage_native_codex, "_open_root", open_root)
+    monkeypatch.setattr(usage_native_codex, "_assert_root", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_reject_root_overlap", lambda *_roots: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_inventory", lambda _root: set())  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_new_rollouts", new_rollouts)
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_candidate_metadata",
+        lambda _fd, _binding: usage_native_codex._CandidateMetadata(True, None),  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType,reportPrivateUsage]
+    )
+    monkeypatch.setattr(usage_native_codex, "_parse_rollout", parse_rollout)
+    monkeypatch.setattr(usage_native_codex, "_registered_role", registered_role)
+    monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+    _stub_native_codex_git_administration(monkeypatch)
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_attested_origin",
+        lambda: "https://github.com/syamaner/roastpilot-agent.git",
+    )
+    monkeypatch.setattr(
+        usage_native_codex,
+        "_terminal_line",
+        lambda: b'{"type":"TERMINAL","binding_id":"binding","task_status":"FAILED"}\n',
+    )
+    monkeypatch.setattr(usage_native_codex, "uuid4", lambda: "binding")
+    monkeypatch.setattr(usage_native_codex, "_close", close)
+    monkeypatch.setattr(native_cli, "append_record", append)
+    monkeypatch.setenv("CODEX_THREAD_ID", "parent")
+    arguments = SimpleNamespace(
+        task_id="task",
+        slice_id="slice",
+        parent_task_id="parent",
+        task_name="leaf",
+        role="engineer-be",
+        usage_root=str(tmp_path / "usage"),
+        repository="syamaner/roastpilot-agent",
+        branch="feature/x",
+        base_sha="a" * 40,
+        output="usage.jsonl",
+    )
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex.supervise_native_codex(arguments)
+    assert appended == []
+    assert all(closed.count(descriptor) == 1 for descriptor in candidates)
 
 
 def test_owned_transcript_counts_identical_assistant_usage_once(
@@ -761,7 +5444,7 @@ def test_schema_version_cli_reports_generic_and_native_worker_families(
     with pytest.raises(SystemExit) as result:
         main(["--schema-version"])
     assert result.value.code == 0
-    assert capsys.readouterr().out == "generic=1 native-worker=3\n"
+    assert capsys.readouterr().out == "generic=1 native-worker=3 native-codex=1\n"
 
 
 def test_native_cli_exposes_no_caller_session_id() -> None:
@@ -2201,6 +6884,7 @@ def test_native_cli_script_suppresses_bytecode_only_when_executed(
         "capture_usage_models.py",
         "capture_usage_claude.py",
         "capture_usage_codex.py",
+        "capture_usage_native_codex.py",
         "capture_usage_transcript.py",
     ):
         shutil.copy2(source.parent / name, scripts / name)
