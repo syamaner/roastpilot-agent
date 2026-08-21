@@ -1659,6 +1659,36 @@ def test_native_codex_streams_two_mebibyte_content_event_at_exact_boundary(tmp_p
             "timestamp": "discarded",
         },
     }
+    context_payload: dict[str, object] = {
+        key: "discarded"
+        for key in usage_native_codex._TURN_CONTEXT_KEYS  # pyright: ignore[reportPrivateUsage]
+    }
+    context_payload.update(
+        {
+            "model": "gpt-5.6-terra",
+            "effort": "high",
+            "realtime_active": False,
+            "workspace_roots": [],
+        }
+    )
+    context: dict[str, object] = {
+        "ordinal": 1,
+        "timestamp": "discarded",
+        "type": "turn_context",
+        "payload": context_payload,
+    }
+    started: dict[str, object] = {
+        "ordinal": 2,
+        "timestamp": "discarded",
+        "type": "event_msg",
+        "payload": {
+            "type": "task_started",
+            "collaboration_mode_kind": "discarded",
+            "model_context_window": 1,
+            "started_at": "discarded",
+            "turn_id": "discarded",
+        },
+    }
     response_payload: dict[str, object] = {
         "type": "message",
         "content": "",
@@ -1667,7 +1697,7 @@ def test_native_codex_streams_two_mebibyte_content_event_at_exact_boundary(tmp_p
         "role": "assistant",
     }
     response: dict[str, object] = {
-        "ordinal": 1,
+        "ordinal": 3,
         "timestamp": "discarded",
         "type": "response_item",
         "payload": response_payload,
@@ -1683,7 +1713,11 @@ def test_native_codex_streams_two_mebibyte_content_event_at_exact_boundary(tmp_p
         "effort": "high",
     }
     rollout = tmp_path / "large.jsonl"
-    rollout.write_bytes(json.dumps(root_meta, separators=(",", ":")).encode() + b"\n" + exact)
+    preamble = b"".join(
+        json.dumps(event, separators=(",", ":")).encode() + b"\n"
+        for event in (root_meta, context, started)
+    )
+    rollout.write_bytes(preamble + exact)
     with rollout.open("rb") as stream:
         _session, totals, _parent, matches, consumed = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
             stream.fileno(), binding
@@ -1696,9 +1730,7 @@ def test_native_codex_streams_two_mebibyte_content_event_at_exact_boundary(tmp_p
     assert consumed < rollout.stat().st_size
 
     one_over = tmp_path / "one-over.jsonl"
-    one_over.write_bytes(
-        json.dumps(root_meta, separators=(",", ":")).encode() + b"\n" + exact[:-1] + b"S\n"
-    )
+    one_over.write_bytes(preamble + exact[:-1] + b"S\n")
     with one_over.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
         usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
 
