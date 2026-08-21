@@ -814,6 +814,13 @@ class NativeCodexUsageRecord(CaptureModel):
                 raise ValueError("successful native Codex record requires a descendant head")
         elif self.task_status is NativeCodexTaskStatus.SUCCESS:
             raise ValueError("failed native Codex record has contradictory task status")
+        if any(
+            value.tzinfo is None or value.utcoffset() is None
+            for value in (self.captured_at, self.started_at, self.completed_at)
+        ):
+            raise ValueError("native Codex timestamps must be timezone-aware")
+        if self.captured_at != self.completed_at:
+            raise ValueError("native Codex capture time must equal completion")
         if self.completed_at < self.started_at:
             raise ValueError("native Codex timestamps are contradictory")
         if self.completed_at - self.started_at != timedelta(milliseconds=self.elapsed_ms):

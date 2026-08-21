@@ -205,7 +205,7 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
     """Native Codex records never claim success without a descendant result."""
     started = datetime.now(UTC)
     payload: dict[str, object] = {
-        "captured_at": datetime.now(UTC),
+        "captured_at": started,
         "task_id": "task-811",
         "slice_id": "native-codex-capture",
         "parent_task_id": "parent-811",
@@ -238,6 +238,15 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
     }
     record = NativeCodexUsageRecord.model_validate(payload)
     assert USAGE_RECORD_ADAPTER.validate_json(record.model_dump_json()) == record
+    for field in ("captured_at", "started_at", "completed_at"):
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate({**payload, field: started.replace(tzinfo=None)})
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate({**payload, field: "2026-08-21T12:00:00"})
+    with pytest.raises(ValidationError):
+        NativeCodexUsageRecord.model_validate(
+            {**payload, "captured_at": started + timedelta(milliseconds=1)}
+        )
     for field, value in (
         ("success", "true"),
         ("whole_tree_verified", 1),
@@ -1349,7 +1358,7 @@ def test_native_codex_rejects_out_of_order_or_repeated_task_events(tmp_path: Pat
             "timestamp": "discarded",
         },
     }
-    started = {
+    started: dict[str, object] = {
         "type": "event_msg",
         "payload": {
             "type": "task_started",
@@ -1390,6 +1399,125 @@ def test_native_codex_rejects_out_of_order_or_repeated_task_events(tmp_path: Pat
             pytest.raises(usage_native_codex.NativeCodexCaptureError),
         ):
             usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    ("position", "accepts"),
+    [("within", True), ("before-start", False), ("after-complete", False)],
+)
+def test_native_codex_response_items_require_active_task_window(
+    tmp_path: Path, position: str, accepts: bool
+) -> None:
+    """Response items are admitted only between task start and completion."""
+    meta: dict[str, object] = {
+        "type": "session_meta",
+        "payload": {
+            "base_instructions": "discarded",
+            "cli_version": "0.147.0",
+            "context_window": 1,
+            "cwd": "discarded",
+            "git": {"branch": "main", "commit_hash": "a" * 40, "repository_url": "discarded"},
+            "history_mode": "discarded",
+            "id": "root-811",
+            "model_provider": "discarded",
+            "originator": "codex-tui",
+            "session_id": "root-811",
+            "source": "cli",
+            "thread_source": "user",
+            "timestamp": "discarded",
+        },
+    }
+    context_payload: dict[str, object] = {
+        key: "discarded"
+        for key in usage_native_codex._TURN_CONTEXT_KEYS  # pyright: ignore[reportPrivateUsage]
+    }
+    context_payload.update(
+        {
+            "model": "gpt-5.6-terra",
+            "effort": "high",
+            "realtime_active": False,
+            "workspace_roots": [],
+            "turn_id": "turn-811",
+        }
+    )
+    context: dict[str, object] = {"type": "turn_context", "payload": context_payload}
+    started: dict[str, object] = {
+        "type": "event_msg",
+        "payload": {
+            "type": "task_started",
+            "collaboration_mode_kind": "discarded",
+            "model_context_window": 1,
+            "started_at": "discarded",
+            "turn_id": "turn-811",
+        },
+    }
+    totals: dict[str, object] = {
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "model_context_window": 1,
+                "total_token_usage": {
+                    "input_tokens": 1,
+                    "cached_input_tokens": 0,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 1,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 2,
+                },
+            },
+            "rate_limits": {},
+        },
+    }
+    complete: dict[str, object] = {
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "completed_at": "discarded",
+            "duration_ms": 1,
+            "last_agent_message": "discarded",
+            "started_at": "discarded",
+            "time_to_first_token_ms": 1,
+            "turn_id": "turn-811",
+        },
+    }
+    response: dict[str, object] = {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "content": "discarded",
+            "id": "discarded",
+            "internal_chat_message_metadata_passthrough": {},
+            "role": "assistant",
+        },
+    }
+    event_options: dict[str, tuple[dict[str, object], ...]] = {
+        "within": (meta, context, started, response, totals, complete),
+        "before-start": (meta, context, response, started, totals, complete),
+        "after-complete": (meta, context, started, totals, complete, response),
+    }
+    events = event_options[position]
+    rollout = tmp_path / f"{position}.jsonl"
+    rollout.write_text(
+        "".join(
+            json.dumps({"ordinal": ordinal, "timestamp": "discarded", **event}) + "\n"
+            for ordinal, event in enumerate(events)
+        )
+    )
+    with rollout.open("rb") as stream:
+        if accepts:
+            usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+        else:
+            with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+                usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
 
 
 def test_native_codex_rejects_decreasing_cumulative_token_totals(tmp_path: Path) -> None:
@@ -3163,7 +3291,7 @@ def test_native_codex_record_persists_exact_registration_hashes() -> None:
     """Native Codex records reject non-SHA registration bindings and bad topology proofs."""
     started = datetime.now(UTC)
     payload: dict[str, object] = {
-        "captured_at": datetime.now(UTC),
+        "captured_at": started,
         "task_id": "task-811",
         "slice_id": "native-codex-capture",
         "parent_task_id": "parent-811",

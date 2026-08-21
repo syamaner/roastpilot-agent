@@ -1662,7 +1662,9 @@ def _parse_rollout(
             elif kind == "response_item":
                 subtype = payload.get("type")
                 if (
-                    not isinstance(subtype, str)
+                    not seen_started
+                    or seen_complete
+                    or not isinstance(subtype, str)
                     or subtype not in _RESPONSE_TYPES
                     or set(payload) not in _RESPONSE_ITEM_KEYS[subtype]
                 ):
