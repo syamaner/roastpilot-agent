@@ -106,6 +106,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useIsMutating } from "@tanstack/react-query";
 
+import { StarGlyphs } from "@/components/shared";
 import { cn } from "@/lib/cn";
 import { useAddTasting, useTastings } from "@/hooks/queries";
 import type {
@@ -553,10 +554,7 @@ function TastingEntry({ entry }: { entry: RoastTasting }): React.JSX.Element {
       className="flex flex-col gap-1 rounded-md border border-border/60 bg-background/40 p-2 text-xs"
     >
       <div className="flex items-center justify-between gap-2">
-        <span aria-label={`${entry.stars} stars`} className="text-roast-caution">
-          {"★".repeat(entry.stars)}
-          <span className="text-muted-foreground/40">{"★".repeat(5 - entry.stars)}</span>
-        </span>
+        <StarGlyphs rating={entry.stars} className="text-roast-caution" />
         <span className="text-muted-foreground">
           {entry.tasted_at_utc ?? entry.recorded_at_utc}
         </span>

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -423,7 +423,11 @@ describe("DetailPage shell", () => {
     // headline must already show the fresh value from the mutation's own
     // response, not the placeholder.
     resolveRate?.(rated);
-    await waitFor(() => expect(screen.getByTestId("rating-headline")).toHaveTextContent("★★★★★"));
+    await waitFor(() =>
+      expect(within(screen.getByTestId("rating-headline")).getByTestId("star-glyphs").textContent).toBe(
+        "★★★★★",
+      ),
+    );
     expect(screen.getByTestId("rating-headline")).toHaveTextContent(
       "seeded straight from the mutation",
     );

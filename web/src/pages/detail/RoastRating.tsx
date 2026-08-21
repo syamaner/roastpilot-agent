@@ -35,6 +35,7 @@
 import { useEffect, useState } from "react";
 import { useIsMutating } from "@tanstack/react-query";
 
+import { StarGlyphs } from "@/components/shared";
 import { cn } from "@/lib/cn";
 import type { OperatorRatingRequest } from "@/lib/types";
 import { ratingMutationKey, useSaveRating, usePartialFailureLock } from "./useSaveRating";
@@ -195,12 +196,7 @@ export function RoastRating({ runId, rating, notes, className }: RoastRatingProp
             <p className="text-sm text-muted-foreground">Not yet rated.</p>
           ) : (
             <>
-              <div aria-label={`${clampStars(rating)} stars`} className="text-2xl leading-none text-roast-caution">
-                {"★".repeat(clampStars(rating) ?? 0)}
-                <span className="text-muted-foreground/40">
-                  {"★".repeat(5 - (clampStars(rating) ?? 0))}
-                </span>
-              </div>
+              <StarGlyphs rating={clampStars(rating) ?? 0} className="text-2xl leading-none text-roast-caution" />
               {notes !== null && notes !== "" && (
                 <p className="text-sm text-foreground">{notes}</p>
               )}
