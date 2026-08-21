@@ -1826,6 +1826,26 @@ def test_native_codex_checkout_attestation_accepts_standard_leaf_venv(
                 os.chmod(path, 0o755, follow_symlinks=False)
             elif stat.S_ISREG(status.st_mode):
                 os.chmod(path, 0o644, follow_symlinks=False)
+    absolute_interpreter = next(
+        (
+            path
+            for path in (venv_root / "bin").iterdir()
+            if path.is_symlink()
+            and re.fullmatch(r"python(?:3(?:\.\d+)?)?", path.name)
+            and os.path.isabs(os.readlink(path))
+        ),
+        None,
+    )
+    if absolute_interpreter is None:
+        pytest.fail("standard venv lacks an absolute interpreter symlink")
+    interpreter_target = tmp_path / f"python{sys.version_info.major}.{sys.version_info.minor}"
+    interpreter_target.write_bytes(b"fixture interpreter\n")
+    interpreter_target.chmod(0o755)
+    absolute_interpreter.unlink()
+    absolute_interpreter.symlink_to(interpreter_target)
+    monkeypatch.setattr(
+        usage_native_codex.sys, "_base_executable", str(interpreter_target), raising=False
+    )
     root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
     monkeypatch.chdir(repository)
     try:
