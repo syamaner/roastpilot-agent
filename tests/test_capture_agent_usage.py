@@ -1815,6 +1815,17 @@ def test_native_codex_checkout_attestation_accepts_standard_leaf_venv(
         venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(repository / ".venv")
     finally:
         os.umask(previous_umask)
+    venv_root = repository / ".venv"
+    for directory, directories, files in os.walk(venv_root, followlinks=False):
+        for name in (".", *directories, *files):
+            path = Path(directory) / name
+            status = path.lstat()
+            if status.st_uid != os.geteuid():
+                pytest.fail("venv fixture contains an unowned node")
+            if stat.S_ISDIR(status.st_mode):
+                os.chmod(path, 0o755, follow_symlinks=False)
+            elif stat.S_ISREG(status.st_mode):
+                os.chmod(path, 0o644, follow_symlinks=False)
     root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
     monkeypatch.chdir(repository)
     try:
