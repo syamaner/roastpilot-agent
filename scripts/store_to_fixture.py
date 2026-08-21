@@ -328,7 +328,8 @@ def _parse_utc(value: str) -> datetime | None:
             offsets.
 
     Returns:
-        An offset-aware datetime, or ``None`` when ``value`` is unparseable.
+        An offset-aware datetime, or ``None`` when ``value`` is unparseable or
+        cannot be normalized to UTC.
     """
     try:
         parsed = datetime.fromisoformat(value)
@@ -336,6 +337,10 @@ def _parse_utc(value: str) -> datetime | None:
         return None
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
+    try:
+        parsed.astimezone(UTC)
+    except OverflowError:
+        return None
     return parsed
 
 
@@ -444,8 +449,14 @@ def _first_crack_onset_utc(connection: sqlite3.Connection, run_id: str) -> tuple
     """Read the earliest distinct MCP first-crack onset from raw telemetry state.
 
     Malformed JSON and missing/null/non-string paths are skipped per row so one
-    bad snapshot cannot hide a later valid onset. When a resumed MCP session
-    legitimately re-stamps the onset, the earliest parseable UTC value wins.
+    bad snapshot cannot hide a later valid onset. Distinctness is keyed by the
+    **parsed UTC instant** (#788), not the raw string: ``Z`` and an equivalent
+    ``+00:00``/shifted-offset rendering of the same instant collapse to one
+    onset, with no tolerance — two instants a microsecond apart still count as
+    two. A value that fails to parse keeps its raw string as its own identity,
+    so genuinely unparseable sources are still counted distinctly. When a
+    resumed MCP session legitimately re-stamps the onset at a distinct instant,
+    the earliest parseable UTC value wins.
 
     Args:
         connection: An open store connection.
@@ -453,7 +464,8 @@ def _first_crack_onset_utc(connection: sqlite3.Connection, run_id: str) -> tuple
 
     Returns:
         A pair of the chosen onset (or ``None`` when absent) and the number of
-        distinct non-empty values seen. If every value is unparseable, the first
+        distinct onsets seen (distinct parsed instants plus distinct
+        unparseable raw strings). If every value is unparseable, the first
         encountered value is returned so normal unparseable-source fallback and
         warning behavior still applies.
     """
@@ -463,7 +475,13 @@ def _first_crack_onset_utc(connection: sqlite3.Connection, run_id: str) -> tuple
         " ORDER BY tick ASC, id ASC",
         (run_id,),
     ).fetchall()
-    distinct: list[str] = []
+    # Keyed by the parsed instant (not the raw string) so equal-instant
+    # renderings in different ISO-8601 forms collapse to one onset; the first
+    # raw string seen for a given instant is retained verbatim for the
+    # downstream warning/mark (#788).
+    parsed_by_instant: dict[datetime, str] = {}
+    unparseable_seen: set[str] = set()
+    unparseable_order: list[str] = []
     for row in rows:
         try:
             document: Any = json.loads(row["raw_state_json"])
@@ -479,13 +497,21 @@ def _first_crack_onset_utc(connection: sqlite3.Connection, run_id: str) -> tuple
         detected_at = status_map.get("detected_at_utc")
         if not isinstance(detected_at, str) or not detected_at:
             continue
-        if detected_at not in distinct:
-            distinct.append(detected_at)
-    if not distinct:
+        parsed = _parse_utc(detected_at)
+        if parsed is not None:
+            instant = parsed.astimezone(UTC)
+            if instant not in parsed_by_instant:
+                parsed_by_instant[instant] = detected_at
+        elif detected_at not in unparseable_seen:
+            unparseable_seen.add(detected_at)
+            unparseable_order.append(detected_at)
+    count = len(parsed_by_instant) + len(unparseable_order)
+    if count == 0:
         return None, 0
-    parseable = [(parsed, value) for value in distinct if (parsed := _parse_utc(value)) is not None]
-    chosen = min(parseable, key=lambda item: item[0])[1] if parseable else distinct[0]
-    return chosen, len(distinct)
+    if parsed_by_instant:
+        earliest_instant = min(parsed_by_instant)
+        return parsed_by_instant[earliest_instant], count
+    return unparseable_order[0], count
 
 
 @dataclass(frozen=True)
@@ -716,6 +742,25 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
             _FIRST_CRACK_KIND,
             run_started,
         )
+        # #788: the generic "source absent" reason from _resolve_utc_mark is
+        # only true when the preferred source WAS consulted (accepted
+        # provenance == "mcp") and genuinely produced nothing — that is the
+        # only case where the source is truly absent. Every other acceptance
+        # provenance means the source was never consulted at all, so it gets
+        # its own fixed, non-reflecting reason: a closed two-way split
+        # (operator override vs. everything else, including unreadable
+        # provenance) rather than echoing the accepted source string into
+        # operator-facing stderr.
+        if accepted_first_crack_source == "mcp":
+            first_crack_fallback_reason = first_crack.fallback_reason
+        elif accepted_first_crack_source == "operator":
+            first_crack_fallback_reason = (
+                "acceptance is operator-sourced, so MCP onset is not authoritative"
+            )
+        else:
+            first_crack_fallback_reason = (
+                "acceptance is not verified MCP-sourced, so MCP onset is not authoritative"
+            )
         frozen_row = connection.execute(
             "SELECT development_percent FROM telemetry_snapshots"
             " WHERE run_id = ? AND development_percent IS NOT NULL"
@@ -771,7 +816,7 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
         return _StoreReadResult(
             roast=roast,
             charge_fallback_reason=charge.fallback_reason,
-            first_crack_fallback_reason=first_crack.fallback_reason,
+            first_crack_fallback_reason=first_crack_fallback_reason,
             first_crack_onset_warning=first_crack_onset_warning,
             frozen_development_percent=frozen_development_percent,
         )
@@ -1109,6 +1154,17 @@ def convert(db_path: Path, out_dir: Path, run_id: str | None = None) -> dict[str
             f"warning: run {roast.run_id} development_time_percent could not be "
             "cross-checked because no frozen development_percent exists; preferred "
             f"anchors: {', '.join(preferred_anchors)}",
+            file=sys.stderr,
+        )
+    elif frozen_development_percent is not None and exported_development_percent is None:
+        # #788: frozen truth exists but span (drop - charge) is non-positive, so
+        # the exported DTR is null and the cross-check cannot run. Warn rather
+        # than refuse (the mark-order guard already tolerates charge == fc ==
+        # drop) — a null DTR must never enter the corpus silently.
+        print(
+            f"warning: run {roast.run_id} development_time_percent could not be "
+            f"cross-checked against frozen development_percent {frozen_development_percent}: "
+            "the exported value is null because the roast span (drop - charge) is not positive",
             file=sys.stderr,
         )
     elif (

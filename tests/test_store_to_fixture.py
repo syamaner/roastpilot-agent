@@ -19,7 +19,7 @@ import asyncio
 import json
 import sqlite3
 import sys
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -1180,6 +1180,437 @@ async def test_tick_reset_is_refused_before_frozen_dtr_cross_check(
 
     with pytest.raises(s2f.FixtureConversionError, match="tick 9999 -> 0"):
         s2f.convert(db_path, tmp_path / "fixture")
+
+
+# --- #788: AC1 — unverifiable cross-check when the exported DTR is null -----
+
+
+@pytest.mark.asyncio
+async def test_degenerate_zero_span_run_warns_unverifiable_and_still_exports(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T1: charge == first crack == drop exports a null DTR with a NEW warning,
+    distinct from the existing frozen-absent warning."""
+    db_path = tmp_path / "degenerate-zero-span.sqlite3"
+    store = RoastStore(db_path=db_path)
+    await store.initialize()
+    await store.create_run(
+        run_id="r", profile=_PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
+    )
+    await store.record_telemetry(
+        run_id="r",
+        tick=0,
+        agent_phase=RoastPhase.DEVELOPMENT,
+        elapsed_seconds=0.0,
+        interval_seconds=0.0,
+        telemetry=RoastTelemetry(bean_temp_c=180.0, env_temp_c=200.0),
+        heat_level_percent=100,
+        fan_level_percent=30,
+        development_percent=42.0,
+    )
+    # All three marks land on the SAME instant: span == 0, so the pre-existing
+    # `<=` mark-order guard tolerates it (per contract, NOT tightened here) and
+    # summary["development_time_percent"] comes out None (span <= 0).
+    await _record_marks(store, "r", charge_s=720.0, first_crack_s=720.0, drop_s=720.0)
+    await store.complete_run(run_id="r", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    entry = s2f.convert(db_path, out_dir, "r")
+    warning = capsys.readouterr().err
+    summary = json.loads((out_dir / "summary.json").read_text())
+
+    assert summary["development_time_percent"] is None
+    assert entry["development_time_percent"] is None
+    assert (out_dir / "roast.jsonl").is_file()
+    assert (out_dir / "summary.json").is_file()
+    assert "r" in warning
+    assert "could not be cross-checked against frozen development_percent 42.0" in warning
+    assert "the exported value is null because the roast span" in warning
+    assert "no frozen development_percent exists" not in warning
+
+
+@pytest.mark.asyncio
+async def test_frozen_absent_and_null_export_warnings_never_both_fire(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T2: the row-1 (frozen absent) and row-3 (null export) messages are
+    mutually exclusive and textually distinguishable."""
+    db_path = tmp_path / "no-frozen-dtr-distinct.sqlite3"
+    store = await _backdated_store(db_path)
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET development_percent = NULL WHERE run_id = ?",
+        ("backdated-run",),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    s2f.convert(db_path, tmp_path / "fixture")
+    warning = capsys.readouterr().err
+
+    assert "no frozen development_percent exists" in warning
+    assert "the exported value is null because the roast span" not in warning
+
+
+@pytest.mark.asyncio
+async def test_happy_path_emits_no_unverifiable_cross_check_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T3: a normal roast (positive span, frozen present, within threshold)
+    triggers neither unverifiable-DTR branch."""
+    db_path = tmp_path / "happy-path.sqlite3"
+    store = await _backdated_store(db_path)
+    await store.close()
+
+    s2f.convert(db_path, tmp_path / "fixture")
+    warning = capsys.readouterr().err
+
+    assert "could not be cross-checked" not in warning
+
+
+# --- #788: AC2 — first-crack onset dedup keyed by parsed UTC instant --------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "second_form",
+    ["same_offset", "z_suffix", "shifted_plus_one_hour"],
+)
+async def test_first_crack_onset_dedup_by_parsed_instant_across_iso_forms(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], second_form: str
+) -> None:
+    """T4: Z / +00:00 / shifted-offset renderings of ONE instant count as one
+    onset, never triggering the ambiguity warning."""
+    db_path = tmp_path / f"onset-instant-dedup-{second_form}.sqlite3"
+    store = await _backdated_store(db_path)
+    first_onset = _backdated_wall(_BACKDATED_FIRST_CRACK_SECONDS)
+    parsed = datetime.fromisoformat(first_onset)
+    if second_form == "same_offset":
+        second_onset = first_onset
+    elif second_form == "z_suffix":
+        second_onset = parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    else:
+        second_onset = parsed.astimezone(timezone(timedelta(hours=1))).isoformat()
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = ?"
+        " WHERE run_id = ? AND elapsed_seconds = 605.0",
+        (
+            json.dumps({"first_crack_status": {"detected_at_utc": second_onset}}),
+            "backdated-run",
+        ),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    entry = s2f.convert(db_path, out_dir)
+    warning = capsys.readouterr().err
+    _, ground = bakeoff_replay.load_roast(out_dir / "roast.jsonl")
+
+    assert entry["first_crack_anchor"] == "fc_status_utc"
+    assert ground.first_crack_seconds == _BACKDATED_FIRST_CRACK_SECONDS
+    assert "distinct onset values" not in warning
+
+
+@pytest.mark.asyncio
+async def test_distinct_onsets_across_iso_forms_choose_earliest_with_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T5: genuinely distinct instants across ISO forms still warn (2 distinct)
+    and select the earliest by parsed instant, not by string/row order."""
+    db_path = tmp_path / "onset-distinct-forms.sqlite3"
+    store = await _backdated_store(db_path)
+    earlier_instant_z = (
+        datetime.fromisoformat(_backdated_wall(574.0))
+        .astimezone(UTC)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = ?"
+        " WHERE run_id = ? AND elapsed_seconds >= 650.0",
+        (
+            json.dumps({"first_crack_status": {"detected_at_utc": earlier_instant_z}}),
+            "backdated-run",
+        ),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    entry = s2f.convert(db_path, out_dir)
+    warning = capsys.readouterr().err
+    _, ground = bakeoff_replay.load_roast(out_dir / "roast.jsonl")
+
+    assert entry["first_crack_anchor"] == "fc_status_utc"
+    assert ground.first_crack_seconds == 574.0
+    assert "2 distinct onset values" in warning
+    assert f"chose earliest {earlier_instant_z}" in warning
+
+
+@pytest.mark.asyncio
+async def test_mixed_duplicate_and_distinct_onset_forms_count_two_not_three(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T6: same instant in two forms plus one genuinely distinct instant counts
+    2, not 3, and the genuinely distinct earlier instant wins."""
+    db_path = tmp_path / "onset-mixed-forms.sqlite3"
+    store = await _backdated_store(db_path)
+    same_instant_z = (
+        datetime.fromisoformat(_backdated_wall(_BACKDATED_FIRST_CRACK_SECONDS))
+        .astimezone(UTC)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    distinct_earlier = _backdated_wall(560.0)
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = ?"
+        " WHERE run_id = ? AND elapsed_seconds = 650.0",
+        (json.dumps({"first_crack_status": {"detected_at_utc": same_instant_z}}), "backdated-run"),
+    )
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = ?"
+        " WHERE run_id = ? AND elapsed_seconds = 655.0",
+        (
+            json.dumps({"first_crack_status": {"detected_at_utc": distinct_earlier}}),
+            "backdated-run",
+        ),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    entry = s2f.convert(db_path, out_dir)
+    warning = capsys.readouterr().err
+    _, ground = bakeoff_replay.load_roast(out_dir / "roast.jsonl")
+
+    assert entry["first_crack_anchor"] == "fc_status_utc"
+    assert ground.first_crack_seconds == 560.0
+    assert "2 distinct onset values" in warning
+    assert f"chose earliest {distinct_earlier}" in warning
+
+
+@pytest.mark.asyncio
+async def test_microsecond_distinct_onsets_are_not_merged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T7: sub-second-distinct instants are never tolerance-merged."""
+    db_path = tmp_path / "onset-microsecond.sqlite3"
+    store = await _backdated_store(db_path)
+    first_micro = "2026-08-10T20:09:35.000100+00:00"
+    second_micro = "2026-08-10T20:09:35.000200Z"
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = ?"
+        " WHERE run_id = ? AND raw_state_json IS NOT NULL",
+        (json.dumps({"first_crack_status": {"detected_at_utc": first_micro}}), "backdated-run"),
+    )
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = ?"
+        " WHERE run_id = ? AND elapsed_seconds = 605.0",
+        (json.dumps({"first_crack_status": {"detected_at_utc": second_micro}}), "backdated-run"),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    warning = capsys.readouterr().err
+
+    assert "2 distinct onset values" in warning
+
+
+@pytest.mark.asyncio
+async def test_all_unparseable_onsets_still_count_distinct_and_fall_back(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T8: two distinct unparseable strings still count separately and the
+    first encountered one is chosen for the (unparseable) fallback path."""
+    db_path = tmp_path / "onset-all-unparseable.sqlite3"
+    store = await _backdated_store(db_path)
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = NULL"
+        " WHERE run_id = ? AND elapsed_seconds NOT IN (600.0, 605.0)",
+        ("backdated-run",),
+    )
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = ?"
+        " WHERE run_id = ? AND elapsed_seconds = 600.0",
+        (json.dumps({"first_crack_status": {"detected_at_utc": "bad-one"}}), "backdated-run"),
+    )
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = ?"
+        " WHERE run_id = ? AND elapsed_seconds = 605.0",
+        (json.dumps({"first_crack_status": {"detected_at_utc": "bad-two"}}), "backdated-run"),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    entry = s2f.convert(db_path, out_dir)
+    warning = capsys.readouterr().err
+
+    assert entry["first_crack_anchor"] == "event_row"
+    assert "source unparseable" in warning
+    assert "2 distinct onset values" in warning
+    assert "chose earliest bad-one" in warning
+
+
+@pytest.mark.asyncio
+async def test_utc_normalization_overflow_onset_falls_back_as_unparseable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A boundary-aware onset that cannot reach UTC uses the safe fallback."""
+    db_path = tmp_path / "onset-normalization-overflow.sqlite3"
+    store = await _backdated_store(db_path)
+    overflow_onset = "0001-01-01T00:00:00+01:00"
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = NULL"
+        " WHERE run_id = ? AND elapsed_seconds NOT IN (600.0, 605.0)",
+        ("backdated-run",),
+    )
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = ?"
+        " WHERE run_id = ? AND elapsed_seconds = 600.0",
+        (
+            json.dumps({"first_crack_status": {"detected_at_utc": overflow_onset}}),
+            "backdated-run",
+        ),
+    )
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = ?"
+        " WHERE run_id = ? AND elapsed_seconds = 605.0",
+        (json.dumps({"first_crack_status": {"detected_at_utc": "bad-two"}}), "backdated-run"),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    entry = s2f.convert(db_path, tmp_path / "fixture")
+    warning = capsys.readouterr().err
+
+    assert entry["first_crack_anchor"] == "event_row"
+    assert "source unparseable" in warning
+    assert "2 distinct onset values" in warning
+    assert f"chose earliest {overflow_onset}" in warning
+
+
+@pytest.mark.asyncio
+async def test_mixed_parseable_and_unparseable_onset_prefers_parseable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T9: one unparseable plus one parseable value still selects the
+    parseable onset and still warns with 2 distinct onset values."""
+    db_path = tmp_path / "onset-mixed-parseable.sqlite3"
+    store = await _backdated_store(db_path)
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = ?"
+        " WHERE run_id = ? AND elapsed_seconds = 600.0",
+        (json.dumps({"first_crack_status": {"detected_at_utc": "not-a-date"}}), "backdated-run"),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    entry = s2f.convert(db_path, out_dir)
+    warning = capsys.readouterr().err
+    _, ground = bakeoff_replay.load_roast(out_dir / "roast.jsonl")
+
+    assert entry["first_crack_anchor"] == "fc_status_utc"
+    assert ground.first_crack_seconds == _BACKDATED_FIRST_CRACK_SECONDS
+    assert "2 distinct onset values" in warning
+
+
+# --- #788: AC3 — first-crack fallback reason distinguishes provenance -------
+
+
+@pytest.mark.asyncio
+async def test_operator_sourced_fallback_reports_fixed_provenance_reason(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T11: an operator-sourced acceptance reports the fixed provenance
+    reason, never the generic 'source absent' text."""
+    db_path = tmp_path / "operator-provenance.sqlite3"
+    store = await _backdated_store(db_path)
+    await store.connection.execute(
+        "UPDATE roast_events SET payload_json = ? WHERE run_id = ? AND kind = ?",
+        (
+            json.dumps({"source": "operator"}),
+            "backdated-run",
+            RoastEventKind.FIRST_CRACK.value,
+        ),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    entry = s2f.convert(db_path, tmp_path / "fixture")
+    warning = capsys.readouterr().err
+
+    assert entry["first_crack_anchor"] == "event_row"
+    assert "acceptance is operator-sourced, so MCP onset is not authoritative" in warning
+    assert "source absent" not in warning
+
+
+@pytest.mark.asyncio
+async def test_named_non_mcp_source_reports_fixed_not_verified_reason(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T12: a named non-MCP, non-operator source uses the fixed fail-closed
+    reason and never reflects the source string into stderr."""
+    db_path = tmp_path / "named-other-source.sqlite3"
+    store = await _backdated_store(db_path)
+    await store.connection.execute(
+        "UPDATE roast_events SET payload_json = ? WHERE run_id = ? AND kind = ?",
+        (
+            json.dumps({"source": "controller"}),
+            "backdated-run",
+            RoastEventKind.FIRST_CRACK.value,
+        ),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    entry = s2f.convert(db_path, tmp_path / "fixture")
+    warning = capsys.readouterr().err
+
+    assert entry["first_crack_anchor"] == "event_row"
+    assert "acceptance is not verified MCP-sourced, so MCP onset is not authoritative" in warning
+    assert "controller" not in warning
+    assert "source absent" not in warning
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload_json",
+    [
+        pytest.param(None, id="missing-payload"),
+        pytest.param(json.dumps({}), id="missing-source"),
+        pytest.param(json.dumps({"source": None}), id="null-source"),
+        pytest.param(json.dumps({"source": "unknown"}), id="unknown-source"),
+        pytest.param(json.dumps({"source": "MCP"}), id="wrong-case"),
+        pytest.param(json.dumps({"source": 7}), id="non-string-source"),
+        pytest.param(json.dumps([]), id="non-object-payload"),
+        pytest.param("{malformed", id="malformed-payload"),
+    ],
+)
+async def test_unreadable_or_unrecognised_provenance_reports_fixed_reason(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], payload_json: str | None
+) -> None:
+    """T14: every arbitrary/malformed/missing/non-string/wrong-case provenance
+    selects the SAME fixed fail-closed reason and never echoes its input."""
+    db_path = tmp_path / "unreadable-provenance.sqlite3"
+    store = await _backdated_store(db_path)
+    await store.connection.execute(
+        "UPDATE roast_events SET payload_json = ? WHERE run_id = ? AND kind = ?",
+        (payload_json, "backdated-run", RoastEventKind.FIRST_CRACK.value),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    entry = s2f.convert(db_path, tmp_path / "fixture")
+    warning = capsys.readouterr().err
+
+    assert entry["first_crack_anchor"] == "event_row"
+    assert "acceptance is not verified MCP-sourced, so MCP onset is not authoritative" in warning
+    assert "source absent" not in warning
 
 
 @pytest.mark.asyncio
