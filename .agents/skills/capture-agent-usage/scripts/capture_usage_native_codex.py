@@ -1724,6 +1724,7 @@ class _CandidateMetadata:
     bound_leaf: bool | None
     parent_thread_id: str | None
     consumed: int = 0
+    invalid_bound_depth: bool = False
 
 
 def _candidate_metadata(fd: int, binding: dict[str, str]) -> _CandidateMetadata:
@@ -1770,7 +1771,10 @@ def _candidate_metadata(fd: int, binding: dict[str, str]) -> _CandidateMetadata:
         else:
             bound_leaf = None
         return _CandidateMetadata(
-            bound_leaf, parent if _safe_identifier(parent) else retained_parent, len(raw)
+            bound_leaf,
+            parent if _safe_identifier(parent) else retained_parent,
+            len(raw),
+            matches_identity and bound_leaf is None,
         )
     except (NativeCodexCaptureError, OSError):
         return _CandidateMetadata(None, None, len(raw))
@@ -2221,6 +2225,8 @@ def supervise_native_codex(arguments: Any) -> int:
                     classified.append((fd, _stat, metadata))
                     observed_total += metadata.consumed
                     if observed_total > MAX_PROVIDER_TOTAL_BYTES:
+                        _fail()
+                    if metadata.invalid_bound_depth:
                         _fail()
                     if metadata.bound_leaf is not True:
                         continue

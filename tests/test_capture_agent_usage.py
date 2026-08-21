@@ -3839,6 +3839,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         ("matching-depth-bool", "after", 0, False, None),
         ("matching-depth-float", "after", 0, False, None),
         ("matching-depth-wrong-int", "after", 0, False, None),
+        ("malformed-sibling-success", "after", 0, False, None),
         ("race-child", "after", 0, False, None),
         ("race-sibling", "after", 0, False, None),
         ("race-replacement", "after", 0, False, None),
@@ -4092,7 +4093,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
                 stream.write(b'{"opaque":"growth"}\n')
         if topology in {"sibling", "sibling-growth"}:
             write_rollout(provider / "other.jsonl", "other-811", "other-parent", 1, complete=True)
-        elif topology == "malformed-sibling":
+        elif topology in {"malformed-sibling", "malformed-sibling-success"}:
             (provider / "other.jsonl").write_text('{"malformed":"candidate"}\n')
         elif topology == "malformed-source":
             (provider / "other.jsonl").write_text(
@@ -4132,7 +4133,13 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         ready = json.loads(frames.values[-1])
         return (
             json.dumps(
-                {"type": "TERMINAL", "binding_id": ready["binding_id"], "task_status": "FAILED"}
+                {
+                    "type": "TERMINAL",
+                    "binding_id": ready["binding_id"],
+                    "task_status": (
+                        "SUCCESS" if topology == "malformed-sibling-success" else "FAILED"
+                    ),
+                }
             ).encode()
             + b"\n"
         )
@@ -4143,7 +4150,19 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
     monkeypatch.setattr(usage_native_codex, "_provider_home", lambda: str(tmp_path / "codex"))
     monkeypatch.setattr(usage_native_codex.sys, "stdout", frames)
     monkeypatch.setattr(usage_native_codex, "_terminal_line", terminal)
-    monkeypatch.setattr(usage_native_codex, "_git_identity", lambda *_args, final: "a" * 40)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
+
+    def git_identity(
+        _repository: str,
+        _branch: str,
+        _base: str,
+        *,
+        final: bool,
+        worktree: object | None = None,
+    ) -> str:
+        return "b" * 40 if final and topology == "malformed-sibling-success" else "a" * 40
+
+    monkeypatch.setattr(usage_native_codex, "_git_identity", git_identity)
+    monkeypatch.setattr(usage_native_codex, "_descendant", lambda _base, _head: True)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     monkeypatch.setattr(usage_native_codex, "_assert_checkout", lambda _root: None)  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
     _stub_native_codex_git_administration(monkeypatch)
     monkeypatch.setattr(
@@ -4225,6 +4244,9 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         "late-closing-child",
         "child",
         "child-growth",
+        "matching-depth-bool",
+        "matching-depth-float",
+        "matching-depth-wrong-int",
         "incomplete-child",
         "malformed-source",
     }:
@@ -4241,6 +4263,8 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
     )
     assert record.subagent_count == expected_children
     assert record.whole_tree_verified is expected_whole
+    if topology == "malformed-sibling-success":
+        assert record.success is True
 
 
 @pytest.mark.parametrize("match_count", [0, 2])
