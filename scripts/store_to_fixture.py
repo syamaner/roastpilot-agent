@@ -328,7 +328,8 @@ def _parse_utc(value: str) -> datetime | None:
             offsets.
 
     Returns:
-        An offset-aware datetime, or ``None`` when ``value`` is unparseable.
+        An offset-aware datetime, or ``None`` when ``value`` is unparseable or
+        cannot be normalized to UTC.
     """
     try:
         parsed = datetime.fromisoformat(value)
@@ -336,6 +337,10 @@ def _parse_utc(value: str) -> datetime | None:
         return None
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
+    try:
+        parsed.astimezone(UTC)
+    except OverflowError:
+        return None
     return parsed
 
 

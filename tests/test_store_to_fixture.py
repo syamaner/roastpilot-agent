@@ -1456,6 +1456,44 @@ async def test_all_unparseable_onsets_still_count_distinct_and_fall_back(
 
 
 @pytest.mark.asyncio
+async def test_utc_normalization_overflow_onset_falls_back_as_unparseable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A boundary-aware onset that cannot reach UTC uses the safe fallback."""
+    db_path = tmp_path / "onset-normalization-overflow.sqlite3"
+    store = await _backdated_store(db_path)
+    overflow_onset = "0001-01-01T00:00:00+01:00"
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = NULL"
+        " WHERE run_id = ? AND elapsed_seconds NOT IN (600.0, 605.0)",
+        ("backdated-run",),
+    )
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = ?"
+        " WHERE run_id = ? AND elapsed_seconds = 600.0",
+        (
+            json.dumps({"first_crack_status": {"detected_at_utc": overflow_onset}}),
+            "backdated-run",
+        ),
+    )
+    await store.connection.execute(
+        "UPDATE telemetry_snapshots SET raw_state_json = ?"
+        " WHERE run_id = ? AND elapsed_seconds = 605.0",
+        (json.dumps({"first_crack_status": {"detected_at_utc": "bad-two"}}), "backdated-run"),
+    )
+    await store.connection.commit()
+    await store.close()
+
+    entry = s2f.convert(db_path, tmp_path / "fixture")
+    warning = capsys.readouterr().err
+
+    assert entry["first_crack_anchor"] == "event_row"
+    assert "source unparseable" in warning
+    assert "2 distinct onset values" in warning
+    assert f"chose earliest {overflow_onset}" in warning
+
+
+@pytest.mark.asyncio
 async def test_mixed_parseable_and_unparseable_onset_prefers_parseable(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
