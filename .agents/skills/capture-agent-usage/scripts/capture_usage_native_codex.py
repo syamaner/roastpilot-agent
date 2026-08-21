@@ -22,6 +22,7 @@ from collections.abc import Iterator
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Any
 from uuid import uuid4
 
@@ -61,6 +62,10 @@ MAX_NPM_BIN_TARGET_BYTES = 4096
 MAX_GIT_ADMIN_FILE_BYTES = 4096
 MAX_GIT_ADMIN_ENTRIES = 8192
 MAX_GIT_ADMIN_DEPTH = 16
+# A linked worktree's shared common directory can change while another worktree
+# commits. Require two clean scans, permitting only bounded transient churn.
+GIT_ADMIN_SHARED_SCAN_ATTEMPTS = 4
+GIT_ADMIN_SHARED_STABLE_SCANS = 2
 _ROLE_EXPECTATIONS: dict[NativeCodexRole, tuple[str, str]] = {
     NativeCodexRole.ENGINEER_BE: ("agents/engineer-be.toml", "high"),
     NativeCodexRole.ENGINEER_FE: ("agents/engineer-fe.toml", "high"),
@@ -240,6 +245,9 @@ class _Root:
     path: str = ""
 
 
+_ACTIVE_GIT_WORKTREE: _Root | None = None
+
+
 @dataclass(frozen=True)
 class _GitFile:
     """One held Git-administration regular file and its immutable attestation."""
@@ -306,6 +314,11 @@ def _fail() -> None:
 def _close(descriptor: int) -> None:
     """Close one owned descriptor through a module-local test seam."""
     os.close(descriptor)
+
+
+def _fchdir(descriptor: int) -> None:
+    """Bind a Git child to an inherited worktree descriptor."""
+    os.fchdir(descriptor)
 
 
 def _safe_identifier(value: object) -> bool:
@@ -531,17 +544,30 @@ def _close_inventory(inventory: _Inventory | set[tuple[int, int, int]]) -> None:
         inventory.close()
 
 
-def _git(args: list[str]) -> str:
+def _git(args: list[str], *, worktree: _Root | None = None) -> str:
     """Run Git with bounded live pipe draining and no provider diagnostics."""
     process: subprocess.Popen[bytes] | None = None
     selector: selectors.BaseSelector | None = None
     try:
+        command = ["git"]
+        popen_kwargs: dict[str, Any] = {}
+        environment = _GIT_ENV
+        bound_worktree = worktree if worktree is not None else _ACTIVE_GIT_WORKTREE
+        if bound_worktree is not None:
+            _assert_worktree_root(bound_worktree)
+            # Bind Git's discovery cwd through the held descriptor.  Explicitly
+            # override any repository-local core.worktree with a fixed relative
+            # worktree resolved from that descriptor-bound cwd.
+            environment = {**_GIT_ENV, "GIT_WORK_TREE": "."}
+            popen_kwargs["pass_fds"] = (bound_worktree.descriptor,)
+            popen_kwargs["preexec_fn"] = partial(_fchdir, bound_worktree.descriptor)
         process = subprocess.Popen(
-            ["git", "-c", "core.fsmonitor=false", *args],
+            [*command, "-c", "core.fsmonitor=false", *args],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_GIT_ENV,
+            env=environment,
+            **popen_kwargs,
         )
         if process.stdout is None or process.stderr is None:
             _fail()
@@ -589,7 +615,14 @@ def _git(args: list[str]) -> str:
                         stream.close()
 
 
-def _git_identity(repository: str, branch: str, base: str, *, final: bool) -> str:
+def _git_identity(
+    repository: str,
+    branch: str,
+    base: str,
+    *,
+    final: bool,
+    worktree: _Root | None = None,
+) -> str:
     if (
         repository != NATIVE_CODEX_REPOSITORY
         or not re.fullmatch(r"[0-9a-f]{40}", base)
@@ -598,29 +631,37 @@ def _git_identity(repository: str, branch: str, base: str, *, final: bool) -> st
         or ".." in branch
     ):
         _fail()
-    if _git(["remote", "get-url", "origin"]) not in NATIVE_CODEX_ACCEPTED_ORIGINS:
+
+    def invoke(args: list[str]) -> str:
+        return _git(args) if worktree is None else _git(args, worktree=worktree)
+
+    if invoke(["remote", "get-url", "origin"]) not in NATIVE_CODEX_ACCEPTED_ORIGINS:
         _fail()
-    head = _git(["rev-parse", "HEAD"])
+    head = invoke(["rev-parse", "HEAD"])
     status_args = (
         ["status", "--porcelain", "--untracked-files=all", "--ignored"]
         if not final
         else ["status", "--porcelain", "--untracked-files=all"]
     )
-    if _git(["branch", "--show-current"]) != branch or _git(status_args):
+    if invoke(["branch", "--show-current"]) != branch or invoke(status_args):
         _fail()
-    _assert_index_clean()
-    if _git(["rev-parse", "HEAD"]) != head:
+    _assert_index_clean(worktree)
+    if invoke(["rev-parse", "HEAD"]) != head:
         _fail()
-    if _git(["rev-parse", "--verify", f"{base}^{{commit}}"]) != base or (
+    if invoke(["rev-parse", "--verify", f"{base}^{{commit}}"]) != base or (
         not final and head != base
     ):
         _fail()
     return head
 
 
-def _assert_index_clean() -> None:
+def _assert_index_clean(worktree: _Root | None = None) -> None:
     """Reject index flags that can hide tracked checkout changes."""
-    rows = _git(["ls-files", "-v", "-t", "-z"]).split("\0")
+    rows = (
+        _git(["ls-files", "-v", "-t", "-z"])
+        if worktree is None
+        else _git(["ls-files", "-v", "-t", "-z"], worktree=worktree)
+    ).split("\0")
     if not rows or rows.pop() != "" or len(rows) > MAX_CHECKOUT_ENTRIES:
         _fail()
     for row in rows:
@@ -858,13 +899,24 @@ def _assert_git_administration_tree(root: _Root) -> None:
 
 def _assert_git_administration_trees(administration: _GitAdministration) -> None:
     """Attest each distinct Git administration root exactly once."""
-    roots = (administration.git_directory, administration.common_directory)
-    seen: set[tuple[int, int]] = set()
-    for root in roots:
-        if root is None or (root.device, root.inode) in seen:
+    _assert_git_administration_tree(administration.git_directory)
+    common = administration.common_directory
+    if common is None or (common.device, common.inode) == (
+        administration.git_directory.device,
+        administration.git_directory.inode,
+    ):
+        return
+    stable_scans = 0
+    for _attempt in range(GIT_ADMIN_SHARED_SCAN_ATTEMPTS):
+        try:
+            _assert_git_administration_tree(common)
+        except NativeCodexCaptureError:
+            stable_scans = 0
             continue
-        seen.add((root.device, root.inode))
-        _assert_git_administration_tree(root)
+        stable_scans += 1
+        if stable_scans == GIT_ADMIN_SHARED_STABLE_SCANS:
+            return
+    _fail()
 
 
 def _assert_git_administration(worktree: _Root, expected: _GitAdministration) -> None:
@@ -910,7 +962,7 @@ def _assert_checkout(root: _Root) -> None:
     """Attest every tracked file and containing directory through held descriptors."""
     _assert_worktree_root(root)
     _assert_checkout_directories(root)
-    paths = _git(["ls-files", "-z"]).split("\0")
+    paths = _git(["ls-files", "-z"], worktree=root).split("\0")
     if not paths or paths.pop() != "" or len(paths) > MAX_CHECKOUT_ENTRIES:
         _fail()
     for path in paths:
@@ -1173,9 +1225,13 @@ def _assert_checkout_directories(root: _Root) -> None:
         os.close(descriptor)
 
 
-def _attested_origin() -> str:
+def _attested_origin(worktree: _Root | None = None) -> str:
     """Return the exact accepted origin spelling for rollout provenance binding."""
-    origin = _git(["remote", "get-url", "origin"])
+    origin = (
+        _git(["remote", "get-url", "origin"])
+        if worktree is None
+        else _git(["remote", "get-url", "origin"], worktree=worktree)
+    )
     if origin not in NATIVE_CODEX_ACCEPTED_ORIGINS:
         _fail()
     return origin
@@ -1997,18 +2053,36 @@ def _terminal_line() -> bytes:
     return line
 
 
-def _descendant(base: str, head: str) -> bool:
+def _descendant(base: str, head: str, *, worktree: _Root | None = None) -> bool:
     if base == head:
         return False
     try:
+        command = ["git"]
+        run_kwargs: dict[str, Any] = {}
+        environment = _GIT_ENV
+        bound_worktree = worktree if worktree is not None else _ACTIVE_GIT_WORKTREE
+        if bound_worktree is not None:
+            _assert_worktree_root(bound_worktree)
+            environment = {**_GIT_ENV, "GIT_WORK_TREE": "."}
+            run_kwargs["pass_fds"] = (bound_worktree.descriptor,)
+            run_kwargs["preexec_fn"] = partial(_fchdir, bound_worktree.descriptor)
         return (
             subprocess.run(
-                ["git", "-c", "core.fsmonitor=false", "merge-base", "--is-ancestor", base, head],
+                [
+                    *command,
+                    "-c",
+                    "core.fsmonitor=false",
+                    "merge-base",
+                    "--is-ancestor",
+                    base,
+                    head,
+                ],
                 check=False,
                 timeout=5,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                env=_GIT_ENV,
+                env=environment,
+                **run_kwargs,
             ).returncode
             == 0
         )
@@ -2052,6 +2126,7 @@ def _provider_home() -> str:
 
 def supervise_native_codex(arguments: Any) -> int:
     """Run one parent-owned READY/status/result protocol without launching a child."""
+    global _ACTIVE_GIT_WORKTREE
     values = (arguments.task_id, arguments.slice_id, arguments.parent_task_id, arguments.task_name)
     parent = os.environ.get("CODEX_THREAD_ID")
     if not all(_safe_identifier(value) for value in values) or not _safe_identifier(parent):
@@ -2068,17 +2143,22 @@ def supervise_native_codex(arguments: Any) -> int:
     selected_name: str | None = None
     relaxed_descriptors: set[int] = set()
     before: _Inventory | set[tuple[int, int, int]] | None = None
+    prior_git_worktree = _ACTIVE_GIT_WORKTREE
     try:
         usage = _open_root(arguments.usage_root, private=True)
         provider = _open_root(os.path.join(codex_home, "sessions"), private=False)
         worktree = _open_root(os.getcwd(), private=False)
+        _ACTIVE_GIT_WORKTREE = worktree
         _reject_root_overlap(usage, provider, worktree)
         _assert_worktree_root(worktree)
         git_administration = _open_git_administration(worktree)
         _assert_git_administration_trees(git_administration)
         _assert_checkout(worktree)
         launch = _git_identity(
-            arguments.repository, arguments.branch, arguments.base_sha, final=False
+            arguments.repository,
+            arguments.branch,
+            arguments.base_sha,
+            final=False,
         )
         config_sha, role_sha, effort, canonical = _registered_role(worktree, role)
         before = _inventory(provider)
@@ -2097,7 +2177,12 @@ def supervise_native_codex(arguments: Any) -> int:
         _assert_checkout(worktree)
         _assert_git_administration(worktree, git_administration)
         if (
-            _git_identity(arguments.repository, arguments.branch, arguments.base_sha, final=False)
+            _git_identity(
+                arguments.repository,
+                arguments.branch,
+                arguments.base_sha,
+                final=False,
+            )
             != launch
             or _attested_origin() != origin
         ):
@@ -2223,7 +2308,10 @@ def supervise_native_codex(arguments: Any) -> int:
         _assert_checkout(worktree)
         _assert_git_administration(worktree, git_administration)
         final = _git_identity(
-            arguments.repository, arguments.branch, arguments.base_sha, final=True
+            arguments.repository,
+            arguments.branch,
+            arguments.base_sha,
+            final=True,
         )
         success = status is NativeCodexTaskStatus.SUCCESS
         if not _descendant(arguments.base_sha, final) and final != arguments.base_sha:
@@ -2289,6 +2377,7 @@ def supervise_native_codex(arguments: Any) -> int:
         sys.stdout.flush()
         return 0
     finally:
+        _ACTIVE_GIT_WORKTREE = prior_git_worktree
         if before is not None:
             _close_inventory(before)
         if selected_fd is not None:

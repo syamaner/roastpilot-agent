@@ -238,6 +238,22 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
     }
     record = NativeCodexUsageRecord.model_validate(payload)
     assert USAGE_RECORD_ADAPTER.validate_json(record.model_dump_json()) == record
+    for field, value in (
+        ("success", "true"),
+        ("whole_tree_verified", 1),
+        ("schema_version", "1"),
+        ("topology_depth", True),
+        ("elapsed_ms", 0.0),
+        ("input_tokens", True),
+        ("cached_input_tokens", "2"),
+        ("cache_write_input_tokens", 3.0),
+        ("output_tokens", "6"),
+        ("reasoning_output_tokens", False),
+        ("total_tokens", 11.0),
+        ("subagent_count", "0"),
+    ):
+        with pytest.raises(ValidationError):
+            NativeCodexUsageRecord.model_validate({**payload, field: value})
     with pytest.raises(ValidationError):
         NativeCodexUsageRecord.model_validate({**payload, "final_head_sha": "a" * 40})
     with pytest.raises(ValidationError):
@@ -2180,6 +2196,52 @@ def test_native_codex_git_administration_accepts_normal_and_linked_worktrees(
             os.close(root.descriptor)
 
 
+def test_native_codex_git_administration_retries_transient_shared_common_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A concurrent linked-worktree update must settle before shared admin passes."""
+    git_directory = usage_native_codex._Root(10, 1, 1)  # pyright: ignore[reportPrivateUsage]
+    common_directory = usage_native_codex._Root(11, 1, 2)  # pyright: ignore[reportPrivateUsage]
+    administration = usage_native_codex._GitAdministration(  # pyright: ignore[reportPrivateUsage]
+        None, git_directory, None, common_directory
+    )
+    common_attempts = 0
+
+    def scan(root: usage_native_codex._Root) -> None:  # pyright: ignore[reportPrivateUsage]
+        nonlocal common_attempts
+        if root == common_directory:
+            common_attempts += 1
+            if common_attempts == 1:
+                raise usage_native_codex.NativeCodexCaptureError("transient")
+
+    monkeypatch.setattr(usage_native_codex, "_assert_git_administration_tree", scan)
+    usage_native_codex._assert_git_administration_trees(administration)  # pyright: ignore[reportPrivateUsage]
+    assert common_attempts == 3
+
+
+def test_native_codex_git_administration_rejects_persistent_shared_common_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shared admin tree which never stabilizes remains fail-closed."""
+    git_directory = usage_native_codex._Root(10, 1, 1)  # pyright: ignore[reportPrivateUsage]
+    common_directory = usage_native_codex._Root(11, 1, 2)  # pyright: ignore[reportPrivateUsage]
+    administration = usage_native_codex._GitAdministration(  # pyright: ignore[reportPrivateUsage]
+        None, git_directory, None, common_directory
+    )
+    common_attempts = 0
+
+    def scan(root: usage_native_codex._Root) -> None:  # pyright: ignore[reportPrivateUsage]
+        nonlocal common_attempts
+        if root == common_directory:
+            common_attempts += 1
+            raise usage_native_codex.NativeCodexCaptureError("persistent")
+
+    monkeypatch.setattr(usage_native_codex, "_assert_git_administration_tree", scan)
+    with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+        usage_native_codex._assert_git_administration_trees(administration)  # pyright: ignore[reportPrivateUsage]
+    assert common_attempts == usage_native_codex.GIT_ADMIN_SHARED_SCAN_ATTEMPTS  # pyright: ignore[reportPrivateUsage]
+
+
 @pytest.mark.parametrize("mutation", ["git-directory-mode", "git-directory-replace"])
 def test_native_codex_git_administration_rejects_normal_layout_drift(
     tmp_path: Path, mutation: str
@@ -2593,6 +2655,52 @@ def test_native_codex_git_attestation_ignores_hostile_repository_overrides(
         )
         == base
     )  # pyright: ignore[reportPrivateUsage]
+
+
+def test_native_codex_git_attestation_binds_held_worktree_over_core_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repository-local core.worktree cannot redirect held native Git queries."""
+    repository = tmp_path / "repository"
+    redirected = tmp_path / "redirected"
+    repository.mkdir()
+    redirected.mkdir()
+    for command in (
+        ["git", "init", "-b", "feature/test"],
+        ["git", "config", "user.email", "capture@example.test"],
+        ["git", "config", "user.name", "Capture"],
+        ["git", "remote", "add", "origin", "https://github.com/syamaner/roastpilot-agent.git"],
+    ):
+        subprocess.run(command, cwd=repository, check=True, capture_output=True)
+    (repository / "tracked.txt").write_text("held worktree\n")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True
+    )
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "config", "core.worktree", str(redirected)],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+    root = usage_native_codex._open_root(str(repository), private=False)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.chdir(redirected)
+    try:
+        assert (
+            usage_native_codex._git_identity(  # pyright: ignore[reportPrivateUsage]
+                "syamaner/roastpilot-agent",
+                "feature/test",
+                base,
+                final=False,
+                worktree=root,
+            )
+            == base
+        )
+    finally:
+        os.close(root.descriptor)
 
 
 def test_native_codex_git_commands_disable_ambient_fsmonitor(

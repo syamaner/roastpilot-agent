@@ -750,6 +750,34 @@ class NativeCodexUsageRecord(CaptureModel):
     whole_tree_verified: bool
     subagent_count: int
 
+    @field_validator("success", "whole_tree_verified", mode="before")
+    @classmethod
+    def require_native_boolean(cls, value: object) -> object:
+        """Reject coercion at persisted native-Codex boolean boundaries."""
+        if type(value) is not bool:
+            raise ValueError("native Codex boolean fields must be JSON booleans")
+        return value
+
+    @field_validator(
+        "schema_version",
+        "topology_depth",
+        "elapsed_ms",
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+        "subagent_count",
+        mode="before",
+    )
+    @classmethod
+    def require_native_integer(cls, value: object) -> object:
+        """Reject coercion at persisted native-Codex integer/count boundaries."""
+        if type(value) is not int:
+            raise ValueError("native Codex integer fields must be JSON integers")
+        return value
+
     @field_validator("role_capability", mode="before")
     @classmethod
     def normalize_serialized_write_capability(cls, value: object) -> object:
