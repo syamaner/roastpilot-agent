@@ -272,19 +272,21 @@ class _GitAdministration:
 
 @dataclass(frozen=True)
 class _InventoryEntry:
-    """One pre-READY rollout descriptor and the generation it bound."""
+    """One bounded pre-READY rollout identity attestation."""
 
     name: str
-    descriptor: int
     device: int
     inode: int
     generation: tuple[int, int, int]
     size: int
+    mode: int
+    uid: int
+    nlink: int
 
 
 @dataclass
 class _Inventory:
-    """Descriptor-owning pre-READY provider inventory."""
+    """Bounded pre-READY provider inventory without retained file descriptors."""
 
     entries: dict[tuple[int, int, int], _InventoryEntry]
 
@@ -297,14 +299,11 @@ class _Inventory:
         return iter(self.entries)
 
     def __eq__(self, other: object) -> bool:
-        """Compare by generation only; descriptors intentionally remain private."""
+        """Compare by generation only."""
         return set(self.entries) == other
 
     def close(self) -> None:
-        """Close every retained provider descriptor exactly once."""
-        for entry in self.entries.values():
-            with suppress(OSError):
-                _close(entry.descriptor)
+        """Retain compatibility with inventory-owning test-double callers."""
 
 
 def _fail() -> None:
@@ -513,20 +512,27 @@ def _walk(root: _Root) -> Iterator[tuple[str, int, os.stat_result]]:
 
 
 def _inventory(root: _Root) -> _Inventory:
-    """Bind every pre-READY rollout descriptor until final reconciliation."""
+    """Snapshot bounded pre-READY rollout identities without retaining their fds."""
     _provider_directory(root.descriptor, expected=(root.device, root.inode))
     result: dict[tuple[int, int, int], _InventoryEntry] = {}
     try:
         for name, fd, status in _walk(root):
             generation = _generation(status)
             if generation in result or len(result) >= MAX_PROVIDER_FILES:
-                os.close(fd)
+                _close(fd)
                 _fail()
             result[generation] = _InventoryEntry(
-                name, fd, status.st_dev, status.st_ino, generation, status.st_size
+                name,
+                status.st_dev,
+                status.st_ino,
+                generation,
+                status.st_size,
+                status.st_mode,
+                status.st_uid,
+                status.st_nlink,
             )
+            _close(fd)
     except BaseException:
-        _Inventory(result).close()
         raise
     return _Inventory(result)
 
@@ -539,7 +545,7 @@ def _inventory_generations(
 
 
 def _close_inventory(inventory: _Inventory | set[tuple[int, int, int]]) -> None:
-    """Close only descriptors owned by a production inventory."""
+    """Release inventory resources for production or set-like test doubles."""
     if isinstance(inventory, _Inventory):
         inventory.close()
 
@@ -1825,35 +1831,36 @@ def _reconcile_rollouts(
     The selected leaf is handled separately and remains size-immutable.
     """
     expected_names = {name for name, _fd, _status in candidates}
-    observed: dict[str, os.stat_result] = {}
+    observed: dict[str, _InventoryEntry] = {}
     final_inventory: _Inventory | set[tuple[int, int, int]] | None = None
     try:
         final_inventory = _inventory(root)
         if not isinstance(final_inventory, _Inventory):
             _fail()
         for entry in final_inventory.entries.values():
-            observed[entry.name] = os.fstat(entry.descriptor)
+            observed[entry.name] = entry
         if isinstance(before, _Inventory):
             for entry in before.entries.values():
-                held = os.fstat(entry.descriptor)
                 path_status = observed.get(entry.name)
                 if (
-                    not stat.S_ISREG(held.st_mode)
-                    or held.st_uid != os.geteuid()
-                    or held.st_nlink <= 0
-                    or (held.st_dev, held.st_ino) != (entry.device, entry.inode)
-                    or path_status is None
-                    or not stat.S_ISREG(path_status.st_mode)
-                    or path_status.st_uid != os.geteuid()
-                    or path_status.st_nlink <= 0
-                    or (path_status.st_dev, path_status.st_ino) != (entry.device, entry.inode)
+                    path_status is None
+                    or not stat.S_ISREG(path_status.mode)
+                    or path_status.uid != os.geteuid()
+                    or path_status.nlink <= 0
+                    or stat.S_IMODE(path_status.mode) & 0o022
+                    or (path_status.device, path_status.inode) != (entry.device, entry.inode)
+                    or path_status.size < entry.size
+                    or (
+                        path_status.generation != entry.generation
+                        and path_status.size == entry.size
+                    )
                 ):
                     _fail()
         observed_new = {
             name: status
             for name, status in observed.items()
-            if _generation(status) not in _inventory_generations(before)
-            and (status.st_dev, status.st_ino)
+            if status.generation not in _inventory_generations(before)
+            and (status.device, status.inode)
             not in {(device, inode) for device, inode, _ctime in _inventory_generations(before)}
         }
         if set(observed_new) != expected_names:
@@ -1861,7 +1868,7 @@ def _reconcile_rollouts(
         for name, descriptor, initial in candidates:
             current = observed_new[name]
             if descriptor not in relaxed_descriptors:
-                if _generation(current) != _generation(initial):
+                if current.generation != _generation(initial):
                     _fail()
                 continue
             held = os.fstat(descriptor)
@@ -1872,12 +1879,12 @@ def _reconcile_rollouts(
                 or stat.S_IMODE(held.st_mode) & 0o022
                 or (held.st_dev, held.st_ino) != (initial.st_dev, initial.st_ino)
                 or held.st_size < initial.st_size
-                or not stat.S_ISREG(current.st_mode)
-                or current.st_uid != os.geteuid()
-                or current.st_nlink <= 0
-                or stat.S_IMODE(current.st_mode) & 0o022
-                or (current.st_dev, current.st_ino) != (initial.st_dev, initial.st_ino)
-                or current.st_size < initial.st_size
+                or not stat.S_ISREG(current.mode)
+                or current.uid != os.geteuid()
+                or current.nlink <= 0
+                or stat.S_IMODE(current.mode) & 0o022
+                or (current.device, current.inode) != (initial.st_dev, initial.st_ino)
+                or current.size < initial.st_size
             ):
                 _fail()
     except OSError:

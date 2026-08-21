@@ -660,6 +660,34 @@ def test_native_codex_inventory_does_not_read_or_size_existing_rollouts(tmp_path
     assert inventory == {(status.st_dev, status.st_ino, status.st_ctime_ns)}
 
 
+def test_native_codex_inventory_closes_large_historical_rollouts_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full historical snapshot retains attestations, not one file descriptor per row."""
+    historical_count = 128
+    for index in range(historical_count):
+        (tmp_path / f"history-{index}.jsonl").write_text("{}\n")
+    monkeypatch.setattr(usage_native_codex, "MAX_PROVIDER_FILES", historical_count)
+    monkeypatch.setattr(usage_native_codex, "MAX_PROVIDER_ENTRIES", historical_count)
+    closed: list[int] = []
+    real_close = usage_native_codex._close  # pyright: ignore[reportPrivateUsage]
+
+    def close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(usage_native_codex, "_close", close)
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    try:
+        inventory = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(root.descriptor)
+
+    assert len(inventory) == historical_count
+    assert len(closed) >= historical_count
+    assert all(not hasattr(entry, "descriptor") for entry in inventory.entries.values())
+
+
 @pytest.mark.parametrize("mode", [0o620, 0o666])
 def test_native_codex_provider_walk_rejects_writable_rollout_files(
     tmp_path: Path, mode: int
@@ -792,17 +820,35 @@ def test_native_codex_retained_pre_ready_descriptor_allows_parent_growth(tmp_pat
         os.close(root.descriptor)
 
 
-@pytest.mark.parametrize("mutation", ["replace", "unlink"])
-def test_native_codex_retained_pre_ready_descriptor_rejects_rebinding(
-    tmp_path: Path, mutation: str
-) -> None:
+def test_native_codex_pre_ready_snapshot_rejects_same_size_generation_drift(tmp_path: Path) -> None:
+    """A historical rollout cannot change generation without append-only growth."""
+    parent = tmp_path / "parent.jsonl"
+    parent.write_bytes(b"{}\n")
+    root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
+    before = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with parent.open("ab") as stream:
+            stream.write(b"x")
+        parent.write_bytes(b"{}\n")
+        with pytest.raises(usage_native_codex.NativeCodexCaptureError):
+            usage_native_codex._reconcile_rollouts(root, before, [])  # pyright: ignore[reportPrivateUsage]
+    finally:
+        before.close()
+        os.close(root.descriptor)
+
+
+@pytest.mark.parametrize("mutation", ["replace", "rename", "unlink"])
+def test_native_codex_pre_ready_snapshot_rejects_rebinding(tmp_path: Path, mutation: str) -> None:
     """Pre-READY files cannot be replaced or disappear after READY."""
     parent = tmp_path / "parent.jsonl"
     parent.write_bytes(b"{}\n")
     root = usage_native_codex._open_root(str(tmp_path), private=False)  # pyright: ignore[reportPrivateUsage]
     before = usage_native_codex._inventory(root)  # pyright: ignore[reportPrivateUsage]
     try:
-        parent.unlink()
+        if mutation == "rename":
+            parent.rename(tmp_path / "renamed.jsonl")
+        else:
+            parent.unlink()
         if mutation == "replace":
             parent.write_bytes(b"{}\n")
         with pytest.raises(usage_native_codex.NativeCodexCaptureError):
