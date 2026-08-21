@@ -2262,9 +2262,10 @@ def supervise_native_codex(arguments: Any) -> int:
                     if observed_total > MAX_PROVIDER_TOTAL_BYTES:
                         _fail()
                 except NativeCodexCaptureError:
-                    # A malformed or incomplete rollout that names the leaf might be a
-                    # child. Capture remains useful, but whole-tree proof is withheld.
-                    fully_scanned = False
+                    # Metadata already proves this rollout names the selected leaf as
+                    # parent. Its incomplete or malformed body is therefore an
+                    # unaccounted child, never a recordable successful lifecycle.
+                    _fail()
                 else:
                     # A fully parsed candidate routed here either proves a child or
                     # contradicts its first-row parent binding; both are fail-closed.

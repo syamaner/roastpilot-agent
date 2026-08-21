@@ -3815,8 +3815,8 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         ("sibling", "after", 0, True, None),
         ("child", "before", 1, False, None),
         ("child", "after", 1, False, None),
-        ("incomplete-child", "before", 0, False, None),
-        ("incomplete-child", "after", 0, False, None),
+        ("incomplete-child", "before", 1, False, None),
+        ("incomplete-child", "after", 1, False, None),
         ("malformed-sibling", "before", 0, False, None),
         ("malformed-sibling", "after", 0, False, None),
         ("malformed-source", "before", 0, False, None),
@@ -4210,6 +4210,7 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         "late-closing-child",
         "child",
         "child-growth",
+        "incomplete-child",
     }:
         with pytest.raises(
             usage_native_codex.NativeCodexCaptureError, match="native Codex capture is invalid"
