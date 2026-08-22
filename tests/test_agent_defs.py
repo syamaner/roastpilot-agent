@@ -661,6 +661,8 @@ def _is_agent_files_call(node: ast.expr) -> bool:
 
 
 _ROSTER_AGGREGATE_ACCESSORS = frozenset({"get", "items", "values"})
+_ROSTER_MEMBER_METHODS = frozenset({"pop"})
+_ROSTER_RETAINING_METHODS = frozenset({"copy"})
 
 
 def _is_agent_roster_collection(node: ast.expr, collection_names: set[str]) -> bool:
@@ -672,7 +674,7 @@ def _is_agent_roster_collection(node: ast.expr, collection_names: set[str]) -> b
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr in _ROSTER_AGGREGATE_ACCESSORS
+        and node.func.attr in _ROSTER_AGGREGATE_ACCESSORS | _ROSTER_RETAINING_METHODS
         and _is_agent_roster_collection(node.func.value, collection_names)
     ):
         return True
@@ -717,6 +719,12 @@ def _is_agent_roster_path(node: ast.expr, path_names: set[str], collection_names
         or (
             isinstance(node, ast.Subscript)
             and _is_agent_roster_collection(node.value, collection_names)
+        )
+        or (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _ROSTER_MEMBER_METHODS
+            and _is_agent_roster_collection(node.func.value, collection_names)
         )
         or (
             isinstance(node, ast.Call)
@@ -765,10 +773,10 @@ def _scope_nodes(
     return tuple(nodes)
 
 
-def _scope_has_unvalidated_role_text_read(
+def _scope_roster_provenance(
     scope: ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
-) -> bool:
-    """Return whether one lexical scope reads governed role text without validation."""
+) -> tuple[set[str], set[str], tuple[ast.AST, ...]]:
+    """Return fixed-point path and collection provenance for one lexical scope."""
     path_names: set[str] = (
         _parametrized_agent_paths(scope)
         if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -809,6 +817,14 @@ def _scope_has_unvalidated_role_text_read(
                 if not target_names <= collection_names:
                     collection_names.update(target_names)
                     changed = True
+    return path_names, collection_names, nodes
+
+
+def _scope_has_unvalidated_role_text_read(
+    scope: ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
+    """Return whether one lexical scope reads governed role text without validation."""
+    path_names, collection_names, nodes = _scope_roster_provenance(scope)
     parents = {
         id(child): node for node in nodes for child in ast.iter_child_nodes(node) if child in nodes
     }
@@ -822,7 +838,7 @@ def _scope_has_unvalidated_role_text_read(
         receiver = node.func.value
         if _is_direct_agent_role_path(receiver) or (
             isinstance(receiver, (ast.Call, ast.Subscript))
-            and _is_agent_roster_collection(receiver, collection_names)
+            and _is_agent_roster_path(receiver, path_names, collection_names)
         ):
             return True
         if not (isinstance(receiver, ast.Name) and receiver.id in path_names):
@@ -872,6 +888,30 @@ def _has_unvalidated_role_text_read(tree: ast.Module) -> bool:
     )
 
 
+def _has_unparsed_roster_field_text(tree: ast.Module, filename: str) -> bool:
+    """Return whether a field consumer reads a parametrized role through ``agent_text``."""
+    if filename != "test_agent_model_pins.py":
+        return False
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not _parametrized_agent_paths(function):
+            continue
+        path_names, collection_names, nodes = _scope_roster_provenance(function)
+        if any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "agent_text"
+            and any(
+                _is_agent_roster_path(argument, path_names, collection_names)
+                for argument in (*node.args, *(keyword.value for keyword in node.keywords))
+            )
+            for node in nodes
+        ):
+            return True
+    return False
+
+
 def _called_shared_helpers(tree: ast.Module) -> set[str]:
     """Return directly invoked names imported from the shared helper module."""
     return {
@@ -888,16 +928,20 @@ _ALLOWED_DIRECTORY_ENUMERATIONS: dict[str, dict[tuple[str, str, str, str], int]]
 _UNAPPROVED_DIRECTORY_ENUMERATION = ("", "", "", "")
 _OS_DIRECTORY_ENUMERATORS = frozenset({"listdir", "scandir", "walk"})
 _GLOB_DIRECTORY_ENUMERATORS = frozenset({"glob", "iglob"})
+_PATH_DIRECTORY_ENUMERATORS = frozenset({"iterdir", "glob", "rglob", "walk"})
 
 
 def _directory_enumeration_bindings(
     tree: ast.Module,
-) -> tuple[set[str], set[str], set[str], set[str]]:
-    """Return imported and conservatively inherited ``os`` and ``glob`` bindings."""
+) -> tuple[set[str], set[str], set[str], set[str], set[str], set[str]]:
+    """Return imported and conservatively inherited directory-enumerator bindings."""
     module_names: set[str] = set()
     function_names: set[str] = set()
     glob_module_names: set[str] = set()
     glob_function_names: set[str] = set()
+    path_factory_names: set[str] = set()
+    path_instance_names: set[str] = set()
+    path_function_names: set[str] = set()
     assignments: list[ast.Assign | ast.AnnAssign] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -914,6 +958,10 @@ def _directory_enumeration_bindings(
             for alias in node.names:
                 if alias.name in _GLOB_DIRECTORY_ENUMERATORS:
                     glob_function_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "pathlib" and node.level == 0:
+            for alias in node.names:
+                if alias.name == "Path":
+                    path_factory_names.add(alias.asname or alias.name)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             assignments.append(node)
     changed = True
@@ -939,7 +987,36 @@ def _directory_enumeration_bindings(
                 and isinstance(value.value, ast.Name)
                 and value.value.id in glob_module_names
             )
-            if not any((is_os_module, is_os_enumerator, is_glob_module, is_glob_enumerator)):
+            is_path_instance = (
+                isinstance(value, ast.Name) and value.id in path_instance_names
+            ) or (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id in path_factory_names
+            )
+            is_path_enumerator = (
+                isinstance(value, ast.Name) and value.id in path_function_names
+            ) or (
+                isinstance(value, ast.Attribute)
+                and value.attr in _PATH_DIRECTORY_ENUMERATORS
+                and (
+                    isinstance(value.value, ast.Name)
+                    and value.value.id in path_instance_names
+                    or isinstance(value.value, ast.Call)
+                    and isinstance(value.value.func, ast.Name)
+                    and value.value.func.id in path_factory_names
+                )
+            )
+            if not any(
+                (
+                    is_os_module,
+                    is_os_enumerator,
+                    is_glob_module,
+                    is_glob_enumerator,
+                    is_path_instance,
+                    is_path_enumerator,
+                )
+            ):
                 continue
             targets = (
                 assignment.targets if isinstance(assignment, ast.Assign) else (assignment.target,)
@@ -959,7 +1036,20 @@ def _directory_enumeration_bindings(
                 if is_glob_enumerator and target.id not in glob_function_names:
                     glob_function_names.add(target.id)
                     changed = True
-    return module_names, function_names, glob_module_names, glob_function_names
+                if is_path_instance and target.id not in path_instance_names:
+                    path_instance_names.add(target.id)
+                    changed = True
+                if is_path_enumerator and target.id not in path_function_names:
+                    path_function_names.add(target.id)
+                    changed = True
+    return (
+        module_names,
+        function_names,
+        glob_module_names,
+        glob_function_names,
+        path_instance_names,
+        path_function_names,
+    )
 
 
 def _directory_enumeration_signature(
@@ -968,10 +1058,13 @@ def _directory_enumeration_signature(
     os_functions: set[str],
     glob_modules: set[str],
     glob_functions: set[str],
+    path_functions: set[str],
 ) -> tuple[str, str, str, str] | None:
     """Return an exact allowed-path signature, or an unapproved-enumerator sentinel."""
     function = node.func
-    if isinstance(function, ast.Name) and function.id in os_functions | glob_functions:
+    if isinstance(function, ast.Name) and function.id in (
+        os_functions | glob_functions | path_functions
+    ):
         return _UNAPPROVED_DIRECTORY_ENUMERATION
     if not isinstance(function, ast.Attribute):
         return None
@@ -987,7 +1080,7 @@ def _directory_enumeration_signature(
         and function.value.id in glob_modules
     ):
         return _UNAPPROVED_DIRECTORY_ENUMERATION
-    if function.attr not in {"iterdir", "glob", "rglob", "walk"}:
+    if function.attr not in _PATH_DIRECTORY_ENUMERATORS:
         return None
     if not (
         isinstance(function.value, ast.BinOp)
@@ -1011,14 +1104,21 @@ def _directory_enumeration_signature(
 
 def _has_only_allowed_directory_enumeration(tree: ast.Module, filename: str) -> bool:
     """Return whether every directory enumeration is one committed exact call site."""
-    os_modules, os_functions, glob_modules, glob_functions = _directory_enumeration_bindings(tree)
+    (
+        os_modules,
+        os_functions,
+        glob_modules,
+        glob_functions,
+        _path_instances,
+        path_functions,
+    ) = _directory_enumeration_bindings(tree)
     expected = _ALLOWED_DIRECTORY_ENUMERATIONS[filename]
     observed = {signature: 0 for signature in expected}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         signature = _directory_enumeration_signature(
-            node, os_modules, os_functions, glob_modules, glob_functions
+            node, os_modules, os_functions, glob_modules, glob_functions, path_functions
         )
         if signature is None:
             continue
@@ -1073,6 +1173,8 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
         raise AssertionError(f"{filename}: AGENTS_DIR use must name one direct role file")
     if _has_unvalidated_role_text_read(tree):
         raise AssertionError(f"{filename}: role definition text must use a shared validated helper")
+    if _has_unparsed_roster_field_text(tree, filename):
+        raise AssertionError(f"{filename}: role fields must use parse_frontmatter")
     if not _has_only_allowed_directory_enumeration(tree, filename):
         raise AssertionError(f"{filename}: directory enumeration is not an approved call site")
     for node in ast.walk(tree):
@@ -1221,6 +1323,16 @@ def test_consuming_guard_rejects_custom_agent_roster_directories(addition: str) 
         "    role_path.read_text()\n",
         "\ndef test_nested_call_derived_roster_read() -> None:\n"
         "    next(iter(agent_files())).read_bytes()\n",
+        "\ndef test_roster_member_method_read() -> None:\n"
+        "    roles = list(agent_files())\n"
+        "    role_path = roles.pop()\n"
+        "    role_path.read_text()\n",
+        "\ndef test_nested_roster_member_method_read() -> None:\n"
+        "    list(agent_files()).pop().read_bytes()\n",
+        "\ndef test_roster_retaining_method_read() -> None:\n"
+        "    roles = list(agent_files()).copy()\n"
+        "    for role_path in roles:\n"
+        "        role_path.read_text()\n",
     ),
     ids=(
         "local-frontmatter-reparse",
@@ -1246,6 +1358,9 @@ def test_consuming_guard_rejects_custom_agent_roster_directories(addition: str) 
         "dict-items-roster-iteration",
         "call-derived-roster-path",
         "nested-call-derived-roster",
+        "roster-member-method",
+        "nested-roster-member-method",
+        "roster-retaining-method",
     ),
 )
 def test_consuming_guard_rejects_unvalidated_role_text_reads(addition: str) -> None:
@@ -1320,6 +1435,34 @@ def test_consuming_guard_allows_nonroster_call_derived_reads() -> None:
         "    next(iter(ordinary_paths)).read_bytes()\n"
     )
     _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_allows_nonroster_collection_methods() -> None:
+    """Ordinary collection member and copy methods remain outside roster provenance."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    addition = (
+        "\ndef test_unrelated_collection_method_read() -> None:\n"
+        "    ordinary_path = ordinary_paths.copy().pop()\n"
+        "    ordinary_path.read_text()\n"
+        "    for another_path in ordinary_paths.copy():\n"
+        "        another_path.read_bytes()\n"
+    )
+    _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_requires_parser_for_parametrized_role_fields() -> None:
+    """A dummy parser call cannot authorize local field reconstruction from role text."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source.replace(
+        "    fm = parse_frontmatter(path)\n",
+        "    parse_frontmatter(agent_files()[0])\n"
+        "    role_path = path\n"
+        '    fm = dict(line.split(": ", 1) for line in agent_text(role_path).splitlines()[1:6])\n',
+        1,
+    )
+    assert mutated != source
+    with pytest.raises(AssertionError, match="role fields must use parse_frontmatter"):
+        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
 
 
 def test_consuming_guard_rejects_outer_roster_path_inside_unrelated_comprehension() -> None:
@@ -1485,6 +1628,13 @@ def test_consuming_guard_rejects_unapproved_agents_dir_uses(addition: str) -> No
         "inherited_glob.glob('*.md')\n",
         "import glob\nenumerate_directory = glob.iglob\nenumerate_directory('*.md')\n"
         "enumerate_directory = unrelated\n",
+        "enumerate_roles = Path('.claude/agents').iterdir\nenumerate_roles()\n",
+        "role_directory = Path('.claude/agents')\nenumerate_roles = role_directory.glob\n"
+        "enumerate_roles('*.md')\n",
+        "role_directory = Path('.claude/agents')\nenumerate_roles = role_directory.rglob\n"
+        "enumerate_roles('*.md')\n",
+        "role_directory = Path('.claude/agents')\nenumerate_roles = role_directory.walk\n"
+        "enumerate_roles()\n",
     ),
     ids=(
         "bound-name-filter",
@@ -1505,6 +1655,10 @@ def test_consuming_guard_rejects_unapproved_agents_dir_uses(addition: str) -> No
         "glob-function-import-alias",
         "glob-module-assignment-chain",
         "glob-function-reassignment",
+        "assigned-path-iterdir",
+        "assigned-path-glob",
+        "assigned-path-rglob",
+        "assigned-path-walk",
     ),
 )
 def test_consuming_guard_rejects_unapproved_directory_enumeration(addition: str) -> None:
@@ -1526,6 +1680,8 @@ def test_consuming_guard_ignores_non_enumerating_module_aliases() -> None:
         "renamed_os = local_os\n"
         "current_directory = renamed_os.getcwd\n"
         "current_directory()\n"
+        "ordinary_method = arbitrary.resolve\n"
+        "ordinary_method()\n"
         "import glob\n"
         "local_glob = glob\n"
         "local_glob.escape('*.md')\n"
