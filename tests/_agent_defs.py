@@ -91,6 +91,15 @@ def split_frontmatter(
         key, value = field.groups()
         if value[0] in _YAML_VALUE_INDICATORS:
             _error(source, "frontmatter field value is quoted or structured")
+        if (
+            value != value.rstrip()
+            or any(not character.isprintable() for character in value)
+            or any(
+                character == "#" and index > 0 and value[index - 1].isspace()
+                for index, character in enumerate(value)
+            )
+        ):
+            _error(source, "frontmatter field value is malformed")
         if key in fields:
             _error(source, f"frontmatter key {key!r} is duplicated")
         fields[key] = value

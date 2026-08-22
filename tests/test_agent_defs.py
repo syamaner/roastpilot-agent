@@ -116,10 +116,10 @@ def test_split_frontmatter_rejects_missing_terminator_with_source() -> None:
         split_frontmatter("---\nname: example\n", source="unterminated.md")
 
 
-def test_split_frontmatter_rejects_bad_terminator() -> None:
-    """Only the exact closing marker ends the leading frontmatter block."""
+def test_split_frontmatter_treats_nonexact_closing_marker_as_malformed_field() -> None:
+    """A nonexact closing marker is consumed as a malformed field, never a terminator."""
     malformed = _document().replace("---\nBody\n", "--- \nBody\n")
-    with pytest.raises(AgentFrontmatterError, match="terminator.md"):
+    with pytest.raises(AgentFrontmatterError, match="frontmatter field is malformed"):
         split_frontmatter(malformed, source="terminator.md")
 
 
@@ -170,6 +170,18 @@ def test_split_frontmatter_allows_embedded_colons_in_plain_values() -> None:
     assert fields["description"] == "Example: embedded: colons"
 
 
+@pytest.mark.parametrize(
+    "value",
+    ("example ", "example # comment", "example\tvalue", "example\x7fvalue"),
+    ids=("trailing-space", "inline-comment", "tab", "delete-control"),
+)
+def test_split_frontmatter_rejects_ambiguous_or_control_scalar_values(value: str) -> None:
+    """Trailing space, inline YAML comments, and controls cannot enter scalar values."""
+    malformed = _document().replace("name: example\n", f"name: {value}\n", 1)
+    with pytest.raises(AgentFrontmatterError, match="frontmatter field value is malformed"):
+        split_frontmatter(malformed, source="scalar.md")
+
+
 def test_split_frontmatter_rejects_duplicate_and_unknown_keys() -> None:
     """Duplicate last-wins and future unreviewed fields are both invalid."""
     duplicate = _document() + ""
@@ -210,9 +222,7 @@ def test_parse_frontmatter_and_agent_body_name_the_source(tmp_path: Path) -> Non
 
 
 _CONSUMER_IMPORTS = {
-    "test_agent_worktree_controls.py": frozenset(
-        {"AGENTS_DIR", "agent_files", "agent_tools", "parse_frontmatter"}
-    ),
+    "test_agent_worktree_controls.py": frozenset({"AGENTS_DIR", "agent_files", "agent_tools"}),
     "test_agent_model_pins.py": frozenset(
         {"AGENTS_DIR", "agent_body", "agent_files", "parse_frontmatter"}
     ),
@@ -278,7 +288,24 @@ def _is_frontmatter_marker(node: ast.expr, bindings: dict[str, str]) -> bool:
     value = _static_string(node, bindings)
     if value is None:
         return False
-    return value in {"---\n", "---\\n"} or value.startswith(("^---\n", "^---\\n"))
+    if value in {"---", "---\n", "---\\n"}:
+        return True
+    inline_flags, separator, _suffix = value.partition(")^---")
+    return value.startswith("^---") or (
+        inline_flags.startswith("(?")
+        and bool(separator)
+        and bool(inline_flags[2:])
+        and all(character.isalpha() or character == "-" for character in inline_flags[2:])
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("----", "plain --- text", "(?m)^## heading", "(?i)role body"),
+)
+def test_frontmatter_marker_detection_ignores_nonmarkers(value: str) -> None:
+    """Bare and inline-flag detection remains specific to the frontmatter marker."""
+    assert not _is_frontmatter_marker(ast.Constant(value=value), {})
 
 
 _REGEX_FRONTMATTER_CALLS = frozenset({"compile", "match", "search", "fullmatch"})
@@ -295,7 +322,9 @@ def _regex_import_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
                     module_names.add(alias.asname or "re")
         elif isinstance(node, ast.ImportFrom) and node.module == "re" and node.level == 0:
             for alias in node.names:
-                if alias.name in _REGEX_FRONTMATTER_CALLS:
+                if alias.name == "*":
+                    function_names.update(_REGEX_FRONTMATTER_CALLS)
+                elif alias.name in _REGEX_FRONTMATTER_CALLS:
                     function_names.add(alias.asname or alias.name)
     return module_names, function_names
 
@@ -391,6 +420,11 @@ def _add_startswith_frontmatter_parser(source: str) -> str:
     return source + '\nfrontmatter_text = "role body"\nfrontmatter_text.startswith("---\\n")\n'
 
 
+def _add_bare_frontmatter_marker_check(source: str) -> str:
+    """Add a bare closing-marker comparison mutation."""
+    return source + '\nfrontmatter_text = "role body"\nfrontmatter_text == "---"\n'
+
+
 def _add_raw_regex_frontmatter_parser(source: str) -> str:
     """Restore the historical raw-regex frontmatter parser mutation."""
     return source + '\nlocal_frontmatter = re.compile(r"^---\\n")\n'
@@ -413,6 +447,16 @@ def _add_function_alias_regex_frontmatter_parser(source: str) -> str:
     )
 
 
+def _add_star_import_regex_frontmatter_parser(source: str) -> str:
+    """Add a star-imported ``re`` parser mutation."""
+    return source + '\nfrom re import *\nmatch(r"^---\\n", "role body")\n'
+
+
+def _add_inline_flag_regex_frontmatter_parser(source: str) -> str:
+    """Add a leading-inline-flag regex frontmatter parser mutation."""
+    return source + '\nlocal_frontmatter = re.compile(r"(?m)^---\\n")\n'
+
+
 _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
     (
         "test_agent_worktree_controls.py",
@@ -427,6 +471,11 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
     (
         "test_agent_model_pins.py",
         _add_startswith_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
+    (
+        "test_agent_model_pins.py",
+        _add_bare_frontmatter_marker_check,
         "local leading-frontmatter parser",
     ),
     (
@@ -449,6 +498,16 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         _add_function_alias_regex_frontmatter_parser,
         "local leading-frontmatter parser",
     ),
+    (
+        "test_agent_model_pins.py",
+        _add_star_import_regex_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
+    (
+        "test_agent_model_pins.py",
+        _add_inline_flag_regex_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
 )
 
 
@@ -459,10 +518,13 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         "renamed-helper",
         "reformatted-roster-glob",
         "startswith-parser",
+        "bare-marker-check",
         "raw-regex-parser",
         "direct-import-regex-parser",
         "module-alias-regex-parser",
         "function-alias-regex-parser",
+        "star-import-regex-parser",
+        "inline-flag-regex-parser",
     ),
 )
 def test_consuming_guard_rejects_local_parser_and_roster_mutations(
