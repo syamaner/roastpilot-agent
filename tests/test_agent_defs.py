@@ -114,6 +114,29 @@ def test_agent_files_rejects_symlinked_roster_entries(
         agent_files(roster)
 
 
+def test_agent_files_rejects_markdown_named_directory(tmp_path: Path) -> None:
+    """A non-symlink directory matching the roster glob cannot be a role definition."""
+    (tmp_path / "nested.md").mkdir()
+    with pytest.raises(AgentFrontmatterError, match="agent roster contains a non-file definition"):
+        agent_files(tmp_path)
+
+
+@pytest.mark.parametrize("leading", ("\ufeff---\n", "\n---\n", "---\r\n"))
+def test_split_frontmatter_rejects_nonexact_opening_marker(leading: str) -> None:
+    """The opening marker is exact, byte-zero, and LF-terminated."""
+    with pytest.raises(AgentFrontmatterError, match="frontmatter must begin"):
+        split_frontmatter(leading + _document().removeprefix("---\n"), source="opening.md")
+
+
+def test_split_frontmatter_rejects_empty_block_and_nonexact_closing_marker() -> None:
+    """An empty block and a nonexact closing marker both fail closed."""
+    with pytest.raises(AgentFrontmatterError, match="frontmatter has no fields"):
+        split_frontmatter("---\n---\n", source="empty.md")
+    malformed = _document().replace("---\nBody\n", "--- \nBody\n")
+    with pytest.raises(AgentFrontmatterError, match="frontmatter field is malformed"):
+        split_frontmatter(malformed, source="closing.md")
+
+
 @pytest.mark.parametrize(
     "line",
     (
@@ -143,6 +166,20 @@ def test_split_frontmatter_rejects_yaml_value_indicators(prefix: str) -> None:
     malformed = _document().replace("name: example\n", f"name: {prefix}example\n", 1)
     with pytest.raises(AgentFrontmatterError, match="quoted or structured"):
         split_frontmatter(malformed, source="yaml.md")
+
+
+def test_split_frontmatter_rejects_duplicate_unknown_and_each_missing_key() -> None:
+    """Key membership is closed: duplicate, unknown, and missing fields are all invalid."""
+    duplicate = _document().replace("tools: Read, Grep\n", "tools: Read, Grep\ntools: Bash\n")
+    with pytest.raises(AgentFrontmatterError, match="duplicated"):
+        split_frontmatter(duplicate, source="duplicate.md")
+    with pytest.raises(AgentFrontmatterError, match="unknown keys"):
+        split_frontmatter(_document({**_fields(), "unknown": "value"}), source="unknown.md")
+    for key in REQUIRED_KEYS:
+        fields = _fields()
+        del fields[key]
+        with pytest.raises(AgentFrontmatterError, match="missing required keys"):
+            split_frontmatter(_document(fields), source="missing.md")
 
 
 @pytest.mark.parametrize(
@@ -178,6 +215,16 @@ def test_split_frontmatter_allows_ordinary_scalar_lookalikes(value: str) -> None
     """The conservative scalar grammar preserves ordinary role prose."""
     fields, _body = split_frontmatter(_document({**_fields(), "description": value}))
     assert fields["description"] == value
+
+
+@pytest.mark.parametrize(
+    "value", ("example ", "example\tvalue", "example\x7fvalue", "example # note")
+)
+def test_split_frontmatter_rejects_ambiguous_or_control_scalars(value: str) -> None:
+    """Trailing space, tabs, controls, and YAML comments cannot enter scalar values."""
+    malformed = _document().replace("name: example\n", f"name: {value}\n", 1)
+    with pytest.raises(AgentFrontmatterError, match="frontmatter field value is malformed"):
+        split_frontmatter(malformed, source="scalar.md")
 
 
 @pytest.mark.parametrize(
@@ -252,7 +299,12 @@ _CONSUMER_AST_SHA256 = {
 
 def _consumer_ast_sha256(path: Path) -> str:
     """Return the comment- and formatting-insensitive canonical AST digest for one consumer."""
-    canonical = ast.dump(ast.parse(path.read_text(), filename=path.name), include_attributes=False)
+    return _canonical_ast_sha256(path.read_text(), path.name)
+
+
+def _canonical_ast_sha256(source: str, filename: str = "consumer.py") -> str:
+    """Return the canonical AST digest for pure-source mutation proofs."""
+    canonical = ast.dump(ast.parse(source, filename=filename), include_attributes=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -262,6 +314,23 @@ def test_governed_consumers_match_closed_canonical_ast_fingerprints() -> None:
         filename: _consumer_ast_sha256(_REPO / "tests" / filename)
         for filename in _CONSUMER_AST_SHA256
     } == _CONSUMER_AST_SHA256
+
+
+def test_canonical_ast_digest_changes_for_semantic_guard_mutations() -> None:
+    """Marker-regex and roster-provenance behavior cannot drift under the closed boundary."""
+    marker = 'import re\nre.compile(r"^---\\n")\n'
+    alternate_marker = 'import re\nre.compile(r"^---")\n'
+    roster = "agent_files()\n"
+    alternate_roster = "agent_files(directory)\n"
+    assert _canonical_ast_sha256(marker) != _canonical_ast_sha256(alternate_marker)
+    assert _canonical_ast_sha256(roster) != _canonical_ast_sha256(alternate_roster)
+
+
+def test_canonical_ast_digest_ignores_comments_and_formatting() -> None:
+    """Comments and layout do not perturb the canonical semantic digest."""
+    compact = "def parse():\n    return agent_files()\n"
+    formatted = "# governance comment\n\ndef parse( ):\n\n    return agent_files( )\n"
+    assert _canonical_ast_sha256(compact) == _canonical_ast_sha256(formatted)
 
 
 def test_governed_consumers_import_and_call_parse_frontmatter() -> None:
