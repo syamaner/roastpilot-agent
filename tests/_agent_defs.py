@@ -18,6 +18,7 @@ OPTIONAL_KEYS: Final = frozenset({"permissionMode"})
 _OPENING_MARKER: Final = re.compile(r"^---\n")
 _FIELD: Final = re.compile(r"([A-Za-z][A-Za-z0-9_]*): ([^\s\r\n][^\r\n]*)\n")
 _TOOL: Final = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+_YAML_VALUE_INDICATORS: Final[frozenset[str]] = frozenset("-?:,[]{}#&*!|>'\"%@`")
 
 
 class AgentFrontmatterError(ValueError):
@@ -88,7 +89,7 @@ def split_frontmatter(
         if field is None:
             _error(source, "frontmatter field is malformed")
         key, value = field.groups()
-        if value[0] in "'\"#[{|>&*!":
+        if value[0] in _YAML_VALUE_INDICATORS:
             _error(source, "frontmatter field value is quoted or structured")
         if key in fields:
             _error(source, f"frontmatter key {key!r} is duplicated")

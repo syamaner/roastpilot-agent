@@ -153,12 +153,21 @@ def test_split_frontmatter_rejects_every_malformed_field_class(line: str) -> Non
         split_frontmatter(malformed, source="malformed.md")
 
 
-@pytest.mark.parametrize("prefix", ("&", "*", "!"))
-def test_split_frontmatter_rejects_yaml_value_prefixes(prefix: str) -> None:
-    """YAML anchors, aliases, and tags cannot enter unquoted closed-grammar values."""
+@pytest.mark.parametrize("prefix", tuple("-?:,[]{}#&*!|>'\"%@`"))
+def test_split_frontmatter_rejects_yaml_value_indicators(prefix: str) -> None:
+    """Every YAML indicator or reserved prefix is closed at scalar value position."""
     malformed = _document().replace("name: example\n", f"name: {prefix}example\n", 1)
     with pytest.raises(AgentFrontmatterError, match="quoted or structured"):
         split_frontmatter(malformed, source="yaml.md")
+
+
+def test_split_frontmatter_allows_embedded_colons_in_plain_values() -> None:
+    """A colon after the first value character remains ordinary scalar content."""
+    fields, _body = split_frontmatter(
+        _document({**_fields(), "description": "Example: embedded: colons"}),
+        source="embedded-colons.md",
+    )
+    assert fields["description"] == "Example: embedded: colons"
 
 
 def test_split_frontmatter_rejects_duplicate_and_unknown_keys() -> None:
@@ -272,6 +281,40 @@ def _is_frontmatter_marker(node: ast.expr, bindings: dict[str, str]) -> bool:
     return value in {"---\n", "---\\n"} or value.startswith(("^---\n", "^---\\n"))
 
 
+_REGEX_FRONTMATTER_CALLS = frozenset({"compile", "match", "search", "fullmatch"})
+
+
+def _regex_import_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
+    """Resolve names bound to the ``re`` module and its parser callables."""
+    module_names: set[str] = set()
+    function_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "re":
+                    module_names.add(alias.asname or "re")
+        elif isinstance(node, ast.ImportFrom) and node.module == "re" and node.level == 0:
+            for alias in node.names:
+                if alias.name in _REGEX_FRONTMATTER_CALLS:
+                    function_names.add(alias.asname or alias.name)
+    return module_names, function_names
+
+
+def _is_regex_frontmatter_call(
+    node: ast.Call, module_names: set[str], function_names: set[str]
+) -> bool:
+    """Return whether a call resolves to an imported ``re`` parser callable."""
+    function = node.func
+    if isinstance(function, ast.Name):
+        return function.id in function_names
+    return (
+        isinstance(function, ast.Attribute)
+        and function.attr in _REGEX_FRONTMATTER_CALLS
+        and isinstance(function.value, ast.Name)
+        and function.value.id in module_names
+    )
+
+
 def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
     """Fail closed when a consumer restores local roster or parser machinery."""
     expected_imports = _CONSUMER_IMPORTS[filename]
@@ -302,6 +345,7 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
     )
 
     bindings = _string_bindings(tree)
+    regex_modules, regex_functions = _regex_import_bindings(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if node.func.attr == "glob" and any(
@@ -318,10 +362,7 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
             raise AssertionError(f"{filename}: local leading-frontmatter parser is forbidden")
         if (
             isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "re"
-            and node.func.attr in {"compile", "match", "search", "fullmatch"}
+            and _is_regex_frontmatter_call(node, regex_modules, regex_functions)
             and any(_is_frontmatter_marker(argument, bindings) for argument in node.args)
         ):
             raise AssertionError(f"{filename}: local leading-frontmatter parser is forbidden")
@@ -355,6 +396,23 @@ def _add_raw_regex_frontmatter_parser(source: str) -> str:
     return source + '\nlocal_frontmatter = re.compile(r"^---\\n")\n'
 
 
+def _add_direct_import_regex_frontmatter_parser(source: str) -> str:
+    """Add a direct-import ``re`` parser mutation without name guessing."""
+    return source + '\nfrom re import match\nmatch(r"^---\\n", "role body")\n'
+
+
+def _add_module_alias_regex_frontmatter_parser(source: str) -> str:
+    """Add a module-alias ``re`` parser mutation."""
+    return source + '\nimport re as local_regex\nlocal_regex.compile(r"^---\\n")\n'
+
+
+def _add_function_alias_regex_frontmatter_parser(source: str) -> str:
+    """Add an aliased direct-import ``re`` parser mutation."""
+    return source + (
+        '\nfrom re import search as local_search\nlocal_search(r"^---\\n", "role body")\n'
+    )
+
+
 _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
     (
         "test_agent_worktree_controls.py",
@@ -376,13 +434,36 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         _add_raw_regex_frontmatter_parser,
         "local leading-frontmatter parser",
     ),
+    (
+        "test_agent_model_pins.py",
+        _add_direct_import_regex_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
+    (
+        "test_agent_model_pins.py",
+        _add_module_alias_regex_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
+    (
+        "test_agent_model_pins.py",
+        _add_function_alias_regex_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
 )
 
 
 @pytest.mark.parametrize(
     ("filename", "mutation", "expected"),
     _CONSUMER_MUTATIONS,
-    ids=("renamed-helper", "reformatted-roster-glob", "startswith-parser", "raw-regex-parser"),
+    ids=(
+        "renamed-helper",
+        "reformatted-roster-glob",
+        "startswith-parser",
+        "raw-regex-parser",
+        "direct-import-regex-parser",
+        "module-alias-regex-parser",
+        "function-alias-regex-parser",
+    ),
 )
 def test_consuming_guard_rejects_local_parser_and_roster_mutations(
     filename: str, mutation: Callable[[str], str], expected: str
@@ -392,3 +473,15 @@ def test_consuming_guard_rejects_local_parser_and_roster_mutations(
     mutated = mutation(source)
     with pytest.raises(AssertionError, match=expected):
         _assert_consumer_uses_shared_agent_defs(mutated, filename)
+
+
+def test_consuming_guard_does_not_guess_unbound_regex_function_provenance() -> None:
+    """An unrelated nested function named ``match`` is not treated as ``re.match``."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source + (
+        "\ndef test_unrelated_match_name() -> None:\n"
+        "    def match(pattern: str, text: str) -> None:\n"
+        "        del pattern, text\n"
+        '    match(r"^---\\n", "role body")\n'
+    )
+    _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
