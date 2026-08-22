@@ -658,9 +658,21 @@ def _is_agent_files_call(node: ast.expr) -> bool:
     )
 
 
+_ROSTER_AGGREGATE_ACCESSORS = frozenset({"get", "items", "values"})
+
+
 def _is_agent_roster_collection(node: ast.expr, collection_names: set[str]) -> bool:
     """Return whether an expression retains a governed roster through collection wrappers."""
     if _is_agent_files_call(node) or (isinstance(node, ast.Name) and node.id in collection_names):
+        return True
+    if isinstance(node, ast.Subscript):
+        return _is_agent_roster_collection(node.value, collection_names)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _ROSTER_AGGREGATE_ACCESSORS
+        and _is_agent_roster_collection(node.func.value, collection_names)
+    ):
         return True
     if isinstance(node, ast.Call):
         return any(
@@ -766,7 +778,9 @@ def _scope_has_unvalidated_role_text_read(
                     continue
                 targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
                 target_names = {name for target in targets for name in _target_names(target)}
-                if _is_agent_roster_collection(value, collection_names):
+                is_roster_collection = _is_agent_roster_collection(value, collection_names)
+                is_roster_path = _is_agent_roster_path(value, path_names, collection_names)
+                if is_roster_collection:
                     if any(_is_destructuring_target(target) for target in targets):
                         if not target_names <= path_names:
                             path_names.update(target_names)
@@ -774,10 +788,7 @@ def _scope_has_unvalidated_role_text_read(
                     elif not target_names <= collection_names:
                         collection_names.update(target_names)
                         changed = True
-                elif (
-                    _is_agent_roster_path(value, path_names, collection_names)
-                    and not target_names <= path_names
-                ):
+                if is_roster_path and not target_names <= path_names:
                     path_names.update(target_names)
                     changed = True
             elif isinstance(node, (ast.For, ast.comprehension)) and (
@@ -786,6 +797,9 @@ def _scope_has_unvalidated_role_text_read(
                 target_names = _target_names(node.target)
                 if not target_names <= path_names:
                     path_names.update(target_names)
+                    changed = True
+                if not target_names <= collection_names:
+                    collection_names.update(target_names)
                     changed = True
     parents = {
         id(child): node for node in nodes for child in ast.iter_child_nodes(node) if child in nodes
@@ -1138,6 +1152,28 @@ def test_consuming_guard_requires_each_imported_shared_helper_directly_called() 
         "\ndef test_nested_starred_roster_unpack_read() -> None:\n"
         "    first, (second, *rest) = agent_files()\n"
         "    assert second.read_bytes()\n",
+        "\ndef test_direct_dict_roster_read() -> None:\n"
+        "    info = {'roster': agent_files()}\n"
+        "    assert info['roster'].read_text()\n",
+        "\ndef test_assigned_dict_roster_iteration() -> None:\n"
+        "    info = {'roster': agent_files()}\n"
+        "    paths = info['roster']\n"
+        "    for path in paths:\n"
+        "        path.read_text()\n",
+        "\ndef test_dict_get_roster_iteration() -> None:\n"
+        "    info = {'roster': agent_files()}\n"
+        "    for path in info.get('roster'):\n"
+        "        path.read_bytes()\n",
+        "\ndef test_dict_values_roster_iteration() -> None:\n"
+        "    info = {'roster': agent_files()}\n"
+        "    for paths in info.values():\n"
+        "        for path in paths:\n"
+        "            path.read_text()\n",
+        "\ndef test_dict_items_roster_iteration() -> None:\n"
+        "    info = {'roster': agent_files()}\n"
+        "    for key, paths in info.items():\n"
+        "        for path in paths:\n"
+        "            path.read_bytes()\n",
     ),
     ids=(
         "local-frontmatter-reparse",
@@ -1156,6 +1192,11 @@ def test_consuming_guard_requires_each_imported_shared_helper_directly_called() 
         "roster-subscript",
         "starred-roster-unpack",
         "nested-starred-roster-unpack",
+        "direct-dict-roster-read",
+        "assigned-dict-roster-iteration",
+        "dict-get-roster-iteration",
+        "dict-values-roster-iteration",
+        "dict-items-roster-iteration",
     ),
 )
 def test_consuming_guard_rejects_unvalidated_role_text_reads(addition: str) -> None:
@@ -1251,6 +1292,25 @@ def test_consuming_guard_allows_unrelated_subscript_and_starred_reads() -> None:
         "    assert ordinary_paths[0].read_text()\n"
         "    first, *rest = ordinary_paths\n"
         "    assert first.read_bytes()\n"
+    )
+    _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_allows_unrelated_dict_retrievals() -> None:
+    """Dictionary accessors without roster provenance remain ordinary reads."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    addition = (
+        "\ndef test_unrelated_dict_reads() -> None:\n"
+        "    info = {'paths': ordinary_paths}\n"
+        "    info['paths'][0].read_text()\n"
+        "    for path in info.get('paths'):\n"
+        "        path.read_bytes()\n"
+        "    for paths in info.values():\n"
+        "        for path in paths:\n"
+        "            path.read_text()\n"
+        "    for key, paths in info.items():\n"
+        "        for path in paths:\n"
+        "            path.read_bytes()\n"
     )
     _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
 
