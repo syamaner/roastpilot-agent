@@ -591,105 +591,6 @@ def _has_only_direct_agent_role_paths(tree: ast.Module) -> bool:
     )
 
 
-def _iterdir_target_names(target: ast.expr) -> set[str]:
-    """Return simple loop target names without evaluating destructuring expressions."""
-    if isinstance(target, ast.Name):
-        return {target.id}
-    if isinstance(target, (ast.Tuple, ast.List)):
-        return {name for element in target.elts for name in _iterdir_target_names(element)}
-    return set()
-
-
-def _is_markdown_suffix_comparison(node: ast.AST, names: set[str]) -> bool:
-    """Return whether a comparison filters one iterated name to Markdown suffixes."""
-    if not isinstance(node, ast.Compare):
-        return False
-    operands = (node.left, *node.comparators)
-    has_markdown_suffix = any(
-        isinstance(operand, ast.Attribute) and operand.attr == "suffix" for operand in operands
-    ) and any(isinstance(operand, ast.Constant) and operand.value == ".md" for operand in operands)
-    if not has_markdown_suffix:
-        return False
-    if not names:
-        return True
-    return any(
-        isinstance(operand, ast.Attribute)
-        and operand.attr == "suffix"
-        and isinstance(operand.value, ast.Name)
-        and operand.value.id in names
-        for operand in operands
-    )
-
-
-def _iterdir_name_receiver(node: ast.expr) -> ast.Name | None:
-    """Return an iterated name used as ``entry.name`` or ``entry.name.lower()``."""
-    if isinstance(node, ast.Attribute) and node.attr == "name" and isinstance(node.value, ast.Name):
-        return node.value
-    if (
-        isinstance(node, ast.Call)
-        and not node.args
-        and not node.keywords
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "lower"
-        and isinstance(node.func.value, ast.Attribute)
-        and node.func.value.attr == "name"
-        and isinstance(node.func.value.value, ast.Name)
-    ):
-        return node.func.value.value
-    return None
-
-
-def _is_markdown_name_endswith(node: ast.AST, names: set[str]) -> bool:
-    """Return whether an iterated entry name is directly filtered to Markdown."""
-    if not (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "endswith"
-        and len(node.args) == 1
-        and not node.keywords
-        and isinstance(node.args[0], ast.Constant)
-        and node.args[0].value == ".md"
-    ):
-        return False
-    receiver = _iterdir_name_receiver(node.func.value)
-    if receiver is None:
-        return False
-    return not names or receiver.id in names
-
-
-def _is_markdown_iterdir_predicate(node: ast.AST, names: set[str]) -> bool:
-    """Return whether a predicate filters an iterated entry to Markdown paths."""
-    return _is_markdown_suffix_comparison(node, names) or _is_markdown_name_endswith(node, names)
-
-
-def _has_local_iterdir_markdown_roster(tree: ast.Module) -> bool:
-    """Return whether a consumer enumerates Markdown roles through ``iterdir``."""
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
-            for generator in node.generators:
-                if not (
-                    isinstance(generator.iter, ast.Call)
-                    and isinstance(generator.iter.func, ast.Attribute)
-                    and generator.iter.func.attr == "iterdir"
-                ):
-                    continue
-                names = _iterdir_target_names(generator.target)
-                if any(
-                    _is_markdown_iterdir_predicate(condition, names) for condition in generator.ifs
-                ):
-                    return True
-        elif (
-            isinstance(node, ast.For)
-            and isinstance(node.iter, ast.Call)
-            and isinstance(node.iter.func, ast.Attribute)
-            and node.iter.func.attr == "iterdir"
-        ):
-            names = _iterdir_target_names(node.target)
-            if any(_is_markdown_iterdir_predicate(child, names) for child in ast.walk(node)):
-                return True
-    return False
-
-
 _ALLOWED_DIRECTORY_ENUMERATIONS: dict[str, dict[tuple[str, str, str, str], int]] = {
     "test_agent_model_pins.py": {("_CODEX_DIR", "agents", "glob", "*.toml"): 2},
     "test_agent_worktree_controls.py": {("_REPO", "docs", "rglob", "*.md"): 1},
@@ -728,7 +629,7 @@ def _directory_enumeration_signature(
         and function.value.id in os_modules
     ):
         return _UNAPPROVED_DIRECTORY_ENUMERATION
-    if function.attr not in {"iterdir", "glob", "rglob"}:
+    if function.attr not in {"iterdir", "glob", "rglob", "walk"}:
         return None
     if not (
         isinstance(function.value, ast.BinOp)
@@ -802,8 +703,6 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
         raise AssertionError(f"{filename}: AGENTS_DIR use must name one direct role file")
     if not _has_only_allowed_directory_enumeration(tree, filename):
         raise AssertionError(f"{filename}: directory enumeration is not an approved call site")
-    if _has_local_iterdir_markdown_roster(tree):
-        raise AssertionError(f"{filename}: local Markdown roster enumeration is forbidden")
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Constant)
@@ -820,7 +719,9 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
                     for argument in _pattern_call_values(node)
                 )
             ):
-                raise AssertionError(f"{filename}: local Markdown roster glob is forbidden")
+                raise AssertionError(  # pragma: no cover - exact enumeration guard rejects first
+                    f"{filename}: local Markdown roster glob is forbidden"
+                )
             if node.func.attr == "startswith" and any(
                 _is_frontmatter_marker(argument, bindings) for argument in _first_call_value(node)
             ):
@@ -901,8 +802,12 @@ def test_consuming_guard_rejects_unapproved_agents_dir_uses(addition: str) -> No
         "for path in arbitrary.iterdir():\n"
         "    if path.suffix == '.md' and path.is_file():\n"
         "        pass\n",
+        "for path in arbitrary.iterdir():\n"
+        "    if path.name.lower().endswith('.md'):\n"
+        "        pass\n",
         "for path in arbitrary.iterdir():\n    if '.md'.endswith(path.name):\n        pass\n",
         "arbitrary.glob('*.md')\n",
+        "arbitrary.walk()\n",
         "import os as filesystem\nfilesystem.scandir(arbitrary)\n",
         "from os import walk as directory_walk\ndirectory_walk(arbitrary)\n",
     ),
@@ -910,8 +815,10 @@ def test_consuming_guard_rejects_unapproved_agents_dir_uses(addition: str) -> No
         "bound-name-filter",
         "bare-iterdir",
         "compound-filter",
+        "normalized-name-filter",
         "reversed-filter",
         "glob",
+        "path-walk",
         "os-module-alias",
         "os-function-alias",
     ),
@@ -946,6 +853,14 @@ def test_consuming_guard_rejects_directory_enumeration_drift(
         _assert_consumer_uses_shared_agent_defs(mutated, filename)
 
 
+def test_consuming_guard_rejects_duplicate_allowed_directory_enumeration() -> None:
+    """An additional exact allowlisted call still violates its fixed expected count."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source + '\n(_CODEX_DIR / "agents").glob("*.toml")\n'
+    with pytest.raises(AssertionError, match="directory enumeration is not an approved call site"):
+        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
 def _rename_consumer_helper(source: str) -> str:
     """Mutate a consumer helper name without changing its implementation."""
     return source.replace("def _discipline_section", "def _renamed_local_parser", 1)
@@ -971,7 +886,7 @@ def _add_recursive_roster_glob(source: str) -> str:
 
 
 def _add_iterdir_roster_enumeration(source: str) -> str:
-    """Add a local Markdown roster enumeration through ``iterdir`` and suffix."""
+    """Add an unapproved local ``iterdir`` call with an inert Markdown filter."""
     return source + (
         '\nroster_directory = Path(".claude/agents")\n'
         'roster_paths = [path for path in roster_directory.iterdir() if path.suffix == ".md"]\n'
@@ -979,7 +894,7 @@ def _add_iterdir_roster_enumeration(source: str) -> str:
 
 
 def _add_for_iterdir_roster_enumeration(source: str) -> str:
-    """Add a statement-form local Markdown roster enumeration through ``iterdir``."""
+    """Add an unapproved statement-form ``iterdir`` call with an inert filter."""
     return source + (
         '\nroster_directory = Path(".claude/agents")\n'
         "roster_paths = []\n"
@@ -1328,124 +1243,6 @@ def test_consuming_guard_ignores_unimported_module_aliases() -> None:
     _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
 
 
-def test_consuming_guard_rejects_nonmarkdown_iterdir_uses() -> None:
-    """A non-Markdown suffix cannot authorize an unapproved directory iterator."""
-    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
-    mutated = source + (
-        '\nordinary_directory = Path(".")\n'
-        "ordinary_paths = [path for path in ordinary_directory.iterdir() "
-        'if path.suffix == ".toml"]\n'
-    )
-    with pytest.raises(AssertionError, match="directory enumeration is not an approved call site"):
-        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
-
-
-def test_consuming_guard_rejects_nonmarkdown_for_iterdir_uses() -> None:
-    """A statement-form non-Markdown filter cannot authorize directory iteration."""
-    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
-    mutated = source + (
-        '\nordinary_directory = Path(".")\n'
-        "ordinary_paths = []\n"
-        "for path in ordinary_directory.iterdir():\n"
-        '    if path.suffix == ".toml":\n'
-        "        ordinary_paths.append(path)\n"
-    )
-    with pytest.raises(AssertionError, match="directory enumeration is not an approved call site"):
-        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
-
-
-def test_markdown_name_endswith_rejects_unknown_or_wrong_receivers() -> None:
-    """The name-suffix fallback fails closed when receiver provenance is unavailable."""
-    unknown_statement = _consumer_ast('value.endswith(".md")\n', "unknown.py").body[0]
-    wrong_statement = _consumer_ast('other.name.endswith(".md")\n', "wrong.py").body[0]
-    assert isinstance(unknown_statement, ast.Expr)
-    assert isinstance(wrong_statement, ast.Expr)
-    assert isinstance(unknown_statement.value, ast.Call)
-    assert isinstance(wrong_statement.value, ast.Call)
-    assert not _is_markdown_name_endswith(unknown_statement.value, {"path"})
-    assert not _is_markdown_name_endswith(wrong_statement.value, {"path"})
-
-
-@pytest.mark.parametrize(
-    "predicate",
-    ("path.name.endswith('.md')", "path.name.lower().endswith('.md')"),
-    ids=("name-endswith", "normalized-name-endswith"),
-)
-def test_consuming_guard_rejects_markdown_name_endswith_iterdir_rosters(predicate: str) -> None:
-    """Local Markdown roster scans cannot hide behind name-call predicates."""
-    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
-    mutated = source + (
-        '\nroster_directory = Path(".claude/agents")\n'
-        "for path in roster_directory.iterdir():\n"
-        f"    if {predicate}:\n"
-        "        pass\n"
-    )
-    with pytest.raises(AssertionError, match="directory enumeration is not an approved call site"):
-        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
-
-
-@pytest.mark.parametrize(
-    "predicate",
-    (
-        "path.name.endswith('.toml')",
-        "path.name.lower().endswith('.toml')",
-        "'.md'.endswith(path.name)",
-    ),
-    ids=("name-nonmarkdown", "normalized-name-nonmarkdown", "reversed"),
-)
-def test_consuming_guard_rejects_nonroster_name_endswith_iterdir_uses(predicate: str) -> None:
-    """A non-roster or reversed predicate cannot authorize directory iteration."""
-    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
-    mutated = source + (
-        '\nordinary_directory = Path(".")\n'
-        "for path in ordinary_directory.iterdir():\n"
-        f"    if {predicate}:\n"
-        "        pass\n"
-    )
-    with pytest.raises(AssertionError, match="directory enumeration is not an approved call site"):
-        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
-
-
-@pytest.mark.parametrize("target", ("(path, metadata)", "[path, metadata]"))
-def test_consuming_guard_rejects_destructured_markdown_for_iterdir_rosters(target: str) -> None:
-    """Tuple and list loop targets cannot bypass statement-form roster detection."""
-    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
-    mutated = source + (
-        '\nroster_directory = Path(".claude/agents")\n'
-        f"for {target} in roster_directory.iterdir():\n"
-        '    if path.suffix == ".md":\n'
-        "        pass\n"
-    )
-    with pytest.raises(AssertionError, match="directory enumeration is not an approved call site"):
-        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
-
-
-def test_consuming_guard_rejects_destructured_nonmarkdown_for_iterdir_use() -> None:
-    """Destructuring and a non-Markdown filter cannot authorize iteration."""
-    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
-    mutated = source + (
-        '\nordinary_directory = Path(".")\n'
-        "for (path, metadata) in ordinary_directory.iterdir():\n"
-        '    if path.suffix == ".toml":\n'
-        "        pass\n"
-    )
-    with pytest.raises(AssertionError, match="directory enumeration is not an approved call site"):
-        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
-
-
-def test_consuming_guard_rejects_nonname_markdown_for_iterdir_target() -> None:
-    """A non-name loop target with a Markdown suffix check fails closed."""
-    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
-    mutated = source + (
-        '\nroster_directory = Path(".claude/agents")\n'
-        "for state.path in roster_directory.iterdir():\n"
-        '    if state.path.suffix == ".md":\n'
-        "        pass\n"
-    )
-    with pytest.raises(AssertionError, match="directory enumeration is not an approved call site"):
-        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
-
-
 def test_static_binding_helpers_ignore_nonname_or_incomplete_assignments() -> None:
     """Defensive binding walkers ignore targets that cannot safely bind one name."""
     string_tree = _consumer_ast('(left, right) = "marker"\n', "bindings.py")
@@ -1462,11 +1259,6 @@ def test_regex_import_bindings_ignores_nonparser_direct_imports() -> None:
     """A direct ``re`` constant import cannot create parser provenance."""
     tree = _consumer_ast("from re import IGNORECASE as local_flag\n", "regex-constant.py")
     assert _regex_import_bindings(tree) == (set(), set())
-
-
-def test_markdown_suffix_comparison_ignores_noncompare_nodes() -> None:
-    """Only comparison expressions can establish a Markdown suffix predicate."""
-    assert not _is_markdown_suffix_comparison(ast.Name(id="path"), {"path"})
 
 
 def test_consuming_guard_ignores_rebound_nonmarker_patterns() -> None:
