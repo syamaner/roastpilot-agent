@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from _agent_defs import AGENTS_DIR, agent_body, agent_files, parse_frontmatter
+from _agent_defs import AGENTS_DIR, agent_body, agent_files, agent_text, parse_frontmatter
 
 _REPO = Path(__file__).resolve().parents[1]
 _CODEX_DIR = _REPO / ".codex"
@@ -408,24 +408,24 @@ def test_installed_codex_exposes_required_agents_md_sections() -> None:
 def test_claude_implementation_roles_follow_slice_routing() -> None:
     """Claude implementation capacity remains leaf-only and slice-scoped."""
     for role in ("engineer-be", "engineer-fe"):
-        instructions = (AGENTS_DIR / f"{role}.md").read_text()
+        instructions = agent_text(AGENTS_DIR / f"{role}.md")
         assert "one approved PR slice" in instructions
         assert "One PR per story" not in instructions
         assert "Do not invoke Codex or spawn agents" in instructions
 
-    planner = (AGENTS_DIR / "story-planner.md").read_text()
+    planner = agent_text(AGENTS_DIR / "story-planner.md")
     assert "Codex-MCP" not in planner
     assert "budget stop" not in planner
     for status in ("healthy", "constrained", "reserve-only"):
         assert f"`{status}`" in planner
 
-    architect = (AGENTS_DIR / "planning-architect.md").read_text()
+    architect = agent_text(AGENTS_DIR / "planning-architect.md")
     assert "Opus PM" not in architect
     assert "Codex parent orchestrator to adjudicate" in architect
     assert "Codex parent owns delivery orchestration and\nscope decomposition" in architect
     assert "human retains product authority per `AGENTS.md`" in architect
 
-    frontend = (AGENTS_DIR / "engineer-fe.md").read_text()
+    frontend = agent_text(AGENTS_DIR / "engineer-fe.md")
     assert "E10 status table" not in frontend
     assert "contract-named epic's status table\n  and registry" in frontend
 

@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 
 import pytest
-from _agent_defs import AGENTS_DIR, agent_files, agent_tools
+from _agent_defs import AGENTS_DIR, agent_files, agent_text, agent_tools
 
 _REPO = Path(__file__).resolve().parents[1]
 _DISCIPLINE_HEADING = re.compile(
@@ -201,7 +201,7 @@ def _expected_variant(tools: set[str]) -> str:
 def test_applicable_roles_carry_worktree_controls(path: Path) -> None:
     """Every Bash role and shell-less binding role carries its canonical control."""
     tools = agent_tools(path)
-    text = path.read_text()
+    text = agent_text(path)
     if "Bash" not in tools and "## Worktree discipline (topology §7 — binding)" not in text:
         return
 
@@ -399,12 +399,15 @@ def test_runbook_line_citation_forms_are_detected(citation: str) -> None:
 
 def test_runbook_citations_never_use_line_anchors() -> None:
     """Runbook citations use durable section names, never line numbers."""
-    guarded = [
-        *agent_files(),
-        *sorted((_REPO / "docs").rglob("*.md")),
-        _REPO / "AGENTS.md",
+    role_offenders = [
+        path.relative_to(_REPO)
+        for path in agent_files()
+        if _has_runbook_line_citation(agent_text(path))
     ]
-    offenders = [
-        path.relative_to(_REPO) for path in guarded if _has_runbook_line_citation(path.read_text())
+    ordinary_paths = [*sorted((_REPO / "docs").rglob("*.md")), _REPO / "AGENTS.md"]
+    offenders = role_offenders + [
+        path.relative_to(_REPO)
+        for path in ordinary_paths
+        if _has_runbook_line_citation(path.read_text())
     ]
     assert not offenders, f"line-anchored runbook citations found in: {offenders}"

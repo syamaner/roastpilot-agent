@@ -161,6 +161,23 @@ def parse_frontmatter(path: Path) -> dict[str, str]:
     return fields
 
 
+def agent_text(path: Path) -> str:
+    """Return one fully validated role definition's exact text.
+
+    Args:
+        path: Agent definition whose complete text is required.
+
+    Returns:
+        Exact decoded definition text after closed frontmatter validation.
+
+    Raises:
+        AgentFrontmatterError: If the definition cannot be read or is malformed.
+    """
+    text = _read_agent(path)
+    split_frontmatter(text, source=path.name)
+    return text
+
+
 def agent_body(path: Path) -> str:
     """Return one definition's exact body after validated leading frontmatter.
 
@@ -173,7 +190,7 @@ def agent_body(path: Path) -> str:
     Raises:
         AgentFrontmatterError: If the definition cannot be read or is malformed.
     """
-    _fields, body = split_frontmatter(_read_agent(path), source=path.name)
+    _fields, body = split_frontmatter(agent_text(path), source=path.name)
     return body
 
 

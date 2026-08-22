@@ -14,6 +14,7 @@ from _agent_defs import (
     AgentFrontmatterError,
     agent_body,
     agent_files,
+    agent_text,
     agent_tools,
     parse_frontmatter,
     split_frontmatter,
@@ -283,6 +284,7 @@ def test_parse_frontmatter_and_agent_body_name_the_source(tmp_path: Path) -> Non
     valid = tmp_path / "body.md"
     body = "Unchanged body\n---\n"
     valid.write_text(_document(body=body))
+    assert agent_text(valid) == _document(body=body)
     assert agent_body(valid) == body
 
 
@@ -298,9 +300,11 @@ def test_parse_frontmatter_rejects_invalid_utf8_with_source_named_reason(tmp_pat
 
 
 _CONSUMER_IMPORTS = {
-    "test_agent_worktree_controls.py": frozenset({"AGENTS_DIR", "agent_files", "agent_tools"}),
+    "test_agent_worktree_controls.py": frozenset(
+        {"AGENTS_DIR", "agent_files", "agent_text", "agent_tools"}
+    ),
     "test_agent_model_pins.py": frozenset(
-        {"AGENTS_DIR", "agent_body", "agent_files", "parse_frontmatter"}
+        {"AGENTS_DIR", "agent_body", "agent_files", "agent_text", "parse_frontmatter"}
     ),
 }
 _CONSUMER_HELPERS = {
@@ -593,6 +597,113 @@ def _has_only_direct_agent_role_paths(tree: ast.Module) -> bool:
     )
 
 
+_ROLE_TEXT_READ_METHODS = frozenset({"read_bytes", "read_text", "open"})
+
+
+def _target_names(target: ast.expr) -> set[str]:
+    """Return simple assigned names without evaluating destructuring expressions."""
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return {name for element in target.elts for name in _target_names(element)}
+    return set()
+
+
+def _is_agent_files_call(node: ast.expr) -> bool:
+    """Return whether an expression directly obtains the governed role roster."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "agent_files"
+    )
+
+
+def _is_direct_agent_role_path(node: ast.expr) -> bool:
+    """Return whether an expression is one direct safe ``AGENTS_DIR`` role path."""
+    return (
+        isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Div)
+        and isinstance(node.left, ast.Name)
+        and node.left.id == "AGENTS_DIR"
+        and _is_safe_agent_role_filename(node.right)
+    )
+
+
+def _parametrized_agent_paths(function: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Return parameters bound by one direct ``agent_files()`` parametrization."""
+    paths: set[str] = set()
+    for decorator in function.decorator_list:
+        if not (
+            isinstance(decorator, ast.Call)
+            and len(decorator.args) >= 2
+            and isinstance(decorator.args[0], ast.Constant)
+            and isinstance(decorator.args[0].value, str)
+            and _is_agent_files_call(decorator.args[1])
+        ):
+            continue
+        paths.update(name.strip() for name in decorator.args[0].value.split(",") if name.strip())
+    return paths
+
+
+def _function_has_unvalidated_role_text_read(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
+    """Return whether one function reads role bytes outside a validated shared helper."""
+    path_names = _parametrized_agent_paths(function)
+    collection_names: set[str] = set()
+    nodes = tuple(ast.walk(function))
+    changed = True
+    while changed:
+        changed = False
+        for node in nodes:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                value = node.value
+                if value is None:
+                    continue
+                targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+                target_names = {name for target in targets for name in _target_names(target)}
+                if _is_agent_files_call(value) and not target_names <= collection_names:
+                    collection_names.update(target_names)
+                    changed = True
+                elif (
+                    _is_direct_agent_role_path(value)
+                    or (isinstance(value, ast.Name) and value.id in path_names)
+                ) and not target_names <= path_names:
+                    path_names.update(target_names)
+                    changed = True
+                elif isinstance(value, ast.Name) and value.id in collection_names:
+                    if not target_names <= collection_names:
+                        collection_names.update(target_names)
+                        changed = True
+            elif isinstance(node, ast.For) and (
+                _is_agent_files_call(node.iter)
+                or (isinstance(node.iter, ast.Name) and node.iter.id in collection_names)
+            ):
+                target_names = _target_names(node.target)
+                if not target_names <= path_names:
+                    path_names.update(target_names)
+                    changed = True
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _ROLE_TEXT_READ_METHODS
+        and (
+            _is_direct_agent_role_path(node.func.value)
+            or (isinstance(node.func.value, ast.Name) and node.func.value.id in path_names)
+        )
+        for node in nodes
+    )
+
+
+def _has_unvalidated_role_text_read(tree: ast.Module) -> bool:
+    """Return whether any governed function bypasses shared role-text validation."""
+    return any(
+        _function_has_unvalidated_role_text_read(function)
+        for function in tree.body
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )
+
+
 _ALLOWED_DIRECTORY_ENUMERATIONS: dict[str, dict[tuple[str, str, str, str], int]] = {
     "test_agent_model_pins.py": {("_CODEX_DIR", "agents", "glob", "*.toml"): 2},
     "test_agent_worktree_controls.py": {("_REPO", "docs", "rglob", "*.md"): 1},
@@ -670,15 +781,6 @@ def _has_only_allowed_directory_enumeration(tree: ast.Module, filename: str) -> 
     return observed == expected
 
 
-def _called_shared_helpers(tree: ast.Module) -> set[str]:
-    """Return direct shared-helper call names without following arbitrary aliases."""
-    return {
-        node.func.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-
-
 def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
     """Fail closed when a consumer restores local roster or parser machinery."""
     expected_imports = _CONSUMER_IMPORTS[filename]
@@ -697,11 +799,6 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
     assert {alias.name for alias in imported.names} == expected_imports, (
         f"{filename}: _agent_defs imports drifted from the shared-consumer contract"
     )
-    missing_calls = (expected_imports - {"AGENTS_DIR"}) - _called_shared_helpers(tree)
-    assert not missing_calls, (
-        f"{filename}: imported shared helpers must be called: {sorted(missing_calls)}"
-    )
-
     helpers = {
         node.name
         for node in tree.body
@@ -716,6 +813,8 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
     regex_modules, regex_functions = _regex_import_bindings(tree)
     if not _has_only_direct_agent_role_paths(tree):
         raise AssertionError(f"{filename}: AGENTS_DIR use must name one direct role file")
+    if _has_unvalidated_role_text_read(tree):
+        raise AssertionError(f"{filename}: role definition text must use a shared validated helper")
     if not _has_only_allowed_directory_enumeration(tree, filename):
         raise AssertionError(f"{filename}: directory enumeration is not an approved call site")
     for node in ast.walk(tree):
@@ -762,24 +861,32 @@ def test_consuming_guard_accepts_current_direct_agent_role_reads(filename: str) 
 
 
 @pytest.mark.parametrize(
-    ("call", "replacement", "missing"),
+    "addition",
     (
-        ("agent_body(path)", "unrelated_helper(path)", "agent_body"),
-        ("parse_frontmatter(path)", "unrelated_helper(path)", "parse_frontmatter"),
+        "\ndef test_local_frontmatter_reparse() -> None:\n"
+        "    for path in agent_files():\n"
+        "        lines = path.read_text().splitlines()\n"
+        '        frontmatter = dict(line.split(": ", 1) for line in lines[1:6])\n'
+        "        assert frontmatter\n",
+        "\ndef test_renamed_role_path_alias() -> None:\n"
+        "    role_paths = agent_files()\n"
+        "    inherited_role_paths = role_paths\n"
+        "    for renamed_path in inherited_role_paths:\n"
+        "        text_path = renamed_path\n"
+        "        assert text_path.read_bytes()\n",
+        "\ndef test_direct_role_path_read() -> None:\n"
+        '    role_path = AGENTS_DIR / "engineer-fe.md"\n'
+        "    assert role_path.open()\n",
     ),
-    ids=("replaced-agent-body", "replaced-frontmatter-parser"),
+    ids=("local-frontmatter-reparse", "renamed-loop-alias", "direct-role-alias"),
 )
-def test_consuming_guard_rejects_imported_shared_helpers_without_calls(
-    call: str, replacement: str, missing: str
-) -> None:
-    """An unrelated call cannot satisfy a required imported shared-helper use."""
+def test_consuming_guard_rejects_unvalidated_role_text_reads(addition: str) -> None:
+    """Role bytes cannot enter a governed function outside the shared helpers."""
     source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
-    mutated = source.replace(call, replacement)
-    assert mutated != source
     with pytest.raises(
-        AssertionError, match=rf"imported shared helpers must be called: \['{missing}'\]"
+        AssertionError, match="role definition text must use a shared validated helper"
     ):
-        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+        _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
 
 
 def test_consuming_guard_ignores_nonenumerating_os_imports() -> None:
