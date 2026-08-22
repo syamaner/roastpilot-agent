@@ -655,6 +655,8 @@ def _is_agent_files_call(node: ast.expr) -> bool:
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "agent_files"
+        and not node.args
+        and not node.keywords
     )
 
 
@@ -715,6 +717,12 @@ def _is_agent_roster_path(node: ast.expr, path_names: set[str], collection_names
         or (
             isinstance(node, ast.Subscript)
             and _is_agent_roster_collection(node.value, collection_names)
+        )
+        or (
+            isinstance(node, ast.Call)
+            and not _is_agent_files_call(node)
+            and not (isinstance(node.func, ast.Name) and node.func.id in _APPROVED_ROLE_PATH_SINKS)
+            and _is_agent_roster_collection(node, collection_names)
         )
     )
 
@@ -813,8 +821,8 @@ def _scope_has_unvalidated_role_text_read(
             continue
         receiver = node.func.value
         if _is_direct_agent_role_path(receiver) or (
-            isinstance(receiver, ast.Subscript)
-            and _is_agent_roster_collection(receiver.value, collection_names)
+            isinstance(receiver, (ast.Call, ast.Subscript))
+            and _is_agent_roster_collection(receiver, collection_names)
         ):
             return True
         if not (isinstance(receiver, ast.Name) and receiver.id in path_names):
@@ -826,6 +834,17 @@ def _scope_has_unvalidated_role_text_read(
             ):
                 if _is_agent_roster_collection(ancestor.iter, collection_names):
                     return True
+                break
+            if isinstance(ancestor, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                for generator in ancestor.generators:
+                    if receiver.id not in _target_names(generator.target):
+                        continue
+                    if _is_agent_roster_collection(generator.iter, collection_names):
+                        return True
+                    break
+                else:
+                    ancestor = parents.get(id(ancestor))
+                    continue
                 break
             ancestor = parents.get(id(ancestor))
         else:
@@ -1042,6 +1061,14 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
 
     bindings = _string_bindings(tree)
     regex_modules, regex_functions = _regex_import_bindings(tree)
+    if any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "agent_files"
+        and not _is_agent_files_call(node)
+        for node in ast.walk(tree)
+    ):
+        raise AssertionError(f"{filename}: agent_files must not receive a custom directory")
     if not _has_only_direct_agent_role_paths(tree):
         raise AssertionError(f"{filename}: AGENTS_DIR use must name one direct role file")
     if _has_unvalidated_role_text_read(tree):
@@ -1101,6 +1128,21 @@ def test_consuming_guard_requires_each_imported_shared_helper_directly_called() 
     assert mutated != source
     with pytest.raises(AssertionError, match="every shared helper must be directly called"):
         _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
+@pytest.mark.parametrize(
+    "addition",
+    (
+        "\nagent_files(external_directory)\n",
+        "\nagent_files(directory=external_directory)\n",
+    ),
+    ids=("positional-directory", "keyword-directory"),
+)
+def test_consuming_guard_rejects_custom_agent_roster_directories(addition: str) -> None:
+    """Governed consumers cannot select a roster outside the committed directory."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    with pytest.raises(AssertionError, match="agent_files must not receive a custom directory"):
+        _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
 
 
 @pytest.mark.parametrize(
@@ -1174,6 +1216,11 @@ def test_consuming_guard_requires_each_imported_shared_helper_directly_called() 
         "    for key, paths in info.items():\n"
         "        for path in paths:\n"
         "            path.read_bytes()\n",
+        "\ndef test_call_derived_roster_path_read() -> None:\n"
+        "    role_path = next(iter(agent_files()))\n"
+        "    role_path.read_text()\n",
+        "\ndef test_nested_call_derived_roster_read() -> None:\n"
+        "    next(iter(agent_files())).read_bytes()\n",
     ),
     ids=(
         "local-frontmatter-reparse",
@@ -1197,6 +1244,8 @@ def test_consuming_guard_requires_each_imported_shared_helper_directly_called() 
         "dict-get-roster-iteration",
         "dict-values-roster-iteration",
         "dict-items-roster-iteration",
+        "call-derived-roster-path",
+        "nested-call-derived-roster",
     ),
 )
 def test_consuming_guard_rejects_unvalidated_role_text_reads(addition: str) -> None:
@@ -1257,6 +1306,18 @@ def test_consuming_guard_allows_nonroster_collection_wrappers() -> None:
         "\ndef test_unrelated_collection_read() -> None:\n"
         "    roles = list(ordinary_paths)\n"
         "    assert [role.read_text() for role in roles]\n"
+    )
+    _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_allows_nonroster_call_derived_reads() -> None:
+    """Calls derived from ordinary collections do not acquire roster provenance."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    addition = (
+        "\ndef test_unrelated_call_derived_read() -> None:\n"
+        "    ordinary_path = next(iter(ordinary_paths))\n"
+        "    ordinary_path.read_text()\n"
+        "    next(iter(ordinary_paths)).read_bytes()\n"
     )
     _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
 
