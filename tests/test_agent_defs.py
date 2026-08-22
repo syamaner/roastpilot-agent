@@ -135,6 +135,7 @@ def test_split_frontmatter_never_silently_skips_malformed_lines() -> None:
         "# comment\n",
         "- name: example\n",
         " name: example\n",
+        "name:  example\n",
         "name: example\n description: continued\n",
         'name: "example"\n',
         "name: \n",

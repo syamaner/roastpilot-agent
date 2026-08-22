@@ -16,7 +16,7 @@ OPTIONAL_KEYS: Final = frozenset({"permissionMode"})
 """Closed set of frontmatter keys a committed role may additionally provide."""
 
 _OPENING_MARKER: Final = re.compile(r"^---\n")
-_FIELD: Final = re.compile(r"([A-Za-z][A-Za-z0-9_]*): ([^\r\n]+)\n")
+_FIELD: Final = re.compile(r"([A-Za-z][A-Za-z0-9_]*): ([^\s\r\n][^\r\n]*)\n")
 _TOOL: Final = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 
 
