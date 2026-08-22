@@ -628,6 +628,47 @@ def _is_markdown_suffix_comparison(node: ast.AST, names: set[str]) -> bool:
     )
 
 
+def _iterdir_name_receiver(node: ast.expr) -> ast.Name | None:
+    """Return an iterated name used as ``entry.name`` or ``entry.name.lower()``."""
+    if isinstance(node, ast.Attribute) and node.attr == "name" and isinstance(node.value, ast.Name):
+        return node.value
+    if (
+        isinstance(node, ast.Call)
+        and not node.args
+        and not node.keywords
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "lower"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "name"
+        and isinstance(node.func.value.value, ast.Name)
+    ):
+        return node.func.value.value
+    return None
+
+
+def _is_markdown_name_endswith(node: ast.AST, names: set[str]) -> bool:
+    """Return whether an iterated entry name is directly filtered to Markdown."""
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "endswith"
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == ".md"
+    ):
+        return False
+    receiver = _iterdir_name_receiver(node.func.value)
+    if receiver is None:
+        return False
+    return not names or receiver.id in names
+
+
+def _is_markdown_iterdir_predicate(node: ast.AST, names: set[str]) -> bool:
+    """Return whether a predicate filters an iterated entry to Markdown paths."""
+    return _is_markdown_suffix_comparison(node, names) or _is_markdown_name_endswith(node, names)
+
+
 def _has_local_iterdir_markdown_roster(tree: ast.Module) -> bool:
     """Return whether a consumer enumerates Markdown roles through ``iterdir``."""
     for node in ast.walk(tree):
@@ -641,7 +682,7 @@ def _has_local_iterdir_markdown_roster(tree: ast.Module) -> bool:
                     continue
                 names = _iterdir_target_names(generator.target)
                 if any(
-                    _is_markdown_suffix_comparison(condition, names) for condition in generator.ifs
+                    _is_markdown_iterdir_predicate(condition, names) for condition in generator.ifs
                 ):
                     return True
         elif (
@@ -651,7 +692,7 @@ def _has_local_iterdir_markdown_roster(tree: ast.Module) -> bool:
             and node.iter.func.attr == "iterdir"
         ):
             names = _iterdir_target_names(node.target)
-            if any(_is_markdown_suffix_comparison(child, names) for child in ast.walk(node)):
+            if any(_is_markdown_iterdir_predicate(child, names) for child in ast.walk(node)):
                 return True
     return False
 
@@ -1171,6 +1212,45 @@ def test_consuming_guard_ignores_nonmarkdown_for_iterdir_uses() -> None:
         "for path in ordinary_directory.iterdir():\n"
         '    if path.suffix == ".toml":\n'
         "        ordinary_paths.append(path)\n"
+    )
+    _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    ("path.name.endswith('.md')", "path.name.lower().endswith('.md')"),
+    ids=("name-endswith", "normalized-name-endswith"),
+)
+def test_consuming_guard_rejects_markdown_name_endswith_iterdir_rosters(predicate: str) -> None:
+    """Local Markdown roster scans cannot hide behind name-call predicates."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source + (
+        '\nroster_directory = Path(".claude/agents")\n'
+        "for path in roster_directory.iterdir():\n"
+        f"    if {predicate}:\n"
+        "        pass\n"
+    )
+    with pytest.raises(AssertionError, match="local Markdown roster enumeration"):
+        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    (
+        "path.name.endswith('.toml')",
+        "path.name.lower().endswith('.toml')",
+        "'.md'.endswith(path.name)",
+    ),
+    ids=("name-nonmarkdown", "normalized-name-nonmarkdown", "reversed"),
+)
+def test_consuming_guard_accepts_nonroster_name_endswith_iterdir_uses(predicate: str) -> None:
+    """Only the iterated entry's Markdown ``endswith`` predicate is roster-like."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source + (
+        '\nordinary_directory = Path(".")\n'
+        "for path in ordinary_directory.iterdir():\n"
+        f"    if {predicate}:\n"
+        "        pass\n"
     )
     _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
 
