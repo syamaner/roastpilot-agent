@@ -148,8 +148,17 @@ def test_split_frontmatter_never_silently_skips_malformed_lines() -> None:
 )
 def test_split_frontmatter_rejects_every_malformed_field_class(line: str) -> None:
     """Blank, comment, list, indentation, multiline, quoted, and CR fields fail closed."""
-    with pytest.raises(AgentFrontmatterError, match="malformed.md"):
-        split_frontmatter("---\n" + line + "---\n", source="malformed.md")
+    malformed = _document().replace("name: example\n", line, 1)
+    with pytest.raises(AgentFrontmatterError, match="frontmatter field"):
+        split_frontmatter(malformed, source="malformed.md")
+
+
+@pytest.mark.parametrize("prefix", ("&", "*", "!"))
+def test_split_frontmatter_rejects_yaml_value_prefixes(prefix: str) -> None:
+    """YAML anchors, aliases, and tags cannot enter unquoted closed-grammar values."""
+    malformed = _document().replace("name: example\n", f"name: {prefix}example\n", 1)
+    with pytest.raises(AgentFrontmatterError, match="quoted or structured"):
+        split_frontmatter(malformed, source="yaml.md")
 
 
 def test_split_frontmatter_rejects_duplicate_and_unknown_keys() -> None:
@@ -258,7 +267,9 @@ def _static_string(node: ast.expr, bindings: dict[str, str]) -> str | None:
 def _is_frontmatter_marker(node: ast.expr, bindings: dict[str, str]) -> bool:
     """Return whether a literal expression denotes a leading frontmatter marker."""
     value = _static_string(node, bindings)
-    return value is not None and (value == "---\n" or value.startswith("^---\n"))
+    if value is None:
+        return False
+    return value in {"---\n", "---\\n"} or value.startswith(("^---\n", "^---\\n"))
 
 
 def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
@@ -339,6 +350,11 @@ def _add_startswith_frontmatter_parser(source: str) -> str:
     return source + '\nfrontmatter_text = "role body"\nfrontmatter_text.startswith("---\\n")\n'
 
 
+def _add_raw_regex_frontmatter_parser(source: str) -> str:
+    """Restore the historical raw-regex frontmatter parser mutation."""
+    return source + '\nlocal_frontmatter = re.compile(r"^---\\n")\n'
+
+
 _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
     (
         "test_agent_worktree_controls.py",
@@ -355,13 +371,18 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         _add_startswith_frontmatter_parser,
         "local leading-frontmatter parser",
     ),
+    (
+        "test_agent_model_pins.py",
+        _add_raw_regex_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
 )
 
 
 @pytest.mark.parametrize(
     ("filename", "mutation", "expected"),
     _CONSUMER_MUTATIONS,
-    ids=("renamed-helper", "reformatted-roster-glob", "startswith-parser"),
+    ids=("renamed-helper", "reformatted-roster-glob", "startswith-parser", "raw-regex-parser"),
 )
 def test_consuming_guard_rejects_local_parser_and_roster_mutations(
     filename: str, mutation: Callable[[str], str], expected: str

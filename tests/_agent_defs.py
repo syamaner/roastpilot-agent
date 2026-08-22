@@ -88,7 +88,7 @@ def split_frontmatter(
         if field is None:
             _error(source, "frontmatter field is malformed")
         key, value = field.groups()
-        if value[0] in "'\"#[{|>":
+        if value[0] in "'\"#[{|>&*!":
             _error(source, "frontmatter field value is quoted or structured")
         if key in fields:
             _error(source, f"frontmatter key {key!r} is duplicated")
