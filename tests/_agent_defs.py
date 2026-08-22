@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 from typing import Final, NoReturn
 
+import yaml
+
 AGENTS_DIR: Final = Path(__file__).resolve().parents[1] / ".claude" / "agents"
 """Authoritative directory containing committed Claude role definitions."""
 
@@ -19,16 +21,6 @@ _OPENING_MARKER: Final = re.compile(r"^---\n")
 _FIELD: Final = re.compile(r"([A-Za-z][A-Za-z0-9_]*): ([^\s\r\n][^\r\n]*)\n")
 _TOOL: Final = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _YAML_VALUE_INDICATORS: Final[frozenset[str]] = frozenset("-?:,[]{}#&*!|>'\"%@`")
-_YAML_IMPLICIT_WORDS: Final[frozenset[str]] = frozenset(
-    {"~", "null", "true", "false", "yes", "no", "on", "off", ".inf", ".nan"}
-)
-_YAML_NUMBER: Final = re.compile(
-    r"[-+]?(?:[0-9][0-9_]*(?:\.[0-9_]*)?(?:[eE][-+]?[0-9_]+)?|"
-    r"\.[0-9_]+(?:[eE][-+]?[0-9_]+)?|"
-    r"0[xX][0-9a-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+|\.(?:inf|nan))$"
-)
-_YAML_DATE_LIKE: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[Tt ][^\r\n]+)?$")
-_YAML_SEXAGESIMAL: Final = re.compile(r"[-+]?[0-9][0-9_]*(?::[0-9][0-9_]*)+$")
 _ALLOWED_TOOLS: Final[frozenset[str]] = frozenset(
     {"Read", "Grep", "Glob", "Bash", "Edit", "Write", "mcp__playwright"}
 )
@@ -43,15 +35,13 @@ def _error(source: str | Path, detail: str) -> NoReturn:
     raise AgentFrontmatterError(f"{source}: {detail}")
 
 
-def _is_yaml_implicit_scalar(value: str) -> bool:
-    """Return whether a conservative YAML loader could coerce a plain scalar."""
-    lowered = value.lower()
-    return (
-        lowered in _YAML_IMPLICIT_WORDS
-        or _YAML_NUMBER.fullmatch(lowered) is not None
-        or _YAML_DATE_LIKE.fullmatch(value) is not None
-        or _YAML_SEXAGESIMAL.fullmatch(value) is not None
-    )
+def _is_yaml_plain_scalar(value: str) -> bool:
+    """Return whether YAML preserves one lexically admitted scalar unchanged."""
+    try:
+        parsed = yaml.safe_load(value)
+    except yaml.YAMLError:
+        return False
+    return type(parsed) is str and parsed == value
 
 
 def _validated_tools(value: str, source: str | Path) -> set[str]:
@@ -137,8 +127,6 @@ def split_frontmatter(
             for index, character in enumerate(value)
         ):
             _error(source, "frontmatter field value is malformed")
-        if _is_yaml_implicit_scalar(value):
-            _error(source, "frontmatter field value is implicitly typed")
         if (
             value != value.rstrip()
             or any(not character.isprintable() for character in value)
@@ -148,6 +136,8 @@ def split_frontmatter(
             )
         ):
             _error(source, "frontmatter field value is malformed")
+        if not _is_yaml_plain_scalar(value):
+            _error(source, "frontmatter field value is implicitly typed")
         if key in fields:
             _error(source, f"frontmatter key {key!r} is duplicated")
         fields[key] = value

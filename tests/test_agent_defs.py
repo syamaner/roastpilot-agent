@@ -193,7 +193,6 @@ def test_split_frontmatter_rejects_duplicate_unknown_and_each_missing_key() -> N
         "0",
         "-12",
         "1.5",
-        "1e3",
         "0x10",
         ".5",
         "-.5E-2",
@@ -203,6 +202,8 @@ def test_split_frontmatter_rejects_duplicate_unknown_and_each_missing_key() -> N
         "2026-08-22T12:34:56Z",
         "12:34",
         "+12:34:56",
+        "1:20.5",
+        "2001-1-1 2:03:04",
     ),
 )
 def test_split_frontmatter_rejects_yaml_implicit_scalar_spellings(value: str) -> None:
@@ -212,7 +213,31 @@ def test_split_frontmatter_rejects_yaml_implicit_scalar_spellings(value: str) ->
         split_frontmatter(malformed, source="implicit.md")
 
 
-@pytest.mark.parametrize("value", ("nullish", "true-blue", "onward", "v1.0", ".5ish", "12:34pm"))
+def test_split_frontmatter_rejects_yaml_parse_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """YAML parser failures retain the source-named closed-frontmatter error."""
+
+    def raise_yaml_error(_value: str) -> None:
+        raise _agent_defs.yaml.YAMLError("invalid scalar")
+
+    monkeypatch.setattr(_agent_defs.yaml, "safe_load", raise_yaml_error)
+    with pytest.raises(AgentFrontmatterError, match="parse-error.md: frontmatter field value"):
+        split_frontmatter(_document(), source="parse-error.md")
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "nullish",
+        "true-blue",
+        "onward",
+        "v1.0",
+        "1e3",
+        ".5ish",
+        "12:34pm",
+        "1:20.5ish",
+        "2001-1-1 2:03:04ish",
+    ),
+)
 def test_split_frontmatter_allows_ordinary_scalar_lookalikes(value: str) -> None:
     """The conservative scalar grammar preserves ordinary role prose."""
     fields, _body = split_frontmatter(_document({**_fields(), "description": value}))
