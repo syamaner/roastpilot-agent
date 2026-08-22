@@ -359,7 +359,7 @@ def _valid_inline_flags(flags: str) -> bool:
 def _is_frontmatter_marker_value(value: str) -> bool:
     """Return whether a value is an exact marker or valid regex-marker prefix."""
     bare_markers = frozenset({"---", "---\n", "---\\n"})
-    regex_prefixes = ("^---\n", "^---\\n")
+    regex_prefixes = ("^---\n", "^---\\n", "---\n", "---\\n")
     if value in bare_markers or value.startswith(regex_prefixes):
         return True
     inline_flags, separator, suffix = value.partition(")")
@@ -412,6 +412,8 @@ def test_frontmatter_marker_detection_ignores_nonmarkers(value: str) -> None:
         "(?im-sx)^---\\n",
         r"^---\n(.*?)\n---\n",
         r"(?m)^---\n(.*?)\n---\n",
+        r"---\n(.*?)\n---\n",
+        r"(?m)---\n(.*?)\n---\n",
     ),
 )
 def test_frontmatter_marker_detection_accepts_exact_bare_and_regex_forms(value: str) -> None:
@@ -883,6 +885,16 @@ def _add_inline_flag_regex_frontmatter_parser(source: str) -> str:
     return source + '\nlocal_frontmatter = re.compile(r"(?m)^---\\n")\n'
 
 
+def _add_unanchored_match_frontmatter_parser(source: str) -> str:
+    """Add a locally start-anchored ``re.match`` parser without ``^``."""
+    return source + '\nlocal_frontmatter = re.match(r"---\\n(.*?)\\n---\\n", role_body)\n'
+
+
+def _add_unanchored_inline_fullmatch_frontmatter_parser(source: str) -> str:
+    """Add an inline-flag ``re.fullmatch`` parser without ``^``."""
+    return source + '\nlocal_frontmatter = re.fullmatch(r"(?m)---\\n(.*?)\\n---\\n", role_body)\n'
+
+
 def _add_callable_alias_regex_frontmatter_parser(source: str) -> str:
     """Bind a regex callable through an alias chain before parsing a marker."""
     return source + (
@@ -1027,6 +1039,16 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
     ),
     (
         "test_agent_model_pins.py",
+        _add_unanchored_match_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
+    (
+        "test_agent_model_pins.py",
+        _add_unanchored_inline_fullmatch_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
+    (
+        "test_agent_model_pins.py",
         _add_callable_alias_regex_frontmatter_parser,
         "local leading-frontmatter parser",
     ),
@@ -1071,6 +1093,8 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         "function-alias-regex-parser",
         "star-import-regex-parser",
         "inline-flag-regex-parser",
+        "unanchored-match-regex-parser",
+        "unanchored-inline-fullmatch-regex-parser",
         "callable-alias-regex-parser",
         "reassigned-callable-alias-regex-parser",
         "module-assignment-alias-regex-parser",
