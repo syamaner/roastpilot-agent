@@ -103,6 +103,13 @@ def test_agent_files_rejects_invalid_rosters(tmp_path: Path, kind: str) -> None:
         agent_files(directory)
 
 
+def test_agent_files_rejects_markdown_named_directory(tmp_path: Path) -> None:
+    """A directory matching the roster glob cannot masquerade as a definition file."""
+    (tmp_path / "nested.md").mkdir()
+    with pytest.raises(AgentFrontmatterError, match="agent roster contains a non-file definition"):
+        agent_files(tmp_path)
+
+
 @pytest.mark.parametrize("leading", ("\ufeff---\n", "\n---\n", "---\r\n"))
 def test_split_frontmatter_rejects_invalid_leading_markers(leading: str) -> None:
     """The opening marker is anchored at byte zero with an exact newline."""
@@ -114,6 +121,12 @@ def test_split_frontmatter_rejects_missing_terminator_with_source() -> None:
     """An unterminated leading block fails with the supplied source name."""
     with pytest.raises(AgentFrontmatterError, match="unterminated.md"):
         split_frontmatter("---\nname: example\n", source="unterminated.md")
+
+
+def test_split_frontmatter_rejects_empty_frontmatter_block() -> None:
+    """An immediate closing marker cannot produce an empty field mapping."""
+    with pytest.raises(AgentFrontmatterError, match="frontmatter has no fields"):
+        split_frontmatter("---\n---\n", source="empty.md")
 
 
 def test_split_frontmatter_treats_nonexact_closing_marker_as_malformed_field() -> None:
@@ -219,6 +232,17 @@ def test_parse_frontmatter_and_agent_body_name_the_source(tmp_path: Path) -> Non
     body = "Unchanged body\n---\n"
     valid.write_text(_document(body=body))
     assert agent_body(valid) == body
+
+
+def test_parse_frontmatter_rejects_invalid_utf8_with_source_named_reason(tmp_path: Path) -> None:
+    """Path-backed parsing refuses invalid bytes without an undecoded fallback."""
+    invalid = tmp_path / "invalid.md"
+    invalid.write_bytes(b"\xff")
+    with pytest.raises(
+        AgentFrontmatterError,
+        match="invalid.md: agent definition cannot be read as UTF-8",
+    ):
+        parse_frontmatter(invalid)
 
 
 _CONSUMER_IMPORTS = {
