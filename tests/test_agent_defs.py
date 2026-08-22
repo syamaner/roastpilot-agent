@@ -1322,6 +1322,31 @@ def test_consuming_guard_allows_nonroster_call_derived_reads() -> None:
     _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
 
 
+def test_consuming_guard_rejects_outer_roster_path_inside_unrelated_comprehension() -> None:
+    """A comprehension cannot hide a roster path that its generator does not bind."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    addition = (
+        "\ndef test_outer_roster_path_in_comprehension() -> None:\n"
+        "    role_path = agent_files()[0]\n"
+        "    assert [role_path.read_text() for ordinary_path in ordinary_paths]\n"
+    )
+    with pytest.raises(
+        AssertionError, match="role definition text must use a shared validated helper"
+    ):
+        _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_allows_comprehension_shadowing_roster_path_name() -> None:
+    """A non-roster comprehension target safely shadows an outer roster path name."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    addition = (
+        "\ndef test_comprehension_shadows_roster_path() -> None:\n"
+        "    role_path = agent_files()[0]\n"
+        "    assert [role_path.read_text() for role_path in ordinary_paths]\n"
+    )
+    _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
+
+
 @pytest.mark.parametrize(
     "assignment",
     (
