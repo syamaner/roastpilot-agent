@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import io
+import json
+import token
+import tokenize
 from pathlib import Path
 
 import _agent_defs
@@ -43,7 +47,7 @@ def _fields() -> dict[str, str]:
     """Return a fresh valid field mapping for parser mutations."""
     return {
         "name": "example",
-        "description": "Example: preserves embedded colons",
+        "description": "Example:preserves embedded colons",
         "tools": "Read, Grep",
         "model": "claude-sonnet-5",
         "effort": "high",
@@ -80,7 +84,7 @@ def test_split_frontmatter_preserves_embedded_colons_and_exact_body() -> None:
     """Only the leading block is parsed; later markers remain body bytes."""
     body = "First body line\n---\nname: body-marker\n"
     fields, actual_body = split_frontmatter(_document(body=body), source="exact.md")
-    assert fields["description"] == "Example: preserves embedded colons"
+    assert fields["description"] == "Example:preserves embedded colons"
     assert actual_body == body
 
 
@@ -227,6 +231,15 @@ def test_split_frontmatter_rejects_ambiguous_or_control_scalars(value: str) -> N
         split_frontmatter(malformed, source="scalar.md")
 
 
+def test_split_frontmatter_rejects_mapping_separator_but_allows_embedded_colon() -> None:
+    """A colon-space mapping separator is forbidden while an embedded colon remains plain."""
+    malformed = _document().replace("name: example\n", "name: example: nested\n", 1)
+    with pytest.raises(AgentFrontmatterError, match="frontmatter field value is malformed"):
+        split_frontmatter(malformed, source="separator.md")
+    fields, _body = split_frontmatter(_document({**_fields(), "description": "READ-ONLY—reports"}))
+    assert fields["description"] == "READ-ONLY—reports"
+
+
 @pytest.mark.parametrize(
     "tools", ("Read,,Grep", "Read, mcp-playwright", "Read, Read", "Read, Task")
 )
@@ -286,56 +299,71 @@ def test_parse_frontmatter_rejects_invalid_utf8_with_source_named_reason(tmp_pat
         parse_frontmatter(invalid)
 
 
-# Governance deliberately couples these two consumers to their exact canonical ASTs.
-# Comments and whitespace are excluded by ``ast.dump``; every executable semantic edit
-# requires a deliberate digest update alongside its review and direct helper tests.
-_CONSUMER_AST_SHA256 = {
-    "test_agent_model_pins.py": "7e74bd710e4001c0683eaea2027495c991871df67632bb59ffa824633910f62c",
+# Governance deliberately couples these two consumers to exact canonical token streams.
+# Comments and ordinary layout are excluded, but every executable token requires a
+# deliberate digest update alongside its review and direct helper tests.
+_CONSUMER_TOKEN_SHA256 = {
+    "test_agent_model_pins.py": "3155dfa4436a4d3277b071b623704508f55e0f133d0e5acf247fea88783b88dd",
     "test_agent_worktree_controls.py": (
-        "6f4211e5a9624ac6bc42419890da448e4b82f705f915c10b36c4b5cf2bf61885"
+        "4e07ff892ab0876da0ccd68f4fb323ba72ddafb543c7fd7f6670106f764fff27"
     ),
 }
 
 
-def _consumer_ast_sha256(path: Path) -> str:
-    """Return the comment- and formatting-insensitive canonical AST digest for one consumer."""
-    return _canonical_ast_sha256(path.read_text(), path.name)
+def _consumer_token_sha256(path: Path) -> str:
+    """Return the version-independent canonical token digest for one consumer."""
+    return _canonical_token_sha256(path.read_text())
 
 
-def _canonical_ast_sha256(source: str, filename: str = "consumer.py") -> str:
-    """Return the canonical AST digest for pure-source mutation proofs."""
-    canonical = ast.dump(ast.parse(source, filename=filename), include_attributes=False)
+def _canonical_token_sha256(source: str) -> str:
+    """Return a comment- and layout-insensitive digest of all executable tokens."""
+    canonical_tokens: list[tuple[str, str]] = []
+    for item in tokenize.generate_tokens(io.StringIO(source).readline):
+        if item.type in {tokenize.COMMENT, tokenize.NL, tokenize.ENDMARKER}:
+            continue
+        token_name = token.tok_name[item.type]
+        token_string = (
+            "" if item.type in {tokenize.INDENT, tokenize.DEDENT, tokenize.NEWLINE} else item.string
+        )
+        canonical_tokens.append((token_name, token_string))
+    canonical = json.dumps(canonical_tokens, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def test_governed_consumers_match_closed_canonical_ast_fingerprints() -> None:
+def test_governed_consumers_match_closed_canonical_token_fingerprints() -> None:
     """Both governed consumers remain exactly at their reviewed executable semantics."""
     assert {
-        filename: _consumer_ast_sha256(_REPO / "tests" / filename)
-        for filename in _CONSUMER_AST_SHA256
-    } == _CONSUMER_AST_SHA256
+        filename: _consumer_token_sha256(_REPO / "tests" / filename)
+        for filename in _CONSUMER_TOKEN_SHA256
+    } == _CONSUMER_TOKEN_SHA256
 
 
-def test_canonical_ast_digest_changes_for_semantic_guard_mutations() -> None:
+def test_canonical_token_digest_changes_for_semantic_guard_mutations() -> None:
     """Marker-regex and roster-provenance behavior cannot drift under the closed boundary."""
     marker = 'import re\nre.compile(r"^---\\n")\n'
     alternate_marker = 'import re\nre.compile(r"^---")\n'
     roster = "agent_files()\n"
     alternate_roster = "agent_files(directory)\n"
-    assert _canonical_ast_sha256(marker) != _canonical_ast_sha256(alternate_marker)
-    assert _canonical_ast_sha256(roster) != _canonical_ast_sha256(alternate_roster)
+    assert _canonical_token_sha256(marker) == (
+        "04d9ce081955e4f4068a02581559ffee9949efd5823ee9c26251b36698ac0c54"
+    )
+    assert _canonical_token_sha256(roster) == (
+        "38a9f7aeb91de5c1e47ea1e7949028372aae9a05432666fdc00bef4d5d874098"
+    )
+    assert _canonical_token_sha256(marker) != _canonical_token_sha256(alternate_marker)
+    assert _canonical_token_sha256(roster) != _canonical_token_sha256(alternate_roster)
 
 
-def test_canonical_ast_digest_ignores_comments_and_formatting() -> None:
+def test_canonical_token_digest_ignores_comments_and_formatting() -> None:
     """Comments and layout do not perturb the canonical semantic digest."""
     compact = "def parse():\n    return agent_files()\n"
     formatted = "# governance comment\n\ndef parse( ):\n\n    return agent_files( )\n"
-    assert _canonical_ast_sha256(compact) == _canonical_ast_sha256(formatted)
+    assert _canonical_token_sha256(compact) == _canonical_token_sha256(formatted)
 
 
 def test_governed_consumers_import_and_call_parse_frontmatter() -> None:
     """Parser provenance remains explicit and load-bearing in both governed consumers."""
-    for filename in _CONSUMER_AST_SHA256:
+    for filename in _CONSUMER_TOKEN_SHA256:
         tree = ast.parse((_REPO / "tests" / filename).read_text(), filename=filename)
         imported = {
             alias.asname or alias.name

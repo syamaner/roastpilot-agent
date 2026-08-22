@@ -132,6 +132,11 @@ def split_frontmatter(
         key, value = field.groups()
         if value[0] in _YAML_VALUE_INDICATORS:
             _error(source, "frontmatter field value is quoted or structured")
+        if any(
+            character == ":" and index + 1 < len(value) and value[index + 1].isspace()
+            for index, character in enumerate(value)
+        ):
+            _error(source, "frontmatter field value is malformed")
         if _is_yaml_implicit_scalar(value):
             _error(source, "frontmatter field value is implicitly typed")
         if (
