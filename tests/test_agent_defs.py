@@ -662,10 +662,26 @@ def _is_agent_roster_collection(node: ast.expr, collection_names: set[str]) -> b
     """Return whether an expression retains a governed roster through collection wrappers."""
     if _is_agent_files_call(node) or (isinstance(node, ast.Name) and node.id in collection_names):
         return True
-    return isinstance(node, ast.Call) and any(
-        _is_agent_roster_collection(argument, collection_names)
-        for argument in (*node.args, *(keyword.value for keyword in node.keywords))
-    )
+    if isinstance(node, ast.Call):
+        return any(
+            _is_agent_roster_collection(argument, collection_names)
+            for argument in (*node.args, *(keyword.value for keyword in node.keywords))
+        )
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        return any(
+            _is_agent_roster_collection(generator.iter, collection_names)
+            for generator in node.generators
+        )
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return any(_is_agent_roster_collection(element, collection_names) for element in node.elts)
+    if isinstance(node, ast.Dict):
+        return any(
+            key is not None
+            and _is_agent_roster_collection(key, collection_names)
+            or _is_agent_roster_collection(value, collection_names)
+            for key, value in zip(node.keys, node.values, strict=True)
+        )
+    return False
 
 
 def _is_direct_agent_role_path(node: ast.expr) -> bool:
@@ -1166,6 +1182,33 @@ def test_consuming_guard_rejects_collection_wrapped_roster_reads(wrapper: str) -
         _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
 
 
+@pytest.mark.parametrize(
+    "assignment",
+    (
+        "roles = [path for path in agent_files()]\n",
+        "roles = {path for path in agent_files()}\n",
+        "roles = {path: path for path in agent_files()}\n",
+        "roles = (path for path in agent_files())\n",
+        "generated_roles = (path for path in agent_files())\nroles = list(generated_roles)\n",
+        "raw_roles = [path for path in agent_files()]\nroles = raw_roles\n",
+    ),
+    ids=("list", "set", "dict", "generator", "wrapped-generator", "alias"),
+)
+def test_consuming_guard_rejects_assigned_roster_comprehension_reads(assignment: str) -> None:
+    """Comprehension and generator results retain roster provenance after assignment."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    addition = (
+        "\ndef test_assigned_roster_comprehension_read() -> None:\n"
+        + "".join(f"    {line}\n" for line in assignment.splitlines())
+        + "    for role in roles:\n"
+        "        role.read_text()\n"
+    )
+    with pytest.raises(
+        AssertionError, match="role definition text must use a shared validated helper"
+    ):
+        _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
+
+
 def test_consuming_guard_allows_nonroster_collection_wrappers() -> None:
     """A collection wrapper without roster provenance remains unrelated to role reads."""
     source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
@@ -1173,6 +1216,29 @@ def test_consuming_guard_allows_nonroster_collection_wrappers() -> None:
         "\ndef test_unrelated_collection_read() -> None:\n"
         "    roles = list(ordinary_paths)\n"
         "    assert [role.read_text() for role in roles]\n"
+    )
+    _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    (
+        "roles = [path for path in ordinary_paths]\n",
+        "roles = {path for path in ordinary_paths}\n",
+        "roles = {path: path for path in ordinary_paths}\n",
+        "roles = (path for path in ordinary_paths)\n",
+        "roles = list(path for path in ordinary_paths)\n",
+    ),
+    ids=("list", "set", "dict", "generator", "wrapped-generator"),
+)
+def test_consuming_guard_allows_nonroster_collection_comprehensions(assignment: str) -> None:
+    """Ordinary collection expressions do not acquire roster provenance."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    addition = (
+        "\ndef test_unrelated_collection_comprehension() -> None:\n"
+        + "".join(f"    {line}\n" for line in assignment.splitlines())
+        + "    for role in roles:\n"
+        "        role.read_text()\n"
     )
     _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
 
