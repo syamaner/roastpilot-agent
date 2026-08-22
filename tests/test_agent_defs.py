@@ -656,6 +656,16 @@ def _is_agent_files_call(node: ast.expr) -> bool:
     )
 
 
+def _is_agent_roster_collection(node: ast.expr, collection_names: set[str]) -> bool:
+    """Return whether an expression retains a governed roster through collection wrappers."""
+    if _is_agent_files_call(node) or (isinstance(node, ast.Name) and node.id in collection_names):
+        return True
+    return isinstance(node, ast.Call) and any(
+        _is_agent_roster_collection(argument, collection_names)
+        for argument in (*node.args, *(keyword.value for keyword in node.keywords))
+    )
+
+
 def _is_direct_agent_role_path(node: ast.expr) -> bool:
     """Return whether an expression is one direct safe ``AGENTS_DIR`` role path."""
     return (
@@ -721,7 +731,10 @@ def _scope_has_unvalidated_role_text_read(
                     continue
                 targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
                 target_names = {name for target in targets for name in _target_names(target)}
-                if _is_agent_files_call(value) and not target_names <= collection_names:
+                if (
+                    _is_agent_roster_collection(value, collection_names)
+                    and not target_names <= collection_names
+                ):
                     collection_names.update(target_names)
                     changed = True
                 elif (
@@ -730,13 +743,8 @@ def _scope_has_unvalidated_role_text_read(
                 ) and not target_names <= path_names:
                     path_names.update(target_names)
                     changed = True
-                elif isinstance(value, ast.Name) and value.id in collection_names:
-                    if not target_names <= collection_names:
-                        collection_names.update(target_names)
-                        changed = True
             elif isinstance(node, (ast.For, ast.comprehension)) and (
-                _is_agent_files_call(node.iter)
-                or (isinstance(node.iter, ast.Name) and node.iter.id in collection_names)
+                _is_agent_roster_collection(node.iter, collection_names)
             ):
                 target_names = _target_names(node.target)
                 if not target_names <= path_names:
@@ -762,9 +770,7 @@ def _scope_has_unvalidated_role_text_read(
             if isinstance(ancestor, (ast.For, ast.comprehension)) and receiver.id in _target_names(
                 ancestor.target
             ):
-                if _is_agent_files_call(ancestor.iter) or (
-                    isinstance(ancestor.iter, ast.Name) and ancestor.iter.id in collection_names
-                ):
+                if _is_agent_roster_collection(ancestor.iter, collection_names):
                     return True
                 break
             ancestor = parents.get(id(ancestor))
@@ -1110,6 +1116,32 @@ def test_consuming_guard_rejects_unvalidated_role_text_reads(addition: str) -> N
         AssertionError, match="role definition text must use a shared validated helper"
     ):
         _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
+
+
+@pytest.mark.parametrize("wrapper", ("list", "tuple", "sorted", "set"))
+def test_consuming_guard_rejects_collection_wrapped_roster_reads(wrapper: str) -> None:
+    """Collection wrappers cannot sever roster provenance before a raw role read."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    addition = (
+        "\ndef test_collection_wrapped_role_read() -> None:\n"
+        f"    roles = {wrapper}(agent_files())\n"
+        "    assert [role.read_text() for role in roles]\n"
+    )
+    with pytest.raises(
+        AssertionError, match="role definition text must use a shared validated helper"
+    ):
+        _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_allows_nonroster_collection_wrappers() -> None:
+    """A collection wrapper without roster provenance remains unrelated to role reads."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    addition = (
+        "\ndef test_unrelated_collection_read() -> None:\n"
+        "    roles = list(ordinary_paths)\n"
+        "    assert [role.read_text() for role in roles]\n"
+    )
+    _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
 
 
 def test_consuming_guard_accepts_unrelated_assignment_fallbacks() -> None:
