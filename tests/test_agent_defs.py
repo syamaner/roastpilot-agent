@@ -123,6 +123,17 @@ def test_agent_files_rejects_external_symlinked_markdown_definition(tmp_path: Pa
         agent_files(roster)
 
 
+def test_agent_files_rejects_external_symlinked_roster_directory(tmp_path: Path) -> None:
+    """A directory symlink cannot substitute an external valid role roster."""
+    external = tmp_path / "external-agents"
+    external.mkdir()
+    (external / "role.md").write_text(_document())
+    roster = tmp_path / "agents"
+    roster.symlink_to(external, target_is_directory=True)
+    with pytest.raises(AgentFrontmatterError, match="agent roster directory is a symlink"):
+        agent_files(roster)
+
+
 @pytest.mark.parametrize("leading", ("\ufeff---\n", "\n---\n", "---\r\n"))
 def test_split_frontmatter_rejects_invalid_leading_markers(leading: str) -> None:
     """The opening marker is anchored at byte zero with an exact newline."""
@@ -749,12 +760,14 @@ _ALLOWED_DIRECTORY_ENUMERATIONS: dict[str, dict[tuple[str, str, str, str], int]]
     "test_agent_worktree_controls.py": {("_REPO", "docs", "rglob", "*.md"): 1},
 }
 _UNAPPROVED_DIRECTORY_ENUMERATION = ("", "", "", "")
+_OS_DIRECTORY_ENUMERATORS = frozenset({"listdir", "scandir", "walk"})
 
 
 def _os_enumeration_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
-    """Return imported ``os`` module and directory-enumerator binding names."""
+    """Return imported and conservatively inherited ``os`` enumerator bindings."""
     module_names: set[str] = set()
     function_names: set[str] = set()
+    assignments: list[ast.Assign | ast.AnnAssign] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -762,8 +775,38 @@ def _os_enumeration_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
                     module_names.add(alias.asname or "os")
         elif isinstance(node, ast.ImportFrom) and node.module == "os" and node.level == 0:
             for alias in node.names:
-                if alias.name in {"listdir", "scandir", "walk"}:
+                if alias.name in _OS_DIRECTORY_ENUMERATORS:
                     function_names.add(alias.asname or alias.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            assignments.append(node)
+    changed = True
+    while changed:
+        changed = False
+        for assignment in assignments:
+            value = assignment.value
+            if value is None:
+                continue
+            is_os_module = isinstance(value, ast.Name) and value.id in module_names
+            is_os_enumerator = (isinstance(value, ast.Name) and value.id in function_names) or (
+                isinstance(value, ast.Attribute)
+                and value.attr in _OS_DIRECTORY_ENUMERATORS
+                and isinstance(value.value, ast.Name)
+                and value.value.id in module_names
+            )
+            if not is_os_module and not is_os_enumerator:
+                continue
+            targets = (
+                assignment.targets if isinstance(assignment, ast.Assign) else (assignment.target,)
+            )
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                if is_os_module and target.id not in module_names:
+                    module_names.add(target.id)
+                    changed = True
+                if is_os_enumerator and target.id not in function_names:
+                    function_names.add(target.id)
+                    changed = True
     return module_names, function_names
 
 
@@ -777,7 +820,7 @@ def _directory_enumeration_signature(
     if not isinstance(function, ast.Attribute):
         return None
     if (
-        function.attr in {"listdir", "scandir", "walk"}
+        function.attr in _OS_DIRECTORY_ENUMERATORS
         and isinstance(function.value, ast.Name)
         and function.value.id in os_modules
     ):
@@ -1027,6 +1070,11 @@ def test_consuming_guard_rejects_unapproved_agents_dir_uses(addition: str) -> No
         "arbitrary.walk()\n",
         "import os as filesystem\nfilesystem.scandir(arbitrary)\n",
         "from os import walk as directory_walk\ndirectory_walk(arbitrary)\n",
+        "import os\nlocal_os = os\nlocal_os.listdir(arbitrary)\n",
+        "import os\nlocal_os = os\nrenamed_os = local_os\nrenamed_os.scandir(arbitrary)\n",
+        "import os\nenumerate_directory = os.listdir\nenumerate_directory(arbitrary)\n",
+        "import os\nenumerate_directory = os.walk\nenumerate_directory(arbitrary)\n"
+        "enumerate_directory = unrelated\n",
     ),
     ids=(
         "bound-name-filter",
@@ -1038,6 +1086,10 @@ def test_consuming_guard_rejects_unapproved_agents_dir_uses(addition: str) -> No
         "path-walk",
         "os-module-alias",
         "os-function-alias",
+        "assigned-os-module-alias",
+        "chained-os-module-alias",
+        "assigned-os-function-alias",
+        "reassigned-os-function-alias",
     ),
 )
 def test_consuming_guard_rejects_unapproved_directory_enumeration(addition: str) -> None:
@@ -1047,6 +1099,20 @@ def test_consuming_guard_rejects_unapproved_directory_enumeration(addition: str)
         _assert_consumer_uses_shared_agent_defs(
             source + f"\n{addition}", "test_agent_model_pins.py"
         )
+
+
+def test_consuming_guard_ignores_non_enumerating_os_aliases() -> None:
+    """Aliased ``os`` access remains allowed when no directory enumerator is called."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    _assert_consumer_uses_shared_agent_defs(
+        source + "\nimport os\n"
+        "local_os = os\n"
+        'alias_registry["os"] = os\n'
+        "renamed_os = local_os\n"
+        "current_directory = renamed_os.getcwd\n"
+        "current_directory()\n",
+        "test_agent_model_pins.py",
+    )
 
 
 @pytest.mark.parametrize(

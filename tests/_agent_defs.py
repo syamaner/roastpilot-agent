@@ -61,6 +61,8 @@ def agent_files(directory: Path = AGENTS_DIR) -> list[Path]:
     Raises:
         AgentFrontmatterError: If the roster directory is missing, invalid, or empty.
     """
+    if directory.is_symlink():
+        _error(directory, "agent roster directory is a symlink")
     if not directory.exists():
         _error(directory, "agent roster directory is missing")
     if not directory.is_dir():
