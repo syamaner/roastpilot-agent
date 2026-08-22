@@ -537,13 +537,20 @@ def _is_markdown_suffix_comparison(node: ast.AST, names: set[str]) -> bool:
     if not isinstance(node, ast.Compare):
         return False
     operands = (node.left, *node.comparators)
+    has_markdown_suffix = any(
+        isinstance(operand, ast.Attribute) and operand.attr == "suffix" for operand in operands
+    ) and any(isinstance(operand, ast.Constant) and operand.value == ".md" for operand in operands)
+    if not has_markdown_suffix:
+        return False
+    if not names:
+        return True
     return any(
         isinstance(operand, ast.Attribute)
         and operand.attr == "suffix"
         and isinstance(operand.value, ast.Name)
         and operand.value.id in names
         for operand in operands
-    ) and any(isinstance(operand, ast.Constant) and operand.value == ".md" for operand in operands)
+    )
 
 
 def _has_local_iterdir_markdown_roster(tree: ast.Module) -> bool:
@@ -1027,6 +1034,45 @@ def test_consuming_guard_ignores_nonmarkdown_for_iterdir_uses() -> None:
     _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
 
 
+@pytest.mark.parametrize("target", ("(path, metadata)", "[path, metadata]"))
+def test_consuming_guard_rejects_destructured_markdown_for_iterdir_rosters(target: str) -> None:
+    """Tuple and list loop targets cannot bypass statement-form roster detection."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source + (
+        '\nroster_directory = Path(".claude/agents")\n'
+        f"for {target} in roster_directory.iterdir():\n"
+        '    if path.suffix == ".md":\n'
+        "        pass\n"
+    )
+    with pytest.raises(AssertionError, match="local Markdown roster enumeration"):
+        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_accepts_destructured_nonmarkdown_for_iterdir_use() -> None:
+    """A structurally matching non-Markdown destructured scan remains unrelated."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source + (
+        '\nordinary_directory = Path(".")\n'
+        "for (path, metadata) in ordinary_directory.iterdir():\n"
+        '    if path.suffix == ".toml":\n'
+        "        pass\n"
+    )
+    _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_rejects_nonname_markdown_for_iterdir_target() -> None:
+    """A non-name loop target with a Markdown suffix check fails closed."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source + (
+        '\nroster_directory = Path(".claude/agents")\n'
+        "for state.path in roster_directory.iterdir():\n"
+        '    if state.path.suffix == ".md":\n'
+        "        pass\n"
+    )
+    with pytest.raises(AssertionError, match="local Markdown roster enumeration"):
+        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
 def test_static_binding_helpers_ignore_nonname_or_incomplete_assignments() -> None:
     """Defensive binding walkers ignore targets that cannot safely bind one name."""
     string_tree = _consumer_ast('(left, right) = "marker"\n', "bindings.py")
@@ -1037,6 +1083,12 @@ def test_static_binding_helpers_ignore_nonname_or_incomplete_assignments() -> No
         "regex-bindings.py",
     )
     assert _regex_import_bindings(regex_tree) == (set(), {"match"})
+
+
+def test_regex_import_bindings_ignores_nonparser_direct_imports() -> None:
+    """A direct ``re`` constant import cannot create parser provenance."""
+    tree = _consumer_ast("from re import IGNORECASE as local_flag\n", "regex-constant.py")
+    assert _regex_import_bindings(tree) == (set(), set())
 
 
 def test_markdown_suffix_comparison_ignores_noncompare_nodes() -> None:
