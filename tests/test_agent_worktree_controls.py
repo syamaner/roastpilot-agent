@@ -14,9 +14,9 @@ import re
 from pathlib import Path
 
 import pytest
+from _agent_defs import AGENTS_DIR, agent_files, agent_text, agent_tools, parse_frontmatter
 
 _REPO = Path(__file__).resolve().parents[1]
-_AGENTS_DIR = _REPO / ".claude" / "agents"
 _DISCIPLINE_HEADING = re.compile(
     r"^## [^\n]*worktree discipline[^\n]*$", re.IGNORECASE | re.MULTILINE
 )
@@ -142,35 +142,6 @@ _ADVERSARIAL_BLOCKS = (
 )
 
 
-def _agent_files() -> list[Path]:
-    """Return every agent definition from the authoritative directory roster."""
-    return sorted(_AGENTS_DIR.glob("*.md"))
-
-
-def _frontmatter(path: Path) -> dict[str, str]:
-    """Parse the simple ``key: value`` frontmatter used by agent definitions."""
-    text = path.read_text()
-    match = re.match(r"^---\n(.*?)\n---\n", text, re.S)
-    assert match, f"{path.name}: no YAML frontmatter"
-    fields: dict[str, str] = {}
-    for line in match.group(1).splitlines():
-        if ":" in line and not line.startswith((" ", "\t", "-")):
-            key, _, value = line.partition(":")
-            fields[key.strip()] = value.strip()
-    assert "tools" in fields, f"{path.name}: frontmatter has no tools field"
-    assert fields["tools"], f"{path.name}: frontmatter tools field is empty"
-    return fields
-
-
-def _tools(path: Path) -> set[str]:
-    """Return the parsed comma-separated frontmatter tool names."""
-    tools = {tool.strip() for tool in _frontmatter(path)["tools"].split(",")}
-    assert "" not in tools, f"{path.name}: frontmatter tools list is malformed"
-    malformed = [tool for tool in tools if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", tool)]
-    assert not malformed, f"{path.name}: malformed frontmatter tool names: {malformed}"
-    return tools
-
-
 def _discipline_section(text: str) -> str | None:
     """Return the worktree-discipline section through the next level-two heading."""
     heading = _DISCIPLINE_HEADING.search(text)
@@ -226,11 +197,12 @@ def _expected_variant(tools: set[str]) -> str:
     return _READ_ONLY_DISCIPLINE_BLOCK
 
 
-@pytest.mark.parametrize("path", _agent_files(), ids=lambda path: path.stem)
+@pytest.mark.parametrize("path", agent_files(), ids=lambda path: path.stem)
 def test_applicable_roles_carry_worktree_controls(path: Path) -> None:
     """Every Bash role and shell-less binding role carries its canonical control."""
-    tools = _tools(path)
-    text = path.read_text()
+    assert parse_frontmatter(path)["name"] == path.stem
+    tools = agent_tools(path)
+    text = agent_text(path)
     if "Bash" not in tools and "## Worktree discipline (topology §7 — binding)" not in text:
         return
 
@@ -397,7 +369,7 @@ def test_shared_checkout_direction_is_narrow_and_routed() -> None:
 
 def test_story_planner_remains_shell_and_write_closed() -> None:
     """A shell addition must force a conscious discipline-block decision."""
-    tools = _tools(_AGENTS_DIR / "story-planner.md")
+    tools = agent_tools(AGENTS_DIR / "story-planner.md")
     forbidden = {"Bash", "Edit", "Write"}
     assert tools.isdisjoint(forbidden), (
         "story-planner.md gained shell or write capability; decide whether to "
@@ -428,12 +400,15 @@ def test_runbook_line_citation_forms_are_detected(citation: str) -> None:
 
 def test_runbook_citations_never_use_line_anchors() -> None:
     """Runbook citations use durable section names, never line numbers."""
-    guarded = [
-        *_agent_files(),
-        *sorted((_REPO / "docs").rglob("*.md")),
-        _REPO / "AGENTS.md",
+    role_offenders = [
+        path.relative_to(_REPO)
+        for path in agent_files()
+        if _has_runbook_line_citation(agent_text(path))
     ]
-    offenders = [
-        path.relative_to(_REPO) for path in guarded if _has_runbook_line_citation(path.read_text())
+    ordinary_paths = [*sorted((_REPO / "docs").rglob("*.md")), _REPO / "AGENTS.md"]
+    offenders = role_offenders + [
+        path.relative_to(_REPO)
+        for path in ordinary_paths
+        if _has_runbook_line_citation(path.read_text())
     ]
     assert not offenders, f"line-anchored runbook citations found in: {offenders}"

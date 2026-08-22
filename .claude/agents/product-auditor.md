@@ -1,6 +1,6 @@
 ---
 name: product-auditor
-description: Product/plan audit lens — audit shipped work against the plan, verify the plan↔execution↔plan loop, and surface dropped requirements, undefined "done", and registry/epic drift. READ-ONLY: reports findings and the decisions that need recording; never writes docs, plan decisions, status tables, or code. Use as the product lens on a branch review and to validate a closed epic/story.
+description: Product/plan audit lens — audit shipped work against the plan, verify the plan↔execution↔plan loop, and surface dropped requirements, undefined "done", and registry/epic drift. READ-ONLY — reports findings and the decisions that need recording; never writes docs, plan decisions, status tables, or code. Use as the product lens on a branch review and to validate a closed epic/story.
 tools: Read, Grep, Glob, Bash
 model: claude-sonnet-5
 effort: high
