@@ -485,3 +485,24 @@ def test_consuming_guard_does_not_guess_unbound_regex_function_provenance() -> N
         '    match(r"^---\\n", "role body")\n'
     )
     _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        'local_regex = object()\nlocal_regex.compile(r"^---\\n")\n',
+        're = object()\nre.match(r"^---\\n", "role body")\n',
+    ),
+    ids=("unimported-attribute", "shadowed-re-attribute"),
+)
+def test_regex_frontmatter_call_requires_an_import_binding_for_attributes(source: str) -> None:
+    """Unimported or shadowed attribute calls cannot impersonate ``re`` parser calls."""
+    tree = _consumer_ast(source, "negative-control.py")
+    call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    )
+    module_names, function_names = _regex_import_bindings(tree)
+    assert module_names == function_names == set()
+    assert not _is_regex_frontmatter_call(call, module_names, function_names)
