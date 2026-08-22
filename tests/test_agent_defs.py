@@ -6,6 +6,7 @@ import ast
 from collections.abc import Callable
 from pathlib import Path
 
+import _agent_defs
 import pytest
 from _agent_defs import (
     AGENTS_DIR,
@@ -223,6 +224,9 @@ def test_split_frontmatter_allows_embedded_colons_in_plain_values() -> None:
         "-.5",
         ".5e2",
         "-.5E-2",
+        "+.INF",
+        "-.NaN",
+        "+.iNf",
         "2026-08-22",
         "2026-08-22T12:34:56Z",
     ),
@@ -297,6 +301,22 @@ def test_parse_frontmatter_and_agent_body_name_the_source(tmp_path: Path) -> Non
     valid.write_text(_document(body=body))
     assert agent_text(valid) == _document(body=body)
     assert agent_body(valid) == body
+
+
+def test_agent_body_reads_and_splits_the_definition_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Body extraction does not re-read an already-read role definition."""
+    path = tmp_path / "body.md"
+    reads: list[Path] = []
+
+    def read_once(actual_path: Path) -> str:
+        reads.append(actual_path)
+        return _document(body="Body\n")
+
+    monkeypatch.setattr(_agent_defs, "_read_agent", read_once)
+    assert agent_body(path) == "Body\n"
+    assert reads == [path]
 
 
 def test_parse_frontmatter_rejects_invalid_utf8_with_source_named_reason(tmp_path: Path) -> None:
@@ -388,17 +408,25 @@ def _valid_inline_flags(flags: str) -> bool:
     )
 
 
+def _has_frontmatter_regex_prefix(value: str) -> bool:
+    """Return whether a value starts with one bounded leading-marker regex form."""
+    if value.startswith(("---\n", "---\\n")):
+        return True
+    if not value.startswith("^---"):
+        return False
+    suffix = value.removeprefix("^---")
+    return not suffix or suffix.startswith(("$", "\\s", "\\n", " ", "\t", "\r", "\n"))
+
+
 def _is_frontmatter_marker_value(value: str) -> bool:
     """Return whether a value is an exact marker or valid regex-marker prefix."""
-    bare_markers = frozenset({"---", "---\n", "---\\n"})
-    regex_prefixes = ("^---\n", "^---\\n", "---\n", "---\\n")
-    if value in bare_markers or value.startswith(regex_prefixes):
+    if value in {"---", "---\n", "---\\n"} or _has_frontmatter_regex_prefix(value):
         return True
     inline_flags, separator, suffix = value.partition(")")
     if (
         not inline_flags.startswith("(?")
         or separator != ")"
-        or not suffix.startswith(regex_prefixes)
+        or not _has_frontmatter_regex_prefix(suffix)
     ):
         return False
     return _valid_inline_flags(inline_flags[2:])
@@ -439,6 +467,9 @@ def test_frontmatter_marker_detection_ignores_nonmarkers(value: str) -> None:
         "---\\n",
         "^---\n",
         "^---\\n",
+        "^---",
+        "^---$",
+        r"^---\s*$",
         "(?m)^---\n",
         "(?m)^---\\n",
         "(?im-sx)^---\\n",
@@ -562,21 +593,14 @@ def _is_regex_frontmatter_call(
 
 def _is_safe_agent_role_filename(node: ast.expr) -> bool:
     """Return whether an expression denotes one leaf role Markdown filename."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return (
-            node.value.endswith(".md")
-            and node.value != ".md"
-            and "/" not in node.value
-            and "\\" not in node.value
-            and ".." not in node.value
-        )
     return (
-        isinstance(node, ast.JoinedStr)
-        and len(node.values) == 2
-        and isinstance(node.values[0], ast.FormattedValue)
-        and isinstance(node.values[0].value, ast.Name)
-        and isinstance(node.values[1], ast.Constant)
-        and node.values[1].value == ".md"
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value.endswith(".md")
+        and node.value != ".md"
+        and "/" not in node.value
+        and "\\" not in node.value
+        and ".." not in node.value
     )
 
 
@@ -609,6 +633,9 @@ def _has_only_direct_agent_role_paths(tree: ast.Module) -> bool:
 
 
 _ROLE_TEXT_READ_METHODS = frozenset({"read_bytes", "read_text", "open"})
+_APPROVED_ROLE_PATH_SINKS = frozenset(
+    {"agent_body", "agent_text", "agent_tools", "parse_frontmatter"}
+)
 
 
 def _target_names(target: ast.expr) -> set[str]:
@@ -743,6 +770,18 @@ def _scope_has_unvalidated_role_text_read(
             ancestor = parents.get(id(ancestor))
         else:
             return True
+    for node in nodes:
+        if not isinstance(node, ast.Call):
+            continue
+        role_arguments = (*node.args, *(keyword.value for keyword in node.keywords))
+        if not any(
+            _is_direct_agent_role_path(argument)
+            or (isinstance(argument, ast.Name) and argument.id in path_names)
+            for argument in role_arguments
+        ):
+            continue
+        if not (isinstance(node.func, ast.Name) and node.func.id in _APPROVED_ROLE_PATH_SINKS):
+            return True
     return False
 
 
@@ -755,28 +794,48 @@ def _has_unvalidated_role_text_read(tree: ast.Module) -> bool:
     )
 
 
+def _called_shared_helpers(tree: ast.Module) -> set[str]:
+    """Return directly invoked names imported from the shared helper module."""
+    return {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+
 _ALLOWED_DIRECTORY_ENUMERATIONS: dict[str, dict[tuple[str, str, str, str], int]] = {
     "test_agent_model_pins.py": {("_CODEX_DIR", "agents", "glob", "*.toml"): 2},
     "test_agent_worktree_controls.py": {("_REPO", "docs", "rglob", "*.md"): 1},
 }
 _UNAPPROVED_DIRECTORY_ENUMERATION = ("", "", "", "")
 _OS_DIRECTORY_ENUMERATORS = frozenset({"listdir", "scandir", "walk"})
+_GLOB_DIRECTORY_ENUMERATORS = frozenset({"glob", "iglob"})
 
 
-def _os_enumeration_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
-    """Return imported and conservatively inherited ``os`` enumerator bindings."""
+def _directory_enumeration_bindings(
+    tree: ast.Module,
+) -> tuple[set[str], set[str], set[str], set[str]]:
+    """Return imported and conservatively inherited ``os`` and ``glob`` bindings."""
     module_names: set[str] = set()
     function_names: set[str] = set()
+    glob_module_names: set[str] = set()
+    glob_function_names: set[str] = set()
     assignments: list[ast.Assign | ast.AnnAssign] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name == "os":
                     module_names.add(alias.asname or "os")
+                elif alias.name == "glob":
+                    glob_module_names.add(alias.asname or "glob")
         elif isinstance(node, ast.ImportFrom) and node.module == "os" and node.level == 0:
             for alias in node.names:
                 if alias.name in _OS_DIRECTORY_ENUMERATORS:
                     function_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "glob" and node.level == 0:
+            for alias in node.names:
+                if alias.name in _GLOB_DIRECTORY_ENUMERATORS:
+                    glob_function_names.add(alias.asname or alias.name)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             assignments.append(node)
     changed = True
@@ -793,7 +852,16 @@ def _os_enumeration_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
                 and isinstance(value.value, ast.Name)
                 and value.value.id in module_names
             )
-            if not is_os_module and not is_os_enumerator:
+            is_glob_module = isinstance(value, ast.Name) and value.id in glob_module_names
+            is_glob_enumerator = (
+                isinstance(value, ast.Name) and value.id in glob_function_names
+            ) or (
+                isinstance(value, ast.Attribute)
+                and value.attr in _GLOB_DIRECTORY_ENUMERATORS
+                and isinstance(value.value, ast.Name)
+                and value.value.id in glob_module_names
+            )
+            if not any((is_os_module, is_os_enumerator, is_glob_module, is_glob_enumerator)):
                 continue
             targets = (
                 assignment.targets if isinstance(assignment, ast.Assign) else (assignment.target,)
@@ -807,15 +875,25 @@ def _os_enumeration_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
                 if is_os_enumerator and target.id not in function_names:
                     function_names.add(target.id)
                     changed = True
-    return module_names, function_names
+                if is_glob_module and target.id not in glob_module_names:
+                    glob_module_names.add(target.id)
+                    changed = True
+                if is_glob_enumerator and target.id not in glob_function_names:
+                    glob_function_names.add(target.id)
+                    changed = True
+    return module_names, function_names, glob_module_names, glob_function_names
 
 
 def _directory_enumeration_signature(
-    node: ast.Call, os_modules: set[str], os_functions: set[str]
+    node: ast.Call,
+    os_modules: set[str],
+    os_functions: set[str],
+    glob_modules: set[str],
+    glob_functions: set[str],
 ) -> tuple[str, str, str, str] | None:
     """Return an exact allowed-path signature, or an unapproved-enumerator sentinel."""
     function = node.func
-    if isinstance(function, ast.Name) and function.id in os_functions:
+    if isinstance(function, ast.Name) and function.id in os_functions | glob_functions:
         return _UNAPPROVED_DIRECTORY_ENUMERATION
     if not isinstance(function, ast.Attribute):
         return None
@@ -823,6 +901,12 @@ def _directory_enumeration_signature(
         function.attr in _OS_DIRECTORY_ENUMERATORS
         and isinstance(function.value, ast.Name)
         and function.value.id in os_modules
+    ):
+        return _UNAPPROVED_DIRECTORY_ENUMERATION
+    if (
+        function.attr in _GLOB_DIRECTORY_ENUMERATORS
+        and isinstance(function.value, ast.Name)
+        and function.value.id in glob_modules
     ):
         return _UNAPPROVED_DIRECTORY_ENUMERATION
     if function.attr not in {"iterdir", "glob", "rglob", "walk"}:
@@ -849,13 +933,15 @@ def _directory_enumeration_signature(
 
 def _has_only_allowed_directory_enumeration(tree: ast.Module, filename: str) -> bool:
     """Return whether every directory enumeration is one committed exact call site."""
-    os_modules, os_functions = _os_enumeration_bindings(tree)
+    os_modules, os_functions, glob_modules, glob_functions = _directory_enumeration_bindings(tree)
     expected = _ALLOWED_DIRECTORY_ENUMERATIONS[filename]
     observed = {signature: 0 for signature in expected}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        signature = _directory_enumeration_signature(node, os_modules, os_functions)
+        signature = _directory_enumeration_signature(
+            node, os_modules, os_functions, glob_modules, glob_functions
+        )
         if signature is None:
             continue
         if signature not in observed:
@@ -882,6 +968,9 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
     assert {alias.name for alias in imported.names} == expected_imports, (
         f"{filename}: _agent_defs imports drifted from the shared-consumer contract"
     )
+    expected_helper_calls = expected_imports - {"AGENTS_DIR"}
+    if not expected_helper_calls <= _called_shared_helpers(tree):
+        raise AssertionError(f"{filename}: every shared helper must be directly called")
     helpers = {
         node.name
         for node in tree.body
@@ -943,6 +1032,18 @@ def test_consuming_guard_accepts_current_direct_agent_role_reads(filename: str) 
     _assert_consumer_uses_shared_agent_defs((_REPO / "tests" / filename).read_text(), filename)
 
 
+def test_consuming_guard_requires_each_imported_shared_helper_directly_called() -> None:
+    """A local reinterpretation over validated text cannot make an import ornamental."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source.replace(
+        "parse_frontmatter(path)",
+        'dict(line.split(": ", 1) for line in agent_text(path).splitlines()[1:6])',
+    )
+    assert mutated != source
+    with pytest.raises(AssertionError, match="every shared helper must be directly called"):
+        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
 @pytest.mark.parametrize(
     "addition",
     (
@@ -978,6 +1079,13 @@ def test_consuming_guard_accepts_current_direct_agent_role_reads(filename: str) 
         "\nclass test_ClassRoleTextBypass:\n"
         "    for class_role_path in agent_files():\n"
         "        class_role_path.read_bytes()\n",
+        "\ndef test_role_path_open_sink() -> None:\n"
+        "    for path in agent_files():\n"
+        "        open(path)\n",
+        "\ndef test_aliased_role_path_sink() -> None:\n"
+        "    shared_wrapper = agent_text\n"
+        "    for path in agent_files():\n"
+        "        shared_wrapper(path)\n",
     ),
     ids=(
         "local-frontmatter-reparse",
@@ -991,6 +1099,8 @@ def test_consuming_guard_accepts_current_direct_agent_role_reads(filename: str) 
         "renamed-comprehension-alias",
         "module-scope",
         "class-scope",
+        "built-in-open-sink",
+        "aliased-shared-sink",
     ),
 )
 def test_consuming_guard_rejects_unvalidated_role_text_reads(addition: str) -> None:
@@ -1031,6 +1141,8 @@ def test_consuming_guard_ignores_nonenumerating_os_imports() -> None:
         'AGENTS_DIR / "nested/role.md"\n',
         'AGENTS_DIR / "../role.md"\n',
         'AGENTS_DIR / "role.md" / "nested"\n',
+        'AGENTS_DIR / f"{role}.md"\n',
+        'AGENTS_DIR / f"{role}/nested.md"\n',
     ),
     ids=(
         "bare-iterdir",
@@ -1040,6 +1152,8 @@ def test_consuming_guard_ignores_nonenumerating_os_imports() -> None:
         "path-separator",
         "traversal",
         "extended-role-path",
+        "dynamic-role-leaf",
+        "dynamic-nested-role-path",
     ),
 )
 def test_consuming_guard_rejects_unapproved_agents_dir_uses(addition: str) -> None:
@@ -1075,6 +1189,13 @@ def test_consuming_guard_rejects_unapproved_agents_dir_uses(addition: str) -> No
         "import os\nenumerate_directory = os.listdir\nenumerate_directory(arbitrary)\n",
         "import os\nenumerate_directory = os.walk\nenumerate_directory(arbitrary)\n"
         "enumerate_directory = unrelated\n",
+        "import glob\nglob.glob('*.md')\n",
+        "import glob as paths\npaths.iglob('*.md')\n",
+        "from glob import glob as enumerate_directory\nenumerate_directory('*.md')\n",
+        "import glob\nlocal_glob = glob\ninherited_glob = local_glob\n"
+        "inherited_glob.glob('*.md')\n",
+        "import glob\nenumerate_directory = glob.iglob\nenumerate_directory('*.md')\n"
+        "enumerate_directory = unrelated\n",
     ),
     ids=(
         "bound-name-filter",
@@ -1090,6 +1211,11 @@ def test_consuming_guard_rejects_unapproved_agents_dir_uses(addition: str) -> No
         "chained-os-module-alias",
         "assigned-os-function-alias",
         "reassigned-os-function-alias",
+        "glob-module",
+        "glob-module-alias",
+        "glob-function-import-alias",
+        "glob-module-assignment-chain",
+        "glob-function-reassignment",
     ),
 )
 def test_consuming_guard_rejects_unapproved_directory_enumeration(addition: str) -> None:
@@ -1101,8 +1227,8 @@ def test_consuming_guard_rejects_unapproved_directory_enumeration(addition: str)
         )
 
 
-def test_consuming_guard_ignores_non_enumerating_os_aliases() -> None:
-    """Aliased ``os`` access remains allowed when no directory enumerator is called."""
+def test_consuming_guard_ignores_non_enumerating_module_aliases() -> None:
+    """Aliased modules remain allowed when no directory enumerator is called."""
     source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
     _assert_consumer_uses_shared_agent_defs(
         source + "\nimport os\n"
@@ -1110,7 +1236,12 @@ def test_consuming_guard_ignores_non_enumerating_os_aliases() -> None:
         'alias_registry["os"] = os\n'
         "renamed_os = local_os\n"
         "current_directory = renamed_os.getcwd\n"
-        "current_directory()\n",
+        "current_directory()\n"
+        "import glob\n"
+        "local_glob = glob\n"
+        "local_glob.escape('*.md')\n"
+        "from glob import escape\n"
+        "escape('*.md')\n",
         "test_agent_model_pins.py",
     )
 

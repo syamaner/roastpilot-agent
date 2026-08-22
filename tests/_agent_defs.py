@@ -44,7 +44,7 @@ def _is_yaml_implicit_scalar(value: str) -> bool:
     lowered = value.lower()
     return (
         lowered in _YAML_IMPLICIT_WORDS
-        or _YAML_NUMBER.fullmatch(value) is not None
+        or _YAML_NUMBER.fullmatch(lowered) is not None
         or _YAML_DATE_LIKE.fullmatch(value) is not None
     )
 
@@ -192,7 +192,7 @@ def agent_body(path: Path) -> str:
     Raises:
         AgentFrontmatterError: If the definition cannot be read or is malformed.
     """
-    _fields, body = split_frontmatter(agent_text(path), source=path.name)
+    _fields, body = split_frontmatter(_read_agent(path), source=path.name)
     return body
 
 

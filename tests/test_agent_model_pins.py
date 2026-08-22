@@ -407,8 +407,9 @@ def test_installed_codex_exposes_required_agents_md_sections() -> None:
 
 def test_claude_implementation_roles_follow_slice_routing() -> None:
     """Claude implementation capacity remains leaf-only and slice-scoped."""
+    role_paths = {path.stem: path for path in agent_files()}
     for role in ("engineer-be", "engineer-fe"):
-        instructions = agent_text(AGENTS_DIR / f"{role}.md")
+        instructions = agent_text(role_paths[role])
         assert "one approved PR slice" in instructions
         assert "One PR per story" not in instructions
         assert "Do not invoke Codex or spawn agents" in instructions
