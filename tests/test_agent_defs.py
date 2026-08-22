@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -189,22 +191,183 @@ def test_parse_frontmatter_and_agent_body_name_the_source(tmp_path: Path) -> Non
     assert agent_body(valid) == body
 
 
+_CONSUMER_IMPORTS = {
+    "test_agent_worktree_controls.py": frozenset(
+        {"AGENTS_DIR", "agent_files", "agent_tools", "parse_frontmatter"}
+    ),
+    "test_agent_model_pins.py": frozenset(
+        {"AGENTS_DIR", "agent_body", "agent_files", "parse_frontmatter"}
+    ),
+}
+_CONSUMER_HELPERS = {
+    "test_agent_worktree_controls.py": frozenset(
+        {
+            "_canonical_block_mismatch",
+            "_discipline_section",
+            "_expected_variant",
+            "_has_runbook_line_citation",
+            "_javascript_agent_calls",
+            "_normalize_section_separator",
+            "_role_backed_agent_calls",
+            "_shared_checkout_direction",
+        }
+    ),
+    "test_agent_model_pins.py": frozenset(
+        {
+            "_assert_live_planning_and_assurance_pins",
+            "_model_family",
+            "_self_identified_families",
+        }
+    ),
+}
+
+
+def _consumer_ast(source: str, filename: str) -> ast.Module:
+    """Parse one governed test consumer as Python source."""
+    return ast.parse(source, filename=filename)
+
+
+def _string_bindings(tree: ast.Module) -> dict[str, str]:
+    """Return literal string bindings for AST pattern matching without execution."""
+    bindings: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            if isinstance(node.value.value, str):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        bindings[target.id] = node.value.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            bindings[node.target.id] = node.value.value
+    return bindings
+
+
+def _static_string(node: ast.expr, bindings: dict[str, str]) -> str | None:
+    """Resolve a direct or module-bound literal string without evaluating code."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return bindings.get(node.id)
+    return None
+
+
+def _is_frontmatter_marker(node: ast.expr, bindings: dict[str, str]) -> bool:
+    """Return whether a literal expression denotes a leading frontmatter marker."""
+    value = _static_string(node, bindings)
+    return value is not None and (value == "---\n" or value.startswith("^---\n"))
+
+
+def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
+    """Fail closed when a consumer restores local roster or parser machinery."""
+    expected_imports = _CONSUMER_IMPORTS[filename]
+    expected_helpers = _CONSUMER_HELPERS[filename]
+    tree = _consumer_ast(source, filename)
+    imports = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "_agent_defs" and node.level == 0
+    ]
+    assert len(imports) == 1, f"{filename}: expected one shared _agent_defs import"
+    imported = imports[0]
+    assert all(alias.asname is None for alias in imported.names), (
+        f"{filename}: _agent_defs imports must not be aliased"
+    )
+    assert {alias.name for alias in imported.names} == expected_imports, (
+        f"{filename}: _agent_defs imports drifted from the shared-consumer contract"
+    )
+
+    helpers = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and not node.name.startswith("test_")
+    }
+    assert helpers == expected_helpers, (
+        f"{filename}: non-test top-level helpers drifted from the closed helper set"
+    )
+
+    bindings = _string_bindings(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "glob" and any(
+                _static_string(argument, bindings) == "*.md" for argument in node.args
+            ):
+                raise AssertionError(f"{filename}: local Markdown roster glob is forbidden")
+            if node.func.attr == "startswith" and any(
+                _is_frontmatter_marker(argument, bindings) for argument in node.args
+            ):
+                raise AssertionError(f"{filename}: local leading-frontmatter parser is forbidden")
+        if isinstance(node, ast.Compare) and any(
+            _is_frontmatter_marker(operand, bindings) for operand in (node.left, *node.comparators)
+        ):
+            raise AssertionError(f"{filename}: local leading-frontmatter parser is forbidden")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "re"
+            and node.func.attr in {"compile", "match", "search", "fullmatch"}
+            and any(_is_frontmatter_marker(argument, bindings) for argument in node.args)
+        ):
+            raise AssertionError(f"{filename}: local leading-frontmatter parser is forbidden")
+
+
 def test_consuming_guards_use_only_the_shared_roster_and_parser() -> None:
     """Neither consumer may restore a local roster glob or frontmatter/body parser."""
-    required_imports = {
-        "test_agent_worktree_controls.py": {"agent_files", "parse_frontmatter", "agent_tools"},
-        "test_agent_model_pins.py": {"agent_files", "parse_frontmatter", "agent_body"},
-    }
-    local_roster = '_REPO / ".claude" / ' + '"agents"'
-    frontmatter_anchor = 'r"' + "^" + "---"
-    for filename, names in required_imports.items():
-        text = (_REPO / "tests" / filename).read_text()
-        assert "from _agent_defs import" in text
-        assert all(name in text for name in names)
-        assert "AGENTS_DIR.glob(" not in text
-        assert local_roster not in text
-        assert "def _agent_files" not in text
-        assert "def _frontmatter" not in text
-        assert "def _tools" not in text
-        assert "def _body" not in text
-        assert frontmatter_anchor not in text
+    for filename in _CONSUMER_IMPORTS:
+        _assert_consumer_uses_shared_agent_defs((_REPO / "tests" / filename).read_text(), filename)
+
+
+def _rename_consumer_helper(source: str) -> str:
+    """Mutate a consumer helper name without changing its implementation."""
+    return source.replace("def _discipline_section", "def _renamed_local_parser", 1)
+
+
+def _add_reformatted_roster_glob(source: str) -> str:
+    """Add a formatting-insensitive local Markdown roster glob mutation."""
+    return (
+        source + '\nroster_directory = Path(".claude/agents")\nroster_directory . glob ( "*.md" )\n'
+    )
+
+
+def _add_startswith_frontmatter_parser(source: str) -> str:
+    """Add a direct leading-frontmatter marker parser mutation."""
+    return source + '\nfrontmatter_text = "role body"\nfrontmatter_text.startswith("---\\n")\n'
+
+
+_CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
+    (
+        "test_agent_worktree_controls.py",
+        _rename_consumer_helper,
+        "non-test top-level helpers",
+    ),
+    (
+        "test_agent_worktree_controls.py",
+        _add_reformatted_roster_glob,
+        "local Markdown roster glob",
+    ),
+    (
+        "test_agent_model_pins.py",
+        _add_startswith_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("filename", "mutation", "expected"),
+    _CONSUMER_MUTATIONS,
+    ids=("renamed-helper", "reformatted-roster-glob", "startswith-parser"),
+)
+def test_consuming_guard_rejects_local_parser_and_roster_mutations(
+    filename: str, mutation: Callable[[str], str], expected: str
+) -> None:
+    """Structural guard rejects renamed helpers and syntax-insensitive bypasses."""
+    source = (_REPO / "tests" / filename).read_text()
+    mutated = mutation(source)
+    with pytest.raises(AssertionError, match=expected):
+        _assert_consumer_uses_shared_agent_defs(mutated, filename)
