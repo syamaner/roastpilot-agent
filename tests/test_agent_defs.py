@@ -420,22 +420,47 @@ def test_frontmatter_marker_detection_accepts_exact_bare_and_regex_forms(value: 
 
 
 def test_consumer_guard_ignores_marker_like_unrelated_keyword_values() -> None:
-    """Only parser patterns, glob patterns, and startswith prefixes are inspected."""
+    """Ordinary keyword values remain outside the marker and roster predicates."""
     source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
     unrelated_startswith = "".join(
         (
             '\nfrontmatter_text = "role body"\n',
-            'frontmatter_text.startswith("ordinary", start="---\\n")\n',
+            'frontmatter_text.startswith("ordinary", start="also ordinary")\n',
         )
     )
     mutated = (
         source
         + (
-            '\nre.compile("ordinary", flags="^---\\n")\n'
+            '\nre.compile("ordinary", flags="ordinary")\n'
             'roster_directory = Path(".")\nroster_directory.glob("ordinary", recursive="*.md")\n'
         )
         + unrelated_startswith
     )
+    _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
+@pytest.mark.parametrize(
+    "expression",
+    (
+        'frontmatter_text.split("---\\n")',
+        'frontmatter_text.partition("---\\n")',
+        're.compile(r"^---\\n(.*?)\\n---\\n")',
+        'frontmatter_text.startswith("---\\n")',
+    ),
+    ids=("split", "partition", "historical-regex", "startswith"),
+)
+def test_consuming_guard_rejects_frontmatter_marker_constants_in_any_api(expression: str) -> None:
+    """A marker literal is forbidden even when its surrounding API drifts."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source + f'\nfrontmatter_text = "role body"\n{expression}\n'
+    with pytest.raises(AssertionError, match="local leading-frontmatter parser"):
+        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_allows_ordinary_delimiter_text() -> None:
+    """Ordinary delimiter-like text remains outside the conservative marker predicate."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source + '\nfrontmatter_text = "role body"\nfrontmatter_text.split("--- ")\n'
     _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
 
 
@@ -520,6 +545,54 @@ def _is_docs_markdown_scan(node: ast.Call) -> bool:
         and function.value.left.id == "_REPO"
         and isinstance(function.value.right, ast.Constant)
         and function.value.right.value == "docs"
+    )
+
+
+def _is_safe_agent_role_filename(node: ast.expr) -> bool:
+    """Return whether an expression denotes one leaf role Markdown filename."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return (
+            node.value.endswith(".md")
+            and node.value != ".md"
+            and "/" not in node.value
+            and "\\" not in node.value
+            and ".." not in node.value
+        )
+    return (
+        isinstance(node, ast.JoinedStr)
+        and len(node.values) == 2
+        and isinstance(node.values[0], ast.FormattedValue)
+        and isinstance(node.values[0].value, ast.Name)
+        and isinstance(node.values[1], ast.Constant)
+        and node.values[1].value == ".md"
+    )
+
+
+def _has_only_direct_agent_role_paths(tree: ast.Module) -> bool:
+    """Return whether every ``AGENTS_DIR`` name is a direct safe role-file path."""
+    direct_paths = {
+        id(node): node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Div)
+        and isinstance(node.left, ast.Name)
+        and node.left.id == "AGENTS_DIR"
+        and _is_safe_agent_role_filename(node.right)
+    }
+    extended_paths = {
+        id(node.left)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Div)
+        and isinstance(node.left, ast.BinOp)
+    }
+    allowed_names = {
+        id(node.left) for path_id, node in direct_paths.items() if path_id not in extended_paths
+    }
+    return all(
+        id(node) in allowed_names
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id == "AGENTS_DIR"
     )
 
 
@@ -612,9 +685,17 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
 
     bindings = _string_bindings(tree)
     regex_modules, regex_functions = _regex_import_bindings(tree)
+    if not _has_only_direct_agent_role_paths(tree):
+        raise AssertionError(f"{filename}: AGENTS_DIR use must name one direct role file")
     if _has_local_iterdir_markdown_roster(tree):
         raise AssertionError(f"{filename}: local Markdown roster enumeration is forbidden")
     for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and _is_frontmatter_marker_value(node.value)
+        ):
+            raise AssertionError(f"{filename}: local leading-frontmatter parser is forbidden")
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if (
                 node.func.attr in {"glob", "rglob"}
@@ -648,6 +729,42 @@ def test_consuming_guards_use_only_the_shared_roster_and_parser() -> None:
     """Neither consumer may restore a local roster glob or frontmatter/body parser."""
     for filename in _CONSUMER_IMPORTS:
         _assert_consumer_uses_shared_agent_defs((_REPO / "tests" / filename).read_text(), filename)
+
+
+@pytest.mark.parametrize("filename", tuple(_CONSUMER_IMPORTS))
+def test_consuming_guard_accepts_current_direct_agent_role_reads(filename: str) -> None:
+    """Committed direct role reads and ``agent_tools`` calls retain their narrow provenance."""
+    _assert_consumer_uses_shared_agent_defs((_REPO / "tests" / filename).read_text(), filename)
+
+
+@pytest.mark.parametrize(
+    "addition",
+    (
+        "AGENTS_DIR.iterdir()\n",
+        "for path in AGENTS_DIR.iterdir():\n    if path.name.endswith('.md'):\n        pass\n",
+        "role_directory = AGENTS_DIR\nrole_directory.iterdir()\n",
+        "import os\nos.listdir(AGENTS_DIR)\nos.scandir(AGENTS_DIR)\n",
+        'AGENTS_DIR / "nested/role.md"\n',
+        'AGENTS_DIR / "../role.md"\n',
+        'AGENTS_DIR / "role.md" / "nested"\n',
+    ),
+    ids=(
+        "bare-iterdir",
+        "name-filtered-iterdir",
+        "alias-enumeration",
+        "os-enumeration",
+        "path-separator",
+        "traversal",
+        "extended-role-path",
+    ),
+)
+def test_consuming_guard_rejects_unapproved_agents_dir_uses(addition: str) -> None:
+    """No API can turn ``AGENTS_DIR`` into a roster-enumeration capability."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    with pytest.raises(AssertionError, match="AGENTS_DIR use must name one direct role file"):
+        _assert_consumer_uses_shared_agent_defs(
+            source + f"\n{addition}", "test_agent_model_pins.py"
+        )
 
 
 def _rename_consumer_helper(source: str) -> str:
@@ -987,7 +1104,7 @@ def test_consuming_guard_does_not_guess_unbound_regex_function_provenance() -> N
         "\ndef test_unrelated_match_name() -> None:\n"
         "    def match(pattern: str, text: str) -> None:\n"
         "        del pattern, text\n"
-        '    match(r"^---\\n", "role body")\n'
+        '    match(r"^----", "role body")\n'
     )
     _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
 
@@ -995,7 +1112,7 @@ def test_consuming_guard_does_not_guess_unbound_regex_function_provenance() -> N
 def test_consuming_guard_ignores_unimported_callable_aliases() -> None:
     """An ordinary local alias cannot impersonate a regex parser callable."""
     source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
-    mutated = source + ('\nlocal_match = ordinary_callable\nlocal_match(r"^---\\n", "role body")\n')
+    mutated = source + ('\nlocal_match = ordinary_callable\nlocal_match(r"^----", "role body")\n')
     _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
 
 
@@ -1005,7 +1122,7 @@ def test_consuming_guard_ignores_unimported_module_aliases() -> None:
     mutated = source + (
         "\nordinary_module = object()\n"
         "local_regex = ordinary_module\n"
-        'local_regex.compile(r"^---\\n")\n'
+        'local_regex.compile(r"^----")\n'
     )
     _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
 
