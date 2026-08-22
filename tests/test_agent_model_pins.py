@@ -22,9 +22,9 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from _agent_defs import AGENTS_DIR, agent_body, agent_files, parse_frontmatter
 
 _REPO = Path(__file__).resolve().parents[1]
-_AGENTS_DIR = _REPO / ".claude" / "agents"
 _CODEX_DIR = _REPO / ".codex"
 _PROJECT_DOC_MAX_BYTES = 131072
 
@@ -52,34 +52,17 @@ _EXPECTED_CODEX: dict[str, tuple[str, str]] = {
 }
 
 
-def _frontmatter(path: Path) -> dict[str, str]:
-    """Return the simple ``key: value`` frontmatter fields of an agent file."""
-    text = path.read_text()
-    match = re.match(r"^---\n(.*?)\n---\n", text, re.S)
-    assert match, f"{path.name}: no YAML frontmatter"
-    fields: dict[str, str] = {}
-    for line in match.group(1).splitlines():
-        if ":" in line and not line.startswith((" ", "\t", "-")):
-            key, _, value = line.partition(":")
-            fields[key.strip()] = value.strip()
-    return fields
-
-
-def _agent_files() -> list[Path]:
-    return sorted(_AGENTS_DIR.glob("*.md"))
-
-
 def test_every_expected_agent_exists() -> None:
-    on_disk = {p.stem for p in _agent_files()}
+    on_disk = {p.stem for p in agent_files()}
     assert on_disk == set(_EXPECTED), (
         f"agent set drifted from the map: only-on-disk={on_disk - set(_EXPECTED)}, "
         f"only-in-map={set(_EXPECTED) - on_disk}"
     )
 
 
-@pytest.mark.parametrize("path", _agent_files(), ids=lambda p: p.stem)
+@pytest.mark.parametrize("path", agent_files(), ids=lambda p: p.stem)
 def test_agent_model_and_effort_match_the_map(path: Path) -> None:
-    fm = _frontmatter(path)
+    fm = parse_frontmatter(path)
     name = fm.get("name")
     assert name == path.stem, (
         f"{path.name}: frontmatter name {name!r} must equal the filename stem "
@@ -96,9 +79,9 @@ def test_agent_model_and_effort_match_the_map(path: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("path", _agent_files(), ids=lambda p: p.stem)
+@pytest.mark.parametrize("path", agent_files(), ids=lambda p: p.stem)
 def test_no_agent_uses_a_floating_alias(path: Path) -> None:
-    model = _frontmatter(path).get("model", "")
+    model = parse_frontmatter(path).get("model", "")
     assert model not in _ALIASES, f"{path.stem}: model {model!r} is a floating alias; pin a full ID"
     assert model.startswith("claude-"), f"{path.stem}: model {model!r} is not a full ID"
 
@@ -123,15 +106,7 @@ def _self_identified_families(body: str) -> set[str]:
     return {match.group(1).lower() for match in _SELF_IDENTIFICATION.finditer(body)}
 
 
-def _body(path: Path) -> str:
-    """Return the agent file's prose body, after its YAML frontmatter block."""
-    text = path.read_text()
-    match = re.match(r"^---\n.*?\n---\n", text, re.S)
-    assert match, f"{path.name}: no YAML frontmatter"
-    return text[match.end() :]
-
-
-@pytest.mark.parametrize("path", _agent_files(), ids=lambda p: p.stem)
+@pytest.mark.parametrize("path", agent_files(), ids=lambda p: p.stem)
 def test_agent_body_never_self_identifies_as_an_inconsistent_model_family(path: Path) -> None:
     """A role body must never claim a model family other than its own frontmatter pin.
 
@@ -139,9 +114,9 @@ def test_agent_body_never_self_identifies_as_an_inconsistent_model_family(path: 
     the motivating case: its frontmatter pins ``claude-opus-5``, so a body claim
     of any OTHER family — including that exact retired sentence — must fail.
     """
-    fm = _frontmatter(path)
+    fm = parse_frontmatter(path)
     pinned_family = _model_family(fm["model"])
-    claimed = _self_identified_families(_body(path))
+    claimed = _self_identified_families(agent_body(path))
     assert claimed <= {pinned_family}, (
         f"{path.stem}: body self-identifies as {sorted(claimed - {pinned_family})}, "
         f"inconsistent with its frontmatter pin family {pinned_family!r}"
@@ -433,24 +408,24 @@ def test_installed_codex_exposes_required_agents_md_sections() -> None:
 def test_claude_implementation_roles_follow_slice_routing() -> None:
     """Claude implementation capacity remains leaf-only and slice-scoped."""
     for role in ("engineer-be", "engineer-fe"):
-        instructions = (_AGENTS_DIR / f"{role}.md").read_text()
+        instructions = (AGENTS_DIR / f"{role}.md").read_text()
         assert "one approved PR slice" in instructions
         assert "One PR per story" not in instructions
         assert "Do not invoke Codex or spawn agents" in instructions
 
-    planner = (_AGENTS_DIR / "story-planner.md").read_text()
+    planner = (AGENTS_DIR / "story-planner.md").read_text()
     assert "Codex-MCP" not in planner
     assert "budget stop" not in planner
     for status in ("healthy", "constrained", "reserve-only"):
         assert f"`{status}`" in planner
 
-    architect = (_AGENTS_DIR / "planning-architect.md").read_text()
+    architect = (AGENTS_DIR / "planning-architect.md").read_text()
     assert "Opus PM" not in architect
     assert "Codex parent orchestrator to adjudicate" in architect
     assert "Codex parent owns delivery orchestration and\nscope decomposition" in architect
     assert "human retains product authority per `AGENTS.md`" in architect
 
-    frontend = (_AGENTS_DIR / "engineer-fe.md").read_text()
+    frontend = (AGENTS_DIR / "engineer-fe.md").read_text()
     assert "E10 status table" not in frontend
     assert "contract-named epic's status table\n  and registry" in frontend
 
