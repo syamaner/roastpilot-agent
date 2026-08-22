@@ -342,9 +342,17 @@ def _is_frontmatter_marker(node: ast.expr, bindings: dict[str, frozenset[str]]) 
     return any(_is_frontmatter_marker_value(value) for value in _static_strings(node, bindings))
 
 
-def _call_values(node: ast.Call) -> tuple[ast.expr, ...]:
-    """Return explicit positional and keyword argument values from one call."""
-    return (*node.args, *(keyword.value for keyword in node.keywords if keyword.arg is not None))
+def _first_call_value(node: ast.Call) -> tuple[ast.expr, ...]:
+    """Return the first positional operand for an API with positional-only input."""
+    return tuple(node.args[:1])
+
+
+def _pattern_call_values(node: ast.Call) -> tuple[ast.expr, ...]:
+    """Return a parser pattern from its first positional or explicit ``pattern=`` argument."""
+    return (
+        *_first_call_value(node),
+        *(keyword.value for keyword in node.keywords if keyword.arg == "pattern"),
+    )
 
 
 @pytest.mark.parametrize(
@@ -374,6 +382,26 @@ def test_frontmatter_marker_detection_ignores_nonmarkers(value: str) -> None:
 def test_frontmatter_marker_detection_accepts_exact_bare_and_regex_forms(value: str) -> None:
     """Only exact actual or escaped-newline frontmatter markers are admitted."""
     assert _is_frontmatter_marker(ast.Constant(value=value), {})
+
+
+def test_consumer_guard_ignores_marker_like_unrelated_keyword_values() -> None:
+    """Only parser patterns, glob patterns, and startswith prefixes are inspected."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    unrelated_startswith = "".join(
+        (
+            '\nfrontmatter_text = "role body"\n',
+            'frontmatter_text.startswith("ordinary", start="---\\n")\n',
+        )
+    )
+    mutated = (
+        source
+        + (
+            '\nre.compile("ordinary", flags="^---\\n")\n'
+            'roster_directory = Path(".")\nroster_directory.glob("ordinary", recursive="*.md")\n'
+        )
+        + unrelated_startswith
+    )
+    _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
 
 
 _REGEX_FRONTMATTER_CALLS = frozenset({"compile", "match", "search", "fullmatch"})
@@ -446,11 +474,12 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if node.func.attr == "glob" and any(
-                "*.md" in _static_strings(argument, bindings) for argument in _call_values(node)
+                "*.md" in _static_strings(argument, bindings)
+                for argument in _pattern_call_values(node)
             ):
                 raise AssertionError(f"{filename}: local Markdown roster glob is forbidden")
             if node.func.attr == "startswith" and any(
-                _is_frontmatter_marker(argument, bindings) for argument in _call_values(node)
+                _is_frontmatter_marker(argument, bindings) for argument in _first_call_value(node)
             ):
                 raise AssertionError(f"{filename}: local leading-frontmatter parser is forbidden")
         if isinstance(node, ast.Compare) and any(
@@ -460,7 +489,10 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
         if (
             isinstance(node, ast.Call)
             and _is_regex_frontmatter_call(node, regex_modules, regex_functions)
-            and any(_is_frontmatter_marker(argument, bindings) for argument in _call_values(node))
+            and any(
+                _is_frontmatter_marker(argument, bindings)
+                for argument in _pattern_call_values(node)
+            )
         ):
             raise AssertionError(f"{filename}: local leading-frontmatter parser is forbidden")
 
