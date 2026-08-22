@@ -185,6 +185,41 @@ def test_split_frontmatter_allows_embedded_colons_in_plain_values() -> None:
 
 @pytest.mark.parametrize(
     "value",
+    (
+        "null",
+        "TRUE",
+        "off",
+        "0",
+        "-12",
+        "1.5",
+        "1e3",
+        "0x10",
+        "2026-08-22",
+        "2026-08-22T12:34:56Z",
+    ),
+)
+def test_split_frontmatter_rejects_yaml_implicit_scalar_spellings(value: str) -> None:
+    """Plain YAML values that loaders coerce cannot enter closed frontmatter."""
+    malformed = _document().replace("name: example\n", f"name: {value}\n", 1)
+    with pytest.raises(AgentFrontmatterError, match="frontmatter field value"):
+        split_frontmatter(malformed, source="implicit.md")
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("nullish", "true-blue", "onward", "v1.0", "2026-08-plan"),
+)
+def test_split_frontmatter_allows_ordinary_implicit_type_lookalikes(value: str) -> None:
+    """Conservative scalar rejection does not consume ordinary role prose."""
+    fields, _body = split_frontmatter(
+        _document({**_fields(), "description": value}),
+        source="lookalike.md",
+    )
+    assert fields["description"] == value
+
+
+@pytest.mark.parametrize(
+    "value",
     ("example ", "example # comment", "example\tvalue", "example\x7fvalue"),
     ids=("trailing-space", "inline-comment", "tab", "delete-control"),
 )
@@ -404,11 +439,13 @@ def test_consumer_guard_ignores_marker_like_unrelated_keyword_values() -> None:
     _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
 
 
-_REGEX_FRONTMATTER_CALLS = frozenset({"compile", "match", "search", "fullmatch"})
+_REGEX_FRONTMATTER_CALLS = frozenset(
+    {"compile", "findall", "finditer", "fullmatch", "match", "search", "split", "sub", "subn"}
+)
 
 
 def _regex_import_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
-    """Resolve imports and conservatively inherited ``re`` parser callable names."""
+    """Resolve imports and conservatively inherited ``re`` module and callable names."""
     module_names: set[str] = set()
     function_names: set[str] = set()
     assignments: list[ast.Assign | ast.AnnAssign] = []
@@ -432,19 +469,25 @@ def _regex_import_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
             value = assignment.value
             if value is None:
                 continue
+            is_regex_module = isinstance(value, ast.Name) and value.id in module_names
             is_regex_callable = (isinstance(value, ast.Name) and value.id in function_names) or (
                 isinstance(value, ast.Attribute)
                 and value.attr in _REGEX_FRONTMATTER_CALLS
                 and isinstance(value.value, ast.Name)
                 and value.value.id in module_names
             )
-            if not is_regex_callable:
+            if not is_regex_module and not is_regex_callable:
                 continue
             targets = (
                 assignment.targets if isinstance(assignment, ast.Assign) else (assignment.target,)
             )
             for target in targets:
-                if isinstance(target, ast.Name) and target.id not in function_names:
+                if not isinstance(target, ast.Name):
+                    continue
+                if is_regex_module and target.id not in module_names:
+                    module_names.add(target.id)
+                    changed = True
+                if is_regex_callable and target.id not in function_names:
                     function_names.add(target.id)
                     changed = True
     return module_names, function_names
@@ -480,6 +523,57 @@ def _is_docs_markdown_scan(node: ast.Call) -> bool:
     )
 
 
+def _iterdir_target_names(target: ast.expr) -> set[str]:
+    """Return simple loop target names without evaluating destructuring expressions."""
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return {name for element in target.elts for name in _iterdir_target_names(element)}
+    return set()
+
+
+def _is_markdown_suffix_comparison(node: ast.AST, names: set[str]) -> bool:
+    """Return whether a comparison filters one iterated name to Markdown suffixes."""
+    if not isinstance(node, ast.Compare):
+        return False
+    operands = (node.left, *node.comparators)
+    return any(
+        isinstance(operand, ast.Attribute)
+        and operand.attr == "suffix"
+        and isinstance(operand.value, ast.Name)
+        and operand.value.id in names
+        for operand in operands
+    ) and any(isinstance(operand, ast.Constant) and operand.value == ".md" for operand in operands)
+
+
+def _has_local_iterdir_markdown_roster(tree: ast.Module) -> bool:
+    """Return whether a consumer enumerates Markdown roles through ``iterdir``."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            for generator in node.generators:
+                if not (
+                    isinstance(generator.iter, ast.Call)
+                    and isinstance(generator.iter.func, ast.Attribute)
+                    and generator.iter.func.attr == "iterdir"
+                ):
+                    continue
+                names = _iterdir_target_names(generator.target)
+                if any(
+                    _is_markdown_suffix_comparison(condition, names) for condition in generator.ifs
+                ):
+                    return True
+        elif (
+            isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Attribute)
+            and node.iter.func.attr == "iterdir"
+        ):
+            names = _iterdir_target_names(node.target)
+            if any(_is_markdown_suffix_comparison(child, names) for child in ast.walk(node)):
+                return True
+    return False
+
+
 def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
     """Fail closed when a consumer restores local roster or parser machinery."""
     expected_imports = _CONSUMER_IMPORTS[filename]
@@ -511,6 +605,8 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
 
     bindings = _string_bindings(tree)
     regex_modules, regex_functions = _regex_import_bindings(tree)
+    if _has_local_iterdir_markdown_roster(tree):
+        raise AssertionError(f"{filename}: local Markdown roster enumeration is forbidden")
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if (
@@ -569,6 +665,14 @@ def _add_keyword_roster_glob(source: str) -> str:
 def _add_recursive_roster_glob(source: str) -> str:
     """Add a recursive local Markdown roster glob mutation."""
     return source + '\nroster_directory = Path(".claude/agents")\nroster_directory.rglob("*.md")\n'
+
+
+def _add_iterdir_roster_enumeration(source: str) -> str:
+    """Add a local Markdown roster enumeration through ``iterdir`` and suffix."""
+    return source + (
+        '\nroster_directory = Path(".claude/agents")\n'
+        'roster_paths = [path for path in roster_directory.iterdir() if path.suffix == ".md"]\n'
+    )
 
 
 def _add_startswith_frontmatter_parser(source: str) -> str:
@@ -662,6 +766,34 @@ def _add_reassigned_callable_alias_frontmatter_parser(source: str) -> str:
     )
 
 
+def _add_module_assignment_alias_frontmatter_parser(source: str) -> str:
+    """Bind the ``re`` module through an alias chain before parsing a marker."""
+    return source + (
+        "\nlocal_regex = re\n"
+        "inherited_regex = local_regex\n"
+        'inherited_regex.compile(r"^---\\n", re.S)\n'
+    )
+
+
+def _add_reassigned_module_alias_frontmatter_parser(source: str) -> str:
+    """Prove a later module-alias reassignment cannot hide a trusted origin."""
+    return source + (
+        '\nlocal_regex = re\nlocal_regex = ordinary_module\nlocal_regex.compile(r"^---\\n", re.S)\n'
+    )
+
+
+def _regex_api_frontmatter_mutation(source: str, api: str) -> str:
+    """Add one standard ``re`` pattern API mutation using a full frontmatter parser."""
+    pattern = 'r"^---\\n(.*?)\\n---\\n"'
+    if api in {"sub", "subn"}:
+        call = f"re.{api}({pattern}, '', 'role body')"
+    elif api == "compile":
+        call = f"re.{api}({pattern})"
+    else:
+        call = f"re.{api}({pattern}, 'role body')"
+    return source + f"\nlocal_frontmatter = {call}\n"
+
+
 _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
     (
         "test_agent_worktree_controls.py",
@@ -682,6 +814,11 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         "test_agent_worktree_controls.py",
         _add_recursive_roster_glob,
         "local Markdown roster glob",
+    ),
+    (
+        "test_agent_worktree_controls.py",
+        _add_iterdir_roster_enumeration,
+        "local Markdown roster enumeration",
     ),
     (
         "test_agent_model_pins.py",
@@ -758,6 +895,16 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         _add_reassigned_callable_alias_frontmatter_parser,
         "local leading-frontmatter parser",
     ),
+    (
+        "test_agent_model_pins.py",
+        _add_module_assignment_alias_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
+    (
+        "test_agent_model_pins.py",
+        _add_reassigned_module_alias_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
 )
 
 
@@ -769,6 +916,7 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         "reformatted-roster-glob",
         "keyword-roster-glob",
         "recursive-roster-glob",
+        "iterdir-roster-enumeration",
         "startswith-parser",
         "bare-marker-check",
         "raw-regex-parser",
@@ -784,6 +932,8 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         "inline-flag-regex-parser",
         "callable-alias-regex-parser",
         "reassigned-callable-alias-regex-parser",
+        "module-assignment-alias-regex-parser",
+        "reassigned-module-alias-regex-parser",
     ),
 )
 def test_consuming_guard_rejects_local_parser_and_roster_mutations(
@@ -794,6 +944,16 @@ def test_consuming_guard_rejects_local_parser_and_roster_mutations(
     mutated = mutation(source)
     with pytest.raises(AssertionError, match=expected):
         _assert_consumer_uses_shared_agent_defs(mutated, filename)
+
+
+@pytest.mark.parametrize("api", sorted(_REGEX_FRONTMATTER_CALLS))
+def test_consuming_guard_rejects_all_standard_regex_frontmatter_apis(api: str) -> None:
+    """Every standalone standard ``re`` pattern API remains bound to the guard."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    with pytest.raises(AssertionError, match="local leading-frontmatter parser"):
+        _assert_consumer_uses_shared_agent_defs(
+            _regex_api_frontmatter_mutation(source, api), "test_agent_model_pins.py"
+        )
 
 
 def test_consuming_guard_does_not_guess_unbound_regex_function_provenance() -> None:
@@ -812,6 +972,28 @@ def test_consuming_guard_ignores_unimported_callable_aliases() -> None:
     """An ordinary local alias cannot impersonate a regex parser callable."""
     source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
     mutated = source + ('\nlocal_match = ordinary_callable\nlocal_match(r"^---\\n", "role body")\n')
+    _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_ignores_unimported_module_aliases() -> None:
+    """An ordinary local module-like alias cannot impersonate imported ``re``."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source + (
+        "\nordinary_module = object()\n"
+        "local_regex = ordinary_module\n"
+        'local_regex.compile(r"^---\\n")\n'
+    )
+    _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_ignores_nonmarkdown_iterdir_uses() -> None:
+    """An unrelated directory suffix filter is not mistaken for the role roster."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source + (
+        '\nordinary_directory = Path(".")\n'
+        "ordinary_paths = [path for path in ordinary_directory.iterdir() "
+        'if path.suffix == ".toml"]\n'
+    )
     _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
 
 

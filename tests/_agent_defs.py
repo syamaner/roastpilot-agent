@@ -19,6 +19,14 @@ _OPENING_MARKER: Final = re.compile(r"^---\n")
 _FIELD: Final = re.compile(r"([A-Za-z][A-Za-z0-9_]*): ([^\s\r\n][^\r\n]*)\n")
 _TOOL: Final = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _YAML_VALUE_INDICATORS: Final[frozenset[str]] = frozenset("-?:,[]{}#&*!|>'\"%@`")
+_YAML_IMPLICIT_WORDS: Final[frozenset[str]] = frozenset(
+    {"~", "null", "true", "false", "yes", "no", "on", "off", ".inf", ".nan"}
+)
+_YAML_NUMBER: Final = re.compile(
+    r"[-+]?(?:[0-9][0-9_]*(?:\.[0-9_]*)?(?:[eE][-+]?[0-9_]+)?|"
+    r"0[xX][0-9a-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+|\.(?:inf|nan))$"
+)
+_YAML_DATE_LIKE: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[Tt ][^\r\n]+)?$")
 
 
 class AgentFrontmatterError(ValueError):
@@ -28,6 +36,16 @@ class AgentFrontmatterError(ValueError):
 def _error(source: str | Path, detail: str) -> NoReturn:
     """Raise one source-named frontmatter failure without relying on assertions."""
     raise AgentFrontmatterError(f"{source}: {detail}")
+
+
+def _is_yaml_implicit_scalar(value: str) -> bool:
+    """Return whether a conservative YAML loader could coerce a plain scalar."""
+    lowered = value.lower()
+    return (
+        lowered in _YAML_IMPLICIT_WORDS
+        or _YAML_NUMBER.fullmatch(value) is not None
+        or _YAML_DATE_LIKE.fullmatch(value) is not None
+    )
 
 
 def agent_files(directory: Path = AGENTS_DIR) -> list[Path]:
@@ -91,6 +109,8 @@ def split_frontmatter(
         key, value = field.groups()
         if value[0] in _YAML_VALUE_INDICATORS:
             _error(source, "frontmatter field value is quoted or structured")
+        if _is_yaml_implicit_scalar(value):
+            _error(source, "frontmatter field value is implicitly typed")
         if (
             value != value.rstrip()
             or any(not character.isprintable() for character in value)
