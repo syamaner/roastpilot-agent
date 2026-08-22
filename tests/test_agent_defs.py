@@ -110,6 +110,18 @@ def test_agent_files_rejects_markdown_named_directory(tmp_path: Path) -> None:
         agent_files(tmp_path)
 
 
+def test_agent_files_rejects_external_symlinked_markdown_definition(tmp_path: Path) -> None:
+    """A Markdown symlink cannot introduce a definition from outside the roster."""
+    roster = tmp_path / "agents"
+    roster.mkdir()
+    external = tmp_path / "external" / "role.md"
+    external.parent.mkdir()
+    external.write_text(_document())
+    (roster / "linked.md").symlink_to(external)
+    with pytest.raises(AgentFrontmatterError, match="agent roster contains a non-file definition"):
+        agent_files(roster)
+
+
 @pytest.mark.parametrize("leading", ("\ufeff---\n", "\n---\n", "---\r\n"))
 def test_split_frontmatter_rejects_invalid_leading_markers(leading: str) -> None:
     """The opening marker is anchored at byte zero with an exact newline."""
@@ -194,6 +206,11 @@ def test_split_frontmatter_allows_embedded_colons_in_plain_values() -> None:
         "1.5",
         "1e3",
         "0x10",
+        ".5",
+        "+.5",
+        "-.5",
+        ".5e2",
+        "-.5E-2",
         "2026-08-22",
         "2026-08-22T12:34:56Z",
     ),
@@ -207,7 +224,7 @@ def test_split_frontmatter_rejects_yaml_implicit_scalar_spellings(value: str) ->
 
 @pytest.mark.parametrize(
     "value",
-    ("nullish", "true-blue", "onward", "v1.0", "2026-08-plan"),
+    ("nullish", "true-blue", "onward", "v1.0", ".5ish", "2026-08-plan"),
 )
 def test_split_frontmatter_allows_ordinary_implicit_type_lookalikes(value: str) -> None:
     """Conservative scalar rejection does not consume ordinary role prose."""
@@ -668,6 +685,15 @@ def _has_only_allowed_directory_enumeration(tree: ast.Module, filename: str) -> 
     return observed == expected
 
 
+def _called_shared_helpers(tree: ast.Module) -> set[str]:
+    """Return direct shared-helper call names without following arbitrary aliases."""
+    return {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+
 def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
     """Fail closed when a consumer restores local roster or parser machinery."""
     expected_imports = _CONSUMER_IMPORTS[filename]
@@ -685,6 +711,10 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
     )
     assert {alias.name for alias in imported.names} == expected_imports, (
         f"{filename}: _agent_defs imports drifted from the shared-consumer contract"
+    )
+    missing_calls = (expected_imports - {"AGENTS_DIR"}) - _called_shared_helpers(tree)
+    assert not missing_calls, (
+        f"{filename}: imported shared helpers must be called: {sorted(missing_calls)}"
     )
 
     helpers = {
@@ -751,6 +781,27 @@ def test_consuming_guards_use_only_the_shared_roster_and_parser() -> None:
 def test_consuming_guard_accepts_current_direct_agent_role_reads(filename: str) -> None:
     """Committed direct role reads and ``agent_tools`` calls retain their narrow provenance."""
     _assert_consumer_uses_shared_agent_defs((_REPO / "tests" / filename).read_text(), filename)
+
+
+@pytest.mark.parametrize(
+    ("call", "replacement", "missing"),
+    (
+        ("agent_body(path)", "unrelated_helper(path)", "agent_body"),
+        ("parse_frontmatter(path)", "unrelated_helper(path)", "parse_frontmatter"),
+    ),
+    ids=("replaced-agent-body", "replaced-frontmatter-parser"),
+)
+def test_consuming_guard_rejects_imported_shared_helpers_without_calls(
+    call: str, replacement: str, missing: str
+) -> None:
+    """An unrelated call cannot satisfy a required imported shared-helper use."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source.replace(call, replacement)
+    assert mutated != source
+    with pytest.raises(
+        AssertionError, match=rf"imported shared helpers must be called: \['{missing}'\]"
+    ):
+        _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
 
 
 def test_consuming_guard_ignores_nonenumerating_os_imports() -> None:

@@ -24,6 +24,7 @@ _YAML_IMPLICIT_WORDS: Final[frozenset[str]] = frozenset(
 )
 _YAML_NUMBER: Final = re.compile(
     r"[-+]?(?:[0-9][0-9_]*(?:\.[0-9_]*)?(?:[eE][-+]?[0-9_]+)?|"
+    r"\.[0-9_]+(?:[eE][-+]?[0-9_]+)?|"
     r"0[xX][0-9a-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+|\.(?:inf|nan))$"
 )
 _YAML_DATE_LIKE: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[Tt ][^\r\n]+)?$")
@@ -67,7 +68,7 @@ def agent_files(directory: Path = AGENTS_DIR) -> list[Path]:
     files = sorted(directory.glob("*.md"))
     if not files:
         _error(directory, "agent roster is empty")
-    if any(not path.is_file() for path in files):
+    if any(path.is_symlink() or not path.is_file() for path in files):
         _error(directory, "agent roster contains a non-file definition")
     return files
 
