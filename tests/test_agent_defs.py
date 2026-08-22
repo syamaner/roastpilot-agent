@@ -408,9 +408,10 @@ _REGEX_FRONTMATTER_CALLS = frozenset({"compile", "match", "search", "fullmatch"}
 
 
 def _regex_import_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
-    """Resolve names bound to the ``re`` module and its parser callables."""
+    """Resolve imports and conservatively inherited ``re`` parser callable names."""
     module_names: set[str] = set()
     function_names: set[str] = set()
+    assignments: list[ast.Assign | ast.AnnAssign] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -422,6 +423,30 @@ def _regex_import_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
                     function_names.update(_REGEX_FRONTMATTER_CALLS)
                 elif alias.name in _REGEX_FRONTMATTER_CALLS:
                     function_names.add(alias.asname or alias.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            assignments.append(node)
+    changed = True
+    while changed:
+        changed = False
+        for assignment in assignments:
+            value = assignment.value
+            if value is None:
+                continue
+            is_regex_callable = (isinstance(value, ast.Name) and value.id in function_names) or (
+                isinstance(value, ast.Attribute)
+                and value.attr in _REGEX_FRONTMATTER_CALLS
+                and isinstance(value.value, ast.Name)
+                and value.value.id in module_names
+            )
+            if not is_regex_callable:
+                continue
+            targets = (
+                assignment.targets if isinstance(assignment, ast.Assign) else (assignment.target,)
+            )
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id not in function_names:
+                    function_names.add(target.id)
+                    changed = True
     return module_names, function_names
 
 
@@ -619,6 +644,24 @@ def _add_inline_flag_regex_frontmatter_parser(source: str) -> str:
     return source + '\nlocal_frontmatter = re.compile(r"(?m)^---\\n")\n'
 
 
+def _add_callable_alias_regex_frontmatter_parser(source: str) -> str:
+    """Bind a regex callable through an alias chain before parsing a marker."""
+    return source + (
+        "\nlocal_match = re.match\n"
+        "inherited_match = local_match\n"
+        'inherited_match(r"^---\\n", "role body")\n'
+    )
+
+
+def _add_reassigned_callable_alias_frontmatter_parser(source: str) -> str:
+    """Prove a later reassignment cannot hide a previously attested regex callable."""
+    return source + (
+        "\nlocal_match = re.match\n"
+        "local_match = ordinary_callable\n"
+        'local_match(r"^---\\n", "role body")\n'
+    )
+
+
 _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
     (
         "test_agent_worktree_controls.py",
@@ -705,6 +748,16 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         _add_inline_flag_regex_frontmatter_parser,
         "local leading-frontmatter parser",
     ),
+    (
+        "test_agent_model_pins.py",
+        _add_callable_alias_regex_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
+    (
+        "test_agent_model_pins.py",
+        _add_reassigned_callable_alias_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
 )
 
 
@@ -729,6 +782,8 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         "function-alias-regex-parser",
         "star-import-regex-parser",
         "inline-flag-regex-parser",
+        "callable-alias-regex-parser",
+        "reassigned-callable-alias-regex-parser",
     ),
 )
 def test_consuming_guard_rejects_local_parser_and_roster_mutations(
@@ -750,6 +805,13 @@ def test_consuming_guard_does_not_guess_unbound_regex_function_provenance() -> N
         "        del pattern, text\n"
         '    match(r"^---\\n", "role body")\n'
     )
+    _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_ignores_unimported_callable_aliases() -> None:
+    """An ordinary local alias cannot impersonate a regex parser callable."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source + ('\nlocal_match = ordinary_callable\nlocal_match(r"^---\\n", "role body")\n')
     _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
 
 
