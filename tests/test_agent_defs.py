@@ -545,21 +545,6 @@ def _is_regex_frontmatter_call(
     )
 
 
-def _is_docs_markdown_scan(node: ast.Call) -> bool:
-    """Return whether a recursive Markdown scan is the consumer's docs-only audit."""
-    function = node.func
-    return (
-        isinstance(function, ast.Attribute)
-        and function.attr == "rglob"
-        and isinstance(function.value, ast.BinOp)
-        and isinstance(function.value.op, ast.Div)
-        and isinstance(function.value.left, ast.Name)
-        and function.value.left.id == "_REPO"
-        and isinstance(function.value.right, ast.Constant)
-        and function.value.right.value == "docs"
-    )
-
-
 def _is_safe_agent_role_filename(node: ast.expr) -> bool:
     """Return whether an expression denotes one leaf role Markdown filename."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -740,22 +725,15 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
             and _is_frontmatter_marker_value(node.value)
         ):
             raise AssertionError(f"{filename}: local leading-frontmatter parser is forbidden")
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if (
-                node.func.attr in {"glob", "rglob"}
-                and not _is_docs_markdown_scan(node)
-                and any(
-                    "*.md" in _static_strings(argument, bindings)
-                    for argument in _pattern_call_values(node)
-                )
-            ):
-                raise AssertionError(  # pragma: no cover - exact enumeration guard rejects first
-                    f"{filename}: local Markdown roster glob is forbidden"
-                )
-            if node.func.attr == "startswith" and any(
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "startswith"
+            and any(
                 _is_frontmatter_marker(argument, bindings) for argument in _first_call_value(node)
-            ):
-                raise AssertionError(f"{filename}: local leading-frontmatter parser is forbidden")
+            )
+        ):
+            raise AssertionError(f"{filename}: local leading-frontmatter parser is forbidden")
         if isinstance(node, ast.Compare) and any(
             _is_frontmatter_marker(operand, bindings) for operand in (node.left, *node.comparators)
         ):
