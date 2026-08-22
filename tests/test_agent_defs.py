@@ -440,6 +440,21 @@ def _is_regex_frontmatter_call(
     )
 
 
+def _is_docs_markdown_scan(node: ast.Call) -> bool:
+    """Return whether a recursive Markdown scan is the consumer's docs-only audit."""
+    function = node.func
+    return (
+        isinstance(function, ast.Attribute)
+        and function.attr == "rglob"
+        and isinstance(function.value, ast.BinOp)
+        and isinstance(function.value.op, ast.Div)
+        and isinstance(function.value.left, ast.Name)
+        and function.value.left.id == "_REPO"
+        and isinstance(function.value.right, ast.Constant)
+        and function.value.right.value == "docs"
+    )
+
+
 def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
     """Fail closed when a consumer restores local roster or parser machinery."""
     expected_imports = _CONSUMER_IMPORTS[filename]
@@ -473,9 +488,13 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
     regex_modules, regex_functions = _regex_import_bindings(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr == "glob" and any(
-                "*.md" in _static_strings(argument, bindings)
-                for argument in _pattern_call_values(node)
+            if (
+                node.func.attr in {"glob", "rglob"}
+                and not _is_docs_markdown_scan(node)
+                and any(
+                    "*.md" in _static_strings(argument, bindings)
+                    for argument in _pattern_call_values(node)
+                )
             ):
                 raise AssertionError(f"{filename}: local Markdown roster glob is forbidden")
             if node.func.attr == "startswith" and any(
@@ -522,6 +541,11 @@ def _add_keyword_roster_glob(source: str) -> str:
     )
 
 
+def _add_recursive_roster_glob(source: str) -> str:
+    """Add a recursive local Markdown roster glob mutation."""
+    return source + '\nroster_directory = Path(".claude/agents")\nroster_directory.rglob("*.md")\n'
+
+
 def _add_startswith_frontmatter_parser(source: str) -> str:
     """Add a direct leading-frontmatter marker parser mutation."""
     return source + '\nfrontmatter_text = "role body"\nfrontmatter_text.startswith("---\\n")\n'
@@ -558,6 +582,13 @@ def _add_use_then_rebind_frontmatter_pattern(source: str) -> str:
         '\nfrontmatter_pattern = r"^---\\n(.*?)\\n---\\n"\n'
         "re.compile(frontmatter_pattern)\n"
         'frontmatter_pattern = "ordinary text"\n'
+    )
+
+
+def _add_annotated_frontmatter_pattern(source: str) -> str:
+    """Add an annotated marker binding feeding a complete regex parser."""
+    return source + (
+        '\nfrontmatter_pattern: str = r"^---\\n(.*?)\\n---\\n"\nre.compile(frontmatter_pattern)\n'
     )
 
 
@@ -605,6 +636,11 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         "local Markdown roster glob",
     ),
     (
+        "test_agent_worktree_controls.py",
+        _add_recursive_roster_glob,
+        "local Markdown roster glob",
+    ),
+    (
         "test_agent_model_pins.py",
         _add_startswith_frontmatter_parser,
         "local leading-frontmatter parser",
@@ -637,6 +673,11 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
     (
         "test_agent_model_pins.py",
         _add_use_then_rebind_frontmatter_pattern,
+        "local leading-frontmatter parser",
+    ),
+    (
+        "test_agent_model_pins.py",
+        _add_annotated_frontmatter_pattern,
         "local leading-frontmatter parser",
     ),
     (
@@ -674,6 +715,7 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         "renamed-helper",
         "reformatted-roster-glob",
         "keyword-roster-glob",
+        "recursive-roster-glob",
         "startswith-parser",
         "bare-marker-check",
         "raw-regex-parser",
@@ -681,6 +723,7 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         "inline-historical-full-regex-parser",
         "keyword-regex-parser",
         "use-then-rebind-regex-parser",
+        "annotated-regex-parser",
         "direct-import-regex-parser",
         "module-alias-regex-parser",
         "function-alias-regex-parser",
