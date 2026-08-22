@@ -917,6 +917,8 @@ def test_consuming_guard_accepts_current_direct_agent_role_reads(filename: str) 
         "\ndef test_direct_role_path_read() -> None:\n"
         '    role_path = AGENTS_DIR / "engineer-fe.md"\n'
         "    assert role_path.open()\n",
+        "\ndef test_inline_direct_role_path_read() -> None:\n"
+        '    assert (AGENTS_DIR / "engineer-fe.md").read_text()\n',
         "\ndef test_list_comprehension_role_read() -> None:\n"
         "    assert [path.read_text() for path in agent_files()]\n",
         "\ndef test_set_comprehension_role_read() -> None:\n"
@@ -938,6 +940,7 @@ def test_consuming_guard_accepts_current_direct_agent_role_reads(filename: str) 
         "local-frontmatter-reparse",
         "renamed-loop-alias",
         "direct-role-alias",
+        "inline-direct-role-path",
         "list-comprehension",
         "set-comprehension",
         "dict-comprehension",
@@ -954,6 +957,17 @@ def test_consuming_guard_rejects_unvalidated_role_text_reads(addition: str) -> N
         AssertionError, match="role definition text must use a shared validated helper"
     ):
         _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_accepts_unrelated_assignment_fallbacks() -> None:
+    """Non-role assignment targets and bare annotations do not create role provenance."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    _assert_consumer_uses_shared_agent_defs(
+        source + "\ndef test_unrelated_assignment_shapes() -> None:\n"
+        '    ordinary_settings["key"] = "value"\n'
+        "    documentation: str\n",
+        "test_agent_model_pins.py",
+    )
 
 
 def test_consuming_guard_ignores_nonenumerating_os_imports() -> None:
