@@ -645,13 +645,34 @@ def _parametrized_agent_paths(function: ast.FunctionDef | ast.AsyncFunctionDef) 
     return paths
 
 
-def _function_has_unvalidated_role_text_read(
-    function: ast.FunctionDef | ast.AsyncFunctionDef,
+def _scope_nodes(
+    scope: ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+) -> tuple[ast.AST, ...]:
+    """Return nodes owned by one lexical scope, excluding nested scopes."""
+    nodes: list[ast.AST] = []
+
+    def visit(node: ast.AST, *, is_root: bool = False) -> None:
+        if not is_root and isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            return
+        nodes.append(node)
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    visit(scope, is_root=True)
+    return tuple(nodes)
+
+
+def _scope_has_unvalidated_role_text_read(
+    scope: ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> bool:
-    """Return whether one function reads role bytes outside a validated shared helper."""
-    path_names = _parametrized_agent_paths(function)
+    """Return whether one lexical scope reads governed role text without validation."""
+    path_names: set[str] = (
+        _parametrized_agent_paths(scope)
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
+        else set()
+    )
     collection_names: set[str] = set()
-    nodes = tuple(ast.walk(function))
+    nodes = _scope_nodes(scope)
     changed = True
     while changed:
         changed = False
@@ -675,7 +696,7 @@ def _function_has_unvalidated_role_text_read(
                     if not target_names <= collection_names:
                         collection_names.update(target_names)
                         changed = True
-            elif isinstance(node, ast.For) and (
+            elif isinstance(node, (ast.For, ast.comprehension)) and (
                 _is_agent_files_call(node.iter)
                 or (isinstance(node.iter, ast.Name) and node.iter.id in collection_names)
             ):
@@ -683,24 +704,43 @@ def _function_has_unvalidated_role_text_read(
                 if not target_names <= path_names:
                     path_names.update(target_names)
                     changed = True
-    return any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in _ROLE_TEXT_READ_METHODS
-        and (
-            _is_direct_agent_role_path(node.func.value)
-            or (isinstance(node.func.value, ast.Name) and node.func.value.id in path_names)
-        )
-        for node in nodes
-    )
+    parents = {
+        id(child): node for node in nodes for child in ast.iter_child_nodes(node) if child in nodes
+    }
+    for node in nodes:
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _ROLE_TEXT_READ_METHODS
+        ):
+            continue
+        receiver = node.func.value
+        if _is_direct_agent_role_path(receiver):
+            return True
+        if not (isinstance(receiver, ast.Name) and receiver.id in path_names):
+            continue
+        ancestor = parents.get(id(node))
+        while ancestor is not None:
+            if isinstance(ancestor, (ast.For, ast.comprehension)) and receiver.id in _target_names(
+                ancestor.target
+            ):
+                if _is_agent_files_call(ancestor.iter) or (
+                    isinstance(ancestor.iter, ast.Name) and ancestor.iter.id in collection_names
+                ):
+                    return True
+                break
+            ancestor = parents.get(id(ancestor))
+        else:
+            return True
+    return False
 
 
 def _has_unvalidated_role_text_read(tree: ast.Module) -> bool:
-    """Return whether any governed function bypasses shared role-text validation."""
+    """Return whether any governed lexical scope bypasses role-text validation."""
     return any(
-        _function_has_unvalidated_role_text_read(function)
-        for function in tree.body
-        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+        _scope_has_unvalidated_role_text_read(scope)
+        for scope in (tree, *ast.walk(tree))
+        if isinstance(scope, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
     )
 
 
@@ -877,11 +917,38 @@ def test_consuming_guard_accepts_current_direct_agent_role_reads(filename: str) 
         "\ndef test_direct_role_path_read() -> None:\n"
         '    role_path = AGENTS_DIR / "engineer-fe.md"\n'
         "    assert role_path.open()\n",
+        "\ndef test_list_comprehension_role_read() -> None:\n"
+        "    assert [path.read_text() for path in agent_files()]\n",
+        "\ndef test_set_comprehension_role_read() -> None:\n"
+        "    assert {path.read_bytes() for path in agent_files()}\n",
+        "\ndef test_dict_comprehension_role_read() -> None:\n"
+        "    assert {path.name: path.read_text() for path in agent_files()}\n",
+        "\ndef test_generator_comprehension_role_read() -> None:\n"
+        "    assert tuple(path.open() for path in agent_files())\n",
+        "\ndef test_renamed_comprehension_role_read() -> None:\n"
+        "    role_roster = agent_files()\n"
+        "    inherited_roster = role_roster\n"
+        "    assert [renamed_path.read_text() for renamed_path in inherited_roster]\n",
+        "\nfor module_role_path in agent_files():\n    module_role_path.read_text()\n",
+        "\nclass test_ClassRoleTextBypass:\n"
+        "    for class_role_path in agent_files():\n"
+        "        class_role_path.read_bytes()\n",
     ),
-    ids=("local-frontmatter-reparse", "renamed-loop-alias", "direct-role-alias"),
+    ids=(
+        "local-frontmatter-reparse",
+        "renamed-loop-alias",
+        "direct-role-alias",
+        "list-comprehension",
+        "set-comprehension",
+        "dict-comprehension",
+        "generator-comprehension",
+        "renamed-comprehension-alias",
+        "module-scope",
+        "class-scope",
+    ),
 )
 def test_consuming_guard_rejects_unvalidated_role_text_reads(addition: str) -> None:
-    """Role bytes cannot enter a governed function outside the shared helpers."""
+    """Role bytes cannot enter any governed scope outside the shared helpers."""
     source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
     with pytest.raises(
         AssertionError, match="role definition text must use a shared validated helper"
