@@ -675,6 +675,17 @@ def _add_iterdir_roster_enumeration(source: str) -> str:
     )
 
 
+def _add_for_iterdir_roster_enumeration(source: str) -> str:
+    """Add a statement-form local Markdown roster enumeration through ``iterdir``."""
+    return source + (
+        '\nroster_directory = Path(".claude/agents")\n'
+        "roster_paths = []\n"
+        "for path in roster_directory.iterdir():\n"
+        '    if path.suffix == ".md":\n'
+        "        roster_paths.append(path)\n"
+    )
+
+
 def _add_startswith_frontmatter_parser(source: str) -> str:
     """Add a direct leading-frontmatter marker parser mutation."""
     return source + '\nfrontmatter_text = "role body"\nfrontmatter_text.startswith("---\\n")\n'
@@ -821,6 +832,11 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         "local Markdown roster enumeration",
     ),
     (
+        "test_agent_worktree_controls.py",
+        _add_for_iterdir_roster_enumeration,
+        "local Markdown roster enumeration",
+    ),
+    (
         "test_agent_model_pins.py",
         _add_startswith_frontmatter_parser,
         "local leading-frontmatter parser",
@@ -917,6 +933,7 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         "keyword-roster-glob",
         "recursive-roster-glob",
         "iterdir-roster-enumeration",
+        "for-iterdir-roster-enumeration",
         "startswith-parser",
         "bare-marker-check",
         "raw-regex-parser",
@@ -995,6 +1012,36 @@ def test_consuming_guard_ignores_nonmarkdown_iterdir_uses() -> None:
         'if path.suffix == ".toml"]\n'
     )
     _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_ignores_nonmarkdown_for_iterdir_uses() -> None:
+    """A statement-form non-Markdown directory scan is unrelated to the roster."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source + (
+        '\nordinary_directory = Path(".")\n'
+        "ordinary_paths = []\n"
+        "for path in ordinary_directory.iterdir():\n"
+        '    if path.suffix == ".toml":\n'
+        "        ordinary_paths.append(path)\n"
+    )
+    _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
+def test_static_binding_helpers_ignore_nonname_or_incomplete_assignments() -> None:
+    """Defensive binding walkers ignore targets that cannot safely bind one name."""
+    string_tree = _consumer_ast('(left, right) = "marker"\n', "bindings.py")
+    assert _string_bindings(string_tree) == {}
+
+    regex_tree = _consumer_ast(
+        "from re import match\nlocal_match: object\n(first, second) = match\n",
+        "regex-bindings.py",
+    )
+    assert _regex_import_bindings(regex_tree) == (set(), {"match"})
+
+
+def test_markdown_suffix_comparison_ignores_noncompare_nodes() -> None:
+    """Only comparison expressions can establish a Markdown suffix predicate."""
+    assert not _is_markdown_suffix_comparison(ast.Name(id="path"), {"path"})
 
 
 def test_consuming_guard_ignores_rebound_nonmarker_patterns() -> None:
