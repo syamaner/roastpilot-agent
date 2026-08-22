@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 
 import pytest
-from _agent_defs import AGENTS_DIR, agent_files, agent_text, agent_tools
+from _agent_defs import AGENTS_DIR, agent_files, agent_text, agent_tools, parse_frontmatter
 
 _REPO = Path(__file__).resolve().parents[1]
 _DISCIPLINE_HEADING = re.compile(
@@ -200,6 +200,7 @@ def _expected_variant(tools: set[str]) -> str:
 @pytest.mark.parametrize("path", agent_files(), ids=lambda path: path.stem)
 def test_applicable_roles_carry_worktree_controls(path: Path) -> None:
     """Every Bash role and shell-less binding role carries its canonical control."""
+    assert parse_frontmatter(path)["name"] == path.stem
     tools = agent_tools(path)
     text = agent_text(path)
     if "Bash" not in tools and "## Worktree discipline (topology §7 — binding)" not in text:

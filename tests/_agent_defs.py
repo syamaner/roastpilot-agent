@@ -28,6 +28,10 @@ _YAML_NUMBER: Final = re.compile(
     r"0[xX][0-9a-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+|\.(?:inf|nan))$"
 )
 _YAML_DATE_LIKE: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[Tt ][^\r\n]+)?$")
+_YAML_SEXAGESIMAL: Final = re.compile(r"[-+]?[0-9][0-9_]*(?::[0-9][0-9_]*)+$")
+_ALLOWED_TOOLS: Final[frozenset[str]] = frozenset(
+    {"Read", "Grep", "Glob", "Bash", "Edit", "Write", "mcp__playwright"}
+)
 
 
 class AgentFrontmatterError(ValueError):
@@ -46,7 +50,23 @@ def _is_yaml_implicit_scalar(value: str) -> bool:
         lowered in _YAML_IMPLICIT_WORDS
         or _YAML_NUMBER.fullmatch(lowered) is not None
         or _YAML_DATE_LIKE.fullmatch(value) is not None
+        or _YAML_SEXAGESIMAL.fullmatch(value) is not None
     )
+
+
+def _validated_tools(value: str, source: str | Path) -> set[str]:
+    """Return one exact-vocabulary tool set or raise a source-named error."""
+    tools: set[str] = set()
+    for raw_tool in value.split(","):
+        tool = raw_tool.strip()
+        if not tool or _TOOL.fullmatch(tool) is None:
+            _error(source, "frontmatter tools field is malformed")
+        if tool not in _ALLOWED_TOOLS:
+            _error(source, f"frontmatter tool {tool!r} is not allowed")
+        if tool in tools:
+            _error(source, f"frontmatter tool {tool!r} is duplicated")
+        tools.add(tool)
+    return tools
 
 
 def agent_files(directory: Path = AGENTS_DIR) -> list[Path]:
@@ -136,6 +156,7 @@ def split_frontmatter(
     missing = REQUIRED_KEYS - set(fields)
     if missing:
         _error(source, f"frontmatter is missing required keys: {sorted(missing)}")
+    _validated_tools(fields["tools"], source)
     return fields, text[end + 1 :]
 
 
@@ -208,12 +229,4 @@ def agent_tools(path: Path) -> set[str]:
     Raises:
         AgentFrontmatterError: If a tool name is malformed, empty, or duplicated.
     """
-    tools: set[str] = set()
-    for raw_tool in parse_frontmatter(path)["tools"].split(","):
-        tool = raw_tool.strip()
-        if not tool or _TOOL.fullmatch(tool) is None:
-            _error(path.name, "frontmatter tools field is malformed")
-        if tool in tools:
-            _error(path.name, f"frontmatter tool {tool!r} is duplicated")
-        tools.add(tool)
-    return tools
+    return _validated_tools(parse_frontmatter(path)["tools"], path.name)
