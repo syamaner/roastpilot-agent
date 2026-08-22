@@ -288,24 +288,48 @@ def _is_frontmatter_marker(node: ast.expr, bindings: dict[str, str]) -> bool:
     value = _static_string(node, bindings)
     if value is None:
         return False
-    if value in {"---", "---\n", "---\\n"}:
+    marker_suffixes = frozenset({"^---\n", "^---\\n"})
+    if value in {"---", "---\n", "---\\n", *marker_suffixes}:
         return True
-    inline_flags, separator, _suffix = value.partition(")^---")
-    return value.startswith("^---") or (
-        inline_flags.startswith("(?")
-        and bool(separator)
-        and bool(inline_flags[2:])
-        and all(character.isalpha() or character == "-" for character in inline_flags[2:])
+    inline_flags, separator, suffix = value.partition(")")
+    if not inline_flags.startswith("(?") or separator != ")" or suffix not in marker_suffixes:
+        return False
+    enabled, minus, disabled = inline_flags[2:].partition("-")
+    valid_flags = frozenset("aiLmsux")
+    return (
+        bool(enabled)
+        and set(enabled) <= valid_flags
+        and len(set(enabled)) == len(enabled)
+        and (not minus or (bool(disabled) and set(disabled) <= valid_flags))
+        and len(set(disabled)) == len(disabled)
     )
 
 
 @pytest.mark.parametrize(
     "value",
-    ("----", "plain --- text", "(?m)^## heading", "(?i)role body"),
+    ("----", "^----", "(?m)^----", "plain --- text", "(?m)^## heading", "(?i)role body"),
 )
 def test_frontmatter_marker_detection_ignores_nonmarkers(value: str) -> None:
     """Bare and inline-flag detection remains specific to the frontmatter marker."""
     assert not _is_frontmatter_marker(ast.Constant(value=value), {})
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "---",
+        "---\n",
+        "---\\n",
+        "^---\n",
+        "^---\\n",
+        "(?m)^---\n",
+        "(?m)^---\\n",
+        "(?im-sx)^---\\n",
+    ),
+)
+def test_frontmatter_marker_detection_accepts_exact_bare_and_regex_forms(value: str) -> None:
+    """Only exact actual or escaped-newline frontmatter markers are admitted."""
+    assert _is_frontmatter_marker(ast.Constant(value=value), {})
 
 
 _REGEX_FRONTMATTER_CALLS = frozenset({"compile", "match", "search", "fullmatch"})
