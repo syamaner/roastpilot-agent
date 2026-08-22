@@ -279,46 +279,37 @@ def _consumer_ast(source: str, filename: str) -> ast.Module:
     return ast.parse(source, filename=filename)
 
 
-def _string_bindings(tree: ast.Module) -> dict[str, str]:
-    """Return literal string bindings for AST pattern matching without execution."""
-    bindings: dict[str, str] = {}
+def _string_bindings(tree: ast.Module) -> dict[str, frozenset[str]]:
+    """Return every literal string binding for each name without execution."""
+    bindings: dict[str, set[str]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
             if isinstance(node.value.value, str):
                 for target in node.targets:
                     if isinstance(target, ast.Name):
-                        bindings[target.id] = node.value.value
+                        bindings.setdefault(target.id, set()).add(node.value.value)
         elif (
             isinstance(node, ast.AnnAssign)
             and isinstance(node.target, ast.Name)
             and isinstance(node.value, ast.Constant)
             and isinstance(node.value.value, str)
         ):
-            bindings[node.target.id] = node.value.value
-    return bindings
+            bindings.setdefault(node.target.id, set()).add(node.value.value)
+    return {name: frozenset(values) for name, values in bindings.items()}
 
 
-def _static_string(node: ast.expr, bindings: dict[str, str]) -> str | None:
-    """Resolve a direct or module-bound literal string without evaluating code."""
+def _static_strings(node: ast.expr, bindings: dict[str, frozenset[str]]) -> frozenset[str]:
+    """Resolve direct or bound literal strings without evaluating code."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
+        return frozenset({node.value})
     if isinstance(node, ast.Name):
-        return bindings.get(node.id)
-    return None
+        return bindings.get(node.id, frozenset())
+    return frozenset()
 
 
-def _is_frontmatter_marker(node: ast.expr, bindings: dict[str, str]) -> bool:
-    """Return whether a literal expression denotes a leading frontmatter marker."""
-    value = _static_string(node, bindings)
-    if value is None:
-        return False
-    marker_suffixes = frozenset({"^---\n", "^---\\n"})
-    if value in {"---", "---\n", "---\\n", *marker_suffixes}:
-        return True
-    inline_flags, separator, suffix = value.partition(")")
-    if not inline_flags.startswith("(?") or separator != ")" or suffix not in marker_suffixes:
-        return False
-    enabled, minus, disabled = inline_flags[2:].partition("-")
+def _valid_inline_flags(flags: str) -> bool:
+    """Return whether one leading inline regex flag group is syntactically closed."""
+    enabled, minus, disabled = flags.partition("-")
     valid_flags = frozenset("aiLmsux")
     return (
         bool(enabled)
@@ -326,7 +317,34 @@ def _is_frontmatter_marker(node: ast.expr, bindings: dict[str, str]) -> bool:
         and len(set(enabled)) == len(enabled)
         and (not minus or (bool(disabled) and set(disabled) <= valid_flags))
         and len(set(disabled)) == len(disabled)
+        and not (set(enabled) & set(disabled))
     )
+
+
+def _is_frontmatter_marker_value(value: str) -> bool:
+    """Return whether a value is an exact marker or valid regex-marker prefix."""
+    bare_markers = frozenset({"---", "---\n", "---\\n"})
+    regex_prefixes = ("^---\n", "^---\\n")
+    if value in bare_markers or value.startswith(regex_prefixes):
+        return True
+    inline_flags, separator, suffix = value.partition(")")
+    if (
+        not inline_flags.startswith("(?")
+        or separator != ")"
+        or not suffix.startswith(regex_prefixes)
+    ):
+        return False
+    return _valid_inline_flags(inline_flags[2:])
+
+
+def _is_frontmatter_marker(node: ast.expr, bindings: dict[str, frozenset[str]]) -> bool:
+    """Return whether any literal value for an expression denotes a marker."""
+    return any(_is_frontmatter_marker_value(value) for value in _static_strings(node, bindings))
+
+
+def _call_values(node: ast.Call) -> tuple[ast.expr, ...]:
+    """Return explicit positional and keyword argument values from one call."""
+    return (*node.args, *(keyword.value for keyword in node.keywords if keyword.arg is not None))
 
 
 @pytest.mark.parametrize(
@@ -349,6 +367,8 @@ def test_frontmatter_marker_detection_ignores_nonmarkers(value: str) -> None:
         "(?m)^---\n",
         "(?m)^---\\n",
         "(?im-sx)^---\\n",
+        r"^---\n(.*?)\n---\n",
+        r"(?m)^---\n(.*?)\n---\n",
     ),
 )
 def test_frontmatter_marker_detection_accepts_exact_bare_and_regex_forms(value: str) -> None:
@@ -426,11 +446,11 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if node.func.attr == "glob" and any(
-                _static_string(argument, bindings) == "*.md" for argument in node.args
+                "*.md" in _static_strings(argument, bindings) for argument in _call_values(node)
             ):
                 raise AssertionError(f"{filename}: local Markdown roster glob is forbidden")
             if node.func.attr == "startswith" and any(
-                _is_frontmatter_marker(argument, bindings) for argument in node.args
+                _is_frontmatter_marker(argument, bindings) for argument in _call_values(node)
             ):
                 raise AssertionError(f"{filename}: local leading-frontmatter parser is forbidden")
         if isinstance(node, ast.Compare) and any(
@@ -440,7 +460,7 @@ def _assert_consumer_uses_shared_agent_defs(source: str, filename: str) -> None:
         if (
             isinstance(node, ast.Call)
             and _is_regex_frontmatter_call(node, regex_modules, regex_functions)
-            and any(_is_frontmatter_marker(argument, bindings) for argument in node.args)
+            and any(_is_frontmatter_marker(argument, bindings) for argument in _call_values(node))
         ):
             raise AssertionError(f"{filename}: local leading-frontmatter parser is forbidden")
 
@@ -463,6 +483,13 @@ def _add_reformatted_roster_glob(source: str) -> str:
     )
 
 
+def _add_keyword_roster_glob(source: str) -> str:
+    """Add a keyword-argument local Markdown roster glob mutation."""
+    return source + (
+        '\nroster_directory = Path(".claude/agents")\nroster_directory.glob(pattern="*.md")\n'
+    )
+
+
 def _add_startswith_frontmatter_parser(source: str) -> str:
     """Add a direct leading-frontmatter marker parser mutation."""
     return source + '\nfrontmatter_text = "role body"\nfrontmatter_text.startswith("---\\n")\n'
@@ -476,6 +503,30 @@ def _add_bare_frontmatter_marker_check(source: str) -> str:
 def _add_raw_regex_frontmatter_parser(source: str) -> str:
     """Restore the historical raw-regex frontmatter parser mutation."""
     return source + '\nlocal_frontmatter = re.compile(r"^---\\n")\n'
+
+
+def _add_historical_full_regex_frontmatter_parser(source: str) -> str:
+    """Restore the complete historical frontmatter regex parser mutation."""
+    return source + '\nlocal_frontmatter = re.compile(r"^---\\n(.*?)\\n---\\n", re.S)\n'
+
+
+def _add_inline_historical_full_regex_frontmatter_parser(source: str) -> str:
+    """Restore the inline-flag spelling of the complete historical parser."""
+    return source + '\nlocal_frontmatter = re.compile(r"(?m)^---\\n(.*?)\\n---\\n", re.S)\n'
+
+
+def _add_keyword_regex_frontmatter_parser(source: str) -> str:
+    """Add a keyword-argument regex frontmatter parser mutation."""
+    return source + '\nlocal_frontmatter = re.compile(pattern=r"^---\\n(.*?)\\n---\\n")\n'
+
+
+def _add_use_then_rebind_frontmatter_pattern(source: str) -> str:
+    """Bind a marker pattern, use it, then rebind safely to prove no hiding."""
+    return source + (
+        '\nfrontmatter_pattern = r"^---\\n(.*?)\\n---\\n"\n'
+        "re.compile(frontmatter_pattern)\n"
+        'frontmatter_pattern = "ordinary text"\n'
+    )
 
 
 def _add_direct_import_regex_frontmatter_parser(source: str) -> str:
@@ -517,6 +568,11 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
         "local Markdown roster glob",
     ),
     (
+        "test_agent_worktree_controls.py",
+        _add_keyword_roster_glob,
+        "local Markdown roster glob",
+    ),
+    (
         "test_agent_model_pins.py",
         _add_startswith_frontmatter_parser,
         "local leading-frontmatter parser",
@@ -529,6 +585,26 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
     (
         "test_agent_model_pins.py",
         _add_raw_regex_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
+    (
+        "test_agent_model_pins.py",
+        _add_historical_full_regex_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
+    (
+        "test_agent_model_pins.py",
+        _add_inline_historical_full_regex_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
+    (
+        "test_agent_model_pins.py",
+        _add_keyword_regex_frontmatter_parser,
+        "local leading-frontmatter parser",
+    ),
+    (
+        "test_agent_model_pins.py",
+        _add_use_then_rebind_frontmatter_pattern,
         "local leading-frontmatter parser",
     ),
     (
@@ -565,9 +641,14 @@ _CONSUMER_MUTATIONS: tuple[tuple[str, Callable[[str], str], str], ...] = (
     ids=(
         "renamed-helper",
         "reformatted-roster-glob",
+        "keyword-roster-glob",
         "startswith-parser",
         "bare-marker-check",
         "raw-regex-parser",
+        "historical-full-regex-parser",
+        "inline-historical-full-regex-parser",
+        "keyword-regex-parser",
+        "use-then-rebind-regex-parser",
         "direct-import-regex-parser",
         "module-alias-regex-parser",
         "function-alias-regex-parser",
@@ -593,6 +674,17 @@ def test_consuming_guard_does_not_guess_unbound_regex_function_provenance() -> N
         "    def match(pattern: str, text: str) -> None:\n"
         "        del pattern, text\n"
         '    match(r"^---\\n", "role body")\n'
+    )
+    _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_ignores_rebound_nonmarker_patterns() -> None:
+    """All-literal binding resolution does not invent a marker from safe values."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    mutated = source + (
+        '\nfrontmatter_pattern = "^----"\n'
+        "re.compile(frontmatter_pattern)\n"
+        'frontmatter_pattern = "(?m)^----"\n'
     )
     _assert_consumer_uses_shared_agent_defs(mutated, "test_agent_model_pins.py")
 
