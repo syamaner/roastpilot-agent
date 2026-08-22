@@ -642,6 +642,8 @@ def _target_names(target: ast.expr) -> set[str]:
     """Return simple assigned names without evaluating destructuring expressions."""
     if isinstance(target, ast.Name):
         return {target.id}
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
     if isinstance(target, (ast.Tuple, ast.List)):
         return {name for element in target.elts for name in _target_names(element)}
     return set()
@@ -675,6 +677,23 @@ def _is_direct_agent_role_path(node: ast.expr) -> bool:
         and node.left.id == "AGENTS_DIR"
         and _is_safe_agent_role_filename(node.right)
     )
+
+
+def _is_agent_roster_path(node: ast.expr, path_names: set[str], collection_names: set[str]) -> bool:
+    """Return whether an expression denotes one path drawn from the governed roster."""
+    return (
+        _is_direct_agent_role_path(node)
+        or (isinstance(node, ast.Name) and node.id in path_names)
+        or (
+            isinstance(node, ast.Subscript)
+            and _is_agent_roster_collection(node.value, collection_names)
+        )
+    )
+
+
+def _is_destructuring_target(target: ast.expr) -> bool:
+    """Return whether assignment from a roster yields paths rather than a roster collection."""
+    return isinstance(target, (ast.List, ast.Tuple, ast.Starred))
 
 
 def _parametrized_agent_paths(function: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
@@ -731,16 +750,18 @@ def _scope_has_unvalidated_role_text_read(
                     continue
                 targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
                 target_names = {name for target in targets for name in _target_names(target)}
-                if (
-                    _is_agent_roster_collection(value, collection_names)
-                    and not target_names <= collection_names
-                ):
-                    collection_names.update(target_names)
-                    changed = True
+                if _is_agent_roster_collection(value, collection_names):
+                    if any(_is_destructuring_target(target) for target in targets):
+                        if not target_names <= path_names:
+                            path_names.update(target_names)
+                            changed = True
+                    elif not target_names <= collection_names:
+                        collection_names.update(target_names)
+                        changed = True
                 elif (
-                    _is_direct_agent_role_path(value)
-                    or (isinstance(value, ast.Name) and value.id in path_names)
-                ) and not target_names <= path_names:
+                    _is_agent_roster_path(value, path_names, collection_names)
+                    and not target_names <= path_names
+                ):
                     path_names.update(target_names)
                     changed = True
             elif isinstance(node, (ast.For, ast.comprehension)) and (
@@ -761,7 +782,10 @@ def _scope_has_unvalidated_role_text_read(
         ):
             continue
         receiver = node.func.value
-        if _is_direct_agent_role_path(receiver):
+        if _is_direct_agent_role_path(receiver) or (
+            isinstance(receiver, ast.Subscript)
+            and _is_agent_roster_collection(receiver.value, collection_names)
+        ):
             return True
         if not (isinstance(receiver, ast.Name) and receiver.id in path_names):
             continue
@@ -781,8 +805,7 @@ def _scope_has_unvalidated_role_text_read(
             continue
         role_arguments = (*node.args, *(keyword.value for keyword in node.keywords))
         if not any(
-            _is_direct_agent_role_path(argument)
-            or (isinstance(argument, ast.Name) and argument.id in path_names)
+            _is_agent_roster_path(argument, path_names, collection_names)
             for argument in role_arguments
         ):
             continue
@@ -1092,6 +1115,13 @@ def test_consuming_guard_requires_each_imported_shared_helper_directly_called() 
         "    shared_wrapper = agent_text\n"
         "    for path in agent_files():\n"
         "        shared_wrapper(path)\n",
+        "\ndef test_roster_subscript_read() -> None:\n    assert agent_files()[0].read_text()\n",
+        "\ndef test_starred_roster_unpack_read() -> None:\n"
+        "    first, *rest = agent_files()\n"
+        "    assert first.read_text()\n",
+        "\ndef test_nested_starred_roster_unpack_read() -> None:\n"
+        "    first, (second, *rest) = agent_files()\n"
+        "    assert second.read_bytes()\n",
     ),
     ids=(
         "local-frontmatter-reparse",
@@ -1107,6 +1137,9 @@ def test_consuming_guard_requires_each_imported_shared_helper_directly_called() 
         "class-scope",
         "built-in-open-sink",
         "aliased-shared-sink",
+        "roster-subscript",
+        "starred-roster-unpack",
+        "nested-starred-roster-unpack",
     ),
 )
 def test_consuming_guard_rejects_unvalidated_role_text_reads(addition: str) -> None:
@@ -1140,6 +1173,18 @@ def test_consuming_guard_allows_nonroster_collection_wrappers() -> None:
         "\ndef test_unrelated_collection_read() -> None:\n"
         "    roles = list(ordinary_paths)\n"
         "    assert [role.read_text() for role in roles]\n"
+    )
+    _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
+
+
+def test_consuming_guard_allows_unrelated_subscript_and_starred_reads() -> None:
+    """Subscript and destructuring stay unrelated without roster provenance."""
+    source = (_REPO / "tests" / "test_agent_model_pins.py").read_text()
+    addition = (
+        "\ndef test_unrelated_subscript_and_unpack() -> None:\n"
+        "    assert ordinary_paths[0].read_text()\n"
+        "    first, *rest = ordinary_paths\n"
+        "    assert first.read_bytes()\n"
     )
     _assert_consumer_uses_shared_agent_defs(source + addition, "test_agent_model_pins.py")
 
