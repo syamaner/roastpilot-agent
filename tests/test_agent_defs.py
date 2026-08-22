@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import io
 import json
-import token
-import tokenize
 from pathlib import Path
+from typing import cast
 
 import _agent_defs
 import pytest
@@ -299,71 +297,90 @@ def test_parse_frontmatter_rejects_invalid_utf8_with_source_named_reason(tmp_pat
         parse_frontmatter(invalid)
 
 
-# Governance deliberately couples these two consumers to exact canonical token streams.
-# Comments and ordinary layout are excluded, but every executable token requires a
-# deliberate digest update alongside its review and direct helper tests.
-_CONSUMER_TOKEN_SHA256 = {
-    "test_agent_model_pins.py": "3155dfa4436a4d3277b071b623704508f55e0f133d0e5acf247fea88783b88dd",
+# Governance deliberately couples these two consumers to exact semantic AST projections.
+# The projection uses the Python 3.11 grammar across supported Python 3.11--3.14, sorts
+# node fields, and excludes only the version-added non-runtime ``type_params`` field.
+# Comments and formatting are absent from ASTs; every retained semantic field requires a
+# deliberate digest update alongside review and direct helper tests.
+_CONSUMER_SEMANTIC_SHA256 = {
+    "test_agent_model_pins.py": "b52d691f0b4f24a9a9e229c66fd524a68113e39276169ed4fa2e24d3d6e3ce96",
     "test_agent_worktree_controls.py": (
-        "4e07ff892ab0876da0ccd68f4fb323ba72ddafb543c7fd7f6670106f764fff27"
+        "90629b80586e0cf5c6b73aab0044155f6c39ca8eda9a4f459f3ae000db841b57"
     ),
 }
+_NON_RUNTIME_AST_FIELDS = frozenset({"type_params"})
 
 
-def _consumer_token_sha256(path: Path) -> str:
-    """Return the version-independent canonical token digest for one consumer."""
-    return _canonical_token_sha256(path.read_text())
+def _consumer_semantic_sha256(path: Path) -> str:
+    """Return the supported-version semantic digest for one governed consumer."""
+    return _canonical_semantic_sha256(path.read_text())
 
 
-def _canonical_token_sha256(source: str) -> str:
-    """Return a comment- and layout-insensitive digest of all executable tokens."""
-    canonical_tokens: list[tuple[str, str]] = []
-    for item in tokenize.generate_tokens(io.StringIO(source).readline):
-        if item.type in {tokenize.COMMENT, tokenize.NL, tokenize.ENDMARKER}:
-            continue
-        token_name = token.tok_name[item.type]
-        token_string = (
-            "" if item.type in {tokenize.INDENT, tokenize.DEDENT, tokenize.NEWLINE} else item.string
-        )
-        canonical_tokens.append((token_name, token_string))
-    canonical = json.dumps(canonical_tokens, ensure_ascii=True, separators=(",", ":"))
+def _semantic_ast_projection(value: object) -> object:
+    """Return a fixed JSON-safe projection of a Python 3.11 semantic AST."""
+    if isinstance(value, ast.AST):
+        field_names = sorted(value._fields)
+        field_values = cast(dict[str, object], vars(value))
+        serialized_fields: list[tuple[str, object]] = []
+        for field in field_names:
+            if field in _NON_RUNTIME_AST_FIELDS:
+                continue
+            field_value: object = field_values.get(field)
+            serialized_fields.append((field, _semantic_ast_projection(field_value)))
+        return {
+            "node": type(value).__name__,
+            "fields": serialized_fields,
+        }
+    if isinstance(value, list):
+        return [_semantic_ast_projection(item) for item in cast(list[object], value)]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError(f"unsupported semantic AST value: {type(value).__name__}")
+
+
+def _canonical_semantic_sha256(source: str) -> str:
+    """Return a comment- and formatting-insensitive cross-version semantic digest."""
+    tree = ast.parse(source, feature_version=(3, 11))
+    canonical = json.dumps(
+        _semantic_ast_projection(tree), ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def test_governed_consumers_match_closed_canonical_token_fingerprints() -> None:
+def test_governed_consumers_match_closed_semantic_fingerprints() -> None:
     """Both governed consumers remain exactly at their reviewed executable semantics."""
     assert {
-        filename: _consumer_token_sha256(_REPO / "tests" / filename)
-        for filename in _CONSUMER_TOKEN_SHA256
-    } == _CONSUMER_TOKEN_SHA256
+        filename: _consumer_semantic_sha256(_REPO / "tests" / filename)
+        for filename in _CONSUMER_SEMANTIC_SHA256
+    } == _CONSUMER_SEMANTIC_SHA256
 
 
-def test_canonical_token_digest_changes_for_semantic_guard_mutations() -> None:
+def test_canonical_semantic_digest_changes_for_guard_mutations() -> None:
     """Marker-regex and roster-provenance behavior cannot drift under the closed boundary."""
     marker = 'import re\nre.compile(r"^---\\n")\n'
     alternate_marker = 'import re\nre.compile(r"^---")\n'
     roster = "agent_files()\n"
     alternate_roster = "agent_files(directory)\n"
-    assert _canonical_token_sha256(marker) == (
-        "04d9ce081955e4f4068a02581559ffee9949efd5823ee9c26251b36698ac0c54"
+    assert _canonical_semantic_sha256(marker) == (
+        "a2029c153284a6ae8282c0f551da4d3ec59be3d79ff86e9c6aac01caf9b3ad58"
     )
-    assert _canonical_token_sha256(roster) == (
-        "38a9f7aeb91de5c1e47ea1e7949028372aae9a05432666fdc00bef4d5d874098"
+    assert _canonical_semantic_sha256(roster) == (
+        "30fd1e1b751065a2b2f89c3326619d7584ef7b8fdedacf630a032843a6b05fce"
     )
-    assert _canonical_token_sha256(marker) != _canonical_token_sha256(alternate_marker)
-    assert _canonical_token_sha256(roster) != _canonical_token_sha256(alternate_roster)
+    assert _canonical_semantic_sha256(marker) != _canonical_semantic_sha256(alternate_marker)
+    assert _canonical_semantic_sha256(roster) != _canonical_semantic_sha256(alternate_roster)
 
 
-def test_canonical_token_digest_ignores_comments_and_formatting() -> None:
+def test_canonical_semantic_digest_ignores_comments_and_formatting() -> None:
     """Comments and layout do not perturb the canonical semantic digest."""
     compact = "def parse():\n    return agent_files()\n"
     formatted = "# governance comment\n\ndef parse( ):\n\n    return agent_files( )\n"
-    assert _canonical_token_sha256(compact) == _canonical_token_sha256(formatted)
+    assert _canonical_semantic_sha256(compact) == _canonical_semantic_sha256(formatted)
 
 
 def test_governed_consumers_import_and_call_parse_frontmatter() -> None:
     """Parser provenance remains explicit and load-bearing in both governed consumers."""
-    for filename in _CONSUMER_TOKEN_SHA256:
+    for filename in _CONSUMER_SEMANTIC_SHA256:
         tree = ast.parse((_REPO / "tests" / filename).read_text(), filename=filename)
         imported = {
             alias.asname or alias.name
