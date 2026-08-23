@@ -55,6 +55,7 @@ def test_mcp_provenance_is_exact_and_case_sensitive() -> None:
     assert not landmarks.is_mcp_first_crack_source("MCP")
     assert not landmarks.is_mcp_first_crack_source("operator")
     assert not landmarks.is_mcp_first_crack_source(None)
+    assert package_landmarks.is_mcp_first_crack_source("mcp")
 
 
 def test_shared_parsers_reject_invalid_shapes_and_normalize_naive_utc() -> None:
@@ -186,6 +187,16 @@ def test_package_utc_mapping_replaces_a_farther_anchor() -> None:
             [
                 ("2026-01-01T00:00:00+00:00", 0.0),
                 ("2026-01-01T00:00:09+00:00", 9.0),
+            ],
+        )
+        == 10.0
+    )
+    assert (
+        package_landmarks.utc_to_run_seconds(
+            "2026-01-01T00:00:10+00:00",
+            [
+                ("2026-01-01T00:00:09+00:00", 9.0),
+                ("2026-01-01T00:00:00+00:00", 0.0),
             ],
         )
         == 10.0
