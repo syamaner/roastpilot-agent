@@ -6,12 +6,13 @@ this suite.
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from unittest import mock
 
 import aiosqlite as aiosqlite_module
 import pytest
 
+from roastpilot_agent import roast_landmarks
 from roastpilot_agent import store as store_module
 from roastpilot_agent.store import (
     MIGRATIONS,
@@ -775,13 +776,16 @@ PROFILE = RoastProfile(
 )
 
 
-async def seeded_store(store: RoastStore, run_id: str = "run-1") -> RoastStore:
+async def seeded_store(
+    store: RoastStore, run_id: str = "run-1", started_at_utc: str | None = None
+) -> RoastStore:
     await store.initialize()
     await store.create_run(
         run_id=run_id,
         profile=PROFILE,
         config=AppConfig(),
         agent_phase=RoastPhase.STARTING,
+        started_at_utc=started_at_utc,
     )
     return store
 
@@ -2943,6 +2947,53 @@ async def test_list_runs_first_crack_time_orders_by_event_time_not_id(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_source", "second_source", "uses_onset"),
+    [
+        (RoastEventSource.MCP, RoastEventSource.OPERATOR, True),
+        (RoastEventSource.OPERATOR, RoastEventSource.MCP, False),
+    ],
+)
+async def test_list_runs_first_crack_equal_time_uses_one_lower_id_event_for_time_and_source(
+    tmp_store: RoastStore,
+    first_source: RoastEventSource,
+    second_source: RoastEventSource,
+    uses_onset: bool,
+) -> None:
+    """Equal-time FC subqueries share the lower-id event's provenance."""
+    confirmation = "2026-06-07T14:09:10+00:00"
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
+    try:
+        for source in (first_source, second_source):
+            await tmp_store.record_event(
+                run_id="run-1",
+                kind=RoastEventKind.FIRST_CRACK,
+                source=source,
+                recorded_at_utc=confirmation,
+            )
+        await tmp_store.connection.execute(
+            "INSERT INTO telemetry_snapshots "
+            "(run_id,tick,recorded_at_utc,elapsed_seconds,agent_phase,raw_state_json) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                "run-1",
+                1,
+                "2026-06-07T14:09:11+00:00",
+                1.0,
+                RoastPhase.DEVELOPMENT.value,
+                '{"first_crack_status":{"detected_at_utc":"2026-06-07T14:09:05+00:00"}}',
+            ),
+        )
+        await tmp_store.connection.commit()
+        [summary] = await tmp_store.list_runs()
+        assert summary.first_crack_at_utc == (
+            "2026-06-07T14:09:05+00:00" if uses_onset else confirmation
+        )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_list_runs_first_crack_time_none_without_fc(tmp_store: RoastStore) -> None:
     """A run that never reached first crack serializes ``first_crack_at_utc`` as
     ``None`` (#111 back-compat: pre-FC runs and any run with no FC event)."""
@@ -2954,11 +3005,396 @@ async def test_list_runs_first_crack_time_none_without_fc(tmp_store: RoastStore)
             kind=RoastEventKind.RUN_STARTED,
             source=RoastEventSource.CONTROLLER,
         )
+        await tmp_store.connection.execute(
+            "INSERT INTO telemetry_snapshots "
+            "(run_id, tick, recorded_at_utc, elapsed_seconds, agent_phase, raw_state_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "run-1",
+                1,
+                "2026-06-07T14:09:11+00:00",
+                1.0,
+                RoastPhase.DEVELOPMENT.value,
+                '{"first_crack_status":{"detected_at_utc":"2026-06-07T14:09:05+00:00"}}',
+            ),
+        )
+        await tmp_store.connection.commit()
         runs = await tmp_store.list_runs()
         assert len(runs) == 1
         assert runs[0].first_crack_at_utc is None
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_uses_post_confirmation_mcp_backdated_onset(tmp_store: RoastStore) -> None:
+    """A confirmed MCP FC projects a later-persisted, backdated status onset."""
+    confirmation = "2026-06-07T14:09:10+00:00"
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
+    try:
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc=confirmation,
+        )
+        await tmp_store.connection.execute(
+            "INSERT INTO telemetry_snapshots "
+            "(run_id, tick, recorded_at_utc, elapsed_seconds, agent_phase, raw_state_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "run-1",
+                1,
+                "2026-06-07T14:09:11+00:00",
+                1.0,
+                RoastPhase.DEVELOPMENT.value,
+                '{"first_crack_status":{"detected_at_utc":"2026-06-07T14:09:05Z"}}',
+            ),
+        )
+        await tmp_store.connection.commit()
+
+        [summary] = await tmp_store.list_runs()
+
+        assert summary.first_crack_at_utc == "2026-06-07T14:09:05+00:00"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("onset", ["2026-06-07T13:59:59+00:00", "2026-06-07T14:09:11+00:00"])
+async def test_list_runs_rejects_mcp_onset_outside_run_to_confirmation_window(
+    tmp_store: RoastStore, onset: str
+) -> None:
+    """A post-confirmation snapshot cannot move FC outside trusted bounds."""
+    confirmation = "2026-06-07T14:09:10+00:00"
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
+    try:
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc=confirmation,
+        )
+        await tmp_store.connection.execute(
+            "INSERT INTO telemetry_snapshots "
+            "(run_id,tick,recorded_at_utc,elapsed_seconds,agent_phase,raw_state_json) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                "run-1",
+                1,
+                "2026-06-07T14:09:11+00:00",
+                1.0,
+                RoastPhase.DEVELOPMENT.value,
+                f'{{"first_crack_status":{{"detected_at_utc":"{onset}"}}}}',
+            ),
+        )
+        await tmp_store.connection.commit()
+        [summary] = await tmp_store.list_runs()
+        assert summary.first_crack_at_utc == confirmation
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("candidates", "expected"),
+    [
+        (["2026-06-07T13:59:59+00:00", "2026-06-07T14:09:05+00:00"], "2026-06-07T14:09:05+00:00"),
+        (["2026-06-07T14:09:11+00:00", "2026-06-07T14:09:06+00:00"], "2026-06-07T14:09:06+00:00"),
+        (["2026-06-07T14:09:06+00:00", "2026-06-07T14:09:05+00:00"], "2026-06-07T14:09:05+00:00"),
+    ],
+)
+async def test_list_runs_selects_earliest_surviving_mcp_onset(
+    tmp_store: RoastStore, candidates: list[str], expected: str
+) -> None:
+    """Out-of-window candidates do not suppress an in-window sibling."""
+    confirmation = "2026-06-07T14:09:10+00:00"
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
+    try:
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc=confirmation,
+        )
+        await tmp_store.connection.executemany(
+            "INSERT INTO telemetry_snapshots "
+            "(run_id,tick,recorded_at_utc,elapsed_seconds,agent_phase,raw_state_json) "
+            "VALUES (?,?,?,?,?,?)",
+            [
+                (
+                    "run-1",
+                    index,
+                    "2026-06-07T14:09:11+00:00",
+                    float(index),
+                    RoastPhase.DEVELOPMENT.value,
+                    f'{{"first_crack_status":{{"detected_at_utc":"{candidate}"}}}}',
+                )
+                for index, candidate in enumerate(candidates, start=1)
+            ],
+        )
+        await tmp_store.connection.commit()
+        [summary] = await tmp_store.list_runs()
+        assert summary.first_crack_at_utc == expected
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_mcp_window_and_source_fail_closed(tmp_store: RoastStore) -> None:
+    """Operator FC and pre-confirmation state retain the accepted event time."""
+    event_time = "2026-06-07T14:09:10+00:00"
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.OPERATOR,
+            recorded_at_utc=event_time,
+        )
+        await tmp_store.connection.execute(
+            "INSERT INTO telemetry_snapshots "
+            "(run_id, tick, recorded_at_utc, elapsed_seconds, agent_phase, raw_state_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "run-1",
+                1,
+                "2026-06-07T14:09:09+00:00",
+                1.0,
+                RoastPhase.DEVELOPMENT.value,
+                '{"first_crack_status":{"detected_at_utc":"2026-06-07T14:09:05+00:00"}}',
+            ),
+        )
+        await tmp_store.connection.commit()
+
+        [summary] = await tmp_store.list_runs()
+
+        assert summary.first_crack_at_utc == event_time
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_legacy_controller_first_crack_ignores_mcp_state_onset(
+    tmp_store: RoastStore,
+) -> None:
+    """Persisted event provenance, not a state payload claim, gates onset use."""
+    event_time = "2026-06-07T14:09:10+00:00"
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.CONTROLLER,
+            recorded_at_utc=event_time,
+            payload={"source": "mcp"},
+        )
+        await tmp_store.connection.execute(
+            "INSERT INTO telemetry_snapshots "
+            "(run_id,tick,recorded_at_utc,elapsed_seconds,agent_phase,raw_state_json) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                "run-1",
+                1,
+                "2026-06-07T14:09:11+00:00",
+                1.0,
+                RoastPhase.DEVELOPMENT.value,
+                '{"first_crack_status":{"detected_at_utc":"2026-06-07T14:09:05+00:00"}}',
+            ),
+        )
+        await tmp_store.connection.commit()
+        [summary] = await tmp_store.list_runs()
+        assert summary.first_crack_at_utc == event_time
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_ignores_malformed_state_from_another_run(tmp_store: RoastStore) -> None:
+    """One malformed raw state cannot abort or alter another run's onset."""
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
+    await tmp_store.create_run(
+        run_id="run-2", profile=PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
+    )
+    try:
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc="2026-06-07T14:09:10+00:00",
+        )
+        await tmp_store.connection.executemany(
+            "INSERT INTO telemetry_snapshots "
+            "(run_id,tick,recorded_at_utc,elapsed_seconds,agent_phase,raw_state_json) "
+            "VALUES (?,?,?,?,?,?)",
+            [
+                (
+                    "run-1",
+                    1,
+                    "2026-06-07T14:09:11+00:00",
+                    1.0,
+                    RoastPhase.DEVELOPMENT.value,
+                    '{"first_crack_status":{"detected_at_utc":"2026-06-07T14:09:05+00:00"}}',
+                ),
+                ("run-2", 1, "2026-06-07T14:09:11+00:00", 1.0, RoastPhase.DEVELOPMENT.value, "{"),
+            ],
+        )
+        await tmp_store.connection.commit()
+        summaries = {summary.id: summary for summary in await tmp_store.list_runs()}
+        assert summaries["run-1"].first_crack_at_utc == "2026-06-07T14:09:05+00:00"
+        assert summaries["run-2"].first_crack_at_utc is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_uses_only_post_confirmation_mcp_onsets(tmp_store: RoastStore) -> None:
+    """A pre-confirmation bogus onset cannot beat a valid later snapshot."""
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
+    try:
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc="2026-06-07T14:09:10+00:00",
+        )
+        await tmp_store.connection.executemany(
+            "INSERT INTO telemetry_snapshots "
+            "(run_id,tick,recorded_at_utc,elapsed_seconds,agent_phase,raw_state_json) "
+            "VALUES (?,?,?,?,?,?)",
+            [
+                (
+                    "run-1",
+                    1,
+                    "2026-06-07T14:09:09+00:00",
+                    1.0,
+                    RoastPhase.DEVELOPMENT.value,
+                    '{"first_crack_status":{"detected_at_utc":"2026-06-07T14:00:00+00:00"}}',
+                ),
+                (
+                    "run-1",
+                    2,
+                    "2026-06-07T14:09:11+00:00",
+                    2.0,
+                    RoastPhase.DEVELOPMENT.value,
+                    '{"first_crack_status":{"detected_at_utc":"2026-06-07T14:09:05+00:00"}}',
+                ),
+            ],
+        )
+        await tmp_store.connection.commit()
+        [summary] = await tmp_store.list_runs()
+        assert summary.first_crack_at_utc == "2026-06-07T14:09:05+00:00"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_onset_query_has_constant_statement_and_bind_shape(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """History onset lookup stays two statements with one MCP bind at any run count."""
+    await seeded_store(tmp_store)
+    original_execute: Any = tmp_store.connection._execute  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType, reportUnknownVariableType]
+    observed: list[tuple[str, object]] = []
+
+    async def traced_execute(function: object, *args: object, **kwargs: object) -> object:
+        """Record only this store's list-query calls before delegating."""
+        if getattr(function, "__name__", None) == "execute":
+            observed.append((str(args[0]), args[1] if len(args) > 1 else ()))
+        return await original_execute(function, *args, **kwargs)
+
+    monkeypatch.setattr(tmp_store.connection, "_execute", traced_execute)
+    try:
+        observed.clear()
+        await tmp_store.list_runs()
+        one_run = list(observed)
+        for index in range(2, 11):
+            await tmp_store.create_run(
+                run_id=f"run-{index}",
+                profile=PROFILE,
+                config=AppConfig(),
+                agent_phase=RoastPhase.STARTING,
+            )
+        observed.clear()
+        await tmp_store.list_runs()
+        ten_runs = list(observed)
+
+        assert len(one_run) == len(ten_runs) == 2
+        for statements in (one_run, ten_runs):
+            onset_sql, onset_parameters = next(
+                (sql, parameters) for sql, parameters in statements if "json_valid" in sql
+            )
+            assert " IN (" not in onset_sql
+            assert onset_parameters == (RoastEventSource.MCP.value,)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_earliest_non_mcp_event_blocks_later_mcp_status(
+    tmp_store: RoastStore,
+) -> None:
+    """The accepted earliest event's source, not a later duplicate, gates onset use."""
+    earlier = "2026-06-07T14:09:10+00:00"
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.OPERATOR,
+            recorded_at_utc=earlier,
+        )
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc="2026-06-07T14:09:11+00:00",
+        )
+        await tmp_store.connection.execute(
+            "INSERT INTO telemetry_snapshots "
+            "(run_id,tick,recorded_at_utc,elapsed_seconds,agent_phase,raw_state_json) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                "run-1",
+                1,
+                "2026-06-07T14:09:12+00:00",
+                1.0,
+                RoastPhase.DEVELOPMENT.value,
+                '{"first_crack_status":{"detected_at_utc":"2026-06-07T14:09:05+00:00"}}',
+            ),
+        )
+        await tmp_store.connection.commit()
+        [summary] = await tmp_store.list_runs()
+        assert summary.first_crack_at_utc == earlier
+    finally:
+        await tmp_store.close()
+
+
+def test_package_landmark_helpers_use_fail_closed_normalized_values() -> None:
+    """Package landmarks normalize onset values and reject unsafe mapping input."""
+    onset = roast_landmarks.earliest_onset_utc(
+        ["bad", "2026-06-07T14:09:05Z", "2026-06-07T14:09:06+00:00"]
+    )
+    assert onset is not None and onset.isoformat() == "2026-06-07T14:09:05+00:00"
+    assert (
+        roast_landmarks.utc_to_run_seconds(
+            "2026-06-07T14:09:05+00:00",
+            [
+                ("2026-06-07T14:09:04+00:00", 4.0),
+                ("2026-06-07T14:09:06+00:00", 6.0),
+            ],
+        )
+        == 5.0
+    )
+    assert (
+        roast_landmarks.utc_to_run_seconds(
+            "2026-06-07T14:09:00+00:00", [("2026-06-07T14:09:05+00:00", 1.0)]
+        )
+        is None
+    )
+    assert roast_landmarks.interpolate_at(5.0, [(0.0, 0.0), (10.0, 10.0)]) == 5.0
+    assert roast_landmarks.interpolate_at(11.0, [(0.0, 0.0), (10.0, 10.0)]) is None
+    assert roast_landmarks.interpolate_at(5.0, [(10.0, 0.0), (0.0, 10.0)]) is None
 
 
 @pytest.mark.asyncio

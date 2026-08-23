@@ -7,9 +7,12 @@ import math
 import sqlite3
 import sys
 from collections.abc import Iterable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+
+from roastpilot_agent import roast_landmarks as package_landmarks
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -52,6 +55,7 @@ def test_mcp_provenance_is_exact_and_case_sensitive() -> None:
     assert not landmarks.is_mcp_first_crack_source("MCP")
     assert not landmarks.is_mcp_first_crack_source("operator")
     assert not landmarks.is_mcp_first_crack_source(None)
+    assert package_landmarks.is_mcp_first_crack_source("mcp")
 
 
 def test_shared_parsers_reject_invalid_shapes_and_normalize_naive_utc() -> None:
@@ -66,6 +70,31 @@ def test_shared_parsers_reject_invalid_shapes_and_normalize_naive_utc() -> None:
     parsed = landmarks.parse_utc("2026-01-01T00:00:00")
     assert parsed is not None
     assert parsed.isoformat() == "2026-01-01T00:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        (["2026-01-01T00:01:00Z", "2026-01-01T00:01:00+00:00"], "2026-01-01T00:01:00+00:00"),
+        (["2026-01-01T00:01:00+00:00", "2026-01-01T00:00:35+00:00"], "2026-01-01T00:00:35+00:00"),
+        (["bad", "", None], None),
+        (["2026-01-01T00:01:00"], "2026-01-01T00:01:00+00:00"),
+    ],
+)
+def test_package_and_script_helpers_share_timestamp_parsing_rules(
+    values: list[object], expected: str | None
+) -> None:
+    """Parity is parsed-instant selection; exporter raw spelling/count remains distinct."""
+    package = package_landmarks.earliest_onset_utc(values)
+    assert (None if package is None else package.isoformat()) == expected
+    raw_states = [_status(value) for value in values if isinstance(value, str) and value]
+    raw, count = landmarks.first_crack_onset_utc(raw_states)
+    if expected is None:
+        assert raw == "bad" if raw_states else raw is None
+    else:
+        assert landmarks.parse_utc(raw) is not None
+        assert landmarks.parse_utc(raw).isoformat() == expected  # type: ignore[union-attr]
+    assert count >= 0
 
 
 def test_utc_mapping_skips_invalid_anchors_and_rejects_negative_results() -> None:
@@ -93,6 +122,154 @@ def test_utc_mapping_skips_invalid_anchors_and_rejects_negative_results() -> Non
         )
         is None
     )
+
+
+def test_landmark_helpers_keep_first_ties_and_reject_ambiguous_or_invalid_edges() -> None:
+    """Ties are stable while invalid mapping and interpolation inputs fail closed."""
+    assert (
+        landmarks.utc_to_run_seconds(
+            "2026-01-01T00:00:10+00:00",
+            [
+                ("2026-01-01T00:00:08+00:00", 8.0),
+                ("2026-01-01T00:00:12+00:00", 99.0),
+            ],
+        )
+        == 10.0
+    )
+    assert landmarks.utc_to_run_seconds("bad", []) is None
+    assert (
+        landmarks.utc_to_run_seconds(
+            "2026-01-01T00:00:10+00:00", [("2026-01-01T00:00:10+00:00", -1.0)]
+        )
+        is None
+    )
+    assert package_landmarks.interpolate_at(0.0, [(0.0, 1.0), (1.0, 2.0)]) == 1.0
+    assert package_landmarks.interpolate_at(1.0, [(0.0, 1.0), (1.0, 2.0)]) == 2.0
+    assert package_landmarks.interpolate_at(0.0, []) is None
+    assert package_landmarks.interpolate_at(2.0, [(0.0, 1.0), (1.0, 2.0)]) is None
+    assert package_landmarks.interpolate_at(0.5, [(1.0, 1.0), (0.0, 2.0)]) is None
+    assert package_landmarks.interpolate_at(1.0, [(0.0, 1.0), (1.0, 2.0), (1.0, 3.0)]) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, "", "not-a-date", "0001-01-01T00:00:00+01:00"],
+)
+def test_package_parse_utc_fails_closed_for_invalid_and_overflow_values(value: object) -> None:
+    """Malformed and normalization-overflow timestamps never escape parsing."""
+    assert package_landmarks.parse_utc(value) is None
+
+
+@pytest.mark.parametrize(
+    ("target", "anchors"),
+    [
+        ("bad", []),
+        ("2026-01-01T00:00:10+00:00", [("bad", 1.0)]),
+        ("2026-01-01T00:00:10+00:00", [("2026-01-01T00:00:10+00:00", True)]),
+        ("2026-01-01T00:00:10+00:00", [("2026-01-01T00:00:10+00:00", object())]),
+        ("2026-01-01T00:00:10+00:00", [("2026-01-01T00:00:10+00:00", "bad")]),
+        ("2026-01-01T00:00:10+00:00", [("2026-01-01T00:00:10+00:00", math.inf)]),
+        ("2026-01-01T00:00:00+00:00", [("2026-01-01T00:00:10+00:00", 1.0)]),
+    ],
+)
+def test_package_utc_mapping_rejects_unsafe_inputs(
+    target: object, anchors: list[tuple[object, object]]
+) -> None:
+    """Invalid, non-finite, and negative mappings are absent."""
+    assert package_landmarks.utc_to_run_seconds(target, anchors) is None
+
+
+def test_package_utc_mapping_replaces_a_farther_anchor() -> None:
+    """A nearer later anchor supersedes an earlier farther usable anchor."""
+    assert (
+        package_landmarks.utc_to_run_seconds(
+            "2026-01-01T00:00:10+00:00",
+            [
+                ("2026-01-01T00:00:00+00:00", 0.0),
+                ("2026-01-01T00:00:09+00:00", 9.0),
+            ],
+        )
+        == 10.0
+    )
+    assert (
+        package_landmarks.utc_to_run_seconds(
+            "2026-01-01T00:00:10+00:00",
+            [
+                ("2026-01-01T00:00:09+00:00", 9.0),
+                ("2026-01-01T00:00:00+00:00", 0.0),
+            ],
+        )
+        == 10.0
+    )
+
+
+def test_package_utc_mapping_ignores_nearer_negative_anchor() -> None:
+    """A closer negative run-clock anchor cannot displace a valid anchor."""
+    assert (
+        package_landmarks.utc_to_run_seconds(
+            "2026-01-01T00:00:10+00:00",
+            [
+                ("2026-01-01T00:00:08+00:00", 8.0),
+                ("2026-01-01T00:00:09+00:00", -1.0),
+            ],
+        )
+        == 10.0
+    )
+    assert (
+        package_landmarks.utc_to_run_seconds(
+            "2026-01-01T00:00:10+00:00", [("2026-01-01T00:00:10+00:00", -1.0)]
+        )
+        is None
+    )
+
+
+def test_package_onset_window_is_inclusive_and_fail_closed() -> None:
+    """Only parseable onset bounds admit a confirmation override."""
+    assert package_landmarks.is_onset_within_event_window(
+        datetime.fromisoformat("2026-01-01T00:00:00+00:00"),
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:01:00+00:00",
+    )
+    assert package_landmarks.is_onset_within_event_window(
+        datetime.fromisoformat("2026-01-01T00:01:00+00:00"),
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:01:00+00:00",
+    )
+    assert not package_landmarks.is_onset_within_event_window(
+        datetime(2026, 1, 1), "2026-01-01T00:00:00+00:00", "2026-01-01T00:01:00+00:00"
+    )
+    assert not package_landmarks.is_onset_within_event_window(
+        datetime.min.replace(tzinfo=timezone(timedelta(hours=1))),
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:01:00+00:00",
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "samples", "expected"),
+    [
+        (True, [], None),
+        (object(), [], None),
+        ("bad", [], None),
+        (math.inf, [], None),
+        (0.0, [(True, 1.0)], None),
+        (0.0, [(0.0, object())], None),
+        (0.0, [("bad", 1.0)], None),
+        (0.0, [(0.0, math.inf)], None),
+        (0.0, [(1.0, 1.0)], None),
+        (1.0, [(1.0, 2.0)], 2.0),
+        (1.0, [(0.0, 0.0), (2.0, 4.0)], 2.0),
+        (2.0, [(0.0, 0.0), (2.0, 4.0)], 4.0),
+        (3.0, [(0.0, 0.0), (2.0, 4.0)], None),
+        (1.0, [(0.0, 0.0), (1.0, 2.0), (1.0, 3.0)], None),
+        (1.0, [(1.0, 1.0), (0.0, 0.0)], None),
+    ],
+)
+def test_package_interpolation_fails_closed_or_returns_exact_value(
+    target: object, samples: list[tuple[object, object]], expected: float | None
+) -> None:
+    """Interpolation accepts only finite strictly increasing coordinates."""
+    assert package_landmarks.interpolate_at(target, samples) == expected
 
 
 def test_exporter_delegates_onset_selection_with_shared_parity(

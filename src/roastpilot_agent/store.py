@@ -56,6 +56,10 @@ from roastpilot_agent.models import (
     recording_origin_slug,
     weight_loss_percent,
 )
+from roastpilot_agent.roast_landmarks import (
+    earliest_onset_within_event_window,
+    is_mcp_first_crack_source,
+)
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
 
 SCHEMA_V1 = """
@@ -1783,11 +1787,12 @@ class RoastStore:
         snapshot via a correlated subquery — one statement, no N+1 — and is
         ``None`` for a run that never recorded one.
 
-        First-crack time (#111) is the *chronologically earliest* persisted
-        ``first_crack`` roast event for the run (the ``idx_roast_events_run_kind``
-        index covers the lookup), and is ``None`` for a run that never reached
-        first crack — both the MCP detection and the operator-override FC paths
-        emit that event, so either crossing is projected.
+        First-crack time is the chronologically earliest accepted ``first_crack``
+        event, except an MCP event may use the earliest valid backdated onset in
+        state snapshots persisted at or after that confirmation. Operator,
+        legacy, malformed, absent, and out-of-window onset paths retain the event
+        timestamp. Unlike the exporter’s whole-run diagnostic sweep, this history
+        projection deliberately considers only post-confirmation state.
 
         The subquery orders by ``recorded_at_utc`` (the event time), NOT by the
         insertion ``id``: ``record_event`` accepts an explicit ``recorded_at_utc``,
@@ -1832,7 +1837,10 @@ class RoastStore:
             "  ORDER BY t.id DESC LIMIT 1) AS dev_pct,"
             " (SELECT e.recorded_at_utc FROM roast_events e"
             "  WHERE e.run_id = r.id AND e.kind = 'first_crack'"
-            "  ORDER BY e.recorded_at_utc ASC LIMIT 1) AS fc_at,"
+            "  ORDER BY e.recorded_at_utc ASC, e.id ASC LIMIT 1) AS fc_at,"
+            " (SELECT e.source FROM roast_events e"
+            "  WHERE e.run_id = r.id AND e.kind = 'first_crack'"
+            "  ORDER BY e.recorded_at_utc ASC, e.id ASC LIMIT 1) AS fc_source,"
             " (SELECT COUNT(*) FROM advisor_decisions a"
             "  WHERE a.run_id = r.id) AS advisor_consults,"
             " (SELECT COUNT(*) FROM advisor_decisions a"
@@ -1851,11 +1859,37 @@ class RoastStore:
             (SafetyVerdict.CLAMP.value, SafetyVerdict.REJECT.value),
         ) as cursor:
             rows = await cursor.fetchall()
+        onset_candidates: dict[str, list[object]] = {}
+        onset_query = (
+            "SELECT t.run_id, CASE WHEN json_valid(t.raw_state_json) "
+            "THEN json_extract(t.raw_state_json, '$.first_crack_status.detected_at_utc') END "
+            "AS onset_candidate FROM telemetry_snapshots t "
+            "WHERE EXISTS (SELECT 1 FROM roast_runs r WHERE r.id = t.run_id "
+            "AND r.excluded = 0) AND EXISTS (SELECT 1 FROM roast_events e "
+            "WHERE e.id = (SELECT first_event.id FROM roast_events first_event "
+            "WHERE first_event.run_id = t.run_id AND first_event.kind = 'first_crack' "
+            "ORDER BY first_event.recorded_at_utc ASC, first_event.id ASC LIMIT 1) "
+            "AND e.source = ? AND t.recorded_at_utc >= e.recorded_at_utc) "
+            "GROUP BY t.run_id, CASE WHEN json_valid(t.raw_state_json) "
+            "THEN json_extract(t.raw_state_json, '$.first_crack_status.detected_at_utc') END"
+        )
+        async with self.connection.execute(onset_query, (RoastEventSource.MCP.value,)) as cursor:
+            for onset_row in await cursor.fetchall():
+                onset_candidates.setdefault(str(onset_row["run_id"]), []).append(
+                    onset_row["onset_candidate"]
+                )
         summaries: list[RoastSummary] = []
         for row in rows:
             profile = RoastProfile.model_validate_json(str(row["profile_json"]))
             roasted_weight = self._optional_float(row["roasted_weight_grams"])
             corrected_charge = self._optional_float(row["corrected_charge_grams"])
+            first_crack_at = None if row["fc_at"] is None else str(row["fc_at"])
+            if is_mcp_first_crack_source(row["fc_source"]):
+                onset = earliest_onset_within_event_window(
+                    onset_candidates.get(str(row["id"]), []), row["started_at_utc"], row["fc_at"]
+                )
+                if onset is not None:
+                    first_crack_at = onset.isoformat()
             summaries.append(
                 RoastSummary(
                     id=str(row["id"]),
@@ -1863,7 +1897,7 @@ class RoastStore:
                     completed_at_utc=None
                     if row["completed_at_utc"] is None
                     else str(row["completed_at_utc"]),
-                    first_crack_at_utc=None if row["fc_at"] is None else str(row["fc_at"]),
+                    first_crack_at_utc=first_crack_at,
                     agent_phase=RoastPhase(str(row["agent_phase"])),
                     outcome=row["outcome"],
                     bean_origin=profile.bean_origin,
