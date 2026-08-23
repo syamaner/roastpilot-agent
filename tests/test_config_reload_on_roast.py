@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
 
 import roastpilot_agent.api as api_module
 from roastpilot_agent.api import RoastService, create_app
@@ -992,6 +993,56 @@ async def test_a_failed_post_write_reload_clears_an_advisory_paused_probe(
 
     def _fail_reload() -> tuple[AppConfig, frozenset[str]]:
         raise ConfigFileError("reload failed")
+
+    monkeypatch.setattr(api_module, "load_app_config", _fail_reload)
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}}
+    )
+
+    assert response.status_code == 500
+    assert "openai/gpt-4.1-mini" in config_file.read_text()
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_write_validation_clears_the_probe(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A validation failure after persistence leaves no affirmative probe state."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+
+    def _fail_reload() -> tuple[AppConfig, frozenset[str]]:
+        raise ValidationError.from_exception_data(
+            "ReloadError", [{"type": "missing", "loc": ("advisor",), "input": {}}]
+        )
+
+    monkeypatch.setattr(api_module, "load_app_config", _fail_reload)
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}}
+    )
+
+    assert response.status_code == 500
+    assert "openai/gpt-4.1-mini" in config_file.read_text()
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_write_os_error_clears_the_probe(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An I/O failure after persistence leaves no affirmative probe state."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+
+    def _fail_reload() -> tuple[AppConfig, frozenset[str]]:
+        raise OSError("reload failed")
 
     monkeypatch.setattr(api_module, "load_app_config", _fail_reload)
 

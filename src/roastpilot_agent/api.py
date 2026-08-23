@@ -4492,7 +4492,7 @@ async def put_config(edit: AppConfigEdit, request: Request) -> AppConfigSnapshot
     try:
         effective, injected_keys = await asyncio.to_thread(load_app_config)
         saved_raw = await asyncio.to_thread(load_saved_raw)
-    except ConfigFileError as exc:
+    except (ConfigFileError, ValidationError, OSError) as exc:
         service = getattr(request.app.state, "service", None)
         if isinstance(service, RoastService):
             # The saved file changed but no effective configuration is available,
