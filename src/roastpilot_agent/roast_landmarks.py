@@ -85,6 +85,22 @@ def is_onset_within_event_window(onset: datetime, started_at: object, event_at: 
     )
 
 
+def earliest_onset_within_event_window(
+    candidates: Iterable[object], started_at: object, event_at: object
+) -> datetime | None:
+    """Return the earliest parsed onset that lies within trusted event bounds."""
+    earliest: datetime | None = None
+    for candidate in candidates:
+        onset = parse_utc(candidate)
+        if (
+            onset is not None
+            and is_onset_within_event_window(onset, started_at, event_at)
+            and (earliest is None or onset < earliest)
+        ):
+            earliest = onset
+    return earliest
+
+
 def utc_to_run_seconds(target: object, anchors: Iterable[tuple[object, object]]) -> float | None:
     """Map a UTC instant to the nearest finite, non-negative run-clock anchor.
 

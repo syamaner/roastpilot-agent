@@ -3096,6 +3096,51 @@ async def test_list_runs_rejects_mcp_onset_outside_run_to_confirmation_window(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("candidates", "expected"),
+    [
+        (["2026-06-07T13:59:59+00:00", "2026-06-07T14:09:05+00:00"], "2026-06-07T14:09:05+00:00"),
+        (["2026-06-07T14:09:11+00:00", "2026-06-07T14:09:06+00:00"], "2026-06-07T14:09:06+00:00"),
+        (["2026-06-07T14:09:06+00:00", "2026-06-07T14:09:05+00:00"], "2026-06-07T14:09:05+00:00"),
+    ],
+)
+async def test_list_runs_selects_earliest_surviving_mcp_onset(
+    tmp_store: RoastStore, candidates: list[str], expected: str
+) -> None:
+    """Out-of-window candidates do not suppress an in-window sibling."""
+    confirmation = "2026-06-07T14:09:10+00:00"
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
+    try:
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc=confirmation,
+        )
+        await tmp_store.connection.executemany(
+            "INSERT INTO telemetry_snapshots "
+            "(run_id,tick,recorded_at_utc,elapsed_seconds,agent_phase,raw_state_json) "
+            "VALUES (?,?,?,?,?,?)",
+            [
+                (
+                    "run-1",
+                    index,
+                    "2026-06-07T14:09:11+00:00",
+                    float(index),
+                    RoastPhase.DEVELOPMENT.value,
+                    f'{{"first_crack_status":{{"detected_at_utc":"{candidate}"}}}}',
+                )
+                for index, candidate in enumerate(candidates, start=1)
+            ],
+        )
+        await tmp_store.connection.commit()
+        [summary] = await tmp_store.list_runs()
+        assert summary.first_crack_at_utc == expected
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_list_runs_mcp_window_and_source_fail_closed(tmp_store: RoastStore) -> None:
     """Operator FC and pre-confirmation state retain the accepted event time."""
     event_time = "2026-06-07T14:09:10+00:00"

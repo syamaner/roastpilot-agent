@@ -57,9 +57,8 @@ from roastpilot_agent.models import (
     weight_loss_percent,
 )
 from roastpilot_agent.roast_landmarks import (
-    earliest_onset_utc,
+    earliest_onset_within_event_window,
     is_mcp_first_crack_source,
-    is_onset_within_event_window,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
 
@@ -1886,10 +1885,10 @@ class RoastStore:
             corrected_charge = self._optional_float(row["corrected_charge_grams"])
             first_crack_at = None if row["fc_at"] is None else str(row["fc_at"])
             if is_mcp_first_crack_source(row["fc_source"]):
-                onset = earliest_onset_utc(onset_candidates.get(str(row["id"]), []))
-                if onset is not None and is_onset_within_event_window(
-                    onset, row["started_at_utc"], row["fc_at"]
-                ):
+                onset = earliest_onset_within_event_window(
+                    onset_candidates.get(str(row["id"]), []), row["started_at_utc"], row["fc_at"]
+                )
+                if onset is not None:
                     first_crack_at = onset.isoformat()
             summaries.append(
                 RoastSummary(
