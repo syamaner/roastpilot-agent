@@ -59,13 +59,22 @@ import math
 import sqlite3
 import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from roast_degree import classify_degree  # noqa: E402
+from roast_landmarks import (  # noqa: E402
+    first_crack_event_source,
+    first_crack_onset_utc,
+    is_mcp_first_crack_source,
+    utc_to_run_seconds,
+)
+from roast_landmarks import (
+    parse_utc as _parse_utc,
+)
 
 #: The controller tick interval (seconds) — the fallback when a telemetry row
 #: predates the ``elapsed_seconds`` column. Mirrors
@@ -310,38 +319,7 @@ def _first_crack_event_source(connection: sqlite3.Connection, run_id: str) -> st
     ).fetchone()
     if row is None or row["payload_json"] is None:
         return None
-    try:
-        payload: Any = json.loads(row["payload_json"])
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    source = cast(dict[str, object], payload).get("source")
-    return source if isinstance(source, str) else None
-
-
-def _parse_utc(value: str) -> datetime | None:
-    """Parse an ISO-8601 instant, treating a missing offset as UTC.
-
-    Args:
-        value: ISO-8601 timestamp; Python 3.11 accepts both ``Z`` and explicit
-            offsets.
-
-    Returns:
-        An offset-aware datetime, or ``None`` when ``value`` is unparseable or
-        cannot be normalized to UTC.
-    """
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    try:
-        parsed.astimezone(UTC)
-    except OverflowError:
-        return None
-    return parsed
+    return first_crack_event_source(row["payload_json"])
 
 
 def _utc_to_run_seconds(
@@ -362,32 +340,16 @@ def _utc_to_run_seconds(
         Run-relative seconds, or ``None`` when the target or every telemetry
         wall timestamp is unparseable, or no row has both required clocks.
     """
-    target = _parse_utc(target_iso)
-    if target is None:
-        return None
     rows = connection.execute(
         "SELECT recorded_at_utc, elapsed_seconds FROM telemetry_snapshots"
         " WHERE run_id = ? AND elapsed_seconds IS NOT NULL"
         " AND recorded_at_utc IS NOT NULL ORDER BY tick ASC, id ASC",
         (run_id,),
     ).fetchall()
-    nearest_elapsed: float | None = None
-    nearest_delta_seconds: float | None = None
-    nearest_distance: float | None = None
-    for row in rows:
-        recorded = _parse_utc(str(row["recorded_at_utc"]))
-        if recorded is None:
-            continue
-        delta_seconds = (target - recorded).total_seconds()
-        distance = abs(delta_seconds)
-        if nearest_distance is None or distance < nearest_distance:
-            nearest_distance = distance
-            nearest_delta_seconds = delta_seconds
-            nearest_elapsed = float(row["elapsed_seconds"])
-    if nearest_elapsed is None or nearest_delta_seconds is None:
-        return None
-    mapped = nearest_elapsed + nearest_delta_seconds
-    return None if mapped < 0.0 else mapped
+    return utc_to_run_seconds(
+        target_iso,
+        ((row["recorded_at_utc"], row["elapsed_seconds"]) for row in rows),
+    )
 
 
 def _telemetry_clock_violations(connection: sqlite3.Connection, run_id: str) -> list[str]:
@@ -475,43 +437,7 @@ def _first_crack_onset_utc(connection: sqlite3.Connection, run_id: str) -> tuple
         " ORDER BY tick ASC, id ASC",
         (run_id,),
     ).fetchall()
-    # Keyed by the parsed instant (not the raw string) so equal-instant
-    # renderings in different ISO-8601 forms collapse to one onset; the first
-    # raw string seen for a given instant is retained verbatim for the
-    # downstream warning/mark (#788).
-    parsed_by_instant: dict[datetime, str] = {}
-    unparseable_seen: set[str] = set()
-    unparseable_order: list[str] = []
-    for row in rows:
-        try:
-            document: Any = json.loads(row["raw_state_json"])
-        except (ValueError, TypeError):
-            continue
-        if not isinstance(document, dict):
-            continue
-        document_map = cast(dict[str, object], document)
-        status = document_map.get("first_crack_status")
-        if not isinstance(status, dict):
-            continue
-        status_map = cast(dict[str, object], status)
-        detected_at = status_map.get("detected_at_utc")
-        if not isinstance(detected_at, str) or not detected_at:
-            continue
-        parsed = _parse_utc(detected_at)
-        if parsed is not None:
-            instant = parsed.astimezone(UTC)
-            if instant not in parsed_by_instant:
-                parsed_by_instant[instant] = detected_at
-        elif detected_at not in unparseable_seen:
-            unparseable_seen.add(detected_at)
-            unparseable_order.append(detected_at)
-    count = len(parsed_by_instant) + len(unparseable_order)
-    if count == 0:
-        return None, 0
-    if parsed_by_instant:
-        earliest_instant = min(parsed_by_instant)
-        return parsed_by_instant[earliest_instant], count
-    return unparseable_order[0], count
+    return first_crack_onset_utc(row["raw_state_json"] for row in rows)
 
 
 @dataclass(frozen=True)
@@ -724,7 +650,7 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
         accepted_first_crack_source = _first_crack_event_source(connection, resolved)
         first_crack_source: str | None = None
         first_crack_onset_count = 0
-        if accepted_first_crack_source == "mcp":
+        if is_mcp_first_crack_source(accepted_first_crack_source):
             first_crack_source, first_crack_onset_count = _first_crack_onset_utc(
                 connection, resolved
             )
@@ -751,7 +677,7 @@ def _read_store_roast(db_path: Path, run_id: str | None = None) -> _StoreReadRes
         # (operator override vs. everything else, including unreadable
         # provenance) rather than echoing the accepted source string into
         # operator-facing stderr.
-        if accepted_first_crack_source == "mcp":
+        if is_mcp_first_crack_source(accepted_first_crack_source):
             first_crack_fallback_reason = first_crack.fallback_reason
         elif accepted_first_crack_source == "operator":
             first_crack_fallback_reason = (
