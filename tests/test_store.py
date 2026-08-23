@@ -5288,19 +5288,30 @@ async def test_build_reference_roast_enforces_upper_usable_span_before_interpola
                     "2026-08-23T12:00:00+00:00",
                     "{}",
                 ),
-                (620.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:20+00:00", "{}"),
                 (
                     610.0,
+                    188.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:10+00:00",
+                    "{}",
+                ),
+                (
+                    620.0,
                     191.0,
                     RoastPhase.DEVELOPMENT,
-                    "2026-08-23T12:00:30+00:00",
+                    "2026-08-23T12:00:20+00:00",
                     '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:15+00:00"}}',
                 ),
             ),
         )
+        await tmp_store.connection.execute(
+            "UPDATE telemetry_snapshots SET bean_temp_c = NULL WHERE run_id = ? AND tick = ?",
+            ("upper-span-before-interpolation", 3),
+        )
+        await tmp_store.connection.commit()
         assert await _reference_landmark_pair(tmp_store, "upper-span-before-interpolation") == (
             620.0,
-            188.0,
+            None,
         )
     finally:
         await tmp_store.close()
