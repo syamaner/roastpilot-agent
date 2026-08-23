@@ -5106,6 +5106,70 @@ async def test_build_reference_roast_falls_back_when_first_development_clock_is_
 
 
 @pytest.mark.asyncio
+async def test_build_reference_roast_fallback_keeps_null_first_development_temperature(
+    tmp_store: RoastStore,
+) -> None:
+    """A forced fallback keeps the first-development elapsed/NULL-temp pair."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="first-development-temperature-null",
+            event_source=RoastEventSource.OPERATOR,
+        )
+        await tmp_store.connection.execute(
+            "UPDATE telemetry_snapshots SET bean_temp_c = NULL WHERE run_id = ? AND tick = ?",
+            ("first-development-temperature-null", 2),
+        )
+        await tmp_store.connection.commit()
+        assert await _reference_landmark_pair(tmp_store, "first-development-temperature-null") == (
+            610.0,
+            None,
+        )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_sql_mcp_source_filter_backs_up_python_gate(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SQL source bind rejects an admitted non-MCP accepted event."""
+    await tmp_store.initialize()
+    try:
+
+        def admit_any_source(_source: object) -> bool:
+            return True
+
+        monkeypatch.setattr(store_module, "is_mcp_first_crack_source", admit_any_source)
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="sql-source-filter",
+            event_source=RoastEventSource.OPERATOR,
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    "{}",
+                ),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (
+                    620.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:20+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:05+00:00"}}',
+                ),
+            ),
+        )
+        assert await _reference_landmark_pair(tmp_store, "sql-source-filter") == (610.0, 188.0)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_build_reference_roast_enforces_upper_usable_span_before_interpolation(
     tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
