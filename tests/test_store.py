@@ -3927,6 +3927,65 @@ async def _record_row(
     )
 
 
+async def _seed_onset_reference(
+    store: RoastStore,
+    *,
+    run_id: str,
+    event_source: RoastEventSource | None = RoastEventSource.MCP,
+    event_at: str = "2026-08-23T12:00:10+00:00",
+    started_at: str = "2026-08-23T11:50:00+00:00",
+    rows: tuple[tuple[float, float, RoastPhase, str, str], ...] = (
+        (600.0, 185.0, RoastPhase.ROASTING_PRE_FIRST_CRACK, "2026-08-23T12:00:00+00:00", "{}"),
+        (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+        (620.0, 191.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:20+00:00", "{}"),
+    ),
+) -> None:
+    """Seed one rated reference run with controlled telemetry/onset state."""
+    profile = _reference_profile()
+    await store.create_run(
+        run_id=run_id,
+        profile=profile,
+        config=AppConfig(),
+        agent_phase=RoastPhase.STARTING,
+        started_at_utc=started_at,
+    )
+    for tick, (elapsed, temperature, phase, recorded_at, raw_state) in enumerate(rows, start=1):
+        await _record_row(
+            store,
+            run_id,
+            tick,
+            phase=phase,
+            charge_elapsed=elapsed,
+            bean_temp=temperature,
+        )
+        await store.connection.execute(
+            "UPDATE telemetry_snapshots SET recorded_at_utc = ?, raw_state_json = ?"
+            " WHERE run_id = ? AND tick = ?",
+            (recorded_at, raw_state, run_id, tick),
+        )
+    if event_source is not None:
+        await store.record_event(
+            run_id=run_id,
+            kind=RoastEventKind.FIRST_CRACK,
+            source=event_source,
+            recorded_at_utc=event_at,
+        )
+    await store.connection.commit()
+    await store.complete_run(run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    await store.set_operator_rating(run_id, rating=4)
+
+
+async def _reference_landmark_pair(
+    store: RoastStore, run_id: str
+) -> tuple[float | None, float | None]:
+    """Return the persisted reference first-crack pair for one seeded run."""
+    reference = await store._build_reference_roast(  # pyright: ignore[reportPrivateUsage]
+        run_id, "test-slug"
+    )
+    assert reference is not None
+    return reference.landmarks.first_crack_elapsed_s, reference.landmarks.first_crack_temp_c
+
+
 @pytest.mark.asyncio
 async def test_build_reference_roast_curve_uses_insertion_order_after_tick_reset(
     tmp_path: Path,
@@ -4505,6 +4564,387 @@ async def test_build_reference_roast_adopts_complete_mcp_onset_pair(
         assert reference is not None
         assert reference.landmarks.first_crack_elapsed_s == 605.0
         assert reference.landmarks.first_crack_temp_c == 186.5
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_keeps_development_pair_for_non_mcp_accepted_event(
+    tmp_store: RoastStore,
+) -> None:
+    """T3: MCP-looking state cannot launder an operator confirmation."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="operator-confirmed",
+            event_source=RoastEventSource.OPERATOR,
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    "{}",
+                ),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (
+                    620.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:20+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:05Z"}}',
+                ),
+            ),
+        )
+        assert await _reference_landmark_pair(tmp_store, "operator-confirmed") == (610.0, 188.0)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_uses_earliest_event_source_not_later_mcp_duplicate(
+    tmp_store: RoastStore,
+) -> None:
+    """T4: the later MCP duplicate cannot replace the accepted controller event."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="later-mcp",
+            event_source=RoastEventSource.CONTROLLER,
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    "{}",
+                ),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (
+                    620.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:20+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:05Z"}}',
+                ),
+            ),
+        )
+        await tmp_store.record_event(
+            run_id="later-mcp",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc="2026-08-23T12:00:11+00:00",
+        )
+        assert await _reference_landmark_pair(tmp_store, "later-mcp") == (610.0, 188.0)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_ignores_onset_without_first_crack_event(
+    tmp_store: RoastStore,
+) -> None:
+    """T5: state alone cannot establish first-crack provenance."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="no-confirmation",
+            event_source=None,
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    "{}",
+                ),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (
+                    620.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:20+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:05Z"}}',
+                ),
+            ),
+        )
+        assert await _reference_landmark_pair(tmp_store, "no-confirmation") == (610.0, 188.0)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_excludes_pre_confirmation_onset_state(
+    tmp_store: RoastStore,
+) -> None:
+    """T6: only state persisted at or after MCP confirmation is eligible."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="pre-confirmation",
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:05Z"}}',
+                ),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (620.0, 191.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:20+00:00", "{}"),
+            ),
+        )
+        assert await _reference_landmark_pair(tmp_store, "pre-confirmation") == (610.0, 188.0)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_skips_malformed_state_and_uses_other_onset(
+    tmp_store: RoastStore,
+) -> None:
+    """T7: malformed state is ignored without blocking valid post-event state."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="malformed-state",
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    "{}",
+                ),
+                (
+                    610.0,
+                    188.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:10+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:05Z"}}',
+                ),
+                (620.0, 191.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:20+00:00", "not-json"),
+            ),
+        )
+        assert await _reference_landmark_pair(tmp_store, "malformed-state") == (605.0, 186.5)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("candidate", "started_at", "event_at"),
+    [
+        ("not-a-timestamp", "2026-08-23T11:50:00+00:00", "2026-08-23T12:00:10+00:00"),
+        ("2026-08-23T11:49:59+00:00", "2026-08-23T11:50:00+00:00", "2026-08-23T12:00:10+00:00"),
+        ("2026-08-23T12:00:11+00:00", "2026-08-23T11:50:00+00:00", "2026-08-23T12:00:10+00:00"),
+    ],
+)
+async def test_build_reference_roast_falls_back_for_unusable_or_out_of_window_onset(
+    tmp_store: RoastStore, candidate: str, started_at: str, event_at: str
+) -> None:
+    """T8: parsing and inclusive run/confirmation bounds fail closed."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="bad-onset",
+            started_at=started_at,
+            event_at=event_at,
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    "{}",
+                ),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (
+                    620.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:20+00:00",
+                    f'{{"first_crack_status":{{"detected_at_utc":"{candidate}"}}}}',
+                ),
+            ),
+        )
+        assert await _reference_landmark_pair(tmp_store, "bad-onset") == (610.0, 188.0)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_falls_back_when_mapping_is_after_confirmation(
+    tmp_store: RoastStore,
+) -> None:
+    """T9: a valid onset cannot map past the first development confirmation."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="mapped-late",
+            event_at="2026-08-23T12:00:30+00:00",
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    "{}",
+                ),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (
+                    620.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:30+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:25+00:00"}}',
+                ),
+            ),
+        )
+        assert await _reference_landmark_pair(tmp_store, "mapped-late") == (610.0, 188.0)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_falls_back_when_mapping_precedes_usable_curve(
+    tmp_store: RoastStore,
+) -> None:
+    """T10: reference interpolation does not extrapolate before the curve."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="mapped-early",
+            event_at="2026-08-23T12:00:30+00:00",
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:10+00:00",
+                    "{}",
+                ),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:20+00:00", "{}"),
+                (
+                    620.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:30+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:05+00:00"}}',
+                ),
+            ),
+        )
+        assert await _reference_landmark_pair(tmp_store, "mapped-early") == (610.0, 188.0)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_falls_back_for_non_monotone_usable_curve(
+    tmp_store: RoastStore,
+) -> None:
+    """T11: a non-monotone curve cannot provide a first-crack temperature."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="non-monotone",
+            event_at="2026-08-23T12:00:30+00:00",
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    "{}",
+                ),
+                (620.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (
+                    610.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:30+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:00+00:00"}}',
+                ),
+            ),
+        )
+        assert await _reference_landmark_pair(tmp_store, "non-monotone") == (620.0, 188.0)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_keeps_complete_fallback_pair_when_interpolation_fails(
+    tmp_store: RoastStore,
+) -> None:
+    """T12: a mapped onset never replaces only the fallback elapsed time."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="atomic-interpolation",
+            event_at="2026-08-23T12:00:30+00:00",
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    "{}",
+                ),
+                (620.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (
+                    610.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:30+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:00+00:00"}}',
+                ),
+            ),
+        )
+        assert await _reference_landmark_pair(tmp_store, "atomic-interpolation") == (620.0, 188.0)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_keeps_complete_fallback_pair_when_bounds_fail(
+    tmp_store: RoastStore,
+) -> None:
+    """T13: an interpolable onset outside usable bounds adopts neither value."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="atomic-bounds",
+            event_at="2026-08-23T12:00:30+00:00",
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    "{}",
+                ),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (
+                    620.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:30+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:25+00:00"}}',
+                ),
+            ),
+        )
+        assert await _reference_landmark_pair(tmp_store, "atomic-bounds") == (610.0, 188.0)
     finally:
         await tmp_store.close()
 
