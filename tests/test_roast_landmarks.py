@@ -149,6 +149,75 @@ def test_landmark_helpers_keep_first_ties_and_reject_ambiguous_or_invalid_edges(
     assert package_landmarks.interpolate_at(1.0, [(0.0, 1.0), (1.0, 2.0), (1.0, 3.0)]) is None
 
 
+@pytest.mark.parametrize(
+    "value",
+    [None, "", "not-a-date", "0001-01-01T00:00:00+01:00"],
+)
+def test_package_parse_utc_fails_closed_for_invalid_and_overflow_values(value: object) -> None:
+    """Malformed and normalization-overflow timestamps never escape parsing."""
+    assert package_landmarks.parse_utc(value) is None
+
+
+@pytest.mark.parametrize(
+    ("target", "anchors"),
+    [
+        ("bad", []),
+        ("2026-01-01T00:00:10+00:00", [("bad", 1.0)]),
+        ("2026-01-01T00:00:10+00:00", [("2026-01-01T00:00:10+00:00", True)]),
+        ("2026-01-01T00:00:10+00:00", [("2026-01-01T00:00:10+00:00", object())]),
+        ("2026-01-01T00:00:10+00:00", [("2026-01-01T00:00:10+00:00", "bad")]),
+        ("2026-01-01T00:00:10+00:00", [("2026-01-01T00:00:10+00:00", math.inf)]),
+        ("2026-01-01T00:00:00+00:00", [("2026-01-01T00:00:10+00:00", 1.0)]),
+    ],
+)
+def test_package_utc_mapping_rejects_unsafe_inputs(
+    target: object, anchors: list[tuple[object, object]]
+) -> None:
+    """Invalid, non-finite, and negative mappings are absent."""
+    assert package_landmarks.utc_to_run_seconds(target, anchors) is None
+
+
+def test_package_utc_mapping_replaces_a_farther_anchor() -> None:
+    """A nearer later anchor supersedes an earlier farther usable anchor."""
+    assert (
+        package_landmarks.utc_to_run_seconds(
+            "2026-01-01T00:00:10+00:00",
+            [
+                ("2026-01-01T00:00:00+00:00", 0.0),
+                ("2026-01-01T00:00:09+00:00", 9.0),
+            ],
+        )
+        == 10.0
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "samples", "expected"),
+    [
+        (True, [], None),
+        (object(), [], None),
+        ("bad", [], None),
+        (math.inf, [], None),
+        (0.0, [(True, 1.0)], None),
+        (0.0, [(0.0, object())], None),
+        (0.0, [("bad", 1.0)], None),
+        (0.0, [(0.0, math.inf)], None),
+        (0.0, [(1.0, 1.0)], None),
+        (1.0, [(1.0, 2.0)], 2.0),
+        (1.0, [(0.0, 0.0), (2.0, 4.0)], 2.0),
+        (2.0, [(0.0, 0.0), (2.0, 4.0)], 4.0),
+        (3.0, [(0.0, 0.0), (2.0, 4.0)], None),
+        (1.0, [(0.0, 0.0), (1.0, 2.0), (1.0, 3.0)], None),
+        (1.0, [(1.0, 1.0), (0.0, 0.0)], None),
+    ],
+)
+def test_package_interpolation_fails_closed_or_returns_exact_value(
+    target: object, samples: list[tuple[object, object]], expected: float | None
+) -> None:
+    """Interpolation accepts only finite strictly increasing coordinates."""
+    assert package_landmarks.interpolate_at(target, samples) == expected
+
+
 def test_exporter_delegates_onset_selection_with_shared_parity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
