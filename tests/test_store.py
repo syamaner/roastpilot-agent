@@ -5114,6 +5114,142 @@ async def test_build_reference_roast_rejects_hidden_null_temperature_clock_reset
 
 
 @pytest.mark.asyncio
+async def test_build_reference_roast_adopts_onset_across_null_temperature_clock_plateau(
+    tmp_store: RoastStore,
+) -> None:
+    """An equal clock plateau is not a reset and still admits a safe onset."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="null-temperature-clock-plateau",
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    "{}",
+                ),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (610.0, 189.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:15+00:00", "{}"),
+                (
+                    620.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:20+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:05+00:00"}}',
+                ),
+            ),
+        )
+        await tmp_store.connection.execute(
+            "UPDATE telemetry_snapshots SET bean_temp_c = NULL WHERE run_id = ? AND tick = ?",
+            ("null-temperature-clock-plateau", 3),
+        )
+        await tmp_store.connection.commit()
+        assert await _reference_landmark_pair(tmp_store, "null-temperature-clock-plateau") == (
+            605.0,
+            186.5,
+        )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_chooses_mixed_offset_event_chronologically(
+    tmp_store: RoastStore,
+) -> None:
+    """The chronologically first accepted event controls onset provenance."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="mixed-offset-event-order",
+            event_source=None,
+            started_at="2026-08-23T09:00:00+00:00",
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+02:00",
+                    "{}",
+                ),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:10:00+02:00", "{}"),
+                (
+                    620.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T13:00:00+02:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T10:00:05+00:00"}}',
+                ),
+            ),
+        )
+        await tmp_store.record_event(
+            run_id="mixed-offset-event-order",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.CONTROLLER,
+            recorded_at_utc="2026-08-23T12:00:00+02:00",
+        )
+        await tmp_store.record_event(
+            run_id="mixed-offset-event-order",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc="2026-08-23T11:00:00+00:00",
+        )
+        assert await _reference_landmark_pair(tmp_store, "mixed-offset-event-order") == (
+            610.0,
+            188.0,
+        )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_admits_post_event_mixed_offset_candidate(
+    tmp_store: RoastStore,
+) -> None:
+    """A candidate after an event instant is not rejected by offset text order."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="mixed-offset-candidate-order",
+            event_at="2026-08-23T12:00:00+02:00",
+            started_at="2026-08-23T09:00:00+00:00",
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T09:50:00+00:00",
+                    "{}",
+                ),
+                (
+                    1200.0,
+                    188.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T10:00:00+00:00",
+                    "{}",
+                ),
+                (
+                    1800.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T10:30:00+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T09:55:00+00:00"}}',
+                ),
+            ),
+        )
+        assert await _reference_landmark_pair(tmp_store, "mixed-offset-candidate-order") == (
+            900.0,
+            186.5,
+        )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_build_reference_roast_uses_monotonic_null_temperature_clock_anchor(
     tmp_store: RoastStore,
 ) -> None:

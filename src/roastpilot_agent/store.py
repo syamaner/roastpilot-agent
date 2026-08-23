@@ -1229,7 +1229,7 @@ class RoastStore:
             return None
         clock_seconds = [seconds for _, seconds in clock_rows]
         if any(
-            current <= previous
+            current < previous
             for previous, current in zip(clock_seconds, clock_seconds[1:], strict=False)
         ):
             return None
@@ -2365,10 +2365,18 @@ class RoastStore:
         async with self.connection.execute(
             "SELECT operator_rating, started_at_utc,"
             " (SELECT e.recorded_at_utc FROM roast_events e WHERE e.run_id = roast_runs.id"
-            "  AND e.kind = 'first_crack' ORDER BY e.recorded_at_utc ASC, e.id ASC"
+            "  AND e.kind = 'first_crack' AND julianday(e.recorded_at_utc) IS NOT NULL"
+            "  AND NOT EXISTS (SELECT 1 FROM roast_events malformed"
+            "   WHERE malformed.run_id = roast_runs.id AND malformed.kind = 'first_crack'"
+            "   AND julianday(malformed.recorded_at_utc) IS NULL)"
+            "  ORDER BY julianday(e.recorded_at_utc) ASC, e.id ASC"
             "  LIMIT 1) AS fc_at,"
             " (SELECT e.source FROM roast_events e WHERE e.run_id = roast_runs.id"
-            "  AND e.kind = 'first_crack' ORDER BY e.recorded_at_utc ASC, e.id ASC"
+            "  AND e.kind = 'first_crack' AND julianday(e.recorded_at_utc) IS NOT NULL"
+            "  AND NOT EXISTS (SELECT 1 FROM roast_events malformed"
+            "   WHERE malformed.run_id = roast_runs.id AND malformed.kind = 'first_crack'"
+            "   AND julianday(malformed.recorded_at_utc) IS NULL)"
+            "  ORDER BY julianday(e.recorded_at_utc) ASC, e.id ASC"
             "  LIMIT 1) AS fc_source"
             " FROM roast_runs WHERE id = ?",
             (run_id,),
@@ -2387,8 +2395,13 @@ class RoastStore:
                 "(SELECT 1 FROM roast_events e WHERE e.id = "
                 "(SELECT first_event.id FROM roast_events first_event "
                 "WHERE first_event.run_id = t.run_id AND first_event.kind = 'first_crack' "
-                "ORDER BY first_event.recorded_at_utc ASC, first_event.id ASC LIMIT 1) "
-                "AND e.source = ? AND t.recorded_at_utc >= e.recorded_at_utc) "
+                "AND julianday(first_event.recorded_at_utc) IS NOT NULL "
+                "AND NOT EXISTS (SELECT 1 FROM roast_events malformed "
+                "WHERE malformed.run_id = t.run_id AND malformed.kind = 'first_crack' "
+                "AND julianday(malformed.recorded_at_utc) IS NULL) "
+                "ORDER BY julianday(first_event.recorded_at_utc) ASC, first_event.id ASC LIMIT 1) "
+                "AND e.source = ? AND julianday(t.recorded_at_utc) IS NOT NULL "
+                "AND julianday(t.recorded_at_utc) >= julianday(e.recorded_at_utc)) "
                 "GROUP BY CASE WHEN json_valid(t.raw_state_json) THEN "
                 "json_extract(t.raw_state_json, '$.first_crack_status.detected_at_utc') END"
             )
