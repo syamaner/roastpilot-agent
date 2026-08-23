@@ -18,18 +18,6 @@ Format: one entry per anti-pattern.
 
 ---
 
-## First-crack onset consumers must use their own persisted-provenance window
-*(fixed by #783 slices 1–2, 23 Aug 2026)*
-
-- **Signature:** a first-crack history or research projection derives an MCP
-  onset from an event confirmation time or unguarded raw state.
-- **Wrong / Right:** slice 1 corrected the plant study; slice 2 corrects
-  ``RoastStore.list_runs`` with post-confirmation MCP status only. Keep
-  ``_build_reference_roast`` for slice 3; do not fold its independent window
-  into either completed consumer.
-
----
-
 ## Known-opaque-provider authority must be attested at the terminal boundary
 *(fixed by #813, 14 Aug 2026)*
 
@@ -836,7 +824,7 @@ Format: one entry per anti-pattern.
 
 ## A roast-landmark consumer must use the backdated onset, not agent receipt time
 
-*(fixed for store fixture export by #779, 11 Aug 2026)*
+*(fixed for store fixture export by #779 and #783 slices 1–2, 23 Aug 2026)*
 
 - **Signature:** consumers of `roast_events.kind IN ('t0_detected',
   'first_crack')`, or an `agent_phase == "development"` transition, that use
@@ -847,8 +835,9 @@ Format: one entry per anti-pattern.
   temperature late. Prefer `roast_runs.t0_detected_at_utc` and
   `raw_state_json.first_crack_status.detected_at_utc`, mapped through paired
   telemetry wall/elapsed clocks; retain a warned event-row fallback for old or
-  operator-marked runs. The history-list FC display and
-  `scripts/plant_model_arx_study.py` remain sibling follow-up sites.
+  operator-marked runs. #783 slice 1 fixed `scripts/plant_model_arx_study.py`
+  and slice 2 fixed the history-list FC display. `_build_reference_roast`
+  remains the independent slice 3 consumer.
 - **Guarded by:** `tests/test_store_to_fixture.py` backdated-anchor invariant,
   temperature, provenance, fallback, ambiguity, and frozen-DTR tests.
 

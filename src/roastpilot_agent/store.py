@@ -1856,27 +1856,25 @@ class RoastStore:
             (SafetyVerdict.CLAMP.value, SafetyVerdict.REJECT.value),
         ) as cursor:
             rows = await cursor.fetchall()
-        run_ids = [str(row["id"]) for row in rows]
         onset_candidates: dict[str, list[object]] = {}
-        if run_ids:
-            placeholders = ", ".join("?" for _ in run_ids)
-            onset_query = (
-                "SELECT DISTINCT t.run_id, CASE WHEN json_valid(t.raw_state_json) "
-                "THEN json_extract(t.raw_state_json, '$.first_crack_status.detected_at_utc') END "
-                "AS onset_candidate FROM telemetry_snapshots t "
-                f"WHERE t.run_id IN ({placeholders}) AND t.recorded_at_utc >= "
-                "(SELECT e.recorded_at_utc FROM roast_events e WHERE e.run_id = t.run_id "
-                "AND e.kind = 'first_crack' ORDER BY e.recorded_at_utc ASC, e.id ASC LIMIT 1) "
-                "AND (SELECT e.source FROM roast_events e WHERE e.run_id = t.run_id "
-                "AND e.kind = 'first_crack' ORDER BY e.recorded_at_utc ASC, e.id ASC LIMIT 1) = ?"
-            )
-            async with self.connection.execute(
-                onset_query, (*run_ids, RoastEventSource.MCP.value)
-            ) as cursor:
-                for onset_row in await cursor.fetchall():
-                    onset_candidates.setdefault(str(onset_row["run_id"]), []).append(
-                        onset_row["onset_candidate"]
-                    )
+        onset_query = (
+            "SELECT t.run_id, CASE WHEN json_valid(t.raw_state_json) "
+            "THEN json_extract(t.raw_state_json, '$.first_crack_status.detected_at_utc') END "
+            "AS onset_candidate FROM telemetry_snapshots t "
+            "WHERE EXISTS (SELECT 1 FROM roast_runs r WHERE r.id = t.run_id "
+            "AND r.excluded = 0) AND EXISTS (SELECT 1 FROM roast_events e "
+            "WHERE e.id = (SELECT first_event.id FROM roast_events first_event "
+            "WHERE first_event.run_id = t.run_id AND first_event.kind = 'first_crack' "
+            "ORDER BY first_event.recorded_at_utc ASC, first_event.id ASC LIMIT 1) "
+            "AND e.source = ? AND t.recorded_at_utc >= e.recorded_at_utc) "
+            "GROUP BY t.run_id, CASE WHEN json_valid(t.raw_state_json) "
+            "THEN json_extract(t.raw_state_json, '$.first_crack_status.detected_at_utc') END"
+        )
+        async with self.connection.execute(onset_query, (RoastEventSource.MCP.value,)) as cursor:
+            for onset_row in await cursor.fetchall():
+                onset_candidates.setdefault(str(onset_row["run_id"]), []).append(
+                    onset_row["onset_candidate"]
+                )
         summaries: list[RoastSummary] = []
         for row in rows:
             profile = RoastProfile.model_validate_json(str(row["profile_json"]))
