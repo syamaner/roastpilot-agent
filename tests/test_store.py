@@ -5132,8 +5132,14 @@ async def test_build_reference_roast_uses_monotonic_null_temperature_clock_ancho
                     "2026-08-23T11:59:40+00:00",
                     "{}",
                 ),
+                (
+                    629.0,
+                    190.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:05+00:00",
+                    "{}",
+                ),
                 (630.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
-                (635.0, 190.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:06+00:00", "{}"),
                 (
                     640.0,
                     191.0,
@@ -5145,12 +5151,12 @@ async def test_build_reference_roast_uses_monotonic_null_temperature_clock_ancho
         )
         await tmp_store.connection.execute(
             "UPDATE telemetry_snapshots SET bean_temp_c = NULL WHERE run_id = ? AND tick = ?",
-            ("null-temperature-anchor", 3),
+            ("null-temperature-anchor", 2),
         )
         await tmp_store.connection.commit()
         assert await _reference_landmark_pair(tmp_store, "null-temperature-anchor") == (
-            629.0,
-            pytest.approx(187.9),
+            624.0,
+            pytest.approx(187.4),
         )
     finally:
         await tmp_store.close()
