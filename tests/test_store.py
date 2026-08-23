@@ -5250,6 +5250,55 @@ async def test_build_reference_roast_admits_post_event_mixed_offset_candidate(
 
 
 @pytest.mark.asyncio
+async def test_build_reference_roast_fails_closed_for_malformed_accepted_event(
+    tmp_store: RoastStore,
+) -> None:
+    """A malformed accepted event cannot launder a later MCP duplicate onset."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="malformed-accepted-event",
+            event_source=None,
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    "{}",
+                ),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (
+                    620.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:20+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:05+00:00"}}',
+                ),
+            ),
+        )
+        await tmp_store.record_event(
+            run_id="malformed-accepted-event",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.CONTROLLER,
+            recorded_at_utc="not-a-timestamp",
+        )
+        await tmp_store.record_event(
+            run_id="malformed-accepted-event",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc="2026-08-23T12:00:10+00:00",
+        )
+        assert await _reference_landmark_pair(tmp_store, "malformed-accepted-event") == (
+            610.0,
+            188.0,
+        )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_build_reference_roast_uses_monotonic_null_temperature_clock_anchor(
     tmp_store: RoastStore,
 ) -> None:
