@@ -18,6 +18,18 @@ Format: one entry per anti-pattern.
 
 ---
 
+## First-crack onset consumers must use their own persisted-provenance window
+*(fixed by #783 slices 1–2, 23 Aug 2026)*
+
+- **Signature:** a first-crack history or research projection derives an MCP
+  onset from an event confirmation time or unguarded raw state.
+- **Wrong / Right:** slice 1 corrected the plant study; slice 2 corrects
+  ``RoastStore.list_runs`` with post-confirmation MCP status only. Keep
+  ``_build_reference_roast`` for slice 3; do not fold its independent window
+  into either completed consumer.
+
+---
+
 ## Known-opaque-provider authority must be attested at the terminal boundary
 *(fixed by #813, 14 Aug 2026)*
 
