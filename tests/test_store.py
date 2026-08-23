@@ -6,7 +6,7 @@ this suite.
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from unittest import mock
 
 import aiosqlite as aiosqlite_module
@@ -3201,6 +3201,48 @@ async def test_list_runs_uses_only_post_confirmation_mcp_onsets(tmp_store: Roast
         await tmp_store.connection.commit()
         [summary] = await tmp_store.list_runs()
         assert summary.first_crack_at_utc == "2026-06-07T14:09:05+00:00"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_onset_query_has_constant_statement_and_bind_shape(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """History onset lookup stays two statements with one MCP bind at any run count."""
+    await seeded_store(tmp_store)
+    original_execute: Any = tmp_store.connection._execute  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType, reportUnknownVariableType]
+    observed: list[tuple[str, object]] = []
+
+    async def traced_execute(function: object, *args: object, **kwargs: object) -> object:
+        """Record only this store's list-query calls before delegating."""
+        if getattr(function, "__name__", None) == "execute":
+            observed.append((str(args[0]), args[1] if len(args) > 1 else ()))
+        return await original_execute(function, *args, **kwargs)
+
+    monkeypatch.setattr(tmp_store.connection, "_execute", traced_execute)
+    try:
+        observed.clear()
+        await tmp_store.list_runs()
+        one_run = list(observed)
+        for index in range(2, 11):
+            await tmp_store.create_run(
+                run_id=f"run-{index}",
+                profile=PROFILE,
+                config=AppConfig(),
+                agent_phase=RoastPhase.STARTING,
+            )
+        observed.clear()
+        await tmp_store.list_runs()
+        ten_runs = list(observed)
+
+        assert len(one_run) == len(ten_runs) == 2
+        for statements in (one_run, ten_runs):
+            onset_sql, onset_parameters = next(
+                (sql, parameters) for sql, parameters in statements if "json_valid" in sql
+            )
+            assert " IN (" not in onset_sql
+            assert onset_parameters == (RoastEventSource.MCP.value,)
     finally:
         await tmp_store.close()
 
