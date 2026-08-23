@@ -1233,10 +1233,7 @@ class RoastStore:
             for previous, current in zip(clock_seconds, clock_seconds[1:], strict=False)
         ):
             return None
-        anchors = [
-            (row["recorded_at_utc"], seconds)
-            for (row, _), seconds in zip(clock_rows, clock_seconds, strict=True)
-        ]
+        anchors = [(row["recorded_at_utc"], seconds) for row, seconds in clock_rows]
         mapped = utc_to_run_seconds(onset.isoformat(), anchors)
         first_t = RoastStore._optional_float(usable_rows[0]["charge_elapsed_seconds"])
         last_t = RoastStore._optional_float(usable_rows[-1]["charge_elapsed_seconds"])
