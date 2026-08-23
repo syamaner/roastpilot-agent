@@ -17,6 +17,10 @@ excluded from the repo by ``AGENTS.md``. This harness regenerates every artifact
 from the operator's local data; the committed bundle carries only code, the
 aggregate outputs, and a data fingerprint (``data-manifest.md``).
 
+Committed plant-model artifacts predate the MCP first-crack-onset correction in
+this module. They are not directly comparable with reruns using corrected
+store-corpus first-crack anchors.
+
 Usage::
 
     # run the study, write artifacts to an output directory
@@ -37,7 +41,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -51,6 +55,12 @@ from alog_to_fixture import (  # noqa: E402
     _step_track,  # pyright: ignore[reportPrivateUsage]
     extract_marks,
     load_alog,
+)
+from roast_landmarks import (  # noqa: E402
+    first_crack_event_source,
+    first_crack_onset_utc,
+    is_mcp_first_crack_source,
+    utc_to_run_seconds,
 )
 
 DEFAULT_ALOG_DIR = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/roasting"
@@ -120,6 +130,7 @@ class Roast:
         fan: Fan setpoint percent, per tick.
         ror: Trailing-window bean RoR, deg C/min, per tick (NaN early).
         fc_t: First-crack time in seconds from charge (or NaN).
+        fc_anchor: Store first-crack anchor provenance, if applicable.
         drop_t: Drop time in seconds from charge.
         landmarks: Characteristic BT landmarks for calibration.
     """
@@ -134,6 +145,7 @@ class Roast:
     fan: NDArray[np.float64]
     ror: NDArray[np.float64] = field(default_factory=lambda: np.empty(0, dtype=np.float64))
     fc_t: float = float("nan")
+    fc_anchor: str | None = None
     drop_t: float = float("nan")
     landmarks: dict[str, float] = field(default_factory=_empty_landmarks)
 
@@ -315,6 +327,86 @@ def completed_store_run_ids(store_copy: Path) -> list[str]:
     return [str(r[0]) for r in rows]
 
 
+def _store_fc_status_anchor(
+    con: sqlite3.Connection, run_id: str, t_grid: NDArray[np.float64], bt: NDArray[np.float64]
+) -> tuple[float, float] | None:
+    """Resolve a mapped MCP first-crack onset and its interpolated BT.
+
+    The accepted controller event is the sole provenance authority. Raw status
+    is considered only when that event says exact ``"mcp"``; all malformed,
+    unmappable, negative, and out-of-grid candidates fail closed so callers can
+    retain the paired historical phase-transition fallback.
+
+    Args:
+        con: Open read-only store connection.
+        run_id: Store run id.
+        t_grid: Charge-referenced study grid.
+        bt: Bean-temperature values parallel to ``t_grid``.
+
+    Returns:
+        ``(fc_t, fc_bt)`` for a safe status onset, otherwise ``None``.
+    """
+    event_row = con.execute(
+        "select payload_json from roast_events where run_id=? and kind='first_crack' "
+        "and monotonic_seconds is not null order by recorded_at_utc asc, id asc limit 1",
+        (run_id,),
+    ).fetchone()
+    if event_row is None or not is_mcp_first_crack_source(first_crack_event_source(event_row[0])):
+        return None
+    raw_rows = con.execute(
+        "select raw_state_json from telemetry_snapshots where run_id=? "
+        "and raw_state_json is not null order by tick asc, id asc",
+        (run_id,),
+    ).fetchall()
+    onset_utc, _ = first_crack_onset_utc(row[0] for row in raw_rows)
+    if onset_utc is None:
+        return None
+    anchors = con.execute(
+        "select recorded_at_utc, charge_elapsed_seconds from telemetry_snapshots "
+        "where run_id=? and recorded_at_utc is not null "
+        "and charge_elapsed_seconds is not null order by tick asc, id asc",
+        (run_id,),
+    ).fetchall()
+    onset_seconds = utc_to_run_seconds(
+        onset_utc,
+        ((row[0], row[1]) for row in anchors),
+    )
+    if (
+        onset_seconds is None
+        or onset_seconds < float(t_grid[0])
+        or onset_seconds > float(t_grid[-1])
+    ):
+        return None
+    return onset_seconds, float(np.interp(onset_seconds, t_grid, bt))
+
+
+def _event_bean_temp(payload_json: object) -> float:
+    """Read the historical first-crack-event bean temperature without raising.
+
+    Args:
+        payload_json: Persisted event payload.
+
+    Returns:
+        A finite or non-finite numeric payload value, or NaN when unusable.
+    """
+    if not isinstance(payload_json, str):
+        return float("nan")
+    try:
+        payload = json.loads(payload_json)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not isinstance(payload, dict):
+        return float("nan")
+    payload_map = cast(dict[str, object], payload)
+    bean_temp = payload_map.get("bean_temp_c", float("nan"))
+    if isinstance(bean_temp, bool) or not isinstance(bean_temp, (float, int, str)):
+        return float("nan")
+    try:
+        return float(bean_temp)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def load_store(store_copy: Path) -> list[Roast]:
     """Load and unify the completed store roasts from a read-only DB copy.
 
@@ -373,10 +465,10 @@ def load_store(store_copy: Path) -> list[Roast]:
             # clock whenever pre-T0 rows are dropped and misalign the t+h targets.
             t_grid = grid
 
-            fc_t = float("nan")
+            fallback_fc_t = float("nan")
             for s in secs:
                 if by_sec[int(s)][4] == "development":
-                    fc_t = float(s)
+                    fallback_fc_t = float(s)
                     break
             fc_ev = con.execute(
                 "select payload_json from roast_events where run_id=? and kind='first_crack' "
@@ -384,9 +476,16 @@ def load_store(store_copy: Path) -> list[Roast]:
                 (rid,),
             ).fetchone()
             drop_bt = float(bt[-1])
-            fc_bt = float("nan")
+            fallback_fc_bt = float("nan")
             if fc_ev is not None:
-                fc_bt = float(json.loads(str(fc_ev[0])).get("bean_temp_c", float("nan")))
+                fallback_fc_bt = _event_bean_temp(fc_ev[0])
+            fc_t = fallback_fc_t
+            fc_bt = fallback_fc_bt
+            fc_anchor = "phase_transition"
+            status_anchor = _store_fc_status_anchor(con, rid, t_grid, bt)
+            if status_anchor is not None:
+                fc_t, fc_bt = status_anchor
+                fc_anchor = "fc_status_utc"
             de_ev = con.execute(
                 "select payload_json from roast_events where run_id=? and kind='drying_end' "
                 "order by id limit 1",
@@ -407,6 +506,7 @@ def load_store(store_copy: Path) -> list[Roast]:
                 heat=heat,
                 fan=fan,
                 fc_t=fc_t,
+                fc_anchor=fc_anchor,
                 drop_t=float(t_grid[-1]),
                 landmarks={
                     "dry_end_bt": de_bt,
@@ -754,12 +854,12 @@ def _copy_store_readonly(store: Path, tmp: Path) -> Path:
 
 
 def _write_landmarks_csv(roasts: list[Roast], out_dir: Path) -> None:
-    lines = ["rid,corpus,turnaround_bt,dry_end_bt,fc_bt,drop_bt,fc_t,drop_t"]
+    lines = ["rid,corpus,turnaround_bt,dry_end_bt,fc_bt,drop_bt,fc_t,fc_anchor,drop_t"]
     for r in roasts:
         m = r.landmarks
         lines.append(
             f"{r.rid},{r.corpus},{m['turnaround_bt']:.1f},{m['dry_end_bt']:.1f},"
-            f"{m['fc_bt']:.1f},{m['drop_bt']:.1f},{r.fc_t:.0f},{r.drop_t:.0f}"
+            f"{m['fc_bt']:.1f},{m['drop_bt']:.1f},{r.fc_t:.0f},{r.fc_anchor or ''},{r.drop_t:.0f}"
         )
     (out_dir / "landmarks.csv").write_text("\n".join(lines) + "\n")
 

@@ -83,3 +83,7 @@ roasts are recorded, so a later re-run may pool one or two more completed roasts
 and shift the aggregate numbers by a fraction of a degree; the qualitative
 finding (and the verdict) is stable. The run ids in `data-manifest.md` identify
 the exact set behind the committed report.
+
+The committed artifacts also predate the MCP first-crack-onset correction used
+by the current harness. Their store-corpus first-crack landmarks are not directly
+comparable with a rerun that resolves the backdated MCP onset.
