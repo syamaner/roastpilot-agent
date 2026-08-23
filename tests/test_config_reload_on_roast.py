@@ -1,9 +1,12 @@
-"""Tests for config reload on roast start (D76/D78 apply-next-roast, #430).
+"""Tests for config reload invalidation at PUT and roast start (D76/D78, #430).
 
 Verifies that:
 - A saved config change (e.g. advisor model slug, controller tick interval) is
   picked up by ``start_roast`` and used by the runner built for that roast,
   without requiring an agent restart.
+- A successful ``PUT /api/config`` clears only advisor-health probes made stale
+  by the freshly resolved effective advisor dispatch, without applying config
+  to the current roast or making a network call.
 - A roast already in progress keeps its captured config (no mid-loop mutation).
 - Safety limits cannot be changed via the saved config file (the injector skips
   ``ROASTPILOT_SAFETY__`` unconditionally).
@@ -22,11 +25,22 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
 
+import roastpilot_agent.api as api_module
+from roastpilot_agent.advisor import FakeAdvisor
 from roastpilot_agent.api import RoastService, create_app
+from roastpilot_agent.config import (
+    AdvisorConfig,
+    AmbientFanDoctrine,
+    AppConfig,
+    ControllerConfig,
+    MCPDeviceConfig,
+)
 from roastpilot_agent.config_store import (
     AdvisorConfigEdit,
     AppConfigEdit,
+    ConfigFileError,
     ControllerConfigEdit,
     PreFirstCrackLeversEdit,
     persist_config_edit,
@@ -56,6 +70,31 @@ def _profile(**kwargs: Any) -> dict[str, Any]:
     }
     base.update(kwargs)
     return base
+
+
+def _reachable_probe(service: RoastService) -> AdvisorHealth:
+    """Build a reachable probe for the service's current advisor config."""
+    return AdvisorHealth(
+        status=AdvisorHealthStatus.REACHABLE,
+        provider="openai_compatible",
+        model_slug=service._config.advisor.model_slug,  # pyright: ignore[reportPrivateUsage]
+    )
+
+
+async def _put_config(app: Any, body: dict[str, Any]) -> Any:
+    """Send one config PUT through the public ASGI boundary."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        return await client.put("/api/config", json=body)
+
+
+async def _health_body(app: Any) -> dict[str, Any]:
+    """Read the public health response through the public ASGI boundary."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/health")
+    assert response.status_code == 200
+    return response.json()
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +607,628 @@ async def test_http_start_roast_with_save_applies_next_roast(
 
     # Verify via the service object (not just HTTP status).
     assert svc._config.advisor.model_slug == "openai/gpt-4-turbo"  # pyright: ignore[reportPrivateUsage]
+
+
+# ---------------------------------------------------------------------------
+# PUT invalidates stale advisor health without applying runtime config
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_put_that_changes_the_model_invalidates_the_probe_before_any_roast(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """A successful model PUT clears a stale probe before any roast starts."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+    app = create_app(service)
+
+    response = await _put_config(app, {"advisor": {"model_slug": "openai/gpt-4.1-mini"}})
+
+    assert response.status_code == 200
+    assert (await service.health()).advisor is None
+    assert await store.active_run() is None
+
+
+@pytest.mark.asyncio
+async def test_health_route_reports_not_probed_after_a_put(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """The public health JSON reports the cleared probe as ``advisor: null``."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+    app = create_app(service)
+
+    response = await _put_config(app, {"advisor": {"model_slug": "openai/gpt-4.1-mini"}})
+
+    assert response.status_code == 200
+
+    assert (await _health_body(app))["advisor"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_put_provider_change_invalidates_the_probe(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """Changing provider changes the dispatch identity even with one slug."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+
+    response = await _put_config(create_app(service), {"advisor": {"provider": "openai"}})
+
+    assert response.status_code == 200
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_put_endpoint_change_invalidates_the_probe(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """Changing the provider endpoint invalidates the contacted-dispatch claim."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"provider_base_url": "http://proxy.local/v1"}}
+    )
+
+    assert response.status_code == 200
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_cosmetic_base_url_put_keeps_the_probe(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """Normalised-equivalent endpoint spelling preserves the exact probe object."""
+    service = RoastService(store, live_serve_mode=True)
+    probe = _reachable_probe(service)
+    service.set_advisor_health(probe)
+
+    response = await _put_config(
+        create_app(service),
+        {"advisor": {"provider_base_url": "https://OPENROUTER.AI/api/v1/"}},
+    )
+
+    assert response.status_code == 200
+    assert (await service.health()).advisor is probe
+
+
+@pytest.mark.asyncio
+async def test_a_temperature_only_put_invalidates_the_probe(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """Temperature shapes both probe and live request settings."""
+    service = RoastService(store, live_serve_mode=True)
+    probe = _reachable_probe(service)
+    service.set_advisor_health(probe)
+
+    response = await _put_config(create_app(service), {"advisor": {"temperature": 0.5}})
+
+    assert response.status_code == 200
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_an_api_key_env_change_invalidates_on_put(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An effective API-key environment-variable name change clears on PUT."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+    monkeypatch.setenv("ROASTPILOT_ADVISOR__API_KEY_ENV", "ANOTHER_ADVISOR_KEY")
+
+    response = await _put_config(create_app(service), {"advisor": {"prompt_version": "c11"}})
+
+    assert response.status_code == 200
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_reasoning_effort_change_invalidates_on_put(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reasoning effort belongs to the provider dispatch identity."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+    monkeypatch.setenv("ROASTPILOT_ADVISOR__REASONING_EFFORT", "high")
+
+    response = await _put_config(create_app(service), {"advisor": {"prompt_version": "c11"}})
+
+    assert response.status_code == 200
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_pinned_phase_slot_change_invalidates_on_put(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A phase-specific advice slot change invalidates even with the base slug fixed."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+    monkeypatch.setenv(
+        "ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE", '{"development": "openai/gpt-4o-mini"}'
+    )
+
+    response = await _put_config(create_app(service), {"advisor": {"prompt_version": "c11"}})
+
+    assert response.status_code == 200
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_base_slug_put_invalidates_even_with_a_pinned_phase_slot(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A base-slug change clears even when a pinned advice slot is unchanged."""
+    monkeypatch.setenv(
+        "ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE", '{"development": "openai/gpt-4o-mini"}'
+    )
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}}
+    )
+
+    assert response.status_code == 200
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_an_advisory_paused_readout_survives_a_put(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """NOT_CONFIGURED records an absent advisor, not a contacted model."""
+    service = RoastService(store, live_serve_mode=True)
+    paused = AdvisorHealth(status=AdvisorHealthStatus.NOT_CONFIGURED)
+    service.set_advisor_health(paused)
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}}
+    )
+
+    assert response.status_code == 200
+    assert (await service.health()).advisor == paused
+
+
+@pytest.mark.asyncio
+async def test_a_model_less_unreachable_does_not_survive_a_put(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """A model-less UNREACHABLE remains a stale contacted-provider claim."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(
+        AdvisorHealth(status=AdvisorHealthStatus.UNREACHABLE, error="probe timed out")
+    )
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}}
+    )
+
+    assert response.status_code == 200
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_controller_only_put_keeps_the_probe(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """The route delegates controller-only edits to the equal-identity helper path."""
+    service = RoastService(store, live_serve_mode=True)
+    probe = _reachable_probe(service)
+    service.set_advisor_health(probe)
+
+    response = await _put_config(
+        create_app(service),
+        {"controller": {"pre_first_crack_levers": {"heat_target_percent": 85}}},
+    )
+
+    assert response.status_code == 200
+    assert (await service.health()).advisor is probe
+
+
+@pytest.mark.asyncio
+async def test_an_env_shadowed_advisor_put_keeps_the_probe(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A saved edit shadowed by a real env value leaves the effective dispatch equal."""
+    monkeypatch.setenv("ROASTPILOT_ADVISOR__MODEL_SLUG", "openai/gpt-4.1-mini")
+    service = RoastService(store, live_serve_mode=True)
+    probe = _reachable_probe(service)
+    service.set_advisor_health(probe)
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4o-mini"}}
+    )
+
+    assert response.status_code == 200
+    assert (await service.health()).advisor is probe
+
+
+@pytest.mark.asyncio
+async def test_the_put_does_not_patch_the_running_config(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """D78 leaves service config unchanged until a next-roast reload."""
+    service = RoastService(store, live_serve_mode=True)
+    original_slug = service._config.advisor.model_slug  # pyright: ignore[reportPrivateUsage]
+    service.set_advisor_health(_reachable_probe(service))
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}}
+    )
+
+    assert response.status_code == 200
+    assert service._config.advisor.model_slug == original_slug  # pyright: ignore[reportPrivateUsage]
+    await service.start_roast(RoastProfile(**_profile()))
+    assert service._config.advisor.model_slug == "openai/gpt-4.1-mini"  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_the_put_makes_no_network_call(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PUT invalidates only in-memory state and never re-probes the advisor."""
+    advisor = FakeAdvisor()
+    service = RoastService(store, advisor=advisor, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+
+    def _unexpected_probe(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("PUT /api/config must not probe the advisor")
+
+    async def _unexpected_healthcheck() -> AdvisorHealth:
+        raise AssertionError("PUT /api/config must not healthcheck the advisor")
+
+    monkeypatch.setattr("roastpilot_agent.live.probe_advisor_health", _unexpected_probe)
+    monkeypatch.setattr(advisor, "healthcheck", _unexpected_healthcheck)
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}}
+    )
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_start_roast_still_invalidates_through_the_shared_helper(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """The retained roast-start trigger clears when only the base slug moved."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4.1-mini")))
+
+    await service.start_roast(RoastProfile(**_profile()))
+
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_put_keeps_the_probe(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """A cross-field persistence rejection leaves the previous probe untouched."""
+    service = RoastService(store, live_serve_mode=True)
+    probe = _reachable_probe(service)
+    service.set_advisor_health(probe)
+    app = create_app(service)
+    setup = {
+        "controller": {
+            "pre_first_crack_levers": {
+                "late_maillard_trim": {"min_trim": 30, "base_trim": 40, "max_trim": 50}
+            }
+        }
+    }
+    assert (await _put_config(app, setup)).status_code == 200
+
+    rejected = await _put_config(
+        app,
+        {"controller": {"pre_first_crack_levers": {"late_maillard_trim": {"min_trim": 70}}}},
+    )
+
+    assert rejected.status_code == 422
+    assert (await service.health()).advisor is probe
+
+
+@pytest.mark.asyncio
+async def test_a_failed_persist_keeps_the_probe(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No invalidation runs if persistence fails before effective reload."""
+    service = RoastService(store, live_serve_mode=True)
+    probe = _reachable_probe(service)
+    service.set_advisor_health(probe)
+
+    def _fail_persist(edit: AppConfigEdit) -> None:
+        raise ConfigFileError("persist failed")
+
+    monkeypatch.setattr(api_module, "persist_config_edit", _fail_persist)
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}}
+    )
+
+    assert response.status_code == 500
+    assert (await service.health()).advisor is probe
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_write_reload_clears_the_probe(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful write with unknown effective state clears a stale probe."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+
+    def _fail_reload() -> tuple[AppConfig, frozenset[str]]:
+        raise ConfigFileError("reload failed")
+
+    monkeypatch.setattr(api_module, "load_app_config", _fail_reload)
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}}
+    )
+
+    assert response.status_code == 500
+    assert "openai/gpt-4.1-mini" in config_file.read_text()
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_write_reload_without_a_service_returns_the_reload_error(
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persisted write keeps its reload failure when no service is attached."""
+
+    def _fail_reload() -> tuple[AppConfig, frozenset[str]]:
+        raise ConfigFileError("reload failed")
+
+    monkeypatch.setattr(api_module, "load_app_config", _fail_reload)
+
+    response = await _put_config(create_app(), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}})
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "reload failed"}
+    assert "openai/gpt-4.1-mini" in config_file.read_text()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_raw_reread_retains_an_effective_matching_probe(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raw-snapshot failure preserves a probe for the known same advisor."""
+    service = RoastService(store, live_serve_mode=True)
+    probe = _reachable_probe(service)
+    service.set_advisor_health(probe)
+
+    def _fail_saved_raw() -> Any:
+        raise ConfigFileError("raw reload failed")
+
+    monkeypatch.setattr(api_module, "load_saved_raw", _fail_saved_raw)
+
+    response = await _put_config(create_app(service), {"advisor": {"model_slug": "openai/gpt-4o"}})
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "raw reload failed"}
+    assert "openai/gpt-4o" in config_file.read_text()
+    assert (await service.health()).advisor is probe
+
+
+@pytest.mark.asyncio
+async def test_a_failed_raw_reread_clears_a_probe_for_a_changed_effective_advisor(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raw-snapshot failure clears a probe stale against the known advisor."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+
+    def _fail_saved_raw() -> Any:
+        raise ConfigFileError("raw reload failed")
+
+    monkeypatch.setattr(api_module, "load_saved_raw", _fail_saved_raw)
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4o-mini"}}
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "raw reload failed"}
+    assert "openai/gpt-4o-mini" in config_file.read_text()
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_raw_reread_without_a_service_returns_the_reload_error(
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raw-snapshot failure stays a 500 when no service is attached."""
+
+    def _fail_saved_raw() -> Any:
+        raise ConfigFileError("raw reload failed")
+
+    monkeypatch.setattr(api_module, "load_saved_raw", _fail_saved_raw)
+
+    response = await _put_config(create_app(), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}})
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "raw reload failed"}
+    assert "openai/gpt-4.1-mini" in config_file.read_text()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_write_reload_clears_an_advisory_paused_probe(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown post-write state clears NOT_CONFIGURED as well as contacted probes."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(AdvisorHealth(status=AdvisorHealthStatus.NOT_CONFIGURED))
+
+    def _fail_reload() -> tuple[AppConfig, frozenset[str]]:
+        raise ConfigFileError("reload failed")
+
+    monkeypatch.setattr(api_module, "load_app_config", _fail_reload)
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}}
+    )
+
+    assert response.status_code == 500
+    assert "openai/gpt-4.1-mini" in config_file.read_text()
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_write_validation_clears_the_probe(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A validation failure after persistence leaves no affirmative probe state."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+
+    def _fail_reload() -> tuple[AppConfig, frozenset[str]]:
+        raise ValidationError.from_exception_data(
+            "ReloadError", [{"type": "missing", "loc": ("advisor",), "input": {}}]
+        )
+
+    monkeypatch.setattr(api_module, "load_app_config", _fail_reload)
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}}
+    )
+
+    assert response.status_code == 500
+    assert "openai/gpt-4.1-mini" in config_file.read_text()
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_write_os_error_clears_the_probe(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An I/O failure after persistence leaves no affirmative probe state."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+
+    def _fail_reload() -> tuple[AppConfig, frozenset[str]]:
+        raise OSError("reload failed")
+
+    monkeypatch.setattr(api_module, "load_app_config", _fail_reload)
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}}
+    )
+
+    assert response.status_code == 500
+    assert "openai/gpt-4.1-mini" in config_file.read_text()
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_put_without_an_attached_service_still_succeeds(config_file: Path) -> None:
+    """The API-only scaffold keeps config PUT available without a service."""
+    response = await _put_config(create_app(), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}})
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_a_put_with_a_non_roastservice_state_object_is_ignored(config_file: Path) -> None:
+    """A non-service state value is tolerated rather than treated as a dependency."""
+    app = create_app()
+    app.state.service = object()
+
+    response = await _put_config(app, {"advisor": {"model_slug": "openai/gpt-4.1-mini"}})
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_an_unprobed_service_survives_a_put(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """An unprobed service short-circuits safely during a successful PUT."""
+    service = RoastService(store, live_serve_mode=True)
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}}
+    )
+
+    assert response.status_code == 200
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_refused_start_keeps_the_probe(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validation of the reloaded config runs before start-path invalidation."""
+    doctrine = AmbientFanDoctrine(enabled=True, max_reading_age_seconds=90.0)
+    initial = AppConfig(
+        controller=ControllerConfig(ambient_fan_doctrine=doctrine),
+        mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=30.0),
+    )
+    refused = AppConfig(
+        advisor=AdvisorConfig(model_slug="openai/gpt-4.1-mini"),
+        controller=ControllerConfig(ambient_fan_doctrine=doctrine),
+        mcp_device=MCPDeviceConfig(),
+    )
+    service = RoastService(store, config=initial, live_serve_mode=True)
+    probe = _reachable_probe(service)
+    service.set_advisor_health(probe)
+
+    def _load_refused() -> tuple[AppConfig, frozenset[str]]:
+        return refused, frozenset()
+
+    monkeypatch.setattr(api_module, "load_app_config", _load_refused)
+
+    with pytest.raises(api_module.RoastConfigError, match="ambient_poll_interval_seconds"):
+        await service.start_roast(RoastProfile(**_profile()))
+
+    assert (await service.health()).advisor is probe
 
 
 # ---------------------------------------------------------------------------

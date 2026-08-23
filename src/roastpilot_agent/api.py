@@ -59,7 +59,7 @@ from roastpilot_agent.catalogue_recommendations import (
     CatalogueRankingContext,
     recommend_from_catalogue,
 )
-from roastpilot_agent.config import AppConfig, ControllerConfig, MCPDeviceConfig
+from roastpilot_agent.config import AdvisorConfig, AppConfig, ControllerConfig, MCPDeviceConfig
 from roastpilot_agent.config_store import (
     AppConfigEdit,
     AppConfigSnapshot,
@@ -1647,23 +1647,72 @@ class RoastService:
         """
         return self._advisor
 
-    def set_advisor_health(self, health: AdvisorHealth) -> None:
+    def set_advisor_health(self, health: AdvisorHealth | None) -> None:
         """Record the startup advisor reachability probe result (issue #168).
 
         Set once by the ``serve`` entrypoint after :func:`live.probe_advisor_health`
         runs, so ``GET /api/health`` can surface whether the advisor answered
         before charge. Pure observability — the advisor is advisory-only.
 
-        Not re-set per roast, but INVALIDATED by :meth:`start_roast` when the
-        reloaded config names a different ``model_slug`` (#747 / D151): a probe
-        describes the model it probed, and since D151 that model is the one
-        that answers, so a stale REACHABLE would vouch for a slug nothing has
-        contacted.
+        The next-roast config reload and ``PUT /api/config`` can clear this
+        readout when the dispatch is stale or unknown: a probe describes the
+        model it probed, so a stale REACHABLE would vouch for a slug nothing
+        has contacted.
 
         Args:
-            health: The reachability probe result to surface on ``/api/health``.
+            health: The reachability probe result to surface on ``/api/health``,
+                or ``None`` when the current dispatch is unknown.
         """
         self._advisor_health = health
+
+    def invalidate_stale_advisor_health(self, incoming: AdvisorConfig) -> bool:
+        """Clear a probe when it no longer describes the effective advisor.
+
+        The only possible side effect is a monotonic ``non-None -> None``
+        transition.  This method never installs, upgrades, or fabricates a
+        health state, so an interleaving start or health poll can only report
+        the honest ``not probed`` state.
+
+        The startup probe runs once against the base ``model_slug``.  Since
+        D151, a changed saved model can answer a later roast, so retaining a
+        reachable probe would vouch for a model nothing contacted.  Clearing,
+        rather than re-probing, is deliberate: ``None`` renders as ``not
+        probed`` and keeps network calls out of both config persistence and
+        roast start.
+
+        The paused ``NOT_CONFIGURED`` status is different: it describes an
+        absent advisor, not a contacted dispatch, so a config change cannot
+        stale it.  A model-less ``UNREACHABLE`` is still a contacted-dispatch
+        claim and must be invalidated when identity changes.
+
+        ``dispatch_identity`` covers the provider, normalised endpoint, API
+        key environment-variable name, base slug, and reasoning effort.
+        ``advice_models`` also covers phase-pinned advice slots. Temperature
+        shapes both healthcheck and live request settings. All must remain
+        equal for a probe to describe the incoming configuration.
+
+        The baseline is ``self._config.advisor``; callers must invoke this
+        method before committing the incoming configuration.
+
+        Args:
+            incoming: The freshly resolved effective advisor configuration.
+
+        Returns:
+            ``True`` if a stale probe was cleared, otherwise ``False``.
+        """
+        probed = self._advisor_health
+        if probed is None:
+            return False
+        if probed.status is AdvisorHealthStatus.NOT_CONFIGURED:
+            return False
+        if (
+            self._config.advisor.dispatch_identity() != incoming.dispatch_identity()
+            or advice_models(self._config.advisor) != advice_models(incoming)
+            or self._config.advisor.temperature != incoming.temperature
+        ):
+            self._advisor_health = None
+            return True
+        return False
 
     def set_spawned_mcp_device(self, device_config: MCPDeviceConfig) -> None:
         """Record the device config the MCP child was most recently spawned with.
@@ -1861,61 +1910,14 @@ class RoastService:
                 )
 
                 fresh_advisor = build_advisor(fresh_config)
-                # Captured BEFORE the commit below overwrites it — the probe
-                # invalidation compares the outgoing advisor config against the
-                # incoming one.
-                previous_advisor = self._config.advisor
+                if self.invalidate_stale_advisor_health(fresh_config.advisor):
+                    _log.debug("start_roast: invalidated stale advisor health probe")
                 # Commit all three atomically so the trio is always consistent
                 # (guards against a future raising build_advisor leaving _config
                 # ahead of _advisor).
                 self._config = fresh_config
                 self._safety = fresh_safety
                 self._advisor = fresh_advisor
-                # Invalidate a probe that no longer describes the advisor we
-                # just built (#747 / D151, safety-reviewer finding). The probe
-                # runs ONCE, at serve startup (``live.probe_advisor_health``),
-                # against ``advisor.model_slug``. Before D151 a changed
-                # ``model_slug`` could not reach a roast, so a stale REACHABLE
-                # was harmless; now the model the operator typed in /config IS
-                # the model that answers, and the first contact with it would
-                # otherwise be the post-FC advisory call while /api/health still
-                # vouched for the previous slug. Clearing (not re-probing) is
-                # deliberate: ``None`` renders as "not probed" — honest, and it
-                # keeps a network call out of the roast-start path. Re-probing
-                # between roasts is issue-sized, not a side effect of starting
-                # a roast.
-                # Keyed on the STATUS, not on whether a model was named (two
-                # successive local Codex P2s). NOT_CONFIGURED says the ADVISOR
-                # is absent — advisory-paused, no API key — which no model
-                # change can stale, so clearing it would regress an explicit
-                # readout to the ambiguous "not probed". But a model-less
-                # result does NOT imply that state: ``probe_advisor_health``
-                # also returns UNREACHABLE with no slug when the probe times
-                # out or raises, and preserving THAT would report the old
-                # advisor offline forever after a model change the probe never
-                # saw. Anything other than NOT_CONFIGURED is a claim about a
-                # specific model, so it is stale unless it still describes the
-                # current one.
-                #
-                # ``dispatch_identity`` names what a probe CONTACTED (provider,
-                # NORMALISED endpoint, key env var, base slug, reasoning effort
-                # — ``build_model`` bakes the effort into every cached agent,
-                # including the one ``healthcheck`` probes with).
-                # ``advice_models`` is compared alongside it because a pinned
-                # phase slot changes which model gives ADVICE without changing
-                # what the probe contacted. Both together are the #134 "advisor
-                # configured" false comfort this probe exists to prevent.
-                probed = self._advisor_health
-                if (
-                    probed is not None
-                    and probed.status is not AdvisorHealthStatus.NOT_CONFIGURED
-                    and (
-                        previous_advisor.dispatch_identity()
-                        != fresh_config.advisor.dispatch_identity()
-                        or advice_models(previous_advisor) != advice_models(fresh_config.advisor)
-                    )
-                ):
-                    self._advisor_health = None
                 # MCP device respawn (#431): when the reloaded mcp_device differs
                 # from what the child was spawned with, stop and restart the child
                 # so hardware changes (serial port, driver, audio input, FC mode,
@@ -4486,13 +4488,32 @@ async def put_config(edit: AppConfigEdit, request: Request) -> AppConfigSnapshot
     except ConfigFileError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     # Re-read effective config + saved raw after write so the response reflects
-    # the just-written state, not a stale snapshot.  load_app_config also does
-    # file I/O (saved-config read + env injection); run it in a thread too.
+    # the just-written state, not a stale snapshot.  Both helpers do sync file
+    # I/O (saved-config read + env injection), so run them in a thread too.
+    service = getattr(request.app.state, "service", None)
     try:
         effective, injected_keys = await asyncio.to_thread(load_app_config)
-        saved_raw = await asyncio.to_thread(load_saved_raw)
-    except ConfigFileError as exc:  # pragma: no cover — written successfully one line above
+    except (ConfigFileError, ValidationError, OSError) as exc:
+        if isinstance(service, RoastService):
+            # The saved file changed but no effective configuration is available,
+            # so retaining any prior readout would make an unknown dispatch look
+            # affirmed.  This is deliberately unconditional, including
+            # NOT_CONFIGURED, unlike the normal validated-helper path below.
+            service.set_advisor_health(None)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    try:
+        saved_raw = await asyncio.to_thread(load_saved_raw)
+    except (ConfigFileError, ValidationError, OSError) as exc:
+        if isinstance(service, RoastService):
+            # The effective advisor is known even though the response snapshot
+            # cannot be built, so clear only a probe made stale by that identity.
+            service.invalidate_stale_advisor_health(effective.advisor)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if isinstance(service, RoastService):
+        # D78 applies saved changes to the next roast only: do not patch the
+        # running config. A later reverting PUT therefore leaves this probe at
+        # the honest terminal ``not probed`` state until a real probe runs.
+        service.invalidate_stale_advisor_health(effective.advisor)
     return build_config_snapshot(effective, saved_raw, injected_keys)
 
 
