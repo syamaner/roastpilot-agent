@@ -700,6 +700,22 @@ async def test_a_cosmetic_base_url_put_keeps_the_probe(
 
 
 @pytest.mark.asyncio
+async def test_a_temperature_only_put_invalidates_the_probe(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """Temperature shapes both probe and live request settings."""
+    service = RoastService(store, live_serve_mode=True)
+    probe = _reachable_probe(service)
+    service.set_advisor_health(probe)
+
+    response = await _put_config(create_app(service), {"advisor": {"temperature": 0.5}})
+
+    assert response.status_code == 200
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
 async def test_an_api_key_env_change_invalidates_on_put(
     store: RoastStore,
     config_file: Path,

@@ -1687,8 +1687,9 @@ class RoastService:
 
         ``dispatch_identity`` covers the provider, normalised endpoint, API
         key environment-variable name, base slug, and reasoning effort.
-        ``advice_models`` also covers phase-pinned advice slots.  Both must
-        remain equal for a probe to describe the incoming configuration.
+        ``advice_models`` also covers phase-pinned advice slots. Temperature
+        shapes both healthcheck and live request settings. All must remain
+        equal for a probe to describe the incoming configuration.
 
         The baseline is ``self._config.advisor``; callers must invoke this
         method before committing the incoming configuration.
@@ -1707,6 +1708,7 @@ class RoastService:
         if (
             self._config.advisor.dispatch_identity() != incoming.dispatch_identity()
             or advice_models(self._config.advisor) != advice_models(incoming)
+            or self._config.advisor.temperature != incoming.temperature
         ):
             self._advisor_health = None
             return True
