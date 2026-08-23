@@ -28,6 +28,7 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 
 import roastpilot_agent.api as api_module
+from roastpilot_agent.advisor import FakeAdvisor
 from roastpilot_agent.api import RoastService, create_app
 from roastpilot_agent.config import (
     AdvisorConfig,
@@ -875,13 +876,18 @@ async def test_the_put_makes_no_network_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A PUT invalidates only in-memory state and never re-probes the advisor."""
-    service = RoastService(store, live_serve_mode=True)
+    advisor = FakeAdvisor()
+    service = RoastService(store, advisor=advisor, live_serve_mode=True)
     service.set_advisor_health(_reachable_probe(service))
 
     def _unexpected_probe(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("PUT /api/config must not probe the advisor")
 
+    async def _unexpected_healthcheck() -> AdvisorHealth:
+        raise AssertionError("PUT /api/config must not healthcheck the advisor")
+
     monkeypatch.setattr("roastpilot_agent.live.probe_advisor_health", _unexpected_probe)
+    monkeypatch.setattr(advisor, "healthcheck", _unexpected_healthcheck)
 
     response = await _put_config(
         create_app(service), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}}

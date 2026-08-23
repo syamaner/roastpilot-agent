@@ -1654,11 +1654,10 @@ class RoastService:
         runs, so ``GET /api/health`` can surface whether the advisor answered
         before charge. Pure observability — the advisor is advisory-only.
 
-        Not re-set per roast, but INVALIDATED by :meth:`start_roast` when the
-        reloaded config names a different ``model_slug`` (#747 / D151): a probe
-        describes the model it probed, and since D151 that model is the one
-        that answers, so a stale REACHABLE would vouch for a slug nothing has
-        contacted.
+        The next-roast config reload and ``PUT /api/config`` can clear this
+        readout when the dispatch is stale or unknown: a probe describes the
+        model it probed, so a stale REACHABLE would vouch for a slug nothing
+        has contacted.
 
         Args:
             health: The reachability probe result to surface on ``/api/health``,
