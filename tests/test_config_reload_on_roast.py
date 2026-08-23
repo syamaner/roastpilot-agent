@@ -1007,6 +1007,55 @@ async def test_a_failed_post_write_reload_without_a_service_returns_the_reload_e
 
 
 @pytest.mark.asyncio
+async def test_a_failed_raw_reread_retains_an_effective_matching_probe(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raw-snapshot failure preserves a probe for the known same advisor."""
+    service = RoastService(store, live_serve_mode=True)
+    probe = _reachable_probe(service)
+    service.set_advisor_health(probe)
+
+    def _fail_saved_raw() -> Any:
+        raise ConfigFileError("raw reload failed")
+
+    monkeypatch.setattr(api_module, "load_saved_raw", _fail_saved_raw)
+
+    response = await _put_config(create_app(service), {"advisor": {"model_slug": "openai/gpt-4o"}})
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "raw reload failed"}
+    assert "openai/gpt-4o" in config_file.read_text()
+    assert (await service.health()).advisor is probe
+
+
+@pytest.mark.asyncio
+async def test_a_failed_raw_reread_clears_a_probe_for_a_changed_effective_advisor(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raw-snapshot failure clears a probe stale against the known advisor."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(_reachable_probe(service))
+
+    def _fail_saved_raw() -> Any:
+        raise ConfigFileError("raw reload failed")
+
+    monkeypatch.setattr(api_module, "load_saved_raw", _fail_saved_raw)
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4o-mini"}}
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "raw reload failed"}
+    assert "openai/gpt-4o-mini" in config_file.read_text()
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
 async def test_a_failed_post_write_reload_clears_an_advisory_paused_probe(
     store: RoastStore,
     config_file: Path,

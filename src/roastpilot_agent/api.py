@@ -4486,13 +4486,12 @@ async def put_config(edit: AppConfigEdit, request: Request) -> AppConfigSnapshot
     except ConfigFileError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     # Re-read effective config + saved raw after write so the response reflects
-    # the just-written state, not a stale snapshot.  load_app_config also does
-    # file I/O (saved-config read + env injection); run it in a thread too.
+    # the just-written state, not a stale snapshot.  Both helpers do sync file
+    # I/O (saved-config read + env injection), so run them in a thread too.
+    service = getattr(request.app.state, "service", None)
     try:
         effective, injected_keys = await asyncio.to_thread(load_app_config)
-        saved_raw = await asyncio.to_thread(load_saved_raw)
     except (ConfigFileError, ValidationError, OSError) as exc:
-        service = getattr(request.app.state, "service", None)
         if isinstance(service, RoastService):
             # The saved file changed but no effective configuration is available,
             # so retaining any prior readout would make an unknown dispatch look
@@ -4500,7 +4499,14 @@ async def put_config(edit: AppConfigEdit, request: Request) -> AppConfigSnapshot
             # NOT_CONFIGURED, unlike the normal validated-helper path below.
             service.set_advisor_health(None)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    service = getattr(request.app.state, "service", None)
+    try:
+        saved_raw = await asyncio.to_thread(load_saved_raw)
+    except (ConfigFileError, ValidationError, OSError) as exc:
+        if isinstance(service, RoastService):
+            # The effective advisor is known even though the response snapshot
+            # cannot be built, so clear only a probe made stale by that identity.
+            service.invalidate_stale_advisor_health(effective.advisor)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     if isinstance(service, RoastService):
         # D78 applies saved changes to the next roast only: do not patch the
         # running config. A later reverting PUT therefore leaves this probe at
