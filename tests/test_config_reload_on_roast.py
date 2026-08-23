@@ -957,15 +957,14 @@ async def test_a_failed_persist_keeps_the_probe(
 
 
 @pytest.mark.asyncio
-async def test_a_failed_post_write_reload_keeps_the_probe(
+async def test_a_failed_post_write_reload_clears_the_probe(
     store: RoastStore,
     config_file: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A successful write without an effective reload cannot clear the probe."""
+    """A successful write with unknown effective state clears a stale probe."""
     service = RoastService(store, live_serve_mode=True)
-    probe = _reachable_probe(service)
-    service.set_advisor_health(probe)
+    service.set_advisor_health(_reachable_probe(service))
 
     def _fail_reload() -> tuple[AppConfig, frozenset[str]]:
         raise ConfigFileError("reload failed")
@@ -977,7 +976,32 @@ async def test_a_failed_post_write_reload_keeps_the_probe(
     )
 
     assert response.status_code == 500
-    assert (await service.health()).advisor is probe
+    assert "openai/gpt-4.1-mini" in config_file.read_text()
+    assert (await service.health()).advisor is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_write_reload_clears_an_advisory_paused_probe(
+    store: RoastStore,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown post-write state clears NOT_CONFIGURED as well as contacted probes."""
+    service = RoastService(store, live_serve_mode=True)
+    service.set_advisor_health(AdvisorHealth(status=AdvisorHealthStatus.NOT_CONFIGURED))
+
+    def _fail_reload() -> tuple[AppConfig, frozenset[str]]:
+        raise ConfigFileError("reload failed")
+
+    monkeypatch.setattr(api_module, "load_app_config", _fail_reload)
+
+    response = await _put_config(
+        create_app(service), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}}
+    )
+
+    assert response.status_code == 500
+    assert "openai/gpt-4.1-mini" in config_file.read_text()
+    assert (await service.health()).advisor is None
 
 
 @pytest.mark.asyncio

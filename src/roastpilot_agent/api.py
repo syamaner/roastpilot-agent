@@ -1647,7 +1647,7 @@ class RoastService:
         """
         return self._advisor
 
-    def set_advisor_health(self, health: AdvisorHealth) -> None:
+    def set_advisor_health(self, health: AdvisorHealth | None) -> None:
         """Record the startup advisor reachability probe result (issue #168).
 
         Set once by the ``serve`` entrypoint after :func:`live.probe_advisor_health`
@@ -1661,7 +1661,8 @@ class RoastService:
         contacted.
 
         Args:
-            health: The reachability probe result to surface on ``/api/health``.
+            health: The reachability probe result to surface on ``/api/health``,
+                or ``None`` when the current dispatch is unknown.
         """
         self._advisor_health = health
 
@@ -1689,6 +1690,9 @@ class RoastService:
         key environment-variable name, base slug, and reasoning effort.
         ``advice_models`` also covers phase-pinned advice slots.  Both must
         remain equal for a probe to describe the incoming configuration.
+
+        The baseline is ``self._config.advisor``; callers must invoke this
+        method before committing the incoming configuration.
 
         Args:
             incoming: The freshly resolved effective advisor configuration.
@@ -4488,7 +4492,14 @@ async def put_config(edit: AppConfigEdit, request: Request) -> AppConfigSnapshot
     try:
         effective, injected_keys = await asyncio.to_thread(load_app_config)
         saved_raw = await asyncio.to_thread(load_saved_raw)
-    except ConfigFileError as exc:  # pragma: no cover — written successfully one line above
+    except ConfigFileError as exc:
+        service = getattr(request.app.state, "service", None)
+        if isinstance(service, RoastService):
+            # The saved file changed but no effective configuration is available,
+            # so retaining any prior readout would make an unknown dispatch look
+            # affirmed.  This is deliberately unconditional, including
+            # NOT_CONFIGURED, unlike the normal validated-helper path below.
+            service.set_advisor_health(None)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     service = getattr(request.app.state, "service", None)
     if isinstance(service, RoastService):
