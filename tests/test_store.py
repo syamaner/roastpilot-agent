@@ -3938,7 +3938,7 @@ async def _seed_onset_reference(
     event_source: RoastEventSource | None = RoastEventSource.MCP,
     event_at: str = "2026-08-23T12:00:10+00:00",
     started_at: str = "2026-08-23T11:50:00+00:00",
-    rows: tuple[tuple[float, float, RoastPhase, str, str], ...] = (
+    rows: tuple[tuple[float | None, float, RoastPhase, str, str], ...] = (
         (600.0, 185.0, RoastPhase.ROASTING_PRE_FIRST_CRACK, "2026-08-23T12:00:00+00:00", "{}"),
         (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
         (620.0, 191.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:20+00:00", "{}"),
