@@ -5037,15 +5037,19 @@ async def test_build_reference_roast_falls_back_for_non_monotone_usable_curve(
 
 @pytest.mark.asyncio
 async def test_build_reference_roast_keeps_complete_fallback_pair_when_interpolation_fails(
-    tmp_store: RoastStore,
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T12: a mapped onset never replaces only the fallback elapsed time."""
+    """T12: an interpolation-only failure never partially adopts an onset."""
     await tmp_store.initialize()
     try:
+
+        def reject_interpolation(_t: object, _samples: Iterable[tuple[object, object]]) -> None:
+            return None
+
+        monkeypatch.setattr(store_module, "interpolate_at", reject_interpolation)
         await _seed_onset_reference(
             tmp_store,
             run_id="atomic-interpolation",
-            event_at="2026-08-23T12:00:30+00:00",
             rows=(
                 (
                     600.0,
@@ -5054,17 +5058,17 @@ async def test_build_reference_roast_keeps_complete_fallback_pair_when_interpola
                     "2026-08-23T12:00:00+00:00",
                     "{}",
                 ),
-                (620.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
                 (
-                    610.0,
+                    620.0,
                     191.0,
                     RoastPhase.DEVELOPMENT,
-                    "2026-08-23T12:00:30+00:00",
-                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:00+00:00"}}',
+                    "2026-08-23T12:00:20+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:05+00:00"}}',
                 ),
             ),
         )
-        assert await _reference_landmark_pair(tmp_store, "atomic-interpolation") == (620.0, 188.0)
+        assert await _reference_landmark_pair(tmp_store, "atomic-interpolation") == (610.0, 188.0)
     finally:
         await tmp_store.close()
 
