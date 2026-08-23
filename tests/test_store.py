@@ -776,13 +776,16 @@ PROFILE = RoastProfile(
 )
 
 
-async def seeded_store(store: RoastStore, run_id: str = "run-1") -> RoastStore:
+async def seeded_store(
+    store: RoastStore, run_id: str = "run-1", started_at_utc: str | None = None
+) -> RoastStore:
     await store.initialize()
     await store.create_run(
         run_id=run_id,
         profile=PROFILE,
         config=AppConfig(),
         agent_phase=RoastPhase.STARTING,
+        started_at_utc=started_at_utc,
     )
     return store
 
@@ -798,7 +801,7 @@ async def fetch_one(
 
 @pytest.mark.asyncio
 async def test_create_run_freezes_profile_and_config(tmp_store: RoastStore) -> None:
-    await seeded_store(tmp_store)
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
     try:
         row = await fetch_one(
             tmp_store, "SELECT agent_phase, profile_json, config_json FROM roast_runs"
@@ -814,7 +817,7 @@ async def test_create_run_freezes_profile_and_config(tmp_store: RoastStore) -> N
 @pytest.mark.asyncio
 async def test_typed_writers_round_trip_enum_values(tmp_store: RoastStore) -> None:
     """Every writer stores the lowercase wire values the CHECKs enforce."""
-    await seeded_store(tmp_store)
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
     try:
         await tmp_store.record_event(
             run_id="run-1",
@@ -870,7 +873,7 @@ async def test_timeline_round_trips_safety_ids_and_command_provenance(
     tmp_store: RoastStore,
 ) -> None:
     """Timeline wire rows retain safety IDs and both command FK states (#787)."""
-    await seeded_store(tmp_store)
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
     try:
         evaluation_id = await tmp_store.record_safety_evaluation(
             run_id="run-1",
@@ -915,7 +918,7 @@ async def test_timeline_round_trips_safety_ids_and_command_provenance(
 async def test_advisor_decision_stores_hash_never_raw_context(
     tmp_store: RoastStore,
 ) -> None:
-    await seeded_store(tmp_store)
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
     try:
         context = AdvisorContext(
             phase=RoastPhase.DEVELOPMENT,
@@ -2959,7 +2962,7 @@ async def test_list_runs_first_crack_equal_time_uses_one_lower_id_event_for_time
 ) -> None:
     """Equal-time FC subqueries share the lower-id event's provenance."""
     confirmation = "2026-06-07T14:09:10+00:00"
-    await seeded_store(tmp_store)
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
     try:
         for source in (first_source, second_source):
             await tmp_store.record_event(
@@ -3027,7 +3030,7 @@ async def test_list_runs_first_crack_time_none_without_fc(tmp_store: RoastStore)
 async def test_list_runs_uses_post_confirmation_mcp_backdated_onset(tmp_store: RoastStore) -> None:
     """A confirmed MCP FC projects a later-persisted, backdated status onset."""
     confirmation = "2026-06-07T14:09:10+00:00"
-    await seeded_store(tmp_store)
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
     try:
         await tmp_store.record_event(
             run_id="run-1",
@@ -3053,6 +3056,41 @@ async def test_list_runs_uses_post_confirmation_mcp_backdated_onset(tmp_store: R
         [summary] = await tmp_store.list_runs()
 
         assert summary.first_crack_at_utc == "2026-06-07T14:09:05+00:00"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("onset", ["2026-06-07T13:59:59+00:00", "2026-06-07T14:09:11+00:00"])
+async def test_list_runs_rejects_mcp_onset_outside_run_to_confirmation_window(
+    tmp_store: RoastStore, onset: str
+) -> None:
+    """A post-confirmation snapshot cannot move FC outside trusted bounds."""
+    confirmation = "2026-06-07T14:09:10+00:00"
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc=confirmation,
+        )
+        await tmp_store.connection.execute(
+            "INSERT INTO telemetry_snapshots "
+            "(run_id,tick,recorded_at_utc,elapsed_seconds,agent_phase,raw_state_json) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                "run-1",
+                1,
+                "2026-06-07T14:09:11+00:00",
+                1.0,
+                RoastPhase.DEVELOPMENT.value,
+                f'{{"first_crack_status":{{"detected_at_utc":"{onset}"}}}}',
+            ),
+        )
+        await tmp_store.connection.commit()
+        [summary] = await tmp_store.list_runs()
+        assert summary.first_crack_at_utc == confirmation
     finally:
         await tmp_store.close()
 
@@ -3129,7 +3167,7 @@ async def test_list_runs_legacy_controller_first_crack_ignores_mcp_state_onset(
 @pytest.mark.asyncio
 async def test_list_runs_ignores_malformed_state_from_another_run(tmp_store: RoastStore) -> None:
     """One malformed raw state cannot abort or alter another run's onset."""
-    await seeded_store(tmp_store)
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
     await tmp_store.create_run(
         run_id="run-2", profile=PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
     )
@@ -3167,7 +3205,7 @@ async def test_list_runs_ignores_malformed_state_from_another_run(tmp_store: Roa
 @pytest.mark.asyncio
 async def test_list_runs_uses_only_post_confirmation_mcp_onsets(tmp_store: RoastStore) -> None:
     """A pre-confirmation bogus onset cannot beat a valid later snapshot."""
-    await seeded_store(tmp_store)
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
     try:
         await tmp_store.record_event(
             run_id="run-1",

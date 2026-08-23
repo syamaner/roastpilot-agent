@@ -61,6 +61,19 @@ def earliest_onset_utc(candidates: Iterable[object]) -> datetime | None:
     return earliest
 
 
+def is_onset_within_event_window(onset: object, started_at: object, event_at: object) -> bool:
+    """Whether a parsed onset lies inclusively within its run/event bounds."""
+    onset_utc = onset if isinstance(onset, datetime) else parse_utc(onset)
+    started_utc = parse_utc(started_at)
+    event_utc = parse_utc(event_at)
+    return (
+        onset_utc is not None
+        and started_utc is not None
+        and event_utc is not None
+        and started_utc <= onset_utc <= event_utc
+    )
+
+
 def utc_to_run_seconds(target: object, anchors: Iterable[tuple[object, object]]) -> float | None:
     """Map a UTC instant to the nearest finite, non-negative run-clock anchor.
 
@@ -88,7 +101,7 @@ def utc_to_run_seconds(target: object, anchors: Iterable[tuple[object, object]])
             delta = (target_utc - recorded_utc).total_seconds()
         except (OverflowError, TypeError, ValueError):
             continue
-        if not math.isfinite(seconds) or not math.isfinite(delta):
+        if not math.isfinite(seconds) or seconds < 0.0 or not math.isfinite(delta):
             continue
         distance = abs(delta)
         if nearest_distance is None or distance < nearest_distance:
@@ -102,7 +115,7 @@ def utc_to_run_seconds(target: object, anchors: Iterable[tuple[object, object]])
 
 
 def interpolate_at(t: object, samples: Iterable[tuple[object, object]]) -> float | None:
-    """Linearly interpolate a finite value in a non-decreasing sample series.
+    """Linearly interpolate a finite value in a strictly increasing sample series.
 
     Args:
         t: Requested sample coordinate.

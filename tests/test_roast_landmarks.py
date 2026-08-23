@@ -191,6 +191,39 @@ def test_package_utc_mapping_replaces_a_farther_anchor() -> None:
     )
 
 
+def test_package_utc_mapping_ignores_nearer_negative_anchor() -> None:
+    """A closer negative run-clock anchor cannot displace a valid anchor."""
+    assert (
+        package_landmarks.utc_to_run_seconds(
+            "2026-01-01T00:00:10+00:00",
+            [
+                ("2026-01-01T00:00:08+00:00", 8.0),
+                ("2026-01-01T00:00:09+00:00", -1.0),
+            ],
+        )
+        == 10.0
+    )
+    assert (
+        package_landmarks.utc_to_run_seconds(
+            "2026-01-01T00:00:10+00:00", [("2026-01-01T00:00:10+00:00", -1.0)]
+        )
+        is None
+    )
+
+
+def test_package_onset_window_is_inclusive_and_fail_closed() -> None:
+    """Only parseable onset bounds admit a confirmation override."""
+    assert package_landmarks.is_onset_within_event_window(
+        "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", "2026-01-01T00:01:00+00:00"
+    )
+    assert package_landmarks.is_onset_within_event_window(
+        "2026-01-01T00:01:00+00:00", "2026-01-01T00:00:00+00:00", "2026-01-01T00:01:00+00:00"
+    )
+    assert not package_landmarks.is_onset_within_event_window(
+        "bad", "2026-01-01T00:00:00+00:00", "2026-01-01T00:01:00+00:00"
+    )
+
+
 @pytest.mark.parametrize(
     ("target", "samples", "expected"),
     [

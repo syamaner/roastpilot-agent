@@ -56,7 +56,11 @@ from roastpilot_agent.models import (
     recording_origin_slug,
     weight_loss_percent,
 )
-from roastpilot_agent.roast_landmarks import earliest_onset_utc, is_mcp_first_crack_source
+from roastpilot_agent.roast_landmarks import (
+    earliest_onset_utc,
+    is_mcp_first_crack_source,
+    is_onset_within_event_window,
+)
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
 
 SCHEMA_V1 = """
@@ -1883,7 +1887,9 @@ class RoastStore:
             first_crack_at = None if row["fc_at"] is None else str(row["fc_at"])
             if is_mcp_first_crack_source(row["fc_source"]):
                 onset = earliest_onset_utc(onset_candidates.get(str(row["id"]), []))
-                if onset is not None:
+                if onset is not None and is_onset_within_event_window(
+                    onset, row["started_at_utc"], row["fc_at"]
+                ):
                     first_crack_at = onset.isoformat()
             summaries.append(
                 RoastSummary(
