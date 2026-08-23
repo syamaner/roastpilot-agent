@@ -5074,6 +5074,89 @@ async def test_build_reference_roast_keeps_complete_fallback_pair_when_interpola
 
 
 @pytest.mark.asyncio
+async def test_build_reference_roast_rejects_hidden_null_temperature_clock_reset(
+    tmp_store: RoastStore,
+) -> None:
+    """A reset in a non-interpolable clock row still blocks onset adoption."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="hidden-clock-reset",
+            event_at="2026-08-23T12:00:10+00:00",
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    "{}",
+                ),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (605.0, 190.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:15+00:00", "{}"),
+                (
+                    620.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:20+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:05+00:00"}}',
+                ),
+            ),
+        )
+        await tmp_store.connection.execute(
+            "UPDATE telemetry_snapshots SET bean_temp_c = NULL WHERE run_id = ? AND tick = ?",
+            ("hidden-clock-reset", 3),
+        )
+        await tmp_store.connection.commit()
+        assert await _reference_landmark_pair(tmp_store, "hidden-clock-reset") == (610.0, 188.0)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_uses_monotonic_null_temperature_clock_anchor(
+    tmp_store: RoastStore,
+) -> None:
+    """A finite monotonic clock remains an onset anchor even without temperature."""
+    await tmp_store.initialize()
+    try:
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="null-temperature-anchor",
+            event_at="2026-08-23T12:00:10+00:00",
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T11:59:40+00:00",
+                    "{}",
+                ),
+                (630.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (635.0, 190.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:06+00:00", "{}"),
+                (
+                    640.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:20+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:00+00:00"}}',
+                ),
+            ),
+        )
+        await tmp_store.connection.execute(
+            "UPDATE telemetry_snapshots SET bean_temp_c = NULL WHERE run_id = ? AND tick = ?",
+            ("null-temperature-anchor", 3),
+        )
+        await tmp_store.connection.commit()
+        assert await _reference_landmark_pair(tmp_store, "null-temperature-anchor") == (
+            629.0,
+            pytest.approx(187.9),
+        )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_build_reference_roast_falls_back_when_first_development_clock_is_null(
     tmp_store: RoastStore,
 ) -> None:
