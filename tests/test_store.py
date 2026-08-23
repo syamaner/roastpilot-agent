@@ -5,6 +5,7 @@ this suite.
 """
 
 import json
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -4916,6 +4917,86 @@ async def test_build_reference_roast_falls_back_when_mapping_precedes_usable_cur
             ),
         )
         assert await _reference_landmark_pair(tmp_store, "mapped-early") == (610.0, 188.0)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_enforces_usable_span_before_interpolation(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T10 isolation: pre-curve mappings fall back before interpolation runs."""
+    await tmp_store.initialize()
+    try:
+
+        def interpolate_pre_span(_t: object, _samples: Iterable[tuple[object, object]]) -> float:
+            return 186.5
+
+        monkeypatch.setattr(store_module, "interpolate_at", interpolate_pre_span)
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="span-before-interpolation",
+            event_at="2026-08-23T12:00:30+00:00",
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:10+00:00",
+                    "{}",
+                ),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:20+00:00", "{}"),
+                (
+                    620.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:30+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:05+00:00"}}',
+                ),
+            ),
+        )
+        assert await _reference_landmark_pair(tmp_store, "span-before-interpolation") == (
+            610.0,
+            188.0,
+        )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_enforces_event_window_before_mapping(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T8 isolation: an out-of-window onset cannot reach safe mapping."""
+    await tmp_store.initialize()
+    try:
+
+        def map_out_of_window(_target: object, _anchors: Iterable[tuple[object, object]]) -> float:
+            return 605.0
+
+        monkeypatch.setattr(store_module, "utc_to_run_seconds", map_out_of_window)
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="window-before-mapping",
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    "{}",
+                ),
+                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (
+                    620.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:20+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T11:49:59+00:00"}}',
+                ),
+            ),
+        )
+        assert await _reference_landmark_pair(tmp_store, "window-before-mapping") == (610.0, 188.0)
     finally:
         await tmp_store.close()
 
