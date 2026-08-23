@@ -7,7 +7,7 @@ import math
 import sqlite3
 import sys
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -226,6 +226,11 @@ def test_package_onset_window_is_inclusive_and_fail_closed() -> None:
     )
     assert not package_landmarks.is_onset_within_event_window(
         datetime(2026, 1, 1), "2026-01-01T00:00:00+00:00", "2026-01-01T00:01:00+00:00"
+    )
+    assert not package_landmarks.is_onset_within_event_window(
+        datetime.min.replace(tzinfo=timezone(timedelta(hours=1))),
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:01:00+00:00",
     )
 
 
