@@ -1056,6 +1056,25 @@ async def test_a_failed_raw_reread_clears_a_probe_for_a_changed_effective_adviso
 
 
 @pytest.mark.asyncio
+async def test_a_failed_raw_reread_without_a_service_returns_the_reload_error(
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raw-snapshot failure stays a 500 when no service is attached."""
+
+    def _fail_saved_raw() -> Any:
+        raise ConfigFileError("raw reload failed")
+
+    monkeypatch.setattr(api_module, "load_saved_raw", _fail_saved_raw)
+
+    response = await _put_config(create_app(), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}})
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "raw reload failed"}
+    assert "openai/gpt-4.1-mini" in config_file.read_text()
+
+
+@pytest.mark.asyncio
 async def test_a_failed_post_write_reload_clears_an_advisory_paused_probe(
     store: RoastStore,
     config_file: Path,
