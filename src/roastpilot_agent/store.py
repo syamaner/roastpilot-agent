@@ -58,7 +58,9 @@ from roastpilot_agent.models import (
 )
 from roastpilot_agent.roast_landmarks import (
     earliest_onset_within_event_window,
+    interpolate_at,
     is_mcp_first_crack_source,
+    utc_to_run_seconds,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
 
@@ -1212,6 +1214,39 @@ class RoastStore:
         converted = float(cast("float", value))
         return converted if math.isfinite(converted) else None
 
+    @staticmethod
+    def _reference_onset_pair(
+        candidates: list[object],
+        started_at_utc: object,
+        fc_at: object,
+        usable_rows: list[aiosqlite.Row],
+        first_dev: aiosqlite.Row,
+    ) -> tuple[float, float] | None:
+        """Return a complete safe onset landmark pair, or ``None`` to fall back."""
+        onset = earliest_onset_within_event_window(candidates, started_at_utc, fc_at)
+        if onset is None:
+            return None
+        anchors = [(row["recorded_at_utc"], row["charge_elapsed_seconds"]) for row in usable_rows]
+        mapped = utc_to_run_seconds(onset.isoformat(), anchors)
+        first_t = RoastStore._optional_float(usable_rows[0]["charge_elapsed_seconds"])
+        last_t = RoastStore._optional_float(usable_rows[-1]["charge_elapsed_seconds"])
+        first_dev_t = RoastStore._optional_float(first_dev["charge_elapsed_seconds"])
+        if (
+            mapped is None
+            or first_t is None
+            or last_t is None
+            or first_dev_t is None
+            or mapped < first_t
+            or mapped > last_t
+            or mapped > first_dev_t
+        ):
+            return None
+        temperature = interpolate_at(
+            mapped,
+            [(row["charge_elapsed_seconds"], row["bean_temp_c"]) for row in usable_rows],
+        )
+        return None if temperature is None else (mapped, temperature)
+
     # --- E6-S3: recovery reads, run completion, immutability exceptions ---
 
     async def read_latest_run(self) -> PersistedRun | None:
@@ -2290,12 +2325,11 @@ class RoastStore:
 
         Reads ``telemetry_snapshots`` for ``run_id`` in tick order and derives:
 
-        - **Landmarks**: the clock-safe, telemetry-phase-only rule pinned by
-          the design note §6.4a — drop is the LAST row tagged
-          ``agent_phase == 'development'`` and first crack is the FIRST such
-          row (development begins at FC); never the run's last row, which can
-          land in the post-drop cooling tail. ``operator_rating`` is read from
-          ``roast_runs``.
+        - **Landmarks**: drop is the LAST ``development``-phase row. First
+          crack uses the accepted MCP event's backdated onset only when its
+          wall-clock mapping and interpolated temperature form a complete,
+          usable pre-drop pair no later than confirmation; otherwise both
+          first-crack values remain the FIRST ``development``-phase row.
         - **Curve**: downsampled to at most 30 points, evenly spaced by index,
           always including the first and last usable row (design note §3.1).
           A row is "usable" when both ``charge_elapsed_seconds`` and
@@ -2322,16 +2356,43 @@ class RoastStore:
             is missing its charge-elapsed clock (no usable curve point).
         """
         async with self.connection.execute(
-            "SELECT operator_rating FROM roast_runs WHERE id = ?", (run_id,)
+            "SELECT operator_rating, started_at_utc,"
+            " (SELECT e.recorded_at_utc FROM roast_events e WHERE e.run_id = roast_runs.id"
+            "  AND e.kind = 'first_crack' ORDER BY e.recorded_at_utc ASC, e.id ASC"
+            "  LIMIT 1) AS fc_at,"
+            " (SELECT e.source FROM roast_events e WHERE e.run_id = roast_runs.id"
+            "  AND e.kind = 'first_crack' ORDER BY e.recorded_at_utc ASC, e.id ASC"
+            "  LIMIT 1) AS fc_source"
+            " FROM roast_runs WHERE id = ?",
+            (run_id,),
         ) as cursor:
             run_row = await cursor.fetchone()
         if run_row is None or run_row["operator_rating"] is None:
             return None
         operator_rating = int(run_row["operator_rating"])
+        onset_candidates: list[object] = []
+        if is_mcp_first_crack_source(run_row["fc_source"]):
+            onset_query = (
+                "SELECT CASE WHEN json_valid(t.raw_state_json) THEN "
+                "json_extract(t.raw_state_json, '$.first_crack_status.detected_at_utc') "
+                "END AS onset_candidate "
+                "FROM telemetry_snapshots t WHERE t.run_id = ? AND EXISTS "
+                "(SELECT 1 FROM roast_events e WHERE e.id = "
+                "(SELECT first_event.id FROM roast_events first_event "
+                "WHERE first_event.run_id = t.run_id AND first_event.kind = 'first_crack' "
+                "ORDER BY first_event.recorded_at_utc ASC, first_event.id ASC LIMIT 1) "
+                "AND e.source = ? AND t.recorded_at_utc >= e.recorded_at_utc) "
+                "GROUP BY CASE WHEN json_valid(t.raw_state_json) THEN "
+                "json_extract(t.raw_state_json, '$.first_crack_status.detected_at_utc') END"
+            )
+            async with self.connection.execute(
+                onset_query, (run_id, RoastEventSource.MCP.value)
+            ) as cursor:
+                onset_candidates = [row["onset_candidate"] for row in await cursor.fetchall()]
 
         async with self.connection.execute(
             "SELECT charge_elapsed_seconds, bean_temp_c, env_temp_c,"
-            " bean_ror_c_per_min, agent_phase, development_percent"
+            " bean_ror_c_per_min, agent_phase, development_percent, recorded_at_utc"
             " FROM telemetry_snapshots WHERE run_id = ? ORDER BY id ASC",
             (run_id,),
         ) as cursor:
@@ -2375,9 +2436,20 @@ class RoastStore:
             for row in sample_rows
         ]
 
+        onset_pair = self._reference_onset_pair(
+            onset_candidates, run_row["started_at_utc"], run_row["fc_at"], usable, first_dev
+        )
+        first_crack_elapsed_s, first_crack_temp_c = (
+            onset_pair
+            if onset_pair is not None
+            else (
+                self._optional_float(first_dev["charge_elapsed_seconds"]),
+                self._optional_float(first_dev["bean_temp_c"]),
+            )
+        )
         landmarks = ReferenceLandmarks(
-            first_crack_temp_c=self._optional_float(first_dev["bean_temp_c"]),
-            first_crack_elapsed_s=self._optional_float(first_dev["charge_elapsed_seconds"]),
+            first_crack_temp_c=first_crack_temp_c,
+            first_crack_elapsed_s=first_crack_elapsed_s,
             drop_temp_c=self._optional_float(last_dev["bean_temp_c"]),
             drop_development_percent=self._optional_float(last_dev["development_percent"]),
             operator_rating=operator_rating,

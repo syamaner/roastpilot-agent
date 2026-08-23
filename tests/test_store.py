@@ -4447,6 +4447,69 @@ async def test_build_reference_roast_landmarks_use_development_phase_not_cooling
 
 
 @pytest.mark.asyncio
+async def test_build_reference_roast_adopts_complete_mcp_onset_pair(
+    tmp_store: RoastStore,
+) -> None:
+    """A post-confirmation MCP onset maps and interpolates as one landmark pair."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        await tmp_store.create_run(
+            run_id="onset-reference",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        for tick, elapsed, temperature, phase in (
+            (1, 600.0, 185.0, RoastPhase.ROASTING_PRE_FIRST_CRACK),
+            (2, 610.0, 188.0, RoastPhase.DEVELOPMENT),
+            (3, 620.0, 191.0, RoastPhase.DEVELOPMENT),
+        ):
+            await _record_row(
+                tmp_store,
+                "onset-reference",
+                tick,
+                phase=phase,
+                charge_elapsed=elapsed,
+                bean_temp=temperature,
+            )
+        await tmp_store.connection.execute(
+            "UPDATE telemetry_snapshots SET recorded_at_utc = CASE id - "
+            "(SELECT MIN(id) FROM telemetry_snapshots) "
+            "WHEN 0 THEN '2026-08-23T12:00:00+00:00' WHEN 1 THEN '2026-08-23T12:00:10+00:00' "
+            "ELSE '2026-08-23T12:00:20+00:00' END, raw_state_json = CASE id - "
+            "(SELECT MIN(id) FROM telemetry_snapshots) WHEN 2 THEN "
+            '\'{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:05Z"}}\' '
+            "ELSE '{}' END "
+            "WHERE run_id = ?",
+            ("onset-reference",),
+        )
+        await tmp_store.connection.execute(
+            "UPDATE roast_runs SET started_at_utc = ? WHERE id = ?",
+            ("2026-08-23T11:50:00+00:00", "onset-reference"),
+        )
+        await tmp_store.connection.commit()
+        await tmp_store.record_event(
+            run_id="onset-reference",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc="2026-08-23T12:00:10+00:00",
+        )
+        await tmp_store.complete_run(
+            run_id="onset-reference", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_operator_rating("onset-reference", rating=4)
+        reference = await tmp_store._build_reference_roast(  # pyright: ignore[reportPrivateUsage]
+            "onset-reference", "test-slug"
+        )
+        assert reference is not None
+        assert reference.landmarks.first_crack_elapsed_s == 605.0
+        assert reference.landmarks.first_crack_temp_c == 186.5
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_build_reference_roast_curve_trims_at_drop_not_cooling_tail(
     tmp_store: RoastStore,
 ) -> None:

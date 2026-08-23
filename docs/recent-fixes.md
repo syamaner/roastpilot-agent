@@ -824,7 +824,7 @@ Format: one entry per anti-pattern.
 
 ## A roast-landmark consumer must use the backdated onset, not agent receipt time
 
-*(fixed for store fixture export by #779 and #783 slices 1–2, 23 Aug 2026)*
+*(fixed across the fixture exporter, plant study, history display, and reference context by #779 and #783 slices 1–3, 23 Aug 2026)*
 
 - **Signature:** consumers of `roast_events.kind IN ('t0_detected',
   'first_crack')`, or an `agent_phase == "development"` transition, that use
@@ -836,8 +836,9 @@ Format: one entry per anti-pattern.
   `raw_state_json.first_crack_status.detected_at_utc`, mapped through paired
   telemetry wall/elapsed clocks; retain a warned event-row fallback for old or
   operator-marked runs. #783 slice 1 fixed `scripts/plant_model_arx_study.py`
-  and slice 2 fixed the history-list FC display. `_build_reference_roast`
-  remains the independent slice 3 consumer.
+  and slice 2 fixed the history-list FC display. Slice 3 fixed
+  `_build_reference_roast` with an atomic complete onset time/temperature pair
+  that falls back together to the first-development pair.
 - **Guarded by:** `tests/test_store_to_fixture.py` backdated-anchor invariant,
   temperature, provenance, fallback, ambiguity, and frozen-DTR tests.
 
