@@ -120,7 +120,7 @@ def interpolate_at(t: object, samples: Iterable[tuple[object, object]]) -> float
         return None
     if not math.isfinite(target):
         return None
-    previous: tuple[float, float] | None = None
+    points: list[tuple[float, float]] = []
     for raw_x, raw_y in samples:
         if isinstance(raw_x, bool) or isinstance(raw_y, bool):
             return None
@@ -132,6 +132,11 @@ def interpolate_at(t: object, samples: Iterable[tuple[object, object]]) -> float
             return None
         if not math.isfinite(x) or not math.isfinite(y):
             return None
+        if points and x <= points[-1][0]:
+            return None
+        points.append((x, y))
+    previous: tuple[float, float] | None = None
+    for x, y in points:
         if previous is None:
             if target < x:
                 return None
@@ -140,13 +145,9 @@ def interpolate_at(t: object, samples: Iterable[tuple[object, object]]) -> float
             previous = (x, y)
             continue
         prev_x, prev_y = previous
-        if x < prev_x:
-            return None
         if target == x:
             return y
         if target < x:
-            if x == prev_x:
-                return None
             return prev_y + ((target - prev_x) / (x - prev_x)) * (y - prev_y)
         previous = (x, y)
     return None

@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from roastpilot_agent import roast_landmarks as package_landmarks
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import roast_landmarks as landmarks  # noqa: E402
@@ -93,6 +95,33 @@ def test_utc_mapping_skips_invalid_anchors_and_rejects_negative_results() -> Non
         )
         is None
     )
+
+
+def test_landmark_helpers_keep_first_ties_and_reject_ambiguous_or_invalid_edges() -> None:
+    """Ties are stable while invalid mapping and interpolation inputs fail closed."""
+    assert (
+        landmarks.utc_to_run_seconds(
+            "2026-01-01T00:00:10+00:00",
+            [
+                ("2026-01-01T00:00:08+00:00", 8.0),
+                ("2026-01-01T00:00:12+00:00", 99.0),
+            ],
+        )
+        == 10.0
+    )
+    assert landmarks.utc_to_run_seconds("bad", []) is None
+    assert (
+        landmarks.utc_to_run_seconds(
+            "2026-01-01T00:00:10+00:00", [("2026-01-01T00:00:10+00:00", -1.0)]
+        )
+        is None
+    )
+    assert package_landmarks.interpolate_at(0.0, [(0.0, 1.0), (1.0, 2.0)]) == 1.0
+    assert package_landmarks.interpolate_at(1.0, [(0.0, 1.0), (1.0, 2.0)]) == 2.0
+    assert package_landmarks.interpolate_at(0.0, []) is None
+    assert package_landmarks.interpolate_at(2.0, [(0.0, 1.0), (1.0, 2.0)]) is None
+    assert package_landmarks.interpolate_at(0.5, [(1.0, 1.0), (0.0, 2.0)]) is None
+    assert package_landmarks.interpolate_at(1.0, [(0.0, 1.0), (1.0, 2.0), (1.0, 3.0)]) is None
 
 
 def test_exporter_delegates_onset_selection_with_shared_parity(

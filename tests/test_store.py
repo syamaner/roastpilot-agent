@@ -2955,6 +2955,20 @@ async def test_list_runs_first_crack_time_none_without_fc(tmp_store: RoastStore)
             kind=RoastEventKind.RUN_STARTED,
             source=RoastEventSource.CONTROLLER,
         )
+        await tmp_store.connection.execute(
+            "INSERT INTO telemetry_snapshots "
+            "(run_id, tick, recorded_at_utc, elapsed_seconds, agent_phase, raw_state_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "run-1",
+                1,
+                "2026-06-07T14:09:11+00:00",
+                1.0,
+                RoastPhase.DEVELOPMENT.value,
+                '{"first_crack_status":{"detected_at_utc":"2026-06-07T14:09:05+00:00"}}',
+            ),
+        )
+        await tmp_store.connection.commit()
         runs = await tmp_store.list_runs()
         assert len(runs) == 1
         assert runs[0].first_crack_at_utc is None
