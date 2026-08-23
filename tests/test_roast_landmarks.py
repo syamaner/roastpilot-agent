@@ -70,6 +70,31 @@ def test_shared_parsers_reject_invalid_shapes_and_normalize_naive_utc() -> None:
     assert parsed.isoformat() == "2026-01-01T00:00:00+00:00"
 
 
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        (["2026-01-01T00:01:00Z", "2026-01-01T00:01:00+00:00"], "2026-01-01T00:01:00+00:00"),
+        (["2026-01-01T00:01:00+00:00", "2026-01-01T00:00:35+00:00"], "2026-01-01T00:00:35+00:00"),
+        (["bad", "", None], None),
+        (["2026-01-01T00:01:00"], "2026-01-01T00:01:00+00:00"),
+    ],
+)
+def test_package_and_script_helpers_share_timestamp_parsing_rules(
+    values: list[object], expected: str | None
+) -> None:
+    """Parity is parsed-instant selection; exporter raw spelling/count remains distinct."""
+    package = package_landmarks.earliest_onset_utc(values)
+    assert (None if package is None else package.isoformat()) == expected
+    raw_states = [_status(value) for value in values if isinstance(value, str) and value]
+    raw, count = landmarks.first_crack_onset_utc(raw_states)
+    if expected is None:
+        assert raw == "bad" if raw_states else raw is None
+    else:
+        assert landmarks.parse_utc(raw) is not None
+        assert landmarks.parse_utc(raw).isoformat() == expected  # type: ignore[union-attr]
+    assert count >= 0
+
+
 def test_utc_mapping_skips_invalid_anchors_and_rejects_negative_results() -> None:
     """Only finite numeric anchors may map a status onset onto the run clock."""
     target = "2026-01-01T00:00:10+00:00"

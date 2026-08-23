@@ -2944,6 +2944,53 @@ async def test_list_runs_first_crack_time_orders_by_event_time_not_id(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_source", "second_source", "uses_onset"),
+    [
+        (RoastEventSource.MCP, RoastEventSource.OPERATOR, True),
+        (RoastEventSource.OPERATOR, RoastEventSource.MCP, False),
+    ],
+)
+async def test_list_runs_first_crack_equal_time_uses_one_lower_id_event_for_time_and_source(
+    tmp_store: RoastStore,
+    first_source: RoastEventSource,
+    second_source: RoastEventSource,
+    uses_onset: bool,
+) -> None:
+    """Equal-time FC subqueries share the lower-id event's provenance."""
+    confirmation = "2026-06-07T14:09:10+00:00"
+    await seeded_store(tmp_store)
+    try:
+        for source in (first_source, second_source):
+            await tmp_store.record_event(
+                run_id="run-1",
+                kind=RoastEventKind.FIRST_CRACK,
+                source=source,
+                recorded_at_utc=confirmation,
+            )
+        await tmp_store.connection.execute(
+            "INSERT INTO telemetry_snapshots "
+            "(run_id,tick,recorded_at_utc,elapsed_seconds,agent_phase,raw_state_json) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                "run-1",
+                1,
+                "2026-06-07T14:09:11+00:00",
+                1.0,
+                RoastPhase.DEVELOPMENT.value,
+                '{"first_crack_status":{"detected_at_utc":"2026-06-07T14:09:05+00:00"}}',
+            ),
+        )
+        await tmp_store.connection.commit()
+        [summary] = await tmp_store.list_runs()
+        assert summary.first_crack_at_utc == (
+            "2026-06-07T14:09:05+00:00" if uses_onset else confirmation
+        )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_list_runs_first_crack_time_none_without_fc(tmp_store: RoastStore) -> None:
     """A run that never reached first crack serializes ``first_crack_at_utc`` as
     ``None`` (#111 back-compat: pre-FC runs and any run with no FC event)."""
