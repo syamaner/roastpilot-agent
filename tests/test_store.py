@@ -5070,16 +5070,15 @@ async def test_build_reference_roast_keeps_complete_fallback_pair_when_interpola
 
 
 @pytest.mark.asyncio
-async def test_build_reference_roast_keeps_complete_fallback_pair_when_bounds_fail(
+async def test_build_reference_roast_falls_back_when_first_development_clock_is_null(
     tmp_store: RoastStore,
 ) -> None:
-    """T13: an interpolable onset outside usable bounds adopts neither value."""
+    """A NULL first-development clock prevents atomic onset adoption safely."""
     await tmp_store.initialize()
     try:
         await _seed_onset_reference(
             tmp_store,
-            run_id="atomic-bounds",
-            event_at="2026-08-23T12:00:30+00:00",
+            run_id="first-development-clock-null",
             rows=(
                 (
                     600.0,
@@ -5088,17 +5087,64 @@ async def test_build_reference_roast_keeps_complete_fallback_pair_when_bounds_fa
                     "2026-08-23T12:00:00+00:00",
                     "{}",
                 ),
-                (610.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
+                (None, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:10+00:00", "{}"),
                 (
                     620.0,
                     191.0,
                     RoastPhase.DEVELOPMENT,
-                    "2026-08-23T12:00:30+00:00",
-                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:25+00:00"}}',
+                    "2026-08-23T12:00:20+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:05+00:00"}}',
                 ),
             ),
         )
-        assert await _reference_landmark_pair(tmp_store, "atomic-bounds") == (610.0, 188.0)
+        assert await _reference_landmark_pair(tmp_store, "first-development-clock-null") == (
+            None,
+            188.0,
+        )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_enforces_upper_usable_span_before_interpolation(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T13: mapping above the last usable row falls back before interpolation."""
+    await tmp_store.initialize()
+    try:
+
+        def interpolate_past_upper_span(
+            _t: object, _samples: Iterable[tuple[object, object]]
+        ) -> float:
+            return 186.5
+
+        monkeypatch.setattr(store_module, "interpolate_at", interpolate_past_upper_span)
+        await _seed_onset_reference(
+            tmp_store,
+            run_id="upper-span-before-interpolation",
+            event_at="2026-08-23T12:00:20+00:00",
+            rows=(
+                (
+                    600.0,
+                    185.0,
+                    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+                    "2026-08-23T12:00:00+00:00",
+                    "{}",
+                ),
+                (620.0, 188.0, RoastPhase.DEVELOPMENT, "2026-08-23T12:00:20+00:00", "{}"),
+                (
+                    610.0,
+                    191.0,
+                    RoastPhase.DEVELOPMENT,
+                    "2026-08-23T12:00:30+00:00",
+                    '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:15+00:00"}}',
+                ),
+            ),
+        )
+        assert await _reference_landmark_pair(tmp_store, "upper-span-before-interpolation") == (
+            620.0,
+            188.0,
+        )
     finally:
         await tmp_store.close()
 

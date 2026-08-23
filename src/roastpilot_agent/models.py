@@ -1056,25 +1056,28 @@ class ReferenceLandmarks(BaseModel):
 
     First crack is an atomic MCP-onset elapsed/temperature pair only when the
     accepted MCP event, wall-clock mapping, usable pre-drop bounds, ordering,
-    and interpolation are all proven; otherwise both values are the FIRST
-    ``development``-phase telemetry row. Drop remains the LAST such row,
-    never the cooling tail. Event monotonic seconds are never used to derive
-    the run-relative landmark clock.
+    and interpolation are all proven; otherwise both values are selected from
+    the FIRST ``development``-phase telemetry row. The fallback fields may
+    individually be ``None`` when that row lacks the corresponding persisted
+    value. Drop remains the LAST such row, never the cooling tail. Its
+    development percent remains the controller-frozen, confirmation-derived
+    value and is never recomputed from onset or drop elapsed seconds. Event
+    monotonic seconds are never used to derive the run-relative landmark clock.
     """
 
     first_crack_temp_c: float | None
-    """Bean temperature in the complete onset pair, or the fallback first development row."""
+    """Bean temperature in the complete onset pair, or the same fallback row."""
     first_crack_elapsed_s: float | None
-    """Charge seconds in the complete onset pair, or the fallback first development row."""
+    """Charge seconds in the complete onset pair, or the same fallback row."""
     drop_temp_c: float | None
     """Bean temperature at the last ``development``-phase telemetry row, or
     ``None`` if that row's temperature was never recorded."""
     drop_development_percent: float | None
     """Development-time-ratio percent at the last ``development``-phase
     telemetry row — the controller's own real-time DTR reading, read directly
-    off the stored column rather than reconstructed from an event timestamp
-    (design note §4's DTR-provenance note) — or ``None`` if that row never
-    recorded one."""
+    off the stored column rather than recomputed from onset/drop elapsed
+    seconds (design note §4's DTR-provenance note) — or ``None`` if that row
+    never recorded one."""
     operator_rating: int
     """The reference run's 1-5 star operator rating."""
 
