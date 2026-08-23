@@ -61,16 +61,27 @@ def earliest_onset_utc(candidates: Iterable[object]) -> datetime | None:
     return earliest
 
 
-def is_onset_within_event_window(onset: object, started_at: object, event_at: object) -> bool:
-    """Whether a parsed onset lies inclusively within its run/event bounds."""
-    onset_utc = onset if isinstance(onset, datetime) else parse_utc(onset)
+def is_onset_within_event_window(onset: datetime, started_at: object, event_at: object) -> bool:
+    """Whether an onset lies inclusively within its run/event bounds.
+
+    Args:
+        onset: Previously parsed onset instant.
+        started_at: Persisted run start timestamp.
+        event_at: Persisted accepted first-crack event timestamp.
+
+    Returns:
+        ``True`` only when every value is usable and the onset is in bounds.
+    """
+    if getattr(onset, "tzinfo", None) is None:
+        return False
+    try:
+        onset_utc = onset.astimezone(UTC)
+    except (OverflowError, ValueError):
+        return False
     started_utc = parse_utc(started_at)
     event_utc = parse_utc(event_at)
     return (
-        onset_utc is not None
-        and started_utc is not None
-        and event_utc is not None
-        and started_utc <= onset_utc <= event_utc
+        started_utc is not None and event_utc is not None and started_utc <= onset_utc <= event_utc
     )
 
 

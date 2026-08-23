@@ -801,7 +801,7 @@ async def fetch_one(
 
 @pytest.mark.asyncio
 async def test_create_run_freezes_profile_and_config(tmp_store: RoastStore) -> None:
-    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
+    await seeded_store(tmp_store)
     try:
         row = await fetch_one(
             tmp_store, "SELECT agent_phase, profile_json, config_json FROM roast_runs"
@@ -817,7 +817,7 @@ async def test_create_run_freezes_profile_and_config(tmp_store: RoastStore) -> N
 @pytest.mark.asyncio
 async def test_typed_writers_round_trip_enum_values(tmp_store: RoastStore) -> None:
     """Every writer stores the lowercase wire values the CHECKs enforce."""
-    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
+    await seeded_store(tmp_store)
     try:
         await tmp_store.record_event(
             run_id="run-1",
@@ -873,7 +873,7 @@ async def test_timeline_round_trips_safety_ids_and_command_provenance(
     tmp_store: RoastStore,
 ) -> None:
     """Timeline wire rows retain safety IDs and both command FK states (#787)."""
-    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
+    await seeded_store(tmp_store)
     try:
         evaluation_id = await tmp_store.record_safety_evaluation(
             run_id="run-1",
@@ -918,7 +918,7 @@ async def test_timeline_round_trips_safety_ids_and_command_provenance(
 async def test_advisor_decision_stores_hash_never_raw_context(
     tmp_store: RoastStore,
 ) -> None:
-    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
+    await seeded_store(tmp_store)
     try:
         context = AdvisorContext(
             phase=RoastPhase.DEVELOPMENT,
@@ -3067,7 +3067,7 @@ async def test_list_runs_rejects_mcp_onset_outside_run_to_confirmation_window(
 ) -> None:
     """A post-confirmation snapshot cannot move FC outside trusted bounds."""
     confirmation = "2026-06-07T14:09:10+00:00"
-    await seeded_store(tmp_store)
+    await seeded_store(tmp_store, started_at_utc="2026-06-07T14:00:00+00:00")
     try:
         await tmp_store.record_event(
             run_id="run-1",
