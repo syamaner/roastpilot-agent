@@ -4,9 +4,10 @@ Write paths (E6-S2) and recovery reads / immutability (E6-S3) extend
 this suite.
 """
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from unittest import mock
 
 import aiosqlite as aiosqlite_module
@@ -755,6 +756,8 @@ from roastpilot_agent.advisor import AdvisorContext, RoastDecision  # noqa: E402
 from roastpilot_agent.config import AppConfig  # noqa: E402
 from roastpilot_agent.models import (  # noqa: E402
     PostFcHeatAuthorityState,
+    ReferenceLandmarks,
+    ReferenceRoast,
     RoastCommand,
     RoastEventKind,
     RoastEventSource,
@@ -3986,6 +3989,76 @@ async def _reference_landmark_pair(
     return reference.landmarks.first_crack_elapsed_s, reference.landmarks.first_crack_temp_c
 
 
+async def _seed_reference_identity_run(
+    store: RoastStore,
+    *,
+    run_id: str,
+    event_source: RoastEventSource,
+    row_count: int = 42,
+) -> None:
+    """Seed a curve whose onset path can vary without changing its shape."""
+    profile = _reference_profile()
+    await store.create_run(
+        run_id=run_id,
+        profile=profile,
+        config=AppConfig(),
+        agent_phase=RoastPhase.STARTING,
+        started_at_utc="2026-08-23T11:50:00+00:00",
+    )
+    first_development = row_count // 2
+    last_development = max(row_count - 6, first_development)
+    for index in range(row_count):
+        phase = (
+            RoastPhase.ROASTING_PRE_FIRST_CRACK
+            if index < first_development
+            else RoastPhase.DEVELOPMENT
+            if index <= last_development
+            else RoastPhase.COOLING
+        )
+        await _record_row(
+            store,
+            run_id,
+            index + 1,
+            phase=phase,
+            charge_elapsed=600.0 + index,
+            bean_temp=180.0 + index,
+            dev_pct=float(index) if phase is RoastPhase.DEVELOPMENT else None,
+        )
+        recorded_at = datetime(2026, 8, 23, 12, 0, index, tzinfo=UTC).isoformat()
+        raw_state = (
+            '{"first_crack_status":{"detected_at_utc":"2026-08-23T12:00:15+00:00"}}'
+            if index == last_development
+            else "{}"
+        )
+        await store.connection.execute(
+            "UPDATE telemetry_snapshots SET recorded_at_utc = ?, raw_state_json = ?"
+            " WHERE run_id = ? AND tick = ?",
+            (recorded_at, raw_state, run_id, index + 1),
+        )
+    await store.connection.commit()
+    await store.record_event(
+        run_id=run_id,
+        kind=RoastEventKind.FIRST_CRACK,
+        source=event_source,
+        recorded_at_utc=datetime(2026, 8, 23, 12, 0, first_development, tzinfo=UTC).isoformat(),
+    )
+    await store.complete_run(run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    await store.set_operator_rating(run_id, rating=4)
+
+
+def _reference_shape_without_first_crack(reference: ReferenceRoast) -> str:
+    """Serialize output that must not vary with landmark-pair selection."""
+    return json.dumps(
+        {
+            "drop_temp_c": reference.landmarks.drop_temp_c,
+            "drop_development_percent": reference.landmarks.drop_development_percent,
+            "curve": [sample.model_dump(mode="json") for sample in reference.curve],
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 @pytest.mark.asyncio
 async def test_build_reference_roast_curve_uses_insertion_order_after_tick_reset(
     tmp_path: Path,
@@ -4947,6 +5020,216 @@ async def test_build_reference_roast_keeps_complete_fallback_pair_when_bounds_fa
         assert await _reference_landmark_pair(tmp_store, "atomic-bounds") == (610.0, 188.0)
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_onset_selection_preserves_curve_and_drop_identity(
+    tmp_store: RoastStore,
+) -> None:
+    """T14: adopting or rejecting onset changes neither curve nor drop output."""
+    await tmp_store.initialize()
+    try:
+        await _seed_reference_identity_run(
+            tmp_store, run_id="adopted-identity", event_source=RoastEventSource.MCP
+        )
+        await _seed_reference_identity_run(
+            tmp_store, run_id="fallback-identity", event_source=RoastEventSource.OPERATOR
+        )
+        adopted = await tmp_store._build_reference_roast(  # pyright: ignore[reportPrivateUsage]
+            "adopted-identity", "test-slug"
+        )
+        fallback = await tmp_store._build_reference_roast(  # pyright: ignore[reportPrivateUsage]
+            "fallback-identity", "test-slug"
+        )
+        assert adopted is not None and fallback is not None
+        assert len(adopted.curve) == len(fallback.curve) == 30
+        adopted_shape = _reference_shape_without_first_crack(adopted)
+        fallback_shape = _reference_shape_without_first_crack(fallback)
+        assert adopted_shape == fallback_shape
+        assert (
+            adopted.landmarks.first_crack_elapsed_s,
+            adopted.landmarks.first_crack_temp_c,
+        ) != (
+            fallback.landmarks.first_crack_elapsed_s,
+            fallback.landmarks.first_crack_temp_c,
+        )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_uses_constant_mcp_statement_shape(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T15: MCP onset uses one typed, bounded extra query, never per row."""
+    await tmp_store.initialize()
+    try:
+        await _seed_reference_identity_run(
+            tmp_store, run_id="mcp-small", event_source=RoastEventSource.MCP, row_count=6
+        )
+        await _seed_reference_identity_run(
+            tmp_store, run_id="mcp-large", event_source=RoastEventSource.MCP, row_count=42
+        )
+        await _seed_reference_identity_run(
+            tmp_store, run_id="operator", event_source=RoastEventSource.OPERATOR, row_count=6
+        )
+        original_execute: Any = tmp_store.connection._execute  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType, reportUnknownVariableType]
+        observed: list[tuple[str, object]] = []
+
+        async def traced_execute(function: object, *args: object, **kwargs: object) -> object:
+            """Capture only SQL calls made by the reference builder."""
+            if getattr(function, "__name__", None) == "execute":
+                observed.append((str(args[0]), args[1] if len(args) > 1 else ()))
+            return await original_execute(function, *args, **kwargs)
+
+        monkeypatch.setattr(tmp_store.connection, "_execute", traced_execute)
+
+        async def build_statements(run_id: str) -> list[tuple[str, object]]:
+            observed.clear()
+            reference = await tmp_store._build_reference_roast(  # pyright: ignore[reportPrivateUsage]
+                run_id, "test-slug"
+            )
+            assert reference is not None
+            return list(observed)
+
+        mcp_small = await build_statements("mcp-small")
+        mcp_large = await build_statements("mcp-large")
+        operator = await build_statements("operator")
+        assert len(mcp_small) == len(mcp_large) == 3
+        assert len(operator) == 2
+        for statements, run_id in ((mcp_small, "mcp-small"), (mcp_large, "mcp-large")):
+            onset_sql, onset_parameters = next(
+                (sql, parameters) for sql, parameters in statements if "json_valid" in sql
+            )
+            assert " IN (" not in onset_sql.upper()
+            assert onset_parameters == (run_id, RoastEventSource.MCP.value)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_onset_uses_insertion_order_after_tick_reset(
+    tmp_path: Path,
+) -> None:
+    """T16: duplicate ticks after restart cannot reorder onset anchors or the curve."""
+    profile = _reference_profile()
+    store = RoastStore(tmp_path / "onset-restart.sqlite3")
+    await store.initialize()
+    try:
+        await store.create_run(
+            run_id="onset-restart",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+            started_at_utc="2026-08-23T11:50:00+00:00",
+        )
+        for tick, elapsed, temperature in ((0, 10.0, 150.0), (1, 20.0, 160.0), (2, 30.0, 170.0)):
+            await _record_row(
+                store,
+                "onset-restart",
+                tick,
+                phase=RoastPhase.ROASTING_PRE_FIRST_CRACK
+                if elapsed < 30.0
+                else RoastPhase.DEVELOPMENT,
+                charge_elapsed=elapsed,
+                bean_temp=temperature,
+            )
+        await store.close()
+        store = RoastStore(store.db_path)
+        await store.initialize()
+        for tick, elapsed, temperature in ((0, 40.0, 180.0), (1, 50.0, 190.0)):
+            await _record_row(
+                store,
+                "onset-restart",
+                tick,
+                phase=RoastPhase.DEVELOPMENT,
+                charge_elapsed=elapsed,
+                bean_temp=temperature,
+            )
+        await store.connection.execute(
+            "UPDATE telemetry_snapshots SET recorded_at_utc = CASE id - "
+            "(SELECT MIN(id) FROM telemetry_snapshots WHERE run_id = ?) "
+            "WHEN 0 THEN '2026-08-23T12:00:00+00:00' "
+            "WHEN 1 THEN '2026-08-23T12:00:10+00:00' "
+            "WHEN 2 THEN '2026-08-23T12:00:20+00:00' "
+            "WHEN 3 THEN '2026-08-23T12:00:30+00:00' "
+            "ELSE '2026-08-23T12:00:40+00:00' END, "
+            "raw_state_json = CASE id - (SELECT MIN(id) FROM telemetry_snapshots WHERE run_id = ?) "
+            'WHEN 4 THEN \'{"first_crack_status":{'
+            '"detected_at_utc":"2026-08-23T12:00:15+00:00"}}\' '
+            "ELSE '{}' END WHERE run_id = ?",
+            ("onset-restart", "onset-restart", "onset-restart"),
+        )
+        await store.connection.commit()
+        await store.record_event(
+            run_id="onset-restart",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc="2026-08-23T12:00:20+00:00",
+        )
+        await store.complete_run(
+            run_id="onset-restart", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await store.set_operator_rating("onset-restart", rating=4)
+        reference = await store._build_reference_roast(  # pyright: ignore[reportPrivateUsage]
+            "onset-restart", "test-slug"
+        )
+        assert reference is not None
+        assert [sample.t_s for sample in reference.curve] == [10.0, 20.0, 30.0, 40.0, 50.0]
+        assert (
+            reference.landmarks.first_crack_elapsed_s,
+            reference.landmarks.first_crack_temp_c,
+        ) == (25.0, 165.0)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_load_reference_roast_is_idempotent_for_mcp_onset(tmp_store: RoastStore) -> None:
+    """T17: repeated retrieval of one accepted onset reference is identical."""
+    await tmp_store.initialize()
+    try:
+        await _seed_reference_identity_run(
+            tmp_store, run_id="idempotent-onset", event_source=RoastEventSource.MCP
+        )
+        profile = _reference_profile()
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        first = await tmp_store.load_reference_roast(slug, profile.bean_weight_grams)
+        second = await tmp_store.load_reference_roast(slug, profile.bean_weight_grams)
+        assert first is not None and second is not None
+        assert first == second
+        assert first.model_dump_json() == second.model_dump_json()
+    finally:
+        await tmp_store.close()
+
+
+def test_reference_roast_schema_and_field_sets_are_unchanged() -> None:
+    """T18: onset provenance remains internal; reference wire shape is stable."""
+    assert set(ReferenceLandmarks.model_fields) == {
+        "first_crack_temp_c",
+        "first_crack_elapsed_s",
+        "drop_temp_c",
+        "drop_development_percent",
+        "operator_rating",
+    }
+    assert set(ReferenceRoast.model_fields) == {
+        "source_run_id",
+        "origin_slug",
+        "landmarks",
+        "curve",
+    }
+    schema: dict[str, object] = ReferenceRoast.model_json_schema()
+    schema_properties = schema.get("properties")
+    assert isinstance(schema_properties, dict)
+    assert set(cast(dict[str, object], schema_properties)) == set(ReferenceRoast.model_fields)
+    definitions = schema.get("$defs")
+    assert isinstance(definitions, dict)
+    landmark_schema = cast(dict[str, object], definitions).get("ReferenceLandmarks")
+    assert isinstance(landmark_schema, dict)
+    landmark_properties = cast(dict[str, object], landmark_schema).get("properties")
+    assert isinstance(landmark_properties, dict)
+    assert set(cast(dict[str, object], landmark_properties)) == set(ReferenceLandmarks.model_fields)
 
 
 @pytest.mark.asyncio
