@@ -88,7 +88,17 @@ def is_onset_within_event_window(onset: datetime, started_at: object, event_at: 
 def earliest_onset_within_event_window(
     candidates: Iterable[object], started_at: object, event_at: object
 ) -> datetime | None:
-    """Return the earliest parsed onset that lies within trusted event bounds."""
+    """Return the earliest parsed onset within trusted event bounds.
+
+    Args:
+        candidates: Persisted candidate onset values.
+        started_at: Persisted run start timestamp.
+        event_at: Persisted accepted first-crack event timestamp.
+
+    Returns:
+        The earliest normalized in-window UTC instant, or ``None`` when none
+        are usable.
+    """
     earliest: datetime | None = None
     for candidate in candidates:
         onset = parse_utc(candidate)
