@@ -35,6 +35,8 @@ def _write_store(
     event_source: str | None = "mcp",
     raw_states: list[str] | None = None,
     with_clock_anchors: bool = True,
+    with_development: bool = True,
+    with_first_crack_event: bool = True,
 ) -> None:
     """Create a minimal, synthetic completed store run for the offline study."""
     con = sqlite3.connect(path)
@@ -76,20 +78,25 @@ def _write_store(
                     150.0 + float(second),
                     80.0,
                     30.0,
-                    "development" if second >= _FALLBACK_FC_SECONDS else "roasting_pre_first_crack",
+                    (
+                        "development"
+                        if with_development and second >= _FALLBACK_FC_SECONDS
+                        else "roasting_pre_first_crack"
+                    ),
                     _wall(second) if with_clock_anchors else None,
                     states[second] if second < len(states) else None,
                 ),
             )
-        con.execute(
-            "insert into roast_events values (1, ?, 'first_crack', ?, ?, ?)",
-            (
-                "synthetic-run",
-                70.0,
-                _wall(_FALLBACK_FC_SECONDS),
-                json.dumps(payload),
-            ),
-        )
+        if with_first_crack_event:
+            con.execute(
+                "insert into roast_events values (1, ?, 'first_crack', ?, ?, ?)",
+                (
+                    "synthetic-run",
+                    70.0,
+                    _wall(_FALLBACK_FC_SECONDS),
+                    json.dumps(payload),
+                ),
+            )
         con.commit()
     finally:
         con.close()
@@ -171,6 +178,32 @@ def test_store_fc_anchor_fails_closed_or_accepts_valid_status(
         assert roast.landmarks["fc_bt"] == 170.0
 
 
+def test_store_without_development_keeps_event_temperature_without_anchor(tmp_path: Path) -> None:
+    """No development telemetry means historical event temperature has no time anchor."""
+    db_path = tmp_path / "no-development.sqlite3"
+    _write_store(db_path, raw_states=["{"], with_development=False)
+
+    roast = _one_store_roast(db_path)
+
+    assert np.isnan(roast.fc_t)
+    assert roast.landmarks["fc_bt"] == 170.0
+    assert roast.fc_anchor is None
+
+
+def test_store_without_first_crack_event_keeps_development_time_without_temperature(
+    tmp_path: Path,
+) -> None:
+    """Development anchors time independently of whether an event supplies BT."""
+    db_path = tmp_path / "no-first-crack-event.sqlite3"
+    _write_store(db_path, raw_states=["{"], with_first_crack_event=False)
+
+    roast = _one_store_roast(db_path)
+
+    assert roast.fc_t == float(_FALLBACK_FC_SECONDS)
+    assert np.isnan(roast.landmarks["fc_bt"])
+    assert roast.fc_anchor == "phase_transition"
+
+
 def test_artisan_loading_keeps_its_existing_first_crack_marks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -220,6 +253,20 @@ def test_landmarks_csv_records_closed_fc_anchor_vocabulary(tmp_path: Path) -> No
             landmarks={"turnaround_bt": 1.0, "dry_end_bt": 2.0, "fc_bt": 3.0, "drop_bt": 4.0},
         ),
         study.Roast(
+            rid="store:unanchored",
+            source_id="unanchored",
+            corpus="store",
+            t=arrays,
+            bt=arrays,
+            et=arrays,
+            heat=arrays,
+            fan=arrays,
+            fc_t=float("nan"),
+            fc_anchor=None,
+            drop_t=1.0,
+            landmarks={"turnaround_bt": 1.0, "dry_end_bt": 2.0, "fc_bt": 3.0, "drop_bt": 4.0},
+        ),
+        study.Roast(
             rid="store:phase",
             source_id="phase",
             corpus="store",
@@ -240,7 +287,8 @@ def test_landmarks_csv_records_closed_fc_anchor_vocabulary(tmp_path: Path) -> No
     rows = (tmp_path / "landmarks.csv").read_text().splitlines()
     assert rows[0].endswith("fc_t,fc_anchor,drop_t")
     assert rows[1].split(",")[-2] == "fc_status_utc"
-    assert rows[2].split(",")[-2] == "phase_transition"
+    assert rows[2].split(",")[-2] == ""
+    assert rows[3].split(",")[-2] == "phase_transition"
 
 
 @pytest.mark.parametrize(

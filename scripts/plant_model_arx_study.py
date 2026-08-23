@@ -481,7 +481,7 @@ def load_store(store_copy: Path) -> list[Roast]:
                 fallback_fc_bt = _event_bean_temp(fc_ev[0])
             fc_t = fallback_fc_t
             fc_bt = fallback_fc_bt
-            fc_anchor = "phase_transition"
+            fc_anchor = "phase_transition" if np.isfinite(fallback_fc_t) else None
             status_anchor = _store_fc_status_anchor(con, rid, t_grid, bt)
             if status_anchor is not None:
                 fc_t, fc_bt = status_anchor
