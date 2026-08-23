@@ -988,6 +988,25 @@ async def test_a_failed_post_write_reload_clears_the_probe(
 
 
 @pytest.mark.asyncio
+async def test_a_failed_post_write_reload_without_a_service_returns_the_reload_error(
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persisted write keeps its reload failure when no service is attached."""
+
+    def _fail_reload() -> tuple[AppConfig, frozenset[str]]:
+        raise ConfigFileError("reload failed")
+
+    monkeypatch.setattr(api_module, "load_app_config", _fail_reload)
+
+    response = await _put_config(create_app(), {"advisor": {"model_slug": "openai/gpt-4.1-mini"}})
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "reload failed"}
+    assert "openai/gpt-4.1-mini" in config_file.read_text()
+
+
+@pytest.mark.asyncio
 async def test_a_failed_post_write_reload_clears_an_advisory_paused_probe(
     store: RoastStore,
     config_file: Path,
