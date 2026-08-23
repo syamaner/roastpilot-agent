@@ -1219,7 +1219,7 @@ class RoastStore:
         candidates: list[object],
         started_at_utc: object,
         fc_at: object,
-        clock_rows: list[aiosqlite.Row],
+        clock_rows: list[tuple[aiosqlite.Row, float]],
         usable_rows: list[aiosqlite.Row],
         first_dev: aiosqlite.Row,
     ) -> tuple[float, float] | None:
@@ -1227,12 +1227,7 @@ class RoastStore:
         onset = earliest_onset_within_event_window(candidates, started_at_utc, fc_at)
         if onset is None:
             return None
-        clock_seconds: list[float] = []
-        for row in clock_rows:
-            seconds = RoastStore._optional_float(row["charge_elapsed_seconds"])
-            if seconds is None:
-                return None
-            clock_seconds.append(seconds)
+        clock_seconds = [seconds for _, seconds in clock_rows]
         if any(
             current <= previous
             for previous, current in zip(clock_seconds, clock_seconds[1:], strict=False)
@@ -1240,7 +1235,7 @@ class RoastStore:
             return None
         anchors = [
             (row["recorded_at_utc"], seconds)
-            for row, seconds in zip(clock_rows, clock_seconds, strict=True)
+            for (row, _), seconds in zip(clock_rows, clock_seconds, strict=True)
         ]
         mapped = utc_to_run_seconds(onset.isoformat(), anchors)
         first_t = RoastStore._optional_float(usable_rows[0]["charge_elapsed_seconds"])
@@ -2432,11 +2427,11 @@ class RoastStore:
         # cooling tail keeps recording a FALLING bean temperature, which must
         # never appear in "what a good roast's shape looked like".
         pre_drop_rows = rows[: last_dev_index + 1]
-        clock_rows = [
-            row
-            for row in pre_drop_rows
-            if self._optional_float(row["charge_elapsed_seconds"]) is not None
-        ]
+        clock_rows: list[tuple[aiosqlite.Row, float]] = []
+        for row in pre_drop_rows:
+            seconds = self._optional_float(row["charge_elapsed_seconds"])
+            if seconds is not None:
+                clock_rows.append((row, seconds))
         usable = [
             row
             for row in pre_drop_rows
