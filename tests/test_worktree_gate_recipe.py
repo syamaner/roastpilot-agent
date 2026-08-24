@@ -50,6 +50,7 @@ _RECIPE_LINE_PREFIX = "cd <abs worktree> && "
 _PROBE_LINE_PATTERN = re.compile(r"^cd <abs worktree> && \.venv/bin/python -c '(?P<source>.*)'$")
 _PYTHON_C_SUFFIX_PATTERN = re.compile(r"\.venv/bin/python -c '(?P<source>.*)'$")
 _FORBIDDEN_LITERALS = ("--clear", "rm -rf .venv/")
+_STOP_ON_FAILURE = "set -e"
 
 #: T14's single exact-match anchor (D154: "byte-exact, not keyword or
 #: proximity"). Copied byte-for-byte from the "Guarded `.venv` rebuild remedy"
@@ -84,6 +85,11 @@ _POISON_VALUES: dict[str, str] = {
     "OPENROUTER_API_KEY": "sk-rp773-poison-credential",
     "PYTHONPATH": "/tmp/rp773-poison-pythonpath",
 }
+_CASE_VARIANT_POISON_VALUES: dict[str, str] = {
+    "roastpilot_advisor__model_slug_by_phase": '{"development": "openrouter/rp773-lower"}',
+    "RoAsTpIlOt_AdViSoR__MoDeL_SlUg_By_PhAsE": '{"development": "openrouter/rp773-mixed"}',
+}
+_ALL_POISON_VALUES = _POISON_VALUES | _CASE_VARIANT_POISON_VALUES
 
 
 @dataclass(frozen=True)
@@ -177,17 +183,25 @@ def _extract_command_lines(block_text: str) -> list[str]:
         Every conforming command line, in order.
 
     Raises:
-        AssertionError: If a non-blank, non-comment line does not start with
-            the required `cd <abs worktree> && ` prefix.
+        AssertionError: If the initial stop-on-failure preamble is absent, or
+            a command does not start with the required `cd <abs worktree> && ` prefix.
     """
     lines: list[str] = []
+    saw_stop_on_failure = False
     for raw_line in block_text.splitlines():
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
+        if stripped == _STOP_ON_FAILURE:
+            if saw_stop_on_failure or lines:
+                raise AssertionError("stop-on-failure preamble must appear exactly once, first")
+            saw_stop_on_failure = True
+            continue
         if not raw_line.startswith(_RECIPE_LINE_PREFIX):
             raise AssertionError(f"recipe line does not match the closed grammar: {raw_line!r}")
         lines.append(raw_line)
+    if not saw_stop_on_failure:
+        raise AssertionError("recipe is missing its stop-on-failure preamble")
     return lines
 
 
@@ -434,6 +448,29 @@ def _run_absence_guard(recipe: RecipeLines, worktree: Path) -> subprocess.Comple
     return subprocess.run(["bash", "-c", rendered], capture_output=True, text=True)
 
 
+def _render_fail_fast_block(block_text: str, worktree: Path, marker: Path) -> str:
+    """Render the whole block with later commands replaced by safe markers.
+
+    Args:
+        block_text: The extracted fenced Bash block.
+        worktree: The temporary worktree substituted into the absence guard.
+        marker: File that each safely substituted later command would append.
+
+    Returns:
+        A control-flow-equivalent script that preserves the real preamble and
+        early absence guard without provisioning a virtual environment.
+    """
+    rendered: list[str] = []
+    for raw_line in block_text.splitlines():
+        if "os.lstat" in raw_line:
+            rendered.append(raw_line.replace("<abs worktree>", str(worktree)))
+        elif raw_line.startswith(_RECIPE_LINE_PREFIX):
+            rendered.append(f"printf 'later command ran\\n' >> {shlex.quote(str(marker))}")
+        else:
+            rendered.append(raw_line)
+    return "\n".join(rendered)
+
+
 def _inspector_command(prefix: str, source: str) -> str:
     """Build `<prefix> <sys.executable> -c <source>` as one shell command.
 
@@ -454,7 +491,7 @@ def _poisoned_env() -> dict[str, str]:
         The poisoned environment mapping.
     """
     env = dict(os.environ)
-    env.update(_POISON_VALUES)
+    env.update(_ALL_POISON_VALUES)
     return env
 
 
@@ -494,7 +531,7 @@ def _assert_no_poisoned_values(output: str) -> None:
     Raises:
         AssertionError: If any synthetic poisoned value appears in `output`.
     """
-    for name, value in _POISON_VALUES.items():
+    for name, value in _ALL_POISON_VALUES.items():
         assert value not in output, f"{name}'s poisoned VALUE leaked into gate output"
 
 
@@ -518,11 +555,30 @@ def _outer_site_packages() -> str:
 def test_recipe_extraction_is_well_formed() -> None:
     """The closed-grammar parse succeeds and matches the Class A line count."""
     recipe = _load_recipe()
+    block = _extract_bash_block(_extract_section(_RUNBOOK.read_text(encoding="utf-8")))
+    assert next(line for line in block.splitlines() if line.strip()) == _STOP_ON_FAILURE
     assert len(recipe.all_lines) == 14
     assert recipe.all_lines[0] == recipe.absence_guard
     assert recipe.all_lines[1] == recipe.venv_create
     assert recipe.all_lines[-1] == recipe.pytest_gate
     assert recipe.all_lines[-2] == recipe.verification
+
+
+def test_t0_complete_recipe_stops_before_later_commands_when_guard_fails(tmp_path: Path) -> None:
+    """T0: a copied complete recipe exits non-zero before any later command runs."""
+    (tmp_path / ".venv").mkdir()
+    block = _extract_bash_block(_extract_section(_RUNBOOK.read_text(encoding="utf-8")))
+    marker = tmp_path / "later-command-ran"
+    script = _render_fail_fast_block(block, tmp_path, marker)
+
+    guarded = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert guarded.returncode != 0
+    assert not marker.exists()
+
+    mutated = script.replace(f"{_STOP_ON_FAILURE}\n", "", 1)
+    bypassed = subprocess.run(["bash", "-c", mutated], capture_output=True, text=True)
+    assert bypassed.returncode == 0
+    assert marker.exists()
 
 
 # --------------------------------------------------------------------------
@@ -731,7 +787,7 @@ def test_t16_verification_fails_closed_when_strip_bypassed() -> None:
     )
     assert result.returncode != 0
     leaked = _parse_leaked(result.stdout)
-    assert set(_POISON_VALUES) <= set(leaked)
+    assert set(_ALL_POISON_VALUES) <= set(leaked)
 
 
 def test_t17_no_poisoned_value_disclosed() -> None:
@@ -777,8 +833,16 @@ def test_t18_pythonpath_and_api_key_also_isolated() -> None:
     assert "OPENROUTER_API_KEY" not in leaked
 
 
+@pytest.mark.parametrize(
+    "environment_name",
+    (
+        "ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE",
+        "roastpilot_advisor__model_slug_by_phase",
+        "RoAsTpIlOt_AdViSoR__MoDeL_SlUg_By_PhAsE",
+    ),
+)
 @pytest.mark.slow
-def test_t19_pytest_gate_strips_ambient_phase_map(tmp_path: Path) -> None:
+def test_t19_pytest_gate_strips_ambient_phase_map(tmp_path: Path, environment_name: str) -> None:
     """T19 (load-bearing, #773's named case): the ambient phase map really
     inverts `test_configured_model_slug_governs_the_phase_that_consults`
     without the strip, and the extracted strip prefix rescues it.
@@ -788,9 +852,7 @@ def test_t19_pytest_gate_strips_ambient_phase_map(tmp_path: Path) -> None:
     target = "tests/test_config.py::test_configured_model_slug_governs_the_phase_that_consults"
 
     poisoned_env = dict(os.environ)
-    poisoned_env["ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE"] = _POISON_VALUES[
-        "ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE"
-    ]
+    poisoned_env[environment_name] = _POISON_VALUES["ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE"]
 
     unstripped_basetemp = tmp_path / "unstripped"
     stripped_basetemp = tmp_path / "stripped"
@@ -1015,7 +1077,7 @@ def test_mutation_g9_g10_value_echoing_prefix_leaks_a_value() -> None:
     """
     recipe = _load_recipe()
     prefix = _env_prefix(recipe.pytest_gate)
-    before_namespace_strip, separator, _ = prefix.partition(" $(env | sed ")
+    before_namespace_strip, separator, _ = prefix.partition(" $(env | awk ")
     assert separator, "extracted strip prefix lost its dynamic namespace removal"
     source = _python_c_source(recipe.verification)
     mutant_source = source.replace(

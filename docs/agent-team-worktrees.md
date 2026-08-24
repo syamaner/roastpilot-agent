@@ -126,6 +126,7 @@ second, so this recipe is a single unit: **do not follow only half of it.** Crea
 and validate the environment before trusting any gate:
 
 ```bash
+set -e
 cd <abs worktree> && python3.11 -c $'import os\nfrom pathlib import Path\np = Path(".venv")\ntry:\n    os.lstat(p)\n    exists = True\nexcept FileNotFoundError:\n    exists = False\nexcept OSError:\n    exists = True\nprint(p if exists else p.resolve())\nprint(not exists)\nraise SystemExit(1 if exists else 0)'
 cd <abs worktree> && python3.11 -m venv .venv
 cd <abs worktree> && .venv/bin/python -c 'import sys; from pathlib import Path; p = Path(sys.prefix).resolve(); ok = p.is_relative_to(Path("<abs worktree>").resolve()); print(p); print(ok); raise SystemExit(0 if ok else 1)'
@@ -138,9 +139,15 @@ cd <abs worktree> && .venv/bin/python -c 'import numpy, sys; from pathlib import
 cd <abs worktree> && env -u PYTHONPATH .venv/bin/python -m ruff check .
 cd <abs worktree> && env -u PYTHONPATH .venv/bin/python -m ruff format --check .
 cd <abs worktree> && env -u PYTHONPATH .venv/bin/python -m pyright
-cd <abs worktree> && env -u PYTHONPATH -u OPENROUTER_API_KEY $(env | sed -n 's/^\(ROASTPILOT_[A-Za-z0-9_]*\)=.*/-u \1/p') .venv/bin/python -c 'import os, sys; leaked = sorted(k for k in os.environ if k.startswith("ROASTPILOT_") or k in {"PYTHONPATH", "OPENROUTER_API_KEY"}); print(leaked); raise SystemExit(1 if leaked else 0)'
-cd <abs worktree> && env -u PYTHONPATH -u OPENROUTER_API_KEY $(env | sed -n 's/^\(ROASTPILOT_[A-Za-z0-9_]*\)=.*/-u \1/p') .venv/bin/python -m pytest --basetemp "$(mktemp -d)" --cov=roastpilot_agent --cov-branch --cov-report=term-missing
+cd <abs worktree> && env -u PYTHONPATH -u OPENROUTER_API_KEY $(env | awk -F= 'tolower($1) ~ /^roastpilot_[a-z0-9_]*$/ { print "-u", $1 }') .venv/bin/python -c 'import os, sys; leaked = sorted(k for k in os.environ if k.upper().startswith("ROASTPILOT_") or k in {"PYTHONPATH", "OPENROUTER_API_KEY"}); print(leaked); raise SystemExit(1 if leaked else 0)'
+cd <abs worktree> && env -u PYTHONPATH -u OPENROUTER_API_KEY $(env | awk -F= 'tolower($1) ~ /^roastpilot_[a-z0-9_]*$/ { print "-u", $1 }') .venv/bin/python -m pytest --basetemp "$(mktemp -d)" --cov=roastpilot_agent --cov-branch --cov-report=term-missing
 ```
+
+The opening `set -e` makes a copied whole block stop at its first failed guard,
+probe, verifier, or gate, so a later successful command cannot mask that
+failure. It does not change the documented one-command-per-Bash-call workflow:
+each self-locating `cd <abs worktree> && ...` line remains independently
+executable and reports its own exit status.
 
 **The pre-creation absence guard runs first, and it fails closed.** `python3.11
 -m venv .venv` silently reuses an existing `.venv` and leaves whatever is
@@ -231,21 +238,21 @@ leaves nothing in the tree, and needs no `.gitignore` change. Every changed line
 and branch arm must be covered before opening, because `codecov/patch` counts
 partial branches.
 
-**The pytest gate strips the whole `ROASTPILOT_` namespace, not an enumerated
+**The pytest gate strips the whole case-insensitive `ROASTPILOT_` namespace, not an enumerated
 key list.** `AppConfig` (`src/roastpilot_agent/config.py`) loads every
-`ROASTPILOT_*` environment variable, with `__` marking nested settings, so a
+`ROASTPILOT_*` environment variable case-insensitively, with `__` marking nested settings, so a
 single ambient override left over from local testing — for example an exported
 `ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE` — can silently outrank a scalar a
 test sets and manufacture a failure pytest would never see in CI. Naming one
 key (`OPENROUTER_API_KEY`) and stopping there repeats exactly the failure this
 runbook exists to prevent: a list of keys goes stale the day a new setting
-ships. The recipe instead scans `env` for every name matching
-`ROASTPILOT_[A-Za-z0-9_]*=` at the start of a line and turns each match into an
-`env -u NAME` argument. The unquoted `$(...)` command substitution is safe
-only because that pattern is anchored to the start of the line and its
-character class contains no whitespace, so every emitted word is a bare `-u
-NAME` token — nothing it produces can reintroduce word-splitting or globbing
-hazards. Two edge cases follow from that: a multi-line value belonging to some
+ships. The recipe instead uses portable `awk` to case-fold every environment
+name and emit `-u NAME` only when it matches `roastpilot_[a-z0-9_]*`. The
+unquoted `$(...)` command substitution is safe because `awk` prints only the
+first `=`-delimited field (the name), and that character grammar contains no
+whitespace, so every emitted word is a bare `-u NAME` token — nothing it
+produces can reintroduce word-splitting or globbing hazards. Two edge cases
+follow from that: a multi-line value belonging to some
 *other* variable that happens to contain a continuation line starting
 `ROASTPILOT_…=` produces a spurious `-u NAME` for a name that does not exist,
 and `env -u` on a non-existent name is a no-op, so the parse's only failure
@@ -258,7 +265,7 @@ stripped by the scan.
 pytest line, exists to catch.** Because the strip is built by parsing text
 rather than proven exhaustive, the verification line runs the *same* strip
 prefix and then asserts, inside the child interpreter, that no
-`ROASTPILOT_`-prefixed key and neither `PYTHONPATH` nor `OPENROUTER_API_KEY`
+case-insensitive `ROASTPILOT_`-prefixed key and neither `PYTHONPATH` nor `OPENROUTER_API_KEY`
 survived into the child process; it exits non-zero if any did. It prints only
 the leaked **names**, never their values — `ROASTPILOT_DB` names the
 operator's personal roast-store path and `OPENROUTER_API_KEY` is a live
