@@ -330,8 +330,15 @@ export function DashboardPage(): React.JSX.Element {
   // rather than flashing empty or borrowing the chart cursor's historical value.
   const latestSnapshotPoint =
     view.points.length > 0 ? view.points[view.points.length - 1] : null;
+  // #789: `telemetry?.bean_temp_c ?? latestSnapshotPoint?.bean` would be WRONG
+  // once `bean_temp_c` is nullable — `??` cannot distinguish "no live frame yet"
+  // from "a live frame arrived and its own reading is null", so it would quietly
+  // paint a stale snapshot temperature over a genuine current-live null. Branch
+  // on `telemetry === null` explicitly (the snapshot fallback applies ONLY
+  // before any live frame has been received), mirroring the RoR readout's
+  // existing pattern immediately below.
   const latestBeanTempC =
-    telemetry?.bean_temp_c ?? latestSnapshotPoint?.bean ?? null;
+    telemetry === null ? latestSnapshotPoint?.bean ?? null : telemetry.bean_temp_c;
   const latestBeanRorCPerMin =
     telemetry === null
       ? latestSnapshotPoint?.ror ?? null

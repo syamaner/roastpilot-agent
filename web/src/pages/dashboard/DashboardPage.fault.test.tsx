@@ -407,6 +407,98 @@ describe("DashboardPage live readout authority (#592)", () => {
   });
 });
 
+describe("DashboardPage live telemetry nullable-temperature boundary (#789)", () => {
+  it("a CURRENT live null bean temp renders an em dash and NEVER reuses a stale snapshot value", () => {
+    // A prior finite snapshot point exists (the /telemetry backfill, or an
+    // earlier live frame) carrying a real bean reading...
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-live", mcp_child: "running" };
+    viewState.points = [{ t: 60, bean: 170, env: 190, ror: 8.5, heat: 65, fan: 30 }];
+    const rendered = renderPage();
+    expect(screen.getByTestId("bean-temp-readout")).toHaveTextContent("170.0 °C");
+
+    // ...then a LIVE telemetry frame arrives whose OWN bean_temp_c is null. This
+    // must NOT fall back to the stale 170.0 °C snapshot point above — the mutant
+    // this guards against is `telemetry?.bean_temp_c ?? latestSnapshotPoint?.bean`,
+    // which cannot distinguish "no live frame yet" from "a live frame's own
+    // reading is null" and would wrongly keep showing 170.0 °C here.
+    streamState.telemetry = {
+      agent_phase: "roasting_pre_first_crack",
+      bean_temp_c: null,
+      env_temp_c: null,
+      bean_ror_c_per_min: 8.5,
+      env_ror_c_per_min: null,
+      heat_percent: 65,
+      fan_percent: 30,
+      cooling_on: false,
+      elapsed_seconds: 121,
+      charge_elapsed_seconds: 61,
+      development_elapsed_seconds: null,
+      development_percent: null,
+      t0_detected: true,
+      first_crack_detected: false,
+    };
+    rendered.rerender(
+      <QueryClientProvider client={rendered.client}>
+        <MemoryRouter>
+          <DashboardPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId("bean-temp-readout")).toHaveTextContent("— °C");
+  });
+
+  it("a finite live bean temp still renders (the boundary widening doesn't regress the ordinary path)", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-live", mcp_child: "running" };
+    streamState.telemetry = {
+      agent_phase: "roasting_pre_first_crack",
+      bean_temp_c: 171.4,
+      env_temp_c: 191.2,
+      bean_ror_c_per_min: 8.5,
+      env_ror_c_per_min: 6.1,
+      heat_percent: 65,
+      fan_percent: 30,
+      cooling_on: false,
+      elapsed_seconds: 121,
+      charge_elapsed_seconds: 61,
+      development_elapsed_seconds: null,
+      development_percent: null,
+      t0_detected: true,
+      first_crack_detected: false,
+    };
+    renderPage();
+    expect(screen.getByTestId("bean-temp-readout")).toHaveTextContent("171.4 °C");
+  });
+
+  it("preserves the rest of a frame carrying a null bean temp — other live values still render (#789)", () => {
+    // A null bean_temp_c must not degrade or drop the surrounding frame: the
+    // RoR, heat/fan, and roast-clock readouts on the SAME frame stay live.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-live", mcp_child: "running" };
+    streamState.telemetry = {
+      agent_phase: "roasting_pre_first_crack",
+      bean_temp_c: null,
+      env_temp_c: null,
+      bean_ror_c_per_min: 9.2,
+      env_ror_c_per_min: 3.4,
+      heat_percent: 72,
+      fan_percent: 35,
+      cooling_on: false,
+      elapsed_seconds: 200,
+      charge_elapsed_seconds: 140,
+      development_elapsed_seconds: null,
+      development_percent: null,
+      t0_detected: true,
+      first_crack_detected: false,
+    };
+    renderPage();
+    expect(screen.getByTestId("bean-temp-readout")).toHaveTextContent("— °C");
+    expect(screen.getByTestId("ror-readout")).toHaveTextContent("9.2 °C/min");
+    expect(screen.getByTestId("roast-timer")).toHaveTextContent("02:20"); // charge_elapsed_seconds=140
+  });
+});
+
 describe("DashboardPage faulted-run sticky banner (#124)", () => {
   it("keeps the faulted dashboard when active_run_id goes null on a refetch", () => {
     // A run is active and has faulted (the SSE fault frame is in the view).

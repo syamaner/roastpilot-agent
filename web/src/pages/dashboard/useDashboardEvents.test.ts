@@ -157,6 +157,48 @@ describe("dashboardReducer", () => {
     expect(s.points[0]).toMatchObject({ t: 510, bean: 120, heat: 70 });
   });
 
+  it("plots a null live bean/env reading as a chart GAP, not a fabricated or dropped value (#789)", () => {
+    // #789: bean_temp_c/env_temp_c are nullable at the wire boundary. A telemetry
+    // frame whose OWN reading is null must still produce a point (the tick's
+    // elapsed_seconds is real — there IS an x to place), carrying `bean`/`env:
+    // null` through untouched so LiveCurve draws a genuine gap (CurvePoint's
+    // documented `null` = gap contract) rather than a zero or an interpolated
+    // value. This is the mutation this test would catch: swapping `t.bean_temp_c`
+    // for `t.bean_temp_c ?? 0` (or any other fabricated fallback) in
+    // `pointFromTelemetry` would turn this into a plotted zero, not a gap.
+    let s = dashboardReducer(
+      initialDashboardViewModel,
+      ev("telemetry", {
+        elapsed_seconds: 300,
+        charge_elapsed_seconds: 60,
+        bean_temp_c: 180,
+        env_temp_c: 200,
+        bean_ror_c_per_min: 5,
+        heat_percent: 70,
+        fan_percent: 40,
+      }),
+    );
+    s = dashboardReducer(
+      s,
+      ev("telemetry", {
+        elapsed_seconds: 301,
+        charge_elapsed_seconds: 61,
+        bean_temp_c: null,
+        env_temp_c: null,
+        bean_ror_c_per_min: null,
+        heat_percent: 70,
+        fan_percent: 40,
+      }),
+    );
+    expect(s.points).toHaveLength(2);
+    // The prior finite reading is untouched (the frame doesn't retroactively
+    // clobber an earlier point).
+    expect(s.points[0]).toMatchObject({ t: 300, bean: 180, env: 200 });
+    // The null-reading tick still plots (a real x — elapsed_seconds is present —
+    // is never dropped), with bean/env carried through as an explicit gap.
+    expect(s.points[1]).toMatchObject({ t: 301, bean: null, env: null, heat: 70, fan: 40 });
+  });
+
   it("plots PRE-charge telemetry so the preheat curve is visible (#326 regression guard for #316)", () => {
     // Pre-charge the server sends charge_elapsed_seconds: null but serve
     // elapsed_seconds is set; the buffer keys on serve elapsed so the preheat frame
