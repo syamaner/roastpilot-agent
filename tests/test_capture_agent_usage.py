@@ -7787,7 +7787,9 @@ def test_write_post_exit_attestation_keeps_ordinary_clean_tree_semantics(
 
 
 @pytest.fixture(autouse=True)
-def isolate_run_metadata_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+def isolate_run_metadata_validation(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
     """Keep launcher tests provider-free unless they exercise Git admission directly."""
 
     def skip_worktree_validation(_arguments: argparse.Namespace) -> None:
@@ -7808,7 +7810,16 @@ def isolate_run_metadata_validation(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError(executable)
 
     monkeypatch.setattr(usage_cli, "_resolved_executable", resolved_executable)
-    monkeypatch.setattr(usage_cli, "_harness_version", harness_version)
+    lifecycle_tests = {
+        "test_version_probe_timeout_kills_reaps_and_never_reaches_a_run",
+        "test_provider_free_executable_integration_captures_only_normalized_usage",
+        "test_early_closed_stdin_fails_without_appending_valid_terminal_usage",
+        "test_real_pipe_backpressure_interleaves_prompt_write_and_stdout_drain",
+        "test_run_timeout_kills_and_reaps_term_ignoring_child_without_a_record",
+        "test_timeout_kills_real_stdout_inheriting_descendant_without_record",
+    }
+    if request.node.name not in lifecycle_tests:
+        monkeypatch.setattr(usage_cli, "_harness_version", harness_version)
 
 
 def _stream(*events: str) -> BytesIO:
