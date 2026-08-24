@@ -16,7 +16,9 @@ observation joined to its required task and slice identifiers. Use `parse-codex`
 frozen parser grammar. `parse-claude` is self-derived, non-authoritative offline
 structural inspection: it derives its expected version from the first valid init
 event and makes no launch-authority claim. The live `run` and `run-native-claude`
-paths remain bound to one CLI version probe before they record usage. Use
+paths remain bound to one CLI version probe before they record usage. Generic
+`run` also attests empty tools, empty MCP servers, and plan permission before
+recording usage. Use
 `annotate-outcome` after final gates to record closed finding
 counts and rework metadata joined to the required task and slice identifiers. The default `.agent-usage/usage.jsonl` is local-only and
 gitignored.
