@@ -6157,14 +6157,33 @@ def test_closed_gate_path_never_reaches_a_host_node(tmp_path: Path) -> None:
 
 
 def test_pyright_nodejs_dependency_is_exactly_pinned() -> None:
-    """T20: the deterministic venv-contained Node provider cannot silently drift."""
+    """T20: the checker and venv-contained Node provider stay exact-pinned."""
     pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
-    pyright_dependencies = [
-        dependency
-        for dependency in pyproject["dependency-groups"]["dev"]
-        if dependency.startswith("pyright")
-    ]
-    assert pyright_dependencies == ["pyright[nodejs]==1.1.410"]
+    dependencies = pyproject["dependency-groups"]["dev"]
+    for package in ("pyright[nodejs]", "nodejs-wheel-binaries"):
+        matching_dependencies = [
+            dependency for dependency in dependencies if dependency.startswith(package)
+        ]
+        assert len(matching_dependencies) == 1
+        assert re.fullmatch(rf"{re.escape(package)}==[^=<>!~\s]+", matching_dependencies[0])
+
+
+def test_installed_nodejs_wheel_binaries_matches_the_exact_declaration(tmp_path: Path) -> None:
+    """T23: the closed child rejects a validation root provisioned off the declared pin."""
+    root = _executable_gate_root(tmp_path)
+    source = (
+        "import importlib.metadata, tomllib; from pathlib import Path; "
+        "pyproject = tomllib.loads(Path('pyproject.toml').read_text()); "
+        "dependencies = pyproject['dependency-groups']['dev']; "
+        "declared = next(dependency.split('==', 1)[1] for dependency in dependencies "
+        "if dependency.startswith('nodejs-wheel-binaries==')); "
+        "installed = importlib.metadata.version('nodejs-wheel-binaries'); "
+        "raise SystemExit(0 if installed == declared else 1)"
+    )
+    interpreter = shlex.quote(str(root / "venv" / "bin" / "python"))
+    command = f"{render_gate_scrub_prefix(str(root))} {interpreter} -c {shlex.quote(source)}"
+    result = _run_gate_command(command, _poisoned_gate_environment(), cwd=Path(__file__).parents[1])
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_closed_gate_path_is_the_literal_minimum_allowlist() -> None:

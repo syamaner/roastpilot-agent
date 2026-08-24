@@ -387,7 +387,11 @@ external interpreter it invokes. Its Node runtime is supplied by pyright's
 the root venv's site-packages: it performs no runtime download and no host
 lookup. The executable must be canonically contained under the resolved venv
 prefix, rather than assumed to occupy any particular installation location;
-never add host paths to the fixed `PATH` to satisfy this requirement.
+never add host paths to the fixed `PATH` to satisfy this requirement. The Node
+runtime version is exact-pinned in the dev group and arrives through the same
+`pip install -e . --group dev` provisioning recipe; the Pyright and Node pins
+move together, and a root provisioned before either bump keeps its old runtime
+until it is reprovisioned.
 
 **Attestation is untouched.** `--validation-root` binds exactly
 `ROASTPILOT_VALIDATION_ROOT`, `ROASTPILOT_VALIDATION_PYTHON`,
