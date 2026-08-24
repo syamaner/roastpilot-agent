@@ -223,22 +223,38 @@ def test_observed_claude_version_binds_generic_stream_exactly() -> None:
         )
 
 
-def test_parse_claude_command_derives_2_1_241_and_hides_invalid_first_events(
+def test_parse_claude_command_self_derives_init_after_leading_valid_event(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The local parser derives only a valid first-init version without leaking input."""
+    """Offline inspection derives from init after a valid leading non-init event."""
     content = (FIXTURES / "claude-2.1.241.jsonl").read_bytes()
     stream = tmp_path / "stream.jsonl"
-    stream.write_bytes(content)
+    lines = content.splitlines()
+    stream.write_bytes(b"\n".join((lines[1], lines[0], *lines[2:])) + b"\n")
     assert main(["parse-claude", str(stream)]) == 0
     assert '"input_tokens":2' in capsys.readouterr().out
-    for first in (b"", b"not-json", b"[]", b"{}", b'{"claude_code_version":1}'):
-        stream.write_bytes(first + b"\n" + b"SENTINEL_UNTRUSTED")
-        with pytest.raises(SystemExit) as error:
-            main(["parse-claude", str(stream)])
-        captured = capsys.readouterr()
-        assert "SENTINEL_UNTRUSTED" not in str(error.value)
-        assert "SENTINEL_UNTRUSTED" not in captured.out + captured.err
+
+    malformed_init = json.loads(lines[0])
+    malformed_init["claude_code_version"] = 1
+    malformed_stream = (
+        b"\n".join((lines[1], json.dumps(malformed_init).encode(), *lines[2:])) + b"\n"
+    )
+    with pytest.raises(ClaudeUsageParseError, match="unverified Claude version"):
+        parse_claude_stream(
+            BytesIO(malformed_stream), expected_version=None, require_launch_authority=False
+        )
+    stream.write_bytes(malformed_stream)
+    with pytest.raises(SystemExit, match="Claude usage stream is invalid"):
+        main(["parse-claude", str(stream)])
+
+    missing_init_stream = b"\n".join((lines[1], *lines[2:])) + b"\n"
+    with pytest.raises(ClaudeAuthorityError, match="init authority is not attested"):
+        parse_claude_stream(
+            BytesIO(missing_init_stream), expected_version=None, require_launch_authority=False
+        )
+    stream.write_bytes(missing_init_stream)
+    with pytest.raises(SystemExit, match="Claude launch authority is not attested"):
+        main(["parse-claude", str(stream)])
 
 
 def test_observed_transcript_version_and_atis_latch_are_exact_and_discarded(

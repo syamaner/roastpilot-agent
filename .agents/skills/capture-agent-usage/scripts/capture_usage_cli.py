@@ -347,19 +347,12 @@ def parse_codex_command(arguments: argparse.Namespace) -> int:
 
 
 def parse_claude_command(arguments: argparse.Namespace) -> int:
-    """Parse a supplied sanitized Claude JSONL file without creating a record."""
+    """Structurally inspect a sanitized Claude JSONL file without creating a record."""
     content = _input_bytes(arguments.stream, MAX_STREAM_BYTES)
-    expected_version = ""
-    try:
-        init = json.loads(content.splitlines()[0])
-        if isinstance(init, dict) and isinstance(init.get("claude_code_version"), str):
-            expected_version = init["claude_code_version"]
-    except (IndexError, json.JSONDecodeError):
-        pass
     _print_parsed_json(
         parse_claude_stream(
             BytesIO(content),
-            expected_version=expected_version,
+            expected_version=None,
             require_launch_authority=False,
         )
     )

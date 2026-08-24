@@ -111,7 +111,7 @@ def _non_negative_number(value: object, field: str) -> float:
     return float(value)
 
 
-def _event_from_line(line: str, *, expected_version: str) -> Mapping[str, Any]:
+def _event_from_line(line: str, *, expected_version: str | None) -> Mapping[str, Any]:
     """Decode one JSONL object and enforce the fixture's top-level grammar."""
 
     def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -142,8 +142,12 @@ def _event_from_line(line: str, *, expected_version: str) -> Mapping[str, Any]:
         subtype = event.get("subtype")
         if subtype not in CLAUDE_SYSTEM_SUBTYPES:
             raise ClaudeUsageParseError("unknown Claude system subtype")
-        if subtype == "init" and event.get("claude_code_version") != expected_version:
-            raise ClaudeUsageParseError("unverified Claude version")
+        if subtype == "init":
+            observed_version = event.get("claude_code_version")
+            if not isinstance(observed_version, str) or not observed_version:
+                raise ClaudeUsageParseError("unverified Claude version")
+            if expected_version is not None and observed_version != expected_version:
+                raise ClaudeUsageParseError("unverified Claude version")
     return event
 
 
@@ -252,7 +256,7 @@ def _terminal_usage(event: Mapping[str, Any]) -> ParsedUsage:
 def parse_claude_stream(
     stream: BinaryIO,
     *,
-    expected_version: str,
+    expected_version: str | None,
     require_launch_authority: bool,
 ) -> ParsedUsage:
     """Parse a complete Claude stream using only the terminal result-level totals.
@@ -260,7 +264,9 @@ def parse_claude_stream(
     Args:
         stream: Binary JSONL stdout from the fixed Claude harness command.
         expected_version: The version observed by the caller's one bounded CLI
-            probe. The Claude init event must equal this value exactly.
+            probe. The Claude init event must equal this value exactly. ``None``
+            is limited to offline structural inspection, where the first valid
+            init event self-derives the expected version without launch authority.
         require_launch_authority: Whether the init event must prove the fixed
             no-tools, no-MCP, plan-permission launch boundary.
 
@@ -272,6 +278,7 @@ def parse_claude_stream(
             or model totals are invalid.
     """
     parsed: ParsedUsage | None = None
+    self_derived_version = expected_version is None
     saw_init = False
     saw_pre_init_activity = False
     bounded_failure: str | None = None
@@ -283,6 +290,8 @@ def parse_claude_stream(
             if event["type"] == "system" and event.get("subtype") == "init":
                 if saw_init:
                     raise ClaudeAuthorityError("Claude init authority is duplicated")
+                if expected_version is None:
+                    expected_version = event["claude_code_version"]
                 if require_launch_authority and saw_pre_init_activity:
                     raise ClaudeAuthorityError("Claude init authority is not attested")
                 _validate_init_authority(event, require_launch_authority)
@@ -301,6 +310,8 @@ def parse_claude_stream(
         bounded_failure = str(exc)
     if bounded_failure is not None:
         raise ClaudeUsageParseError(bounded_failure) from None
+    if self_derived_version and not saw_init:
+        raise ClaudeAuthorityError("Claude init authority is not attested")
     if parsed is None:
         raise ClaudeUsageMissingTerminalError("Claude stream has no terminal result usage event")
     return parsed
