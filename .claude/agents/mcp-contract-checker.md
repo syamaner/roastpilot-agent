@@ -82,6 +82,11 @@ bullet; that bullet governs **write-capable workers only** and does not
 apply to you — follow this section's parent-supplied exact commands
 instead.
 
+The printed `RUN` lines execute in order. The first verifies the reconstructed
+environment; if it exits non-zero, stop and report. Do not run a later gate,
+repair the environment, or compose, reorder, remove, or re-quote any supplied
+command: each `RUN` line carries its own environment.
+
 ## Worktree discipline (topology §7 — binding)
 
 - Verify the worktree provisioned by the lead for this task at the sha under

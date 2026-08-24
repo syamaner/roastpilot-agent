@@ -84,6 +84,7 @@ from capture_usage_models import (
     render_allowed_tools,
     render_validation_commands,
 )
+from capture_usage_models import validation_environment_values as _validation_environment_values
 from capture_usage_native_codex import (
     NativeCodexCaptureError,
     supervise_native_codex,
@@ -863,34 +864,6 @@ def _validate_validation_root(raw: str) -> str:
             with suppress(OSError):
                 os.close(descriptor)
     return root_real
-
-
-def _validation_environment_values(root: str) -> dict[str, str]:
-    """Build the closed validation-role environment map from one validated root.
-
-    Args:
-        root: The canonical resolved validation root.
-
-    Returns:
-        The exact twelve-key mapping of §2.4, every value derived only from
-        ``root``.
-    """
-    cache = os.path.join(root, "cache")
-    tmp = os.path.join(root, "tmp")
-    return {
-        "ROASTPILOT_VALIDATION_ROOT": root,
-        "ROASTPILOT_VALIDATION_PYTHON": os.path.join(root, "venv", "bin", "python"),
-        "ROASTPILOT_VALIDATION_TMP": tmp,
-        "TMPDIR": tmp,
-        "XDG_CACHE_HOME": cache,
-        "PYTHONPYCACHEPREFIX": os.path.join(cache, "pycache"),
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "RUFF_CACHE_DIR": os.path.join(cache, "ruff"),
-        "COVERAGE_FILE": os.path.join(tmp, "coverage"),
-        "COFFEE_ROAST_LOG_DIR": os.path.join(tmp, "coffee-roast-logs"),
-        "PIP_CACHE_DIR": os.path.join(cache, "pip"),
-        "PYTEST_ADDOPTS": f"-o cache_dir={os.path.join(cache, 'pytest')}",
-    }
 
 
 def _plan_identity_checks(root: str, sha: str) -> None:

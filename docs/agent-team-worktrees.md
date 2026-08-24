@@ -460,6 +460,15 @@ cache/temp/coverage destinations above, and the unchanged byte-clean,
 unchanged-head post-exit attestation that still yields no record and no
 handback if anything lands in the worktree.
 
+The three validation roles' gate commands begin from an empty environment and
+reinstate only a closed, root-derived set, so the #773 protection applies even
+when a parent runs a `RUN` line in an ordinary shell. The three
+`ROASTPILOT_VALIDATION_*` keys are deliberately absent from the gate child;
+containment redirections remain, with `PYTEST_ADDOPTS` rendered as an explicit
+pytest cache option. This does not alter the launched role's twelve-key
+environment. The non-atomicity caveat above also applies when the verification
+and later `RUN` lines are separate calls.
+
 ## Parent-provisioned bound roots for read-only capture runs (D169)
 
 D166–D168 above cover exactly one bound-root kind, `--validation-root`, for

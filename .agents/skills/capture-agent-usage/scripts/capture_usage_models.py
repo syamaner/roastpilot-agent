@@ -187,6 +187,91 @@ attestation, so their gates run against an external per-run root instead
 rejected for every other role.
 """
 
+SCRUBBED_ENVIRONMENT_PREFIX = "ROASTPILOT_"
+"""Case-insensitive namespace removed from every validation gate child."""
+
+SCRUBBED_ENVIRONMENT_NAMES = frozenset({"PYTHONPATH", "OPENROUTER_API_KEY"})
+"""Additional inherited names removed from every validation gate child."""
+
+
+def is_scrubbed_environment_name(name: str) -> bool:
+    """Return whether one environment-variable name is excluded from gate children.
+
+    Args:
+        name: The environment-variable name to classify.
+
+    Returns:
+        ``True`` for every case-insensitive ``ROASTPILOT_*`` name and the two
+        explicitly scrubbed inherited names.
+    """
+    return (
+        name.upper().startswith(SCRUBBED_ENVIRONMENT_PREFIX) or name in SCRUBBED_ENVIRONMENT_NAMES
+    )
+
+
+def validation_environment_values(root: str) -> dict[str, str]:
+    """Build the closed validation-role launch environment from one validated root.
+
+    Args:
+        root: The canonical resolved validation root.
+
+    Returns:
+        The exact twelve-key mapping bound to a captured validation-role launch.
+    """
+    cache = os.path.join(root, "cache")
+    tmp = os.path.join(root, "tmp")
+    return {
+        "ROASTPILOT_VALIDATION_ROOT": root,
+        "ROASTPILOT_VALIDATION_PYTHON": os.path.join(root, "venv", "bin", "python"),
+        "ROASTPILOT_VALIDATION_TMP": tmp,
+        "TMPDIR": tmp,
+        "XDG_CACHE_HOME": cache,
+        "PYTHONPYCACHEPREFIX": os.path.join(cache, "pycache"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "RUFF_CACHE_DIR": os.path.join(cache, "ruff"),
+        "COVERAGE_FILE": os.path.join(tmp, "coverage"),
+        "COFFEE_ROAST_LOG_DIR": os.path.join(tmp, "coffee-roast-logs"),
+        "PIP_CACHE_DIR": os.path.join(cache, "pip"),
+        "PYTEST_ADDOPTS": f"-o cache_dir={os.path.join(cache, 'pytest')}",
+    }
+
+
+def render_gate_environment(root: str) -> tuple[tuple[str, str], ...]:
+    """Render the closed, root-derived environment for a validation gate command.
+
+    Args:
+        root: The canonical resolved validation root.
+
+    Returns:
+        Ordered, whitespace-free key/value assignments for an ``env -i`` gate.
+    """
+    values = validation_environment_values(root)
+    reinstated = tuple(
+        (key, value)
+        for key, value in values.items()
+        if not is_scrubbed_environment_name(key) and key != "PYTEST_ADDOPTS"
+    )
+    return (
+        *reinstated,
+        ("PATH", f"{root}/venv/bin:/usr/bin:/bin"),
+        ("HOME", f"{root}/tmp"),
+        ("PYTHONUTF8", "1"),
+        ("RP_VALIDATION_GATE", "1"),
+    )
+
+
+def render_gate_scrub_prefix(root: str) -> str:
+    """Render the shared ``env -i`` prefix for one validation gate command.
+
+    Args:
+        root: The canonical resolved validation root.
+
+    Returns:
+        One shell-token-safe ``env -i`` command prefix with closed assignments.
+    """
+    assignments = " ".join(f"{key}={value}" for key, value in render_gate_environment(root))
+    return f"env -i {assignments}"
+
 
 class ValidationCommandKind(Enum):
     """Closed command-matching kind for one committed validation-role rule.
@@ -204,7 +289,8 @@ class ValidationCommandKind(Enum):
 class ValidationCommand:
     """One committed validation-role gate command template.
 
-    ``template`` uses exactly two placeholders, ``{python}`` and ``{tmp}``,
+    ``template`` uses exactly four placeholders, ``{scrub}``, ``{python}``,
+    ``{cache}``, and ``{tmp}``,
     substituted only from the one already-validated resolved root every
     other validation-environment consumer uses (D168, §2.2).
     """
@@ -213,25 +299,45 @@ class ValidationCommand:
     template: str
 
 
+VALIDATION_ENVIRONMENT_VERIFY_COMMAND = ValidationCommand(
+    ValidationCommandKind.EXACT,
+    "{scrub} {python} -m pytest tests/gate/test_gate_environment.py -q "
+    "-o cache_dir={cache}/pytest --basetemp {tmp}/pytest",
+)
+"""First fail-closed verification command for every validation role."""
+
+
 VALIDATION_ROLE_COMMANDS: dict[NativeClaudeRole, tuple[ValidationCommand, ...]] = {
     NativeClaudeRole.QA: (
-        ValidationCommand(ValidationCommandKind.PREFIX, "{python} -m pytest"),
-        ValidationCommand(ValidationCommandKind.EXACT, "{python} -m pyright --pythonpath {python}"),
-        ValidationCommand(ValidationCommandKind.EXACT, "{python} -m ruff check ."),
-        ValidationCommand(ValidationCommandKind.EXACT, "{python} -m ruff format --check ."),
+        VALIDATION_ENVIRONMENT_VERIFY_COMMAND,
+        ValidationCommand(
+            ValidationCommandKind.PREFIX,
+            "{scrub} {python} -m pytest -o cache_dir={cache}/pytest",
+        ),
+        ValidationCommand(
+            ValidationCommandKind.EXACT, "{scrub} {python} -m pyright --pythonpath {python}"
+        ),
+        ValidationCommand(ValidationCommandKind.EXACT, "{scrub} {python} -m ruff check ."),
+        ValidationCommand(ValidationCommandKind.EXACT, "{scrub} {python} -m ruff format --check ."),
     ),
     NativeClaudeRole.MCP_CONTRACT_CHECKER: (
-        ValidationCommand(ValidationCommandKind.EXACT, "{python} -m pip show coffee-roaster-mcp"),
+        VALIDATION_ENVIRONMENT_VERIFY_COMMAND,
+        ValidationCommand(
+            ValidationCommandKind.EXACT, "{scrub} {python} -m pip show coffee-roaster-mcp"
+        ),
         ValidationCommand(
             ValidationCommandKind.EXACT,
-            "{python} -m pytest tests/test_mcp_client.py -q --basetemp {tmp}/pytest",
+            "{scrub} {python} -m pytest tests/test_mcp_client.py -q "
+            "-o cache_dir={cache}/pytest --basetemp {tmp}/pytest",
         ),
     ),
     NativeClaudeRole.SIM_ROAST_RUNNER: (
+        VALIDATION_ENVIRONMENT_VERIFY_COMMAND,
         ValidationCommand(
             ValidationCommandKind.EXACT,
-            "{python} -m pytest tests/test_milestone1.py "
-            "tests/test_milestone1_real_mcp.py -q --basetemp {tmp}/pytest",
+            "{scrub} {python} -m pytest tests/test_milestone1.py "
+            "tests/test_milestone1_real_mcp.py -q -o cache_dir={cache}/pytest "
+            "--basetemp {tmp}/pytest",
         ),
     ),
 }
@@ -262,7 +368,12 @@ def render_validation_commands(role: NativeClaudeRole, root: str) -> tuple[str, 
     commands = VALIDATION_ROLE_COMMANDS.get(role, ())
     python = os.path.join(root, "venv", "bin", "python")
     tmp = os.path.join(root, "tmp")
-    return tuple(command.template.format(python=python, tmp=tmp) for command in commands)
+    cache = os.path.join(root, "cache")
+    scrub = render_gate_scrub_prefix(root)
+    return tuple(
+        command.template.format(scrub=scrub, python=python, cache=cache, tmp=tmp)
+        for command in commands
+    )
 
 
 def render_allowed_tools(role: NativeClaudeRole, root: str) -> tuple[str, ...]:

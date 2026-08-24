@@ -125,3 +125,6 @@ Invoke each through its ordinary committed Claude role so its existing Bash/git
 authority can inspect the exact merge-base patch, including deleted and replaced
 bytes. Their provider-owned plaintext transcripts remain local and untracked;
 native capture does not emit a metadata record for these excluded launches.
+
+Validation-role gate commands start from an empty environment and restore only
+their closed, root-derived containment set before every `RUN` line.
