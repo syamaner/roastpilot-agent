@@ -6028,6 +6028,23 @@ def test_rendered_gate_scrub_bypasses_a_path_leading_fake_env_shim(tmp_path: Pat
     assert command.startswith(f"{shlex.quote(usage_models.SYSTEM_ENV_EXECUTABLE)} -i ")
 
 
+def test_system_env_executable_resolution_fails_closed_when_candidates_are_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The canonical ``env`` resolver rejects when neither absolute candidate is usable."""
+    candidates: list[str] = []
+
+    def unavailable(path: str) -> bool:
+        candidates.append(path)
+        return False
+
+    monkeypatch.setattr(usage_models.os.path, "isfile", unavailable)
+    with pytest.raises(RuntimeError) as raised:
+        usage_models._resolve_system_env_executable()  # pyright: ignore[reportPrivateUsage]
+    assert raised.value.args == ("system env utility is unavailable",)
+    assert candidates == ["/usr/bin/env", "/bin/env"]
+
+
 def test_rendered_gate_scrub_reinstates_exact_root_derived_values(tmp_path: Path) -> None:
     """T10: every retained containment assignment reaches the gate child unchanged."""
     root = _executable_gate_root(tmp_path)
@@ -6238,10 +6255,10 @@ def test_pyright_node_runtime_is_canonically_contained_in_the_bound_venv(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_pyright_provider_node_is_canonically_contained_in_the_bound_venv(
+def test_pyright_nodejs_wheel_provider_contract_is_canonically_contained_in_the_bound_venv(
     tmp_path: Path,
 ) -> None:
-    """T22: Pyright's selected packaged Node is contained without host-PATH assumptions."""
+    """T22: the pinned ``nodejs_wheel`` provider contract is venv-contained."""
     root = _executable_gate_root(tmp_path)
     source = (
         "import os, sys, sysconfig; from pathlib import Path; import nodejs_wheel; "
