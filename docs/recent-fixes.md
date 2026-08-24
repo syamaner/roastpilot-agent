@@ -844,3 +844,38 @@ Format: one entry per anti-pattern.
   the `tests/test_store.py` reference-onset matrix.
 
 - **#787 (11 Aug 2026):** Before whole-run ordering or arithmetic assumes a telemetry clock is monotonic, scan both `tick` and non-NULL `elapsed_seconds` in immutable `telemetry_snapshots.id` order; a resettable-column `ORDER BY` sorts the defect away, while equal values and legacy NULL elapsed values remain valid and non-finite elapsed values require their own honest refusal.
+
+## `telemetry?.field ?? staleFallback` cannot tell "no live frame yet" from "a live frame's own field is null" once that field is nullable
+*(fixed by #789, 24 Aug 2026)*
+
+- **Signature:** `grep -n 'telemetry?\.\w\+ ?? .*\.(bean|env|point|snapshot)' web/src/pages/**` —
+  any `web/` view-model expression of the shape `liveFrame?.field ?? someStaleFallback`
+  where `field` is (or is being widened to) nullable. The `?.` and the `??` both
+  collapse on `null`, so the expression cannot distinguish "the live object itself
+  is absent" from "the live object is present and its own field is genuinely null."
+- **Wrong:** `DashboardPage`'s `latestBeanTempC` read
+  `telemetry?.bean_temp_c ?? latestSnapshotPoint?.bean ?? null`. While
+  `bean_temp_c` was typed as a plain (non-nullable) `number`, this was harmless —
+  `telemetry?.bean_temp_c` could only be `undefined` when `telemetry` itself was
+  `null`. Once `bean_temp_c` was widened to `number | null` (the live telemetry
+  wire boundary is untrusted, independent of what the backend model currently
+  guarantees), the SAME expression became a latent bug: a live frame whose own
+  `bean_temp_c` reading is `null` would silently fall through to and repaint the
+  STALE snapshot temperature, instead of showing the current, genuinely-unknown
+  reading.
+- **Right:** branch explicitly on whether a live frame has been received at all
+  (`telemetry === null ? staleFallback : telemetry.field`), never on the field's
+  own value via `?.`/`??` chained past a fallback. This repo already had two
+  correct precedents for the identical rule before this fix — `latestBeanRorCPerMin`
+  on the very next line in `DashboardPage.tsx`, and `resolveMicStatus`
+  (`web/src/pages/dashboard/micStatus.ts`, #200) — both treat "a received live
+  frame is authoritative even when its own value is null" as the load-bearing
+  rule; the new fix mirrors that established pattern rather than inventing a
+  third one. Applies to any other current/planned nullable live-telemetry field
+  paired with a stale-fallback (backfill point, hydrated snapshot, cached read).
+- **Guarded by:** `DashboardPage.fault.test.tsx`'s "DashboardPage live telemetry
+  nullable-temperature boundary (#789)" suite (a current live `null` must render
+  "— °C", never the prior snapshot's finite value — fail-then-pass verified
+  against the pre-fix `??`-chain expression) + `useDashboardEvents.test.ts`'s
+  "plots a null live bean/env reading as a chart GAP" test (the downstream chart
+  path, already correct with no source change, gets its own regression guard).

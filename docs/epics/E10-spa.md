@@ -319,6 +319,29 @@ is unambiguous between the home hub and the live roast. `StartRoastView` and
 `LivePage`'s inline start view both navigate to `/live` after a successful start (not
 `/`). A `/config` route placeholder is added for the upcoming Config FE (#419 S2).
 
+Post-E10 robustness follow-up (not an E10 story): **#789 — live telemetry
+nullable-temperature wire boundary.** Widened `bean_temp_c`/`env_temp_c` on the
+SSE `TelemetryEventData` mirror (`web/src/lib/types.ts`) from `number` to
+`number | null`. This hardens the SPA's SSE-frame boundary in its own right —
+the TS contract now treats a per-tick reading as untrusted-nullable
+independent of what the current Python model happens to guarantee — rather
+than reacting to an observed backend defect (the Python `TelemetryEventData`
+still sends a finite float on every live tick). Fixed the one place the
+widening would otherwise have silently regressed: `DashboardPage`'s
+`latestBeanTempC` read `telemetry?.bean_temp_c ?? latestSnapshotPoint?.bean`,
+which cannot distinguish "no live frame yet" from "a live frame's own reading
+is null" once the field is nullable, and would have painted a STALE snapshot
+temperature over a genuine current-live `null`. Rewritten to branch on
+`telemetry === null` explicitly — mirroring the RoR readout's existing (#592)
+pattern immediately below it, and `resolveMicStatus`'s established "a received
+live frame is authoritative even when its own value is null" precedent. Every
+other consumer already handled the wider type correctly with no source change:
+the chart-gap path (`useDashboardEvents`'s `pointFromTelemetry` feeds straight
+into `CurvePoint.bean`/`.env`, already typed `number | null` — a live `null`
+now renders as a genuine chart gap, not a fabricated/zero value), `RoastHeader`
+/ `ChargeBanner` / `RecoveryModal` (already `formatTempC`/`number | null`
+throughout), and the `/__stream-smoke` harness page.
+
 ### E10 follow-ups — closed (15–16 Jun 2026)
 
 The S1–S6 review-deferred follow-ups and contract/observability fast-follows are

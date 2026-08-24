@@ -105,8 +105,17 @@ export interface MicStatus {
 // the SPA renders each tick; carries the server-authoritative phase.
 export interface TelemetryEventData {
   agent_phase: RoastPhase;
-  bean_temp_c: number;
-  env_temp_c: number;
+  // #789: widened to nullable at this wire boundary — the untrusted-JSON edge of
+  // the SSE contract, independent of what the current Python model happens to
+  // guarantee. A consumer must treat a CURRENT live frame's `null` reading as
+  // authoritative (render "—", chart a gap) and NEVER silently substitute an
+  // older snapshot/backfill value for it — the same "live frame wins, even when
+  // its own value is null" rule `mic_status` below and `resolveMicStatus`
+  // (dashboard) already establish. Falling back to a stale value is permitted
+  // ONLY before any live telemetry frame has been received at all (`telemetry
+  // === null`), not when a received frame's own field is null.
+  bean_temp_c: number | null;
+  env_temp_c: number | null;
   bean_ror_c_per_min: number | null;
   env_ror_c_per_min: number | null;
   heat_percent: number | null;
