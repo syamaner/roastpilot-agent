@@ -2,7 +2,9 @@
 
 The parent starts ``supervise-native-codex`` before dispatching its named leaf.
 This process keeps descriptor-relative bindings open, writes one READY frame,
-then accepts exactly one terminal task status on stdin.  It never launches Codex.
+then accepts exactly one terminal task status on stdin. It probes the resolved
+Codex executable once for the run-scoped version binding and never launches a
+Codex task.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from capture_usage_models import (
     NATIVE_CODEX_REPOSITORY,
     NATIVE_CODEX_ROLE_INSTRUCTION_SHA256,
     NATIVE_CODEX_ROLE_SHA256,
+    HarnessFamily,
     NativeCodexRole,
     NativeCodexTaskStatus,
     NativeCodexUsageRecord,
@@ -1450,9 +1453,9 @@ def _leaf_launch_boundary(payload: dict[str, Any], binding: dict[str, str]) -> N
 
 
 def _parse_rollout(
-    fd: int, binding: dict[str, str]
+    fd: int, binding: dict[str, str], expected_version: str
 ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
-    """Stream and validate the admitted 0.147.0 metadata grammar only."""
+    """Stream and validate rollout metadata bound to the observed CLI version."""
     seen_meta = seen_context = seen_started = seen_complete = False
     session = ""
     parent_thread = ""
@@ -1578,7 +1581,7 @@ def _parse_rollout(
                     session == ""
                     or _string(payload.get("session_id")) != session
                     or payload.get("originator") != "codex-tui"
-                    or payload.get("cli_version") != "0.147.0"
+                    or payload.get("cli_version") != expected_version
                 ):
                     _fail()
                 seen_meta = True
@@ -2138,13 +2141,16 @@ def _provider_home() -> str:
 
 
 def supervise_native_codex(arguments: Any) -> int:
-    """Run one parent-owned READY/status/result protocol without launching a child."""
+    """Run one parent-owned READY/status/result protocol bound to one probe."""
     global _ACTIVE_GIT_WORKTREE
     values = (arguments.task_id, arguments.slice_id, arguments.parent_task_id, arguments.task_name)
     parent = os.environ.get("CODEX_THREAD_ID")
     if not all(_safe_identifier(value) for value in values) or not _safe_identifier(parent):
         _fail()
     role = NativeCodexRole(arguments.role)
+    from capture_usage_cli import _harness_version, _resolved_executable
+
+    harness_version = _harness_version(_resolved_executable(HarnessFamily.CODEX))
     codex_home = _provider_home()
     usage: _Root | None = None
     provider: _Root | None = None
@@ -2239,7 +2245,9 @@ def supervise_native_codex(arguments: Any) -> int:
                         _fail()
                     if metadata.bound_leaf is not True:
                         continue
-                    session, totals, _spawned_from, matches, consumed = _parse_rollout(fd, binding)
+                    session, totals, _spawned_from, matches, consumed = _parse_rollout(
+                        fd, binding, harness_version
+                    )
                     observed_total += consumed
                     if observed_total > MAX_PROVIDER_TOTAL_BYTES:
                         _fail()
@@ -2271,7 +2279,7 @@ def supervise_native_codex(arguments: Any) -> int:
                     continue
                 try:
                     _session, _child_totals, _spawned_from, _matches, consumed = _parse_rollout(
-                        fd, binding
+                        fd, binding, harness_version
                     )
                     observed_total += consumed
                     if observed_total > MAX_PROVIDER_TOTAL_BYTES:
@@ -2351,6 +2359,7 @@ def supervise_native_codex(arguments: Any) -> int:
             final_head_sha=final,
             parent_thread_id=parent,
             leaf_session_id=leaf,
+            harness_version=harness_version,
             exit_code=None,
             task_status=status,
             success=success,

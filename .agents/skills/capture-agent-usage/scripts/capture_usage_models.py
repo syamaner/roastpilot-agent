@@ -854,7 +854,7 @@ class NativeCodexUsageRecord(CaptureModel):
     parent_thread_id: SafeIdentifier
     leaf_session_id: SafeIdentifier
     topology_depth: Literal[1] = 1
-    harness_version: Literal["0.147.0"] = "0.147.0"
+    harness_version: SafeIdentifier
     # Native collaboration reports a task terminal state, not a shell exit code.
     exit_code: None = None
     task_status: NativeCodexTaskStatus
@@ -879,6 +879,14 @@ class NativeCodexUsageRecord(CaptureModel):
         """Reject coercion at persisted native-Codex boolean boundaries."""
         if type(value) is not bool:
             raise ValueError("native Codex boolean fields must be JSON booleans")
+        return value
+
+    @field_validator("harness_version", mode="before")
+    @classmethod
+    def require_native_codex_harness_version(cls, value: object) -> object:
+        """Require one observed semantic version without providing a default."""
+        if not isinstance(value, str) or re.fullmatch(r"^\d+\.\d+\.\d+$", value) is None:
+            raise ValueError("native Codex harness version is invalid")
         return value
 
     @field_validator(

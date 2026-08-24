@@ -207,6 +207,61 @@ FIXTURES = Path(__file__).parent / "fixtures" / "agent-usage"
 USAGE_RECORD_ADAPTER = cast(TypeAdapter[UsageRecord], _USAGE_RECORD_ADAPTER)
 
 
+def test_observed_claude_version_binds_generic_stream_exactly() -> None:
+    """A supplied installed-version stream admits only its probed version."""
+    content = (FIXTURES / "claude-2.1.241.jsonl").read_bytes()
+
+    usage = usage_claude.parse_claude_stream(
+        BytesIO(content), expected_version="2.1.241", require_launch_authority=True
+    )
+
+    assert usage.input_tokens == 2
+    with pytest.raises(ClaudeUsageParseError, match="unverified Claude version"):
+        usage_claude.parse_claude_stream(
+            BytesIO(content), expected_version="2.1.240", require_launch_authority=True
+        )
+
+
+def test_observed_transcript_version_and_atis_latch_are_exact_and_discarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated latch rows validate exactly and retain neither latch value nor version drift."""
+    session_id = "71111111-1111-4111-8111-111111111111"
+    content = (FIXTURES / "claude-2.1.241-transcript" / "engineer-be.jsonl").read_bytes()
+    transcript, installed_session = _install_owned_transcript(
+        tmp_path, monkeypatch, content, session_id
+    )
+
+    usage = usage_transcript.parse_owned_transcript(
+        tmp_path,
+        installed_session,
+        NativeClaudeRole.ENGINEER_BE,
+        "high",
+        expected_version="2.1.241",
+        expected_permission_mode="auto",
+    )
+
+    assert usage.input_tokens == 2
+    assert "SYNTHETIC_ATIS_SENTINEL" not in repr(usage)
+    for old, new in (
+        (b'"atis":"SYNTHETIC_ATIS_SENTINEL_A",', b'"unexpected":true,'),
+        (b'"atis":"SYNTHETIC_ATIS_SENTINEL_A",', b""),
+        (b'"sessionId":"71111111-1111-4111-8111-111111111111"', b'"sessionId":1'),
+    ):
+        transcript.write_bytes(content.replace(old, new))
+        with pytest.raises(
+            usage_transcript.TranscriptError, match="owned Claude transcript is invalid"
+        ):
+            usage_transcript.parse_owned_transcript(
+                tmp_path,
+                installed_session,
+                NativeClaudeRole.ENGINEER_BE,
+                "high",
+                expected_version="2.1.241",
+                expected_permission_mode="auto",
+            )
+
+
 def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
     """Native Codex records never claim success without a descendant result."""
     started = datetime.now(UTC)
@@ -227,6 +282,7 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
         "final_head_sha": "b" * 40,
         "parent_thread_id": "thread-811",
         "leaf_session_id": "leaf-811",
+        "harness_version": "0.147.0",
         "exit_code": None,
         "task_status": NativeCodexTaskStatus.SUCCESS,
         "success": True,
@@ -603,10 +659,10 @@ def test_native_codex_rollout_uses_final_cumulative_total_once(
     with rollout.open("rb") as stream:
         if raises:
             with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-                usage_native_codex._parse_rollout(stream.fileno(), manifest)  # pyright: ignore[reportPrivateUsage]
+                usage_native_codex._parse_rollout(stream.fileno(), manifest, "0.147.0")  # pyright: ignore[reportPrivateUsage]
             return
         session, totals, _parent, matches, consumed = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
-            stream.fileno(), manifest
+            stream.fileno(), manifest, "0.147.0"
         )
     assert session == "leaf-811"
     assert matches is expected_match
@@ -782,7 +838,7 @@ def test_native_codex_parser_rejects_writable_rollout_before_reading(
 
     monkeypatch.setattr(usage_native_codex, "_json", unexpected_json)
     with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+        usage_native_codex._parse_rollout(stream.fileno(), {}, "0.147.0")  # pyright: ignore[reportPrivateUsage]
 
 
 def test_native_codex_inventory_rejects_renamed_pre_ready_inode(tmp_path: Path) -> None:
@@ -1098,7 +1154,7 @@ def test_native_codex_rollout_rejects_drifting_observed_root_schema(tmp_path: Pa
         "effort": "high",
     }
     with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+        usage_native_codex._parse_rollout(stream.fileno(), binding, "0.147.0")  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.parametrize("discriminator", [["event_msg"], {"type": "event_msg"}])
@@ -1112,7 +1168,7 @@ def test_native_codex_parser_rejects_non_string_root_discriminator(
         + "\n"
     )
     with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+        usage_native_codex._parse_rollout(stream.fileno(), {}, "0.147.0")  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.parametrize("value", [["token_count"], {"type": "token_count"}])
@@ -1152,7 +1208,7 @@ def test_native_codex_parser_rejects_non_string_nested_discriminator(
         + "\n"
     )
     with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+        usage_native_codex._parse_rollout(stream.fileno(), {}, "0.147.0")  # pyright: ignore[reportPrivateUsage]
 
 
 def test_native_codex_parser_enforces_actual_bytes_after_initial_stat(
@@ -1164,7 +1220,9 @@ def test_native_codex_parser_enforces_actual_bytes_after_initial_stat(
     monkeypatch.setattr(usage_native_codex, "MAX_PROVIDER_FILE_BYTES", 1)
     with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
         usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
-            stream.fileno(), {"parent": "parent-811", "path": "/root/leaf", "role": "engineer-be"}
+            stream.fileno(),
+            {"parent": "parent-811", "path": "/root/leaf", "role": "engineer-be"},
+            "0.147.0",
         )
 
 
@@ -1183,7 +1241,7 @@ def test_native_codex_malformed_candidate_withholds_whole_tree_proof(
     with rollout.open("rb") as stream:
         assert usage_native_codex._candidate_binding(stream.fileno(), binding) is None  # pyright: ignore[reportPrivateUsage]
         with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-            usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+            usage_native_codex._parse_rollout(stream.fileno(), binding, "0.147.0")  # pyright: ignore[reportPrivateUsage]
 
 
 def test_native_codex_parses_unrelated_root_session_without_leaf_requirements(
@@ -1228,7 +1286,7 @@ def test_native_codex_parses_unrelated_root_session_without_leaf_requirements(
     }
     with rollout.open("rb") as stream:
         session, totals, parent, matches, _consumed = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
-            stream.fileno(), binding
+            stream.fileno(), binding, "0.147.0"
         )
     assert (session, totals, parent, matches) == ("root-811", (0, 0, 0, 0, 0, 0), "", False)
 
@@ -1276,7 +1334,7 @@ def test_native_codex_rejects_mismatched_or_nontext_session_identifiers(
         + "\n"
     )
     with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+        usage_native_codex._parse_rollout(stream.fileno(), {}, "0.147.0")  # pyright: ignore[reportPrivateUsage]
 
 
 def test_native_codex_rejects_task_started_before_turn_context(tmp_path: Path) -> None:
@@ -1335,13 +1393,13 @@ def test_native_codex_rejects_task_started_before_turn_context(tmp_path: Path) -
 
     ordered = write("ordered.jsonl", (meta, context, started))
     with ordered.open("rb") as stream:
-        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+        usage_native_codex._parse_rollout(stream.fileno(), {}, "0.147.0")  # pyright: ignore[reportPrivateUsage]
     malformed = write("context-after-start.jsonl", (meta, started, context))
     with (
         malformed.open("rb") as stream,
         pytest.raises(usage_native_codex.NativeCodexCaptureError),
     ):
-        usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+        usage_native_codex._parse_rollout(stream.fileno(), {}, "0.147.0")  # pyright: ignore[reportPrivateUsage]
 
 
 def test_native_codex_rejects_out_of_order_or_repeated_task_events(tmp_path: Path) -> None:
@@ -1404,7 +1462,7 @@ def test_native_codex_rejects_out_of_order_or_repeated_task_events(tmp_path: Pat
             rollout.open("rb") as stream,
             pytest.raises(usage_native_codex.NativeCodexCaptureError),
         ):
-            usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+            usage_native_codex._parse_rollout(stream.fileno(), binding, "0.147.0")  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.parametrize(
@@ -1520,10 +1578,10 @@ def test_native_codex_response_items_require_active_task_window(
     )
     with rollout.open("rb") as stream:
         if accepts:
-            usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+            usage_native_codex._parse_rollout(stream.fileno(), {}, "0.147.0")  # pyright: ignore[reportPrivateUsage]
         else:
             with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-                usage_native_codex._parse_rollout(stream.fileno(), {})  # pyright: ignore[reportPrivateUsage]
+                usage_native_codex._parse_rollout(stream.fileno(), {}, "0.147.0")  # pyright: ignore[reportPrivateUsage]
 
 
 def test_native_codex_rejects_decreasing_cumulative_token_totals(tmp_path: Path) -> None:
@@ -1631,7 +1689,7 @@ def test_native_codex_rejects_decreasing_cumulative_token_totals(tmp_path: Path)
         )
     )
     with unknown.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+        usage_native_codex._parse_rollout(stream.fileno(), binding, "0.147.0")  # pyright: ignore[reportPrivateUsage]
     rollout = tmp_path / "decreasing.jsonl"
     rollout.write_text(
         "".join(
@@ -1640,7 +1698,7 @@ def test_native_codex_rejects_decreasing_cumulative_token_totals(tmp_path: Path)
         )
     )
     with rollout.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+        usage_native_codex._parse_rollout(stream.fileno(), binding, "0.147.0")  # pyright: ignore[reportPrivateUsage]
 
 
 def test_native_codex_streams_two_mebibyte_content_event_at_exact_boundary(tmp_path: Path) -> None:
@@ -1726,7 +1784,7 @@ def test_native_codex_streams_two_mebibyte_content_event_at_exact_boundary(tmp_p
     rollout.write_bytes(preamble + exact)
     with rollout.open("rb") as stream:
         _session, totals, _parent, matches, consumed = usage_native_codex._parse_rollout(  # pyright: ignore[reportPrivateUsage]
-            stream.fileno(), binding
+            stream.fileno(), binding, "0.147.0"
         )
     assert totals == (0, 0, 0, 0, 0, 0) and matches is False
     assert consumed == rollout.stat().st_size
@@ -1738,7 +1796,7 @@ def test_native_codex_streams_two_mebibyte_content_event_at_exact_boundary(tmp_p
     one_over = tmp_path / "one-over.jsonl"
     one_over.write_bytes(preamble + exact[:-1] + b"S\n")
     with one_over.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+        usage_native_codex._parse_rollout(stream.fileno(), binding, "0.147.0")  # pyright: ignore[reportPrivateUsage]
 
 
 def test_native_codex_bounded_reader_rejects_partial_and_count_overflow(
@@ -1754,13 +1812,13 @@ def test_native_codex_bounded_reader_rejects_partial_and_count_overflow(
     partial = tmp_path / "partial.jsonl"
     partial.write_bytes(b'{"ordinal":0}')
     with partial.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+        usage_native_codex._parse_rollout(stream.fileno(), binding, "0.147.0")  # pyright: ignore[reportPrivateUsage]
 
     monkeypatch.setattr(usage_native_codex, "MAX_PROVIDER_LINES", 1)
     overflow = tmp_path / "overflow.jsonl"
     overflow.write_bytes(b"{}\n{}\n")
     with overflow.open("rb") as stream, pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex._parse_rollout(stream.fileno(), binding)  # pyright: ignore[reportPrivateUsage]
+        usage_native_codex._parse_rollout(stream.fileno(), binding, "0.147.0")  # pyright: ignore[reportPrivateUsage]
 
 
 def test_native_codex_json_depth_fails_closed() -> None:
@@ -3217,7 +3275,7 @@ def test_native_codex_supervisor_usage_root_replacement_appends_nothing(
         return usage_native_codex._CandidateMetadata(True, None)  # pyright: ignore[reportPrivateUsage]
 
     def parse(
-        _fd: int, _binding: dict[str, str]
+        _fd: int, _binding: dict[str, str], _expected_version: str
     ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
         return "leaf", (0, 0, 0, 0, 0, 0), "", True, 0
 
@@ -3345,6 +3403,7 @@ def test_native_codex_record_persists_exact_registration_hashes() -> None:
         "final_head_sha": "b" * 40,
         "parent_thread_id": "thread-811",
         "leaf_session_id": "leaf-811",
+        "harness_version": "0.147.0",
         "task_status": NativeCodexTaskStatus.SUCCESS,
         "success": True,
         "started_at": started,
@@ -3587,7 +3646,7 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
         return entries
 
     def parse_rollout(
-        _fd: int, _binding: dict[str, str]
+        _fd: int, _binding: dict[str, str], _expected_version: str
     ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
         nonlocal parsed_after_terminal
         if not parsed_after_terminal:
@@ -4546,7 +4605,7 @@ def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
     )  # pyright: ignore[reportUnknownArgumentType,reportUnknownLambdaType]
 
     def parse_rollout(
-        descriptor: int, _binding: dict[str, str]
+        descriptor: int, _binding: dict[str, str], _expected_version: str
     ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
         return "leaf", (0, 0, 0, 0, 0, 0), "", descriptor == 90, 0
 
@@ -4615,7 +4674,7 @@ def test_native_codex_supervisor_rejects_aggregate_actual_candidate_growth(
         ]
 
     def parse(
-        _fd: int, _binding: dict[str, str]
+        _fd: int, _binding: dict[str, str], _expected_version: str
     ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
         return "leaf", (0, 0, 0, 0, 0, 0), "", _fd == candidates[0], 4
 
@@ -4709,7 +4768,7 @@ def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
         ]
 
     def parse_rollout(
-        descriptor: int, _binding: dict[str, str]
+        descriptor: int, _binding: dict[str, str], _expected_version: str
     ) -> tuple[str, tuple[int, int, int, int, int, int], str, bool, int]:
         if failure == "later_parse_error" and descriptor == candidates[1]:
             raise usage_native_codex.NativeCodexCaptureError("invalid rollout")
@@ -4805,7 +4864,12 @@ def test_owned_transcript_counts_identical_assistant_usage_once(
     monkeypatch.setattr(usage_transcript.Path, "home", lambda: home)
 
     usage = usage_transcript.parse_owned_transcript(
-        tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high", expected_permission_mode="auto"
+        tmp_path,
+        session_id,
+        NativeClaudeRole.ENGINEER_BE,
+        "high",
+        expected_version="2.1.233",
+        expected_permission_mode="auto",
     )
 
     assert usage.usage_message_count == 1
@@ -4875,6 +4939,7 @@ def test_owned_transcript_tolerates_non_terminal_tool_activity_rows(
         session_id,
         NativeClaudeRole.QA,
         "high",
+        expected_version="2.1.233",
         expected_permission_mode="dontAsk",
         require_handback=True,
     )
@@ -4892,7 +4957,9 @@ def test_historical_2_1_231_stream_fixtures_reject_current_version(fixture: str)
     """Current stream admission rejects each retained historical Claude version fixture."""
     content = (FIXTURES / fixture).read_bytes()
     with pytest.raises(ClaudeUsageParseError, match="unverified Claude version") as error:
-        parse_claude_stream(BytesIO(content), require_launch_authority=True)
+        parse_claude_stream(
+            BytesIO(content), expected_version="2.1.233", require_launch_authority=True
+        )
     assert "SYNTHETIC" not in str(error.value)
 
 
@@ -4923,7 +4990,12 @@ def test_historical_2_1_231_transcript_fixtures_reject_current_version(
     _, installed_session = _install_owned_transcript(tmp_path, monkeypatch, content, session_id)
     with pytest.raises(usage_transcript.TranscriptError) as error:
         usage_transcript.parse_owned_transcript(
-            tmp_path, installed_session, role, "high", expected_permission_mode="auto"
+            tmp_path,
+            installed_session,
+            role,
+            "high",
+            expected_version="2.1.233",
+            expected_permission_mode="auto",
         )
     assert str(error.value) == "owned Claude transcript is invalid"
     assert "SYNTHETIC" not in str(error.value)
@@ -4939,7 +5011,12 @@ def test_owned_transcript_accepts_repeated_matching_agent_setting(
     transcript, session_id = _install_owned_transcript(tmp_path, monkeypatch, repeated)
 
     usage = usage_transcript.parse_owned_transcript(
-        tmp_path, session_id, NativeClaudeRole.ENGINEER_BE, "high", expected_permission_mode="auto"
+        tmp_path,
+        session_id,
+        NativeClaudeRole.ENGINEER_BE,
+        "high",
+        expected_version="2.1.233",
+        expected_permission_mode="auto",
     )
 
     assert usage.usage_message_count == 1
@@ -4988,6 +5065,7 @@ def test_owned_transcript_rejects_closed_mutations(
             session_id,
             NativeClaudeRole.ENGINEER_BE,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="auto",
         )
     after = transcript.stat()
@@ -5055,7 +5133,12 @@ def test_owned_transcript_parses_every_committed_2_1_233_role_fixture(
     session_id = json.loads(content.splitlines()[0])["sessionId"]
     _, installed_session_id = _install_owned_transcript(tmp_path, monkeypatch, content, session_id)
     usage = usage_transcript.parse_owned_transcript(
-        tmp_path, installed_session_id, role, effort, expected_permission_mode=permission_mode
+        tmp_path,
+        installed_session_id,
+        role,
+        effort,
+        expected_version="2.1.233",
+        expected_permission_mode=permission_mode,
     )
     assert usage.model == model
     assert usage.usage_message_count == message_count
@@ -5126,6 +5209,7 @@ def test_owned_transcript_mode_row_admits_exact_shape_only(
             session_id,
             NativeClaudeRole.STORY_PLANNER,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="dontAsk",
         )
 
@@ -5183,6 +5267,7 @@ def test_owned_transcript_ai_title_row_admits_exact_shape_only(
             session_id,
             NativeClaudeRole.QA,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="dontAsk",
         )
 
@@ -5205,6 +5290,7 @@ def test_native_transcript_binds_model_and_effort_to_the_pinned_role(
         session_id,
         NativeClaudeRole.STORY_PLANNER,
         planner_pin.effort,
+        expected_version="2.1.233",
         expected_permission_mode="dontAsk",
     )
     assert usage.model == "claude-fable-5" != planner_pin.model
@@ -5224,6 +5310,7 @@ def test_native_transcript_binds_model_and_effort_to_the_pinned_role(
             session_id,
             NativeClaudeRole.QA,
             qa_pin.effort,
+            expected_version="2.1.233",
             expected_permission_mode="dontAsk",
         )
 
@@ -5235,6 +5322,7 @@ def test_native_transcript_binds_model_and_effort_to_the_pinned_role(
         session_id,
         NativeClaudeRole.QA,
         qa_pin.effort,
+        expected_version="2.1.233",
         expected_permission_mode="dontAsk",
     )
     assert usage.model == qa_pin.model == "claude-sonnet-5"
@@ -5263,6 +5351,7 @@ def test_owned_transcript_rejects_unsafe_exact_file_types(
             session_id,
             NativeClaudeRole.ENGINEER_BE,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="auto",
         )
 
@@ -5281,6 +5370,7 @@ def test_owned_transcript_rejects_subagents_and_lifecycle_skew(
             session_id,
             NativeClaudeRole.ENGINEER_BE,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="auto",
         )
     (session_tree / "subagents").rmdir()
@@ -5293,6 +5383,7 @@ def test_owned_transcript_rejects_subagents_and_lifecycle_skew(
             "high",
             started_at=datetime(2026, 8, 1, tzinfo=UTC),
             completed_at=datetime(2026, 8, 1, tzinfo=UTC),
+            expected_version="2.1.233",
             expected_permission_mode="auto",
         )
 
@@ -5499,6 +5590,7 @@ def test_owned_transcript_rejects_jsonl_and_binding_boundaries(
             session_id,
             NativeClaudeRole.ENGINEER_BE,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="auto",
         )
     assert transcript.read_bytes() != b""
@@ -5529,6 +5621,7 @@ def test_owned_transcript_rejects_remaining_identity_and_usage_mutations(
                 session_id,
                 NativeClaudeRole.ENGINEER_BE,
                 "high",
+                expected_version="2.1.233",
                 expected_permission_mode="auto",
             )
         assert transcript.read_bytes() == variant
@@ -5555,6 +5648,7 @@ def test_owned_transcript_rejects_assistant_root_agent_id_without_retaining_cont
             session_id,
             NativeClaudeRole.ENGINEER_BE,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="auto",
         )
     assert str(error.value) == "owned Claude transcript is invalid"
@@ -5591,6 +5685,7 @@ def test_owned_transcript_errors_are_fixed_and_content_free(
             session_id,
             NativeClaudeRole.ENGINEER_BE,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="auto",
         )
     assert str(error.value) in {
@@ -5622,6 +5717,7 @@ def test_owned_transcript_reader_never_mutates_its_exact_file(
             session_id,
             NativeClaudeRole.ENGINEER_BE,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="auto",
         ).usage_message_count
         == 1
@@ -5647,6 +5743,7 @@ def test_owned_transcript_rejects_row_and_file_bounds(
             session_id,
             NativeClaudeRole.ENGINEER_BE,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="auto",
         )
     monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_ROWS", 500_000)
@@ -5657,6 +5754,7 @@ def test_owned_transcript_rejects_row_and_file_bounds(
             session_id,
             NativeClaudeRole.ENGINEER_BE,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="auto",
         )
     monkeypatch.setattr(usage_transcript, "MAX_TRANSCRIPT_ROW_BYTES", 4 * 1024 * 1024)
@@ -5667,6 +5765,7 @@ def test_owned_transcript_rejects_row_and_file_bounds(
             session_id,
             NativeClaudeRole.ENGINEER_BE,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="auto",
         )
     assert transcript.read_bytes() == content
@@ -7695,6 +7794,17 @@ def isolate_run_metadata_validation(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(usage_cli, "_validate_worktree_metadata", skip_worktree_validation)
 
+    def resolved_executable(_harness: HarnessFamily) -> str:
+        """Keep supervisor units on a local synthetic executable path."""
+        return "/stub/harness"
+
+    def harness_version(_executable: str) -> str:
+        """Bind legacy supervisor fixtures to their sanctioned Codex version."""
+        return "0.147.0"
+
+    monkeypatch.setattr(usage_cli, "_resolved_executable", resolved_executable)
+    monkeypatch.setattr(usage_cli, "_harness_version", harness_version)
+
 
 def _stream(*events: str) -> BytesIO:
     """Build a binary JSONL stream matching the future fixed subprocess stdout type."""
@@ -7703,7 +7813,7 @@ def _stream(*events: str) -> BytesIO:
 
 def _parse_claude_lax(stream: BinaryIO) -> ParsedUsage:
     """Parse a sanitized fixture without asserting a live launch boundary."""
-    return parse_claude_stream(stream, require_launch_authority=False)
+    return parse_claude_stream(stream, expected_version="2.1.233", require_launch_authority=False)
 
 
 def _exception_chain(exception: BaseException) -> tuple[BaseException, ...]:
@@ -7909,6 +8019,7 @@ def test_claude_fixture_uses_whole_tree_terminal_model_usage() -> None:
     init_event["permissionMode"] = "plan"
     usage = parse_claude_stream(
         _stream("\n".join(json.dumps(event) for event in historical) + "\n"),
+        expected_version="2.1.233",
         require_launch_authority=False,
     )
 
@@ -7946,7 +8057,9 @@ def test_claude_2_1_233_fixture_matches_frozen_grammar_without_content() -> None
     fixture = FIXTURES / "claude-2.1.233.jsonl"
     events = [json.loads(line) for line in fixture.read_text().splitlines()]
     with fixture.open("rb") as stream:
-        usage = parse_claude_stream(stream, require_launch_authority=True)
+        usage = parse_claude_stream(
+            stream, expected_version="2.1.233", require_launch_authority=True
+        )
 
     assert {event["type"] for event in events} <= CLAUDE_EVENT_TYPES
     assert frozenset({"system", "assistant", "rate_limit_event", "result"}) == CLAUDE_EVENT_TYPES
@@ -7971,7 +8084,11 @@ def test_claude_2_1_233_fixture_matches_frozen_grammar_without_content() -> None
 
     terminal["usage"]["SANITIZED_MESSAGE"] = 0
     with pytest.raises(ClaudeUsageParseError) as exc_info:
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
+        parse_claude_stream(
+            _stream(json.dumps(terminal) + "\n"),
+            expected_version="2.1.233",
+            require_launch_authority=False,
+        )
     assert "SANITIZED_MESSAGE" not in str(exc_info.value)
 
 
@@ -7980,7 +8097,9 @@ def test_claude_2_1_233_native_fixture_records_observed_stream_and_authority_rej
     fixture = FIXTURES / "claude-2.1.233-native.jsonl"
     events = [json.loads(line) for line in fixture.read_text().splitlines()]
     with fixture.open("rb") as stream:
-        usage = parse_claude_stream(stream, require_launch_authority=False)
+        usage = parse_claude_stream(
+            stream, expected_version="2.1.233", require_launch_authority=False
+        )
 
     assert {event["type"] for event in events} == CLAUDE_EVENT_TYPES
     assert {
@@ -8003,13 +8122,15 @@ def test_claude_2_1_233_native_fixture_records_observed_stream_and_authority_rej
     for sentinel in ("message_synthetic_native", "request_synthetic_native", "00000000-"):
         assert sentinel not in serialized
     with fixture.open("rb") as stream, pytest.raises(ClaudeAuthorityError, match="not attested"):
-        parse_claude_stream(stream, require_launch_authority=True)
+        parse_claude_stream(stream, expected_version="2.1.233", require_launch_authority=True)
 
 
 def test_claude_retired_stream_event_type_fails_closed() -> None:
     """``user`` is retired: no supplied 2.1.233 fixture observes it as a stream event."""
     with pytest.raises(ClaudeUsageParseError, match="unknown Claude event type"):
-        parse_claude_stream(_stream('{"type":"user"}\n'), require_launch_authority=False)
+        parse_claude_stream(
+            _stream('{"type":"user"}\n'), expected_version="2.1.233", require_launch_authority=False
+        )
 
 
 def test_claude_retired_default_permission_mode_fails_closed() -> None:
@@ -8018,7 +8139,11 @@ def test_claude_retired_default_permission_mode_fails_closed() -> None:
     init["permissionMode"] = "default"
     for strict in (False, True):
         with pytest.raises(ClaudeAuthorityError, match="init authority is malformed"):
-            parse_claude_stream(_stream(json.dumps(init) + "\n"), require_launch_authority=strict)
+            parse_claude_stream(
+                _stream(json.dumps(init) + "\n"),
+                expected_version="2.1.233",
+                require_launch_authority=strict,
+            )
 
 
 @pytest.mark.parametrize(
@@ -8036,7 +8161,11 @@ def test_claude_retired_failure_subtypes_fail_closed(subtype: str) -> None:
     terminal["subtype"] = subtype
     terminal["is_error"] = True
     with pytest.raises(ClaudeUsageParseError, match="status is invalid"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
+        parse_claude_stream(
+            _stream(json.dumps(terminal) + "\n"),
+            expected_version="2.1.233",
+            require_launch_authority=False,
+        )
 
 
 def test_claude_launch_authority_attestation_fails_closed() -> None:
@@ -8074,13 +8203,16 @@ def test_claude_launch_authority_attestation_fails_closed() -> None:
     legacy = (FIXTURES / "claude-2.1.228.jsonl").read_bytes()
     for strict in (False, True):
         with pytest.raises(ClaudeUsageParseError, match="unverified Claude version"):
-            parse_claude_stream(BytesIO(legacy), require_launch_authority=strict)
+            parse_claude_stream(
+                BytesIO(legacy), expected_version="2.1.233", require_launch_authority=strict
+            )
 
     for field, value in (("tools", ["SENTINEL_TOOL"]), ("mcp_servers", ["SENTINEL_MCP"])):
         drifted = {**init, field: value}
         with pytest.raises(ClaudeAuthorityError) as error:
             parse_claude_stream(
                 _stream(json.dumps(drifted) + "\n", json.dumps(terminal) + "\n"),
+                expected_version="2.1.233",
                 require_launch_authority=True,
             )
         assert "SENTINEL" not in str(error.value)
@@ -8091,6 +8223,7 @@ def test_claude_launch_authority_attestation_fails_closed() -> None:
             with pytest.raises(ClaudeAuthorityError) as error:
                 parse_claude_stream(
                     _stream(json.dumps(malformed) + "\n", json.dumps(terminal) + "\n"),
+                    expected_version="2.1.233",
                     require_launch_authority=strict,
                 )
             assert "SENTINEL" not in str(error.value)
@@ -8101,6 +8234,7 @@ def test_claude_launch_authority_attestation_fails_closed() -> None:
             with pytest.raises(ClaudeAuthorityError):
                 parse_claude_stream(
                     _stream(json.dumps(malformed) + "\n", json.dumps(terminal) + "\n"),
+                    expected_version="2.1.233",
                     require_launch_authority=strict,
                 )
         malformed[field] = value
@@ -8108,6 +8242,7 @@ def test_claude_launch_authority_attestation_fails_closed() -> None:
             with pytest.raises(ClaudeAuthorityError):
                 parse_claude_stream(
                     _stream(json.dumps(malformed) + "\n", json.dumps(terminal) + "\n"),
+                    expected_version="2.1.233",
                     require_launch_authority=strict,
                 )
 
@@ -8116,18 +8251,29 @@ def test_claude_launch_authority_attestation_fails_closed() -> None:
     )
     for strict in (False, True):
         with pytest.raises(ClaudeAuthorityError):
-            parse_claude_stream(BytesIO(duplicate.getvalue()), require_launch_authority=strict)
+            parse_claude_stream(
+                BytesIO(duplicate.getvalue()),
+                expected_version="2.1.233",
+                require_launch_authority=strict,
+            )
     assert (
         parse_claude_stream(
-            _stream(json.dumps(terminal) + "\n"), require_launch_authority=False
+            _stream(json.dumps(terminal) + "\n"),
+            expected_version="2.1.233",
+            require_launch_authority=False,
         ).input_tokens
         == 2
     )
     with pytest.raises(ClaudeAuthorityError):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=True)
+        parse_claude_stream(
+            _stream(json.dumps(terminal) + "\n"),
+            expected_version="2.1.233",
+            require_launch_authority=True,
+        )
     with pytest.raises(ClaudeAuthorityError):
         parse_claude_stream(
             _stream(json.dumps(terminal) + "\n", json.dumps(init) + "\n"),
+            expected_version="2.1.233",
             require_launch_authority=True,
         )
 
@@ -8139,12 +8285,18 @@ def test_claude_launch_authority_attestation_fails_closed() -> None:
             json.dumps(pre_init) + "\n", json.dumps(init) + "\n", json.dumps(terminal) + "\n"
         )
         with pytest.raises(ClaudeAuthorityError) as error:
-            parse_claude_stream(BytesIO(stream.getvalue()), require_launch_authority=True)
+            parse_claude_stream(
+                BytesIO(stream.getvalue()),
+                expected_version="2.1.233",
+                require_launch_authority=True,
+            )
         assert str(error.value) == "Claude init authority is not attested"
         assert "PRE_INIT_SENTINEL" not in str(error.value)
         assert (
             parse_claude_stream(
-                BytesIO(stream.getvalue()), require_launch_authority=False
+                BytesIO(stream.getvalue()),
+                expected_version="2.1.233",
+                require_launch_authority=False,
             ).input_tokens
             == 2
         )
@@ -8228,13 +8380,16 @@ def test_parser_errors_do_not_echo_untrusted_discriminators() -> None:
 
     with pytest.raises(ClaudeUsageParseError) as claude_type_error:
         parse_claude_stream(
-            _stream(json.dumps({"type": sentinel}) + "\n"), require_launch_authority=False
+            _stream(json.dumps({"type": sentinel}) + "\n"),
+            expected_version="2.1.233",
+            require_launch_authority=False,
         )
     assert sentinel not in str(claude_type_error.value)
 
     with pytest.raises(ClaudeUsageParseError) as claude_subtype_error:
         parse_claude_stream(
             _stream(json.dumps({"type": "system", "subtype": sentinel}) + "\n"),
+            expected_version="2.1.233",
             require_launch_authority=False,
         )
     assert sentinel not in str(claude_subtype_error.value)
@@ -8245,7 +8400,11 @@ def test_malformed_or_missing_terminal_usage_fails_closed() -> None:
     with pytest.raises(CodexUsageParseError, match="terminal"):
         parse_codex_stream(_stream('{"type":"turn.started"}\n'))
     with pytest.raises(ClaudeUsageParseError, match="terminal"):
-        parse_claude_stream(_stream('{"type":"assistant"}\n'), require_launch_authority=False)
+        parse_claude_stream(
+            _stream('{"type":"assistant"}\n'),
+            expected_version="2.1.233",
+            require_launch_authority=False,
+        )
     with pytest.raises(CodexUsageParseError, match="schema"):
         parse_codex_stream(_stream('{"type":"turn.completed","usage":{"input_tokens":1}}\n'))
     with pytest.raises(CodexUsageParseError):
@@ -8370,7 +8529,9 @@ def test_binary_stream_ingestion_rejects_overlong_partial_and_invalid_utf8_event
     with pytest.raises(CodexUsageParseError, match="partial event"):
         parse_codex_stream(BytesIO(b'{"type":"turn.started"}'))
     with pytest.raises(ClaudeUsageParseError, match="invalid UTF-8"):
-        parse_claude_stream(BytesIO(b"\xff\n"), require_launch_authority=False)
+        parse_claude_stream(
+            BytesIO(b"\xff\n"), expected_version="2.1.233", require_launch_authority=False
+        )
     with pytest.raises(CodexUsageParseError, match="malformed Codex JSON"):
         parse_codex_stream(BytesIO(b"{not-json}\n"))
 
@@ -8431,7 +8592,7 @@ def test_malformed_claude_json_does_not_retain_provider_text() -> None:
     sentinel = "JSON_SENTINEL"
     with pytest.raises(ClaudeUsageParseError, match="malformed Claude JSONL event") as error:
         usage_claude._event_from_line(  # pyright: ignore[reportPrivateUsage]
-            '{"type":"system","payload":"JSON_SENTINEL",}'
+            '{"type":"system","payload":"JSON_SENTINEL",}', expected_version="2.1.233"
         )
     exception = error.value
     assert exception.__cause__ is None
@@ -8444,7 +8605,11 @@ def test_claude_utf8_error_does_not_retain_provider_bytes_transitively() -> None
     """End-to-end Claude decoding retains no raw bytes through nested exception links."""
     sentinel = "E2E_SENTINEL"
     with pytest.raises(ClaudeUsageParseError, match="usage stream contains invalid UTF-8") as error:
-        parse_claude_stream(BytesIO(b'{"k":"E2E_SENTINEL"\xff\n'), require_launch_authority=False)
+        parse_claude_stream(
+            BytesIO(b'{"k":"E2E_SENTINEL"\xff\n'),
+            expected_version="2.1.233",
+            require_launch_authority=False,
+        )
     exception = error.value
     assert exception.__cause__ is None
     assert exception.__context__ is None
@@ -8457,7 +8622,9 @@ def test_malformed_claude_stream_does_not_retain_provider_text() -> None:
     sentinel = "MALFORMED_SENTINEL"
     with pytest.raises(ClaudeUsageParseError, match="malformed Claude JSONL event") as error:
         parse_claude_stream(
-            BytesIO(b'{"type" "MALFORMED_SENTINEL"}\n'), require_launch_authority=False
+            BytesIO(b'{"type" "MALFORMED_SENTINEL"}\n'),
+            expected_version="2.1.233",
+            require_launch_authority=False,
         )
     exception = error.value
     assert exception.__cause__ is None
@@ -8476,7 +8643,9 @@ def test_malformed_claude_stream_does_not_retain_provider_text() -> None:
 def test_claude_bounded_stream_errors_preserve_fixed_messages(stream: bytes, message: str) -> None:
     """Claude translates every bounded-reader failure without changing its fixed text."""
     with pytest.raises(ClaudeUsageParseError, match=message) as error:
-        parse_claude_stream(BytesIO(stream), require_launch_authority=False)
+        parse_claude_stream(
+            BytesIO(stream), expected_version="2.1.233", require_launch_authority=False
+        )
     exception = error.value
     assert exception.__cause__ is None
     assert exception.__context__ is None
@@ -8490,7 +8659,7 @@ def test_claude_duplicate_key_error_remains_outside_json_decode_translation() ->
         ClaudeUsageParseError, match="Claude event contains duplicate JSON keys"
     ) as error:
         usage_claude._event_from_line(  # pyright: ignore[reportPrivateUsage]
-            '{"type":"system","type":"system"}'
+            '{"type":"system","type":"system"}', expected_version="2.1.233"
         )
     assert _exception_chain(error.value) == ()
 
@@ -8814,7 +8983,11 @@ def test_claude_terminal_usage_missing_installed_key_fails_closed(removed_key: s
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     del terminal["usage"][removed_key]
     with pytest.raises(ClaudeUsageParseError, match="usage schema"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
+        parse_claude_stream(
+            _stream(json.dumps(terminal) + "\n"),
+            expected_version="2.1.233",
+            require_launch_authority=False,
+        )
 
 
 def test_claude_terminal_usage_extra_or_model_usage_drift_fails_closed() -> None:
@@ -8822,7 +8995,11 @@ def test_claude_terminal_usage_extra_or_model_usage_drift_fails_closed() -> None
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     terminal["usage"]["unknown"] = 0
     with pytest.raises(ClaudeUsageParseError, match="usage schema"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
+        parse_claude_stream(
+            _stream(json.dumps(terminal) + "\n"),
+            expected_version="2.1.233",
+            require_launch_authority=False,
+        )
 
 
 def test_claude_duplicate_json_keys_fail_closed() -> None:
@@ -8834,7 +9011,9 @@ def test_claude_duplicate_json_keys_fail_closed() -> None:
     )
     for stream in (duplicate_result, duplicate_model):
         with pytest.raises(ClaudeUsageParseError, match="duplicate JSON keys"):
-            parse_claude_stream(BytesIO(stream), require_launch_authority=False)
+            parse_claude_stream(
+                BytesIO(stream), expected_version="2.1.233", require_launch_authority=False
+            )
 
 
 @pytest.mark.parametrize(
@@ -8846,7 +9025,11 @@ def test_claude_terminal_requires_observed_success_status(field: str, value: obj
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     terminal[field] = value
     with pytest.raises(ClaudeUsageParseError, match="status is invalid"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
+        parse_claude_stream(
+            _stream(json.dumps(terminal) + "\n"),
+            expected_version="2.1.233",
+            require_launch_authority=False,
+        )
 
 
 @pytest.mark.parametrize(
@@ -8864,7 +9047,11 @@ def test_claude_2_1_228_failure_statuses_are_retired_rejection_evidence(subtype:
     terminal["subtype"] = subtype
     terminal["is_error"] = True
     with pytest.raises(ClaudeUsageParseError, match="status is invalid"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
+        parse_claude_stream(
+            _stream(json.dumps(terminal) + "\n"),
+            expected_version="2.1.233",
+            require_launch_authority=False,
+        )
 
 
 def test_claude_malformed_top_level_usage_and_non_finite_model_sum_fail_closed() -> None:
@@ -8872,18 +9059,30 @@ def test_claude_malformed_top_level_usage_and_non_finite_model_sum_fail_closed()
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     terminal["usage"]["input_tokens"] = "invalid"
     with pytest.raises(ClaudeUsageParseError, match="malformed Claude usage field"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
+        parse_claude_stream(
+            _stream(json.dumps(terminal) + "\n"),
+            expected_version="2.1.233",
+            require_launch_authority=False,
+        )
 
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     for model in terminal["modelUsage"].values():
         model["costUSD"] = 1e308
     with pytest.raises(ClaudeUsageParseError, match="modelUsage costUSD sum"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
+        parse_claude_stream(
+            _stream(json.dumps(terminal) + "\n"),
+            expected_version="2.1.233",
+            require_launch_authority=False,
+        )
 
     terminal = json.loads((FIXTURES / "claude-2.1.228.jsonl").read_text().splitlines()[-1])
     terminal["modelUsage"]["synthetic-primary"]["unknown"] = 0
     with pytest.raises(ClaudeUsageParseError, match="modelUsage schema"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
+        parse_claude_stream(
+            _stream(json.dumps(terminal) + "\n"),
+            expected_version="2.1.233",
+            require_launch_authority=False,
+        )
 
 
 def test_whole_tree_defaults_false_and_incomplete_usage_rejects_totals() -> None:
@@ -8923,7 +9122,11 @@ def test_non_finite_json_estimates_reject_at_parser_boundary(field: str) -> None
     else:
         terminal["modelUsage"]["synthetic-primary"][field] = float("nan")
     with pytest.raises(ClaudeUsageParseError, match="malformed Claude usage field"):
-        parse_claude_stream(_stream(json.dumps(terminal) + "\n"), require_launch_authority=False)
+        parse_claude_stream(
+            _stream(json.dumps(terminal) + "\n"),
+            expected_version="2.1.233",
+            require_launch_authority=False,
+        )
 
 
 def test_sink_uses_private_modes_and_refuses_symlink(
@@ -11206,6 +11409,7 @@ def test_handback_extracts_ordered_text_blocks_and_skips_thinking(
         session_id,
         NativeClaudeRole.STORY_PLANNER,
         "high",
+        expected_version="2.1.233",
         expected_permission_mode="dontAsk",
         require_handback=True,
     )
@@ -11226,6 +11430,7 @@ def test_handback_ignores_content_in_earlier_assistant_rows(
         installed,
         NativeClaudeRole.STORY_PLANNER,
         "high",
+        expected_version="2.1.233",
         expected_permission_mode="dontAsk",
         require_handback=True,
     )
@@ -11249,6 +11454,7 @@ def test_handback_requires_end_turn_terminal_stop_reason(
             session_id,
             NativeClaudeRole.STORY_PLANNER,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="dontAsk",
             require_handback=True,
         )
@@ -11273,6 +11479,7 @@ def test_handback_rejects_tool_use_block_in_terminal_turn(
             session_id,
             NativeClaudeRole.STORY_PLANNER,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="dontAsk",
             require_handback=True,
         )
@@ -11298,6 +11505,7 @@ def test_handback_block_allowlist_is_closed_to_text_and_thinking_only(
             session_id,
             NativeClaudeRole.STORY_PLANNER,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="dontAsk",
             require_handback=True,
         )
@@ -11329,6 +11537,7 @@ def test_handback_rejects_empty_or_malformed_content(
             session_id,
             NativeClaudeRole.STORY_PLANNER,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="dontAsk",
             require_handback=True,
         )
@@ -11349,6 +11558,7 @@ def test_handback_rejects_oversize_text(tmp_path: Path, monkeypatch: pytest.Monk
             session_id,
             NativeClaudeRole.STORY_PLANNER,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="dontAsk",
             require_handback=True,
         )
@@ -11370,6 +11580,7 @@ def test_handback_rejects_text_block_with_unfrozen_key(
             session_id,
             NativeClaudeRole.STORY_PLANNER,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="dontAsk",
             require_handback=True,
         )
@@ -11390,6 +11601,7 @@ def test_handback_is_none_and_unread_when_not_required(
         session_id,
         NativeClaudeRole.STORY_PLANNER,
         "high",
+        expected_version="2.1.233",
         expected_permission_mode="dontAsk",
     )
     assert usage.handback_text is None
@@ -11726,6 +11938,7 @@ def test_transcript_permission_mode_attestation_rejects_mismatch(
             installed,
             NativeClaudeRole.STORY_PLANNER,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="dontAsk",
         )
 
@@ -11745,6 +11958,7 @@ def test_transcript_permission_mode_attestation_rejects_omission(
             installed,
             NativeClaudeRole.STORY_PLANNER,
             "high",
+            expected_version="2.1.233",
             expected_permission_mode="dontAsk",
         )
 

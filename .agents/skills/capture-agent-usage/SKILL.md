@@ -41,7 +41,10 @@ the committed roles `engineer-be`, `engineer-fe`, `mcp-contract-checker`,
 `planning-architect`, `pr-triage`, `product-auditor`, `qa`,
 `sim-roast-runner`, and `story-planner`. It derives READ_ONLY or
 WRITE capability from the committed tools, launches with the committed effort, and
-accepts only Claude 2.1.233 metadata. It reads only the generated parent transcript,
+binds the version probed from the installed authenticated CLI and requires every
+version-bearing evidence field to equal it exactly while rejecting unknown or
+changed stream/transcript structure. Generic Codex streams carry no version-bearing
+field, so that path is probe-only by design. It reads only the generated parent transcript,
 deduplicates numeric usage, rejects any subagent tree, and writes no transcript content
 or host path to the sink. `safety-reviewer` and `security-reviewer` are excluded
 because their mandatory whole-diff assurance requires the ordinary role path's

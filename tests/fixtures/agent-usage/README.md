@@ -83,3 +83,17 @@ already on the frozen `auto` mode) are unchanged by this round.
 
 No prompt, response, credential, environment value, repository path, or live
 session identifier is retained.
+
+## Observed-version binding fixtures (24 August 2026)
+
+The four `claude-2.1.241*` fixtures are lead-supplied, hash-verified sanitized
+synthetic evidence for the installed Claude CLI shape. They contain no prompt,
+response, credential, environment value, or host path; raw provider transcripts
+remain local and uncommitted. The generic and native stream fixtures preserve the
+new opaque metadata shapes without retaining their values. The WRITE (`auto`) and
+READ_ONLY (`dontAsk`) transcripts contain repeated, exactly shaped `atis-latch`
+rows whose `atis` values are discarded by the parser.
+
+Older retained Claude-version fixtures are rejection evidence: they fail when
+their version-bearing evidence disagrees with the version bound by the harness
+probe, rather than because their names appear outside an allow-list.
