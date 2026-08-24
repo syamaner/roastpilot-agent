@@ -382,7 +382,16 @@ check, not a substitute for it.
 (`.github/workflows/ci.yml:51-55`): with no worktree `.venv`, pyright has
 nothing for pyproject's `venvPath`/`venv` settings to resolve, so `qa`'s
 committed pyright gate (D168 below) resolves `--pythonpath` against the same
-external interpreter it invokes.
+external interpreter it invokes. Its Node runtime is supplied by pyright's
+`nodejs` extra and resolved through the imported `nodejs_wheel` package inside
+the root venv's site-packages: it performs no runtime download and no host
+lookup. The executable must be canonically contained under the resolved venv
+prefix, rather than assumed to occupy any particular installation location;
+never add host paths to the fixed `PATH` to satisfy this requirement. The Node
+runtime version is exact-pinned in the dev group and arrives through the same
+`pip install -e . --group dev` provisioning recipe; the Pyright and Node pins
+move together, and a root provisioned before either bump keeps its old runtime
+until it is reprovisioned.
 
 **Attestation is untouched.** `--validation-root` binds exactly
 `ROASTPILOT_VALIDATION_ROOT`, `ROASTPILOT_VALIDATION_PYTHON`,
@@ -449,7 +458,7 @@ no bypass mode. The parent is the **sole interface** to this role's exact
 gate commands: it runs `print-validation-commands --role <role>
 --validation-root <root>` (`capture_usage_cli.py`) and pastes that verbatim
 output into the role's brief. This runbook intentionally does not restate
-those seven dynamic command strings — they depend on the per-run root and
+those ten dynamic command strings — they depend on the per-run root and
 only `print-validation-commands` can render them correctly, from the same
 table that builds the argv rules. Exactly one rule (`qa`'s `pytest` gate) is
 a *prefix* rule; it admits arbitrary pytest arguments and the execution of
@@ -459,6 +468,15 @@ parent-authored prompts, the per-run `0700` external root, the redirected
 cache/temp/coverage destinations above, and the unchanged byte-clean,
 unchanged-head post-exit attestation that still yields no record and no
 handback if anything lands in the worktree.
+
+The three validation roles' gate commands begin from an empty environment and
+reinstate only a closed, root-derived set, so the #773 protection applies even
+when a parent runs a `RUN` line in an ordinary shell. The three
+`ROASTPILOT_VALIDATION_*` keys are deliberately absent from the gate child;
+containment redirections remain, with `PYTEST_ADDOPTS` rendered as an explicit
+pytest cache option. This does not alter the launched role's twelve-key
+environment. The non-atomicity caveat above also applies when the verification
+and later `RUN` lines are separate calls.
 
 ## Parent-provisioned bound roots for read-only capture runs (D169)
 

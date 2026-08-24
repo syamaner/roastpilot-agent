@@ -37,6 +37,7 @@ import capture_usage_models as usage_models
 import capture_usage_native_codex as usage_native_codex
 import capture_usage_transcript as usage_transcript
 import pytest
+import test_worktree_gate_recipe as worktree_gate_recipe
 from capture_usage_claude import (
     CLAUDE_EVENT_TYPES,
     CLAUDE_MODEL_USAGE_KEYS,
@@ -73,6 +74,7 @@ from capture_usage_models import (
     NATIVE_ROLE_EXCLUSIONS,
     PLAN_ROOT_ENVIRONMENT_KEY,
     VALIDATION_ENVIRONMENT_ROLES,
+    VALIDATION_ENVIRONMENT_VERIFY_COMMAND,
     VALIDATION_ROLE_COMMANDS,
     BoundedStreamError,
     BoundRoot,
@@ -93,8 +95,12 @@ from capture_usage_models import (
     UsageRecord,
     ValidationCommandKind,
     bounded_jsonl_lines,
+    is_scrubbed_environment_name,
     render_allowed_tools,
+    render_gate_environment,
+    render_gate_scrub_prefix,
     render_validation_commands,
+    validation_environment_values,
 )
 from capture_usage_models import (
     USAGE_RECORD_ADAPTER as _USAGE_RECORD_ADAPTER,  # pyright: ignore[reportUnknownVariableType]
@@ -5777,25 +5783,37 @@ def test_render_allowed_tools_is_exact_literal_per_role() -> None:
     root = "/validated/root"
     python = f"{root}/venv/bin/python"
     tmp = f"{root}/tmp"
+    cache = f"{root}/cache"
+    scrub = render_gate_scrub_prefix(root)
+    verify = (
+        f"{scrub} {python} -m pytest tests/gate/test_gate_environment.py -q "
+        f"-o cache_dir={cache}/pytest --basetemp {tmp}/pytest"
+    )
     assert render_allowed_tools(NativeClaudeRole.QA, root) == (
-        f"Bash({python} -m pytest:*)",
-        f"Bash({python} -m pyright --pythonpath {python})",
-        f"Bash({python} -m ruff check .)",
-        f"Bash({python} -m ruff format --check .)",
+        f"Bash({verify})",
+        f"Bash({scrub} {python} -m pytest -o cache_dir={cache}/pytest:*)",
+        f"Bash({scrub} {python} -m pyright --pythonpath {python})",
+        f"Bash({scrub} {python} -m ruff check .)",
+        f"Bash({scrub} {python} -m ruff format --check .)",
     )
     assert render_allowed_tools(NativeClaudeRole.MCP_CONTRACT_CHECKER, root) == (
-        f"Bash({python} -m pip show coffee-roaster-mcp)",
-        f"Bash({python} -m pytest tests/test_mcp_client.py -q --basetemp {tmp}/pytest)",
+        f"Bash({verify})",
+        f"Bash({scrub} {python} -m pip show coffee-roaster-mcp)",
+        f"Bash({scrub} {python} -m pytest tests/test_mcp_client.py -q "
+        f"-o cache_dir={cache}/pytest --basetemp {tmp}/pytest)",
     )
     assert render_allowed_tools(NativeClaudeRole.SIM_ROAST_RUNNER, root) == (
-        f"Bash({python} -m pytest tests/test_milestone1.py "
-        f"tests/test_milestone1_real_mcp.py -q --basetemp {tmp}/pytest)",
+        f"Bash({verify})",
+        f"Bash({scrub} {python} -m pytest tests/test_milestone1.py "
+        f"tests/test_milestone1_real_mcp.py -q -o cache_dir={cache}/pytest "
+        f"--basetemp {tmp}/pytest)",
     )
     assert render_validation_commands(NativeClaudeRole.QA, root) == (
-        f"{python} -m pytest",
-        f"{python} -m pyright --pythonpath {python}",
-        f"{python} -m ruff check .",
-        f"{python} -m ruff format --check .",
+        verify,
+        f"{scrub} {python} -m pytest -o cache_dir={cache}/pytest",
+        f"{scrub} {python} -m pyright --pythonpath {python}",
+        f"{scrub} {python} -m ruff check .",
+        f"{scrub} {python} -m ruff format --check .",
     )
 
 
@@ -5840,22 +5858,31 @@ def test_render_allowed_tools_uses_the_validated_resolved_root_not_the_raw_argum
 def test_validation_role_commands_table_is_a_closed_positive_grammar() -> None:
     """T7: every template is well-formed and uses only the closed module set."""
     allowed_modules = {"pytest", "pyright", "ruff", "pip"}
-    forbidden_fragments = ("(", ")", ";", "&", "|", "$", "`")
+    forbidden_fragments = ("(", ")", ";", "&", "|", "$", "`", "'", '"')
     prefix_entries: list[tuple[NativeClaudeRole, usage_models.ValidationCommand]] = []
     for role, commands in VALIDATION_ROLE_COMMANDS.items():
-        for command in commands:
-            assert command.template.startswith("{python} -m ")
-            module = command.template.removeprefix("{python} -m ").split(" ", 1)[0]
+        assert commands[0] == VALIDATION_ENVIRONMENT_VERIFY_COMMAND
+        assert commands.count(VALIDATION_ENVIRONMENT_VERIFY_COMMAND) == 1
+        for index, command in enumerate(commands):
+            assert command.template.startswith("{scrub} {python} -m ")
+            module = command.template.removeprefix("{scrub} {python} -m ").split(" ", 1)[0]
             assert module in allowed_modules
             if module == "pip":
-                assert command.template == "{python} -m pip show coffee-roaster-mcp"
+                assert command.template == "{scrub} {python} -m pip show coffee-roaster-mcp"
             if command.kind is ValidationCommandKind.PREFIX:
                 prefix_entries.append((role, command))
-            rendered = command.template.format(python="/r/venv/bin/python", tmp="/r/tmp")
+            if index > 0 and module == "pytest":
+                assert "-o cache_dir={cache}/pytest" in command.template
+            rendered = command.template.format(
+                scrub=render_gate_scrub_prefix("/r"),
+                python="/r/venv/bin/python",
+                cache="/r/cache",
+                tmp="/r/tmp",
+            )
             assert rendered.count("*") == 0
             for fragment in forbidden_fragments:
                 assert fragment not in rendered
-    expected_prefix_entry = (NativeClaudeRole.QA, VALIDATION_ROLE_COMMANDS[NativeClaudeRole.QA][0])
+    expected_prefix_entry = (NativeClaudeRole.QA, VALIDATION_ROLE_COMMANDS[NativeClaudeRole.QA][1])
     assert prefix_entries == [expected_prefix_entry]
     for role, commands in VALIDATION_ROLE_COMMANDS.items():
         rules = render_allowed_tools(role, "/r")
@@ -5865,7 +5892,7 @@ def test_validation_role_commands_table_is_a_closed_positive_grammar() -> None:
             assert rule.startswith("Bash(") and rule.endswith(")")
             inner = rule.removeprefix("Bash(").removesuffix(")")
             assert inner != "*"
-            assert inner.startswith("/r/venv/bin/python -m ")
+            assert inner.startswith(render_gate_scrub_prefix("/r") + " /r/venv/bin/python -m ")
             assert inner.count("*") <= 1
             if command.kind is ValidationCommandKind.PREFIX:
                 assert inner.endswith(":*")
@@ -5873,6 +5900,464 @@ def test_validation_role_commands_table_is_a_closed_positive_grammar() -> None:
             else:
                 assert not inner.endswith(":*")
                 assert "*" not in inner
+
+
+def test_gate_environment_is_derived_from_the_closed_launch_map() -> None:
+    """T4/T5: the gate map filters scrubbed launch names and preserves containment."""
+    root = "/validated/root"
+    values = validation_environment_values(root)
+    environment = render_gate_environment(root)
+    expected_keys = (
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "PYTHONPYCACHEPREFIX",
+        "PYTHONDONTWRITEBYTECODE",
+        "RUFF_CACHE_DIR",
+        "COVERAGE_FILE",
+        "COFFEE_ROAST_LOG_DIR",
+        "PIP_CACHE_DIR",
+        "PATH",
+        "HOME",
+        "PYTHONUTF8",
+        "RP_VALIDATION_GATE",
+    )
+    assert tuple(key for key, _ in environment) == expected_keys
+    assert all(
+        value and not any(character.isspace() for character in value) for _, value in environment
+    )
+    assert sum(value.count(":") for _, value in environment) == 2
+    assert dict(environment)["PATH"] == f"{root}/venv/bin:/usr/bin:/bin"
+    assert dict(environment)["HOME"] == f"{root}/tmp"
+    assert dict(environment)["PYTHONUTF8"] == "1"
+    assert dict(environment)["RP_VALIDATION_GATE"] == "1"
+    for key, value in environment:
+        if key in values:
+            assert value == values[key]
+        assert not is_scrubbed_environment_name(key)
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("ROASTPILOT_DB", True),
+        ("roastpilot_advisor__model_slug_by_phase", True),
+        ("RoAsTpIlOt_X", True),
+        ("PYTHONPATH", True),
+        ("OPENROUTER_API_KEY", True),
+        ("PYTEST_ADDOPTS", True),
+        ("TMPDIR", False),
+        ("RP_VALIDATION_GATE", False),
+        ("PATH", False),
+        ("COFFEE_ROAST_LOG_DIR", False),
+    ],
+)
+def test_scrubbed_environment_name_predicate_is_closed(name: str, expected: bool) -> None:
+    """T6: the shared predicate handles namespace casing and exact extra names."""
+    assert is_scrubbed_environment_name(name) is expected
+
+
+def _executable_gate_root(tmp_path: Path) -> Path:
+    """Create a disposable rendered-command root backed by this test venv."""
+    root = tmp_path / "gate-root"
+    root.mkdir()
+    (root / "cache").mkdir()
+    (root / "tmp").mkdir()
+    (root / "venv").symlink_to(Path(sys.prefix))
+    return root
+
+
+def _run_gate_command(
+    command: str, environment: dict[str, str] | None = None, cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run one rendered gate command without exposing test poison values in assertions."""
+    return subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=cwd,
+        check=False,
+    )
+
+
+def _poisoned_gate_environment() -> dict[str, str]:
+    """Return a synthetic ambient environment containing every #773 poison name."""
+    environment = dict(os.environ)
+    environment.update(worktree_gate_recipe._ALL_POISON_VALUES)  # pyright: ignore[reportPrivateUsage]
+    environment["PYTEST_ADDOPTS"] = "--disable-warnings"
+    return environment
+
+
+def test_rendered_gate_scrub_removes_every_poisoned_name_and_preserves_containment(
+    tmp_path: Path,
+) -> None:
+    """T8/T9/T10/T12: ``env -i`` removes standard and residual poison without disclosure."""
+    root = _executable_gate_root(tmp_path)
+    prefix = render_gate_scrub_prefix(str(root))
+    source = "import os; print('\\n'.join(sorted(os.environ)))"
+    command = f"{prefix} {shlex.quote(sys.executable)} -c {shlex.quote(source)}"
+    result = _run_gate_command(command, _poisoned_gate_environment())
+    assert result.returncode == 0, result.stderr
+    names = [line for line in result.stdout.splitlines() if line]
+    assert not any(is_scrubbed_environment_name(name) for name in names)
+    assert dict(render_gate_environment(str(root))).keys() <= set(names)
+    worktree_gate_recipe._assert_no_poisoned_values(  # pyright: ignore[reportPrivateUsage]
+        result.stdout + result.stderr
+    )
+    assert "--disable-warnings" not in result.stdout + result.stderr
+
+
+def test_rendered_gate_scrub_bypasses_a_path_leading_fake_env_shim(tmp_path: Path) -> None:
+    """The closed gate always starts with its canonical ``env`` executable."""
+    root = _executable_gate_root(tmp_path)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_env = fake_bin / "env"
+    fake_env.write_text("#!/bin/sh\nexit 73\n")
+    fake_env.chmod(0o755)
+    environment = _poisoned_gate_environment()
+    environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+    source = "raise SystemExit(0)"
+    command = (
+        f"{render_gate_scrub_prefix(str(root))} {shlex.quote(sys.executable)} -c "
+        f"{shlex.quote(source)}"
+    )
+    result = _run_gate_command(command, environment)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert str(fake_env) not in command
+    assert command.startswith(f"{shlex.quote(usage_models.SYSTEM_ENV_EXECUTABLE)} -i ")
+
+
+def test_system_env_executable_resolution_fails_closed_when_candidates_are_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The canonical ``env`` resolver rejects when neither absolute candidate is usable."""
+    candidates: list[str] = []
+
+    def observe_candidate(path: str) -> str:
+        candidates.append(path)
+        return path
+
+    def unavailable(_path: str) -> bool:
+        return False
+
+    monkeypatch.setattr(usage_models.os.path, "realpath", observe_candidate)
+    monkeypatch.setattr(usage_models.os.path, "isfile", unavailable)
+    with pytest.raises(RuntimeError) as raised:
+        usage_models._resolve_system_env_executable()  # pyright: ignore[reportPrivateUsage]
+    assert raised.value.args == ("system env utility is unavailable",)
+    assert candidates == ["/usr/bin/env", "/bin/env"]
+
+
+def test_system_env_executable_resolution_preserves_an_attested_env_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A BusyBox target is attested while the fixed ``env`` alias remains executable."""
+    alias = "/usr/bin/env"
+    busybox = "/bin/busybox"
+    checks: list[tuple[str, str]] = []
+
+    def resolve_busybox(_path: str) -> str:
+        return busybox
+
+    def regular_file(path: str) -> bool:
+        checks.append(("isfile", path))
+        return path == busybox
+
+    def executable(path: str, mode: int) -> bool:
+        checks.append(("access", path))
+        return path == busybox and mode == os.X_OK
+
+    monkeypatch.setattr(usage_models.os.path, "realpath", resolve_busybox)
+    monkeypatch.setattr(usage_models.os.path, "isfile", regular_file)
+    monkeypatch.setattr(usage_models.os, "access", executable)
+
+    resolved = usage_models._resolve_system_env_executable()  # pyright: ignore[reportPrivateUsage]
+    assert resolved == alias
+    assert checks == [("isfile", busybox), ("access", busybox)]
+    monkeypatch.setattr(usage_models, "SYSTEM_ENV_EXECUTABLE", resolved)
+    assert render_gate_scrub_prefix("/validated/root").startswith(f"{alias} -i ")
+
+
+def test_rendered_gate_scrub_reinstates_exact_root_derived_values(tmp_path: Path) -> None:
+    """T10: every retained containment assignment reaches the gate child unchanged."""
+    root = _executable_gate_root(tmp_path)
+    expected = dict(render_gate_environment(str(root)))
+    source = (
+        "import os, sys; "
+        f"expected = {expected!r}; "
+        "ok = all(os.environ[key] == value for key, value in expected.items()); "
+        "raise SystemExit(0 if ok else 1)"
+    )
+    command = (
+        f"{render_gate_scrub_prefix(str(root))} {shlex.quote(sys.executable)} -c "
+        f"{shlex.quote(source)}"
+    )
+    result = _run_gate_command(command, _poisoned_gate_environment())
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_rendered_gate_scrub_handles_a_namespace_name_outside_the_recipe_grammar(
+    tmp_path: Path,
+) -> None:
+    """T9: ``env -i`` removes a valid execve name that #773's text parser cannot see."""
+    root = _executable_gate_root(tmp_path)
+    prefix = render_gate_scrub_prefix(str(root))
+    source = "import os; print('\\n'.join(sorted(os.environ)))"
+    environment = _poisoned_gate_environment()
+    environment["ROASTPILOT_A B"] = "synthetic-space-name"
+    result = _run_gate_command(
+        f"{prefix} {shlex.quote(sys.executable)} -c {shlex.quote(source)}", environment
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ROASTPILOT_A B" not in result.stdout.splitlines()
+    assert "synthetic-space-name" not in result.stdout + result.stderr
+
+
+def test_rendered_ruff_gate_runs_from_the_closed_environment(tmp_path: Path) -> None:
+    """T11: a real committed gate remains usable after the environment reconstruction."""
+    root = _executable_gate_root(tmp_path)
+    command = render_validation_commands(NativeClaudeRole.QA, str(root))[3]
+    result = _run_gate_command(command, _poisoned_gate_environment())
+    assert result.returncode == 0, result.stdout + result.stderr
+    worktree_gate_recipe._assert_no_poisoned_values(  # pyright: ignore[reportPrivateUsage]
+        result.stdout + result.stderr
+    )
+    assert "--disable-warnings" not in result.stdout + result.stderr
+
+
+def test_gate_environment_verifier_fails_closed_for_clean_leaked_missing_and_absent_cases(
+    tmp_path: Path,
+) -> None:
+    """T13-T16: the first gate verifies names only and cannot silently skip collection."""
+    root = _executable_gate_root(tmp_path)
+    command = render_validation_commands(NativeClaudeRole.QA, str(root))[0]
+    clean = _run_gate_command(command, _poisoned_gate_environment())
+    assert clean.returncode == 0, clean.stdout + clean.stderr
+    poison_value = "synthetic-verifier-poison"
+    scrub = render_gate_scrub_prefix(str(root))
+    leaked = _run_gate_command(
+        command.replace(scrub, scrub.replace(" -i ", f" -i ROASTPILOT_DB={poison_value} ", 1), 1),
+        _poisoned_gate_environment(),
+    )
+    assert leaked.returncode != 0
+    assert "ROASTPILOT_DB" in leaked.stdout + leaked.stderr
+    assert poison_value not in leaked.stdout + leaked.stderr
+    pytest_addopts_value = "--disable-warnings"
+    leaked_pytest_addopts = _run_gate_command(
+        command.replace(
+            scrub, scrub.replace(" -i ", f" -i PYTEST_ADDOPTS={pytest_addopts_value} ", 1), 1
+        ),
+        _poisoned_gate_environment(),
+    )
+    assert leaked_pytest_addopts.returncode != 0
+    assert "PYTEST_ADDOPTS" in leaked_pytest_addopts.stdout + leaked_pytest_addopts.stderr
+    assert pytest_addopts_value not in leaked_pytest_addopts.stdout + leaked_pytest_addopts.stderr
+    missing = _run_gate_command(
+        command.replace(f" TMPDIR={root}/tmp", "", 1), _poisoned_gate_environment()
+    )
+    assert missing.returncode != 0
+    assert "TMPDIR" in missing.stdout + missing.stderr
+    bare = command.removeprefix(render_gate_scrub_prefix(str(root)) + " ")
+    bare_environment = _poisoned_gate_environment()
+    bare_environment.pop("RP_VALIDATION_GATE", None)
+    absent = _run_gate_command(bare, bare_environment)
+    assert absent.returncode == 5
+
+
+@pytest.mark.parametrize(
+    "gate_target",
+    ("tests/gate", str(Path(__file__).resolve().parents[1] / "tests" / "gate")),
+    ids=("relative", "absolute"),
+)
+def test_gate_directory_is_not_collected_without_the_validation_sentinel(gate_target: str) -> None:
+    """T17: relative and absolute gate targets fail closed without the sentinel."""
+    environment = dict(os.environ)
+    environment.pop("RP_VALIDATION_GATE", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", gate_target],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert result.returncode == 5
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [
+        (
+            "tests/gate",
+            "tests/test_capture_agent_usage.py::test_gate_directory_is_not_collected_without_the_validation_sentinel",
+        ),
+        (
+            "tests/test_capture_agent_usage.py::test_gate_directory_is_not_collected_without_the_validation_sentinel",
+            "tests/gate",
+        ),
+        (
+            str(Path(__file__).resolve().parents[1] / "tests" / "gate"),
+            "tests/test_capture_agent_usage.py::test_gate_directory_is_not_collected_without_the_validation_sentinel",
+        ),
+        (
+            "tests/test_capture_agent_usage.py::test_gate_directory_is_not_collected_without_the_validation_sentinel",
+            str(Path(__file__).resolve().parents[1] / "tests" / "gate"),
+        ),
+    ],
+)
+def test_mixed_explicit_gate_targets_fail_closed_without_the_sentinel(
+    targets: tuple[str, str],
+) -> None:
+    """Explicit gate targets fail closed in either mixed-argument ordering."""
+    environment = dict(os.environ)
+    environment.pop("RP_VALIDATION_GATE", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", *targets],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert result.returncode == 5
+    assert "validation gate sentinel is absent" in result.stdout + result.stderr
+
+
+def test_gate_target_guard_preserves_broad_discovery_and_gateway_boundary() -> None:
+    """Broad discovery remains legal and a gateway prefix is not a gate target."""
+    environment = dict(os.environ)
+    environment.pop("RP_VALIDATION_GATE", None)
+    broad = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests", "--collect-only", "-q"],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert broad.returncode == 0, broad.stdout + broad.stderr
+    gateway = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/gateway"],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert gateway.returncode != 5
+    assert "validation gate sentinel is absent" not in gateway.stdout + gateway.stderr
+
+
+@pytest.mark.slow
+@pytest.mark.serial(reason="runs a nested broad pytest suite through a real shell subprocess")
+def test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper(tmp_path: Path) -> None:
+    """The actual QA prefix collects the gate checks during broad suite execution."""
+    root = _executable_gate_root(tmp_path)
+    wrapper = render_validation_commands(NativeClaudeRole.QA, str(root))[1]
+    excluded = "not test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper"
+    command = f"{wrapper} tests -k {shlex.quote(excluded)}"
+    result = _run_gate_command(command, _poisoned_gate_environment(), cwd=Path(__file__).parents[1])
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_rendered_pyright_gate_runs_cold_under_the_closed_environment(tmp_path: Path) -> None:
+    """T18: the byte-exact pyright gate uses its venv-contained Node runtime."""
+    root = _executable_gate_root(tmp_path)
+    cwd = tmp_path / "typed-module"
+    cwd.mkdir()
+    (cwd / "typed_module.py").write_text("answer: int = 42\n")
+    command = render_validation_commands(NativeClaudeRole.QA, str(root))[2]
+    result = _run_gate_command(command, _poisoned_gate_environment(), cwd=cwd)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert not any(marker in output.lower() for marker in ("nodeenv", "download", "network"))
+    worktree_gate_recipe._assert_no_poisoned_values(  # pyright: ignore[reportPrivateUsage]
+        output
+    )
+    assert "--disable-warnings" not in output
+
+
+def test_pyright_node_runtime_is_canonically_contained_in_the_bound_venv(
+    tmp_path: Path,
+) -> None:
+    """T19: package Node, sibling-prefix, and symlink paths fail closed by components."""
+    root = _executable_gate_root(tmp_path)
+    source = (
+        "import os, sys, sysconfig; from pathlib import Path; import nodejs_wheel; "
+        "prefix = Path(sys.prefix).resolve(); "
+        "purelib = Path(sysconfig.get_path('purelib')).resolve(); "
+        "package = Path(nodejs_wheel.__file__).resolve().parent; "
+        "node = (package / 'bin' / 'node').resolve(); "
+        "within = lambda path: Path(path).resolve().is_relative_to(prefix); "
+        "sibling = prefix.parent / (prefix.name + '-evil') / 'bin' / 'node'; "
+        "escape = Path(os.environ['TMPDIR']) / 'escaped-node'; "
+        "escape_target = Path('/bin/sh').resolve(); "
+        "fixture_ready = (escape_target.is_file() and os.access(escape_target, os.X_OK) "
+        "and not escape_target.is_relative_to(prefix)); "
+        "fixture_ready or (_ for _ in ()).throw(SystemExit(1)); "
+        "escape.symlink_to(escape_target); "
+        "ok = (purelib.is_relative_to(prefix) and package.is_relative_to(purelib) "
+        "and node.is_file() and os.access(node, os.X_OK) and within(node) "
+        "and not within(sibling) and not within(escape)); "
+        "raise SystemExit(0 if ok else 1)"
+    )
+    interpreter = shlex.quote(str(root / "venv" / "bin" / "python"))
+    command = f"{render_gate_scrub_prefix(str(root))} {interpreter} -c {shlex.quote(source)}"
+    result = _run_gate_command(command, _poisoned_gate_environment())
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_pyright_nodejs_wheel_provider_contract_is_canonically_contained_in_the_bound_venv(
+    tmp_path: Path,
+) -> None:
+    """T22: the pinned ``nodejs_wheel`` provider contract is venv-contained."""
+    root = _executable_gate_root(tmp_path)
+    source = (
+        "import os, sys, sysconfig; from pathlib import Path; import nodejs_wheel; "
+        "prefix = Path(sys.prefix).resolve(); "
+        "purelib = Path(sysconfig.get_path('purelib')).resolve(); "
+        "package = Path(nodejs_wheel.__file__).resolve().parent; "
+        "node = (package / 'bin' / 'node').resolve(); "
+        "ok = (purelib.is_relative_to(prefix) and package.is_relative_to(purelib) "
+        "and node.is_file() and os.access(node, os.X_OK) and node.is_relative_to(prefix)); "
+        "raise SystemExit(0 if ok else 1)"
+    )
+    interpreter = shlex.quote(str(root / "venv" / "bin" / "python"))
+    command = f"{render_gate_scrub_prefix(str(root))} {interpreter} -c {shlex.quote(source)}"
+    result = _run_gate_command(command, _poisoned_gate_environment())
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_pyright_nodejs_dependency_is_exactly_pinned() -> None:
+    """T20: the checker and venv-contained Node provider stay exact-pinned."""
+    pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+    dependencies = pyproject["dependency-groups"]["dev"]
+    for package in ("pyright[nodejs]", "nodejs-wheel-binaries"):
+        matching_dependencies = [
+            dependency for dependency in dependencies if dependency.startswith(package)
+        ]
+        assert len(matching_dependencies) == 1
+        assert re.fullmatch(rf"{re.escape(package)}==[^=<>!~\s]+", matching_dependencies[0])
+
+
+def test_installed_nodejs_wheel_binaries_matches_the_exact_declaration(tmp_path: Path) -> None:
+    """T23: the closed child rejects a validation root provisioned off the declared pin."""
+    root = _executable_gate_root(tmp_path)
+    source = (
+        "import importlib.metadata, tomllib; from pathlib import Path; "
+        "pyproject = tomllib.loads(Path('pyproject.toml').read_text()); "
+        "dependencies = pyproject['dependency-groups']['dev']; "
+        "declared = next(dependency.split('==', 1)[1] for dependency in dependencies "
+        "if dependency.startswith('nodejs-wheel-binaries==')); "
+        "installed = importlib.metadata.version('nodejs-wheel-binaries'); "
+        "raise SystemExit(0 if installed == declared else 1)"
+    )
+    interpreter = shlex.quote(str(root / "venv" / "bin" / "python"))
+    command = f"{render_gate_scrub_prefix(str(root))} {interpreter} -c {shlex.quote(source)}"
+    result = _run_gate_command(command, _poisoned_gate_environment(), cwd=Path(__file__).parents[1])
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_closed_gate_path_is_the_literal_minimum_allowlist() -> None:
+    """T21: the rendered environment cannot gain a host Node search path."""
+    assert dict(render_gate_environment("/r"))["PATH"] == "/r/venv/bin:/usr/bin:/bin"
 
 
 def test_validation_role_commands_table_keys_equal_validation_environment_roles() -> None:
@@ -5909,7 +6394,17 @@ def test_native_claude_argv_never_revalidates_the_root(monkeypatch: pytest.Monke
 
 
 @pytest.mark.parametrize(
-    "flag", ["--allowed-tools", "--allowedTools", "--tools", "--permission-mode", "--add-dir"]
+    "flag",
+    [
+        "--allowed-tools",
+        "--allowedTools",
+        "--tools",
+        "--permission-mode",
+        "--add-dir",
+        "--scrub",
+        "--verify",
+        "--environment",
+    ],
 )
 def test_no_caller_permission_surface_options_exist_on_native(
     flag: str, capsys: pytest.CaptureFixture[str]
@@ -5921,7 +6416,17 @@ def test_no_caller_permission_surface_options_exist_on_native(
 
 
 @pytest.mark.parametrize(
-    "flag", ["--allowed-tools", "--allowedTools", "--tools", "--permission-mode", "--add-dir"]
+    "flag",
+    [
+        "--allowed-tools",
+        "--allowedTools",
+        "--tools",
+        "--permission-mode",
+        "--add-dir",
+        "--scrub",
+        "--verify",
+        "--environment",
+    ],
 )
 def test_no_caller_permission_surface_options_exist_on_run(
     flag: str, capsys: pytest.CaptureFixture[str]
@@ -12180,7 +12685,7 @@ def test_sim_roast_runner_rejects_a_skipped_real_mcp_lane() -> None:
 def test_runbook_and_skill_and_agents_row_point_to_print_validation_commands() -> None:
     """T17: the runbook, SKILL.md, and the AGENTS.md row cite the single interface.
 
-    None of the three duplicates the seven dynamic per-role command strings —
+    None of the three duplicates the ten dynamic per-role command strings —
     only ``print-validation-commands`` (run by the parent) can render them,
     because they depend on the per-run root.
     """
@@ -13893,7 +14398,7 @@ def test_print_validation_commands_pytest_arg_renders_quoted_covered_run_line(
         args.append(f"--pytest-arg={token}")
     assert main(args) == 0
     printed = capsys.readouterr().out.splitlines()
-    prefix = render_validation_commands(NativeClaudeRole.QA, resolved_root)[0]
+    prefix = render_validation_commands(NativeClaudeRole.QA, resolved_root)[1]
     run_line = next(line for line in printed if line.startswith("RUN " + prefix))
     run_command = run_line.removeprefix("RUN ")
     assert shlex.split(run_command) == [*shlex.split(prefix), *tokens]
@@ -13915,8 +14420,9 @@ def test_print_validation_commands_accepts_explicit_coverage_capable_qa_args(
     for token in tokens:
         args.append(f"--pytest-arg={token}")
     assert main(args) == 0
+    prefix = render_validation_commands(NativeClaudeRole.QA, os.path.realpath(root))[1]
     run_line = next(
-        line for line in capsys.readouterr().out.splitlines() if line.startswith("RUN ")
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("RUN " + prefix)
     )
     assert shlex.split(run_line.removeprefix("RUN "))[-len(tokens) :] == tokens
 

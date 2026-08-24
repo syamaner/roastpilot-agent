@@ -65,10 +65,11 @@ itself executable and must never be run as written. The per-run root is not
 knowable in advance, and a denied-by-default provider allow-rule matches
 only the byte-exact command it was built from.
 
-Your committed native launch carries exactly one fixed, exact
-`--allowedTools` rule (D168): one pytest invocation containing both
-`tests/test_milestone1.py` and `tests/test_milestone1_real_mcp.py`, followed
-by `-q --basetemp <root>/tmp/pytest`. **Any other command, including
+Your committed native launch carries exactly two fixed, exact
+`--allowedTools` rules (D168), executed in order: the gate-environment
+verifier, then one pytest invocation containing both `tests/test_milestone1.py`
+and `tests/test_milestone1_real_mcp.py`, followed by `-q --basetemp
+<root>/tmp/pytest`. **Any other command, including
 `roastpilot-agent --replay`, is denied outright by the provider's `dontAsk`
 default, with no prompt and no retry** — see Procedure step 2 above. If a
 command you need is denied, stop and report — never attempt a workaround.
@@ -87,6 +88,11 @@ shared by every READ_ONLY role, including its `#738` per-worktree `.venv`
 bullet; that bullet governs **write-capable workers only** and does not
 apply to you — follow this section's parent-supplied exact command
 instead.
+
+The printed `RUN` lines execute in order. The first verifies the reconstructed
+environment; if it exits non-zero, stop and report. Do not run a later gate,
+repair the environment, or compose, reorder, remove, or re-quote any supplied
+command: each `RUN` line carries its own environment.
 
 ## Worktree discipline (topology §7 — binding)
 

@@ -146,14 +146,16 @@ roastpilot-agent = "roastpilot_agent.cli:main"
 
 [dependency-groups]
 dev = [
-  # Pinned exactly (not >=) so local == CI (#102). The `pyright` PyPI package
-  # is a thin wrapper that, by default, downloads the matching pyright node
-  # binary at run time — so the wrapper version is the typeshed/checker
+  # Pinned exactly (not >=) so local == CI (#102). The `nodejs` extra supplies
+  # pyright's Node binary through the venv-local `nodejs_wheel` package, so no
+  # runtime download is needed. The wrapper version is the typeshed/checker
   # version. With `>=`, a fresh CI install resolved a newer wrapper (1.1.410)
   # than a stale local env (1.1.408); the newer typeshed flagged
   # `@asynccontextmanager -> AsyncIterator[None]` as reportDeprecated, so a PR
-  # passed locally but failed CI. Exact-pin both ends; bump deliberately.
-  "pyright==1.1.410",
+  # passed locally but failed CI. Exact-pin both ends; the wrapper and Node
+  # runtime are a coupled bump, so reprovision validation roots after either moves.
+  "pyright[nodejs]==1.1.410",
+  "nodejs-wheel-binaries==24.19.0",
   "pytest>=8.0",
   "pytest-asyncio>=1.0",
   "pytest-cov>=5.0",

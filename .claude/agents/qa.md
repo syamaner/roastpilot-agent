@@ -63,13 +63,14 @@ variable, and do not compose your own absolute-path command — the per-run
 root is not knowable in advance, and a denied-by-default provider allow-rule
 matches only the byte-exact command it was built from.
 
-Your committed native launch carries one fixed, role-specific
-`--allowedTools` allow-list (D168): the `pytest` gate is a *prefix* rule (any
-pytest arguments are admitted, including plugin selection and collection
-paths — this is a discipline and attestation boundary, not an OS sandbox,
-contained by the redirected per-run root and the byte-clean post-exit
-attestation), and the `pyright`, `ruff check`, and `ruff format --check`
-gates are each an *exact* rule. **Any command not on that list is denied
+Your committed native launch carries exactly five fixed, role-specific
+`--allowedTools` rules (D168), executed in order: the gate-environment
+verifier is an *exact* rule; the `pytest` gate is a *prefix* rule (any pytest
+arguments are admitted, including plugin selection and collection paths — this
+is a discipline and attestation boundary, not an OS sandbox, contained by the
+redirected per-run root and the byte-clean post-exit attestation); and the
+`pyright`, `ruff check`, and `ruff format --check` gates are each *exact*
+rules. **Any command not on that list is denied
 outright by the provider's `dontAsk` default, with no prompt and no retry.**
 If a command you need is denied, stop and report — never attempt a
 workaround, a different flag combination, or a shell escape.
@@ -91,6 +92,11 @@ shared by every READ_ONLY role, including its `#738` per-worktree `.venv`
 bullet; that bullet governs **write-capable workers only** and does not
 apply to you — follow this section's parent-supplied exact commands
 instead.
+
+The printed `RUN` lines execute in order. The first verifies the reconstructed
+environment; if it exits non-zero, stop and report. Do not run a later gate,
+repair the environment, or compose, reorder, remove, or re-quote any supplied
+command: each `RUN` line carries its own environment.
 
 ## Worktree discipline (topology §7 — binding)
 
