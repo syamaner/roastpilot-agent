@@ -1972,9 +1972,18 @@ def test_native_codex_cli_maps_nested_discriminator_error_without_leakage(
 ) -> None:
     """Supervisor parser failures reach the CLI as one fixed metadata-safe error."""
 
-    def fail(_arguments: object) -> NoReturn:
+    def fail(_arguments: object, *, harness_version: str) -> NoReturn:
+        assert harness_version == "0.147.0"
         raise usage_native_codex.NativeCodexCaptureError("/host/SECRET trace")
 
+    def resolved(_family: HarnessFamily) -> str:
+        return "/stub/codex"
+
+    def version(_executable: str) -> str:
+        return "0.147.0"
+
+    monkeypatch.setattr(usage_cli, "_resolved_executable", resolved)
+    monkeypatch.setattr(usage_cli, "_harness_version", version)
     monkeypatch.setattr(usage_cli, "supervise_native_codex", fail)
     with pytest.raises(SystemExit, match="native Codex capture is invalid") as error:
         main(
@@ -2798,9 +2807,22 @@ def test_native_codex_cli_round_trip_and_fixed_error(monkeypatch: pytest.MonkeyP
     )
     assert arguments.role == "engineer-be" and arguments.task_name == "leaf"
 
-    def fail(_arguments: argparse.Namespace) -> int:
+    observed: list[str] = []
+
+    def resolved(family: HarnessFamily) -> str:
+        assert family is HarnessFamily.CODEX
+        return "/stub/codex"
+
+    def version(executable: str) -> str:
+        observed.append(executable)
+        return "0.147.0"
+
+    def fail(_arguments: argparse.Namespace, *, harness_version: str) -> int:
+        assert harness_version == "0.147.0"
         raise usage_native_codex.NativeCodexCaptureError("SECRET")
 
+    monkeypatch.setattr(usage_cli, "_resolved_executable", resolved)
+    monkeypatch.setattr(usage_cli, "_harness_version", version)
     monkeypatch.setattr(usage_cli, "supervise_native_codex", fail)
     with pytest.raises(SystemExit) as error:
         usage_cli.main(
@@ -2826,7 +2848,57 @@ def test_native_codex_cli_round_trip_and_fixed_error(monkeypatch: pytest.MonkeyP
                 "/private/tmp/usage",
             ]
         )
+    assert observed == ["/stub/codex"]
     assert error.value.code == "capture-agent-usage: native Codex capture is invalid"
+
+
+def test_native_codex_cli_probes_resolved_executable_once_before_supervision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrapper owns exactly one fixed version probe and passes it inward."""
+
+    class VersionProcess:
+        """Completed version probe exposing only the subprocess contract in use."""
+
+        def __init__(self) -> None:
+            self.stdout = BytesIO(b"codex 0.148.0\n")
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+        def poll(self) -> int:
+            return 0
+
+        def terminate(self) -> None:
+            raise AssertionError("completed version probe must not terminate")
+
+        def kill(self) -> None:
+            raise AssertionError("completed version probe must not kill")
+
+    probe_argv: list[list[str]] = []
+    observed_versions: list[str] = []
+
+    def popen(argv: list[str], **_kwargs: object) -> VersionProcess:
+        probe_argv.append(argv)
+        return VersionProcess()
+
+    def resolved(family: HarnessFamily) -> str:
+        assert family is HarnessFamily.CODEX
+        return "/fixed/codex"
+
+    def supervise(_arguments: object, *, harness_version: str) -> int:
+        observed_versions.append(harness_version)
+        return 0
+
+    monkeypatch.setattr(usage_cli, "_resolved_executable", resolved)
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", popen)
+    monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
+    monkeypatch.setattr(usage_cli, "supervise_native_codex", supervise)
+
+    assert usage_cli.supervise_native_codex_command(argparse.Namespace()) == 0
+    assert probe_argv == [["/fixed/codex", "--version"]]
+    assert observed_versions == ["0.148.0"]
 
 
 def test_native_codex_walk_rejects_symlink_non_json_and_depth(tmp_path: Path) -> None:
@@ -3454,7 +3526,7 @@ def test_native_codex_supervisor_usage_root_replacement_appends_nothing(
     with pytest.raises(
         usage_native_codex.NativeCodexCaptureError, match="native Codex capture is invalid"
     ):
-        usage_native_codex.supervise_native_codex(arguments)
+        usage_native_codex.supervise_native_codex(arguments, harness_version="0.147.0")
     assert appended == []
     assert [json.loads(frame)["type"] for frame in frames.values] == ["READY"]
 
@@ -3653,7 +3725,7 @@ def test_native_codex_supervisor_closes_roots_when_acquisition_fails(
         output="usage.jsonl",
     )
     with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex.supervise_native_codex(arguments)
+        usage_native_codex.supervise_native_codex(arguments, harness_version="0.147.0")
     for descriptor in held:
         with pytest.raises(OSError):
             os.fstat(descriptor)
@@ -3684,7 +3756,7 @@ def test_native_codex_supervisor_rejects_codex_home_before_root_access(
         output="usage.jsonl",
     )
     with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex.supervise_native_codex(arguments)
+        usage_native_codex.supervise_native_codex(arguments, harness_version="0.147.0")
 
 
 def test_native_codex_provider_home_is_closed_to_default_or_platform(
@@ -3910,11 +3982,11 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
     )
     if child_parent is not None:
         with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-            usage_native_codex.supervise_native_codex(arguments)
+            usage_native_codex.supervise_native_codex(arguments, harness_version="0.147.0")
         assert captured == []
         assert [json.loads(frame)["type"] for frame in frames.values] == ["READY"]
         return
-    assert usage_native_codex.supervise_native_codex(arguments) == 0
+    assert usage_native_codex.supervise_native_codex(arguments, harness_version="0.147.0") == 0
     assert len(captured) == 1
     record = captured[0]
     assert record.native_role is role
@@ -3932,14 +4004,33 @@ def test_native_codex_supervisor_records_registered_role_terminal_outcome(
 
 
 @pytest.mark.parametrize(
-    ("role", "status", "instructions"),
+    ("role", "status", "instructions", "observed_version", "rollout_version"),
     [
-        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.SUCCESS, "exact"),
-        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.FAILED, "exact"),
-        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED, "exact"),
-        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "stale"),
-        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "pre_ready_drift"),
-        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "writable_worktree"),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.SUCCESS, "exact", "0.148.0", "0.148.0"),
+        (NativeCodexRole.ENGINEER_FE, NativeCodexTaskStatus.FAILED, "exact", "0.147.0", "0.147.0"),
+        (NativeCodexRole.REPAIR, NativeCodexTaskStatus.CANCELLED, "exact", "0.147.0", "0.147.0"),
+        (NativeCodexRole.ENGINEER_BE, NativeCodexTaskStatus.FAILED, "stale", "0.147.0", "0.147.0"),
+        (
+            NativeCodexRole.ENGINEER_BE,
+            NativeCodexTaskStatus.FAILED,
+            "pre_ready_drift",
+            "0.147.0",
+            "0.147.0",
+        ),
+        (
+            NativeCodexRole.ENGINEER_BE,
+            NativeCodexTaskStatus.FAILED,
+            "writable_worktree",
+            "0.147.0",
+            "0.147.0",
+        ),
+        (
+            NativeCodexRole.ENGINEER_BE,
+            NativeCodexTaskStatus.FAILED,
+            "version-mismatch",
+            "0.148.0",
+            "0.147.0",
+        ),
     ],
 )
 def test_native_codex_supervisor_real_registered_lifecycle(
@@ -3949,6 +4040,8 @@ def test_native_codex_supervisor_real_registered_lifecycle(
     role: NativeCodexRole,
     status: NativeCodexTaskStatus,
     instructions: str,
+    observed_version: str,
+    rollout_version: str,
 ) -> None:
     """A real registered-role lifecycle persists only its closed metadata record."""
     repository = tmp_path / "repository"
@@ -4018,7 +4111,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
                     exact_instructions if instructions == "exact" else "SECRET_PROVIDER_PROMPT"
                 ),
                 "originator": "codex-tui",
-                "cli_version": "0.147.0",
+                "cli_version": rollout_version,
                 "context_window": 1,
                 "cwd": str(repository),
                 "history_mode": "discarded",
@@ -4206,16 +4299,18 @@ def test_native_codex_supervisor_real_registered_lifecycle(
         base_sha=base,
         output=Path(".agent-usage/usage.jsonl"),
     )
-    if instructions in {"stale", "pre_ready_drift", "writable_worktree"}:
+    if instructions in {"stale", "pre_ready_drift", "writable_worktree", "version-mismatch"}:
         with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-            usage_native_codex.supervise_native_codex(arguments)
+            usage_native_codex.supervise_native_codex(arguments, harness_version=observed_version)
         assert not (usage / ".agent-usage" / "usage.jsonl").exists()
         assert [json.loads(frame)["type"] for frame in captured_stdout.frames] == (
             [] if instructions in {"pre_ready_drift", "writable_worktree"} else ["READY"]
         )
         assert "SECRET_PROVIDER_PROMPT" not in capsys.readouterr().out
         return
-    assert usage_native_codex.supervise_native_codex(arguments) == 0
+    assert (
+        usage_native_codex.supervise_native_codex(arguments, harness_version=observed_version) == 0
+    )
     assert capsys.readouterr().out == ""
     frames = [json.loads(frame) for frame in captured_stdout.frames]
     assert [frame["type"] for frame in frames] == ["READY", "RESULT"]
@@ -4227,6 +4322,7 @@ def test_native_codex_supervisor_real_registered_lifecycle(
     assert record.success is (status is NativeCodexTaskStatus.SUCCESS)
     assert record.whole_tree_verified is True
     assert record.subagent_count == 0
+    assert record.harness_version == observed_version
     assert record.base_sha == record.launch_head_sha == base
     assert record.final_head_sha == git("rev-parse", "HEAD")
     assert (
@@ -4670,11 +4766,11 @@ def test_native_codex_supervisor_real_rollout_topology_classification(
         with pytest.raises(
             usage_native_codex.NativeCodexCaptureError, match="native Codex capture is invalid"
         ):
-            usage_native_codex.supervise_native_codex(arguments)
+            usage_native_codex.supervise_native_codex(arguments, harness_version="0.147.0")
         assert not (usage / ".agent-usage" / "usage.jsonl").exists()
         assert [json.loads(frame)["type"] for frame in frames.values] == ["READY"]
         return
-    assert usage_native_codex.supervise_native_codex(arguments) == 0
+    assert usage_native_codex.supervise_native_codex(arguments, harness_version="0.147.0") == 0
     record = NativeCodexUsageRecord.model_validate_json(
         (usage / ".agent-usage" / "usage.jsonl").read_text()
     )
@@ -4765,7 +4861,7 @@ def test_native_codex_supervisor_requires_exactly_one_matching_rollout(
         output="usage.jsonl",
     )
     with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex.supervise_native_codex(arguments)
+        usage_native_codex.supervise_native_codex(arguments, harness_version="0.147.0")
     assert not appended
 
 
@@ -4861,7 +4957,7 @@ def test_native_codex_supervisor_rejects_aggregate_actual_candidate_growth(
         output="usage.jsonl",
     )
     with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex.supervise_native_codex(arguments)
+        usage_native_codex.supervise_native_codex(arguments, harness_version="0.147.0")
 
 
 @pytest.mark.parametrize("failure", ["duplicate", "later_parse_error"])
@@ -4964,7 +5060,7 @@ def test_native_codex_supervisor_closes_candidate_fds_on_failed_selection(
         output="usage.jsonl",
     )
     with pytest.raises(usage_native_codex.NativeCodexCaptureError):
-        usage_native_codex.supervise_native_codex(arguments)
+        usage_native_codex.supervise_native_codex(arguments, harness_version="0.147.0")
     assert appended == []
     assert all(closed.count(descriptor) == 1 for descriptor in candidates)
 
@@ -5004,6 +5100,32 @@ def test_owned_transcript_counts_identical_assistant_usage_once(
     assert usage.cache_creation_input_tokens == 36_369
     assert usage.output_tokens == 9
     assert transcript.read_bytes() == duplicated
+
+
+def test_owned_transcript_rejects_later_assistant_version_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every assistant row, not only the first, must match the probed version."""
+    session_id = "11111111-1111-4111-8111-111111111233"
+    rows = _story_planner_rows(session_id, fixture="qa.jsonl")
+    assistant_indices = [index for index, row in enumerate(rows) if row["type"] == "assistant"]
+    assert len(assistant_indices) == 2
+    assert rows[assistant_indices[0]]["version"] == "2.1.233"
+    rows[assistant_indices[1]]["version"] = "2.1.999"
+    _install_owned_transcript(tmp_path, monkeypatch, _dump_rows(rows), session_id)
+
+    with pytest.raises(
+        usage_transcript.TranscriptError, match="owned Claude transcript is invalid"
+    ):
+        usage_transcript.parse_owned_transcript(
+            tmp_path,
+            session_id,
+            NativeClaudeRole.QA,
+            "high",
+            expected_version="2.1.233",
+            expected_permission_mode="dontAsk",
+            require_handback=True,
+        )
 
 
 def test_owned_transcript_tolerates_non_terminal_tool_activity_rows(
@@ -7060,13 +7182,14 @@ def _native_popen(
     code: int = 0,
     prompt_fail: bool = False,
     transcript: bytes | None = None,
+    version: str = "2.1.233",
 ) -> Callable[..., _NativeProcess]:
     """Return a fake version/worker launcher that creates only one parent transcript."""
 
     def fake(argv: list[str], **kwargs: object) -> _NativeProcess:
         observed.append((argv, kwargs))
         if argv[-1] == "--version":
-            process = _NativeProcess(b"Claude Code 2.1.233\\n")
+            process = _NativeProcess(f"Claude Code {version}\\n".encode())
             processes.append(process)
             return process
         if transcript is not None:
@@ -7210,17 +7333,21 @@ def test_native_command_launches_exact_worker_and_records_immutable_transcript(
     """D161 binds a UUID session, fixed argv and stdin to one immutable parent transcript."""
     project, observed = _configure_native_launcher(tmp_path, monkeypatch)
     processes: list[_NativeProcess] = []
-    transcript = _native_transcript_bytes()
+    transcript = _native_transcript_bytes().replace(b'"version":"2.1.233"', b'"version":"2.1.241"')
     monkeypatch.setattr(
         usage_cli.subprocess,
         "Popen",
-        _native_popen(project, observed, processes, transcript=transcript),
+        _native_popen(project, observed, processes, transcript=transcript, version="2.1.241"),
     )
+    monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
 
     assert main(_native_cli_args()) == 0
 
-    assert len(observed) == 1
-    argv, kwargs = observed[0]
+    version_launches = [(argv, kwargs) for argv, kwargs in observed if argv[-1] == "--version"]
+    worker_launches = [(argv, kwargs) for argv, kwargs in observed if argv[-1] != "--version"]
+    assert len(version_launches) == len(worker_launches) == 1
+    assert version_launches[0][0] == ["claude", "--version"]
+    argv, kwargs = worker_launches[0]
     expected_argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
         "claude",
         NativeClaudeRole.ENGINEER_BE,
@@ -7234,13 +7361,14 @@ def test_native_command_launches_exact_worker_and_records_immutable_transcript(
     assert kwargs["stdout"] is subprocess.DEVNULL and kwargs["stderr"] is subprocess.DEVNULL
     assert kwargs["stdin"] is subprocess.PIPE
     assert UUID(_NATIVE_SESSION_ID).version == 4
-    assert processes[0].stdin.value == b"SENTINEL_NATIVE_PROMPT" and processes[0].stdin.closed
+    assert processes[1].stdin.value == b"SENTINEL_NATIVE_PROMPT" and processes[1].stdin.closed
     stored = project / f"{_NATIVE_SESSION_ID}.jsonl"
     before = stored.stat()
     raw = Path(".agent-usage/usage.jsonl").read_text()
     record = USAGE_RECORD_ADAPTER.validate_json(raw)
     assert isinstance(record, NativeWorkerUsageRecord)
     assert record.success and record.usage_complete and record.final_head_sha == "7d60f41"
+    assert record.harness_version == "2.1.241"
     assert (
         record.session_id == _NATIVE_SESSION_ID
         and record.native_role is NativeClaudeRole.ENGINEER_BE
@@ -9604,6 +9732,7 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
     sentinel = b"SENTINEL_PROMPT_CONTENT"
     prompt.write_bytes(sentinel)
     observed: dict[str, object] = {}
+    version_calls = 0
 
     class FakeProcess:
         """Minimal fixed harness process with a complete terminal event."""
@@ -9641,10 +9770,12 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
             raise AssertionError("completed process must not be killed")
 
     def fake_popen(argv: list[str], **kwargs: object) -> FakeProcess:
+        nonlocal version_calls
         if argv[-1] == "--version":
             observed["version_argv"] = argv
             observed["version_kwargs"] = kwargs
-            return FakeProcess(b"codex-cli 0.147.0\n")
+            version_calls += 1
+            return FakeProcess(b"codex-cli 0.148.0\n")
         observed["argv"] = argv
         observed["kwargs"] = kwargs
         process = FakeProcess(_codex_terminal_event())
@@ -9656,6 +9787,7 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
 
     monkeypatch.setattr(usage_cli.shutil, "which", fake_which)
     monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
     assert (
         main(
             [
@@ -9708,12 +9840,14 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
     assert process.stdin.value == sentinel
     assert process.stdin.closed
     assert observed["kwargs"]["shell"] is False  # type: ignore[index]
+    assert observed["version_argv"] == ["/stub/CODEX", "--version"]
+    assert version_calls == 1
     record = (tmp_path / ".agent-usage/usage.jsonl").read_text()
     assert sentinel.decode() not in record
     assert "SENTINEL_PROMPT_CONTENT" not in str(observed["argv"])
     assert json.loads(record)["effort"] == "high"
     parsed_record = json.loads(record)
-    assert parsed_record["harness_version"] == "0.147.0"
+    assert parsed_record["harness_version"] == "0.148.0"
     assert not parsed_record["whole_tree_verified"]
     assert {
         item.relative_to(tmp_path).as_posix() for item in tmp_path.rglob("*") if item.is_file()

@@ -2,9 +2,9 @@
 
 The parent starts ``supervise-native-codex`` before dispatching its named leaf.
 This process keeps descriptor-relative bindings open, writes one READY frame,
-then accepts exactly one terminal task status on stdin. It probes the resolved
-Codex executable once for the run-scoped version binding and never launches a
-Codex task.
+then accepts exactly one terminal task status on stdin. Its CLI wrapper probes
+the resolved Codex executable once for the run-scoped version binding; this
+module never launches a Codex task.
 """
 
 from __future__ import annotations
@@ -34,7 +34,6 @@ from capture_usage_models import (
     NATIVE_CODEX_REPOSITORY,
     NATIVE_CODEX_ROLE_INSTRUCTION_SHA256,
     NATIVE_CODEX_ROLE_SHA256,
-    HarnessFamily,
     NativeCodexRole,
     NativeCodexTaskStatus,
     NativeCodexUsageRecord,
@@ -2140,17 +2139,14 @@ def _provider_home() -> str:
     _fail()
 
 
-def supervise_native_codex(arguments: Any) -> int:
-    """Run one parent-owned READY/status/result protocol bound to one probe."""
+def supervise_native_codex(arguments: Any, *, harness_version: str) -> int:
+    """Run one parent-owned READY/status/result protocol bound to one observed version."""
     global _ACTIVE_GIT_WORKTREE
     values = (arguments.task_id, arguments.slice_id, arguments.parent_task_id, arguments.task_name)
     parent = os.environ.get("CODEX_THREAD_ID")
     if not all(_safe_identifier(value) for value in values) or not _safe_identifier(parent):
         _fail()
     role = NativeCodexRole(arguments.role)
-    from capture_usage_cli import _harness_version, _resolved_executable
-
-    harness_version = _harness_version(_resolved_executable(HarnessFamily.CODEX))
     codex_home = _provider_home()
     usage: _Root | None = None
     provider: _Root | None = None

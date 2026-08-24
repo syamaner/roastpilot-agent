@@ -2308,7 +2308,9 @@ def _add_output_option(parser: argparse.ArgumentParser) -> None:
 
 def supervise_native_codex_command(arguments: argparse.Namespace) -> int:
     """Hold native-Codex bindings while the parent dispatches its named leaf."""
-    return supervise_native_codex(arguments)
+    executable = _resolved_executable(HarnessFamily.CODEX)
+    harness_version = _harness_version(executable)
+    return supervise_native_codex(arguments, harness_version=harness_version)
 
 
 EnumMember = TypeVar("EnumMember")
