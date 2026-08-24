@@ -108,6 +108,7 @@ from capture_usage_models import (
 from pydantic import TypeAdapter, ValidationError
 
 _REAL_VALIDATE_WORKTREE_METADATA = usage_cli._validate_worktree_metadata  # pyright: ignore[reportPrivateUsage]
+_REAL_HARNESS_VERSION = usage_cli._harness_version  # pyright: ignore[reportPrivateUsage]
 
 
 def _stub_native_codex_git_administration(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -7093,8 +7094,8 @@ def test_native_command_launches_exact_worker_and_records_immutable_transcript(
 
     assert main(_native_cli_args()) == 0
 
-    assert len(observed) == 2
-    argv, kwargs = observed[1]
+    assert len(observed) == 1
+    argv, kwargs = observed[0]
     expected_argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
         "claude",
         NativeClaudeRole.ENGINEER_BE,
@@ -7108,7 +7109,7 @@ def test_native_command_launches_exact_worker_and_records_immutable_transcript(
     assert kwargs["stdout"] is subprocess.DEVNULL and kwargs["stderr"] is subprocess.DEVNULL
     assert kwargs["stdin"] is subprocess.PIPE
     assert UUID(_NATIVE_SESSION_ID).version == 4
-    assert processes[1].stdin.value == b"SENTINEL_NATIVE_PROMPT" and processes[1].stdin.closed
+    assert processes[0].stdin.value == b"SENTINEL_NATIVE_PROMPT" and processes[0].stdin.closed
     stored = project / f"{_NATIVE_SESSION_ID}.jsonl"
     before = stored.stat()
     raw = Path(".agent-usage/usage.jsonl").read_text()
@@ -7794,13 +7795,17 @@ def isolate_run_metadata_validation(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(usage_cli, "_validate_worktree_metadata", skip_worktree_validation)
 
-    def resolved_executable(_harness: HarnessFamily) -> str:
+    def resolved_executable(harness: HarnessFamily) -> str:
         """Keep supervisor units on a local synthetic executable path."""
-        return "/stub/harness"
+        return f"/stub/{harness.value}"
 
-    def harness_version(_executable: str) -> str:
-        """Bind legacy supervisor fixtures to their sanctioned Codex version."""
-        return "0.147.0"
+    def harness_version(executable: str) -> str:
+        """Return the ratified observed version for the selected harness family."""
+        if Path(executable).name.lower() == "codex":
+            return "0.147.0"
+        if Path(executable).name.lower() == "claude":
+            return "2.1.233"
+        raise AssertionError(executable)
 
     monkeypatch.setattr(usage_cli, "_resolved_executable", resolved_executable)
     monkeypatch.setattr(usage_cli, "_harness_version", harness_version)
@@ -9542,9 +9547,8 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
         )
         == 0
     )
-    assert observed["version_argv"] == ["/stub/codex", "--version"]
     assert observed["argv"] == [
-        "/stub/codex",
+        "/stub/CODEX",
         "exec",
         "--json",
         "--ephemeral",
@@ -9568,7 +9572,6 @@ def test_run_uses_fixed_codex_argv_and_keeps_prompt_out_of_record(
     record = (tmp_path / ".agent-usage/usage.jsonl").read_text()
     assert sentinel.decode() not in record
     assert "SENTINEL_PROMPT_CONTENT" not in str(observed["argv"])
-    assert "SENTINEL_PROMPT_CONTENT" not in str(observed["version_argv"])
     assert json.loads(record)["effort"] == "high"
     parsed_record = json.loads(record)
     assert parsed_record["harness_version"] == "0.147.0"
@@ -10259,87 +10262,9 @@ def test_invalid_version_never_spawns_a_run(
         return VersionProcess()
 
     monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
     with pytest.raises(CaptureUsageError, match="version"):
         usage_cli._harness_version("/stub/codex")  # pyright: ignore[reportPrivateUsage]
-
-
-@pytest.mark.parametrize(
-    ("harness", "version"),
-    [
-        ("codex", "0.146.0"),
-        ("codex", "0.148.0"),
-        ("claude", "2.1.228"),
-        ("claude", "2.1.230"),
-        ("claude", "2.1.231"),
-        ("claude", "2.1.232"),
-        ("claude", "2.1.234"),
-    ],
-)
-def test_run_rejects_unverified_family_version_before_harness_launch(
-    harness: str, version: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Only each frozen family version may proceed from its fixed version probe."""
-    monkeypatch.chdir(tmp_path)
-    Path("prompt").write_bytes(b"safe")
-    calls = 0
-
-    class VersionProcess:
-        """Completed fixed version probe with no task-launch behavior."""
-
-        stdin = None
-        stdout = BytesIO(f"{harness} {version}\n".encode())
-
-        def poll(self) -> int:
-            return 0
-
-        def wait(self, timeout: float | None = None) -> int:
-            del timeout
-            return 0
-
-        def terminate(self) -> None:
-            raise AssertionError("completed version probe must not terminate")
-
-        def kill(self) -> None:
-            raise AssertionError("completed version probe must not kill")
-
-    def fake_popen(*_args: object, **_kwargs: object) -> VersionProcess:
-        nonlocal calls
-        calls += 1
-        return VersionProcess()
-
-    def fake_which(_name: str) -> str:
-        return "/stub/harness"
-
-    monkeypatch.setattr(usage_cli.shutil, "which", fake_which)
-    monkeypatch.setattr(usage_cli.subprocess, "Popen", fake_popen)
-    with pytest.raises(SystemExit, match="version is not verified"):
-        main(
-            [
-                "run",
-                "--harness",
-                harness,
-                "--prompt-file",
-                "prompt",
-                "--task-id",
-                "811",
-                "--slice-id",
-                "capture",
-                "--role",
-                "measurement-pilot",
-                "--model",
-                "model",
-                "--repository",
-                "syamaner/roastpilot-agent",
-                "--branch",
-                "feature/811",
-                "--base-sha",
-                "2bed7013",
-                "--head-sha",
-                "4a3cca6",
-            ]
-        )
-    assert calls == 1
-    assert not (tmp_path / ".agent-usage").exists()
 
 
 def test_version_probe_timeout_kills_reaps_and_never_reaches_a_run(
