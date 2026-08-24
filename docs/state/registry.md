@@ -2,6 +2,25 @@
 
 ## Active Epic
 
+**24 Aug 2026 — #773 closed: the "Per-worktree gate environment" recipe in
+`docs/agent-team-worktrees.md` now fails closed on all three findings it
+shipped with (PR #772 / #738 / #733). A pre-creation absence guard (lexists-
+aware, catches a dangling `.venv` symlink) blocks `python3.11 -m venv .venv`
+from silently reusing a contaminated venv, with a guarded rebuild remedy that
+refuses `--clear` and `rm -rf .venv/` through a possibly-borrowed symlink; all
+three containment/provenance probes now exit non-zero on `False` via an
+explicit `SystemExit` (never a bare `assert`, which `PYTHONOPTIMIZE` strips);
+and the pytest gate strips the whole `ROASTPILOT_*` namespace, not just
+`OPENROUTER_API_KEY`, with a same-prefix post-strip verification line that
+fails closed on any residual and never prints a value. New executable module
+`tests/test_worktree_gate_recipe.py` extracts and runs the recipe's own bytes
+under a closed grammar (31 tests, hardware-free). The Class C sibling —
+`VALIDATION_ROLE_COMMANDS` in
+`.agents/skills/capture-agent-usage/scripts/capture_usage_models.py`, which
+carries no environment-stripping prefix at all — is a genuine sibling of the
+same finding class and is explicitly OUT OF SCOPE here; it is recorded under
+the existing #811 / D166-D168 line, not a new issue.**
+
 **17 Aug 2026 — #735 story-closing implementation complete: `claude-code-review.yml` enables `track_progress`
 only for `opened`/`synchronize`/`ready_for_review`/`reopened` and disables it
 (fail-closed) for `edited` and any other action, because the action does not
