@@ -533,7 +533,7 @@ def test_recipe_extraction_is_well_formed() -> None:
 def test_t1_prefix_probe_exits_zero_when_contained() -> None:
     """T1: the prefix probe exits 0 and prints path+True when contained."""
     recipe = _load_recipe()
-    result = _run_source(recipe.prefix_probe_source, _REPO)
+    result = _run_source(recipe.prefix_probe_source, Path(sys.prefix).resolve())
     assert result.returncode == 0, result.stdout + result.stderr
     lines = [line for line in result.stdout.splitlines() if line]
     assert len(lines) == 2
@@ -633,7 +633,7 @@ def test_t7_probes_print_path_and_boolean_on_positive_arm() -> None:
     """T7: every probe prints exactly a path line then a boolean line, positive arm."""
     recipe = _load_recipe()
     for source, worktree in (
-        (recipe.prefix_probe_source, _REPO),
+        (recipe.prefix_probe_source, Path(sys.prefix).resolve()),
         (recipe.first_party_probe_source, _REPO),
     ):
         result = _run_source(source, worktree)
