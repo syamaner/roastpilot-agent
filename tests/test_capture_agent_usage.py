@@ -5944,6 +5944,7 @@ def test_gate_environment_is_derived_from_the_closed_launch_map() -> None:
         ("RoAsTpIlOt_X", True),
         ("PYTHONPATH", True),
         ("OPENROUTER_API_KEY", True),
+        ("PYTEST_ADDOPTS", True),
         ("TMPDIR", False),
         ("RP_VALIDATION_GATE", False),
         ("PATH", False),
@@ -5982,6 +5983,7 @@ def _poisoned_gate_environment() -> dict[str, str]:
     """Return a synthetic ambient environment containing every #773 poison name."""
     environment = dict(os.environ)
     environment.update(worktree_gate_recipe._ALL_POISON_VALUES)  # pyright: ignore[reportPrivateUsage]
+    environment["PYTEST_ADDOPTS"] = "--disable-warnings"
     return environment
 
 
@@ -6001,6 +6003,7 @@ def test_rendered_gate_scrub_removes_every_poisoned_name_and_preserves_containme
     worktree_gate_recipe._assert_no_poisoned_values(  # pyright: ignore[reportPrivateUsage]
         result.stdout + result.stderr
     )
+    assert "--disable-warnings" not in result.stdout + result.stderr
 
 
 def test_rendered_gate_scrub_reinstates_exact_root_derived_values(tmp_path: Path) -> None:
@@ -6047,6 +6050,7 @@ def test_rendered_ruff_gate_runs_from_the_closed_environment(tmp_path: Path) -> 
     worktree_gate_recipe._assert_no_poisoned_values(  # pyright: ignore[reportPrivateUsage]
         result.stdout + result.stderr
     )
+    assert "--disable-warnings" not in result.stdout + result.stderr
 
 
 def test_gate_environment_verifier_fails_closed_for_clean_leaked_missing_and_absent_cases(
@@ -6065,6 +6069,14 @@ def test_gate_environment_verifier_fails_closed_for_clean_leaked_missing_and_abs
     assert leaked.returncode != 0
     assert "ROASTPILOT_DB" in leaked.stdout + leaked.stderr
     assert poison_value not in leaked.stdout + leaked.stderr
+    pytest_addopts_value = "--disable-warnings"
+    leaked_pytest_addopts = _run_gate_command(
+        command.replace("env -i ", f"env -i PYTEST_ADDOPTS={pytest_addopts_value} ", 1),
+        _poisoned_gate_environment(),
+    )
+    assert leaked_pytest_addopts.returncode != 0
+    assert "PYTEST_ADDOPTS" in leaked_pytest_addopts.stdout + leaked_pytest_addopts.stderr
+    assert pytest_addopts_value not in leaked_pytest_addopts.stdout + leaked_pytest_addopts.stderr
     missing = _run_gate_command(
         command.replace(f" TMPDIR={root}/tmp", "", 1), _poisoned_gate_environment()
     )

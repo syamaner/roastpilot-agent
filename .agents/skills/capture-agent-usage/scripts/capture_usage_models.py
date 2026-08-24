@@ -190,7 +190,7 @@ rejected for every other role.
 SCRUBBED_ENVIRONMENT_PREFIX = "ROASTPILOT_"
 """Case-insensitive namespace removed from every validation gate child."""
 
-SCRUBBED_ENVIRONMENT_NAMES = frozenset({"PYTHONPATH", "OPENROUTER_API_KEY"})
+SCRUBBED_ENVIRONMENT_NAMES = frozenset({"PYTHONPATH", "OPENROUTER_API_KEY", "PYTEST_ADDOPTS"})
 """Additional inherited names removed from every validation gate child."""
 
 
@@ -201,7 +201,7 @@ def is_scrubbed_environment_name(name: str) -> bool:
         name: The environment-variable name to classify.
 
     Returns:
-        ``True`` for every case-insensitive ``ROASTPILOT_*`` name and the two
+        ``True`` for every case-insensitive ``ROASTPILOT_*`` name and the three
         explicitly scrubbed inherited names.
     """
     return (
@@ -247,9 +247,7 @@ def render_gate_environment(root: str) -> tuple[tuple[str, str], ...]:
     """
     values = validation_environment_values(root)
     reinstated = tuple(
-        (key, value)
-        for key, value in values.items()
-        if not is_scrubbed_environment_name(key) and key != "PYTEST_ADDOPTS"
+        (key, value) for key, value in values.items() if not is_scrubbed_environment_name(key)
     )
     return (
         *reinstated,
