@@ -263,6 +263,79 @@ def test_observed_transcript_version_and_atis_latch_are_exact_and_discarded(
             )
 
 
+def test_observed_read_only_transcript_latches_and_handback_are_exact_and_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T11a: READ_ONLY 2.1.241 latches validate repeatedly without retained disclosure."""
+    session_id = "72222222-2222-4222-8222-222222222222"
+    content = (FIXTURES / "claude-2.1.241-transcript" / "story-planner.jsonl").read_bytes()
+    transcript, installed_session = _install_owned_transcript(
+        tmp_path, monkeypatch, content, session_id
+    )
+    usage = usage_transcript.parse_owned_transcript(
+        tmp_path,
+        installed_session,
+        NativeClaudeRole.STORY_PLANNER,
+        "high",
+        expected_version="2.1.241",
+        expected_permission_mode="dontAsk",
+        require_handback=True,
+    )
+    captured = capsys.readouterr()
+    assert usage.handback_text == "SYNTHETIC_STORY_HANDOFF"
+    assert "SYNTHETIC_ATIS_SENTINEL" not in repr(usage)
+    assert "SYNTHETIC_ATIS_SENTINEL" not in (usage.handback_text or "")
+    assert captured.out == captured.err == ""
+    replacements = (
+        (b'"atis":"SYNTHETIC_ATIS_SENTINEL_A",', b'"unexpected":true,'),
+        (b'"atis":"SYNTHETIC_ATIS_SENTINEL_A",', b""),
+        (b'"atis":"SYNTHETIC_ATIS_SENTINEL_A"', b'"atis":1'),
+        (b'"atis":"SYNTHETIC_ATIS_SENTINEL_A"', b'"atis":{}'),
+        (b'"sessionId":"72222222-2222-4222-8222-222222222222",', b""),
+        (b'"sessionId":"72222222-2222-4222-8222-222222222222"', b'"sessionId":1'),
+        (b'"sessionId":"72222222-2222-4222-8222-222222222222"', b'"sessionId":"foreign"'),
+    )
+    for old, new in replacements:
+        transcript.write_bytes(content.replace(old, new, 1))
+        with pytest.raises(
+            usage_transcript.TranscriptError, match="owned Claude transcript is invalid"
+        ):
+            usage_transcript.parse_owned_transcript(
+                tmp_path,
+                installed_session,
+                NativeClaudeRole.STORY_PLANNER,
+                "high",
+                expected_version="2.1.241",
+                expected_permission_mode="dontAsk",
+                require_handback=True,
+            )
+        captured = capsys.readouterr()
+        assert captured.out == captured.err == ""
+
+
+def test_observed_native_2_1_241_opaque_fields_are_not_retained_and_schema_stays_closed() -> None:
+    """T12a: observed additive fields parse, while terminal usage schemas reject extras."""
+    content = (FIXTURES / "claude-2.1.241-native.jsonl").read_bytes()
+    usage = usage_claude.parse_claude_stream(
+        BytesIO(content), expected_version="2.1.241", require_launch_authority=True
+    )
+    assert usage.input_tokens == 2
+    assert "memory_paths" not in repr(usage)
+    assert "rate_limit_info" not in repr(usage)
+    assert "context_management" not in repr(usage)
+    rows = [json.loads(line) for line in content.splitlines()]
+    for container in (rows[-1]["usage"], rows[-1]["modelUsage"]["synthetic-native"]):
+        container["SENTINEL_EXTRA"] = 0
+        with pytest.raises(ClaudeUsageParseError, match="schema") as error:
+            usage_claude.parse_claude_stream(
+                _stream("\n".join(json.dumps(row) for row in rows) + "\n"),
+                expected_version="2.1.241",
+                require_launch_authority=True,
+            )
+        assert "SENTINEL_EXTRA" not in str(error.value)
+        del container["SENTINEL_EXTRA"]
+
+
 def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
     """Native Codex records never claim success without a descendant result."""
     started = datetime.now(UTC)
