@@ -223,6 +223,24 @@ def test_observed_claude_version_binds_generic_stream_exactly() -> None:
         )
 
 
+def test_parse_claude_command_derives_2_1_241_and_hides_invalid_first_events(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The local parser derives only a valid first-init version without leaking input."""
+    content = (FIXTURES / "claude-2.1.241.jsonl").read_bytes()
+    stream = tmp_path / "stream.jsonl"
+    stream.write_bytes(content)
+    assert main(["parse-claude", str(stream)]) == 0
+    assert '"input_tokens":2' in capsys.readouterr().out
+    for first in (b"", b"not-json", b"[]", b"{}", b'{"claude_code_version":1}'):
+        stream.write_bytes(first + b"\n" + b"SENTINEL_UNTRUSTED")
+        with pytest.raises(SystemExit) as error:
+            main(["parse-claude", str(stream)])
+        captured = capsys.readouterr()
+        assert "SENTINEL_UNTRUSTED" not in str(error.value)
+        assert "SENTINEL_UNTRUSTED" not in captured.out + captured.err
+
+
 def test_observed_transcript_version_and_atis_latch_are_exact_and_discarded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -399,6 +417,24 @@ def test_native_codex_record_requires_closed_success_and_git_outcomes() -> None:
     ):
         with pytest.raises(ValidationError):
             NativeCodexUsageRecord.model_validate({**payload, field: value})
+    invalid_harness_versions: tuple[object, ...] = (
+        None,
+        {},
+        True,
+        1,
+        "0.147",
+        "v0.147.0",
+        "0.147.0.1",
+    )
+    for value in invalid_harness_versions:
+        with pytest.raises(ValidationError, match="harness version"):
+            NativeCodexUsageRecord.model_validate({**payload, "harness_version": value})
+    assert (
+        NativeCodexUsageRecord.model_validate(
+            {**payload, "harness_version": "99.100.101"}
+        ).harness_version
+        == "99.100.101"
+    )
     with pytest.raises(ValidationError):
         NativeCodexUsageRecord.model_validate({**payload, "final_head_sha": "a" * 40})
     with pytest.raises(ValidationError):
