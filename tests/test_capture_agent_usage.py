@@ -6057,19 +6057,20 @@ def test_system_env_executable_resolution_preserves_an_attested_env_alias(
     busybox = "/bin/busybox"
     checks: list[tuple[str, str]] = []
 
-    monkeypatch.setattr(usage_models.os.path, "realpath", lambda path: busybox)
-    monkeypatch.setattr(
-        usage_models.os.path,
-        "isfile",
-        lambda path: checks.append(("isfile", path)) is None and path == busybox,
-    )
-    monkeypatch.setattr(
-        usage_models.os,
-        "access",
-        lambda path, mode: (
-            checks.append(("access", path)) is None and path == busybox and mode == os.X_OK
-        ),
-    )
+    def resolve_busybox(_path: str) -> str:
+        return busybox
+
+    def regular_file(path: str) -> bool:
+        checks.append(("isfile", path))
+        return path == busybox
+
+    def executable(path: str, mode: int) -> bool:
+        checks.append(("access", path))
+        return path == busybox and mode == os.X_OK
+
+    monkeypatch.setattr(usage_models.os.path, "realpath", resolve_busybox)
+    monkeypatch.setattr(usage_models.os.path, "isfile", regular_file)
+    monkeypatch.setattr(usage_models.os, "access", executable)
 
     resolved = usage_models._resolve_system_env_executable()  # pyright: ignore[reportPrivateUsage]
     assert resolved == alias
