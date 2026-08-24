@@ -1054,32 +1054,30 @@ class ReferenceCurveSample(BaseModel):
 class ReferenceLandmarks(BaseModel):
     """First-crack and drop landmarks for a completed reference roast.
 
-    Extracted with the clock-safe, telemetry-phase-only rule pinned by the
-    #567 design note §6.4a: first crack is the FIRST ``telemetry_snapshots``
-    row tagged ``agent_phase == 'development'`` (development begins at FC),
-    and drop is the LAST such row — never the run's final row, which can fall
-    in the post-drop cooling tail (bean temperature keeps being recorded
-    while it falls after drop). This rule stays entirely within the
-    run-relative telemetry clock and never rebases against
-    ``roast_events.monotonic_seconds``, a different clock origin (see the
-    ``store-telemetry-event-clock-mismatch`` precedent).
+    First crack is an atomic MCP-onset elapsed/temperature pair only when the
+    accepted MCP event, wall-clock mapping, usable pre-drop bounds, ordering,
+    and interpolation are all proven; otherwise both values are selected from
+    the FIRST ``development``-phase telemetry row. The fallback fields may
+    individually be ``None`` when that row lacks the corresponding persisted
+    value. Drop remains the LAST such row, never the cooling tail. Its
+    development percent remains the controller-frozen, confirmation-derived
+    value and is never recomputed from onset or drop elapsed seconds. Event
+    monotonic seconds are never used to derive the run-relative landmark clock.
     """
 
     first_crack_temp_c: float | None
-    """Bean temperature at the first ``development``-phase telemetry row, or
-    ``None`` if that row's temperature was never recorded."""
+    """Bean temperature in the complete onset pair, or the same fallback row."""
     first_crack_elapsed_s: float | None
-    """Charge-elapsed seconds at the first ``development``-phase telemetry
-    row, or ``None`` if that row's charge-elapsed clock was never recorded."""
+    """Charge seconds in the complete onset pair, or the same fallback row."""
     drop_temp_c: float | None
     """Bean temperature at the last ``development``-phase telemetry row, or
     ``None`` if that row's temperature was never recorded."""
     drop_development_percent: float | None
     """Development-time-ratio percent at the last ``development``-phase
     telemetry row — the controller's own real-time DTR reading, read directly
-    off the stored column rather than reconstructed from an event timestamp
-    (design note §4's DTR-provenance note) — or ``None`` if that row never
-    recorded one."""
+    off the stored column rather than recomputed from onset/drop elapsed
+    seconds (design note §4's DTR-provenance note) — or ``None`` if that row
+    never recorded one."""
     operator_rating: int
     """The reference run's 1-5 star operator rating."""
 

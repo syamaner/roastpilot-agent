@@ -375,6 +375,10 @@ mark-ready/reopen draft-cycle workaround for metadata edits.**
 >   nothing. The fix is still correct and is being made, but it hardens a LATENT trap. See
 >   the 12 Aug block at the top.]
 >
+> **CLOSEOUT (23 Aug 2026 — #783):** The final reference-context consumer now
+> adopts a proven MCP onset elapsed/temperature pair atomically, otherwise
+> retaining the first-development pair; the standalone onset-anchor class is closed.
+>
 > **Two lessons, and the second is the sharper one.** First: consolidating by surface
 > similarity rather than by defect class silently discards work, and it reads as tidy while
 > doing it. Second: **#785 was reopened a full round AFTER #783 and #788, because the same
