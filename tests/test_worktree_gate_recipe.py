@@ -74,6 +74,16 @@ ABSENCE_GUARD_SERIALIZATION_SENTENCE = (
     "can be silently reused by CPython venv. The recipe is not atomic."
 )
 
+#: T14's third exact-match anchor. Adjacent scrubbed commands remain separate
+#: Bash calls in the documented workflow, so their environment boundary is not
+#: an atomic transaction.
+ADJACENT_SCRUB_SERIALIZATION_SENTENCE = (
+    "When the adjacent verification and pytest lines run as separate Bash calls,\n"
+    "they are not atomic: the single-writer/serialization discipline must prevent\n"
+    "ambient environment mutation between them. A copied whole block remains\n"
+    "protected by its opening `set -e`."
+)
+
 #: Poisoned values used by the AC3 tests. Every name is drawn from a real
 #: `ROASTPILOT_*` setting (`config.py`) or a real credential/path variable the
 #: gate recipe must isolate; every value is a throwaway sentinel that must
@@ -755,6 +765,7 @@ def test_t14_canonical_remedy_sentence_present_byte_exact() -> None:
     runbook_text = _RUNBOOK.read_text(encoding="utf-8")
     assert CANONICAL_REMEDY_SENTENCE in runbook_text
     assert ABSENCE_GUARD_SERIALIZATION_SENTENCE in runbook_text
+    assert ADJACENT_SCRUB_SERIALIZATION_SENTENCE in runbook_text
 
 
 # --------------------------------------------------------------------------

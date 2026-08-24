@@ -149,6 +149,11 @@ failure. It does not change the documented one-command-per-Bash-call workflow:
 each self-locating `cd <abs worktree> && ...` line remains independently
 executable and reports its own exit status.
 
+When the adjacent verification and pytest lines run as separate Bash calls,
+they are not atomic: the single-writer/serialization discipline must prevent
+ambient environment mutation between them. A copied whole block remains
+protected by its opening `set -e`.
+
 **The pre-creation absence guard runs first, and it fails closed.** `python3.11
 -m venv .venv` silently reuses an existing `.venv` and leaves whatever is
 already installed intact — Python 3.11 reserves deletion for `--clear` — so a

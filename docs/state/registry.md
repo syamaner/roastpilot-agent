@@ -14,7 +14,9 @@ and the pytest gate strips the whole `ROASTPILOT_*` namespace, not just
 `OPENROUTER_API_KEY`, with a same-prefix post-strip verification line that
 fails closed on any residual and never prints a value. New executable module
 `tests/test_worktree_gate_recipe.py` extracts and runs the recipe's own bytes
-under a closed grammar (31 tests, hardware-free). The Class C sibling —
+under a closed grammar (34 collected hardware-free cases), including a
+whole-block `set -e` fail-fast proof and case-insensitive `ROASTPILOT_`
+strip/verification coverage. The Class C sibling —
 `VALIDATION_ROLE_COMMANDS` in
 `.agents/skills/capture-agent-usage/scripts/capture_usage_models.py`, which
 carries no environment-stripping prefix at all — is a genuine sibling of the
