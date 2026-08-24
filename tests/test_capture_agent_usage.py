@@ -7196,7 +7196,7 @@ def test_native_command_rejects_model_mismatch_without_sink_record(
     with pytest.raises(SystemExit, match="native Claude transcript is invalid"):
         main(_native_cli_args())
 
-    assert len(observed) == 2
+    assert len(observed) == 1
     assert not Path(".agent-usage/usage.jsonl").exists()
 
 
@@ -7220,9 +7220,7 @@ def test_native_command_fails_closed_at_transcript_launch_boundaries(
     def fake(argv: list[str], **kwargs: object) -> _NativeProcess:
         observed.append((argv, kwargs))
         if argv[-1] == "--version":
-            version = (
-                b"Claude Code 2.1.999\\n" if failure == "version" else b"Claude Code 2.1.233\\n"
-            )
+            version = b"Claude Code 2.1.999\n" if failure == "version" else b"Claude Code 2.1.233\n"
             return _NativeProcess(version)
         if failure != "transcript":
             (project / f"{_NATIVE_SESSION_ID}.jsonl").write_bytes(_native_transcript_bytes())
@@ -7248,7 +7246,7 @@ def test_native_command_fails_closed_at_transcript_launch_boundaries(
         main(_native_cli_args())
     assert "SENTINEL_NATIVE_PROMPT" not in str(error.value)
     assert not Path(".agent-usage/usage.jsonl").exists()
-    assert len(observed) == (1 if failure == "version" else 2)
+    assert len(observed) == 2
 
 
 @pytest.mark.parametrize("sink_kind", ["symlink", "fifo", "hardlink"])
@@ -7809,7 +7807,6 @@ def isolate_run_metadata_validation(
             return "2.1.233"
         raise AssertionError(executable)
 
-    monkeypatch.setattr(usage_cli, "_resolved_executable", resolved_executable)
     lifecycle_tests = {
         "test_version_probe_timeout_kills_reaps_and_never_reaches_a_run",
         "test_provider_free_executable_integration_captures_only_normalized_usage",
@@ -7817,8 +7814,14 @@ def isolate_run_metadata_validation(
         "test_real_pipe_backpressure_interleaves_prompt_write_and_stdout_drain",
         "test_run_timeout_kills_and_reaps_term_ignoring_child_without_a_record",
         "test_timeout_kills_real_stdout_inheriting_descendant_without_record",
+        "test_native_command_fails_closed_at_transcript_launch_boundaries",
     }
-    if request.node.name not in lifecycle_tests:  # pyright: ignore[reportUnknownMemberType]
+    original_name = cast(
+        str,
+        request.node.originalname or request.node.name,  # pyright: ignore[reportUnknownMemberType]
+    )
+    if original_name not in lifecycle_tests:
+        monkeypatch.setattr(usage_cli, "_resolved_executable", resolved_executable)
         monkeypatch.setattr(usage_cli, "_harness_version", harness_version)
 
 
@@ -12418,7 +12421,7 @@ def test_native_launch_validates_root_exactly_once_and_binds_add_dir(
     assert main(_native_cli_args(role="qa", validation_root=str(root))) == 0
     assert calls == [str(root)]
 
-    worker_argv = observed[1][0]
+    worker_argv = observed[0][0]
     resolved_root = os.path.realpath(root)
     add_dir_index = worker_argv.index("--add-dir")
     assert worker_argv[add_dir_index + 1] == resolved_root
@@ -12452,7 +12455,7 @@ def test_native_launch_allowed_tools_rules_use_the_resolved_root_end_to_end(
     )
     assert main(_native_cli_args(role="qa", validation_root=str(raw_root))) == 0
 
-    worker_argv = observed[1][0]
+    worker_argv = observed[0][0]
     resolved_root = os.path.realpath(root)
     rules = worker_argv[worker_argv.index("--allowedTools") + 1 :]
     assert rules
@@ -12472,7 +12475,7 @@ def test_native_launch_add_dir_absent_for_write_role(
         _native_popen(project, observed, processes, transcript=_native_transcript_bytes()),
     )
     assert main(_native_cli_args(role="engineer-be")) == 0
-    worker_argv = observed[1][0]
+    worker_argv = observed[0][0]
     assert "--add-dir" not in worker_argv
 
 
@@ -14337,7 +14340,7 @@ def test_native_launch_binds_plan_root_end_to_end(
         main(_native_cli_args(role="story-planner", plan_root=str(plan_root), plan_sha=plan_sha))
         == 0
     )
-    worker_argv = observed[1][0]
+    worker_argv = observed[0][0]
     assert worker_argv[worker_argv.index("--add-dir") + 1] == resolved_plan_root
     assert "--allowedTools" not in worker_argv
     raw = Path(".agent-usage/usage.jsonl").read_text()
@@ -14382,7 +14385,7 @@ def test_native_launch_binds_evidence_bundle_end_to_end(
         )
         == 0
     )
-    worker_argv = observed[1][0]
+    worker_argv = observed[0][0]
     assert worker_argv[worker_argv.index("--add-dir") + 1] == os.path.realpath(evidence_root)
     assert "--allowedTools" not in worker_argv
     raw = Path(".agent-usage/usage.jsonl").read_text()
@@ -14441,7 +14444,7 @@ def test_native_launch_product_auditor_with_plan_root(
         main(_native_cli_args(role="product-auditor", plan_root=str(plan_root), plan_sha=plan_sha))
         == 0
     )
-    bound_argv = observed[1][0]
+    bound_argv = observed[0][0]
     assert bound_argv[bound_argv.index("--add-dir") + 1] == resolved_plan_root
     assert "--allowedTools" not in bound_argv
 
