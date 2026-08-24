@@ -5967,7 +5967,7 @@ def _executable_gate_root(tmp_path: Path) -> Path:
 
 
 def _run_gate_command(
-    command: str, environment: dict[str, str] | None = None
+    command: str, environment: dict[str, str] | None = None, cwd: Path | None = None
 ) -> subprocess.CompletedProcess[str]:
     """Run one rendered gate command without exposing test poison values in assertions."""
     return subprocess.run(
@@ -5975,6 +5975,7 @@ def _run_gate_command(
         capture_output=True,
         text=True,
         env=environment,
+        cwd=cwd,
         check=False,
     )
 
@@ -6095,6 +6096,80 @@ def test_gate_directory_is_not_collected_without_the_validation_sentinel() -> No
         [sys.executable, "-m", "pytest", "tests/gate"], capture_output=True, text=True, check=False
     )
     assert result.returncode == 5
+
+
+def test_rendered_pyright_gate_runs_cold_under_the_closed_environment(tmp_path: Path) -> None:
+    """T18: the byte-exact pyright gate uses its venv-contained Node runtime."""
+    root = _executable_gate_root(tmp_path)
+    cwd = tmp_path / "typed-module"
+    cwd.mkdir()
+    (cwd / "typed_module.py").write_text("answer: int = 42\n")
+    command = render_validation_commands(NativeClaudeRole.QA, str(root))[2]
+    result = _run_gate_command(command, _poisoned_gate_environment(), cwd=cwd)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert not any(marker in output.lower() for marker in ("nodeenv", "download", "network"))
+    worktree_gate_recipe._assert_no_poisoned_values(  # pyright: ignore[reportPrivateUsage]
+        output
+    )
+    assert "--disable-warnings" not in output
+
+
+def test_pyright_node_runtime_is_canonically_contained_in_the_bound_venv(
+    tmp_path: Path,
+) -> None:
+    """T19: package Node, sibling-prefix, and symlink paths fail closed by components."""
+    root = _executable_gate_root(tmp_path)
+    source = (
+        "import os, sys, sysconfig; from pathlib import Path; import nodejs_wheel; "
+        "prefix = Path(sys.prefix).resolve(); "
+        "purelib = Path(sysconfig.get_path('purelib')).resolve(); "
+        "package = Path(nodejs_wheel.__file__).resolve().parent; "
+        "node = (package / 'bin' / 'node').resolve(); "
+        "within = lambda path: Path(path).resolve().is_relative_to(prefix); "
+        "sibling = prefix.parent / (prefix.name + '-evil') / 'bin' / 'node'; "
+        "escape = Path(os.environ['TMPDIR']) / 'escaped-node'; "
+        "escape.symlink_to(Path(sys.executable).resolve()); "
+        "ok = (purelib.is_relative_to(prefix) and package.is_relative_to(purelib) "
+        "and node.is_file() and os.access(node, os.X_OK) and within(node) "
+        "and not within(sibling) and not within(escape)); "
+        "raise SystemExit(0 if ok else 1)"
+    )
+    interpreter = shlex.quote(str(root / "venv" / "bin" / "python"))
+    command = f"{render_gate_scrub_prefix(str(root))} {interpreter} -c {shlex.quote(source)}"
+    result = _run_gate_command(command, _poisoned_gate_environment())
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_closed_gate_path_never_reaches_a_host_node(tmp_path: Path) -> None:
+    """T22: any Node found on the fixed PATH must be canonically venv-contained."""
+    root = _executable_gate_root(tmp_path)
+    source = (
+        "import shutil, sys; from pathlib import Path; "
+        "prefix = Path(sys.prefix).resolve(); node = shutil.which('node'); "
+        "ok = node is None or Path(node).resolve().is_relative_to(prefix); "
+        "raise SystemExit(0 if ok else 1)"
+    )
+    interpreter = shlex.quote(str(root / "venv" / "bin" / "python"))
+    command = f"{render_gate_scrub_prefix(str(root))} {interpreter} -c {shlex.quote(source)}"
+    result = _run_gate_command(command, _poisoned_gate_environment())
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_pyright_nodejs_dependency_is_exactly_pinned() -> None:
+    """T20: the deterministic venv-contained Node provider cannot silently drift."""
+    pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+    pyright_dependencies = [
+        dependency
+        for dependency in pyproject["dependency-groups"]["dev"]
+        if dependency.startswith("pyright")
+    ]
+    assert pyright_dependencies == ["pyright[nodejs]==1.1.410"]
+
+
+def test_closed_gate_path_is_the_literal_minimum_allowlist() -> None:
+    """T21: the rendered environment cannot gain a host Node search path."""
+    assert dict(render_gate_environment("/r"))["PATH"] == "/r/venv/bin:/usr/bin:/bin"
 
 
 def test_validation_role_commands_table_keys_equal_validation_environment_roles() -> None:

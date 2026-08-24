@@ -382,7 +382,12 @@ check, not a substitute for it.
 (`.github/workflows/ci.yml:51-55`): with no worktree `.venv`, pyright has
 nothing for pyproject's `venvPath`/`venv` settings to resolve, so `qa`'s
 committed pyright gate (D168 below) resolves `--pythonpath` against the same
-external interpreter it invokes.
+external interpreter it invokes. Its Node runtime is supplied by pyright's
+`nodejs` extra and resolved through the imported `nodejs_wheel` package inside
+the root venv's site-packages: it performs no runtime download and no host
+lookup. The executable must be canonically contained under the resolved venv
+prefix, rather than assumed to occupy any particular installation location;
+never add host paths to the fixed `PATH` to satisfy this requirement.
 
 **Attestation is untouched.** `--validation-root` binds exactly
 `ROASTPILOT_VALIDATION_ROOT`, `ROASTPILOT_VALIDATION_PYTHON`,

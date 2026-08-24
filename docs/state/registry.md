@@ -21,7 +21,10 @@ strip/verification coverage. The Class C sibling —
 `.agents/skills/capture-agent-usage/scripts/capture_usage_models.py`, which
 carries no environment-stripping prefix at all — is a genuine sibling of the
 same finding class and is explicitly OUT OF SCOPE here; it is recorded under
-the existing #811 / D166-D168 line, not a new issue.**
+the existing #811 / D166-D168 line, not a new issue. #811 now closes the
+validation gate's pyright toolchain over the same root-bound environment:
+the exact dev-only `pyright[nodejs]` pin resolves Node through venv-contained
+`nodejs_wheel`, without host PATH widening or a runtime download.**
 
 **17 Aug 2026 — #735 story-closing implementation complete: `claude-code-review.yml` enables `track_progress`
 only for `opened`/`synchronize`/`ready_for_review`/`reopened` and disables it
