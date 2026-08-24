@@ -6049,6 +6049,35 @@ def test_system_env_executable_resolution_fails_closed_when_candidates_are_unava
     assert candidates == ["/usr/bin/env", "/bin/env"]
 
 
+def test_system_env_executable_resolution_preserves_an_attested_env_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A BusyBox target is attested while the fixed ``env`` alias remains executable."""
+    alias = "/usr/bin/env"
+    busybox = "/bin/busybox"
+    checks: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(usage_models.os.path, "realpath", lambda path: busybox)
+    monkeypatch.setattr(
+        usage_models.os.path,
+        "isfile",
+        lambda path: checks.append(("isfile", path)) is None and path == busybox,
+    )
+    monkeypatch.setattr(
+        usage_models.os,
+        "access",
+        lambda path, mode: (
+            checks.append(("access", path)) is None and path == busybox and mode == os.X_OK
+        ),
+    )
+
+    resolved = usage_models._resolve_system_env_executable()  # pyright: ignore[reportPrivateUsage]
+    assert resolved == alias
+    assert checks == [("isfile", busybox), ("access", busybox)]
+    monkeypatch.setattr(usage_models, "SYSTEM_ENV_EXECUTABLE", resolved)
+    assert render_gate_scrub_prefix("/validated/root").startswith(f"{alias} -i ")
+
+
 def test_rendered_gate_scrub_reinstates_exact_root_derived_values(tmp_path: Path) -> None:
     """T10: every retained containment assignment reaches the gate child unchanged."""
     root = _executable_gate_root(tmp_path)

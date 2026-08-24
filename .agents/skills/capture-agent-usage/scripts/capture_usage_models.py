@@ -193,11 +193,11 @@ SCRUBBED_ENVIRONMENT_PREFIX = "ROASTPILOT_"
 
 
 def _resolve_system_env_executable() -> str:
-    """Return the canonical system ``env`` executable without consulting ``PATH``."""
+    """Return a trusted ``env`` alias after attesting its resolved executable target."""
     for candidate in ("/usr/bin/env", "/bin/env"):
         resolved = os.path.realpath(candidate)
         if os.path.isfile(resolved) and os.access(resolved, os.X_OK):
-            return resolved
+            return candidate
     raise RuntimeError("system env utility is unavailable")
 
 
