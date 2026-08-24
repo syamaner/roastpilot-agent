@@ -126,50 +126,106 @@ second, so this recipe is a single unit: **do not follow only half of it.** Crea
 and validate the environment before trusting any gate:
 
 ```bash
+set -e
+cd <abs worktree> && python3.11 -c $'import os\nfrom pathlib import Path\np = Path(".venv")\ntry:\n    os.lstat(p)\n    exists = True\nexcept FileNotFoundError:\n    exists = False\nexcept OSError:\n    exists = True\nprint(p if exists else p.resolve())\nprint(not exists)\nraise SystemExit(1 if exists else 0)'
 cd <abs worktree> && python3.11 -m venv .venv
-cd <abs worktree> && .venv/bin/python -c 'import sys; from pathlib import Path; p = Path(sys.prefix).resolve(); print(p); print(p.is_relative_to(Path("<abs worktree>").resolve()))'
+cd <abs worktree> && .venv/bin/python -c 'import sys; from pathlib import Path; p = Path(sys.prefix).resolve(); ok = p.is_relative_to(Path("<abs worktree>").resolve()); print(p); print(ok); raise SystemExit(0 if ok else 1)'
 cd <abs worktree> && grep -Fx 'include-system-site-packages = false' .venv/pyvenv.cfg
 cd <abs worktree> && .venv/bin/python -m pip list
 cd <abs worktree> && .venv/bin/python -m pip install --upgrade pip
 cd <abs worktree> && .venv/bin/python -m pip install -e . --group dev
-cd <abs worktree> && .venv/bin/python -c 'import roastpilot_agent as r; from pathlib import Path; p = Path(r.__file__).resolve(); print(p); print(p.is_relative_to(Path("<abs worktree>/src").resolve()))'
-cd <abs worktree> && .venv/bin/python -c 'import numpy, sys; from pathlib import Path; p = Path(numpy.__file__).resolve(); print(p); print(p.is_relative_to(Path(sys.prefix).resolve()))'
+cd <abs worktree> && .venv/bin/python -c 'import roastpilot_agent as r; from pathlib import Path; p = Path(r.__file__).resolve(); ok = p.is_relative_to(Path("<abs worktree>/src").resolve()); print(p); print(ok); raise SystemExit(0 if ok else 1)'
+cd <abs worktree> && .venv/bin/python -c 'import numpy, sys; from pathlib import Path; p = Path(numpy.__file__).resolve(); ok = p.is_relative_to(Path(sys.prefix).resolve()); print(p); print(ok); raise SystemExit(0 if ok else 1)'
 cd <abs worktree> && env -u PYTHONPATH .venv/bin/python -m ruff check .
 cd <abs worktree> && env -u PYTHONPATH .venv/bin/python -m ruff format --check .
 cd <abs worktree> && env -u PYTHONPATH .venv/bin/python -m pyright
-cd <abs worktree> && env -u PYTHONPATH -u OPENROUTER_API_KEY .venv/bin/python -m pytest --basetemp "$(mktemp -d)" --cov=roastpilot_agent --cov-branch --cov-report=term-missing
+cd <abs worktree> && env -u PYTHONPATH -u OPENROUTER_API_KEY $(env | awk -F= 'tolower($1) ~ /^roastpilot_[a-z0-9_]*$/ { print "-u", $1 }') .venv/bin/python -c 'import os, sys; leaked = sorted(k for k in os.environ if k.upper().startswith("ROASTPILOT_") or k in {"PYTHONPATH", "OPENROUTER_API_KEY"}); print(leaked); raise SystemExit(1 if leaked else 0)'
+cd <abs worktree> && env -u PYTHONPATH -u OPENROUTER_API_KEY $(env | awk -F= 'tolower($1) ~ /^roastpilot_[a-z0-9_]*$/ { print "-u", $1 }') .venv/bin/python -m pytest --basetemp "$(mktemp -d)" --cov=roastpilot_agent --cov-branch --cov-report=term-missing
 ```
 
+The opening `set -e` makes a copied whole block stop at its first failed guard,
+probe, verifier, or gate, so a later successful command cannot mask that
+failure. It does not change the documented one-command-per-Bash-call workflow:
+each self-locating `cd <abs worktree> && ...` line remains independently
+executable and reports its own exit status.
+
+When the adjacent verification and pytest lines run as separate Bash calls,
+they are not atomic: the single-writer/serialization discipline must prevent
+ambient environment mutation between them. A copied whole block remains
+protected by its opening `set -e`.
+
+**The pre-creation absence guard runs first, and it fails closed.** `python3.11
+-m venv .venv` silently reuses an existing `.venv` and leaves whatever is
+already installed intact — Python 3.11 reserves deletion for `--clear` — so a
+prior attempt's contamination can survive a naive "just re-run the recipe."
+The guard therefore exits non-zero, before creating or touching anything,
+whenever `<abs worktree>/.venv` already exists **as any filesystem object**: a
+real directory, a regular file, a live symlink, or a **dangling** symlink. It
+uses `os.lstat`, which reports a symlink's own existence without following it,
+so a dangling symlink is caught the same as every other case; a plain
+existence check that follows symlinks (`os.path.exists` / `Path.exists()` /
+shell `test -e` alone) would miss a dangling symlink and fail open. An
+unreadable parent directory is treated the same way — the guard cannot prove
+`.venv` is absent, so it reports existence and stops rather than guessing. A
+non-zero exit here means **do not run `python3.11 -m venv .venv` yet**; follow
+the guarded rebuild remedy immediately below.
+
+This two-line guard/create recipe assumes exactly one provisioning writer for
+this worktree path. Concurrent provisioning of the same `.venv` path must be
+serialized under the shared-surface rule: a real directory created in the gap
+can be silently reused by CPython venv. The recipe is not atomic.
+
+**Guarded `.venv` rebuild remedy.** If `.venv` is a real directory, remove it
+with `rm -rf .venv` (no trailing slash) and restart the recipe from the
+absence guard above; if `.venv` is a symlink — live or dangling — stop and
+report rather than removing or clearing anything through it, because it may be
+another checkout's borrowed venv. This recipe never uses `--clear` and never
+uses `rm -rf .venv/` (trailing slash): either one, run through a `.venv` that
+turns out to be a symlink, deletes the *target* directory's contents — another
+checkout's environment — not just the link, which is an unrecoverable
+cross-tree write from a recipe whose entire purpose is containment.
+
 **Never create this venv with `--system-site-packages`.** Immediately after venv
-creation, the prefix command must print the resolved path and then `True`, proving
-component-aware containment within `<abs worktree>`; `pyvenv.cfg` must contain
-the exact false setting above, and the first, pre-install `pip list` should be
-short. `False` identifies a borrowed or symlinked venv and means this is
-**not a valid gate environment — discard the gate result and rebuild the venv**.
+creation, the prefix command must print the resolved path, then `True`, and
+then exit `0`, proving component-aware containment within `<abs worktree>`;
+`pyvenv.cfg` must contain the exact false setting above, and the first,
+pre-install `pip list` should be short. `False` (exit `1`) identifies a
+borrowed or symlinked venv and means this is **not a valid gate environment —
+discard the gate result and follow the guarded `.venv` rebuild remedy above**.
 The prefix realpath assertion catches whole-venv borrowing — a `.venv` that is
 itself a symlink or resolves outside the worktree — but cannot detect a symlinked
 subdirectory inside an otherwise local venv. A config mismatch or a long
 inherited package list (for example, Django or torch is already present) has the
 same fail-closed result; never report gates from that environment. After
 dependency installation, the **primary assertion** is the first-party path
-command: it must print the resolved path and then `True`, proving component-aware
-containment within `<abs worktree>/src/`. `False` means the gates are about to
-describe the wrong tree and this is **not a valid gate environment — discard the
-gate result and reinstall from the worktree or rebuild the venv**. An editable
+command: it must print the resolved path, then `True`, and then exit `0`,
+proving component-aware containment within `<abs worktree>/src/`. `False`
+(exit `1`) means the gates are about to describe the wrong tree and this is
+**not a valid gate environment — discard the gate result, reinstall from the
+worktree once `.venv` is confirmed clean, or follow the guarded `.venv`
+rebuild remedy above**. An editable
 install pointed at the wrong directory triggers this; that is what happens when
 `pip install -e .` runs without self-locating, the cwd-resets rule above biting
 inside the gate recipe itself. This first-party assertion also catches
 subdirectory-level borrowing; it directly checks where the package under test
 comes from. Numpy remains the third-party provenance canary, including for
 `--system-site-packages` contamination: the recipe must print the resolved
-package path and then `True`, proving component-aware containment within the
-resolved `sys.prefix`. `False` means contamination, so this is **not a valid gate
-environment — discard the gate result and rebuild the venv**. The prefix,
+package path, then `True`, and then exit `0`, proving component-aware
+containment within the resolved `sys.prefix`. `False` (exit `1`) means
+contamination, so this is **not a valid gate environment — discard the gate
+result and follow the guarded `.venv` rebuild remedy above**. The prefix,
 first-party, and third-party path assertions cover different borrowing depths;
-none is individually sufficient. Every gate unsets inherited `PYTHONPATH`, which
+none is individually sufficient. Every probe's exit status is produced by an
+explicit `raise SystemExit(...)`, never a bare `assert` — `assert` is removed
+under `python -O` / `PYTHONOPTIMIZE`, and these probe lines do not unset
+`PYTHONOPTIMIZE`, so an `assert`-based probe would silently pass in exactly the
+ambient-environment way the pytest gate below is designed to avoid. Every gate
+unsets inherited `PYTHONPATH`, which
 can silently outrank the venv for tooling imports even when both package probes
 pass. **A containment or provenance check is only as good as the comparison it
-performs and the environment it performs it in.** Version comparison is
+performs and the environment it performs it in — and only fail-closed if a
+failed comparison stops the recipe, not merely describes the failure.** Version
+comparison is
 informational only: dependencies are ranged and
 the repository has no lockfile, so a fresh venv may legitimately resolve a newer
 version than an older repository venv; that difference must **not** trigger a
@@ -186,6 +242,44 @@ therefore passes its own `--basetemp "$(mktemp -d)"`. It is unique per run,
 leaves nothing in the tree, and needs no `.gitignore` change. Every changed line
 and branch arm must be covered before opening, because `codecov/patch` counts
 partial branches.
+
+**The pytest gate strips the whole case-insensitive `ROASTPILOT_` namespace, not an enumerated
+key list.** `AppConfig` (`src/roastpilot_agent/config.py`) loads every
+`ROASTPILOT_*` environment variable case-insensitively, with `__` marking nested settings, so a
+single ambient override left over from local testing — for example an exported
+`ROASTPILOT_ADVISOR__MODEL_SLUG_BY_PHASE` — can silently outrank a scalar a
+test sets and manufacture a failure pytest would never see in CI. Naming one
+key (`OPENROUTER_API_KEY`) and stopping there repeats exactly the failure this
+runbook exists to prevent: a list of keys goes stale the day a new setting
+ships. The recipe instead uses portable `awk` to case-fold every environment
+name and emit `-u NAME` only when it matches `roastpilot_[a-z0-9_]*`. The
+unquoted `$(...)` command substitution is safe because `awk` prints only the
+first `=`-delimited field (the name), and that character grammar contains no
+whitespace, so every emitted word is a bare `-u NAME` token — nothing it
+produces can reintroduce word-splitting or globbing hazards. Two edge cases
+follow from that: a multi-line value belonging to some
+*other* variable that happens to contain a continuation line starting
+`ROASTPILOT_…=` produces a spurious `-u NAME` for a name that does not exist,
+and `env -u` on a non-existent name is a no-op, so the parse's only failure
+direction is **over-stripping (safe)**, never under-stripping; and a
+`ROASTPILOT_`-prefixed name outside the `[A-Za-z0-9_]` grammar — settable only
+through `env 'ROASTPILOT_A B=1'`, not by an ordinary shell export — is **not**
+stripped by the scan.
+
+**That residual is exactly what the verification line, immediately before the
+pytest line, exists to catch.** Because the strip is built by parsing text
+rather than proven exhaustive, the verification line runs the *same* strip
+prefix and then asserts, inside the child interpreter, that no
+case-insensitive `ROASTPILOT_`-prefixed key and neither `PYTHONPATH` nor `OPENROUTER_API_KEY`
+survived into the child process; it exits non-zero if any did. It prints only
+the leaked **names**, never their values — `ROASTPILOT_DB` names the
+operator's personal roast-store path and `OPENROUTER_API_KEY` is a live
+provider credential, and this runbook is public, so a debugging aid that
+echoes `env` output would publish a credential the moment someone pasted a
+transcript into a PR. A non-zero exit from the verification line means the
+strip under-approximated for this shell's environment: fix the export or the
+strip pattern and rerun both the verification line and the pytest line before
+trusting the pytest result.
 
 ### Manual pyright isolation verification
 
