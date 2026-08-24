@@ -6034,10 +6034,14 @@ def test_system_env_executable_resolution_fails_closed_when_candidates_are_unava
     """The canonical ``env`` resolver rejects when neither absolute candidate is usable."""
     candidates: list[str] = []
 
-    def unavailable(path: str) -> bool:
+    def observe_candidate(path: str) -> str:
         candidates.append(path)
+        return path
+
+    def unavailable(_path: str) -> bool:
         return False
 
+    monkeypatch.setattr(usage_models.os.path, "realpath", observe_candidate)
     monkeypatch.setattr(usage_models.os.path, "isfile", unavailable)
     with pytest.raises(RuntimeError) as raised:
         usage_models._resolve_system_env_executable()  # pyright: ignore[reportPrivateUsage]
