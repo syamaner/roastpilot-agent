@@ -158,6 +158,11 @@ unreadable parent directory is treated the same way — the guard cannot prove
 non-zero exit here means **do not run `python3.11 -m venv .venv` yet**; follow
 the guarded rebuild remedy immediately below.
 
+This two-line guard/create recipe assumes exactly one provisioning writer for
+this worktree path. Concurrent provisioning of the same `.venv` path must be
+serialized under the shared-surface rule: a real directory created in the gap
+can be silently reused by CPython venv. The recipe is not atomic.
+
 **Guarded `.venv` rebuild remedy.** If `.venv` is a real directory, remove it
 with `rm -rf .venv` (no trailing slash) and restart the recipe from the
 absence guard above; if `.venv` is a symlink — live or dangling — stop and

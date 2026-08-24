@@ -63,6 +63,16 @@ CANONICAL_REMEDY_SENTENCE = (
     "another checkout's borrowed venv."
 )
 
+#: T14's second exact-match anchor. The absence guard and the following venv
+#: creation command are deliberately not presented as an atomic provisioning
+#: primitive; concurrent writers remain a shared surface.
+ABSENCE_GUARD_SERIALIZATION_SENTENCE = (
+    "This two-line guard/create recipe assumes exactly one provisioning writer for\n"
+    "this worktree path. Concurrent provisioning of the same `.venv` path must be\n"
+    "serialized under the shared-surface rule: a real directory created in the gap\n"
+    "can be silently reused by CPython venv. The recipe is not atomic."
+)
+
 #: Poisoned values used by the AC3 tests. Every name is drawn from a real
 #: `ROASTPILOT_*` setting (`config.py`) or a real credential/path variable the
 #: gate recipe must isolate; every value is a throwaway sentinel that must
@@ -475,6 +485,19 @@ def _parse_leaked(stdout: str) -> list[str]:
     return parsed_items
 
 
+def _assert_no_poisoned_values(output: str) -> None:
+    """Raise when captured output discloses any synthetic poison value.
+
+    Args:
+        output: Combined captured stdout and stderr from a gate subprocess.
+
+    Raises:
+        AssertionError: If any synthetic poisoned value appears in `output`.
+    """
+    for name, value in _POISON_VALUES.items():
+        assert value not in output, f"{name}'s poisoned VALUE leaked into gate output"
+
+
 def _outer_site_packages() -> str:
     """Return this interpreter's first site-packages directory (for T5).
 
@@ -672,9 +695,10 @@ def test_t13_no_forbidden_literals_in_command_lines() -> None:
 
 
 def test_t14_canonical_remedy_sentence_present_byte_exact() -> None:
-    """T14: the guarded rebuild remedy sentence appears verbatim (D154 exact-match)."""
+    """T14: the closed rebuild and serialization disclosures are byte-exact."""
     runbook_text = _RUNBOOK.read_text(encoding="utf-8")
     assert CANONICAL_REMEDY_SENTENCE in runbook_text
+    assert ABSENCE_GUARD_SERIALIZATION_SENTENCE in runbook_text
 
 
 # --------------------------------------------------------------------------
@@ -730,8 +754,7 @@ def test_t17_no_poisoned_value_disclosed() -> None:
     combined = (
         strip_applied.stdout + strip_applied.stderr + strip_bypassed.stdout + strip_bypassed.stderr
     )
-    for name, value in _POISON_VALUES.items():
-        assert value not in combined, f"{name}'s poisoned VALUE leaked into gate output"
+    _assert_no_poisoned_values(combined)
 
 
 def test_t18_pythonpath_and_api_key_also_isolated() -> None:
@@ -983,28 +1006,35 @@ def test_mutation_g8_missing_verification_line_fails_structural_check() -> None:
 
 
 def test_mutation_g9_g10_value_echoing_prefix_leaks_a_value() -> None:
-    """G9/G10 mutation: a naive value-echoing check would leak a credential,
-    which is exactly what T17 exists to catch; the real verification source
-    never reads or prints a value."""
-    poisoned_env = dict(os.environ)
-    secret_value = "sk-rp773-mutation-secret"
-    poisoned_env["OPENROUTER_API_KEY"] = secret_value
+    """G9/G10 mutation: the extracted verifier must never echo a value.
 
-    naive_echo = subprocess.run(
-        ["bash", "-c", "env | grep OPENROUTER_API_KEY || true"],
+    The mutant removes the actual dynamic namespace strip from the extracted
+    prefix and rewrites the actual verifier's `print(leaked)` call to echo the
+    named values. It then runs through T15/T17's bash inspection route, so the
+    exact value-disclosure comparison used by T17 must reject its output.
+    """
+    recipe = _load_recipe()
+    prefix = _env_prefix(recipe.pytest_gate)
+    before_namespace_strip, separator, _ = prefix.partition(" $(env | sed ")
+    assert separator, "extracted strip prefix lost its dynamic namespace removal"
+    source = _python_c_source(recipe.verification)
+    mutant_source = source.replace(
+        "print(leaked)", "print([(key, os.environ[key]) for key in leaked])"
+    )
+    assert mutant_source != source
+
+    mutant = subprocess.run(
+        ["bash", "-c", _inspector_command(before_namespace_strip, mutant_source)],
         capture_output=True,
         text=True,
-        env=poisoned_env,
+        env=_poisoned_env(),
     )
-    assert secret_value in naive_echo.stdout, (
-        "mutant did not actually disclose a value (test is vacuous)"
+    captured = mutant.stdout + mutant.stderr
+    assert _POISON_VALUES["ROASTPILOT_DB"] in captured, (
+        "mutant did not disclose a synthetic poisoned value (test is vacuous)"
     )
-
-    recipe = _load_recipe()
-    source = _python_c_source(recipe.verification)
-    assert "os.environ[" not in source
-    assert ".values()" not in source
-    assert "os.getenv" not in source
+    with pytest.raises(AssertionError):
+        _assert_no_poisoned_values(captured)
 
 
 def test_mutation_g8_heading_rename_fails_t20() -> None:
