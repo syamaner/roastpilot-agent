@@ -7818,7 +7818,7 @@ def isolate_run_metadata_validation(
         "test_run_timeout_kills_and_reaps_term_ignoring_child_without_a_record",
         "test_timeout_kills_real_stdout_inheriting_descendant_without_record",
     }
-    if request.node.name not in lifecycle_tests:
+    if request.node.name not in lifecycle_tests:  # pyright: ignore[reportUnknownMemberType]
         monkeypatch.setattr(usage_cli, "_harness_version", harness_version)
 
 
