@@ -57,9 +57,10 @@ never themselves executable and must never be run as written. The per-run
 root is not knowable in advance, and a denied-by-default provider allow-rule
 matches only the byte-exact command it was built from.
 
-Your committed native launch carries exactly two fixed, exact
-`--allowedTools` rules (D168): `pip show coffee-roaster-mcp` and
-`pytest tests/test_mcp_client.py -q --basetemp <root>/tmp/pytest`. **Any
+Your committed native launch carries exactly three fixed, exact
+`--allowedTools` rules (D168), executed in order: the gate-environment
+verifier, `pip show coffee-roaster-mcp`, and `pytest tests/test_mcp_client.py
+-q --basetemp <root>/tmp/pytest`. **Any
 other command is denied outright by the provider's `dontAsk` default, with
 no prompt and no retry** — no interpreter one-liner is on the list, so
 re-derive the installed tool surface with `Read`/`Grep` over the source

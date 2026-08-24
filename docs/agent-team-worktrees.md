@@ -458,7 +458,7 @@ no bypass mode. The parent is the **sole interface** to this role's exact
 gate commands: it runs `print-validation-commands --role <role>
 --validation-root <root>` (`capture_usage_cli.py`) and pastes that verbatim
 output into the role's brief. This runbook intentionally does not restate
-those seven dynamic command strings — they depend on the per-run root and
+those ten dynamic command strings — they depend on the per-run root and
 only `print-validation-commands` can render them correctly, from the same
 table that builds the argv rules. Exactly one rule (`qa`'s `pytest` gate) is
 a *prefix* rule; it admits arbitrary pytest arguments and the execution of

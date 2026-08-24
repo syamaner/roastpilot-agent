@@ -65,10 +65,11 @@ itself executable and must never be run as written. The per-run root is not
 knowable in advance, and a denied-by-default provider allow-rule matches
 only the byte-exact command it was built from.
 
-Your committed native launch carries exactly one fixed, exact
-`--allowedTools` rule (D168): one pytest invocation containing both
-`tests/test_milestone1.py` and `tests/test_milestone1_real_mcp.py`, followed
-by `-q --basetemp <root>/tmp/pytest`. **Any other command, including
+Your committed native launch carries exactly two fixed, exact
+`--allowedTools` rules (D168), executed in order: the gate-environment
+verifier, then one pytest invocation containing both `tests/test_milestone1.py`
+and `tests/test_milestone1_real_mcp.py`, followed by `-q --basetemp
+<root>/tmp/pytest`. **Any other command, including
 `roastpilot-agent --replay`, is denied outright by the provider's `dontAsk`
 default, with no prompt and no retry** — see Procedure step 2 above. If a
 command you need is denied, stop and report — never attempt a workaround.

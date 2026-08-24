@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
 collect_ignore_glob = [] if os.environ.get("RP_VALIDATION_GATE") == "1" else ["test_*.py"]
 
 
-def _is_validation_gate_target(argument: str) -> bool:
+def _is_validation_gate_target(argument: str, rootpath: Path) -> bool:
     """Return whether one explicit pytest argument addresses ``tests/gate``."""
-    target = argument.split("::", 1)[0].removeprefix("./").rstrip("/")
-    return target == "tests/gate" or target.startswith("tests/gate/")
+    candidate = Path(argument.split("::", 1)[0]).expanduser()
+    root = rootpath.resolve()
+    target = (candidate if candidate.is_absolute() else root / candidate).resolve()
+    gate = (root / "tests" / "gate").resolve()
+    return target == gate or gate in target.parents
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -21,6 +25,8 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     if (
         os.environ.get("RP_VALIDATION_GATE") != "1"
         and requested
-        and any(_is_validation_gate_target(argument) for argument in requested)
+        and any(
+            _is_validation_gate_target(argument, session.config.rootpath) for argument in requested
+        )
     ):
         pytest.exit("validation gate sentinel is absent", returncode=5)

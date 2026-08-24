@@ -6135,12 +6135,17 @@ def test_gate_environment_verifier_fails_closed_for_clean_leaked_missing_and_abs
     assert absent.returncode == 5
 
 
-def test_gate_directory_is_not_collected_without_the_validation_sentinel() -> None:
-    """T17: ordinary pytest invocation sees no validation-only tests."""
+@pytest.mark.parametrize(
+    "gate_target",
+    ("tests/gate", str(Path(__file__).resolve().parents[1] / "tests" / "gate")),
+    ids=("relative", "absolute"),
+)
+def test_gate_directory_is_not_collected_without_the_validation_sentinel(gate_target: str) -> None:
+    """T17: relative and absolute gate targets fail closed without the sentinel."""
     environment = dict(os.environ)
     environment.pop("RP_VALIDATION_GATE", None)
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/gate"],
+        [sys.executable, "-m", "pytest", gate_target],
         capture_output=True,
         text=True,
         env=environment,
@@ -6159,6 +6164,14 @@ def test_gate_directory_is_not_collected_without_the_validation_sentinel() -> No
         (
             "tests/test_capture_agent_usage.py::test_gate_directory_is_not_collected_without_the_validation_sentinel",
             "tests/gate",
+        ),
+        (
+            str(Path(__file__).resolve().parents[1] / "tests" / "gate"),
+            "tests/test_capture_agent_usage.py::test_gate_directory_is_not_collected_without_the_validation_sentinel",
+        ),
+        (
+            "tests/test_capture_agent_usage.py::test_gate_directory_is_not_collected_without_the_validation_sentinel",
+            str(Path(__file__).resolve().parents[1] / "tests" / "gate"),
         ),
     ],
 )
@@ -6202,6 +6215,8 @@ def test_gate_target_guard_preserves_broad_discovery_and_gateway_boundary() -> N
     assert "validation gate sentinel is absent" not in gateway.stdout + gateway.stderr
 
 
+@pytest.mark.slow
+@pytest.mark.serial(reason="runs a nested broad pytest suite through a real shell subprocess")
 def test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper(tmp_path: Path) -> None:
     """The actual QA prefix collects the gate checks during broad suite execution."""
     root = _executable_gate_root(tmp_path)
@@ -12640,7 +12655,7 @@ def test_sim_roast_runner_rejects_a_skipped_real_mcp_lane() -> None:
 def test_runbook_and_skill_and_agents_row_point_to_print_validation_commands() -> None:
     """T17: the runbook, SKILL.md, and the AGENTS.md row cite the single interface.
 
-    None of the three duplicates the seven dynamic per-role command strings —
+    None of the three duplicates the ten dynamic per-role command strings —
     only ``print-validation-commands`` (run by the parent) can render them,
     because they depend on the per-run root.
     """
