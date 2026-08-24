@@ -9,12 +9,18 @@ import pytest
 collect_ignore_glob = [] if os.environ.get("RP_VALIDATION_GATE") == "1" else ["test_*.py"]
 
 
+def _is_validation_gate_target(argument: str) -> bool:
+    """Return whether one explicit pytest argument addresses ``tests/gate``."""
+    target = argument.split("::", 1)[0].removeprefix("./").rstrip("/")
+    return target == "tests/gate" or target.startswith("tests/gate/")
+
+
 def pytest_sessionstart(session: pytest.Session) -> None:
     """Fail closed when an explicit validation-gate target lacks its sentinel."""
     requested = tuple(str(argument) for argument in session.config.args)
     if (
         os.environ.get("RP_VALIDATION_GATE") != "1"
         and requested
-        and all(argument.startswith("tests/gate") for argument in requested)
+        and any(_is_validation_gate_target(argument) for argument in requested)
     ):
         pytest.exit("validation gate sentinel is absent", returncode=5)

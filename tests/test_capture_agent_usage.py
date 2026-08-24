@@ -6007,6 +6007,27 @@ def test_rendered_gate_scrub_removes_every_poisoned_name_and_preserves_containme
     assert "--disable-warnings" not in result.stdout + result.stderr
 
 
+def test_rendered_gate_scrub_bypasses_a_path_leading_fake_env_shim(tmp_path: Path) -> None:
+    """The closed gate always starts with its canonical ``env`` executable."""
+    root = _executable_gate_root(tmp_path)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_env = fake_bin / "env"
+    fake_env.write_text("#!/bin/sh\nexit 73\n")
+    fake_env.chmod(0o755)
+    environment = _poisoned_gate_environment()
+    environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+    source = "raise SystemExit(0)"
+    command = (
+        f"{render_gate_scrub_prefix(str(root))} {shlex.quote(sys.executable)} -c "
+        f"{shlex.quote(source)}"
+    )
+    result = _run_gate_command(command, environment)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert str(fake_env) not in command
+    assert command.startswith(f"{shlex.quote(usage_models.SYSTEM_ENV_EXECUTABLE)} -i ")
+
+
 def test_rendered_gate_scrub_reinstates_exact_root_derived_values(tmp_path: Path) -> None:
     """T10: every retained containment assignment reaches the gate child unchanged."""
     root = _executable_gate_root(tmp_path)
@@ -6063,8 +6084,9 @@ def test_gate_environment_verifier_fails_closed_for_clean_leaked_missing_and_abs
     clean = _run_gate_command(command, _poisoned_gate_environment())
     assert clean.returncode == 0, clean.stdout + clean.stderr
     poison_value = "synthetic-verifier-poison"
+    scrub = render_gate_scrub_prefix(str(root))
     leaked = _run_gate_command(
-        command.replace("env -i ", f"env -i ROASTPILOT_DB={poison_value} ", 1),
+        command.replace(scrub, scrub.replace(" -i ", f" -i ROASTPILOT_DB={poison_value} ", 1), 1),
         _poisoned_gate_environment(),
     )
     assert leaked.returncode != 0
@@ -6072,7 +6094,9 @@ def test_gate_environment_verifier_fails_closed_for_clean_leaked_missing_and_abs
     assert poison_value not in leaked.stdout + leaked.stderr
     pytest_addopts_value = "--disable-warnings"
     leaked_pytest_addopts = _run_gate_command(
-        command.replace("env -i ", f"env -i PYTEST_ADDOPTS={pytest_addopts_value} ", 1),
+        command.replace(
+            scrub, scrub.replace(" -i ", f" -i PYTEST_ADDOPTS={pytest_addopts_value} ", 1), 1
+        ),
         _poisoned_gate_environment(),
     )
     assert leaked_pytest_addopts.returncode != 0
@@ -6092,10 +6116,79 @@ def test_gate_environment_verifier_fails_closed_for_clean_leaked_missing_and_abs
 
 def test_gate_directory_is_not_collected_without_the_validation_sentinel() -> None:
     """T17: ordinary pytest invocation sees no validation-only tests."""
+    environment = dict(os.environ)
+    environment.pop("RP_VALIDATION_GATE", None)
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/gate"], capture_output=True, text=True, check=False
+        [sys.executable, "-m", "pytest", "tests/gate"],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
     )
     assert result.returncode == 5
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [
+        (
+            "tests/gate",
+            "tests/test_capture_agent_usage.py::test_gate_directory_is_not_collected_without_the_validation_sentinel",
+        ),
+        (
+            "tests/test_capture_agent_usage.py::test_gate_directory_is_not_collected_without_the_validation_sentinel",
+            "tests/gate",
+        ),
+    ],
+)
+def test_mixed_explicit_gate_targets_fail_closed_without_the_sentinel(
+    targets: tuple[str, str],
+) -> None:
+    """Explicit gate targets fail closed in either mixed-argument ordering."""
+    environment = dict(os.environ)
+    environment.pop("RP_VALIDATION_GATE", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", *targets],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert result.returncode == 5
+    assert "validation gate sentinel is absent" in result.stdout + result.stderr
+
+
+def test_gate_target_guard_preserves_broad_discovery_and_gateway_boundary() -> None:
+    """Broad discovery remains legal and a gateway prefix is not a gate target."""
+    environment = dict(os.environ)
+    environment.pop("RP_VALIDATION_GATE", None)
+    broad = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests", "--collect-only", "-q"],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert broad.returncode == 0, broad.stdout + broad.stderr
+    gateway = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/gateway"],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert gateway.returncode != 5
+    assert "validation gate sentinel is absent" not in gateway.stdout + gateway.stderr
+
+
+def test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper(tmp_path: Path) -> None:
+    """The actual QA prefix collects the gate checks during broad suite execution."""
+    root = _executable_gate_root(tmp_path)
+    wrapper = render_validation_commands(NativeClaudeRole.QA, str(root))[1]
+    excluded = "not test_rendered_qa_full_suite_gate_runs_under_the_actual_wrapper"
+    command = f"{wrapper} tests -k {shlex.quote(excluded)}"
+    result = _run_gate_command(command, _poisoned_gate_environment(), cwd=Path(__file__).parents[1])
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_rendered_pyright_gate_runs_cold_under_the_closed_environment(tmp_path: Path) -> None:
@@ -6145,13 +6238,19 @@ def test_pyright_node_runtime_is_canonically_contained_in_the_bound_venv(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_closed_gate_path_never_reaches_a_host_node(tmp_path: Path) -> None:
-    """T22: any Node found on the fixed PATH must be canonically venv-contained."""
+def test_pyright_provider_node_is_canonically_contained_in_the_bound_venv(
+    tmp_path: Path,
+) -> None:
+    """T22: Pyright's selected packaged Node is contained without host-PATH assumptions."""
     root = _executable_gate_root(tmp_path)
     source = (
-        "import shutil, sys; from pathlib import Path; "
-        "prefix = Path(sys.prefix).resolve(); node = shutil.which('node'); "
-        "ok = node is None or Path(node).resolve().is_relative_to(prefix); "
+        "import os, sys, sysconfig; from pathlib import Path; import nodejs_wheel; "
+        "prefix = Path(sys.prefix).resolve(); "
+        "purelib = Path(sysconfig.get_path('purelib')).resolve(); "
+        "package = Path(nodejs_wheel.__file__).resolve().parent; "
+        "node = (package / 'bin' / 'node').resolve(); "
+        "ok = (purelib.is_relative_to(prefix) and package.is_relative_to(purelib) "
+        "and node.is_file() and os.access(node, os.X_OK) and node.is_relative_to(prefix)); "
         "raise SystemExit(0 if ok else 1)"
     )
     interpreter = shlex.quote(str(root / "venv" / "bin" / "python"))

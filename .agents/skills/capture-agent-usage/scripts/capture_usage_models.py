@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -190,6 +191,19 @@ rejected for every other role.
 SCRUBBED_ENVIRONMENT_PREFIX = "ROASTPILOT_"
 """Case-insensitive namespace removed from every validation gate child."""
 
+
+def _resolve_system_env_executable() -> str:
+    """Return the canonical system ``env`` executable without consulting ``PATH``."""
+    for candidate in ("/usr/bin/env", "/bin/env"):
+        resolved = os.path.realpath(candidate)
+        if os.path.isfile(resolved) and os.access(resolved, os.X_OK):
+            return resolved
+    raise RuntimeError("system env utility is unavailable")
+
+
+SYSTEM_ENV_EXECUTABLE = _resolve_system_env_executable()
+"""Canonical system ``env`` executable used to start closed gate children."""
+
 SCRUBBED_ENVIRONMENT_NAMES = frozenset({"PYTHONPATH", "OPENROUTER_API_KEY", "PYTEST_ADDOPTS"})
 """Additional inherited names removed from every validation gate child."""
 
@@ -268,7 +282,7 @@ def render_gate_scrub_prefix(root: str) -> str:
         One shell-token-safe ``env -i`` command prefix with closed assignments.
     """
     assignments = " ".join(f"{key}={value}" for key, value in render_gate_environment(root))
-    return f"env -i {assignments}"
+    return f"{shlex.quote(SYSTEM_ENV_EXECUTABLE)} -i {assignments}"
 
 
 class ValidationCommandKind(Enum):
