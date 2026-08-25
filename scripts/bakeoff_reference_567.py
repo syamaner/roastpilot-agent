@@ -50,15 +50,17 @@ self-exclusion, fixture reconstruction, reference injection, replay, resume,
 the cost guard, and the report — is provable at zero spend.
 
 Reads the real operator SQLite store (default ``~/roasts/roastpilot.sqlite3``,
-``--store``), but NEVER opens that file itself: :func:`snapshot_store_to_temp`
-backs it up (via SQLite's own online backup API, against a strictly
-``mode=ro`` source connection) to a private temp copy first, and every
-:class:`~roastpilot_agent.store.RoastStore` call in this script — ``list_runs``
-/ ``read_run`` / the private reference-retrieval methods — operates on THAT
-copy. ``RoastStore.initialize()`` opens read-write and applies WAL/migrations
-(the normal, safe thing for the live agent to do to its own store), so this
-isolation is what keeps the operator's live database untouched even though
-this script only ever calls read methods on the (temp-copy) store.
+``--store``), but NEVER opens that file itself:
+:func:`store_snapshot.snapshot_store_to_temp` (the shared helper every
+offline store-reading script uses, #726) backs it up (via SQLite's own online
+backup API, against a strictly ``mode=ro`` source connection) to a private
+temp copy first, and every :class:`~roastpilot_agent.store.RoastStore` call in
+this script — ``list_runs`` / ``read_run`` / the private reference-retrieval
+methods — operates on THAT copy. ``RoastStore.initialize()`` opens read-write
+and applies WAL/migrations (the normal, safe thing for the live agent to do to
+its own store), so this isolation is what keeps the operator's live database
+untouched even though this script only ever calls read methods on the
+(temp-copy) store.
 
 Exact operator run command (paid, real model calls)::
 
@@ -90,7 +92,6 @@ import argparse
 import asyncio
 import dataclasses
 import json
-import sqlite3
 import sys
 import tempfile
 import time
@@ -109,6 +110,7 @@ from bakeoff_replay import (  # noqa: E402
     build_ticks,
     replay_roast,
 )
+from store_snapshot import snapshot_store_to_temp  # noqa: E402
 from store_to_fixture import FixtureConversionError  # noqa: E402
 from store_to_fixture import convert as convert_store_run
 
@@ -167,52 +169,6 @@ DEFAULT_WEIGHT_TOLERANCE_FRAC = 0.10
 DEFAULT_MIN_GROUP_SIZE = 2
 
 ReasoningEffort = Literal["off", "minimal", "low", "medium", "high"]
-
-
-# --- Read-only store isolation (Codex PR #578 finding: never open the operator's
-# --- live DB read-write) -------------------------------------------------------
-
-
-def snapshot_store_to_temp(store_path: Path, tmp_dir: Path) -> Path:
-    """Copy the operator store to a private temp file; this script opens ONLY the copy.
-
-    ``RoastStore.initialize()`` opens its database read-write and applies the
-    WAL pragma + any pending migration (the normal, safe thing for the live
-    agent to do to ITS OWN store) — but this script is documented read-only
-    against the OPERATOR's real ``~/roasts/roastpilot.sqlite3``, and must never
-    open that file read-write, even transiently, even under ``--dry-run``.
-
-    Uses SQLite's own online backup API (:meth:`sqlite3.Connection.backup`)
-    against a strictly read-only (``mode=ro``) source connection, so the
-    snapshot is a fully consistent point-in-time copy (including anything
-    still only in the source's WAL) without ever acquiring a write lock on the
-    operator's file. The returned path lives under ``tmp_dir`` (the caller's
-    temp directory, cleaned up on exit) and is the ONLY path this script ever
-    opens read-write.
-
-    Args:
-        store_path: The real operator store to copy.
-        tmp_dir: A scratch directory the caller owns and will clean up.
-
-    Returns:
-        The path to the private snapshot copy.
-
-    Raises:
-        FileNotFoundError: If ``store_path`` does not exist.
-    """
-    if not store_path.exists():
-        raise FileNotFoundError(f"no store at {store_path}")
-    snapshot_path = tmp_dir / "store-snapshot.sqlite3"
-    source = sqlite3.connect(f"file:{store_path}?mode=ro", uri=True)
-    try:
-        target = sqlite3.connect(str(snapshot_path))
-        try:
-            source.backup(target)
-        finally:
-            target.close()
-    finally:
-        source.close()
-    return snapshot_path
 
 
 # --- Arm definitions (design note §6.4) --------------------------------------

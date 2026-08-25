@@ -18,6 +18,43 @@ Format: one entry per anti-pattern.
 
 ---
 
+## Naive read-only SQLite URI f-strings mis-parse `?`/`#` in the path
+*(fixed by #726 item 3, scripts-only consolidation)*
+
+- **Signature:** `rg -n 'f"file:\{[^}]+\}\?mode=ro"'` anywhere in `scripts/` — a
+  hand-rolled read-only SQLite URI built by directly interpolating a `Path`
+  into an f-string, rather than `path.resolve().as_uri()`.
+- **Wrong / Right:** `f"file:{path}?mode=ro"` reads an unescaped `?`/`#` in
+  `path` as the URI's own query-string/fragment delimiter (RFC 3986),
+  silently truncating or corrupting the path SQLite actually opens — a store
+  filename containing either character could open the wrong file (or fail)
+  instead of the intended one, and a relative path is rejected outright.
+  `scripts/rpd_corpus_score.py` already had the correct pattern
+  (`path.resolve().as_uri()`, which percent-encodes per RFC 3986);
+  `scripts/bakeoff_reference_567.py`, `scripts/store_to_fixture.py`, and
+  `scripts/plant_model_arx_study.py` each carried their own slightly
+  different naive/near-naive read-only-connect or online-backup-snapshot
+  helper. All four are now scripts-only consolidated onto
+  `scripts/store_snapshot.py`'s `read_only_sqlite_uri` /
+  `connect_read_only` / `snapshot_store_to_temp`, so a future offline script
+  that needs read-only store access imports the shared helper instead of
+  re-deriving the URI. `git grep -n 'sqlite3\.connect' scripts/` should show
+  exactly one write-side raw connect (the online-backup target in
+  `snapshot_store_to_temp`) plus the one canonical read-side raw connect
+  inside `connect_read_only`; every other caller goes through
+  `connect_read_only`/`snapshot_store_to_temp`, never its own
+  `sqlite3.connect`.
+- **Guarded by:** `tests/test_store_snapshot.py` (URI grammar for `?`/`#`/`%`/
+  space/non-ASCII/relative paths, read-only write-failure, missing-store,
+  invalid-snapshot-name, WAL-inclusive-snapshot, and cross-module binding
+  identity for `rpd_corpus_score.snapshot_store_to_temp` /
+  `bakeoff_reference_567.snapshot_store_to_temp`),
+  `tests/test_store_to_fixture.py::test_store_path_with_hash_character_reads_correctly`,
+  and
+  `tests/test_plant_model_arx_study.py::test_completed_store_run_ids_reads_store_under_question_mark_directory`.
+
+---
+
 ## Real timeout tests must not require a scheduler callback race
 *(fixed as a prerequisite to #849, 25 Aug 2026)*
 

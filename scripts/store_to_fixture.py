@@ -75,6 +75,7 @@ from roast_landmarks import (  # noqa: E402
 from roast_landmarks import (
     parse_utc as _parse_utc,
 )
+from store_snapshot import connect_read_only  # noqa: E402
 
 #: The controller tick interval (seconds) — the fallback when a telemetry row
 #: predates the ``elapsed_seconds`` column. Mirrors
@@ -185,6 +186,13 @@ class StoreRoast:
 def _connect_readonly(db_path: Path) -> sqlite3.Connection:
     """Open the store strictly read-only (never mutate the operator's roast data).
 
+    Delegates the connection itself to the shared
+    :func:`store_snapshot.connect_read_only` helper (#726) — a correctly
+    percent-encoded ``mode=ro`` URI, so a store path containing ``?``/``#``
+    opens the intended file rather than mis-parsing those characters as a
+    URI query-string/fragment delimiter — then sets the name-keyed row
+    factory this module's callers rely on.
+
     Args:
         db_path: Path to the SQLite store.
 
@@ -195,10 +203,7 @@ def _connect_readonly(db_path: Path) -> sqlite3.Connection:
         FileNotFoundError: If the database file does not exist (the read-only
             ``file:`` URI would otherwise create an empty database).
     """
-    if not db_path.exists():
-        raise FileNotFoundError(f"no store at {db_path}")
-    uri = f"file:{db_path}?mode=ro"
-    connection = sqlite3.connect(uri, uri=True)
+    connection = connect_read_only(db_path)
     connection.row_factory = sqlite3.Row
     return connection
 

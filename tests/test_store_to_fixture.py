@@ -2234,6 +2234,46 @@ def test_missing_store_file_raises(tmp_path: Path) -> None:
         s2f.read_store_roast(tmp_path / "nope.sqlite3")
 
 
+def test_connect_readonly_returns_name_keyed_row_factory(tmp_path: Path) -> None:
+    """``_connect_readonly`` delegates to the shared ``store_snapshot`` helper
+    (#726) but still returns a ``sqlite3.Row``-keyed connection — the contract
+    every caller in this module relies on."""
+    db_path = tmp_path / "store.sqlite3"
+    connection = sqlite3.connect(str(db_path))
+    connection.execute("CREATE TABLE roast_runs (id TEXT PRIMARY KEY)")
+    connection.execute("INSERT INTO roast_runs (id) VALUES ('seed')")
+    connection.commit()
+    connection.close()
+
+    ro = s2f._connect_readonly(db_path)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    try:
+        assert ro.row_factory is sqlite3.Row
+        row = ro.execute("SELECT id FROM roast_runs").fetchone()
+        assert row["id"] == "seed"
+    finally:
+        ro.close()
+
+
+def test_connect_readonly_missing_store_raises_file_not_found(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="no store at"):
+        s2f._connect_readonly(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            tmp_path / "nope.sqlite3"
+        )
+
+
+@pytest.mark.asyncio
+async def test_store_path_with_hash_character_reads_correctly(tmp_path: Path) -> None:
+    """A store filename containing ``#`` must open the intended file rather
+    than a mis-parsed URI (the naive ``file:{path}?mode=ro`` form reads ``#``
+    as the URI fragment delimiter, silently truncating the path)."""
+    db_path = tmp_path / "operator#db.sqlite3"
+    store = await _synthetic_store(db_path, run_id="hash-run")
+    await store.close()
+
+    roast = s2f.read_store_roast(db_path)
+    assert roast.run_id == "hash-run"
+
+
 def test_empty_store_raises(tmp_path: Path) -> None:
     """A store with no completed runs raises rather than emitting an empty fixture."""
     import sqlite3
