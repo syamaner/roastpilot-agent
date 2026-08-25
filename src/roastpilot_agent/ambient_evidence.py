@@ -468,8 +468,8 @@ def derive_ambient_doctrine_evidence(
             effective_throughout=True,
             ever_retired=False,
             episodes=episodes,
-            development_count=development_count,
-            fresh_count=fresh_count,
+            development_count=0,
+            fresh_count=0,
             reason=NotProvenReason.UNUSABLE_CLOCK_OR_DATA,
         )
     if fresh_count == 0:

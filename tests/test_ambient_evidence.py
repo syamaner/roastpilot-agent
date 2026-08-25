@@ -180,6 +180,24 @@ def test_malformed_ambient_row_blocks_later_evidence(malformed_raw_state: str) -
     assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
 
 
+def test_unusable_clock_discards_preceding_fresh_snapshot_counts() -> None:
+    """A later backwards clock invalidates all retained snapshot count claims."""
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (),
+        (
+            _snapshot(row_id=1, tick=1, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
+            _snapshot(row_id=2, tick=2, timestamp="2026-08-25T12:00:10+00:00", token=2.0),
+            _snapshot(row_id=3, tick=3, timestamp="2026-08-25T12:00:05+00:00", token=3.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+    assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
+    assert evidence.retained_development_snapshot_count == 0
+    assert evidence.fresh_retained_development_snapshot_count == 0
+    assert evidence.retained_development_snapshot_fraction == 0.0
+
+
 @pytest.mark.parametrize("invalid_running", (0, 1, "true"))
 def test_non_bool_ambient_running_is_malformed_and_cannot_be_repaired(
     invalid_running: object,
