@@ -109,6 +109,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from bakeoff_replay import JointWindowScore, joint_score_to_json, joint_window_score  # noqa: E402
 
 from roastpilot_agent.ambient_evidence import (  # noqa: E402
+    AMBIENT_EVIDENCE_CLAIM,
     AmbientDoctrineEvidence,
     AmbientEvidenceVerdict,
     FractionBasis,
@@ -854,7 +855,11 @@ def render_markdown_table(report: CorpusReport) -> str:
         f"{stats['ambient_evidence_observed']}/{stats['n_scored']} "
         f"({FractionBasis.RETAINED_DEVELOPMENT_SNAPSHOTS.value})"
     )
-    return "\n".join(lines) + "\n" + aggregate_line
+    evidence_note = _escape_markdown_cell(
+        f"Ambient evidence: {AMBIENT_EVIDENCE_CLAIM} "
+        f"({FractionBasis.RETAINED_DEVELOPMENT_SNAPSHOTS.value})"
+    )
+    return "\n".join(lines) + "\n" + aggregate_line + "\n" + evidence_note
 
 
 def report_to_json(report: CorpusReport) -> dict[str, Any]:
@@ -878,6 +883,8 @@ def report_to_json(report: CorpusReport) -> dict[str, Any]:
         entry["ambient_doctrine_evidence"] = run.ambient_evidence.model_dump(mode="json")
         runs.append(entry)
     return {
+        "ambient_evidence_claim": AMBIENT_EVIDENCE_CLAIM,
+        "ambient_evidence_fraction_basis": FractionBasis.RETAINED_DEVELOPMENT_SNAPSHOTS.value,
         "runs": runs,
         "skipped": [{"run_id": skip.run_id, "reason": skip.reason} for skip in report.skipped],
         "aggregate": aggregate_stats(report),

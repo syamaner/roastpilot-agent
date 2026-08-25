@@ -2323,9 +2323,7 @@ class RoastService:
             "ambient.poll_interval_seconds, or disable the doctrine."
         )
 
-    def _build_recovery_config(
-        self, frozen: FrozenRunConfig, *, run_id: str = "unknown"
-    ) -> AppConfig:
+    def _build_recovery_config(self, frozen: FrozenRunConfig, *, run_id: str) -> AppConfig:
         """Recombine a run's FROZEN controller/safety with the CURRENT process config.
 
         This preserves apply-next-roast semantics across a restart: config edits
@@ -2369,6 +2367,7 @@ class RoastService:
 
         Args:
             frozen: The run's frozen controller/safety generation.
+            run_id: The persisted run receiving any retirement diagnostic.
 
         Returns:
             The recovery application config.

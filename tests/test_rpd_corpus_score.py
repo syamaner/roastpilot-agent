@@ -1347,6 +1347,9 @@ async def test_aggregate_stats_and_rendering(tmp_store: RoastStore) -> None:
 
         payload = scorer.report_to_json(report)
         assert payload["aggregate"] == stats
+        assert payload["ambient_evidence_claim"] == scorer.AMBIENT_EVIDENCE_CLAIM
+        assert payload["ambient_evidence_fraction_basis"] == "retained_development_snapshots"
+        json.dumps(payload, allow_nan=False)
         assert len(payload["runs"]) == 2
         assert len(payload["skipped"]) == 1
         run_hit_entry = next(r for r in payload["runs"] if r["run_id"] == "run-hit")
@@ -1354,6 +1357,7 @@ async def test_aggregate_stats_and_rendering(tmp_store: RoastStore) -> None:
         assert run_hit_entry["bean_name"] == "Guatemala Conebosque"
         assert run_hit_entry["operator_rating"] == 5
         assert run_hit_entry["ambient_doctrine_evidence"]["verdict"] == "not_proven"
+        assert f"Ambient evidence: {scorer.AMBIENT_EVIDENCE_CLAIM}" in table
     finally:
         await tmp_store.close()
 

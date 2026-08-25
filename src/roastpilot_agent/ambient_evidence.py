@@ -26,6 +26,12 @@ from roastpilot_agent.mcp_client import (
 from roastpilot_agent.models import RoastPhase
 
 RECOVERY_PAYLOAD_KEY = "ambient_fan_doctrine_recovery"
+AMBIENT_EVIDENCE_CLAIM = (
+    "Fresh ambient was durably observed while effective; the fraction is over retained "
+    "DEVELOPMENT telemetry snapshots. It is not evidence the advisor reasoned on ambient "
+    "and not controller-tick or advisor-decision coverage."
+)
+"""The sole public interpretation of the retained ambient-evidence fraction."""
 
 
 class DoctrineRecoveryState(Enum):
@@ -207,21 +213,27 @@ def _episode_from_row(row: Mapping[str, object]) -> DoctrineRecoveryEpisode:
     )
 
 
-def _snapshot_status(row: Mapping[str, object]) -> AmbientStatus | None:
-    """Validate the retained raw state and reject boolean/non-finite payload members."""
+def _snapshot_status(row: Mapping[str, object]) -> tuple[AmbientStatus | None, bool]:
+    """Parse one retained status, returning whether its retained shape was malformed."""
     raw_state = row.get("raw_state_json")
     if not isinstance(raw_state, str):
-        return None
+        return None, True
     try:
         root = json.loads(raw_state)
     except (TypeError, ValueError):
-        return None
+        return None, True
     root_mapping = _object_mapping(root)
     if root_mapping is None:
-        return None
+        return None, True
     raw_status = _object_mapping(root_mapping.get("ambient_status"))
     if raw_status is None:
-        return None
+        return None, True
+    try:
+        status = AmbientStatus.model_validate(raw_status)
+    except Exception:  # noqa: BLE001 - malformed retained JSON is not evidence
+        return None, True
+    if not ambient_reading_is_live(status):
+        return status, False
     for field in (
         "temperature_c",
         "humidity_percent",
@@ -229,13 +241,8 @@ def _snapshot_status(row: Mapping[str, object]) -> AmbientStatus | None:
         "last_reading_monotonic_seconds",
     ):
         if not _is_finite_number(raw_status.get(field)):
-            return None
-    if not isinstance(raw_status.get("ambient_running"), bool):
-        return None
-    try:
-        return AmbientStatus.model_validate(raw_status)
-    except Exception:  # noqa: BLE001 - malformed retained JSON is not evidence
-        return None
+            return None, True
+    return status, False
 
 
 def derive_ambient_doctrine_evidence(
@@ -327,7 +334,12 @@ def derive_ambient_doctrine_evidence(
         if is_development:
             development_count += 1
 
-        status = _snapshot_status(row)
+        status, malformed = _snapshot_status(row)
+        if malformed:
+            unusable_clock = True
+            token = None
+            corroborated_at = None
+            continue
         if status is None or not ambient_reading_is_live(status):
             token = None
             corroborated_at = None

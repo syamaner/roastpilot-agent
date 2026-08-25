@@ -3846,7 +3846,10 @@ def test_recovery_config_reraises_a_failure_the_doctrine_did_not_cause() -> None
     assert frozen.controller.ambient_fan_doctrine.enabled is False
 
     with pytest.raises(ValidationError, match="ceiling_guard_temp_c"):
-        service._build_recovery_config(frozen)  # pyright: ignore[reportPrivateUsage]
+        service._build_recovery_config(  # pyright: ignore[reportPrivateUsage]
+            frozen,
+            run_id="run-recovery-validation",
+        )
 
 
 @pytest.mark.asyncio

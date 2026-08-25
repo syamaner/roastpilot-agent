@@ -103,6 +103,85 @@ def test_duplicate_token_and_tick_reset_cannot_cross_corroborate() -> None:
     assert evidence.not_proven_reason is NotProvenReason.NO_CORROBORATED_FRESH_READING
 
 
+@pytest.mark.parametrize(
+    "malformed_raw_state",
+    (
+        "{not json",
+        "[]",
+        "{}",
+        json.dumps(
+            {
+                "ambient_status": {
+                    "mode": "yoctopuce",
+                    "status": "ok",
+                    "ambient_running": True,
+                    "temperature_c": "23.0",
+                    "humidity_percent": 50.0,
+                    "pressure_hpa": 1000.0,
+                    "last_reading_monotonic_seconds": 2.0,
+                }
+            }
+        ),
+        json.dumps(
+            {
+                "ambient_status": {
+                    "mode": "yoctopuce",
+                    "status": "ok",
+                    "ambient_running": True,
+                    "temperature_c": 23.0,
+                    "humidity_percent": 50.0,
+                    "pressure_hpa": 1000.0,
+                    "last_reading_monotonic_seconds": float("inf"),
+                }
+            }
+        ),
+    ),
+)
+def test_malformed_ambient_row_blocks_later_evidence(malformed_raw_state: str) -> None:
+    """Malformed retained ambient data cannot be repaired by later good rows."""
+    malformed_row = _snapshot(
+        row_id=2,
+        tick=2,
+        timestamp="2026-08-25T12:00:10+00:00",
+        token=2.0,
+    )
+    malformed_row["raw_state_json"] = malformed_raw_state
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (),
+        (
+            _snapshot(row_id=1, tick=1, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
+            malformed_row,
+            _snapshot(row_id=3, tick=3, timestamp="2026-08-25T12:00:20+00:00", token=2.0),
+            _snapshot(row_id=4, tick=4, timestamp="2026-08-25T12:00:30+00:00", token=3.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+    assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
+
+
+def test_stopped_ambient_resets_then_later_recorroboration_can_be_observed() -> None:
+    """A valid stopped runtime is a non-fresh denominator row, not malformed data."""
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (),
+        (
+            _snapshot(row_id=1, tick=1, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
+            _snapshot(
+                row_id=2,
+                tick=2,
+                timestamp="2026-08-25T12:00:10+00:00",
+                token=1.0,
+                running=False,
+            ),
+            _snapshot(row_id=3, tick=3, timestamp="2026-08-25T12:00:20+00:00", token=2.0),
+            _snapshot(row_id=4, tick=4, timestamp="2026-08-25T12:00:30+00:00", token=3.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.OBSERVED
+    assert evidence.retained_development_snapshot_fraction == 0.25
+
+
 def test_retirement_is_sticky_even_when_later_recovery_preserves() -> None:
     """A later preserved episode cannot rewrite an earlier retirement."""
     evidence = derive_ambient_doctrine_evidence(
