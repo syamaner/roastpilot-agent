@@ -326,7 +326,8 @@ def parse_owned_transcript(
         role: The committed native role attested against ``agent-setting`` rows.
         effort: The committed effort attested against every assistant row.
         expected_version: The version observed by the caller's one bounded CLI
-            probe. Every assistant row must equal this value exactly.
+            probe. Every row carrying a version must equal this value exactly;
+            every assistant row must carry it.
         expected_permission_mode: The single frozen permission-mode value
             (derived by the caller from the committed capability mapping) that
             every row's optional ``permissionMode`` key must equal exactly.
@@ -370,6 +371,8 @@ def parse_owned_transcript(
                     or row.get("type") not in _ALLOWED_TYPES
                     or row.get("sessionId") != session_id
                 ):
+                    raise TranscriptError("owned Claude transcript is invalid")
+                if "version" in row and row["version"] != expected_version:
                     raise TranscriptError("owned Claude transcript is invalid")
                 if "permissionMode" in row:
                     row_permission_mode = row.get("permissionMode")

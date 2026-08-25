@@ -5140,6 +5140,34 @@ def test_owned_transcript_rejects_later_assistant_version_mismatch(
         )
 
 
+def test_owned_transcript_rejects_version_mismatch_on_user_row_without_handback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A version-bearing user row cannot bypass the parent probe binding."""
+    session_id = "11111111-1111-4111-8111-111111111233"
+    rows = _story_planner_rows(session_id, fixture="qa.jsonl")
+    user_row = next(row for row in rows if row["type"] == "user")
+    assert user_row["version"] == "2.1.233"
+    user_row["version"] = "2.1.999"
+    _install_owned_transcript(tmp_path, monkeypatch, _dump_rows(rows), session_id)
+
+    with pytest.raises(
+        usage_transcript.TranscriptError, match="owned Claude transcript is invalid"
+    ) as error:
+        usage_transcript.parse_owned_transcript(
+            tmp_path,
+            session_id,
+            NativeClaudeRole.QA,
+            "high",
+            expected_version="2.1.233",
+            expected_permission_mode="dontAsk",
+            require_handback=True,
+        )
+    assert "2.1.999" not in str(error.value)
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
 def test_owned_transcript_tolerates_non_terminal_tool_activity_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
