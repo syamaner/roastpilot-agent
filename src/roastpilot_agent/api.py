@@ -44,6 +44,10 @@ from roastpilot_agent.advisor import (
     RoastDecision,
 )
 from roastpilot_agent.advisor_screen import advice_models
+from roastpilot_agent.ambient_evidence import (
+    RECOVERY_PAYLOAD_KEY,
+    DoctrineRecoveryState,
+)
 from roastpilot_agent.bean_sourcing import (
     BEAN_EXTRACTION_PROMPT_VERSION,
     BeanExtractionError,
@@ -678,6 +682,7 @@ class RoastRunner:
         exporter: LogExporter | None = None,
         raw_state: RawStateSource | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        configured_doctrine_enabled: bool | None = None,
     ) -> None:
         self._controller = controller
         self._store = store
@@ -722,6 +727,14 @@ class RoastRunner:
         #: freezes at drop (#758 review finding 1).
         self._ambient_grace_deadline: float | None = None
         self._scheduler: TickScheduler | None = None
+        # On recovery the rebuilt runner config may retire an enabled frozen
+        # doctrine.  Retain the start-generation flag solely to stamp the
+        # recovery breadcrumb; controller behaviour remains owned by config.
+        self._configured_doctrine_enabled = (
+            config.controller.ambient_fan_doctrine.enabled
+            if configured_doctrine_enabled is None
+            else configured_doctrine_enabled
+        )
 
     async def start(self, profile: RoastProfile, *, recording_roast_num: int | None = None) -> None:
         """Begin the run: drive the controller's idle→preheating start, then
@@ -1207,17 +1220,42 @@ class RoastRunner:
     async def _flush_events(self) -> None:
         for event in self._emitter.drain():
             try:
+                payload = self._event_payload_for_persistence(event)
                 await self._store.record_event(
                     run_id=self._run_id,
                     kind=event.kind,
                     source=_event_source(event),
                     monotonic_seconds=event.monotonic_seconds,
-                    payload=event.payload,
+                    payload=payload,
                 )
             except Exception:
                 # One bad row never crashes the safety tick loop or drops a
                 # sibling event already delivered to SSE.
                 continue
+
+    def _event_payload_for_persistence(self, event: _BufferedEvent) -> object:
+        """Add recovery evidence to the persisted copy without changing SSE bytes."""
+        payload = event.payload
+        if event.kind is not RoastEventKind.RECOVERY_REQUIRED or not isinstance(payload, dict):
+            return payload
+        source_payload = cast("dict[str, object]", payload)
+        if RECOVERY_PAYLOAD_KEY in source_payload:
+            return source_payload
+        effective_enabled = self._config.controller.ambient_fan_doctrine.enabled
+        state = (
+            DoctrineRecoveryState.RETIRED.value
+            if self._configured_doctrine_enabled and not effective_enabled
+            else DoctrineRecoveryState.PRESERVED.value
+        )
+        persistence_payload: dict[str, object] = {
+            **source_payload,
+            RECOVERY_PAYLOAD_KEY: {
+                "configured_enabled": self._configured_doctrine_enabled,
+                "effective_enabled": effective_enabled,
+                "state": state,
+            },
+        }
+        return persistence_payload
 
     async def _persist_t0_if_charged(self, snapshot: ControllerSnapshot) -> None:
         """Persist the absolute charge/T0 instant once, when the controller first
@@ -2170,6 +2208,7 @@ class RoastService:
         *,
         config: AppConfig | None = None,
         safety: SafetyPolicy | None = None,
+        configured_doctrine_enabled: bool | None = None,
     ) -> "RoastRunner | None":
         """Construct a controller + runner bound to ``run_id`` (shared by the
         fresh-start and restart-recovery paths). ``None`` in API-only mode.
@@ -2220,6 +2259,7 @@ class RoastService:
             clock=self._clock,
             exporter=self._exporter,
             raw_state=self._raw_state,
+            configured_doctrine_enabled=configured_doctrine_enabled,
         )
         self.runner = runner
         return runner
@@ -2283,7 +2323,7 @@ class RoastService:
             "ambient.poll_interval_seconds, or disable the doctrine."
         )
 
-    def _build_recovery_config(self, frozen: FrozenRunConfig) -> AppConfig:
+    def _build_recovery_config(self, frozen: FrozenRunConfig, *, run_id: str) -> AppConfig:
         """Recombine a run's FROZEN controller/safety with the CURRENT process config.
 
         This preserves apply-next-roast semantics across a restart: config edits
@@ -2327,6 +2367,7 @@ class RoastService:
 
         Args:
             frozen: The run's frozen controller/safety generation.
+            run_id: The persisted run receiving any retirement diagnostic.
 
         Returns:
             The recovery application config.
@@ -2355,9 +2396,10 @@ class RoastService:
             # text before retrying, would couple this to validator wording.
             recovered = AppConfig.model_validate(payload)
             _log.warning(
-                "Recovered run's ambient fan doctrine is inconsistent with the current "
+                "Recovered run %s ambient fan doctrine is inconsistent with the current "
                 "ambient poll interval; retiring the doctrine for this run (advisory "
-                "only — c11 falls back to its absent-ambient branch). #732"
+                "only — c11 falls back to its absent-ambient branch). #732",
+                run_id,
             )
             return recovered
 
@@ -2421,7 +2463,9 @@ class RoastService:
         # preserves apply-next-roast semantics across a process restart: config
         # edits made after this run started cannot alter its control, scheduling,
         # reference lookup, API prechecks, or safety policy.
-        recovery_config = self._build_recovery_config(persisted.frozen_config)
+        recovery_config = self._build_recovery_config(
+            persisted.frozen_config, run_id=persisted.run_id
+        )
         recovery_safety = SafetyPolicy(recovery_config.safety)
         self._safety = recovery_safety
         runner = await self._build_runner(
@@ -2429,6 +2473,9 @@ class RoastService:
             persisted.profile,
             config=recovery_config,
             safety=recovery_safety,
+            configured_doctrine_enabled=(
+                persisted.frozen_config.controller.ambient_fan_doctrine.enabled
+            ),
         )
         if runner is None:  # pragma: no cover — guarded above
             return

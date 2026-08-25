@@ -32,6 +32,11 @@ from pydantic import ValidationError
 import roastpilot_agent.api as api_module
 from roastpilot_agent import __version__
 from roastpilot_agent.advisor import AdvisorContext, FakeAdvisor, RoastDecision
+from roastpilot_agent.ambient_evidence import (
+    RECOVERY_PAYLOAD_KEY,
+    DoctrineRecoveryState,
+    NotProvenReason,
+)
 from roastpilot_agent.api import (
     _DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     EventBroadcaster,
@@ -1176,6 +1181,50 @@ async def test_timeline_wraps_non_dict_event_payload(
     )
     body = (await client.get("/api/roasts/run-w/timeline")).json()
     assert body["events"][0]["payload"] == {"value": ["finished", 1]}
+
+
+@pytest.mark.asyncio
+async def test_timeline_hides_internal_recovery_evidence_but_offline_reader_keeps_it(
+    client: AsyncClient,
+    store: RoastStore,
+) -> None:
+    """Recovery evidence remains durable corpus data, not a REST timeline field."""
+    await store.create_run(
+        run_id="run-internal-recovery-evidence",
+        profile=_profile(),
+        config=AppConfig(
+            controller=ControllerConfig(ambient_fan_doctrine=AmbientFanDoctrine(enabled=True))
+        ),
+        agent_phase=RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+    )
+    await store.record_event(
+        run_id="run-internal-recovery-evidence",
+        kind=RoastEventKind.RECOVERY_REQUIRED,
+        source=RoastEventSource.SAFETY,
+        payload={
+            "rule": "in_session_recovery",
+            "verdict": "recovery",
+            "reason": "operator acknowledgement required",
+            RECOVERY_PAYLOAD_KEY: {
+                "configured_enabled": True,
+                "effective_enabled": True,
+                "state": "preserved",
+            },
+        },
+    )
+
+    timeline = await client.get("/api/roasts/run-internal-recovery-evidence/timeline")
+    assert timeline.status_code == 200
+    assert timeline.json()["events"][0]["payload"] == {
+        "rule": "in_session_recovery",
+        "verdict": "recovery",
+        "reason": "operator acknowledgement required",
+    }
+
+    evidence = await store.read_ambient_doctrine_evidence("run-internal-recovery-evidence")
+    assert [episode.state for episode in evidence.recovery_episodes] == [
+        DoctrineRecoveryState.PRESERVED
+    ]
 
 
 @pytest.mark.asyncio
@@ -3846,7 +3895,10 @@ def test_recovery_config_reraises_a_failure_the_doctrine_did_not_cause() -> None
     assert frozen.controller.ambient_fan_doctrine.enabled is False
 
     with pytest.raises(ValidationError, match="ceiling_guard_temp_c"):
-        service._build_recovery_config(frozen)  # pyright: ignore[reportPrivateUsage]
+        service._build_recovery_config(  # pyright: ignore[reportPrivateUsage]
+            frozen,
+            run_id="run-recovery-validation",
+        )
 
 
 @pytest.mark.asyncio
@@ -3905,6 +3957,12 @@ async def test_recover_on_start_survives_a_frozen_doctrine_the_live_poll_interva
     assert doctrine.enabled is False
     assert doctrine.max_reading_age_seconds == 90.0
     assert service.runner._config.controller.tick_interval_seconds == 1.0  # pyright: ignore[reportPrivateUsage]
+    evidence = await store.read_ambient_doctrine_evidence("run-doctrine-voided")
+    assert evidence.not_proven_reason is NotProvenReason.DOCTRINE_RETIRED
+    episode = evidence.recovery_episodes[-1]
+    assert episode.state is DoctrineRecoveryState.RETIRED
+    assert episode.configured_enabled is True
+    assert episode.effective_enabled is False
 
 
 @pytest.mark.asyncio
@@ -3956,6 +4014,11 @@ async def test_recover_on_start_preserves_a_frozen_doctrine_that_still_fits(
     doctrine = service.runner._config.controller.ambient_fan_doctrine  # pyright: ignore[reportPrivateUsage]
     assert doctrine.enabled is True
     assert doctrine.max_reading_age_seconds == 90.0
+    evidence = await store.read_ambient_doctrine_evidence("run-doctrine-still-fits")
+    episode = evidence.recovery_episodes[-1]
+    assert episode.state is DoctrineRecoveryState.PRESERVED
+    assert episode.configured_enabled is True
+    assert episode.effective_enabled is True
 
 
 @pytest.mark.asyncio
@@ -5043,6 +5106,91 @@ async def test_acknowledge_recovery_resumes_to_payload_target(store: RoastStore)
     assert result.result == "accepted"
     await _tick(service, clock)
     assert (await store.read_run(run_id)).agent_phase is RoastPhase.COOLING  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("effective_enabled", "expected_state"),
+    ((False, DoctrineRecoveryState.RETIRED), (True, DoctrineRecoveryState.PRESERVED)),
+)
+async def test_recovery_evidence_persists_enriched_copy_without_changing_sse_payload(
+    store: RoastStore,
+    effective_enabled: bool,
+    expected_state: DoctrineRecoveryState,
+) -> None:
+    """The real flush enriches only the store copy for both recovery outcomes."""
+    clock = FakeClock()
+    frozen_config = AppConfig(
+        controller=ControllerConfig(
+            telemetry_log_interval_seconds=1.0,
+            ambient_fan_doctrine=AmbientFanDoctrine(enabled=True),
+        ),
+        mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=30.0),
+    )
+    service, run_id = await _live_service(
+        store,
+        mcp=FakeMCPClient([_reading(bean=178.0, env=185.0)]),
+        clock=clock,
+        config=frozen_config,
+    )
+    assert service.runner is not None
+    effective_doctrine = frozen_config.controller.ambient_fan_doctrine.model_copy(
+        update={"enabled": effective_enabled}
+    )
+    effective_controller = frozen_config.controller.model_copy(
+        update={"ambient_fan_doctrine": effective_doctrine}
+    )
+    effective_config = frozen_config.model_copy(update={"controller": effective_controller})
+    service.runner._config = effective_config  # pyright: ignore[reportPrivateUsage]
+    assert service.runner._configured_doctrine_enabled is True  # pyright: ignore[reportPrivateUsage]
+    subscriber = service.events.subscribe()
+    raw_payload: dict[str, object] = {"reason": "recovery"}
+    service.runner._emitter.emit(  # pyright: ignore[reportPrivateUsage]
+        RoastEventKind.RECOVERY_REQUIRED,
+        raw_payload,
+    )
+    frame = subscriber.get_nowait()
+    assert RECOVERY_PAYLOAD_KEY not in raw_payload
+    assert RECOVERY_PAYLOAD_KEY not in frame.data
+    await service.runner._flush_events()  # pyright: ignore[reportPrivateUsage]
+    evidence = await store.read_ambient_doctrine_evidence(run_id)
+    episode = evidence.recovery_episodes[-1]
+    assert episode.state is expected_state
+    assert episode.configured_enabled is True
+    assert episode.effective_enabled is effective_enabled
+
+
+@pytest.mark.asyncio
+async def test_recovery_persistence_enrichment_is_idempotent_for_existing_metadata(
+    store: RoastStore,
+) -> None:
+    """A pre-enriched recovery payload is returned unchanged rather than wrapped again."""
+    clock = FakeClock()
+    service, _run_id = await _live_service(
+        store,
+        mcp=FakeMCPClient([_reading(bean=178.0, env=185.0)]),
+        clock=clock,
+    )
+    assert service.runner is not None
+    payload: dict[str, object] = {
+        RECOVERY_PAYLOAD_KEY: {
+            "configured_enabled": True,
+            "effective_enabled": False,
+            "state": "retired",
+        }
+    }
+    event = api_module._BufferedEvent(  # pyright: ignore[reportPrivateUsage]
+        kind=RoastEventKind.RECOVERY_REQUIRED,
+        payload=payload,
+        monotonic_seconds=clock(),
+    )
+    persisted = service.runner._event_payload_for_persistence(event)  # pyright: ignore[reportPrivateUsage]
+    assert persisted is payload
+    assert payload[RECOVERY_PAYLOAD_KEY] == {
+        "configured_enabled": True,
+        "effective_enabled": False,
+        "state": "retired",
+    }
 
 
 @pytest.mark.asyncio

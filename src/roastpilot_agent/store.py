@@ -9,6 +9,7 @@ migration mechanism. Write paths land in E6-S2, recovery reads in E6-S3.
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import re
 import uuid
@@ -20,6 +21,11 @@ import aiosqlite
 from pydantic import BaseModel, ConfigDict
 
 from roastpilot_agent.advisor import AdvisorContext, RoastDecision
+from roastpilot_agent.ambient_evidence import (
+    RECOVERY_PAYLOAD_KEY,
+    AmbientDoctrineEvidence,
+    derive_ambient_doctrine_evidence,
+)
 from roastpilot_agent.config import AppConfig, ControllerConfig, SafetyLimits
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
@@ -63,6 +69,8 @@ from roastpilot_agent.roast_landmarks import (
     utc_to_run_seconds,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
+
+_log = logging.getLogger(__name__)
 
 SCHEMA_V1 = """
 CREATE TABLE roast_runs (
@@ -684,6 +692,53 @@ class RoastStore:
         if self._connection is None:
             raise RuntimeError("store is not initialized")
         return self._connection
+
+    async def read_ambient_doctrine_evidence(self, run_id: str) -> AmbientDoctrineEvidence:
+        """Read conservative ambient-doctrine evidence without modifying the store.
+
+        This offline/corpus-only full-row read deliberately preserves durable
+        insertion order: restart resets process-local ticks, so neither recovery
+        nor snapshot chronology can be reconstructed by sorting on tick.
+        Historical JSON is untrusted corpus data; parsing occurs in the total
+        derivation and fails toward a typed ``not_proven`` result rather than an exception.
+
+        Args:
+            run_id: The persisted roast-run identifier.
+
+        Returns:
+            The run's retained DEVELOPMENT-snapshot evidence.
+        """
+        try:
+            async with self.connection.execute(
+                "SELECT config_json FROM roast_runs WHERE id = ?", (run_id,)
+            ) as cursor:
+                config_row = await cursor.fetchone()
+            async with self.connection.execute(
+                "SELECT id, recorded_at_utc, payload_json FROM roast_events"
+                " WHERE run_id = ? AND kind = ?"
+                " ORDER BY id ASC",
+                (run_id, RoastEventKind.RECOVERY_REQUIRED.value),
+            ) as cursor:
+                recovery_rows = [dict(row) for row in await cursor.fetchall()]
+            async with self.connection.execute(
+                "SELECT id, tick, recorded_at_utc, agent_phase, raw_state_json"
+                " FROM telemetry_snapshots WHERE run_id = ? ORDER BY id ASC",
+                (run_id,),
+            ) as cursor:
+                snapshot_rows = [dict(row) for row in await cursor.fetchall()]
+            frozen = (
+                None
+                if config_row is None
+                else FrozenRunConfig.model_validate_json(str(config_row["config_json"]))
+            )
+            return derive_ambient_doctrine_evidence(
+                None if frozen is None else frozen.controller,
+                recovery_rows,
+                snapshot_rows,
+            )
+        except Exception:  # noqa: BLE001 - a corrupt historical row is not a read failure
+            _log.warning("Ambient doctrine evidence unavailable for run %s", run_id)
+            return derive_ambient_doctrine_evidence(None, (), ())
 
     async def initialize(self) -> None:
         """Open the database, set durability PRAGMAs, apply migrations."""
@@ -2105,7 +2160,7 @@ class RoastStore:
                 source=RoastEventSource(str(row["source"])),
                 monotonic_seconds=self._optional_float(row["monotonic_seconds"]),
                 recorded_at_utc=str(row["recorded_at_utc"]),
-                payload=_loads(row["payload_json"]),
+                payload=_timeline_payload(_loads(row["payload_json"])),
             )
             for row in event_rows
         ]
@@ -3138,6 +3193,13 @@ def _loads(value: Any) -> dict[str, Any] | None:
     if isinstance(parsed, dict):
         return cast("dict[str, Any]", parsed)
     return {"value": parsed}
+
+
+def _timeline_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Project durable event payloads onto the REST-visible timeline boundary."""
+    if payload is None or RECOVERY_PAYLOAD_KEY not in payload:
+        return payload
+    return {key: value for key, value in payload.items() if key != RECOVERY_PAYLOAD_KEY}
 
 
 def _utc_now() -> str:

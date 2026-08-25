@@ -628,6 +628,56 @@ async def test_score_run_normalizes_non_finite_ambient_to_none(tmp_store: RoastS
         await tmp_store.close()
 
 
+@pytest.mark.asyncio
+async def test_score_run_keeps_rpd_score_when_evidence_read_fails(
+    tmp_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Evidence read failure degrades only its claim, never the existing RP-D score."""
+    await tmp_store.initialize()
+    try:
+        profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
+        await _seed_scoreable_run(
+            tmp_store, "evidence-fallback", profile=profile, drop_temp_c=195.0, dtr_percent=16.0
+        )
+
+        async def _raise_evidence_read(_run_id: str) -> object:
+            raise RuntimeError("retained evidence unavailable")
+
+        monkeypatch.setattr(tmp_store, "read_ambient_doctrine_evidence", _raise_evidence_read)
+        result = await scorer.score_run(tmp_store, "evidence-fallback")
+        assert isinstance(result, scorer.ScoredRun)
+        assert result.score.hit is True
+        assert result.ambient_evidence.not_proven_reason is not None
+        assert result.ambient_evidence.not_proven_reason.value == "run_or_config_unavailable"
+    finally:
+        await tmp_store.close()
+
+
+def test_ambient_evidence_cells_cover_observed_and_defensive_reasonless_paths() -> None:
+    """The renderer formats both valid evidence outcomes and its inert fallback."""
+    observed = scorer.AmbientDoctrineEvidence(
+        verdict=scorer.AmbientEvidenceVerdict.OBSERVED,
+        not_proven_reason=None,
+        configured_enabled=True,
+        effective_throughout=True,
+        ever_retired=False,
+        recovery_episodes=(),
+        retained_development_snapshot_count=2,
+        fresh_retained_development_snapshot_count=1,
+        retained_development_snapshot_fraction=0.5,
+    )
+    # The default doctrine is disabled, so use the existing immutable model's
+    # construct escape hatch only to exercise a defensive branch impossible
+    # through the aggregate validator.
+    reasonless = scorer.AmbientDoctrineEvidence.model_construct(
+        verdict=scorer.AmbientEvidenceVerdict.NOT_PROVEN,
+        not_proven_reason=None,
+    )
+    assert scorer._ambient_evidence_cell(observed) == "observed (1/2)"  # pyright: ignore[reportPrivateUsage]
+    assert scorer._ambient_evidence_cell(reasonless) == "not proven (unknown)"  # pyright: ignore[reportPrivateUsage]
+
+
 # --- _extract_drop_reading / _nearest_reading_to_timestamp: direct unit tests --
 # (the fallback branches score_run's own drop-gate makes unreachable through
 # score_run itself — a valid drop_event_recorded_at_utc is guaranteed non-None
@@ -1297,6 +1347,8 @@ def test_aggregate_stats_empty_corpus() -> None:
         "hit_rate": 0.0,
         "mean_scalar": 0.0,
         "rated": 0,
+        "ambient_evidence_observed_runs": 0,
+        "ambient_evidence_scored_runs": 0,
     }
 
 
@@ -1328,6 +1380,8 @@ async def test_aggregate_stats_and_rendering(tmp_store: RoastStore) -> None:
         assert stats["hit_rate"] == pytest.approx(0.5)
         assert stats["mean_scalar"] == pytest.approx(0.5)
         assert stats["rated"] == 1
+        assert stats["ambient_evidence_observed_runs"] == 0
+        assert stats["ambient_evidence_scored_runs"] == 2
 
         table = scorer.render_markdown_table(report)
         assert "HIT" in table
@@ -1340,15 +1394,22 @@ async def test_aggregate_stats_and_rendering(tmp_store: RoastStore) -> None:
         # The #711 Goodhart guard extends to the aggregate: the mean scalar
         # line states how many of the scored runs are actually rated.
         assert "(rated: 1/2)" in table
+        assert "retained DEVELOPMENT telemetry-snapshot coverage" in table
+        assert "ambient evidence observed RUNS: 0/2 scored RUNS" in table
 
         payload = scorer.report_to_json(report)
         assert payload["aggregate"] == stats
+        assert payload["ambient_evidence_claim"] == scorer.AMBIENT_EVIDENCE_CLAIM
+        assert "ambient_evidence_fraction_basis" not in payload
+        json.dumps(payload, allow_nan=False)
         assert len(payload["runs"]) == 2
         assert len(payload["skipped"]) == 1
         run_hit_entry = next(r for r in payload["runs"] if r["run_id"] == "run-hit")
         assert run_hit_entry["hit"] is True
         assert run_hit_entry["bean_name"] == "Guatemala Conebosque"
         assert run_hit_entry["operator_rating"] == 5
+        assert run_hit_entry["ambient_doctrine_evidence"]["verdict"] == "not_proven"
+        assert f"Ambient evidence: {scorer.AMBIENT_EVIDENCE_CLAIM}" in table
     finally:
         await tmp_store.close()
 
@@ -1372,10 +1433,10 @@ async def test_render_markdown_table_escapes_pipe_and_newline_in_bean_name(
         table = scorer.render_markdown_table(report)
 
         row_line = next(line for line in table.splitlines() if "Evil" in line)
-        # Exactly 8 columns (9 DELIMITING pipes) — count only pipes that are
+        # Exactly 9 columns (10 DELIMITING pipes) — count only pipes that are
         # not part of an escaped "\|" (the escaped pipe is still a literal
         # '|' character, just no longer a column delimiter).
-        assert row_line.replace("\\|", "").count("|") == 9
+        assert row_line.replace("\\|", "").count("|") == 10
         assert "\n" not in row_line
         assert "Evil \\| Bean Name" in table
     finally:
@@ -1399,9 +1460,9 @@ async def test_render_markdown_table_escapes_pipe_in_a_bogus_run_id(
 
         table = scorer.render_markdown_table(report)
         row_line = next(line for line in table.splitlines() if "run not found" in line)
-        # Exactly 8 columns (9 DELIMITING pipes) — count only pipes that are
+        # Exactly 9 columns (10 DELIMITING pipes) — count only pipes that are
         # not part of an escaped "\|".
-        assert row_line.replace("\\|", "").count("|") == 9
+        assert row_line.replace("\\|", "").count("|") == 10
         assert "bad\\|id-w" in table
     finally:
         await tmp_store.close()

@@ -108,6 +108,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from bakeoff_replay import JointWindowScore, joint_score_to_json, joint_window_score  # noqa: E402
 
+from roastpilot_agent.ambient_evidence import (  # noqa: E402
+    AMBIENT_EVIDENCE_CLAIM,
+    AmbientDoctrineEvidence,
+    AmbientEvidenceVerdict,
+    FractionBasis,
+    derive_ambient_doctrine_evidence,
+)
 from roastpilot_agent.models import (  # noqa: E402
     DropReason,
     RoastCommand,
@@ -201,6 +208,7 @@ class ScoredRun:
     ambient_temp_c: float | None
     rating: int | None
     score: JointWindowScore
+    ambient_evidence: AmbientDoctrineEvidence
 
 
 @dataclasses.dataclass(frozen=True)
@@ -605,6 +613,10 @@ async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
         # run must not abort the whole corpus; skip it like every other
         # per-run data problem.
         return SkippedRun(run_id=run_id, reason=f"corrupt trace or profile: {exc}")
+    try:
+        ambient_evidence = await store.read_ambient_doctrine_evidence(run_id)
+    except Exception:  # noqa: BLE001 - evidence must never discard a valid RP-D score
+        ambient_evidence = derive_ambient_doctrine_evidence(None, (), ())
     return ScoredRun(
         run_id=run_id,
         bean_name=detail.profile.name,
@@ -616,6 +628,7 @@ async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
         ambient_temp_c=_finite_or_none(detail.ambient_temp_c),
         rating=detail.rating,
         score=score,
+        ambient_evidence=ambient_evidence,
     )
 
 
@@ -749,6 +762,12 @@ def aggregate_stats(report: CorpusReport) -> dict[str, Any]:
         "hit_rate": (hits / n_scored) if n_scored else 0.0,
         "mean_scalar": mean_scalar,
         "rated": rated,
+        "ambient_evidence_observed_runs": sum(
+            1
+            for run in report.scored
+            if run.ambient_evidence.verdict is AmbientEvidenceVerdict.OBSERVED
+        ),
+        "ambient_evidence_scored_runs": n_scored,
     }
 
 
@@ -777,6 +796,20 @@ def _escape_markdown_cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
 
 
+def _ambient_evidence_cell(evidence: AmbientDoctrineEvidence) -> str:
+    """Render the deliberately narrow ambient claim for one Markdown row."""
+    if evidence.verdict is AmbientEvidenceVerdict.OBSERVED:
+        return (
+            "observed "
+            f"({evidence.fresh_retained_development_snapshot_count}/"
+            f"{evidence.retained_development_snapshot_count})"
+        )
+    reason = evidence.not_proven_reason
+    if reason is None:
+        return "not proven (unknown)"
+    return f"not proven ({reason.value})"
+
+
 def render_markdown_table(report: CorpusReport) -> str:
     """Render the per-roast markdown table + corpus aggregate line.
 
@@ -793,9 +826,10 @@ def render_markdown_table(report: CorpusReport) -> str:
         aggregate summary line.
     """
     header = (
-        "| Run | Bean | Ambient °C | Target drop/DTR | Achieved drop/DTR | HIT | Scalar | Rating |"
+        "| Run | Bean | Ambient °C | Target drop/DTR | Achieved drop/DTR | HIT | Scalar | Rating "
+        "| Ambient evidence (retained DEVELOPMENT telemetry-snapshot coverage) |"
     )
-    separator = "|---|---|---|---|---|---|---|---|"
+    separator = "|---|---|---|---|---|---|---|---|---|"
     lines = [header, separator]
     for run in report.scored:
         score = run.score
@@ -806,20 +840,27 @@ def render_markdown_table(report: CorpusReport) -> str:
             f"| {score.target_drop_temp_c:.1f} °C / {score.target_dtr_percent:.1f}% "
             f"| {score.drop_temp_c:.1f} °C / {score.dtr_percent:.1f}% "
             f"| {'HIT' if score.hit else 'MISS'} | {score.scalar:.2f} "
-            f"| {'—' if run.rating is None else f'{run.rating}★'} |"
+            f"| {'—' if run.rating is None else f'{run.rating}★'} "
+            f"| {_escape_markdown_cell(_ambient_evidence_cell(run.ambient_evidence))} |"
         )
     for skip in report.skipped:
         skip_run_id = _escape_markdown_cell(skip.run_id[:8])
         reason = _escape_markdown_cell(skip.reason)
-        lines.append(f"| {skip_run_id} | (skipped: {reason}) | | | | | | |")
+        lines.append(f"| {skip_run_id} | (skipped: {reason}) | | | | | | | |")
     stats = aggregate_stats(report)
     aggregate_line = (
         f"\nN scored: {stats['n_scored']} (skipped: {stats['n_skipped']}) | "
         f"HIT: {stats['hits']}/{stats['n_scored']} "
         f"({stats['hit_rate'] * 100:.1f}%) | mean scalar: {stats['mean_scalar']:.4f} "
-        f"(rated: {stats['rated']}/{stats['n_scored']})"
+        f"(rated: {stats['rated']}/{stats['n_scored']}) | ambient evidence observed RUNS: "
+        f"{stats['ambient_evidence_observed_runs']}/{stats['ambient_evidence_scored_runs']} "
+        "scored RUNS"
     )
-    return "\n".join(lines) + "\n" + aggregate_line
+    evidence_note = _escape_markdown_cell(
+        f"Ambient evidence: {AMBIENT_EVIDENCE_CLAIM} "
+        f"({FractionBasis.RETAINED_DEVELOPMENT_SNAPSHOTS.value})"
+    )
+    return "\n".join(lines) + "\n" + aggregate_line + "\n" + evidence_note
 
 
 def report_to_json(report: CorpusReport) -> dict[str, Any]:
@@ -840,8 +881,10 @@ def report_to_json(report: CorpusReport) -> dict[str, Any]:
         entry["bean_name"] = run.bean_name
         entry["ambient_temp_c"] = run.ambient_temp_c
         entry["operator_rating"] = run.rating
+        entry["ambient_doctrine_evidence"] = run.ambient_evidence.model_dump(mode="json")
         runs.append(entry)
     return {
+        "ambient_evidence_claim": AMBIENT_EVIDENCE_CLAIM,
         "runs": runs,
         "skipped": [{"run_id": skip.run_id, "reason": skip.reason} for skip in report.skipped],
         "aggregate": aggregate_stats(report),
