@@ -22,6 +22,7 @@ target it constructs itself.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sqlite3
 import stat
@@ -91,8 +92,27 @@ def _reject_existing_snapshot_symlink(snapshot_path: Path) -> None:
     )
 
 
-def _write_snapshot_atomically(snapshot_path: Path, snapshot_bytes: bytes) -> None:
-    """Publish snapshot bytes without opening the caller-visible path for writing."""
+def _reject_existing_snapshot_artifacts(snapshot_path: Path) -> None:
+    """Reject a final snapshot or SQLite sidecar already in the destination."""
+    for artifact_path in (
+        snapshot_path,
+        snapshot_path.with_name(f"{snapshot_path.name}-wal"),
+        snapshot_path.with_name(f"{snapshot_path.name}-shm"),
+    ):
+        try:
+            artifact_path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ValueError(f"cannot safely inspect snapshot artifact {artifact_path}") from error
+        raise ValueError(
+            f"snapshot destination artifact {artifact_path} already exists; "
+            "refusing to replace caller-owned files"
+        )
+
+
+def _write_snapshot_atomically(snapshot_path: Path, source: sqlite3.Connection) -> None:
+    """Back up ``source`` to a staged file, then atomically publish it."""
     try:
         descriptor, temporary_name = tempfile.mkstemp(
             dir=snapshot_path.parent,
@@ -103,14 +123,24 @@ def _write_snapshot_atomically(snapshot_path: Path, snapshot_bytes: bytes) -> No
         raise sqlite3.OperationalError("unable to open database file") from error
     temporary_path = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "wb") as temporary_file:
-            temporary_file.write(snapshot_bytes)
-            temporary_file.flush()
+        os.close(descriptor)
+        target = sqlite3.connect(str(temporary_path))
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+        with temporary_path.open("rb") as temporary_file:
             os.fsync(temporary_file.fileno())
         os.replace(temporary_path, snapshot_path)
     finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
+        for staged_artifact in (
+            temporary_path,
+            temporary_path.with_name(f"{temporary_path.name}-journal"),
+            temporary_path.with_name(f"{temporary_path.name}-wal"),
+            temporary_path.with_name(f"{temporary_path.name}-shm"),
+        ):
+            with contextlib.suppress(FileNotFoundError):
+                staged_artifact.unlink()
 
 
 def read_only_sqlite_uri(path: Path) -> str:
@@ -175,13 +205,15 @@ def snapshot_store_to_temp(
 
     Uses SQLite's own online backup API (:meth:`sqlite3.Connection.backup`)
     against a strictly read-only (``mode=ro``) source connection (see
-    :func:`connect_read_only`), so the snapshot is a fully consistent
-    point-in-time copy (including anything still only in the source's WAL)
-    without ever acquiring a write lock on the operator's file. The live
-    agent's own store is opened read-write and has migrations applied — the
-    normal, safe thing for the live agent to do to ITS OWN store — so this
-    isolation is what keeps the operator's live database untouched even
-    though a caller of this function only ever needs read access.
+    :func:`connect_read_only`) and a private staged-file target in ``tmp_dir``.
+    The staged database is closed and flushed before an atomic replacement, so
+    the snapshot is a fully consistent point-in-time copy (including anything
+    still only in the source's WAL) without opening the caller-visible target
+    for writing. The live agent's own store is opened read-write and has
+    migrations applied — the normal, safe thing for the live agent to do to
+    ITS OWN store — so this isolation is what keeps the operator's live
+    database untouched even though a caller of this function only ever needs
+    read access.
 
     Args:
         store_path: The real store to copy. Never opened read-write.
@@ -202,12 +234,10 @@ def snapshot_store_to_temp(
             a path separator (i.e. is not a single plain filename); or if the
             resulting ``tmp_dir / snapshot_name`` target aliases ``store_path``
             — the same resolved path, a symlink to the source, or a hard link
-            to the source. This alias check runs, and fails closed, before
-            either database is opened: opening the writable target in that
-            situation would silently turn the operator's live database into
-            its own backup target (and could hang indefinitely against the
-            read-only source connection's lock), which violates this
-            function's read-only-source guarantee.
+            to the source; or if the final target or either SQLite sidecar
+            already exists. These checks run, and fail closed, before either
+            database is opened so a caller-owned file cannot be followed or
+            replaced.
     """
     is_invalid = (
         not snapshot_name
@@ -225,15 +255,10 @@ def snapshot_store_to_temp(
             f"snapshot target {snapshot_path} aliases the source store {store_path}; "
             "refusing to open the operator's live database as its own backup target"
         )
+    _reject_existing_snapshot_artifacts(snapshot_path)
     source = connect_read_only(store_path)
     try:
-        target = sqlite3.connect(":memory:")
-        try:
-            source.backup(target)
-            snapshot_bytes = target.serialize()
-        finally:
-            target.close()
+        _write_snapshot_atomically(snapshot_path, source)
     finally:
         source.close()
-    _write_snapshot_atomically(snapshot_path, snapshot_bytes)
     return snapshot_path

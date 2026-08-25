@@ -33,6 +33,10 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _staged_artifacts(directory: Path, snapshot_path: Path) -> list[Path]:
+    return list(directory.glob(f".{snapshot_path.name}.*.tmp*"))
+
+
 # --- read_only_sqlite_uri: exact URI grammar -----------------------------------
 
 
@@ -442,15 +446,13 @@ def test_snapshot_store_to_temp_cleans_up_after_failed_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed publication preserves the old target and removes private bytes."""
+    """A failed publication removes private bytes and leaves no final target."""
     store_path = tmp_path / "store.sqlite3"
     dest_dir = tmp_path / "snap"
     dest_dir.mkdir()
     snapshot_path = dest_dir / store_snapshot.DEFAULT_SNAPSHOT_NAME
     _seed_db(store_path)
-    snapshot_path.write_bytes(b"previous snapshot")
     source_before = _sha256(store_path)
-    target_before = snapshot_path.read_bytes()
 
     def failed_replace(_source: Path, _target: Path) -> None:
         raise OSError("publication failed")
@@ -460,9 +462,106 @@ def test_snapshot_store_to_temp_cleans_up_after_failed_publication(
     with pytest.raises(OSError, match="publication failed"):
         store_snapshot.snapshot_store_to_temp(store_path, dest_dir)
 
-    assert snapshot_path.read_bytes() == target_before
+    assert not snapshot_path.exists()
     assert _sha256(store_path) == source_before
-    assert list(dest_dir.glob(f".{snapshot_path.name}.*.tmp")) == []
+    assert _staged_artifacts(dest_dir, snapshot_path) == []
+
+
+def test_snapshot_store_to_temp_stages_a_large_snapshot_without_memory_or_serialize(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public path backs up directly to a staged file, never ``:memory:``."""
+    store_path = tmp_path / "store.sqlite3"
+    dest_dir = tmp_path / "snap"
+    dest_dir.mkdir()
+    _seed_db(store_path)
+    source = sqlite3.connect(str(store_path))
+    try:
+        source.execute("CREATE TABLE payloads (payload BLOB NOT NULL)")
+        source.execute("INSERT INTO payloads VALUES (?)", (b"x" * (2 * 1024 * 1024),))
+        source.commit()
+    finally:
+        source.close()
+
+    class NoSerializeConnection(sqlite3.Connection):
+        def serialize(self, *, name: str = "main") -> bytes:
+            raise AssertionError("snapshot staging must not serialize the database")
+
+    real_connect = sqlite3.connect
+    opened_paths: list[str] = []
+
+    def staged_connect(database: str, *, uri: bool = False) -> sqlite3.Connection:
+        assert database != ":memory:"
+        opened_paths.append(database)
+        return real_connect(database, uri=uri, factory=NoSerializeConnection)
+
+    monkeypatch.setattr(store_snapshot.sqlite3, "connect", staged_connect)
+
+    snapshot_path = store_snapshot.snapshot_store_to_temp(store_path, dest_dir)
+
+    assert str(snapshot_path) not in opened_paths
+    assert any(path.endswith(".tmp") for path in opened_paths)
+    verify = sqlite3.connect(str(snapshot_path))
+    try:
+        assert verify.execute("SELECT length(payload) FROM payloads").fetchone() == (
+            2 * 1024 * 1024,
+        )
+    finally:
+        verify.close()
+
+
+def test_snapshot_store_to_temp_cleans_staging_after_target_connect_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A private staged-target connection failure leaves no temporary bytes."""
+    store_path = tmp_path / "store.sqlite3"
+    dest_dir = tmp_path / "snap"
+    dest_dir.mkdir()
+    _seed_db(store_path)
+    source_before = _sha256(store_path)
+    snapshot_path = dest_dir / store_snapshot.DEFAULT_SNAPSHOT_NAME
+    real_connect = sqlite3.connect
+
+    def fail_staged_connect(database: str, *, uri: bool = False) -> sqlite3.Connection:
+        if database.endswith(".tmp"):
+            raise sqlite3.OperationalError("staged target unavailable")
+        return real_connect(database, uri=uri)
+
+    monkeypatch.setattr(store_snapshot.sqlite3, "connect", fail_staged_connect)
+
+    with pytest.raises(sqlite3.OperationalError, match="staged target unavailable"):
+        store_snapshot.snapshot_store_to_temp(store_path, dest_dir)
+
+    assert _sha256(store_path) == source_before
+    assert not snapshot_path.exists()
+    assert _staged_artifacts(dest_dir, snapshot_path) == []
+
+
+def test_snapshot_store_to_temp_cleans_staging_after_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed durable flush leaves neither staging nor a final target."""
+    store_path = tmp_path / "store.sqlite3"
+    dest_dir = tmp_path / "snap"
+    dest_dir.mkdir()
+    _seed_db(store_path)
+    source_before = _sha256(store_path)
+    snapshot_path = dest_dir / store_snapshot.DEFAULT_SNAPSHOT_NAME
+
+    def failed_fsync(_descriptor: int) -> None:
+        raise OSError("staged flush failed")
+
+    monkeypatch.setattr(store_snapshot.os, "fsync", failed_fsync)
+
+    with pytest.raises(OSError, match="staged flush failed"):
+        store_snapshot.snapshot_store_to_temp(store_path, dest_dir)
+
+    assert _sha256(store_path) == source_before
+    assert not snapshot_path.exists()
+    assert _staged_artifacts(dest_dir, snapshot_path) == []
 
 
 def test_snapshot_store_to_temp_rejects_unrelated_target_symlink_before_connections(
@@ -498,6 +597,69 @@ def test_snapshot_store_to_temp_rejects_unrelated_target_symlink_before_connecti
 
     assert _sha256(store_path) == source_before
     assert _sha256(unrelated_path) == unrelated_before
+
+
+@pytest.mark.parametrize("suffix", ["", "-wal", "-shm"])
+def test_snapshot_store_to_temp_rejects_existing_destination_artifact_before_connections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    """Any prior final file or SQLite sidecar remains caller-owned and intact."""
+    store_path = tmp_path / "store.sqlite3"
+    dest_dir = tmp_path / "snap"
+    dest_dir.mkdir()
+    _seed_db(store_path)
+    source_before = _sha256(store_path)
+    snapshot_path = dest_dir / store_snapshot.DEFAULT_SNAPSHOT_NAME
+    artifact_path = snapshot_path.with_name(f"{snapshot_path.name}{suffix}")
+    artifact_path.write_bytes(b"caller-owned destination artifact")
+    artifact_before = artifact_path.read_bytes()
+
+    def fail_source_connection(_path: Path) -> sqlite3.Connection:
+        raise AssertionError("source connection must not open for an existing destination artifact")
+
+    def fail_sqlite_connection(*args: object, **kwargs: object) -> sqlite3.Connection:
+        raise AssertionError("SQLite connection must not open for an existing destination artifact")
+
+    monkeypatch.setattr(store_snapshot, "connect_read_only", fail_source_connection)
+    monkeypatch.setattr(store_snapshot.sqlite3, "connect", fail_sqlite_connection)
+
+    with pytest.raises(ValueError, match="already exists"):
+        store_snapshot.snapshot_store_to_temp(store_path, dest_dir)
+
+    assert _sha256(store_path) == source_before
+    assert artifact_path.read_bytes() == artifact_before
+
+
+def test_snapshot_store_to_temp_rejects_uninspectable_destination_sidecar_before_connections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable sidecar path fails closed before opening either database."""
+    store_path = tmp_path / "store.sqlite3"
+    dest_dir = tmp_path / "snap"
+    dest_dir.mkdir()
+    _seed_db(store_path)
+    source_before = _sha256(store_path)
+    sidecar_path = dest_dir / f"{store_snapshot.DEFAULT_SNAPSHOT_NAME}-wal"
+    original_lstat = Path.lstat
+
+    def denied_sidecar_lstat(path: Path) -> os.stat_result:
+        if path == sidecar_path:
+            raise PermissionError("sidecar metadata denied")
+        return original_lstat(path)
+
+    def fail_source_connection(_path: Path) -> sqlite3.Connection:
+        raise AssertionError("source connection must not open for an unreadable sidecar")
+
+    monkeypatch.setattr(store_snapshot.Path, "lstat", denied_sidecar_lstat)
+    monkeypatch.setattr(store_snapshot, "connect_read_only", fail_source_connection)
+
+    with pytest.raises(ValueError, match="cannot safely inspect snapshot artifact"):
+        store_snapshot.snapshot_store_to_temp(store_path, dest_dir)
+
+    assert _sha256(store_path) == source_before
 
 
 def test_snapshot_store_to_temp_replaces_a_symlink_swapped_after_validation(
@@ -688,7 +850,7 @@ def test_snapshot_store_to_temp_is_wal_inclusive(tmp_path: Path) -> None:
 
 
 def test_snapshot_store_to_temp_corrupt_source_not_modified(tmp_path: Path) -> None:
-    """A corrupt source DB must not be modified by a failed snapshot attempt."""
+    """A failed source backup removes staging and never modifies source bytes."""
     store_path = tmp_path / "corrupt.sqlite3"
     store_path.write_bytes(b"not a real sqlite database at all")
     before = _sha256(store_path)
@@ -697,6 +859,9 @@ def test_snapshot_store_to_temp_corrupt_source_not_modified(tmp_path: Path) -> N
     with pytest.raises(sqlite3.DatabaseError):
         store_snapshot.snapshot_store_to_temp(store_path, dest_dir)
     assert _sha256(store_path) == before
+    snapshot_path = dest_dir / store_snapshot.DEFAULT_SNAPSHOT_NAME
+    assert not snapshot_path.exists()
+    assert _staged_artifacts(dest_dir, snapshot_path) == []
 
 
 # --- adoption: RPD + bakeoff module bindings are the shared helper ------------

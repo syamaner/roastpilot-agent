@@ -39,8 +39,8 @@ Format: one entry per anti-pattern.
   `connect_read_only` / `snapshot_store_to_temp`, so a future offline script
   that needs read-only store access imports the shared helper instead of
   re-deriving the URI. `git grep -n 'sqlite3\.connect' scripts/` should show
-  exactly one write-side raw connect (the online-backup target in
-  `snapshot_store_to_temp`) plus the one canonical read-side raw connect
+  exactly one private staged-file write-side connect in
+  `snapshot_store_to_temp` plus the one canonical read-only source connect
   inside `connect_read_only`; every other caller goes through
   `connect_read_only`/`snapshot_store_to_temp`, never its own
   `sqlite3.connect`.
