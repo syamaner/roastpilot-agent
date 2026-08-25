@@ -628,6 +628,56 @@ async def test_score_run_normalizes_non_finite_ambient_to_none(tmp_store: RoastS
         await tmp_store.close()
 
 
+@pytest.mark.asyncio
+async def test_score_run_keeps_rpd_score_when_evidence_read_fails(
+    tmp_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Evidence read failure degrades only its claim, never the existing RP-D score."""
+    await tmp_store.initialize()
+    try:
+        profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
+        await _seed_scoreable_run(
+            tmp_store, "evidence-fallback", profile=profile, drop_temp_c=195.0, dtr_percent=16.0
+        )
+
+        async def _raise_evidence_read(_run_id: str) -> object:
+            raise RuntimeError("retained evidence unavailable")
+
+        monkeypatch.setattr(tmp_store, "read_ambient_doctrine_evidence", _raise_evidence_read)
+        result = await scorer.score_run(tmp_store, "evidence-fallback")
+        assert isinstance(result, scorer.ScoredRun)
+        assert result.score.hit is True
+        assert result.ambient_evidence.not_proven_reason is not None
+        assert result.ambient_evidence.not_proven_reason.value == "run_or_config_unavailable"
+    finally:
+        await tmp_store.close()
+
+
+def test_ambient_evidence_cells_cover_observed_and_defensive_reasonless_paths() -> None:
+    """The renderer formats both valid evidence outcomes and its inert fallback."""
+    observed = scorer.AmbientDoctrineEvidence(
+        verdict=scorer.AmbientEvidenceVerdict.OBSERVED,
+        not_proven_reason=None,
+        configured_enabled=True,
+        effective_throughout=True,
+        ever_retired=False,
+        recovery_episodes=(),
+        retained_development_snapshot_count=2,
+        fresh_retained_development_snapshot_count=1,
+        retained_development_snapshot_fraction=0.5,
+    )
+    # The default doctrine is disabled, so use the existing immutable model's
+    # construct escape hatch only to exercise a defensive branch impossible
+    # through the aggregate validator.
+    reasonless = scorer.AmbientDoctrineEvidence.model_construct(
+        verdict=scorer.AmbientEvidenceVerdict.NOT_PROVEN,
+        not_proven_reason=None,
+    )
+    assert scorer._ambient_evidence_cell(observed) == "observed (1/2)"  # pyright: ignore[reportPrivateUsage]
+    assert scorer._ambient_evidence_cell(reasonless) == "not proven (unknown)"  # pyright: ignore[reportPrivateUsage]
+
+
 # --- _extract_drop_reading / _nearest_reading_to_timestamp: direct unit tests --
 # (the fallback branches score_run's own drop-gate makes unreachable through
 # score_run itself — a valid drop_event_recorded_at_utc is guaranteed non-None

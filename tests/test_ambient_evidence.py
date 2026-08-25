@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+import roastpilot_agent.ambient_evidence as ambient_evidence
 from roastpilot_agent.ambient_evidence import (
     RECOVERY_PAYLOAD_KEY,
     AmbientDoctrineEvidence,
@@ -262,3 +263,265 @@ def test_positive_model_requires_effective_fresh_evidence() -> None:
             fresh_retained_development_snapshot_count=0,
             retained_development_snapshot_fraction=0.0,
         )
+
+
+def test_model_rejects_inverted_counts_and_non_finite_fraction() -> None:
+    """The aggregate cannot express inverted counts or an unrepresentable fraction."""
+    with pytest.raises(ValueError, match="count cannot invert"):
+        AmbientDoctrineEvidence(
+            verdict=AmbientEvidenceVerdict.NOT_PROVEN,
+            not_proven_reason=NotProvenReason.NO_DEVELOPMENT_SNAPSHOTS,
+            configured_enabled=True,
+            effective_throughout=True,
+            ever_retired=False,
+            recovery_episodes=(),
+            retained_development_snapshot_count=1,
+            fresh_retained_development_snapshot_count=2,
+            retained_development_snapshot_fraction=1.0,
+        )
+    with pytest.raises(ValueError, match="fraction must be finite"):
+        AmbientDoctrineEvidence(
+            verdict=AmbientEvidenceVerdict.NOT_PROVEN,
+            not_proven_reason=NotProvenReason.NO_DEVELOPMENT_SNAPSHOTS,
+            configured_enabled=True,
+            effective_throughout=True,
+            ever_retired=False,
+            recovery_episodes=(),
+            retained_development_snapshot_count=0,
+            fresh_retained_development_snapshot_count=0,
+            retained_development_snapshot_fraction=float("inf"),
+        )
+
+
+def test_model_rejects_effective_retirement_and_invalid_verdict_reasons() -> None:
+    """Model invariants prevent false positive and reason-less evidence claims."""
+    retired = ambient_evidence.DoctrineRecoveryEpisode(
+        event_id=1,
+        configured_enabled=True,
+        effective_enabled=False,
+        state=DoctrineRecoveryState.RETIRED,
+    )
+    with pytest.raises(ValueError, match="cannot be effective"):
+        AmbientDoctrineEvidence(
+            verdict=AmbientEvidenceVerdict.NOT_PROVEN,
+            not_proven_reason=NotProvenReason.DOCTRINE_RETIRED,
+            configured_enabled=True,
+            effective_throughout=True,
+            ever_retired=True,
+            recovery_episodes=(retired,),
+            retained_development_snapshot_count=0,
+            fresh_retained_development_snapshot_count=0,
+            retained_development_snapshot_fraction=0.0,
+        )
+    with pytest.raises(ValueError, match="positive evidence has no failure reason"):
+        AmbientDoctrineEvidence(
+            verdict=AmbientEvidenceVerdict.OBSERVED,
+            not_proven_reason=NotProvenReason.DOCTRINE_DISABLED,
+            configured_enabled=True,
+            effective_throughout=True,
+            ever_retired=False,
+            recovery_episodes=(),
+            retained_development_snapshot_count=1,
+            fresh_retained_development_snapshot_count=1,
+            retained_development_snapshot_fraction=1.0,
+        )
+    with pytest.raises(ValueError, match="positive evidence needs"):
+        AmbientDoctrineEvidence(
+            verdict=AmbientEvidenceVerdict.OBSERVED,
+            not_proven_reason=None,
+            configured_enabled=True,
+            effective_throughout=True,
+            ever_retired=False,
+            recovery_episodes=(),
+            retained_development_snapshot_count=1,
+            fresh_retained_development_snapshot_count=0,
+            retained_development_snapshot_fraction=0.0,
+        )
+    with pytest.raises(ValueError, match="not_proven evidence needs a reason"):
+        AmbientDoctrineEvidence(
+            verdict=AmbientEvidenceVerdict.NOT_PROVEN,
+            not_proven_reason=None,
+            configured_enabled=True,
+            effective_throughout=True,
+            ever_retired=False,
+            recovery_episodes=(),
+            retained_development_snapshot_count=0,
+            fresh_retained_development_snapshot_count=0,
+            retained_development_snapshot_fraction=0.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload_json",
+    (
+        None,
+        "not json",
+        "[]",
+        "{}",
+        json.dumps({RECOVERY_PAYLOAD_KEY: {"configured_enabled": True}}),
+        json.dumps(
+            {
+                RECOVERY_PAYLOAD_KEY: {
+                    "configured_enabled": "true",
+                    "effective_enabled": True,
+                    "state": "preserved",
+                }
+            }
+        ),
+        json.dumps(
+            {
+                RECOVERY_PAYLOAD_KEY: {
+                    "configured_enabled": True,
+                    "effective_enabled": True,
+                    "state": "unknown",
+                }
+            }
+        ),
+        json.dumps(
+            {
+                RECOVERY_PAYLOAD_KEY: {
+                    "configured_enabled": True,
+                    "effective_enabled": True,
+                    "state": "future",
+                }
+            }
+        ),
+        json.dumps(
+            {
+                RECOVERY_PAYLOAD_KEY: {
+                    "configured_enabled": True,
+                    "effective_enabled": False,
+                    "state": "preserved",
+                }
+            }
+        ),
+        json.dumps(
+            {
+                RECOVERY_PAYLOAD_KEY: {
+                    "configured_enabled": False,
+                    "effective_enabled": False,
+                    "state": "retired",
+                }
+            }
+        ),
+    ),
+)
+def test_recovery_grammar_fails_closed(payload_json: object) -> None:
+    """Every malformed recovery payload remains a typed unknown episode."""
+    episode = ambient_evidence._episode_from_row(  # pyright: ignore[reportPrivateUsage]
+        {"id": True, "payload_json": payload_json}
+    )
+    assert episode.event_id == 0
+    assert episode.state is DoctrineRecoveryState.UNKNOWN
+
+
+def test_non_string_json_mapping_keys_fail_closed() -> None:
+    """Untyped decoded mappings need string keys before their members are trusted."""
+    assert ambient_evidence._object_mapping({1: "value"}) is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    "raw_state_json",
+    (
+        None,
+        "not json",
+        "[]",
+        "{}",
+        json.dumps({"ambient_status": {"mode": "invalid"}}),
+        json.dumps(
+            {
+                "ambient_status": {
+                    "mode": "yoctopuce",
+                    "status": "ok",
+                    "ambient_running": True,
+                    "temperature_c": float("inf"),
+                    "humidity_percent": 50.0,
+                    "pressure_hpa": 1000.0,
+                    "last_reading_monotonic_seconds": 1.0,
+                }
+            }
+        ),
+    ),
+)
+def test_snapshot_status_marks_each_malformed_shape(raw_state_json: object) -> None:
+    """Malformed retained state is distinct from a valid but stopped runtime."""
+    status, malformed = ambient_evidence._snapshot_status(  # pyright: ignore[reportPrivateUsage]
+        {"raw_state_json": raw_state_json}
+    )
+    assert status is None
+    assert malformed is True
+
+
+def test_derivation_rejects_bad_clock_phase_and_timestamp_forms() -> None:
+    """Bad chronology remains terminally not-proven despite later fresh evidence."""
+    non_string_timestamp = _snapshot(
+        row_id=3,
+        tick=3,
+        timestamp="2026-08-25T12:00:20+00:00",
+        token=2.0,
+    )
+    non_string_timestamp["recorded_at_utc"] = None
+    invalid_rows = (
+        _snapshot(row_id=1, tick=True, timestamp="2026-08-25T12:00:00+00:00"),
+        _snapshot(row_id=2, tick=2, timestamp="2026-08-25T12:00:10+00:00", phase="unknown"),
+        non_string_timestamp,
+        _snapshot(row_id=4, tick=4, timestamp="not a timestamp", token=3.0),
+        _snapshot(row_id=5, tick=5, timestamp="2026-08-25T12:00:20", token=4.0),
+        _snapshot(row_id=6, tick=6, timestamp="2026-08-25T12:00:30+00:00", token=5.0),
+        _snapshot(row_id=7, tick=7, timestamp="2026-08-25T12:00:15+00:00", token=6.0),
+        _snapshot(row_id=8, tick=8, timestamp="2026-08-25T12:00:40+00:00", token=7.0),
+    )
+    evidence = derive_ambient_doctrine_evidence(_controller(), (), invalid_rows)
+    assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
+
+
+def test_cross_episode_clock_restarts_are_valid() -> None:
+    """A tick reset isolates timestamp domains rather than creating a backwards clock."""
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (),
+        (
+            _snapshot(row_id=1, tick=5, timestamp="2026-08-25T12:01:00+00:00", token=1.0),
+            _snapshot(row_id=2, tick=0, timestamp="2026-08-25T12:00:00+00:00", token=2.0),
+            _snapshot(row_id=3, tick=1, timestamp="2026-08-25T12:00:10+00:00", token=3.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.OBSERVED
+
+
+def test_live_unread_status_resets_without_becoming_malformed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live status without an admitted token is an ordinary non-fresh reset."""
+
+    def _tokenless(_status: object) -> None:
+        return None
+
+    monkeypatch.setattr(ambient_evidence, "ambient_reading_token", _tokenless)
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (),
+        (_snapshot(row_id=1, tick=1, timestamp="2026-08-25T12:00:00+00:00"),),
+    )
+    assert evidence.not_proven_reason is NotProvenReason.NO_CORROBORATED_FRESH_READING
+
+
+def test_missing_config_and_non_development_rows_fail_closed_for_their_own_reasons() -> None:
+    """Absent config and an empty retained DEVELOPMENT denominator stay distinct."""
+    assert (
+        derive_ambient_doctrine_evidence(None, (), ()).not_proven_reason
+        is NotProvenReason.RUN_OR_CONFIG_UNAVAILABLE
+    )
+    no_development = derive_ambient_doctrine_evidence(
+        _controller(),
+        (),
+        (
+            _snapshot(
+                row_id=1,
+                tick=1,
+                timestamp="2026-08-25T12:00:00+00:00",
+                phase="roasting_pre_first_crack",
+            ),
+        ),
+    )
+    assert no_development.not_proven_reason is NotProvenReason.NO_DEVELOPMENT_SNAPSHOTS
