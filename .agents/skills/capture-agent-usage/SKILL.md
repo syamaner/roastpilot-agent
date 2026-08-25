@@ -13,9 +13,13 @@ while the record itself has `success=false`; this indicates capture succeeded, n
 
 Use `scripts/capture_usage_cli.py snapshot-capacity` only for a qualitative capacity
 observation joined to its required task and slice identifiers. Use `parse-codex` or `parse-claude` with sanitized streams to verify the
-frozen parser grammar; `parse-claude` validates Claude init grammar but makes no
-launch-authority claim. The live `run` path additionally attests empty tools,
-empty MCP servers, and plan permission before it records usage. Use `annotate-outcome` after final gates to record closed finding
+frozen parser grammar. `parse-claude` is self-derived, non-authoritative offline
+structural inspection: it derives its expected version from the first valid init
+event and makes no launch-authority claim. The live `run` and `run-native-claude`
+paths remain bound to one CLI version probe before they record usage. Generic
+`run` also attests empty tools, empty MCP servers, and plan permission before
+recording usage. Use
+`annotate-outcome` after final gates to record closed finding
 counts and rework metadata joined to the required task and slice identifiers. The default `.agent-usage/usage.jsonl` is local-only and
 gitignored.
 
@@ -41,7 +45,10 @@ the committed roles `engineer-be`, `engineer-fe`, `mcp-contract-checker`,
 `planning-architect`, `pr-triage`, `product-auditor`, `qa`,
 `sim-roast-runner`, and `story-planner`. It derives READ_ONLY or
 WRITE capability from the committed tools, launches with the committed effort, and
-accepts only Claude 2.1.233 metadata. It reads only the generated parent transcript,
+binds the version probed from the installed authenticated CLI and requires every
+version-bearing evidence field to equal it exactly while rejecting unknown or
+changed stream/transcript structure. Generic Codex streams carry no version-bearing
+field, so that path is probe-only by design. It reads only the generated parent transcript,
 deduplicates numeric usage, rejects any subagent tree, and writes no transcript content
 or host path to the sink. `safety-reviewer` and `security-reviewer` are excluded
 because their mandatory whole-diff assurance requires the ordinary role path's

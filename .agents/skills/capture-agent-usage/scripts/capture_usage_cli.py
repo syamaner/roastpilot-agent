@@ -108,10 +108,6 @@ VERSION_TIMEOUT_SECONDS = 5
 TERMINATE_GRACE_SECONDS = 1
 _SEMVER = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 _SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
-_VERIFIED_HARNESS_VERSIONS = {
-    HarnessFamily.CODEX: "0.147.0",
-    HarnessFamily.CLAUDE: "2.1.233",
-}
 _GIT_TIMEOUT_SECONDS = 5
 _GIT_OUTPUT_LIMIT = 4096
 _PROTECTED_ATTRIBUTION_ROLES = (
@@ -351,10 +347,12 @@ def parse_codex_command(arguments: argparse.Namespace) -> int:
 
 
 def parse_claude_command(arguments: argparse.Namespace) -> int:
-    """Parse a supplied sanitized Claude JSONL file without creating a record."""
+    """Structurally inspect a sanitized Claude JSONL file without creating a record."""
+    content = _input_bytes(arguments.stream, MAX_STREAM_BYTES)
     _print_parsed_json(
         parse_claude_stream(
-            BytesIO(_input_bytes(arguments.stream, MAX_STREAM_BYTES)),
+            BytesIO(content),
+            expected_version=None,
             require_launch_authority=False,
         )
     )
@@ -1507,6 +1505,11 @@ def _harness_version(executable: str) -> str:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if key in _NATIVE_SAFE_INHERITED_ENVIRONMENT_KEYS
+            },
             shell=False,
             start_new_session=True,
         )
@@ -1799,8 +1802,6 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
         prompt = _prompt_bytes(arguments.prompt_file)
         executable = _resolved_executable(HarnessFamily.CLAUDE)
         version = _harness_version(executable)
-        if version != _VERIFIED_HARNESS_VERSIONS[HarnessFamily.CLAUDE]:
-            raise CaptureUsageError("selected harness version is not verified")
         _validate_native_worktree(arguments, pin.capability, post_exit=False)
         started_at = _utc_now()
         started_monotonic = time.monotonic()
@@ -1842,6 +1843,7 @@ def run_native_claude_command(arguments: argparse.Namespace) -> int:
                 session_id,
                 role,
                 pin.effort,
+                expected_version=version,
                 expected_permission_mode=NATIVE_PERMISSION_MODES[pin.capability],
                 require_handback=require_handback,
                 started_at=started_at,
@@ -1959,8 +1961,6 @@ def run_command(arguments: argparse.Namespace) -> int:
     try:
         executable = _resolved_executable(arguments.harness)
         version = _harness_version(executable)
-        if version != _VERIFIED_HARNESS_VERSIONS[arguments.harness]:
-            raise CaptureUsageError("selected harness version is not verified")
         started_at = _utc_now()
         started_monotonic = time.monotonic()
         arguments.started_at = started_at
@@ -1984,7 +1984,11 @@ def run_command(arguments: argparse.Namespace) -> int:
             if arguments.harness is HarnessFamily.CODEX:
                 usage = parse_codex_stream(process.stdout)
             else:
-                usage = parse_claude_stream(process.stdout, require_launch_authority=True)
+                usage = parse_claude_stream(
+                    process.stdout,
+                    expected_version=version,
+                    require_launch_authority=True,
+                )
             writer.join()
             if not writer_result[0]:
                 raise CaptureUsageError("prompt delivery failed") from None
@@ -2309,7 +2313,9 @@ def _add_output_option(parser: argparse.ArgumentParser) -> None:
 
 def supervise_native_codex_command(arguments: argparse.Namespace) -> int:
     """Hold native-Codex bindings while the parent dispatches its named leaf."""
-    return supervise_native_codex(arguments)
+    executable = _resolved_executable(HarnessFamily.CODEX)
+    harness_version = _harness_version(executable)
+    return supervise_native_codex(arguments, harness_version=harness_version)
 
 
 EnumMember = TypeVar("EnumMember")

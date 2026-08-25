@@ -414,8 +414,10 @@ authorization.** The same successful `_validate_validation_root` call that
 builds the twelve-key `env=` map above also returns the canonical resolved
 root, and the capture tool passes it to the three validation roles' native
 launch as exactly one `--add-dir <validated real root>` argv pair, placed
-immediately before `--permission-mode`. Installed Claude Code 2.1.233
-documents `--add-dir` as additional directories allowed for tool access; live
+immediately before `--permission-mode`. Observed-version binding probes the
+installed authenticated Claude CLI and requires every version-bearing evidence
+field to agree with that one observed value. Claude Code documents `--add-dir`
+as additional directories allowed for tool access; live
 evidence showed a D166 validation role under `dontAsk` could not otherwise
 execute the external interpreter, leaving the validation environment
 unusable. `--add-dir` grants **path access, not tools** — the committed

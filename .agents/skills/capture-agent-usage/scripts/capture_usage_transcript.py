@@ -1,4 +1,4 @@
-"""Closed parser for one owned Claude 2.1.233 parent transcript."""
+"""Closed parser for one owned Claude parent transcript bound to a probe."""
 
 from __future__ import annotations
 
@@ -35,20 +35,24 @@ _ALLOWED_TYPES = frozenset(
         "ai-title",
         "assistant",
         "attachment",
+        "atis-latch",
         "last-prompt",
         "mode",
         "queue-operation",
         "user",
     }
 )
-"""Row types observed across the five committed 2.1.233 transcript fixtures.
+"""Row types observed across the committed 2.1.233 and 2.1.241 transcript fixtures.
 
-``mode`` and ``ai-title`` are metadata-only rows with independently closed shapes.
+``mode``, ``ai-title``, and discarded ``atis-latch`` rows are metadata-only rows
+with independently closed shapes.
 """
 _MODE_ROW_KEYS = frozenset({"type", "mode", "sessionId"})
 """Exact observed keys of the metadata-only ``mode`` row (story-planner.jsonl)."""
 _AI_TITLE_ROW_KEYS = frozenset({"type", "aiTitle", "sessionId"})
 """Exact observed keys of the metadata-only ``ai-title`` row."""
+_ATIS_LATCH_ROW_KEYS = frozenset({"atis", "sessionId", "type"})
+"""Exact observed keys of a discarded ``atis-latch`` metadata row."""
 _USAGE_REQUIRED = frozenset(
     {"input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"}
 )
@@ -308,6 +312,7 @@ def parse_owned_transcript(
     role: NativeClaudeRole,
     effort: str,
     *,
+    expected_version: str,
     expected_permission_mode: str,
     require_handback: bool = False,
     started_at: datetime | None = None,
@@ -320,6 +325,9 @@ def parse_owned_transcript(
         session_id: The exact generated session identifier to bind.
         role: The committed native role attested against ``agent-setting`` rows.
         effort: The committed effort attested against every assistant row.
+        expected_version: The version observed by the caller's one bounded CLI
+            probe. Every row carrying a version must equal this value exactly;
+            every assistant row must carry it.
         expected_permission_mode: The single frozen permission-mode value
             (derived by the caller from the committed capability mapping) that
             every row's optional ``permissionMode`` key must equal exactly.
@@ -364,6 +372,8 @@ def parse_owned_transcript(
                     or row.get("sessionId") != session_id
                 ):
                     raise TranscriptError("owned Claude transcript is invalid")
+                if "version" in row and row["version"] != expected_version:
+                    raise TranscriptError("owned Claude transcript is invalid")
                 if "permissionMode" in row:
                     row_permission_mode = row.get("permissionMode")
                     if (
@@ -372,6 +382,14 @@ def parse_owned_transcript(
                     ):
                         raise TranscriptError("owned Claude transcript permission mode is invalid")
                     permission_mode_seen = True
+                if row["type"] == "atis-latch":
+                    if (
+                        set(row) != _ATIS_LATCH_ROW_KEYS
+                        or not isinstance(row.get("atis"), str)
+                        or not isinstance(row.get("sessionId"), str)
+                    ):
+                        raise TranscriptError("owned Claude transcript is invalid")
+                    continue
                 if row["type"] == "mode":
                     if set(row) != _MODE_ROW_KEYS or row.get("mode") != "normal":
                         raise TranscriptError("owned Claude transcript is invalid")
@@ -413,7 +431,7 @@ def parse_owned_transcript(
                     not isinstance(message, dict)
                     or "agentId" in row
                     or "mode" in row
-                    or row.get("version") != "2.1.233"
+                    or row.get("version") != expected_version
                     or row.get("effort") != effort
                 ):
                     raise TranscriptError("owned Claude transcript is invalid")
