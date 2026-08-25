@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -94,6 +95,42 @@ def test_connect_read_only_opens_the_literal_file_for_special_characters(
     finally:
         connection.close()
     assert rows == [("seed",)]
+
+
+def test_connect_read_only_calls_sqlite3_connect_with_percent_encoded_uri_and_uri_true(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deterministic, SQLite-build-independent proof of the exact call made.
+
+    The real end-to-end tests above (``test_connect_read_only_opens_the_
+    literal_file_for_special_characters`` etc.) prove behaviour against a
+    live SQLite build with URI filenames actually compiled in
+    (``SQLITE_USE_URI``), which is not guaranteed on every host. This test
+    instead mocks :func:`sqlite3.connect` and asserts the exact positional
+    URI and ``uri=True`` keyword ``connect_read_only`` passes it, so it fails
+    deterministically — independent of the host's SQLite build — if
+    ``uri=True`` is ever dropped, inverted, or the raw (non-percent-encoded)
+    path is passed instead of :func:`store_snapshot.read_only_sqlite_uri`'s
+    result.
+    """
+    path = tmp_path / "store.sqlite3"
+    path.touch()
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    sentinel_connection = object()
+
+    def fake_connect(*args: object, **kwargs: object) -> object:
+        calls.append((args, kwargs))
+        return sentinel_connection
+
+    monkeypatch.setattr(store_snapshot.sqlite3, "connect", fake_connect)
+
+    result = store_snapshot.connect_read_only(path)
+
+    assert result is sentinel_connection
+    assert len(calls) == 1
+    (positional_args, keyword_args) = calls[0]
+    assert positional_args == (store_snapshot.read_only_sqlite_uri(path),)
+    assert keyword_args == {"uri": True}
 
 
 # --- connect_read_only: missing store, default row factory, write failure -----
@@ -336,3 +373,70 @@ def test_rpd_corpus_score_binds_the_shared_snapshot_helper() -> None:
 
 def test_bakeoff_reference_567_binds_the_shared_snapshot_helper() -> None:
     assert bakeoff_reference_567.snapshot_store_to_temp is store_snapshot.snapshot_store_to_temp
+
+
+# --- import separation: never reach the roaster/control path ------------------
+
+
+def test_store_snapshot_module_does_not_directly_import_controller_safety_or_mcp_client() -> None:
+    """Static check on this module's own import statements.
+
+    ``store_snapshot`` is a shared helper for offline, read-only scripts
+    (bake-off harnesses, fixture exporters, corpus scorers); it must never
+    pull in the live roaster/control path.
+    """
+    import ast
+
+    tree = ast.parse(Path(store_snapshot.__file__).read_text())
+    imported_modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported_modules.add(node.module)
+        elif isinstance(node, ast.Import):
+            imported_modules.update(alias.name for alias in node.names)
+    forbidden = {
+        "roastpilot_agent.controller",
+        "roastpilot_agent.safety",
+        "roastpilot_agent.mcp_client",
+    }
+    assert imported_modules.isdisjoint(forbidden)
+
+
+def test_store_snapshot_never_transitively_imports_controller_safety_or_mcp_client() -> None:
+    """Authoritative transitive-import check: the roaster/control path must be
+    unreachable from this shared offline-script helper.
+
+    Runs in a FRESH subprocess — this pytest process may already have
+    imported ``controller``/``safety``/``mcp_client`` via other test modules
+    collected in the same session, which would make an in-process
+    ``sys.modules`` check a false pass. The subprocess only ever puts
+    ``scripts/`` on ``sys.path`` and imports ``store_snapshot``, then
+    inspects what that pulled in — so this fails meaningfully (a non-empty,
+    named list of forbidden modules) if a future change to
+    ``store_snapshot.py`` or anything it imports ever reaches the control
+    path, directly or transitively.
+    """
+    scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+    script = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(scripts_dir)!r})\n"
+        "import store_snapshot\n"
+        "loaded = {m for m in sys.modules if m.startswith('roastpilot_agent.')}\n"
+        "forbidden = {\n"
+        "    'roastpilot_agent.controller',\n"
+        "    'roastpilot_agent.safety',\n"
+        "    'roastpilot_agent.mcp_client',\n"
+        "}\n"
+        "hit = sorted(loaded & forbidden)\n"
+        "print(','.join(hit))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == "", (
+        f"store_snapshot transitively imported forbidden modules: {result.stdout.strip()}\n"
+        f"stderr: {result.stderr}"
+    )

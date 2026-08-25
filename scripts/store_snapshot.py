@@ -4,12 +4,14 @@ Consolidates the read-only ``sqlite3`` URI construction and the "copy the
 operator's live store to a private temp file" pattern that several offline
 scripts (``rpd_corpus_score.py``, ``bakeoff_reference_567.py``,
 ``store_to_fixture.py``, ``plant_model_arx_study.py``) each re-implemented
-slightly differently. Two of those copies built the read-only URI with a naive
-``f"file:{path}?mode=ro"`` — SQLite's URI filenames follow RFC 3986, so an
-unescaped ``?``/``#`` (or a relative path) in ``path`` is misparsed, silently
-truncating or corrupting the path SQLite actually opens. This module adopts
-the already-correct pattern (``path.resolve().as_uri()``, which
-percent-encodes per RFC 3986) as the single source of truth.
+slightly differently. Three of those copies (``bakeoff_reference_567.py``,
+``store_to_fixture.py``, ``plant_model_arx_study.py``) built the read-only URI
+with a naive ``f"file:{path}?mode=ro"`` — SQLite's URI filenames follow RFC
+3986, so an unescaped ``?``/``#`` (or a relative path) in ``path`` is
+misparsed, silently truncating or corrupting the path SQLite actually opens.
+The fourth (``rpd_corpus_score.py``) already had the correct pattern. This
+module adopts that already-correct pattern (``path.resolve().as_uri()``,
+which percent-encodes per RFC 3986) as the single source of truth.
 
 Every function here is strictly read-only against the caller-supplied
 ``db_path`` / ``store_path``: nothing in this module ever opens the live
