@@ -210,6 +210,37 @@ def test_one_restart_breadcrumb_cannot_account_for_two_tick_resets() -> None:
     assert evidence.retained_development_snapshot_fraction == 0.0
 
 
+def test_two_restart_breadcrumbs_account_for_two_tick_resets_in_order() -> None:
+    """Each reset binds its own restart breadcrumb in the corresponding UTC interval."""
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (
+            _recovery(
+                event_id=1,
+                rule="restart_recovery",
+                recorded_at_utc="2026-08-25T12:00:30+00:00",
+            ),
+            _recovery(
+                event_id=2,
+                rule="restart_recovery",
+                recorded_at_utc="2026-08-25T12:01:30+00:00",
+            ),
+        ),
+        (
+            _snapshot(row_id=1, tick=4, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
+            _snapshot(row_id=2, tick=0, timestamp="2026-08-25T12:01:00+00:00", token=2.0),
+            _snapshot(row_id=3, tick=1, timestamp="2026-08-25T12:01:10+00:00", token=3.0),
+            _snapshot(row_id=4, tick=0, timestamp="2026-08-25T12:02:00+00:00", token=4.0),
+            _snapshot(row_id=5, tick=1, timestamp="2026-08-25T12:02:10+00:00", token=5.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.OBSERVED
+    assert [episode.event_id for episode in evidence.recovery_episodes] == [1, 2]
+    assert evidence.retained_development_snapshot_count == 5
+    assert evidence.fresh_retained_development_snapshot_count == 2
+    assert evidence.retained_development_snapshot_fraction == 0.4
+
+
 @pytest.mark.parametrize(
     ("missing_verdict", "verdict"),
     ((True, "recovery"), (False, "not_recovery"), (False, 1)),
