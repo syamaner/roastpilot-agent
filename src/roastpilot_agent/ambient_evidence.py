@@ -319,6 +319,20 @@ def _episode_from_row(  # pyright: ignore[reportUnusedFunction] - grammar test c
     return _parsed_recovery_from_row(row).episode
 
 
+def _normalize_recovery_configuration(
+    parsed: _ParsedRecovery,
+    configured_enabled: bool,
+) -> _ParsedRecovery:
+    """Fail closed when a recovery row contradicts the frozen doctrine setting."""
+    episode = parsed.episode
+    if episode.configured_enabled is None or episode.configured_enabled == configured_enabled:
+        return parsed
+    return _ParsedRecovery(
+        DoctrineRecoveryEpisode(event_id=episode.event_id, state=DoctrineRecoveryState.UNKNOWN),
+        None,
+    )
+
+
 def _snapshot_status(row: Mapping[str, object]) -> tuple[_RetainedAmbientStatus | None, bool]:
     """Parse one retained status, returning whether its retained shape was malformed."""
     raw_state = row.get("raw_state_json")
@@ -400,7 +414,10 @@ def derive_ambient_doctrine_evidence(
             reason=NotProvenReason.RUN_OR_CONFIG_UNAVAILABLE,
         )
     configured_enabled = frozen_controller.ambient_fan_doctrine.enabled
-    parsed_recoveries = tuple(_parsed_recovery_from_row(row) for row in recovery_rows)
+    parsed_recoveries = tuple(
+        _normalize_recovery_configuration(_parsed_recovery_from_row(row), configured_enabled)
+        for row in recovery_rows
+    )
     episodes = tuple(parsed.episode for parsed in parsed_recoveries)
     ever_retired = any(episode.state is DoctrineRecoveryState.RETIRED for episode in episodes)
     unknown_recovery = any(episode.state is DoctrineRecoveryState.UNKNOWN for episode in episodes)

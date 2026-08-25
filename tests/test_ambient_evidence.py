@@ -68,11 +68,14 @@ def _recovery(
     *,
     event_id: int,
     state: str = "preserved",
+    configured_enabled: bool = True,
+    effective_enabled: bool | None = None,
     rule: str = "in_session_recovery",
     verdict: object = "recovery",
     recorded_at_utc: str = "2026-08-25T12:00:30+00:00",
 ) -> dict[str, object]:
     """Build one fully typed recovery event row."""
+    effective = state == "preserved" if effective_enabled is None else effective_enabled
     return {
         "id": event_id,
         "recorded_at_utc": recorded_at_utc,
@@ -81,8 +84,8 @@ def _recovery(
                 "rule": rule,
                 "verdict": verdict,
                 RECOVERY_PAYLOAD_KEY: {
-                    "configured_enabled": True,
-                    "effective_enabled": state == "preserved",
+                    "configured_enabled": configured_enabled,
+                    "effective_enabled": effective,
                     "state": state,
                 },
             }
@@ -187,6 +190,26 @@ def test_restart_recovery_accounts_for_one_tick_reset() -> None:
     assert evidence.verdict is AmbientEvidenceVerdict.OBSERVED
 
 
+def test_one_restart_breadcrumb_cannot_account_for_two_tick_resets() -> None:
+    """Each process-generation reset consumes one distinct restart record."""
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (_recovery(event_id=1, rule="restart_recovery"),),
+        (
+            _snapshot(row_id=1, tick=4, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
+            _snapshot(row_id=2, tick=0, timestamp="2026-08-25T12:01:00+00:00", token=2.0),
+            _snapshot(row_id=3, tick=1, timestamp="2026-08-25T12:01:10+00:00", token=3.0),
+            _snapshot(row_id=4, tick=0, timestamp="2026-08-25T12:02:00+00:00", token=4.0),
+            _snapshot(row_id=5, tick=1, timestamp="2026-08-25T12:02:10+00:00", token=5.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+    assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
+    assert evidence.retained_development_snapshot_count == 0
+    assert evidence.fresh_retained_development_snapshot_count == 0
+    assert evidence.retained_development_snapshot_fraction == 0.0
+
+
 @pytest.mark.parametrize(
     ("missing_verdict", "verdict"),
     ((True, "recovery"), (False, "not_recovery"), (False, 1)),
@@ -251,6 +274,48 @@ def test_ordinary_recovery_retirement_remains_sticky() -> None:
         DoctrineRecoveryState.RETIRED,
         DoctrineRecoveryState.PRESERVED,
     ]
+
+
+@pytest.mark.parametrize(
+    ("state", "effective_enabled"),
+    (("preserved", False), ("retired", False)),
+)
+def test_recovery_configuration_contradicting_frozen_enabled_is_unknown(
+    state: str,
+    effective_enabled: bool,
+) -> None:
+    """A contradictory recovery record cannot remain an episode or reset breadcrumb."""
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (
+            _recovery(
+                event_id=1,
+                state=state,
+                configured_enabled=False,
+                effective_enabled=effective_enabled,
+                rule="restart_recovery",
+            ),
+        ),
+        (
+            _snapshot(row_id=1, tick=4, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
+            _snapshot(row_id=2, tick=0, timestamp="2026-08-25T12:01:00+00:00", token=2.0),
+            _snapshot(row_id=3, tick=1, timestamp="2026-08-25T12:01:10+00:00", token=3.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+    assert evidence.not_proven_reason is NotProvenReason.RECOVERY_STATE_UNKNOWN
+    assert evidence.recovery_episodes[0].state is DoctrineRecoveryState.UNKNOWN
+
+
+def test_contradictory_recovery_keeps_disabled_doctrine_failure_semantics() -> None:
+    """A frozen-disabled run still reports disabled doctrine before recovery details."""
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(enabled=False),
+        (_recovery(event_id=1, configured_enabled=True),),
+        (),
+    )
+    assert evidence.not_proven_reason is NotProvenReason.DOCTRINE_DISABLED
+    assert evidence.recovery_episodes[0].state is DoctrineRecoveryState.UNKNOWN
 
 
 def test_same_generation_duplicate_token_never_counts_fresh() -> None:
