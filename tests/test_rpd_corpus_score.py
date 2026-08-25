@@ -1297,6 +1297,7 @@ def test_aggregate_stats_empty_corpus() -> None:
         "hit_rate": 0.0,
         "mean_scalar": 0.0,
         "rated": 0,
+        "ambient_evidence_observed": 0,
     }
 
 
@@ -1328,6 +1329,7 @@ async def test_aggregate_stats_and_rendering(tmp_store: RoastStore) -> None:
         assert stats["hit_rate"] == pytest.approx(0.5)
         assert stats["mean_scalar"] == pytest.approx(0.5)
         assert stats["rated"] == 1
+        assert stats["ambient_evidence_observed"] == 0
 
         table = scorer.render_markdown_table(report)
         assert "HIT" in table
@@ -1340,6 +1342,8 @@ async def test_aggregate_stats_and_rendering(tmp_store: RoastStore) -> None:
         # The #711 Goodhart guard extends to the aggregate: the mean scalar
         # line states how many of the scored runs are actually rated.
         assert "(rated: 1/2)" in table
+        assert "retained DEVELOPMENT telemetry-snapshot coverage" in table
+        assert "ambient evidence observed: 0/2" in table
 
         payload = scorer.report_to_json(report)
         assert payload["aggregate"] == stats
@@ -1349,6 +1353,7 @@ async def test_aggregate_stats_and_rendering(tmp_store: RoastStore) -> None:
         assert run_hit_entry["hit"] is True
         assert run_hit_entry["bean_name"] == "Guatemala Conebosque"
         assert run_hit_entry["operator_rating"] == 5
+        assert run_hit_entry["ambient_doctrine_evidence"]["verdict"] == "not_proven"
     finally:
         await tmp_store.close()
 

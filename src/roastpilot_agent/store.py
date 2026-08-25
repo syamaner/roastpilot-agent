@@ -19,6 +19,10 @@ from typing import Any, Literal, cast
 import aiosqlite
 from pydantic import BaseModel, ConfigDict
 
+from roastpilot_agent.ambient_evidence import (
+    AmbientDoctrineEvidence,
+    derive_ambient_doctrine_evidence,
+)
 from roastpilot_agent.advisor import AdvisorContext, RoastDecision
 from roastpilot_agent.config import AppConfig, ControllerConfig, SafetyLimits
 from roastpilot_agent.models import (
@@ -684,6 +688,51 @@ class RoastStore:
         if self._connection is None:
             raise RuntimeError("store is not initialized")
         return self._connection
+
+    async def read_ambient_doctrine_evidence(self, run_id: str) -> AmbientDoctrineEvidence:
+        """Read conservative ambient-doctrine evidence without modifying the store.
+
+        The three queries deliberately preserve durable insertion order: restart
+        resets process-local ticks, so neither recovery nor snapshot chronology
+        can be reconstructed by sorting on tick.  Historical JSON is untrusted
+        corpus data; parsing occurs in the total derivation and fails toward a
+        typed ``not_proven`` result rather than an exception.
+
+        Args:
+            run_id: The persisted roast-run identifier.
+
+        Returns:
+            The run's retained DEVELOPMENT-snapshot evidence.
+        """
+        try:
+            async with self.connection.execute(
+                "SELECT config_json FROM roast_runs WHERE id = ?", (run_id,)
+            ) as cursor:
+                config_row = await cursor.fetchone()
+            async with self.connection.execute(
+                "SELECT id, payload_json FROM roast_events WHERE run_id = ? AND kind = ?"
+                " ORDER BY id ASC",
+                (run_id, RoastEventKind.RECOVERY_REQUIRED.value),
+            ) as cursor:
+                recovery_rows = [dict(row) for row in await cursor.fetchall()]
+            async with self.connection.execute(
+                "SELECT id, tick, recorded_at_utc, agent_phase, raw_state_json"
+                " FROM telemetry_snapshots WHERE run_id = ? ORDER BY id ASC",
+                (run_id,),
+            ) as cursor:
+                snapshot_rows = [dict(row) for row in await cursor.fetchall()]
+            frozen = (
+                None
+                if config_row is None
+                else FrozenRunConfig.model_validate_json(str(config_row["config_json"]))
+            )
+            return derive_ambient_doctrine_evidence(
+                None if frozen is None else frozen.controller,
+                recovery_rows,
+                snapshot_rows,
+            )
+        except Exception:  # noqa: BLE001 - a corrupt historical row is not a read failure
+            return derive_ambient_doctrine_evidence(None, (), ())
 
     async def initialize(self) -> None:
         """Open the database, set durability PRAGMAs, apply migrations."""
