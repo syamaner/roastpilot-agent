@@ -375,13 +375,15 @@ def test_snapshot_store_to_temp_rejects_intermediate_symlink_directory_alias_bef
     assert _sha256(store_path) == before
 
 
-def test_aliases_same_file_rejects_uninspectable_existing_target(
+def test_snapshot_store_to_temp_rejects_uninspectable_existing_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Only a missing entry is treated as safe; inspection failures fail closed."""
     store_path = tmp_path / "store.sqlite3"
-    snapshot_path = tmp_path / "snapshot.sqlite3"
+    dest_dir = tmp_path / "snap"
+    dest_dir.mkdir()
+    snapshot_path = dest_dir / store_snapshot.DEFAULT_SNAPSHOT_NAME
     _seed_db(store_path)
     snapshot_path.touch()
     source_before = _sha256(store_path)
@@ -396,43 +398,55 @@ def test_aliases_same_file_rejects_uninspectable_existing_target(
             raise PermissionError("target metadata denied")
         return original_stat(path, follow_symlinks=follow_symlinks)
 
+    def direct_lstat(path: Path) -> os.stat_result:
+        return os.lstat(path)
+
     monkeypatch.setattr(store_snapshot.Path, "resolve", unresolved)
     monkeypatch.setattr(store_snapshot.Path, "stat", denied_target_stat)
+    monkeypatch.setattr(store_snapshot.Path, "lstat", direct_lstat)
 
     with pytest.raises(ValueError, match="cannot safely inspect source"):
-        store_snapshot._aliases_same_file(store_path, snapshot_path)
+        store_snapshot.snapshot_store_to_temp(store_path, dest_dir)
 
     assert _sha256(store_path) == source_before
 
 
-def test_reject_existing_snapshot_symlink_rejects_uninspectable_target(
+def test_snapshot_store_to_temp_rejects_uninspectable_target_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A target metadata error cannot be mistaken for an absent safe target."""
     store_path = tmp_path / "store.sqlite3"
-    snapshot_path = tmp_path / "snapshot.sqlite3"
+    dest_dir = tmp_path / "snap"
+    dest_dir.mkdir()
+    snapshot_path = dest_dir / store_snapshot.DEFAULT_SNAPSHOT_NAME
     _seed_db(store_path)
     source_before = _sha256(store_path)
 
-    def denied_lstat(_path: Path) -> os.stat_result:
-        raise PermissionError("target metadata denied")
+    original_lstat = Path.lstat
+
+    def denied_lstat(path: Path) -> os.stat_result:
+        if path == snapshot_path:
+            raise PermissionError("target metadata denied")
+        return original_lstat(path)
 
     monkeypatch.setattr(store_snapshot.Path, "lstat", denied_lstat)
 
     with pytest.raises(ValueError, match="cannot safely inspect snapshot target"):
-        store_snapshot._reject_existing_snapshot_symlink(snapshot_path)
+        store_snapshot.snapshot_store_to_temp(store_path, dest_dir)
 
     assert _sha256(store_path) == source_before
 
 
-def test_write_snapshot_atomically_cleans_up_after_failed_publication(
+def test_snapshot_store_to_temp_cleans_up_after_failed_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failed publication preserves the old target and removes private bytes."""
     store_path = tmp_path / "store.sqlite3"
-    snapshot_path = tmp_path / "snapshot.sqlite3"
+    dest_dir = tmp_path / "snap"
+    dest_dir.mkdir()
+    snapshot_path = dest_dir / store_snapshot.DEFAULT_SNAPSHOT_NAME
     _seed_db(store_path)
     snapshot_path.write_bytes(b"previous snapshot")
     source_before = _sha256(store_path)
@@ -444,11 +458,11 @@ def test_write_snapshot_atomically_cleans_up_after_failed_publication(
     monkeypatch.setattr(store_snapshot.os, "replace", failed_replace)
 
     with pytest.raises(OSError, match="publication failed"):
-        store_snapshot._write_snapshot_atomically(snapshot_path, b"new snapshot")
+        store_snapshot.snapshot_store_to_temp(store_path, dest_dir)
 
     assert snapshot_path.read_bytes() == target_before
     assert _sha256(store_path) == source_before
-    assert list(tmp_path.glob(f".{snapshot_path.name}.*.tmp")) == []
+    assert list(dest_dir.glob(f".{snapshot_path.name}.*.tmp")) == []
 
 
 def test_snapshot_store_to_temp_rejects_unrelated_target_symlink_before_connections(
