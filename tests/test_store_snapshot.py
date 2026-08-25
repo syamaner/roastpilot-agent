@@ -341,6 +341,81 @@ def test_snapshot_store_to_temp_rejects_symlink_alias(tmp_path: Path) -> None:
     assert _sha256(store_path) == before
 
 
+def test_snapshot_store_to_temp_rejects_unrelated_target_symlink_before_connections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A target symlink cannot redirect snapshot writes to an unrelated file."""
+    store_path = tmp_path / "store.sqlite3"
+    unrelated_path = tmp_path / "unrelated.sqlite3"
+    _seed_db(store_path)
+    _seed_db(unrelated_path)
+    source_before = _sha256(store_path)
+    unrelated_before = _sha256(unrelated_path)
+    dest_dir = tmp_path / "snap"
+    dest_dir.mkdir()
+    target_path = dest_dir / store_snapshot.DEFAULT_SNAPSHOT_NAME
+    try:
+        target_path.symlink_to(unrelated_path)
+    except OSError:
+        pytest.skip("symlink creation is not supported on this filesystem/platform")
+
+    def fail_source_connection(_path: Path) -> sqlite3.Connection:
+        raise AssertionError("source connection must not open for a symlink target")
+
+    def fail_sqlite_connection(*args: object, **kwargs: object) -> sqlite3.Connection:
+        raise AssertionError("SQLite connection must not open for a symlink target")
+
+    monkeypatch.setattr(store_snapshot, "connect_read_only", fail_source_connection)
+    monkeypatch.setattr(store_snapshot.sqlite3, "connect", fail_sqlite_connection)
+
+    with pytest.raises(ValueError, match="through a symlink"):
+        store_snapshot.snapshot_store_to_temp(store_path, dest_dir)
+
+    assert _sha256(store_path) == source_before
+    assert _sha256(unrelated_path) == unrelated_before
+
+
+def test_snapshot_store_to_temp_replaces_a_symlink_swapped_after_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-validation target swap cannot redirect writes through its symlink."""
+    store_path = tmp_path / "store.sqlite3"
+    unrelated_path = tmp_path / "unrelated.sqlite3"
+    _seed_db(store_path)
+    _seed_db(unrelated_path)
+    source_before = _sha256(store_path)
+    unrelated_before = _sha256(unrelated_path)
+    dest_dir = tmp_path / "snap"
+    dest_dir.mkdir()
+    snapshot_path = dest_dir / store_snapshot.DEFAULT_SNAPSHOT_NAME
+    real_connect_read_only = store_snapshot.connect_read_only
+
+    def swap_target_after_validation(path: Path) -> sqlite3.Connection:
+        connection = real_connect_read_only(path)
+        try:
+            snapshot_path.symlink_to(unrelated_path)
+        except OSError:
+            connection.close()
+            pytest.skip("symlink creation is not supported on this filesystem/platform")
+        return connection
+
+    monkeypatch.setattr(store_snapshot, "connect_read_only", swap_target_after_validation)
+
+    result = store_snapshot.snapshot_store_to_temp(store_path, dest_dir)
+
+    assert result == snapshot_path
+    assert not result.is_symlink()
+    assert _sha256(store_path) == source_before
+    assert _sha256(unrelated_path) == unrelated_before
+    connection = sqlite3.connect(str(result))
+    try:
+        assert connection.execute("SELECT name FROM widgets").fetchall() == [("seed",)]
+    finally:
+        connection.close()
+
+
 def test_snapshot_store_to_temp_rejects_hard_link_alias(tmp_path: Path) -> None:
     """A pre-existing hard link at the computed target path sharing the
     source's inode must be rejected — resolved-path equality alone would miss

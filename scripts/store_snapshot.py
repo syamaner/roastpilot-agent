@@ -22,7 +22,10 @@ target it constructs itself.
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import stat
+import tempfile
 from pathlib import Path
 from typing import Final
 
@@ -65,6 +68,45 @@ def _aliases_same_file(store_path: Path, snapshot_path: Path) -> bool:
         # already covers every case reachable without both paths existing.
         return False
     return (source_stat.st_dev, source_stat.st_ino) == (target_stat.st_dev, target_stat.st_ino)
+
+
+def _reject_existing_snapshot_symlink(snapshot_path: Path) -> None:
+    """Reject a pre-existing target symlink before opening either database."""
+    try:
+        target_stat = snapshot_path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ValueError(f"cannot safely inspect snapshot target {snapshot_path}") from error
+    if not stat.S_ISLNK(target_stat.st_mode):
+        return
+    raise ValueError(
+        f"snapshot target {snapshot_path} aliases the source store or another file "
+        "through a symlink; "
+        "refusing to open it"
+    )
+
+
+def _write_snapshot_atomically(snapshot_path: Path, snapshot_bytes: bytes) -> None:
+    """Publish snapshot bytes without opening the caller-visible path for writing."""
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=snapshot_path.parent,
+            prefix=f".{snapshot_path.name}.",
+            suffix=".tmp",
+        )
+    except FileNotFoundError as error:
+        raise sqlite3.OperationalError("unable to open database file") from error
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as temporary_file:
+            temporary_file.write(snapshot_bytes)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, snapshot_path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
 
 
 def read_only_sqlite_uri(path: Path) -> str:
@@ -171,6 +213,7 @@ def snapshot_store_to_temp(
     if is_invalid:
         raise ValueError(f"snapshot_name must be a single plain filename, got {snapshot_name!r}")
     snapshot_path = tmp_dir / snapshot_name
+    _reject_existing_snapshot_symlink(snapshot_path)
     if _aliases_same_file(store_path, snapshot_path):
         raise ValueError(
             f"snapshot target {snapshot_path} aliases the source store {store_path}; "
@@ -178,11 +221,13 @@ def snapshot_store_to_temp(
         )
     source = connect_read_only(store_path)
     try:
-        target = sqlite3.connect(str(snapshot_path))
+        target = sqlite3.connect(":memory:")
         try:
             source.backup(target)
+            snapshot_bytes = target.serialize()
         finally:
             target.close()
     finally:
         source.close()
+    _write_snapshot_atomically(snapshot_path, snapshot_bytes)
     return snapshot_path
