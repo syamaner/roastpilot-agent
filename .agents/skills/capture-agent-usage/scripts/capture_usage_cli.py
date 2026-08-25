@@ -1505,6 +1505,11 @@ def _harness_version(executable: str) -> str:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if key in _NATIVE_SAFE_INHERITED_ENVIRONMENT_KEYS
+            },
             shell=False,
             start_new_session=True,
         )

@@ -714,6 +714,14 @@ class TaskUsageRecord(CaptureModel):
     usage_complete: bool
     parent_task_id: SafeIdentifier | None = None
 
+    @field_validator("harness_version", mode="before")
+    @classmethod
+    def require_task_harness_version(cls, value: object) -> object:
+        """Require one observed semantic version without providing a default."""
+        if not isinstance(value, str) or re.fullmatch(r"^\d+\.\d+\.\d+$", value) is None:
+            raise ValueError("task harness version is invalid")
+        return value
+
     @model_validator(mode="after")
     def validate_usage(self) -> TaskUsageRecord:
         """Protect normalized usage and client-estimate provenance invariants."""
@@ -790,6 +798,14 @@ class NativeWorkerUsageRecord(CaptureModel):
     estimate_basis: EstimateBasis = EstimateBasis.NOT_EXPOSED
     usage_complete: Literal[True] = True
     whole_tree_verified: Literal[True] = True
+
+    @field_validator("harness_version", mode="before")
+    @classmethod
+    def require_native_worker_harness_version(cls, value: object) -> object:
+        """Require one observed semantic version without providing a default."""
+        if not isinstance(value, str) or re.fullmatch(r"^\d+\.\d+\.\d+$", value) is None:
+            raise ValueError("native worker harness version is invalid")
+        return value
 
     @field_validator("harness", mode="before")
     @classmethod

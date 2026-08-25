@@ -2876,11 +2876,11 @@ def test_native_codex_cli_probes_resolved_executable_once_before_supervision(
         def kill(self) -> None:
             raise AssertionError("completed version probe must not kill")
 
-    probe_argv: list[list[str]] = []
+    probe_calls: list[tuple[list[str], dict[str, object]]] = []
     observed_versions: list[str] = []
 
-    def popen(argv: list[str], **_kwargs: object) -> VersionProcess:
-        probe_argv.append(argv)
+    def popen(argv: list[str], **kwargs: object) -> VersionProcess:
+        probe_calls.append((argv, kwargs))
         return VersionProcess()
 
     def resolved(family: HarnessFamily) -> str:
@@ -2895,9 +2895,21 @@ def test_native_codex_cli_probes_resolved_executable_once_before_supervision(
     monkeypatch.setattr(usage_cli.subprocess, "Popen", popen)
     monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
     monkeypatch.setattr(usage_cli, "supervise_native_codex", supervise)
+    monkeypatch.setenv("PATH", "/allowed/codex-bin")
+    monkeypatch.setenv("LANG", "en_GB.UTF-8")
+    monkeypatch.setenv("NODE_OPTIONS", "--require=/host/injected.js")
+    monkeypatch.setenv("ROASTPILOT_PROBE_SENTINEL", "hostile")
+    monkeypatch.setenv("roastpilot_probe_sentinel", "hostile")
 
     assert usage_cli.supervise_native_codex_command(argparse.Namespace()) == 0
-    assert probe_argv == [["/fixed/codex", "--version"]]
+    assert [argv for argv, _kwargs in probe_calls] == [["/fixed/codex", "--version"]]
+    probe_environment = cast(dict[str, str], probe_calls[0][1]["env"])
+    assert probe_environment["PATH"] == "/allowed/codex-bin"
+    assert probe_environment["LANG"] == "en_GB.UTF-8"
+    assert "NODE_OPTIONS" not in probe_environment
+    assert "ROASTPILOT_PROBE_SENTINEL" not in probe_environment
+    assert "roastpilot_probe_sentinel" not in probe_environment
+    assert set(probe_environment) <= usage_cli._NATIVE_SAFE_INHERITED_ENVIRONMENT_KEYS  # pyright: ignore[reportPrivateUsage]
     assert observed_versions == ["0.148.0"]
 
 
@@ -5763,6 +5775,17 @@ def test_native_record_uses_distinct_schema_v3_and_adapter_roundtrips() -> None:
     assert _task_record().schema_version == 1
 
 
+@pytest.mark.parametrize("value", [None, {}, True, 1, "0.147", "v0.147.0", "0.147.0.1"])
+def test_generic_and_native_worker_records_reject_malformed_harness_versions(value: object) -> None:
+    """Every persisted non-Codex record requires one complete observed semver."""
+    with pytest.raises(ValidationError, match="harness version"):
+        TaskUsageRecord.model_validate({**_task_record().model_dump(), "harness_version": value})
+    with pytest.raises(ValidationError, match="harness version"):
+        NativeWorkerUsageRecord.model_validate(
+            {**_native_record_payload(), "harness_version": value}
+        )
+
+
 def test_native_record_capability_enforces_read_only_and_write_provenance() -> None:
     """Schema v3 encodes the distinct final-head invariants for each capability."""
     read_only = _native_record_payload()
@@ -7333,6 +7356,11 @@ def test_native_command_launches_exact_worker_and_records_immutable_transcript(
     """D161 binds a UUID session, fixed argv and stdin to one immutable parent transcript."""
     project, observed = _configure_native_launcher(tmp_path, monkeypatch)
     processes: list[_NativeProcess] = []
+    monkeypatch.setenv("PATH", "/allowed/native-bin")
+    monkeypatch.setenv("LANG", "en_GB.UTF-8")
+    monkeypatch.setenv("NODE_OPTIONS", "--require=/host/injected.js")
+    monkeypatch.setenv("ROASTPILOT_PROBE_SENTINEL", "hostile")
+    monkeypatch.setenv("roastpilot_probe_sentinel", "hostile")
     transcript = _native_transcript_bytes().replace(b'"version":"2.1.233"', b'"version":"2.1.241"')
     monkeypatch.setattr(
         usage_cli.subprocess,
@@ -7347,6 +7375,13 @@ def test_native_command_launches_exact_worker_and_records_immutable_transcript(
     worker_launches = [(argv, kwargs) for argv, kwargs in observed if argv[-1] != "--version"]
     assert len(version_launches) == len(worker_launches) == 1
     assert version_launches[0][0] == ["claude", "--version"]
+    probe_environment = cast(dict[str, str], version_launches[0][1]["env"])
+    assert probe_environment["PATH"] == "/allowed/native-bin"
+    assert probe_environment["LANG"] == "en_GB.UTF-8"
+    assert "NODE_OPTIONS" not in probe_environment
+    assert "ROASTPILOT_PROBE_SENTINEL" not in probe_environment
+    assert "roastpilot_probe_sentinel" not in probe_environment
+    assert set(probe_environment) <= usage_cli._NATIVE_SAFE_INHERITED_ENVIRONMENT_KEYS  # pyright: ignore[reportPrivateUsage]
     argv, kwargs = worker_launches[0]
     expected_argv = usage_cli._native_claude_argv(  # pyright: ignore[reportPrivateUsage]
         "claude",
@@ -7380,6 +7415,72 @@ def test_native_command_launches_exact_worker_and_records_immutable_transcript(
         before.st_mtime_ns,
         transcript,
     )
+
+
+def test_generic_claude_probe_uses_closed_environment_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generic Claude probes retain only the closed inherited environment."""
+    monkeypatch.chdir(tmp_path)
+    prompt = tmp_path / "prompt"
+    prompt.write_text("prompt")
+    monkeypatch.setenv("PATH", "/allowed/bin")
+    monkeypatch.setenv("LANG", "en_GB.UTF-8")
+    monkeypatch.setenv("NODE_OPTIONS", "--require=/host/injected.js")
+    monkeypatch.setenv("ROASTPILOT_PROBE_SENTINEL", "hostile")
+    monkeypatch.setenv("roastpilot_probe_sentinel", "hostile")
+    observed: list[tuple[list[str], dict[str, object]]] = []
+
+    def popen(argv: list[str], **kwargs: object) -> _NativeProcess:
+        observed.append((argv, kwargs))
+        if argv[-1] == "--version":
+            return _NativeProcess(b"Claude Code 2.1.241\n")
+        return _NativeProcess((FIXTURES / "claude-2.1.241.jsonl").read_bytes())
+
+    def resolved(_family: HarnessFamily) -> str:
+        return "/stub/claude"
+
+    monkeypatch.setattr(usage_cli, "_resolved_executable", resolved)
+    monkeypatch.setattr(usage_cli.subprocess, "Popen", popen)
+    monkeypatch.setattr(usage_cli, "_harness_version", _REAL_HARNESS_VERSION)
+
+    assert (
+        main(
+            [
+                "run",
+                "--harness",
+                "claude",
+                "--prompt-file",
+                str(prompt),
+                "--task-id",
+                "811",
+                "--slice-id",
+                "capture",
+                "--role",
+                "measurement",
+                "--model",
+                "synthetic-primary",
+                "--repository",
+                "syamaner/roastpilot-agent",
+                "--branch",
+                "feature/811",
+                "--base-sha",
+                "2bed7013",
+                "--head-sha",
+                "4a3cca6",
+            ]
+        )
+        == 0
+    )
+    probes = [(argv, kwargs) for argv, kwargs in observed if argv[-1] == "--version"]
+    assert len(probes) == 1
+    probe_environment = cast(dict[str, str], probes[0][1]["env"])
+    assert probe_environment["PATH"] == "/allowed/bin"
+    assert probe_environment["LANG"] == "en_GB.UTF-8"
+    assert "NODE_OPTIONS" not in probe_environment
+    assert "ROASTPILOT_PROBE_SENTINEL" not in probe_environment
+    assert "roastpilot_probe_sentinel" not in probe_environment
+    assert set(probe_environment) <= usage_cli._NATIVE_SAFE_INHERITED_ENVIRONMENT_KEYS  # pyright: ignore[reportPrivateUsage]
 
 
 def test_native_command_records_nonzero_complete_transcript_as_unsuccessful(
