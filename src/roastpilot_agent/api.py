@@ -37,10 +37,6 @@ from pydantic import BaseModel, Field, ValidationError
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from roastpilot_agent import __version__
-from roastpilot_agent.ambient_evidence import (
-    DoctrineRecoveryState,
-    RECOVERY_PAYLOAD_KEY,
-)
 from roastpilot_agent.advisor import (
     AdvisorContext,
     AdvisorDescriptor,
@@ -48,6 +44,10 @@ from roastpilot_agent.advisor import (
     RoastDecision,
 )
 from roastpilot_agent.advisor_screen import advice_models
+from roastpilot_agent.ambient_evidence import (
+    RECOVERY_PAYLOAD_KEY,
+    DoctrineRecoveryState,
+)
 from roastpilot_agent.bean_sourcing import (
     BEAN_EXTRACTION_PROMPT_VERSION,
     BeanExtractionError,
@@ -1235,18 +1235,19 @@ class RoastRunner:
 
     def _event_payload_for_persistence(self, event: _BufferedEvent) -> object:
         """Add recovery evidence to the persisted copy without changing SSE bytes."""
-        if event.kind is not RoastEventKind.RECOVERY_REQUIRED or not isinstance(event.payload, dict):
-            return event.payload
-        source_payload = cast("dict[str, Any]", event.payload)
+        payload = event.payload
+        if event.kind is not RoastEventKind.RECOVERY_REQUIRED or not isinstance(payload, dict):
+            return payload
+        source_payload = cast("dict[str, object]", payload)
         if RECOVERY_PAYLOAD_KEY in source_payload:
-            return event.payload
+            return source_payload
         effective_enabled = self._config.controller.ambient_fan_doctrine.enabled
         state = (
             DoctrineRecoveryState.RETIRED.value
             if self._configured_doctrine_enabled and not effective_enabled
             else DoctrineRecoveryState.PRESERVED.value
         )
-        return {
+        persistence_payload: dict[str, object] = {
             **source_payload,
             RECOVERY_PAYLOAD_KEY: {
                 "configured_enabled": self._configured_doctrine_enabled,
@@ -1254,6 +1255,7 @@ class RoastRunner:
                 "state": state,
             },
         }
+        return persistence_payload
 
     async def _persist_t0_if_charged(self, snapshot: ControllerSnapshot) -> None:
         """Persist the absolute charge/T0 instant once, when the controller first

@@ -7,20 +7,23 @@ import json
 import pytest
 
 from roastpilot_agent.ambient_evidence import (
+    RECOVERY_PAYLOAD_KEY,
     AmbientDoctrineEvidence,
     AmbientEvidenceVerdict,
     DoctrineRecoveryState,
     NotProvenReason,
-    RECOVERY_PAYLOAD_KEY,
     derive_ambient_doctrine_evidence,
 )
-from roastpilot_agent.config import ControllerConfig
+from roastpilot_agent.config import AmbientFanDoctrine, ControllerConfig
 
 
 def _controller(*, enabled: bool = True, max_age: float = 90.0) -> ControllerConfig:
     """Build a frozen-controller equivalent for one evidence case."""
     return ControllerConfig(
-        ambient_fan_doctrine={"enabled": enabled, "max_reading_age_seconds": max_age}
+        ambient_fan_doctrine=AmbientFanDoctrine(
+            enabled=enabled,
+            max_reading_age_seconds=max_age,
+        )
     )
 
 
@@ -138,13 +141,17 @@ def test_frozen_age_bound_is_closed(age: int, expected: AmbientEvidenceVerdict) 
         (),
         (
             _snapshot(row_id=1, tick=1, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
-            _snapshot(row_id=2, tick=2, timestamp="2026-08-25T12:00:01+00:00", token=2.0),
+            _snapshot(
+                row_id=2,
+                tick=2,
+                timestamp="2026-08-25T12:00:01+00:00",
+                phase="roasting_pre_first_crack",
+                token=2.0,
+            ),
             _snapshot(
                 row_id=3,
                 tick=3,
-                timestamp=(
-                    f"2026-08-25T12:{(age + 1) // 60:02d}:{(age + 1) % 60:02d}+00:00"
-                ),
+                timestamp=(f"2026-08-25T12:{(age + 1) // 60:02d}:{(age + 1) % 60:02d}+00:00"),
                 token=2.0,
             ),
         ),

@@ -802,7 +802,10 @@ def _ambient_evidence_cell(evidence: AmbientDoctrineEvidence) -> str:
             f"({evidence.fresh_retained_development_snapshot_count}/"
             f"{evidence.retained_development_snapshot_count})"
         )
-    return f"not proven ({evidence.not_proven_reason.value})"
+    reason = evidence.not_proven_reason
+    if reason is None:
+        return "not proven (unknown)"
+    return f"not proven ({reason.value})"
 
 
 def render_markdown_table(report: CorpusReport) -> str:

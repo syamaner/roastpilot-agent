@@ -1377,10 +1377,10 @@ async def test_render_markdown_table_escapes_pipe_and_newline_in_bean_name(
         table = scorer.render_markdown_table(report)
 
         row_line = next(line for line in table.splitlines() if "Evil" in line)
-        # Exactly 8 columns (9 DELIMITING pipes) — count only pipes that are
+        # Exactly 9 columns (10 DELIMITING pipes) — count only pipes that are
         # not part of an escaped "\|" (the escaped pipe is still a literal
         # '|' character, just no longer a column delimiter).
-        assert row_line.replace("\\|", "").count("|") == 9
+        assert row_line.replace("\\|", "").count("|") == 10
         assert "\n" not in row_line
         assert "Evil \\| Bean Name" in table
     finally:
@@ -1404,9 +1404,9 @@ async def test_render_markdown_table_escapes_pipe_in_a_bogus_run_id(
 
         table = scorer.render_markdown_table(report)
         row_line = next(line for line in table.splitlines() if "run not found" in line)
-        # Exactly 8 columns (9 DELIMITING pipes) — count only pipes that are
+        # Exactly 9 columns (10 DELIMITING pipes) — count only pipes that are
         # not part of an escaped "\|".
-        assert row_line.replace("\\|", "").count("|") == 9
+        assert row_line.replace("\\|", "").count("|") == 10
         assert "bad\\|id-w" in table
     finally:
         await tmp_store.close()

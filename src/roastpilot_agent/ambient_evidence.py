@@ -12,7 +12,7 @@ import math
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import cast
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -24,7 +24,6 @@ from roastpilot_agent.mcp_client import (
     project_live_ambient,
 )
 from roastpilot_agent.models import RoastPhase
-
 
 RECOVERY_PAYLOAD_KEY = "ambient_fan_doctrine_recovery"
 
@@ -90,10 +89,11 @@ class AmbientDoctrineEvidence(BaseModel):
     retained_development_snapshot_fraction: float
 
     @model_validator(mode="after")
-    def _validate_consistency(self) -> "AmbientDoctrineEvidence":
+    def _validate_consistency(self) -> AmbientDoctrineEvidence:
         """Reject internally inconsistent positive or fractional claims."""
         if not (
-            0 <= self.fresh_retained_development_snapshot_count
+            0
+            <= self.fresh_retained_development_snapshot_count
             <= self.retained_development_snapshot_count
         ):
             raise ValueError("fresh retained DEVELOPMENT count cannot invert")
@@ -101,12 +101,14 @@ class AmbientDoctrineEvidence(BaseModel):
             0.0 <= self.retained_development_snapshot_fraction <= 1.0
         ):
             raise ValueError("retained DEVELOPMENT fraction must be finite and in [0, 1]")
-        if self.ever_retired or any(
-            episode.state in (DoctrineRecoveryState.RETIRED, DoctrineRecoveryState.UNKNOWN)
-            for episode in self.recovery_episodes
+        if self.effective_throughout and (
+            self.ever_retired
+            or any(
+                episode.state in (DoctrineRecoveryState.RETIRED, DoctrineRecoveryState.UNKNOWN)
+                for episode in self.recovery_episodes
+            )
         ):
-            if self.effective_throughout:
-                raise ValueError("retired or unknown recovery cannot be effective throughout")
+            raise ValueError("retired or unknown recovery cannot be effective throughout")
         if self.verdict is AmbientEvidenceVerdict.OBSERVED:
             if self.not_proven_reason is not None:
                 raise ValueError("positive evidence has no failure reason")
@@ -120,6 +122,16 @@ class AmbientDoctrineEvidence(BaseModel):
 def _is_finite_number(value: object) -> bool:
     """Whether ``value`` is a finite numeric scalar but not a boolean."""
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _object_mapping(value: object) -> Mapping[str, object] | None:
+    """Narrow an untrusted JSON value to a mapping with string keys."""
+    if not isinstance(value, dict):
+        return None
+    raw_mapping = cast("dict[object, object]", value)
+    if not all(isinstance(key, str) for key in raw_mapping):
+        return None
+    return cast("Mapping[str, object]", raw_mapping)
 
 
 def _not_proven(
@@ -158,10 +170,11 @@ def _episode_from_row(row: Mapping[str, object]) -> DoctrineRecoveryEpisode:
         root = json.loads(raw_payload)
     except (TypeError, ValueError):
         return DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN)
-    if not isinstance(root, dict):
+    root_mapping = _object_mapping(root)
+    if root_mapping is None:
         return DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN)
-    payload = root.get(RECOVERY_PAYLOAD_KEY)
-    if not isinstance(payload, dict) or set(payload) != {
+    payload = _object_mapping(root_mapping.get(RECOVERY_PAYLOAD_KEY))
+    if payload is None or set(payload) != {
         "configured_enabled",
         "effective_enabled",
         "state",
@@ -203,10 +216,11 @@ def _snapshot_status(row: Mapping[str, object]) -> AmbientStatus | None:
         root = json.loads(raw_state)
     except (TypeError, ValueError):
         return None
-    if not isinstance(root, dict):
+    root_mapping = _object_mapping(root)
+    if root_mapping is None:
         return None
-    raw_status = root.get("ambient_status")
-    if not isinstance(raw_status, dict):
+    raw_status = _object_mapping(root_mapping.get("ambient_status"))
+    if raw_status is None:
         return None
     for field in (
         "temperature_c",
@@ -254,7 +268,6 @@ def derive_ambient_doctrine_evidence(
     episodes = tuple(_episode_from_row(row) for row in recovery_rows)
     ever_retired = any(episode.state is DoctrineRecoveryState.RETIRED for episode in episodes)
     unknown_recovery = any(episode.state is DoctrineRecoveryState.UNKNOWN for episode in episodes)
-    effective_throughout = configured_enabled and not ever_retired and not unknown_recovery
     if not configured_enabled:
         return _not_proven(
             configured_enabled=configured_enabled,
@@ -358,7 +371,12 @@ def derive_ambient_doctrine_evidence(
             corroborated_at = observed_at
         if is_development and corroborated_at is not None:
             age_seconds = (observed_at - corroborated_at).total_seconds()
-            if math.isfinite(age_seconds) and 0.0 <= age_seconds <= frozen_controller.ambient_fan_doctrine.max_reading_age_seconds:
+            if (
+                math.isfinite(age_seconds)
+                and 0.0
+                <= age_seconds
+                <= frozen_controller.ambient_fan_doctrine.max_reading_age_seconds
+            ):
                 fresh_count += 1
 
     if development_count == 0:

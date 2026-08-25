@@ -19,11 +19,11 @@ from typing import Any, Literal, cast
 import aiosqlite
 from pydantic import BaseModel, ConfigDict
 
+from roastpilot_agent.advisor import AdvisorContext, RoastDecision
 from roastpilot_agent.ambient_evidence import (
     AmbientDoctrineEvidence,
     derive_ambient_doctrine_evidence,
 )
-from roastpilot_agent.advisor import AdvisorContext, RoastDecision
 from roastpilot_agent.config import AppConfig, ControllerConfig, SafetyLimits
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
