@@ -18,6 +18,18 @@ Format: one entry per anti-pattern.
 
 ---
 
+## Real timeout tests must not require a scheduler callback race
+*(fixed as a prerequisite to #849, 25 Aug 2026)*
+
+- **Signature:** a short real timeout combined with an assertion that an async
+  provider callback already started.
+- **Wrong / Right:** use the real-timeout test for ledger timeout behaviour and
+  a separate deterministic provider failure for strict reserve-parse ordering.
+- **Guarded by:** `test_run_model_over_corpus_ledgers_a_real_timed_out_page_with_reserve_floor`
+  and `test_run_model_over_corpus_orders_every_reserve_parse_before_the_provider_call`.
+
+---
+
 ## Known-opaque-provider authority must be attested at the terminal boundary
 *(fixed by #813, 14 Aug 2026)*
 

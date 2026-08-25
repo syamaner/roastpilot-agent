@@ -1253,7 +1253,7 @@ def _function_model_hanging() -> FunctionModel:
 
 @pytest.mark.asyncio
 async def test_run_model_over_corpus_ledgers_a_real_timed_out_page_with_reserve_floor(
-    corpus: list[bo.CorpusPage], tmp_path: Path
+    corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """End-to-end wiring proof (#601 fold round 1/4, FOLD 4): a REAL timed-out
     extraction call (a hanging model + a short extraction timeout, not a
@@ -1264,6 +1264,16 @@ async def test_run_model_over_corpus_ledgers_a_real_timed_out_page_with_reserve_
     (#601 fold round 4, FOLD 1) -- both land on disk."""
     price = bo.RosterModel("m1", 1.0, 1.0, "x")
     ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
+    call_order: list[str] = []
+    real_reserve_prompt_text = bo._reserve_prompt_text  # pyright: ignore[reportPrivateUsage]
+
+    def _tracking_reserve_prompt_text(page: bo.CorpusPage) -> str:
+        if "provider_call_started" in call_order:
+            raise AssertionError("reserve parse ran AFTER the provider call started")
+        call_order.append("parse")
+        return real_reserve_prompt_text(page)
+
+    monkeypatch.setattr(bo, "_reserve_prompt_text", _tracking_reserve_prompt_text)
     run = await bo.run_model_over_corpus(
         [corpus[0]],
         model_slug="m1",
@@ -1273,6 +1283,7 @@ async def test_run_model_over_corpus_ledgers_a_real_timed_out_page_with_reserve_
         roster_price=price,
         ledger=ledger,
     )
+    assert call_order == ["parse", "parse"]
     assert run.pages[0].error is not None  # the extraction call DID fail
     assert len(ledger.entries) == 2  # pending, then final (#601 fold round 4, FOLD 1)
     pending, entry = ledger.entries
@@ -1290,16 +1301,14 @@ async def test_run_model_over_corpus_ledgers_a_real_timed_out_page_with_reserve_
 
 
 @pytest.mark.asyncio
-async def test_run_model_over_corpus_ledgers_a_timeout_with_zero_post_call_parsing(
+async def test_run_model_over_corpus_orders_every_reserve_parse_before_the_provider_call(
     corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#601 fold round 3/4, FOLD 2 + FOLD 1: the reserve is computed/cached
-    BEFORE the billable call, and the PENDING ledger entry is written before
-    it too, so a REAL timeout's failure handler appends the FINAL entry with
-    ZERO post-call parsing -- a kill between the call and the final append
-    must never lose a billed charge (the pending entry already covers it).
-    Proven by failing the parse if it EVER runs after the provider call
-    starts."""
+    """Every reserve parse completes before a deterministic provider failure.
+
+    The prior timeout driver raced scheduler entry; genuine timeout behaviour
+    remains in ``test_run_model_over_corpus_ledgers_a_real_timed_out_page_with_reserve_floor``.
+    """
     call_order: list[str] = []
     real_reserve_prompt_text = bo._reserve_prompt_text  # pyright: ignore[reportPrivateUsage]
 
@@ -1313,8 +1322,7 @@ async def test_run_model_over_corpus_ledgers_a_timeout_with_zero_post_call_parsi
 
     async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         call_order.append("provider_call_started")
-        await asyncio.sleep(10)
-        return ModelResponse(parts=[TextPart("too late")])  # pragma: no cover
+        raise ModelAPIError("test-model", "simulated provider outage")
 
     price = bo.RosterModel("m1", 1.0, 1.0, "x")
     ledger = bo.ChargeLedger(bo.ledger_path(tmp_path / "o.json"))
@@ -1323,7 +1331,6 @@ async def test_run_model_over_corpus_ledgers_a_timeout_with_zero_post_call_parsi
         model_slug="m1",
         advisor_config=_ADVISOR_CONFIG,
         model=FunctionModel(respond),
-        sourcing_config=bo.BeanSourcingConfig(extraction_timeout_seconds=0.05),
         roster_price=price,
         ledger=ledger,
     )
@@ -1336,7 +1343,10 @@ async def test_run_model_over_corpus_ledgers_a_timeout_with_zero_post_call_parsi
     pending, entry = ledger.entries
     assert pending.is_pending is True
     assert entry.is_pending is False
-    assert entry.timed_out is True
+    assert entry.timed_out is False
+    assert entry.reserve_applied is True
+    assert entry.priced_usd > 0.0
+    assert entry.call_id == pending.call_id
 
 
 @pytest.mark.asyncio
