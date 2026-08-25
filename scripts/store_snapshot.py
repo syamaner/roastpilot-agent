@@ -30,6 +30,43 @@ from typing import Final
 DEFAULT_SNAPSHOT_NAME: Final[str] = "store-snapshot.sqlite3"
 
 
+def _aliases_same_file(store_path: Path, snapshot_path: Path) -> bool:
+    """Return ``True`` if ``snapshot_path`` would write through to ``store_path``.
+
+    Two distinct filesystem paths can name the same underlying file. This
+    checks both mechanisms a caller-supplied ``tmp_dir``/``snapshot_name``
+    combination could use to alias the source store:
+
+    * Resolved-path equality — covers the literal same path *and* the case
+      where ``snapshot_path`` already exists as a symlink (directly or via
+      an intermediate symlinked directory) that ultimately resolves to
+      ``store_path``.
+    * Matching ``(st_dev, st_ino)`` — covers a pre-existing hard link at
+      ``snapshot_path`` sharing an inode with ``store_path``; hard links are
+      never resolved by :meth:`~pathlib.Path.resolve`, so this check is
+      required in addition to (not instead of) the resolved-path check.
+
+    Args:
+        store_path: The caller-supplied source database.
+        snapshot_path: The computed target path the backup would open for
+            writing.
+
+    Returns:
+        ``True`` if writing to ``snapshot_path`` would mutate ``store_path``.
+    """
+    if store_path.resolve() == snapshot_path.resolve():
+        return True
+    try:
+        source_stat = store_path.stat()
+        target_stat = snapshot_path.stat()
+    except OSError:
+        # Either path does not exist (yet) as a real filesystem entry, so it
+        # cannot be a hard link to the other — the resolved-path check above
+        # already covers every case reachable without both paths existing.
+        return False
+    return (source_stat.st_dev, source_stat.st_ino) == (target_stat.st_dev, target_stat.st_ino)
+
+
 def read_only_sqlite_uri(path: Path) -> str:
     """Build a percent-encoded, read-only ``sqlite3`` URI for ``path``.
 
@@ -64,12 +101,25 @@ def connect_read_only(db_path: Path) -> sqlite3.Connection:
         that want ``sqlite3.Row`` set it themselves).
 
     Raises:
-        FileNotFoundError: If ``db_path`` does not exist (the read-only
-            ``file:`` URI would otherwise create an empty database).
+        FileNotFoundError: If ``db_path`` does not exist at the initial check,
+            or — closing a TOCTOU window — if ``db_path`` is removed or
+            rotated out from under the caller between that check and the
+            SQLite open itself. That race is detected narrowly: only when the
+            ``sqlite3.connect`` call raises ``sqlite3.OperationalError`` *and*
+            a post-failure existence check proves ``db_path`` is now absent.
+            Every other open failure (corruption, permissions, locking, a
+            malformed database, or any other cause left while ``db_path``
+            still exists) re-raises the original ``sqlite3.OperationalError``
+            unchanged — it is never reinterpreted as a missing file.
     """
     if not db_path.exists():
         raise FileNotFoundError(f"no store at {db_path}")
-    return sqlite3.connect(read_only_sqlite_uri(db_path), uri=True)
+    try:
+        return sqlite3.connect(read_only_sqlite_uri(db_path), uri=True)
+    except sqlite3.OperationalError:
+        if not db_path.exists():
+            raise FileNotFoundError(f"no store at {db_path}") from None
+        raise
 
 
 def snapshot_store_to_temp(
@@ -101,7 +151,15 @@ def snapshot_store_to_temp(
     Raises:
         FileNotFoundError: If ``store_path`` does not exist.
         ValueError: If ``snapshot_name`` is empty, ``.``, ``..``, or contains
-            a path separator (i.e. is not a single plain filename).
+            a path separator (i.e. is not a single plain filename); or if the
+            resulting ``tmp_dir / snapshot_name`` target aliases ``store_path``
+            — the same resolved path, a symlink to the source, or a hard link
+            to the source. This alias check runs, and fails closed, before
+            either database is opened: opening the writable target in that
+            situation would silently turn the operator's live database into
+            its own backup target (and could hang indefinitely against the
+            read-only source connection's lock), which violates this
+            function's read-only-source guarantee.
     """
     is_invalid = (
         not snapshot_name
@@ -113,6 +171,11 @@ def snapshot_store_to_temp(
     if is_invalid:
         raise ValueError(f"snapshot_name must be a single plain filename, got {snapshot_name!r}")
     snapshot_path = tmp_dir / snapshot_name
+    if _aliases_same_file(store_path, snapshot_path):
+        raise ValueError(
+            f"snapshot target {snapshot_path} aliases the source store {store_path}; "
+            "refusing to open the operator's live database as its own backup target"
+        )
     source = connect_read_only(store_path)
     try:
         target = sqlite3.connect(str(snapshot_path))

@@ -199,6 +199,53 @@ def test_connect_read_only_corrupt_db_query_fails_without_modifying_bytes(
     assert _sha256(path) == before
 
 
+# --- connect_read_only: TOCTOU race between the existence check and the open --
+
+
+def test_connect_read_only_translates_open_failure_when_path_removed_mid_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file removed/rotated between the initial ``exists()`` check and the
+    SQLite open translates to the documented ``FileNotFoundError``, instead of
+    leaking a raw ``sqlite3.OperationalError`` that does not name the real
+    cause. The removal happens INSIDE the faked ``sqlite3.connect`` call, so
+    ``db_path`` genuinely exists at the initial check and is genuinely absent
+    only once the post-failure check runs — exercising the real race window,
+    not just its two static end-states."""
+    path = tmp_path / "store.sqlite3"
+    _seed_db(path)
+
+    def racing_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        path.unlink()
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(store_snapshot.sqlite3, "connect", racing_connect)
+
+    with pytest.raises(FileNotFoundError, match="no store at"):
+        store_snapshot.connect_read_only(path)
+    assert not path.exists()
+
+
+def test_connect_read_only_reraises_operational_error_unchanged_when_path_still_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An open failure that is NOT a missing file (corruption, permissions,
+    locking, ...) re-raises the original ``sqlite3.OperationalError``
+    unchanged — it must never be flattened into a missing-file claim while
+    the path is still present."""
+    path = tmp_path / "store.sqlite3"
+    _seed_db(path)
+
+    def failing_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store_snapshot.sqlite3, "connect", failing_connect)
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        store_snapshot.connect_read_only(path)
+    assert path.exists()
+
+
 # --- snapshot_store_to_temp: seeded reads, WAL inclusion, naming --------------
 
 
@@ -254,6 +301,95 @@ def test_snapshot_store_to_temp_missing_temp_directory_writes_nowhere(
     with pytest.raises(sqlite3.OperationalError):
         store_snapshot.snapshot_store_to_temp(store_path, missing_dir)
     assert not missing_dir.exists()
+
+
+# --- snapshot_store_to_temp: destination-aliases-source rejection -------------
+
+
+def test_snapshot_store_to_temp_rejects_same_resolved_path_alias(tmp_path: Path) -> None:
+    """``tmp_dir``/``snapshot_name`` resolving to the literal source path must
+    fail closed instead of opening the operator's live database as its own
+    backup target."""
+    store_path = tmp_path / "store.sqlite3"
+    _seed_db(store_path)
+    before = _sha256(store_path)
+
+    with pytest.raises(ValueError, match="aliases the source store"):
+        store_snapshot.snapshot_store_to_temp(store_path, tmp_path, snapshot_name=store_path.name)
+
+    assert _sha256(store_path) == before
+
+
+def test_snapshot_store_to_temp_rejects_symlink_alias(tmp_path: Path) -> None:
+    """A pre-existing symlink at the computed target path pointing at the
+    source must be rejected, not silently followed for the write."""
+    store_path = tmp_path / "store.sqlite3"
+    _seed_db(store_path)
+    before = _sha256(store_path)
+    dest_dir = tmp_path / "snap"
+    dest_dir.mkdir()
+    link_name = "linked.sqlite3"
+    link_path = dest_dir / link_name
+    try:
+        link_path.symlink_to(store_path)
+    except OSError:
+        pytest.skip("symlink creation is not supported on this filesystem/platform")
+
+    with pytest.raises(ValueError, match="aliases the source store"):
+        store_snapshot.snapshot_store_to_temp(store_path, dest_dir, snapshot_name=link_name)
+
+    assert _sha256(store_path) == before
+
+
+def test_snapshot_store_to_temp_rejects_hard_link_alias(tmp_path: Path) -> None:
+    """A pre-existing hard link at the computed target path sharing the
+    source's inode must be rejected — resolved-path equality alone would miss
+    this, since hard links are not resolved by ``Path.resolve``."""
+    store_path = tmp_path / "store.sqlite3"
+    _seed_db(store_path)
+    before = _sha256(store_path)
+    dest_dir = tmp_path / "snap"
+    dest_dir.mkdir()
+    link_name = "hardlinked.sqlite3"
+    link_path = dest_dir / link_name
+    try:
+        os.link(store_path, link_path)
+    except OSError:
+        pytest.skip("hard link creation is not supported on this filesystem/platform")
+
+    with pytest.raises(ValueError, match="aliases the source store"):
+        store_snapshot.snapshot_store_to_temp(store_path, dest_dir, snapshot_name=link_name)
+
+    assert _sha256(store_path) == before
+
+
+def test_snapshot_store_to_temp_alias_rejection_precedes_any_connection_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Proves the alias check runs, and fails closed, BEFORE either the
+    read-only source connection or the writable target connection is opened
+    — not merely that the eventual ``ValueError`` happens to be raised.
+    Patching both ``connect_read_only`` and ``sqlite3.connect`` to explode
+    means this test fails loudly if either is ever reached ahead of the alias
+    check, which also proves no source mutation is possible (the source is
+    never even opened)."""
+    store_path = tmp_path / "store.sqlite3"
+    _seed_db(store_path)
+    before = _sha256(store_path)
+
+    def fail_connect_read_only(db_path: Path) -> sqlite3.Connection:
+        raise AssertionError("connect_read_only must not be called for an aliasing target")
+
+    def fail_sqlite_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        raise AssertionError("sqlite3.connect must not be called for an aliasing target")
+
+    monkeypatch.setattr(store_snapshot, "connect_read_only", fail_connect_read_only)
+    monkeypatch.setattr(store_snapshot.sqlite3, "connect", fail_sqlite_connect)
+
+    with pytest.raises(ValueError, match="aliases the source store"):
+        store_snapshot.snapshot_store_to_temp(store_path, tmp_path, snapshot_name=store_path.name)
+
+    assert _sha256(store_path) == before
 
 
 @pytest.mark.parametrize(
