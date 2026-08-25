@@ -5076,10 +5076,10 @@ async def test_recovery_evidence_persists_enriched_copy_without_changing_sse_pay
 ) -> None:
     """The real flush enriches only the store copy for both recovery outcomes."""
     clock = FakeClock()
-    config = AppConfig(
+    frozen_config = AppConfig(
         controller=ControllerConfig(
             telemetry_log_interval_seconds=1.0,
-            ambient_fan_doctrine=AmbientFanDoctrine(enabled=effective_enabled),
+            ambient_fan_doctrine=AmbientFanDoctrine(enabled=True),
         ),
         mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=30.0),
     )
@@ -5087,10 +5087,18 @@ async def test_recovery_evidence_persists_enriched_copy_without_changing_sse_pay
         store,
         mcp=FakeMCPClient([_reading(bean=178.0, env=185.0)]),
         clock=clock,
-        config=config,
+        config=frozen_config,
     )
     assert service.runner is not None
-    service.runner._configured_doctrine_enabled = True  # pyright: ignore[reportPrivateUsage]
+    effective_doctrine = frozen_config.controller.ambient_fan_doctrine.model_copy(
+        update={"enabled": effective_enabled}
+    )
+    effective_controller = frozen_config.controller.model_copy(
+        update={"ambient_fan_doctrine": effective_doctrine}
+    )
+    effective_config = frozen_config.model_copy(update={"controller": effective_controller})
+    service.runner._config = effective_config  # pyright: ignore[reportPrivateUsage]
+    assert service.runner._configured_doctrine_enabled is True  # pyright: ignore[reportPrivateUsage]
     subscriber = service.events.subscribe()
     raw_payload: dict[str, object] = {"reason": "recovery"}
     service.runner._emitter.emit(  # pyright: ignore[reportPrivateUsage]
