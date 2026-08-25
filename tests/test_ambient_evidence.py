@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -150,6 +151,39 @@ def test_malformed_ambient_row_blocks_later_evidence(malformed_raw_state: str) -
         token=2.0,
     )
     malformed_row["raw_state_json"] = malformed_raw_state
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (_recovery(event_id=1),),
+        (
+            _snapshot(row_id=1, tick=1, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
+            malformed_row,
+            _snapshot(row_id=3, tick=3, timestamp="2026-08-25T12:00:20+00:00", token=2.0),
+            _snapshot(row_id=4, tick=4, timestamp="2026-08-25T12:00:30+00:00", token=3.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+    assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
+
+
+@pytest.mark.parametrize("invalid_running", (0, 1, "true"))
+def test_non_bool_ambient_running_is_malformed_and_cannot_be_repaired(
+    invalid_running: object,
+) -> None:
+    """Raw Pydantic-coercible running values are not admitted retained evidence."""
+    malformed_row = _snapshot(
+        row_id=2,
+        tick=2,
+        timestamp="2026-08-25T12:00:10+00:00",
+        token=2.0,
+    )
+    raw_state = json.loads(str(malformed_row["raw_state_json"]))
+    assert isinstance(raw_state, dict)
+    raw_state_mapping = cast("dict[str, object]", raw_state)
+    raw_status = raw_state_mapping["ambient_status"]
+    assert isinstance(raw_status, dict)
+    raw_status_mapping = cast("dict[str, object]", raw_status)
+    raw_status_mapping["ambient_running"] = invalid_running
+    malformed_row["raw_state_json"] = json.dumps(raw_state)
     evidence = derive_ambient_doctrine_evidence(
         _controller(),
         (_recovery(event_id=1),),

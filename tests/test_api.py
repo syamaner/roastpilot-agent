@@ -32,7 +32,11 @@ from pydantic import ValidationError
 import roastpilot_agent.api as api_module
 from roastpilot_agent import __version__
 from roastpilot_agent.advisor import AdvisorContext, FakeAdvisor, RoastDecision
-from roastpilot_agent.ambient_evidence import RECOVERY_PAYLOAD_KEY, DoctrineRecoveryState
+from roastpilot_agent.ambient_evidence import (
+    RECOVERY_PAYLOAD_KEY,
+    DoctrineRecoveryState,
+    NotProvenReason,
+)
 from roastpilot_agent.api import (
     _DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     EventBroadcaster,
@@ -3909,6 +3913,12 @@ async def test_recover_on_start_survives_a_frozen_doctrine_the_live_poll_interva
     assert doctrine.enabled is False
     assert doctrine.max_reading_age_seconds == 90.0
     assert service.runner._config.controller.tick_interval_seconds == 1.0  # pyright: ignore[reportPrivateUsage]
+    evidence = await store.read_ambient_doctrine_evidence("run-doctrine-voided")
+    assert evidence.not_proven_reason is NotProvenReason.DOCTRINE_RETIRED
+    episode = evidence.recovery_episodes[-1]
+    assert episode.state is DoctrineRecoveryState.RETIRED
+    assert episode.configured_enabled is True
+    assert episode.effective_enabled is False
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,8 @@ from typing import Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from roastpilot_agent.models import RoastPhase
+
 RECOVERY_PAYLOAD_KEY = "ambient_fan_doctrine_recovery"
 AMBIENT_EVIDENCE_CLAIM = (
     "Fresh ambient was durably observed while effective; the fraction is over retained "
@@ -257,6 +259,8 @@ def _snapshot_status(row: Mapping[str, object]) -> tuple[_RetainedAmbientStatus 
     raw_status = _object_mapping(root_mapping.get("ambient_status"))
     if raw_status is None:
         return None, True
+    if not isinstance(raw_status.get("ambient_running"), bool):
+        return None, True
     try:
         status = _RetainedAmbientStatus.model_validate(raw_status)
     except Exception:  # noqa: BLE001 - malformed retained JSON is not evidence
@@ -378,21 +382,11 @@ def derive_ambient_doctrine_evidence(
             previous_timestamp = None
 
         raw_phase = row.get("agent_phase")
-        if not isinstance(raw_phase, str) or raw_phase not in {
-            "idle",
-            "starting",
-            "preheating",
-            "roasting_pre_first_crack",
-            "development",
-            "cooling",
-            "complete",
-            "faulted",
-            "operator_recovery_required",
-        }:
+        try:
+            is_development = RoastPhase(raw_phase) is RoastPhase.DEVELOPMENT
+        except (TypeError, ValueError):
             unusable_clock = True
             is_development = False
-        else:
-            is_development = raw_phase == "development"
         if is_development:
             development_count += 1
 
@@ -437,6 +431,9 @@ def derive_ambient_doctrine_evidence(
             previous_timestamp = observed_at
             continue
         previous_timestamp = observed_at
+        # The MCP child's epoch is fixed within one agent tick generation.
+        # Any future in-run respawn needs an explicit evidence reset/breadcrumb
+        # plus dedicated tests before its tokens may corroborate this sequence.
         if token is None:
             token = current_token
             continue
