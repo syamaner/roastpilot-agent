@@ -63,17 +63,27 @@ def _snapshot(
     }
 
 
-def _recovery(*, event_id: int, state: str = "preserved") -> dict[str, object]:
+def _recovery(
+    *,
+    event_id: int,
+    state: str = "preserved",
+    rule: str = "in_session_recovery",
+    verdict: object = "recovery",
+    recorded_at_utc: str = "2026-08-25T12:00:30+00:00",
+) -> dict[str, object]:
     """Build one fully typed recovery event row."""
     return {
         "id": event_id,
+        "recorded_at_utc": recorded_at_utc,
         "payload_json": json.dumps(
             {
+                "rule": rule,
+                "verdict": verdict,
                 RECOVERY_PAYLOAD_KEY: {
                     "configured_enabled": True,
                     "effective_enabled": state == "preserved",
                     "state": state,
-                }
+                },
             }
         ),
     }
@@ -106,6 +116,104 @@ def test_unaccounted_tick_reset_cannot_cross_corroborate() -> None:
     )
     assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
     assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
+
+
+def test_ordinary_recovery_cannot_account_for_a_tick_reset() -> None:
+    """An in-session preserved event cannot mask a missing restart breadcrumb."""
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (_recovery(event_id=1),),
+        (
+            _snapshot(row_id=1, tick=4, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
+            _snapshot(row_id=2, tick=0, timestamp="2026-08-25T12:01:00+00:00", token=2.0),
+            _snapshot(row_id=3, tick=1, timestamp="2026-08-25T12:01:10+00:00", token=3.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+    assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
+    assert evidence.retained_development_snapshot_count == 0
+    assert evidence.fresh_retained_development_snapshot_count == 0
+    assert evidence.retained_development_snapshot_fraction == 0.0
+
+
+def test_restart_recovery_accounts_for_one_tick_reset() -> None:
+    """A valid restart breadcrumb permits fresh corroboration in the new generation."""
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (_recovery(event_id=1, rule="restart_recovery"),),
+        (
+            _snapshot(row_id=1, tick=4, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
+            _snapshot(row_id=2, tick=0, timestamp="2026-08-25T12:01:00+00:00", token=2.0),
+            _snapshot(row_id=3, tick=1, timestamp="2026-08-25T12:01:10+00:00", token=3.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.OBSERVED
+
+
+@pytest.mark.parametrize(
+    ("missing_verdict", "verdict"),
+    ((True, "recovery"), (False, "not_recovery"), (False, 1)),
+)
+def test_restart_boundary_requires_exact_root_recovery_verdict(
+    missing_verdict: bool,
+    verdict: object,
+) -> None:
+    """Missing, wrong, or non-string root verdicts cannot account for a reset."""
+    recovery = _recovery(event_id=1, rule="restart_recovery", verdict=verdict)
+    if missing_verdict:
+        root = json.loads(str(recovery["payload_json"]))
+        assert isinstance(root, dict)
+        cast("dict[str, object]", root).pop("verdict")
+        recovery["payload_json"] = json.dumps(root)
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (recovery,),
+        (
+            _snapshot(row_id=1, tick=4, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
+            _snapshot(row_id=2, tick=0, timestamp="2026-08-25T12:01:00+00:00", token=2.0),
+            _snapshot(row_id=3, tick=1, timestamp="2026-08-25T12:01:10+00:00", token=3.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+    assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
+    assert evidence.retained_development_snapshot_count == 0
+    assert evidence.fresh_retained_development_snapshot_count == 0
+    assert evidence.retained_development_snapshot_fraction == 0.0
+
+
+def test_older_restart_recovery_cannot_be_borrowed_for_a_later_reset() -> None:
+    """A restart record outside the reset interval cannot mask a missing breadcrumb."""
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (
+            _recovery(
+                event_id=1,
+                rule="restart_recovery",
+                recorded_at_utc="2026-08-25T11:59:50+00:00",
+            ),
+        ),
+        (
+            _snapshot(row_id=1, tick=4, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
+            _snapshot(row_id=2, tick=0, timestamp="2026-08-25T12:01:00+00:00", token=2.0),
+            _snapshot(row_id=3, tick=1, timestamp="2026-08-25T12:01:10+00:00", token=3.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+    assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
+
+
+def test_ordinary_recovery_retirement_remains_sticky() -> None:
+    """An ordinary recovery row still contributes to doctrine-state semantics."""
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (_recovery(event_id=1, state="retired"), _recovery(event_id=2)),
+        (),
+    )
+    assert evidence.not_proven_reason is NotProvenReason.DOCTRINE_RETIRED
+    assert [episode.state for episode in evidence.recovery_episodes] == [
+        DoctrineRecoveryState.RETIRED,
+        DoctrineRecoveryState.PRESERVED,
+    ]
 
 
 def test_same_generation_duplicate_token_never_counts_fresh() -> None:
@@ -588,18 +696,19 @@ def test_derivation_rejects_bad_clock_phase_and_timestamp_forms() -> None:
     assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
 
 
-def test_cross_episode_clock_restarts_are_valid() -> None:
-    """A tick reset isolates timestamp domains rather than creating a backwards clock."""
+def test_cross_episode_backwards_boundary_chronology_fails_closed() -> None:
+    """A restart breadcrumb cannot bind a reset with backwards persisted UTC time."""
     evidence = derive_ambient_doctrine_evidence(
         _controller(),
-        (_recovery(event_id=1),),
+        (_recovery(event_id=1, rule="restart_recovery"),),
         (
             _snapshot(row_id=1, tick=5, timestamp="2026-08-25T12:01:00+00:00", token=1.0),
             _snapshot(row_id=2, tick=0, timestamp="2026-08-25T12:00:00+00:00", token=2.0),
             _snapshot(row_id=3, tick=1, timestamp="2026-08-25T12:00:10+00:00", token=3.0),
         ),
     )
-    assert evidence.verdict is AmbientEvidenceVerdict.OBSERVED
+    assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+    assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
 
 
 def test_live_unread_status_resets_without_becoming_malformed(

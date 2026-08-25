@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Literal, Protocol, cast
@@ -109,6 +110,14 @@ class DoctrineRecoveryEpisode(BaseModel):
     state: DoctrineRecoveryState
 
 
+@dataclass(frozen=True)
+class _ParsedRecovery:
+    """Private recovery parse result including restart-generation evidence."""
+
+    episode: DoctrineRecoveryEpisode
+    restart_recorded_at: datetime | None
+
+
 class AmbientDoctrineEvidence(BaseModel):
     """Conservative aggregate for one run's retained ambient evidence."""
 
@@ -171,6 +180,19 @@ def _object_mapping(value: object) -> Mapping[str, object] | None:
     return cast("Mapping[str, object]", raw_mapping)
 
 
+def _aware_timestamp(value: object) -> datetime | None:
+    """Parse one retained UTC timestamp only when it has an explicit offset."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
 def _not_proven(
     *,
     configured_enabled: bool | None,
@@ -196,27 +218,44 @@ def _not_proven(
     )
 
 
-def _episode_from_row(row: Mapping[str, object]) -> DoctrineRecoveryEpisode:
-    """Parse one recovery row; malformed or legacy payloads remain explicit unknowns."""
+def _parsed_recovery_from_row(row: Mapping[str, object]) -> _ParsedRecovery:
+    """Parse one recovery row and whether its root rule attests a restart."""
     event_id = row.get("id")
-    safe_id = event_id if isinstance(event_id, int) and not isinstance(event_id, bool) else 0
+    if isinstance(event_id, int) and not isinstance(event_id, bool):
+        valid_event_id = True
+        safe_id = event_id
+    else:
+        valid_event_id = False
+        safe_id = 0
     raw_payload = row.get("payload_json")
     if not isinstance(raw_payload, str):
-        return DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN)
+        return _ParsedRecovery(
+            DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN),
+            None,
+        )
     try:
         root = json.loads(raw_payload)
     except (TypeError, ValueError, RecursionError):
-        return DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN)
+        return _ParsedRecovery(
+            DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN),
+            None,
+        )
     root_mapping = _object_mapping(root)
     if root_mapping is None:
-        return DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN)
+        return _ParsedRecovery(
+            DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN),
+            None,
+        )
     payload = _object_mapping(root_mapping.get(RECOVERY_PAYLOAD_KEY))
     if payload is None or set(payload) != {
         "configured_enabled",
         "effective_enabled",
         "state",
     }:
-        return DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN)
+        return _ParsedRecovery(
+            DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN),
+            None,
+        )
     configured = payload["configured_enabled"]
     effective = payload["effective_enabled"]
     state = payload["state"]
@@ -225,23 +264,54 @@ def _episode_from_row(row: Mapping[str, object]) -> DoctrineRecoveryEpisode:
         or not isinstance(effective, bool)
         or not isinstance(state, str)
     ):
-        return DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN)
+        return _ParsedRecovery(
+            DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN),
+            None,
+        )
     try:
         parsed_state = DoctrineRecoveryState(state)
     except ValueError:
-        return DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN)
+        return _ParsedRecovery(
+            DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN),
+            None,
+        )
     if parsed_state is DoctrineRecoveryState.UNKNOWN:
-        return DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN)
+        return _ParsedRecovery(
+            DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN),
+            None,
+        )
     if parsed_state is DoctrineRecoveryState.PRESERVED and configured != effective:
-        return DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN)
+        return _ParsedRecovery(
+            DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN),
+            None,
+        )
     if parsed_state is DoctrineRecoveryState.RETIRED and (not configured or effective):
-        return DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN)
-    return DoctrineRecoveryEpisode(
-        event_id=safe_id,
-        configured_enabled=configured,
-        effective_enabled=effective,
-        state=parsed_state,
+        return _ParsedRecovery(
+            DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN),
+            None,
+        )
+    return _ParsedRecovery(
+        DoctrineRecoveryEpisode(
+            event_id=safe_id,
+            configured_enabled=configured,
+            effective_enabled=effective,
+            state=parsed_state,
+        ),
+        _aware_timestamp(row.get("recorded_at_utc"))
+        if (
+            valid_event_id
+            and root_mapping.get("rule") == "restart_recovery"
+            and root_mapping.get("verdict") == "recovery"
+        )
+        else None,
     )
+
+
+def _episode_from_row(  # pyright: ignore[reportUnusedFunction] - grammar test compatibility
+    row: Mapping[str, object],
+) -> DoctrineRecoveryEpisode:
+    """Parse one recovery row; malformed or legacy payloads remain explicit unknowns."""
+    return _parsed_recovery_from_row(row).episode
 
 
 def _snapshot_status(row: Mapping[str, object]) -> tuple[_RetainedAmbientStatus | None, bool]:
@@ -325,7 +395,8 @@ def derive_ambient_doctrine_evidence(
             reason=NotProvenReason.RUN_OR_CONFIG_UNAVAILABLE,
         )
     configured_enabled = frozen_controller.ambient_fan_doctrine.enabled
-    episodes = tuple(_episode_from_row(row) for row in recovery_rows)
+    parsed_recoveries = tuple(_parsed_recovery_from_row(row) for row in recovery_rows)
+    episodes = tuple(parsed.episode for parsed in parsed_recoveries)
     ever_retired = any(episode.state is DoctrineRecoveryState.RETIRED for episode in episodes)
     unknown_recovery = any(episode.state is DoctrineRecoveryState.UNKNOWN for episode in episodes)
     if not configured_enabled:
@@ -363,19 +434,37 @@ def derive_ambient_doctrine_evidence(
     fresh_count = 0
     previous_tick: int | None = None
     previous_timestamp: datetime | None = None
+    previous_snapshot_recorded_at: object = None
     token: float | None = None
     corroborated_at: datetime | None = None
     unusable_clock = False
-    tick_reset_count = 0
+    used_restart_event_ids: set[int] = set()
     for row in snapshot_rows:
         raw_tick = row.get("tick")
+        raw_recorded_at = row.get("recorded_at_utc")
         if not isinstance(raw_tick, int) or isinstance(raw_tick, bool):
             unusable_clock = True
+            previous_snapshot_recorded_at = raw_recorded_at
             continue
         reset = previous_tick is None or raw_tick <= previous_tick
         if previous_tick is not None and reset:
-            tick_reset_count += 1
+            previous_boundary_at = _aware_timestamp(previous_snapshot_recorded_at)
+            first_post_reset_at = _aware_timestamp(raw_recorded_at)
+            matching_restarts = [
+                parsed
+                for parsed in parsed_recoveries
+                if parsed.episode.event_id not in used_restart_event_ids
+                and parsed.restart_recorded_at is not None
+                and previous_boundary_at is not None
+                and first_post_reset_at is not None
+                and previous_boundary_at < parsed.restart_recorded_at <= first_post_reset_at
+            ]
+            if len(matching_restarts) != 1:
+                unusable_clock = True
+            else:
+                used_restart_event_ids.add(matching_restarts[0].episode.event_id)
         previous_tick = raw_tick
+        previous_snapshot_recorded_at = raw_recorded_at
         if reset:
             token = None
             corroborated_at = None
@@ -406,20 +495,8 @@ def derive_ambient_doctrine_evidence(
             token = None
             corroborated_at = None
             continue
-        raw_recorded_at = row.get("recorded_at_utc")
-        if not isinstance(raw_recorded_at, str):
-            unusable_clock = True
-            token = None
-            corroborated_at = None
-            continue
-        try:
-            observed_at = datetime.fromisoformat(raw_recorded_at)
-        except ValueError:
-            unusable_clock = True
-            token = None
-            corroborated_at = None
-            continue
-        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        observed_at = _aware_timestamp(raw_recorded_at)
+        if observed_at is None:
             unusable_clock = True
             token = None
             corroborated_at = None
@@ -450,8 +527,6 @@ def derive_ambient_doctrine_evidence(
             ):
                 fresh_count += 1
 
-    if tick_reset_count > len(episodes):
-        unusable_clock = True
     if development_count == 0:
         return _not_proven(
             configured_enabled=configured_enabled,

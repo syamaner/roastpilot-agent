@@ -713,7 +713,8 @@ class RoastStore:
             ) as cursor:
                 config_row = await cursor.fetchone()
             async with self.connection.execute(
-                "SELECT id, payload_json FROM roast_events WHERE run_id = ? AND kind = ?"
+                "SELECT id, recorded_at_utc, payload_json FROM roast_events"
+                " WHERE run_id = ? AND kind = ?"
                 " ORDER BY id ASC",
                 (run_id, RoastEventKind.RECOVERY_REQUIRED.value),
             ) as cursor:
