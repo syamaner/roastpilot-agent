@@ -1184,6 +1184,50 @@ async def test_timeline_wraps_non_dict_event_payload(
 
 
 @pytest.mark.asyncio
+async def test_timeline_hides_internal_recovery_evidence_but_offline_reader_keeps_it(
+    client: AsyncClient,
+    store: RoastStore,
+) -> None:
+    """Recovery evidence remains durable corpus data, not a REST timeline field."""
+    await store.create_run(
+        run_id="run-internal-recovery-evidence",
+        profile=_profile(),
+        config=AppConfig(
+            controller=ControllerConfig(ambient_fan_doctrine=AmbientFanDoctrine(enabled=True))
+        ),
+        agent_phase=RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+    )
+    await store.record_event(
+        run_id="run-internal-recovery-evidence",
+        kind=RoastEventKind.RECOVERY_REQUIRED,
+        source=RoastEventSource.SAFETY,
+        payload={
+            "rule": "in_session_recovery",
+            "verdict": "recovery",
+            "reason": "operator acknowledgement required",
+            RECOVERY_PAYLOAD_KEY: {
+                "configured_enabled": True,
+                "effective_enabled": True,
+                "state": "preserved",
+            },
+        },
+    )
+
+    timeline = await client.get("/api/roasts/run-internal-recovery-evidence/timeline")
+    assert timeline.status_code == 200
+    assert timeline.json()["events"][0]["payload"] == {
+        "rule": "in_session_recovery",
+        "verdict": "recovery",
+        "reason": "operator acknowledgement required",
+    }
+
+    evidence = await store.read_ambient_doctrine_evidence("run-internal-recovery-evidence")
+    assert [episode.state for episode in evidence.recovery_episodes] == [
+        DoctrineRecoveryState.PRESERVED
+    ]
+
+
+@pytest.mark.asyncio
 async def test_read_telemetry_points_rejects_downsample_below_one(store: RoastStore) -> None:
     await _seed_telemetry(store, "run-z", 1)
     with pytest.raises(ValueError, match="downsample"):

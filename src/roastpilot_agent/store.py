@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict
 
 from roastpilot_agent.advisor import AdvisorContext, RoastDecision
 from roastpilot_agent.ambient_evidence import (
+    RECOVERY_PAYLOAD_KEY,
     AmbientDoctrineEvidence,
     derive_ambient_doctrine_evidence,
 )
@@ -2159,7 +2160,7 @@ class RoastStore:
                 source=RoastEventSource(str(row["source"])),
                 monotonic_seconds=self._optional_float(row["monotonic_seconds"]),
                 recorded_at_utc=str(row["recorded_at_utc"]),
-                payload=_loads(row["payload_json"]),
+                payload=_timeline_payload(_loads(row["payload_json"])),
             )
             for row in event_rows
         ]
@@ -3192,6 +3193,13 @@ def _loads(value: Any) -> dict[str, Any] | None:
     if isinstance(parsed, dict):
         return cast("dict[str, Any]", parsed)
     return {"value": parsed}
+
+
+def _timeline_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Project durable event payloads onto the REST-visible timeline boundary."""
+    if payload is None or RECOVERY_PAYLOAD_KEY not in payload:
+        return payload
+    return {key: value for key, value in payload.items() if key != RECOVERY_PAYLOAD_KEY}
 
 
 def _utc_now() -> str:
