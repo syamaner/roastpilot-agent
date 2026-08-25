@@ -19,7 +19,7 @@ Format: one entry per anti-pattern.
 ---
 
 ## Real timeout tests must not require a scheduler callback race
-*(fixed by #849, 25 Aug 2026)*
+*(fixed as a prerequisite to #849, 25 Aug 2026)*
 
 - **Signature:** a short real timeout combined with an assertion that an async
   provider callback already started.

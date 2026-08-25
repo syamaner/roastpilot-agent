@@ -1304,7 +1304,11 @@ async def test_run_model_over_corpus_ledgers_a_real_timed_out_page_with_reserve_
 async def test_run_model_over_corpus_orders_every_reserve_parse_before_the_provider_call(
     corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every reserve parse completes before a deterministic provider failure."""
+    """Every reserve parse completes before a deterministic provider failure.
+
+    The prior timeout driver raced scheduler entry; genuine timeout behaviour
+    remains in ``test_run_model_over_corpus_ledgers_a_real_timed_out_page_with_reserve_floor``.
+    """
     call_order: list[str] = []
     real_reserve_prompt_text = bo._reserve_prompt_text  # pyright: ignore[reportPrivateUsage]
 
@@ -1327,7 +1331,6 @@ async def test_run_model_over_corpus_orders_every_reserve_parse_before_the_provi
         model_slug="m1",
         advisor_config=_ADVISOR_CONFIG,
         model=FunctionModel(respond),
-        sourcing_config=bo.BeanSourcingConfig(),
         roster_price=price,
         ledger=ledger,
     )
