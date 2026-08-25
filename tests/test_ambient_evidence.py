@@ -288,6 +288,36 @@ def test_malformed_ambient_row_blocks_later_evidence(malformed_raw_state: str) -
     assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
 
 
+def test_oversized_retained_number_fails_closed_without_raising() -> None:
+    """An arbitrary-precision JSON integer cannot escape finite-value validation."""
+    hostile_row = _snapshot(
+        row_id=1,
+        tick=1,
+        timestamp="2026-08-25T12:00:00+00:00",
+        token=1.0,
+    )
+    raw_state = json.loads(str(hostile_row["raw_state_json"]))
+    assert isinstance(raw_state, dict)
+    raw_status = cast("dict[str, object]", raw_state)["ambient_status"]
+    assert isinstance(raw_status, dict)
+    cast("dict[str, object]", raw_status)["temperature_c"] = 10**400
+    hostile_row["raw_state_json"] = json.dumps(raw_state)
+
+    status, malformed = ambient_evidence._snapshot_status(  # pyright: ignore[reportPrivateUsage]
+        hostile_row
+    )
+    assert status is None
+    assert malformed is True
+    assert ambient_evidence._is_finite_number(10**400) is False  # pyright: ignore[reportPrivateUsage]
+
+    evidence = derive_ambient_doctrine_evidence(_controller(), (), (hostile_row,))
+    assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+    assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
+    assert evidence.retained_development_snapshot_count == 0
+    assert evidence.fresh_retained_development_snapshot_count == 0
+    assert evidence.retained_development_snapshot_fraction == 0.0
+
+
 def test_unusable_clock_discards_preceding_fresh_snapshot_counts() -> None:
     """A later backwards clock invalidates all retained snapshot count claims."""
     evidence = derive_ambient_doctrine_evidence(

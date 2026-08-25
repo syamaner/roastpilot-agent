@@ -167,7 +167,12 @@ class AmbientDoctrineEvidence(BaseModel):
 
 def _is_finite_number(value: object) -> bool:
     """Whether ``value`` is a finite numeric scalar but not a boolean."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _object_mapping(value: object) -> Mapping[str, object] | None:
