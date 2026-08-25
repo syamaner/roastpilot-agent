@@ -94,8 +94,8 @@ def test_first_token_is_uncorroborated_then_changed_token_is_observed() -> None:
     assert evidence.retained_development_snapshot_fraction == 0.5
 
 
-def test_duplicate_token_and_tick_reset_cannot_cross_corroborate() -> None:
-    """A restart episode resets token identity and first-token evidence."""
+def test_unaccounted_tick_reset_cannot_cross_corroborate() -> None:
+    """An unaccounted restart is unusable rather than duplicate-token evidence."""
     evidence = derive_ambient_doctrine_evidence(
         _controller(),
         (),
@@ -106,6 +106,21 @@ def test_duplicate_token_and_tick_reset_cannot_cross_corroborate() -> None:
     )
     assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
     assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
+
+
+def test_same_generation_duplicate_token_never_counts_fresh() -> None:
+    """A fixed finite token cannot rebase freshness without a reset or recovery."""
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (),
+        (
+            _snapshot(row_id=1, tick=1, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
+            _snapshot(row_id=2, tick=2, timestamp="2026-08-25T12:00:10+00:00", token=1.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+    assert evidence.not_proven_reason is NotProvenReason.NO_CORROBORATED_FRESH_READING
+    assert evidence.fresh_retained_development_snapshot_count == 0
 
 
 @pytest.mark.parametrize(
@@ -196,6 +211,49 @@ def test_non_bool_ambient_running_is_malformed_and_cannot_be_repaired(
     )
     assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
     assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
+
+
+def test_invalid_retained_status_after_bool_guard_is_malformed() -> None:
+    """Closed retained-status validation still rejects an invalid mode after raw checks."""
+    malformed_row = _snapshot(
+        row_id=2,
+        tick=2,
+        timestamp="2026-08-25T12:00:10+00:00",
+        token=2.0,
+    )
+    raw_state = json.loads(str(malformed_row["raw_state_json"]))
+    assert isinstance(raw_state, dict)
+    raw_status = cast("dict[str, object]", raw_state)["ambient_status"]
+    assert isinstance(raw_status, dict)
+    cast("dict[str, object]", raw_status)["mode"] = "unexpected"
+    malformed_row["raw_state_json"] = json.dumps(raw_state)
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (_recovery(event_id=1),),
+        (
+            _snapshot(row_id=1, tick=1, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
+            malformed_row,
+            _snapshot(row_id=3, tick=3, timestamp="2026-08-25T12:00:20+00:00", token=2.0),
+            _snapshot(row_id=4, tick=4, timestamp="2026-08-25T12:00:30+00:00", token=3.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+    assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
+
+
+def test_non_live_retained_projection_is_absent() -> None:
+    """A valid stopped retained runtime projects no ambient triad."""
+    status = ambient_evidence._RetainedAmbientStatus.model_validate(  # pyright: ignore[reportPrivateUsage]
+        {
+            "mode": "yoctopuce",
+            "status": "ok",
+            "ambient_running": False,
+            "temperature_c": 23.0,
+            "humidity_percent": 50.0,
+            "pressure_hpa": 1000.0,
+        }
+    )
+    assert ambient_evidence._retained_live_ambient(status) == (None, None, None)  # pyright: ignore[reportPrivateUsage]
 
 
 def test_stopped_ambient_resets_then_later_recorroboration_can_be_observed() -> None:

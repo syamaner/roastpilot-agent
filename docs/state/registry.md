@@ -930,6 +930,11 @@ mark-ready/reopen draft-cycle workaround for metadata edits.**
 
 ## Active Context
 
+**25 Aug 2026 — D174 / #742 implementation ready for PR review.** The branch
+provides conservative retained DEVELOPMENT telemetry-snapshot and ordered
+recovery evidence. It does not prove advisor use or hardware behaviour; #742
+is not merged or closed.
+
 **31 Jul 2026 — CLAUDE PR-SCOPED APPROVAL RESTORED (#663 / D108-D118).** The
 25-Jul operator-authorized outage exception is closed. The trusted bridge merged in
 #679 and the bounded privileged-PR override merged in #688. The pre-activation

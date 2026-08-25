@@ -3970,6 +3970,11 @@ async def test_recover_on_start_preserves_a_frozen_doctrine_that_still_fits(
     doctrine = service.runner._config.controller.ambient_fan_doctrine  # pyright: ignore[reportPrivateUsage]
     assert doctrine.enabled is True
     assert doctrine.max_reading_age_seconds == 90.0
+    evidence = await store.read_ambient_doctrine_evidence("run-doctrine-still-fits")
+    episode = evidence.recovery_episodes[-1]
+    assert episode.state is DoctrineRecoveryState.PRESERVED
+    assert episode.configured_enabled is True
+    assert episode.effective_enabled is True
 
 
 @pytest.mark.asyncio
@@ -5101,6 +5106,39 @@ async def test_recovery_evidence_persists_enriched_copy_without_changing_sse_pay
     assert episode.state is expected_state
     assert episode.configured_enabled is True
     assert episode.effective_enabled is effective_enabled
+
+
+@pytest.mark.asyncio
+async def test_recovery_persistence_enrichment_is_idempotent_for_existing_metadata(
+    store: RoastStore,
+) -> None:
+    """A pre-enriched recovery payload is returned unchanged rather than wrapped again."""
+    clock = FakeClock()
+    service, _run_id = await _live_service(
+        store,
+        mcp=FakeMCPClient([_reading(bean=178.0, env=185.0)]),
+        clock=clock,
+    )
+    assert service.runner is not None
+    payload: dict[str, object] = {
+        RECOVERY_PAYLOAD_KEY: {
+            "configured_enabled": True,
+            "effective_enabled": False,
+            "state": "retired",
+        }
+    }
+    event = api_module._BufferedEvent(  # pyright: ignore[reportPrivateUsage]
+        kind=RoastEventKind.RECOVERY_REQUIRED,
+        payload=payload,
+        monotonic_seconds=clock(),
+    )
+    persisted = service.runner._event_payload_for_persistence(event)  # pyright: ignore[reportPrivateUsage]
+    assert persisted is payload
+    assert payload[RECOVERY_PAYLOAD_KEY] == {
+        "configured_enabled": True,
+        "effective_enabled": False,
+        "state": "retired",
+    }
 
 
 @pytest.mark.asyncio
