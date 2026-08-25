@@ -439,6 +439,7 @@ def derive_ambient_doctrine_evidence(
     fresh_count = 0
     previous_tick: int | None = None
     previous_timestamp: datetime | None = None
+    previous_live_timestamp: datetime | None = None
     previous_snapshot_recorded_at: object = None
     token: float | None = None
     corroborated_at: datetime | None = None
@@ -474,6 +475,23 @@ def derive_ambient_doctrine_evidence(
             token = None
             corroborated_at = None
             previous_timestamp = None
+            previous_live_timestamp = None
+
+        observed_at = _aware_timestamp(raw_recorded_at)
+        if observed_at is None:
+            unusable_clock = True
+            token = None
+            corroborated_at = None
+            previous_live_timestamp = None
+            continue
+        if previous_timestamp is not None and observed_at < previous_timestamp:
+            unusable_clock = True
+            token = None
+            corroborated_at = None
+            previous_live_timestamp = None
+            previous_timestamp = observed_at
+            continue
+        previous_timestamp = observed_at
 
         raw_phase = row.get("agent_phase")
         try:
@@ -489,39 +507,31 @@ def derive_ambient_doctrine_evidence(
             unusable_clock = True
             token = None
             corroborated_at = None
+            previous_live_timestamp = None
             continue
         if status is None or not _retained_ambient_is_live(status):
             token = None
             corroborated_at = None
+            previous_live_timestamp = None
             continue
         triad = _retained_live_ambient(status)
         current_token = _retained_ambient_token(status)
         if current_token is None or not all(_is_finite_number(value) for value in triad):
             token = None
             corroborated_at = None
+            previous_live_timestamp = None
             continue
-        observed_at = _aware_timestamp(raw_recorded_at)
-        if observed_at is None:
-            unusable_clock = True
-            token = None
-            corroborated_at = None
-            continue
-        if previous_timestamp is not None and observed_at < previous_timestamp:
-            unusable_clock = True
-            token = None
-            corroborated_at = None
-            previous_timestamp = observed_at
-            continue
-        previous_timestamp = observed_at
         # The MCP child's epoch is fixed within one agent tick generation.
         # Any future in-run respawn needs an explicit evidence reset/breadcrumb
         # plus dedicated tests before its tokens may corroborate this sequence.
         if token is None:
             token = current_token
+            previous_live_timestamp = observed_at
             continue
         if current_token != token:
             token = current_token
-            corroborated_at = observed_at
+            corroborated_at = previous_live_timestamp
+        previous_live_timestamp = observed_at
         if is_development and corroborated_at is not None:
             age_seconds = (observed_at - corroborated_at).total_seconds()
             if (

@@ -40,6 +40,7 @@ def _snapshot(
     phase: str = "development",
     token: float = 1.0,
     running: bool = True,
+    status: str = "ok",
 ) -> dict[str, object]:
     """Build a retained raw-state row with a complete ambient status."""
     return {
@@ -51,7 +52,7 @@ def _snapshot(
             {
                 "ambient_status": {
                     "mode": "yoctopuce",
-                    "status": "ok",
+                    "status": status,
                     "ambient_running": running,
                     "temperature_c": 23.0,
                     "humidity_percent": 50.0,
@@ -127,6 +128,42 @@ def test_ordinary_recovery_cannot_account_for_a_tick_reset() -> None:
             _snapshot(row_id=1, tick=4, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
             _snapshot(row_id=2, tick=0, timestamp="2026-08-25T12:01:00+00:00", token=2.0),
             _snapshot(row_id=3, tick=1, timestamp="2026-08-25T12:01:10+00:00", token=3.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+    assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
+    assert evidence.retained_development_snapshot_count == 0
+    assert evidence.fresh_retained_development_snapshot_count == 0
+    assert evidence.retained_development_snapshot_fraction == 0.0
+
+
+@pytest.mark.parametrize(("status", "running"), (("ok", False), ("unavailable", False)))
+def test_non_live_backwards_timestamp_cannot_widen_a_later_reset_window(
+    status: str,
+    running: bool,
+) -> None:
+    """Every valid-tick row constrains chronology before non-live handling."""
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (
+            _recovery(
+                event_id=1,
+                rule="restart_recovery",
+                recorded_at_utc="2026-08-25T12:00:30+00:00",
+            ),
+        ),
+        (
+            _snapshot(row_id=1, tick=1, timestamp="2026-08-25T12:01:00+00:00", token=1.0),
+            _snapshot(
+                row_id=2,
+                tick=2,
+                timestamp="2026-08-25T12:00:10+00:00",
+                token=1.0,
+                running=running,
+                status=status,
+            ),
+            _snapshot(row_id=3, tick=0, timestamp="2026-08-25T12:02:00+00:00", token=2.0),
+            _snapshot(row_id=4, tick=1, timestamp="2026-08-25T12:02:10+00:00", token=3.0),
         ),
     )
     assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
@@ -482,12 +519,26 @@ def test_frozen_age_bound_is_closed(age: int, expected: AmbientEvidenceVerdict) 
             _snapshot(
                 row_id=3,
                 tick=3,
-                timestamp=(f"2026-08-25T12:{(age + 1) // 60:02d}:{(age + 1) % 60:02d}+00:00"),
+                timestamp=f"2026-08-25T12:{age // 60:02d}:{age % 60:02d}+00:00",
                 token=2.0,
             ),
         ),
     )
     assert evidence.verdict is expected
+
+
+def test_token_change_observed_after_the_frozen_age_is_not_fresh() -> None:
+    """The preceding live timestamp is the conservative token-change anchor."""
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(max_age=90.0),
+        (),
+        (
+            _snapshot(row_id=1, tick=1, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
+            _snapshot(row_id=2, tick=2, timestamp="2026-08-25T12:02:00+00:00", token=2.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+    assert evidence.not_proven_reason is NotProvenReason.NO_CORROBORATED_FRESH_READING
 
 
 def test_disabled_doctrine_and_charge_like_data_are_not_evidence() -> None:
