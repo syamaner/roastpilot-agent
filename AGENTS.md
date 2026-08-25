@@ -801,8 +801,10 @@ operator; do not silently substitute self-review or another same-family lens.
   policy: installed Codex 0.147.0 V2 does not enforce parent depth through
   `max_depth`. Fresh Codex 0.147.0 V2 runtime verification established that
   each leaf's `agents.enabled = false` removes spawn capability. Repository
-  configuration is not a hard sandbox guarantee; the parent verifies the leaf
-  handback.
+  configuration is not a hard sandbox guarantee; capture persists the observed
+  Codex version and exact post-run rollout/topology evidence, and the parent
+  verifies the leaf handback. Admission of a later structurally compatible
+  semver does not silently extend this 0.147.0 runtime proof to that version.
 
 ### Shared agent resources
 

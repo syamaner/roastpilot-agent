@@ -42,9 +42,10 @@ _ALLOWED_TYPES = frozenset(
         "user",
     }
 )
-"""Row types observed across the five committed 2.1.233 transcript fixtures.
+"""Row types observed across the committed 2.1.233 and 2.1.241 transcript fixtures.
 
-``mode`` and ``ai-title`` are metadata-only rows with independently closed shapes.
+``mode``, ``ai-title``, and discarded ``atis-latch`` rows are metadata-only rows
+with independently closed shapes.
 """
 _MODE_ROW_KEYS = frozenset({"type", "mode", "sessionId"})
 """Exact observed keys of the metadata-only ``mode`` row (story-planner.jsonl)."""
