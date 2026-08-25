@@ -16,6 +16,7 @@ import pytest
 
 from roastpilot_agent import roast_landmarks
 from roastpilot_agent import store as store_module
+from roastpilot_agent.ambient_evidence import AmbientEvidenceVerdict, NotProvenReason
 from roastpilot_agent.store import (
     MIGRATIONS,
     PhysicallyImpossibleWeightError,
@@ -69,6 +70,34 @@ async def test_migrations_create_all_expected_tables(tmp_store: RoastStore) -> N
     await tmp_store.initialize()
     try:
         assert await fetch_names(tmp_store, "table") == EXPECTED_TABLES
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_read_ambient_evidence_corrupt_config_fails_closed_with_run_bound_warning(
+    tmp_store: RoastStore,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A corrupt frozen config remains a typed offline absence, not a store exception."""
+    await tmp_store.initialize()
+    try:
+        await tmp_store.create_run(
+            run_id="ambient-corrupt-config",
+            profile=_reference_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await tmp_store.connection.execute(
+            "UPDATE roast_runs SET config_json = '{not json' WHERE id = ?",
+            ("ambient-corrupt-config",),
+        )
+        await tmp_store.connection.commit()
+        evidence = await tmp_store.read_ambient_doctrine_evidence("ambient-corrupt-config")
+        assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+        assert evidence.not_proven_reason is NotProvenReason.RUN_OR_CONFIG_UNAVAILABLE
+        assert "Ambient doctrine evidence unavailable for run ambient-corrupt-config" in caplog.text
+        assert "{not json" not in caplog.text
     finally:
         await tmp_store.close()
 

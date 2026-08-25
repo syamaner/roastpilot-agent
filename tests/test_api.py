@@ -32,6 +32,7 @@ from pydantic import ValidationError
 import roastpilot_agent.api as api_module
 from roastpilot_agent import __version__
 from roastpilot_agent.advisor import AdvisorContext, FakeAdvisor, RoastDecision
+from roastpilot_agent.ambient_evidence import RECOVERY_PAYLOAD_KEY, DoctrineRecoveryState
 from roastpilot_agent.api import (
     _DRAFT_BEAN_FROM_URL_MAX_BODY_BYTES,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     EventBroadcaster,
@@ -5046,6 +5047,50 @@ async def test_acknowledge_recovery_resumes_to_payload_target(store: RoastStore)
     assert result.result == "accepted"
     await _tick(service, clock)
     assert (await store.read_run(run_id)).agent_phase is RoastPhase.COOLING  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("effective_enabled", "expected_state"),
+    ((False, DoctrineRecoveryState.RETIRED), (True, DoctrineRecoveryState.PRESERVED)),
+)
+async def test_recovery_evidence_persists_enriched_copy_without_changing_sse_payload(
+    store: RoastStore,
+    effective_enabled: bool,
+    expected_state: DoctrineRecoveryState,
+) -> None:
+    """The real flush enriches only the store copy for both recovery outcomes."""
+    clock = FakeClock()
+    config = AppConfig(
+        controller=ControllerConfig(
+            telemetry_log_interval_seconds=1.0,
+            ambient_fan_doctrine=AmbientFanDoctrine(enabled=effective_enabled),
+        ),
+        mcp_device=MCPDeviceConfig(ambient_poll_interval_seconds=30.0),
+    )
+    service, run_id = await _live_service(
+        store,
+        mcp=FakeMCPClient([_reading(bean=178.0, env=185.0)]),
+        clock=clock,
+        config=config,
+    )
+    assert service.runner is not None
+    service.runner._configured_doctrine_enabled = True  # pyright: ignore[reportPrivateUsage]
+    subscriber = service.events.subscribe()
+    raw_payload: dict[str, object] = {"reason": "recovery"}
+    service.runner._emitter.emit(  # pyright: ignore[reportPrivateUsage]
+        RoastEventKind.RECOVERY_REQUIRED,
+        raw_payload,
+    )
+    frame = subscriber.get_nowait()
+    assert RECOVERY_PAYLOAD_KEY not in raw_payload
+    assert RECOVERY_PAYLOAD_KEY not in frame.data
+    await service.runner._flush_events()  # pyright: ignore[reportPrivateUsage]
+    evidence = await store.read_ambient_doctrine_evidence(run_id)
+    episode = evidence.recovery_episodes[-1]
+    assert episode.state is expected_state
+    assert episode.configured_enabled is True
+    assert episode.effective_enabled is effective_enabled
 
 
 @pytest.mark.asyncio

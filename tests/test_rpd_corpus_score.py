@@ -1347,7 +1347,8 @@ def test_aggregate_stats_empty_corpus() -> None:
         "hit_rate": 0.0,
         "mean_scalar": 0.0,
         "rated": 0,
-        "ambient_evidence_observed": 0,
+        "ambient_evidence_observed_runs": 0,
+        "ambient_evidence_scored_runs": 0,
     }
 
 
@@ -1379,7 +1380,8 @@ async def test_aggregate_stats_and_rendering(tmp_store: RoastStore) -> None:
         assert stats["hit_rate"] == pytest.approx(0.5)
         assert stats["mean_scalar"] == pytest.approx(0.5)
         assert stats["rated"] == 1
-        assert stats["ambient_evidence_observed"] == 0
+        assert stats["ambient_evidence_observed_runs"] == 0
+        assert stats["ambient_evidence_scored_runs"] == 2
 
         table = scorer.render_markdown_table(report)
         assert "HIT" in table
@@ -1393,12 +1395,12 @@ async def test_aggregate_stats_and_rendering(tmp_store: RoastStore) -> None:
         # line states how many of the scored runs are actually rated.
         assert "(rated: 1/2)" in table
         assert "retained DEVELOPMENT telemetry-snapshot coverage" in table
-        assert "ambient evidence observed: 0/2" in table
+        assert "ambient evidence observed RUNS: 0/2 scored RUNS" in table
 
         payload = scorer.report_to_json(report)
         assert payload["aggregate"] == stats
         assert payload["ambient_evidence_claim"] == scorer.AMBIENT_EVIDENCE_CLAIM
-        assert payload["ambient_evidence_fraction_basis"] == "retained_development_snapshots"
+        assert "ambient_evidence_fraction_basis" not in payload
         json.dumps(payload, allow_nan=False)
         assert len(payload["runs"]) == 2
         assert len(payload["skipped"]) == 1

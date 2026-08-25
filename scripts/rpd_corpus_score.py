@@ -762,11 +762,12 @@ def aggregate_stats(report: CorpusReport) -> dict[str, Any]:
         "hit_rate": (hits / n_scored) if n_scored else 0.0,
         "mean_scalar": mean_scalar,
         "rated": rated,
-        "ambient_evidence_observed": sum(
+        "ambient_evidence_observed_runs": sum(
             1
             for run in report.scored
             if run.ambient_evidence.verdict is AmbientEvidenceVerdict.OBSERVED
         ),
+        "ambient_evidence_scored_runs": n_scored,
     }
 
 
@@ -851,9 +852,9 @@ def render_markdown_table(report: CorpusReport) -> str:
         f"\nN scored: {stats['n_scored']} (skipped: {stats['n_skipped']}) | "
         f"HIT: {stats['hits']}/{stats['n_scored']} "
         f"({stats['hit_rate'] * 100:.1f}%) | mean scalar: {stats['mean_scalar']:.4f} "
-        f"(rated: {stats['rated']}/{stats['n_scored']}) | ambient evidence observed: "
-        f"{stats['ambient_evidence_observed']}/{stats['n_scored']} "
-        f"({FractionBasis.RETAINED_DEVELOPMENT_SNAPSHOTS.value})"
+        f"(rated: {stats['rated']}/{stats['n_scored']}) | ambient evidence observed RUNS: "
+        f"{stats['ambient_evidence_observed_runs']}/{stats['ambient_evidence_scored_runs']} "
+        "scored RUNS"
     )
     evidence_note = _escape_markdown_cell(
         f"Ambient evidence: {AMBIENT_EVIDENCE_CLAIM} "
@@ -884,7 +885,6 @@ def report_to_json(report: CorpusReport) -> dict[str, Any]:
         runs.append(entry)
     return {
         "ambient_evidence_claim": AMBIENT_EVIDENCE_CLAIM,
-        "ambient_evidence_fraction_basis": FractionBasis.RETAINED_DEVELOPMENT_SNAPSHOTS.value,
         "runs": runs,
         "skipped": [{"run_id": skip.run_id, "reason": skip.reason} for skip in report.skipped],
         "aggregate": aggregate_stats(report),

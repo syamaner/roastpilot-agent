@@ -12,18 +12,9 @@ import math
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from enum import Enum
-from typing import cast
+from typing import Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, model_validator
-
-from roastpilot_agent.config import ControllerConfig
-from roastpilot_agent.mcp_client import (
-    AmbientStatus,
-    ambient_reading_is_live,
-    ambient_reading_token,
-    project_live_ambient,
-)
-from roastpilot_agent.models import RoastPhase
 
 RECOVERY_PAYLOAD_KEY = "ambient_fan_doctrine_recovery"
 AMBIENT_EVIDENCE_CLAIM = (
@@ -65,6 +56,44 @@ class FractionBasis(Enum):
     """The exact denominator represented by ambient coverage."""
 
     RETAINED_DEVELOPMENT_SNAPSHOTS = "retained_development_snapshots"
+
+
+class _AmbientDoctrineConfig(Protocol):
+    """The frozen doctrine fields required by offline retained-state derivation."""
+
+    @property
+    def enabled(self) -> bool:
+        """Whether the frozen doctrine was enabled."""
+        ...
+
+    @property
+    def max_reading_age_seconds(self) -> float:
+        """The frozen retained-reading age bound."""
+        ...
+
+
+class _FrozenControllerConfig(Protocol):
+    """The neutral frozen-controller projection needed by this offline module."""
+
+    @property
+    def ambient_fan_doctrine(self) -> _AmbientDoctrineConfig:
+        """The frozen ambient doctrine projection."""
+        ...
+
+
+class _RetainedAmbientStatus(BaseModel):
+    """Local, closed retained-JSON projection; it deliberately imports no live MCP path."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    mode: Literal["disabled", "yoctopuce"]
+    status: Literal["disabled", "unavailable", "ok"]
+    reason: str | None = None
+    ambient_running: bool = False
+    temperature_c: float | None = None
+    humidity_percent: float | None = None
+    pressure_hpa: float | None = None
+    last_reading_monotonic_seconds: float | None = None
 
 
 class DoctrineRecoveryEpisode(BaseModel):
@@ -174,7 +203,7 @@ def _episode_from_row(row: Mapping[str, object]) -> DoctrineRecoveryEpisode:
         return DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN)
     try:
         root = json.loads(raw_payload)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return DoctrineRecoveryEpisode(event_id=safe_id, state=DoctrineRecoveryState.UNKNOWN)
     root_mapping = _object_mapping(root)
     if root_mapping is None:
@@ -213,14 +242,14 @@ def _episode_from_row(row: Mapping[str, object]) -> DoctrineRecoveryEpisode:
     )
 
 
-def _snapshot_status(row: Mapping[str, object]) -> tuple[AmbientStatus | None, bool]:
+def _snapshot_status(row: Mapping[str, object]) -> tuple[_RetainedAmbientStatus | None, bool]:
     """Parse one retained status, returning whether its retained shape was malformed."""
     raw_state = row.get("raw_state_json")
     if not isinstance(raw_state, str):
         return None, True
     try:
         root = json.loads(raw_state)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return None, True
     root_mapping = _object_mapping(root)
     if root_mapping is None:
@@ -229,10 +258,10 @@ def _snapshot_status(row: Mapping[str, object]) -> tuple[AmbientStatus | None, b
     if raw_status is None:
         return None, True
     try:
-        status = AmbientStatus.model_validate(raw_status)
+        status = _RetainedAmbientStatus.model_validate(raw_status)
     except Exception:  # noqa: BLE001 - malformed retained JSON is not evidence
         return None, True
-    if not ambient_reading_is_live(status):
+    if not _retained_ambient_is_live(status):
         return status, False
     for field in (
         "temperature_c",
@@ -245,8 +274,28 @@ def _snapshot_status(row: Mapping[str, object]) -> tuple[AmbientStatus | None, b
     return status, False
 
 
+def _retained_ambient_is_live(status: _RetainedAmbientStatus) -> bool:
+    """Whether the retained MCP status says the ambient runtime was live."""
+    return status.status == "ok" and status.ambient_running
+
+
+def _retained_live_ambient(
+    status: _RetainedAmbientStatus,
+) -> tuple[float | None, float | None, float | None]:
+    """Project the retained live triad without importing the live MCP module."""
+    if not _retained_ambient_is_live(status):
+        return None, None, None
+    return status.temperature_c, status.humidity_percent, status.pressure_hpa
+
+
+def _retained_ambient_token(status: _RetainedAmbientStatus) -> float | None:
+    """Return the finite opaque retained reading token, if one was recorded."""
+    token = status.last_reading_monotonic_seconds
+    return token if token is not None and math.isfinite(token) else None
+
+
 def derive_ambient_doctrine_evidence(
-    frozen_controller: ControllerConfig | None,
+    frozen_controller: _FrozenControllerConfig | None,
     recovery_rows: Sequence[Mapping[str, object]],
     snapshot_rows: Sequence[Mapping[str, object]],
 ) -> AmbientDoctrineEvidence:
@@ -313,12 +362,15 @@ def derive_ambient_doctrine_evidence(
     token: float | None = None
     corroborated_at: datetime | None = None
     unusable_clock = False
+    tick_reset_count = 0
     for row in snapshot_rows:
         raw_tick = row.get("tick")
         if not isinstance(raw_tick, int) or isinstance(raw_tick, bool):
             unusable_clock = True
             continue
         reset = previous_tick is None or raw_tick <= previous_tick
+        if previous_tick is not None and reset:
+            tick_reset_count += 1
         previous_tick = raw_tick
         if reset:
             token = None
@@ -326,11 +378,21 @@ def derive_ambient_doctrine_evidence(
             previous_timestamp = None
 
         raw_phase = row.get("agent_phase")
-        try:
-            is_development = RoastPhase(str(raw_phase)) is RoastPhase.DEVELOPMENT
-        except ValueError:
+        if not isinstance(raw_phase, str) or raw_phase not in {
+            "idle",
+            "starting",
+            "preheating",
+            "roasting_pre_first_crack",
+            "development",
+            "cooling",
+            "complete",
+            "faulted",
+            "operator_recovery_required",
+        }:
             unusable_clock = True
             is_development = False
+        else:
+            is_development = raw_phase == "development"
         if is_development:
             development_count += 1
 
@@ -340,12 +402,12 @@ def derive_ambient_doctrine_evidence(
             token = None
             corroborated_at = None
             continue
-        if status is None or not ambient_reading_is_live(status):
+        if status is None or not _retained_ambient_is_live(status):
             token = None
             corroborated_at = None
             continue
-        triad = project_live_ambient(status)
-        current_token = ambient_reading_token(status)
+        triad = _retained_live_ambient(status)
+        current_token = _retained_ambient_token(status)
         if current_token is None or not all(_is_finite_number(value) for value in triad):
             token = None
             corroborated_at = None
@@ -391,6 +453,8 @@ def derive_ambient_doctrine_evidence(
             ):
                 fresh_count += 1
 
+    if tick_reset_count > len(episodes):
+        unusable_clock = True
     if development_count == 0:
         return _not_proven(
             configured_enabled=configured_enabled,

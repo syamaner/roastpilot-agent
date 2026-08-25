@@ -9,6 +9,7 @@ migration mechanism. Write paths land in E6-S2, recovery reads in E6-S3.
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import re
 import uuid
@@ -67,6 +68,8 @@ from roastpilot_agent.roast_landmarks import (
     utc_to_run_seconds,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
+
+_log = logging.getLogger(__name__)
 
 SCHEMA_V1 = """
 CREATE TABLE roast_runs (
@@ -692,11 +695,11 @@ class RoastStore:
     async def read_ambient_doctrine_evidence(self, run_id: str) -> AmbientDoctrineEvidence:
         """Read conservative ambient-doctrine evidence without modifying the store.
 
-        The three queries deliberately preserve durable insertion order: restart
-        resets process-local ticks, so neither recovery nor snapshot chronology
-        can be reconstructed by sorting on tick.  Historical JSON is untrusted
-        corpus data; parsing occurs in the total derivation and fails toward a
-        typed ``not_proven`` result rather than an exception.
+        This offline/corpus-only full-row read deliberately preserves durable
+        insertion order: restart resets process-local ticks, so neither recovery
+        nor snapshot chronology can be reconstructed by sorting on tick.
+        Historical JSON is untrusted corpus data; parsing occurs in the total
+        derivation and fails toward a typed ``not_proven`` result rather than an exception.
 
         Args:
             run_id: The persisted roast-run identifier.
@@ -732,6 +735,7 @@ class RoastStore:
                 snapshot_rows,
             )
         except Exception:  # noqa: BLE001 - a corrupt historical row is not a read failure
+            _log.warning("Ambient doctrine evidence unavailable for run %s", run_id)
             return derive_ambient_doctrine_evidence(None, (), ())
 
     async def initialize(self) -> None:

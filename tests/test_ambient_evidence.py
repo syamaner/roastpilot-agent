@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -101,7 +104,7 @@ def test_duplicate_token_and_tick_reset_cannot_cross_corroborate() -> None:
         ),
     )
     assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
-    assert evidence.not_proven_reason is NotProvenReason.NO_CORROBORATED_FRESH_READING
+    assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
 
 
 @pytest.mark.parametrize(
@@ -149,7 +152,7 @@ def test_malformed_ambient_row_blocks_later_evidence(malformed_raw_state: str) -
     malformed_row["raw_state_json"] = malformed_raw_state
     evidence = derive_ambient_doctrine_evidence(
         _controller(),
-        (),
+        (_recovery(event_id=1),),
         (
             _snapshot(row_id=1, tick=1, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
             malformed_row,
@@ -479,7 +482,7 @@ def test_cross_episode_clock_restarts_are_valid() -> None:
     """A tick reset isolates timestamp domains rather than creating a backwards clock."""
     evidence = derive_ambient_doctrine_evidence(
         _controller(),
-        (),
+        (_recovery(event_id=1),),
         (
             _snapshot(row_id=1, tick=5, timestamp="2026-08-25T12:01:00+00:00", token=1.0),
             _snapshot(row_id=2, tick=0, timestamp="2026-08-25T12:00:00+00:00", token=2.0),
@@ -497,7 +500,7 @@ def test_live_unread_status_resets_without_becoming_malformed(
     def _tokenless(_status: object) -> None:
         return None
 
-    monkeypatch.setattr(ambient_evidence, "ambient_reading_token", _tokenless)
+    monkeypatch.setattr(ambient_evidence, "_retained_ambient_token", _tokenless)
     evidence = derive_ambient_doctrine_evidence(
         _controller(),
         (),
@@ -525,3 +528,53 @@ def test_missing_config_and_non_development_rows_fail_closed_for_their_own_reaso
         ),
     )
     assert no_development.not_proven_reason is NotProvenReason.NO_DEVELOPMENT_SNAPSHOTS
+
+
+def test_retained_evidence_import_boundary_is_local_and_transitively_closed() -> None:
+    """Offline evidence must not load controller, safety, or the live MCP client."""
+    source = Path(ambient_evidence.__file__).read_text(encoding="utf-8")
+    assert "roastpilot_agent.mcp_client" not in source
+    assert "roastpilot_agent.controller" not in source
+    assert "roastpilot_agent.safety" not in source
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import roastpilot_agent.ambient_evidence; "
+            "assert not {'roastpilot_agent.controller', 'roastpilot_agent.safety', "
+            "'roastpilot_agent.mcp_client'} & set(sys.modules)",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
+
+
+def test_deeply_nested_retained_json_fails_closed_without_raising() -> None:
+    """Hostile retained JSON recursion cannot escape either offline decode boundary."""
+    nested = "[" * 2000 + "0" + "]" * 2000
+    episode = ambient_evidence._episode_from_row(  # pyright: ignore[reportPrivateUsage]
+        {"id": 1, "payload_json": nested}
+    )
+    status, malformed = ambient_evidence._snapshot_status(  # pyright: ignore[reportPrivateUsage]
+        {"raw_state_json": nested}
+    )
+    assert episode.state is DoctrineRecoveryState.UNKNOWN
+    assert status is None
+    assert malformed is True
+
+
+def test_unaccounted_tick_reset_blocks_observed_evidence() -> None:
+    """A second process-generation segment needs its own durable recovery episode."""
+    evidence = derive_ambient_doctrine_evidence(
+        _controller(),
+        (),
+        (
+            _snapshot(row_id=1, tick=4, timestamp="2026-08-25T12:00:00+00:00", token=1.0),
+            _snapshot(row_id=2, tick=0, timestamp="2026-08-25T12:01:00+00:00", token=2.0),
+            _snapshot(row_id=3, tick=1, timestamp="2026-08-25T12:01:10+00:00", token=3.0),
+        ),
+    )
+    assert evidence.verdict is AmbientEvidenceVerdict.NOT_PROVEN
+    assert evidence.not_proven_reason is NotProvenReason.UNUSABLE_CLOCK_OR_DATA
