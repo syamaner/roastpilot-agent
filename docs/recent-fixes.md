@@ -43,7 +43,8 @@ Format: one entry per anti-pattern.
   `snapshot_store_to_temp` plus the one canonical read-only source connect
   inside `connect_read_only`; every other caller goes through
   `connect_read_only`/`snapshot_store_to_temp`, never its own
-  `sqlite3.connect`.
+  `sqlite3.connect`. The shared helper rejects any caller-owned final target
+  or SQLite `-journal`/`-wal`/`-shm` artefact before opening either database.
 - **Guarded by:** `tests/test_store_snapshot.py` (URI grammar for `?`/`#`/`%`/
   space/non-ASCII/relative paths, read-only write-failure, missing-store,
   invalid-snapshot-name, WAL-inclusive-snapshot, and cross-module binding

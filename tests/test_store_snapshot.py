@@ -599,7 +599,7 @@ def test_snapshot_store_to_temp_rejects_unrelated_target_symlink_before_connecti
     assert _sha256(unrelated_path) == unrelated_before
 
 
-@pytest.mark.parametrize("suffix", ["", "-wal", "-shm"])
+@pytest.mark.parametrize("suffix", ["", "-journal", "-wal", "-shm"])
 def test_snapshot_store_to_temp_rejects_existing_destination_artifact_before_connections(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -96,6 +96,7 @@ def _reject_existing_snapshot_artifacts(snapshot_path: Path) -> None:
     """Reject a final snapshot or SQLite sidecar already in the destination."""
     for artifact_path in (
         snapshot_path,
+        snapshot_path.with_name(f"{snapshot_path.name}-journal"),
         snapshot_path.with_name(f"{snapshot_path.name}-wal"),
         snapshot_path.with_name(f"{snapshot_path.name}-shm"),
     ):
@@ -234,10 +235,10 @@ def snapshot_store_to_temp(
             a path separator (i.e. is not a single plain filename); or if the
             resulting ``tmp_dir / snapshot_name`` target aliases ``store_path``
             — the same resolved path, a symlink to the source, or a hard link
-            to the source; or if the final target or either SQLite sidecar
-            already exists. These checks run, and fail closed, before either
-            database is opened so a caller-owned file cannot be followed or
-            replaced.
+            to the source; or if the final target or any SQLite sidecar
+            (``-journal``, ``-wal``, or ``-shm``) already exists. These checks
+            run, and fail closed, before either database is opened so a
+            caller-owned file cannot be followed or replaced.
     """
     is_invalid = (
         not snapshot_name
