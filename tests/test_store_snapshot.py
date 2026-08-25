@@ -321,8 +321,8 @@ def test_snapshot_store_to_temp_rejects_same_resolved_path_alias(tmp_path: Path)
 
 
 def test_snapshot_store_to_temp_rejects_symlink_alias(tmp_path: Path) -> None:
-    """A pre-existing symlink at the computed target path pointing at the
-    source must be rejected, not silently followed for the write."""
+    """The target-symlink guard rejects a pre-existing source symlink before
+    the resolved-path alias check could inspect it."""
     store_path = tmp_path / "store.sqlite3"
     _seed_db(store_path)
     before = _sha256(store_path)
@@ -339,6 +339,116 @@ def test_snapshot_store_to_temp_rejects_symlink_alias(tmp_path: Path) -> None:
         store_snapshot.snapshot_store_to_temp(store_path, dest_dir, snapshot_name=link_name)
 
     assert _sha256(store_path) == before
+
+
+def test_snapshot_store_to_temp_rejects_intermediate_symlink_directory_alias_before_connections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A regular target entry reached through a symlinked parent is rejected
+    by resolved-path equality before either SQLite connection opens."""
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    store_path = store_dir / "store.sqlite3"
+    _seed_db(store_path)
+    before = _sha256(store_path)
+    linked_dir = tmp_path / "linked-store"
+    try:
+        linked_dir.symlink_to(store_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is not supported on this filesystem/platform")
+    snapshot_path = linked_dir / store_path.name
+    assert not snapshot_path.is_symlink()
+
+    def fail_source_connection(_path: Path) -> sqlite3.Connection:
+        raise AssertionError("source connection must not open for an aliasing target")
+
+    def fail_sqlite_connection(*args: object, **kwargs: object) -> sqlite3.Connection:
+        raise AssertionError("SQLite connection must not open for an aliasing target")
+
+    monkeypatch.setattr(store_snapshot, "connect_read_only", fail_source_connection)
+    monkeypatch.setattr(store_snapshot.sqlite3, "connect", fail_sqlite_connection)
+
+    with pytest.raises(ValueError, match="aliases the source store"):
+        store_snapshot.snapshot_store_to_temp(store_path, linked_dir, snapshot_name=store_path.name)
+
+    assert _sha256(store_path) == before
+
+
+def test_aliases_same_file_rejects_uninspectable_existing_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a missing entry is treated as safe; inspection failures fail closed."""
+    store_path = tmp_path / "store.sqlite3"
+    snapshot_path = tmp_path / "snapshot.sqlite3"
+    _seed_db(store_path)
+    snapshot_path.touch()
+    source_before = _sha256(store_path)
+
+    def unresolved(path: Path, *, strict: bool = False) -> Path:
+        return path
+
+    original_stat = Path.stat
+
+    def denied_target_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if path == snapshot_path:
+            raise PermissionError("target metadata denied")
+        return original_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(store_snapshot.Path, "resolve", unresolved)
+    monkeypatch.setattr(store_snapshot.Path, "stat", denied_target_stat)
+
+    with pytest.raises(ValueError, match="cannot safely inspect source"):
+        store_snapshot._aliases_same_file(store_path, snapshot_path)
+
+    assert _sha256(store_path) == source_before
+
+
+def test_reject_existing_snapshot_symlink_rejects_uninspectable_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A target metadata error cannot be mistaken for an absent safe target."""
+    store_path = tmp_path / "store.sqlite3"
+    snapshot_path = tmp_path / "snapshot.sqlite3"
+    _seed_db(store_path)
+    source_before = _sha256(store_path)
+
+    def denied_lstat(_path: Path) -> os.stat_result:
+        raise PermissionError("target metadata denied")
+
+    monkeypatch.setattr(store_snapshot.Path, "lstat", denied_lstat)
+
+    with pytest.raises(ValueError, match="cannot safely inspect snapshot target"):
+        store_snapshot._reject_existing_snapshot_symlink(snapshot_path)
+
+    assert _sha256(store_path) == source_before
+
+
+def test_write_snapshot_atomically_cleans_up_after_failed_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed publication preserves the old target and removes private bytes."""
+    store_path = tmp_path / "store.sqlite3"
+    snapshot_path = tmp_path / "snapshot.sqlite3"
+    _seed_db(store_path)
+    snapshot_path.write_bytes(b"previous snapshot")
+    source_before = _sha256(store_path)
+    target_before = snapshot_path.read_bytes()
+
+    def failed_replace(_source: Path, _target: Path) -> None:
+        raise OSError("publication failed")
+
+    monkeypatch.setattr(store_snapshot.os, "replace", failed_replace)
+
+    with pytest.raises(OSError, match="publication failed"):
+        store_snapshot._write_snapshot_atomically(snapshot_path, b"new snapshot")
+
+    assert snapshot_path.read_bytes() == target_before
+    assert _sha256(store_path) == source_before
+    assert list(tmp_path.glob(f".{snapshot_path.name}.*.tmp")) == []
 
 
 def test_snapshot_store_to_temp_rejects_unrelated_target_symlink_before_connections(

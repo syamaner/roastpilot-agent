@@ -57,16 +57,20 @@ def _aliases_same_file(store_path: Path, snapshot_path: Path) -> bool:
     Returns:
         ``True`` if writing to ``snapshot_path`` would mutate ``store_path``.
     """
-    if store_path.resolve() == snapshot_path.resolve():
-        return True
     try:
+        if store_path.resolve() == snapshot_path.resolve():
+            return True
         source_stat = store_path.stat()
         target_stat = snapshot_path.stat()
-    except OSError:
+    except FileNotFoundError:
         # Either path does not exist (yet) as a real filesystem entry, so it
         # cannot be a hard link to the other — the resolved-path check above
         # already covers every case reachable without both paths existing.
         return False
+    except OSError as error:
+        raise ValueError(
+            f"cannot safely inspect source {store_path} or snapshot target {snapshot_path}"
+        ) from error
     return (source_stat.st_dev, source_stat.st_ino) == (target_stat.st_dev, target_stat.st_ino)
 
 
@@ -192,6 +196,8 @@ def snapshot_store_to_temp(
 
     Raises:
         FileNotFoundError: If ``store_path`` does not exist.
+        sqlite3.OperationalError: If ``tmp_dir`` does not already exist, so a
+            private temporary snapshot cannot be created there.
         ValueError: If ``snapshot_name`` is empty, ``.``, ``..``, or contains
             a path separator (i.e. is not a single plain filename); or if the
             resulting ``tmp_dir / snapshot_name`` target aliases ``store_path``
