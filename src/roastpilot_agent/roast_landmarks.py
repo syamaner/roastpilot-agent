@@ -3,10 +3,101 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 
-from roastpilot_agent.models import RoastEventSource
+from roastpilot_agent.models import RoastEventSource, RoastPhase
+
+
+class DropReadingSource(Enum):
+    """The persisted evidence used to resolve a roast's drop reading."""
+
+    DROP_EVENT_ANCHOR = "drop_event_anchor"
+    LAST_DEVELOPMENT_ROW = "last_development_row"
+
+
+@dataclass(frozen=True)
+class DropReadingRow:
+    """One telemetry row needed to derive a persisted drop reading."""
+
+    agent_phase: str
+    bean_temp_c: float | None
+    development_percent: float | None
+    recorded_at_utc: str | None
+
+
+@dataclass(frozen=True)
+class DropReading:
+    """The achieved drop temperature and controller-frozen DTR."""
+
+    bean_temp_c: float
+    development_percent: float
+    source: DropReadingSource
+
+
+def select_drop_reading(
+    rows: Sequence[DropReadingRow], drop_event_recorded_at_utc: str | None
+) -> DropReading | None:
+    """Resolve an authoritative drop temperature and DTR from persisted rows.
+
+    Temperature is selected from the telemetry row nearest the executed
+    ``drop_beans`` event, while DTR is the last finite controller-frozen value
+    in insertion order. The values deliberately come from different rows:
+    taking temperature from the frozen-DTR row can select a cooling tail, and
+    taking DTR from the temperature row loses it when boundary telemetry was
+    suppressed by the logging throttle.
+
+    Args:
+        rows: Telemetry rows in durable insertion order.
+        drop_event_recorded_at_utc: Executed ``drop_beans`` event timestamp.
+
+    Returns:
+        A complete drop reading, or ``None`` when neither the event anchor nor
+        the last-development-row fallback has both required values.
+    """
+    if not rows:
+        return None
+    drop_time = parse_utc(drop_event_recorded_at_utc)
+    if drop_time is not None:
+        frozen_dtr = rows[-1].development_percent
+        for row in rows:
+            dtr = row.development_percent
+            if dtr is not None:
+                frozen_dtr = dtr
+
+        nearest_temp: float | None = None
+        nearest_distance: float | None = None
+        for row in rows:
+            row_time = parse_utc(row.recorded_at_utc)
+            temperature = row.bean_temp_c
+            if row_time is None or temperature is None:
+                continue
+            distance = abs((row_time - drop_time).total_seconds())
+            if nearest_distance is None or distance < nearest_distance:
+                nearest_distance = distance
+                nearest_temp = temperature
+        if nearest_temp is not None and frozen_dtr is not None:
+            return DropReading(
+                bean_temp_c=nearest_temp,
+                development_percent=frozen_dtr,
+                source=DropReadingSource.DROP_EVENT_ANCHOR,
+            )
+
+    for row in reversed(rows):
+        if RoastPhase(str(row.agent_phase)) is not RoastPhase.DEVELOPMENT:
+            continue
+        temperature = row.bean_temp_c
+        dtr = row.development_percent
+        if temperature is None or dtr is None:
+            return None
+        return DropReading(
+            bean_temp_c=temperature,
+            development_percent=dtr,
+            source=DropReadingSource.LAST_DEVELOPMENT_ROW,
+        )
+    return None
 
 
 def parse_utc(value: object) -> datetime | None:

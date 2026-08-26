@@ -10,52 +10,20 @@ LLM, no network, no store WRITE of any kind.
 - ``target_drop_temp_c`` / ``target_development_percent`` come from the run's
   frozen ``roast_runs.profile_json`` (the profile instantiated at roast start,
   immutable thereafter).
-- The achieved drop bean temperature and achieved DTR are read off
-  ``telemetry_snapshots``, **primarily anchored on the executed ``drop_beans``
-  command event's own ``recorded_at_utc``** (from ``roast_events``): the
-  telemetry row (whatever phase it happens to be tagged) whose
-  ``recorded_at_utc`` is NEAREST that instant is the true drop-instant
-  reading. Confirmed against the ratified #559 Conebosque A/B on the real
-  store: the drop event and the nearest telemetry row are within a
-  millisecond of each other for both arms (188.0 °C / 20.997 % baseline,
-  190.0 °C / 24.257 % treatment — matching the ratified 188/21 and 190/24 to
-  the nearest integer). **Fallback (drop event missing/unparseable, or no row
-  near it has both fields populated):** the LAST row tagged ``agent_phase =
-  'development'`` — the same clock-safe anchor
-  :meth:`~roastpilot_agent.store.RoastStore._build_reference_roast` uses
-  (design note §6.4a): development begins at first crack, so this is never the
-  run's final row, which can land deep in the post-drop COOLING tail with a
-  falling, physically meaningless bean temperature (the trap: a bare
-  ``MAX(tick WHERE development_percent IS NOT NULL)`` lands there because
-  ``development_percent`` freezes at drop and is echoed on every later row).
-  The fallback returns that row's OWN reading directly (Codex P2, round 3) —
-  it deliberately does NOT try the row immediately following it, since
-  without a correlated timestamp that successor could be an ordinary
-  PERIODIC cooling sample several seconds (and several degrees) after the
-  true drop on exactly the HISTORICAL, pre-force-persist stores this
-  fallback exists for. **KNOWN LIMITATION** (Codex P1, round 3; documented,
-  not redesigned — see :func:`_extract_drop_reading`'s docstring for the
-  full analysis): the event-anchored PRIMARY read assumes the drop event's
-  timestamp is stamped at the true drop instant, verified true for every
-  advisor/policy/ceiling-guard drop in the real corpus (all 15 scored runs),
-  but an OPERATOR-initiated drop's event may be flush-stamped up to one
-  controller tick late — acceptable for this offline eval tool today; no
-  operator-drop run has entered the corpus yet.
-  Telemetry rows are read in durable INSERTION-id order, never ``(tick, id)``
-  — a restart resets the process-local tick counter to zero, so ordering by
-  tick can interleave a post-restart run's low ticks ahead of a pre-restart
-  run's high ticks (mirrors
-  :meth:`~roastpilot_agent.store.RoastStore.read_telemetry_points`'s own
-  documented insertion-id rule). Every timestamp compare normalizes a naive
-  (offset-less) ISO string to UTC before subtracting, so a legacy row's naive
-  ``recorded_at_utc`` never raises against the drop event's offset-aware one.
-  The event-anchored read is tried FIRST and unconditionally, even when the
-  run has NO ``development``-phase row at all: a same-tick ceiling-guard drop
-  (first crack detected at/above the ceiling guard temperature) transitions
-  DEVELOPMENT → COOLING within the SAME tick it fires the drop, so only a
-  single COOLING-tagged row is ever persisted — that guard-forced failure
-  must still be counted in the corpus as an abnormal 0.00 MISS, not silently
-  excluded.
+- Achieved drop temperature and DTR come from
+  :meth:`roastpilot_agent.store.RoastStore.read_drop_reading`, the shared
+  authoritative persisted-reading API. Temperature is the finite telemetry
+  value nearest the executed ``drop_beans`` event; DTR is the last finite,
+  controller-frozen value in durable insertion order. They deliberately come
+  from different rows: taking temperature from the frozen-DTR row can select
+  the cooling tail, while taking DTR from the event-nearest row loses it when
+  boundary telemetry is suppressed by the logging throttle. If that complete
+  event-anchored reading is unavailable, the API falls back to the last
+  ``development``-phase row's own complete reading, never a following cooling
+  row. It normalizes naive timestamps to UTC, rejects malformed timestamps and
+  non-finite values, and uses ``id`` rather than resettable ``tick`` ordering.
+  The anchor is attempted before the fallback even when no development row
+  exists, retaining same-tick guard-drop scoring.
 - ``terminated_abnormally`` is ``True`` whenever ``outcome != 'completed'``
   (aborted/faulted), OR — within an otherwise ``'completed'`` run — a
   cleanly-detectable guard/emergency termination: an ``emergency_stop``
@@ -95,11 +63,9 @@ import dataclasses
 import json
 import math
 import os
-import sqlite3
 import statistics
 import sys
 import tempfile
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -118,9 +84,7 @@ from roastpilot_agent.ambient_evidence import (  # noqa: E402
 )
 from roastpilot_agent.models import (  # noqa: E402
     DropReason,
-    RoastCommand,
     RoastEventKind,
-    RoastPhase,
 )
 from roastpilot_agent.safety import SafetyVerdict  # noqa: E402
 from roastpilot_agent.store import RoastStore  # noqa: E402
@@ -178,11 +142,6 @@ class CorpusReport:
     skipped: list[SkippedRun]
 
 
-def _optional_float(value: object) -> float | None:
-    """Read a nullable numeric SQLite column as ``float | None``."""
-    return None if value is None else float(cast("float", value))
-
-
 def _finite_or_none(value: float | None) -> float | None:
     """Normalize a non-finite float to ``None`` (JSON ``null`` / "unknown" display).
 
@@ -206,213 +165,6 @@ def _finite_or_none(value: float | None) -> float | None:
     if value is None or not math.isfinite(value):
         return None
     return value
-
-
-@dataclasses.dataclass(frozen=True)
-class DropReading:
-    """The achieved drop bean temperature and DTR read off telemetry.
-
-    Attributes:
-        bean_temp_c: The achieved drop bean temperature (°C).
-        development_percent: The achieved DTR as a percentage.
-    """
-
-    bean_temp_c: float
-    development_percent: float
-
-
-async def _fetch_telemetry_rows(store: RoastStore, run_id: str) -> list[sqlite3.Row]:
-    """Every telemetry row for ``run_id``, in durable INSERTION-id order.
-
-    Ordered by ``id`` alone, never ``(tick, id)``: a restart resets the
-    process-local tick counter to zero
-    (:meth:`~roastpilot_agent.store.RoastStore.read_telemetry_points`'s own
-    documented rule), so ordering by ``tick`` first can interleave a
-    post-restart run's low ticks ahead of a pre-restart run's high ticks —
-    the durable autoincrement ``id`` is the only column insertion order (and
-    therefore chronology) is guaranteed to track.
-    """
-    async with store.connection.execute(
-        "SELECT agent_phase, bean_temp_c, development_percent, recorded_at_utc"
-        " FROM telemetry_snapshots WHERE run_id = ? ORDER BY id ASC",
-        (run_id,),
-    ) as cursor:
-        return list(await cursor.fetchall())
-
-
-def _development_row_indices(rows: list[sqlite3.Row]) -> list[int]:
-    """Indices (into ``rows``) of every ``development``-phase telemetry row."""
-    return [
-        index
-        for index, row in enumerate(rows)
-        if RoastPhase(str(row["agent_phase"])) is RoastPhase.DEVELOPMENT
-    ]
-
-
-def _parse_recorded_at(value: str) -> datetime | None:
-    """Parse an ISO-8601 ``recorded_at_utc`` string as a timezone-AWARE ``datetime``.
-
-    Every current write path stamps an offset-aware instant (``_utc_now()``
-    is ``datetime.now(UTC).isoformat()``), but ``datetime.fromisoformat``
-    faithfully parses a NAIVE timestamp too (no UTC offset) — e.g. a legacy
-    or hand-constructed row. Subtracting a naive ``datetime`` from an aware
-    one raises ``TypeError``, which a bare ``except ValueError`` around the
-    parse alone does NOT catch — one such row would otherwise raise
-    uncaught out of :func:`_nearest_reading_to_timestamp` and abort the
-    whole corpus (Codex P2, round 3). A naive result is assumed UTC (the
-    only timezone this store ever writes) and stamped accordingly, so every
-    returned value is always safely subtractable from another.
-
-    Args:
-        value: The ISO-8601 timestamp string to parse.
-
-    Returns:
-        A timezone-aware ``datetime``, or ``None`` if ``value`` does not
-        parse as ISO-8601 at all.
-    """
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
-
-
-def _nearest_reading_to_timestamp(
-    rows: list[sqlite3.Row], target_recorded_at_utc: str
-) -> DropReading | None:
-    """The telemetry row (any phase) whose ``recorded_at_utc`` is nearest ``target``.
-
-    Considers every row with BOTH ``bean_temp_c`` and ``development_percent``
-    populated and returns the one whose ``recorded_at_utc`` is closest in
-    absolute time to ``target_recorded_at_utc`` — the drop-instant reading,
-    independent of which phase label the controller happened to persist that
-    tick under. Every timestamp is parsed via :func:`_parse_recorded_at`
-    (normalized to timezone-aware), so a naive-vs-aware pair compares safely
-    instead of raising.
-
-    Args:
-        rows: Every telemetry row for the run (see :func:`_fetch_telemetry_rows`).
-        target_recorded_at_utc: The anchor instant (ISO-8601 UTC), typically
-            the executed ``drop_beans`` command event's own ``recorded_at_utc``.
-
-    Returns:
-        The nearest :class:`DropReading`, or ``None`` when
-        ``target_recorded_at_utc`` does not parse as ISO-8601, or no row has
-        both fields populated with a parseable timestamp.
-    """
-    target = _parse_recorded_at(target_recorded_at_utc)
-    if target is None:
-        return None
-    best_diff_seconds: float | None = None
-    best_reading: DropReading | None = None
-    for row in rows:
-        temp = _optional_float(row["bean_temp_c"])
-        dtr = _optional_float(row["development_percent"])
-        if temp is None or dtr is None:
-            continue
-        row_time = _parse_recorded_at(str(row["recorded_at_utc"]))
-        if row_time is None:
-            continue
-        diff_seconds = abs((row_time - target).total_seconds())
-        if best_diff_seconds is None or diff_seconds < best_diff_seconds:
-            best_diff_seconds = diff_seconds
-            best_reading = DropReading(bean_temp_c=temp, development_percent=dtr)
-    return best_reading
-
-
-def _extract_drop_reading(
-    rows: list[sqlite3.Row],
-    development_indices: list[int],
-    drop_event_recorded_at_utc: str | None,
-) -> DropReading | None:
-    """The achieved drop reading given pre-fetched rows and the drop event's timestamp.
-
-    **Primary: event-anchored (Codex P1).** When
-    ``drop_event_recorded_at_utc`` is available, :func:`_nearest_reading_to_timestamp`
-    picks the telemetry row (whatever phase it is tagged) closest in time to
-    the executed ``drop_beans`` command event — the true drop-instant
-    reading, regardless of which control-loop tick or phase label persisted
-    it. Verified against the real store's ratified #559 Conebosque A/B: the
-    drop event and the nearest telemetry row land within a millisecond of
-    each other for both arms. Tried FIRST and unconditionally (Codex P1,
-    round 3): it needs only the drop event and nearby telemetry, so it alone
-    can score a run with NO ``development``-phase row at all — a same-tick
-    ceiling-guard drop (first crack detected at/above the ceiling guard
-    temperature) has the controller transition DEVELOPMENT -> COOLING
-    within the SAME tick it fires the drop, so only a single
-    COOLING-tagged row is ever persisted. A prior version of this scorer
-    gated on ``development_indices`` being non-empty BEFORE ever trying the
-    event anchor, silently excluding every such guard-forced failure from
-    the corpus instead of counting it as the abnormal 0.00 MISS it is.
-
-    **KNOWN LIMITATION (Codex P1, round 3 — verified zero current corpus
-    impact, documented rather than redesigned again):** this primary path
-    assumes the drop event's ``recorded_at_utc`` is stamped at (or
-    immediately after) the true drop instant. Verified true for every
-    advisor/policy/ceiling-guard drop path
-    (:meth:`RoastController._execute_drop` /
-    ``_maybe_ceiling_guard_drop``) — confirmed against the real store: all
-    15 currently-scored corpus runs are advisor-driven, and every
-    event-anchored reading lands 0-2 °C AT OR ABOVE the last-development
-    row's own temperature, never on a fallen (post-drop-cooling) reading. An
-    OPERATOR-initiated drop's command event may be flush-stamped up to one
-    controller tick late (unverified either way — no operator-drop run is in
-    the corpus yet), which could pull the event-anchored read onto an
-    already-cooling sample a few degrees short. Reconstructing an exact
-    sub-sample drop instant from ~5 s telemetry is inherently approximate for
-    an offline yardstick; acceptable here, revisit if/when an operator-drop
-    run enters the corpus (a real trace, not a synthetic worry, would let
-    this be measured rather than argued).
-
-    **Fallback: last-development row's own reading.** Used only when the
-    drop event's timestamp is missing/unparseable, or no row near it has
-    both fields populated — e.g. a HISTORICAL run recorded before
-    phase-boundary telemetry was force-persisted on every D96-state change.
-    Returns the LAST ``development``-phase telemetry row's OWN reading
-    directly (Codex P2, round 3) — the same clock-safe anchor
-    :meth:`~roastpilot_agent.store.RoastStore._build_reference_roast` uses
-    (design note §6.4a): never the run's chronologically final row (a
-    post-drop COOLING-tail sample with a falling bean temperature), and
-    never a bare ``MAX(tick)`` over rows with a non-null
-    ``development_percent`` (a predicate cooling-tail rows also satisfy,
-    since ``development_percent`` freezes at drop and is echoed on every
-    later row). Deliberately does NOT try the row immediately following the
-    last ``development`` row: without a correlated timestamp to bound it,
-    that successor could be an ordinary PERIODIC cooling sample several
-    seconds (and several degrees) after the true drop, on exactly the
-    HISTORICAL pre-force-persist stores this fallback exists for — a
-    "blind" successor guess is less trustworthy than the last confirmed
-    development-phase measurement itself. Skipped entirely (returns
-    ``None``) when ``development_indices`` is empty AND the event anchor
-    already failed — there is nothing left to fall back to.
-
-    Args:
-        rows: Every telemetry row for the run, in insertion-id order (see
-            :func:`_fetch_telemetry_rows`).
-        development_indices: Indices of every ``development``-phase row (see
-            :func:`_development_row_indices`); MAY be empty (a same-tick
-            guard-drop run has none).
-        drop_event_recorded_at_utc: The executed ``drop_beans`` command
-            event's ``recorded_at_utc``, or ``None`` when unavailable.
-
-    Returns:
-        The :class:`DropReading`, or ``None`` when neither the event-anchored
-        read nor the fallback heuristic can find a row with both fields.
-    """
-    if drop_event_recorded_at_utc is not None:
-        nearest = _nearest_reading_to_timestamp(rows, drop_event_recorded_at_utc)
-        if nearest is not None:
-            return nearest
-
-    if not development_indices:
-        return None
-
-    last_dev = rows[development_indices[-1]]
-    last_dev_temp = _optional_float(last_dev["bean_temp_c"])
-    last_dev_dtr = _optional_float(last_dev["development_percent"])
-    if last_dev_temp is None or last_dev_dtr is None:
-        return None
-    return DropReading(bean_temp_c=last_dev_temp, development_percent=last_dev_dtr)
 
 
 async def _terminated_abnormally(store: RoastStore, run_id: str, outcome: str | None) -> bool:
@@ -458,43 +210,6 @@ async def _terminated_abnormally(store: RoastStore, run_id: str, outcome: str | 
     return False
 
 
-async def _drop_event_recorded_at(store: RoastStore, run_id: str) -> str | None:
-    """The ``recorded_at_utc`` of ``run_id``'s executed ``drop_beans`` command event.
-
-    A drop is a ``command_executed`` :class:`~roastpilot_agent.models.RoastEventKind`
-    event whose payload ``command`` is
-    :attr:`~roastpilot_agent.models.RoastCommand.DROP_BEANS`'s value — emitted
-    for a policy, advisor, operator, OR ceiling-guard drop
-    (:meth:`RoastController._execute_drop` / ``_maybe_ceiling_guard_drop``), so
-    it is the single signal that the beans were actually dropped. A run that
-    reaches DEVELOPMENT and is then cooled/ended WITHOUT a drop (e.g. an operator
-    ``start_cooling`` recovery) has development telemetry but no drop event; its
-    post-development rows are not a drop reading and must not be scored as one.
-    One query serves both :func:`score_run`'s drop-gate (``None`` ⇒ no drop
-    ever happened) and :func:`_extract_drop_reading`'s event-anchored read
-    (a non-``None`` timestamp). The command value is bound as a query
-    parameter (mirrors the typed-value discipline of the guard/verdict
-    queries); ordered by ``id`` (insertion order) so the FIRST executed drop
-    wins on the (structurally unreachable today) chance more than one is ever
-    persisted.
-
-    Args:
-        store: The (snapshot-backed) store to read.
-        run_id: The run to check.
-
-    Returns:
-        The event's ``recorded_at_utc``, or ``None`` if no executed
-        ``drop_beans`` command event exists.
-    """
-    async with store.connection.execute(
-        "SELECT recorded_at_utc FROM roast_events WHERE run_id = ? AND kind = ?"
-        " AND json_extract(payload_json, '$.command') = ? ORDER BY id ASC LIMIT 1",
-        (run_id, RoastEventKind.COMMAND_EXECUTED.value, RoastCommand.DROP_BEANS.value),
-    ) as cursor:
-        row = await cursor.fetchone()
-    return None if row is None else str(row["recorded_at_utc"])
-
-
 async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
     """Score one run, or explain why it could not be scored.
 
@@ -516,22 +231,20 @@ async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
         return SkippedRun(run_id=run_id, reason=f"could not parse frozen profile: {exc}")
     if detail is None:
         return SkippedRun(run_id=run_id, reason="run not found")
-    rows = await _fetch_telemetry_rows(store, run_id)
     # The drop-gate is checked BEFORE the development-row check (Codex P1,
     # round 3): a same-tick ceiling-guard drop has NO development-phase row
-    # at all (see _extract_drop_reading), so gating on development_indices
-    # first would silently exclude every such guard-forced failure from the
+    # at all, so gating on development rows first would silently exclude every
+    # such guard-forced failure from the
     # corpus. Presence of an executed drop event is the correct, independent
     # gate — a run that reached DEVELOPMENT and cooled/ended WITHOUT ever
     # dropping (e.g. an operator start_cooling recovery) is still excluded.
-    drop_event_recorded_at_utc = await _drop_event_recorded_at(store, run_id)
+    drop_event_recorded_at_utc = await store.read_drop_event_recorded_at(run_id)
     if drop_event_recorded_at_utc is None:
         return SkippedRun(
             run_id=run_id,
             reason="no drop_beans command event (run cooled/ended without a bean drop)",
         )
-    development_indices = _development_row_indices(rows)
-    reading = _extract_drop_reading(rows, development_indices, drop_event_recorded_at_utc)
+    reading = await store.read_drop_reading(run_id)
     if reading is None:
         return SkippedRun(
             run_id=run_id,

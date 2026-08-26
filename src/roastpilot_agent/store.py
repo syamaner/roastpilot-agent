@@ -63,9 +63,12 @@ from roastpilot_agent.models import (
     weight_loss_percent,
 )
 from roastpilot_agent.roast_landmarks import (
+    DropReading,
+    DropReadingRow,
     earliest_onset_within_event_window,
     interpolate_at,
     is_mcp_first_crack_source,
+    select_drop_reading,
     utc_to_run_seconds,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
@@ -1269,6 +1272,55 @@ class RoastStore:
         converted = float(cast("float", value))
         return converted if math.isfinite(converted) else None
 
+    async def read_drop_event_recorded_at(self, run_id: str) -> str | None:
+        """Read the first executed ``drop_beans`` event timestamp for a run.
+
+        Args:
+            run_id: The roast run identifier.
+
+        Returns:
+            The first durable executed-drop timestamp, or ``None`` when no
+            executed bean drop was persisted.
+        """
+        async with self.connection.execute(
+            "SELECT recorded_at_utc FROM roast_events WHERE run_id = ? AND kind = ?"
+            " AND json_extract(payload_json, '$.command') = ? ORDER BY id ASC LIMIT 1",
+            (run_id, RoastEventKind.COMMAND_EXECUTED.value, RoastCommand.DROP_BEANS.value),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return None if row is None else str(row["recorded_at_utc"])
+
+    async def read_drop_reading(self, run_id: str) -> DropReading | None:
+        """Read a complete authoritative drop temperature and DTR for a run.
+
+        Both queries are read-only and use durable insertion order, so a
+        controller restart's reset tick cannot reorder persisted telemetry.
+
+        Args:
+            run_id: The roast run identifier.
+
+        Returns:
+            The event-anchored or development-row fallback reading, or
+            ``None`` when persisted evidence is incomplete.
+        """
+        async with self.connection.execute(
+            "SELECT agent_phase, bean_temp_c, development_percent, recorded_at_utc"
+            " FROM telemetry_snapshots WHERE run_id = ? ORDER BY id ASC",
+            (run_id,),
+        ) as cursor:
+            rows = [
+                DropReadingRow(
+                    agent_phase=str(row["agent_phase"]),
+                    bean_temp_c=self._optional_float(row["bean_temp_c"]),
+                    development_percent=self._optional_float(row["development_percent"]),
+                    recorded_at_utc=None
+                    if row["recorded_at_utc"] is None
+                    else str(row["recorded_at_utc"]),
+                )
+                for row in await cursor.fetchall()
+            ]
+        return select_drop_reading(rows, await self.read_drop_event_recorded_at(run_id))
+
     @staticmethod
     def _reference_onset_pair(
         candidates: list[object],
@@ -2385,9 +2437,12 @@ class RoastStore:
         best-match id query, and this builder is its internal, unfiltered
         materialization step.
 
-        Reads ``telemetry_snapshots`` for ``run_id`` in tick order and derives:
+        Reads ``telemetry_snapshots`` for ``run_id`` in insertion order and derives:
 
-        - **Landmarks**: drop is the LAST ``development``-phase row. First
+        - **Landmarks**: drop temperature is anchored to the executed
+          ``drop_beans`` event while DTR is the last frozen value; when that
+          evidence is incomplete, both fall back to the LAST
+          ``development``-phase row. First
           crack uses the accepted MCP event's backdated onset only when its
           wall-clock mapping and interpolated temperature form a complete,
           usable pre-drop pair no later than confirmation; otherwise both
@@ -2397,10 +2452,8 @@ class RoastStore:
           A row is "usable" when both ``charge_elapsed_seconds`` and
           ``bean_temp_c`` are recorded (``t_s``/``bean_c`` are non-optional on
           :class:`~roastpilot_agent.models.ReferenceCurveSample``). The curve
-          is also TRIMMED to rows at or before the drop landmark (Fix D, PR
-          #574 review) — the last-development row's position is computed
-          ONCE and shared with the drop landmark above, so the two can never
-          disagree about where the roast's "good shape" ends and the
+          is also TRIMMED to rows at or before the last-development row (Fix
+          D, PR #574 review), so the roast's "good shape" ends before the
           post-drop cooling tail (falling temperatures) begins.
 
         Args:
@@ -2486,7 +2539,6 @@ class RoastStore:
             return None
         first_dev = rows[development_indices[0]]
         last_dev_index = development_indices[-1]
-        last_dev = rows[last_dev_index]
 
         # Trim the curve to rows AT OR BEFORE the drop (Fix D): the post-drop
         # cooling tail keeps recording a FALLING bean temperature, which must
@@ -2532,11 +2584,14 @@ class RoastStore:
                 self._optional_float(first_dev["bean_temp_c"]),
             )
         )
+        drop_reading = await self.read_drop_reading(run_id)
         landmarks = ReferenceLandmarks(
             first_crack_temp_c=first_crack_temp_c,
             first_crack_elapsed_s=first_crack_elapsed_s,
-            drop_temp_c=self._optional_float(last_dev["bean_temp_c"]),
-            drop_development_percent=self._optional_float(last_dev["development_percent"]),
+            drop_temp_c=None if drop_reading is None else drop_reading.bean_temp_c,
+            drop_development_percent=(
+                None if drop_reading is None else drop_reading.development_percent
+            ),
             operator_rating=operator_rating,
         )
         return ReferenceRoast(
