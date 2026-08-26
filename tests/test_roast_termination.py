@@ -315,6 +315,56 @@ def test_commandless_invalid_lever_payload_fails_closed(payload: dict[str, objec
     )
 
 
+def test_unknown_command_with_lever_values_fails_closed() -> None:
+    """A command key prevents an unknown command from looking like a lever event."""
+    result = classify_termination(
+        run_found=True,
+        run_outcome="completed",
+        drop_anchor=DropEventAnchor(2, "2026-08-26T12:00:00+00:00"),
+        event_rows=(
+            _event(
+                1,
+                RoastEventKind.COMMAND_EXECUTED,
+                {"command": "unknown-command", "heat_percent": 55, "fan_percent": 40},
+            ),
+        ),
+        emergency_stop_recorded_at_utc=(),
+    )
+
+    assert result.classification is TerminationClassification.ABNORMAL_BEFORE_OR_AT_DROP
+    assert result.evidence == (
+        TerminationEvidence(
+            TerminationEvidenceKind.UNKNOWN_DROP_REASON,
+            EvidencePosition.BEFORE_OR_AT_DROP,
+        ),
+    )
+
+
+def test_failed_commandless_lever_payload_fails_closed() -> None:
+    """Only executed commandless lever events may bypass command parsing."""
+    result = classify_termination(
+        run_found=True,
+        run_outcome="completed",
+        drop_anchor=DropEventAnchor(2, "2026-08-26T12:00:00+00:00"),
+        event_rows=(
+            _event(
+                1,
+                RoastEventKind.COMMAND_FAILED,
+                {"heat_percent": 55, "fan_percent": 40},
+            ),
+        ),
+        emergency_stop_recorded_at_utc=(),
+    )
+
+    assert result.classification is TerminationClassification.ABNORMAL_BEFORE_OR_AT_DROP
+    assert result.evidence == (
+        TerminationEvidence(
+            TerminationEvidenceKind.UNKNOWN_DROP_REASON,
+            EvidencePosition.BEFORE_OR_AT_DROP,
+        ),
+    )
+
+
 def test_malformed_command_payload_fails_closed() -> None:
     """Raw malformed command JSON is conservative rather than a SQL/parser crash."""
     result = classify_termination(
