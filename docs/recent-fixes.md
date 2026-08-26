@@ -18,6 +18,15 @@ Format: one entry per anti-pattern.
 
 ---
 
+## Independent drop readings can source cooling-tail temperature
+*(fixed by #726 item 1, shared persisted reading)*
+
+- **Signature:** `rg -n 'development_percent IS NOT NULL|DROP_BEANS|drop_beans|_drop_time|drop_index|drop_seconds' --glob '*.py' .` — inspect each independent persisted-data reader before adding a new drop anchor.
+- **Wrong / Right:** reading both values from the last row carrying a frozen DTR can use a late cooling-tail temperature. Read temperature from the executed `drop_beans` event's nearest telemetry row and DTR from the final finite frozen value; order both queries by insertion `id`, not restart-resettable ticks. If the event anchor is incomplete, use only the last `development` row's own complete pair.
+- **Guarded by:** `test_drop_reading_temperature_comes_from_the_drop_event_row`, `test_drop_reading_dtr_comes_from_the_frozen_value_not_the_temperature_row`, `test_drop_reading_frozen_dtr_uses_insertion_order_after_tick_reset`, and `test_scorer_and_reference_roast_agree_on_the_same_run`.
+
+---
+
 ## Naive read-only SQLite URI f-strings mis-parse `?`/`#` in the path
 *(fixed by #726 item 3, scripts-only consolidation)*
 
