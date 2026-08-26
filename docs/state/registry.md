@@ -6,14 +6,14 @@
 pilot, not pilot sample 12 — this PR adds no product behaviour, capture
 parser, workflow, dependency, test fixture, production artifact, or plan
 decision. An independent product audit against the implementation tree found
-AC1–AC12 met in committed code because the pilot completed eleven samples
-within the required 10–15 reporting window. The audit returned verdict CLOSE.
+AC1–AC11 met in committed code. AC12's 10–15-sample paired-reporting
+requirement is also met because the pilot completed eleven samples in the
+window. The audit returned verdict CLOSE.
 Separately, the requested provider-efficiency comparability assessment remains
 unsupported because whole-delivery-tree Codex, parent-interactive, and
 hosted-review usage capture is incomplete; `whole_tree_verified` (a per-record
-field in `capture_usage_models.py`) is false across the pilot at aggregate
-scope, so
-no whole-delivery-tree verification holds pilot-wide. No efficiency
+field in `capture_usage_models.py`) is false at aggregate pilot scope, so no
+whole-delivery-tree verification holds pilot-wide. No efficiency
 comparison is drawn and no routing, price, quota, or model-allocation policy
 change is proposed or made here. No new plan D-number is taken by this
 closeout. No hardware operation and no production artifact publication
