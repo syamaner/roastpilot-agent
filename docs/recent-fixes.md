@@ -27,6 +27,15 @@ Format: one entry per anti-pattern.
 
 ---
 
+## Script-local abnormal termination ignores the durable drop boundary
+*(fixed by #726 item 2, shared termination classifier)*
+
+- **Signature:** `rg -n 'SafetyVerdict\.EMERGENCY_STOP\.value|DropReason\.CEILING_GUARD\.value' --glob '*.py' .`; `rg -n "outcome != .completed." --glob '*.py' .`; `rg -n "json_extract\\(payload_json" --glob '*.py' .` — inspect RP-D consumers for an independent outcome/verdict/reason derivation.
+- **Wrong / Right:** classifying a run abnormal from any `outcome != 'completed'`, any e-stop verdict anywhere, or an executed event reason alone can zero a valid roast whose e-stop happened in the cooling tail and miss a guard crossing whose attempt failed. Classify relative to the first successfully executed `drop_beans`; order `roast_events` by insertion `id`; compare cross-table evidence only by parseable UTC with strict `>`; count failed typed ceiling-guard drops; fail closed on equality, malformed/missing timestamps, unknown typed values, and uncorroborated outcomes.
+- **Guarded by:** `test_post_drop_emergency_stop_after_clean_drop_is_scorable_with_provenance`, `test_failed_ceiling_guard_then_development_target_drop_is_abnormal`, `test_same_tick_guard_drop_classifies_from_command_evidence_alone`, `test_equal_cross_table_timestamps_fail_closed`, `test_unknown_drop_reason_fails_closed`, `test_uncorroborated_outcome_and_pre_drop_fault_fail_closed`, and `test_event_positioning_and_anchor_selection_use_insertion_id`.
+
+---
+
 ## Naive read-only SQLite URI f-strings mis-parse `?`/`#` in the path
 *(fixed by #726 item 3, scripts-only consolidation)*
 

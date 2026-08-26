@@ -71,6 +71,13 @@ from roastpilot_agent.roast_landmarks import (
     select_drop_reading,
     utc_to_run_seconds,
 )
+from roastpilot_agent.roast_termination import (
+    DropEventAnchor,
+    RunTermination,
+    TerminationEventRow,
+    classify_termination,
+    select_first_executed_drop_event,
+)
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
 
 _log = logging.getLogger(__name__)
@@ -1272,6 +1279,34 @@ class RoastStore:
         converted = float(cast("float", value))
         return converted if math.isfinite(converted) else None
 
+    async def read_first_executed_drop_event(self, run_id: str) -> DropEventAnchor | None:
+        """Read the first durably recorded executed ``drop_beans`` event.
+
+        Args:
+            run_id: The roast run identifier.
+
+        Returns:
+            The first durable executed-drop anchor, or ``None`` when no
+            closed-grammar event payload proves an executed bean drop.
+        """
+        async with self.connection.execute(
+            "SELECT id, kind, recorded_at_utc, payload_json FROM roast_events"
+            " WHERE run_id = ? AND kind = ? ORDER BY id ASC",
+            (run_id, RoastEventKind.COMMAND_EXECUTED.value),
+        ) as cursor:
+            rows = [
+                TerminationEventRow(
+                    event_id=int(row["id"]),
+                    kind=str(row["kind"]),
+                    payload_json=None if row["payload_json"] is None else str(row["payload_json"]),
+                    recorded_at_utc=None
+                    if row["recorded_at_utc"] is None
+                    else str(row["recorded_at_utc"]),
+                )
+                for row in await cursor.fetchall()
+            ]
+        return select_first_executed_drop_event(rows)
+
     async def read_drop_event_recorded_at(self, run_id: str) -> str | None:
         """Read the first executed ``drop_beans`` event timestamp for a run.
 
@@ -1282,13 +1317,57 @@ class RoastStore:
             The first durable executed-drop timestamp, or ``None`` when no
             executed bean drop was persisted.
         """
+        anchor = await self.read_first_executed_drop_event(run_id)
+        return None if anchor is None else anchor.recorded_at_utc
+
+    async def read_termination(self, run_id: str) -> RunTermination:
+        """Classify persisted abnormal-termination evidence without writing.
+
+        Args:
+            run_id: The roast run identifier.
+
+        Returns:
+            A fail-closed termination classification. A missing run is never
+            returned as ``None`` or interpreted as normal.
+        """
         async with self.connection.execute(
-            "SELECT recorded_at_utc FROM roast_events WHERE run_id = ? AND kind = ?"
-            " AND json_extract(payload_json, '$.command') = ? ORDER BY id ASC LIMIT 1",
-            (run_id, RoastEventKind.COMMAND_EXECUTED.value, RoastCommand.DROP_BEANS.value),
+            "SELECT outcome FROM roast_runs WHERE id = ?", (run_id,)
         ) as cursor:
-            row = await cursor.fetchone()
-        return None if row is None else str(row["recorded_at_utc"])
+            run_row = await cursor.fetchone()
+        async with self.connection.execute(
+            "SELECT id, kind, payload_json FROM roast_events WHERE run_id = ?"
+            " AND kind IN (?, ?, ?) ORDER BY id ASC",
+            (
+                run_id,
+                RoastEventKind.COMMAND_EXECUTED.value,
+                RoastEventKind.COMMAND_FAILED.value,
+                RoastEventKind.FAULT.value,
+            ),
+        ) as cursor:
+            event_rows = [
+                TerminationEventRow(
+                    event_id=int(row["id"]),
+                    kind=str(row["kind"]),
+                    payload_json=None if row["payload_json"] is None else str(row["payload_json"]),
+                )
+                for row in await cursor.fetchall()
+            ]
+        async with self.connection.execute(
+            "SELECT recorded_at_utc FROM safety_evaluations"
+            " WHERE run_id = ? AND verdict = ? ORDER BY id ASC",
+            (run_id, SafetyVerdict.EMERGENCY_STOP.value),
+        ) as cursor:
+            emergency_stop_recorded_at_utc = [
+                None if row["recorded_at_utc"] is None else str(row["recorded_at_utc"])
+                for row in await cursor.fetchall()
+            ]
+        return classify_termination(
+            run_found=run_row is not None,
+            run_outcome=None if run_row is None else cast(str | None, run_row["outcome"]),
+            drop_anchor=await self.read_first_executed_drop_event(run_id),
+            event_rows=event_rows,
+            emergency_stop_recorded_at_utc=emergency_stop_recorded_at_utc,
+        )
 
     async def read_drop_reading(self, run_id: str) -> DropReading | None:
         """Read a complete authoritative drop temperature and DTR for a run.

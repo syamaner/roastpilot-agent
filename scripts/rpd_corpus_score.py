@@ -1,4 +1,4 @@
-"""RP-D joint-objective offline corpus scorer (#711, plan D124, PR-D2).
+"""RP-D joint-objective offline corpus scorer (#711, plan D175, PR-D2).
 
 Scores every finished, non-excluded roast in the real operator SQLite store
 against the RP-D joint-window metric (:func:`bakeoff_replay.joint_window_score`,
@@ -24,15 +24,14 @@ LLM, no network, no store WRITE of any kind.
   non-finite values, and uses ``id`` rather than resettable ``tick`` ordering.
   The anchor is attempted before the fallback even when no development row
   exists, retaining same-tick guard-drop scoring.
-- ``terminated_abnormally`` is ``True`` whenever ``outcome != 'completed'``
-  (aborted/faulted), OR — within an otherwise ``'completed'`` run — a
-  cleanly-detectable guard/emergency termination: an ``emergency_stop``
-  :class:`~roastpilot_agent.safety.SafetyVerdict` anywhere in the run's
-  ``safety_evaluations``, or a ceiling-guard drop (a persisted
-  ``command_executed`` event whose payload's typed ``reason`` is
-  ``DropReason.CEILING_GUARD.value``, D88 amendment A1). Both are queried
-  directly off typed enum values bound as SQL parameters (D15: never a raw
-  string literal) — no heuristic re-derivation from temperature/DTR.
+- Termination is classified by :meth:`roastpilot_agent.store.RoastStore.read_termination`.
+  The first successfully executed ``drop_beans`` event is the boundary;
+  ``roast_events`` evidence is positioned by durable insertion ``id`` and
+  cross-table evidence only by parseable UTC timestamps with strict ``>``.
+  Equality, malformed/missing timestamps, unknown typed values, and
+  uncorroborated outcomes fail closed to abnormal-before-or-at-drop. Ceiling
+  guard evidence includes both successful drops and failed ``drop_beans``
+  attempts carrying the typed ceiling-guard reason.
 
 **Read-only store isolation.** Never opens the operator's real
 ``~/roasts/roastpilot.sqlite3`` directly: :func:`store_snapshot.snapshot_store_to_temp`
@@ -82,11 +81,7 @@ from roastpilot_agent.ambient_evidence import (  # noqa: E402
     FractionBasis,
     derive_ambient_doctrine_evidence,
 )
-from roastpilot_agent.models import (  # noqa: E402
-    DropReason,
-    RoastEventKind,
-)
-from roastpilot_agent.safety import SafetyVerdict  # noqa: E402
+from roastpilot_agent.roast_termination import RunTermination  # noqa: E402
 from roastpilot_agent.store import RoastStore  # noqa: E402
 
 #: Default operator store path (mirrors every other offline bake-off script).
@@ -105,6 +100,7 @@ class ScoredRun:
         rating: The D42 operator rating (1-5), or ``None`` when never rated.
             ALWAYS rendered alongside the scalar (the #711 Goodhart guard).
         score: The :class:`~bakeoff_replay.JointWindowScore`.
+        termination: Stable abnormal-termination classification provenance.
     """
 
     run_id: str
@@ -113,6 +109,7 @@ class ScoredRun:
     rating: int | None
     score: JointWindowScore
     ambient_evidence: AmbientDoctrineEvidence
+    termination: RunTermination
 
 
 @dataclasses.dataclass(frozen=True)
@@ -167,49 +164,6 @@ def _finite_or_none(value: float | None) -> float | None:
     return value
 
 
-async def _terminated_abnormally(store: RoastStore, run_id: str, outcome: str | None) -> bool:
-    """Whether ``run_id`` ended in a guard-drop, emergency stop, or fault.
-
-    ``outcome != 'completed'`` (aborted/faulted) is always abnormal. Within an
-    otherwise ``'completed'`` run, this additionally checks for the two
-    cleanly-detectable in-run guard events: an ``emergency_stop``
-    :class:`~roastpilot_agent.safety.SafetyVerdict` anywhere in
-    ``safety_evaluations`` for the run, or a ceiling-guard drop — a
-    ``command_executed`` :class:`~roastpilot_agent.models.RoastEventKind`
-    event whose payload's ``reason`` key is
-    :attr:`~roastpilot_agent.models.DropReason.CEILING_GUARD`'s value (D88
-    amendment A1's decoupled bitter-line safety anchor,
-    :meth:`~roastpilot_agent.controller.RoastController._maybe_ceiling_guard_drop`).
-    Both typed enum values are bound as query parameters (D15: never a raw
-    SQL string literal for a verdict/reason comparison).
-
-    Args:
-        store: The (snapshot-backed) store to read.
-        run_id: The run to check.
-        outcome: The run's ``roast_runs.outcome`` (``None`` for an unfinished
-            run, though callers only ever pass a finished run's outcome here).
-
-    Returns:
-        ``True`` if the run's termination was abnormal per the rule above.
-    """
-    if outcome != "completed":
-        return True
-    async with store.connection.execute(
-        "SELECT 1 FROM safety_evaluations WHERE run_id = ? AND verdict = ? LIMIT 1",
-        (run_id, SafetyVerdict.EMERGENCY_STOP.value),
-    ) as cursor:
-        if await cursor.fetchone() is not None:
-            return True
-    async with store.connection.execute(
-        "SELECT 1 FROM roast_events WHERE run_id = ? AND kind = ?"
-        " AND json_extract(payload_json, '$.reason') = ? LIMIT 1",
-        (run_id, RoastEventKind.COMMAND_EXECUTED.value, DropReason.CEILING_GUARD.value),
-    ) as cursor:
-        if await cursor.fetchone() is not None:
-            return True
-    return False
-
-
 async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
     """Score one run, or explain why it could not be scored.
 
@@ -251,14 +205,14 @@ async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
             reason="no drop reading (no telemetry near the drop event and no usable "
             "development-phase row to fall back on)",
         )
-    terminated_abnormally = await _terminated_abnormally(store, run_id, detail.outcome)
+    termination = await store.read_termination(run_id)
     try:
         score = joint_window_score(
             drop_temp_c=reading.bean_temp_c,
             target_drop_temp_c=detail.profile.target_drop_temp_c,
             dtr_percent=reading.development_percent,
             target_dtr_percent=detail.profile.target_development_percent,
-            terminated_abnormally=terminated_abnormally,
+            terminated_abnormally=termination.terminated_abnormally,
         )
     except ValueError as exc:
         # joint_window_score fails closed on a non-finite achieved/target value
@@ -282,6 +236,7 @@ async def score_run(store: RoastStore, run_id: str) -> ScoredRun | SkippedRun:
         rating=detail.rating,
         score=score,
         ambient_evidence=ambient_evidence,
+        termination=termination,
     )
 
 
@@ -535,6 +490,13 @@ def report_to_json(report: CorpusReport) -> dict[str, Any]:
         entry["ambient_temp_c"] = run.ambient_temp_c
         entry["operator_rating"] = run.rating
         entry["ambient_doctrine_evidence"] = run.ambient_evidence.model_dump(mode="json")
+        entry["termination"] = {
+            "classification": run.termination.classification.value,
+            "evidence": [
+                {"kind": evidence.kind.value, "position": evidence.position.value}
+                for evidence in run.termination.evidence
+            ],
+        }
         runs.append(entry)
     return {
         "ambient_evidence_claim": AMBIENT_EVIDENCE_CLAIM,
