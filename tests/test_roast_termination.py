@@ -266,7 +266,16 @@ def test_ordinary_lever_and_known_non_roast_failure_events_are_ignored() -> None
         event_rows=(
             _event(1, RoastEventKind.COMMAND_EXECUTED, {"heat_percent": 55, "fan_percent": 40}),
             _event(2, RoastEventKind.COMMAND_FAILED, {"command": "set_targets"}),
-            _event(3, RoastEventKind.COMMAND_FAILED, {"command": "shutdown_heat_off"}),
+            _event(
+                3,
+                RoastEventKind.COMMAND_FAILED,
+                {
+                    "command": "shutdown_heat_off",
+                    "context": "shutdown",
+                    "unconfirmed": True,
+                    "reason": "timeout",
+                },
+            ),
             _event(4, RoastEventKind.COMMAND_FAILED, {"command": "mcp_stop"}),
         ),
         emergency_stop_recorded_at_utc=(),
@@ -274,6 +283,36 @@ def test_ordinary_lever_and_known_non_roast_failure_events_are_ignored() -> None
 
     assert result.classification is TerminationClassification.NORMAL
     assert result.evidence == ()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"heat_percent": True, "fan_percent": 40},
+        {"heat_percent": 55, "fan_percent": False},
+        {"fan_percent": 40},
+        {"heat_percent": 55},
+        {"heat_percent": "55", "fan_percent": 40},
+        {"heat_percent": 55, "fan_percent": "40"},
+    ],
+)
+def test_commandless_invalid_lever_payload_fails_closed(payload: dict[str, object]) -> None:
+    """Only integer heat/fan lever payloads are ordinary executed commands."""
+    result = classify_termination(
+        run_found=True,
+        run_outcome="completed",
+        drop_anchor=DropEventAnchor(2, "2026-08-26T12:00:00+00:00"),
+        event_rows=(_event(1, RoastEventKind.COMMAND_EXECUTED, payload),),
+        emergency_stop_recorded_at_utc=(),
+    )
+
+    assert result.classification is TerminationClassification.ABNORMAL_BEFORE_OR_AT_DROP
+    assert result.evidence == (
+        TerminationEvidence(
+            TerminationEvidenceKind.UNKNOWN_DROP_REASON,
+            EvidencePosition.BEFORE_OR_AT_DROP,
+        ),
+    )
 
 
 def test_malformed_command_payload_fails_closed() -> None:
