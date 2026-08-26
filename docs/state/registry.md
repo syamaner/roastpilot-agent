@@ -590,10 +590,9 @@ mark-ready/reopen draft-cycle workaround for metadata edits.**
 > OUTCOMES, so it is a standalone corpus scorer reading the frozen `profile_json`
 > targets, deliberately NOT wired into `advisor_bakeoff.py` (the replay context's
 > targets default to the achieved values = a self-comparison that always HITs);
-> D124 clarified in `roastpilot-plan`. **Follow-ups:** **#726** (shared
-> `RoastStore.read_drop_reading` + abnormal-termination classifier + snapshot/URI
-> helper; owns robust guard-drop classification — two review findings deferred
-> there, zero current-corpus impact as all 15 drops are advisor-sourced). **#711
+> D124 clarified in `roastpilot-plan`. **Follow-ups:** **#726**'s shared
+> `RoastStore.read_drop_reading`, boundary-relative abnormal-termination classifier,
+> and snapshot/URI helper are complete. **#711
 > itself stays OPEN by design** — its remaining item, registering the two
 > Conebosque roasts as labelled fixtures, is folded into RP-B's kickoff (they are
 > RP-B's replay-harness eval input, not needed by the store-reading scorer). No PR
