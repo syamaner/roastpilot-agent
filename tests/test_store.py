@@ -3960,6 +3960,37 @@ async def _record_row(
     )
 
 
+async def _insert_drop_telemetry(
+    store: RoastStore,
+    run_id: str,
+    *,
+    tick: int,
+    phase: RoastPhase,
+    bean_temp: float | None,
+    dtr: float | None,
+    recorded_at: str,
+) -> None:
+    """Insert deterministic timestamped telemetry for drop-reading tests."""
+    await store.connection.execute(
+        "INSERT INTO telemetry_snapshots "
+        "(run_id, tick, recorded_at_utc, agent_phase, bean_temp_c, development_percent) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (run_id, tick, recorded_at, phase.value, bean_temp, dtr),
+    )
+    await store.connection.commit()
+
+
+async def _record_executed_drop(store: RoastStore, run_id: str, *, recorded_at: str) -> None:
+    """Record an executed bean-drop event with a deterministic timestamp."""
+    await store.record_event(
+        run_id=run_id,
+        kind=RoastEventKind.COMMAND_EXECUTED,
+        source=RoastEventSource.CONTROLLER,
+        payload={"command": RoastCommand.DROP_BEANS.value},
+        recorded_at_utc=recorded_at,
+    )
+
+
 async def _seed_onset_reference(
     store: RoastStore,
     *,
@@ -5604,8 +5635,8 @@ async def test_build_reference_roast_uses_constant_mcp_statement_shape(
         mcp_small = await build_statements("mcp-small")
         mcp_large = await build_statements("mcp-large")
         operator = await build_statements("operator")
-        assert len(mcp_small) == len(mcp_large) == 3
-        assert len(operator) == 2
+        assert len(mcp_small) == len(mcp_large) == 5
+        assert len(operator) == 4
         for statements, run_id in ((mcp_small, "mcp-small"), (mcp_large, "mcp-large")):
             onset_sql, onset_parameters = next(
                 (sql, parameters) for sql, parameters in statements if "json_valid" in sql
@@ -6339,5 +6370,240 @@ async def test_load_reference_roast_returns_none_when_every_candidate_is_unbuild
         await _seed_unbuildable_run(tmp_store, "unbuildable-b", profile=profile, rating=4)
 
         assert await tmp_store.load_reference_roast(slug, 250.0) is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_read_drop_event_recorded_at_returns_the_first_executed_drop(
+    tmp_store: RoastStore,
+) -> None:
+    """Only the first durable executed drop event is the authoritative gate."""
+    await tmp_store.initialize()
+    try:
+        await tmp_store.create_run(
+            run_id="drop-events",
+            profile=_reference_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await tmp_store.record_event(
+            run_id="drop-events",
+            kind=RoastEventKind.PHASE_CHANGED,
+            source=RoastEventSource.CONTROLLER,
+            payload={"phase": "cooling", "command": RoastCommand.DROP_BEANS.value},
+            recorded_at_utc="2026-01-01T00:00:00+00:00",
+        )
+        await _record_executed_drop(
+            tmp_store, "drop-events", recorded_at="2026-01-01T00:00:10+00:00"
+        )
+        await _record_executed_drop(
+            tmp_store, "drop-events", recorded_at="2026-01-01T00:00:05+00:00"
+        )
+        assert (
+            await tmp_store.read_drop_event_recorded_at("drop-events")
+            == "2026-01-01T00:00:10+00:00"
+        )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_read_drop_event_recorded_at_orders_by_id_not_timestamp(
+    tmp_store: RoastStore,
+) -> None:
+    """Restart-safe insertion order outranks contradictory wall-clock values."""
+    await tmp_store.initialize()
+    try:
+        await tmp_store.create_run(
+            run_id="event-order",
+            profile=_reference_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await _record_executed_drop(
+            tmp_store, "event-order", recorded_at="2026-01-01T00:00:10+00:00"
+        )
+        await _record_executed_drop(
+            tmp_store, "event-order", recorded_at="2026-01-01T00:00:00+00:00"
+        )
+        assert (
+            await tmp_store.read_drop_event_recorded_at("event-order")
+            == "2026-01-01T00:00:10+00:00"
+        )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_drop_reading_frozen_dtr_uses_insertion_order_after_tick_reset(
+    tmp_store: RoastStore,
+) -> None:
+    """The final frozen DTR follows durable ids, never process-local ticks."""
+    await tmp_store.initialize()
+    try:
+        await tmp_store.create_run(
+            run_id="tick-reset",
+            profile=_reference_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await _insert_drop_telemetry(
+            tmp_store,
+            "tick-reset",
+            tick=50,
+            phase=RoastPhase.DEVELOPMENT,
+            bean_temp=188.0,
+            dtr=15.0,
+            recorded_at="2026-01-01T00:00:00+00:00",
+        )
+        await _insert_drop_telemetry(
+            tmp_store,
+            "tick-reset",
+            tick=0,
+            phase=RoastPhase.COOLING,
+            bean_temp=190.0,
+            dtr=20.0,
+            recorded_at="2026-01-01T00:00:05+00:00",
+        )
+        await _record_executed_drop(
+            tmp_store, "tick-reset", recorded_at="2026-01-01T00:00:00+00:00"
+        )
+        reading = await tmp_store.read_drop_reading("tick-reset")
+        assert reading is not None
+        assert (reading.bean_temp_c, reading.development_percent) == (188.0, 20.0)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_drop_landmark_uses_the_drop_event_anchor(
+    tmp_store: RoastStore,
+) -> None:
+    """Landmarks use the drop event while the reference curve stays development-trimmed."""
+    await tmp_store.initialize()
+    try:
+        await tmp_store.create_run(
+            run_id="anchored-reference",
+            profile=_reference_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await _insert_drop_telemetry(
+            tmp_store,
+            "anchored-reference",
+            tick=1,
+            phase=RoastPhase.DEVELOPMENT,
+            bean_temp=188.0,
+            dtr=10.0,
+            recorded_at="2026-01-01T00:00:00+00:00",
+        )
+        await tmp_store.connection.execute(
+            "UPDATE telemetry_snapshots SET charge_elapsed_seconds = 600.0 WHERE run_id = ?",
+            ("anchored-reference",),
+        )
+        await _insert_drop_telemetry(
+            tmp_store,
+            "anchored-reference",
+            tick=2,
+            phase=RoastPhase.DEVELOPMENT,
+            bean_temp=190.0,
+            dtr=15.1,
+            recorded_at="2026-01-01T00:00:10+00:00",
+        )
+        await tmp_store.connection.execute(
+            "UPDATE telemetry_snapshots SET charge_elapsed_seconds = 650.0 "
+            "WHERE run_id = ? AND tick = 2",
+            ("anchored-reference",),
+        )
+        await tmp_store.connection.commit()
+        await _record_executed_drop(
+            tmp_store, "anchored-reference", recorded_at="2026-01-01T00:00:00+00:00"
+        )
+        await tmp_store.complete_run(
+            run_id="anchored-reference", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_operator_rating("anchored-reference", rating=4)
+        reference = await tmp_store._build_reference_roast("anchored-reference", "test")  # pyright: ignore[reportPrivateUsage]
+        assert reference is not None
+        assert reference.landmarks.drop_temp_c == 188.0
+        assert reference.landmarks.drop_development_percent == 15.1
+        assert reference.curve[-1].bean_c == 190.0
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_read_drop_reading_writes_nothing(tmp_store: RoastStore) -> None:
+    """The public drop-reading API is SELECT-only over the roast store."""
+    await tmp_store.initialize()
+    try:
+        await tmp_store.create_run(
+            run_id="read-only",
+            profile=_reference_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await _insert_drop_telemetry(
+            tmp_store,
+            "read-only",
+            tick=1,
+            phase=RoastPhase.DEVELOPMENT,
+            bean_temp=188.0,
+            dtr=20.0,
+            recorded_at="2026-01-01T00:00:00+00:00",
+        )
+        await _record_executed_drop(tmp_store, "read-only", recorded_at="2026-01-01T00:00:00+00:00")
+        async with tmp_store.connection.execute(
+            "SELECT (SELECT COUNT(*) FROM roast_runs), "
+            "(SELECT COUNT(*) FROM telemetry_snapshots), "
+            "(SELECT COUNT(*) FROM roast_events), "
+            "(SELECT updated_at_utc FROM roast_runs WHERE id = 'read-only')"
+        ) as cursor:
+            before_row = await cursor.fetchone()
+        assert before_row is not None
+        before = tuple(before_row)
+        assert await tmp_store.read_drop_event_recorded_at("read-only") is not None
+        assert await tmp_store.read_drop_reading("read-only") is not None
+        async with tmp_store.connection.execute(
+            "SELECT (SELECT COUNT(*) FROM roast_runs), "
+            "(SELECT COUNT(*) FROM telemetry_snapshots), "
+            "(SELECT COUNT(*) FROM roast_events), "
+            "(SELECT updated_at_utc FROM roast_runs WHERE id = 'read-only')"
+        ) as cursor:
+            after_row = await cursor.fetchone()
+        assert after_row is not None
+        after = tuple(after_row)
+        assert after == before
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_drop_reading_treats_a_non_finite_temperature_as_absent(
+    tmp_store: RoastStore,
+) -> None:
+    """SQLite infinity is absent from the shared finite-only projection."""
+    await tmp_store.initialize()
+    try:
+        await tmp_store.create_run(
+            run_id="non-finite",
+            profile=_reference_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await _insert_drop_telemetry(
+            tmp_store,
+            "non-finite",
+            tick=1,
+            phase=RoastPhase.COOLING,
+            bean_temp=float("inf"),
+            dtr=20.9,
+            recorded_at="2026-01-01T00:00:00+00:00",
+        )
+        await _record_executed_drop(
+            tmp_store, "non-finite", recorded_at="2026-01-01T00:00:00+00:00"
+        )
+        assert await tmp_store.read_drop_reading("non-finite") is None
     finally:
         await tmp_store.close()

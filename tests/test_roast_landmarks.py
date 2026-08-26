@@ -20,6 +20,16 @@ import roast_landmarks as landmarks  # noqa: E402
 import store_to_fixture as s2f  # noqa: E402
 
 
+def _drop_row(
+    phase: str,
+    temperature: float | None,
+    dtr: float | None,
+    recorded_at: str | None,
+) -> package_landmarks.DropReadingRow:
+    """Build one synthetic persisted row for drop-reading selection tests."""
+    return package_landmarks.DropReadingRow(phase, temperature, dtr, recorded_at)
+
+
 def _status(value: str) -> str:
     """Build one synthetic raw first-crack status state."""
     return json.dumps({"first_crack_status": {"detected_at_utc": value}})
@@ -177,6 +187,143 @@ def test_package_utc_mapping_rejects_unsafe_inputs(
 ) -> None:
     """Invalid, non-finite, and negative mappings are absent."""
     assert package_landmarks.utc_to_run_seconds(target, anchors) is None
+
+
+def test_drop_reading_temperature_comes_from_the_drop_event_row() -> None:
+    """The cooling-tail frozen-DTR row cannot replace the event-anchored temperature."""
+    reading = package_landmarks.select_drop_reading(
+        [
+            _drop_row("development", 188.0, 20.9, "2026-01-01T00:00:00+00:00"),
+            _drop_row("cooling", 195.0, 20.9, "2026-01-01T00:00:05+00:00"),
+        ],
+        "2026-01-01T00:00:00+00:00",
+    )
+    assert reading is not None
+    assert reading.bean_temp_c == 188.0
+    assert reading.development_percent == 20.9
+    assert reading.source is package_landmarks.DropReadingSource.DROP_EVENT_ANCHOR
+
+
+def test_drop_reading_dtr_comes_from_the_frozen_value_not_the_temperature_row() -> None:
+    """A throttle-suppressed anchor DTR is recovered from the frozen value."""
+    reading = package_landmarks.select_drop_reading(
+        [
+            _drop_row("development", 188.0, None, "2026-01-01T00:00:00+00:00"),
+            _drop_row("cooling", 195.0, 20.9, "2026-01-01T00:00:05+00:00"),
+        ],
+        "2026-01-01T00:00:00+00:00",
+    )
+    assert reading is not None
+    assert (reading.bean_temp_c, reading.development_percent) == (188.0, 20.9)
+
+
+def test_drop_reading_scores_a_same_tick_guard_drop_with_no_development_row() -> None:
+    """A cooling-tagged same-tick guard drop remains event-anchor readable."""
+    reading = package_landmarks.select_drop_reading(
+        [_drop_row("cooling", 198.0, 0.5, "2026-01-01T00:00:00+00:00")],
+        "2026-01-01T00:00:00+00:00",
+    )
+    assert reading is not None
+    assert reading.source is package_landmarks.DropReadingSource.DROP_EVENT_ANCHOR
+
+
+def test_drop_reading_falls_back_to_last_development_row_without_a_drop_event() -> None:
+    """Absent event evidence uses the last development row's own complete reading."""
+    reading = package_landmarks.select_drop_reading(
+        [
+            _drop_row("development", 190.0, 15.1, "2026-01-01T00:00:00+00:00"),
+            _drop_row("cooling", 180.0, 15.1, "2026-01-01T00:00:05+00:00"),
+        ],
+        None,
+    )
+    assert reading is not None
+    assert (reading.bean_temp_c, reading.development_percent) == (190.0, 15.1)
+    assert reading.source is package_landmarks.DropReadingSource.LAST_DEVELOPMENT_ROW
+
+
+def test_drop_reading_falls_back_on_an_unparseable_event_timestamp() -> None:
+    """An unusable event timestamp cannot prevent the safe fallback."""
+    reading = package_landmarks.select_drop_reading(
+        [_drop_row("development", 195.0, 16.0, "2026-01-01T00:00:00+00:00")], "bad"
+    )
+    assert reading is not None
+    assert reading.source is package_landmarks.DropReadingSource.LAST_DEVELOPMENT_ROW
+
+
+def test_drop_reading_naive_row_timestamp_compares_safely() -> None:
+    """Legacy naive row timestamps are normalized before anchor comparison."""
+    reading = package_landmarks.select_drop_reading(
+        [_drop_row("development", 195.0, 16.0, "2026-01-01T00:00:00")],
+        "2026-01-01T00:00:00.500000+00:00",
+    )
+    assert reading is not None
+    assert reading.bean_temp_c == 195.0
+
+
+def test_drop_reading_skips_rows_with_unparseable_timestamps() -> None:
+    """A malformed candidate timestamp is skipped instead of aborting selection."""
+    reading = package_landmarks.select_drop_reading(
+        [
+            _drop_row("development", 180.0, 10.0, "bad"),
+            _drop_row("cooling", 195.0, 16.0, "2026-01-01T00:00:00.5+00:00"),
+        ],
+        "2026-01-01T00:00:00+00:00",
+    )
+    assert reading is not None
+    assert reading.bean_temp_c == 195.0
+
+
+def test_drop_reading_returns_none_for_an_empty_row_set() -> None:
+    """No rows never raises or fabricates a partial reading."""
+    assert package_landmarks.select_drop_reading([], "2026-01-01T00:00:00+00:00") is None
+
+
+def test_drop_reading_returns_none_when_no_row_ever_recorded_a_dtr() -> None:
+    """An anchor temperature without a frozen DTR is incomplete evidence."""
+    assert (
+        package_landmarks.select_drop_reading(
+            [_drop_row("cooling", 188.0, None, "2026-01-01T00:00:00+00:00")],
+            "2026-01-01T00:00:00+00:00",
+        )
+        is None
+    )
+
+
+def test_drop_reading_returns_none_when_no_row_ever_recorded_a_temperature() -> None:
+    """A frozen DTR without a usable temperature is incomplete evidence."""
+    assert (
+        package_landmarks.select_drop_reading(
+            [_drop_row("cooling", None, 20.9, "2026-01-01T00:00:00+00:00")],
+            "2026-01-01T00:00:00+00:00",
+        )
+        is None
+    )
+
+
+def test_drop_reading_fallback_ignores_a_complete_but_fallen_successor_row() -> None:
+    """Fallback never guesses that a later cooling sample was the drop."""
+    reading = package_landmarks.select_drop_reading(
+        [
+            _drop_row("development", 195.0, 16.0, "2026-01-01T00:00:00+00:00"),
+            _drop_row("cooling", 180.0, 16.0, "2026-01-01T00:00:25+00:00"),
+        ],
+        "bad",
+    )
+    assert reading is not None
+    assert reading.bean_temp_c == 195.0
+
+
+def test_drop_reading_anchor_tie_breaks_on_insertion_order() -> None:
+    """Equal anchor distances retain the earlier inserted telemetry row."""
+    reading = package_landmarks.select_drop_reading(
+        [
+            _drop_row("development", 188.0, 20.9, "2026-01-01T00:00:00+00:00"),
+            _drop_row("cooling", 195.0, 20.9, "2026-01-01T00:00:02+00:00"),
+        ],
+        "2026-01-01T00:00:01+00:00",
+    )
+    assert reading is not None
+    assert reading.bean_temp_c == 188.0
 
 
 def test_package_utc_mapping_replaces_a_farther_anchor() -> None:

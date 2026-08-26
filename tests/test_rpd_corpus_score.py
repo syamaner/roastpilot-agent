@@ -299,13 +299,30 @@ async def test_score_run_ignores_a_genuine_later_cooling_tail_row(
     await tmp_store.initialize()
     try:
         profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
-        await _seed_scoreable_run(
+        await _create_run(tmp_store, "cooling-tail-run", profile=profile)
+        await _insert_telemetry_row_at(
             tmp_store,
             "cooling-tail-run",
-            profile=profile,
-            drop_temp_c=195.0,
-            dtr_percent=16.0,
-            add_cooling_tail=True,
+            1,
+            phase=RoastPhase.DEVELOPMENT,
+            bean_temp=195.0,
+            dev_pct=16.0,
+            recorded_at_utc="2026-01-01T00:00:00.000000+00:00",
+        )
+        await _record_drop_event(
+            tmp_store, "cooling-tail-run", recorded_at_utc="2026-01-01T00:00:00.100000+00:00"
+        )
+        await _insert_telemetry_row_at(
+            tmp_store,
+            "cooling-tail-run",
+            2,
+            phase=RoastPhase.COOLING,
+            bean_temp=175.0,
+            dev_pct=None,
+            recorded_at_utc="2026-01-01T00:00:25.000000+00:00",
+        )
+        await tmp_store.complete_run(
+            run_id="cooling-tail-run", outcome="completed", agent_phase=RoastPhase.COMPLETE
         )
         result = await scorer.score_run(tmp_store, "cooling-tail-run")
         assert isinstance(result, scorer.ScoredRun)
@@ -389,15 +406,10 @@ async def test_score_run_prefers_the_transition_tick_row_over_the_last_developme
 
 
 @pytest.mark.asyncio
-async def test_fetch_telemetry_rows_orders_by_insertion_id_not_tick(
+async def test_store_drop_reading_orders_by_insertion_id_not_tick(
     tmp_store: RoastStore,
 ) -> None:
-    """Telemetry chronology follows the durable insertion id, never
-    ``(tick, id)`` (fix #1, Codex P1): a restart resets the process-local
-    tick counter to zero, so a post-restart row can carry a LOWER tick than
-    an older pre-restart row despite being chronologically LATER. Mirrors
-    ``RoastStore.read_telemetry_points``'s own documented insertion-id rule.
-    """
+    """A restarted run's final frozen DTR follows durable insertion id."""
     await tmp_store.initialize()
     try:
         profile = _profile()
@@ -413,7 +425,7 @@ async def test_fetch_telemetry_rows_orders_by_insertion_id_not_tick(
             500,
             phase=RoastPhase.DEVELOPMENT,
             bean_temp=190.0,
-            dev_pct=None,
+            dev_pct=15.0,
             recorded_at_utc="2026-01-01T00:00:00.000000+00:00",
         )
         # Post-restart: the tick counter reset to a LOW value, inserted
@@ -424,16 +436,15 @@ async def test_fetch_telemetry_rows_orders_by_insertion_id_not_tick(
             5,
             phase=RoastPhase.DEVELOPMENT,
             bean_temp=170.0,
-            dev_pct=None,
+            dev_pct=20.0,
             recorded_at_utc="2026-01-01T00:01:00.000000+00:00",
         )
-        rows = await scorer._fetch_telemetry_rows(  # pyright: ignore[reportPrivateUsage]
-            tmp_store, "restart-run"
+        await _record_drop_event(
+            tmp_store, "restart-run", recorded_at_utc="2026-01-01T00:00:00.000000+00:00"
         )
-        # Insertion (id) order: the pre-restart (high-tick) row first, the
-        # post-restart (low-tick) row last. A (tick, id) sort would reverse
-        # this (5 sorts before 500), putting the STALE pre-restart row last.
-        assert [float(row["bean_temp_c"]) for row in rows] == [190.0, 170.0]
+        reading = await tmp_store.read_drop_reading("restart-run")
+        assert reading is not None
+        assert (reading.bean_temp_c, reading.development_percent) == (190.0, 20.0)
     finally:
         await tmp_store.close()
 
@@ -589,6 +600,119 @@ async def test_score_run_same_tick_ceiling_guard_drop_with_no_development_row(
         await tmp_store.close()
 
 
+@pytest.mark.asyncio
+async def test_scorer_and_reference_roast_agree_on_the_same_run(tmp_store: RoastStore) -> None:
+    """Both consumers receive the same shared event-anchored drop reading."""
+    await tmp_store.initialize()
+    try:
+        profile = _profile(target_drop_temp_c=188.0, target_development_percent=20.9)
+        await _create_run(tmp_store, "shared-reading", profile=profile)
+        await _insert_telemetry_row_at(
+            tmp_store,
+            "shared-reading",
+            1,
+            phase=RoastPhase.DEVELOPMENT,
+            bean_temp=188.0,
+            dev_pct=None,
+            recorded_at_utc="2026-01-01T00:00:00+00:00",
+        )
+        await _insert_telemetry_row_at(
+            tmp_store,
+            "shared-reading",
+            2,
+            phase=RoastPhase.COOLING,
+            bean_temp=195.0,
+            dev_pct=20.9,
+            recorded_at_utc="2026-01-01T00:00:05+00:00",
+        )
+        await tmp_store.connection.execute(
+            "UPDATE telemetry_snapshots SET charge_elapsed_seconds = tick * 10 WHERE run_id = ?",
+            ("shared-reading",),
+        )
+        await tmp_store.connection.commit()
+        await _record_drop_event(
+            tmp_store, "shared-reading", recorded_at_utc="2026-01-01T00:00:00+00:00"
+        )
+        await tmp_store.complete_run(
+            run_id="shared-reading", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_operator_rating("shared-reading", rating=4)
+        scored = await scorer.score_run(tmp_store, "shared-reading")
+        reference = await tmp_store._build_reference_roast(  # pyright: ignore[reportPrivateUsage]
+            "shared-reading", "test"
+        )
+        assert isinstance(scored, scorer.ScoredRun)
+        assert reference is not None
+        assert (scored.score.drop_temp_c, scored.score.dtr_percent) == (
+            reference.landmarks.drop_temp_c,
+            reference.landmarks.drop_development_percent,
+        )
+    finally:
+        await tmp_store.close()
+
+
+def test_scorer_has_no_private_drop_reading_helper() -> None:
+    """The scorer cannot silently regain an independent drop-reading copy."""
+    assert not hasattr(scorer, "_extract_drop_reading")
+    assert not hasattr(scorer, "_nearest_reading_to_timestamp")
+
+
+@pytest.mark.asyncio
+async def test_drop_reading_ignores_a_non_drop_command_executed_event(
+    tmp_store: RoastStore,
+) -> None:
+    """An executed non-drop command cannot make a run eligible for scoring."""
+    await tmp_store.initialize()
+    try:
+        await _create_run(tmp_store, "non-drop-command", profile=_profile())
+        await _record_row(
+            tmp_store,
+            "non-drop-command",
+            1,
+            phase=RoastPhase.DEVELOPMENT,
+            bean_temp=188.0,
+            dev_pct=20.0,
+        )
+        await tmp_store.record_event(
+            run_id="non-drop-command",
+            kind=RoastEventKind.COMMAND_EXECUTED,
+            source=RoastEventSource.CONTROLLER,
+            payload={"command": RoastCommand.SET_FAN.value},
+        )
+        result = await scorer.score_run(tmp_store, "non-drop-command")
+        assert isinstance(result, scorer.SkippedRun)
+        assert "no drop_beans" in result.reason
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_score_run_preserves_joint_window_value_error_skip(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scorer still converts metric validation failures into a run skip."""
+    await tmp_store.initialize()
+    try:
+        await _seed_scoreable_run(
+            tmp_store,
+            "metric-value-error",
+            profile=_profile(),
+            drop_temp_c=195.0,
+            dtr_percent=16.0,
+        )
+
+        def raise_value_error(**_: object) -> object:
+            """Exercise the scorer's defensive metric-error branch."""
+            raise ValueError("synthetic metric rejection")
+
+        monkeypatch.setattr(scorer, "joint_window_score", raise_value_error)
+        result = await scorer.score_run(tmp_store, "metric-value-error")
+        assert isinstance(result, scorer.SkippedRun)
+        assert "corrupt trace or profile" in result.reason
+    finally:
+        await tmp_store.close()
+
+
 def test_finite_or_none() -> None:
     assert scorer._finite_or_none(None) is None  # pyright: ignore[reportPrivateUsage]
     assert scorer._finite_or_none(float("inf")) is None  # pyright: ignore[reportPrivateUsage]
@@ -676,174 +800,6 @@ def test_ambient_evidence_cells_cover_observed_and_defensive_reasonless_paths() 
     )
     assert scorer._ambient_evidence_cell(observed) == "observed (1/2)"  # pyright: ignore[reportPrivateUsage]
     assert scorer._ambient_evidence_cell(reasonless) == "not proven (unknown)"  # pyright: ignore[reportPrivateUsage]
-
-
-# --- _extract_drop_reading / _nearest_reading_to_timestamp: direct unit tests --
-# (the fallback branches score_run's own drop-gate makes unreachable through
-# score_run itself — a valid drop_event_recorded_at_utc is guaranteed non-None
-# by the time score_run calls _extract_drop_reading — but genuinely defensive
-# code the pure helpers must still cover: an unparseable event timestamp, an
-# unparseable per-row timestamp, and the no-successor-row fallback tail.)
-
-
-def _make_telemetry_rows(
-    specs: list[tuple[str, float | None, float | None, str]],
-) -> list[sqlite3.Row]:
-    """Build real ``sqlite3.Row`` objects (not RoastStore-backed) shaped like
-    :func:`rpd_corpus_score._fetch_telemetry_rows`'s projection, for direct
-    unit tests of the pure row-processing helpers.
-
-    Args:
-        specs: ``(agent_phase, bean_temp_c, development_percent, recorded_at_utc)``
-            tuples, in the intended row order.
-    """
-    connection = sqlite3.connect(":memory:")
-    connection.row_factory = sqlite3.Row
-    connection.execute(
-        "CREATE TABLE t (agent_phase TEXT, bean_temp_c REAL,"
-        " development_percent REAL, recorded_at_utc TEXT)"
-    )
-    connection.executemany("INSERT INTO t VALUES (?, ?, ?, ?)", specs)
-    rows = list(
-        connection.execute(
-            "SELECT agent_phase, bean_temp_c, development_percent, recorded_at_utc"
-            " FROM t ORDER BY rowid"
-        )
-    )
-    connection.close()
-    return rows
-
-
-def test_nearest_reading_to_timestamp_skips_row_with_unparseable_recorded_at() -> None:
-    """A row whose own ``recorded_at_utc`` fails to parse must be skipped,
-    not crash the search — the next candidate still wins."""
-    rows = _make_telemetry_rows(
-        [
-            ("development", 180.0, 10.0, "not-a-timestamp"),
-            ("cooling", 195.0, 16.0, "2026-01-01T00:00:00.500000+00:00"),
-        ]
-    )
-    reading = scorer._nearest_reading_to_timestamp(  # pyright: ignore[reportPrivateUsage]
-        rows, "2026-01-01T00:00:00.000000+00:00"
-    )
-    assert reading is not None
-    assert reading.bean_temp_c == 195.0
-    assert reading.development_percent == 16.0
-
-
-def test_extract_drop_reading_falls_back_to_last_dev_row_on_unparseable_event_timestamp() -> None:
-    """An unparseable ``drop_event_recorded_at_utc`` falls back to the last
-    ``development`` row's OWN reading, not a following row — the successor
-    and the last-development row are made to DIFFER so this discriminates a
-    regression back to the (removed) successor-row heuristic."""
-    rows = _make_telemetry_rows(
-        [
-            ("development", 195.0, 16.0, "2026-01-01T00:00:00+00:00"),
-            ("cooling", 180.0, 16.0, "2026-01-01T00:00:05+00:00"),
-        ]
-    )
-    reading = scorer._extract_drop_reading(  # pyright: ignore[reportPrivateUsage]
-        rows, [0], "not-a-timestamp"
-    )
-    assert reading is not None
-    assert reading.bean_temp_c == 195.0
-    assert reading.development_percent == 16.0
-
-
-def test_extract_drop_reading_falls_back_to_last_development_row_when_no_successor() -> None:
-    """No row follows the last development row: the fallback's final tail —
-    the last development row's own reading — must still be returned."""
-    rows = _make_telemetry_rows([("development", 195.0, 16.0, "2026-01-01T00:00:00+00:00")])
-    reading = scorer._extract_drop_reading(  # pyright: ignore[reportPrivateUsage]
-        rows, [0], "not-a-timestamp"
-    )
-    assert reading is not None
-    assert reading.bean_temp_c == 195.0
-    assert reading.development_percent == 16.0
-
-
-def test_extract_drop_reading_skips_event_anchor_when_timestamp_is_none() -> None:
-    """``drop_event_recorded_at_utc=None`` — structurally unreachable through
-    ``score_run``, which gates on a non-``None`` event timestamp before ever
-    calling this helper, but a defensive path the pure helper must still
-    cover — skips the event-anchor entirely and goes straight to the
-    fallback."""
-    rows = _make_telemetry_rows([("development", 195.0, 16.0, "2026-01-01T00:00:00+00:00")])
-    reading = scorer._extract_drop_reading(rows, [0], None)  # pyright: ignore[reportPrivateUsage]
-    assert reading is not None
-    assert reading.bean_temp_c == 195.0
-    assert reading.development_percent == 16.0
-
-
-def test_extract_drop_reading_fallback_ignores_a_complete_but_fallen_successor_row() -> None:
-    """Regression test (Codex P2, round 3): a COMPLETE (both fields
-    populated) but genuinely fallen cooling successor row — the exact shape
-    a pre-force-persist historical run's periodic cadence can produce — must
-    still be ignored by the fallback in favor of the last ``development``
-    row's own reading. Without a correlated timestamp (the event anchor
-    already failed here), the fallback can no longer tell that successor
-    apart from a real several-seconds-later cooling sample, so it must never
-    be trusted, even when it is superficially "complete"."""
-    rows = _make_telemetry_rows(
-        [
-            ("development", 195.0, 16.0, "2026-01-01T00:00:00+00:00"),
-            # A LATER, fallen cooling sample: both fields present, but the
-            # temperature has genuinely dropped (real post-drop cooling).
-            ("cooling", 180.0, 16.0, "2026-01-01T00:00:25+00:00"),
-        ]
-    )
-    reading = scorer._extract_drop_reading(  # pyright: ignore[reportPrivateUsage]
-        rows, [0], "not-a-timestamp"
-    )
-    assert reading is not None
-    # If the removed successor-row heuristic had been used, this would read
-    # 180.0 (the fallen temp) instead of the true 195.0.
-    assert reading.bean_temp_c == pytest.approx(195.0)
-    assert reading.development_percent == pytest.approx(16.0)
-
-
-def test_nearest_reading_to_timestamp_compares_naive_and_aware_timestamps_safely() -> None:
-    """Regression test (Codex P2, round 3): a legacy row's NAIVE ISO
-    timestamp (no UTC offset) compared against the drop event's
-    offset-AWARE one must not raise ``TypeError`` — both are normalized to
-    UTC-aware before subtracting, so the naive row is still found and used."""
-    rows = _make_telemetry_rows(
-        [
-            # NAIVE: no "+00:00" offset.
-            ("development", 195.0, 16.0, "2026-01-01T00:00:00.000000"),
-        ]
-    )
-    reading = scorer._nearest_reading_to_timestamp(  # pyright: ignore[reportPrivateUsage]
-        rows, "2026-01-01T00:00:00.500000+00:00"
-    )
-    assert reading is not None
-    assert reading.bean_temp_c == 195.0
-    assert reading.development_percent == 16.0
-
-
-def test_extract_drop_reading_empty_development_indices_uses_event_anchor() -> None:
-    """``development_indices=[]`` (a same-tick ceiling-guard drop has NO
-    ``development``-phase row at all): the event anchor alone must still
-    find the reading — the fallback is never consulted, and must never index
-    an empty list."""
-    rows = _make_telemetry_rows([("cooling", 198.0, 0.5, "2026-01-01T00:00:00.100000+00:00")])
-    reading = scorer._extract_drop_reading(  # pyright: ignore[reportPrivateUsage]
-        rows, [], "2026-01-01T00:00:00.000000+00:00"
-    )
-    assert reading is not None
-    assert reading.bean_temp_c == 198.0
-    assert reading.development_percent == 0.5
-
-
-def test_extract_drop_reading_empty_development_indices_and_failed_anchor_returns_none() -> None:
-    """``development_indices=[]`` AND the event anchor also fails to find a
-    usable row: there is nothing left to fall back to, so the pure helper
-    must return ``None`` rather than raise on an empty-list index."""
-    rows = _make_telemetry_rows([])
-    reading = scorer._extract_drop_reading(  # pyright: ignore[reportPrivateUsage]
-        rows, [], "2026-01-01T00:00:00.000000+00:00"
-    )
-    assert reading is None
 
 
 @pytest.mark.asyncio
@@ -950,15 +906,13 @@ async def test_score_run_no_development_row_and_no_event_match_is_skipped(
 
 
 @pytest.mark.asyncio
-async def test_score_run_non_finite_metric_input_is_skipped(tmp_store: RoastStore) -> None:
-    """A non-finite achieved drop temp (a corrupt historical trace) makes
-    ``joint_window_score`` raise ``ValueError`` — one corrupt run must be
-    skipped, not abort the whole corpus (fix #4, Codex P2).
+async def test_score_run_non_finite_drop_reading_is_skipped(tmp_store: RoastStore) -> None:
+    """A non-finite achieved drop temperature is absent before scoring.
 
     Uses ``inf``, not ``nan``: SQLite silently stores a bound ``NaN`` REAL
     parameter as ``NULL`` (round-trip verified), which would instead exercise
-    the "missing bean_temp_c" skip path — ``+/-Infinity`` round-trips as
-    IEEE-754 and reaches the metric unchanged.
+    the "missing bean_temp_c" skip path. ``+/-Infinity`` round-trips as
+    IEEE-754 and must now fail closed as no drop reading.
     """
     await tmp_store.initialize()
     try:
@@ -981,7 +935,7 @@ async def test_score_run_non_finite_metric_input_is_skipped(tmp_store: RoastStor
         )
         result = await scorer.score_run(tmp_store, "corrupt-run")
         assert isinstance(result, scorer.SkippedRun)
-        assert "corrupt trace or profile" in result.reason
+        assert "no drop reading" in result.reason
     finally:
         await tmp_store.close()
 
