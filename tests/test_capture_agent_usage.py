@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import importlib.util
 import inspect
@@ -8195,6 +8196,7 @@ def isolate_run_metadata_validation(
         "test_early_closed_stdin_fails_without_appending_valid_terminal_usage",
         "test_real_pipe_backpressure_interleaves_prompt_write_and_stdout_drain",
         "test_run_timeout_kills_and_reaps_term_ignoring_child_without_a_record",
+        "test_git_output_timeout_kills_term_ignoring_process_group",
         "test_timeout_kills_real_stdout_inheriting_descendant_without_record",
         "test_native_command_fails_closed_at_transcript_launch_boundaries",
     }
@@ -10299,6 +10301,125 @@ def test_git_output_rejects_oversized_or_invalid_utf8_response(
         usage_cli._git_output(["status", "--porcelain"])  # pyright: ignore[reportPrivateUsage]
 
 
+def _process_finished_or_zombie(
+    pid: int, *, stat_reader: Callable[[int], str] | None = None
+) -> bool:
+    """Whether a timeout-cleanup process has exited or is a harmless zombie.
+
+    Args:
+        pid: The process identifier to probe.
+        stat_reader: Injectable ``/proc/<pid>/stat`` reader for deterministic
+            exception-grammar tests.
+
+    Returns:
+        ``True`` when the process no longer exists or has become a zombie.
+
+    Raises:
+        PermissionError: If the stat read is not permitted.
+        OSError: If the stat read fails for a reason other than a missing process.
+        IndexError: If procfs returns malformed or short stat data.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    read_stat: Callable[[int], str] = stat_reader or _read_proc_stat
+    try:
+        state = read_stat(pid).split()[2]
+    except (ProcessLookupError, FileNotFoundError):
+        return True
+    return state == "Z"
+
+
+def _read_proc_stat(pid: int) -> str:
+    """Read one process's procfs stat record for the timeout-cleanup assertion."""
+    return Path(f"/proc/{pid}/stat").read_text()
+
+
+def test_timeout_cleanup_liveness_helper_handles_expected_exit_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The narrow liveness grammar accepts only raced-away and zombie processes."""
+    calls = 0
+
+    def unreadable_stat(_: int) -> str:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("stat reader must not run after kill ESRCH")
+
+    def missing_kill(_: int, __: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "kill", missing_kill)
+    assert _process_finished_or_zombie(123, stat_reader=unreadable_stat) is True
+    assert calls == 0
+
+    def reachable_kill(_: int, __: int) -> None:
+        return None
+
+    monkeypatch.setattr(os, "kill", reachable_kill)
+    assert (
+        _process_finished_or_zombie(
+            123, stat_reader=lambda _: (_ for _ in ()).throw(ProcessLookupError())
+        )
+        is True
+    )
+    assert (
+        _process_finished_or_zombie(
+            123, stat_reader=lambda _: (_ for _ in ()).throw(FileNotFoundError())
+        )
+        is True
+    )
+    assert _process_finished_or_zombie(123, stat_reader=lambda _: "123 (stub) Z") is True
+    assert _process_finished_or_zombie(123, stat_reader=lambda _: "123 (stub) S") is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    [PermissionError(), OSError(errno.EIO, "unrelated stat failure")],
+)
+def test_timeout_cleanup_liveness_helper_propagates_unexpected_stat_errors(
+    error: OSError, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Permission and unrelated procfs failures cannot be mistaken for cleanup success."""
+
+    def reachable_kill(_: int, __: int) -> None:
+        return None
+
+    monkeypatch.setattr(os, "kill", reachable_kill)
+
+    def fail_stat(_: int) -> str:
+        raise error
+
+    with pytest.raises(type(error)):
+        _process_finished_or_zombie(123, stat_reader=fail_stat)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [PermissionError(), OSError(errno.EIO, "unrelated kill probe failure")],
+)
+def test_timeout_cleanup_liveness_helper_propagates_unexpected_kill_errors(
+    error: OSError, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Permission and unrelated kill-probe failures cannot imply cleanup success."""
+    stat_calls = 0
+
+    def fail_kill(_: int, __: int) -> None:
+        raise error
+
+    def unreadable_stat(_: int) -> str:
+        nonlocal stat_calls
+        stat_calls += 1
+        raise AssertionError("stat reader must not run after a kill-probe failure")
+
+    monkeypatch.setattr(os, "kill", fail_kill)
+
+    with pytest.raises(type(error)):
+        _process_finished_or_zombie(123, stat_reader=unreadable_stat)
+    assert stat_calls == 0
+
+
 @pytest.mark.serial(reason="drives a real TERM-ignoring process group")
 def test_git_output_timeout_kills_term_ignoring_process_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -10329,15 +10450,7 @@ def test_git_output_timeout_kills_term_ignoring_process_group(
 
     pid = int(marker.read_text())
     for _ in range(20):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            break
-        try:
-            state = Path(f"/proc/{pid}/stat").read_text().split()[2]
-        except FileNotFoundError:
-            break
-        if state == "Z":
+        if _process_finished_or_zombie(pid):
             break
         time.sleep(0.01)
     else:
@@ -11261,15 +11374,7 @@ def test_timeout_kills_real_stdout_inheriting_descendant_without_record(
         )
     descendant = int(marker.read_text())
     for _ in range(20):
-        try:
-            os.kill(descendant, 0)
-        except ProcessLookupError:
-            break
-        try:
-            state = Path(f"/proc/{descendant}/stat").read_text().split()[2]
-        except FileNotFoundError:
-            break
-        if state == "Z":
+        if _process_finished_or_zombie(descendant):
             break
         time.sleep(0.01)
     else:
