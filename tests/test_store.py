@@ -796,6 +796,10 @@ from roastpilot_agent.models import (  # noqa: E402
     RoastTelemetry,
     recording_origin_slug,
 )
+from roastpilot_agent.roast_termination import (  # noqa: E402
+    TerminationClassification,
+    TerminationEvidenceKind,
+)
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict  # noqa: E402
 
 PROFILE = RoastProfile(
@@ -6602,5 +6606,201 @@ async def test_store_drop_reading_treats_a_non_finite_temperature_as_absent(
             tmp_store, "non-finite", recorded_at="2026-01-01T00:00:00+00:00"
         )
         assert await tmp_store.read_drop_reading("non-finite") is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_read_drop_event_recorded_at_delegates_to_the_anchor_read(
+    tmp_store: RoastStore,
+) -> None:
+    """The timestamp compatibility method shares the sole drop-boundary read."""
+    await tmp_store.initialize()
+    try:
+        await tmp_store.create_run(
+            run_id="drop-anchor",
+            profile=PROFILE,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        assert await tmp_store.read_first_executed_drop_event("drop-anchor") is None
+        assert await tmp_store.read_drop_event_recorded_at("drop-anchor") is None
+
+        await tmp_store.record_event(
+            run_id="drop-anchor",
+            kind=RoastEventKind.COMMAND_EXECUTED,
+            source=RoastEventSource.ADVISOR,
+            payload={"command": RoastCommand.DROP_BEANS.value},
+            recorded_at_utc="2026-08-26T12:00:00+00:00",
+        )
+        await tmp_store.record_event(
+            run_id="drop-anchor",
+            kind=RoastEventKind.COMMAND_EXECUTED,
+            source=RoastEventSource.OPERATOR,
+            payload={"command": RoastCommand.DROP_BEANS.value},
+            recorded_at_utc="2026-08-26T11:00:00+00:00",
+        )
+        anchor = await tmp_store.read_first_executed_drop_event("drop-anchor")
+        assert anchor is not None
+        assert anchor.recorded_at_utc == "2026-08-26T12:00:00+00:00"
+        assert await tmp_store.read_drop_event_recorded_at("drop-anchor") == anchor.recorded_at_utc
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_read_termination_malformed_or_null_payload_fails_closed(
+    tmp_store: RoastStore,
+) -> None:
+    """Raw null/invalid command payloads are conservative and never crash SQLite."""
+    await tmp_store.initialize()
+    try:
+        for run_id, payload_json in (("null-payload", None), ("bad-payload", "not-json")):
+            await tmp_store.create_run(
+                run_id=run_id,
+                profile=PROFILE,
+                config=AppConfig(),
+                agent_phase=RoastPhase.STARTING,
+            )
+            await tmp_store.connection.execute(
+                "INSERT INTO roast_events"
+                " (run_id, kind, source, recorded_at_utc, payload_json)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    RoastEventKind.COMMAND_EXECUTED.value,
+                    RoastEventSource.CONTROLLER.value,
+                    "2026-08-26T12:00:00+00:00",
+                    payload_json,
+                ),
+            )
+            await tmp_store.record_event(
+                run_id=run_id,
+                kind=RoastEventKind.COMMAND_EXECUTED,
+                source=RoastEventSource.ADVISOR,
+                payload={"command": RoastCommand.DROP_BEANS.value},
+                recorded_at_utc="2026-08-26T12:00:01+00:00",
+            )
+            await tmp_store.complete_run(
+                run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE
+            )
+        await tmp_store.connection.commit()
+
+        for run_id in ("null-payload", "bad-payload"):
+            termination = await tmp_store.read_termination(run_id)
+            assert (
+                termination.classification is TerminationClassification.ABNORMAL_BEFORE_OR_AT_DROP
+            )
+            assert termination.evidence[0].kind is TerminationEvidenceKind.UNKNOWN_DROP_REASON
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_read_termination_missing_run_fails_closed(tmp_store: RoastStore) -> None:
+    """A missing run returns conservative typed termination provenance."""
+    await tmp_store.initialize()
+    try:
+        termination = await tmp_store.read_termination("no-such-run")
+        assert termination.classification is TerminationClassification.ABNORMAL_BEFORE_OR_AT_DROP
+        assert termination.evidence[0].kind is TerminationEvidenceKind.ABNORMAL_RUN_OUTCOME
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_read_termination_uses_timestamp_not_reset_tick_for_emergency_stops(
+    tmp_store: RoastStore,
+) -> None:
+    """Restart-reset tick values cannot alter cross-table termination ordering."""
+    await tmp_store.initialize()
+    try:
+        run_id = "reset-ticks"
+        await tmp_store.create_run(
+            run_id=run_id, profile=PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
+        )
+        await tmp_store.record_event(
+            run_id=run_id,
+            kind=RoastEventKind.COMMAND_EXECUTED,
+            source=RoastEventSource.ADVISOR,
+            payload={"command": RoastCommand.DROP_BEANS.value},
+            recorded_at_utc="2026-08-26T12:00:00+00:00",
+        )
+        await tmp_store.connection.execute(
+            "INSERT INTO safety_evaluations"
+            " (run_id, tick, rule, verdict, reason, recorded_at_utc) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                100,
+                "test",
+                SafetyVerdict.EMERGENCY_STOP.value,
+                "before restart",
+                "2026-08-26T12:00:01+00:00",
+            ),
+        )
+        await tmp_store.connection.execute(
+            "INSERT INTO safety_evaluations"
+            " (run_id, tick, rule, verdict, reason, recorded_at_utc) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                0,
+                "test",
+                SafetyVerdict.EMERGENCY_STOP.value,
+                "after restart",
+                "2026-08-26T12:00:02+00:00",
+            ),
+        )
+        await tmp_store.connection.commit()
+        await tmp_store.complete_run(
+            run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+
+        termination = await tmp_store.read_termination(run_id)
+        assert termination.classification is TerminationClassification.ABNORMAL_AFTER_DROP
+        assert [item.position.value for item in termination.evidence] == [
+            "after_drop",
+            "after_drop",
+        ]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_read_termination_writes_nothing(tmp_store: RoastStore) -> None:
+    """Termination classification is SELECT-only across every relevant table."""
+    await tmp_store.initialize()
+    try:
+        run_id = "termination-read-only"
+        await tmp_store.create_run(
+            run_id=run_id, profile=PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
+        )
+        await tmp_store.record_event(
+            run_id=run_id,
+            kind=RoastEventKind.COMMAND_EXECUTED,
+            source=RoastEventSource.ADVISOR,
+            payload={"command": RoastCommand.DROP_BEANS.value},
+        )
+        await tmp_store.complete_run(
+            run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+
+        async def read_back() -> tuple[tuple[object, ...], ...]:
+            """Read all affected rows in stable table and insertion order."""
+            projections = (
+                "SELECT * FROM roast_runs WHERE id = ?",
+                "SELECT * FROM roast_events WHERE run_id = ? ORDER BY id ASC",
+                "SELECT * FROM safety_evaluations WHERE run_id = ? ORDER BY id ASC",
+                "SELECT * FROM telemetry_snapshots WHERE run_id = ? ORDER BY id ASC",
+            )
+            rows: list[tuple[object, ...]] = []
+            for projection in projections:
+                async with tmp_store.connection.execute(projection, (run_id,)) as cursor:
+                    rows.extend(tuple(row) for row in await cursor.fetchall())
+            return tuple(rows)
+
+        before = await read_back()
+        termination = await tmp_store.read_termination(run_id)
+        assert termination.classification is TerminationClassification.NORMAL
+        assert await read_back() == before
     finally:
         await tmp_store.close()
