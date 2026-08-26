@@ -62,6 +62,7 @@ from roast_landmarks import (  # noqa: E402
     is_mcp_first_crack_source,
     utc_to_run_seconds,
 )
+from store_snapshot import connect_read_only, snapshot_store_to_temp  # noqa: E402
 
 DEFAULT_ALOG_DIR = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/roasting"
 DEFAULT_STORE = Path.home() / "roasts/roastpilot.sqlite3"
@@ -319,7 +320,7 @@ def _completed_run_ids_query(con: sqlite3.Connection) -> str:
 
 def completed_store_run_ids(store_copy: Path) -> list[str]:
     """Return the completed, non-discarded store run ids, ordered, from a read-only copy."""
-    con = sqlite3.connect(f"file:{store_copy}?mode=ro", uri=True)
+    con = connect_read_only(store_copy)
     try:
         rows = con.execute(_completed_run_ids_query(con)).fetchall()
     finally:
@@ -420,7 +421,7 @@ def load_store(store_copy: Path) -> list[Roast]:
         The parsed completed, non-discarded roasts with usable telemetry
         (>= 60 raw rows).
     """
-    con = sqlite3.connect(f"file:{store_copy}?mode=ro", uri=True)
+    con = connect_read_only(store_copy)
     roasts: list[Roast] = []
     try:
         run_ids = [str(r[0]) for r in con.execute(_completed_run_ids_query(con))]
@@ -817,10 +818,12 @@ def _copy_store_readonly(store: Path, tmp: Path) -> Path:
 
     The app runs SQLite in WAL mode and does not checkpoint, so committed rows
     can live in the ``-wal`` sidecar. A plain file copy of the ``.sqlite3`` alone
-    would miss them. This uses the SQLite backup API from a **read-only**
-    connection, which consolidates the main DB + WAL into a single self-contained
-    snapshot. The operator's live DB is never opened read-write; the source
-    file's sha256 is verified unchanged across the backup.
+    would miss them. Delegates the actual copy to the shared
+    :func:`store_snapshot.snapshot_store_to_temp` helper (#726), which uses the
+    SQLite backup API from a **read-only** connection and consolidates the main
+    DB + WAL into a single self-contained snapshot. The operator's live DB is
+    never opened read-write; the source file's sha256 is verified unchanged
+    across the backup.
 
     Args:
         store: The live store DB path.
@@ -833,16 +836,7 @@ def _copy_store_readonly(store: Path, tmp: Path) -> Path:
         RuntimeError: If the source file's sha256 changed across the backup.
     """
     src_sha = _sha256(store)
-    dst = tmp / "store_copy.sqlite3"
-    src = sqlite3.connect(f"file:{store}?mode=ro", uri=True)
-    try:
-        snap = sqlite3.connect(dst)
-        try:
-            src.backup(snap)
-        finally:
-            snap.close()
-    finally:
-        src.close()
+    dst = snapshot_store_to_temp(store, tmp, snapshot_name="store_copy.sqlite3")
     if _sha256(store) != src_sha:
         raise RuntimeError("store source sha256 changed during backup -- not read-only")
     return dst

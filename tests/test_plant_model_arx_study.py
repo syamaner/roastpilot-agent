@@ -298,3 +298,70 @@ def test_landmarks_csv_records_closed_fc_anchor_vocabulary(tmp_path: Path) -> No
 def test_historical_event_temperature_is_malformed_payload_safe(payload: object) -> None:
     """Malformed historical fallback payloads cannot abort a store-corpus load."""
     assert np.isnan(study._event_bean_temp(payload))  # pyright: ignore[reportPrivateUsage]
+
+
+# --- shared read-only snapshot adoption (#726 item 3) -------------------------
+
+
+def test_copy_store_readonly_writes_store_copy_sqlite3(tmp_path: Path) -> None:
+    """``_copy_store_readonly`` delegates the copy to the shared helper but
+    keeps its own ``store_copy.sqlite3`` filename contract."""
+    db_path = tmp_path / "source.sqlite3"
+    _write_store(db_path)
+    dest_dir = tmp_path / "snap"
+    dest_dir.mkdir()
+
+    copy_path = study._copy_store_readonly(db_path, dest_dir)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert copy_path == dest_dir / "store_copy.sqlite3"
+    assert study.completed_store_run_ids(copy_path) == ["synthetic-run"]
+
+
+def test_copy_store_readonly_missing_source_raises_file_not_found(tmp_path: Path) -> None:
+    dest_dir = tmp_path / "snap"
+    dest_dir.mkdir()
+    with pytest.raises(FileNotFoundError):
+        study._copy_store_readonly(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            tmp_path / "nope.sqlite3", dest_dir
+        )
+
+
+def test_copy_store_readonly_raises_runtime_error_on_source_change_during_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre/post sha256 guard fails closed with the exact ``RuntimeError``
+    if the source mutates while the backup is in flight — preserved exactly,
+    independent of which helper performs the underlying copy."""
+    db_path = tmp_path / "source.sqlite3"
+    _write_store(db_path)
+    dest_dir = tmp_path / "snap"
+    dest_dir.mkdir()
+
+    real_snapshot = study.snapshot_store_to_temp
+
+    def _mutating_snapshot(store_path: Path, tmp_dir: Path, **kwargs: object) -> Path:
+        result = real_snapshot(store_path, tmp_dir, **kwargs)  # type: ignore[arg-type]
+        # Simulate a concurrent writer mutating the source AFTER the backup
+        # completed but before the guard re-hashes it.
+        with store_path.open("ab") as handle:
+            handle.write(b"\x00")
+        return result
+
+    monkeypatch.setattr(study, "snapshot_store_to_temp", _mutating_snapshot)
+
+    with pytest.raises(RuntimeError, match="sha256 changed during backup"):
+        study._copy_store_readonly(db_path, dest_dir)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+
+def test_completed_store_run_ids_reads_store_under_question_mark_directory(
+    tmp_path: Path,
+) -> None:
+    """A store path whose PARENT directory contains ``?`` must still open
+    correctly, read-only — the naive ``f"file:{path}?mode=ro"`` form would
+    misparse the embedded ``?`` as the URI query-string delimiter."""
+    odd_dir = tmp_path / "roasts?2026"
+    odd_dir.mkdir()
+    db_path = odd_dir / "store.sqlite3"
+    _write_store(db_path)
+
+    assert study.completed_store_run_ids(db_path) == ["synthetic-run"]

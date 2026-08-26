@@ -67,8 +67,8 @@ LLM, no network, no store WRITE of any kind.
   string literal) — no heuristic re-derivation from temperature/DTR.
 
 **Read-only store isolation.** Never opens the operator's real
-``~/roasts/roastpilot.sqlite3`` directly: :func:`snapshot_store_to_temp`
-(the same online-backup pattern ``bakeoff_reference_567.py`` uses) copies it
+``~/roasts/roastpilot.sqlite3`` directly: :func:`store_snapshot.snapshot_store_to_temp`
+(the shared helper every offline store-reading script uses, #726) copies it
 to a private temp file first, against a strictly ``mode=ro`` source
 connection, and every :class:`~roastpilot_agent.store.RoastStore` call in this
 script operates on that copy.
@@ -103,10 +103,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))  # bakeoff_replay
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # bakeoff_replay, store_snapshot
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from bakeoff_replay import JointWindowScore, joint_score_to_json, joint_window_score  # noqa: E402
+from store_snapshot import snapshot_store_to_temp  # noqa: E402
 
 from roastpilot_agent.ambient_evidence import (  # noqa: E402
     AMBIENT_EVIDENCE_CLAIM,
@@ -126,67 +127,6 @@ from roastpilot_agent.store import RoastStore  # noqa: E402
 
 #: Default operator store path (mirrors every other offline bake-off script).
 DEFAULT_STORE = Path.home() / "roasts" / "roastpilot.sqlite3"
-
-
-def _read_only_sqlite_uri(path: Path) -> str:
-    """Build a percent-encoded, read-only ``sqlite3`` URI for ``path``.
-
-    A raw ``f"file:{path}?mode=ro"`` (the naive form) mis-parses a path
-    containing ``?`` or ``#``: SQLite's URI filenames follow RFC 3986, so an
-    unescaped ``?``/``#`` in the path is read as the query-string/fragment
-    delimiter, silently truncating or corrupting the path SQLite actually
-    opens — a store path containing either character could open the wrong
-    file (or fail) instead of opening the intended file read-only.
-    :meth:`~pathlib.Path.as_uri` percent-encodes the path per RFC 3986 before
-    the ``mode=ro`` query string is appended, so both characters (and any
-    other reserved/non-ASCII byte) round-trip correctly. Requires an absolute
-    path, hence the ``resolve()``.
-
-    Args:
-        path: The SQLite file path to open read-only.
-
-    Returns:
-        A ``file:...?mode=ro`` URI safe to pass to ``sqlite3.connect(uri=True)``.
-    """
-    return f"{path.resolve().as_uri()}?mode=ro"
-
-
-def snapshot_store_to_temp(store_path: Path, tmp_dir: Path) -> Path:
-    """Copy the operator store to a private temp file; this script opens ONLY the copy.
-
-    Mirrors :func:`bakeoff_reference_567.snapshot_store_to_temp` exactly: uses
-    SQLite's own online backup API (:meth:`sqlite3.Connection.backup`) against
-    a strictly read-only (``mode=ro``) source connection, so the snapshot is a
-    fully consistent point-in-time copy (including anything still only in the
-    source's WAL) without ever acquiring a write lock on the operator's file.
-    ``RoastStore.initialize()`` opens read-write and applies WAL/migrations —
-    the normal, safe thing for the live agent to do to ITS OWN store — so this
-    isolation is what keeps the operator's live database untouched even though
-    this script only ever calls read methods on the (temp-copy) store.
-
-    Args:
-        store_path: The real operator store to copy.
-        tmp_dir: A scratch directory the caller owns and will clean up.
-
-    Returns:
-        The path to the private snapshot copy.
-
-    Raises:
-        FileNotFoundError: If ``store_path`` does not exist.
-    """
-    if not store_path.exists():
-        raise FileNotFoundError(f"no store at {store_path}")
-    snapshot_path = tmp_dir / "store-snapshot.sqlite3"
-    source = sqlite3.connect(_read_only_sqlite_uri(store_path), uri=True)
-    try:
-        target = sqlite3.connect(str(snapshot_path))
-        try:
-            source.backup(target)
-        finally:
-            target.close()
-    finally:
-        source.close()
-    return snapshot_path
 
 
 @dataclasses.dataclass(frozen=True)
