@@ -6,10 +6,11 @@
 pilot, not pilot sample 12 — this PR adds no product behaviour, capture
 parser, workflow, dependency, test fixture, production artifact, or plan
 decision. An independent product audit against the implementation tree found
-AC1–AC11 met in committed code and returned verdict CLOSE. AC12
-(provider-efficiency comparability) remains unsupported, because
-whole-delivery-tree Codex, parent-interactive, and hosted-review usage
-capture is incomplete; `whole_tree_verified` (a per-record field in
+AC1–AC12 met in committed code because the pilot completed eleven samples
+within the required 10–15 reporting window, and returned verdict CLOSE.
+Separately, the requested provider-efficiency comparability assessment remains
+unsupported because whole-delivery-tree Codex, parent-interactive, and
+hosted-review usage capture is incomplete; `whole_tree_verified` (a per-record field in
 `capture_usage_models.py`) is false across the pilot at aggregate scope, so
 no whole-delivery-tree verification holds pilot-wide. No efficiency
 comparison is drawn and no routing, price, quota, or model-allocation policy
@@ -21,7 +22,8 @@ band: (1) #794/PR #839, (2) #788/PR #840, (3) #778/PR #841, (4) #754/PR #842,
 (8) #789/PR #846, (9) #773/PR #847, (10) #742/PR #851, (11) #726 item 3/PR
 #852. Capture-infrastructure PRs #814, #819, #821, #827, #837, #838, #848,
 and #849 were excluded from the sample count as infrastructure work, not a
-pilot sample (the same rule already applied to #811 itself). PR #850 is an
+pilot sample (the same D173 rule applies to capture-infrastructure work under
+#811). PR #850 is an
 unrelated deterministic-test repair, neither capture infrastructure nor a
 pilot sample.**
 
