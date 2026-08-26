@@ -888,8 +888,8 @@ async def test_score_run_no_development_row_and_no_event_match_is_skipped(
 ) -> None:
     """A drop event exists but there is NO telemetry at all (so the event
     anchor has nothing to match) and NO development-phase row to fall back
-    on — the unified terminal skip, exercising ``_extract_drop_reading``'s
-    empty-``development_indices`` guard directly through ``score_run``."""
+    on — the shared drop-reading selection's empty-development/no-event guard,
+    reached through ``RoastStore.read_drop_reading`` and ``score_run``."""
     await tmp_store.initialize()
     try:
         profile = _profile()
