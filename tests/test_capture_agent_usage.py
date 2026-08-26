@@ -10395,6 +10395,31 @@ def test_timeout_cleanup_liveness_helper_propagates_unexpected_stat_errors(
         _process_finished_or_zombie(123, stat_reader=fail_stat)
 
 
+@pytest.mark.parametrize(
+    "error",
+    [PermissionError(), OSError(errno.EIO, "unrelated kill probe failure")],
+)
+def test_timeout_cleanup_liveness_helper_propagates_unexpected_kill_errors(
+    error: OSError, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Permission and unrelated kill-probe failures cannot imply cleanup success."""
+    stat_calls = 0
+
+    def fail_kill(_: int, __: int) -> None:
+        raise error
+
+    def unreadable_stat(_: int) -> str:
+        nonlocal stat_calls
+        stat_calls += 1
+        raise AssertionError("stat reader must not run after a kill-probe failure")
+
+    monkeypatch.setattr(os, "kill", fail_kill)
+
+    with pytest.raises(type(error)):
+        _process_finished_or_zombie(123, stat_reader=unreadable_stat)
+    assert stat_calls == 0
+
+
 @pytest.mark.serial(reason="drives a real TERM-ignoring process group")
 def test_git_output_timeout_kills_term_ignoring_process_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
