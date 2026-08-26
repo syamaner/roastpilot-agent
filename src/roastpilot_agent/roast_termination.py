@@ -32,6 +32,7 @@ class TerminationEvidenceKind(Enum):
     EMERGENCY_STOP_VERDICT = "emergency_stop_verdict"
     CEILING_GUARD_DROP_EXECUTED = "ceiling_guard_drop_executed"
     CEILING_GUARD_DROP_FAILED = "ceiling_guard_drop_failed"
+    FAULT_EVENT = "fault_event"
     UNKNOWN_DROP_REASON = "unknown_drop_reason"
 
 
@@ -40,6 +41,14 @@ class EvidencePosition(Enum):
 
     BEFORE_OR_AT_DROP = "before_or_at_drop"
     AFTER_DROP = "after_drop"
+
+
+class PersistedNonRoastCommand(Enum):
+    """Non-MCP command names deliberately persisted in command-failure events."""
+
+    SET_TARGETS = "set_targets"
+    SHUTDOWN_HEAT_OFF = "shutdown_heat_off"
+    MCP_STOP = "mcp_stop"
 
 
 @dataclass(frozen=True)
@@ -128,14 +137,30 @@ def _parse_event_kind(value: str) -> RoastEventKind | None:
         return None
 
 
-def _parse_command(value: object) -> RoastCommand | None:
-    """Convert one persisted command to its typed vocabulary, or fail closed."""
+def _parse_command(value: object) -> RoastCommand | PersistedNonRoastCommand | None:
+    """Convert one persisted command to its closed typed vocabulary, or fail closed."""
     if not isinstance(value, str):
         return None
     try:
         return RoastCommand(value)
     except ValueError:
-        return None
+        try:
+            return PersistedNonRoastCommand(value)
+        except ValueError:
+            return None
+
+
+def _is_ordinary_executed_lever_payload(payload: dict[str, object]) -> bool:
+    """Return whether a commandless payload has the persisted lever-event shape."""
+    heat = payload.get("heat_percent")
+    fan = payload.get("fan_percent")
+    return (
+        "command" not in payload
+        and isinstance(heat, int)
+        and not isinstance(heat, bool)
+        and isinstance(fan, int)
+        and not isinstance(fan, bool)
+    )
 
 
 def _parse_drop_reason(value: object) -> DropReason | None:
@@ -211,7 +236,16 @@ def classify_termination(
             continue
         event_position = _event_position(row.event_id, drop_anchor)
         if event_kind is RoastEventKind.FAULT:
+            event_evidence.append(
+                TerminationEvidence(
+                    kind=TerminationEvidenceKind.FAULT_EVENT,
+                    position=event_position,
+                )
+            )
             corroborator_positions.append(event_position)
+            continue
+        if event_kind not in (RoastEventKind.COMMAND_EXECUTED, RoastEventKind.COMMAND_FAILED):
+            event_evidence.append(_unknown_evidence())
             continue
 
         payload = _parse_payload_object(row.payload_json)
@@ -220,7 +254,14 @@ def classify_termination(
             continue
         command = _parse_command(payload.get("command"))
         if command is None:
+            if (
+                event_kind is RoastEventKind.COMMAND_EXECUTED
+                and _is_ordinary_executed_lever_payload(payload)
+            ):
+                continue
             event_evidence.append(_unknown_evidence())
+            continue
+        if isinstance(command, PersistedNonRoastCommand):
             continue
         if command is not RoastCommand.DROP_BEANS:
             continue
@@ -232,7 +273,7 @@ def classify_termination(
             continue
         if reason is DropReason.DEVELOPMENT_TARGET:
             continue
-        if reason is DropReason.CEILING_GUARD:  # pragma: no branch - DropReason is exhaustive
+        if reason is DropReason.CEILING_GUARD:
             if event_kind is RoastEventKind.COMMAND_EXECUTED:
                 event_evidence.append(
                     TerminationEvidence(
@@ -240,13 +281,15 @@ def classify_termination(
                         position=event_position,
                     )
                 )
-            elif event_kind is RoastEventKind.COMMAND_FAILED:
+            else:
                 event_evidence.append(
                     TerminationEvidence(
                         kind=TerminationEvidenceKind.CEILING_GUARD_DROP_FAILED,
                         position=event_position,
                     )
                 )
+            continue
+        event_evidence.append(_unknown_evidence())
 
     emergency_evidence = tuple(
         TerminationEvidence(

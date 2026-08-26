@@ -32,7 +32,12 @@ from roastpilot_agent.models import (  # noqa: E402
     RoastProfile,
     RoastTelemetry,
 )
-from roastpilot_agent.roast_termination import TerminationClassification  # noqa: E402
+from roastpilot_agent.roast_termination import (  # noqa: E402
+    EvidencePosition,
+    TerminationClassification,
+    TerminationEvidence,
+    TerminationEvidenceKind,
+)
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict  # noqa: E402
 from roastpilot_agent.store import RoastStore  # noqa: E402
 
@@ -1114,6 +1119,40 @@ async def test_completed_run_with_development_target_drop_stays_normal(
 
 
 @pytest.mark.asyncio
+async def test_ordinary_lever_and_known_command_failures_stay_normal_in_scoring(
+    tmp_store: RoastStore,
+) -> None:
+    """Real non-drop command payloads do not make a clean scored roast abnormal."""
+    await tmp_store.initialize()
+    try:
+        profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
+        await _seed_scoreable_run(
+            tmp_store, "ordinary-commands", profile=profile, drop_temp_c=195.0, dtr_percent=16.0
+        )
+        await tmp_store.record_event(
+            run_id="ordinary-commands",
+            kind=RoastEventKind.COMMAND_EXECUTED,
+            source=RoastEventSource.CONTROLLER,
+            payload={"heat_percent": 55, "fan_percent": 40},
+        )
+        for command in ("set_targets", "shutdown_heat_off", "mcp_stop"):
+            await tmp_store.record_event(
+                run_id="ordinary-commands",
+                kind=RoastEventKind.COMMAND_FAILED,
+                source=RoastEventSource.SAFETY,
+                payload={"command": command},
+            )
+
+        result = await scorer.score_run(tmp_store, "ordinary-commands")
+        assert isinstance(result, scorer.ScoredRun)
+        assert result.termination.classification is TerminationClassification.NORMAL
+        assert result.score.terminated_abnormally is False
+        assert result.score.hit is True
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_completed_run_with_non_emergency_verdicts_stays_normal(
     tmp_store: RoastStore,
 ) -> None:
@@ -1200,13 +1239,83 @@ async def test_post_drop_emergency_stop_after_clean_drop_is_scorable_with_proven
         assert result.termination.terminated_abnormally is False
         assert result.termination.classification.value == "abnormal_after_drop"
         assert [item.kind.value for item in result.termination.evidence] == [
+            "fault_event",
             "emergency_stop_verdict",
             "abnormal_run_outcome",
         ]
         assert [item.position.value for item in result.termination.evidence] == [
             "after_drop",
             "after_drop",
+            "after_drop",
         ]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fault_before_drop", "expected_classification", "expected_position", "expected_hit"),
+    [
+        (
+            True,
+            TerminationClassification.ABNORMAL_BEFORE_OR_AT_DROP,
+            EvidencePosition.BEFORE_OR_AT_DROP,
+            False,
+        ),
+        (
+            False,
+            TerminationClassification.ABNORMAL_AFTER_DROP,
+            EvidencePosition.AFTER_DROP,
+            True,
+        ),
+    ],
+)
+async def test_completed_run_fault_position_controls_scoring(
+    tmp_store: RoastStore,
+    fault_before_drop: bool,
+    expected_classification: TerminationClassification,
+    expected_position: EvidencePosition,
+    expected_hit: bool,
+) -> None:
+    """Completed runs retain positioned fault provenance in corpus scoring."""
+    await tmp_store.initialize()
+    try:
+        profile = _profile(target_drop_temp_c=195.0, target_development_percent=16.0)
+        await _create_run(tmp_store, "positioned-fault", profile=profile)
+        await _record_row(
+            tmp_store,
+            "positioned-fault",
+            1,
+            phase=RoastPhase.DEVELOPMENT,
+            bean_temp=195.0,
+            dev_pct=16.0,
+        )
+        if fault_before_drop:
+            await tmp_store.record_event(
+                run_id="positioned-fault",
+                kind=RoastEventKind.FAULT,
+                source=RoastEventSource.CONTROLLER,
+            )
+        await _record_drop_event(tmp_store, "positioned-fault")
+        if not fault_before_drop:
+            await tmp_store.record_event(
+                run_id="positioned-fault",
+                kind=RoastEventKind.FAULT,
+                source=RoastEventSource.CONTROLLER,
+            )
+        await tmp_store.complete_run(
+            run_id="positioned-fault", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+
+        result = await scorer.score_run(tmp_store, "positioned-fault")
+        assert isinstance(result, scorer.ScoredRun)
+        assert result.termination.classification is expected_classification
+        assert result.termination.evidence == (
+            TerminationEvidence(TerminationEvidenceKind.FAULT_EVENT, expected_position),
+        )
+        assert result.score.terminated_abnormally is fault_before_drop
+        assert result.score.hit is expected_hit
+        assert result.score.scalar == pytest.approx(1.0 if expected_hit else 0.0)
     finally:
         await tmp_store.close()
 

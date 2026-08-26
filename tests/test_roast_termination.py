@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+from typing import cast
 
 import pytest
 
+from roastpilot_agent import roast_termination
 from roastpilot_agent.models import DropReason, RoastCommand, RoastEventKind
 from roastpilot_agent.roast_termination import (
     DropEventAnchor,
     EvidencePosition,
     TerminationClassification,
     TerminationEventRow,
+    TerminationEvidence,
     TerminationEvidenceKind,
     classify_termination,
     select_first_executed_drop_event,
@@ -55,6 +58,7 @@ def test_post_drop_emergency_stop_is_abnormal_after_drop() -> None:
     assert result.classification is TerminationClassification.ABNORMAL_AFTER_DROP
     assert result.terminated_abnormally is False
     assert [(item.kind, item.position) for item in result.evidence] == [
+        (TerminationEvidenceKind.FAULT_EVENT, EvidencePosition.AFTER_DROP),
         (TerminationEvidenceKind.EMERGENCY_STOP_VERDICT, EvidencePosition.AFTER_DROP),
         (TerminationEvidenceKind.ABNORMAL_RUN_OUTCOME, EvidencePosition.AFTER_DROP),
     ]
@@ -189,6 +193,32 @@ def test_unknown_drop_reason_fails_closed() -> None:
     assert result.evidence[0].kind is TerminationEvidenceKind.UNKNOWN_DROP_REASON
 
 
+def test_unhandled_typed_drop_reason_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A future parsed drop reason cannot silently escape the decision chain."""
+
+    def future_drop_reason(_: object) -> DropReason:
+        """Represent a future enum member at the closed parser seam."""
+        return cast(DropReason, object())
+
+    monkeypatch.setattr(roast_termination, "_parse_drop_reason", future_drop_reason)
+    result = classify_termination(
+        run_found=True,
+        run_outcome="completed",
+        drop_anchor=DropEventAnchor(1, "2026-08-26T12:00:00+00:00"),
+        event_rows=(
+            _event(
+                1,
+                RoastEventKind.COMMAND_EXECUTED,
+                _drop_payload(DropReason.CEILING_GUARD),
+            ),
+        ),
+        emergency_stop_recorded_at_utc=(),
+    )
+
+    assert result.classification is TerminationClassification.ABNORMAL_BEFORE_OR_AT_DROP
+    assert result.evidence[0].kind is TerminationEvidenceKind.UNKNOWN_DROP_REASON
+
+
 def test_absent_reason_on_advisor_drop_is_normal() -> None:
     """An ordinary advisor/operator drop has no reason evidence by design."""
     result = classify_termination(
@@ -225,6 +255,25 @@ def test_non_drop_commands_are_ignored() -> None:
     )
 
     assert result.classification is TerminationClassification.NORMAL
+
+
+def test_ordinary_lever_and_known_non_roast_failure_events_are_ignored() -> None:
+    """Real command telemetry and known housekeeping failures are not abnormal."""
+    result = classify_termination(
+        run_found=True,
+        run_outcome="completed",
+        drop_anchor=DropEventAnchor(5, "2026-08-26T12:00:00+00:00"),
+        event_rows=(
+            _event(1, RoastEventKind.COMMAND_EXECUTED, {"heat_percent": 55, "fan_percent": 40}),
+            _event(2, RoastEventKind.COMMAND_FAILED, {"command": "set_targets"}),
+            _event(3, RoastEventKind.COMMAND_FAILED, {"command": "shutdown_heat_off"}),
+            _event(4, RoastEventKind.COMMAND_FAILED, {"command": "mcp_stop"}),
+        ),
+        emergency_stop_recorded_at_utc=(),
+    )
+
+    assert result.classification is TerminationClassification.NORMAL
+    assert result.evidence == ()
 
 
 def test_malformed_command_payload_fails_closed() -> None:
@@ -272,6 +321,7 @@ def test_unknown_event_command_and_reason_values_fail_closed() -> None:
         TerminationEvidenceKind.UNKNOWN_DROP_REASON,
         TerminationEvidenceKind.UNKNOWN_DROP_REASON,
         TerminationEvidenceKind.UNKNOWN_DROP_REASON,
+        TerminationEvidenceKind.UNKNOWN_DROP_REASON,
     ]
     assert select_first_executed_drop_event((rows[0],)) is None
 
@@ -295,6 +345,37 @@ def test_uncorroborated_outcome_and_pre_drop_fault_fail_closed() -> None:
 
     assert uncorroborated.classification is TerminationClassification.ABNORMAL_BEFORE_OR_AT_DROP
     assert mixed.classification is TerminationClassification.ABNORMAL_BEFORE_OR_AT_DROP
+
+
+@pytest.mark.parametrize(
+    ("fault_event_id", "expected_classification", "expected_position"),
+    [
+        (
+            1,
+            TerminationClassification.ABNORMAL_BEFORE_OR_AT_DROP,
+            EvidencePosition.BEFORE_OR_AT_DROP,
+        ),
+        (3, TerminationClassification.ABNORMAL_AFTER_DROP, EvidencePosition.AFTER_DROP),
+    ],
+)
+def test_completed_run_fault_has_positioned_typed_provenance(
+    fault_event_id: int,
+    expected_classification: TerminationClassification,
+    expected_position: EvidencePosition,
+) -> None:
+    """A completed run retains fault provenance relative to the drop boundary."""
+    result = classify_termination(
+        run_found=True,
+        run_outcome="completed",
+        drop_anchor=DropEventAnchor(2, "2026-08-26T12:00:00+00:00"),
+        event_rows=(_event(fault_event_id, RoastEventKind.FAULT),),
+        emergency_stop_recorded_at_utc=(),
+    )
+
+    assert result.classification is expected_classification
+    assert result.evidence == (
+        TerminationEvidence(TerminationEvidenceKind.FAULT_EVENT, expected_position),
+    )
 
 
 def test_event_positioning_and_anchor_selection_use_insertion_id() -> None:

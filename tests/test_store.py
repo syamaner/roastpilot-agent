@@ -785,6 +785,7 @@ async def test_migration_embedding_transaction_is_rejected(
 from roastpilot_agent.advisor import AdvisorContext, RoastDecision  # noqa: E402
 from roastpilot_agent.config import AppConfig  # noqa: E402
 from roastpilot_agent.models import (  # noqa: E402
+    DropReason,
     PostFcHeatAuthorityState,
     ReferenceLandmarks,
     ReferenceRoast,
@@ -6692,6 +6693,51 @@ async def test_read_termination_malformed_or_null_payload_fails_closed(
                 termination.classification is TerminationClassification.ABNORMAL_BEFORE_OR_AT_DROP
             )
             assert termination.evidence[0].kind is TerminationEvidenceKind.UNKNOWN_DROP_REASON
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_read_termination_keeps_failed_ceiling_guard_provenance(
+    tmp_store: RoastStore,
+) -> None:
+    """A failed ceiling guard remains abnormal after a later normal drop."""
+    await tmp_store.initialize()
+    try:
+        run_id = "failed-guard-then-target"
+        await tmp_store.create_run(
+            run_id=run_id,
+            profile=PROFILE,
+            config=AppConfig(),
+            agent_phase=RoastPhase.DEVELOPMENT,
+        )
+        await tmp_store.record_event(
+            run_id=run_id,
+            kind=RoastEventKind.COMMAND_FAILED,
+            source=RoastEventSource.CONTROLLER,
+            payload={
+                "command": RoastCommand.DROP_BEANS.value,
+                "reason": DropReason.CEILING_GUARD.value,
+            },
+        )
+        await tmp_store.record_event(
+            run_id=run_id,
+            kind=RoastEventKind.COMMAND_EXECUTED,
+            source=RoastEventSource.CONTROLLER,
+            payload={
+                "command": RoastCommand.DROP_BEANS.value,
+                "reason": DropReason.DEVELOPMENT_TARGET.value,
+            },
+        )
+        await tmp_store.complete_run(
+            run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+
+        termination = await tmp_store.read_termination(run_id)
+        assert termination.classification is TerminationClassification.ABNORMAL_BEFORE_OR_AT_DROP
+        assert [item.kind for item in termination.evidence] == [
+            TerminationEvidenceKind.CEILING_GUARD_DROP_FAILED,
+        ]
     finally:
         await tmp_store.close()
 
