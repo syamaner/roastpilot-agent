@@ -6554,27 +6554,24 @@ async def test_read_drop_reading_writes_nothing(tmp_store: RoastStore) -> None:
             recorded_at="2026-01-01T00:00:00+00:00",
         )
         await _record_executed_drop(tmp_store, "read-only", recorded_at="2026-01-01T00:00:00+00:00")
-        async with tmp_store.connection.execute(
-            "SELECT (SELECT COUNT(*) FROM roast_runs), "
-            "(SELECT COUNT(*) FROM telemetry_snapshots), "
-            "(SELECT COUNT(*) FROM roast_events), "
-            "(SELECT updated_at_utc FROM roast_runs WHERE id = 'read-only')"
-        ) as cursor:
-            before_row = await cursor.fetchone()
-        assert before_row is not None
-        before = tuple(before_row)
+
+        async def read_back() -> tuple[tuple[object, ...], ...]:
+            """Return complete affected persisted rows in durable order."""
+            projections = (
+                "SELECT * FROM roast_runs WHERE id = 'read-only'",
+                "SELECT * FROM telemetry_snapshots WHERE run_id = 'read-only' ORDER BY id ASC",
+                "SELECT * FROM roast_events WHERE run_id = 'read-only' ORDER BY id ASC",
+            )
+            rows: list[tuple[object, ...]] = []
+            for projection in projections:
+                async with tmp_store.connection.execute(projection) as cursor:
+                    rows.extend(tuple(row) for row in await cursor.fetchall())
+            return tuple(rows)
+
+        before = await read_back()
         assert await tmp_store.read_drop_event_recorded_at("read-only") is not None
         assert await tmp_store.read_drop_reading("read-only") is not None
-        async with tmp_store.connection.execute(
-            "SELECT (SELECT COUNT(*) FROM roast_runs), "
-            "(SELECT COUNT(*) FROM telemetry_snapshots), "
-            "(SELECT COUNT(*) FROM roast_events), "
-            "(SELECT updated_at_utc FROM roast_runs WHERE id = 'read-only')"
-        ) as cursor:
-            after_row = await cursor.fetchone()
-        assert after_row is not None
-        after = tuple(after_row)
-        assert after == before
+        assert await read_back() == before
     finally:
         await tmp_store.close()
 
