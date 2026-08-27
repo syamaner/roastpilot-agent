@@ -674,7 +674,11 @@ def test_json_sink_rejects_nonfinite_report_values() -> None:
 
 def test_report_values_are_authoritative_planner_values(tmp_path: Path) -> None:
     """T72/G40: config-owned parameters and all derived fields match the planner."""
-    fixture = _write_fixture(tmp_path, [(60.0, 180.0), (120.0, 181.0), (180.0, 182.0)], drop=180.0)
+    fixture = _write_fixture(
+        tmp_path,
+        [(60.0, 190.5), (120.0, 191.0), (180.0, 191.5)],
+        drop=180.0,
+    )
     parsed = validator.read_fixture(fixture)
     config = ControllerConfig(joint_window_planner=JointWindowPlanner(enabled=True))
     minimum = 13.0 - config.drop_dev_margin_percent
@@ -690,8 +694,8 @@ def test_report_values_are_authoritative_planner_values(tmp_path: Path) -> None:
     row = report.rows[-1]
     plan = plan_joint_window(
         JointWindowInputs(
-            182.0,
-            1.0,
+            191.5,
+            0.5,
             180.0,
             60.0,
             195.0,
