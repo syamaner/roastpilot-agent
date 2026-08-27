@@ -336,7 +336,14 @@ def test_resource_bounds_and_non_regular_paths_refuse(
     assert _run(fixture, capsys)[0] == 2
     monkeypatch.setattr(validator, "_MAX_FIXTURE_BYTES", 16 * 1024 * 1024)
     monkeypatch.setattr(validator, "_MAX_LINE_BYTES", 10)
-    assert _run(fixture, capsys)[0] == 2
+    marker = "OVERLONG_LINE_SECRET"
+    overlong = tmp_path / "overlong.jsonl"
+    overlong.write_text(f'{{"type":"telemetry","marker":"{marker}"}}\n', encoding="utf-8")
+    code, stdout, stderr = _run(overlong, capsys)
+    assert code == 2
+    assert stdout == ""
+    assert stderr == "joint-window-validate: fixture rule: line length exceeds limit at line 1\n"
+    assert marker not in stdout + stderr
     monkeypatch.setattr(validator, "_MAX_LINE_BYTES", 64 * 1024)
     monkeypatch.setattr(validator, "_MAX_LINES", 1)
     assert _run(fixture, capsys)[0] == 2
