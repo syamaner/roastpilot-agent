@@ -447,6 +447,16 @@ def plan_joint_window(
         inputs.bean_temp_c + bean_ror_c_per_min * projected_close_runway_seconds / 60.0
     )
 
+    output_numeric_values = (
+        effective_target_temp_c,
+        window_open_runway_seconds,
+        window_close_runway_seconds,
+        projected_temp_at_open_c,
+        projected_temp_at_close_c,
+    )
+    if not all(math.isfinite(value) for value in output_numeric_values):
+        return None
+
     if projected_temp_at_close_c < effective_target_temp_c - temp_margin_c:
         status = JointWindowStatus.TEMP_SHORT
     elif window_close_runway_seconds <= closing_horizon_seconds:

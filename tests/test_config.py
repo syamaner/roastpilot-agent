@@ -997,6 +997,20 @@ def test_joint_window_planner_defaults() -> None:
     assert planner.closing_horizon_seconds == 30.0
 
 
+@pytest.mark.parametrize("value", [0.0, -0.1])
+def test_joint_window_planner_temp_margin_must_be_positive(value: float) -> None:
+    """The temperature margin rejects zero and negative values at the boundary."""
+    with pytest.raises(pydantic.ValidationError):
+        JointWindowPlanner(temp_margin_c=value)
+
+
+@pytest.mark.parametrize("value", [0.0, -0.1])
+def test_joint_window_planner_closing_horizon_must_be_positive(value: float) -> None:
+    """The closing horizon rejects zero and negative values at the boundary."""
+    with pytest.raises(pydantic.ValidationError):
+        JointWindowPlanner(closing_horizon_seconds=value)
+
+
 def test_joint_window_planner_enabled_without_ceiling_guard_is_rejected() -> None:
     """T23: ``joint_window_planner.enabled=True`` with the ceiling guard OFF
     is unconstructible, and the message names both fields."""

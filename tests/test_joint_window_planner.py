@@ -219,6 +219,25 @@ def test_t6_negative_close_runway_projects_to_now_not_backwards() -> None:
     assert plan.status is JointWindowStatus.CLOSING
 
 
+def test_t6_negative_open_runway_projects_to_now_and_can_be_ahead() -> None:
+    """An already-open window never projects RoR backwards from now."""
+    inputs = replace(
+        _BASE_INPUTS,
+        charge_elapsed_seconds=600.0,
+        development_elapsed_seconds=100.0,
+        development_percent_min=15.0,
+        development_percent_max=25.0,
+        bean_temp_c=196.0,
+        bean_ror_c_per_min=6.0,
+    )
+    plan = _call(inputs)
+    assert plan is not None
+    assert plan.window_open_runway_seconds < 0.0
+    assert plan.window_close_runway_seconds > _CLOSING_HORIZON_SECONDS
+    assert plan.projected_temp_at_open_c == inputs.bean_temp_c
+    assert plan.status is JointWindowStatus.AHEAD
+
+
 # --- T7: precedence -----------------------------------------------------
 
 
@@ -457,6 +476,27 @@ def test_t15_missing_ror_returns_none_not_an_exception() -> None:
 
 def test_t15_missing_development_elapsed_returns_none_not_an_exception() -> None:
     assert _call(development_elapsed_seconds=None) is None
+
+
+def test_t15_finite_input_overflow_returns_no_partial_plan() -> None:
+    """Finite input multiplication that overflows makes the plan atomically absent."""
+    assert _call(bean_ror_c_per_min=1e308) is None
+
+
+def test_t15_large_but_finite_outputs_remain_valid() -> None:
+    """Large finite arithmetic remains usable rather than being over-rejected."""
+    plan = _call(bean_temp_c=1e300, bean_ror_c_per_min=1e300)
+    assert plan is not None
+    assert all(
+        math.isfinite(value)
+        for value in (
+            plan.effective_target_temp_c,
+            plan.window_open_runway_seconds,
+            plan.window_close_runway_seconds,
+            plan.projected_temp_at_open_c,
+            plan.projected_temp_at_close_c,
+        )
+    )
 
 
 # --- T16: clock validity -----------------------------------------------------
