@@ -5688,6 +5688,7 @@ async def test_ceiling_guard_fires_identically_with_joint_window_flag_on_or_off(
     the joint-window planner is enabled or not. The planner grants no new
     drop authority and changes no existing one."""
     executed_by_flag: dict[bool, list[dict[str, object]]] = {}
+    context_by_flag: dict[bool, AdvisorContext] = {}
     phase_by_flag: dict[bool, RoastPhase] = {}
     for flag_on in (True, False):
         config = _joint_window_config(ceiling_guard_temp_c=196.0)
@@ -5696,7 +5697,12 @@ async def test_ceiling_guard_fires_identically_with_joint_window_flag_on_or_off(
                 update={"joint_window_planner": JointWindowPlanner(enabled=False)}
             )
         harness = await _joint_window_development_harness(config, fc_ror_c_per_min=5.0)
-        harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=5.0)]
+        telemetry = reading(bean=196.0, bean_ror_c_per_min=-300.0)
+        limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+        context_by_flag[flag_on] = harness.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
+            telemetry, limits
+        )
+        harness.reader.readings = [telemetry]
         harness.controller.request_advisory()
         await harness.controller.tick()
         executed_by_flag[flag_on] = [
@@ -5706,12 +5712,16 @@ async def test_ceiling_guard_fires_identically_with_joint_window_flag_on_or_off(
         ]
         phase_by_flag[flag_on] = harness.controller.phase
 
-    assert phase_by_flag[True] is phase_by_flag[False] is RoastPhase.COOLING
+    on_context = context_by_flag[True]
+    assert on_context.joint_window_status is JointWindowStatus.TEMP_SHORT
+    assert cast(float, on_context.joint_window_close_runway_seconds) > 0.0
+    assert context_by_flag[False].joint_window_status is None
     assert {
         "command": "drop_beans",
         "source": "policy",
         "reason": DropReason.CEILING_GUARD.value,
     } in executed_by_flag[True]
+    assert phase_by_flag[True] is phase_by_flag[False] is RoastPhase.COOLING
     assert executed_by_flag[True] == executed_by_flag[False]
 
 
