@@ -53,9 +53,10 @@ class _Parser(argparse.ArgumentParser):
         """Raise a typed, data-free CLI refusal instead of printing usage.
 
         Args:
-            message: The grammar rule violated by the caller.
+            message: The grammar detail, intentionally never echoed.
         """
-        raise FixtureError(f"cli rule: {message}")
+        del message
+        raise FixtureError("cli rule: invalid arguments")
 
 
 @dataclass(frozen=True)
@@ -131,7 +132,10 @@ def _number(value: object, field: str, line_number: int) -> float:
     """
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise FixtureError(f"fixture rule: {field} must be a number at line {line_number}")
-    numeric = float(value)
+    try:
+        numeric = float(value)
+    except OverflowError as error:
+        raise FixtureError(f"fixture rule: {field} must be finite at line {line_number}") from error
     if not math.isfinite(numeric):
         raise FixtureError(f"fixture rule: {field} must be finite at line {line_number}")
     return numeric
@@ -155,6 +159,8 @@ def _parse_line(line: str, line_number: int) -> dict[str, Any] | None:
         raise FixtureError(f"fixture rule: invalid JSON constant at line {line_number}") from error
     except json.JSONDecodeError as error:
         raise FixtureError(f"fixture rule: invalid JSON at line {line_number}") from error
+    except (RecursionError, ValueError) as error:
+        raise FixtureError(f"fixture rule: invalid JSON at line {line_number}") from error
     if not isinstance(parsed, dict):
         raise FixtureError(f"fixture rule: JSON object required at line {line_number}")
     return cast("dict[str, Any]", parsed)
@@ -172,10 +178,10 @@ def read_fixture(fixture: Path) -> ParsedFixture:
     Raises:
         FixtureError: If the path, input size, grammar, or ordering is invalid.
     """
-    fixture_path = fixture.expanduser()
     try:
+        fixture_path = fixture.expanduser()
         fixture_stat = fixture_path.stat()
-    except OSError as error:  # pragma: no cover - filesystem TOCTOU after the successful stat
+    except (OSError, RuntimeError) as error:
         raise FixtureError("fixture rule: existing regular file required") from error
     if not stat.S_ISREG(fixture_stat.st_mode):
         raise FixtureError("fixture rule: regular file required")
@@ -260,22 +266,37 @@ def read_fixture(fixture: Path) -> ParsedFixture:
     return ParsedFixture(telemetry, t0_seconds, first_crack_seconds, drop_seconds)
 
 
-def _ror(telemetry: list[TelemetryRow], index: int) -> float | None:
-    """Estimate RoR at one recorded sample using the prior sixty-second row.
+def _ror_series(telemetry: list[TelemetryRow]) -> list[float | None]:
+    """Estimate RoR for every recorded sample in one forward cursor pass.
 
     Args:
         telemetry: Full recorded telemetry, including pre-first-crack history.
-        index: Index of the current sample in ``telemetry``.
 
     Returns:
-        °C/min rounded to three places, or ``None`` without sufficient history.
+        °C/min values rounded to three places, or ``None`` without sufficient
+        history. For each row, the anchor is the nearest earlier persisted row
+        at least sixty seconds old.
     """
-    now = telemetry[index]
-    for past in reversed(telemetry[:index]):
-        elapsed_seconds = now.monotonic_seconds - past.monotonic_seconds
-        if elapsed_seconds >= _ROR_WINDOW_SECONDS:
-            return round((now.bean_temp_c - past.bean_temp_c) / elapsed_seconds * 60.0, 3)
-    return None
+    estimates: list[float | None] = []
+    cursor = 0
+    for index, now in enumerate(telemetry):
+        while (
+            cursor + 1 < index
+            and now.monotonic_seconds - telemetry[cursor + 1].monotonic_seconds
+            >= _ROR_WINDOW_SECONDS
+        ):
+            cursor += 1
+        if cursor >= index:
+            estimates.append(None)
+            continue
+        elapsed_seconds = now.monotonic_seconds - telemetry[cursor].monotonic_seconds
+        if elapsed_seconds < _ROR_WINDOW_SECONDS:
+            estimates.append(None)
+            continue
+        estimates.append(
+            round((now.bean_temp_c - telemetry[cursor].bean_temp_c) / elapsed_seconds * 60.0, 3)
+        )
+    return estimates
 
 
 def _controller_config() -> ControllerConfig:
@@ -334,12 +355,12 @@ def _same_file_or_path(first: Path, second: Path) -> bool:
     Returns:
         ``True`` for resolved-path or inode identity.
     """
-    if first.exists() and second.exists():
-        try:
+    try:
+        if first.exists() and second.exists():
             return os.path.samefile(first, second)
-        except OSError:  # pragma: no cover - a filesystem race cannot be reproduced reliably
-            return False
-    return first.resolve() == second.resolve()
+    except (OSError, RuntimeError) as error:
+        raise FixtureError("output rule: path resolution failed") from error
+    return first == second
 
 
 def validate_json_out_path(fixture: Path, json_out: Path | None) -> Path | None:
@@ -357,10 +378,13 @@ def validate_json_out_path(fixture: Path, json_out: Path | None) -> Path | None:
     """
     if json_out is None:
         return None
-    resolved_output = json_out.expanduser().resolve()
+    try:
+        resolved_output = json_out.expanduser().resolve()
+        fixture_path = fixture.expanduser().resolve()
+    except (OSError, RuntimeError) as error:
+        raise FixtureError("output rule: path resolution failed") from error
     if resolved_output.is_relative_to(_REPO_ROOT):
         raise FixtureError("output rule: json-out must be outside the repository")
-    fixture_path = fixture.expanduser().resolve()
     if _same_file_or_path(resolved_output, fixture_path):
         raise FixtureError("output rule: json-out must not be the fixture")
     if not resolved_output.parent.is_dir():
@@ -407,11 +431,12 @@ def build_report(
 
     planner_config = config.joint_window_planner
     rows: list[ReportRow] = []
+    ror_values = _ror_series(fixture.telemetry)
     for index, telemetry_row in selected:
         charge_s = telemetry_row.monotonic_seconds - fixture.t0_seconds
         dev_s = telemetry_row.monotonic_seconds - fixture.first_crack_seconds
         dtr_pct = dev_s / charge_s * 100.0 if charge_s > 0.0 else None
-        ror_c_min = _ror(fixture.telemetry, index)
+        ror_c_min = ror_values[index]
         plan = plan_joint_window(
             JointWindowInputs(
                 bean_temp_c=telemetry_row.bean_temp_c,
@@ -628,7 +653,7 @@ def _parser() -> _Parser:
     Returns:
         A parser with only the authorised input and output options.
     """
-    parser = _Parser(description=__doc__)
+    parser = _Parser(add_help=False)
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--target-drop-temp-c", type=float, required=True)
     parser.add_argument("--target-development-percent", type=float, required=True)

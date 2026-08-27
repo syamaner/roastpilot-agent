@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
@@ -213,7 +215,7 @@ def test_required_targets_fail_closed(
     del args[position : position + 2]
     assert validator.main(args) == 2
     captured = capsys.readouterr()
-    assert "target" in captured.err
+    assert captured.err == "joint-window-validate: cli rule: invalid arguments\n"
     assert captured.out == ""
 
 
@@ -776,3 +778,208 @@ def test_each_joint_window_status_is_reachable(
         development_percent_max=maximum,
     )
     assert report.rows[-1].status is expected
+
+
+def _bakeoff_ror(rows: list[validator.TelemetryRow], index: int) -> float | None:
+    """Return the established reverse-lookback RoR definition for parity checks."""
+    now = rows[index]
+    for past in reversed(rows[:index]):
+        elapsed = now.monotonic_seconds - past.monotonic_seconds
+        if elapsed >= validator._ROR_WINDOW_SECONDS:  # pyright: ignore[reportPrivateUsage]
+            return round((now.bean_temp_c - past.bean_temp_c) / elapsed * 60.0, 3)
+    return None
+
+
+@pytest.mark.parametrize(
+    "times",
+    [
+        [0.0, 59.999, 60.0, 120.0],
+        [0.0, 0.0, 60.0, 60.0, 120.0],
+        [0.0, 61.0, 240.0, 600.0],
+        [float(index) for index in range(0, 241, 3)],
+    ],
+)
+def test_ror_series_matches_bakeoff_definition(times: list[float]) -> None:
+    """The cursor preserves boundary, duplicate, sparse, and dense semantics."""
+    rows = [
+        validator.TelemetryRow(time, 100.0 + index, index + 1) for index, time in enumerate(times)
+    ]
+    assert validator._ror_series(rows) == [  # pyright: ignore[reportPrivateUsage]
+        _bakeoff_ror(rows, index) for index in range(len(rows))
+    ]
+
+
+def test_ror_series_uses_bounded_linear_index_work() -> None:
+    """A dense admitted series cannot regress to per-row reverse-slice work."""
+
+    class CountingRows:
+        """Count indexing and charge slices by the number of rows they touch."""
+
+        def __init__(self, values: list[validator.TelemetryRow]) -> None:
+            """Store the rows while observing every indexed access."""
+            self._values = values
+            self.work = 0
+
+        def __len__(self) -> int:
+            """Return the admitted row count."""
+            return len(self._values)
+
+        def __iter__(self) -> object:
+            """Iterate in the persisted telemetry order."""
+            return iter(self._values)
+
+        def __getitem__(
+            self, index: int | slice
+        ) -> validator.TelemetryRow | list[validator.TelemetryRow]:
+            if isinstance(index, slice):
+                self.work += len(range(*index.indices(len(self))))
+            else:
+                self.work += 1
+            return self._values[index]
+
+    rows = CountingRows(
+        [
+            validator.TelemetryRow(float(index), 100.0 + index / 100.0, index + 1)
+            for index in range(12_000)
+        ]
+    )
+    estimates = validator._ror_series(cast("list[validator.TelemetryRow]", rows))  # pyright: ignore[reportPrivateUsage]
+    assert len(estimates) == len(rows)
+    assert rows.work < len(rows) * 8
+
+
+def test_huge_json_integer_refuses_without_overflow_or_marker(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A finite JSON integer too large for float conversion stays data-free."""
+    marker = "HUGE_INTEGER_SECRET"
+    fixture = tmp_path / f"{marker}.jsonl"
+    fixture.write_text(
+        '{"type":"telemetry","monotonic_seconds":120,"bean_temp_c":' + "1" + "0" * 400 + "}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(validator.FixtureError, match="must be finite at line 1"):
+        validator.read_fixture(fixture)
+    code, stdout, stderr = _run(fixture, capsys)
+    assert code == 2
+    assert marker not in stdout + stderr
+    assert "OverflowError" not in stderr
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "[" * 1_200 + '"NESTING_SECRET"' + "]" * 1_200 + "\n",
+        '{"type":"telemetry","monotonic_seconds":' + "9" * 4_500 + ',"bean_temp_c":160}\n',
+    ],
+)
+def test_decoder_limits_are_invalid_json_and_data_free(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], content: str
+) -> None:
+    """Recursion and Python's integer-digit guard map to the fixed refusal."""
+    marker = "DECODER_SECRET"
+    fixture = tmp_path / f"{marker}.jsonl"
+    fixture.write_text(content, encoding="utf-8")
+    code, stdout, stderr = _run(fixture, capsys)
+    assert code == 2
+    assert "invalid JSON at line 1" in stderr
+    assert marker not in stdout + stderr
+
+
+def test_path_expansion_and_resolution_failures_are_data_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Operator path expansion and resolution errors always become FixtureError."""
+    marker = "PATH_SECRET"
+    fixture = _write_fixture(tmp_path, [(120.0, 160.0), (180.0, 170.0)], name=f"{marker}.jsonl")
+
+    def fail_expanduser(_self: Path) -> Path:
+        """Raise a deterministic expansion failure."""
+        raise OSError("private path")
+
+    monkeypatch.setattr(Path, "expanduser", fail_expanduser)
+    with pytest.raises(validator.FixtureError, match="existing regular file required") as expansion:
+        validator.read_fixture(fixture)
+    assert marker not in str(expansion.value)
+
+    monkeypatch.undo()
+
+    def fail_resolve(_self: Path) -> Path:
+        """Raise a deterministic resolution failure."""
+        raise RuntimeError("private path")
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+    with pytest.raises(validator.FixtureError, match="path resolution failed") as resolution:
+        validator.validate_json_out_path(fixture, tmp_path / "report.json")
+    assert marker not in str(resolution.value)
+
+    monkeypatch.undo()
+
+    def fail_exists(_self: Path) -> bool:
+        """Raise a deterministic path-identity failure."""
+        raise OSError("private path")
+
+    monkeypatch.setattr(Path, "exists", fail_exists)
+    with pytest.raises(validator.FixtureError, match="path resolution failed") as identity:
+        validator._same_file_or_path(fixture, tmp_path / "report.json")  # pyright: ignore[reportPrivateUsage]
+    assert marker not in str(identity.value)
+
+
+def test_json_out_symlink_loop_refuses_without_path_leak(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A real loop during output resolution fails closed before fixture reading."""
+    marker = "LOOP_SECRET"
+    fixture = _write_fixture(tmp_path, [(120.0, 160.0), (180.0, 170.0)], name=f"{marker}.jsonl")
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    code, stdout, stderr = _run(fixture, capsys, "--json-out", str(loop))
+    assert code == 2
+    assert marker not in stdout + stderr
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--help"],
+        ["-h"],
+        [
+            "--fixture",
+            "CLI_SECRET",
+            "--target-drop-temp-c",
+            "not-a-float",
+            "--target-development-percent",
+            "13",
+        ],
+        ["--unknown", "CLI_SECRET"],
+    ],
+)
+def test_cli_grammar_refuses_without_usage_or_argument_echo(
+    capsys: pytest.CaptureFixture[str], arguments: list[str]
+) -> None:
+    """Only the four authorised options exist and parser failures are data-free."""
+    assert validator.main(arguments) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "joint-window-validate: cli rule: invalid arguments\n"
+    assert "CLI_SECRET" not in captured.err
+    assert "usage:" not in captured.err
+
+
+def test_validator_import_graph_excludes_hardware_runtime_modules() -> None:
+    """A fresh interpreter imports no controller, safety, or MCP client module."""
+    code = (
+        "import json, sys; import joint_window_validate; "
+        "print(json.dumps(sorted(name for name in sys.modules "
+        "if name in {'roastpilot_agent.controller', 'roastpilot_agent.safety', "
+        "'roastpilot_agent.mcp_client'})))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        check=True,
+        env={**os.environ, "PYTHONPATH": str(_REPO_ROOT / "scripts")},
+        text=True,
+    )
+    assert json.loads(completed.stdout) == []
