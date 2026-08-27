@@ -38,6 +38,7 @@ from roastpilot_agent.config import AdvisorConfig
 from roastpilot_agent.models import (
     AdvisorHealth,
     AdvisorHealthStatus,
+    JointWindowStatus,
     PostFcHeatAuthorityState,
     ReferenceCurveSample,
     ReferenceLandmarks,
@@ -396,6 +397,39 @@ class AdvisorContext(BaseModel):
     # fan-brake rule, which takes precedence whenever fan is the only brake left.
     # ``None`` for callers that build no controller.
     ambient_fan_step_max_pp: float | None = None
+    # #710 (RP-C) slice 3: the deterministic joint-window drop planner's own
+    # atomic six-field feasibility block (D176/D177), one per
+    # ``post_fc_control.JointWindowPlan`` field, built by
+    # ``RoastController._build_advisor_context`` via
+    # ``post_fc_control.plan_joint_window`` — never reimplemented here. This
+    # SHAPE is added unconditionally; the VALUES stay inert until the
+    # operator both selects the ``c12`` teaching AND sets
+    # ``ControllerConfig.joint_window_planner.enabled=True`` (D177 also
+    # requires ``post_first_crack_control.ceiling_guard_drop_enabled=True``
+    # at that point).
+    #
+    # Atomic by construction: all six are ``None`` together (the planner
+    # disabled, or ``plan_joint_window`` returned its one atomic absent
+    # block for any invalid tick), or all six are populated together from
+    # the SAME ``JointWindowPlan`` instance — never a partial block. Current
+    # bean temperature and DTR are already carried above
+    # (``current_bean_temp_c``, ``development_time_ratio``) and are
+    # deliberately NOT re-surfaced here (the #218 two-copies failure).
+    #
+    # Read-only advisory context with no control authority: nothing in the
+    # controller, safety policy, or any drop path
+    # (``_maybe_ceiling_guard_drop``, ``_maybe_deterministic_drop``,
+    # ``_execute_deterministic_drop``, ``_drop_development_is_coherent``, the
+    # advisor ``should_drop`` branch) reads these fields back — they grant no
+    # new drop authority. ``None`` for every caller that does not enable the
+    # planner (the default), and for every older caller/fixture/replay/
+    # bake-off context that predates #710 slice 3.
+    joint_window_status: JointWindowStatus | None = None
+    joint_window_effective_target_temp_c: float | None = None
+    joint_window_open_runway_seconds: float | None = None
+    joint_window_close_runway_seconds: float | None = None
+    joint_window_projected_temp_at_open_c: float | None = None
+    joint_window_projected_temp_at_close_c: float | None = None
 
 
 class RoastDecision(BaseModel):
@@ -976,17 +1010,19 @@ def instructions_for(prompt_version: str) -> str:
 
     Resolves both prompt namespaces: the ``v``-prefixed per-tick advisory lenses
     in :data:`_PROMPTS` and the ``c``-prefixed control teaching SYSTEM frames in
-    :data:`_CONTROL_TEACHING_PROMPTS` (``c1``, ``c2``, ``c3``). The live post-FC
-    advisor runs with ``prompt_version="c3"`` (the active default after the roast-3
-    fan-as-active-brake tuning; ``c1`` / ``c2`` stay selectable for an A/B), so the
-    control teaching frame is the system ``instructions`` of the production agent;
-    the per-tick #275 context is the user message. The ``c``-namespace is checked
-    first so a control version can never be shadowed by a same-named user lens.
+    :data:`_CONTROL_TEACHING_PROMPTS` (``c1``..``c12``). The live post-FC advisor
+    runs with ``prompt_version="c3"`` (the active default after the roast-3
+    fan-as-active-brake tuning); ``c1`` / ``c2`` / ``c4``..``c12`` all stay
+    selectable-only for an A/B — including ``c12`` (#710 RP-C), the deterministic
+    joint-window drop planner's teaching, gated on the D176 decision-level
+    acceptance — so the control teaching frame is the system ``instructions`` of
+    the production agent; the per-tick #275 context is the user message. The
+    ``c``-namespace is checked first so a control version can never be shadowed
+    by a same-named user lens.
 
     Args:
         prompt_version: The advisor prompt version — a ``c`` control teaching
-            frame (``c1`` / ``c2`` / ``c3``) or a ``v`` per-tick lens
-            (``v0``..``v8``).
+            frame (``c1``..``c12``) or a ``v`` per-tick lens (``v0``..``v8``).
 
     Returns:
         The instruction text for ``prompt_version``.
@@ -1079,12 +1115,21 @@ baseline consult mis-stated a hand-computed percentage ~6 pp low) on top of
 PACE of a fan increase on the room: an aggressive regime is appropriate at or
 above ``ambient_fan_threshold_c``, graduated steps below it — the boundary
 arrives as context DATA so it re-fits from RP-D scores without a prompt edit)
-on top of ``c10``. ``c1`` / ``c2`` / ``c4`` / ``c5`` / ``c6`` / ``c7`` / ``c8``
-/ ``c9`` / ``c10`` / ``c11`` stay selectable for the #396 A/B; ``c3`` remains
-the live default until the A/B validates a successor (operator-gated).
+on top of ``c10``. ``c12`` (#710 RP-C) adds the deterministic joint-window drop
+planner's teaching (temperature-first: hold and accept a development-ratio
+overrun when the planner's ``joint_window_status`` reads ``temp_short``,
+bounded by the already-enforced ceiling and the controller-owned
+deterministic ceiling guard, never by the model's own judgement) on top of
+``c11``. ``c1`` / ``c2`` / ``c4`` / ``c5`` / ``c6`` / ``c7`` / ``c8``
+/ ``c9`` / ``c10`` / ``c11`` / ``c12`` stay selectable for the #396 A/B;
+``c3`` remains the live default until the A/B validates a successor
+(operator-gated).
 ``c10``'s promotion is gated on the #705 part-2 math-reliability bake-off in
-particular, and ``c11``'s on the RP-B decision-level bake-off plus a
-single-variable hardware roast scored by RP-D (#711).
+particular, ``c11``'s on the RP-B decision-level bake-off plus a
+single-variable hardware roast scored by RP-D (#711), and ``c12``'s on the
+D176 decision-level acceptance (both halves) plus #707 supervised hardware
+validation or a validated #580 simulator for any physical-outcome claim —
+no such claim is made by this teaching itself.
 """
 
 _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
@@ -1906,6 +1951,98 @@ _C11_AMBIENT_FAN_SECTION = (
 )
 _CONTROL_TEACHING_PROMPTS["c11"] = _CONTROL_TEACHING_PROMPTS["c10"].replace(
     "THE OBJECTIVE\n", _C11_AMBIENT_FAN_SECTION + "THE OBJECTIVE\n", 1
+)
+
+# --- c12 (#710 RP-C: the deterministic joint-window drop planner) -----------
+#
+# c12 is c11 PLUS one section, spliced just before THE OBJECTIVE so all of
+# c1..c11 is preserved byte-for-byte. Motivation (D176/D177, #710 RP-C): the
+# deterministic, stateless ``plan_joint_window`` classifier already runs
+# every post-first-crack tick when ``joint_window_planner.enabled`` is true,
+# surfacing its atomic six-field read into ``AdvisorContext``
+# (``joint_window_status`` plus the effective target and the four open/close
+# runway/projection fields). This section is the ONLY teaching that reads
+# those six fields; it is selectable-only (``c3`` stays the live default)
+# and the six fields stay ``None`` whenever the planner is disabled, so an
+# unselected or flag-off deployment sees no behavioural change at all.
+#
+# D176's ratified acceptance criterion is temperature-first: when the
+# planner's read says the bean is materially short of its effective target,
+# the correct call is to keep steering toward that target and accept the
+# development ratio running past its window - the OPPOSITE of the issue
+# body's superseded framing that a temperature-short drop is preferable to
+# an over-developed one. That policy is bounded, not open-ended: the
+# effective target itself is already the profile target capped against the
+# enforced ceiling, and the hold this section teaches is terminated by the
+# controller-owned deterministic ceiling guard, never by the model's own
+# judgement about when enough is enough (D177 makes that guard a
+# construction-time requirement of enabling this planner at all).
+#
+# This section QUALIFIES the drop-decisiveness teaching above (c4) and the
+# authoritative-DTR teaching above (c10); it never cancels either. c4's "you
+# are in the window, drop" call and c10's "read development_time_ratio, do
+# not recompute it" rule both stand unchanged - this section only adds a
+# dedicated, forward-looking read for the specific case where the DTR
+# window and the drop temperature disagree about whether the roast is
+# ready.
+#
+# NO numbers here - not the margin, not the horizon (the #218 two-copies
+# discipline; the guard test asserts the section is digit-free). Both
+# numbers arrive as config-owned DATA behind the six context fields, so an
+# operator re-fit changes config, never this prose. Selectable-only; ``c3``
+# stays the live default, and promotion is gated on the D176 decision-level
+# bake-off plus #707 supervised hardware validation or a validated #580
+# simulator (RP-D, #711) — operator-gated.
+_C12_JOINT_WINDOW_SECTION = (
+    "POST-FIRST-CRACK: THE JOINT-WINDOW READ - TEMPERATURE FIRST, BOUNDED BY "
+    "THE CEILING\n"
+    "- When present, joint_window_status is a dedicated, forward-looking "
+    "read of the same joint temperature/development objective taught above, "
+    "built from the current rate of rise projected out to the "
+    "development-ratio window's open and close boundaries. It carries "
+    "exactly one of four values: ahead, on_track, temp_short, or closing.\n"
+    "- temp_short means that even projected out to the window's close, the "
+    "bean lands materially below joint_window_effective_target_temp_c: keep "
+    "steering toward that target and accept the development ratio running "
+    "past its window while you close the temperature gap. This is the "
+    "correct, patient call, not a reason to drop early on a "
+    "temperature-short beat - a temperature-short drop is never preferable "
+    "to letting development run a little long while temperature catches "
+    "up.\n"
+    "- joint_window_effective_target_temp_c is already the lower of the "
+    "profile's own drop target and the indicated bitter ceiling, so holding "
+    "for temperature is never licence to chase a number past the ceiling. "
+    "The hold this status teaches is bounded by a controller-owned "
+    "deterministic guard that ends it if it must - that guard's decision is "
+    "not yours to make or to second-guess; your job is only to keep "
+    "steering toward the effective target while temp_short persists.\n"
+    "- closing means temperature is not the constraint and the development "
+    "window is at or almost at its close boundary "
+    "(joint_window_close_runway_seconds): treat this as your drop signal, "
+    "consistent with the drop-decisiveness call above - do not brake or "
+    "hold further once the window is closing and temperature is not "
+    "short.\n"
+    "- ahead means the bean is already projected to reach "
+    "joint_window_effective_target_temp_c by the window's open boundary "
+    "(joint_window_open_runway_seconds): the joint objective is already "
+    "satisfied on the temperature side, so a drop once the window opens is "
+    "not disqualified on temperature grounds.\n"
+    "- on_track means neither of the above applies: keep steering exactly "
+    "as the objective and lever-stability teaching above already directs.\n"
+    "- joint_window_projected_temp_at_open_c and "
+    "joint_window_projected_temp_at_close_c are forward-LOOKING projections "
+    "at those two boundaries under the current rate of rise, not the "
+    "bean's current reading - never substitute either for "
+    "current_bean_temp_c in your rationale.\n"
+    "- If joint_window_status is absent from context, this dedicated read "
+    "is not available this tick: apply the objective and development-ratio "
+    "teaching above exactly as written. Do not infer a status from any "
+    "other value, and treat the absence as ordinary, not as licence to hold "
+    "indefinitely.\n"
+    "\n"
+)
+_CONTROL_TEACHING_PROMPTS["c12"] = _CONTROL_TEACHING_PROMPTS["c11"].replace(
+    "THE OBJECTIVE\n", _C12_JOINT_WINDOW_SECTION + "THE OBJECTIVE\n", 1
 )
 
 

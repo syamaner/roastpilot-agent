@@ -57,11 +57,14 @@ from roastpilot_agent.models import (
     recording_origin_slug,
 )
 from roastpilot_agent.post_fc_control import (
+    JointWindowInputs,
+    JointWindowPlan,
     PostFcControllerState,
     PostFcControlOutput,
     PostFcProjectionInputs,
     PostFcRecoveryTrigger,
     PostFcRorController,
+    plan_joint_window,
 )
 from roastpilot_agent.roast_history import (
     DecisionTraceEntry,
@@ -5172,6 +5175,70 @@ class RoastController:
             self._config.ambient_fan_doctrine.max_reading_age_seconds,
         )
 
+    def _joint_window_plan(
+        self, telemetry: RoastTelemetry, limits: PhaseControlLimits
+    ) -> JointWindowPlan | None:
+        """Classify this tick's joint-window feasibility (#710 RP-C slice 3).
+
+        Gate is closed-by-default: returns ``None`` immediately unless
+        ``ControllerConfig.joint_window_planner.enabled`` is ``True``. No
+        second precondition is added here — :func:`plan_joint_window`'s own
+        ordered validity chain already voids a pre-first-crack tick (no
+        development clock yet), a missing rate-of-rise reading, a non-finite
+        telemetry value, an invalid clock pairing, and an out-of-open-unit-
+        interval development-percent fraction (D176/D177).
+
+        Every :class:`~roastpilot_agent.post_fc_control.JointWindowInputs`
+        field is sourced from the SAME expression an existing caller already
+        uses this tick — never re-derived — so the planner's read matches
+        exactly what the rest of this tick's advisory cycle and safety
+        evaluation see:
+
+        - ``ceiling_temp_c`` is ``limits.bitter_ceiling_temp_c``, the
+          resolved bitter ceiling off the SAME ``PhaseControlLimits``
+          instance :meth:`_build_advisor_context`'s caller later passes to
+          ``evaluate_command(bounds=...)`` — told == enforced by identity
+          (#273/#294), never a fresh ``_policy_limits_for`` call.
+        - ``development_percent_min`` / ``development_percent_max`` are the
+          byte-identical expressions :meth:`_build_advisor_context` already
+          uses to build ``target_development_percent_min`` /
+          ``_max`` from ``self._config.drop_dev_margin_percent`` — never a
+          second margin literal.
+
+        Args:
+            telemetry: The latest roaster telemetry snapshot.
+            limits: The phase-resolved control box for this advisory cycle —
+                the SAME instance the caller passes to
+                ``evaluate_command(bounds=...)``.
+
+        Returns:
+            The atomic feasibility plan, or ``None`` when the planner is
+            disabled or any input this tick is invalid.
+        """
+        if not self._config.joint_window_planner.enabled:
+            return None
+        planner = self._config.joint_window_planner
+        assert self._profile is not None  # guarded by caller
+        inputs = JointWindowInputs(
+            bean_temp_c=telemetry.bean_temp_c,
+            bean_ror_c_per_min=telemetry.bean_ror_c_per_min,
+            charge_elapsed_seconds=self._charge_elapsed_seconds(),
+            development_elapsed_seconds=self._development_elapsed_seconds(),
+            target_drop_temp_c=self._profile.target_drop_temp_c,
+            ceiling_temp_c=limits.bitter_ceiling_temp_c,
+            development_percent_min=(
+                self._profile.target_development_percent - self._config.drop_dev_margin_percent
+            ),
+            development_percent_max=(
+                self._profile.target_development_percent + self._config.drop_dev_margin_percent
+            ),
+        )
+        return plan_joint_window(
+            inputs,
+            temp_margin_c=planner.temp_margin_c,
+            closing_horizon_seconds=planner.closing_horizon_seconds,
+        )
+
     def _build_advisor_context(
         self, telemetry: RoastTelemetry, limits: PhaseControlLimits
     ) -> AdvisorContext:
@@ -5190,6 +5257,7 @@ class RoastController:
         """
         assert self._profile is not None  # guarded by caller
         doctrine_ambient_temp_c, doctrine_ambient_humidity_pct = self._doctrine_ambient(telemetry)
+        joint_window_plan = self._joint_window_plan(telemetry, limits)
         return AdvisorContext(
             phase=self._phase,
             # Charge-referenced (#219): the DTR denominator the advisor reasons
@@ -5328,6 +5396,30 @@ class RoastController:
                 self._config.ambient_fan_doctrine.step_max_pp
                 if self._config.ambient_fan_doctrine.enabled
                 else None
+            ),
+            # #710 (RP-C) slice 3: the deterministic joint-window drop
+            # planner's atomic six-field read (D176/D177), mirroring the
+            # ``ambient_*`` group's own inert-until-enabled posture above.
+            # All six derive from the SINGLE ``joint_window_plan`` computed
+            # by :meth:`_joint_window_plan` this tick — never independently
+            # recomputed — so the block is populated or absent together,
+            # never partially. ``None`` when the planner is disabled or this
+            # tick's inputs are invalid (see :meth:`_joint_window_plan`).
+            joint_window_status=(None if joint_window_plan is None else joint_window_plan.status),
+            joint_window_effective_target_temp_c=(
+                None if joint_window_plan is None else joint_window_plan.effective_target_temp_c
+            ),
+            joint_window_open_runway_seconds=(
+                None if joint_window_plan is None else joint_window_plan.window_open_runway_seconds
+            ),
+            joint_window_close_runway_seconds=(
+                None if joint_window_plan is None else joint_window_plan.window_close_runway_seconds
+            ),
+            joint_window_projected_temp_at_open_c=(
+                None if joint_window_plan is None else joint_window_plan.projected_temp_at_open_c
+            ),
+            joint_window_projected_temp_at_close_c=(
+                None if joint_window_plan is None else joint_window_plan.projected_temp_at_close_c
             ),
         )
 

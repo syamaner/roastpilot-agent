@@ -1900,6 +1900,194 @@ def test_c11_registered_selectable_and_not_the_live_default() -> None:
     )
 
 
+# --- c12 (#710 RP-C: the deterministic joint-window drop planner, T47-T55) --
+
+
+def test_c12_chain_integrity_c1_through_c12_byte_identical_to_their_splices() -> None:
+    """T47 (AC7, G21): each of c2..c12 equals ITS OWN documented splice from
+    the version directly below it — reconstructed here independently of the
+    module's own assembly order, so a splice performed from the wrong
+    parent, on the wrong anchor, or more than once would be caught even if
+    the module's internal wiring happened to still produce the right STRING
+    by accident. Also pins that c1..c11 stay byte-for-byte unchanged by the
+    c12 addition (AC7 rule 9)."""
+    from roastpilot_agent.advisor import (
+        _C2_DEVELOPMENT_STRETCH_SECTION,  # pyright: ignore[reportPrivateUsage]
+        _C3_FAN_BRAKE_SECTION,  # pyright: ignore[reportPrivateUsage]
+        _C4_DROP_DECISIVENESS_SECTION,  # pyright: ignore[reportPrivateUsage]
+        _C5_HEAT_FLOOR_SECTION,  # pyright: ignore[reportPrivateUsage]
+        _C6_HEAT_RECOVERY_SECTION,  # pyright: ignore[reportPrivateUsage]
+        _C7_DTR_PACE_SECTION,  # pyright: ignore[reportPrivateUsage]
+        _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION,  # pyright: ignore[reportPrivateUsage]
+        _C9_REFERENCE_CURVE_SECTION,  # pyright: ignore[reportPrivateUsage]
+        _C10_DTR_AUTHORITY_SECTION,  # pyright: ignore[reportPrivateUsage]
+        _C11_AMBIENT_FAN_SECTION,  # pyright: ignore[reportPrivateUsage]
+        _C12_JOINT_WINDOW_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    c1 = control_teaching_prompt("c1")
+    assert c1  # non-empty base
+
+    chain = [
+        ("c2", _C2_DEVELOPMENT_STRETCH_SECTION),
+        ("c3", _C3_FAN_BRAKE_SECTION),
+        ("c4", _C4_DROP_DECISIVENESS_SECTION),
+        ("c5", _C5_HEAT_FLOOR_SECTION),
+        ("c6", _C6_HEAT_RECOVERY_SECTION),
+        ("c7", _C7_DTR_PACE_SECTION),
+        ("c8", _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION),
+        ("c9", _C9_REFERENCE_CURVE_SECTION),
+        ("c10", _C10_DTR_AUTHORITY_SECTION),
+        ("c11", _C11_AMBIENT_FAN_SECTION),
+        ("c12", _C12_JOINT_WINDOW_SECTION),
+    ]
+    previous = c1
+    for version, section in chain:
+        expected = previous.replace("THE OBJECTIVE\n", section + "THE OBJECTIVE\n", 1)
+        actual = control_teaching_prompt(version)
+        assert actual == expected, f"{version} must be EXACTLY its parent plus its own section"
+        previous = actual
+
+
+def test_c12_section_absent_from_earlier_versions() -> None:
+    """T48 (G21): the c12 section must not have leaked into any
+    already-shipped earlier version, including the live default c3."""
+    from roastpilot_agent.advisor import (
+        _C12_JOINT_WINDOW_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    assert _C12_JOINT_WINDOW_SECTION not in control_teaching_prompt("c11")
+    assert _C12_JOINT_WINDOW_SECTION not in control_teaching_prompt("c10")
+    assert _C12_JOINT_WINDOW_SECTION not in control_teaching_prompt("c3")
+
+
+def test_c12_section_names_no_numbers() -> None:
+    """T49 (G20): the margin and horizon are DATA
+    (``JointWindowPlanner.temp_margin_c`` / ``closing_horizon_seconds``),
+    never prompt literals — the #218 two-copies discipline."""
+    from roastpilot_agent.advisor import (
+        _C12_JOINT_WINDOW_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    assert not re.search(r"\d", _C12_JOINT_WINDOW_SECTION), (
+        "the joint-window section must name no hardcoded numbers"
+    )
+
+
+def test_c12_section_names_all_statuses_and_all_context_keys() -> None:
+    """T50 (AC7): the section names all four wire-form status labels
+    (``models.JointWindowStatus``'s serialised values) and all six
+    ``joint_window_*`` context keys verbatim."""
+    from roastpilot_agent.advisor import (
+        _C12_JOINT_WINDOW_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    section = _C12_JOINT_WINDOW_SECTION
+    for status_label in ("ahead", "on_track", "temp_short", "closing"):
+        assert status_label in section
+    for key in (
+        "joint_window_status",
+        "joint_window_effective_target_temp_c",
+        "joint_window_open_runway_seconds",
+        "joint_window_close_runway_seconds",
+        "joint_window_projected_temp_at_open_c",
+        "joint_window_projected_temp_at_close_c",
+    ):
+        assert key in section
+
+
+def test_c12_section_states_temperature_first_and_the_ceiling_bound_together() -> None:
+    """T51 (AC1, D176/D177): the temperature-first instruction and the
+    ceiling-bound statement occur WITHIN the c12 section itself — not merely
+    inherited from an earlier splice — so the SAME teaching both licenses
+    the hold and bounds it."""
+    from roastpilot_agent.advisor import (
+        _C12_JOINT_WINDOW_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    section = _C12_JOINT_WINDOW_SECTION
+    temp_short_bullet = _bullet_starting_with(section, "- temp_short means").lower()
+    assert "keep steering toward" in temp_short_bullet
+    assert "accept the development ratio running" in temp_short_bullet
+    # The ceiling bound is stated in the SAME section (the very next bullet),
+    # never merely assumed from an earlier splice.
+    ceiling_bullet = _bullet_starting_with(
+        section, "- joint_window_effective_target_temp_c is already"
+    ).lower()
+    assert "bitter ceiling" in ceiling_bullet
+    assert "controller-owned" in ceiling_bullet
+    assert "deterministic guard" in ceiling_bullet
+
+
+def test_c12_section_has_an_absent_status_fallback_that_never_licenses_holding() -> None:
+    """T52 (AC7 rule 6): an absent-``joint_window_status`` fallback exists and
+    directs the model to apply the existing objective/DTR teaching exactly
+    as written — never to infer a status from another value, and never to
+    treat the absence as licence to hold indefinitely."""
+    from roastpilot_agent.advisor import (
+        _C12_JOINT_WINDOW_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    section = _C12_JOINT_WINDOW_SECTION
+    fallback = _bullet_starting_with(section, "- If joint_window_status is absent").lower()
+    assert "apply the objective and development-ratio" in fallback
+    assert "exactly as written" in fallback
+    assert "do not infer a status" in fallback
+    assert "licence to hold indefinitely" in fallback
+
+
+_SUPERSEDED_TEMP_SHORT_PHRASES = (
+    "a temperature-short drop is preferable",
+    "temperature-short drop is preferable to",
+    "dropping temperature-short beats over-developing",
+    "prefer to drop temperature-short",
+    "better to drop temperature-short",
+    "drop temperature-short rather than over-develop",
+)
+
+
+def test_c12_never_restores_the_superseded_drop_temp_short_framing() -> None:
+    """T53 (AC1): the superseded framing D176 replaces — that dropping
+    temperature-short beats over-developing — is absent from both the new
+    section and the whole assembled c12 prompt (never a close-paraphrase
+    reintroduction; only the ratified opposite appears)."""
+    from roastpilot_agent.advisor import (
+        _C12_JOINT_WINDOW_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    section_normalized = " ".join(_C12_JOINT_WINDOW_SECTION.lower().split())
+    c12_normalized = " ".join(control_teaching_prompt("c12").lower().split())
+    for phrase in _SUPERSEDED_TEMP_SHORT_PHRASES:
+        assert phrase not in section_normalized
+        assert phrase not in c12_normalized
+    # The ratified OPPOSITE is what actually appears.
+    assert "is never preferable to" in section_normalized
+
+
+def test_c12_does_not_move_the_live_default() -> None:
+    """T54 (G-default): adding c12 must never move the live default."""
+    assert CONTROL_TEACHING_PROMPT_VERSION == "c3"
+    assert AdvisorConfig().prompt_version == "c3"
+
+
+def test_c12_registered_selectable_and_not_the_live_default() -> None:
+    """T55 (AC7/AC3): c12 is a registered, selectable version wired the same
+    as its siblings (``instructions_for`` resolves it to the same text, and
+    the unknown-version ``ValueError`` is unaffected), and adding it does
+    not make it live — c3 stays the default. c12 is promoted only if the
+    D176 decision-level acceptance (both halves) and #707 supervised
+    hardware validation or a validated #580 simulator validate it —
+    operator-gated."""
+    assert instructions_for("c12") == control_teaching_prompt("c12")
+    assert control_teaching_prompt("c12")  # non-empty
+    assert CONTROL_TEACHING_PROMPT_VERSION == "c3"
+    assert control_teaching_prompt("c12") != control_teaching_prompt(
+        CONTROL_TEACHING_PROMPT_VERSION
+    )
+    with pytest.raises(ValueError):
+        instructions_for("does-not-exist")
+
+
 # --- Codex P2 follow-up (#499): assert on the FINAL ASSEMBLED prompt, not
 # just the c1 fragment. The splice chain (c1 -> c2 -> c3 -> c4 -> c5 -> c6)
 # means a section added to c1 can be directly contradicted by a LATER-spliced
@@ -1918,7 +2106,7 @@ def test_c11_registered_selectable_and_not_the_live_default() -> None:
 # #559) is now the newest/most-spliced version and is added the same way.
 
 
-@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9", "c10", "c11"])
+@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9", "c10", "c11", "c12"])
 def test_assembled_prompt_carries_the_joint_objective_and_no_contradiction(
     version: str,
 ) -> None:
@@ -1939,7 +2127,7 @@ def test_assembled_prompt_carries_the_joint_objective_and_no_contradiction(
     assert "latest acceptable drop" not in lowered
 
 
-@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9", "c10", "c11"])
+@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9", "c10", "c11", "c12"])
 def test_assembled_prompt_joint_objective_precedes_every_later_section(
     version: str,
 ) -> None:
@@ -1959,6 +2147,7 @@ def test_assembled_prompt_joint_objective_precedes_every_later_section(
         "POST-FIRST-CRACK: A REFERENCE ROAST",  # c9
         "POST-FIRST-CRACK: READ THE PROVIDED DEVELOPMENT RATIO",  # c10
         "POST-FIRST-CRACK: MATCH FAN AGGRESSION TO THE ROOM",  # c11
+        "POST-FIRST-CRACK: THE JOINT-WINDOW READ",  # c12
     ):
         if marker in prompt:
             assert prompt.index(marker) > joint_index, (

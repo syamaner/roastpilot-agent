@@ -171,7 +171,7 @@ const PROVIDER_OPTIONS: FieldOption[] = [
   { value: "ollama",            label: "Ollama (local)" },
 ];
 
-// All eleven c-series control-teaching prompts are real and selectable (c1–c11
+// All twelve c-series control-teaching prompts are real and selectable (c1–c12
 // confirmed in advisor.py _CONTROL_TEACHING_PROMPTS). c3 is the live default.
 // c1/c2 are the original cuts (retained for A/B); c4/c5/c6 are experiment
 // selectors (#396); c7 is the #499 part-2 DTR-pace-mismatch experiment; c8 is
@@ -182,7 +182,11 @@ const PROVIDER_OPTIONS: FieldOption[] = [
 // development_time_ratio, don't recompute it from the raw seconds); c11 is the
 // #709 RP-B ambient-aware fan doctrine (condition fan aggression on the room:
 // aggressive airflow at/above the ambient_fan_threshold_c boundary, graduated
-// steps below it — the boundary itself is agent-side config, not a UI field).
+// steps below it — the boundary itself is agent-side config, not a UI field);
+// c12 is the #710 RP-C deterministic joint-window drop planner's teaching
+// (temperature-first: hold and accept a development-ratio overrun when
+// materially temperature-short, bounded by the controller-owned ceiling
+// guard — the margin/horizon are agent-side config, not UI fields).
 // Legacy v0/v1 prompts are internal only — not exposed here.
 const PROMPT_VERSION_OPTIONS: FieldOption[] = [
   { value: "c1", label: "c1 — original (v1 baseline)" },
@@ -196,6 +200,7 @@ const PROMPT_VERSION_OPTIONS: FieldOption[] = [
   { value: "c9", label: "c9 — experiment (#567 reference-roast A/B)" },
   { value: "c10", label: "c10 — experiment (#705 read-provided-DTR A/B)" },
   { value: "c11", label: "c11 — experiment (#709 ambient-aware fan A/B)" },
+  { value: "c12", label: "c12 — experiment (#710 RP-C joint-window A/B)" },
 ];
 
 // ---------------------------------------------------------------------------

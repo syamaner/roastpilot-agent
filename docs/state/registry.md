@@ -2,6 +2,48 @@
 
 ## Active Epic
 
+**27 Aug 2026 — #710 (RP-C) slice 3 implementation complete (`Refs #710`,
+decision-level acceptance half 2 pending): the deterministic joint-window
+drop planner (`post_fc_control.plan_joint_window`,
+`post_fc_control.JointWindowInputs` / `JointWindowPlan`,
+`models.JointWindowStatus`) is now surfaced to the advisor. Six new
+`advisor.AdvisorContext.joint_window_*` fields are built by
+`controller.RoastController._build_advisor_context` on every advisory tick,
+atomically populated together or left atomically `None` together (never
+partial), sourced from the SAME `PhaseControlLimits` instance and the SAME
+`drop_dev_margin_percent` the safety gate and the rest of the advisor
+context already use — no second derivation, no new drop authority, no new
+`DropReason`, and no drop path (ceiling guard, the D84 dev-target anchor, or
+the advisor's own `should_drop` branch) reads the new fields back. The whole
+group stays `None` by default: `config.JointWindowPlanner.enabled=False`
+default-off, and D177's existing cross-field invariant (planner enabled
+requires `post_first_crack_control.ceiling_guard_drop_enabled=True`)
+unchanged. A new selectable-only control-teaching version,
+`advisor._C12_JOINT_WINDOW_SECTION` (spliced onto `c11` as `c12`), teaches
+the D176-ratified temperature-first policy — continue toward the effective
+target and accept a development-ratio overrun when materially
+temperature-short, bounded by the controller-owned deterministic ceiling
+guard — and never restores the superseded "drop temperature-short" framing.
+`c3` remains the live default; `c12` is selectable only for an operator-run
+A/B. The SPA hand-mirror
+(`web/src/pages/config/configSchema.ts`) adds the matching `c12` option,
+twelve entries total, the first eleven byte-unchanged.
+
+Evidence posture (D176, decision-level only — no RP-D physical-outcome
+improvement is claimed, and none is reserved by this entry; that claim stays
+reserved for #707 supervised hardware validation or a validated #580
+simulator): half 1 of the D176 acceptance ("the deterministic planner
+reports `TEMP_SHORT` before the DTR window closes" on the recorded
+temp-short fixtures) is already satisfied and recorded, sanitized, in the
+issue's own comment thread — nothing further is restated here. Half 2 (the
+isolated c11-versus-c12 `should_drop`-withholding comparison, run by the
+lead with an operator-local, uncommitted harness against private recorded
+evidence per the issue's protocol) is **PENDING** as of this commit — this
+implementation slice ships no comparison harness (`scripts/joint_window_validate.py`
+remains the half-1 validator only, unchanged) and performs no private-evidence
+work. Per the fail-closed default, this PR links `Refs #710`, not `Closes`,
+until half 2 records a recorded PASS.
+
 **26 Aug 2026 — #811 closed: administrative closure of the Codex-led-delivery
 pilot, not pilot sample 12 — this PR adds no product behaviour, capture
 parser, workflow, dependency, test fixture, production artifact, or plan
