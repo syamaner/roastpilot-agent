@@ -340,7 +340,14 @@ def test_resource_bounds_and_non_regular_paths_refuse(
     monkeypatch.setattr(validator, "_MAX_LINE_BYTES", 64 * 1024)
     monkeypatch.setattr(validator, "_MAX_LINES", 1)
     assert _run(fixture, capsys)[0] == 2
-    assert _run(tmp_path, capsys)[0] == 2
+    marker = "NON_REGULAR_PATH_SECRET"
+    directory = tmp_path / marker
+    directory.mkdir()
+    code, stdout, stderr = _run(directory, capsys)
+    assert code == 2
+    assert stdout == ""
+    assert stderr == "joint-window-validate: fixture rule: regular file required\n"
+    assert marker not in stdout + stderr
 
 
 def test_running_byte_bound_does_not_trust_the_initial_stat(
