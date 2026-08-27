@@ -181,7 +181,7 @@ def read_fixture(fixture: Path) -> ParsedFixture:
     try:
         fixture_path = fixture.expanduser()
         fixture_stat = fixture_path.stat()
-    except (OSError, RuntimeError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         raise FixtureError("fixture rule: existing regular file required") from error
     if not stat.S_ISREG(fixture_stat.st_mode):
         raise FixtureError("fixture rule: regular file required")
@@ -293,9 +293,8 @@ def _ror_series(telemetry: list[TelemetryRow]) -> list[float | None]:
         if elapsed_seconds < _ROR_WINDOW_SECONDS:
             estimates.append(None)
             continue
-        estimates.append(
-            round((now.bean_temp_c - telemetry[cursor].bean_temp_c) / elapsed_seconds * 60.0, 3)
-        )
+        ror_c_per_min = (now.bean_temp_c - telemetry[cursor].bean_temp_c) / elapsed_seconds * 60.0
+        estimates.append(round(ror_c_per_min, 3) if math.isfinite(ror_c_per_min) else None)
     return estimates
 
 
@@ -356,9 +355,11 @@ def _same_file_or_path(first: Path, second: Path) -> bool:
         ``True`` for resolved-path or inode identity.
     """
     try:
+        if "\x00" in os.fspath(first) or "\x00" in os.fspath(second):
+            raise ValueError("embedded null byte")
         if first.exists() and second.exists():
             return os.path.samefile(first, second)
-    except (OSError, RuntimeError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         raise FixtureError("output rule: path resolution failed") from error
     return first == second
 
@@ -381,7 +382,7 @@ def validate_json_out_path(fixture: Path, json_out: Path | None) -> Path | None:
     try:
         resolved_output = json_out.expanduser().resolve()
         fixture_path = fixture.expanduser().resolve()
-    except (OSError, RuntimeError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         raise FixtureError("output rule: path resolution failed") from error
     if resolved_output.is_relative_to(_REPO_ROOT):
         raise FixtureError("output rule: json-out must be outside the repository")

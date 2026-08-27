@@ -848,6 +848,41 @@ def test_ror_series_uses_bounded_linear_index_work() -> None:
     assert rows.work < len(rows) * 8
 
 
+def test_overflowing_derived_ror_is_absent_in_text_and_strict_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finite inputs with an overflowing temperature difference stay absent."""
+    fixture = _write_fixture(
+        tmp_path,
+        [(60.0, -1e308), (120.0, 1e308)],
+        fc=120.0,
+        drop=120.0,
+    )
+    output = tmp_path / "overflow.json"
+    code, stdout, stderr = _run(fixture, capsys, "--json-out", str(output))
+    serialized = output.read_text(encoding="utf-8")
+    payload = json.loads(serialized)
+    row = payload["rows"][-1]
+
+    assert code == 0
+    assert stderr == ""
+    assert "inf" not in stdout.lower()
+    assert "nan" not in stdout.lower()
+    assert "inf" not in serialized.lower()
+    assert "nan" not in serialized.lower()
+    assert row["ror_c_min"] is None
+    assert row["status"] is None
+    for field in (
+        "effective_target_temp_c",
+        "window_open_runway_seconds",
+        "window_close_runway_seconds",
+        "projected_temp_at_open_c",
+        "projected_temp_at_close_c",
+    ):
+        assert row[field] is None
+    assert payload["summary"]["absent_row_count"] == 1
+
+
 def test_huge_json_integer_refuses_without_overflow_or_marker(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -923,6 +958,37 @@ def test_path_expansion_and_resolution_failures_are_data_free(
     with pytest.raises(validator.FixtureError, match="path resolution failed") as identity:
         validator._same_file_or_path(fixture, tmp_path / "report.json")  # pyright: ignore[reportPrivateUsage]
     assert marker not in str(identity.value)
+
+
+def test_embedded_nul_paths_are_fixed_data_free_refusals(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Direct and CLI NUL-bearing paths never escape the path error boundary."""
+    marker = "NUL_PATH_SECRET"
+    fixture = _write_fixture(tmp_path, [(120.0, 160.0), (180.0, 170.0)])
+    nul_path = Path(f"{tmp_path}/{marker}\x00fixture.jsonl")
+
+    with pytest.raises(validator.FixtureError, match="existing regular file required") as read:
+        validator.read_fixture(nul_path)
+    with pytest.raises(validator.FixtureError, match="path resolution failed") as output:
+        validator.validate_json_out_path(fixture, nul_path)
+    with pytest.raises(validator.FixtureError, match="path resolution failed") as identity:
+        validator._same_file_or_path(nul_path, fixture)  # pyright: ignore[reportPrivateUsage]
+    assert marker not in str(read.value) + str(output.value) + str(identity.value)
+
+    assert validator.main(_args(nul_path)) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "joint-window-validate: fixture rule: existing regular file required\n"
+    assert "Traceback" not in captured.err
+    assert marker not in captured.err
+
+    assert validator.main(_args(fixture, "--json-out", str(nul_path))) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "joint-window-validate: output rule: path resolution failed\n"
+    assert "Traceback" not in captured.err
+    assert marker not in captured.err
 
 
 def test_json_out_symlink_loop_refuses_without_path_leak(
