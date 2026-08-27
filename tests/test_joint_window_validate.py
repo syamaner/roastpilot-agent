@@ -398,14 +398,17 @@ def test_nonfinite_json_constants_are_refused(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], constant: str
 ) -> None:
     """T61/G25: Python's permissive JSON constants never become telemetry."""
-    fixture = tmp_path / "constants.jsonl"
+    marker = "JSON_CONSTANT_SECRET"
+    fixture = tmp_path / f"{marker}.jsonl"
     fixture.write_text(
         '{"type":"telemetry","monotonic_seconds":120,"bean_temp_c":' + constant + "}\n",
         encoding="utf-8",
     )
-    code, _, stderr = _run(fixture, capsys)
+    code, stdout, stderr = _run(fixture, capsys)
     assert code == 2
-    assert "line 1" in stderr
+    assert stdout == ""
+    assert stderr == "joint-window-validate: fixture rule: invalid JSON constant at line 1\n"
+    assert marker not in stdout + stderr
 
 
 def test_decreasing_telemetry_clock_refuses(
