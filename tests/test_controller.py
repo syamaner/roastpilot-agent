@@ -9,6 +9,7 @@ extend this suite.
 import asyncio
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -27,6 +28,7 @@ from roastpilot_agent.coherence import LeverDirection
 from roastpilot_agent.config import (
     AmbientFanDoctrine,
     ControllerConfig,
+    JointWindowPlanner,
     LateMaillardTrim,
     PostFirstCrackControl,
     PreFirstCrackLevers,
@@ -53,6 +55,7 @@ from roastpilot_agent.models import (
     AdvisorHealthStatus,
     AppliedRoasterState,
     DropReason,
+    JointWindowStatus,
     OperatorAction,
     PostFcHeatAuthorityState,
     ReferenceCurveSample,
@@ -64,7 +67,12 @@ from roastpilot_agent.models import (
     RoastStyle,
     RoastTelemetry,
 )
-from roastpilot_agent.post_fc_control import PostFcRecoveryTrigger
+from roastpilot_agent.post_fc_control import (
+    JointWindowInputs,
+    JointWindowPlan,
+    PostFcRecoveryTrigger,
+    plan_joint_window,
+)
 from roastpilot_agent.roast_history import DecisionTraceEntry, RoastMilestoneKind
 from roastpilot_agent.safety import (
     COMMAND_PHASE_MATRIX,
@@ -5337,6 +5345,380 @@ async def test_stale_ambient_reaches_the_predicate_as_none_and_never_clamps() ->
     signal = harness.controller._post_fc_fan_signal(harness.sink.snapshots[-1])  # pyright: ignore[reportPrivateUsage]
     assert signal is not None and signal.ambient_temp_c is None
     assert harness.controller.snapshot().current_fan == 100
+
+
+# --- #710 (RP-C) slice 3: the deterministic joint-window drop planner's ------
+# atomic six-field advisor-context block (D176/D177, T39-T46) ---------------
+
+
+def _joint_window_config(
+    *,
+    ceiling_guard_temp_c: float = 196.0,
+    temp_margin_c: float | None = None,
+    closing_horizon_seconds: float | None = None,
+    drop_dev_margin_percent: float | None = None,
+) -> ControllerConfig:
+    """A ``ControllerConfig`` with the #710 RP-C joint-window planner ENABLED
+    and its D177-required ceiling guard ENABLED, unless the caller overrides
+    the guard's own temperature. The RoR-taper loop stays OFF — isolated,
+    mirroring :func:`_ceiling_guard_config` — so a joint-window assertion is
+    never entangled with taper heat actuation. Every enabled planner here is
+    constructed THROUGH ``ControllerConfig(...)`` (never assembled via a
+    later ``model_copy(update=...)``) so the D177 cross-field validator
+    always runs (C3 sweep)."""
+    planner_kwargs: dict[str, object] = {"enabled": True}
+    if temp_margin_c is not None:
+        planner_kwargs["temp_margin_c"] = temp_margin_c
+    if closing_horizon_seconds is not None:
+        planner_kwargs["closing_horizon_seconds"] = closing_horizon_seconds
+    config_kwargs: dict[str, object] = {
+        "post_first_crack_control": PostFirstCrackControl(
+            enabled=False,
+            ceiling_guard_drop_enabled=True,
+            ceiling_guard_temp_c=ceiling_guard_temp_c,
+        ),
+        "joint_window_planner": JointWindowPlanner(**planner_kwargs),  # type: ignore[arg-type]
+    }
+    if drop_dev_margin_percent is not None:
+        config_kwargs["drop_dev_margin_percent"] = drop_dev_margin_percent
+    return ControllerConfig(**config_kwargs)  # type: ignore[arg-type]
+
+
+async def _joint_window_development_harness(
+    config: ControllerConfig, *, fc_ror_c_per_min: float = -2.0
+) -> Harness:
+    """A harness genuinely TICKED from PREHEATING through a real MCP-detected
+    first crack into DEVELOPMENT (via :func:`_charge_through_fc`), so
+    ``_charge_monotonic``/``_first_crack_monotonic`` carry REAL, valid clock
+    values — never hand-set — before a joint-window test builds a context
+    directly. Built with no advisor (``_charge_through_fc``'s FC-edge tick
+    then no-ops on any consult attempt, per ``self._advisor is None``): a
+    caller that wants a scripted advisor for the DEVELOPMENT ticks that
+    follow assigns ``harness.controller._advisor`` AFTER this returns, so the
+    priming drive can never silently consume one of the caller's scripted
+    decisions."""
+    harness = make_harness(config=config)
+    await _charge_through_fc(harness, fc_ror_c_per_min=fc_ror_c_per_min)
+    return harness
+
+
+def _expected_joint_window_plan(
+    harness: Harness, telemetry: RoastTelemetry, limits: PhaseControlLimits
+) -> JointWindowPlan | None:
+    """Independently recompute the joint-window plan a valid tick SHOULD
+    produce, from the byte-identical expressions §2.3 of the #710 slice 3
+    contract specifies (never the controller's own helper), so a
+    field-by-field comparison against ``AdvisorContext.joint_window_*``
+    actually proves the wiring rather than restating it."""
+    controller = harness.controller
+    planner = controller._config.joint_window_planner  # pyright: ignore[reportPrivateUsage]
+    drop_dev_margin_percent = controller._config.drop_dev_margin_percent  # pyright: ignore[reportPrivateUsage]
+    inputs = JointWindowInputs(
+        bean_temp_c=telemetry.bean_temp_c,
+        bean_ror_c_per_min=telemetry.bean_ror_c_per_min,
+        charge_elapsed_seconds=controller._charge_elapsed_seconds(),  # pyright: ignore[reportPrivateUsage]
+        development_elapsed_seconds=controller._development_elapsed_seconds(),  # pyright: ignore[reportPrivateUsage]
+        target_drop_temp_c=PROFILE.target_drop_temp_c,
+        ceiling_temp_c=limits.bitter_ceiling_temp_c,
+        development_percent_min=(PROFILE.target_development_percent - drop_dev_margin_percent),
+        development_percent_max=(PROFILE.target_development_percent + drop_dev_margin_percent),
+    )
+    return plan_joint_window(
+        inputs,
+        temp_margin_c=planner.temp_margin_c,
+        closing_horizon_seconds=planner.closing_horizon_seconds,
+    )
+
+
+def _joint_window_fields(
+    ctx: AdvisorContext,
+) -> tuple[
+    JointWindowStatus | None, float | None, float | None, float | None, float | None, float | None
+]:
+    """The six ``joint_window_*`` fields as one tuple, for atomicity asserts."""
+    return (
+        ctx.joint_window_status,
+        ctx.joint_window_effective_target_temp_c,
+        ctx.joint_window_open_runway_seconds,
+        ctx.joint_window_close_runway_seconds,
+        ctx.joint_window_projected_temp_at_open_c,
+        ctx.joint_window_projected_temp_at_close_c,
+    )
+
+
+@pytest.mark.asyncio
+async def test_joint_window_context_all_six_none_with_flag_off() -> None:
+    """T39 (AC3/AC5): flag OFF (default config) — on a valid DEVELOPMENT tick
+    with FC detected, live RoR, and valid clocks, all six ``joint_window_*``
+    fields are ``None``. The planner defaults to disabled, so a bare context
+    build without a caller-selected joint-window config must never reach
+    it."""
+    harness = await _joint_window_development_harness(_BASELINE_POST_FC_CONFIG)
+    assert harness.controller._config.joint_window_planner.enabled is False  # pyright: ignore[reportPrivateUsage]
+    harness.clock.advance(45.0)
+    telemetry = reading(bean=192.0, bean_ror_c_per_min=1.5, first_crack_detected=True)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(telemetry, limits)  # pyright: ignore[reportPrivateUsage]
+    assert _joint_window_fields(ctx) == (None, None, None, None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_joint_window_context_matches_a_direct_plan_call_field_by_field() -> None:
+    """T40 (AC5/AC6): flag ON — all six fields exactly equal a direct
+    ``plan_joint_window`` call built from the SAME inputs, asserted
+    field-by-field, including exact float equality of both runways and both
+    projections."""
+    harness = await _joint_window_development_harness(_joint_window_config())
+    harness.clock.advance(45.0)  # well into development, a live window
+    telemetry = reading(bean=192.0, bean_ror_c_per_min=1.5, first_crack_detected=True)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(telemetry, limits)  # pyright: ignore[reportPrivateUsage]
+    expected = _expected_joint_window_plan(harness, telemetry, limits)
+    assert expected is not None, "test premise: this tick's inputs must be VALID"
+    assert ctx.joint_window_status is expected.status
+    assert ctx.joint_window_effective_target_temp_c == expected.effective_target_temp_c
+    assert ctx.joint_window_open_runway_seconds == expected.window_open_runway_seconds
+    assert ctx.joint_window_close_runway_seconds == expected.window_close_runway_seconds
+    assert ctx.joint_window_projected_temp_at_open_c == expected.projected_temp_at_open_c
+    assert ctx.joint_window_projected_temp_at_close_c == expected.projected_temp_at_close_c
+
+
+def _void_bean_ror_none(harness: Harness, telemetry: RoastTelemetry) -> RoastTelemetry:
+    """Missing rate-of-rise — validity check 1 (Missing)."""
+    return telemetry.model_copy(update={"bean_ror_c_per_min": None})
+
+
+def _void_pre_fc_no_development_clock(
+    harness: Harness, telemetry: RoastTelemetry
+) -> RoastTelemetry:
+    """No development clock yet — validity check 1 (Missing)."""
+    harness.controller._first_crack_monotonic = None  # pyright: ignore[reportPrivateUsage]
+    return telemetry
+
+
+def _void_non_finite_bean_temp(harness: Harness, telemetry: RoastTelemetry) -> RoastTelemetry:
+    """A non-finite telemetry value — validity check 2 (Non-finite)."""
+    return telemetry.model_copy(update={"bean_temp_c": float("nan")})
+
+
+def _void_charge_not_yet(harness: Harness, telemetry: RoastTelemetry) -> RoastTelemetry:
+    """``charge_elapsed_seconds <= 0.0`` — validity check 3 (Clock validity)."""
+    harness.controller._charge_monotonic = None  # pyright: ignore[reportPrivateUsage]
+    return telemetry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "voider",
+    [
+        _void_bean_ror_none,
+        _void_pre_fc_no_development_clock,
+        _void_non_finite_bean_temp,
+        _void_charge_not_yet,
+    ],
+    ids=[
+        "bean_ror_c_per_min_none",
+        "pre_fc_no_development_clock",
+        "non_finite_bean_temp_c",
+        "charge_elapsed_not_positive",
+    ],
+)
+async def test_joint_window_context_atomic_none_on_a_voiding_input(
+    voider: Callable[[Harness, RoastTelemetry], RoastTelemetry],
+) -> None:
+    """T41 (AC5): flag ON with a voiding input — all six fields ``None``
+    ATOMICALLY, asserted as a set so a partial block fails (G16)."""
+    harness = await _joint_window_development_harness(_joint_window_config())
+    harness.clock.advance(45.0)
+    telemetry = voider(
+        harness, reading(bean=192.0, bean_ror_c_per_min=1.5, first_crack_detected=True)
+    )
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(telemetry, limits)  # pyright: ignore[reportPrivateUsage]
+    assert _joint_window_fields(ctx) == (None, None, None, None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_joint_window_ceiling_is_the_same_limits_instance_the_gate_enforces() -> None:
+    """T42 (AC6): the ceiling fed to the planner is
+    ``limits.bitter_ceiling_temp_c`` off the SAME box the advisory cycle
+    later passes to ``evaluate_command(bounds=...)`` — never a fresh
+    ``_policy_limits_for`` derivation. Proven by injecting a
+    ``PhaseControlLimits`` whose ceiling could never arise from a fresh
+    derivation under this config/phase, and confirming the planner's
+    effective target reflects exactly the INJECTED value, not the real
+    resolved one (G-lim)."""
+    harness = await _joint_window_development_harness(
+        _joint_window_config(ceiling_guard_temp_c=196.0)
+    )
+    harness.clock.advance(45.0)
+    telemetry = reading(bean=170.0, bean_ror_c_per_min=1.5, first_crack_detected=True)
+    real_limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    assert real_limits.bitter_ceiling_temp_c == 196.0  # test premise
+    injected_limits = real_limits.model_copy(update={"bitter_ceiling_temp_c": 190.5})
+    ctx = harness.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
+        telemetry, injected_limits
+    )
+    assert ctx.bitter_ceiling_temp_c == 190.5  # the pre-existing told==enforced field
+    assert ctx.joint_window_effective_target_temp_c == min(PROFILE.target_drop_temp_c, 190.5)
+    assert ctx.joint_window_effective_target_temp_c != min(
+        PROFILE.target_drop_temp_c, real_limits.bitter_ceiling_temp_c
+    )
+
+
+@pytest.mark.asyncio
+async def test_joint_window_development_window_uses_the_shared_margin_config() -> None:
+    """T43 (AC6): ``development_percent_min``/``_max`` fed to the planner are
+    the SAME margin already told to the advisor as
+    ``target_development_percent_min``/``_max`` — one source, no second
+    margin copy — proven with a NON-default margin so a hardcoded duplicate
+    literal in the wiring would disagree with this test (G-margin)."""
+    config = _joint_window_config(drop_dev_margin_percent=7.0)
+    harness = await _joint_window_development_harness(config)
+    harness.clock.advance(45.0)
+    telemetry = reading(bean=192.0, bean_ror_c_per_min=1.5, first_crack_detected=True)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(telemetry, limits)  # pyright: ignore[reportPrivateUsage]
+    assert ctx.target_development_percent_min == 13.0
+    assert ctx.target_development_percent_max == 27.0
+    expected = _expected_joint_window_plan(harness, telemetry, limits)
+    assert expected is not None
+    assert ctx.joint_window_open_runway_seconds == expected.window_open_runway_seconds
+    assert ctx.joint_window_close_runway_seconds == expected.window_close_runway_seconds
+
+
+@pytest.mark.asyncio
+async def test_joint_window_context_never_changes_the_control_loop_when_temp_short() -> None:
+    """T44 (AC2/AC6): flag ON with the planner reading ``TEMP_SHORT`` on every
+    tick, across five REPEATED DEVELOPMENT ticks (order-sensitive) —
+    executed commands, drop events, phase transitions, and safety verdicts
+    are IDENTICAL to the same scripted scenario with the flag OFF. Advisory
+    context is read-only: nothing in the control loop reacts to
+    ``joint_window_status`` (G22).
+
+    The final tick's scripted decision is ``should_drop=True`` — reachable
+    (the clock is advanced enough between ticks that the SYSTEM development
+    percent clears the #312 coherence floor) while the bean stays flat and
+    far below the effective target, so ``joint_window_status`` reads
+    ``TEMP_SHORT`` on every tick INCLUDING the one that actually drops. A
+    mutation that reads ``joint_window_status`` inside the advisor's own
+    ``should_drop`` branch (e.g. suppressing the drop on ``TEMP_SHORT``)
+    changes ON's outcome without changing OFF's — exactly what this test
+    exists to catch."""
+    # Bean far below any plausible effective target with a flat rate of rise:
+    # deterministically TEMP_SHORT at every window boundary regardless of the
+    # exact runway sign (open/closed already), per plan_joint_window's own
+    # ordered chain (TEMP_SHORT is evaluated first, at window close).
+    flat_reading = reading(bean=150.0, bean_ror_c_per_min=0.0)
+    scripted_decisions = [decision(heat=40, fan=60, drop=False) for _ in range(4)] + [
+        decision(heat=40, fan=60, drop=True)
+    ]
+
+    on_config = _joint_window_config(ceiling_guard_temp_c=196.0)
+    off_config = on_config.model_copy(
+        update={"joint_window_planner": JointWindowPlanner(enabled=False)}
+    )
+
+    on_advisor = FakeAdvisor(list(scripted_decisions))
+    on_harness = await _joint_window_development_harness(on_config, fc_ror_c_per_min=0.0)
+    on_harness.controller._advisor = on_advisor  # pyright: ignore[reportPrivateUsage]
+    on_harness.reader.readings = [flat_reading]
+    for _ in range(5):
+        on_harness.clock.advance(10.0)
+        on_harness.controller.request_advisory()
+        await on_harness.controller.tick()
+
+    off_advisor = FakeAdvisor(list(scripted_decisions))
+    off_harness = await _joint_window_development_harness(off_config, fc_ror_c_per_min=0.0)
+    off_harness.controller._advisor = off_advisor  # pyright: ignore[reportPrivateUsage]
+    off_harness.reader.readings = [flat_reading]
+    for _ in range(5):
+        off_harness.clock.advance(10.0)
+        off_harness.controller.request_advisory()
+        await off_harness.controller.tick()
+
+    # Test premise: the ON harness's advisory contexts really did read
+    # TEMP_SHORT on every DEVELOPMENT tick, including the drop tick.
+    on_development_contexts = [
+        ctx for ctx in on_advisor.contexts if ctx.phase is RoastPhase.DEVELOPMENT
+    ]
+    assert len(on_development_contexts) == 5
+    assert all(
+        ctx.joint_window_status is JointWindowStatus.TEMP_SHORT for ctx in on_development_contexts
+    )
+    # The OFF arm's OWN contexts stay fully None (G15): a removed gate would
+    # populate them too, even though nothing downstream reads them back.
+    off_development_contexts = [
+        ctx for ctx in off_advisor.contexts if ctx.phase is RoastPhase.DEVELOPMENT
+    ]
+    assert len(off_development_contexts) == 5
+    assert all(
+        _joint_window_fields(ctx) == (None, None, None, None, None, None)
+        for ctx in off_development_contexts
+    )
+
+    # Test premise: the drop really did reach the advisor should_drop branch
+    # (not intercepted by the #312 coherence guard) on the CORRECT code —
+    # both arms end in COOLING via one advisor-sourced drop_beans.
+    assert on_harness.controller.phase is off_harness.controller.phase is RoastPhase.COOLING
+    assert on_harness.executor.commands == off_harness.executor.commands
+    assert on_harness.executor.commands.count("drop_beans") == 1
+    assert on_harness.executor.targets == off_harness.executor.targets
+    on_executed = [
+        cast("dict[str, object]", p)
+        for k, p in on_harness.events.events
+        if k is RoastEventKind.COMMAND_EXECUTED
+    ]
+    off_executed = [
+        cast("dict[str, object]", p)
+        for k, p in off_harness.events.events
+        if k is RoastEventKind.COMMAND_EXECUTED
+    ]
+    assert {"command": "drop_beans", "source": "advisor"} in on_executed
+    assert on_executed == off_executed
+    on_verdicts = [e.verdict for e in on_harness.sink.evaluations]
+    off_verdicts = [e.verdict for e in off_harness.sink.evaluations]
+    assert on_verdicts == off_verdicts
+
+
+@pytest.mark.asyncio
+async def test_ceiling_guard_fires_identically_with_joint_window_flag_on_or_off() -> None:
+    """T45 (AC1/AC2): the ceiling-guard drop fires identically — same tick,
+    same typed ``DropReason.CEILING_GUARD``, same event payload — whether
+    the joint-window planner is enabled or not. The planner grants no new
+    drop authority and changes no existing one."""
+    executed_by_flag: dict[bool, list[dict[str, object]]] = {}
+    phase_by_flag: dict[bool, RoastPhase] = {}
+    for flag_on in (True, False):
+        config = _joint_window_config(ceiling_guard_temp_c=196.0)
+        if not flag_on:
+            config = config.model_copy(
+                update={"joint_window_planner": JointWindowPlanner(enabled=False)}
+            )
+        harness = await _joint_window_development_harness(config, fc_ror_c_per_min=5.0)
+        harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=5.0)]
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+        executed_by_flag[flag_on] = [
+            cast("dict[str, object]", p)
+            for k, p in harness.events.events
+            if k is RoastEventKind.COMMAND_EXECUTED
+        ]
+        phase_by_flag[flag_on] = harness.controller.phase
+
+    assert phase_by_flag[True] is phase_by_flag[False] is RoastPhase.COOLING
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in executed_by_flag[True]
+    assert executed_by_flag[True] == executed_by_flag[False]
+
+
+def test_drop_reason_has_exactly_two_members() -> None:
+    """T46 (AC2): #710 grants no new ``DropReason`` — the closed set stays
+    exactly the two pre-existing members."""
+    assert set(DropReason) == {DropReason.DEVELOPMENT_TARGET, DropReason.CEILING_GUARD}
 
 
 def test_fan_ceiling_release_latch_survives_transitions_within_a_run() -> None:
