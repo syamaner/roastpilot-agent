@@ -883,6 +883,102 @@ def test_overflowing_derived_ror_is_absent_in_text_and_strict_json(
     assert payload["summary"]["absent_row_count"] == 1
 
 
+@pytest.mark.parametrize(
+    ("telemetry", "t0", "fc", "drop", "refusal"),
+    [
+        (
+            [(-1e308, 160.0)],
+            0.0,
+            120.0,
+            1e308,
+            "fixture rule: drop distance must be finite at line 3",
+        ),
+        (
+            [(1e308, 160.0)],
+            -1e308,
+            -1e308,
+            1e308,
+            "fixture rule: rebased clocks must be finite at line 3",
+        ),
+    ],
+)
+def test_extreme_finite_timestamps_refuse_before_rendering_or_json_write(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    telemetry: list[tuple[float, float]],
+    t0: float,
+    fc: float,
+    drop: float,
+    refusal: str,
+) -> None:
+    """Overflowing timestamp arithmetic refuses without rendering a partial report."""
+    marker = "TIMESTAMP_OVERFLOW_SECRET"
+    fixture = _write_fixture(
+        tmp_path,
+        telemetry,
+        t0=t0,
+        fc=fc,
+        drop=drop,
+        name=f"{marker}.jsonl",
+    )
+    output = tmp_path / f"{marker}.json"
+    code, stdout, stderr = _run(fixture, capsys, "--json-out", str(output))
+
+    assert code == 2
+    assert stdout == ""
+    assert stderr == f"joint-window-validate: {refusal}\n"
+    assert not output.exists()
+    for unsafe in ("inf", "nan", marker):
+        assert unsafe not in stdout.lower() + stderr.lower()
+
+
+def test_overflowing_telemetry_elapsed_time_refuses_before_ror_estimation() -> None:
+    """The recorded-series cursor cannot compare an infinite timestamp distance."""
+    rows = [
+        validator.TelemetryRow(-1e308, 160.0, 1),
+        validator.TelemetryRow(1e308, 170.0, 2),
+    ]
+    with pytest.raises(
+        validator.FixtureError, match="telemetry elapsed time must be finite at line 2"
+    ):
+        validator._ror_series(rows)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_overflowing_cursor_candidate_elapsed_time_refuses_before_comparison() -> None:
+    """The cursor's prospective anchor comparison is also finite-only."""
+    rows = [
+        validator.TelemetryRow(-1e308, 150.0, 1),
+        validator.TelemetryRow(-1e308, 160.0, 2),
+        validator.TelemetryRow(1e308, 170.0, 3),
+    ]
+    with pytest.raises(
+        validator.FixtureError, match="telemetry elapsed time must be finite at line 3"
+    ):
+        validator._ror_series(rows)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_nonfinite_dtr_from_direct_parsed_fixture_refuses() -> None:
+    """An unreachable reader-invariant breach cannot serialize an infinite DTR."""
+    parsed = validator.ParsedFixture(
+        telemetry=[validator.TelemetryRow(1.0, 160.0, 37)],
+        t0_seconds=math.nextafter(1.0, 0.0),
+        first_crack_seconds=-1e308,
+        drop_seconds=1.0,
+    )
+    config = ControllerConfig(joint_window_planner=JointWindowPlanner(enabled=True))
+    with pytest.raises(
+        validator.FixtureError, match="development percent must be finite at line 37"
+    ):
+        validator.build_report(
+            parsed,
+            target_drop_temp_c=195.0,
+            target_development_percent=13.0,
+            config=config,
+            development_percent_min=10.0,
+            development_percent_max=16.0,
+        )
+
+
 def test_huge_json_integer_refuses_without_overflow_or_marker(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

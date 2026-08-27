@@ -280,16 +280,23 @@ def _ror_series(telemetry: list[TelemetryRow]) -> list[float | None]:
     estimates: list[float | None] = []
     cursor = 0
     for index, now in enumerate(telemetry):
-        while (
-            cursor + 1 < index
-            and now.monotonic_seconds - telemetry[cursor + 1].monotonic_seconds
-            >= _ROR_WINDOW_SECONDS
-        ):
+        while cursor + 1 < index:
+            candidate_elapsed = now.monotonic_seconds - telemetry[cursor + 1].monotonic_seconds
+            if not math.isfinite(candidate_elapsed):
+                raise FixtureError(
+                    f"fixture rule: telemetry elapsed time must be finite at line {now.line_number}"
+                )
+            if candidate_elapsed < _ROR_WINDOW_SECONDS:
+                break
             cursor += 1
         if cursor >= index:
             estimates.append(None)
             continue
         elapsed_seconds = now.monotonic_seconds - telemetry[cursor].monotonic_seconds
+        if not math.isfinite(elapsed_seconds):
+            raise FixtureError(
+                f"fixture rule: telemetry elapsed time must be finite at line {now.line_number}"
+            )
         if elapsed_seconds < _ROR_WINDOW_SECONDS:
             estimates.append(None)
             continue
@@ -418,10 +425,15 @@ def build_report(
     Raises:
         FixtureError: If no first-crack-through-drop telemetry sample exists.
     """
-    drop_index = min(
-        range(len(fixture.telemetry)),
-        key=lambda index: abs(fixture.telemetry[index].monotonic_seconds - fixture.drop_seconds),
-    )
+    drop_distances: list[float] = []
+    for telemetry_row in fixture.telemetry:
+        distance = abs(telemetry_row.monotonic_seconds - fixture.drop_seconds)
+        if not math.isfinite(distance):
+            raise FixtureError(
+                f"fixture rule: drop distance must be finite at line {telemetry_row.line_number}"
+            )
+        drop_distances.append(distance)
+    drop_index = min(range(len(fixture.telemetry)), key=drop_distances.__getitem__)
     selected = [
         (index, row)
         for index, row in enumerate(fixture.telemetry)
@@ -436,7 +448,16 @@ def build_report(
     for index, telemetry_row in selected:
         charge_s = telemetry_row.monotonic_seconds - fixture.t0_seconds
         dev_s = telemetry_row.monotonic_seconds - fixture.first_crack_seconds
+        if not math.isfinite(charge_s) or not math.isfinite(dev_s):
+            raise FixtureError(
+                f"fixture rule: rebased clocks must be finite at line {telemetry_row.line_number}"
+            )
         dtr_pct = dev_s / charge_s * 100.0 if charge_s > 0.0 else None
+        if dtr_pct is not None and not math.isfinite(dtr_pct):
+            raise FixtureError(
+                "fixture rule: development percent must be finite at line "
+                f"{telemetry_row.line_number}"
+            )
         ror_c_min = ror_values[index]
         plan = plan_joint_window(
             JointWindowInputs(
