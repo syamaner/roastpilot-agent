@@ -274,6 +274,27 @@ def test_json_out_inside_repository_is_refused_via_direct_symlink_and_dotdot(
         assert not output.exists()
 
 
+def test_json_out_with_missing_parent_refuses_before_rendering_or_write(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An absent output parent refuses before a report can reach stdout."""
+    marker = "MISSING_PARENT_SECRET"
+    fixture = _write_fixture(tmp_path, [(120.0, 160.0), (180.0, 170.0)])
+    parent = tmp_path / marker
+    output = parent / "report.json"
+
+    code, stdout, stderr = _run(fixture, capsys, "--json-out", str(output))
+
+    assert code == 2
+    assert stdout == ""
+    assert stderr == (
+        "joint-window-validate: output rule: json-out parent must be an existing directory\n"
+    )
+    assert not parent.exists()
+    assert not output.exists()
+    assert marker not in stdout + stderr
+
+
 @pytest.mark.parametrize("missing_kind", ["beans_added", "first_crack_detected", "beans_dropped"])
 def test_missing_required_events_are_path_free(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], missing_kind: str
@@ -423,7 +444,7 @@ def test_unknown_event_kind_and_telemetry_columns_are_ignored(
     assert capsys.readouterr().out == plain_output
 
 
-@pytest.mark.parametrize("kind", ["beans_dropped", "first_crack_detected"])
+@pytest.mark.parametrize("kind", ["beans_added", "beans_dropped", "first_crack_detected"])
 def test_duplicate_required_event_refuses(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], kind: str
 ) -> None:
