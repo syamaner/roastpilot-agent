@@ -185,4 +185,4 @@ active-epic pointer in [docs/state/registry.md](docs/state/registry.md).
 
 ## License
 
-MIT (to be confirmed at first release).
+MIT. See [LICENSE](LICENSE).
