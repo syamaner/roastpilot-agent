@@ -422,22 +422,29 @@ def test_decreasing_telemetry_clock_refuses(
 
 
 @pytest.mark.parametrize(
-    "bad_row",
+    ("bad_row", "expected_stderr"),
     [
-        {"monotonic_seconds": 120.0, "bean_temp_c": 160.0},
-        {"type": 1, "monotonic_seconds": 120.0, "bean_temp_c": 160.0},
-        {"type": "other", "monotonic_seconds": 120.0, "bean_temp_c": 160.0},
-        [],
-        {"type": "telemetry", "monotonic_seconds": True, "bean_temp_c": 160.0},
-        {"type": "telemetry", "monotonic_seconds": 120.0, "bean_temp_c": False},
+        ({"monotonic_seconds": 120.0, "bean_temp_c": 160.0}, None),
+        ({"type": 1, "monotonic_seconds": 120.0, "bean_temp_c": 160.0}, None),
+        (
+            {"type": "other", "monotonic_seconds": 120.0, "bean_temp_c": 160.0},
+            "joint-window-validate: fixture rule: known string type required at line 1\n",
+        ),
+        ([], None),
+        ({"type": "telemetry", "monotonic_seconds": True, "bean_temp_c": 160.0}, None),
+        ({"type": "telemetry", "monotonic_seconds": 120.0, "bean_temp_c": False}, None),
     ],
 )
 def test_type_and_number_grammar_is_strict(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], bad_row: object
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], bad_row: object, expected_stderr: str | None
 ) -> None:
     """T63/G27: unknown types, non-objects, and bool numbers fail closed."""
     fixture = _write_fixture(tmp_path, [], rows=[bad_row])
-    assert _run(fixture, capsys)[0] == 2
+    code, stdout, stderr = _run(fixture, capsys)
+    assert code == 2
+    if expected_stderr is not None:
+        assert stdout == ""
+        assert stderr == expected_stderr
 
 
 def test_unknown_event_kind_and_telemetry_columns_are_ignored(
