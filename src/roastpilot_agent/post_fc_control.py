@@ -165,22 +165,305 @@ from enum import Enum
 from pydantic import BaseModel
 
 from roastpilot_agent.config import PostFirstCrackControl
-from roastpilot_agent.models import PostFcHeatAuthorityState
+from roastpilot_agent.models import JointWindowStatus, PostFcHeatAuthorityState
 
 # Re-exported for existing callers/tests that import PostFcHeatAuthorityState
-# from this module (D96 slice 2, #559): the enum's HOME moved to models.py
-# (so AdvisorContext, in advisor.py, can carry it without models.py — a leaf
-# module with no roastpilot_agent imports of its own — importing back into
-# post_fc_control.py, which would cycle). Same reasoning models.py already
-# documents for RoastPhase and DropReason.
+# (and, since #710 slice 1, JointWindowStatus) from this module (D96 slice 2,
+# #559): the enums' HOME is models.py (so AdvisorContext, in advisor.py, can
+# carry them without models.py — a leaf module with no roastpilot_agent
+# imports of its own — importing back into post_fc_control.py, which would
+# cycle). Same reasoning models.py already documents for RoastPhase and
+# DropReason.
 __all__ = [
+    "JointWindowInputs",
+    "JointWindowPlan",
+    "JointWindowStatus",
     "PostFcControlOutput",
     "PostFcControllerState",
     "PostFcHeatAuthorityState",
     "PostFcProjectionInputs",
     "PostFcRecoveryTrigger",
     "PostFcRorController",
+    "plan_joint_window",
 ]
+
+
+# --- #710 (RP-C) slice 1: the deterministic joint-window drop planner -------
+#
+# A pure, stateless, total function — no clock read, no I/O, no randomness, no
+# mutable state, never raises. It does not call ``controller``, ``safety``, or
+# ``control_policy``, and never imports ``mcp_client``: the SAME module-level
+# constraint the docstring above states for the stateful PI loop applies
+# unchanged here. Deliberate contrast with recovery v2's
+# ``PostFcRorController._projection_result`` below, which IS stateful (it
+# latches the last-seen elapsed clocks and rejects a backwards clock): this
+# planner is stateless per D176, carries no backwards-clock latch, and uses
+# the SAME ``drop_dev_margin_percent`` window already told to the advisor —
+# never recovery v2's separate ``+2``/``+5`` horizons.
+
+
+@dataclass(frozen=True)
+class JointWindowInputs:
+    """Closed grammar of live values the joint-window planner classifies.
+
+    Every field :func:`plan_joint_window` reads is explicit here; nothing
+    else reaches it (#710 slice 1, D176/D177).
+
+    ``charge_elapsed_seconds`` / ``development_elapsed_seconds`` share the
+    charge-relative origin already established by
+    ``RoastController._charge_elapsed_seconds`` /
+    ``RoastController._development_elapsed_seconds``. ``development_elapsed_
+    seconds`` is ``None`` before first crack (no development clock yet), and
+    ``bean_ror_c_per_min`` is ``float | None`` for the same reason
+    ``AdvisorContext.bean_ror_c_per_min`` is.
+
+    ``development_percent_min`` / ``development_percent_max`` are the SAME
+    two numbers already told to the advisor — built from
+    ``ControllerConfig.drop_dev_margin_percent`` around the profile's target
+    development percent. Never recompute the margin here; this is the
+    told == enforced discipline the controller's own drop-coherence-guard
+    comment documents.
+
+    ``ceiling_temp_c`` is the resolved TOLD ceiling
+    (``control_policy._bitter_ceiling_temp_c``'s live value — the ceiling
+    guard's temperature when the guard is enabled, ``SafetyLimits.
+    bitter_ceiling_temp_c`` otherwise) from the SAME ``SafetyLimits`` instance
+    the safety gate clamps into. Pass that instance's value through
+    unchanged; do not re-derive it.
+    """
+
+    #: The current bean temperature, °C.
+    bean_temp_c: float
+    #: The current smoothed bean rate-of-rise, °C/min. ``None`` when no
+    #: reading is available yet. Zero or negative is VALID — it is evidence
+    #: of a temperature-short trajectory, not an error.
+    bean_ror_c_per_min: float | None
+    #: Seconds since charge (the origin every roast clock shares), > 0 for
+    #: any tick this planner is meaningfully called on.
+    charge_elapsed_seconds: float
+    #: Seconds since first crack (development start). ``None`` before first
+    #: crack, when there is no development clock yet.
+    development_elapsed_seconds: float | None
+    #: The profile's own target drop temperature, °C — pre-cap; the planner
+    #: caps it against ``ceiling_temp_c`` itself (AC10).
+    target_drop_temp_c: float
+    #: The resolved, enforced bitter ceiling, °C (told == enforced by
+    #: identity with the safety gate's own ``SafetyLimits`` instance).
+    ceiling_temp_c: float
+    #: The DTR window's lower bound, percentage points (target minus the
+    #: configured drop-development margin).
+    development_percent_min: float
+    #: The DTR window's upper bound, percentage points (target plus the
+    #: configured drop-development margin).
+    development_percent_max: float
+
+
+class JointWindowPlan(BaseModel, frozen=True):
+    """One atomic joint-window feasibility snapshot (#710 slice 1).
+
+    Never partially populated: :func:`plan_joint_window` returns either a
+    fully populated plan or ``None`` (the one atomic absent block), mirroring
+    ``_ProjectionResult``'s documented rule — invalid input is deliberately
+    content-free so a caller can never mistake a partial runway or
+    temperature for a control value.
+
+    Deliberately NOT re-surfaced here: current bean temperature and current
+    DTR. Both already live in ``AdvisorContext`` (``current_bean_temp_c``,
+    ``development_time_ratio``); duplicating them under a second name would
+    be the #218 two-copies failure this repo has repeatedly paid for.
+
+    ``window_open_runway_seconds`` / ``window_close_runway_seconds`` keep
+    their RAW (possibly negative) values, so a caller can distinguish "the
+    window closes in 12 s" from "the window closed 40 s ago". Only the two
+    projected-temperature fields use the runway clamped to ``max(0.0, …)``
+    (see :func:`plan_joint_window`).
+    """
+
+    #: The classification this tick (AC9's ordered, disjoint chain).
+    status: JointWindowStatus
+    #: ``min(target_drop_temp_c, ceiling_temp_c)`` — the temperature the
+    #: model can actually chase without licence to hold through the enforced
+    #: ceiling (AC10).
+    effective_target_temp_c: float
+    #: Seconds until the DTR window OPENS (``development_percent_min``),
+    #: raw/unclamped; negative means it already opened.
+    window_open_runway_seconds: float
+    #: Seconds until the DTR window CLOSES (``development_percent_max``),
+    #: raw/unclamped; negative means it already closed.
+    window_close_runway_seconds: float
+    #: The bean temperature projected at window OPEN under the current RoR,
+    #: using the runway clamped to zero (never extrapolated backwards).
+    projected_temp_at_open_c: float
+    #: The bean temperature projected at window CLOSE under the current RoR,
+    #: using the runway clamped to zero (never extrapolated backwards).
+    projected_temp_at_close_c: float
+
+
+def plan_joint_window(
+    inputs: JointWindowInputs,
+    *,
+    temp_margin_c: float,
+    closing_horizon_seconds: float,
+) -> JointWindowPlan | None:
+    """Classify this tick's joint DTR-window / drop-temperature feasibility.
+
+    Pure, stateless, and total — no clock read, no I/O, no randomness, no
+    mutable state; never raises (#710 slice 1, D176/D177).
+
+    Validity is checked in order; the first failing check returns ``None``
+    (the one atomic absent block — never a partially populated plan):
+
+    1. **Missing** — ``bean_ror_c_per_min`` or ``development_elapsed_seconds``
+       is ``None`` (no development clock, or no RoR reading, yet).
+    2. **Non-finite** — any of the eight ``inputs`` fields, or
+       ``temp_margin_c`` / ``closing_horizon_seconds``, is not
+       ``math.isfinite``.
+    3. **Clock validity** — ``charge_elapsed_seconds <= 0.0``,
+       ``development_elapsed_seconds < 0.0``, or
+       ``development_elapsed_seconds > charge_elapsed_seconds``. No
+       backwards-clock latch — the planner is stateless.
+    4. **Window ordering** — ``development_percent_min >
+       development_percent_max``. Equality is VALID:
+       ``ControllerConfig.drop_dev_margin_percent`` is ``ge=0.0``, so
+       ``margin == 0.0`` is a currently-supported configuration that
+       collapses the window to a single point, not an absent one.
+    5. **Open-unit-interval fractions** — with ``f_open =
+       development_percent_min / 100.0`` and ``f_close =
+       development_percent_max / 100.0``, both must satisfy
+       ``0.0 < f < 1.0``: the runway closed form divides by ``1 - f``, and
+       ``RoastProfile.target_development_percent`` (``gt=0, lt=100``)
+       combined with a large ``drop_dev_margin_percent`` (``le=100.0``) can
+       construct ``f <= 0`` or ``f >= 1``.
+
+    ``bean_ror_c_per_min <= 0.0`` is deliberately NOT a guard — D176 states
+    zero or negative RoR "remains valid evidence of a temperature-short
+    trajectory"; voiding it would erase exactly the fan-crash case #707/D122
+    exists to detect.
+
+    Arithmetic (all Celsius; RoR in °C/min). Both clocks advance one second
+    per second, so DTR reaches fraction ``f`` after ``t = (f * charge -
+    development) / (1 - f)`` seconds — the identical closed form already in
+    production in :meth:`PostFcRorController._projection_result`::
+
+        window_open_runway_seconds  = (f_open  * charge - development) / (1 - f_open)
+        window_close_runway_seconds = (f_close * charge - development) / (1 - f_close)
+        effective_target_temp_c     = min(target_drop_temp_c, ceiling_temp_c)
+
+    The reported runway fields keep the RAW (possibly negative) value, so a
+    caller can distinguish "closes in 12 s" from "closed 40 s ago". Only the
+    two projected-temperature fields use ``max(0.0, runway)``: a non-positive
+    runway means that DTR boundary is already past, and projecting a
+    negative runway would extrapolate the RoR BACKWARDS to a temperature the
+    roast has already left — understating a real shortfall at exactly the
+    decisive moment. Clamping to ``0.0`` projects to NOW, the honest and
+    conservative reading.
+
+    Classification is one ordered, disjoint chain — the first match wins
+    (AC9):
+
+    1. ``TEMP_SHORT`` — ``projected_temp_at_close_c < effective_target_temp_c
+       - temp_margin_c`` (strict ``<``; exact equality is NOT
+       ``TEMP_SHORT``). Evaluated at window CLOSE, the last moment a drop is
+       still inside the window, and takes precedence over ``CLOSING`` so a
+       closing window with a material temperature miss still reads as
+       temperature-short — this is what makes D176's AC4 temperature-first
+       ruling true by construction.
+    2. ``CLOSING`` — ``window_close_runway_seconds <=
+       closing_horizon_seconds`` (``<=``; exact equality IS ``CLOSING``, and
+       a negative runway — window already past — qualifies too). Means
+       temperature is not materially short and the viable window is
+       expiring: drop.
+    3. ``AHEAD`` — ``projected_temp_at_open_c >= effective_target_temp_c``
+       (``>=``; boundary equality is ``AHEAD``, D177). Evaluated at window
+       OPEN: reaching the effective target by the earliest feasible drop
+       point means the joint constraint is already satisfied.
+    4. ``ON_TRACK`` — the remaining valid case.
+
+    Args:
+        inputs: The closed grammar of live values for this tick.
+        temp_margin_c: The status temperature margin, °C (config-owned;
+            ``JointWindowPlanner.temp_margin_c``, default 3.0). Never hard-
+            coded here — a second copy of a config-owned number is the #218
+            failure this module elsewhere avoids.
+        closing_horizon_seconds: The closing-window horizon, seconds
+            (config-owned; ``JointWindowPlanner.closing_horizon_seconds``,
+            default 30.0).
+
+    Returns:
+        The atomic feasibility plan, or ``None`` if any input is invalid.
+    """
+    bean_ror_c_per_min = inputs.bean_ror_c_per_min
+    development_elapsed_seconds = inputs.development_elapsed_seconds
+    if bean_ror_c_per_min is None or development_elapsed_seconds is None:
+        return None
+
+    numeric_values = (
+        inputs.bean_temp_c,
+        bean_ror_c_per_min,
+        inputs.charge_elapsed_seconds,
+        development_elapsed_seconds,
+        inputs.target_drop_temp_c,
+        inputs.ceiling_temp_c,
+        inputs.development_percent_min,
+        inputs.development_percent_max,
+        temp_margin_c,
+        closing_horizon_seconds,
+    )
+    if not all(math.isfinite(value) for value in numeric_values):
+        return None
+
+    charge_elapsed_seconds = inputs.charge_elapsed_seconds
+    if (
+        charge_elapsed_seconds <= 0.0
+        or development_elapsed_seconds < 0.0
+        or development_elapsed_seconds > charge_elapsed_seconds
+    ):
+        return None
+
+    if inputs.development_percent_min > inputs.development_percent_max:
+        return None
+
+    f_open = inputs.development_percent_min / 100.0
+    f_close = inputs.development_percent_max / 100.0
+    if not (0.0 < f_open < 1.0) or not (0.0 < f_close < 1.0):
+        return None
+
+    window_open_runway_seconds = (f_open * charge_elapsed_seconds - development_elapsed_seconds) / (
+        1.0 - f_open
+    )
+    window_close_runway_seconds = (
+        f_close * charge_elapsed_seconds - development_elapsed_seconds
+    ) / (1.0 - f_close)
+
+    effective_target_temp_c = min(inputs.target_drop_temp_c, inputs.ceiling_temp_c)
+
+    projected_open_runway_seconds = max(0.0, window_open_runway_seconds)
+    projected_close_runway_seconds = max(0.0, window_close_runway_seconds)
+
+    projected_temp_at_open_c = (
+        inputs.bean_temp_c + bean_ror_c_per_min * projected_open_runway_seconds / 60.0
+    )
+    projected_temp_at_close_c = (
+        inputs.bean_temp_c + bean_ror_c_per_min * projected_close_runway_seconds / 60.0
+    )
+
+    if projected_temp_at_close_c < effective_target_temp_c - temp_margin_c:
+        status = JointWindowStatus.TEMP_SHORT
+    elif window_close_runway_seconds <= closing_horizon_seconds:
+        status = JointWindowStatus.CLOSING
+    elif projected_temp_at_open_c >= effective_target_temp_c:
+        status = JointWindowStatus.AHEAD
+    else:
+        status = JointWindowStatus.ON_TRACK
+
+    return JointWindowPlan(
+        status=status,
+        effective_target_temp_c=effective_target_temp_c,
+        window_open_runway_seconds=window_open_runway_seconds,
+        window_close_runway_seconds=window_close_runway_seconds,
+        projected_temp_at_open_c=projected_temp_at_open_c,
+        projected_temp_at_close_c=projected_temp_at_close_c,
+    )
 
 
 class PostFcRecoveryTrigger(Enum):

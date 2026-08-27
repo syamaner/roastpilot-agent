@@ -959,10 +959,12 @@ async def test_build_replay_service_both_live_opt_outs_leaves_controller_config_
     tmp_path: Path,
 ) -> None:
     """With BOTH ``use_live_post_fc_control`` and
-    ``use_live_reference_retrieval`` set, no pin applies at all — the
-    supplied ``controller`` section passes through completely unmodified
-    (the ``model_copy`` pin block never runs when neither invariant needs
-    enforcing)."""
+    ``use_live_reference_retrieval`` set, neither of THOSE two pins applies —
+    the supplied ``post_first_crack_control``/``reference_curve`` sections
+    pass through unmodified. (Since #710/D177, the ``joint_window_planner``
+    pin has no opt-out and always runs the ``model_copy``, but its pinned
+    value equals ``live_config.controller``'s own default-inert group, so
+    the resolved config is still equal in VALUE to the supplied one.)"""
     from roastpilot_agent.config import AppConfig, PostFirstCrackControl, ReferenceCurve
 
     live_config = AppConfig(
@@ -986,6 +988,123 @@ async def test_build_replay_service_both_live_opt_outs_leaves_controller_config_
         assert service._config.controller == live_config.controller  # pyright: ignore[reportPrivateUsage]
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_replay_service_pins_joint_window_planner_off_by_default(
+    tmp_path: Path,
+) -> None:
+    """T28 (#710 RP-C slice 1, D177): replay must never reproduce an old
+    recording under a LIVE ``joint_window_planner`` — the SAME class of
+    reasoning as the post-FC-control and reference-curve pins above. The pin
+    applies regardless of whether a config was supplied, and regardless of
+    what that config's own ``joint_window_planner.enabled`` was — there is
+    no ``use_live_*`` opt-out for this one (D177: an opt-out here would
+    create exactly the invalid combination the config validator forbids)."""
+    from roastpilot_agent.config import AppConfig, JointWindowPlanner, PostFirstCrackControl
+
+    service_no_config, _source, store_no_config = build_replay_service(
+        _COOLING_COMPLETE, tmp_path / "cc_jwp_no_config.sqlite3"
+    )
+    try:
+        assert (
+            service_no_config._config.controller.joint_window_planner.enabled is False  # pyright: ignore[reportPrivateUsage]
+        )
+    finally:
+        await store_no_config.close()
+
+    # A config that is LEGITIMATELY constructible with the planner enabled
+    # (guard on, per D177) — the exact shape the pin must still override.
+    live_default_config = AppConfig(
+        controller=AppConfig().controller.model_copy(
+            update={
+                "joint_window_planner": JointWindowPlanner(enabled=True),
+                "post_first_crack_control": PostFirstCrackControl(ceiling_guard_drop_enabled=True),
+            }
+        )
+    )
+    service_explicit, _source2, store_explicit = build_replay_service(
+        _COOLING_COMPLETE,
+        tmp_path / "cc_jwp_explicit_config.sqlite3",
+        config=live_default_config,
+    )
+    try:
+        assert (
+            service_explicit._config.controller.joint_window_planner.enabled is False  # pyright: ignore[reportPrivateUsage]
+        )
+    finally:
+        await store_explicit.close()
+
+
+@pytest.mark.asyncio
+async def test_build_replay_service_resolved_config_satisfies_d177_invariant(
+    tmp_path: Path,
+) -> None:
+    """T29 (#710 RP-C slice 1, D177): the resolved replay ``ControllerConfig``
+    re-validates cleanly — this is the test that catches the
+    ``model_copy(update=…)`` validator-bypass class (§2.5/Class C): a config
+    that is legitimately ``joint_window_planner.enabled=True`` (guard on) has
+    its ``post_first_crack_control`` pinned to ``ceiling_guard_drop_enabled=
+    False`` by the SAME pin block, which would violate D177 if
+    ``joint_window_planner`` were not pinned off in that identical
+    ``model_copy`` call. A flag-only assertion (``enabled is False``) would
+    pass even if this invariant were violated in the OTHER direction (guard
+    off, planner somehow left on) — re-validating the whole resolved model
+    is what actually proves the combination is never invalid."""
+    from roastpilot_agent.config import AppConfig, ControllerConfig, JointWindowPlanner
+
+    live_default_config = AppConfig(
+        controller=AppConfig().controller.model_copy(
+            update={"joint_window_planner": JointWindowPlanner(enabled=True)}
+        )
+    )
+    service, _source, store = build_replay_service(
+        _COOLING_COMPLETE,
+        tmp_path / "cc_jwp_d177_revalidate.sqlite3",
+        config=live_default_config,
+    )
+    try:
+        resolved = service._config.controller  # pyright: ignore[reportPrivateUsage]
+        # Re-validating must raise nothing — the resolved config never
+        # violates the D177 invariant despite the unvalidated model_copy.
+        ControllerConfig.model_validate(resolved.model_dump())
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_replay_pins_joint_window_planner_without_changing_phase_timeline(
+    tmp_path: Path,
+) -> None:
+    """T30: bare-default replay and explicit-``AppConfig()`` replay produce
+    identical phase timelines with the #710 pin in place — extending
+    ``test_replay_pins_the_baseline_post_fc_control_by_default``'s existing
+    guarantee (the joint-window planner is default-off either way, so this
+    also confirms the new pin introduces no behavioural change to the
+    baseline replay path)."""
+    from roastpilot_agent.config import AppConfig
+
+    _app1, service1, source1 = await create_replay_app(
+        _COOLING_COMPLETE, tmp_path / "cc_jwp_timeline_no_config.sqlite3", step_mode=True, speed=60
+    )
+    try:
+        no_config_timeline = await _phase_timeline(service1, source1)
+    finally:
+        await source1.aclose()
+
+    _app2, service2, source2 = await create_replay_app(
+        _COOLING_COMPLETE,
+        tmp_path / "cc_jwp_timeline_explicit_config.sqlite3",
+        step_mode=True,
+        speed=60,
+        config=AppConfig(),
+    )
+    try:
+        explicit_config_timeline = await _phase_timeline(service2, source2)
+    finally:
+        await source2.aclose()
+
+    assert no_config_timeline == explicit_config_timeline
 
 
 @pytest.mark.asyncio

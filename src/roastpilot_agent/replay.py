@@ -67,7 +67,12 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from roastpilot_agent.api import QueuedOperatorAction, RoastService, create_app
-from roastpilot_agent.config import AppConfig, PostFirstCrackControl, ReferenceCurve
+from roastpilot_agent.config import (
+    AppConfig,
+    JointWindowPlanner,
+    PostFirstCrackControl,
+    ReferenceCurve,
+)
 from roastpilot_agent.live import mount_spa
 from roastpilot_agent.mcp_client import (
     EventSnapshot,
@@ -1050,13 +1055,26 @@ def build_replay_service(
     ``use_live_reference_retrieval`` is set, mirroring
     ``use_live_post_fc_control``'s own escape hatch exactly.
 
+    **The joint-window planner (#710 RP-C slice 1, D177) is pinned OFF
+    unconditionally — no ``use_live_*`` opt-out.** ``model_copy(update=…)``
+    does not re-run pydantic validators, so an operator config that is
+    legitimately ``joint_window_planner.enabled=True`` (and therefore, per
+    D177, has the ceiling guard on) would, after the ``post_first_crack_
+    control`` pin above turns the guard off, silently hold a field
+    combination the D177 validator exists to forbid. This factory also
+    overrides ``joint_window_planner`` to ``JointWindowPlanner(enabled=
+    False)`` in the SAME ``model_copy``, always — adding a live opt-out here
+    would create exactly the invalid combination D177 forbids, so none is
+    authorised.
+
     Args:
         export_dir: The recorded ``roast.jsonl`` export directory to replay.
         store_path: Where to create the replay's own SQLite store.
         config: The base config to replay under; defaults to ``AppConfig()``.
             Its ``post_first_crack_control`` and ``reference_curve`` sections
             are overridden per the invariants above unless the matching
-            ``use_live_*`` flag is set.
+            ``use_live_*`` flag is set. Its ``joint_window_planner`` section
+            is always overridden to ``enabled=False`` with no opt-out.
         use_live_post_fc_control: Opt OUT of the pinned-baseline invariant —
             replay under ``config``'s own (possibly live-default) post-FC
             control settings instead. Default ``False``.
@@ -1083,10 +1101,15 @@ def build_replay_service(
         )
     if not use_live_reference_retrieval:
         controller_pins["reference_curve"] = ReferenceCurve(enabled=False)
-    if controller_pins:
-        app_config = app_config.model_copy(
-            update={"controller": app_config.controller.model_copy(update=controller_pins)}
-        )
+    # #710 (RP-C) slice 1 / D177: always pinned off, unconditionally — no
+    # ``use_live_*`` opt-out is authorised (see the docstring above). This
+    # also means ``controller_pins`` is never empty any more, so (unlike
+    # before #710) the ``model_copy`` below always runs, even when BOTH
+    # ``use_live_*`` flags are set.
+    controller_pins["joint_window_planner"] = JointWindowPlanner(enabled=False)
+    app_config = app_config.model_copy(
+        update={"controller": app_config.controller.model_copy(update=controller_pins)}
+    )
     control = ReplayRoasterControl()
     safety = SafetyPolicy(app_config.safety)
     store = RoastStore(store_path)

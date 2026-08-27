@@ -1403,6 +1403,62 @@ class AmbientFanDoctrine(BaseModel):
         return self
 
 
+class JointWindowPlanner(BaseModel):
+    """The deterministic joint-window drop planner's config (#710 RP-C slice
+    1, D176/D177).
+
+    Mirrors :class:`AmbientFanDoctrine` / :class:`ReferenceCurve`'s own
+    inert-until-enabled posture: with ``enabled=False`` (the default), the
+    controller populates none of ``AdvisorContext``'s six
+    ``joint_window_*`` fields, so they stay ``None`` and the advisor's
+    prompt JSON gains only always-null keys — a context-SHAPE addition, not
+    a behavioural one, so the live ``c3`` advisor's baseline stays
+    uncontaminated. Enabling is deliberately two acts, mirroring
+    ``AmbientFanDoctrine``: selecting the ``c12`` teaching AND setting
+    ``enabled=True``.
+
+    Both numbers below are DATA, never baked into the ``c12`` prose (the
+    #218 two-copies discipline): ``temp_margin_c`` and
+    ``closing_horizon_seconds`` are HYPOTHESES the operator may re-fit from
+    the D176 decision-level acceptance runs, and a re-fit must never require
+    a prompt edit.
+
+    **D177's cross-field invariant** (enforced on :class:`ControllerConfig`,
+    not here, because the other half — ``ceiling_guard_drop_enabled`` — lives
+    on :class:`PostFirstCrackControl`): ``enabled=True`` REQUIRES
+    ``post_first_crack_control.ceiling_guard_drop_enabled=True``. A teaching
+    that advises continuing to roast while temperature is materially short
+    (AC4's temperature-first ruling) must never run without the controller-
+    owned deterministic stop that terminates the hold — the identical
+    failure direction :attr:`PostFirstCrackControl.recovery_enabled` already
+    requires ``ceiling_guard_drop_enabled`` for.
+    """
+
+    model_config = FINITE_NUMERIC_MODEL_CONFIG
+
+    enabled: bool = Field(default=False)
+    """Master flag. ``False`` by default — no ``joint_window_*`` context
+    field is ever populated, and the planner is never invoked, so a bare
+    :class:`AppConfig` remains fully inert with respect to #710."""
+
+    temp_margin_c: float = Field(default=3.0, gt=0)
+    """The ``TEMP_SHORT`` status temperature margin, °C.
+
+    Default 3.0 — D176-ratified, aligned to RP-D's own ratified temperature
+    tolerance (``docs/analysis`` RP-D joint-score work). A projected drop
+    temperature more than this far below the effective target (at DTR
+    window close) reads as ``TEMP_SHORT``."""
+
+    closing_horizon_seconds: float = Field(default=30.0, gt=0)
+    """How close (in seconds) the DTR window's upper boundary must be for
+    the status to read ``CLOSING``.
+
+    Default 30.0 — D176-ratified, chosen so the ~5 s post-FC advisory
+    cadence (``post_fc_min_consult_interval_seconds``, default 5.0) gets
+    several consult opportunities inside the closing window without
+    labelling most of DEVELOPMENT as closing."""
+
+
 class ControllerConfig(BaseModel):
     """Controller timing and advisory-call thresholds.
 
@@ -1599,6 +1655,52 @@ class ControllerConfig(BaseModel):
     # inputs stay INERT until explicitly enabled, so selecting the prompt and
     # feeding it data are one deliberate act rather than a default.
     ambient_fan_doctrine: AmbientFanDoctrine = Field(default_factory=AmbientFanDoctrine)
+
+    # #710 (RP-C) slice 1: the deterministic joint-window drop planner's own
+    # config group. Mirrors ``ambient_fan_doctrine``/``reference_curve``
+    # above — a selectable advisor teaching whose context inputs stay INERT
+    # until explicitly enabled.
+    joint_window_planner: JointWindowPlanner = Field(default_factory=JointWindowPlanner)
+
+    @model_validator(mode="after")
+    def _check_joint_window_planner_requires_ceiling_guard(self) -> "ControllerConfig":
+        """Forbid the joint-window planner without the deterministic ceiling guard.
+
+        D177 (#710 RP-C slice 1). ``joint_window_planner.enabled=True``
+        pairs a teaching that advises CONTINUING to roast while temperature
+        is materially short (AC4's 6 Aug temperature-first ruling — "hold
+        for temp, accept DTR overrun") with a controller-owned deterministic
+        stop that terminates that hold. Without the ceiling guard, the only
+        backstop left is ``SafetyLimits.max_bean_temp_c`` (an emergency-stop
+        threshold, default 230 °C — far above the 196/198 bitter-line pair),
+        leaving the bitter line owned solely by the advisor's own judgment.
+        This is the identical failure direction
+        :meth:`PostFirstCrackControl._check_recovery_requires_ceiling_guard_and_master_flag`
+        already closes for ``recovery_enabled``; D177 extends it to this
+        planner. Unconstructible at construction, not merely logged — the
+        same BLOCKER-class posture :meth:`AppConfig.
+        _check_ceiling_guard_within_safety_bounds` records.
+
+        Returns:
+            The validated controller configuration.
+
+        Raises:
+            ValueError: If ``joint_window_planner.enabled`` is ``True``
+                while ``post_first_crack_control.ceiling_guard_drop_enabled``
+                is ``False``.
+        """
+        if (
+            self.joint_window_planner.enabled
+            and not self.post_first_crack_control.ceiling_guard_drop_enabled
+        ):
+            raise ValueError(
+                "joint_window_planner.enabled requires "
+                "post_first_crack_control.ceiling_guard_drop_enabled=True — a "
+                "temperature-first teaching that advises continuing while "
+                "temperature is materially short must never run without the "
+                "controller-owned deterministic stop that terminates the hold"
+            )
+        return self
 
     def advisory_interval_for(self, phase: RoastPhase) -> float | None:
         """Return the minimum-interval consult floor for ``phase`` in seconds.

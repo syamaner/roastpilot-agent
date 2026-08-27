@@ -27,6 +27,7 @@ from roastpilot_agent.config import (
     AppConfig,
     BeanSourcingConfig,
     ControllerConfig,
+    JointWindowPlanner,
     LateMaillardTrim,
     LoggingConfig,
     MCPConfig,
@@ -981,3 +982,69 @@ def test_ceiling_guard_equal_to_bitter_ceiling_temp_is_valid() -> None:
         safety=SafetyLimits(bitter_ceiling_temp_c=196.0, emergency_drop_temp_c=198.0),
     )
     assert config.controller.post_first_crack_control.ceiling_guard_temp_c == 196.0
+
+
+# --- #710 (RP-C) slice 1, D177: the joint-window planner requires the ---
+# --- deterministic ceiling guard (a cross-field check on ControllerConfig) ---
+
+
+def test_joint_window_planner_defaults() -> None:
+    """T22: the planner group is inert by default with the D176-ratified
+    numbers."""
+    planner = JointWindowPlanner()
+    assert planner.enabled is False
+    assert planner.temp_margin_c == 3.0
+    assert planner.closing_horizon_seconds == 30.0
+
+
+def test_joint_window_planner_enabled_without_ceiling_guard_is_rejected() -> None:
+    """T23: ``joint_window_planner.enabled=True`` with the ceiling guard OFF
+    is unconstructible, and the message names both fields."""
+    with pytest.raises(
+        pydantic.ValidationError,
+        match=r"joint_window_planner\.enabled.*ceiling_guard_drop_enabled",
+    ):
+        ControllerConfig(
+            joint_window_planner=JointWindowPlanner(enabled=True),
+            post_first_crack_control=PostFirstCrackControl(ceiling_guard_drop_enabled=False),
+        )
+
+
+def test_joint_window_planner_enabled_without_ceiling_guard_rejected_via_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T24: the same invalid combination is rejected through the
+    ``ROASTPILOT_CONTROLLER__…`` environment-variable path, not only direct
+    construction."""
+    monkeypatch.setenv("ROASTPILOT_CONTROLLER__JOINT_WINDOW_PLANNER__ENABLED", "true")
+    monkeypatch.setenv(
+        "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__CEILING_GUARD_DROP_ENABLED", "false"
+    )
+    with pytest.raises(pydantic.ValidationError):
+        AppConfig()
+
+
+def test_joint_window_planner_enabled_with_ceiling_guard_default_constructs() -> None:
+    """T25: ``enabled=True`` with the guard at its default ``True`` constructs
+    cleanly."""
+    config = ControllerConfig(joint_window_planner=JointWindowPlanner(enabled=True))
+    assert config.joint_window_planner.enabled is True
+    assert config.post_first_crack_control.ceiling_guard_drop_enabled is True
+
+
+def test_joint_window_planner_disabled_with_ceiling_guard_off_constructs() -> None:
+    """T26: ``enabled=False`` with the guard also ``False`` constructs
+    cleanly — the incumbent baseline arm (planner never enabled) stays
+    available regardless of the guard's own setting."""
+    config = ControllerConfig(
+        post_first_crack_control=PostFirstCrackControl(ceiling_guard_drop_enabled=False)
+    )
+    assert config.joint_window_planner.enabled is False
+    assert config.post_first_crack_control.ceiling_guard_drop_enabled is False
+
+
+def test_bare_app_config_joint_window_planner_group_is_inert() -> None:
+    """T27: a bare ``AppConfig()`` remains valid and the whole group is
+    inert."""
+    config = AppConfig()
+    assert config.controller.joint_window_planner.enabled is False

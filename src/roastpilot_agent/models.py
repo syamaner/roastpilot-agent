@@ -241,6 +241,59 @@ class PostFcHeatAuthorityState(Enum):
     GLIDING = "gliding"
 
 
+class JointWindowStatus(Enum):
+    """The deterministic joint-window drop planner's per-tick feasibility
+    read (#710 RP-C slice 1; D176/D177).
+
+    A plain ``Enum`` (D15: never string-compared in core logic; comparing a
+    member against a raw string must stay a pyright-strict error). Home is
+    HERE, not ``post_fc_control.py``, for the identical reason
+    :class:`PostFcHeatAuthorityState` above already documents:
+    ``post_fc_control.py`` must not import back from a module that imports
+    it, and :class:`~roastpilot_agent.advisor.AdvisorContext` (in
+    ``advisor.py``) needs to carry this value without creating that cycle.
+    ``post_fc_control.py`` re-exports it in ``__all__`` exactly as it already
+    re-exports :class:`PostFcHeatAuthorityState`.
+
+    Evaluated by :func:`~roastpilot_agent.post_fc_control.plan_joint_window`
+    as one ordered, disjoint chain — ``TEMP_SHORT`` first, then ``CLOSING``,
+    then ``AHEAD``, otherwise ``ON_TRACK`` (AC9/D177). Per the 6 Aug operator
+    ruling (D176's AC4), the joint-window teaching treats ``TEMP_SHORT`` as
+    "continue toward the effective target, accept the development-ratio
+    overrun" — the OPPOSITE of the issue body's superseded "drop temp-short"
+    framing — bounded by the deterministic ceiling guard, which is unaffected
+    by anything in this module.
+
+    * ``TEMP_SHORT`` — even at the DTR window's close, the bean is projected
+      to land below the effective target (target capped by the enforced
+      ceiling) by more than the configured temperature margin. Takes
+      precedence over ``CLOSING``: a closing window with a material
+      temperature miss still reads as temperature-short, never as "drop now".
+    * ``CLOSING`` — not temperature-short, and the DTR window's upper
+      boundary is at most the configured closing horizon away (including
+      already past). Means the viable window is expiring and temperature is
+      not the constraint — drop.
+    * ``AHEAD`` — the bean is projected to already be at or above the
+      effective target by the time the DTR window OPENS. Boundary equality
+      (projected temp exactly equal to the effective target) is ``AHEAD``,
+      not ``ON_TRACK`` (D177).
+    * ``ON_TRACK`` — the residual valid case: not temperature-short, not
+      closing, and not yet ahead.
+
+    Carried by ``AdvisorContext.joint_window_status`` (``None`` when the
+    planner is disabled, its inputs are invalid, or the plan is otherwise
+    absent — see :func:`~roastpilot_agent.post_fc_control.plan_joint_window`'s
+    atomic ``None`` return). Read-only advisory context: nothing in the
+    controller, safety policy, or drop paths reads this value back, and it
+    grants no new drop authority (AC7).
+    """
+
+    AHEAD = "ahead"
+    ON_TRACK = "on_track"
+    TEMP_SHORT = "temp_short"
+    CLOSING = "closing"
+
+
 # --- #197: microphone / first-crack capture-alive health (observability) ---
 #
 # The MCP audio first-crack pipeline reports a rich liveness status
