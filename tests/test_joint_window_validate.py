@@ -254,6 +254,7 @@ def test_output_never_leaks_fixture_identity_or_absolute_clock(
         "BEAN_MARKER",
         "DATE_MARKER",
         "987",
+        "SYNTHETIC_PRIVACY_MARKER",
     )
     for marker in markers:
         assert marker not in all_output
