@@ -18,6 +18,15 @@ Format: one entry per anti-pattern.
 
 ---
 
+## One global visual-diff budget can hide a material stable UI regression
+*(fixed by #653, closed screenshot policy)*
+
+- **Signature:** `rg -n 'toHaveScreenshot|maxDiffPixelRatio|maxDiffPixels' web/tests web/playwright.config.ts` — a direct screenshot matcher, a project-wide tolerance, or a locator inheriting a page-area ratio.
+- **Wrong / Right:** applying one loose full-page ratio to every screenshot lets a small, stable panel disappear within the area-derived allowance. Use the closed `visualBudgets.ts` helper and inventory: only unmasked-canvas pages may use the calibrated loose ratio; DOM pages are tighter; material locators use absolute pixel caps; calibration runs only in the pinned linux/amd64 image with `RP_VISUAL_CALIBRATE=1` to tighten allowances to zero.
+- **Guarded by:** `web/tests/contracts/screenshotPolicy.test.ts`, which derives the callsite inventory structurally, rejects raw matcher calls and global defaults, checks class shape/count/numeric invariants, and requires the four material-region locator contracts.
+
+---
+
 ## Independent drop readings can source cooling-tail temperature
 *(fixed by #726 item 1, shared persisted reading)*
 
