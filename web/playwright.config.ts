@@ -19,7 +19,7 @@ import { WEB_URLS } from "./tests/e2e/urls";
  * screenshot. Determinism kit: `deviceScaleFactor: 1` (uPlot scales its backing
  * store by DPR), the specs await the `window.__chart` point-count before shooting
  * (`waitForChartPoints`), `fonts.ready` + animations off, replay-fixed data, and a
- * small NON-ZERO `maxDiffPixelRatio`. The `window.__chart` data-assert STAYS as the
+ * calibrated class-specific budget. The `window.__chart` data-assert STAYS as the
  * authoritative correctness layer alongside the pixels (D26 §4).
  *
  * MULTI-FIXTURE HARNESS: the dashboard at `/` renders the live SSE stream of
@@ -49,20 +49,6 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? "github" : "list",
-  expect: {
-    toHaveScreenshot: {
-      // Small but non-zero (D26): absorbs sub-pixel AA noise from the un-masked
-      // canvas without hiding real drift. NEVER widened to paper over a flake —
-      // fix determinism (point-count gate / DPR / fonts) instead.
-      maxDiffPixelRatio: 0.01,
-      animations: "disabled",
-      // #530: NOTE — `fullPage` is NOT a valid key here (Playwright's
-      // `toHaveScreenshot` project-wide default type omits it; it only exists on
-      // the per-call `expect(page).toHaveScreenshot(name, { fullPage: true })`
-      // signature, confirmed by `tsc -b`). Every `expect(page).toHaveScreenshot()`
-      // call site sets it explicitly instead — see each `*.spec.ts` file.
-    },
-  },
   use: {
     baseURL: WEB_URLS.session2,
     viewport: { width: 1600, height: 1000 },

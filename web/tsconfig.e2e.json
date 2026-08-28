@@ -13,5 +13,5 @@
     "noUnusedParameters": true,
     "types": ["node"]
   },
-  "include": ["tests/e2e", "playwright.config.ts"]
+  "include": ["tests/e2e", "tests/contracts", "playwright.config.ts"]
 }
