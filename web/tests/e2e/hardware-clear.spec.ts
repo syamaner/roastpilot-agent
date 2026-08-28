@@ -2,6 +2,8 @@
 
 import { expect, test } from "@playwright/test";
 
+import { expectScreenshot, SCREENSHOT_CLASSES } from "./visualBudgets";
+
 test.beforeEach(async ({ page }) => {
   await page.goto("/__hardware-clear-harness");
   await expect(page.getByTestId("hardware-clear-required")).toBeVisible();
@@ -14,7 +16,7 @@ test("hardware-clear warning blocks start and states the physical safety boundar
   await expect(page.getByText(/physically verified the roaster is inactive/i)).toBeVisible();
   await expect(page.getByText(/never turns heat, fan, or cooling on/i)).toBeVisible();
   await expect(page.getByTestId("start-roast-form")).toHaveCount(0);
-  await expect(page).toHaveScreenshot("hardware-clear-required.png", { fullPage: true });
+  await expectScreenshot(page, "hardware-clear-required.png", SCREENSHOT_CLASSES.DOM_PAGE);
 });
 
 test("hardware-clear confirmation requires checkbox and reason, then latches success", async ({

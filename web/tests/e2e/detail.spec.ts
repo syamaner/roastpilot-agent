@@ -14,11 +14,12 @@
 import { expect, test } from "@playwright/test";
 
 import { readChartData, settle, waitForChartPoints } from "./helpers";
+import { expectScreenshot, SCREENSHOT_CLASSES } from "./visualBudgets";
 
 // The five columns the decision-trace table renders, in order
 // (DecisionTraceTable.tsx). The detail snapshot asserts the live header row
 // matches this EXACTLY, so a trace column added / removed / reordered fails
-// structurally even when the pixel diff stays under `maxDiffPixelRatio` — the
+// structurally even when a pixel diff is small — the
 // same blind spot #241 closed for the history table (#253). Scoped to the
 // trace table's own testid so a second table on the page can never make this
 // match the wrong header row.
@@ -72,7 +73,7 @@ test("roast-detail — full-page snapshot of the detail page (canvas un-masked)"
   // #566: baseline regenerated — "Your rating" now renders the read-only
   // headline (stars + saved note, with an "Edit" affordance) instead of the
   // old always-editable star-picker form.
-  await expect(page).toHaveScreenshot("roast-detail.png", { fullPage: true });
+  await expectScreenshot(page, "roast-detail.png", SCREENSHOT_CLASSES.CANVAS_PAGE);
 });
 
 test("roast-detail-selected — CLAMP row selected highlights the curve", async ({ page }) => {
@@ -103,7 +104,7 @@ test("roast-detail-selected — CLAMP row selected highlights the curve", async 
   // highlight not being set fails the hook.
   await expect(curve).toBeInViewport();
   await settle(page);
-  await expect(curve).toHaveScreenshot("roast-detail-selected.png");
+  await expectScreenshot(curve, "roast-detail-selected.png", SCREENSHOT_CLASSES.CANVAS_LOCATOR);
 });
 
 test("the detail curve carries the full persisted series + T0/FC/drop markers", async ({
@@ -175,7 +176,7 @@ test.describe("capped detail lists (#271)", () => {
 
     // #566: baseline regenerated for the same rating-headline redesign as
     // roast-detail.png above.
-    await expect(page).toHaveScreenshot("roast-detail-capped.png", { fullPage: true });
+    await expectScreenshot(page, "roast-detail-capped.png", SCREENSHOT_CLASSES.CANVAS_PAGE);
   });
 
   test("'View all' opens the full, scrollable history and Escape closes it", async ({ page }) => {
@@ -213,6 +214,6 @@ test.describe("advisor-failure detail (#170)", () => {
     await expect(page.getByTestId("advisor-timeline-empty")).toHaveCount(0);
     // #566: baseline regenerated for the same rating-headline redesign as
     // roast-detail.png above.
-    await expect(page).toHaveScreenshot("roast-detail-advisor-failed.png", { fullPage: true });
+    await expectScreenshot(page, "roast-detail-advisor-failed.png", SCREENSHOT_CLASSES.CANVAS_PAGE);
   });
 });

@@ -4,7 +4,7 @@ Two tracks, split by job. **Do not conflate them.**
 
 ## 1. The CI gate — scripted `@playwright/test` snapshots
 
-The merge gate is the scripted `toHaveScreenshot()` suite in `*.spec.ts`, run
+The merge gate is the scripted Playwright screenshot suite in `*.spec.ts`, run
 **inside the pinned Playwright Linux image**
 (`mcr.microsoft.com/playwright:v1.55.1-noble`). The committed baseline PNGs under
 `__screenshots__/` are generated **in that same image**, so they match the GitHub
@@ -13,7 +13,7 @@ their pixels drift and the gate will flap.
 
 What the gate asserts:
 
-- **The whole page** (`toHaveScreenshot`) per replay state — header, connection
+- **The whole page** (`expectScreenshot`) per replay state — header, connection
   indicator, verdict badges, legend, panels, modals, tables, **AND the uPlot
   canvas** (D26 — see below).
 - The **`window.__chart` chart-data hook** (`readChartData`) is asserted as the
@@ -23,7 +23,7 @@ What the gate asserts:
   reaches the SPA over the live SSE path against the actual replay backend.
 
 Determinism kit (D26, viewport/full-page fixed by #530): a 1600×1000 viewport,
-`fullPage: true` on every `expect(page).toHaveScreenshot()` (the project's
+`fullPage: true` on every page-class `expectScreenshot()` call (the project's
 `devices["Desktop Chrome"]` spread carries its own 1280×720 viewport, which wins
 over the top-level `use.viewport` unless re-asserted after the spread — see
 `playwright.config.ts`'s `chromium` project — and even a correctly-applied fixed
@@ -31,8 +31,23 @@ viewport can't cover pages taller than it, so `fullPage: true` is the actual
 "whole page" guarantee, not the viewport size), `deviceScaleFactor: 1` (uPlot
 scales its backing store by DPR), the specs wait on the `window.__chart`
 point-count (`waitForChartPoints`) before shooting, `fonts.ready` awaited
-(`settle`), animations disabled, reduced motion, replay-fixed data, and a small
-**non-zero** `maxDiffPixelRatio` (0.01).
+(`settle`), animations disabled, reduced motion, and replay-fixed data.
+
+### Closed budgets and inventory (D179)
+
+`visualBudgets.ts` is the only sanctioned screenshot surface. It verifies that a
+target's rendered canvas membership matches its closed class before comparison:
+`CANVAS_PAGE` is the sole full-page ratio class; canvas-free `DOM_PAGE` uses a
+substantially tighter full-page ratio; `DOM_LOCATOR` and `CANVAS_LOCATOR` use
+absolute pixel caps so a material region cannot be diluted by page area. The
+structural Vitest policy guard derives every `expectScreenshot()` call from the
+11 e2e specs and requires exact equality with the checked-in inventory.
+
+Budgets are calibrated only with `RP_VISUAL_CALIBRATE=1` in the pinned
+linux/amd64 image. That exact value sets every allowance to zero to expose
+observed differences; unset, empty and other values keep the committed policy.
+Do not set it in CI or the baseline producer. No test may call Playwright's raw
+matcher outside the helper, and no project-wide screenshot tolerance is allowed.
 
 ### The uPlot canvas is UN-MASKED (D26 — revises D24)
 

@@ -14,6 +14,7 @@
 import { expect, test } from "@playwright/test";
 
 import { readChartData, settle, waitForChartPoints } from "./helpers";
+import { expectScreenshot, SCREENSHOT_CLASSES } from "./visualBudgets";
 
 test.beforeEach(async ({ page }) => {
   await page.goto("/__chart-harness");
@@ -26,7 +27,7 @@ test("foundation chrome — full-page snapshot with the un-masked canvas", async
   // The DOM chrome (header, connection indicator, verdict badges, legend) AND the
   // rendered curve are the baseline now; correctness is also asserted via the data
   // hook in the tests below.
-  await expect(page).toHaveScreenshot("foundation-chrome.png", { fullPage: true });
+  await expectScreenshot(page, "foundation-chrome.png", SCREENSHOT_CLASSES.CANVAS_PAGE);
 });
 
 test("engaged D96 authority status exposes entry diagnostics", async ({ page }) => {
@@ -36,7 +37,7 @@ test("engaged D96 authority status exposes entry diagnostics", async ({ page }) 
   await expect(status).toContainText("RoR 4.8 °C/min");
   await expect(status).toContainText("Target 6.4 °C/min");
   await expect(status).toContainText("Heat ceiling 75 %");
-  await expect(status).toHaveScreenshot("foundation-d96-recovering.png");
+  await expectScreenshot(status, "foundation-d96-recovering.png", SCREENSHOT_CLASSES.DOM_LOCATOR);
 });
 
 test("chart data hook exposes the five series + markers (D24)", async ({ page }) => {

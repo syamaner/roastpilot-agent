@@ -82,7 +82,8 @@ system Google Chrome** (no heavy download) + the `capture.mjs` screenshot script
    machine — that rule is also the macOS-Docker friction fix). Determinism kit:
    `deviceScaleFactor: 1` (uPlot scales its backing store by DPR), wait on the
    `window.__chart` point-count hook before shooting, `fonts.ready`, animations off,
-   replay-fixed data, residual jitter absorbed by `maxDiffPixelRatio ≈ 0.01`. The
+   replay-fixed data, residual jitter absorbed only by the calibrated,
+   class-scoped visual budget. The
    **chart-data assertion stays as a complementary layer, not a replacement** — it
    is the authoritative correctness oracle (data-assert green + pixel-diff red ⇒ a
    render/CSS regression, not a data bug); the snapshot is a visual-smoke layer over
@@ -218,8 +219,10 @@ Owner: lead / `ui-reviewer`. Acceptance criteria:
   band folded into the °C scale) + adds a scale-covers-data guard.
 - [x] **Canvas determinism kit applied** so the un-masked snapshots are stable in
   CI: `deviceScaleFactor: 1`, wait on the `window.__chart` point-count hook before
-  shooting, `fonts.ready`, animations off, replay-fixed data, `maxDiffPixelRatio ≈
-  0.01` (kept non-zero). Baselines are **never** generated/diffed on macOS — CI
+  shooting, `fonts.ready`, animations off, and replay-fixed data. **D179 narrowing:**
+  the former suite-wide 1% tolerance is retired; a closed helper/inventory applies
+  the calibrated loose ratio only to unmasked-canvas pages, tighter DOM-page ratios,
+  and absolute locator caps. Baselines are **never** generated/diffed on macOS — CI
   Docker only (+ the `web-snapshots-update.yml` producer). **D26 addendum:** the
   bundled axis webfont is **optional**, not required — baselines are generated AND
   diffed only inside the one pinned amd64 image (Docker-vs-Docker), so the system

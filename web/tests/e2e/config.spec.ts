@@ -33,6 +33,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
 import type { AppConfigSnapshot, DevicesSnapshot, HealthResponse } from "../../src/lib/types";
+import { expectScreenshot, SCREENSHOT_CLASSES } from "./visualBudgets";
 
 // ---------------------------------------------------------------------------
 // Fixture: a representative, fully-populated AppConfigSnapshot.
@@ -226,7 +227,7 @@ test("config — Hardware pane on load (rail + ambient group), full-page snapsho
   await expect(modeField).not.toContainText("Guarded");
 
   await settle(page);
-  await expect(page).toHaveScreenshot("config.png", { fullPage: true });
+  await expectScreenshot(page, "config.png", SCREENSHOT_CLASSES.DOM_PAGE);
 });
 
 test("config-safety — Safety pane shows a read-only/Guarded field, full-page snapshot", async ({
@@ -250,7 +251,7 @@ test("config-safety — Safety pane shows a read-only/Guarded field, full-page s
   await expect(input).toHaveValue("230");
 
   await settle(page);
-  await expect(page).toHaveScreenshot("config-safety.png", { fullPage: true });
+  await expectScreenshot(page, "config-safety.png", SCREENSHOT_CLASSES.DOM_PAGE);
 });
 
 test("config-fc-detection — fc_mode renders the real yaml value as its inherit option, never a bogus concrete option (#482)", async ({
