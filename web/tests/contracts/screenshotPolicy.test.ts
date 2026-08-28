@@ -1,7 +1,7 @@
 /** Structural guard for the closed visual-regression screenshot policy. */
 
-import { readdirSync, readFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import ts from "typescript";
@@ -26,9 +26,14 @@ const MODULE_PATH = import.meta.url.startsWith("file:")
   ? fileURLToPath(import.meta.url)
   : import.meta.url.replace(/^\/@fs/, "");
 const WEB_ROOT = resolve(dirname(MODULE_PATH), "../..");
+const TESTS_ROOT = join(WEB_ROOT, "tests");
 const E2E_ROOT = join(WEB_ROOT, "tests", "e2e");
 const HELPER_PATH = join(E2E_ROOT, "visualBudgets.ts");
 const CONFIG_PATH = join(WEB_ROOT, "playwright.config.ts");
+
+const TEST_SOURCE_EXTENSIONS = new Set([".ts", ".tsx"]);
+const EXCLUDED_TEST_SOURCE_SUFFIXES = [".d.ts", ".generated.ts", ".generated.tsx"];
+const EXCLUDED_TEST_SOURCE_DIRECTORIES = new Set(["__screenshots__", "generated"]);
 
 type HelperCall = ScreenshotInventoryEntry;
 
@@ -39,6 +44,26 @@ function discoverSpecFiles(directory = E2E_ROOT): string[] {
     const childPath = join(directory, child.name);
     if (child.isDirectory()) return discoverSpecFiles(childPath);
     return child.isFile() && child.name.endsWith(".spec.ts") ? [childPath] : [];
+  });
+}
+
+/** Return whether a path is an admitted TypeScript/TSX test source. */
+function isTestSourceFile(path: string): boolean {
+  return (
+    TEST_SOURCE_EXTENSIONS.has(extname(path)) &&
+    !EXCLUDED_TEST_SOURCE_SUFFIXES.some((suffix) => path.endsWith(suffix))
+  );
+}
+
+/** Recursively discover all admitted test source files across the test tree. */
+function discoverTestSourceFiles(directory = TESTS_ROOT): string[] {
+  const children = readdirSync(directory, { withFileTypes: true });
+  return children.flatMap((child) => {
+    const childPath = join(directory, child.name);
+    if (child.isDirectory()) {
+      return EXCLUDED_TEST_SOURCE_DIRECTORIES.has(child.name) ? [] : discoverTestSourceFiles(childPath);
+    }
+    return child.isFile() && isTestSourceFile(childPath) ? [childPath] : [];
   });
 }
 
@@ -53,14 +78,13 @@ function propertyName(name: ts.PropertyName): string | undefined {
   return undefined;
 }
 
-/** Collect direct Playwright screenshot matcher invocations from a source file. */
-function directScreenshotCalls(file: ts.SourceFile): ts.CallExpression[] {
-  const calls: ts.CallExpression[] = [];
+/** Collect all Playwright screenshot matcher accesses from a source file. */
+function directScreenshotCalls(file: ts.SourceFile): ts.PropertyAccessExpression[] {
+  const calls: ts.PropertyAccessExpression[] = [];
   const visit = (node: ts.Node): void => {
     if (
-      ts.isCallExpression(node) &&
-      ts.isPropertyAccessExpression(node.expression) &&
-      node.expression.name.text === "toHaveScreenshot"
+      ts.isPropertyAccessExpression(node) &&
+      node.name.text === "toHaveScreenshot"
     ) {
       calls.push(node);
     }
@@ -183,8 +207,33 @@ describe("visual screenshot policy", () => {
   });
 
   test("permits direct screenshot matching only in the sanctioned helper", () => {
-    for (const path of discoverSpecFiles()) expect(directScreenshotCalls(sourceFile(path))).toHaveLength(0);
+    const testSources = discoverTestSourceFiles();
+    expect(testSources).not.toHaveLength(0);
+    for (const path of testSources) {
+      if (path !== HELPER_PATH) expect(directScreenshotCalls(sourceFile(path))).toHaveLength(0);
+    }
     expect(directScreenshotCalls(sourceFile(HELPER_PATH))).toHaveLength(1);
+  });
+
+  test("detects raw matchers in e2e helpers and non-e2e test sources", () => {
+    const e2eFixtureDirectory = mkdtempSync(join(E2E_ROOT, ".screenshot-policy-"));
+    const contractFixtureDirectory = mkdtempSync(join(TESTS_ROOT, ".screenshot-policy-"));
+    const e2eHelper = join(e2eFixtureDirectory, "raw-helper.ts");
+    const contractSource = join(contractFixtureDirectory, "raw-contract.tsx");
+    const rawMatcher = "expect(target).toHaveScreenshot('escape.png');";
+
+    try {
+      writeFileSync(e2eHelper, rawMatcher);
+      writeFileSync(contractSource, rawMatcher);
+      const discovered = discoverTestSourceFiles();
+
+      expect(discovered).toEqual(expect.arrayContaining([e2eHelper, contractSource]));
+      expect(directScreenshotCalls(sourceFile(e2eHelper))).toHaveLength(1);
+      expect(directScreenshotCalls(sourceFile(contractSource))).toHaveLength(1);
+    } finally {
+      rmSync(e2eFixtureDirectory, { recursive: true, force: true });
+      rmSync(contractFixtureDirectory, { recursive: true, force: true });
+    }
   });
 
   test("derives an exact helper-call inventory with literal names and closed classes", () => {
