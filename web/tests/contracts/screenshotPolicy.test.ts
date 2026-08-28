@@ -1,6 +1,6 @@
 /** Structural guard for the closed visual-regression screenshot policy. */
 
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,8 +32,8 @@ const HELPER_PATH = join(E2E_ROOT, "visualBudgets.ts");
 const CONFIG_PATH = join(WEB_ROOT, "playwright.config.ts");
 
 const TEST_SOURCE_EXTENSIONS = new Set([".ts", ".tsx"]);
-const EXCLUDED_TEST_SOURCE_SUFFIXES = [".d.ts", ".generated.ts", ".generated.tsx"];
-const EXCLUDED_TEST_SOURCE_DIRECTORIES = new Set(["__screenshots__", "generated"]);
+const EXCLUDED_TEST_SOURCE_SUFFIXES = [".d.ts"];
+const EXCLUDED_TEST_SOURCE_DIRECTORIES = new Set(["__screenshots__"]);
 
 type HelperCall = ScreenshotInventoryEntry;
 
@@ -215,21 +215,38 @@ describe("visual screenshot policy", () => {
     expect(directScreenshotCalls(sourceFile(HELPER_PATH))).toHaveLength(1);
   });
 
-  test("detects raw matchers in e2e helpers and non-e2e test sources", () => {
+  test("detects raw matchers in e2e helpers and every admitted non-e2e test source", () => {
     const e2eFixtureDirectory = mkdtempSync(join(E2E_ROOT, ".screenshot-policy-"));
     const contractFixtureDirectory = mkdtempSync(join(TESTS_ROOT, ".screenshot-policy-"));
     const e2eHelper = join(e2eFixtureDirectory, "raw-helper.ts");
     const contractSource = join(contractFixtureDirectory, "raw-contract.tsx");
+    const generatedDirectory = join(contractFixtureDirectory, "generated");
+    const generatedDirectorySource = join(generatedDirectory, "raw-helper.ts");
+    const generatedTypeScriptSource = join(contractFixtureDirectory, "raw.generated.ts");
+    const generatedTsxSource = join(contractFixtureDirectory, "raw.generated.tsx");
     const rawMatcher = "expect(target).toHaveScreenshot('escape.png');";
 
     try {
+      mkdirSync(generatedDirectory);
       writeFileSync(e2eHelper, rawMatcher);
       writeFileSync(contractSource, rawMatcher);
+      writeFileSync(generatedDirectorySource, rawMatcher);
+      writeFileSync(generatedTypeScriptSource, rawMatcher);
+      writeFileSync(generatedTsxSource, rawMatcher);
       const discovered = discoverTestSourceFiles();
 
-      expect(discovered).toEqual(expect.arrayContaining([e2eHelper, contractSource]));
+      expect(discovered).toEqual(expect.arrayContaining([
+        e2eHelper,
+        contractSource,
+        generatedDirectorySource,
+        generatedTypeScriptSource,
+        generatedTsxSource,
+      ]));
       expect(directScreenshotCalls(sourceFile(e2eHelper))).toHaveLength(1);
       expect(directScreenshotCalls(sourceFile(contractSource))).toHaveLength(1);
+      expect(directScreenshotCalls(sourceFile(generatedDirectorySource))).toHaveLength(1);
+      expect(directScreenshotCalls(sourceFile(generatedTypeScriptSource))).toHaveLength(1);
+      expect(directScreenshotCalls(sourceFile(generatedTsxSource))).toHaveLength(1);
     } finally {
       rmSync(e2eFixtureDirectory, { recursive: true, force: true });
       rmSync(contractFixtureDirectory, { recursive: true, force: true });
