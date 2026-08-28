@@ -23,6 +23,7 @@ import { expect, test } from "@playwright/test";
 import { advanceTo, AGENTS, step, stepTo } from "./global-setup";
 import { readChartData, settle, settleStepped, waitForChartPoints } from "./helpers";
 import { WEB_URLS } from "./urls";
+import { expectScreenshot, SCREENSHOT_CLASSES } from "./visualBudgets";
 
 test("dashboard-live — preheating with the charge band, full-page snapshot (canvas un-masked)", async ({
   page,
@@ -118,7 +119,7 @@ test("dashboard-live — preheating with the charge band, full-page snapshot (ca
   await expect(page.getByTestId("ambient-pressure")).toHaveText("1013 hPa");
 
   await settle(page);
-  await expect(page).toHaveScreenshot("dashboard-live.png", { fullPage: true });
+  await expectScreenshot(page, "dashboard-live.png", SCREENSHOT_CLASSES.CANVAS_PAGE);
 });
 
 test("dashboard-fault — real env-ceiling fault renders the fault banner + trail (canvas un-masked)", async ({
@@ -180,7 +181,7 @@ test("dashboard-fault — real env-ceiling fault renders the fault banner + trai
   expect((hook.scales.x.max ?? 0) - (hook.scales.x.min ?? 0)).toBeGreaterThan(0);
 
   await settle(page);
-  await expect(page).toHaveScreenshot("dashboard-fault.png", { fullPage: true });
+  await expectScreenshot(page, "dashboard-fault.png", SCREENSHOT_CLASSES.CANVAS_PAGE);
 });
 
 test("dashboard-recovery — pre-T0 overrun opens the no-auto-resume recovery modal (canvas un-masked)", async ({
@@ -226,7 +227,7 @@ test("dashboard-recovery — pre-T0 overrun opens the no-auto-resume recovery mo
   expect(hook.scales.pct.max).toBe(100);
 
   await settle(page);
-  await expect(page).toHaveScreenshot("dashboard-recovery.png", { fullPage: true });
+  await expectScreenshot(page, "dashboard-recovery.png", SCREENSHOT_CLASSES.CANVAS_PAGE);
 });
 
 test("dashboard-developed — full ramping curve at first crack (canvas un-masked, real shape)", async ({
@@ -349,10 +350,12 @@ test("dashboard-developed — full ramping curve at first crack (canvas un-maske
   // Genuinely new UI block: keep an element-scoped visual contract in addition
   // to the existing whole-page developed baseline (#653 convention). Canonical
   // pixels are generated only by the pinned CI baseline workflow.
-  await expect(beanTemperatureReadout).toHaveScreenshot(
+  await expectScreenshot(
+    beanTemperatureReadout,
     "bean-temperature-developed.png",
+    SCREENSHOT_CLASSES.DOM_LOCATOR,
   );
-  await expect(page).toHaveScreenshot("dashboard-developed.png", { fullPage: true });
+  await expectScreenshot(page, "dashboard-developed.png", SCREENSHOT_CLASSES.CANVAS_PAGE);
 
   // Reload after the one-shot first_crack SSE event has already passed. The
   // server telemetry + persisted event snapshots must restore both values;
@@ -428,5 +431,5 @@ test("dashboard-charge-window — preheating + bean in the charge band shows the
   expect(hook.scales.pct.max).toBe(100);
 
   await settle(page);
-  await expect(page).toHaveScreenshot("dashboard-charge-window.png", { fullPage: true });
+  await expectScreenshot(page, "dashboard-charge-window.png", SCREENSHOT_CLASSES.CANVAS_PAGE);
 });

@@ -15,6 +15,7 @@
 import { expect, test } from "@playwright/test";
 
 import { advanceTo, AGENTS, step } from "./global-setup";
+import { expectScreenshot, SCREENSHOT_CLASSES } from "./visualBudgets";
 
 // One test against the single shared stepped run (the lead-scoped S2 smoke).
 // Open the page FIRST so the SSE stream connects, THEN advance the replay — the
@@ -60,5 +61,5 @@ test("real-replay smoke — server phase reaches the SPA, chrome snapshot", asyn
   // Phase comes from the server, surfaced by the reducer — assert it landed.
   await expect(page.getByTestId("smoke-phase")).toHaveText("preheating");
   await page.evaluate(() => document.fonts.ready);
-  await expect(page).toHaveScreenshot("stream-smoke-preheating.png", { fullPage: true });
+  await expectScreenshot(page, "stream-smoke-preheating.png", SCREENSHOT_CLASSES.DOM_PAGE);
 });

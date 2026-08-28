@@ -29,6 +29,7 @@ import { expect, test } from "@playwright/test";
 import { advanceTo, AGENTS, step } from "./global-setup";
 import { settle, settleStepped } from "./helpers";
 import { WEB_URLS } from "./urls";
+import { expectScreenshot, SCREENSHOT_CLASSES } from "./visualBudgets";
 
 test("mic-green — capture-alive OK mic renders the green icon (real replay, server-derived)", async ({
   page,
@@ -57,7 +58,7 @@ test("mic-green — capture-alive OK mic renders the green icon (real replay, se
   await expect(mic).toContainText(/mic ok/i);
 
   await settle(page);
-  await expect(page).toHaveScreenshot("mic-green.png", { fullPage: true });
+  await expectScreenshot(page, "mic-green.png", SCREENSHOT_CLASSES.CANVAS_PAGE);
 });
 
 test("mic-error — a faulted capture pipeline renders the red icon (snapshot-mocked, never green)", async ({
@@ -99,5 +100,5 @@ test("mic-error — a faulted capture pipeline renders the red icon (snapshot-mo
   await expect(mic).toContainText(/mic error/i);
 
   await settle(page);
-  await expect(page).toHaveScreenshot("mic-error.png", { fullPage: true });
+  await expectScreenshot(page, "mic-error.png", SCREENSHOT_CLASSES.CANVAS_PAGE);
 });

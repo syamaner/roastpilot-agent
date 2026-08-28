@@ -22,6 +22,7 @@
 import { expect, test } from "@playwright/test";
 
 import { readChartData, settle, waitForChartPoints } from "./helpers";
+import { expectScreenshot, SCREENSHOT_CLASSES } from "./visualBudgets";
 
 // Mirror of FIXTURE_FINISHED_RUN_ID from liveFinishedFixture.ts.
 const FIXTURE_FINISHED_RUN_ID = "live-finished-fixture-001";
@@ -78,5 +79,5 @@ test("live-finished — stat tiles, detail link, curve data-assert + snapshot", 
   expect(Math.max(...xs)).toBeGreaterThan(Math.min(...xs));
 
   // Full-page pixel snapshot (canvas un-masked, D26 — CI Docker only).
-  await expect(page).toHaveScreenshot("live-finished.png", { fullPage: true });
+  await expectScreenshot(page, "live-finished.png", SCREENSHOT_CLASSES.CANVAS_PAGE);
 });

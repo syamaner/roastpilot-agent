@@ -19,6 +19,8 @@
 
 import { expect, test } from "@playwright/test";
 
+import { expectScreenshot, SCREENSHOT_CLASSES } from "./visualBudgets";
+
 test.beforeEach(async ({ page }) => {
   await page.goto("/__home-harness");
   await expect(page.getByTestId("home-page")).toBeVisible();
@@ -41,5 +43,5 @@ test("home — landing hub with all entry points + persistent nav (full-page sna
   await expect(page.getByTestId("nav-live-roast")).toHaveCount(0);
   await expect(page.getByTestId("home-live-status-chip")).toHaveCount(0);
 
-  await expect(page).toHaveScreenshot("home.png", { fullPage: true });
+  await expectScreenshot(page, "home.png", SCREENSHOT_CLASSES.DOM_PAGE);
 });

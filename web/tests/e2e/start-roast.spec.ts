@@ -10,16 +10,11 @@
  *   - start-roast                       → the idle form with the saved-profile dropdown
  *   - start-roast-add-modal             → the add-profile modal open (full page)
  *   - start-roast-add-modal-draft-panel → JUST the draft-from-URL panel (#637), scoped
- *     to its container locator rather than the full page. The full-page shot's 1%
- *     `maxDiffPixelRatio` tolerance (tuned to absorb un-masked-canvas AA noise
- *     elsewhere in the suite) is loose enough that this panel's dark-on-dark, modest
- *     footprint can appear or vanish within budget without failing the full-page
- *     comparison — confirmed empirically: adding the panel moved only ~1% of the
- *     full-page pixels by pixelmatch's perceptual metric, right at the threshold. A
- *     locator-scoped shot of a small region has no such headroom: if the panel
- *     disappears, `toHaveScreenshot` on its locator fails outright (element not
- *     found / zero-size) before any pixel math runs, so this closes that gap
- *     without loosening or fighting the full-page tolerance.
+ *     to its container locator rather than the full page. The DOM-only page budget
+ *     is intentionally tighter than canvas pages, but a locator-scoped shot still
+ *     prevents a material region from being diluted by page area. If the panel
+ *     disappears, the helper fails on its locator itself (element not found / zero
+ *     size) before pixel math runs.
  *   - start-roast-add-modal-catalogue-results → JUST the populated catalogue
  *     recommendation panel (#573), proving the result-card hierarchy without
  *     diluting it into the full-page tolerance.
@@ -30,6 +25,8 @@
  */
 
 import { expect, test } from "@playwright/test";
+
+import { expectScreenshot, SCREENSHOT_CLASSES } from "./visualBudgets";
 
 test.beforeEach(async ({ page }) => {
   await page.goto("/__start-roast-harness");
@@ -47,7 +44,7 @@ test("start-roast — idle form with the saved bean-profile dropdown (full-page 
   await expect(select).toContainText("Ethiopia Yirgacheffe Koke (Natural)");
   await expect(select).toContainText("Colombia Huila (Washed)");
 
-  await expect(page).toHaveScreenshot("start-roast.png", { fullPage: true });
+  await expectScreenshot(page, "start-roast.png", SCREENSHOT_CLASSES.DOM_PAGE);
 });
 
 test("selecting a saved profile fills the form + pre-fills the per-roast weight (data-assert)", async ({
@@ -76,25 +73,25 @@ test("start-roast-add-modal — the add-profile modal open (full-page snapshot)"
   await expect(page.getByTestId("bean-profile-save")).toBeVisible();
   await page.evaluate(() => document.fonts.ready);
 
-  await expect(page).toHaveScreenshot("start-roast-add-modal.png", { fullPage: true });
+  await expectScreenshot(page, "start-roast-add-modal.png", SCREENSHOT_CLASSES.DOM_PAGE);
 });
 
 test("start-roast-add-modal — the draft-from-URL panel, scoped snapshot (#637)", async ({
   page,
 }) => {
-  // A locator-scoped shot of just the draft-from-URL panel (#637): the full-page
-  // shot above budgets a 1% maxDiffPixelRatio (tuned for the un-masked canvas
-  // elsewhere in the suite), which is loose enough that this panel's addition can
-  // sit within tolerance and never fail the full-page comparison. Scoping to the
-  // panel's own locator removes that headroom — if the panel is missing entirely,
-  // `toHaveScreenshot` fails on the locator itself, not a diluted page-wide ratio.
+  // A locator-scoped shot of just the draft-from-URL panel (#637) prevents the
+  // material region from inheriting a full-page allowance.
   await page.getByTestId("bean-profile-add-button").click();
   const panel = page.getByTestId("bean-profile-draft-panel");
   await expect(panel).toBeVisible();
   await expect(page.getByTestId("bean-profile-draft-url")).toBeVisible();
   await page.evaluate(() => document.fonts.ready);
 
-  await expect(panel).toHaveScreenshot("start-roast-add-modal-draft-panel.png");
+  await expectScreenshot(
+    panel,
+    "start-roast-add-modal-draft-panel.png",
+    SCREENSHOT_CLASSES.DOM_LOCATOR,
+  );
 });
 
 test("catalogue recommendations hand the selected server URL to draft-and-review (#573)", async ({
@@ -198,7 +195,11 @@ test("catalogue recommendations hand the selected server URL to draft-and-review
     "Adds a country and process pairing that is new to the saved library.",
   );
   await page.evaluate(() => document.fonts.ready);
-  await expect(panel).toHaveScreenshot("start-roast-add-modal-catalogue-results.png");
+  await expectScreenshot(
+    panel,
+    "start-roast-add-modal-catalogue-results.png",
+    SCREENSHOT_CLASSES.DOM_LOCATOR,
+  );
 
   await page.getByTestId("bean-profile-catalogue-draft-candidate-01").click();
   await expect(page.getByTestId("bean-profile-draft-ready-status")).toContainText(

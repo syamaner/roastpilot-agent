@@ -8,14 +8,14 @@
  * decoupled from the fixture's run count.
  *
  * Two required states (kickoff §5): `history` (a populated table) and
- * `history-empty` (the first-run empty state). DOM-chrome `toHaveScreenshot()`;
+ * `history-empty` (the first-run empty state). DOM-chrome screenshot helper;
  * there is no canvas on this page, so nothing is masked.
  *
  * #241 — why the populated baseline went stale-blind: the route intercept works
  * fine (the data IS mocked), but the committed `history-linux.png` was last
  * regenerated at #114 (5 columns) and never refreshed after #181 added the
  * Advisor column or #111 the FC column. Adding two narrow, lightly-inked columns
- * to a `w-full` table moved fewer pixels than `maxDiffPixelRatio` allowed, so the
+ * to a `w-full` table could be diluted by a page-wide allowance, so the
  * gate passed against the stale image AND `--update-snapshots` (Playwright 1.55
  * only rewrites a snapshot whose comparison FAILS) left it untouched. The fix:
  * (1) the fixture below is typed to the full `RoastSummary` contract so every
@@ -30,6 +30,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
 import type { RoastSummary } from "../../src/lib/types";
+import { expectScreenshot, SCREENSHOT_CLASSES } from "./visualBudgets";
 
 // The seven columns the history table renders, in order (HistoryTable.tsx). The
 // populated-state test asserts the live header row matches this EXACTLY, so a
@@ -164,7 +165,7 @@ test("history — populated table", async ({ page }) => {
   const ambientCells = page.getByTestId("history-ambient");
   await expect(ambientCells).toHaveText(["22.4°C · 41%", "26.8°C · 55%", "—"]);
   await settle(page);
-  await expect(page).toHaveScreenshot("history.png", { fullPage: true });
+  await expectScreenshot(page, "history.png", SCREENSHOT_CLASSES.DOM_PAGE);
 });
 
 test("history-empty — first-run empty state", async ({ page }) => {
@@ -172,5 +173,5 @@ test("history-empty — first-run empty state", async ({ page }) => {
   await page.goto("/roasts");
   await expect(page.getByTestId("history-empty")).toBeVisible();
   await settle(page);
-  await expect(page).toHaveScreenshot("history-empty.png", { fullPage: true });
+  await expectScreenshot(page, "history-empty.png", SCREENSHOT_CLASSES.DOM_PAGE);
 });
