@@ -33,7 +33,6 @@ const CONFIG_PATH = join(WEB_ROOT, "playwright.config.ts");
 
 const TEST_SOURCE_EXTENSIONS = new Set([".ts", ".tsx"]);
 const EXCLUDED_TEST_SOURCE_SUFFIXES = [".d.ts"];
-const EXCLUDED_TEST_SOURCE_DIRECTORIES = new Set(["__screenshots__"]);
 
 type HelperCall = ScreenshotInventoryEntry;
 
@@ -60,9 +59,7 @@ function discoverTestSourceFiles(directory = TESTS_ROOT): string[] {
   const children = readdirSync(directory, { withFileTypes: true });
   return children.flatMap((child) => {
     const childPath = join(directory, child.name);
-    if (child.isDirectory()) {
-      return EXCLUDED_TEST_SOURCE_DIRECTORIES.has(child.name) ? [] : discoverTestSourceFiles(childPath);
-    }
+    if (child.isDirectory()) return discoverTestSourceFiles(childPath);
     return child.isFile() && isTestSourceFile(childPath) ? [childPath] : [];
   });
 }
@@ -92,6 +89,15 @@ function directScreenshotCalls(file: ts.SourceFile): ts.PropertyAccessExpression
   };
   visit(file);
   return calls;
+}
+
+/** Assert that only the sanctioned helper accesses the screenshot matcher. */
+function assertOnlySanctionedHelperUsesDirectScreenshotMatcher(testSources = discoverTestSourceFiles()): void {
+  expect(testSources).not.toHaveLength(0);
+  for (const path of testSources) {
+    if (path !== HELPER_PATH) expect(directScreenshotCalls(sourceFile(path))).toHaveLength(0);
+  }
+  expect(directScreenshotCalls(sourceFile(HELPER_PATH))).toHaveLength(1);
 }
 
 /** Collect structurally valid helper calls, rejecting dynamic names/classes. */
@@ -207,15 +213,10 @@ describe("visual screenshot policy", () => {
   });
 
   test("permits direct screenshot matching only in the sanctioned helper", () => {
-    const testSources = discoverTestSourceFiles();
-    expect(testSources).not.toHaveLength(0);
-    for (const path of testSources) {
-      if (path !== HELPER_PATH) expect(directScreenshotCalls(sourceFile(path))).toHaveLength(0);
-    }
-    expect(directScreenshotCalls(sourceFile(HELPER_PATH))).toHaveLength(1);
+    assertOnlySanctionedHelperUsesDirectScreenshotMatcher();
   });
 
-  test("detects raw matchers in e2e helpers and every admitted non-e2e test source", () => {
+  test("rejects raw matchers from every recursive executable test-source path", () => {
     const e2eFixtureDirectory = mkdtempSync(join(E2E_ROOT, ".screenshot-policy-"));
     const contractFixtureDirectory = mkdtempSync(join(TESTS_ROOT, ".screenshot-policy-"));
     const e2eHelper = join(e2eFixtureDirectory, "raw-helper.ts");
@@ -224,29 +225,29 @@ describe("visual screenshot policy", () => {
     const generatedDirectorySource = join(generatedDirectory, "raw-helper.ts");
     const generatedTypeScriptSource = join(contractFixtureDirectory, "raw.generated.ts");
     const generatedTsxSource = join(contractFixtureDirectory, "raw.generated.tsx");
+    const screenshotDirectory = join(contractFixtureDirectory, "__screenshots__");
+    const screenshotDirectorySource = join(screenshotDirectory, "raw-helper.ts");
     const rawMatcher = "expect(target).toHaveScreenshot('escape.png');";
+    const violations = [
+      e2eHelper,
+      contractSource,
+      generatedDirectorySource,
+      generatedTypeScriptSource,
+      generatedTsxSource,
+      screenshotDirectorySource,
+    ];
 
     try {
       mkdirSync(generatedDirectory);
-      writeFileSync(e2eHelper, rawMatcher);
-      writeFileSync(contractSource, rawMatcher);
-      writeFileSync(generatedDirectorySource, rawMatcher);
-      writeFileSync(generatedTypeScriptSource, rawMatcher);
-      writeFileSync(generatedTsxSource, rawMatcher);
-      const discovered = discoverTestSourceFiles();
+      mkdirSync(screenshotDirectory);
+      for (const violation of violations) {
+        writeFileSync(violation, rawMatcher);
+        const discovered = discoverTestSourceFiles();
 
-      expect(discovered).toEqual(expect.arrayContaining([
-        e2eHelper,
-        contractSource,
-        generatedDirectorySource,
-        generatedTypeScriptSource,
-        generatedTsxSource,
-      ]));
-      expect(directScreenshotCalls(sourceFile(e2eHelper))).toHaveLength(1);
-      expect(directScreenshotCalls(sourceFile(contractSource))).toHaveLength(1);
-      expect(directScreenshotCalls(sourceFile(generatedDirectorySource))).toHaveLength(1);
-      expect(directScreenshotCalls(sourceFile(generatedTypeScriptSource))).toHaveLength(1);
-      expect(directScreenshotCalls(sourceFile(generatedTsxSource))).toHaveLength(1);
+        expect(discovered).toContain(violation);
+        expect(() => assertOnlySanctionedHelperUsesDirectScreenshotMatcher(discovered)).toThrow();
+        rmSync(violation);
+      }
     } finally {
       rmSync(e2eFixtureDirectory, { recursive: true, force: true });
       rmSync(contractFixtureDirectory, { recursive: true, force: true });
