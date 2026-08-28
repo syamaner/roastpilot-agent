@@ -137,7 +137,11 @@ async function assertCanvasMembership(
     throw new Error(`${screenshotClass} requires a ${expectsPage ? "Page" : "Locator"} target`);
   }
 
-  const canvas = target.locator("[data-testid='live-curve'] canvas");
+  const canvas = isPage(target)
+    ? target.locator("[data-testid='live-curve'] canvas")
+    : (await target.getAttribute("data-testid")) === "live-curve"
+      ? target.locator("canvas")
+      : target.locator("[data-testid='live-curve'] canvas");
   const canvasCount = await canvas.count();
   const expectsCanvas =
     screenshotClass === SCREENSHOT_CLASSES.CANVAS_PAGE ||
