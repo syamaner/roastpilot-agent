@@ -27,17 +27,10 @@ export const CANVAS_PAGE_MAX_DIFF_PIXEL_RATIO = 0.01;
 /** DOM-only pages are at least five times tighter than canvas pages. */
 export const DOM_PAGE_MAX_DIFF_PIXEL_RATIO = 0.002;
 /** Locator budgets are absolute so page area cannot dilute a material region. */
+/** Exact zero is the empirical closed-ladder selection: all five fresh pinned Linux/amd64 calibration runs observed zero differing pixels for both locator classes, including the canvas locator. */
 export const DOM_LOCATOR_MAX_DIFF_PIXELS = 0;
 /** Chart locators remain tighter than the equivalent canvas-page allowance. */
 export const CANVAS_LOCATOR_MAX_DIFF_PIXELS = 0;
-
-/** Named, immutable visual-comparison budgets. */
-export const SCREENSHOT_BUDGETS = {
-  CANVAS_PAGE_MAX_DIFF_PIXEL_RATIO,
-  DOM_PAGE_MAX_DIFF_PIXEL_RATIO,
-  DOM_LOCATOR_MAX_DIFF_PIXELS,
-  CANVAS_LOCATOR_MAX_DIFF_PIXELS,
-} as const;
 
 /** Snapshot inventory entry, derived structurally from each e2e callsite. */
 export interface ScreenshotInventoryEntry {
