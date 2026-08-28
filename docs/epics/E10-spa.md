@@ -82,7 +82,8 @@ system Google Chrome** (no heavy download) + the `capture.mjs` screenshot script
    machine — that rule is also the macOS-Docker friction fix). Determinism kit:
    `deviceScaleFactor: 1` (uPlot scales its backing store by DPR), wait on the
    `window.__chart` point-count hook before shooting, `fonts.ready`, animations off,
-   replay-fixed data, residual jitter absorbed by `maxDiffPixelRatio ≈ 0.01`. The
+   replay-fixed data, residual jitter absorbed only by the calibrated,
+   class-scoped visual budget. The
    **chart-data assertion stays as a complementary layer, not a replacement** — it
    is the authoritative correctness oracle (data-assert green + pixel-diff red ⇒ a
    render/CSS regression, not a data bug); the snapshot is a visual-smoke layer over

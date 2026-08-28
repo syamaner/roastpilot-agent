@@ -24,12 +24,12 @@ export const MINIMUM_PAGE_AREA_PIXELS = 1600 * 1000;
 
 /** Canvas pages are the sole ratio-based loose class. */
 export const CANVAS_PAGE_MAX_DIFF_PIXEL_RATIO = 0.01;
-/** DOM-only pages are at least ten times tighter than canvas pages. */
-export const DOM_PAGE_MAX_DIFF_PIXEL_RATIO = 0.001;
+/** DOM-only pages are at least five times tighter than canvas pages. */
+export const DOM_PAGE_MAX_DIFF_PIXEL_RATIO = 0.002;
 /** Locator budgets are absolute so page area cannot dilute a material region. */
-export const DOM_LOCATOR_MAX_DIFF_PIXELS = 512;
+export const DOM_LOCATOR_MAX_DIFF_PIXELS = 0;
 /** Chart locators remain tighter than the equivalent canvas-page allowance. */
-export const CANVAS_LOCATOR_MAX_DIFF_PIXELS = 1024;
+export const CANVAS_LOCATOR_MAX_DIFF_PIXELS = 0;
 
 /** Named, immutable visual-comparison budgets. */
 export const SCREENSHOT_BUDGETS = {
