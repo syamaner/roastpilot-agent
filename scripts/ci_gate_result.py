@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 from collections.abc import Mapping, Sequence
+from typing import cast
 
 _VALID_MODES = frozenset({"full", "docs-only"})
 _VALID_RESULTS = frozenset({"success", "failure", "cancelled", "skipped"})
@@ -74,12 +75,12 @@ def _load_needs(
     if not raw_needs:
         return None, ("<needs>", "non-empty JSON object", "missing or empty")
     try:
-        decoded = json.loads(raw_needs)
+        decoded: object = json.loads(raw_needs)
     except json.JSONDecodeError:
         return None, ("<needs>", "JSON object", "invalid JSON")
     if not isinstance(decoded, dict):
         return None, ("<needs>", "JSON object", type(decoded).__name__)
-    return decoded, None
+    return cast(dict[str, object], decoded), None
 
 
 def _evaluate(
@@ -102,7 +103,7 @@ def _evaluate(
         if not isinstance(entry, dict):
             rows.append((job_id, "object with string result", type(entry).__name__))
             continue
-        result = entry.get("result")
+        result: object = cast(dict[str, object], entry).get("result")
         if not isinstance(result, str):
             rows.append((job_id, "string result", type(result).__name__))
             continue

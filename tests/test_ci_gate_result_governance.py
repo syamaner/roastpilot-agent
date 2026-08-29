@@ -6,6 +6,7 @@ import ast
 import stat
 import sys
 from pathlib import Path
+from typing import cast
 
 import yaml
 
@@ -21,14 +22,25 @@ def test_workflows_remain_inert_and_do_not_reference_the_future_gate_authority()
         assert "ci_gate_result" not in source
         assert ".ci-gate-base" not in source
         assert "needs.classify.outputs" not in source
-        loaded = yaml.safe_load(source)
-        if not isinstance(loaded, dict) or not isinstance(loaded.get("jobs"), dict):
+        loaded: object = yaml.safe_load(source)
+        if not isinstance(loaded, dict):
             continue
-        for name, job in loaded["jobs"].items():
-            if name == "classify" or not isinstance(job, dict):
+        jobs: object = cast(dict[str, object], loaded).get("jobs")
+        if not isinstance(jobs, dict):
+            continue
+        for name, raw_job in cast(dict[str, object], jobs).items():
+            if name == "classify" or not isinstance(raw_job, dict):
                 continue
-            needs = job.get("needs", [])
-            values = {needs} if isinstance(needs, str) else set(needs)
+            job = cast(dict[str, object], raw_job)
+            needs: object = job.get("needs", [])
+            if isinstance(needs, str):
+                values = {needs}
+            elif isinstance(needs, list):
+                raw_needs = cast(list[object], needs)
+                values = {value for value in raw_needs if isinstance(value, str)}
+                assert len(values) == len(raw_needs)
+            else:
+                raise AssertionError(f"{workflow}: invalid needs shape")
             assert "classify" not in values
 
 
