@@ -389,7 +389,12 @@ jobs:
           files: ./coverage.xml
           disable_search: true
 
-  # D180 (#702, slice 3): the docs-ci smoke path. A closed-grammar
+  # D180 (#702, slice 3): the docs-ci smoke path runs for exact full and
+  # docs-only classifier results. Docs-only PRs additionally use the
+  # lightweight merge-base diff validation and authenticated Codecov upload;
+  # full-mode smoke validates the minimal environment without publishing a
+  # partial coverage report.
+  # A closed-grammar
   # Markdown-only diff (D180 §2.2's residual: the classifier and gate helper
   # execute from trusted base bytes, so this job's own admission condition
   # cannot be forged from a pull request's own copy) runs lightweight
@@ -417,10 +422,10 @@ jobs:
           cache: "pip"
 
       # Lightweight repository/document validation: a real whitespace/diff
-      # check over the recomputed merge base — the classifier already proved
-      # the diff is Markdown-only under its closed grammar; this is the
-      # independent, genuinely local check this fast path still runs itself.
+      # check over the PR merge base. Push/dispatch events have no PR base,
+      # but still run the docs-ci smoke below.
       - name: Whitespace and diff validation
+        if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |

@@ -57,6 +57,7 @@ _DOCS_ONLY_CONDITION = "needs.classify.outputs.mode == 'docs-only'"
 _DOCS_FASTPATH_CONDITION = (
     "needs.classify.outputs.mode == 'docs-only' || needs.classify.outputs.mode == 'full'"
 )
+_PULL_REQUEST_CONDITION = "github.event_name == 'pull_request'"
 _TIMEOUT_BEARING_JOBS = ("classify", "checks", "web", "web-snapshots", "docs-fastpath")
 
 
@@ -640,6 +641,10 @@ def test_docs_fastpath_job_structure_and_dependency_group() -> None:
         "Upload coverage to Codecov",
     ]
     install_step = steps[3]
+    whitespace_step = steps[2]
+    assert whitespace_step["if"] == _PULL_REQUEST_CONDITION
+    whitespace_env = _mapping(whitespace_step["env"])
+    assert whitespace_env == {"BASE_SHA": "${{ github.event.pull_request.base.sha }}"}
     assert install_step["run"] == (
         "python -m pip install --upgrade pip\npython -m pip install --group docs-ci\n"
     )
