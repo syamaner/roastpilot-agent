@@ -631,6 +631,34 @@ def test_docs_fastpath_selection_is_nonempty_strict_subset_matching_governance()
     assert docs_selected == expected
 
 
+def test_docs_fastpath_step_order_includes_independent_reverification() -> None:
+    """M20: the re-verification step exists and runs before the pytest selection."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    steps = _steps(_mapping(jobs["docs-fastpath"]))
+    runs = [cast(str, step["run"]) for step in steps if isinstance(step.get("run"), str)]
+    verify_index = next(
+        index for index, run in enumerate(runs) if "ci_docs_fastpath_verify.py" in run
+    )
+    pytest_index = next(index for index, run in enumerate(runs) if " pytest" in run)
+    assert verify_index < pytest_index, (
+        "the independent re-verification must run before the docs pytest selection"
+    )
+
+
+def test_docs_fastpath_uploads_coverage_with_disable_search() -> None:
+    """M23: the docs-fastpath job's own real Codecov upload step exists."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    steps = _steps(_mapping(jobs["docs-fastpath"]))
+    uploads = [step for step in steps if step.get("uses") == "codecov/codecov-action@v5"]
+    assert len(uploads) == 1
+    upload_with = _mapping(uploads[0]["with"])
+    assert upload_with["disable_search"] is True
+    assert upload_with["files"] == "./coverage.xml"
+    assert upload_with["token"] == "${{ secrets.CODECOV_TOKEN }}"
+
+
 def test_web_snapshots_worker_retains_permissions_and_container_pin() -> None:
     """The moved Playwright worker keeps its narrowed permissions and image pin."""
     workflow = _workflow()

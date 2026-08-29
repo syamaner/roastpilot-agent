@@ -565,6 +565,41 @@ def test_docs_reading_tests_match_the_hand_audited_inventory() -> None:
     assert len(readers) == 29
 
 
+def _committed_docs_marked_tests(source: str) -> set[str]:
+    """Return the exact `test_` function names carrying `@pytest.mark.docs` in ``source``.
+
+    Module-level ``pytestmark = pytest.mark.docs`` is deliberately NOT
+    resolved here: slice 2 requires exact per-function markers for every
+    genuine docs/**/*.md reader (only the separate, non-reading `docs_ci`
+    marker may still be applied at module scope).
+    """
+
+    tree = ast.parse(source)
+    marked: set[str] = set()
+    for statement in tree.body:
+        if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in statement.decorator_list:
+            if ast.unparse(decorator) == "pytest.mark.docs":
+                marked.add(statement.name)
+    return marked
+
+
+def test_committed_docs_markers_exactly_match_the_governance_derived_readers() -> None:
+    """M25: every governance-derived reader is marked, and nothing else is.
+
+    This is the link the marker-removal mutation actually breaks: unlike
+    `docs_reading_tests` (which only inspects read expressions, never
+    decorators), this test inspects the *committed* `@pytest.mark.docs`
+    decorators and requires them to equal the independently re-derived
+    reader inventory for every module known to read docs/**/*.md content.
+    """
+
+    for filename in (*_KNOWN_READERS, "test_worktree_gate_recipe.py"):
+        source = (_REPO / "tests" / filename).read_text(encoding="utf-8")
+        assert _committed_docs_marked_tests(source) == docs_reading_tests(source), filename
+
+
 def test_no_unrelated_test_module_is_classified_as_a_docs_reader() -> None:
     """Every `tests/test_*.py` outside the five known modules has zero readers."""
 
