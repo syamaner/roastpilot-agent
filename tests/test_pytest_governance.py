@@ -719,7 +719,7 @@ def _assert_base_authority_classifier(steps: list[dict[str, object]], checkout_a
     assert diff_checkout["uses"] == checkout_action
     expected_diff_ref = (
         "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha "
-        "|| github.event.repository.default_branch }}"
+        "|| github.sha }}"
     )
     assert diff_checkout["with"] == {
         "ref": expected_diff_ref,
@@ -770,8 +770,31 @@ def test_pr_classifier_uses_base_authority_in_both_workflows() -> None:
 
 
 @pytest.mark.docs_ci
+def test_non_pr_classifier_checkout_binds_exact_event_sha_in_both_workflows() -> None:
+    """Require non-PR classifier checkouts to use the immutable event SHA."""
+
+    expected_ref = (
+        "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha "
+        "|| github.sha }}"
+    )
+    workflows = (
+        (_workflow(), "actions/checkout@v6.0.2"),
+        (_codeql_workflow(), "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"),
+    )
+    for workflow, _checkout_action in workflows:
+        jobs = _mapping(workflow["jobs"])
+        classify = _mapping(jobs["classify"])
+        diff_checkout = _steps(classify)[0]
+        checkout_with = _mapping(diff_checkout["with"])
+        ref = cast(str, checkout_with["ref"])
+
+        assert ref == expected_ref
+        assert "github.event.repository.default_branch" not in ref
+
+
+@pytest.mark.docs_ci
 def test_pr_classifier_base_authority_mutations_fail_closed() -> None:
-    """Mutating base binding or the PR helper path invalidates both workflow guards."""
+    """Mutating authority bindings or helper paths invalidates both workflow guards."""
 
     workflows = (
         (_workflow(), "actions/checkout@v6.0.2"),
@@ -786,6 +809,18 @@ def test_pr_classifier_base_authority_mutations_fail_closed() -> None:
         }
         with pytest.raises(AssertionError):
             _assert_base_authority_classifier(base_ref_mutant, checkout_action)
+
+        non_pr_ref_mutant = copy.deepcopy(_steps(classify))
+        non_pr_ref_mutant[0]["with"] = {
+            **cast(dict[str, object], non_pr_ref_mutant[0]["with"]),
+            "ref": (
+                "${{ github.event_name == 'pull_request' "
+                "&& github.event.pull_request.head.sha "
+                "|| github.event.repository.default_branch }}"
+            ),
+        }
+        with pytest.raises(AssertionError):
+            _assert_base_authority_classifier(non_pr_ref_mutant, checkout_action)
 
         helper_path_mutant = copy.deepcopy(_steps(classify))
         helper_path_mutant[2]["run"] = cast(str, helper_path_mutant[2]["run"]).replace(
