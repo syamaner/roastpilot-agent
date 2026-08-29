@@ -16,6 +16,26 @@ permissions:
   contents: read
 
 jobs:
+  classify:
+    name: Classify CI change
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.classify.outputs.mode }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify pull-request change
+        id: classify
+        run: >-
+          python scripts/ci_change_classifier.py
+          --event-name "${{ github.event_name }}"
+          --base-sha "${{ github.event.pull_request.base.sha }}"
+          --head-sha "${{ github.event.pull_request.head.sha }}"
+
   quality:
     name: Quality (lint, format, pyright, contract drift)
     runs-on: ubuntu-latest

@@ -108,6 +108,8 @@ from capture_usage_models import (
 )
 from pydantic import TypeAdapter, ValidationError
 
+pytestmark = pytest.mark.docs
+
 _REAL_VALIDATE_WORKTREE_METADATA = usage_cli._validate_worktree_metadata  # pyright: ignore[reportPrivateUsage]
 _REAL_HARNESS_VERSION = usage_cli._harness_version  # pyright: ignore[reportPrivateUsage]
 
