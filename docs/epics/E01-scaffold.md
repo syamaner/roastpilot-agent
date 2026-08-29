@@ -26,7 +26,7 @@ Acceptance criteria:
   deps (FastAPI, Pydantic, pydantic-settings, PydanticAI, MCP client,
   aiosqlite, httpx), dev deps (ruff, pyright, pytest).
 - [x] `ruff check`, `ruff format --check`, `pyright` (strict), `pytest` all
-  green locally and in GitHub Actions CI.
+  passing locally and in GitHub Actions CI.
 - [x] Nine typed module stubs per plan §4: controller, mcp_client, advisor,
   safety, store, api, replay, models, config.
 - [x] `tests/conftest.py` placeholders: fake MCP client, fake advisor, temp
