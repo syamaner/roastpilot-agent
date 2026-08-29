@@ -32,7 +32,10 @@ def test_analyze_needs_classify_and_carries_the_exact_docs_only_condition() -> N
     needs = analyze.get("needs", [])
     needs_values = {needs} if isinstance(needs, str) else set(cast(list[str], needs))
     assert needs_values == {"classify"}
-    assert analyze.get("if") == "needs.classify.outputs.mode != 'docs-only'"
+    assert analyze.get("if") == (
+        "always() && !(needs.classify.result == 'success' "
+        "&& needs.classify.outputs.mode == 'docs-only')"
+    )
 
 
 @pytest.mark.docs_ci

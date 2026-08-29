@@ -221,17 +221,10 @@ def test_a_genuine_three_commit_docs_only_history_is_docs_only(
     assert classifier.classify_change("pull_request", base, head) is classifier.ChangeMode.DOCS_ONLY
 
 
-def test_a_real_mode_bit_only_change_on_a_docs_file_stays_docs_only(
+def test_a_real_mode_bit_only_change_on_a_docs_file_is_full(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A real ``100644`` -> ``100755`` mode-bit change is still docs-only.
-
-    ``_REGULAR_FILE_MODES`` deliberately admits both ``100644`` and
-    ``100755``: an executable-bit-only change is still a real regular file
-    (never a symlink or a gitlink), so this is the correct, verified
-    behaviour, not a fail-closed case — the real-Git proof this module
-    exists for.
-    """
+    """A real ``100644`` -> ``100755`` docs transition fails closed."""
 
     repo = tmp_path / "repo"
     _init_repo(repo)
@@ -243,4 +236,4 @@ def test_a_real_mode_bit_only_change_on_a_docs_file_stays_docs_only(
     head = _commit(repo, "mode-bit-only change")
 
     monkeypatch.chdir(repo)
-    assert classifier.classify_change("pull_request", base, head) is classifier.ChangeMode.DOCS_ONLY
+    assert classifier.classify_change("pull_request", base, head) is classifier.ChangeMode.FULL
