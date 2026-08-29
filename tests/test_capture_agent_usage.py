@@ -108,8 +108,6 @@ from capture_usage_models import (
 )
 from pydantic import TypeAdapter, ValidationError
 
-pytestmark = pytest.mark.docs
-
 _REAL_VALIDATE_WORKTREE_METADATA = usage_cli._validate_worktree_metadata  # pyright: ignore[reportPrivateUsage]
 _REAL_HARNESS_VERSION = usage_cli._harness_version  # pyright: ignore[reportPrivateUsage]
 
@@ -13100,6 +13098,7 @@ def test_validation_environment_roles_are_read_only_bash_only_subset() -> None:
         assert not ({"Edit", "Write"} & tools)
 
 
+@pytest.mark.docs
 def test_provisioning_docs_set_bytecode_variables_on_both_pip_commands() -> None:
     """Both provisioning ``pip install`` recipe lines set both bytecode-containment vars."""
     doc = Path(__file__).resolve().parents[1] / "docs" / "agent-team-worktrees.md"
@@ -13330,6 +13329,7 @@ def test_sim_roast_runner_rejects_a_skipped_real_mcp_lane() -> None:
     assert "tests/test_milestone1_real_mcp.py` is a gate failure" in normalized
 
 
+@pytest.mark.docs
 def test_runbook_and_skill_and_agents_row_point_to_print_validation_commands() -> None:
     """T17: the runbook, SKILL.md, and the AGENTS.md row cite the single interface.
 
@@ -13371,6 +13371,7 @@ def test_native_review_contracts_fail_closed_on_missing_parent_evidence() -> Non
     assert "Fail closed when required trace evidence is absent or partial" in simulation
 
 
+@pytest.mark.docs
 def test_native_usage_and_evidence_collection_contracts_are_documented() -> None:
     """Runbook and skill retain the external sink, freshness, and pagination boundaries."""
     root = Path(__file__).resolve().parents[1]
@@ -15380,6 +15381,7 @@ def test_validation_role_files_instruct_run_line_execution() -> None:
         assert "never" in text and "executable" in text
 
 
+@pytest.mark.docs
 def test_bound_root_literal_sweep_matches_only_expected_sites() -> None:
     """Class-sweep#3: every bound-root/add-dir literal is a policy, argv, doc, or test site."""
     pattern = re.compile(

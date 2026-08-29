@@ -24,8 +24,6 @@ from typing import cast
 import pytest
 from _agent_defs import AGENTS_DIR, agent_body, agent_files, agent_text, parse_frontmatter
 
-pytestmark = pytest.mark.docs
-
 _REPO = Path(__file__).resolve().parents[1]
 _CODEX_DIR = _REPO / ".codex"
 _PROJECT_DOC_MAX_BYTES = 131072
@@ -178,6 +176,7 @@ def test_agents_md_canonical_pin_guard_rejects_planning_and_safety_decoys(
         _assert_live_planning_and_assurance_pins(agents_md.replace(source, replacement, 1))
 
 
+@pytest.mark.docs
 def test_topology_reference_table_rows_match_the_map() -> None:
     """Light regex guard over the §4 reference table's Claude rows.
 
