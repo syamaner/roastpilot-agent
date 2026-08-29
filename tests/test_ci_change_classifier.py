@@ -1021,7 +1021,12 @@ def _assert_exact_docs_markers(tree: ast.Module, readers: set[str], filename: st
 
 
 def _module_has_pytestmark_docs(tree: ast.Module) -> bool:
-    """Return whether a module still registers the retired module-level docs marker."""
+    """Return whether a module has the retired module-level docs marker.
+
+    Pytest accepts a single marker or a literal list, tuple, or set of markers
+    for ``pytestmark``.  Keep this check static: dynamic expressions are not
+    evaluated by this governance audit.
+    """
 
     for statement in tree.body:
         if not isinstance(statement, ast.Assign):
@@ -1031,7 +1036,12 @@ def _module_has_pytestmark_docs(tree: ast.Module) -> bool:
             for target in statement.targets
         ):
             continue
-        if ast.unparse(statement.value) == "pytest.mark.docs":
+        marker_values: tuple[ast.expr, ...]
+        if isinstance(statement.value, (ast.List, ast.Set, ast.Tuple)):
+            marker_values = tuple(statement.value.elts)
+        else:
+            marker_values = (statement.value,)
+        if any(ast.unparse(value) == "pytest.mark.docs" for value in marker_values):
             return True
     return False
 
@@ -1104,6 +1114,40 @@ def test_docs_governance_detects_a_hidden_unmarked_markdown_read() -> None:
     )
     assert _docs_reading_test_modules(source) == {"test_hidden"}
     assert not _module_has_pytestmark_docs(ast.parse(source))
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        pytest.param("pytestmark = pytest.mark.docs\n", True, id="scalar-docs"),
+        pytest.param(
+            "pytestmark = [pytest.mark.docs, pytest.mark.slow]\n",
+            True,
+            id="list-docs",
+        ),
+        pytest.param(
+            "pytestmark = (pytest.mark.slow, pytest.mark.docs)\n",
+            True,
+            id="tuple-docs",
+        ),
+        pytest.param(
+            "pytestmark = {pytest.mark.docs, pytest.mark.slow}\n",
+            True,
+            id="set-docs",
+        ),
+        pytest.param(
+            "pytestmark = [pytest.mark.slow, pytest.mark.serial]\n",
+            False,
+            id="unrelated-list",
+        ),
+        pytest.param("pytestmark = module_marks\n", False, id="dynamic-expression"),
+    ],
+)
+def test_docs_governance_rejects_literal_module_docs_markers(source: str, expected: bool) -> None:
+    """Only literal module ``docs`` marker forms trigger the retired-mark audit."""
+
+    assert _module_has_pytestmark_docs(ast.parse(source)) is expected
 
 
 @pytest.mark.docs_ci
