@@ -648,6 +648,20 @@ def _expression_has_docs_root(expression: ast.expr) -> bool:
     )
 
 
+def _expression_uses_alias(expression: ast.expr, aliases: set[str]) -> bool:
+    """Return whether an expression refers to one of the known path aliases."""
+
+    return any(isinstance(node, ast.Name) and node.id in aliases for node in ast.walk(expression))
+
+
+def _expression_completes_partial_docs_alias(expression: ast.expr, aliases: set[str]) -> bool:
+    """Return whether path composition completes a docs-root alias with ``.md``."""
+
+    return _expression_uses_alias(expression, aliases) and any(
+        value.endswith(".md") for value in _string_constants(expression)
+    )
+
+
 def _is_docs_markdown_glob_call(node: ast.AST, root_aliases: set[str]) -> bool:
     """Return whether a call is a ``*.md`` glob/rglob rooted at ``docs/``.
 
@@ -732,6 +746,7 @@ def _local_helpers(func: _FunctionNode) -> tuple[dict[str, _FunctionNode], set[s
 def _analyse_function(
     func: _FunctionNode,
     module_aliases: set[str],
+    module_partial_aliases: set[str],
     known_functions: set[str],
     filename: str,
     class_methods: dict[str, str] | None = None,
@@ -747,7 +762,7 @@ def _analyse_function(
     """
 
     aliases = set(module_aliases)
-    partial_aliases: set[str] = set()
+    partial_aliases = set(module_partial_aliases)
     calls: set[str] = set()
     unresolved: list[str] = []
     has_docs_glob = False
@@ -771,8 +786,13 @@ def _analyse_function(
         nodes.extend(ast.iter_child_nodes(node))
         if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            full_match = _expression_is_docs_markdown(node.value, aliases)
-            partial_match = not full_match and _expression_has_docs_root(node.value)
+            full_match = _expression_is_docs_markdown(
+                node.value, aliases
+            ) or _expression_completes_partial_docs_alias(node.value, partial_aliases)
+            partial_match = not full_match and (
+                _expression_has_docs_root(node.value)
+                or _expression_uses_alias(node.value, partial_aliases)
+            )
             for target in targets:
                 if isinstance(target, ast.Name):
                     if full_match:
@@ -872,14 +892,32 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
 
     tree = ast.parse(source)
     module_aliases: set[str] = set()
+    module_partial_aliases: set[str] = set()
     for statement in tree.body:
         if isinstance(statement, (ast.Assign, ast.AnnAssign)):
             value = statement.value
             targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
-            if value is not None and _expression_is_docs_markdown(value, module_aliases):
-                for target in targets:
-                    if isinstance(target, ast.Name):
-                        module_aliases.add(target.id)
+            if value is None:
+                continue
+            full_match = _expression_is_docs_markdown(
+                value, module_aliases
+            ) or _expression_completes_partial_docs_alias(value, module_partial_aliases)
+            partial_match = not full_match and (
+                _expression_has_docs_root(value)
+                or _expression_uses_alias(value, module_partial_aliases)
+            )
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                if full_match:
+                    module_aliases.add(target.id)
+                    module_partial_aliases.discard(target.id)
+                elif partial_match:
+                    module_aliases.discard(target.id)
+                    module_partial_aliases.add(target.id)
+                else:
+                    module_aliases.discard(target.id)
+                    module_partial_aliases.discard(target.id)
 
     functions: dict[str, _FunctionNode] = {
         statement.name: statement
@@ -936,6 +974,7 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
         analysis = _analyse_function(
             node,
             module_aliases,
+            module_partial_aliases,
             known_functions,
             filename,
             class_methods.get(class_name) if class_name else None,
@@ -950,6 +989,13 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
             "docs-content governance found an unresolved dynamic read receiver that "
             f"could hide an unmarked docs read: {unresolved}"
         )
+
+    for fixture_name in fixtures:
+        fixture = functions[fixture_name]
+        fixture_parameters = {
+            argument.arg for argument in fixture.args.args if argument.arg in fixtures
+        }
+        analyses[fixture_name].calls.update(fixture_parameters)
 
     def reads_transitively(name: str, seen: frozenset[str]) -> bool:
         if name in seen or name not in analyses or len(seen) >= _MAX_DOCS_CALL_GRAPH_DEPTH:
@@ -1062,9 +1108,11 @@ def _module_has_unsafe_pytestmark(tree: ast.Module) -> bool:
 
 
 def _test_module_paths(tests_root: Path) -> list[Path]:
-    """Return every pytest-style test module below ``tests_root`` in stable order."""
+    """Return every configured-default pytest test module below ``tests_root``."""
 
-    return sorted(tests_root.rglob("test_*.py"))
+    return sorted(
+        {path for pattern in ("test_*.py", "*_test.py") for path in tests_root.rglob(pattern)}
+    )
 
 
 @pytest.mark.docs_ci
@@ -1105,15 +1153,17 @@ def test_docs_reading_tests_carry_the_exact_docs_marker_and_nothing_else() -> No
 
 @pytest.mark.docs_ci
 def test_docs_governance_discovers_nested_test_modules(tmp_path: Path) -> None:
-    """Nested pytest modules remain visible to the exact marker self-audit."""
+    """Both configured default nested pytest filename forms remain visible."""
 
     tests_root = tmp_path / "tests"
     nested = tests_root / "nested"
     nested.mkdir(parents=True)
     (tests_root / "test_top_level.py").write_text("def test_top() -> None: pass\n")
     (nested / "test_nested.py").write_text("def test_nested() -> None: pass\n")
+    (nested / "suffix_test.py").write_text("def test_suffix() -> None: pass\n")
     (nested / "helper.py").write_text("pass\n")
     assert [path.relative_to(tests_root).as_posix() for path in _test_module_paths(tests_root)] == [
+        "nested/suffix_test.py",
         "nested/test_nested.py",
         "test_top_level.py",
     ]
@@ -1326,6 +1376,43 @@ def test_docs_governance_detects_non_literal_construction(source: str, expected:
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_propagates_staged_docs_root_aliases() -> None:
+    """Partial docs roots remain known through slash and joinpath composition."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def test_slash() -> None:\n"
+        '    root = Path("docs")\n'
+        '    path = root / "guide.md"\n'
+        "    path.read_text()\n\n"
+        "def test_joinpath() -> None:\n"
+        '    root = Path("docs")\n'
+        '    path = root.joinpath("guide.md")\n'
+        "    path.read_text()\n\n"
+        "def test_non_docs() -> None:\n"
+        '    root = Path("config")\n'
+        '    path = root / "guide.md"\n'
+        "    path.read_text()\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_joinpath", "test_slash"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_fails_closed_on_ambiguous_staged_docs_root_alias() -> None:
+    """A partial docs alias without a proven Markdown suffix stays fail-closed."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def test_ambiguous() -> None:\n"
+        '    root = Path("docs")\n'
+        "    path = root / filename\n"
+        "    path.read_text()\n"
+    )
+    with pytest.raises(AssertionError, match="no provable '.md' segment"):
+        _docs_reading_test_modules(source, filename="staged_alias.py")
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_follows_a_same_module_helper_call() -> None:
     """A test reaching a docs read only through a same-module helper is caught."""
 
@@ -1363,6 +1450,51 @@ def test_docs_governance_follows_a_same_module_fixture() -> None:
         "    assert unrelated == 1\n"
     )
     assert _docs_reading_test_modules(source) == {"test_uses_fixture"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_follows_transitive_fixture_parameters() -> None:
+    """Fixture dependency parameters contribute bounded transitive read edges."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture\n"
+        "def docs_leaf() -> str:\n"
+        '    return Path("docs/fixture.md").read_text()\n\n'
+        "@pytest.fixture\n"
+        "def docs_middle(docs_leaf: str) -> str:\n"
+        "    return docs_leaf\n\n"
+        "def test_docs_fixture(docs_middle: str) -> None:\n"
+        "    assert docs_middle\n\n"
+        "@pytest.fixture\n"
+        "async def async_leaf() -> str:\n"
+        '    return Path("docs/async-fixture.md").read_text()\n\n'
+        "@pytest.fixture\n"
+        "async def async_middle(async_leaf: str) -> str:\n"
+        "    return async_leaf\n\n"
+        "async def test_async_fixture(async_middle: str) -> None:\n"
+        "    assert async_middle\n\n"
+        "@pytest.fixture\n"
+        "def plain_leaf() -> int:\n"
+        "    return 1\n\n"
+        "@pytest.fixture\n"
+        "def plain_middle(plain_leaf: int) -> int:\n"
+        "    return plain_leaf\n\n"
+        "def test_plain_fixture(plain_middle: int) -> None:\n"
+        "    assert plain_middle == 1\n\n"
+        "@pytest.fixture\n"
+        "def cycle_left(cycle_right: str) -> str:\n"
+        "    return cycle_right\n\n"
+        "@pytest.fixture\n"
+        "def cycle_right(cycle_left: str) -> str:\n"
+        "    return cycle_left\n\n"
+        "def test_cycle(cycle_left: str) -> None:\n"
+        "    assert cycle_left\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_async_fixture",
+        "test_docs_fixture",
+    }
 
 
 @pytest.mark.docs_ci
