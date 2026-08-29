@@ -26,10 +26,9 @@ The detector walks only the module's own top-level ``def``/``async def``
 statements (no classes, matching this repository's plain-function test
 convention) and a bounded same-module call/fixture graph: a helper function
 or ``@pytest.fixture`` that itself reads docs content marks every test that
-calls it or depends on it, transitively, with cycles resolved to "not a new
-reader" rather than raised (test helper graphs in this repository are not
-expected to recurse, and a missed transitive edge here is still caught by
-the downstream equality test above).
+calls it or depends on it, transitively. Same-module cycles are resolved by
+a deterministic reverse-graph fixed point, so a reader reached through any
+member of a cycle cannot depend on call-edge traversal order.
 """
 
 from __future__ import annotations
@@ -416,22 +415,19 @@ def docs_reading_tests(source: str) -> set[str]:
         edges |= _parameter_names(function) & fixture_names
         call_edges[name] = edges - {name}
 
-    memo: dict[str, bool] = {}
+    callers: dict[str, set[str]] = {name: set() for name in functions}
+    for caller, callees in call_edges.items():
+        for callee in callees:
+            if callee in callers:
+                callers[callee].add(caller)
 
-    def resolve(name: str, stack: frozenset[str]) -> bool:
-        if name in memo:
-            return memo[name]
-        if name in stack:
-            return False
-        if direct_reads.get(name):
-            memo[name] = True
-            return True
-        result = any(
-            resolve(callee, stack | {name})
-            for callee in call_edges.get(name, ())
-            if callee in functions
-        )
-        memo[name] = result
-        return result
+    readers = {name for name, reads_docs in direct_reads.items() if reads_docs}
+    pending = sorted(readers)
+    while pending:
+        callee = pending.pop()
+        for caller in sorted(callers[callee]):
+            if caller not in readers:
+                readers.add(caller)
+                pending.append(caller)
 
-    return {name for name in functions if name.startswith("test_") and resolve(name, frozenset())}
+    return {name for name in readers if name.startswith("test_")}

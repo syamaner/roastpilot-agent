@@ -505,6 +505,29 @@ def test_total_budget_exceeded_between_calls_is_full_and_stops_further_git_calls
     assert calls[0][:3] == ["git", "cat-file", "-e"]
 
 
+def test_total_budget_caps_near_deadline_call_and_refuses_launch_at_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A near-deadline call gets only its remaining budget; expiry launches nothing."""
+
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append((arguments, kwargs))
+        return subprocess.CompletedProcess(arguments, 0, stdout=b"")
+
+    readings = iter([0.0, 59.75, 60.0])
+
+    def fake_monotonic() -> float:
+        return next(readings, 60.0)
+
+    monkeypatch.setattr(classifier.subprocess, "run", fake_run)
+    monkeypatch.setattr(classifier.time, "monotonic", fake_monotonic)
+    assert classifier.classify_change("pull_request", _BASE, _HEAD) is classifier.ChangeMode.FULL
+    assert len(calls) == 1
+    assert calls[0][1]["timeout"] == pytest.approx(0.25)
+
+
 def test_subprocess_timeout_expired_resolves_to_full_not_docs_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -818,3 +841,21 @@ def test_cyclic_same_module_helper_calls_resolve_without_crashing() -> None:
         "    _a()\n"
     )
     assert docs_reading_tests(source) == set()
+
+
+def test_cyclic_same_module_helpers_propagate_docs_reads_from_either_entrypoint() -> None:
+    """A reader in a helper cycle marks tests entering through either helper."""
+
+    source = (
+        "from pathlib import Path\n"
+        "def _a() -> None:\n"
+        "    _b()\n"
+        "    Path('docs/guide.md').read_text()\n"
+        "def _b() -> None:\n"
+        "    _a()\n"
+        "def test_via_a() -> None:\n"
+        "    _a()\n"
+        "def test_via_b() -> None:\n"
+        "    _b()\n"
+    )
+    assert docs_reading_tests(source) == {"test_via_a", "test_via_b"}

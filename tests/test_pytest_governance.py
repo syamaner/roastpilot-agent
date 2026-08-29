@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import re
 import shlex
 import subprocess
@@ -708,6 +709,90 @@ def _codeql_workflow() -> dict[str, object]:
         "on" if key is True else cast(str, key): value for key, value in raw_workflow.items()
     }
     return _mapping(normalized)
+
+
+def _assert_base_authority_classifier(steps: list[dict[str, object]], checkout_action: str) -> None:
+    """Require PR classification to execute immutable base-checkout helper bytes."""
+
+    assert len(steps) == 3
+    diff_checkout, base_checkout, classify = steps
+    assert diff_checkout["uses"] == checkout_action
+    expected_diff_ref = (
+        "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha "
+        "|| github.event.repository.default_branch }}"
+    )
+    assert diff_checkout["with"] == {
+        "ref": expected_diff_ref,
+        "fetch-depth": 0,
+        "persist-credentials": False,
+    }
+    assert base_checkout["if"] == "github.event_name == 'pull_request'"
+    assert base_checkout["uses"] == checkout_action
+    assert base_checkout["with"] == {
+        "ref": "${{ github.event.pull_request.base.sha }}",
+        "path": ".ci-classifier-base",
+        "fetch-depth": 1,
+        "persist-credentials": False,
+    }
+    assert classify["id"] == "classify"
+    run = cast(str, classify["run"])
+    base_command = "python .ci-classifier-base/scripts/ci_change_classifier.py"
+    head_command = "python scripts/ci_change_classifier.py"
+    pull_request_guard = 'if [[ "${{ github.event_name }}" == "pull_request" ]]; then'
+    assert pull_request_guard in run
+    assert base_command in run
+    assert head_command in run
+    else_index = run.index("else")
+    assert (
+        run.index(pull_request_guard)
+        < run.index(base_command)
+        < else_index
+        < run.index(head_command)
+    )
+    assert '--base-sha "${{ github.event.pull_request.base.sha }}"' in run[:else_index]
+    assert '--head-sha "${{ github.event.pull_request.head.sha }}"' in run[:else_index]
+    assert '--base-sha "${{ github.sha }}"' in run[else_index:]
+    assert '--head-sha "${{ github.sha }}"' in run[else_index:]
+
+
+@pytest.mark.docs_ci
+def test_pr_classifier_uses_base_authority_in_both_workflows() -> None:
+    """PR helper edits cannot influence either workflow's classification bytes."""
+
+    workflows = (
+        (_workflow(), "actions/checkout@v6.0.2"),
+        (_codeql_workflow(), "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"),
+    )
+    for workflow, checkout_action in workflows:
+        jobs = _mapping(workflow["jobs"])
+        classify = _mapping(jobs["classify"])
+        _assert_base_authority_classifier(_steps(classify), checkout_action)
+
+
+@pytest.mark.docs_ci
+def test_pr_classifier_base_authority_mutations_fail_closed() -> None:
+    """Mutating base binding or the PR helper path invalidates both workflow guards."""
+
+    workflows = (
+        (_workflow(), "actions/checkout@v6.0.2"),
+        (_codeql_workflow(), "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"),
+    )
+    for workflow, checkout_action in workflows:
+        classify = _mapping(_mapping(workflow["jobs"])["classify"])
+        base_ref_mutant = copy.deepcopy(_steps(classify))
+        base_ref_mutant[1]["with"] = {
+            **cast(dict[str, object], base_ref_mutant[1]["with"]),
+            "ref": "${{ github.event.pull_request.head.sha }}",
+        }
+        with pytest.raises(AssertionError):
+            _assert_base_authority_classifier(base_ref_mutant, checkout_action)
+
+        helper_path_mutant = copy.deepcopy(_steps(classify))
+        helper_path_mutant[2]["run"] = cast(str, helper_path_mutant[2]["run"]).replace(
+            ".ci-classifier-base/scripts/ci_change_classifier.py", "scripts/ci_change_classifier.py"
+        )
+        with pytest.raises(AssertionError):
+            _assert_base_authority_classifier(helper_path_mutant, checkout_action)
 
 
 @pytest.mark.docs_ci

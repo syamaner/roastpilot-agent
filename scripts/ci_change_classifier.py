@@ -67,14 +67,15 @@ def _run_git(arguments: Sequence[str], *, deadline: float = math.inf) -> bytes:
         OSError: If Git cannot be executed.
     """
 
-    if time.monotonic() > deadline:
+    remaining_seconds = deadline - time.monotonic()
+    if remaining_seconds <= 0:
         raise TimeoutError("classifier total budget exceeded before this Git call")
     completed = subprocess.run(
         ["git", *arguments],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-        timeout=_GIT_CALL_TIMEOUT_SECONDS,
+        timeout=min(_GIT_CALL_TIMEOUT_SECONDS, remaining_seconds),
     )
     return completed.stdout
 

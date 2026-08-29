@@ -29,19 +29,36 @@ jobs:
     outputs:
       mode: ${{ steps.classify.outputs.mode }}
     steps:
-      - name: Check out repository
+      - name: Check out diff repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.repository.default_branch }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Classify pull-request change
+      - name: Check out pull-request base classifier authority
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .ci-classifier-base
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Classify change
         id: classify
-        run: >-
-          python scripts/ci_change_classifier.py
-          --event-name "${{ github.event_name }}"
-          --base-sha "${{ github.event.pull_request.base.sha }}"
-          --head-sha "${{ github.event.pull_request.head.sha }}"
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            python .ci-classifier-base/scripts/ci_change_classifier.py \
+              --event-name "${{ github.event_name }}" \
+              --base-sha "${{ github.event.pull_request.base.sha }}" \
+              --head-sha "${{ github.event.pull_request.head.sha }}"
+          else
+            python scripts/ci_change_classifier.py \
+              --event-name "${{ github.event_name }}" \
+              --base-sha "${{ github.sha }}" \
+              --head-sha "${{ github.sha }}"
+          fi
 
   analyze:
     name: "Analyze (${{ matrix.language }})"
