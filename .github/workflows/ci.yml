@@ -488,9 +488,12 @@ jobs:
     needs: [classify, quality, pytest-ordinary, pytest-serial, pytest-stress, package, coverage, docs-fastpath]
     timeout-minutes: 10
     steps:
-      - name: Check out repository
+      - name: Check out trusted gate authority
         uses: actions/checkout@v6.0.2
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
+          path: .ci-gate-base
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Require every job to match its declared mode-conditional state
@@ -498,7 +501,7 @@ jobs:
           NEEDS_JSON: ${{ toJSON(needs) }}
           MODE: ${{ needs.classify.outputs.mode }}
         run: >-
-          python3 scripts/ci_gate_result.py
+          python3 .ci-gate-base/scripts/ci_gate_result.py
           --always classify
           --full-only quality --full-only pytest-ordinary --full-only pytest-serial
           --full-only pytest-stress --full-only package --full-only coverage
@@ -552,9 +555,12 @@ jobs:
     needs: [classify, web-unit-worker]
     timeout-minutes: 10
     steps:
-      - name: Check out repository
+      - name: Check out trusted gate authority
         uses: actions/checkout@v6.0.2
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
+          path: .ci-gate-base
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Require the web-unit worker to match its declared mode-conditional state
@@ -562,7 +568,7 @@ jobs:
           NEEDS_JSON: ${{ toJSON(needs) }}
           MODE: ${{ needs.classify.outputs.mode }}
         run: >-
-          python3 scripts/ci_gate_result.py
+          python3 .ci-gate-base/scripts/ci_gate_result.py
           --always classify
           --full-only web-unit-worker
 
@@ -656,9 +662,12 @@ jobs:
     needs: [classify, web-snapshots-worker]
     timeout-minutes: 10
     steps:
-      - name: Check out repository
+      - name: Check out trusted gate authority
         uses: actions/checkout@v6.0.2
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
+          path: .ci-gate-base
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Require the Playwright-snapshots worker to match its declared mode-conditional state
@@ -666,6 +675,6 @@ jobs:
           NEEDS_JSON: ${{ toJSON(needs) }}
           MODE: ${{ needs.classify.outputs.mode }}
         run: >-
-          python3 scripts/ci_gate_result.py
+          python3 .ci-gate-base/scripts/ci_gate_result.py
           --always classify
           --full-only web-snapshots-worker

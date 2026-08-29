@@ -302,7 +302,7 @@ def test_checks_is_a_fail_closed_aggregate_of_every_python_gate() -> None:
         "MODE": "${{ needs.classify.outputs.mode }}",
     }
     assert "${{" not in check_run
-    assert check_run.strip().startswith("python3 scripts/ci_gate_result.py")
+    assert check_run.strip().startswith("python3 .ci-gate-base/scripts/ci_gate_result.py")
 
     for job in jobs.values():
         mapped_job = _mapping(job)
@@ -377,6 +377,30 @@ _FULL_ONLY_JOB_IDS = {
 _DOCS_ONLY_JOB_IDS = {"docs-fastpath"}
 _FULL_ONLY_CONDITION = "needs.classify.outputs.mode != 'docs-only'"
 _DOCS_ONLY_CONDITION = "needs.classify.outputs.mode == 'docs-only'"
+_GATE_AUTHORITY_REF = (
+    "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}"
+)
+_GATE_AUTHORITY_PATH = ".ci-gate-base"
+
+
+def _assert_trusted_gate_authority(steps: list[dict[str, object]]) -> None:
+    """Require an aggregate gate to execute only the trusted authority helper."""
+
+    assert len(steps) == 2
+    authority_checkout, gate_step = steps
+    assert authority_checkout == {
+        "name": "Check out trusted gate authority",
+        "uses": "actions/checkout@v6.0.2",
+        "with": {
+            "ref": _GATE_AUTHORITY_REF,
+            "path": _GATE_AUTHORITY_PATH,
+            "fetch-depth": 1,
+            "persist-credentials": False,
+        },
+    }
+    run = cast(str, gate_step["run"])
+    assert run.strip().startswith(f"python3 {_GATE_AUTHORITY_PATH}/scripts/ci_gate_result.py")
+    assert "python3 scripts/ci_gate_result.py" not in run
 
 
 def _gate_run_step(job: dict[str, object]) -> dict[str, object]:
@@ -412,7 +436,7 @@ def _gate_argv_classes(run: str) -> tuple[set[str], set[str], set[str]]:
 
 @pytest.mark.docs_ci
 def test_required_check_names_appear_exactly_once_on_trivial_gate_jobs() -> None:
-    """Each required check name is a tiny gate: checkout + the gate script only."""
+    """Each required check is a tiny gate using only trusted helper bytes."""
     workflow = _workflow()
     jobs = _mapping(workflow["jobs"])
     seen_names: dict[str, str] = {}
@@ -425,11 +449,8 @@ def test_required_check_names_appear_exactly_once_on_trivial_gate_jobs() -> None
         seen_names[name] = job_id
         assert job_id in _GATE_JOB_IDS
         steps = _steps(mapped)
-        assert len(steps) == 2
-        checkout, gate_step = steps
-        assert checkout["uses"] == "actions/checkout@v6.0.2"
-        checkout_with = cast(dict[str, object], checkout.get("with", {}))
-        assert checkout_with.get("persist-credentials") is False
+        _assert_trusted_gate_authority(steps)
+        gate_step = steps[1]
         run = gate_step["run"]
         assert isinstance(run, str)
         assert "install" not in run.lower()
@@ -438,6 +459,31 @@ def test_required_check_names_appear_exactly_once_on_trivial_gate_jobs() -> None
         assert mapped.get("timeout-minutes") == 10
     assert set(seen_names) == _REQUIRED_CHECK_NAMES
     assert set(seen_names.values()) == _GATE_JOB_IDS
+
+
+@pytest.mark.docs_ci
+def test_aggregate_gate_authority_mutations_fail_closed() -> None:
+    """A PR-controlled checkout or helper path cannot replace aggregate authority."""
+
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    for job_id in _GATE_JOB_IDS:
+        gate_steps = _steps(_mapping(jobs[job_id]))
+
+        pr_checkout_mutant = copy.deepcopy(gate_steps)
+        pr_checkout_mutant[0]["with"] = {
+            **cast(dict[str, object], pr_checkout_mutant[0]["with"]),
+            "ref": "${{ github.event.pull_request.head.sha }}",
+        }
+        with pytest.raises(AssertionError):
+            _assert_trusted_gate_authority(pr_checkout_mutant)
+
+        pr_helper_mutant = copy.deepcopy(gate_steps)
+        pr_helper_mutant[1]["run"] = cast(str, pr_helper_mutant[1]["run"]).replace(
+            f"{_GATE_AUTHORITY_PATH}/", ""
+        )
+        with pytest.raises(AssertionError):
+            _assert_trusted_gate_authority(pr_helper_mutant)
 
 
 @pytest.mark.docs_ci
