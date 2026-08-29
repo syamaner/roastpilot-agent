@@ -445,6 +445,7 @@ jobs:
           tests/test_ci_change_classifier.py
           tests/test_ci_gate_result.py
           tests/test_ci_docs_fastpath_verify.py
+          tests/test_pytest_governance.py
           --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts
           --cov-report=xml:coverage.xml
 

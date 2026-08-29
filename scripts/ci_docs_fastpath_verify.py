@@ -76,6 +76,10 @@ def _recomputed_docs_only_paths(base_sha: str, head_sha: str) -> tuple[str, ...]
             stderr=subprocess.DEVNULL,
             timeout=_GIT_TIMEOUT_SECONDS,
         )
+    except UnicodeDecodeError as error:
+        raise DocsFastpathVerificationError(
+            f"independent merge-base is not valid ASCII: {error}"
+        ) from error
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
         raise DocsFastpathVerificationError(
             f"independent Git recomputation failed: {error}"

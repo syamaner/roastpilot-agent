@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import runpy
 import subprocess
 import sys
@@ -124,6 +125,18 @@ def test_recomputation_timeout_is_reported(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.mark.docs_ci
+def test_recomputation_non_ascii_merge_base_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-ASCII merge-base response takes the named local failure path."""
+
+    def fake_run(_arguments: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(["git", "merge-base"], 0, stdout=b"\xff\n")
+
+    monkeypatch.setattr(verify.subprocess, "run", fake_run)
+    with pytest.raises(verify.DocsFastpathVerificationError, match="merge-base is not valid ASCII"):
+        verify._recomputed_docs_only_paths(_BASE, _HEAD)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.docs_ci
 def test_recomputation_empty_changed_set_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     """An empty independently-recomputed changed-path set fails closed."""
 
@@ -206,6 +219,58 @@ def test_writes_nothing_to_github_output(monkeypatch: pytest.MonkeyPatch) -> Non
     # GITHUB_OUTPUT at all, unlike `ci_change_classifier`.
     verify.verify_docs_only(_BASE, _HEAD)
     assert "GITHUB_OUTPUT" not in Path(verify.__file__).read_text(encoding="utf-8")
+
+
+@pytest.mark.docs_ci
+def test_ci_scripts_do_not_transitively_import_hardware_control_modules() -> None:
+    """Fast-path tooling stays independent of runtime hardware-control modules."""
+
+    roots = {
+        "ci_change_classifier",
+        "ci_gate_result",
+        "ci_docs_fastpath_verify",
+        "docs_reader_governance",
+    }
+    forbidden = {
+        "roastpilot_agent.controller",
+        "roastpilot_agent.safety",
+        "roastpilot_agent.mcp_client",
+    }
+
+    def source_path(module: str) -> Path | None:
+        script_path = _REPO / "scripts" / f"{module}.py"
+        if script_path.is_file():
+            return script_path
+        package_path = _REPO / "src" / Path(*module.split("."))
+        for candidate in (package_path.with_suffix(".py"), package_path / "__init__.py"):
+            if candidate.is_file():
+                return candidate
+        return None
+
+    pending = list(roots)
+    visited: set[str] = set()
+    while pending:
+        module = pending.pop()
+        if module in visited:
+            continue
+        visited.add(module)
+        path = source_path(module)
+        assert path is not None, f"missing local source for {module}"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module is not None:
+                imported.add(node.module)
+                imported.update(f"{node.module}.{alias.name}" for alias in node.names)
+        for imported_module in imported:
+            assert not any(
+                imported_module == blocked or imported_module.startswith(f"{blocked}.")
+                for blocked in forbidden
+            ), f"{module} imports forbidden runtime module {imported_module}"
+            if source_path(imported_module) is not None:
+                pending.append(imported_module)
 
 
 @pytest.mark.docs_ci

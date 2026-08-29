@@ -11,6 +11,7 @@ import tomllib
 from pathlib import Path
 from typing import cast
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -408,6 +409,7 @@ def _gate_argv_classes(run: str) -> tuple[set[str], set[str], set[str]]:
     return always, full_only, docs_only
 
 
+@pytest.mark.docs_ci
 def test_required_check_names_appear_exactly_once_on_trivial_gate_jobs() -> None:
     """Each required check name is a tiny gate: checkout + the gate script only."""
     workflow = _workflow()
@@ -437,6 +439,7 @@ def test_required_check_names_appear_exactly_once_on_trivial_gate_jobs() -> None
     assert set(seen_names.values()) == _GATE_JOB_IDS
 
 
+@pytest.mark.docs_ci
 def test_every_gate_needs_equals_its_declared_argv_class_union() -> None:
     """A gate's `needs` list is exactly the union of its declared argv classes."""
     workflow = _workflow()
@@ -455,6 +458,7 @@ def test_every_gate_needs_equals_its_declared_argv_class_union() -> None:
         assert "classify" in always
 
 
+@pytest.mark.docs_ci
 def test_checks_gate_declares_the_full_docs_only_worker_partition() -> None:
     """The `Checks` gate's declared classes match the full-only/docs-only job sets."""
     workflow = _workflow()
@@ -473,6 +477,7 @@ def test_checks_gate_declares_the_full_docs_only_worker_partition() -> None:
     assert docs_only == {"docs-fastpath"}
 
 
+@pytest.mark.docs_ci
 def test_full_only_jobs_carry_the_exact_condition_and_need_classify() -> None:
     """Every full-only job's `if` is the exact string, never a status function."""
     workflow = _workflow()
@@ -485,6 +490,7 @@ def test_full_only_jobs_carry_the_exact_condition_and_need_classify() -> None:
         assert "classify" in needs_set, job_id
 
 
+@pytest.mark.docs_ci
 def test_docs_fastpath_carries_the_exact_docs_only_condition() -> None:
     """`docs-fastpath`'s `if` is the exact equality form, and it needs classify."""
     workflow = _workflow()
@@ -496,6 +502,7 @@ def test_docs_fastpath_carries_the_exact_docs_only_condition() -> None:
     assert needs_set == {"classify"}
 
 
+@pytest.mark.docs_ci
 def test_no_worker_if_condition_uses_a_status_function() -> None:
     """No full-only/docs-only worker `if` contains `always()`, `failure()`, or `!cancelled()`."""
     workflow = _workflow()
@@ -507,6 +514,7 @@ def test_no_worker_if_condition_uses_a_status_function() -> None:
             assert forbidden not in condition, f"{job_id}: {condition!r} contains {forbidden!r}"
 
 
+@pytest.mark.docs_ci
 def test_no_trigger_level_path_filtering_or_continue_on_error_in_either_workflow() -> None:
     """Class 2 sweep: no `paths`/`paths-ignore`/`continue-on-error` in either workflow."""
     for workflow_path in (
@@ -519,6 +527,7 @@ def test_no_trigger_level_path_filtering_or_continue_on_error_in_either_workflow
         assert "continue-on-error" not in text
 
 
+@pytest.mark.docs_ci
 def test_every_ci_job_declares_a_timeout() -> None:
     """Every job in `ci.yml` carries `timeout-minutes` (a timeout is a job failure)."""
     workflow = _workflow()
@@ -527,6 +536,7 @@ def test_every_ci_job_declares_a_timeout() -> None:
         assert "timeout-minutes" in _mapping(job), job_id
 
 
+@pytest.mark.docs_ci
 def test_docs_fastpath_pytest_invocation_is_not_a_governed_lane() -> None:
     """The docs-fastpath job's own pytest step is outside the four governed lanes."""
     workflow = _workflow()
@@ -543,6 +553,7 @@ def test_docs_fastpath_pytest_invocation_is_not_a_governed_lane() -> None:
     assert '-m "(docs or docs_ci) and not stress"' in cast(str, pytest_runs[0])
 
 
+@pytest.mark.docs_ci
 def test_docs_fastpath_selection_is_nonempty_strict_subset_matching_governance() -> None:
     """The exact `(docs or docs_ci)` collection matches the governance-derived inventory."""
     docs_returncode, docs_selected, docs_output = _collect_nodeids(
@@ -563,6 +574,7 @@ def test_docs_fastpath_selection_is_nonempty_strict_subset_matching_governance()
         "test_ci_change_classifier.py",
         "test_ci_gate_result.py",
         "test_ci_docs_fastpath_verify.py",
+        "test_pytest_governance.py",
     }
     expected: set[str] = set()
     for path in sorted((REPO_ROOT / "tests").glob("test_*.py")):
@@ -631,6 +643,7 @@ def test_docs_fastpath_selection_is_nonempty_strict_subset_matching_governance()
     assert docs_selected == expected
 
 
+@pytest.mark.docs_ci
 def test_docs_fastpath_step_order_includes_independent_reverification() -> None:
     """M20: the re-verification step exists and runs before the pytest selection."""
     workflow = _workflow()
@@ -646,6 +659,7 @@ def test_docs_fastpath_step_order_includes_independent_reverification() -> None:
     )
 
 
+@pytest.mark.docs_ci
 def test_docs_fastpath_uploads_coverage_with_disable_search() -> None:
     """M23: the docs-fastpath job's own real Codecov upload step exists."""
     workflow = _workflow()
@@ -659,6 +673,7 @@ def test_docs_fastpath_uploads_coverage_with_disable_search() -> None:
     assert upload_with["token"] == "${{ secrets.CODECOV_TOKEN }}"
 
 
+@pytest.mark.docs_ci
 def test_web_snapshots_worker_retains_permissions_and_container_pin() -> None:
     """The moved Playwright worker keeps its narrowed permissions and image pin."""
     workflow = _workflow()
@@ -669,6 +684,7 @@ def test_web_snapshots_worker_retains_permissions_and_container_pin() -> None:
     assert container["image"] == "ghcr.io/${{ github.repository }}/playwright:v1.55.1-noble"
 
 
+@pytest.mark.docs_ci
 def test_gate_jobs_declare_no_permissions_block() -> None:
     """Gate jobs inherit the workflow-level `contents: read`; they declare none of their own."""
     workflow = _workflow()
@@ -693,6 +709,7 @@ def _codeql_workflow() -> dict[str, object]:
     return _mapping(normalized)
 
 
+@pytest.mark.docs_ci
 def test_codeql_analyze_needs_classify_with_the_exact_docs_only_condition() -> None:
     """`analyze` is skipped only on a docs-only PR; every other trigger still analyzes."""
     workflow = _codeql_workflow()
@@ -702,6 +719,7 @@ def test_codeql_analyze_needs_classify_with_the_exact_docs_only_condition() -> N
     assert analyze["if"] == _FULL_ONLY_CONDITION
 
 
+@pytest.mark.docs_ci
 def test_codeql_classify_pins_checkout_by_sha_and_narrows_permissions() -> None:
     """The new `classify` job matches this file's SHA-pin convention and narrows permissions."""
     workflow = _codeql_workflow()
@@ -716,6 +734,7 @@ def test_codeql_classify_pins_checkout_by_sha_and_narrows_permissions() -> None:
     assert re.fullmatch(r"actions/checkout@[0-9a-f]{40}", uses)
 
 
+@pytest.mark.docs_ci
 def test_codeql_matrix_and_triggers_are_unwidened_and_unnarrowed() -> None:
     """The three-language matrix and all four triggers survive the split untouched."""
     workflow = _codeql_workflow()
