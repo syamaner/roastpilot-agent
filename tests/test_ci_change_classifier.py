@@ -664,6 +664,7 @@ def _analyse_function(
     module_aliases: set[str],
     known_functions: set[str],
     filename: str,
+    class_methods: dict[str, str] | None = None,
 ) -> _FunctionAnalysis:
     """Walk one function body for a direct docs read, calls, and unresolved reads.
 
@@ -690,7 +691,12 @@ def _analyse_function(
             return target.id in partial_aliases
         return _expression_has_docs_root(target)
 
-    for node in ast.walk(func):
+    nodes: list[ast.AST] = list(func.body)
+    while nodes:
+        node = nodes.pop(0)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        nodes.extend(ast.iter_child_nodes(node))
         if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             full_match = _expression_is_docs_markdown(node.value, aliases)
@@ -737,6 +743,19 @@ def _analyse_function(
                     "'docs' component with no provable '.md' segment — cannot prove this "
                     "is or is not a docs read"
                 )
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in {"self", "cls"}
+        ):
+            callee = (class_methods or {}).get(node.func.attr)
+            if callee is None:
+                unresolved.append(
+                    f"{filename}:{node.lineno}: unresolved same-class call edge "
+                    f"`{node.func.value.id}.{node.func.attr}()`"
+                )
+            else:
+                calls.add(callee)
     return _FunctionAnalysis(reads_directly=reads, calls=calls, unresolved=unresolved)
 
 
@@ -756,8 +775,8 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
         filename: A label used only in unresolved-call diagnostics.
 
     Returns:
-        The set of top-level ``test_*`` function names that read docs
-        content.
+        The set of qualified executable test prefixes that read docs content:
+        top-level ``test_*`` names and ``ClassName::test_method`` names.
 
     Raises:
         AssertionError: If a read receiver has partial docs evidence (a
@@ -783,17 +802,45 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
         for statement in tree.body
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
+    class_methods: dict[str, dict[str, str]] = {}
+    for statement in tree.body:
+        if not isinstance(statement, ast.ClassDef):
+            continue
+        members = [
+            member
+            for member in statement.body
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        if not any(member.name.startswith("test_") for member in members):
+            continue
+        methods: dict[str, str] = {}
+        for member in members:
+            qualified_name = f"{statement.name}::{member.name}"
+            functions[qualified_name] = member
+            methods[member.name] = qualified_name
+        class_methods[statement.name] = methods
     fixtures = {
         name
         for name, node in functions.items()
         if any(_is_pytest_fixture_decorator(decorator) for decorator in node.decorator_list)
     }
-    known_functions = set(functions)
+    known_functions = {
+        statement.name
+        for statement in tree.body
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
 
     analyses: dict[str, _FunctionAnalysis] = {}
     unresolved: list[str] = []
     for name, node in functions.items():
-        analysis = _analyse_function(node, module_aliases, known_functions, filename)
+        class_name = name.partition("::")[0] if "::" in name else None
+        analysis = _analyse_function(
+            node,
+            module_aliases,
+            known_functions,
+            filename,
+            class_methods.get(class_name) if class_name else None,
+        )
         analyses[name] = analysis
         unresolved.extend(analysis.unresolved)
     if unresolved:
@@ -813,7 +860,7 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
 
     readers: set[str] = set()
     for name, node in functions.items():
-        if not name.startswith("test_"):
+        if not name.startswith("test_") and "::test_" not in name:
             continue
         param_names = [argument.arg for argument in node.args.args]
         fixture_edges = {param for param in param_names if param in fixtures}
@@ -828,6 +875,40 @@ def _function_has_docs_marker(node: ast.FunctionDef | ast.AsyncFunctionDef) -> b
     """Return whether a function carries the exact ``@pytest.mark.docs`` decorator."""
 
     return any(ast.unparse(decorator) == "pytest.mark.docs" for decorator in node.decorator_list)
+
+
+def _marked_docs_test_prefixes(tree: ast.Module) -> set[str]:
+    """Return exact test prefixes carrying a method- or class-level docs marker."""
+
+    marked: set[str] = set()
+    for statement in tree.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if statement.name.startswith("test_") and _function_has_docs_marker(statement):
+                marked.add(statement.name)
+            continue
+        if not isinstance(statement, ast.ClassDef):
+            continue
+        class_marked = any(
+            ast.unparse(decorator) == "pytest.mark.docs" for decorator in statement.decorator_list
+        )
+        for member in statement.body:
+            if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if member.name.startswith("test_") and (
+                class_marked or _function_has_docs_marker(member)
+            ):
+                marked.add(f"{statement.name}::{member.name}")
+    return marked
+
+
+def _assert_exact_docs_markers(tree: ast.Module, readers: set[str], filename: str) -> None:
+    """Fail when exact docs-reader prefixes and effective docs markers differ."""
+
+    marked = _marked_docs_test_prefixes(tree)
+    assert marked == readers, (
+        f"{filename}: @pytest.mark.docs must sit on exactly the readers "
+        f"{sorted(readers)}, found {sorted(marked)}"
+    )
 
 
 def _module_has_pytestmark_docs(tree: ast.Module) -> bool:
@@ -860,17 +941,7 @@ def test_docs_reading_tests_carry_the_exact_docs_marker_and_nothing_else() -> No
         readers = _docs_reading_test_modules(source, filename=path.name)
         if readers:
             markdown_readers[path] = readers
-        marked = {
-            statement.name
-            for statement in tree.body
-            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and statement.name.startswith("test_")
-            and _function_has_docs_marker(statement)
-        }
-        assert marked == readers, (
-            f"{path.name}: @pytest.mark.docs must sit on exactly the readers "
-            f"{sorted(readers)}, found {sorted(marked)}"
-        )
+        _assert_exact_docs_markers(tree, readers, path.name)
 
     assert set(markdown_readers) == {
         _REPO / "tests" / "test_agent_model_pins.py",
@@ -1065,6 +1136,133 @@ def test_docs_governance_follows_a_same_module_fixture() -> None:
         "    assert unrelated == 1\n"
     )
     assert _docs_reading_test_modules(source) == {"test_uses_fixture"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_detects_direct_class_readers_without_siblings() -> None:
+    """Class test methods use qualified prefixes and do not select non-readers."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class TestDocs:\n"
+        "    def test_reader(self) -> None:\n"
+        '        Path("docs/class.md").read_text()\n\n'
+        "    def test_sibling(self) -> None:\n"
+        "        assert True\n"
+    )
+    assert _docs_reading_test_modules(source) == {"TestDocs::test_reader"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_class_marker_must_not_overmark_siblings() -> None:
+    """A class marker is valid only when every marked method is a docs reader."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.mark.docs\n"
+        "class TestDocs:\n"
+        "    def test_reader(self) -> None:\n"
+        '        Path("docs/class.md").read_text()\n\n'
+        "    def test_sibling(self) -> None:\n"
+        "        assert True\n"
+    )
+    tree = ast.parse(source)
+    readers = _docs_reading_test_modules(source)
+    assert _marked_docs_test_prefixes(tree) == {
+        "TestDocs::test_reader",
+        "TestDocs::test_sibling",
+    }
+    with pytest.raises(AssertionError, match="must sit on exactly the readers"):
+        _assert_exact_docs_markers(tree, readers, "class_overmark.py")
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_accepts_exact_class_and_method_markers() -> None:
+    """Class markers cover all-reader classes; method markers cover only that method."""
+
+    class_source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.mark.docs\n"
+        "class TestAllReaders:\n"
+        "    def test_one(self) -> None:\n"
+        '        Path("docs/one.md").read_text()\n\n'
+        "    def test_two(self) -> None:\n"
+        '        Path("docs/two.md").read_text()\n'
+    )
+    method_source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "class TestMethodMarker:\n"
+        "    @pytest.mark.docs\n"
+        "    def test_reader(self) -> None:\n"
+        '        Path("docs/method.md").read_text()\n\n'
+        "    def test_sibling(self) -> None:\n"
+        "        assert True\n"
+    )
+    for source in (class_source, method_source):
+        tree = ast.parse(source)
+        _assert_exact_docs_markers(tree, _docs_reading_test_modules(source), "marked_class.py")
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_follows_class_methods_to_top_level_and_same_class_helpers() -> None:
+    """Class readers reach both top-level fixtures and bounded same-class helpers."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture\n"
+        "def runbook() -> str:\n"
+        '    return Path("docs/fixture.md").read_text()\n\n'
+        "def load_top_level() -> str:\n"
+        '    return Path("docs/helper.md").read_text()\n\n'
+        "class TestDocs:\n"
+        "    def _load_self(self) -> str:\n"
+        '        return Path("docs/self.md").read_text()\n\n'
+        "    def test_fixture(self, runbook: str) -> None:\n"
+        "        assert runbook\n\n"
+        "    def test_top_level_helper(self) -> None:\n"
+        "        assert load_top_level()\n\n"
+        "    def test_same_class_helper(self) -> None:\n"
+        "        assert self._load_self()\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "TestDocs::test_fixture",
+        "TestDocs::test_top_level_helper",
+        "TestDocs::test_same_class_helper",
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_fails_closed_on_an_unresolved_same_class_call() -> None:
+    """An unresolvable self/cls edge cannot silently hide a docs reader."""
+
+    source = (
+        "class TestDocs:\n    def test_dynamic(self) -> None:\n        self._dynamic_reader()\n"
+    )
+    with pytest.raises(AssertionError, match="unresolved same-class call edge"):
+        _docs_reading_test_modules(source, filename="class_dynamic.py")
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_missing_or_surplus_class_method_markers() -> None:
+    """Removing a class-reader marker or adding one to a sibling reds exactness."""
+
+    missing = (
+        "from pathlib import Path\n\n"
+        "class TestMissing:\n"
+        "    def test_reader(self) -> None:\n"
+        '        Path("docs/missing.md").read_text()\n'
+    )
+    surplus = (
+        "import pytest\n\n"
+        "class TestSurplus:\n"
+        "    @pytest.mark.docs\n"
+        "    def test_non_reader(self) -> None:\n"
+        "        assert True\n"
+    )
+    for source in (missing, surplus):
+        tree = ast.parse(source)
+        with pytest.raises(AssertionError, match="must sit on exactly the readers"):
+            _assert_exact_docs_markers(tree, _docs_reading_test_modules(source), "class_marker.py")
 
 
 @pytest.mark.docs_ci
