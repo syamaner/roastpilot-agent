@@ -356,6 +356,24 @@ def test_main_converts_an_unexpected_exception_to_full_output(
     assert output.read_text(encoding="utf-8") == "mode=full\n"
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--event-name", "pull_request", "--head-sha", _HEAD],
+        ["--event-name", "pull_request", "--base-sha", _BASE],
+    ],
+)
+def test_main_converts_missing_required_sha_to_full_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, arguments: list[str]
+) -> None:
+    """Missing required SHA flags exit cleanly after emitting the full-safe mode."""
+
+    output = tmp_path / "github-output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    assert classifier.main(arguments) == 0
+    assert output.read_text(encoding="utf-8") == "mode=full\n"
+
+
 def test_main_suppresses_a_secondary_output_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unavailable output sink cannot raise through the workflow boundary."""
 

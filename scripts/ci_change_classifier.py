@@ -213,7 +213,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         parsed = _parse_arguments(arguments)
         mode = classify_change(parsed.event_name, parsed.base_sha, parsed.head_sha)
         _write_output(mode, os.environ.get("GITHUB_OUTPUT"))
-    except Exception:
+    except (Exception, SystemExit):
         with suppress(Exception):
             _write_output(ChangeMode.FULL, os.environ.get("GITHUB_OUTPUT"))
     return 0
