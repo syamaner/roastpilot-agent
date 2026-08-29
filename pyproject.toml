@@ -154,7 +154,22 @@ roastpilot-agent = "roastpilot_agent.cli:main"
 docs-ci = [
   "pytest>=8.0",
   "pytest-cov>=5.0",
-  "pyyaml>=6.0,<7"
+  # Demonstrated requirement, not a functional need of the selected tests
+  # themselves: pyproject.toml's `asyncio_mode = "strict"` makes pytest's
+  # own collection of the (always-scanned) `tests/` tree fail closed with a
+  # hard collection error on every module that imports `pytest_asyncio`
+  # directly, well before the `-m` marker filter can apply. Confirmed live
+  # in a from-scratch external venv (handback evidence records the exact
+  # collection-error signature this addition resolves).
+  "pytest-asyncio>=1.0",
+  "pyyaml>=6.0,<7",
+  # Demonstrated requirement: three docs-marked tests in
+  # tests/test_worktree_gate_recipe.py (T4/T5/T7) execute the committed
+  # runbook recipe's own third-party-containment probe under the real
+  # interpreter, and that probe imports numpy as its live third-party test
+  # subject — confirmed live in a from-scratch external venv, where all
+  # three failed for exactly that reason before this line was added.
+  "numpy>=1.26"
 ]
 dev = [
   # Pinned exactly (not >=) so local == CI (#102). The `nodejs` extra supplies

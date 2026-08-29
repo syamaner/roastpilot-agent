@@ -421,12 +421,30 @@ jobs:
           "$(git merge-base "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
           "${{ github.event.pull_request.head.sha }}"
 
+      # Explicit file arguments (not a bare `-m` over the whole `tests/`
+      # tree) are load-bearing here, confirmed live in a from-scratch
+      # external venv installed with only the `docs-ci` group: pytest always
+      # eagerly collects every module under `testpaths`, so a module the
+      # marker filter would deselect (e.g. tests/test_advisor.py's optional
+      # `anthropic` import) still aborts collection before the `-m` filter
+      # ever applies. Scoping to exactly the modules governed by
+      # scripts/docs_reader_governance.py (tests/test_pytest_governance.py's
+      # `governed_modules`) avoids every such unrelated collection error
+      # without installing anything beyond the demonstrated `docs-ci` set.
       - name: Documentation-behaviour and fast-path-tooling tests
         env:
           COVERAGE_FILE: .coverage.docs-fastpath
         run: >-
           env -u OPENROUTER_API_KEY python -m pytest
           -m "(docs or docs_ci) and not stress"
+          tests/test_agent_model_pins.py
+          tests/test_agent_worktree_controls.py
+          tests/test_capture_agent_usage.py
+          tests/test_config.py
+          tests/test_worktree_gate_recipe.py
+          tests/test_ci_change_classifier.py
+          tests/test_ci_gate_result.py
+          tests/test_ci_docs_fastpath_verify.py
           --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts
           --cov-report=xml:coverage.xml
 
