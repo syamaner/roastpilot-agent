@@ -24,6 +24,8 @@ from typing import cast
 import pytest
 from _agent_defs import AGENTS_DIR, agent_body, agent_files, agent_text, parse_frontmatter
 
+pytestmark = pytest.mark.docs
+
 _REPO = Path(__file__).resolve().parents[1]
 _CODEX_DIR = _REPO / ".codex"
 _PROJECT_DOC_MAX_BYTES = 131072

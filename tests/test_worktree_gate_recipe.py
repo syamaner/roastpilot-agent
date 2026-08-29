@@ -37,6 +37,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.docs
+
 _REPO = Path(__file__).resolve().parents[1]
 _RUNBOOK = _REPO / "docs" / "agent-team-worktrees.md"
 

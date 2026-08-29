@@ -40,6 +40,8 @@ from roastpilot_agent.config import (
 from roastpilot_agent.models import RoastPhase
 from roastpilot_agent.store import FrozenRunConfig
 
+pytestmark = pytest.mark.docs
+
 
 def _declared_le(model: type[pydantic.BaseModel], field: str) -> float:
     """Return a field's declared ``le`` bound from its own constraint metadata.
