@@ -1,6 +1,6 @@
 """CLI tests (E10-S1): argument parsing + the ``--replay`` serve dispatch.
 
-Hardware-free and server-free: the serve path is exercised with uvicorn's
+The tests are hardware-free and server-free: the serve path is exercised with uvicorn's
 ``Server.serve`` patched to a no-op, so the replay app is built and the run is
 driven without binding a socket.
 """
