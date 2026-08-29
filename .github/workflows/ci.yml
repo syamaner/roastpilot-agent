@@ -19,19 +19,39 @@ jobs:
   classify:
     name: Classify CI change
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       mode: ${{ steps.classify.outputs.mode }}
     steps:
+      # Step 1: head checkout — the classifier interrogates the head
+      # checkout's own object database (it compares commits, not the
+      # worktree), so this stays first and untouched.
       - name: Check out repository
         uses: actions/checkout@v6.0.2
         with:
           fetch-depth: 0
           persist-credentials: false
 
+      # Step 2: base checkout — trusted-base execution (D180 §2.2). The base
+      # ref resolves to the PR base SHA on pull_request, or the default
+      # branch on push/workflow_dispatch, so the classifier byte source is
+      # always protected-branch bytes, never a pull request's own copy. Must
+      # come AFTER the head checkout above: actions/checkout at path `.`
+      # cleans the workspace root and would delete a base checkout placed
+      # before it.
+      - name: Check out trusted base
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.repository.default_branch }}
+          path: .ci-gate-base
+          persist-credentials: false
+
+      # Step 3: run the base-trusted classifier copy over the head checkout's
+      # object database.
       - name: Classify pull-request change
         id: classify
         run: >-
-          python scripts/ci_change_classifier.py
+          python3 .ci-gate-base/scripts/ci_change_classifier.py
           --event-name "${{ github.event_name }}"
           --base-sha "${{ github.event.pull_request.base.sha }}"
           --head-sha "${{ github.event.pull_request.head.sha }}"
@@ -39,6 +59,8 @@ jobs:
   quality:
     name: Quality (lint, format, pyright, contract drift)
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode != 'docs-only'
 
     steps:
       - name: Check out repository
@@ -100,6 +122,8 @@ jobs:
   pytest-ordinary:
     name: Python tests (ordinary, xdist)
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode != 'docs-only'
     steps:
       - name: Check out repository
         uses: actions/checkout@v6.0.2
@@ -139,6 +163,8 @@ jobs:
   pytest-serial:
     name: Python tests (serial)
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode != 'docs-only'
     steps:
       - name: Check out repository
         uses: actions/checkout@v6.0.2
@@ -178,6 +204,8 @@ jobs:
   pytest-stress:
     name: Python tests (stress ${{ matrix.case }})
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode != 'docs-only'
     strategy:
       fail-fast: false
       matrix:
@@ -233,6 +261,8 @@ jobs:
   package:
     name: Package (wheel build + clean-venv smoke)
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode != 'docs-only'
     steps:
       - name: Check out repository
         uses: actions/checkout@v6.0.2
@@ -318,7 +348,8 @@ jobs:
   coverage:
     name: Coverage (combine + normalize + upload)
     runs-on: ubuntu-latest
-    needs: [pytest-ordinary, pytest-serial, pytest-stress, package]
+    needs: [classify, pytest-ordinary, pytest-serial, pytest-stress, package]
+    if: needs.classify.outputs.mode != 'docs-only'
     steps:
       - name: Check out repository
         uses: actions/checkout@v6.0.2
@@ -358,36 +389,109 @@ jobs:
           files: ./coverage.xml
           disable_search: true
 
+  # D180 (#702, slice 3): the docs-only fast path. A closed-grammar
+  # Markdown-only diff (D180 §2.2's residual: the classifier and gate helper
+  # execute from trusted base bytes, so this job's own admission condition
+  # cannot be forged from a pull request's own copy) runs lightweight
+  # repository/document validation plus the focused docs/docs_ci pytest lane
+  # with a real, authenticated Codecov upload — never a synthetic status —
+  # instead of the full Python test suite, wheel build/smoke, web unit suite,
+  # or Playwright suite (A4).
+  docs-fastpath:
+    name: Docs fast path (docs tests + Codecov upload)
+    runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode == 'docs-only'
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # Lightweight repository/document validation: a real whitespace/diff
+      # check over the recomputed merge base — the classifier already proved
+      # the diff is Markdown-only under its closed grammar; this is the
+      # independent, genuinely local check this fast path still runs itself.
+      - name: Whitespace and diff validation
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          merge_base="$(git merge-base "${BASE_SHA}" HEAD)"
+          git diff --check "${merge_base}" HEAD
+
+      - name: Install dependencies (docs-ci group only — no MCP/audio/ML/build tooling)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group docs-ci
+
+      - name: Run docs and fast-path tooling tests with coverage
+        run: >-
+          env -u OPENROUTER_API_KEY python -m pytest -m "(docs or docs_ci) and not stress"
+          --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts
+          --cov-report=xml:coverage.xml
+
+      - name: Normalize coverage filenames for Codecov
+        run: python scripts/tooling_coverage.py coverage.xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          disable_search: true
+
   checks:
     name: Checks
     if: always()
     runs-on: ubuntu-latest
-    needs: [quality, pytest-ordinary, pytest-serial, pytest-stress, package, coverage]
+    timeout-minutes: 10
+    needs:
+      [
+        classify,
+        quality,
+        pytest-ordinary,
+        pytest-serial,
+        pytest-stress,
+        package,
+        coverage,
+        docs-fastpath,
+      ]
     steps:
-      - name: Require every Python quality gate to succeed
-        env:
-          NEEDS_JSON: ${{ toJSON(needs) }}
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import sys
+      # Base-trusted execution (D180 §2.2): the aggregate gate helper itself
+      # decides a required, branch-protected status, so it runs from the
+      # trusted base checkout, never from this pull request's own copy.
+      - name: Check out trusted base
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.repository.default_branch }}
+          path: .ci-gate-base
+          persist-credentials: false
 
-          needs = json.loads(os.environ["NEEDS_JSON"])
-          failed = {
-              name: details["result"]
-              for name, details in needs.items()
-              if details["result"] != "success"
-          }
-          if failed:
-              print(f"Required CI jobs did not succeed: {failed}")
-              sys.exit(1)
-          PY
+      - name: Require every declared job to match its closed-mode expectation
+        env:
+          MODE: ${{ needs.classify.outputs.mode }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: >-
+          python3 .ci-gate-base/scripts/ci_gate_result.py
+          --always classify
+          --full-only quality --full-only pytest-ordinary --full-only pytest-serial
+          --full-only pytest-stress --full-only package --full-only coverage
+          --docs-only docs-fastpath
 
   # The SPA (web/) lint + typecheck + unit/component tests on a normal runner.
-  web:
-    name: Web (lint + typecheck + unit)
+  web-unit-worker:
+    name: Web worker (lint + typecheck + unit)
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode != 'docs-only'
     defaults:
       run:
         working-directory: web
@@ -420,6 +524,29 @@ jobs:
         # SSE/reducer/query paths the pages ride on.
         run: npm run test:coverage
 
+  web:
+    name: Web (lint + typecheck + unit)
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [classify, web-unit-worker]
+    steps:
+      - name: Check out trusted base
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.repository.default_branch }}
+          path: .ci-gate-base
+          persist-credentials: false
+
+      - name: Require the web unit worker to match its closed-mode expectation
+        env:
+          MODE: ${{ needs.classify.outputs.mode }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: >-
+          python3 .ci-gate-base/scripts/ci_gate_result.py
+          --always classify
+          --full-only web-unit-worker
+
   # The D24/D26 visual gate: the scripted toHaveScreenshot() snapshot suite, run
   # INSIDE the pinned Playwright Linux image so its pixels match the committed
   # baselines (which are generated in this same image — see the web-snapshots-update
@@ -433,10 +560,11 @@ jobs:
   # other is the built SPA proxying /api to it. So the container needs BOTH Python
   # (the agent) and Node (Playwright). Replay mode never spawns the MCP child, so
   # no libportaudio2 / sounddevice is needed here (unlike the Python `checks` job).
-  web-snapshots:
-    name: Web (Playwright snapshots)
+  web-snapshots-worker:
+    name: Web worker (Playwright snapshots)
     runs-on: ubuntu-latest
-    needs: web
+    needs: [classify, web-unit-worker]
+    if: needs.classify.outputs.mode != 'docs-only'
     # packages: read lets the container pull the GHCR-mirrored Playwright image
     # with the built-in GITHUB_TOKEN (#262). contents: read is the checkout floor.
     permissions:
@@ -495,3 +623,26 @@ jobs:
           name: playwright-report
           path: web/playwright-report/
           retention-days: 7
+
+  web-snapshots:
+    name: Web (Playwright snapshots)
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [classify, web-snapshots-worker]
+    steps:
+      - name: Check out trusted base
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.repository.default_branch }}
+          path: .ci-gate-base
+          persist-credentials: false
+
+      - name: Require the Playwright snapshot worker to match its closed-mode expectation
+        env:
+          MODE: ${{ needs.classify.outputs.mode }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: >-
+          python3 .ci-gate-base/scripts/ci_gate_result.py
+          --always classify
+          --full-only web-snapshots-worker

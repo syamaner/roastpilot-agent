@@ -10,9 +10,50 @@ import tomllib
 from pathlib import Path
 from typing import cast
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+#: D180 (#702, slice 3) job topology (§2.3).
+_REQUIRED_CHECK_NAMES = {
+    "checks": "Checks",
+    "web": "Web (lint + typecheck + unit)",
+    "web-snapshots": "Web (Playwright snapshots)",
+}
+_GATE_ARGV_CLASSES: dict[str, dict[str, tuple[str, ...]]] = {
+    "checks": {
+        "always": ("classify",),
+        "full-only": (
+            "quality",
+            "pytest-ordinary",
+            "pytest-serial",
+            "pytest-stress",
+            "package",
+            "coverage",
+        ),
+        "docs-only": ("docs-fastpath",),
+    },
+    "web": {"always": ("classify",), "full-only": ("web-unit-worker",), "docs-only": ()},
+    "web-snapshots": {
+        "always": ("classify",),
+        "full-only": ("web-snapshots-worker",),
+        "docs-only": (),
+    },
+}
+_FULL_ONLY_WORKER_JOBS = (
+    "quality",
+    "pytest-ordinary",
+    "pytest-serial",
+    "pytest-stress",
+    "package",
+    "coverage",
+    "web-unit-worker",
+    "web-snapshots-worker",
+)
+_FULL_ONLY_CONDITION = "needs.classify.outputs.mode != 'docs-only'"
+_DOCS_ONLY_CONDITION = "needs.classify.outputs.mode == 'docs-only'"
+_TIMEOUT_BEARING_JOBS = ("classify", "checks", "web", "web-snapshots", "docs-fastpath")
 
 
 def _pytest_options() -> dict[str, object]:
@@ -272,8 +313,30 @@ def test_ci_lanes_are_bounded_parallel_and_write_unique_coverage_files() -> None
     assert '"coverage>=7.6"' in install_coverage
 
 
+def _argv_declared_classes(run: str) -> dict[str, tuple[str, ...]]:
+    """Parse one gate invocation's ``--always``/``--full-only``/``--docs-only`` argv."""
+    tokens = shlex.split(run)
+    classes: dict[str, list[str]] = {"always": [], "full-only": [], "docs-only": []}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        flag = token.removeprefix("--")
+        if flag in classes:
+            classes[flag].append(tokens[index + 1])
+            index += 2
+        else:
+            index += 1
+    return {key: tuple(value) for key, value in classes.items()}
+
+
 def test_checks_is_a_fail_closed_aggregate_of_every_python_gate() -> None:
-    """The required Checks status whitelists success from every Python gate."""
+    """The required Checks status whitelists success from every Python gate.
+
+    D180 (#702, slice 3): ``checks`` now runs the base-trusted
+    ``ci_gate_result.py`` helper (one checkout + one gate invocation) rather
+    than an inline heredoc, and ``needs`` includes ``classify`` and
+    ``docs-fastpath`` alongside the six full-path jobs.
+    """
     workflow = _workflow()
     jobs = _mapping(workflow["jobs"])
     checks = [job for job in jobs.values() if _mapping(job).get("name") == "Checks"]
@@ -281,22 +344,31 @@ def test_checks_is_a_fail_closed_aggregate_of_every_python_gate() -> None:
     checks_job = _mapping(checks[0])
     assert checks_job["if"] == "always()"
     assert set(cast(list[str], checks_job["needs"])) == {
+        "classify",
         "quality",
         "pytest-ordinary",
         "pytest-serial",
         "pytest-stress",
         "package",
         "coverage",
+        "docs-fastpath",
     }
     check_steps = _steps(checks_job)
-    assert len(check_steps) == 1
-    check_step = check_steps[0]
-    check_run = check_step["run"]
-    assert isinstance(check_run, str)
-    assert _mapping(check_step["env"]) == {"NEEDS_JSON": "${{ toJSON(needs) }}"}
-    assert 'os.environ["NEEDS_JSON"]' in check_run
-    assert "${{" not in check_run
-    assert '"success"' in check_run
+    assert len(check_steps) == 2
+    checkout_step, gate_step = check_steps
+    assert checkout_step["uses"] == "actions/checkout@v6.0.2"
+    checkout_with = _mapping(checkout_step["with"])
+    assert checkout_with["path"] == ".ci-gate-base"
+    assert checkout_with["persist-credentials"] is False
+
+    gate_run = gate_step["run"]
+    assert isinstance(gate_run, str)
+    assert gate_run.startswith("python3 .ci-gate-base/scripts/ci_gate_result.py")
+    assert "${{" not in gate_run
+    gate_env = _mapping(gate_step["env"])
+    assert gate_env["MODE"] == "${{ needs.classify.outputs.mode }}"
+    assert gate_env["NEEDS_JSON"] == "${{ toJSON(needs) }}"
+
     for job in jobs.values():
         mapped_job = _mapping(job)
         assert "continue-on-error" not in mapped_job
@@ -310,6 +382,10 @@ def test_checks_is_a_fail_closed_aggregate_of_every_python_gate() -> None:
         "pytest-stress",
         "package",
         "coverage",
+        "docs-fastpath",
+        "checks",
+        "web",
+        "web-snapshots",
     ):
         assert "permissions" not in _mapping(jobs[job_id])
     assert _mapping(jobs["web"])["name"] == "Web (lint + typecheck + unit)"
@@ -337,3 +413,150 @@ def test_checks_is_a_fail_closed_aggregate_of_every_python_gate() -> None:
             if uses is not None:
                 assert isinstance(uses, str)
                 assert uses.startswith("actions/") or uses == "codecov/codecov-action@v5"
+
+
+@pytest.mark.docs_ci
+def test_required_gates_run_exactly_one_base_checkout_and_one_gate_invocation() -> None:
+    """Each of the three required checks belongs to a minimal gate job (D180 §3.6)."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    for job_id, required_name in _REQUIRED_CHECK_NAMES.items():
+        job = _mapping(jobs[job_id])
+        assert job["name"] == required_name
+        steps = _steps(job)
+        assert len(steps) == 2, f"{job_id}: a gate job must have exactly one checkout + one run"
+        checkout_step, gate_step = steps
+        assert checkout_step["uses"] == "actions/checkout@v6.0.2"
+        checkout_with = _mapping(checkout_step["with"])
+        assert checkout_with["path"] == ".ci-gate-base"
+        gate_run = gate_step["run"]
+        assert isinstance(gate_run, str)
+        assert gate_run.startswith("python3 .ci-gate-base/scripts/ci_gate_result.py")
+        assert "${{" not in gate_run
+        assert job["if"] == "always()"
+
+
+@pytest.mark.docs_ci
+def test_gate_needs_equals_the_union_of_its_declared_argv_classes() -> None:
+    """A ``needs`` edit cannot silently drop a check without also editing argv (D180 §3.6)."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    for job_id, classes in _GATE_ARGV_CLASSES.items():
+        job = _mapping(jobs[job_id])
+        _, gate_step = _steps(job)
+        gate_run = gate_step["run"]
+        assert isinstance(gate_run, str)
+        declared = _argv_declared_classes(gate_run)
+        assert declared == classes, f"{job_id}: argv classes drifted from the expected mapping"
+        needs = set(cast(list[str], job["needs"]))
+        declared_union = {name for names in classes.values() for name in names}
+        assert needs == declared_union, f"{job_id}: needs must equal the union of argv classes"
+
+
+@pytest.mark.docs_ci
+def test_full_only_workers_carry_the_exact_literal_condition_and_no_status_function() -> None:
+    """Every full-only worker's ``if`` is the exact literal string (D180 §3.6)."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    for job_id in _FULL_ONLY_WORKER_JOBS:
+        job = _mapping(jobs[job_id])
+        assert job.get("if") == _FULL_ONLY_CONDITION, f"{job_id}: wrong or missing condition"
+        needs = job.get("needs", [])
+        needs_values = {needs} if isinstance(needs, str) else set(cast(list[str], needs))
+        assert "classify" in needs_values, f"{job_id}: must declare needs: classify"
+        for forbidden in ("always()", "failure()", "!cancelled()"):
+            assert forbidden not in cast(str, job["if"])
+
+    docs_fastpath = _mapping(jobs["docs-fastpath"])
+    assert docs_fastpath.get("if") == _DOCS_ONLY_CONDITION
+    assert "classify" in set(cast(list[str], docs_fastpath["needs"]))
+
+    for job_id in _REQUIRED_CHECK_NAMES:
+        assert _mapping(jobs[job_id])["if"] == "always()"
+
+
+@pytest.mark.docs_ci
+def test_no_trigger_level_path_filtering_or_continue_on_error() -> None:
+    """A required workflow with a `paths` filter would leave its check pending forever."""
+    for workflow_path in (
+        REPO_ROOT / ".github" / "workflows" / "ci.yml",
+        REPO_ROOT / ".github" / "workflows" / "codeql.yml",
+    ):
+        raw_loaded = cast(dict[object, object], yaml.safe_load(workflow_path.read_text()))
+        loaded = {
+            "on" if key is True else cast(str, key): value for key, value in raw_loaded.items()
+        }
+        on_block = loaded.get("on")
+        assert isinstance(on_block, dict)
+        for trigger in cast(dict[str, object], on_block).values():
+            if isinstance(trigger, dict):
+                assert "paths" not in trigger
+                assert "paths-ignore" not in trigger
+        jobs = cast(dict[str, object], loaded["jobs"])
+        for job in jobs.values():
+            mapped_job = _mapping(job)
+            assert "continue-on-error" not in mapped_job
+            for step in _steps(mapped_job):
+                assert "continue-on-error" not in step
+
+
+@pytest.mark.docs_ci
+def test_new_or_newly_tiny_jobs_carry_a_timeout() -> None:
+    """The four new/newly-tiny jobs are bounded; heavy pre-existing jobs are out of scope."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    for job_id in _TIMEOUT_BEARING_JOBS:
+        assert isinstance(_mapping(jobs[job_id]).get("timeout-minutes"), int)
+
+
+@pytest.mark.docs_ci
+def test_docs_fastpath_job_structure_and_dependency_group() -> None:
+    """The docs-only fast path runs the exact ordered steps D180 §2.5 specifies."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    job = _mapping(jobs["docs-fastpath"])
+    assert job["name"] == "Docs fast path (docs tests + Codecov upload)"
+    steps = _steps(job)
+    step_names = [step.get("name") for step in steps]
+    assert step_names == [
+        "Check out repository",
+        "Set up Python",
+        "Whitespace and diff validation",
+        "Install dependencies (docs-ci group only — no MCP/audio/ML/build tooling)",
+        "Run docs and fast-path tooling tests with coverage",
+        "Normalize coverage filenames for Codecov",
+        "Upload coverage to Codecov",
+    ]
+    install_step = steps[3]
+    assert "--group docs-ci" in cast(str, install_step["run"])
+    pytest_step = steps[4]
+    pytest_run = cast(str, pytest_step["run"])
+    assert '-m "(docs or docs_ci) and not stress"' in pytest_run
+    assert "--cov=scripts" in pytest_run
+    assert "--cov=.agents/skills/capture-agent-usage/scripts" in pytest_run
+    assert "--cov-report=xml:coverage.xml" in pytest_run
+    assert "OPENROUTER_API_KEY" in pytest_run
+    codecov_step = steps[6]
+    assert codecov_step["uses"] == "codecov/codecov-action@v5"
+    codecov_with = _mapping(codecov_step["with"])
+    assert codecov_with["disable_search"] is True
+    assert codecov_with["token"] == "${{ secrets.CODECOV_TOKEN }}"
+
+    # docs-fastpath's pytest invocation is deliberately not a governed lane:
+    # it never appears in `_pytest_lanes`'s job-id allowlist.
+    assert "docs-fastpath" not in {job_id for job_id, _, _ in _pytest_lanes(workflow)}
+
+    with (REPO_ROOT / "pyproject.toml").open("rb") as config_file:
+        project = cast(dict[str, object], tomllib.load(config_file))
+    dependency_groups = _mapping(project["dependency-groups"])
+    docs_ci_group = dependency_groups["docs-ci"]
+    dev_group = dependency_groups["dev"]
+    assert isinstance(docs_ci_group, list)
+    assert isinstance(dev_group, list)
+    docs_ci_entries = cast(list[str], docs_ci_group)
+    assert set(docs_ci_entries) <= set(cast(list[str], dev_group))
+    assert not any(entry.startswith("coffee-roaster-mcp") for entry in docs_ci_entries)
+
+    markers = cast(list[str], _pytest_options()["markers"])
+    registered = {marker.partition(":")[0] for marker in markers}
+    assert "docs_ci" in registered

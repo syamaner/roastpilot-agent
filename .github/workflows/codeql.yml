@@ -14,9 +14,48 @@ permissions:
   security-events: write
 
 jobs:
+  # D180 (#702, slice 3): docs-only pull requests skip CodeQL analysis (non-
+  # required, best-effort work), mirroring the same trusted-base classifier
+  # execution ci.yml uses. Every non-pull_request trigger (push to main,
+  # schedule, workflow_dispatch) still analyzes unconditionally, because the
+  # classifier returns FULL for every non-pull_request event.
+  classify:
+    name: Classify CI change
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Narrower than the workflow-level permissions: this job never touches
+    # the CodeQL security-events surface.
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.classify.outputs.mode }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out trusted base
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.repository.default_branch }}
+          path: .ci-gate-base
+          persist-credentials: false
+
+      - name: Classify pull-request change
+        id: classify
+        run: >-
+          python3 .ci-gate-base/scripts/ci_change_classifier.py
+          --event-name "${{ github.event_name }}"
+          --base-sha "${{ github.event.pull_request.base.sha }}"
+          --head-sha "${{ github.event.pull_request.head.sha }}"
+
   analyze:
     name: "Analyze (${{ matrix.language }})"
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode != 'docs-only'
     strategy:
       fail-fast: false
       matrix:

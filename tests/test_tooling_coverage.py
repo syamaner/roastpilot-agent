@@ -134,12 +134,17 @@ def test_ci_normalizes_coverage_filenames_before_codecov_upload() -> None:
             run = step_mapping.get("run")
             if isinstance(run, str) and run.startswith("python -m pytest"):
                 pytest_runs.append(run)
-    assert len(codecov_steps) == 1
-    codecov_job, codecov_step = codecov_steps[0]
-    assert codecov_job == "coverage"
-    codecov_with = _mapping(codecov_step["with"])
-    assert codecov_with["files"] == "./coverage.xml"
-    assert codecov_with["disable_search"] is True
+    # D180 (#702, slice 3): the docs-only fast path is a second, genuinely
+    # authenticated Codecov upload (never a synthetic status) — a distinct
+    # job from the full-path `coverage` job, not a duplicate of it.
+    assert len(codecov_steps) == 2
+    codecov_job_ids = {job_id for job_id, _ in codecov_steps}
+    assert codecov_job_ids == {"coverage", "docs-fastpath"}
+    for _, codecov_step in codecov_steps:
+        codecov_with = _mapping(codecov_step["with"])
+        assert codecov_with["files"] == "./coverage.xml"
+        assert codecov_with["disable_search"] is True
+        assert codecov_with["token"] == "${{ secrets.CODECOV_TOKEN }}"
     assert pytest_runs and all(
         "--cov-report=" in shlex.split(run)
         and not any(
