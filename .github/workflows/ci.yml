@@ -19,6 +19,7 @@ jobs:
   classify:
     name: Classify CI change
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       mode: ${{ steps.classify.outputs.mode }}
     steps:
@@ -39,6 +40,9 @@ jobs:
   quality:
     name: Quality (lint, format, pyright, contract drift)
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode != 'docs-only'
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
@@ -100,6 +104,9 @@ jobs:
   pytest-ordinary:
     name: Python tests (ordinary, xdist)
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode != 'docs-only'
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v6.0.2
@@ -139,6 +146,9 @@ jobs:
   pytest-serial:
     name: Python tests (serial)
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode != 'docs-only'
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v6.0.2
@@ -178,6 +188,9 @@ jobs:
   pytest-stress:
     name: Python tests (stress ${{ matrix.case }})
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode != 'docs-only'
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -233,6 +246,9 @@ jobs:
   package:
     name: Package (wheel build + clean-venv smoke)
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode != 'docs-only'
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v6.0.2
@@ -318,7 +334,9 @@ jobs:
   coverage:
     name: Coverage (combine + normalize + upload)
     runs-on: ubuntu-latest
-    needs: [pytest-ordinary, pytest-serial, pytest-stress, package]
+    needs: [classify, pytest-ordinary, pytest-serial, pytest-stress, package]
+    if: needs.classify.outputs.mode != 'docs-only'
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v6.0.2
@@ -358,36 +376,106 @@ jobs:
           files: ./coverage.xml
           disable_search: true
 
+  # #702 slice 2: the docs-only fast path's own real test + Codecov-upload
+  # body. Runs ONLY when `classify` resolved `docs-only`; the docs-fastpath
+  # re-verification step (ci_docs_fastpath_verify.py) independently re-derives
+  # the same verdict from this job's own checkout before anything else here
+  # is trusted, so a stale/wrong classify output cannot become authoritative
+  # on its own word.
+  docs-fastpath:
+    name: Docs fast path (docs tests + Codecov upload)
+    runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode == 'docs-only'
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # Deliberately minimal: no coffee-roaster-mcp, no PortAudio, no
+      # Playwright, no build tooling, never `--group dev` (pyproject.toml's
+      # `docs-ci` dependency-group docstring explains why).
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group docs-ci
+
+      - name: Independently re-verify the docs-only verdict
+        run: >-
+          python scripts/ci_docs_fastpath_verify.py
+          --base-sha "${{ github.event.pull_request.base.sha }}"
+          --head-sha "${{ github.event.pull_request.head.sha }}"
+
+      - name: Whitespace/diff validation
+        run: >-
+          git diff --check
+          "$(git merge-base "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
+          "${{ github.event.pull_request.head.sha }}"
+
+      - name: Documentation-behaviour and fast-path-tooling tests
+        env:
+          COVERAGE_FILE: .coverage.docs-fastpath
+        run: >-
+          env -u OPENROUTER_API_KEY python -m pytest
+          -m "(docs or docs_ci) and not stress"
+          --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts
+          --cov-report=xml:coverage.xml
+
+      - name: Normalize coverage filenames for Codecov
+        run: python scripts/tooling_coverage.py coverage.xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          disable_search: true
+
+  # The tiny, stdlib-only required-check gate: it inherits `contents: read`,
+  # runs on every PR/push regardless of mode (`if: always()`), and delegates
+  # every fail-closed decision to ci_gate_result.py — no `${{` expression
+  # appears in its `run:` line (tests/test_pytest_governance.py:298 asserts
+  # this), only static job-id strings; the real values arrive through env.
   checks:
     name: Checks
     if: always()
     runs-on: ubuntu-latest
-    needs: [quality, pytest-ordinary, pytest-serial, pytest-stress, package, coverage]
+    needs: [classify, quality, pytest-ordinary, pytest-serial, pytest-stress, package, coverage, docs-fastpath]
+    timeout-minutes: 10
     steps:
-      - name: Require every Python quality gate to succeed
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Require every job to match its declared mode-conditional state
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import sys
+          MODE: ${{ needs.classify.outputs.mode }}
+        run: >-
+          python3 scripts/ci_gate_result.py
+          --always classify
+          --full-only quality --full-only pytest-ordinary --full-only pytest-serial
+          --full-only pytest-stress --full-only package --full-only coverage
+          --docs-only docs-fastpath
 
-          needs = json.loads(os.environ["NEEDS_JSON"])
-          failed = {
-              name: details["result"]
-              for name, details in needs.items()
-              if details["result"] != "success"
-          }
-          if failed:
-              print(f"Required CI jobs did not succeed: {failed}")
-              sys.exit(1)
-          PY
-
-  # The SPA (web/) lint + typecheck + unit/component tests on a normal runner.
-  web:
-    name: Web (lint + typecheck + unit)
+  # The web-unit worker: unchanged body, moved byte-for-byte from the
+  # pre-split `web` job. Skipped on a docs-only PR.
+  web-unit-worker:
+    name: Web worker (lint + typecheck + unit)
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode != 'docs-only'
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: web
@@ -420,6 +508,32 @@ jobs:
         # SSE/reducer/query paths the pages ride on.
         run: npm run test:coverage
 
+  # The tiny required-check gate for the web-unit worker.
+  web:
+    name: Web (lint + typecheck + unit)
+    if: always()
+    runs-on: ubuntu-latest
+    needs: [classify, web-unit-worker]
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Require the web-unit worker to match its declared mode-conditional state
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          MODE: ${{ needs.classify.outputs.mode }}
+        run: >-
+          python3 scripts/ci_gate_result.py
+          --always classify
+          --full-only web-unit-worker
+
+  # The D24/D26 visual gate worker: unchanged body, moved byte-for-byte from
+  # the pre-split `web-snapshots` job (including the GHCR mirror pin comment
+  # below). Skipped on a docs-only PR.
+  #
   # The D24/D26 visual gate: the scripted toHaveScreenshot() snapshot suite, run
   # INSIDE the pinned Playwright Linux image so its pixels match the committed
   # baselines (which are generated in this same image — see the web-snapshots-update
@@ -433,10 +547,12 @@ jobs:
   # other is the built SPA proxying /api to it. So the container needs BOTH Python
   # (the agent) and Node (Playwright). Replay mode never spawns the MCP child, so
   # no libportaudio2 / sounddevice is needed here (unlike the Python `checks` job).
-  web-snapshots:
-    name: Web (Playwright snapshots)
+  web-snapshots-worker:
+    name: Web worker (Playwright snapshots)
     runs-on: ubuntu-latest
-    needs: web
+    needs: [classify, web-unit-worker]
+    if: needs.classify.outputs.mode != 'docs-only'
+    timeout-minutes: 40
     # packages: read lets the container pull the GHCR-mirrored Playwright image
     # with the built-in GITHUB_TOKEN (#262). contents: read is the checkout floor.
     permissions:
@@ -495,3 +611,25 @@ jobs:
           name: playwright-report
           path: web/playwright-report/
           retention-days: 7
+
+  # The tiny required-check gate for the Playwright-snapshots worker.
+  web-snapshots:
+    name: Web (Playwright snapshots)
+    if: always()
+    runs-on: ubuntu-latest
+    needs: [classify, web-snapshots-worker]
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Require the Playwright-snapshots worker to match its declared mode-conditional state
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          MODE: ${{ needs.classify.outputs.mode }}
+        run: >-
+          python3 scripts/ci_gate_result.py
+          --always classify
+          --full-only web-snapshots-worker

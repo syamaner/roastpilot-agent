@@ -145,6 +145,17 @@ Issues = "https://github.com/syamaner/roastpilot-agent/issues"
 roastpilot-agent = "roastpilot_agent.cli:main"
 
 [dependency-groups]
+# #702 slice 2: the minimal install for the docs-only CI fast path. Deliberately
+# excludes coffee-roaster-mcp (and therefore PortAudio), Playwright, build tooling,
+# and the full dev group — a docs-only PR runs only the focused fast-path-tooling
+# and docs-behaviour tests (`-m "(docs or docs_ci) and not stress"`), never the
+# 1,184-test module-level sweep slice 1 shipped with. Add a package here only when
+# a selected test demonstrably requires it; never widen to `--group dev`.
+docs-ci = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "pyyaml>=6.0,<7"
+]
 dev = [
   # Pinned exactly (not >=) so local == CI (#102). The `nodejs` extra supplies
   # pyright's Node binary through the venv-local `nodejs_wheel` package, so no
@@ -254,7 +265,8 @@ pythonpath = ["src", "scripts", ".agents/skills/capture-agent-usage/scripts"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
-    "docs: reads or asserts committed docs/**/*.md content; marked for docs-governance auditing only and does not alter lane selection.",
+    "docs: reads or asserts committed docs/**/*.md content, on the exact executable test/class returned by scripts/docs_reader_governance.py; selected (with docs_ci) by the docs-only CI fast path (#702) in addition to full-suite membership.",
+    "docs_ci: focused fast-path-tooling/workflow-structure test that the docs-only CI fast path itself must execute to trust its own shortcut (the classifier, gate script, and verify script); never a docs/**/*.md content reader itself — see the docs marker for that.",
     "slow: spawns a real subprocess / initialises a real MCP session (still hardware-free)",
     "stress: production-size resource-bound regression: exercises a real production limit (bytes, counts, corpus) at its real value; slow by construction; ALWAYS runs in CI in the dedicated stress lane (three-entry matrix); locally deselectable with `-m 'not stress'`.",
     "serial: must not run concurrently with any other test: mutates a shared repository path, drives real process groups / a real MCP child, or depends on process-global state; runs in the serial lane. Reason is stated at the marker site.",
