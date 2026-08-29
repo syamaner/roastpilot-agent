@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 import shlex
 import subprocess
@@ -168,6 +169,86 @@ def _collect_nodeids(arguments: list[str]) -> tuple[int, set[str], str]:
         if re.fullmatch(r"tests/.*::.*", line.strip())
     }
     return result.returncode, nodeids, result.stdout + result.stderr
+
+
+def _module_has_docs_ci_marker(tree: ast.Module) -> bool:
+    """Return whether a module broadly applies the docs-ci marker."""
+
+    return any(
+        isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "pytestmark"
+            for target in statement.targets
+        )
+        and any(ast.unparse(node) == "pytest.mark.docs_ci" for node in ast.walk(statement.value))
+        for statement in tree.body
+    )
+
+
+def _marked_test_prefixes(marker: str) -> set[str]:
+    """Return exact test-node prefixes bearing one function-level marker."""
+
+    prefixes: set[str] = set()
+    for path in (REPO_ROOT / "tests").glob("test_*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        assert not _module_has_docs_ci_marker(tree)
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        for statement in tree.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if statement.name.startswith("test_") and any(
+                    ast.unparse(decorator) == f"pytest.mark.{marker}"
+                    for decorator in statement.decorator_list
+                ):
+                    prefixes.add(f"{relative}::{statement.name}")
+            elif isinstance(statement, ast.ClassDef):
+                class_marked = any(
+                    ast.unparse(decorator) == f"pytest.mark.{marker}"
+                    for decorator in statement.decorator_list
+                )
+                for method in statement.body:
+                    if (
+                        isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and method.name.startswith("test_")
+                        and (
+                            class_marked
+                            or any(
+                                ast.unparse(decorator) == f"pytest.mark.{marker}"
+                                for decorator in method.decorator_list
+                            )
+                        )
+                    ):
+                        prefixes.add(f"{relative}::{statement.name}::{method.name}")
+    return prefixes
+
+
+@pytest.mark.docs_ci
+def test_docs_fastpath_marker_selection_is_closed_nonempty_and_strict() -> None:
+    """The docs and docs-ci node inventories exactly govern the focused lane."""
+
+    docs_code, docs, docs_output = _collect_nodeids(["-m", "docs and not stress"])
+    docs_ci_code, docs_ci, docs_ci_output = _collect_nodeids(["-m", "docs_ci and not stress"])
+    selected_code, selected, selected_output = _collect_nodeids(
+        ["-m", "(docs or docs_ci) and not stress"]
+    )
+    full_code, full, full_output = _collect_nodeids([])
+    assert docs_code == 0, docs_output
+    assert docs_ci_code == 0, docs_ci_output
+    assert selected_code == 0, selected_output
+    assert full_code == 0, full_output
+    assert selected == docs | docs_ci
+    assert selected and selected < full
+    docs_ci_prefixes = _marked_test_prefixes("docs_ci")
+    assert docs_ci_prefixes
+    assert all(
+        any(nodeid == prefix or nodeid.startswith(f"{prefix}[") for prefix in docs_ci_prefixes)
+        for nodeid in docs_ci
+    )
+    selected_prefixes = {
+        prefix
+        for prefix in docs_ci_prefixes
+        if any(nodeid == prefix or nodeid.startswith(f"{prefix}[") for nodeid in docs_ci)
+    }
+    assert selected_prefixes == docs_ci_prefixes
 
 
 def test_pytest_markers_are_registered_and_full_gate_is_unfiltered() -> None:
@@ -498,6 +579,34 @@ def test_no_trigger_level_path_filtering_or_continue_on_error() -> None:
             assert "continue-on-error" not in mapped_job
             for step in _steps(mapped_job):
                 assert "continue-on-error" not in step
+
+
+@pytest.mark.docs_ci
+def test_codeql_analyze_runs_unless_classify_succeeds_with_exact_docs_only() -> None:
+    """CodeQL may skip only the successful, exact docs-only classifier verdict."""
+
+    loaded = yaml.safe_load((REPO_ROOT / ".github/workflows/codeql.yml").read_text())
+    assert isinstance(loaded, dict)
+    raw_workflow = cast(dict[object, object], loaded)
+    workflow = _mapping(
+        {"on" if key is True else cast(str, key): value for key, value in raw_workflow.items()}
+    )
+    jobs = _mapping(workflow["jobs"])
+    analyze = _mapping(jobs["analyze"])
+    expected = (
+        "always() && !(needs.classify.result == 'success' "
+        "&& needs.classify.outputs.mode == 'docs-only')"
+    )
+    assert analyze["needs"] == ["classify"]
+    assert analyze["if"] == expected
+
+    for mutant in (
+        "needs.classify.outputs.mode != 'docs-only'",
+        "always() && needs.classify.result == 'success'",
+    ):
+        mutated = dict(analyze)
+        mutated["if"] = mutant
+        assert mutated["if"] != expected
 
 
 @pytest.mark.docs_ci

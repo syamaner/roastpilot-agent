@@ -55,7 +55,7 @@ jobs:
     name: "Analyze (${{ matrix.language }})"
     runs-on: ubuntu-latest
     needs: [classify]
-    if: needs.classify.outputs.mode != 'docs-only'
+    if: always() && !(needs.classify.result == 'success' && needs.classify.outputs.mode == 'docs-only')
     strategy:
       fail-fast: false
       matrix:

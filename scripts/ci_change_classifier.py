@@ -114,8 +114,8 @@ def _parse_name_status(output: bytes) -> tuple[tuple[str, tuple[bytes, ...]], ..
     return tuple(entries)
 
 
-def _is_regular_file(commit: str, path: bytes, *, deadline: float | None = None) -> bool:
-    """Return whether ``path`` is a regular file at ``commit``.
+def _regular_file_mode(commit: str, path: bytes, *, deadline: float | None = None) -> bytes | None:
+    """Return a regular-file mode for ``path`` at ``commit``, else ``None``.
 
     This separate local object check rejects symlinks and submodules, which
     ``git diff --name-status`` intentionally does not describe.
@@ -125,9 +125,17 @@ def _is_regular_file(commit: str, path: bytes, *, deadline: float | None = None)
     output = _run_git(["ls-tree", "-z", commit, "--", decoded_path], deadline=deadline)
     expected_suffix = b"\t" + path + b"\0"
     if not output.endswith(expected_suffix):
-        return False
+        return None
     metadata = output[: -len(expected_suffix)].split(b" ")
-    return len(metadata) == 3 and metadata[0] in _REGULAR_FILE_MODES and metadata[1] == b"blob"
+    if len(metadata) != 3 or metadata[0] not in _REGULAR_FILE_MODES or metadata[1] != b"blob":
+        return None
+    return metadata[0]
+
+
+def _is_regular_file(commit: str, path: bytes, *, deadline: float | None = None) -> bool:
+    """Return whether ``path`` is a regular file at ``commit``."""
+
+    return _regular_file_mode(commit, path, deadline=deadline) is not None
 
 
 def _entries_are_docs_only(
@@ -148,20 +156,18 @@ def _entries_are_docs_only(
             if not _is_regular_file(head_sha, paths[0], deadline=deadline):
                 return False
         elif status == "M":
-            if not (
-                _is_regular_file(merge_base, paths[0], deadline=deadline)
-                and _is_regular_file(head_sha, paths[0], deadline=deadline)
-            ):
+            base_mode = _regular_file_mode(merge_base, paths[0], deadline=deadline)
+            head_mode = _regular_file_mode(head_sha, paths[0], deadline=deadline)
+            if base_mode is None or head_mode is None or base_mode != head_mode:
                 return False
         elif status == "D":
             if not _is_regular_file(merge_base, paths[0], deadline=deadline):
                 return False
         else:
             old_path, new_path = paths
-            if not (
-                _is_regular_file(merge_base, old_path, deadline=deadline)
-                and _is_regular_file(head_sha, new_path, deadline=deadline)
-            ):
+            base_mode = _regular_file_mode(merge_base, old_path, deadline=deadline)
+            head_mode = _regular_file_mode(head_sha, new_path, deadline=deadline)
+            if base_mode is None or head_mode is None or base_mode != head_mode:
                 return False
     return True
 
@@ -171,8 +177,7 @@ def classify_change(event_name: str, base_sha: str, head_sha: str) -> ChangeMode
 
     Every local Git call is bounded by a per-call timeout
     (:data:`_GIT_CALL_TIMEOUT_SECONDS`) and the whole classification is bounded
-    by a total worktime budget (:data:`_TOTAL_BUDGET_SECONDS`, checked before
-    each subsequent call so an exceeded budget issues no further Git call).
+    by a total worktime budget (:data:`_TOTAL_BUDGET_SECONDS`).
     Neither bound is environment-configurable.
 
     Args:
