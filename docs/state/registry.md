@@ -21,7 +21,7 @@ new `scripts/ci_docs_fastpath_verify.py` before trusting anything else
 (imports `ci_change_classifier.classify_change` directly — one authoritative
 grammar, D154 — plus one deliberately narrowing `git diff --name-only`
 redundancy), then runs a focused, non-empty, strict-subset test selection
-(`-m "(docs or docs_ci) and not stress"`, scoped to the eight modules
+(`-m "(docs or docs_ci) and not stress"`, scoped to the nine modules
 `scripts/docs_reader_governance.py` governs, to avoid unrelated collection
 errors from modules outside the selection) with a real Codecov upload
 (`disable_search: true`, no threshold or token change). `codeql.yml` gains a
