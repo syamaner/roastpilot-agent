@@ -821,6 +821,7 @@ class _FunctionAnalysis:
     return_names: set[str]
     call_result_assignments: dict[str, str]
     read_names: set[str]
+    read_calls: set[str]
 
 
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
@@ -897,6 +898,26 @@ def _analyse_function(
     return_names: set[str] = set()
     call_result_assignments: dict[str, str] = {}
     read_names: set[str] = set()
+    read_calls: set[str] = set()
+
+    def _call_key(expression: ast.expr) -> str | None:
+        """Resolve one admitted local, module, or containing-class call expression."""
+
+        while isinstance(expression, ast.Await):
+            expression = expression.value
+        if not isinstance(expression, ast.Call):
+            return None
+        if isinstance(expression.func, ast.Name):
+            return (local_functions or {}).get(expression.func.id) or (
+                expression.func.id if expression.func.id in known_functions else None
+            )
+        if (
+            isinstance(expression.func, ast.Attribute)
+            and isinstance(expression.func.value, ast.Name)
+            and expression.func.value.id in {"self", "cls", class_name}
+        ):
+            return (class_methods or {}).get(expression.func.attr)
+        return None
 
     def _receiver_is_docs(target: ast.expr) -> bool:
         if isinstance(target, ast.Name):
@@ -923,13 +944,7 @@ def _analyse_function(
                 _expression_has_docs_root(node.value)
                 or _expression_uses_alias(node.value, partial_aliases)
             )
-            call_result = (
-                node.value.func.id
-                if isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Name)
-                and node.value.func.id in known_functions
-                else None
-            )
+            call_result = _call_key(node.value)
             for target in targets:
                 if isinstance(target, ast.Name):
                     if call_result is not None:
@@ -961,16 +976,14 @@ def _analyse_function(
                     returns_docs = True
                 elif isinstance(node.value, ast.Name):
                     return_names.add(node.value.id)
-                elif (
-                    isinstance(node.value, ast.Call)
-                    and isinstance(node.value.func, ast.Name)
-                    and node.value.func.id in known_functions
-                ):
-                    return_calls.add(node.value.func.id)
+                elif (call_key := _call_key(node.value)) is not None:
+                    return_calls.add(call_key)
             continue
         if isinstance(node.func, ast.Name):
             if node.func.id == "open" and node.args:
                 target = node.args[0]
+                if (call_key := _call_key(target)) is not None:
+                    read_calls.add(call_key)
                 if _receiver_is_docs(target):
                     reads = True
                 elif _receiver_is_partial(target):
@@ -989,6 +1002,8 @@ def _analyse_function(
                 calls.add(node.func.id)
         elif isinstance(node.func, ast.Attribute) and node.func.attr in _READ_METHOD_NAMES:
             target = node.func.value
+            if (call_key := _call_key(target)) is not None:
+                read_calls.add(call_key)
             if isinstance(target, ast.Name):
                 read_names.add(target.id)
                 if target.id in ambiguous_parameters:
@@ -1025,6 +1040,7 @@ def _analyse_function(
         return_names=return_names,
         call_result_assignments=call_result_assignments,
         read_names=read_names,
+        read_calls=read_calls,
     )
 
 
@@ -1226,6 +1242,10 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
             for target, callee in analysis.call_result_assignments.items()
         ):
             analysis.reads_directly = True
+        if any(
+            callee in analyses and analyses[callee].returns_docs for callee in analysis.read_calls
+        ):
+            analysis.reads_directly = True
 
     def reads_transitively(name: str, seen: frozenset[str]) -> bool:
         if name in seen or name not in analyses:
@@ -1376,31 +1396,20 @@ def _assert_conftests_docs_free(tests_root: Path) -> None:
         relative_path = (
             path.relative_to(_REPO).as_posix() if path.is_relative_to(_REPO) else str(path)
         )
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Return)
-                and node.value is not None
-                and (
-                    _expression_is_docs_markdown(node.value, set())
-                    or _expression_has_docs_root(node.value)
-                )
-            ):
-                raise AssertionError(
-                    f"{relative_path}:{node.lineno}: conftest returns docs Markdown provenance"
-                )
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr in _READ_METHOD_NAMES
-                and (
-                    _expression_is_docs_markdown(node.func.value, set())
-                    or _expression_has_docs_root(node.func.value)
-                )
-            ):
-                raise AssertionError(
-                    f"{relative_path}:{node.lineno}: conftest reads docs Markdown provenance"
-                )
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        functions = [
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        probe = (
+            source
+            + "\n\ndef test_conftest_docs_provenance_probe() -> None:\n"
+            + "".join(f"    {name}().read_text()\n" for name in functions)
+        )
+        if _docs_reading_test_modules(probe, filename=relative_path):
+            raise AssertionError(f"{relative_path}: conftest exposes docs Markdown provenance")
 
 
 def _assert_default_pytest_collection_options(options: dict[str, object]) -> None:
@@ -1481,7 +1490,7 @@ def test_docs_governance_rejects_docs_provenance_in_nested_conftests(tmp_path: P
         "conftest.py",
         "nested/conftest.py",
     ]
-    with pytest.raises(AssertionError, match="nested/conftest.py:4: conftest"):
+    with pytest.raises(AssertionError, match="nested/conftest.py: conftest exposes"):
         _assert_conftests_docs_free(tests_root)
 
 
