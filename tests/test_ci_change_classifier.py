@@ -659,12 +659,50 @@ class _FunctionAnalysis:
     unresolved: list[str]
 
 
+_FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
+
+
+def _local_helpers(func: _FunctionNode) -> tuple[dict[str, _FunctionNode], set[str]]:
+    """Collect statically named local def/async/lambda helpers in one function scope."""
+
+    definitions: dict[str, list[_FunctionNode]] = {}
+    assigned: set[str] = set()
+    nodes: list[ast.AST] = list(func.body) if not isinstance(func, ast.Lambda) else [func.body]
+    while nodes:
+        node = nodes.pop(0)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            definitions.setdefault(node.name, []).append(node)
+            nodes.extend(node.body)
+            continue
+        if isinstance(node, ast.ClassDef):
+            continue
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                if isinstance(node.value, ast.Lambda):
+                    definitions.setdefault(target.id, []).append(node.value)
+                else:
+                    assigned.add(target.id)
+        nodes.extend(ast.iter_child_nodes(node))
+    helpers = {
+        name: candidates[0]
+        for name, candidates in definitions.items()
+        if len(candidates) == 1 and name not in assigned
+    }
+    ambiguous = (set(definitions) - set(helpers)) | (assigned & set(definitions))
+    return helpers, ambiguous
+
+
 def _analyse_function(
-    func: ast.FunctionDef | ast.AsyncFunctionDef,
+    func: _FunctionNode,
     module_aliases: set[str],
     known_functions: set[str],
     filename: str,
     class_methods: dict[str, str] | None = None,
+    local_functions: dict[str, str] | None = None,
+    ambiguous_local_functions: set[str] | None = None,
 ) -> _FunctionAnalysis:
     """Walk one function body for a direct docs read, calls, and unresolved reads.
 
@@ -691,7 +729,7 @@ def _analyse_function(
             return target.id in partial_aliases
         return _expression_has_docs_root(target)
 
-    nodes: list[ast.AST] = list(func.body)
+    nodes: list[ast.AST] = list(func.body) if not isinstance(func, ast.Lambda) else [func.body]
     while nodes:
         node = nodes.pop(0)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
@@ -731,6 +769,12 @@ def _analyse_function(
                         "component with no provable '.md' segment — cannot prove this is "
                         "or is not a docs read"
                     )
+            elif node.func.id in (local_functions or {}):
+                calls.add((local_functions or {})[node.func.id])
+            elif node.func.id in (ambiguous_local_functions or set()):
+                unresolved.append(
+                    f"{filename}:{node.lineno}: unresolved local helper edge `{node.func.id}()`"
+                )
             elif node.func.id in known_functions:
                 calls.add(node.func.id)
         elif isinstance(node.func, ast.Attribute) and node.func.attr in _READ_METHOD_NAMES:
@@ -797,7 +841,7 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
                     if isinstance(target, ast.Name):
                         module_aliases.add(target.id)
 
-    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {
+    functions: dict[str, _FunctionNode] = {
         statement.name: statement
         for statement in tree.body
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -822,13 +866,28 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
     fixtures = {
         name
         for name, node in functions.items()
-        if any(_is_pytest_fixture_decorator(decorator) for decorator in node.decorator_list)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(_is_pytest_fixture_decorator(decorator) for decorator in node.decorator_list)
     }
     known_functions = {
         statement.name
         for statement in tree.body
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
+    local_targets: dict[str, dict[str, str]] = {}
+    ambiguous_local_targets: dict[str, set[str]] = {}
+    local_keys: set[str] = set()
+    for owner, node in list(functions.items()):
+        helpers, ambiguous = _local_helpers(node)
+        targets = {name: f"{owner}::<local>::{name}" for name in helpers}
+        local_targets[owner] = targets
+        ambiguous_local_targets[owner] = ambiguous
+        for helper_name, helper in helpers.items():
+            key = targets[helper_name]
+            functions[key] = helper
+            local_targets[key] = targets
+            ambiguous_local_targets[key] = ambiguous
+            local_keys.add(key)
 
     analyses: dict[str, _FunctionAnalysis] = {}
     unresolved: list[str] = []
@@ -840,9 +899,12 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
             known_functions,
             filename,
             class_methods.get(class_name) if class_name else None,
+            local_targets.get(name),
+            ambiguous_local_targets.get(name),
         )
         analyses[name] = analysis
-        unresolved.extend(analysis.unresolved)
+        if name not in local_keys:
+            unresolved.extend(analysis.unresolved)
     if unresolved:
         raise AssertionError(
             "docs-content governance found an unresolved dynamic read receiver that "
@@ -853,6 +915,11 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
         if name in seen or name not in analyses or len(seen) >= _MAX_DOCS_CALL_GRAPH_DEPTH:
             return False
         analysis = analyses[name]
+        if analysis.unresolved:
+            raise AssertionError(
+                "docs-content governance found an unresolved local helper edge that "
+                f"could hide an unmarked docs read: {analysis.unresolved}"
+            )
         if analysis.reads_directly:
             return True
         next_seen = seen | {name}
@@ -860,6 +927,8 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
 
     readers: set[str] = set()
     for name, node in functions.items():
+        if name in local_keys:
+            continue
         if not name.startswith("test_") and "::test_" not in name:
             continue
         param_names = [argument.arg for argument in node.args.args]
@@ -1136,6 +1205,61 @@ def test_docs_governance_follows_a_same_module_fixture() -> None:
         "    assert unrelated == 1\n"
     )
     assert _docs_reading_test_modules(source) == {"test_uses_fixture"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_follows_invoked_local_def_and_ignores_unused_one() -> None:
+    """An invoked nested def propagates its read; an unused nested def does not."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def test_local() -> None:\n"
+        "    def load() -> str:\n"
+        '        return Path("docs/local.md").read_text()\n\n'
+        "    def unused() -> str:\n"
+        '        return Path("docs/unused.md").read_text()\n\n'
+        "    assert load()\n\n"
+        "def test_non_reader() -> None:\n"
+        "    def unused() -> str:\n"
+        '        return Path("docs/never.md").read_text()\n\n'
+        "    assert True\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_local"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_follows_transitive_async_and_lambda_local_helpers() -> None:
+    """Local def, async def, and lambda edges propagate through the bounded graph."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "async def test_async_local() -> None:\n"
+        "    async def middle() -> str:\n"
+        "        return await leaf()\n\n"
+        "    async def leaf() -> str:\n"
+        '        return Path("docs/async.md").read_text()\n\n'
+        "    assert await middle()\n\n"
+        "def test_lambda_local() -> None:\n"
+        '    load = lambda: Path("docs/lambda.md").read_text()\n'
+        "    assert load()\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_async_local", "test_lambda_local"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_fails_closed_on_an_ambiguous_invoked_local_helper() -> None:
+    """An invoked locally rebound helper name is a named fail-closed edge."""
+
+    source = (
+        "def test_ambiguous() -> None:\n"
+        "    def load() -> str:\n"
+        "        return ''\n\n"
+        "    def load() -> str:\n"
+        "        return ''\n\n"
+        "    assert load()\n"
+    )
+    with pytest.raises(AssertionError, match="unresolved local helper edge"):
+        _docs_reading_test_modules(source, filename="local_ambiguous.py")
 
 
 @pytest.mark.docs_ci
