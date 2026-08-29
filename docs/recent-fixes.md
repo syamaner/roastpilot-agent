@@ -11,7 +11,7 @@ Keep entries short-lived: prune once the pattern is no longer a live hazard (the
 underlying code is gone or a test now guards it repo-wide). This is a *hazard list*,
 not a changelog.
 
-Format: one entry per anti-pattern.
+Format: use one entry per anti-pattern.
 - **Signature:** a grep pattern / file glob that flags a likely reintroduction.
 - **Wrong / Right:** the mistake and the fix.
 - **Guarded by:** the test (if any) that now catches it repo-wide.

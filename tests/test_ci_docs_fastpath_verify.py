@@ -1,4 +1,4 @@
-"""Unit and real-Git tests for the docs-fastpath independent re-verification."""
+"""Unit and real-Git coverage for the docs-fastpath independent re-verification."""
 
 from __future__ import annotations
 
