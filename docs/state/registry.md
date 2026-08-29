@@ -1,5 +1,75 @@
 # RoastPilot Agent Project State Registry
 
+## Repository infrastructure
+
+**29 Aug 2026 — #702 slice 2 implementation complete (`Refs #702`; precedent:
+the #735 workflow entry above). Repository-infrastructure work — no product
+epic owns it, so this status block is the completion record (contract §0).**
+This slice activates the docs-only CI fast path designed in slice 1
+(`b00134a`, the inert classifier): `ci.yml` splits every full-path job
+(quality, the three pytest lanes, package, coverage, and the two web workers)
+behind `needs.classify.outputs.mode != 'docs-only'`, adds a `docs-fastpath`
+job that runs only when the verdict is `docs-only`, and turns the three
+required checks (`Checks`, `Web (lint + typecheck + unit)`,
+`Web (Playwright snapshots)`) into tiny, stdlib-only gate jobs that delegate
+their pass/fail decision to the new `scripts/ci_gate_result.py` — a
+fail-closed aggregate that raises on any unknown mode, undeclared job,
+`failure`/`cancelled` result, or duplicate/empty declaration, never on the
+classifier's own "swallow and emit FULL" polarity. The `docs-fastpath` job
+independently re-derives the docs-only verdict from its own checkout via the
+new `scripts/ci_docs_fastpath_verify.py` before trusting anything else
+(imports `ci_change_classifier.classify_change` directly — one authoritative
+grammar, D154 — plus one deliberately narrowing `git diff --name-only`
+redundancy), then runs a focused, non-empty, strict-subset test selection
+(`-m "(docs or docs_ci) and not stress"`, scoped to the eight modules
+`scripts/docs_reader_governance.py` governs, to avoid unrelated collection
+errors from modules outside the selection) with a real Codecov upload
+(`disable_search: true`, no threshold or token change). `codeql.yml` gains a
+matching `classify` job (SHA-pinned checkout, narrowed
+`permissions: {contents: read}`) and skips `analyze` on the same condition;
+every non-`pull_request` trigger (`push`, `schedule`, `workflow_dispatch`)
+is unaffected because the classifier resolves those to `FULL`
+unconditionally.
+
+`scripts/ci_change_classifier.py` is hardened, not just consumed: a
+per-Git-call subprocess timeout and a total wall-clock budget (B5(ii),
+checked before every subsequent call), and the regular-file check now
+compares exact mode bytes at both diff endpoints so a pure
+`100644`→`100755` mode-bit flip on an otherwise-untouched docs file is
+`FULL`, not docs-only. The slice-1 module-level `pytest.mark.docs` sweep
+(1,184 tests across five modules) is replaced by an exact per-function
+inventory from the new shared `scripts/docs_reader_governance.py` analyzer
+(non-literal path construction, a bounded same-module call/fixture graph,
+and a narrow `UnresolvedDocsReaderEdge` for genuine ambiguity rather than a
+silent guess or a broad remark); a new `docs_ci` marker covers the
+fast-path tooling's own focused tests. All 27 `§3.3` mutation-table guards
+were live-mutated (scratch-copy/restore, never `git checkout --`) and
+independently confirmed red before commit; three real gaps found during
+that pass (M20/M23 structural coverage, M25's marker-removal link) were
+closed with new tests. The full local pytest gate (single process, every
+marker), `ruff check`/`ruff format --check`/`pyright` (repo-wide), the web
+gates (`lint`/`typecheck`/`build`/`test:coverage`/`playwright test` — the
+Playwright run confirms the harness itself starts and only the well-known
+darwin-vs-Linux-baseline mismatch fires, per this repo's own documented
+local-Playwright convention), and a from-scratch external venv installed
+with only the new `docs-ci` dependency group (which required adding
+`pytest-asyncio` and `numpy` beyond the originally planned pytest/pytest-cov/
+PyYAML set — both demonstrated requirements, recorded in `pyproject.toml`'s
+own comments) all pass.
+
+**Not claimed by this committed block:** no docs-only or representative
+code/mixed proof PR has been opened against this branch, so A5–A7's live
+required-check/Codecov evidence, CodeQL's `analyze` jobs reporting
+unambiguous `skipped`, and the `push`-to-`main` full-coverage-upload check
+(A8) are all **pending, post-merge (or pre-merge-proof) completion checks**
+— not evidence this entry asserts. Per the ratified contract, proof-PR
+sequencing, the D118 privileged-workflow-review dispatch, and the final
+plan-repo decision row are lead-owned after this handback. **Operating
+note:** a failed, cancelled, or timed-out `classify` job leaves
+`needs.classify.outputs.mode` empty, which `ci_gate_result.py` rejects for
+every declared job — every gate reds closed; re-run the `classify` job (or
+the whole run) rather than treating a red gate here as a product defect.
+
 ## Active Epic
 
 **27 Aug 2026 — #710 (RP-C) slice 3 implementation complete (`Refs #710`,
