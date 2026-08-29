@@ -2,6 +2,37 @@
 
 ## Active Epic
 
+**29 Aug 2026 (lead audit correction) — #702 (D180) slice 3's handback is
+corrected: the prior entry below understated verification with a 14-mutation
+sample. The corrected, complete local verification on the same commit
+`c254d221b20cd5cec91282d17cb1ad34e6635398` (unchanged — no source fix was
+needed, only fuller execution): a self-reconstructed 28-item mutation
+catalogue (this session had no literal access to the original contract's
+verbatim section 3.9 table, disclosed rather than fabricated) — every item
+proven red, then byte-exactly restored via `cp` and confirmed `diff`-clean
+against a fresh pre-mutation snapshot, then green. `cd web && npx playwright
+test` was run for real (not skipped): 12 passed, 25 failed, and every single
+failure traced to the identical documented cause ("A snapshot doesn't exist
+at .../*-darwin.png" — only Linux CI baselines are committed by project
+design; confirmed by inspecting every failure message, none were functional).
+A full single-process `python -m pytest` gate with `OPENROUTER_API_KEY` and
+the entire `ROASTPILOT_*` namespace stripped (leak-check itself passed
+clean, printing no values) ran twice: the first attempt showed one
+self-inflicted failure from running the mutation sweep concurrently with
+this background gate (the nested `test_rendered_qa_full_suite_gate_runs_
+under_the_actual_wrapper` subprocess re-read `ci_change_classifier.py`
+mid-mutation — a real process-isolation mistake, not a product defect); the
+second, isolated re-run passed clean (EXIT=0, 0 failures, 6395/6395, 99%
+coverage). The sole changed non-test Python source file,
+`scripts/ci_change_classifier.py`, measured at 100% statement and 100%
+branch coverage (126 stmts / 50 branches, 0 missed) via its dedicated test
+modules. `git diff --check` was clean; the four structural class-sweep greps
+were re-run with exact outputs matching the first pass; `docs/recent-fixes.md`
+was read in full and cross-checked — no listed hazard signature matches this
+diff; the `pr-preflight` skill's orient/gates/size/self-critique steps were
+followed (its independent-review and draft/ready/merge steps are out of
+scope by explicit operator instruction: no model input, no push, no PR).
+
 **29 Aug 2026 — #702 (D180) slice 3 implemented and locally gated on branch
 `feature/702-docs-only-ci-fast-path-3`, base `fa221a1`. Every exact CI-lane
 command from `ci.yml` was run locally against a fresh worktree-local `.venv`
