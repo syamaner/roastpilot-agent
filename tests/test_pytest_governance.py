@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 import shlex
 import subprocess
@@ -281,22 +282,26 @@ def test_checks_is_a_fail_closed_aggregate_of_every_python_gate() -> None:
     checks_job = _mapping(checks[0])
     assert checks_job["if"] == "always()"
     assert set(cast(list[str], checks_job["needs"])) == {
+        "classify",
         "quality",
         "pytest-ordinary",
         "pytest-serial",
         "pytest-stress",
         "package",
         "coverage",
+        "docs-fastpath",
     }
     check_steps = _steps(checks_job)
-    assert len(check_steps) == 1
-    check_step = check_steps[0]
-    check_run = check_step["run"]
+    gate_step = next(step for step in check_steps if "run" in step)
+    check_run = gate_step["run"]
     assert isinstance(check_run, str)
-    assert _mapping(check_step["env"]) == {"NEEDS_JSON": "${{ toJSON(needs) }}"}
-    assert 'os.environ["NEEDS_JSON"]' in check_run
+    assert _mapping(gate_step["env"]) == {
+        "NEEDS_JSON": "${{ toJSON(needs) }}",
+        "MODE": "${{ needs.classify.outputs.mode }}",
+    }
     assert "${{" not in check_run
-    assert '"success"' in check_run
+    assert check_run.strip().startswith("python3 scripts/ci_gate_result.py")
+
     for job in jobs.values():
         mapped_job = _mapping(job)
         assert "continue-on-error" not in mapped_job
@@ -310,6 +315,7 @@ def test_checks_is_a_fail_closed_aggregate_of_every_python_gate() -> None:
         "pytest-stress",
         "package",
         "coverage",
+        "docs-fastpath",
     ):
         assert "permissions" not in _mapping(jobs[job_id])
     assert _mapping(jobs["web"])["name"] == "Web (lint + typecheck + unit)"
@@ -317,6 +323,8 @@ def test_checks_is_a_fail_closed_aggregate_of_every_python_gate() -> None:
     checks_needs = cast(list[str], checks_job["needs"])
     assert "web" not in checks_needs
     assert "web-snapshots" not in checks_needs
+    assert "web-unit-worker" not in checks_needs
+    assert "web-snapshots-worker" not in checks_needs
 
     quality_steps = _steps(_mapping(jobs["quality"]))
     quality_runs = [step.get("run") for step in quality_steps]
@@ -337,3 +345,361 @@ def test_checks_is_a_fail_closed_aggregate_of_every_python_gate() -> None:
             if uses is not None:
                 assert isinstance(uses, str)
                 assert uses.startswith("actions/") or uses == "codecov/codecov-action@v5"
+
+
+# ---------------------------------------------------------------------------
+# Gate/worker split structure (#702 slice 2). The classify job's mode is now
+# consumed by every conditional job and every gate; these tests are the
+# authoritative replacement for the slice-1 inertness test retired at
+# tests/test_ci_change_classifier.py:549-577 (contract §3.1, "Slice-1
+# inertness test retirement" — this contract is the ratified slice-2
+# authority that supersedes it).
+# ---------------------------------------------------------------------------
+
+_REQUIRED_CHECK_NAMES = {
+    "Checks",
+    "Web (lint + typecheck + unit)",
+    "Web (Playwright snapshots)",
+}
+_GATE_JOB_IDS = {"checks", "web", "web-snapshots"}
+_FULL_ONLY_JOB_IDS = {
+    "quality",
+    "pytest-ordinary",
+    "pytest-serial",
+    "pytest-stress",
+    "package",
+    "coverage",
+    "web-unit-worker",
+    "web-snapshots-worker",
+}
+_DOCS_ONLY_JOB_IDS = {"docs-fastpath"}
+_FULL_ONLY_CONDITION = "needs.classify.outputs.mode != 'docs-only'"
+_DOCS_ONLY_CONDITION = "needs.classify.outputs.mode == 'docs-only'"
+
+
+def _gate_run_step(job: dict[str, object]) -> dict[str, object]:
+    """Return the sole `ci_gate_result.py`-invoking step of a gate job."""
+    steps = _steps(job)
+    gate_steps = [step for step in steps if "run" in step]
+    assert len(gate_steps) == 1
+    return gate_steps[0]
+
+
+def _gate_argv_classes(run: str) -> tuple[set[str], set[str], set[str]]:
+    """Parse a gate's `--always`/`--full-only`/`--docs-only` argv into three sets."""
+    tokens = shlex.split(run)
+    always: set[str] = set()
+    full_only: set[str] = set()
+    docs_only: set[str] = set()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--always":
+            always.add(tokens[index + 1])
+            index += 2
+        elif token == "--full-only":
+            full_only.add(tokens[index + 1])
+            index += 2
+        elif token == "--docs-only":
+            docs_only.add(tokens[index + 1])
+            index += 2
+        else:
+            index += 1
+    return always, full_only, docs_only
+
+
+def test_required_check_names_appear_exactly_once_on_trivial_gate_jobs() -> None:
+    """Each required check name is a tiny gate: checkout + the gate script only."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    seen_names: dict[str, str] = {}
+    for job_id, job in jobs.items():
+        mapped = _mapping(job)
+        name = mapped.get("name")
+        if not isinstance(name, str) or name not in _REQUIRED_CHECK_NAMES:
+            continue
+        assert name not in seen_names, f"{name!r} appears on both {seen_names[name]} and {job_id}"
+        seen_names[name] = job_id
+        assert job_id in _GATE_JOB_IDS
+        steps = _steps(mapped)
+        assert len(steps) == 2
+        checkout, gate_step = steps
+        assert checkout["uses"] == "actions/checkout@v6.0.2"
+        checkout_with = cast(dict[str, object], checkout.get("with", {}))
+        assert checkout_with.get("persist-credentials") is False
+        run = gate_step["run"]
+        assert isinstance(run, str)
+        assert "install" not in run.lower()
+        assert "${{" not in run
+        assert "permissions" not in mapped
+        assert mapped.get("timeout-minutes") == 10
+    assert set(seen_names) == _REQUIRED_CHECK_NAMES
+    assert set(seen_names.values()) == _GATE_JOB_IDS
+
+
+def test_every_gate_needs_equals_its_declared_argv_class_union() -> None:
+    """A gate's `needs` list is exactly the union of its declared argv classes."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    for job_id in _GATE_JOB_IDS:
+        job = _mapping(jobs[job_id])
+        run = cast(str, _gate_run_step(job)["run"])
+        always, full_only, docs_only = _gate_argv_classes(run)
+        declared = always | full_only | docs_only
+        assert len(always) + len(full_only) + len(docs_only) == len(declared), (
+            f"{job_id}: a job id is declared in more than one class"
+        )
+        needs = job.get("needs", [])
+        needs_set = {needs} if isinstance(needs, str) else set(cast(list[str], needs))
+        assert needs_set == declared, f"{job_id}: needs {needs_set} != declared {declared}"
+        assert "classify" in always
+
+
+def test_checks_gate_declares_the_full_docs_only_worker_partition() -> None:
+    """The `Checks` gate's declared classes match the full-only/docs-only job sets."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    run = cast(str, _gate_run_step(_mapping(jobs["checks"]))["run"])
+    always, full_only, docs_only = _gate_argv_classes(run)
+    assert always == {"classify"}
+    assert full_only == {
+        "quality",
+        "pytest-ordinary",
+        "pytest-serial",
+        "pytest-stress",
+        "package",
+        "coverage",
+    }
+    assert docs_only == {"docs-fastpath"}
+
+
+def test_full_only_jobs_carry_the_exact_condition_and_need_classify() -> None:
+    """Every full-only job's `if` is the exact string, never a status function."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    for job_id in _FULL_ONLY_JOB_IDS:
+        job = _mapping(jobs[job_id])
+        assert job.get("if") == _FULL_ONLY_CONDITION, job_id
+        needs = job.get("needs", [])
+        needs_set = {needs} if isinstance(needs, str) else set(cast(list[str], needs))
+        assert "classify" in needs_set, job_id
+
+
+def test_docs_fastpath_carries_the_exact_docs_only_condition() -> None:
+    """`docs-fastpath`'s `if` is the exact equality form, and it needs classify."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    job = _mapping(jobs["docs-fastpath"])
+    assert job.get("if") == _DOCS_ONLY_CONDITION
+    needs = job.get("needs", [])
+    needs_set = {needs} if isinstance(needs, str) else set(cast(list[str], needs))
+    assert needs_set == {"classify"}
+
+
+def test_no_worker_if_condition_uses_a_status_function() -> None:
+    """No full-only/docs-only worker `if` contains `always()`, `failure()`, or `!cancelled()`."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    for job_id in _FULL_ONLY_JOB_IDS | _DOCS_ONLY_JOB_IDS:
+        condition = _mapping(jobs[job_id]).get("if")
+        assert isinstance(condition, str)
+        for forbidden in ("always()", "failure()", "!cancelled()"):
+            assert forbidden not in condition, f"{job_id}: {condition!r} contains {forbidden!r}"
+
+
+def test_no_trigger_level_path_filtering_or_continue_on_error_in_either_workflow() -> None:
+    """Class 2 sweep: no `paths`/`paths-ignore`/`continue-on-error` in either workflow."""
+    for workflow_path in (
+        REPO_ROOT / ".github" / "workflows" / "ci.yml",
+        REPO_ROOT / ".github" / "workflows" / "codeql.yml",
+    ):
+        text = workflow_path.read_text(encoding="utf-8")
+        assert "paths:" not in text
+        assert "paths-ignore:" not in text
+        assert "continue-on-error" not in text
+
+
+def test_every_ci_job_declares_a_timeout() -> None:
+    """Every job in `ci.yml` carries `timeout-minutes` (a timeout is a job failure)."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    for job_id, job in jobs.items():
+        assert "timeout-minutes" in _mapping(job), job_id
+
+
+def test_docs_fastpath_pytest_invocation_is_not_a_governed_lane() -> None:
+    """The docs-fastpath job's own pytest step is outside the four governed lanes."""
+    workflow = _workflow()
+    lane_job_ids = {job_id for job_id, _, _ in _pytest_lanes(workflow)}
+    assert "docs-fastpath" not in lane_job_ids
+    jobs = _mapping(workflow["jobs"])
+    docs_fastpath_steps = _steps(_mapping(jobs["docs-fastpath"]))
+    pytest_runs = [
+        step["run"]
+        for step in docs_fastpath_steps
+        if isinstance(step.get("run"), str) and "pytest" in cast(str, step["run"])
+    ]
+    assert len(pytest_runs) == 1
+    assert '-m "(docs or docs_ci) and not stress"' in cast(str, pytest_runs[0])
+
+
+def test_docs_fastpath_selection_is_nonempty_strict_subset_matching_governance() -> None:
+    """The exact `(docs or docs_ci)` collection matches the governance-derived inventory."""
+    docs_returncode, docs_selected, docs_output = _collect_nodeids(
+        ["-m", "(docs or docs_ci) and not stress"]
+    )
+    assert docs_returncode == 0, docs_output
+    full_returncode, full, full_output = _collect_nodeids([])
+    assert full_returncode == 0, full_output
+    assert docs_selected
+    assert docs_selected < full
+
+    governed_modules = {
+        "test_agent_model_pins.py",
+        "test_agent_worktree_controls.py",
+        "test_capture_agent_usage.py",
+        "test_config.py",
+        "test_worktree_gate_recipe.py",
+        "test_ci_change_classifier.py",
+        "test_ci_gate_result.py",
+        "test_ci_docs_fastpath_verify.py",
+    }
+    expected: set[str] = set()
+    for path in sorted((REPO_ROOT / "tests").glob("test_*.py")):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        module_marked = False
+        function_marked: set[str] = set()
+        for statement in tree.body:
+            if isinstance(statement, ast.Assign):
+                target_names = {
+                    target.id for target in statement.targets if isinstance(target, ast.Name)
+                }
+                if "pytestmark" in target_names:
+                    value = statement.value
+                    expressions = (
+                        value.elts if isinstance(value, (ast.List, ast.Tuple)) else [value]
+                    )
+                    if any(
+                        ast.unparse(expression) in {"pytest.mark.docs", "pytest.mark.docs_ci"}
+                        for expression in expressions
+                    ):
+                        module_marked = True
+            if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in statement.decorator_list:
+                if ast.unparse(decorator) in {"pytest.mark.docs", "pytest.mark.docs_ci"}:
+                    function_marked.add(statement.name)
+        if module_marked:
+            marked = {
+                statement.name
+                for statement in tree.body
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and statement.name.startswith("test_")
+            }
+        else:
+            marked = function_marked
+        if not marked:
+            continue
+        assert path.name in governed_modules, f"unexpected docs/docs_ci marker in {path.name}"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--collect-only",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                "--override-ini",
+                "addopts=",
+                str(path),
+            ],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        for nodeid in result.stdout.splitlines():
+            nodeid = nodeid.strip()
+            if not re.fullmatch(r"tests/.*::.*", nodeid):
+                continue
+            function_name = nodeid.split("::")[-1].split("[")[0]
+            if function_name in marked:
+                expected.add(nodeid)
+    assert docs_selected == expected
+
+
+def test_web_snapshots_worker_retains_permissions_and_container_pin() -> None:
+    """The moved Playwright worker keeps its narrowed permissions and image pin."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    worker = _mapping(jobs["web-snapshots-worker"])
+    assert worker["permissions"] == {"contents": "read", "packages": "read"}
+    container = _mapping(worker["container"])
+    assert container["image"] == "ghcr.io/${{ github.repository }}/playwright:v1.55.1-noble"
+
+
+def test_gate_jobs_declare_no_permissions_block() -> None:
+    """Gate jobs inherit the workflow-level `contents: read`; they declare none of their own."""
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    for job_id in _GATE_JOB_IDS:
+        assert "permissions" not in _mapping(jobs[job_id])
+
+
+# ---------------------------------------------------------------------------
+# CodeQL structure (#702 slice 2, B3).
+# ---------------------------------------------------------------------------
+
+
+def _codeql_workflow() -> dict[str, object]:
+    """Load the CodeQL workflow as a structural mapping."""
+    loaded = yaml.safe_load((REPO_ROOT / ".github/workflows/codeql.yml").read_text())
+    assert isinstance(loaded, dict)
+    raw_workflow = cast(dict[object, object], loaded)
+    normalized = {
+        "on" if key is True else cast(str, key): value for key, value in raw_workflow.items()
+    }
+    return _mapping(normalized)
+
+
+def test_codeql_analyze_needs_classify_with_the_exact_docs_only_condition() -> None:
+    """`analyze` is skipped only on a docs-only PR; every other trigger still analyzes."""
+    workflow = _codeql_workflow()
+    jobs = _mapping(workflow["jobs"])
+    analyze = _mapping(jobs["analyze"])
+    assert cast(list[str], analyze["needs"]) == ["classify"]
+    assert analyze["if"] == _FULL_ONLY_CONDITION
+
+
+def test_codeql_classify_pins_checkout_by_sha_and_narrows_permissions() -> None:
+    """The new `classify` job matches this file's SHA-pin convention and narrows permissions."""
+    workflow = _codeql_workflow()
+    jobs = _mapping(workflow["jobs"])
+    classify = _mapping(jobs["classify"])
+    assert classify["permissions"] == {"contents": "read"}
+    steps = _steps(classify)
+    checkout = steps[0]
+    uses = cast(str, checkout["uses"])
+    assert uses.startswith("actions/checkout@")
+    assert "@v" not in uses.split("#")[0], "checkout must be SHA-pinned, not tag-pinned"
+    assert re.fullmatch(r"actions/checkout@[0-9a-f]{40}", uses)
+
+
+def test_codeql_matrix_and_triggers_are_unwidened_and_unnarrowed() -> None:
+    """The three-language matrix and all four triggers survive the split untouched."""
+    workflow = _codeql_workflow()
+    jobs = _mapping(workflow["jobs"])
+    analyze = _mapping(jobs["analyze"])
+    strategy = _mapping(analyze["strategy"])
+    assert strategy["fail-fast"] is False
+    matrix = _mapping(strategy["matrix"])
+    assert matrix["language"] == ["actions", "javascript-typescript", "python"]
+
+    triggers = _mapping(workflow["on"])
+    assert _mapping(triggers["push"])["branches"] == ["main"]
+    assert _mapping(triggers["pull_request"])["branches"] == ["main"]
+    assert "schedule" in triggers
+    assert "workflow_dispatch" in triggers
