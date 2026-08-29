@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import runpy
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -10,6 +12,7 @@ import ci_change_classifier
 import ci_docs_fastpath_verify as verify
 import pytest
 
+_REPO = Path(__file__).resolve().parents[1]
 _BASE = "a" * 40
 _HEAD = "b" * 40
 
@@ -203,6 +206,18 @@ def test_writes_nothing_to_github_output(monkeypatch: pytest.MonkeyPatch) -> Non
     # GITHUB_OUTPUT at all, unlike `ci_change_classifier`.
     verify.verify_docs_only(_BASE, _HEAD)
     assert "GITHUB_OUTPUT" not in Path(verify.__file__).read_text(encoding="utf-8")
+
+
+@pytest.mark.docs_ci
+def test_module_entrypoint_reports_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The committed script entrypoint runs `main` and exits with its return code."""
+
+    monkeypatch.setattr(
+        sys, "argv", ["ci_docs_fastpath_verify.py", "--base-sha", "not-a-sha", "--head-sha", _HEAD]
+    )
+    with pytest.raises(SystemExit) as result:
+        runpy.run_path(str(_REPO / "scripts" / "ci_docs_fastpath_verify.py"), run_name="__main__")
+    assert result.value.code == 1
 
 
 @pytest.mark.slow

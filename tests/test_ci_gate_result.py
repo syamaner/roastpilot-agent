@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import runpy
+import sys
+from pathlib import Path
+
 import ci_gate_result
 import pytest
 
@@ -9,6 +13,8 @@ import pytest
 # focused test suite — the docs-only CI fast path (#702) runs it to trust
 # the mechanism that grants its own shortcut.
 pytestmark = pytest.mark.docs_ci
+
+_REPO = Path(__file__).resolve().parents[1]
 
 
 def _needs(**results: str) -> dict[str, object]:
@@ -217,6 +223,77 @@ def test_duplicate_job_id_across_classes_is_rejected() -> None:
             full_only=["classify"],
             docs_only=[],
         )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"always": ["classify", "classify"], "full_only": [], "docs_only": []},
+        {"always": [], "full_only": ["quality", "quality"], "docs_only": []},
+        {"always": [], "full_only": [], "docs_only": ["docs-fastpath", "docs-fastpath"]},
+    ],
+)
+def test_duplicate_job_id_within_one_class_is_rejected(kwargs: dict[str, list[str]]) -> None:
+    """A job id repeated within the SAME declared class is also an authoring error."""
+
+    with pytest.raises(ci_gate_result.GateResultError, match="more than one class"):
+        ci_gate_result.evaluate_gate("full", _needs(classify="success"), **kwargs)
+
+
+def test_needs_entry_that_is_not_an_object_is_rejected() -> None:
+    """A `needs.<id>` entry that isn't itself a JSON object has no `result` to check."""
+
+    with pytest.raises(ci_gate_result.GateResultError, match="no string 'result'"):
+        ci_gate_result.evaluate_gate(
+            "full",
+            {"classify": "not-an-object"},
+            always=["classify"],
+            full_only=[],
+            docs_only=[],
+        )
+
+
+def test_load_needs_rejects_a_missing_environment_value() -> None:
+    """`_load_needs(None)` fails closed rather than defaulting to an empty mapping."""
+
+    with pytest.raises(ci_gate_result.GateResultError, match="missing or empty"):
+        ci_gate_result._load_needs(None)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_load_needs_rejects_malformed_json() -> None:
+    """Genuinely malformed JSON in NEEDS_JSON fails closed with a named reason."""
+
+    with pytest.raises(ci_gate_result.GateResultError, match="not valid JSON"):
+        ci_gate_result._load_needs("{not json")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_load_needs_rejects_valid_json_that_is_not_an_object() -> None:
+    """Valid JSON that parses to a non-object (e.g. a list) is still rejected."""
+
+    with pytest.raises(ci_gate_result.GateResultError, match="not a JSON object"):
+        ci_gate_result._load_needs("[]")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_main_reports_malformed_needs_json_end_to_end(capsys: pytest.CaptureFixture[str]) -> None:
+    """`main` surfaces a malformed NEEDS_JSON environment value as a clean non-zero exit."""
+
+    exit_code = ci_gate_result.main(
+        ["--always", "classify"],
+        {"NEEDS_JSON": "{not json", "MODE": "full"},
+    )
+    assert exit_code == 1
+    assert "not valid JSON" in capsys.readouterr().err
+
+
+def test_module_entrypoint_reports_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The committed script entrypoint runs `main` and exits with its return code."""
+
+    monkeypatch.setenv("NEEDS_JSON", '{"classify": {"result": "success"}}')
+    monkeypatch.setenv("MODE", "full")
+    monkeypatch.setattr(sys, "argv", ["ci_gate_result.py", "--always", "classify"])
+    with pytest.raises(SystemExit) as result:
+        runpy.run_path(str(_REPO / "scripts" / "ci_gate_result.py"), run_name="__main__")
+    assert result.value.code == 0
 
 
 def test_failure_message_names_mode_and_expected_versus_actual_with_no_env_dump() -> None:

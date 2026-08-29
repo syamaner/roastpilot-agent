@@ -87,7 +87,7 @@ def _recomputed_docs_only_paths(base_sha: str, head_sha: str) -> tuple[str, ...]
         names = tuple(name.decode("utf-8", errors="strict") for name in raw[:-1].split(b"\0"))
     except UnicodeDecodeError as error:
         raise DocsFastpathVerificationError(f"changed path is not valid UTF-8: {error}") from error
-    if not names:
+    if not names:  # pragma: no cover — bytes.split always yields >=1 element, even on b""
         raise DocsFastpathVerificationError("independent recomputation found no changed paths")
     return names
 

@@ -302,7 +302,8 @@ def test_empty_or_invalid_merge_base_is_full(
 ) -> None:
     """An empty or malformed merge-base result cannot be docs-only."""
 
-    def fake_git(arguments: Iterable[str]) -> bytes:
+    def fake_git(arguments: Iterable[str], *, deadline: float = math.inf) -> bytes:
+        del deadline
         command = tuple(arguments)
         if command[:2] == ("cat-file", "-e"):
             return b""
@@ -327,7 +328,8 @@ def test_git_failures_and_exceptions_are_full(
 ) -> None:
     """Missing objects, diff failure, and any Git exception are fail-closed."""
 
-    def fake_git(arguments: Iterable[str]) -> bytes:
+    def fake_git(arguments: Iterable[str], *, deadline: float = math.inf) -> bytes:
+        del deadline
         command = tuple(arguments)
         if command[0] == failing_command:
             raise OSError("unavailable")
@@ -775,3 +777,44 @@ def test_unresolved_dynamic_call_edge_fails_the_governance_test_with_a_named_rea
     )
     with pytest.raises(UnresolvedDocsReaderEdge, match="test_ambiguous"):
         docs_reading_tests(source)
+
+
+def test_unresolved_dynamic_call_edge_via_builtin_open_also_raises() -> None:
+    """The same ambiguity through the builtin `open()` call form also raises."""
+
+    source = (
+        "from pathlib import Path\n"
+        "DOCS_DIR = Path('docs')\n"
+        "def test_ambiguous() -> None:\n"
+        "    open(DOCS_DIR).read()\n"
+    )
+    with pytest.raises(UnresolvedDocsReaderEdge, match="test_ambiguous"):
+        docs_reading_tests(source)
+
+
+def test_triple_alias_chain_needs_the_full_fixed_point_iteration() -> None:
+    """A three-hop alias chain, declared in reverse order, still resolves as a reader."""
+
+    source = (
+        "from pathlib import Path\n"
+        "def test_reads() -> None:\n"
+        "    third = second\n"
+        "    second = first\n"
+        "    first = Path('docs/guide.md')\n"
+        "    third.read_text()\n"
+    )
+    assert docs_reading_tests(source) == {"test_reads"}
+
+
+def test_cyclic_same_module_helper_calls_resolve_without_crashing() -> None:
+    """A same-module call cycle resolves deterministically instead of recursing forever."""
+
+    source = (
+        "def _a() -> None:\n"
+        "    _b()\n"
+        "def _b() -> None:\n"
+        "    _a()\n"
+        "def test_reads() -> None:\n"
+        "    _a()\n"
+    )
+    assert docs_reading_tests(source) == set()
