@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import ast
+import shutil
 import stat
 import sys
 from pathlib import Path
 from typing import cast
 
+import pytest
 import yaml
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -47,8 +49,25 @@ def test_workflows_remain_inert_and_do_not_reference_the_future_gate_authority()
 def test_helper_file_is_present_at_its_exact_regular_repository_path() -> None:
     """Future deletion or replacement with a symlink cannot silently strand trusted-base CI."""
 
-    assert _SCRIPT.is_file()
-    assert stat.S_ISREG(_SCRIPT.stat().st_mode)
+    metadata = _SCRIPT.lstat()
+    assert not _SCRIPT.is_symlink()
+    assert stat.S_ISREG(metadata.st_mode)
+
+
+@pytest.mark.serial
+def test_helper_file_presence_rejects_a_symlink_mutation(tmp_path: Path) -> None:
+    """A real helper-path symlink fails closed, then restores from scratch only."""
+
+    scratch_copy = tmp_path / _SCRIPT.name
+    shutil.copy2(_SCRIPT, scratch_copy)
+    try:
+        _SCRIPT.unlink()
+        _SCRIPT.symlink_to(scratch_copy)
+        with pytest.raises(AssertionError):
+            test_helper_file_is_present_at_its_exact_regular_repository_path()
+    finally:
+        _SCRIPT.unlink(missing_ok=True)
+        shutil.copy2(scratch_copy, _SCRIPT)
 
 
 def _import_roots(source: str) -> set[str]:
