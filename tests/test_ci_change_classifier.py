@@ -22,6 +22,14 @@ import ci_change_classifier as classifier
 import pytest
 from docs_reader_governance import UnresolvedDocsReaderEdge, docs_reading_tests
 
+# The whole module is fast, hardware-free, and IS the classifier's own focused
+# test suite (never a docs/**/*.md content reader itself) — the docs-only CI
+# fast path (#702) runs it to trust the mechanism that grants its own
+# shortcut. The real-Git integration coverage lives in the separate `slow`
+# tests/test_ci_change_classifier_real_git.py, deliberately excluded here to
+# keep the fast path fast.
+pytestmark = pytest.mark.docs_ci
+
 _REPO = Path(__file__).resolve().parents[1]
 _BASE = "a" * 40
 _HEAD = "b" * 40

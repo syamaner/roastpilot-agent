@@ -5,6 +5,11 @@ from __future__ import annotations
 import ci_gate_result
 import pytest
 
+# The whole module is fast, hardware-free, and IS the gate script's own
+# focused test suite — the docs-only CI fast path (#702) runs it to trust
+# the mechanism that grants its own shortcut.
+pytestmark = pytest.mark.docs_ci
+
 
 def _needs(**results: str) -> dict[str, object]:
     """Build a ``toJSON(needs)`` payload from ``job_id=result`` keyword pairs."""
