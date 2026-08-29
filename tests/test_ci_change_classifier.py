@@ -28,10 +28,10 @@ def _name_status(*fields: bytes) -> bytes:
     return b"\0".join(fields) + b"\0"
 
 
-def _regular_tree_entry(path: bytes) -> bytes:
+def _regular_tree_entry(path: bytes, mode: bytes = b"100644") -> bytes:
     """Build a regular-file ``git ls-tree -z`` record for ``path``."""
 
-    return b"100644 blob " + (b"d" * 40) + b"\t" + path + b"\0"
+    return mode + b" blob " + (b"d" * 40) + b"\t" + path + b"\0"
 
 
 def _install_git_fixture(
@@ -39,6 +39,7 @@ def _install_git_fixture(
     diff: bytes,
     *,
     regular_paths: set[tuple[str, bytes]] | None = None,
+    modes: dict[tuple[str, bytes], bytes] | None = None,
 ) -> list[tuple[str, ...]]:
     """Install a deterministic local Git transcript and return its command log."""
 
@@ -58,7 +59,8 @@ def _install_git_fixture(
         if command[:2] == ("ls-tree", "-z"):
             commit, path = command[2], command[-1].encode()
             if admitted is None or (commit, path) in admitted:
-                return _regular_tree_entry(path)
+                mode = b"100644" if modes is None else modes.get((commit, path), b"100644")
+                return _regular_tree_entry(path, mode)
             return b"120000 blob " + (b"e" * 40) + b"\t" + path + b"\0"
         raise AssertionError(f"unexpected Git command: {command!r}")
 
@@ -191,6 +193,44 @@ def test_symlink_is_full_even_when_its_path_matches_the_docs_grammar(
     assert classifier.classify_change("pull_request", _BASE, _HEAD) is classifier.ChangeMode.FULL
 
 
+@pytest.mark.parametrize("status", [b"M", b"R100", b"C100"])
+def test_regular_mode_transition_is_full(monkeypatch: pytest.MonkeyPatch, status: bytes) -> None:
+    """An admitted docs path changing 100644/100755 fails closed."""
+
+    paths = (b"docs/safe.md",) if status == b"M" else (b"docs/old.md", b"docs/new.md")
+    modes = {(_MERGE_BASE, paths[0]): b"100644", (_HEAD, paths[-1]): b"100755"}
+    _install_git_fixture(monkeypatch, _name_status(status, *paths), modes=modes)
+    assert classifier.classify_change("pull_request", _BASE, _HEAD) is classifier.ChangeMode.FULL
+
+
+@pytest.mark.parametrize("status", [b"M", b"R100", b"C100"])
+def test_unchanged_regular_mode_is_docs_only(
+    monkeypatch: pytest.MonkeyPatch, status: bytes
+) -> None:
+    """Content-only changes retain docs-only when both regular modes match."""
+
+    paths = (b"docs/safe.md",) if status == b"M" else (b"docs/old.md", b"docs/new.md")
+    modes = {(_MERGE_BASE, paths[0]): b"100755", (_HEAD, paths[-1]): b"100755"}
+    _install_git_fixture(monkeypatch, _name_status(status, *paths), modes=modes)
+    assert (
+        classifier.classify_change("pull_request", _BASE, _HEAD) is classifier.ChangeMode.DOCS_ONLY
+    )
+
+
+@pytest.mark.parametrize("status", [b"A", b"D"])
+def test_executable_regular_addition_or_deletion_is_docs_only(
+    monkeypatch: pytest.MonkeyPatch, status: bytes
+) -> None:
+    """A/D admit either regular mode because no mode comparison exists."""
+
+    commit = _HEAD if status == b"A" else _MERGE_BASE
+    modes = {(commit, b"docs/executable.md"): b"100755"}
+    _install_git_fixture(monkeypatch, _name_status(status, b"docs/executable.md"), modes=modes)
+    assert (
+        classifier.classify_change("pull_request", _BASE, _HEAD) is classifier.ChangeMode.DOCS_ONLY
+    )
+
+
 @pytest.mark.parametrize(
     "payload",
     [b"\xff\0docs/safe.md\0", b"A\0", b"R100\0docs/old.md\0", b"A\0docs/safe.md"],
@@ -228,11 +268,11 @@ def test_regular_file_confirmation_failure_is_full_for_every_admitted_status(
 ) -> None:
     """No admitted status can bypass the regular-file confirmation."""
 
-    def not_regular(_commit: str, _path: bytes, *, deadline: float | None = None) -> bool:
+    def not_regular(_commit: str, _path: bytes, *, deadline: float | None = None) -> bytes | None:
         del deadline
-        return False
+        return None
 
-    monkeypatch.setattr(classifier, "_is_regular_file", not_regular)
+    monkeypatch.setattr(classifier, "_regular_file_mode", not_regular)
     assert not classifier._entries_are_docs_only([entry], _MERGE_BASE, _HEAD)  # pyright: ignore[reportPrivateUsage]
 
 
