@@ -150,21 +150,10 @@ def test_a_real_gitlink_submodule_entry_is_full(
     _write(repo, "README.md", "root\n")
     base = _commit(repo, "root")
 
-    submodule = tmp_path / "submodule"
-    _init_repo(submodule)
-    _write(submodule, "file.txt", "content\n")
-    _commit(submodule, "submodule root")
-
-    _git(
-        repo,
-        "-c",
-        "protocol.file.allow=always",
-        "submodule",
-        "add",
-        str(submodule),
-        "docs/sub.md",
-    )
-    head = _commit(repo, "add a real gitlink under docs")
+    _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{base},docs/sub.md")
+    _git(repo, "commit", "--quiet", "-m", "add a real gitlink under docs")
+    head = _git(repo, "rev-parse", "HEAD")
+    assert _git(repo, "diff", "--name-only", base, head).splitlines() == ["docs/sub.md"]
 
     monkeypatch.chdir(repo)
     assert classifier.classify_change("pull_request", base, head) is classifier.ChangeMode.FULL

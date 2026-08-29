@@ -92,6 +92,40 @@ def test_run_git_uses_only_the_local_closed_command_shape(monkeypatch: pytest.Mo
     ]
 
 
+@pytest.mark.docs_ci
+def test_run_git_caps_a_near_deadline_call_to_the_remaining_total_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A started Git call cannot outlive the classifier's remaining total budget."""
+
+    observed: list[float] = []
+
+    def fake_run(_arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        observed.append(cast(float, kwargs["timeout"]))
+        return subprocess.CompletedProcess([], 0, stdout=b"")
+
+    monkeypatch.setattr(classifier.time, "monotonic", lambda: 59.5)
+    monkeypatch.setattr(classifier.subprocess, "run", fake_run)
+    classifier._run_git(["status"], deadline=60.0)  # pyright: ignore[reportPrivateUsage]
+    assert observed == [0.5]
+
+
+@pytest.mark.docs_ci
+def test_run_git_does_not_spawn_when_the_total_budget_is_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero remaining budget fails closed before any subprocess launch."""
+
+    monkeypatch.setattr(classifier.time, "monotonic", lambda: 60.0)
+
+    def no_spawn(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        pytest.fail("expired budget must not spawn Git")
+
+    monkeypatch.setattr(classifier.subprocess, "run", no_spawn)
+    with pytest.raises(classifier._BudgetExceeded):  # pyright: ignore[reportPrivateUsage]
+        classifier._run_git(["status"], deadline=60.0)  # pyright: ignore[reportPrivateUsage]
+
+
 @pytest.mark.parametrize("status", [b"A", b"M", b"D"])
 def test_classifies_single_allowed_markdown_status_as_docs_only(
     monkeypatch: pytest.MonkeyPatch, status: bytes
@@ -754,6 +788,12 @@ def _analyse_function(
             has_docs_glob = True
             if isinstance(node.target, ast.Name):
                 aliases.add(node.target.id)
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            for generator in node.generators:
+                if _is_docs_markdown_glob_call(generator.iter, docs_root_aliases) and isinstance(
+                    generator.target, ast.Name
+                ):
+                    aliases.add(generator.target.id)
         if _is_docs_markdown_glob_call(node, docs_root_aliases):
             has_docs_glob = True
         if not isinstance(node, ast.Call):
@@ -1154,6 +1194,29 @@ def test_docs_governance_detects_a_hidden_unmarked_markdown_read() -> None:
         pytest.param(
             "from pathlib import Path\n\n"
             "def test_a() -> None:\n"
+            '    texts = [entry.read_text() for entry in Path("docs").glob("*.md")]\n'
+            "    assert texts\n",
+            {"test_a"},
+            id="list-comprehension-docs-glob",
+        ),
+        pytest.param(
+            "from pathlib import Path\n\n"
+            "def test_a() -> None:\n"
+            '    assert any(entry.read_text() for entry in Path("docs").rglob("*.md"))\n',
+            {"test_a"},
+            id="generator-comprehension-docs-rglob",
+        ),
+        pytest.param(
+            "from pathlib import Path\n\n"
+            "def test_a() -> None:\n"
+            '    texts = [entry.read_text() for entry in Path("config").glob("*.md")]\n'
+            "    assert texts\n",
+            set[str](),
+            id="list-comprehension-non-docs-negative",
+        ),
+        pytest.param(
+            "from pathlib import Path\n\n"
+            "def test_a() -> None:\n"
             '    for entry in Path("config").glob("*.md"):\n'
             "        entry.read_text()\n",
             set[str](),
@@ -1429,6 +1492,9 @@ _EXACT_CLASSIFY_CONSUMERS = frozenset(
 )
 _FULL_ONLY_WORKER_CONDITION = "needs.classify.outputs.mode != 'docs-only'"
 _DOCS_ONLY_CONDITION = "needs.classify.outputs.mode == 'docs-only'"
+_DOCS_FASTPATH_CONDITION = (
+    "needs.classify.outputs.mode == 'docs-only' || needs.classify.outputs.mode == 'full'"
+)
 _GATE_JOBS = frozenset({"checks", "web", "web-snapshots"})
 _FULL_ONLY_WORKERS = frozenset(
     {
@@ -1493,6 +1559,8 @@ def test_ci_classifier_job_uses_closed_checkout_settings_and_base_trusted_execut
         elif name in _FULL_ONLY_WORKERS:
             assert job.get("if") == _FULL_ONLY_WORKER_CONDITION, f"{name}: wrong worker condition"
         elif name == "docs-fastpath":
-            assert job.get("if") == _DOCS_ONLY_CONDITION, "docs-fastpath: wrong worker condition"
+            assert job.get("if") == _DOCS_FASTPATH_CONDITION, (
+                "docs-fastpath: wrong worker condition"
+            )
 
     assert actual_consumers == _EXACT_CLASSIFY_CONSUMERS

@@ -24,7 +24,7 @@ _REQUIRED_CHECK_NAMES = {
 }
 _GATE_ARGV_CLASSES: dict[str, dict[str, tuple[str, ...]]] = {
     "checks": {
-        "always": ("classify",),
+        "always": ("classify", "docs-fastpath"),
         "full-only": (
             "quality",
             "pytest-ordinary",
@@ -33,7 +33,7 @@ _GATE_ARGV_CLASSES: dict[str, dict[str, tuple[str, ...]]] = {
             "package",
             "coverage",
         ),
-        "docs-only": ("docs-fastpath",),
+        "docs-only": (),
     },
     "web": {"always": ("classify",), "full-only": ("web-unit-worker",), "docs-only": ()},
     "web-snapshots": {
@@ -54,6 +54,9 @@ _FULL_ONLY_WORKER_JOBS = (
 )
 _FULL_ONLY_CONDITION = "needs.classify.outputs.mode != 'docs-only'"
 _DOCS_ONLY_CONDITION = "needs.classify.outputs.mode == 'docs-only'"
+_DOCS_FASTPATH_CONDITION = (
+    "needs.classify.outputs.mode == 'docs-only' || needs.classify.outputs.mode == 'full'"
+)
 _TIMEOUT_BEARING_JOBS = ("classify", "checks", "web", "web-snapshots", "docs-fastpath")
 
 
@@ -549,7 +552,7 @@ def test_full_only_workers_carry_the_exact_literal_condition_and_no_status_funct
             assert forbidden not in cast(str, job["if"])
 
     docs_fastpath = _mapping(jobs["docs-fastpath"])
-    assert docs_fastpath.get("if") == _DOCS_ONLY_CONDITION
+    assert docs_fastpath.get("if") == _DOCS_FASTPATH_CONDITION
     assert "classify" in set(cast(list[str], docs_fastpath["needs"]))
 
     for job_id in _REQUIRED_CHECK_NAMES:
@@ -652,6 +655,7 @@ def test_docs_fastpath_job_structure_and_dependency_group() -> None:
     assert "--cov-report=xml:coverage.xml" in pytest_run
     assert "OPENROUTER_API_KEY" in pytest_run
     codecov_step = steps[6]
+    assert codecov_step["if"] == _DOCS_ONLY_CONDITION
     assert codecov_step["uses"] == "codecov/codecov-action@v5"
     codecov_with = _mapping(codecov_step["with"])
     assert codecov_with["disable_search"] is True

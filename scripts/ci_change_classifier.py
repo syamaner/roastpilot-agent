@@ -47,9 +47,9 @@ def _run_git(arguments: Sequence[str], *, deadline: float | None = None) -> byte
 
     Args:
         arguments: Git arguments excluding the executable name.
-        deadline: Optional ``time.monotonic()`` instant after which no further
-            Git call may start. Raises :class:`_BudgetExceeded` when already
-            past the deadline, before spawning a process.
+        deadline: Optional ``time.monotonic()`` instant that caps both Git
+            process start and its timeout. Raises :class:`_BudgetExceeded`
+            when no positive budget remains, before spawning a process.
 
     Returns:
         The command's byte-for-byte standard output.
@@ -61,14 +61,18 @@ def _run_git(arguments: Sequence[str], *, deadline: float | None = None) -> byte
         _BudgetExceeded: If the total worktime budget has already elapsed.
     """
 
-    if deadline is not None and time.monotonic() >= deadline:
-        raise _BudgetExceeded
+    timeout = _GIT_CALL_TIMEOUT_SECONDS
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _BudgetExceeded
+        timeout = min(timeout, remaining)
     completed = subprocess.run(
         ["git", *arguments],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-        timeout=_GIT_CALL_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     return completed.stdout
 
