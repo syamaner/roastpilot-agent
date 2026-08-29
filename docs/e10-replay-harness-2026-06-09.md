@@ -171,3 +171,5 @@ session-1 → real env-ceiling FAULT, `cooling-complete` → real COMPLETE (exer
 STOP_COOLING), the synthetic fault → real recovery, and the gated-route safety
 boundary (incl. the live `create_app`). `ruff` / `ruff format --check` /
 `pyright` (strict) / `pytest` green.
+
+<!-- issue-702 final-head mixed-path proof -->

@@ -1,4 +1,4 @@
-"""E1 scaffold smoke tests.
+"""E1 scaffold smoke tests and mixed-path CI proof.
 
 Real suites (test_controller, test_safety, test_advisor, test_mcp_client,
 test_store, test_api, test_milestone1) land with their epics per component
