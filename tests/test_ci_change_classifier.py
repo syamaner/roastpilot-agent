@@ -1036,21 +1036,28 @@ def _module_has_pytestmark_docs(tree: ast.Module) -> bool:
     return False
 
 
+def _test_module_paths(tests_root: Path) -> list[Path]:
+    """Return every pytest-style test module below ``tests_root`` in stable order."""
+
+    return sorted(tests_root.rglob("test_*.py"))
+
+
 @pytest.mark.docs_ci
 def test_docs_reading_tests_carry_the_exact_docs_marker_and_nothing_else() -> None:
     """Every committed-Markdown reader is marked at the exact function, module-wide."""
 
     markdown_readers: dict[Path, set[str]] = {}
-    for path in sorted((_REPO / "tests").glob("test_*.py")):
+    for path in _test_module_paths(_REPO / "tests"):
+        relative_path = path.relative_to(_REPO).as_posix()
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source)
         assert not _module_has_pytestmark_docs(tree), (
-            f"{path.name}: retired module-level `pytestmark = pytest.mark.docs` still present"
+            f"{relative_path}: retired module-level `pytestmark = pytest.mark.docs` still present"
         )
-        readers = _docs_reading_test_modules(source, filename=path.name)
+        readers = _docs_reading_test_modules(source, filename=relative_path)
         if readers:
             markdown_readers[path] = readers
-        _assert_exact_docs_markers(tree, readers, path.name)
+        _assert_exact_docs_markers(tree, readers, relative_path)
 
     assert set(markdown_readers) == {
         _REPO / "tests" / "test_agent_model_pins.py",
@@ -1068,6 +1075,22 @@ def test_docs_reading_tests_carry_the_exact_docs_marker_and_nothing_else() -> No
         )
         == set()
     )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_discovers_nested_test_modules(tmp_path: Path) -> None:
+    """Nested pytest modules remain visible to the exact marker self-audit."""
+
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "nested"
+    nested.mkdir(parents=True)
+    (tests_root / "test_top_level.py").write_text("def test_top() -> None: pass\n")
+    (nested / "test_nested.py").write_text("def test_nested() -> None: pass\n")
+    (nested / "helper.py").write_text("pass\n")
+    assert [path.relative_to(tests_root).as_posix() for path in _test_module_paths(tests_root)] == [
+        "nested/test_nested.py",
+        "test_top_level.py",
+    ]
 
 
 @pytest.mark.docs_ci
