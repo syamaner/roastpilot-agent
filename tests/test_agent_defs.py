@@ -328,9 +328,9 @@ def test_parse_frontmatter_rejects_invalid_utf8_with_source_named_reason(tmp_pat
 # Comments and formatting are absent from ASTs; every retained semantic field requires a
 # deliberate digest update alongside review and direct helper tests.
 _CONSUMER_SEMANTIC_SHA256 = {
-    "test_agent_model_pins.py": "5ec9a9cb53b1af0d2c395e94245e9494a4e99b1306d8b372319c39fb611a0d13",
+    "test_agent_model_pins.py": "6ae75063dc945f6c84d471f7b4bc8c32506147dbf080e5872d774ed699ba73a5",
     "test_agent_worktree_controls.py": (
-        "d58fd72659166c6623701f9ee1add669be2ffab34ac8078658533f65d132617e"
+        "f87b4b5ddda26bb9d32c539766115995c9ce23bb1817d3cf8e1f60deba3040bb"
     ),
 }
 _NON_RUNTIME_AST_FIELDS = frozenset({"type_params"})

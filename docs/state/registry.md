@@ -2,6 +2,97 @@
 
 ## Active Epic
 
+**29 Aug 2026 — #702 (D180) slice 3 implemented and locally gated on branch
+`feature/702-docs-only-ci-fast-path-3`, base `fa221a1`. Every exact CI-lane
+command from `ci.yml` was run locally against a fresh worktree-local `.venv`
+and passed: `quality` (ruff check, ruff format --check, pyright strict,
+`check_contract_drift.py`, CLI smoke), `pytest-ordinary` (`-n 4 --dist
+worksteal -m "not serial and not stress"`), `pytest-serial` (`-m "serial and
+not stress"`, includes the pre-existing `test_rendered_qa_full_suite_gate_
+runs_under_the_actual_wrapper` nested-harness test), the three named
+`pytest-stress` node IDs, `package` (real wheel build + clean-venv install +
+SPA-bundled smoke), the coverage combine/xml/`tooling_coverage.py`
+normalize/report pipeline, and `web` (`npm ci`, lint, typecheck, build,
+`vitest run --coverage`: 74 files / 1210 tests). A separate, freshly
+provisioned `docs-ci`-only venv (no `coffee-roaster-mcp`, no ML/audio stack,
+no Playwright, no build tooling) ran the exact `docs-fastpath` pytest
+command end to end: 70 of 6395 collected tests selected
+(`-m "(docs or docs_ci) and not stress"`), all passing in ~18s, coverage.xml
+generated and normalized cleanly by `tooling_coverage.py` — empirically
+confirming the Tier-1 minimal dependency group is sufficient. 14 genuine
+source mutations (bounded worktime, base-trusted checkout structure, argv/
+needs equality, the `docs-ci` group's `coffee-roaster-mcp` exclusion, exact
+docs-marker placement — both under- and over-marking, the AST detector's
+`docs/` prefix requirement, the unresolved-dynamic-call fail-closed raise,
+the frozen `ci_gate_result.py` helper's `_expected_result` logic, and
+`_REGULAR_FILE_MODES` widened to admit a symlink) were each applied to the
+real committed file (snapshotted first via `cp`, restored the same way,
+never via git), proven to fail the intended guard test(s) red, then restored
+to green — full detail in the handback. The `Web (Playwright snapshots)`
+job's real Docker/Linux run was not executed locally (project convention:
+baselines are generated and diffed only inside the pinned CI container, never
+on a dev machine — see `web/tests/e2e/README.md`); its job structure is
+covered instead by the static YAML governance tests. Two real, in-scope bugs
+were found and fixed by this local execution that could not have been caught
+by static review alone: a base-trusted-reference prefix check that only
+matched when the script sat directly under `.ci-gate-base/` (missed the real
+`.ci-gate-base/scripts/` layout), and three monkeypatched test doubles for
+`_run_git`/`_is_regular_file` missing the new `deadline` keyword parameter.
+`ci.yml` splits `Checks`/`Web (lint + typecheck + unit)`/
+`Web (Playwright snapshots)` into tiny always-on gate jobs (one base
+checkout + one `ci_gate_result.py` invocation) plus `*-worker` jobs that run
+only when `classify.outputs.mode != 'docs-only'`, and adds `docs-fastpath`
+(docs-only-only: whitespace/diff validation, the new `docs-ci` dependency
+group, the `(docs or docs_ci) and not stress` pytest lane, and a real
+Codecov upload). Both `ci_gate_result.py` and `ci_change_classifier.py` now
+execute from a trusted base checkout (`.ci-gate-base`, resolved via
+`github.event.pull_request.base.sha` on `pull_request` or the default
+branch otherwise) rather than the pull request's own copy — base-trusted
+execution — with the classify step order fixed at head-checkout,
+base-checkout, run. `ci_change_classifier.py` gained a bounded per-call
+Git timeout (20s) and a total worktime budget (60s, checked before each
+subsequent call so an exceeded budget issues no further Git call); this
+hardening is inert on the slice's own PR (which runs the base copy from
+`main`) and takes effect starting with the next PR. `codeql.yml` gained a
+matching `classify` job (narrowed to `contents: read`, SHA-pinned checkout)
+and `analyze` now needs it with the same docs-only skip condition; every
+non-`pull_request` trigger (push, schedule, `workflow_dispatch`) is
+unaffected because the classifier returns `full` for any non-`pull_request`
+event. The five module-level `pytestmark = pytest.mark.docs` markers are
+replaced by exact per-function `@pytest.mark.docs` decorators on the ~36
+functions that actually read committed `docs/**/*.md` content (an AST
+reader-detector extended for non-literal construction — `.joinpath`,
+`os.path.join`, f-strings, `str.format`, loop-bound glob aliases, same-module
+helper/fixture call graphs, and a named-reason failure on an unresolved
+dynamic read receiver); a new `docs_ci` marker covers focused fast-path
+tooling/workflow-structure tests that do not read committed Markdown. The
+three slice-1/2a inertness governance tests ("no job may consume this yet")
+are replaced by equally mechanical consumption guards, not deleted.
+
+**Residual, stated rather than buried (D180 §2.2):** base-trusted execution
+removes the classifier/gate-helper *bytes* from pull-request control but
+cannot remove the *workflow file itself* from `pull_request`-event control;
+containment is the existing D118 privileged-review-override path plus these
+`main`-side governance tests.
+
+**Explicitly NOT claimed by this entry (hosted-CI only, per the D180
+contract's proof protocol — this delegation committed both the implementation
+and provisional plan branches locally but did not push or open a PR, per
+explicit operator instruction):** every gate above ran locally, not on a
+GitHub Actions runner, so the live CodeQL docs-only skip, the `main`-push
+full-coverage Codecov upload, the disposable docs-only/mixed proof-PR pair,
+the GHCR-container `Web (Playwright snapshots)` run, and the D118
+dispatch/merge lifecycle are all still unobserved. `#702` stays open pending
+that hosted evidence. PR #864 (superseded slice-2 branch) is untouched by
+this delegation.
+
+**Operating notes:** (1) if `classify` fails, is cancelled, or times out, the
+gates fail closed (`MODE` empty) — re-run the workflow run. (2) a pull
+request whose base commit predates `fa221a1` has no
+`scripts/ci_gate_result.py` at that commit, so a gate step exits non-zero
+(helper absent) until the branch is updated onto current `main`; strict-mode
+branch protection already requires this before merge.
+
 **27 Aug 2026 — #710 (RP-C) slice 3 implementation complete (`Refs #710`,
 decision-level acceptance half 2 pending): the deterministic joint-window
 drop planner (`post_fc_control.plan_joint_window`,
