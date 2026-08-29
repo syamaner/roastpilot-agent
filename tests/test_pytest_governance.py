@@ -637,9 +637,15 @@ def test_docs_fastpath_job_structure_and_dependency_group() -> None:
         "Upload coverage to Codecov",
     ]
     install_step = steps[3]
-    assert "--group docs-ci" in cast(str, install_step["run"])
+    assert install_step["run"] == (
+        "python -m pip install --upgrade pip\npython -m pip install --group docs-ci\n"
+    )
     pytest_step = steps[4]
     pytest_run = cast(str, pytest_step["run"])
+    assert pytest_run.startswith("env -u OPENROUTER_API_KEY PYTHONPATH=src python -m pytest ")
+    assert "working-directory" not in job
+    assert "working-directory" not in pytest_step
+    assert "env" not in pytest_step
     assert '-m "(docs or docs_ci) and not stress"' in pytest_run
     assert "--cov=scripts" in pytest_run
     assert "--cov=.agents/skills/capture-agent-usage/scripts" in pytest_run
@@ -660,11 +666,33 @@ def test_docs_fastpath_job_structure_and_dependency_group() -> None:
     dependency_groups = _mapping(project["dependency-groups"])
     docs_ci_group = dependency_groups["docs-ci"]
     dev_group = dependency_groups["dev"]
+    project_dependencies = project["project"]
     assert isinstance(docs_ci_group, list)
     assert isinstance(dev_group, list)
+    assert isinstance(project_dependencies, dict)
+    dependencies = _mapping(cast(dict[str, object], project_dependencies))["dependencies"]
+    assert isinstance(dependencies, list)
     docs_ci_entries = cast(list[str], docs_ci_group)
-    assert set(docs_ci_entries) <= set(cast(list[str], dev_group))
-    assert not any(entry.startswith("coffee-roaster-mcp") for entry in docs_ci_entries)
+    admissible = set(cast(list[str], dev_group)) | set(cast(list[str], dependencies))
+    assert set(docs_ci_entries) <= admissible
+    normalized = {
+        re.split(r"[<>=!~;\[]", entry, maxsplit=1)[0].lower() for entry in docs_ci_entries
+    }
+    assert not (
+        {
+            "sounddevice",
+            "coffee-roaster-mcp",
+            "transformers",
+            "onnxruntime",
+            "torch",
+            "build",
+            "hatchling",
+            "hatch",
+        }
+        & normalized
+    )
+    assert not any("playwright" in name for name in normalized)
+    assert "src" in cast(list[str], _pytest_options()["pythonpath"])
 
     markers = cast(list[str], _pytest_options()["markers"])
     registered = {marker.partition(":")[0] for marker in markers}
