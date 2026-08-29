@@ -430,11 +430,11 @@ jobs:
       - name: Install dependencies (docs-ci group only — no MCP/audio/ML/build tooling)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e . --group docs-ci
+          python -m pip install --group docs-ci
 
       - name: Run docs and fast-path tooling tests with coverage
         run: >-
-          env -u OPENROUTER_API_KEY python -m pytest -m "(docs or docs_ci) and not stress"
+          env -u OPENROUTER_API_KEY PYTHONPATH=src python -m pytest -m "(docs or docs_ci) and not stress"
           --cov=scripts --cov=.agents/skills/capture-agent-usage/scripts
           --cov-report=xml:coverage.xml
 

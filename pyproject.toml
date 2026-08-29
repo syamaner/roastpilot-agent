@@ -222,18 +222,12 @@ dev = [
   "numpy>=1.26"
 ]
 
-# D180 (#702, slice 3): the docs-only CI fast path installs only this minimal
-# subset of `dev`, at identical pins, so a docs-only pull request never pulls
-# `coffee-roaster-mcp` (and its ML/audio stack), Playwright, or build tooling.
-# Every member here is demonstrably required for full pytest COLLECTION
-# (every test module under `tests/` is imported regardless of `-m`
-# selection, per module-level imports across the suite), not merely by the
-# docs-marked tests themselves: `numpy` (scripts/curve_feature_eval.py and
-# its tests import it at module scope), and the anthropic/google PydanticAI
-# provider extras (test_advisor.py imports
-# `pydantic_ai.models.anthropic`/`.google` at module scope). `pytest-cov` is
-# needed for the lane's `--cov`/`--cov-report=xml` flags and
-# `pytest-asyncio` for the project's `asyncio_mode = "strict"` setting.
+# D180 (#702, slice 3): the docs-only CI fast path installs this empirically
+# derived group only. Each requirement is an identical member of
+# `project.dependencies` or `dev` needed by repository-wide pytest collection
+# or the selected tests. It deliberately excludes coffee-roaster-mcp,
+# sounddevice, transformers, onnxruntime, torch, every Playwright package, and
+# build, hatchling, and hatch.
 docs-ci = [
   "pytest>=8.0",
   "pytest-asyncio>=1.0",
@@ -241,7 +235,15 @@ docs-ci = [
   "numpy>=1.26",
   "pydantic-ai-slim[anthropic]>=1.0,<2",
   "anthropic<1",
-  "pydantic-ai-slim[google]>=1.0,<2"
+  "pydantic-ai-slim[google]>=1.0,<2",
+  "pydantic-settings>=2.7,<3",
+  "mcp>=1.0.0,<2",
+  "aiosqlite>=0.22,<1",
+  "extruct>=0.18,<0.19",
+  "trafilatura>=2.1,<3",
+  "openai>=2.29.0,<3",
+  "pyyaml>=6.0,<7",
+  "fastapi>=0.136,<1"
 ]
 
 [tool.hatch.build.targets.wheel]
