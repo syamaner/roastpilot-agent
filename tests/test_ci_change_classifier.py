@@ -7,6 +7,7 @@ import runpy
 import subprocess
 import sys
 import time
+import tomllib
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -698,6 +699,42 @@ def _is_pytest_fixture_decorator(decorator: ast.expr) -> bool:
     return False
 
 
+def _fixture_exposed_name(function_name: str, decorators: list[ast.expr]) -> str | None:
+    """Return one statically resolved fixture name or fail closed on ambiguity."""
+
+    fixture_decorators = [
+        decorator for decorator in decorators if _is_pytest_fixture_decorator(decorator)
+    ]
+    if not fixture_decorators:
+        return None
+    if len(fixture_decorators) != 1:
+        raise AssertionError(
+            f"fixture `{function_name}` has multiple fixture decorators; cannot resolve its name"
+        )
+    decorator = fixture_decorators[0]
+    if not isinstance(decorator, ast.Call):
+        return function_name
+    if decorator.args or any(keyword.arg is None for keyword in decorator.keywords):
+        raise AssertionError(f"fixture `{function_name}` has an ambiguous fixture decorator shape")
+    name_keywords = [keyword for keyword in decorator.keywords if keyword.arg == "name"]
+    if not name_keywords:
+        return function_name
+    if len(name_keywords) != 1:
+        raise AssertionError(f"fixture `{function_name}` has conflicting `name=` overrides")
+    name_value = name_keywords[0].value
+    if not isinstance(name_value, ast.Constant) or not isinstance(name_value.value, str):
+        raise AssertionError(f"fixture `{function_name}` has a non-literal `name=` override")
+    if not name_value.value:
+        raise AssertionError(f"fixture `{function_name}` has an empty `name=` override")
+    return name_value.value
+
+
+def _fixture_parameter_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Return statically named positional and keyword-only fixture parameters."""
+
+    return {argument.arg for argument in [*node.args.args, *node.args.kwonlyargs]}
+
+
 @dataclass
 class _FunctionAnalysis:
     """One same-module function's direct docs-read status and call edges."""
@@ -866,7 +903,7 @@ def _analyse_function(
 def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[str]:
     """Return the exact executable test names that read committed ``docs/**/*.md``.
 
-    A test counts when it (or a same-module helper/fixture it calls,
+    A test counts when it (or a same-module helper/fixture it calls or requests,
     transitively, bounded to :data:`_MAX_DOCS_CALL_GRAPH_DEPTH`) performs a
     provable docs-rooted ``read_text``/``read_bytes``/``open`` (method or
     builtin) call, or reads a ``Name`` bound by a docs-rooted
@@ -941,12 +978,47 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
             functions[qualified_name] = member
             methods[member.name] = qualified_name
         class_methods[statement.name] = methods
-    fixtures = {
-        name
-        for name, node in functions.items()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and any(_is_pytest_fixture_decorator(decorator) for decorator in node.decorator_list)
+    module_fixture_nodes: dict[str, str] = {}
+    class_fixture_nodes: dict[str, dict[str, str]] = {}
+    for function_key, node in functions.items():
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        fixture_name = _fixture_exposed_name(node.name, node.decorator_list)
+        if fixture_name is None:
+            continue
+        class_name = function_key.partition("::")[0] if "::" in function_key else None
+        fixture_nodes = (
+            class_fixture_nodes.setdefault(class_name, {})
+            if class_name is not None
+            else module_fixture_nodes
+        )
+        if fixture_name in fixture_nodes:
+            raise AssertionError(
+                f"fixtures `{fixture_nodes[fixture_name]}` and `{function_key}` expose "
+                f"the duplicate name `{fixture_name}`"
+            )
+        fixture_nodes[fixture_name] = function_key
+    for class_name, fixture_nodes in class_fixture_nodes.items():
+        shared_names = module_fixture_nodes.keys() & fixture_nodes.keys()
+        if shared_names:
+            raise AssertionError(
+                f"class `{class_name}` fixture name(s) collide with module fixtures: "
+                f"{sorted(shared_names)}"
+            )
+    fixtures = set(module_fixture_nodes.values()) | {
+        fixture
+        for fixture_nodes in class_fixture_nodes.values()
+        for fixture in fixture_nodes.values()
     }
+
+    def fixture_nodes_for(function_key: str) -> dict[str, str]:
+        """Return the fail-closed fixture names available to one executable node."""
+
+        class_name = function_key.partition("::")[0] if "::" in function_key else None
+        if class_name is None:
+            return module_fixture_nodes
+        return module_fixture_nodes | class_fixture_nodes.get(class_name, {})
+
     known_functions = {
         statement.name
         for statement in tree.body
@@ -992,8 +1064,12 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
 
     for fixture_name in fixtures:
         fixture = functions[fixture_name]
+        assert isinstance(fixture, (ast.FunctionDef, ast.AsyncFunctionDef))
+        available_fixture_nodes = fixture_nodes_for(fixture_name)
         fixture_parameters = {
-            argument.arg for argument in fixture.args.args if argument.arg in fixtures
+            available_fixture_nodes[parameter]
+            for parameter in _fixture_parameter_names(fixture)
+            if parameter in available_fixture_nodes
         }
         analyses[fixture_name].calls.update(fixture_parameters)
 
@@ -1017,8 +1093,13 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
             continue
         if not name.startswith("test_") and "::test_" not in name:
             continue
-        param_names = [argument.arg for argument in node.args.args]
-        fixture_edges = {param for param in param_names if param in fixtures}
+        assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        available_fixture_nodes = fixture_nodes_for(name)
+        fixture_edges = {
+            available_fixture_nodes[parameter]
+            for parameter in _fixture_parameter_names(node)
+            if parameter in available_fixture_nodes
+        }
         if reads_transitively(name, frozenset()) or any(
             reads_transitively(fixture_name, frozenset()) for fixture_name in fixture_edges
         ):
@@ -1115,6 +1196,13 @@ def _test_module_paths(tests_root: Path) -> list[Path]:
     )
 
 
+def _assert_default_pytest_collection_options(options: dict[str, object]) -> None:
+    """Fail if pytest collection no longer uses the audited default test shapes."""
+
+    assert "python_files" not in options, "pytest python_files must remain unset"
+    assert options.get("testpaths") == ["tests"], "pytest testpaths must remain exactly ['tests']"
+
+
 @pytest.mark.docs_ci
 def test_docs_reading_tests_carry_the_exact_docs_marker_and_nothing_else() -> None:
     """Every committed-Markdown reader is marked at the exact function, module-wide."""
@@ -1167,6 +1255,21 @@ def test_docs_governance_discovers_nested_test_modules(tmp_path: Path) -> None:
         "nested/test_nested.py",
         "test_top_level.py",
     ]
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_binds_test_discovery_to_pytest_configuration() -> None:
+    """The path self-audit fails closed when pytest collection settings drift."""
+
+    configuration = tomllib.loads((_REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    options = cast(dict[str, object], configuration["tool"]["pytest"]["ini_options"])
+    _assert_default_pytest_collection_options(options)
+    with pytest.raises(AssertionError, match="python_files"):
+        _assert_default_pytest_collection_options(
+            {"testpaths": ["tests"], "python_files": ["*_spec.py"]}
+        )
+    with pytest.raises(AssertionError, match="testpaths"):
+        _assert_default_pytest_collection_options({"testpaths": ["integration"]})
 
 
 @pytest.mark.docs_ci
@@ -1450,6 +1553,159 @@ def test_docs_governance_follows_a_same_module_fixture() -> None:
         "    assert unrelated == 1\n"
     )
     assert _docs_reading_test_modules(source) == {"test_uses_fixture"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_follows_keyword_only_fixture_parameters() -> None:
+    """Keyword-only test and fixture parameters retain their static fixture edges."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture\n"
+        "def direct_docs() -> str:\n"
+        '    return Path("docs/direct.md").read_text()\n\n'
+        "def test_keyword_only(*, direct_docs: str) -> None:\n"
+        "    assert direct_docs\n\n"
+        "@pytest.fixture\n"
+        "def docs_leaf() -> str:\n"
+        '    return Path("docs/leaf.md").read_text()\n\n'
+        "@pytest.fixture\n"
+        "def docs_middle(*, docs_leaf: str) -> str:\n"
+        "    return docs_leaf\n\n"
+        "def test_keyword_only_transitive(*, docs_middle: str) -> None:\n"
+        "    assert docs_middle\n\n"
+        "@pytest.fixture\n"
+        "def plain_leaf() -> int:\n"
+        "    return 1\n\n"
+        "@pytest.fixture\n"
+        "def plain_middle(*, plain_leaf: int) -> int:\n"
+        "    return plain_leaf\n\n"
+        "def test_keyword_only_plain(*, plain_middle: int) -> None:\n"
+        "    assert plain_middle == 1\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_keyword_only",
+        "test_keyword_only_transitive",
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_resolves_literal_fixture_name_overrides() -> None:
+    """Literal fixture aliases retain direct, transitive, and async reader edges."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture(name='docs_alias')\n"
+        "def docs_source() -> str:\n"
+        '    return Path("docs/alias.md").read_text()\n\n'
+        "@pytest.fixture(name='middle_alias')\n"
+        "def docs_middle(*, docs_alias: str) -> str:\n"
+        "    return docs_alias\n\n"
+        "def test_alias(*, middle_alias: str) -> None:\n"
+        "    assert middle_alias\n\n"
+        "@pytest.fixture(name='async_alias')\n"
+        "async def async_source() -> str:\n"
+        '    return Path("docs/async-alias.md").read_text()\n\n'
+        "async def test_async_alias(*, async_alias: str) -> None:\n"
+        "    assert async_alias\n\n"
+        "@pytest.fixture(name='plain_alias')\n"
+        "def plain_source() -> int:\n"
+        "    return 1\n\n"
+        "def test_plain_alias(*, plain_alias: int) -> None:\n"
+        "    assert plain_alias == 1\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_alias", "test_async_alias"}
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        pytest.param(
+            "import pytest\n\n"
+            "@pytest.fixture(name=fixture_name)\n"
+            "def fixture() -> int:\n"
+            "    return 1\n",
+            "non-literal",
+            id="dynamic-name",
+        ),
+        pytest.param(
+            "import pytest\n\n@pytest.fixture(name='')\ndef fixture() -> int:\n    return 1\n",
+            "empty",
+            id="empty-name",
+        ),
+        pytest.param(
+            "import pytest\n\n@pytest.fixture(*options)\ndef fixture() -> int:\n    return 1\n",
+            "ambiguous fixture decorator shape",
+            id="dynamic-decorator-shape",
+        ),
+        pytest.param(
+            "import pytest\n\n@pytest.fixture(name='first')\n@pytest.fixture(name='second')\n"
+            "def fixture() -> int:\n    return 1\n",
+            "multiple fixture decorators",
+            id="conflicting-name-overrides",
+        ),
+        pytest.param(
+            "import pytest\n\n@pytest.fixture(name='same')\ndef first() -> int:\n    return 1\n\n"
+            "@pytest.fixture(name='same')\ndef second() -> int:\n    return 2\n",
+            "duplicate name",
+            id="duplicate-exposed-name",
+        ),
+        pytest.param(
+            "import pytest\n\n"
+            "@pytest.fixture(name='same')\n"
+            "def module_fixture() -> int:\n"
+            "    return 1\n\n"
+            "class TestScoped:\n"
+            "    @pytest.fixture(name='same')\n"
+            "    def class_fixture(self) -> int:\n"
+            "        return 2\n\n"
+            "    def test_one(self) -> None:\n"
+            "        assert True\n",
+            "collide with module fixtures",
+            id="module-class-collision",
+        ),
+    ],
+)
+def test_docs_governance_fails_closed_on_ambiguous_fixture_names(source: str, message: str) -> None:
+    """Unsafe fixture-name declarations cannot silently remove a reader edge."""
+
+    with pytest.raises(AssertionError, match=message):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_resolves_class_scoped_fixture_dependencies() -> None:
+    """Class tests resolve class and module fixtures without scope leakage."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture\n"
+        "def module_plain() -> int:\n"
+        "    return 1\n\n"
+        "def test_module_does_not_see_class_fixture(class_docs: str) -> None:\n"
+        "    assert class_docs\n\n"
+        "class TestScoped:\n"
+        "    @pytest.fixture(name='class_docs')\n"
+        "    def docs_leaf(self) -> str:\n"
+        '        return Path("docs/class-fixture.md").read_text()\n\n'
+        "    @pytest.fixture\n"
+        "    def docs_middle(self, class_docs: str) -> str:\n"
+        "        return class_docs\n\n"
+        "    @pytest.fixture\n"
+        "    def plain_fixture(self, module_plain: int) -> int:\n"
+        "        return module_plain\n\n"
+        "    def test_direct(self, class_docs: str) -> None:\n"
+        "        assert class_docs\n\n"
+        "    def test_transitive(self, docs_middle: str) -> None:\n"
+        "        assert docs_middle\n\n"
+        "    def test_plain(self, plain_fixture: int) -> None:\n"
+        "        assert plain_fixture == 1\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "TestScoped::test_direct",
+        "TestScoped::test_transitive",
+    }
 
 
 @pytest.mark.docs_ci
