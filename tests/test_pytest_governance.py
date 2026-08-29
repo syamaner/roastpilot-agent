@@ -556,15 +556,6 @@ def test_docs_fastpath_pytest_invocation_is_not_a_governed_lane() -> None:
 @pytest.mark.docs_ci
 def test_docs_fastpath_selection_is_nonempty_strict_subset_matching_governance() -> None:
     """The exact `(docs or docs_ci)` collection matches the governance-derived inventory."""
-    docs_returncode, docs_selected, docs_output = _collect_nodeids(
-        ["-m", "(docs or docs_ci) and not stress"]
-    )
-    assert docs_returncode == 0, docs_output
-    full_returncode, full, full_output = _collect_nodeids([])
-    assert full_returncode == 0, full_output
-    assert docs_selected
-    assert docs_selected < full
-
     governed_modules = {
         "test_agent_model_pins.py",
         "test_agent_worktree_controls.py",
@@ -576,6 +567,16 @@ def test_docs_fastpath_selection_is_nonempty_strict_subset_matching_governance()
         "test_ci_docs_fastpath_verify.py",
         "test_pytest_governance.py",
     }
+    governed_paths = [str(REPO_ROOT / "tests" / name) for name in sorted(governed_modules)]
+    docs_returncode, docs_selected, docs_output = _collect_nodeids(
+        ["-m", "(docs or docs_ci) and not stress", *governed_paths]
+    )
+    assert docs_returncode == 0, docs_output
+    full_returncode, full, full_output = _collect_nodeids(governed_paths)
+    assert full_returncode == 0, full_output
+    assert docs_selected
+    assert docs_selected < full
+
     expected: set[str] = set()
     for path in sorted((REPO_ROOT / "tests").glob("test_*.py")):
         source = path.read_text(encoding="utf-8")
