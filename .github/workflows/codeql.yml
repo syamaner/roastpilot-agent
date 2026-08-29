@@ -14,9 +14,41 @@ permissions:
   security-events: write
 
 jobs:
+  # #702 slice 2: mirrors ci.yml's classify job. Every non-`pull_request`
+  # event (push, schedule, workflow_dispatch) resolves to FULL unconditionally
+  # (ci_change_classifier.py:158-163), so `push` to `main`, the weekly
+  # schedule, and a manual dispatch all continue to analyze without exception.
+  classify:
+    name: Classify CI change
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Narrows away the workflow-level `security-events: write` this job never
+    # needs — it only classifies a diff, it never uploads a SARIF result.
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.classify.outputs.mode }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify pull-request change
+        id: classify
+        run: >-
+          python scripts/ci_change_classifier.py
+          --event-name "${{ github.event_name }}"
+          --base-sha "${{ github.event.pull_request.base.sha }}"
+          --head-sha "${{ github.event.pull_request.head.sha }}"
+
   analyze:
     name: "Analyze (${{ matrix.language }})"
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.mode != 'docs-only'
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
