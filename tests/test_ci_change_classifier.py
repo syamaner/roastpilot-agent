@@ -735,6 +735,80 @@ def _fixture_parameter_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> se
     return {argument.arg for argument in [*node.args.args, *node.args.kwonlyargs]}
 
 
+def _module_value_sources(tree: ast.Module) -> dict[str, ast.expr]:
+    """Return uniquely assigned module names; rebinds intentionally stay unresolved."""
+
+    sources: dict[str, ast.expr] = {}
+    ambiguous: set[str] = set()
+    for statement in tree.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)) or statement.value is None:
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            if target.id in sources:
+                ambiguous.add(target.id)
+            else:
+                sources[target.id] = statement.value
+    for name in ambiguous:
+        sources.pop(name, None)
+    return sources
+
+
+def _resolve_module_values(
+    expression: ast.expr, sources: dict[str, ast.expr], seen: frozenset[str] = frozenset()
+) -> list[ast.expr] | None:
+    """Resolve one admitted static module value into leaf expressions, or ``None``."""
+
+    if isinstance(expression, ast.Name):
+        if expression.id in seen or expression.id not in sources:
+            return None
+        return _resolve_module_values(sources[expression.id], sources, seen | {expression.id})
+    if isinstance(expression, (ast.List, ast.Tuple, ast.Set)):
+        if any(isinstance(item, ast.Starred) for item in expression.elts):
+            return None
+        values: list[ast.expr] = []
+        for item in expression.elts:
+            resolved = _resolve_module_values(item, sources, seen)
+            if resolved is None:
+                values.append(item)
+            else:
+                values.extend(resolved)
+        return values
+    return [expression]
+
+
+def _parametrized_docs_and_ambiguous_parameters(
+    node: ast.FunctionDef | ast.AsyncFunctionDef, sources: dict[str, ast.expr]
+) -> tuple[set[str], set[str]]:
+    """Return docs and unresolved read-receiver parameters from static parametrization."""
+
+    docs: set[str] = set()
+    ambiguous: set[str] = set()
+    for decorator in node.decorator_list:
+        if not (
+            isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Attribute)
+            and decorator.func.attr == "parametrize"
+            and len(decorator.args) >= 2
+            and isinstance(decorator.args[0], ast.Constant)
+            and isinstance(decorator.args[0].value, str)
+        ):
+            continue
+        names = [name.strip() for name in decorator.args[0].value.split(",")]
+        values = _resolve_module_values(decorator.args[1], sources)
+        if values is None or len(names) != 1:
+            ambiguous.update(names)
+            continue
+        for value in values:
+            if _expression_is_docs_markdown(value, set()):
+                docs.add(names[0])
+            elif not _string_constants(value):
+                ambiguous.add(names[0])
+    return docs, ambiguous
+
+
 @dataclass
 class _FunctionAnalysis:
     """One same-module function's direct docs-read status and call edges."""
@@ -742,6 +816,11 @@ class _FunctionAnalysis:
     reads_directly: bool
     calls: set[str]
     unresolved: list[str]
+    returns_docs: bool
+    return_calls: set[str]
+    return_names: set[str]
+    call_result_assignments: dict[str, str]
+    read_names: set[str]
 
 
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
@@ -784,8 +863,10 @@ def _analyse_function(
     func: _FunctionNode,
     module_aliases: set[str],
     module_partial_aliases: set[str],
+    module_value_sources: dict[str, ast.expr],
     known_functions: set[str],
     filename: str,
+    class_name: str | None = None,
     class_methods: dict[str, str] | None = None,
     local_functions: dict[str, str] | None = None,
     ambiguous_local_functions: set[str] | None = None,
@@ -800,10 +881,22 @@ def _analyse_function(
 
     aliases = set(module_aliases)
     partial_aliases = set(module_partial_aliases)
+    if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        parameter_docs, ambiguous_parameters = _parametrized_docs_and_ambiguous_parameters(
+            func, module_value_sources
+        )
+        aliases.update(parameter_docs)
+    else:
+        ambiguous_parameters: set[str] = set()
     calls: set[str] = set()
     unresolved: list[str] = []
     has_docs_glob = False
     reads = False
+    returns_docs = False
+    return_calls: set[str] = set()
+    return_names: set[str] = set()
+    call_result_assignments: dict[str, str] = {}
+    read_names: set[str] = set()
 
     def _receiver_is_docs(target: ast.expr) -> bool:
         if isinstance(target, ast.Name):
@@ -830,8 +923,17 @@ def _analyse_function(
                 _expression_has_docs_root(node.value)
                 or _expression_uses_alias(node.value, partial_aliases)
             )
+            call_result = (
+                node.value.func.id
+                if isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id in known_functions
+                else None
+            )
             for target in targets:
                 if isinstance(target, ast.Name):
+                    if call_result is not None:
+                        call_result_assignments[target.id] = call_result
                     if full_match:
                         aliases.add(target.id)
                         partial_aliases.discard(target.id)
@@ -854,6 +956,17 @@ def _analyse_function(
         if _is_docs_markdown_glob_call(node, docs_root_aliases):
             has_docs_glob = True
         if not isinstance(node, ast.Call):
+            if isinstance(node, ast.Return) and node.value is not None:
+                if _receiver_is_docs(node.value):
+                    returns_docs = True
+                elif isinstance(node.value, ast.Name):
+                    return_names.add(node.value.id)
+                elif (
+                    isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in known_functions
+                ):
+                    return_calls.add(node.value.func.id)
             continue
         if isinstance(node.func, ast.Name):
             if node.func.id == "open" and node.args:
@@ -876,6 +989,13 @@ def _analyse_function(
                 calls.add(node.func.id)
         elif isinstance(node.func, ast.Attribute) and node.func.attr in _READ_METHOD_NAMES:
             target = node.func.value
+            if isinstance(target, ast.Name):
+                read_names.add(target.id)
+                if target.id in ambiguous_parameters:
+                    unresolved.append(
+                        f"{filename}:{node.lineno}: parametrized receiver `{target.id}` "
+                        "is ambiguous"
+                    )
             if _receiver_is_docs(target):
                 reads = True
             elif _receiver_is_partial(target):
@@ -884,20 +1004,28 @@ def _analyse_function(
                     "'docs' component with no provable '.md' segment — cannot prove this "
                     "is or is not a docs read"
                 )
-        elif (
-            isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id in {"self", "cls"}
-        ):
+        elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+            receiver = node.func.value.id
+            if receiver not in {"self", "cls", class_name}:
+                continue
             callee = (class_methods or {}).get(node.func.attr)
             if callee is None:
                 unresolved.append(
                     f"{filename}:{node.lineno}: unresolved same-class call edge "
-                    f"`{node.func.value.id}.{node.func.attr}()`"
+                    f"`{receiver}.{node.func.attr}()`"
                 )
             else:
                 calls.add(callee)
-    return _FunctionAnalysis(reads_directly=reads, calls=calls, unresolved=unresolved)
+    return _FunctionAnalysis(
+        reads_directly=reads,
+        calls=calls,
+        unresolved=unresolved,
+        returns_docs=returns_docs,
+        return_calls=return_calls,
+        return_names=return_names,
+        call_result_assignments=call_result_assignments,
+        read_names=read_names,
+    )
 
 
 def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[str]:
@@ -928,6 +1056,7 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
     """
 
     tree = ast.parse(source)
+    module_value_sources = _module_value_sources(tree)
     module_aliases: set[str] = set()
     module_partial_aliases: set[str] = set()
     for statement in tree.body:
@@ -1047,8 +1176,10 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
             node,
             module_aliases,
             module_partial_aliases,
+            module_value_sources,
             known_functions,
             filename,
+            class_name,
             class_methods.get(class_name) if class_name else None,
             local_targets.get(name),
             ambiguous_local_targets.get(name),
@@ -1072,10 +1203,38 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
             if parameter in available_fixture_nodes
         }
         analyses[fixture_name].calls.update(fixture_parameters)
+        analyses[fixture_name].return_calls.update(
+            available_fixture_nodes[parameter]
+            for parameter in analyses[fixture_name].return_names
+            if parameter in available_fixture_nodes
+        )
+
+    changed = True
+    while changed:
+        changed = False
+        for analysis in analyses.values():
+            if not analysis.returns_docs and any(
+                analyses[callee].returns_docs
+                for callee in analysis.return_calls
+                if callee in analyses
+            ):
+                analysis.returns_docs = True
+                changed = True
+    for analysis in analyses.values():
+        if any(
+            target in analysis.read_names and callee in analyses and analyses[callee].returns_docs
+            for target, callee in analysis.call_result_assignments.items()
+        ):
+            analysis.reads_directly = True
 
     def reads_transitively(name: str, seen: frozenset[str]) -> bool:
-        if name in seen or name not in analyses or len(seen) >= _MAX_DOCS_CALL_GRAPH_DEPTH:
+        if name in seen or name not in analyses:
             return False
+        if len(seen) >= _MAX_DOCS_CALL_GRAPH_DEPTH:
+            raise AssertionError(
+                "docs-content governance exceeded the bounded same-module call graph at "
+                f"`{name}`; cannot prove whether it reads docs content"
+            )
         analysis = analyses[name]
         if analysis.unresolved:
             raise AssertionError(
@@ -1100,8 +1259,16 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
             for parameter in _fixture_parameter_names(node)
             if parameter in available_fixture_nodes
         }
-        if reads_transitively(name, frozenset()) or any(
-            reads_transitively(fixture_name, frozenset()) for fixture_name in fixture_edges
+        reads_fixture_value = any(
+            parameter in analyses[name].read_names
+            and fixture_name in analyses
+            and analyses[fixture_name].returns_docs
+            for parameter, fixture_name in available_fixture_nodes.items()
+        )
+        if (
+            reads_fixture_value
+            or reads_transitively(name, frozenset())
+            or any(reads_transitively(fixture_name, frozenset()) for fixture_name in fixture_edges)
         ):
             readers.add(name)
     return readers
@@ -1196,6 +1363,46 @@ def _test_module_paths(tests_root: Path) -> list[Path]:
     )
 
 
+def _conftest_paths(tests_root: Path) -> list[Path]:
+    """Return every pytest conftest below the configured test root in stable order."""
+
+    return sorted(tests_root.rglob("conftest.py"))
+
+
+def _assert_conftests_docs_free(tests_root: Path) -> None:
+    """Reject conftest provenance that can hide docs reads from test markers."""
+
+    for path in _conftest_paths(tests_root):
+        relative_path = (
+            path.relative_to(_REPO).as_posix() if path.is_relative_to(_REPO) else str(path)
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Return)
+                and node.value is not None
+                and (
+                    _expression_is_docs_markdown(node.value, set())
+                    or _expression_has_docs_root(node.value)
+                )
+            ):
+                raise AssertionError(
+                    f"{relative_path}:{node.lineno}: conftest returns docs Markdown provenance"
+                )
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in _READ_METHOD_NAMES
+                and (
+                    _expression_is_docs_markdown(node.func.value, set())
+                    or _expression_has_docs_root(node.func.value)
+                )
+            ):
+                raise AssertionError(
+                    f"{relative_path}:{node.lineno}: conftest reads docs Markdown provenance"
+                )
+
+
 def _assert_default_pytest_collection_options(options: dict[str, object]) -> None:
     """Fail if pytest collection no longer uses the audited default test shapes."""
 
@@ -1208,6 +1415,7 @@ def test_docs_reading_tests_carry_the_exact_docs_marker_and_nothing_else() -> No
     """Every committed-Markdown reader is marked at the exact function, module-wide."""
 
     markdown_readers: dict[Path, set[str]] = {}
+    _assert_conftests_docs_free(_REPO / "tests")
     for path in _test_module_paths(_REPO / "tests"):
         relative_path = path.relative_to(_REPO).as_posix()
         source = path.read_text(encoding="utf-8")
@@ -1255,6 +1463,50 @@ def test_docs_governance_discovers_nested_test_modules(tmp_path: Path) -> None:
         "nested/test_nested.py",
         "test_top_level.py",
     ]
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_docs_provenance_in_nested_conftests(tmp_path: Path) -> None:
+    """Nested conftest readers, returns, and ambiguous paths cannot evade markers."""
+
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "nested"
+    nested.mkdir(parents=True)
+    (tests_root / "conftest.py").write_text("def helper() -> int:\n    return 1\n")
+    (nested / "conftest.py").write_text(
+        "from pathlib import Path\n\ndef helper() -> str:\n"
+        '    return Path("docs/hidden.md").read_text()\n'
+    )
+    assert [path.relative_to(tests_root).as_posix() for path in _conftest_paths(tests_root)] == [
+        "conftest.py",
+        "nested/conftest.py",
+    ]
+    with pytest.raises(AssertionError, match="nested/conftest.py:4: conftest"):
+        _assert_conftests_docs_free(tests_root)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_fails_closed_at_call_depth_but_not_cycles() -> None:
+    """Unvisited over-bound edges fail while cycles terminate without a false reader."""
+
+    deep = "\n\n".join(
+        [
+            *(
+                f"def helper_{index}() -> str:\n    return helper_{index + 1}()"
+                for index in range(9)
+            ),
+            'def helper_9() -> str:\n    return Path("docs/deep.md").read_text()',
+            "def test_deep() -> None:\n    assert helper_0()",
+        ]
+    )
+    with pytest.raises(AssertionError, match="exceeded the bounded"):
+        _docs_reading_test_modules("from pathlib import Path\n\n" + deep)
+    cycle = (
+        "def left() -> str:\n    return right()\n\n"
+        "def right() -> str:\n    return left()\n\n"
+        "def test_cycle() -> None:\n    assert left()\n"
+    )
+    assert _docs_reading_test_modules(cycle) == set()
 
 
 @pytest.mark.docs_ci
@@ -1479,6 +1731,28 @@ def test_docs_governance_detects_non_literal_construction(source: str, expected:
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_tracks_bounded_parametrized_path_sources() -> None:
+    """Literal and uniquely named parametrization values classify path receivers."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "DOCS = (Path('docs/one.md'),)\n"
+        "SCRIPTS = (Path('scripts/one.py'),)\n\n"
+        "@pytest.mark.parametrize('path', DOCS)\n"
+        "def test_docs(path: Path) -> None:\n    path.read_text()\n\n"
+        "@pytest.mark.parametrize('path', SCRIPTS)\n"
+        "def test_non_docs(path: Path) -> None:\n    path.read_text()\n\n"
+        "@pytest.mark.parametrize('path', unknown)\n"
+        "def test_unknown(path: Path) -> None:\n    path.read_text()\n"
+    )
+    with pytest.raises(AssertionError, match="parametrized receiver `path` is ambiguous"):
+        _docs_reading_test_modules(source)
+    assert _docs_reading_test_modules(source.rsplit("@pytest.mark.parametrize", 1)[0]) == {
+        "test_docs"
+    }
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_propagates_staged_docs_root_aliases() -> None:
     """Partial docs roots remain known through slash and joinpath composition."""
 
@@ -1532,6 +1806,39 @@ def test_docs_governance_follows_a_same_module_helper_call() -> None:
         "    assert _no_read() == 1\n"
     )
     assert _docs_reading_test_modules(source) == {"test_via_helper"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_docs_paths_returned_by_helpers_and_fixtures() -> None:
+    """Returned docs paths count only when a consumer subsequently reads them."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "def path_leaf() -> Path:\n"
+        '    return Path("docs/returned.md")\n\n'
+        "async def path_middle() -> Path:\n"
+        "    return path_leaf()\n\n"
+        "def test_helper_read() -> None:\n"
+        "    path = path_leaf()\n"
+        "    path.read_text()\n\n"
+        "async def test_async_read() -> None:\n"
+        "    path = path_middle()\n"
+        "    path.read_bytes()\n\n"
+        "def test_receives_without_read() -> None:\n"
+        "    assert path_leaf()\n\n"
+        "@pytest.fixture\n"
+        "def docs_path() -> Path:\n"
+        '    return Path("docs/fixture-return.md")\n\n'
+        "def test_fixture_read(docs_path: Path) -> None:\n"
+        "    docs_path.open()\n\n"
+        "def test_fixture_without_read(docs_path: Path) -> None:\n"
+        "    assert docs_path\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_async_read",
+        "test_fixture_read",
+        "test_helper_read",
+    }
 
 
 @pytest.mark.docs_ci
@@ -1899,6 +2206,25 @@ def test_docs_governance_follows_class_methods_to_top_level_and_same_class_helpe
         "TestDocs::test_top_level_helper",
         "TestDocs::test_same_class_helper",
     }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_follows_class_qualified_helpers() -> None:
+    """Static class-qualified calls share the same bounded helper graph as self calls."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class TestDocs:\n"
+        "    @staticmethod\n"
+        "    def leaf() -> str:\n"
+        '        return Path("docs/class-qualified.md").read_text()\n\n'
+        "    @classmethod\n"
+        "    def middle(cls) -> str:\n"
+        "        return TestDocs.leaf()\n\n"
+        "    def test_reader(self) -> None:\n"
+        "        assert TestDocs.middle()\n"
+    )
+    assert _docs_reading_test_modules(source) == {"TestDocs::test_reader"}
 
 
 @pytest.mark.docs_ci
