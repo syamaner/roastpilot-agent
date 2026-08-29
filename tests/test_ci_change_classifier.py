@@ -1020,12 +1020,32 @@ def _assert_exact_docs_markers(tree: ast.Module, readers: set[str], filename: st
     )
 
 
-def _module_has_pytestmark_docs(tree: ast.Module) -> bool:
-    """Return whether a module has the retired module-level docs marker.
+def _is_proven_docs_free_pytestmark(value: ast.expr) -> bool:
+    """Return whether a ``pytestmark`` value statically excludes ``docs``.
 
-    Pytest accepts a single marker or a literal list, tuple, or set of markers
-    for ``pytestmark``.  Keep this check static: dynamic expressions are not
-    evaluated by this governance audit.
+    Only literal list, tuple, and set containers of direct pytest marker
+    expressions are admitted. A dynamic or otherwise unrecognised expression
+    may resolve to ``pytest.mark.docs`` at collection time and is unsafe.
+    """
+
+    if isinstance(value, (ast.List, ast.Set, ast.Tuple)):
+        return all(_is_proven_docs_free_pytestmark(element) for element in value.elts)
+    marker = value.func if isinstance(value, ast.Call) else value
+    return (
+        isinstance(marker, ast.Attribute)
+        and marker.attr != "docs"
+        and isinstance(marker.value, ast.Attribute)
+        and marker.value.attr == "mark"
+        and isinstance(marker.value.value, ast.Name)
+        and marker.value.value.id == "pytest"
+    )
+
+
+def _module_has_unsafe_pytestmark(tree: ast.Module) -> bool:
+    """Return whether a module ``pytestmark`` can violate exact docs selection.
+
+    Module-level docs marks and marks that cannot statically prove ``docs`` is
+    absent are both retired because either can broad-mark non-reader tests.
     """
 
     for statement in tree.body:
@@ -1036,12 +1056,7 @@ def _module_has_pytestmark_docs(tree: ast.Module) -> bool:
             for target in statement.targets
         ):
             continue
-        marker_values: tuple[ast.expr, ...]
-        if isinstance(statement.value, (ast.List, ast.Set, ast.Tuple)):
-            marker_values = tuple(statement.value.elts)
-        else:
-            marker_values = (statement.value,)
-        if any(ast.unparse(value) == "pytest.mark.docs" for value in marker_values):
+        if not _is_proven_docs_free_pytestmark(statement.value):
             return True
     return False
 
@@ -1061,8 +1076,9 @@ def test_docs_reading_tests_carry_the_exact_docs_marker_and_nothing_else() -> No
         relative_path = path.relative_to(_REPO).as_posix()
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source)
-        assert not _module_has_pytestmark_docs(tree), (
-            f"{relative_path}: retired module-level `pytestmark = pytest.mark.docs` still present"
+        assert not _module_has_unsafe_pytestmark(tree), (
+            f"{relative_path}: module-level pytestmark is docs-bearing or ambiguous; "
+            "only statically proven docs-free literal marker forms are allowed"
         )
         readers = _docs_reading_test_modules(source, filename=relative_path)
         if readers:
@@ -1113,7 +1129,7 @@ def test_docs_governance_detects_a_hidden_unmarked_markdown_read() -> None:
         '    Path("docs/hidden.md").read_text()\n'
     )
     assert _docs_reading_test_modules(source) == {"test_hidden"}
-    assert not _module_has_pytestmark_docs(ast.parse(source))
+    assert not _module_has_unsafe_pytestmark(ast.parse(source))
 
 
 @pytest.mark.docs_ci
@@ -1136,18 +1152,30 @@ def test_docs_governance_detects_a_hidden_unmarked_markdown_read() -> None:
             True,
             id="set-docs",
         ),
+        pytest.param("pytestmark = pytest.mark.slow\n", False, id="scalar-non-docs"),
+        pytest.param(
+            "pytestmark = pytest.mark.skipif(condition, reason='because')\n",
+            False,
+            id="non-docs-marker-call",
+        ),
         pytest.param(
             "pytestmark = [pytest.mark.slow, pytest.mark.serial]\n",
             False,
             id="unrelated-list",
         ),
-        pytest.param("pytestmark = module_marks\n", False, id="dynamic-expression"),
+        pytest.param("pytestmark = module_marks\n", True, id="dynamic-name"),
+        pytest.param("pytestmark = [*module_marks]\n", True, id="starred-container"),
+        pytest.param(
+            "pytestmark = [pytest.mark.slow] + module_marks\n",
+            True,
+            id="concatenation",
+        ),
     ],
 )
-def test_docs_governance_rejects_literal_module_docs_markers(source: str, expected: bool) -> None:
-    """Only literal module ``docs`` marker forms trigger the retired-mark audit."""
+def test_docs_governance_rejects_unsafe_module_docs_markers(source: str, expected: bool) -> None:
+    """Only statically proven docs-free module marks pass the retired-mark audit."""
 
-    assert _module_has_pytestmark_docs(ast.parse(source)) is expected
+    assert _module_has_unsafe_pytestmark(ast.parse(source)) is expected
 
 
 @pytest.mark.docs_ci
