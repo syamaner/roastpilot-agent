@@ -314,6 +314,26 @@ def test_terminate_git_process_escalates_to_kill(monkeypatch: pytest.MonkeyPatch
     assert process.terminated and process.killed
 
 
+@pytest.mark.docs_ci
+def test_run_git_raises_for_a_completed_nonzero_live_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drained live process with a nonzero result cannot yield trusted Git output."""
+    process = _LiveGitProcess(b"")
+    process.returncode = 7
+
+    def fake_popen(_arguments: list[str], **_kwargs: object) -> _LiveGitProcess:
+        return process
+
+    monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        classifier._run_git(["status"])  # pyright: ignore[reportPrivateUsage]
+
+    assert error.value.returncode == 7
+    assert process.polls >= 2
+
+
 @pytest.mark.parametrize("status", [b"A", b"M", b"D"])
 def test_classifies_single_allowed_markdown_status_as_docs_only(
     monkeypatch: pytest.MonkeyPatch, status: bytes
