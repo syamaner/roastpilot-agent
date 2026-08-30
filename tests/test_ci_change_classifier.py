@@ -4171,6 +4171,20 @@ def test_docs_governance_rejects_module_scope_docs_reads_with_collected_tests() 
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_rejects_ambiguous_module_scope_docs_reads() -> None:
+    """A dynamic module docs filename cannot evade the import-time read boundary."""
+    source = (
+        "from pathlib import Path\n\n"
+        "dynamic_name = get_dynamic_name()\n"
+        'cached = Path("docs", dynamic_name).read_text()\n\n'
+        "def test_collected() -> None:\n    assert cached\n"
+    )
+
+    with pytest.raises(AssertionError, match="module-scope docs read receiver is ambiguous"):
+        _docs_reading_test_modules(source, filename="module_dynamic_cache.py")
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_rejects_unaudited_inherited_collected_test_methods() -> None:
     """A collected subclass cannot silently inherit a local docs reader."""
     standalone = "class TestStandalone:\n    def test_plain(self) -> None:\n        assert True\n"
