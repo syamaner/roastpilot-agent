@@ -7,6 +7,7 @@ import io
 import runpy
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from collections.abc import Iterable, Sequence
@@ -53,6 +54,77 @@ class _FakeGitProcess:
         if self.returncode is None:
             raise subprocess.TimeoutExpired("git", 0.0)
         return self.returncode
+
+
+class _LiveGitProcess(_FakeGitProcess):
+    """A process double that releases output only after live polling begins."""
+
+    def __init__(self, output: bytes) -> None:
+        super().__init__(running=True)
+        self.stdout = _LiveOutput(output)
+        self.polls = 0
+        self.terminated = False
+        self.killed = False
+        self.waits = 0
+
+    def poll(self) -> int | None:
+        """Remain live and release stdout after the second poll."""
+
+        self.polls += 1
+        if self.polls == 2:
+            self.stdout.release.set()
+        return self.returncode
+
+    def terminate(self) -> None:
+        """Record termination and unblock the stream."""
+
+        self.terminated = True
+        self.stdout.release.set()
+        super().terminate()
+
+    def kill(self) -> None:
+        """Record forced cleanup."""
+
+        self.killed = True
+        super().kill()
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Count bounded waits before using the ordinary fake result."""
+
+        del timeout
+        self.waits += 1
+        return super().wait()
+
+
+class _LiveOutput:
+    """A single chunk that cannot be read before polling releases it."""
+
+    def __init__(self, output: bytes) -> None:
+        self.output = output
+        self.release = threading.Event()
+        self.reads = 0
+
+    def read(self, _size: int) -> bytes:
+        """Block until the process has been polled twice, then return EOF."""
+
+        self.release.wait()
+        self.reads += 1
+        return self.output if self.reads == 1 else b""
+
+
+class _Clock:
+    """Monotonic deterministic clock without exhausted iterator behaviour."""
+
+    def __init__(self, step: float) -> None:
+        self.value = 0.0
+        self.step = step
+
+    def __call__(self) -> float:
+        """Return the current time and advance by a fixed amount."""
+
+        value = self.value
+        self.value += self.step
+        return value
 
 
 def _name_status(*fields: bytes) -> bytes:
@@ -156,6 +228,90 @@ def test_run_git_does_not_spawn_when_the_total_budget_is_exhausted(
     monkeypatch.setattr(classifier.subprocess, "run", no_spawn)
     with pytest.raises(classifier._BudgetExceeded):  # pyright: ignore[reportPrivateUsage]
         classifier._run_git(["status"], deadline=60.0)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.docs_ci
+def test_run_git_terminates_on_mid_run_output_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live polling notices streamed output over the cap and terminates the child."""
+
+    process = _LiveGitProcess(b"five!")
+
+    def fake_popen(_arguments: list[str], **_kwargs: object) -> _LiveGitProcess:
+        return process
+
+    def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(classifier, "_MAX_GIT_OUTPUT_BYTES", 4)
+    monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(classifier.time, "sleep", no_sleep)
+    with pytest.raises(classifier._GitOutputLimitExceeded):  # pyright: ignore[reportPrivateUsage]
+        classifier._run_git(["status"])  # pyright: ignore[reportPrivateUsage]
+    assert process.polls >= 2
+    assert process.terminated
+
+
+@pytest.mark.docs_ci
+def test_run_git_terminates_on_mid_run_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A running child is terminated when the total budget expires during polling."""
+
+    process = _LiveGitProcess(b"")
+    clock = _Clock(1.0)
+
+    def fake_popen(_arguments: list[str], **_kwargs: object) -> _LiveGitProcess:
+        return process
+
+    def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(classifier.time, "monotonic", clock)
+    monkeypatch.setattr(classifier.time, "sleep", no_sleep)
+    with pytest.raises(classifier._BudgetExceeded):  # pyright: ignore[reportPrivateUsage]
+        classifier._run_git(["status"], deadline=2.5)  # pyright: ignore[reportPrivateUsage]
+    assert process.terminated
+
+
+@pytest.mark.docs_ci
+def test_run_git_terminates_on_mid_run_per_call_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A running child is terminated when its per-call interval expires."""
+
+    process = _LiveGitProcess(b"")
+    clock = _Clock(1.0)
+
+    def fake_popen(_arguments: list[str], **_kwargs: object) -> _LiveGitProcess:
+        return process
+
+    def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(classifier, "_GIT_CALL_TIMEOUT_SECONDS", 1.5)
+    monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(classifier.time, "monotonic", clock)
+    monkeypatch.setattr(classifier.time, "sleep", no_sleep)
+    with pytest.raises(subprocess.TimeoutExpired):
+        classifier._run_git(["status"])  # pyright: ignore[reportPrivateUsage]
+    assert process.terminated
+
+
+@pytest.mark.docs_ci
+def test_terminate_git_process_escalates_to_kill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cleanup kills a child when its bounded post-terminate wait expires."""
+
+    process = _LiveGitProcess(b"")
+    original_wait = process.wait
+
+    def timeout_once(timeout: float | None = None) -> int:
+        """Force the first cleanup wait to time out, then allow the kill wait."""
+
+        if process.waits == 0:
+            process.waits += 1
+            raise subprocess.TimeoutExpired("git", timeout or 0.0)
+        return original_wait(timeout)
+
+    monkeypatch.setattr(process, "wait", timeout_once)
+    classifier._terminate_git_process(cast(subprocess.Popen[bytes], process))  # pyright: ignore[reportPrivateUsage]
+    assert process.terminated and process.killed
 
 
 @pytest.mark.parametrize("status", [b"A", b"M", b"D"])
