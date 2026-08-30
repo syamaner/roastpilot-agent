@@ -115,11 +115,18 @@ class _LiveOutput:
 class _FailingLiveOutput(_LiveOutput):
     """A live stream that returns one valid prefix before its next read fails."""
 
+    def __init__(self, output: bytes | tuple[bytes, ...]) -> None:
+        """Initialize the blocked stream and its deterministic failure signal."""
+
+        super().__init__(output)
+        self.failed = threading.Event()
+
     def read(self, size: int) -> bytes:
         """Return the configured prefix once, then model an OS-level drain failure."""
 
         result = super().read(size)
         if self.reads > len(self.chunks):
+            self.failed.set()
             raise OSError("stdout drain failed")
         return result
 
@@ -415,6 +422,35 @@ def test_run_git_reraises_a_drain_failure_after_a_valid_prefix(
     monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen)
     with pytest.raises(OSError, match="stdout drain failed"):
         classifier._run_git(["diff", "--name-status"])  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.docs_ci
+def test_run_git_terminates_a_live_process_when_its_drain_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live polling iteration observes drain failure before accepting any output."""
+
+    process = _LiveGitProcess(b"docs/guide.md")
+    output = _FailingLiveOutput(b"docs/guide.md")
+    process.stdout = output
+
+    def remain_live_until_failure() -> None:
+        """Release the drain and keep the child live until its error is visible."""
+
+        process.polls += 1
+        output.release.set()
+        assert output.failed.wait(timeout=1.0)
+        return None
+
+    def fake_popen(_arguments: list[str], **_kwargs: object) -> _LiveGitProcess:
+        return process
+
+    monkeypatch.setattr(process, "poll", remain_live_until_failure)
+    monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(classifier, "_GIT_CALL_TIMEOUT_SECONDS", 0.1)
+    with pytest.raises(OSError, match="stdout drain failed"):
+        classifier._run_git(["status"])  # pyright: ignore[reportPrivateUsage]
+    assert process.terminated
 
 
 @pytest.mark.parametrize("status", [b"A", b"M", b"D"])
