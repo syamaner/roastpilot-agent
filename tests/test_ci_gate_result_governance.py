@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 from typing import cast
 
+import ci_gate_result as gate_result
 import pytest
 import yaml
 
@@ -29,6 +30,15 @@ _BASE_REF_EXPRESSION = (
     "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}"
 )
 _GATE_JOB_NAMES = frozenset({"checks", "web", "web-snapshots"})
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    (("full", "skipped"), ("docs-only", "success")),
+)
+def test_expected_result_maps_docs_only_jobs_in_both_modes(mode: str, expected: str) -> None:
+    """Docs-only jobs skip in full mode and must succeed in docs-only mode."""
+    assert gate_result._expected_result(mode, "docs-only") == expected  # pyright: ignore[reportPrivateUsage]
 
 
 def _load_workflow(path: Path) -> dict[str, object]:
