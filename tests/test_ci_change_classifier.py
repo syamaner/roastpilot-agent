@@ -925,26 +925,30 @@ class _FunctionAnalysis:
 
 
 def _repository_imported_function_analyses(
-    tree: ast.Module, repository_root: Path
+    tree: ast.Module, filename: str, repository_root: Path
 ) -> tuple[dict[str, _FunctionAnalysis], set[str]]:
-    """Return static analyses for direct imports from repository-local modules."""
+    """Return static analyses for direct imports from confined first-party modules."""
 
     analyses: dict[str, _FunctionAnalysis] = {}
     ambiguous: set[str] = set()
     for statement in tree.body:
         if not isinstance(statement, ast.ImportFrom) or statement.module is None:
             continue
-        module_path = repository_root.joinpath(*statement.module.split("."))
-        source_path = next(
-            (
-                path
-                for path in (module_path.with_suffix(".py"), module_path / "__init__.py")
-                if path.is_file()
-            ),
-            None,
-        )
-        if source_path is None:
+        importer = Path(filename)
+        if not importer.is_absolute():
+            importer = repository_root / importer
+        candidates: set[Path] = set()
+        for base in (importer.parent, repository_root):
+            module_path = base.joinpath(*statement.module.split("."))
+            for path in (module_path.with_suffix(".py"), module_path / "__init__.py"):
+                if path.is_file() and path.is_relative_to(repository_root):
+                    candidates.add(path)
+        if len(candidates) > 1:
+            ambiguous.update(imported.asname or imported.name for imported in statement.names)
             continue
+        if not candidates:
+            continue
+        source_path = candidates.pop()
         imported_tree = ast.parse(source_path.read_text(encoding="utf-8"))
         functions = {
             node.name: node
@@ -1272,7 +1276,7 @@ def _docs_reading_test_modules(
 
     tree = ast.parse(source)
     imported_analyses, ambiguous_imports = _repository_imported_function_analyses(
-        tree, repository_root
+        tree, filename, repository_root
     )
     module_value_sources = _module_value_sources(tree)
     module_aliases: set[str] = set()
@@ -1762,26 +1766,49 @@ def test_docs_governance_discovers_nested_test_modules(tmp_path: Path) -> None:
 def test_docs_governance_follows_repository_local_imported_helpers(tmp_path: Path) -> None:
     """Repository-local imported helper reads and return paths reach consumers."""
 
-    (tmp_path / "helpers.py").write_text(
+    tests_root = tmp_path / "tests"
+    tests_root.mkdir()
+    (tests_root / "_agent_defs.py").write_text(
         "from pathlib import Path\n\n"
         "def docs_reader() -> str:\n    return Path('docs/imported.md').read_text()\n\n"
         "def docs_path() -> Path:\n    return Path('docs/imported-path.md')\n\n"
         "def non_docs() -> str:\n    return Path('config/imported.md').read_text()\n"
     )
     source = (
-        "from helpers import docs_reader, docs_path, non_docs\n\n"
+        "from _agent_defs import docs_reader, docs_path, non_docs\n\n"
         "def test_direct() -> None:\n    assert docs_reader()\n\n"
         "def test_returned() -> None:\n    docs_path().read_text()\n\n"
         "def test_non_docs() -> None:\n    assert non_docs()\n"
     )
     assert _docs_reading_test_modules(
-        source, filename=str(tmp_path / "test_imported.py"), repository_root=tmp_path
+        source, filename=str(tests_root / "test_imported.py"), repository_root=tmp_path
     ) == {"test_direct", "test_returned"}
     with pytest.raises(AssertionError, match="imported callable provenance"):
         _docs_reading_test_modules(
-            "from helpers import missing\n\ndef test_ambiguous() -> None:\n    missing()\n",
-            filename=str(tmp_path / "test_imported.py"),
+            "from _agent_defs import missing\n\ndef test_ambiguous() -> None:\n    missing()\n",
+            filename=str(tests_root / "test_imported.py"),
             repository_root=tmp_path,
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_multiple_local_import_roots(
+    tmp_path: Path,
+) -> None:
+    """Competing importer-relative and repository-root modules fail closed."""
+
+    (tmp_path / "tests" / "package").mkdir(parents=True)
+    (tmp_path / "tests" / "package" / "helpers.py").write_text(
+        "def docs_reader():\n    return ''\n"
+    )
+    source = (
+        "from package.helpers import docs_reader\n\ndef test_reader():\n    assert docs_reader()\n"
+    )
+    (tmp_path / "package").mkdir()
+    (tmp_path / "package" / "helpers.py").write_text("def docs_reader():\n    return ''\n")
+    with pytest.raises(AssertionError, match="imported callable provenance"):
+        _docs_reading_test_modules(
+            source, filename=str(tmp_path / "tests" / "test_import.py"), repository_root=tmp_path
         )
 
 
