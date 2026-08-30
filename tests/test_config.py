@@ -2,7 +2,7 @@
 § Configuration Model; D5).
 
 Documented defaults, env-var loading (``ROASTPILOT_`` prefix with ``__``
-nesting), validation rejections, and the guidance-vs-safety-bound link.
+nesting), validation rejections, and the guidance-vs-safety-bound relationship.
 """
 
 import inspect
