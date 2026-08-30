@@ -1143,22 +1143,59 @@ def _builtin_open_import_aliases(tree: ast.Module) -> set[str]:
     }
 
 
-def _is_pytest_fixture_decorator(decorator: ast.expr) -> bool:
+def _pytest_fixture_aliases(tree: ast.Module) -> tuple[set[str], set[str]]:
+    """Return direct pytest.fixture aliases and aliases rebound in this module."""
+
+    aliases = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.ImportFrom) and statement.module == "pytest"
+        for alias in statement.names
+        if alias.name == "fixture"
+    }
+    rebound = {
+        target.id
+        for statement in tree.body
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        )
+        if isinstance(target, ast.Name) and target.id in aliases
+    }
+    return aliases - rebound, rebound
+
+
+def _is_pytest_fixture_decorator(
+    decorator: ast.expr, fixture_aliases: set[str], ambiguous_fixture_aliases: set[str]
+) -> bool:
     """Return whether a decorator expression is (a call to) ``pytest.fixture``."""
 
     target = decorator.func if isinstance(decorator, ast.Call) else decorator
     if isinstance(target, ast.Attribute):
-        return target.attr == "fixture"
+        return (
+            target.attr == "fixture"
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "pytest"
+        )
     if isinstance(target, ast.Name):
-        return target.id == "fixture"
+        if target.id in ambiguous_fixture_aliases:
+            raise AssertionError(f"fixture decorator alias `{target.id}` is ambiguous")
+        return target.id in fixture_aliases
     return False
 
 
-def _fixture_exposed_name(function_name: str, decorators: list[ast.expr]) -> str | None:
+def _fixture_exposed_name(
+    function_name: str,
+    decorators: list[ast.expr],
+    fixture_aliases: set[str],
+    ambiguous_fixture_aliases: set[str],
+) -> str | None:
     """Return one statically resolved fixture name or fail closed on ambiguity."""
 
     fixture_decorators = [
-        decorator for decorator in decorators if _is_pytest_fixture_decorator(decorator)
+        decorator
+        for decorator in decorators
+        if _is_pytest_fixture_decorator(decorator, fixture_aliases, ambiguous_fixture_aliases)
     ]
     if not fixture_decorators:
         return None
@@ -1184,11 +1221,17 @@ def _fixture_exposed_name(function_name: str, decorators: list[ast.expr]) -> str
     return name_value.value
 
 
-def _fixture_is_autouse(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+def _fixture_is_autouse(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    fixture_aliases: set[str],
+    ambiguous_fixture_aliases: set[str],
+) -> bool:
     """Return a fixture's literal autouse setting or fail closed on ambiguity."""
 
     decorators = [
-        decorator for decorator in node.decorator_list if _is_pytest_fixture_decorator(decorator)
+        decorator
+        for decorator in node.decorator_list
+        if _is_pytest_fixture_decorator(decorator, fixture_aliases, ambiguous_fixture_aliases)
     ]
     if not decorators or not isinstance(decorators[0], ast.Call):
         return False
@@ -1276,13 +1319,43 @@ def _fixture_parameter_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> se
     return {argument.arg for argument in [*node.args.args, *node.args.kwonlyargs]}
 
 
+def _requested_fixture_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Return literal request.getfixturevalue dependencies or fail closed."""
+
+    names: set[str] = set()
+    for call in ast.walk(node):
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "getfixturevalue"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "request"
+        ):
+            continue
+        if (
+            len(call.args) != 1
+            or call.keywords
+            or not isinstance(call.args[0], ast.Constant)
+            or not isinstance(call.args[0].value, str)
+            or not call.args[0].value
+        ):
+            raise AssertionError("request.getfixturevalue requires one literal fixture name")
+        names.add(call.args[0].value)
+    return names
+
+
 def _fixture_params_state(
-    node: ast.FunctionDef | ast.AsyncFunctionDef, sources: dict[str, ast.expr]
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    sources: dict[str, ast.expr],
+    fixture_aliases: set[str],
+    ambiguous_fixture_aliases: set[str],
 ) -> str:
     """Return ``none``, ``docs``, ``non-doc``, or ``ambiguous`` fixture params state."""
 
     decorators = [
-        decorator for decorator in node.decorator_list if _is_pytest_fixture_decorator(decorator)
+        decorator
+        for decorator in node.decorator_list
+        if _is_pytest_fixture_decorator(decorator, fixture_aliases, ambiguous_fixture_aliases)
     ]
     if len(decorators) != 1 or not isinstance(decorators[0], ast.Call):
         return "none"
@@ -1380,6 +1453,22 @@ def _parametrized_docs_and_ambiguous_parameters(
                 docs.add(names[0])
             elif not _string_constants(value):
                 ambiguous.add(names[0])
+    positional = [*node.args.posonlyargs, *node.args.args]
+    if node.args.defaults:
+        for parameter, default in zip(
+            positional[-len(node.args.defaults) :], node.args.defaults, strict=True
+        ):
+            if _expression_is_docs_markdown(default, set()):
+                docs.add(parameter.arg)
+            elif not _string_constants(default):
+                ambiguous.add(parameter.arg)
+    for parameter, default in zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True):
+        if default is None:
+            continue
+        if _expression_is_docs_markdown(default, set()):
+            docs.add(parameter.arg)
+        elif not _string_constants(default):
+            ambiguous.add(parameter.arg)
     return docs, ambiguous
 
 
@@ -1744,6 +1833,8 @@ def _analyse_function(
     ambiguous_module_values: set[tuple[str, str]] | None = None,
     imported_classes: set[str] | None = None,
     builtin_open_import_aliases: set[str] | None = None,
+    fixture_aliases: set[str] | None = None,
+    ambiguous_fixture_aliases: set[str] | None = None,
 ) -> _FunctionAnalysis:
     """Walk one function body for a direct docs read, calls, and unresolved reads.
 
@@ -1768,7 +1859,12 @@ def _analyse_function(
     reads = False
     returns_docs = False
     fixture_params = (
-        _fixture_params_state(func, module_value_sources)
+        _fixture_params_state(
+            func,
+            module_value_sources,
+            fixture_aliases or set(),
+            ambiguous_fixture_aliases or set(),
+        )
         if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef))
         else "none"
     )
@@ -2348,6 +2444,7 @@ def _docs_reading_test_modules(
         tree, filename, imported_analyses, ambiguous_imports
     )
     module_value_sources = _module_value_sources(tree)
+    fixture_aliases, ambiguous_fixture_aliases = _pytest_fixture_aliases(tree)
     module_aliases: set[str] = set()
     module_partial_aliases: set[str] = set()
     module_aliases.update(imported_docs_values)
@@ -2414,7 +2511,9 @@ def _docs_reading_test_modules(
     for function_key, node in functions.items():
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        fixture_name = _fixture_exposed_name(node.name, node.decorator_list)
+        fixture_name = _fixture_exposed_name(
+            node.name, node.decorator_list, fixture_aliases, ambiguous_fixture_aliases
+        )
         if fixture_name is None:
             continue
         class_name = function_key.partition("::")[0] if "::" in function_key else None
@@ -2458,6 +2557,7 @@ def _docs_reading_test_modules(
         available = fixture_nodes_for(function_key)
         class_name = function_key.partition("::")[0] if "::" in function_key else None
         requested = module_usefixtures | _usefixtures_names(node.decorator_list)
+        requested |= _requested_fixture_names(node)
         if class_name is not None:
             requested |= class_usefixtures.get(class_name, set())
         missing = requested - available.keys()
@@ -2469,7 +2569,9 @@ def _docs_reading_test_modules(
             fixture_name
             for fixture_name in available.values()
             if _fixture_is_autouse(
-                cast(ast.FunctionDef | ast.AsyncFunctionDef, functions[fixture_name])
+                cast(ast.FunctionDef | ast.AsyncFunctionDef, functions[fixture_name]),
+                fixture_aliases,
+                ambiguous_fixture_aliases,
             )
         }
         return autouse | {available[name] for name in requested}
@@ -2519,6 +2621,8 @@ def _docs_reading_test_modules(
             ambiguous_module_values,
             imported_classes,
             builtin_open_import_aliases,
+            fixture_aliases,
+            ambiguous_fixture_aliases,
         )
         analyses[name] = analysis
         if name not in local_keys:
@@ -2602,6 +2706,13 @@ def _docs_reading_test_modules(
             for parameter in _fixture_parameter_names(fixture)
             if parameter in available_fixture_nodes
         }
+        requested_fixture_names = _requested_fixture_names(fixture)
+        missing_requested = requested_fixture_names - available_fixture_nodes.keys()
+        if missing_requested:
+            raise AssertionError(
+                f"{filename}: request.getfixturevalue cannot resolve {sorted(missing_requested)}"
+            )
+        fixture_parameters |= {available_fixture_nodes[name] for name in requested_fixture_names}
         analyses[fixture_name].calls.update(fixture_parameters)
         analyses[fixture_name].return_calls.update(
             available_fixture_nodes[parameter]
@@ -4139,6 +4250,58 @@ def test_docs_governance_follows_a_same_module_fixture() -> None:
         "    assert unrelated == 1\n"
     )
     assert _docs_reading_test_modules(source) == {"test_uses_fixture"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_literal_request_getfixturevalue_dependencies() -> None:
+    """Literal request.getfixturevalue calls add their fixture edge exactly."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture\ndef docs_fixture() -> str:\n"
+        "    return Path('docs/request.md').read_text()\n\n"
+        "@pytest.fixture\ndef plain_fixture() -> int:\n    return 1\n\n"
+        "def test_docs(request) -> None:\n    assert request.getfixturevalue('docs_fixture')\n\n"
+        "def test_plain(request) -> None:\n"
+        "    assert request.getfixturevalue('plain_fixture') == 1\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_docs"}
+    with pytest.raises(
+        AssertionError, match="request.getfixturevalue requires one literal fixture name"
+    ):
+        _docs_reading_test_modules(source.replace("'plain_fixture'", "fixture_name"))
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_docs_rooted_parameter_defaults() -> None:
+    """Positional and keyword-only defaults retain docs or fail-closed provenance."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def test_positional(path=Path('docs/default.md')) -> None:\n    path.read_text()\n\n"
+        "def test_keyword_only(*, path=Path('docs/keyword.md')) -> None:\n    path.read_bytes()\n\n"
+        "def test_plain(path=Path('config/default.md')) -> None:\n    path.read_text()\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_keyword_only", "test_positional"}
+    with pytest.raises(AssertionError, match="parametrized receiver `path` is ambiguous"):
+        _docs_reading_test_modules(
+            "from pathlib import Path\n\ndef test_dynamic(path=build_path()) -> None:\n"
+            "    path.read_text()\n"
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_recognizes_scoped_pytest_fixture_import_aliases() -> None:
+    """A direct pytest.fixture import alias participates in the fixture graph."""
+
+    source = (
+        "from pathlib import Path\nfrom pytest import fixture as fx\n\n"
+        "@fx\ndef docs_alias() -> str:\n    return Path('docs/alias-fixture.md').read_text()\n\n"
+        "def test_alias(docs_alias: str) -> None:\n    assert docs_alias\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_alias"}
+    with pytest.raises(AssertionError, match="fixture decorator alias `fx` is ambiguous"):
+        _docs_reading_test_modules(source.replace("@fx", "fx = object\n\n@fx"))
 
 
 @pytest.mark.docs_ci
