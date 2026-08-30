@@ -729,6 +729,73 @@ def _fixture_exposed_name(function_name: str, decorators: list[ast.expr]) -> str
     return name_value.value
 
 
+def _fixture_is_autouse(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Return a fixture's literal autouse setting or fail closed on ambiguity."""
+
+    decorators = [
+        decorator for decorator in node.decorator_list if _is_pytest_fixture_decorator(decorator)
+    ]
+    if not decorators or not isinstance(decorators[0], ast.Call):
+        return False
+    values = [keyword.value for keyword in decorators[0].keywords if keyword.arg == "autouse"]
+    if not values:
+        return False
+    if (
+        len(values) != 1
+        or not isinstance(values[0], ast.Constant)
+        or not isinstance(values[0].value, bool)
+    ):
+        raise AssertionError(f"fixture `{node.name}` has an ambiguous `autouse=` setting")
+    return values[0].value
+
+
+def _usefixtures_names(decorators: Iterable[ast.expr]) -> set[str]:
+    """Return literal ``usefixtures`` names or fail closed on dynamic forms."""
+
+    names: set[str] = set()
+    for decorator in decorators:
+        if not (
+            isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Attribute)
+            and decorator.func.attr == "usefixtures"
+        ):
+            continue
+        if (
+            decorator.keywords
+            or not decorator.args
+            or any(
+                not isinstance(argument, ast.Constant) or not isinstance(argument.value, str)
+                for argument in decorator.args
+            )
+        ):
+            raise AssertionError("pytest.mark.usefixtures must use literal fixture names")
+        names.update(
+            cast(str, argument.value)
+            for argument in decorator.args
+            if isinstance(argument, ast.Constant)
+        )
+    return names
+
+
+def _module_usefixtures_names(tree: ast.Module) -> set[str]:
+    """Return literal module-level ``usefixtures`` marks."""
+
+    names: set[str] = set()
+    for statement in tree.body:
+        if not isinstance(statement, ast.Assign) or not any(
+            isinstance(target, ast.Name) and target.id == "pytestmark"
+            for target in statement.targets
+        ):
+            continue
+        values = (
+            statement.value.elts
+            if isinstance(statement.value, (ast.List, ast.Set, ast.Tuple))
+            else [statement.value]
+        )
+        names.update(_usefixtures_names(values))
+    return names
+
+
 def _fixture_parameter_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     """Return statically named positional and keyword-only fixture parameters."""
 
@@ -855,6 +922,78 @@ class _FunctionAnalysis:
     call_result_assignments: dict[str, str]
     read_names: set[str]
     read_calls: set[str]
+
+
+def _repository_imported_function_analyses(
+    tree: ast.Module, repository_root: Path
+) -> tuple[dict[str, _FunctionAnalysis], set[str]]:
+    """Return static analyses for direct imports from repository-local modules."""
+
+    analyses: dict[str, _FunctionAnalysis] = {}
+    ambiguous: set[str] = set()
+    for statement in tree.body:
+        if not isinstance(statement, ast.ImportFrom) or statement.module is None:
+            continue
+        module_path = repository_root.joinpath(*statement.module.split("."))
+        source_path = next(
+            (
+                path
+                for path in (module_path.with_suffix(".py"), module_path / "__init__.py")
+                if path.is_file()
+            ),
+            None,
+        )
+        if source_path is None:
+            continue
+        imported_tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        functions = {
+            node.name: node
+            for node in imported_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        bindings = {
+            node.name
+            for node in imported_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        } | {
+            target.id
+            for node in imported_tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            if isinstance(target, ast.Name)
+        }
+        for imported in statement.names:
+            alias = imported.asname or imported.name
+            if imported.name == "*" or alias in analyses:
+                ambiguous.add(alias)
+                continue
+            if imported.name not in functions:
+                if imported.name not in bindings:
+                    ambiguous.add(alias)
+                continue
+            source = source_path.read_text(encoding="utf-8")
+            proxy = (
+                source
+                + "\n\ndef test_import_direct() -> None:\n"
+                + f"    {imported.name}()\n\n"
+                + "def test_import_return() -> None:\n"
+                + f"    {imported.name}().read_text()\n"
+            )
+            readers = _docs_reading_test_modules(
+                proxy, filename=str(source_path), repository_root=repository_root
+            )
+            analyses[alias] = _FunctionAnalysis(
+                reads_directly="test_import_direct" in readers,
+                calls=set(),
+                unresolved=[],
+                returns_docs="test_import_return" in readers,
+                return_calls=set(),
+                return_names=set(),
+                call_result_assignments={},
+                read_names=set(),
+                read_calls=set(),
+            )
+    return analyses, ambiguous
 
 
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
@@ -1102,7 +1241,9 @@ def _analyse_function(
     )
 
 
-def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[str]:
+def _docs_reading_test_modules(
+    source: str, filename: str = "<module>", repository_root: Path = _REPO
+) -> set[str]:
     """Return the exact executable test names that read committed ``docs/**/*.md``.
 
     A test counts when it (or a same-module helper/fixture it calls or requests,
@@ -1130,6 +1271,9 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
     """
 
     tree = ast.parse(source)
+    imported_analyses, ambiguous_imports = _repository_imported_function_analyses(
+        tree, repository_root
+    )
     module_value_sources = _module_value_sources(tree)
     module_aliases: set[str] = set()
     module_partial_aliases: set[str] = set()
@@ -1181,6 +1325,12 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
             functions[qualified_name] = member
             methods[member.name] = qualified_name
         class_methods[statement.name] = methods
+    module_usefixtures = _module_usefixtures_names(tree)
+    class_usefixtures = {
+        statement.name: _usefixtures_names(statement.decorator_list)
+        for statement in tree.body
+        if isinstance(statement, ast.ClassDef)
+    }
     module_fixture_nodes: dict[str, str] = {}
     class_fixture_nodes: dict[str, dict[str, str]] = {}
     for function_key, node in functions.items():
@@ -1222,11 +1372,35 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
             return module_fixture_nodes
         return module_fixture_nodes | class_fixture_nodes.get(class_name, {})
 
+    def activated_fixture_nodes(
+        function_key: str, node: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> set[str]:
+        """Return literal autouse and usefixtures dependencies for one test."""
+
+        available = fixture_nodes_for(function_key)
+        class_name = function_key.partition("::")[0] if "::" in function_key else None
+        requested = module_usefixtures | _usefixtures_names(node.decorator_list)
+        if class_name is not None:
+            requested |= class_usefixtures.get(class_name, set())
+        missing = requested - available.keys()
+        if missing:
+            raise AssertionError(
+                f"{filename}: pytest fixture activation cannot resolve {sorted(missing)}"
+            )
+        autouse = {
+            fixture_name
+            for fixture_name in available.values()
+            if _fixture_is_autouse(
+                cast(ast.FunctionDef | ast.AsyncFunctionDef, functions[fixture_name])
+            )
+        }
+        return autouse | {available[name] for name in requested}
+
     known_functions = {
         statement.name
         for statement in tree.body
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    } | set(imported_analyses)
     local_targets: dict[str, dict[str, str]] = {}
     ambiguous_local_targets: dict[str, set[str]] = {}
     local_keys: set[str] = set()
@@ -1266,6 +1440,22 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
             "docs-content governance found an unresolved dynamic read receiver that "
             f"could hide an unmarked docs read: {unresolved}"
         )
+    analyses.update(imported_analyses)
+    for name, node in functions.items():
+        if (
+            name in local_keys
+            or not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            or (not name.startswith("test_") and "::test_" not in name)
+        ):
+            continue
+        if any(
+            isinstance(call.func, ast.Name) and call.func.id in ambiguous_imports
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+        ):
+            raise AssertionError(
+                f"{filename}: imported callable provenance for `{name}` is ambiguous"
+            )
 
     for fixture_name in fixtures:
         fixture = functions[fixture_name]
@@ -1337,6 +1527,7 @@ def _docs_reading_test_modules(source: str, filename: str = "<module>") -> set[s
             for parameter in _fixture_parameter_names(node)
             if parameter in available_fixture_nodes
         }
+        fixture_edges |= activated_fixture_nodes(name, node)
         reads_fixture_value = any(
             parameter in analyses[name].read_names
             and fixture_name in analyses
@@ -1382,6 +1573,37 @@ def _marked_docs_test_prefixes(tree: ast.Module) -> set[str]:
     return marked
 
 
+def _marked_test_prefixes(tree: ast.Module, marker: str) -> set[str]:
+    """Return tests carrying one exact function- or class-level marker."""
+
+    marker_text = f"pytest.mark.{marker}"
+    marked: set[str] = set()
+    for statement in tree.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if statement.name.startswith("test_") and any(
+                ast.unparse(decorator) == marker_text for decorator in statement.decorator_list
+            ):
+                marked.add(statement.name)
+        elif isinstance(statement, ast.ClassDef):
+            class_marked = any(
+                ast.unparse(decorator) == marker_text for decorator in statement.decorator_list
+            )
+            for member in statement.body:
+                if (
+                    isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and member.name.startswith("test_")
+                    and (
+                        class_marked
+                        or any(
+                            ast.unparse(decorator) == marker_text
+                            for decorator in member.decorator_list
+                        )
+                    )
+                ):
+                    marked.add(f"{statement.name}::{member.name}")
+    return marked
+
+
 def _assert_exact_docs_markers(tree: ast.Module, readers: set[str], filename: str) -> None:
     """Fail when exact docs-reader prefixes and effective docs markers differ."""
 
@@ -1389,6 +1611,10 @@ def _assert_exact_docs_markers(tree: ast.Module, readers: set[str], filename: st
     assert marked == readers, (
         f"{filename}: @pytest.mark.docs must sit on exactly the readers "
         f"{sorted(readers)}, found {sorted(marked)}"
+    )
+    assert not readers & _marked_test_prefixes(tree, "stress"), (
+        f"{filename}: docs readers cannot carry pytest.mark.stress because the docs selector "
+        "excludes stress"
     )
 
 
@@ -1530,6 +1756,77 @@ def test_docs_governance_discovers_nested_test_modules(tmp_path: Path) -> None:
         "nested/test_nested.py",
         "test_top_level.py",
     ]
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_follows_repository_local_imported_helpers(tmp_path: Path) -> None:
+    """Repository-local imported helper reads and return paths reach consumers."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def docs_reader() -> str:\n    return Path('docs/imported.md').read_text()\n\n"
+        "def docs_path() -> Path:\n    return Path('docs/imported-path.md')\n\n"
+        "def non_docs() -> str:\n    return Path('config/imported.md').read_text()\n"
+    )
+    source = (
+        "from helpers import docs_reader, docs_path, non_docs\n\n"
+        "def test_direct() -> None:\n    assert docs_reader()\n\n"
+        "def test_returned() -> None:\n    docs_path().read_text()\n\n"
+        "def test_non_docs() -> None:\n    assert non_docs()\n"
+    )
+    assert _docs_reading_test_modules(
+        source, filename=str(tmp_path / "test_imported.py"), repository_root=tmp_path
+    ) == {"test_direct", "test_returned"}
+    with pytest.raises(AssertionError, match="imported callable provenance"):
+        _docs_reading_test_modules(
+            "from helpers import missing\n\ndef test_ambiguous() -> None:\n    missing()\n",
+            filename=str(tmp_path / "test_imported.py"),
+            repository_root=tmp_path,
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_literal_fixture_activation() -> None:
+    """Autouse and literal usefixtures edges select only their affected tests."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "class TestAutouse:\n"
+        "    @pytest.fixture(autouse=True)\n"
+        "    def docs_fixture(self) -> str:\n"
+        "        return Path('docs/autouse.md').read_text()\n\n"
+        "    def test_autouse(self) -> None:\n        assert True\n\n"
+        "def test_unaffected() -> None:\n    assert True\n\n"
+        "@pytest.fixture\n"
+        "def marked_fixture() -> str:\n"
+        "    return Path('docs/marked.md').read_text()\n\n"
+        "@pytest.mark.usefixtures('marked_fixture')\n"
+        "def test_marked() -> None:\n    assert True\n"
+    )
+    assert _docs_reading_test_modules(source) == {"TestAutouse::test_autouse", "test_marked"}
+    with pytest.raises(AssertionError, match="autouse"):
+        _docs_reading_test_modules(
+            source.replace("autouse=True", "autouse=enabled"), filename="dynamic_autouse.py"
+        )
+    with pytest.raises(AssertionError, match="usefixtures"):
+        _docs_reading_test_modules(
+            source.replace("'marked_fixture'", "fixture_name"), filename="dynamic_usefixtures.py"
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_docs_stress_overlap() -> None:
+    """A docs reader cannot be excluded from the fast lane by ``stress``."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.mark.docs\n@pytest.mark.stress\n"
+        "def test_reader() -> None:\n    Path('docs/stress.md').read_text()\n"
+    )
+    tree = ast.parse(source)
+    readers = _docs_reading_test_modules(source)
+    with pytest.raises(AssertionError, match="cannot carry pytest.mark.stress"):
+        _assert_exact_docs_markers(tree, readers, "stress_overlap.py")
 
 
 @pytest.mark.docs_ci
