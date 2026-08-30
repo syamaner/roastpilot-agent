@@ -241,6 +241,61 @@ def test_stage_codecov_input_directory_replaces_stale_safe_output(tmp_path: Path
     assert not (staging_directory / "stale.txt").exists()
 
 
+def test_stage_codecov_input_directory_rejects_an_empty_normalized_report(tmp_path: Path) -> None:
+    """Removing every covered filename fails before a no-source artifact is created."""
+    coverage_xml = _write_coverage_xml(tmp_path, ())
+    (tmp_path / "codecov.yml").touch()
+    staging_directory = tmp_path / "codecov-input"
+
+    with pytest.raises(ValueError, match="no filenames"):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+
+    assert not staging_directory.exists()
+
+
+def test_stage_codecov_input_directory_caps_filename_and_config_resource_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Small test caps prove both artifact-derived resource limits fail closed."""
+    coverage_xml = _write_coverage_xml(tmp_path, ("scripts/one.py", "scripts/two.py"))
+    config_path = tmp_path / "codecov.yml"
+    config_path.write_bytes(b"xx")
+    staging_directory = tmp_path / "codecov-input"
+    monkeypatch.setattr(tooling_coverage, "MAX_CODECOV_COVERED_FILENAMES", 1)
+
+    with pytest.raises(ValueError, match="too many filenames"):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+    assert not staging_directory.exists()
+
+    monkeypatch.setattr(tooling_coverage, "MAX_CODECOV_COVERED_FILENAMES", 2)
+    monkeypatch.setattr(tooling_coverage, "MAX_CODECOV_CONFIG_BYTES", 1)
+    with pytest.raises(ValueError, match="configuration exceeds"):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+    assert not staging_directory.exists()
+
+
+def test_stage_codecov_input_directory_never_removes_arbitrary_destinations(tmp_path: Path) -> None:
+    """Only the fixed direct staging child is eligible for replacement."""
+    coverage_xml = _write_coverage_xml(tmp_path, ("scripts/child.py",))
+    (tmp_path / "codecov.yml").touch()
+    sentinel = tmp_path / "sentinel.txt"
+    sentinel.write_text("must survive", encoding="utf-8")
+    arbitrary_directory = tmp_path / "arbitrary-codecov-target"
+    arbitrary_directory.mkdir()
+    arbitrary_sentinel = arbitrary_directory / "sentinel.txt"
+    arbitrary_sentinel.write_text("must survive", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="fixed repository child"):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, tmp_path)
+    with pytest.raises(ValueError, match="fixed repository child"):
+        tooling_coverage.stage_codecov_input_directory(
+            coverage_xml, tmp_path, arbitrary_directory
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "must survive"
+    assert arbitrary_sentinel.read_text(encoding="utf-8") == "must survive"
+
+
 @pytest.mark.parametrize(
     "filename",
     (

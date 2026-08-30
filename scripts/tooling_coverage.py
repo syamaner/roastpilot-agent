@@ -18,6 +18,9 @@ MAX_COVERAGE_XML_BYTES = 10 * 1024 * 1024
 CODECOV_REPORT_NAME = "coverage.xml"
 CODECOV_CONFIG_NAME = "codecov.yml"
 CODECOV_RESERVED_PATHS = frozenset({CODECOV_REPORT_NAME, CODECOV_CONFIG_NAME, ".git"})
+CODECOV_INPUT_DIRECTORY_NAME = "codecov-input"
+MAX_CODECOV_COVERED_FILENAMES = 10_000
+MAX_CODECOV_CONFIG_BYTES = 1024 * 1024
 
 
 def skill_script_roots(repo_root: Path) -> tuple[str, ...]:
@@ -162,7 +165,9 @@ def stage_codecov_input_directory(
     report_path = _regular_file(coverage_xml, "coverage XML")
     filenames = _normalized_coverage_filenames(report_path)
     config_path = _regular_file(repo_root / CODECOV_CONFIG_NAME, "codecov configuration")
-    _require_safe_staging_destination(staging_directory)
+    if config_path.stat().st_size > MAX_CODECOV_CONFIG_BYTES:
+        raise ValueError("codecov configuration exceeds the size limit")
+    _require_safe_staging_destination(repo_root, staging_directory)
 
     temporary_directory = Path(
         tempfile.mkdtemp(prefix=".codecov-input-", dir=staging_directory.parent)
@@ -197,6 +202,10 @@ def _normalized_coverage_filenames(coverage_xml: Path) -> tuple[str, ...]:
     )
     if len(filenames) != len(set(filenames)):
         raise ValueError("coverage XML contains duplicate final filenames")
+    if not filenames:
+        raise ValueError("coverage XML contains no filenames")
+    if len(filenames) > MAX_CODECOV_COVERED_FILENAMES:
+        raise ValueError("coverage XML contains too many filenames")
     _require_no_staging_path_conflicts(filenames)
     return filenames
 
@@ -231,14 +240,17 @@ def _copy_regular_file(source: Path, destination: Path) -> None:
     destination.write_bytes(source.read_bytes())
 
 
-def _require_safe_staging_destination(staging_directory: Path) -> None:
-    """Reject a symlink or non-directory destination before replacing it."""
+def _require_safe_staging_destination(repo_root: Path, staging_directory: Path) -> None:
+    """Bind staging to the one safe direct child of a regular repository root."""
+    if repo_root.is_symlink() or not repo_root.is_dir():
+        raise ValueError("repository root must be a non-symlink directory")
+    expected_staging_directory = repo_root / CODECOV_INPUT_DIRECTORY_NAME
+    if staging_directory != expected_staging_directory:
+        raise ValueError("Codecov staging destination must be the fixed repository child")
     if staging_directory.is_symlink() or (
         staging_directory.exists() and not staging_directory.is_dir()
     ):
         raise ValueError("Codecov staging destination must be a non-symlink directory")
-    if staging_directory.parent.is_symlink() or not staging_directory.parent.is_dir():
-        raise ValueError("Codecov staging parent must be a non-symlink directory")
 
 
 def _remove_existing_staging_directory(staging_directory: Path) -> None:
@@ -362,7 +374,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     repo_root = Path.cwd()
     coverage_xml = Path(arguments[0])
     normalize_coverage_xml(coverage_xml, repo_root)
-    stage_codecov_input_directory(coverage_xml, repo_root, Path(arguments[1]))
+    staging_directory = repo_root / arguments[1]
+    stage_codecov_input_directory(coverage_xml, repo_root, staging_directory)
     return 0
 
 
