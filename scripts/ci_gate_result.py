@@ -17,6 +17,30 @@ from typing import cast
 _VALID_MODES = frozenset({"full", "docs-only"})
 _VALID_RESULTS = frozenset({"success", "failure", "cancelled", "skipped"})
 _CLASSES = ("always", "full-only", "docs-only")
+_MANIFESTS: dict[str, dict[str, tuple[str, ...]]] = {
+    "checks": {
+        "always": ("classify", "docs-fastpath", "codecov-upload"),
+        "full-only": (
+            "quality",
+            "pytest-ordinary",
+            "pytest-serial",
+            "pytest-stress",
+            "package",
+            "coverage",
+        ),
+        "docs-only": (),
+    },
+    "web": {
+        "always": ("classify",),
+        "full-only": ("web-unit-worker",),
+        "docs-only": (),
+    },
+    "web-snapshots": {
+        "always": ("classify",),
+        "full-only": ("web-snapshots-worker",),
+        "docs-only": (),
+    },
+}
 
 
 def _parse_arguments(arguments: Sequence[str] | None) -> argparse.Namespace:
@@ -39,22 +63,34 @@ def _failure(mode: str | None, rows: Sequence[tuple[str, str, str]]) -> int:
     return 1
 
 
-def _declared_jobs(
-    namespace: argparse.Namespace,
-) -> tuple[dict[str, str], tuple[str, str, str] | None]:
-    """Return declared job expectations or one closed configuration error."""
+def _declared_jobs(namespace: argparse.Namespace) -> dict[str, tuple[str, ...]]:
+    """Return the parsed command-line classes without trusting them as authority."""
+
+    return {
+        job_class: tuple(getattr(namespace, job_class.replace("-", "_"))) for job_class in _CLASSES
+    }
+
+
+def _manifest_jobs(
+    job_name: str | None,
+) -> tuple[dict[str, str], dict[str, tuple[str, ...]] | None, tuple[str, str, str] | None]:
+    """Return the fixed manifest for one protected gate or a closed identity error."""
+
+    if not job_name:
+        return {}, None, ("<configuration>", "known GITHUB_JOB", "missing")
+    manifest = _MANIFESTS.get(job_name)
+    if manifest is None:
+        return {}, None, ("<configuration>", "known GITHUB_JOB", job_name)
 
     declared: dict[str, str] = {}
     for job_class in _CLASSES:
-        for job_id in getattr(namespace, job_class.replace("-", "_")):
-            if not job_id:
-                return {}, ("<configuration>", "non-empty job id", "empty job id")
+        for job_id in manifest[job_class]:
             if job_id in declared:
-                return {}, ("<configuration>", "unique job id", job_id)
+                return {}, None, ("<configuration>", "unique manifest job id", job_id)
             declared[job_id] = job_class
     if not declared:
-        return {}, ("<configuration>", "at least one declared job", "none")
-    return declared, None
+        return {}, None, ("<configuration>", "non-empty manifest", job_name)
+    return declared, manifest, None
 
 
 def _expected_result(mode: str, job_class: str) -> str:
@@ -91,9 +127,11 @@ def _evaluate(
     mode = environment.get("MODE")
     if mode not in _VALID_MODES:
         return False, (("<mode>", "full or docs-only", mode or "<missing>"),)
-    declared, declaration_error = _declared_jobs(namespace)
-    if declaration_error is not None:
-        return False, (declaration_error,)
+    declared, manifest, manifest_error = _manifest_jobs(environment.get("GITHUB_JOB"))
+    if manifest_error is not None or manifest is None:
+        return False, (manifest_error,) if manifest_error is not None else ()
+    if _declared_jobs(namespace) != manifest:
+        return False, (("<configuration>", "exact manifest argv", "inconsistent argv"),)
     needs, needs_error = _load_needs(environment.get("NEEDS_JSON"))
     if needs_error is not None or needs is None:
         return False, (needs_error,) if needs_error is not None else ()

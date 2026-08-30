@@ -26,8 +26,7 @@ _GATE_SCRIPT = _REPO / "scripts" / "ci_gate_result.py"
 _CLASSIFIER_SCRIPT = _REPO / "scripts" / "ci_change_classifier.py"
 _PROTECTED_SCRIPTS = (_GATE_SCRIPT, _CLASSIFIER_SCRIPT)
 _BASE_REF_EXPRESSION = (
-    "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || "
-    "github.event.repository.default_branch }}"
+    "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}"
 )
 _GATE_JOB_NAMES = frozenset({"checks", "web", "web-snapshots"})
 

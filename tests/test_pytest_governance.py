@@ -681,7 +681,24 @@ def test_docs_fastpath_job_structure_and_dependency_group() -> None:
     codecov_upload = _mapping(jobs["codecov-upload"])
     assert codecov_upload["needs"] == ["classify", "coverage", "docs-fastpath"]
     assert codecov_upload["if"] == "always()"
-    assert all("run" not in step for step in _steps(codecov_upload))
+    codecov_steps = _steps(codecov_upload)
+    assert all("run" not in step and "uses" in step for step in codecov_steps)
+    assert all(not str(step["uses"]).startswith("actions/checkout@") for step in codecov_steps)
+    assert {step["uses"] for step in codecov_steps} == {
+        "actions/download-artifact@v4",
+        "codecov/codecov-action@v5",
+    }
+    for step in codecov_steps:
+        with_block = _mapping(step["with"])
+        if step["uses"] == "actions/download-artifact@v4":
+            assert with_block["name"] in {"codecov-coverage-full", "codecov-coverage-docs"}
+            assert with_block["path"] == "."
+        else:
+            assert with_block == {
+                "token": "${{ secrets.CODECOV_TOKEN }}",
+                "files": "./coverage.xml",
+                "disable_search": True,
+            }
 
     # docs-fastpath's pytest invocation is deliberately not a governed lane:
     # it never appears in `_pytest_lanes`'s job-id allowlist.
