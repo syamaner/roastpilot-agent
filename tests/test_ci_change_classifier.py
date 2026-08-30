@@ -59,7 +59,7 @@ class _FakeGitProcess:
 class _LiveGitProcess(_FakeGitProcess):
     """A process double that releases output only after live polling begins."""
 
-    def __init__(self, output: bytes) -> None:
+    def __init__(self, output: bytes | tuple[bytes, ...]) -> None:
         super().__init__(running=True)
         self.stdout = _LiveOutput(output)
         self.polls = 0
@@ -97,10 +97,10 @@ class _LiveGitProcess(_FakeGitProcess):
 
 
 class _LiveOutput:
-    """A single chunk that cannot be read before polling releases it."""
+    """One or more chunks that cannot be read before polling releases them."""
 
-    def __init__(self, output: bytes) -> None:
-        self.output = output
+    def __init__(self, output: bytes | tuple[bytes, ...]) -> None:
+        self.chunks = (output,) if isinstance(output, bytes) else output
         self.release = threading.Event()
         self.reads = 0
 
@@ -109,7 +109,7 @@ class _LiveOutput:
 
         self.release.wait()
         self.reads += 1
-        return self.output if self.reads == 1 else b""
+        return self.chunks[self.reads - 1] if self.reads <= len(self.chunks) else b""
 
 
 class _Clock:
@@ -248,6 +248,30 @@ def test_run_git_terminates_on_mid_run_output_limit(monkeypatch: pytest.MonkeyPa
     with pytest.raises(classifier._GitOutputLimitExceeded):  # pyright: ignore[reportPrivateUsage]
         classifier._run_git(["status"])  # pyright: ignore[reportPrivateUsage]
     assert process.polls >= 2
+    assert process.terminated
+
+
+@pytest.mark.docs_ci
+def test_run_git_discards_later_live_chunks_after_output_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The drain keeps boundedly consuming chunks after output becomes untrusted."""
+    process = _LiveGitProcess((b"five!", b"discarded"))
+
+    def fake_popen(_arguments: list[str], **_kwargs: object) -> _LiveGitProcess:
+        return process
+
+    def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(classifier, "_MAX_GIT_OUTPUT_BYTES", 4)
+    monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(classifier.time, "sleep", no_sleep)
+
+    with pytest.raises(classifier._GitOutputLimitExceeded):  # pyright: ignore[reportPrivateUsage]
+        classifier._run_git(["status"])  # pyright: ignore[reportPrivateUsage]
+
+    assert process.stdout.reads == 3
     assert process.terminated
 
 

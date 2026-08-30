@@ -2,6 +2,12 @@
 
 ## Active Epic
 
+**30 Aug 2026 — #702 (D180) test-coverage addendum:** Following `7bef8e3`,
+the exact-head repair adds direct docs-only gate-result mapping coverage in
+both modes and multi-chunk live-output coverage after the closed Git-output
+limit is set. These are test-only fail-closed proofs; they do not update the
+separate hosted-proof, coverage-status, final-review, or merge state.
+
 **30 Aug 2026 — #702 (D180) exact-head evidence addendum:** The earlier
 `3f0bf47` closure addendum is superseded only for later evidence. `998c29c`
 hardened the docs CI fast-path governance; `803327d` added hidden-Codecov-
