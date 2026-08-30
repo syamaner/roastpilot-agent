@@ -1029,6 +1029,7 @@ def _repository_imported_function_analyses(
     set[str],
     set[str],
     set[str],
+    set[str],
     dict[tuple[str, str], str],
     set[tuple[str, str]],
     set[tuple[str, str]],
@@ -1038,6 +1039,7 @@ def _repository_imported_function_analyses(
 
     analyses: dict[str, _FunctionAnalysis] = {}
     ambiguous: set[str] = set()
+    imported_classes: set[str] = set()
     docs_values: set[str] = set()
     ambiguous_values: set[str] = set()
     module_calls: dict[tuple[str, str], str] = {}
@@ -1158,6 +1160,8 @@ def _repository_imported_function_analyses(
                         ambiguous_values.add(alias)
                 elif imported.name not in classes:
                     ambiguous.add(alias)
+                else:
+                    imported_classes.add(alias)
                 continue
             source = source_path.read_text(encoding="utf-8")
             proxy = (
@@ -1184,6 +1188,7 @@ def _repository_imported_function_analyses(
     return (
         analyses,
         ambiguous,
+        imported_classes,
         docs_values,
         ambiguous_values,
         module_calls,
@@ -1244,6 +1249,7 @@ def _analyse_function(
     ambiguous_module_calls: set[tuple[str, str]] | None = None,
     module_docs_values: set[tuple[str, str]] | None = None,
     ambiguous_module_values: set[tuple[str, str]] | None = None,
+    imported_classes: set[str] | None = None,
 ) -> _FunctionAnalysis:
     """Walk one function body for a direct docs read, calls, and unresolved reads.
 
@@ -1278,6 +1284,9 @@ def _analyse_function(
     call_result_assignments: dict[str, str] = {}
     read_names: set[str] = set()
     read_calls: set[str] = set()
+    reader_aliases: set[str] = set()
+    ambiguous_reader_aliases: set[str] = set()
+    non_docs_aliases: set[str] = set()
     control_flow_docs_aliases = {
         target.id
         for conditional in ast.walk(func)
@@ -1288,6 +1297,20 @@ def _analyse_function(
             assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
         )
         if isinstance(target, ast.Name) and _expression_is_docs_markdown(assignment.value, set())
+    }
+    control_flow_reader_aliases = {
+        target.id
+        for conditional in ast.walk(func)
+        if isinstance(conditional, ast.If)
+        for assignment in ast.walk(conditional)
+        if isinstance(assignment, (ast.Assign, ast.AnnAssign))
+        and isinstance(assignment.value, ast.Attribute)
+        and assignment.value.attr in _READ_METHOD_NAMES
+        and _expression_is_docs_markdown(assignment.value.value, set())
+        for target in (
+            assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+        )
+        if isinstance(target, ast.Name)
     }
 
     def _call_key(expression: ast.expr) -> str | None:
@@ -1337,6 +1360,25 @@ def _analyse_function(
             return "ambiguous"
         return "none"
 
+    def _reader_alias_state(value: ast.expr) -> str:
+        """Return the fail-closed docs provenance of one bound reader method."""
+        if not (isinstance(value, ast.Attribute) and value.attr in _READ_METHOD_NAMES):
+            return "none"
+        target = value.value
+        if _receiver_is_docs(target) or _module_receiver_state(target) == "docs":
+            return "docs"
+        if isinstance(target, ast.Name) and target.id in non_docs_aliases:
+            return "non-docs"
+        if (
+            _receiver_is_partial(target)
+            or _module_receiver_state(target) == "ambiguous"
+            or not _string_constants(target)
+        ):
+            return "ambiguous"
+        if isinstance(target, ast.Name):
+            return "ambiguous"
+        return "non-docs"
+
     nodes: list[ast.AST] = list(func.body) if not isinstance(func, ast.Lambda) else [func.body]
     while nodes:
         node = nodes.pop(0)
@@ -1353,8 +1395,22 @@ def _analyse_function(
                 or _expression_uses_alias(node.value, partial_aliases)
             )
             call_result = _call_key(node.value)
+            reader_alias_state = _reader_alias_state(node.value)
             for target in targets:
                 if isinstance(target, ast.Name):
+                    if reader_alias_state == "docs":
+                        reader_aliases.add(target.id)
+                        ambiguous_reader_aliases.discard(target.id)
+                    elif reader_alias_state == "ambiguous":
+                        reader_aliases.discard(target.id)
+                        ambiguous_reader_aliases.add(target.id)
+                    elif reader_alias_state == "non-docs":
+                        if target.id not in control_flow_reader_aliases:
+                            reader_aliases.discard(target.id)
+                            ambiguous_reader_aliases.discard(target.id)
+                    elif target.id not in control_flow_reader_aliases:
+                        reader_aliases.discard(target.id)
+                        ambiguous_reader_aliases.discard(target.id)
                     if (
                         isinstance(node.value, ast.Attribute)
                         and node.value.attr == "param"
@@ -1372,6 +1428,12 @@ def _analyse_function(
                     elif target.id not in control_flow_docs_aliases:
                         aliases.discard(target.id)
                         partial_aliases.discard(target.id)
+                    if full_match or partial_match:
+                        non_docs_aliases.discard(target.id)
+                    elif _string_constants(node.value):
+                        non_docs_aliases.add(target.id)
+                    else:
+                        non_docs_aliases.discard(target.id)
         docs_root_aliases = aliases | partial_aliases
         if _is_docs_rooted_glob_call(node, docs_root_aliases) and not _is_docs_markdown_glob_call(
             node, docs_root_aliases
@@ -1431,7 +1493,13 @@ def _analyse_function(
                     "or is not a docs read"
                 )
         elif isinstance(node.func, ast.Name):
-            if node.func.id == "open":
+            if node.func.id in reader_aliases:
+                reads = True
+            elif node.func.id in ambiguous_reader_aliases:
+                unresolved.append(
+                    f"{filename}:{node.lineno}: bound reader alias `{node.func.id}` is ambiguous"
+                )
+            elif node.func.id == "open":
                 try:
                     target = _builtin_open_target(node)
                 except AssertionError as error:
@@ -1483,6 +1551,11 @@ def _analyse_function(
                     "is or is not a docs read"
                 )
         elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+            if node.func.value.id in (imported_classes or set()):
+                unresolved.append(
+                    f"{filename}:{node.lineno}: imported class method call provenance is ambiguous"
+                )
+                continue
             module_key = (node.func.value.id, node.func.attr)
             if module_key in (module_calls or {}):
                 calls.add((module_calls or {})[module_key])
@@ -1550,6 +1623,7 @@ def _docs_reading_test_modules(
     (
         imported_analyses,
         ambiguous_imports,
+        imported_classes,
         imported_docs_values,
         ambiguous_imported_values,
         module_calls,
@@ -1723,6 +1797,7 @@ def _docs_reading_test_modules(
             ambiguous_module_calls,
             module_docs_values,
             ambiguous_module_values,
+            imported_classes,
         )
         analyses[name] = analysis
         if name not in local_keys:
@@ -2152,6 +2227,76 @@ def test_docs_governance_fails_closed_on_imported_non_function_receivers(tmp_pat
             "def test_path() -> None:\n    DOCS_PATH.read_text()\n",
             repository_root=tmp_path,
         )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_fails_closed_on_repository_imported_class_method_calls(
+    tmp_path: Path,
+) -> None:
+    """Imported repository classes cannot hide docs reads behind their methods."""
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "class Docs:\n"
+        "    @staticmethod\n"
+        "    def load() -> str:\n"
+        "        return Path('docs/imported-class.md').read_text()\n\n"
+        "class Config:\n"
+        "    @staticmethod\n"
+        "    def load() -> str:\n"
+        "        return Path('config/imported-class.md').read_text()\n"
+    )
+    for class_name in ("Docs", "Config"):
+        source = (
+            f"from helpers import {class_name}\n\n"
+            f"def test_class_method() -> None:\n    assert {class_name}.load()\n"
+        )
+        with pytest.raises(AssertionError, match="imported class method call provenance"):
+            _docs_reading_test_modules(source, repository_root=tmp_path)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_bound_reader_method_aliases() -> None:
+    """Bound reader aliases preserve docs, non-docs, branch, and async provenance."""
+    source = (
+        "from pathlib import Path\n\n"
+        "def test_docs_alias() -> None:\n"
+        "    reader = Path('docs/alias.md').read_text\n"
+        "    assert reader()\n\n"
+        "def test_non_docs_alias() -> None:\n"
+        "    path = Path('config/alias.md')\n"
+        "    reader = path.read_text\n"
+        "    assert reader()\n\n"
+        "def test_reassigned_alias() -> None:\n"
+        "    reader = Path('docs/first.md').read_text\n"
+        "    reader = Path('config/second.md').read_text\n"
+        "    assert reader()\n\n"
+        "async def test_async_alias() -> None:\n"
+        "    reader = Path('docs/async.md').read_bytes\n"
+        "    assert reader()\n\n"
+        "def test_branch_alias(enabled: bool) -> None:\n"
+        "    if enabled:\n"
+        "        reader = Path('docs/branch.md').read_text\n"
+        "    else:\n"
+        "        reader = Path('config/branch.md').read_text\n"
+        "    assert reader()\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_async_alias",
+        "test_branch_alias",
+        "test_docs_alias",
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_fails_closed_on_dynamic_bound_reader_alias() -> None:
+    """An alias of a dynamic reader method cannot suppress marker enforcement."""
+    source = (
+        "def test_dynamic_alias() -> None:\n"
+        "    reader = get_dynamic_reader().read_text\n"
+        "    assert reader()\n"
+    )
+    with pytest.raises(AssertionError, match="bound reader alias `reader` is ambiguous"):
+        _docs_reading_test_modules(source, filename="dynamic_reader_alias.py")
 
 
 @pytest.mark.docs_ci
