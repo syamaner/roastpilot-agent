@@ -288,9 +288,7 @@ def test_stage_codecov_input_directory_never_removes_arbitrary_destinations(tmp_
     with pytest.raises(ValueError, match="fixed repository child"):
         tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, tmp_path)
     with pytest.raises(ValueError, match="fixed repository child"):
-        tooling_coverage.stage_codecov_input_directory(
-            coverage_xml, tmp_path, arbitrary_directory
-        )
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, arbitrary_directory)
 
     assert sentinel.read_text(encoding="utf-8") == "must survive"
     assert arbitrary_sentinel.read_text(encoding="utf-8") == "must survive"
