@@ -477,6 +477,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml
           disable_search: true
+          disable_file_fixes: true
 
       - name: Download normalized docs coverage artifact
         if: needs.classify.outputs.mode == 'docs-only' && needs.docs-fastpath.result == 'success'
@@ -492,6 +493,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml
           disable_search: true
+          disable_file_fixes: true
 
   checks:
     name: Checks
