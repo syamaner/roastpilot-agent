@@ -2,7 +2,7 @@
 
 ## Goal
 
-A repository where every later epic starts from green: package layout, all
+A repository where every later epic starts from passing: package layout, all
 four quality gates passing in CI from the first commit, typed module stubs,
 agent rules (AGENTS.md per D14), sub-agents, and the epic spec files
 themselves.
