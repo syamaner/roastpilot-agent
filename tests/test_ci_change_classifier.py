@@ -796,6 +796,25 @@ def _module_usefixtures_names(tree: ast.Module) -> set[str]:
     return names
 
 
+def _class_usefixtures_names(node: ast.ClassDef) -> set[str]:
+    """Return literal class decorator and ``pytestmark`` fixture activation."""
+
+    names = _usefixtures_names(node.decorator_list)
+    for statement in node.body:
+        if not isinstance(statement, ast.Assign) or not any(
+            isinstance(target, ast.Name) and target.id == "pytestmark"
+            for target in statement.targets
+        ):
+            continue
+        values = (
+            statement.value.elts
+            if isinstance(statement.value, (ast.List, ast.Set, ast.Tuple))
+            else [statement.value]
+        )
+        names.update(_usefixtures_names(values))
+    return names
+
+
 def _fixture_parameter_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     """Return statically named positional and keyword-only fixture parameters."""
 
@@ -926,11 +945,13 @@ class _FunctionAnalysis:
 
 def _repository_imported_function_analyses(
     tree: ast.Module, filename: str, repository_root: Path
-) -> tuple[dict[str, _FunctionAnalysis], set[str]]:
+) -> tuple[dict[str, _FunctionAnalysis], set[str], set[str], set[str]]:
     """Return static analyses for direct imports from confined first-party modules."""
 
     analyses: dict[str, _FunctionAnalysis] = {}
     ambiguous: set[str] = set()
+    docs_values: set[str] = set()
+    ambiguous_values: set[str] = set()
     for statement in tree.body:
         if not isinstance(statement, ast.ImportFrom) or statement.module is None:
             continue
@@ -955,24 +976,27 @@ def _repository_imported_function_analyses(
             for node in imported_tree.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
-        bindings = {
-            node.name
+        assignments = {
+            target.id: node.value
             for node in imported_tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-        } | {
-            target.id
-            for node in imported_tree.body
-            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None
             for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
             if isinstance(target, ast.Name)
         }
+        classes = {node.name for node in imported_tree.body if isinstance(node, ast.ClassDef)}
         for imported in statement.names:
             alias = imported.asname or imported.name
             if imported.name == "*" or alias in analyses:
                 ambiguous.add(alias)
                 continue
             if imported.name not in functions:
-                if imported.name not in bindings:
+                if imported.name in assignments:
+                    value = assignments[imported.name]
+                    if _expression_is_docs_markdown(value, set()):
+                        docs_values.add(alias)
+                    elif not _string_constants(value):
+                        ambiguous_values.add(alias)
+                elif imported.name not in classes:
                     ambiguous.add(alias)
                 continue
             source = source_path.read_text(encoding="utf-8")
@@ -997,7 +1021,7 @@ def _repository_imported_function_analyses(
                 read_names=set(),
                 read_calls=set(),
             )
-    return analyses, ambiguous
+    return analyses, ambiguous, docs_values, ambiguous_values
 
 
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
@@ -1275,12 +1299,13 @@ def _docs_reading_test_modules(
     """
 
     tree = ast.parse(source)
-    imported_analyses, ambiguous_imports = _repository_imported_function_analyses(
-        tree, filename, repository_root
+    imported_analyses, ambiguous_imports, imported_docs_values, ambiguous_imported_values = (
+        _repository_imported_function_analyses(tree, filename, repository_root)
     )
     module_value_sources = _module_value_sources(tree)
     module_aliases: set[str] = set()
     module_partial_aliases: set[str] = set()
+    module_aliases.update(imported_docs_values)
     for statement in tree.body:
         if isinstance(statement, (ast.Assign, ast.AnnAssign)):
             value = statement.value
@@ -1331,7 +1356,7 @@ def _docs_reading_test_modules(
         class_methods[statement.name] = methods
     module_usefixtures = _module_usefixtures_names(tree)
     class_usefixtures = {
-        statement.name: _usefixtures_names(statement.decorator_list)
+        statement.name: _class_usefixtures_names(statement)
         for statement in tree.body
         if isinstance(statement, ast.ClassDef)
     }
@@ -1453,13 +1478,20 @@ def _docs_reading_test_modules(
         ):
             continue
         if any(
-            isinstance(call.func, ast.Name) and call.func.id in ambiguous_imports
+            (isinstance(call.func, ast.Name) and call.func.id in ambiguous_imports)
+            or (
+                isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id in ambiguous_imports
+            )
             for call in ast.walk(node)
             if isinstance(call, ast.Call)
         ):
             raise AssertionError(
                 f"{filename}: imported callable provenance for `{name}` is ambiguous"
             )
+        if analyses[name].read_names & ambiguous_imported_values:
+            raise AssertionError(f"{filename}: imported value provenance for `{name}` is ambiguous")
 
     for fixture_name in fixtures:
         fixture = functions[fixture_name]
@@ -1792,6 +1824,42 @@ def test_docs_governance_follows_repository_local_imported_helpers(tmp_path: Pat
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_fails_closed_on_imported_non_function_receivers(tmp_path: Path) -> None:
+    """Imported classes and values cannot hide direct docs reads."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\nclass Reader: pass\n"
+        "DOCS_PATH = Path('docs/imported.md')\nCONFIG_PATH = Path('config/imported.md')\n"
+    )
+    assert (
+        _docs_reading_test_modules(
+            "from helpers import Reader\n\ndef test_class() -> None:\n    Reader()\n",
+            repository_root=tmp_path,
+        )
+        == set()
+    )
+    assert _docs_reading_test_modules(
+        "from helpers import DOCS_PATH\n\ndef test_path() -> None:\n    DOCS_PATH.read_text()\n",
+        repository_root=tmp_path,
+    ) == {"test_path"}
+    assert (
+        _docs_reading_test_modules(
+            "from helpers import CONFIG_PATH\n\n"
+            "def test_non_docs() -> None:\n    assert CONFIG_PATH\n",
+            repository_root=tmp_path,
+        )
+        == set()
+    )
+    (tmp_path / "helpers.py").write_text("DOCS_PATH = build_path()\n")
+    with pytest.raises(AssertionError, match="imported value provenance"):
+        _docs_reading_test_modules(
+            "from helpers import DOCS_PATH\n\n"
+            "def test_path() -> None:\n    DOCS_PATH.read_text()\n",
+            repository_root=tmp_path,
+        )
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_rejects_multiple_local_import_roots(
     tmp_path: Path,
 ) -> None:
@@ -1828,9 +1896,16 @@ def test_docs_governance_tracks_literal_fixture_activation() -> None:
         "def marked_fixture() -> str:\n"
         "    return Path('docs/marked.md').read_text()\n\n"
         "@pytest.mark.usefixtures('marked_fixture')\n"
-        "def test_marked() -> None:\n    assert True\n"
+        "def test_marked() -> None:\n    assert True\n\n"
+        "class TestClassMarked:\n"
+        "    pytestmark = pytest.mark.usefixtures('marked_fixture')\n\n"
+        "    def test_class_marked(self) -> None:\n        assert True\n"
     )
-    assert _docs_reading_test_modules(source) == {"TestAutouse::test_autouse", "test_marked"}
+    assert _docs_reading_test_modules(source) == {
+        "TestAutouse::test_autouse",
+        "TestClassMarked::test_class_marked",
+        "test_marked",
+    }
     with pytest.raises(AssertionError, match="autouse"):
         _docs_reading_test_modules(
             source.replace("autouse=True", "autouse=enabled"), filename="dynamic_autouse.py"
