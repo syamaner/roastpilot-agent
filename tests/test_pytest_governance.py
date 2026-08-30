@@ -24,7 +24,7 @@ _REQUIRED_CHECK_NAMES = {
 }
 _GATE_ARGV_CLASSES: dict[str, dict[str, tuple[str, ...]]] = {
     "checks": {
-        "always": ("classify", "docs-fastpath"),
+        "always": ("classify", "docs-fastpath", "codecov-upload"),
         "full-only": (
             "quality",
             "pytest-ordinary",
@@ -58,7 +58,14 @@ _DOCS_FASTPATH_CONDITION = (
     "needs.classify.outputs.mode == 'docs-only' || needs.classify.outputs.mode == 'full'"
 )
 _PULL_REQUEST_CONDITION = "github.event_name == 'pull_request'"
-_TIMEOUT_BEARING_JOBS = ("classify", "checks", "web", "web-snapshots", "docs-fastpath")
+_TIMEOUT_BEARING_JOBS = (
+    "classify",
+    "checks",
+    "web",
+    "web-snapshots",
+    "docs-fastpath",
+    "codecov-upload",
+)
 
 
 def _pytest_options() -> dict[str, object]:
@@ -437,6 +444,7 @@ def test_checks_is_a_fail_closed_aggregate_of_every_python_gate() -> None:
         "package",
         "coverage",
         "docs-fastpath",
+        "codecov-upload",
     }
     check_steps = _steps(checks_job)
     assert len(check_steps) == 2
@@ -628,7 +636,7 @@ def test_docs_fastpath_job_structure_and_dependency_group() -> None:
     workflow = _workflow()
     jobs = _mapping(workflow["jobs"])
     job = _mapping(jobs["docs-fastpath"])
-    assert job["name"] == "Docs fast path (docs tests + Codecov upload)"
+    assert job["name"] == "Docs fast path (docs tests + coverage artifact)"
     steps = _steps(job)
     step_names = [step.get("name") for step in steps]
     assert step_names == [
@@ -638,7 +646,7 @@ def test_docs_fastpath_job_structure_and_dependency_group() -> None:
         "Install dependencies (docs-ci group only — no MCP/audio/ML/build tooling)",
         "Run docs and fast-path tooling tests with coverage",
         "Normalize coverage filenames for Codecov",
-        "Upload coverage to Codecov",
+        "Upload normalized docs coverage artifact",
     ]
     install_step = steps[3]
     whitespace_step = steps[2]
@@ -659,12 +667,18 @@ def test_docs_fastpath_job_structure_and_dependency_group() -> None:
     assert "--cov=.agents/skills/capture-agent-usage/scripts" in pytest_run
     assert "--cov-report=xml:coverage.xml" in pytest_run
     assert "OPENROUTER_API_KEY" in pytest_run
-    codecov_step = steps[6]
-    assert codecov_step["if"] == _DOCS_ONLY_CONDITION
-    assert codecov_step["uses"] == "codecov/codecov-action@v5"
-    codecov_with = _mapping(codecov_step["with"])
-    assert codecov_with["disable_search"] is True
-    assert codecov_with["token"] == "${{ secrets.CODECOV_TOKEN }}"
+    artifact_step = steps[6]
+    assert artifact_step["uses"] == "actions/upload-artifact@v4"
+    assert _mapping(artifact_step["with"]) == {
+        "name": "codecov-coverage-docs",
+        "path": "coverage.xml",
+        "if-no-files-found": "error",
+    }
+
+    codecov_upload = _mapping(jobs["codecov-upload"])
+    assert codecov_upload["needs"] == ["classify", "coverage", "docs-fastpath"]
+    assert codecov_upload["if"] == "always()"
+    assert all("run" not in step for step in _steps(codecov_upload))
 
     # docs-fastpath's pytest invocation is deliberately not a governed lane:
     # it never appears in `_pytest_lanes`'s job-id allowlist.

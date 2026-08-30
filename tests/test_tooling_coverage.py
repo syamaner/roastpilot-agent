@@ -118,7 +118,7 @@ def test_ci_normalizes_coverage_filenames_before_codecov_upload() -> None:
     combine_index = step_names.index("Combine coverage data")
     xml_index = step_names.index("Generate combined coverage XML")
     normalize_index = step_names.index("Normalize coverage filenames for Codecov")
-    upload_index = step_names.index("Upload coverage to Codecov")
+    upload_index = step_names.index("Upload normalized full coverage artifact")
 
     assert combine_index < xml_index < normalize_index < upload_index
     normalize_step = coverage_steps[normalize_index]
@@ -134,17 +134,38 @@ def test_ci_normalizes_coverage_filenames_before_codecov_upload() -> None:
             run = step_mapping.get("run")
             if isinstance(run, str) and run.startswith("python -m pytest"):
                 pytest_runs.append(run)
-    # D180 (#702, slice 3): the docs-only fast path is a second, genuinely
-    # authenticated Codecov upload (never a synthetic status) — a distinct
-    # job from the full-path `coverage` job, not a duplicate of it.
+    # The token-bearing Codecov boundary is structurally isolated from every
+    # checkout/run step and consumes only the two narrow producer artifacts.
     assert len(codecov_steps) == 2
     codecov_job_ids = {job_id for job_id, _ in codecov_steps}
-    assert codecov_job_ids == {"coverage", "docs-fastpath"}
+    assert codecov_job_ids == {"codecov-upload"}
     for _, codecov_step in codecov_steps:
         codecov_with = _mapping(codecov_step["with"])
         assert codecov_with["files"] == "./coverage.xml"
         assert codecov_with["disable_search"] is True
         assert codecov_with["token"] == "${{ secrets.CODECOV_TOKEN }}"
+    upload_job = _mapping(jobs["codecov-upload"])
+    assert upload_job["needs"] == ["classify", "coverage", "docs-fastpath"]
+    assert upload_job["if"] == "always()"
+    upload_steps = [_mapping(step) for step in cast(list[object], upload_job["steps"])]
+    assert [step["name"] for step in upload_steps] == [
+        "Download normalized full coverage artifact",
+        "Upload full coverage to Codecov",
+        "Download normalized docs coverage artifact",
+        "Upload docs coverage to Codecov",
+    ]
+    assert all(
+        "run" not in step and step.get("uses") != "actions/checkout@v6.0.2" for step in upload_steps
+    )
+    downloads = [step for step in upload_steps if step["uses"] == "actions/download-artifact@v4"]
+    assert [_mapping(step["with"])["name"] for step in downloads] == [
+        "codecov-coverage-full",
+        "codecov-coverage-docs",
+    ]
+    for job_id, job in jobs.items():
+        job_mapping = _mapping(job)
+        receives_token = "CODECOV_TOKEN" in str(job_mapping)
+        assert not receives_token or job_id == "codecov-upload"
     assert pytest_runs and all(
         "--cov-report=" in shlex.split(run)
         and not any(
