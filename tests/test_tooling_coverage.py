@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import runpy
 import shlex
+import stat
 import sys
 import tomllib
 import xml.etree.ElementTree as ElementTree
@@ -241,6 +242,24 @@ def test_stage_codecov_input_directory_replaces_stale_safe_output(tmp_path: Path
     assert not (staging_directory / "stale.txt").exists()
 
 
+def test_stage_codecov_input_directory_rejects_an_executable_in_stale_output(
+    tmp_path: Path,
+) -> None:
+    """A stale executable cannot be removed as though it were inert input."""
+    coverage_xml = _write_coverage_xml(tmp_path, ("scripts/child.py",))
+    (tmp_path / "codecov.yml").touch()
+    staging_directory = tmp_path / "codecov-input"
+    staging_directory.mkdir()
+    executable = staging_directory / "stale.py"
+    executable.touch()
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+
+    with pytest.raises(ValueError, match="executable"):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+
+    assert executable.exists()
+
+
 def test_stage_codecov_input_directory_rejects_an_empty_normalized_report(tmp_path: Path) -> None:
     """Removing every covered filename fails before a no-source artifact is created."""
     coverage_xml = _write_coverage_xml(tmp_path, ())
@@ -249,6 +268,41 @@ def test_stage_codecov_input_directory_rejects_an_empty_normalized_report(tmp_pa
 
     with pytest.raises(ValueError, match="no filenames"):
         tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+
+    assert not staging_directory.exists()
+
+
+def test_stage_codecov_input_directory_rechecks_invalid_xml_at_staging_boundary(
+    tmp_path: Path,
+) -> None:
+    """Staging revalidates malformed, oversized, duplicate, and incomplete reports."""
+    config_path = tmp_path / "codecov.yml"
+    config_path.touch()
+    staging_directory = tmp_path / "codecov-input"
+
+    oversized = tmp_path / "oversized.xml"
+    oversized.write_bytes(b"x" * (tooling_coverage.MAX_COVERAGE_XML_BYTES + 1))
+    with pytest.raises(ValueError, match="size limit"):
+        tooling_coverage.stage_codecov_input_directory(oversized, tmp_path, staging_directory)
+
+    malformed = tmp_path / "malformed.xml"
+    malformed.write_text("<coverage>", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed"):
+        tooling_coverage.stage_codecov_input_directory(malformed, tmp_path, staging_directory)
+
+    duplicate = _write_coverage_xml(tmp_path, ("scripts/child.py", "scripts/child.py"))
+    with pytest.raises(ValueError, match="duplicate final filenames"):
+        tooling_coverage.stage_codecov_input_directory(duplicate, tmp_path, staging_directory)
+
+    missing_filename = tmp_path / "missing-filename.xml"
+    missing_filename.write_text(
+        "<coverage><packages><package><classes><class /></classes></package></packages></coverage>",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="has no filename"):
+        tooling_coverage.stage_codecov_input_directory(
+            missing_filename, tmp_path, staging_directory
+        )
 
     assert not staging_directory.exists()
 
@@ -335,6 +389,21 @@ def test_stage_codecov_input_directory_rejects_path_conflicts_and_symlinked_outp
     staging_directory.symlink_to(outside, target_is_directory=True)
     with pytest.raises(ValueError, match="non-symlink directory"):
         tooling_coverage.stage_codecov_input_directory(safe_xml, tmp_path, staging_directory)
+
+
+def test_stage_codecov_input_directory_rejects_a_symlinked_repository_root(tmp_path: Path) -> None:
+    """The fixed staging child cannot be rooted through a repository symlink."""
+    real_repository_root = tmp_path / "real-repository"
+    real_repository_root.mkdir()
+    coverage_xml = _write_coverage_xml(real_repository_root, ("scripts/child.py",))
+    (real_repository_root / "codecov.yml").touch()
+    repository_link = tmp_path / "repository-link"
+    repository_link.symlink_to(real_repository_root, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="repository root must be a non-symlink directory"):
+        tooling_coverage.stage_codecov_input_directory(
+            coverage_xml, repository_link, repository_link / "codecov-input"
+        )
 
 
 def test_stage_codecov_input_directory_rejects_a_symlink_in_existing_output(tmp_path: Path) -> None:
