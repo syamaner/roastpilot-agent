@@ -2139,6 +2139,50 @@ def test_docs_governance_rejects_multiple_local_import_roots(
 
 
 @pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    ("import_line", "receiver"),
+    [
+        pytest.param("import helpers", "helpers", id="plain-module-import"),
+        pytest.param(
+            "import helpers as local_helpers", "local_helpers", id="aliased-module-import"
+        ),
+    ],
+)
+def test_docs_governance_rejects_ambiguous_local_module_import_aliases(
+    tmp_path: Path, import_line: str, receiver: str
+) -> None:
+    """Plain and aliased imports reject competing confined local modules."""
+
+    tests_root = tmp_path / "tests"
+    tests_root.mkdir()
+    (tests_root / "helpers.py").write_text("def docs_reader() -> str:\n    return ''\n")
+    (tmp_path / "helpers.py").write_text("def docs_reader() -> str:\n    return ''\n")
+    source = f"{import_line}\n\ndef test_reader() -> None:\n    assert {receiver}.docs_reader()\n"
+    with pytest.raises(AssertionError, match="imported callable provenance"):
+        _docs_reading_test_modules(
+            source, filename=str(tests_root / "test_import.py"), repository_root=tmp_path
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_records_wildcard_and_reimport_import_ambiguity(tmp_path: Path) -> None:
+    """Wildcard and duplicate direct imports enter the analyser's ambiguity set."""
+
+    (tmp_path / "helpers.py").write_text("def docs_reader() -> str:\n    return ''\n")
+    wildcard_tree = ast.parse("from helpers import *\n")
+    _, wildcard_ambiguity, *_ = _repository_imported_function_analyses(
+        wildcard_tree, "test_import.py", tmp_path
+    )
+    assert wildcard_ambiguity == {"*"}
+
+    reimport_tree = ast.parse("from helpers import docs_reader\nfrom helpers import docs_reader\n")
+    _, reimport_ambiguity, *_ = _repository_imported_function_analyses(
+        reimport_tree, "test_import.py", tmp_path
+    )
+    assert reimport_ambiguity == {"docs_reader"}
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_tracks_literal_fixture_activation() -> None:
     """Autouse and literal usefixtures edges select only their affected tests."""
 
@@ -2521,17 +2565,25 @@ def test_docs_governance_accepts_builtin_open_file_keyword() -> None:
 
 @pytest.mark.docs_ci
 @pytest.mark.parametrize(
-    "call",
+    ("call", "message"),
     [
-        "open('docs/a.md', file='docs/b.md')",
-        "open(**kwargs)",
+        pytest.param(
+            "open('docs/a.md', file='docs/b.md')",
+            "conflicting positional",
+            id="conflicting-receivers",
+        ),
+        pytest.param("open(**kwargs)", "dynamic keyword", id="dynamic-keywords"),
+        pytest.param("open()", "no statically unique", id="no-receiver"),
+        pytest.param("open(*args)", "dynamic positional", id="dynamic-positional"),
     ],
 )
-def test_docs_governance_fails_closed_on_ambiguous_builtin_open_shapes(call: str) -> None:
+def test_docs_governance_fails_closed_on_ambiguous_builtin_open_shapes(
+    call: str, message: str
+) -> None:
     """Duplicate, conflicting, and dynamic builtin-open shapes cannot hide readers."""
 
     source = f"def test_open() -> None:\n    {call}\n"
-    with pytest.raises(AssertionError, match="builtin open"):
+    with pytest.raises(AssertionError, match=message):
         _docs_reading_test_modules(source)
 
     duplicate = ast.Call(
