@@ -674,7 +674,7 @@ def test_docs_fastpath_job_structure_and_dependency_group() -> None:
     assert artifact_step["uses"] == "actions/upload-artifact@v4"
     assert _mapping(artifact_step["with"]) == {
         "name": "codecov-coverage-docs",
-        "path": "coverage.xml",
+        "path": "codecov-input",
         "if-no-files-found": "error",
     }
 
@@ -692,11 +692,13 @@ def test_docs_fastpath_job_structure_and_dependency_group() -> None:
         with_block = _mapping(step["with"])
         if step["uses"] == "actions/download-artifact@v4":
             assert with_block["name"] in {"codecov-coverage-full", "codecov-coverage-docs"}
-            assert with_block["path"] == "."
+            assert with_block["path"] == "codecov-input"
         else:
             assert with_block == {
                 "token": "${{ secrets.CODECOV_TOKEN }}",
                 "files": "./coverage.xml",
+                "root_dir": ".",
+                "working-directory": "./codecov-input",
                 "disable_search": True,
                 "disable_file_fixes": True,
             }

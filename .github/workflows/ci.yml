@@ -380,13 +380,13 @@ jobs:
         run: python -m coverage report --skip-covered
 
       - name: Normalize coverage filenames for Codecov
-        run: python scripts/tooling_coverage.py coverage.xml
+        run: python scripts/tooling_coverage.py coverage.xml codecov-input
 
       - name: Upload normalized full coverage artifact
         uses: actions/upload-artifact@v4
         with:
           name: codecov-coverage-full
-          path: coverage.xml
+          path: codecov-input
           if-no-files-found: error
 
   # D180 (#702, slice 3): the docs-ci smoke path runs for exact full and
@@ -445,13 +445,13 @@ jobs:
           --cov-report=xml:coverage.xml
 
       - name: Normalize coverage filenames for Codecov
-        run: python scripts/tooling_coverage.py coverage.xml
+        run: python scripts/tooling_coverage.py coverage.xml codecov-input
 
       - name: Upload normalized docs coverage artifact
         uses: actions/upload-artifact@v4
         with:
           name: codecov-coverage-docs
-          path: coverage.xml
+          path: codecov-input
           if-no-files-found: error
 
   # This sole token-bearing boundary runs no checkout or commands. It consumes
@@ -468,7 +468,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: codecov-coverage-full
-          path: .
+          path: codecov-input
 
       - name: Upload full coverage to Codecov
         if: needs.classify.outputs.mode == 'full' && needs.coverage.result == 'success'
@@ -476,6 +476,8 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml
+          root_dir: .
+          working-directory: ./codecov-input
           disable_search: true
           disable_file_fixes: true
 
@@ -484,7 +486,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: codecov-coverage-docs
-          path: .
+          path: codecov-input
 
       - name: Upload docs coverage to Codecov
         if: needs.classify.outputs.mode == 'docs-only' && needs.docs-fastpath.result == 'success'
@@ -492,6 +494,8 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml
+          root_dir: .
+          working-directory: ./codecov-input
           disable_search: true
           disable_file_fixes: true
 
