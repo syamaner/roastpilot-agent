@@ -1145,7 +1145,7 @@ def _repository_imported_function_analyses(
             for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
             if isinstance(target, ast.Name)
         }
-        classes = {node.name for node in imported_tree.body if isinstance(node, ast.ClassDef)}
+        classes = {node.name: node for node in imported_tree.body if isinstance(node, ast.ClassDef)}
         for imported in statement.names:
             alias = imported.asname or imported.name
             if imported.name == "*" or alias in analyses:
@@ -1160,7 +1160,17 @@ def _repository_imported_function_analyses(
                         ambiguous_values.add(alias)
                 elif imported.name not in classes:
                     ambiguous.add(alias)
-                else:
+                elif any(
+                    isinstance(candidate, ast.Call)
+                    and (
+                        (
+                            isinstance(candidate.func, ast.Attribute)
+                            and candidate.func.attr in _READ_METHOD_NAMES
+                        )
+                        or (isinstance(candidate.func, ast.Name) and candidate.func.id == "open")
+                    )
+                    for candidate in ast.walk(classes[imported.name])
+                ):
                     imported_classes.add(alias)
                 continue
             source = source_path.read_text(encoding="utf-8")
@@ -1287,6 +1297,8 @@ def _analyse_function(
     reader_aliases: set[str] = set()
     ambiguous_reader_aliases: set[str] = set()
     non_docs_aliases: set[str] = set()
+    imported_class_instances: set[str] = set()
+    ambiguous_imported_class_instances: set[str] = set()
     control_flow_docs_aliases = {
         target.id
         for conditional in ast.walk(func)
@@ -1307,6 +1319,20 @@ def _analyse_function(
         and isinstance(assignment.value, ast.Attribute)
         and assignment.value.attr in _READ_METHOD_NAMES
         and _expression_is_docs_markdown(assignment.value.value, set())
+        for target in (
+            assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+        )
+        if isinstance(target, ast.Name)
+    }
+    control_flow_imported_class_instances = {
+        target.id
+        for conditional in ast.walk(func)
+        if isinstance(conditional, ast.If)
+        for assignment in ast.walk(conditional)
+        if isinstance(assignment, (ast.Assign, ast.AnnAssign))
+        and isinstance(assignment.value, ast.Call)
+        and isinstance(assignment.value.func, ast.Name)
+        and assignment.value.func.id in (imported_classes or set())
         for target in (
             assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
         )
@@ -1379,6 +1405,31 @@ def _analyse_function(
             return "ambiguous"
         return "non-docs"
 
+    def _imported_class_instance_state(value: ast.expr) -> str:
+        """Return exact or ambiguous imported-class-instance provenance for an assignment."""
+        if isinstance(value, ast.Name) and value.id in imported_class_instances:
+            return "known"
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id in (imported_classes or set())
+        ):
+            return "known"
+        if any(
+            isinstance(candidate, ast.Name) and candidate.id in (imported_classes or set())
+            for candidate in ast.walk(value)
+        ):
+            return "ambiguous"
+        return "none"
+
+    def _is_imported_class_instance(value: ast.expr) -> bool:
+        """Return whether one call receiver is a known imported-class instance."""
+        return (isinstance(value, ast.Name) and value.id in imported_class_instances) or (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id in (imported_classes or set())
+        )
+
     nodes: list[ast.AST] = list(func.body) if not isinstance(func, ast.Lambda) else [func.body]
     while nodes:
         node = nodes.pop(0)
@@ -1396,8 +1447,18 @@ def _analyse_function(
             )
             call_result = _call_key(node.value)
             reader_alias_state = _reader_alias_state(node.value)
+            imported_class_instance_state = _imported_class_instance_state(node.value)
             for target in targets:
                 if isinstance(target, ast.Name):
+                    if imported_class_instance_state == "known":
+                        imported_class_instances.add(target.id)
+                        ambiguous_imported_class_instances.discard(target.id)
+                    elif imported_class_instance_state == "ambiguous":
+                        imported_class_instances.discard(target.id)
+                        ambiguous_imported_class_instances.add(target.id)
+                    elif target.id not in control_flow_imported_class_instances:
+                        imported_class_instances.discard(target.id)
+                        ambiguous_imported_class_instances.discard(target.id)
                     if reader_alias_state == "docs":
                         reader_aliases.add(target.id)
                         ambiguous_reader_aliases.discard(target.id)
@@ -1527,6 +1588,19 @@ def _analyse_function(
                 )
             elif node.func.id in known_functions:
                 calls.add(node.func.id)
+        elif isinstance(node.func, ast.Attribute) and _is_imported_class_instance(node.func.value):
+            unresolved.append(
+                f"{filename}:{node.lineno}: imported class instance method call provenance "
+                "is ambiguous"
+            )
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and (node.func.value.id in ambiguous_imported_class_instances)
+        ):
+            unresolved.append(
+                f"{filename}:{node.lineno}: imported class instance provenance is ambiguous"
+            )
         elif isinstance(node.func, ast.Attribute) and node.func.attr in _READ_METHOD_NAMES:
             target = node.func.value
             if (call_key := _call_key(target)) is not None:
@@ -2252,6 +2326,74 @@ def test_docs_governance_fails_closed_on_repository_imported_class_method_calls(
         )
         with pytest.raises(AssertionError, match="imported class method call provenance"):
             _docs_reading_test_modules(source, repository_root=tmp_path)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_fails_closed_on_repository_imported_class_instances(
+    tmp_path: Path,
+) -> None:
+    """Chained and assigned imported-class instances cannot hide docs reads."""
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "class Docs:\n"
+        "    def __init__(self, label: str = '') -> None:\n"
+        "        self.label = label\n\n"
+        "    async def load(self) -> str:\n"
+        "        return Path('docs/imported-instance.md').read_text()\n\n"
+        "class Config:\n"
+        "    def load(self) -> str:\n"
+        "        return Path('config/imported-instance.md').read_text()\n"
+    )
+    sources = (
+        "from helpers import Docs\n\n"
+        "async def test_chained() -> None:\n    assert await Docs('x').load()\n",
+        "from helpers import Docs\n\n"
+        "def test_assigned() -> None:\n"
+        "    instance = Docs('x')\n"
+        "    alias = instance\n"
+        "    assert alias.load()\n",
+        "from helpers import Docs\n\n"
+        "def test_branch(enabled: bool) -> None:\n"
+        "    if enabled:\n"
+        "        instance = Docs()\n"
+        "    else:\n"
+        "        instance = object()\n"
+        "    assert instance.load()\n",
+        "from helpers import Config\n\n"
+        "def test_second_class() -> None:\n    assert Config().load()\n",
+    )
+    for source in sources:
+        with pytest.raises(AssertionError, match="imported class instance method call provenance"):
+            _docs_reading_test_modules(source, repository_root=tmp_path)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_allows_reassigned_non_class_instances_and_rejects_ambiguous_ones(
+    tmp_path: Path,
+) -> None:
+    """Sequentially cleared provenance is safe, while dynamic imported-class flow is not."""
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "class Docs:\n"
+        "    def load(self) -> str:\n"
+        "        return Path('docs/ambiguous-instance.md').read_text()\n"
+    )
+    non_class_source = (
+        "from helpers import Docs\n\n"
+        "def test_non_class() -> None:\n"
+        "    instance = Docs()\n"
+        "    instance = object()\n"
+        "    assert instance.__class__\n"
+    )
+    assert _docs_reading_test_modules(non_class_source, repository_root=tmp_path) == set()
+    ambiguous_source = (
+        "from helpers import Docs\n\n"
+        "def test_ambiguous() -> None:\n"
+        "    instance = construct(Docs)\n"
+        "    assert instance.load()\n"
+    )
+    with pytest.raises(AssertionError, match="imported class instance provenance is ambiguous"):
+        _docs_reading_test_modules(ambiguous_source, repository_root=tmp_path)
 
 
 @pytest.mark.docs_ci
