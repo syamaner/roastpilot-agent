@@ -676,6 +676,7 @@ def test_docs_fastpath_job_structure_and_dependency_group() -> None:
         "name": "codecov-coverage-docs",
         "path": "codecov-input",
         "if-no-files-found": "error",
+        "include-hidden-files": True,
     }
 
     codecov_upload = _mapping(jobs["codecov-upload"])
