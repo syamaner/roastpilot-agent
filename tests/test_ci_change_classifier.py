@@ -704,7 +704,7 @@ def _is_docs_rooted_glob_call(node: ast.AST, root_aliases: set[str]) -> bool:
 
 
 def _builtin_open_target(node: ast.Call) -> ast.expr:
-    """Return builtin ``open``'s sole file receiver or fail closed on shape drift."""
+    """Return an ``open`` call's sole file receiver or fail closed on shape drift."""
 
     file_keywords = [keyword for keyword in node.keywords if keyword.arg == "file"]
     if any(keyword.arg is None for keyword in node.keywords):
@@ -718,6 +718,53 @@ def _builtin_open_target(node: ast.Call) -> ast.expr:
     if node.args and isinstance(node.args[0], ast.Starred):
         raise AssertionError("builtin open has dynamic positional receiver")
     return node.args[0] if node.args else file_keywords[0].value
+
+
+def _qualified_open_target(node: ast.Call) -> ast.expr | None:
+    """Return an exact ``io.open``/``builtins.open`` receiver, if present.
+
+    Only the literal standard-library module spellings are admitted here.  Import
+    aliases are rejected separately before the call graph is traversed, so a
+    renamed qualified opener cannot silently evade the docs-reader marker rule.
+    """
+
+    if not (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "open"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in {"io", "builtins"}
+    ):
+        return None
+    return _builtin_open_target(node)
+
+
+def _assert_no_aliased_qualified_open_calls(tree: ast.Module, filename: str) -> None:
+    """Reject invoked aliases of the two governed qualified open functions."""
+
+    module_aliases: set[str] = set()
+    open_aliases: set[str] = set()
+    for statement in ast.walk(tree):
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                if alias.name in {"io", "builtins"} and alias.asname is not None:
+                    module_aliases.add(alias.asname)
+        elif isinstance(statement, ast.ImportFrom) and statement.module in {"io", "builtins"}:
+            for alias in statement.names:
+                if alias.name == "open":
+                    open_aliases.add(alias.asname or alias.name)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "open"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in module_aliases
+        ):
+            raise AssertionError(f"{filename}:{node.lineno}: aliased qualified open is ambiguous")
+        if isinstance(node.func, ast.Name) and node.func.id in open_aliases:
+            raise AssertionError(f"{filename}:{node.lineno}: imported open alias is ambiguous")
 
 
 def _is_pytest_fixture_decorator(decorator: ast.expr) -> bool:
@@ -1366,7 +1413,24 @@ def _analyse_function(
                 elif (call_key := _call_key(node.value)) is not None:
                     return_calls.add(call_key)
             continue
-        if isinstance(node.func, ast.Name):
+        qualified_target = _qualified_open_target(node)
+        if qualified_target is not None:
+            target = qualified_target
+            if (call_key := _call_key(target)) is not None:
+                read_calls.add(call_key)
+            if _receiver_is_docs(target) or _module_receiver_state(target) == "docs":
+                reads = True
+            elif _module_receiver_state(target) == "ambiguous":
+                unresolved.append(
+                    f"{filename}:{node.lineno}: imported module value provenance is ambiguous"
+                )
+            elif _receiver_is_partial(target):
+                unresolved.append(
+                    f"{filename}:{node.lineno}: qualified `open(...)` receiver folds a 'docs' "
+                    "component with no provable '.md' segment — cannot prove this is "
+                    "or is not a docs read"
+                )
+        elif isinstance(node.func, ast.Name):
             if node.func.id == "open":
                 try:
                     target = _builtin_open_target(node)
@@ -1482,6 +1546,7 @@ def _docs_reading_test_modules(
     """
 
     tree = ast.parse(source)
+    _assert_no_aliased_qualified_open_calls(tree, filename)
     (
         imported_analyses,
         ambiguous_imports,
@@ -2848,6 +2913,53 @@ def test_docs_governance_tracks_open_on_a_returned_path() -> None:
         "def test_non_docs() -> None:\n    open(config_path())\n"
     )
     assert _docs_reading_test_modules(source) == {"test_docs"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_exact_qualified_open_calls() -> None:
+    """Literal ``io.open`` and ``builtins.open`` reads use builtin-open provenance rules."""
+
+    source = (
+        "import builtins\nimport io\n\n"
+        "def test_io_positional() -> None:\n    io.open('docs/io.md')\n\n"
+        "def test_builtins_keyword() -> None:\n    builtins.open(file='docs/builtins.md')\n\n"
+        "def test_non_docs() -> None:\n    io.open('config/no.md')\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_builtins_keyword", "test_io_positional"}
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            "import io as io_module\n\n"
+            "def test_alias() -> None:\n    io_module.open('docs/alias.md')\n",
+            "aliased qualified open is ambiguous",
+        ),
+        (
+            "from builtins import open as governed_open\n\n"
+            "def test_alias() -> None:\n    governed_open('docs/alias.md')\n",
+            "imported open alias is ambiguous",
+        ),
+        (
+            "import io\n\n"
+            "def test_conflict() -> None:\n    io.open('docs/one.md', file='docs/two.md')\n",
+            "conflicting positional",
+        ),
+        (
+            "import builtins\n\ndef test_dynamic() -> None:\n    builtins.open(*paths)\n",
+            "dynamic positional",
+        ),
+    ],
+)
+def test_docs_governance_fails_closed_on_qualified_open_ambiguity(
+    source: str, message: str
+) -> None:
+    """Aliased or malformed qualified open shapes cannot bypass docs governance."""
+
+    with pytest.raises(AssertionError, match=message):
+        _docs_reading_test_modules(source, filename="qualified_open.py")
 
 
 @pytest.mark.docs_ci
