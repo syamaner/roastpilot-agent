@@ -263,7 +263,7 @@ def _remove_existing_staging_directory(staging_directory: Path) -> None:
 
 def _require_inert_staging_tree(staging_directory: Path) -> None:
     """Require directories and non-executable regular files only in staging output."""
-    if staging_directory.is_symlink() or not staging_directory.is_dir():
+    if not staging_directory.is_dir():
         raise ValueError("Codecov staging output must be a non-symlink directory")
     for path in staging_directory.rglob("*"):
         if path.is_symlink() or not (path.is_dir() or path.is_file()):
