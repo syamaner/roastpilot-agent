@@ -1492,6 +1492,10 @@ def _docs_reading_test_modules(
         module_docs_values,
         ambiguous_module_values,
     ) = _repository_imported_function_analyses(tree, filename, repository_root)
+    if "*" in ambiguous_imports:
+        raise AssertionError(
+            f"{filename}: wildcard repository-local import provenance is ambiguous"
+        )
     module_value_sources = _module_value_sources(tree)
     module_aliases: set[str] = set()
     module_partial_aliases: set[str] = set()
@@ -2165,21 +2169,21 @@ def test_docs_governance_rejects_ambiguous_local_module_import_aliases(
 
 
 @pytest.mark.docs_ci
-def test_docs_governance_records_wildcard_and_reimport_import_ambiguity(tmp_path: Path) -> None:
-    """Wildcard and duplicate direct imports enter the analyser's ambiguity set."""
+def test_docs_governance_rejects_wildcard_and_reimport_local_imports(tmp_path: Path) -> None:
+    """Wildcard and duplicate imports fail before bare calls can evade provenance."""
 
     (tmp_path / "helpers.py").write_text("def docs_reader() -> str:\n    return ''\n")
-    wildcard_tree = ast.parse("from helpers import *\n")
-    _, wildcard_ambiguity, *_ = _repository_imported_function_analyses(
-        wildcard_tree, "test_import.py", tmp_path
-    )
-    assert wildcard_ambiguity == {"*"}
-
-    reimport_tree = ast.parse("from helpers import docs_reader\nfrom helpers import docs_reader\n")
-    _, reimport_ambiguity, *_ = _repository_imported_function_analyses(
-        reimport_tree, "test_import.py", tmp_path
-    )
-    assert reimport_ambiguity == {"docs_reader"}
+    with pytest.raises(AssertionError, match="wildcard repository-local import provenance"):
+        _docs_reading_test_modules(
+            "from helpers import *\n\ndef test_reader() -> None:\n    docs_reader()\n",
+            repository_root=tmp_path,
+        )
+    with pytest.raises(AssertionError, match="imported callable provenance"):
+        _docs_reading_test_modules(
+            "from helpers import docs_reader\nfrom helpers import docs_reader\n\n"
+            "def test_reader() -> None:\n    docs_reader()\n",
+            repository_root=tmp_path,
+        )
 
 
 @pytest.mark.docs_ci

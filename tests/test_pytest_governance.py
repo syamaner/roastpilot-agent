@@ -469,6 +469,7 @@ def test_checks_is_a_fail_closed_aggregate_of_every_python_gate() -> None:
 
     assert workflow["permissions"] == {"contents": "read"}
     for job_id in (
+        "classify",
         "quality",
         "pytest-ordinary",
         "pytest-serial",
@@ -476,7 +477,9 @@ def test_checks_is_a_fail_closed_aggregate_of_every_python_gate() -> None:
         "package",
         "coverage",
         "docs-fastpath",
+        "codecov-upload",
         "checks",
+        "web-unit-worker",
         "web",
         "web-snapshots",
     ):
