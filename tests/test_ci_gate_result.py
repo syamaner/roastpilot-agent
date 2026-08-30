@@ -114,6 +114,42 @@ def test_protected_gate_manifests_are_complete_and_exact() -> None:
     assert gate._MANIFESTS == _EXPECTED_MANIFESTS  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.parametrize(
+    ("manifest", "expected"),
+    [
+        (
+            {
+                "checks": {
+                    "always": ("classify", "classify"),
+                    "full-only": (),
+                    "docs-only": (),
+                }
+            },
+            "unique manifest job id\tclassify",
+        ),
+        (
+            {"checks": {"always": (), "full-only": (), "docs-only": ()}},
+            "non-empty manifest\tchecks",
+        ),
+    ],
+)
+def test_malformed_fixed_manifests_fail_closed_with_bounded_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    manifest: dict[str, dict[str, tuple[str, ...]]],
+    expected: str,
+) -> None:
+    """Duplicate and empty trusted manifests cannot silently exempt a protected gate."""
+
+    monkeypatch.setattr(gate, "_MANIFESTS", manifest)  # pyright: ignore[reportPrivateUsage]
+    output = _assert_failure(
+        capsys,
+        _manifest_arguments("checks"),
+        _environment("full", _needs(classify="success")),
+    )
+    assert expected in output
+
+
 @pytest.mark.parametrize("job_name", (None, "", "unknown", "quality"))
 def test_missing_or_unknown_github_job_fails_closed(
     capsys: pytest.CaptureFixture[str], job_name: str | None
