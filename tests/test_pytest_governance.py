@@ -698,6 +698,7 @@ def test_docs_fastpath_job_structure_and_dependency_group() -> None:
                 "token": "${{ secrets.CODECOV_TOKEN }}",
                 "files": "./coverage.xml",
                 "disable_search": True,
+                "disable_file_fixes": True,
             }
 
     # docs-fastpath's pytest invocation is deliberately not a governed lane:
