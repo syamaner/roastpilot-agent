@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import io
 import runpy
 import subprocess
 import sys
@@ -21,6 +22,37 @@ _REPO = Path(__file__).resolve().parents[1]
 _BASE = "a" * 40
 _HEAD = "b" * 40
 _MERGE_BASE = "c" * 40
+
+
+class _FakeGitProcess:
+    """Small byte-streaming local Git process double for subprocess-bound tests."""
+
+    def __init__(self, output: bytes = b"", *, running: bool = False) -> None:
+        self.stdout = io.BytesIO(output)
+        self.returncode: int | None = None if running else 0
+
+    def poll(self) -> int | None:
+        """Return the configured child state."""
+
+        return self.returncode
+
+    def terminate(self) -> None:
+        """Make the fake child exit after termination."""
+
+        self.returncode = -15
+
+    def kill(self) -> None:
+        """Make the fake child exit after a forced kill."""
+
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Return the configured child exit state without blocking."""
+
+        del timeout
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("git", 0.0)
+        return self.returncode
 
 
 def _name_status(*fields: bytes) -> bytes:
@@ -74,20 +106,19 @@ def test_run_git_uses_only_the_local_closed_command_shape(monkeypatch: pytest.Mo
 
     calls: list[tuple[list[str], dict[str, object]]] = []
 
-    def fake_run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+    def fake_popen(arguments: list[str], **kwargs: object) -> _FakeGitProcess:
         calls.append((arguments, kwargs))
-        return subprocess.CompletedProcess(arguments, 0, stdout=b"local-output")
+        return _FakeGitProcess(b"local-output")
 
-    monkeypatch.setattr(classifier.subprocess, "run", fake_run)
+    monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen)
     assert classifier._run_git(["merge-base", _BASE, _HEAD]) == b"local-output"  # pyright: ignore[reportPrivateUsage]
     assert calls == [
         (
             ["git", "merge-base", _BASE, _HEAD],
             {
-                "check": True,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.DEVNULL,
-                "timeout": classifier._GIT_CALL_TIMEOUT_SECONDS,  # pyright: ignore[reportPrivateUsage]
+                "shell": False,
             },
         )
     ]
@@ -99,16 +130,16 @@ def test_run_git_caps_a_near_deadline_call_to_the_remaining_total_budget(
 ) -> None:
     """A started Git call cannot outlive the classifier's remaining total budget."""
 
-    observed: list[float] = []
+    calls: list[list[str]] = []
 
-    def fake_run(_arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        observed.append(cast(float, kwargs["timeout"]))
-        return subprocess.CompletedProcess([], 0, stdout=b"")
+    def fake_popen(arguments: list[str], **_kwargs: object) -> _FakeGitProcess:
+        calls.append(arguments)
+        return _FakeGitProcess()
 
     monkeypatch.setattr(classifier.time, "monotonic", lambda: 59.5)
-    monkeypatch.setattr(classifier.subprocess, "run", fake_run)
+    monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen)
     classifier._run_git(["status"], deadline=60.0)  # pyright: ignore[reportPrivateUsage]
-    assert observed == [0.5]
+    assert calls == [["git", "status"]]
 
 
 @pytest.mark.docs_ci
@@ -438,16 +469,55 @@ def test_a_slow_git_call_past_the_per_call_timeout_is_full(
     undetected).
     """
 
-    observed_timeouts: list[object] = []
+    calls: list[list[str]] = []
 
-    def fake_run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        observed_timeouts.append(kwargs.get("timeout"))
-        raise subprocess.TimeoutExpired(cmd=arguments, timeout=20.0)
+    def fake_popen(arguments: list[str], **_kwargs: object) -> _FakeGitProcess:
+        calls.append(arguments)
+        return _FakeGitProcess(running=True)
 
-    monkeypatch.setattr(classifier.subprocess, "run", fake_run)
+    responses = iter([0.0, 1.0, 22.0])
+    monkeypatch.setattr(classifier.time, "monotonic", lambda: next(responses))
+
+    def no_sleep(_seconds: float) -> None:
+        """Avoid a real delay while exercising the bounded timeout path."""
+
+    monkeypatch.setattr(classifier.time, "sleep", no_sleep)
+    monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen)
     assert classifier.classify_change("pull_request", _BASE, _HEAD) is classifier.ChangeMode.FULL
-    assert observed_timeouts
-    assert observed_timeouts[0] == classifier._GIT_CALL_TIMEOUT_SECONDS  # pyright: ignore[reportPrivateUsage]
+    assert calls == [["git", "cat-file", "-e", f"{_BASE}^{{commit}}"]]
+
+
+@pytest.mark.docs_ci
+def test_run_git_accepts_exactly_the_closed_output_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Git result at the byte cap remains available to the closed parser."""
+
+    monkeypatch.setattr(classifier, "_MAX_GIT_OUTPUT_BYTES", 4)
+
+    def fake_popen_exact(_arguments: list[str], **_kwargs: object) -> _FakeGitProcess:
+        """Return a child whose output is exactly the small test cap."""
+
+        return _FakeGitProcess(b"four")
+
+    monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen_exact)
+    assert classifier._run_git(["status"]) == b"four"  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.docs_ci
+def test_excess_git_output_is_full_and_stops_the_git_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One byte beyond the cap fails closed before any later Git call can run."""
+
+    calls: list[list[str]] = []
+
+    def fake_popen(arguments: list[str], **_kwargs: object) -> _FakeGitProcess:
+        calls.append(arguments)
+        return _FakeGitProcess(b"five!")
+
+    monkeypatch.setattr(classifier, "_MAX_GIT_OUTPUT_BYTES", 4)
+    monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen)
+    assert classifier.classify_change("pull_request", _BASE, _HEAD) is classifier.ChangeMode.FULL
+    assert calls == [["git", "cat-file", "-e", f"{_BASE}^{{commit}}"]]
 
 
 def test_exceeded_total_budget_is_full_and_issues_no_further_git_call(
@@ -475,12 +545,12 @@ def test_exceeded_total_budget_is_full_and_issues_no_further_git_call(
         except StopIteration:
             return 1_000.0
 
-    def fake_run(arguments: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+    def fake_popen(arguments: list[str], **_kwargs: object) -> _FakeGitProcess:
         calls.append(arguments)
-        return subprocess.CompletedProcess(arguments, 0, stdout=b"")
+        return _FakeGitProcess()
 
     monkeypatch.setattr(classifier.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(classifier.subprocess, "run", fake_run)
+    monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen)
     assert classifier.classify_change("pull_request", _BASE, _HEAD) is classifier.ChangeMode.FULL
     # Only the first `cat-file` call ran; the deadline check before the second
     # `cat-file` call raised _BudgetExceeded, so no further Git call happened.
@@ -739,7 +809,7 @@ def _qualified_open_target(node: ast.Call) -> ast.expr | None:
 
 
 def _assert_no_aliased_qualified_open_calls(tree: ast.Module, filename: str) -> None:
-    """Reject invoked aliases of the two governed qualified open functions."""
+    """Reject invoked module aliases that cannot retain qualified-open provenance."""
 
     module_aliases: set[str] = set()
     open_aliases: set[str] = set()
@@ -748,7 +818,7 @@ def _assert_no_aliased_qualified_open_calls(tree: ast.Module, filename: str) -> 
             for alias in statement.names:
                 if alias.name in {"io", "builtins"} and alias.asname is not None:
                     module_aliases.add(alias.asname)
-        elif isinstance(statement, ast.ImportFrom) and statement.module in {"io", "builtins"}:
+        elif isinstance(statement, ast.ImportFrom) and statement.module == "io":
             for alias in statement.names:
                 if alias.name == "open":
                     open_aliases.add(alias.asname or alias.name)
@@ -765,6 +835,18 @@ def _assert_no_aliased_qualified_open_calls(tree: ast.Module, filename: str) -> 
             raise AssertionError(f"{filename}:{node.lineno}: aliased qualified open is ambiguous")
         if isinstance(node.func, ast.Name) and node.func.id in open_aliases:
             raise AssertionError(f"{filename}:{node.lineno}: imported open alias is ambiguous")
+
+
+def _builtin_open_import_aliases(tree: ast.Module) -> set[str]:
+    """Return direct ``builtins.open`` bindings that retain builtin provenance."""
+
+    return {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.ImportFrom) and statement.module == "builtins"
+        for alias in statement.names
+        if alias.name == "open"
+    }
 
 
 def _is_pytest_fixture_decorator(decorator: ast.expr) -> bool:
@@ -1208,6 +1290,42 @@ def _repository_imported_function_analyses(
     )
 
 
+def _assert_no_imported_collected_test_callables(
+    tree: ast.Module,
+    filename: str,
+    imported_analyses: dict[str, _FunctionAnalysis],
+    ambiguous_imports: set[str],
+) -> None:
+    """Reject repository-local imported callables that pytest would collect as tests."""
+
+    imported_test_names = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.ImportFrom)
+        for alias in statement.names
+        if (alias.asname or alias.name).startswith("test_")
+        and (alias.asname or alias.name) in set(imported_analyses) | ambiguous_imports
+    }
+    for statement in tree.body:
+        if isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                name = alias.asname or alias.name
+                if name in imported_test_names:
+                    raise AssertionError(
+                        f"{filename}:{statement.lineno}: repository-local imported callable "
+                        f"`{name}` would be collected as a test"
+                    )
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id in imported_test_names:
+                raise AssertionError(
+                    f"{filename}:{target.lineno}: imported collected test callable `{target.id}` "
+                    "is reassigned"
+                )
+
+
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
 
 
@@ -1260,6 +1378,7 @@ def _analyse_function(
     module_docs_values: set[tuple[str, str]] | None = None,
     ambiguous_module_values: set[tuple[str, str]] | None = None,
     imported_classes: set[str] | None = None,
+    builtin_open_import_aliases: set[str] | None = None,
 ) -> _FunctionAnalysis:
     """Walk one function body for a direct docs read, calls, and unresolved reads.
 
@@ -1296,6 +1415,8 @@ def _analyse_function(
     read_calls: set[str] = set()
     reader_aliases: set[str] = set()
     ambiguous_reader_aliases: set[str] = set()
+    builtin_open_aliases: set[str] = set(builtin_open_import_aliases or set())
+    ambiguous_builtin_open_aliases: set[str] = set()
     non_docs_aliases: set[str] = set()
     imported_class_instances: set[str] = set()
     ambiguous_imported_class_instances: set[str] = set()
@@ -1324,6 +1445,33 @@ def _analyse_function(
         )
         if isinstance(target, ast.Name)
     }
+    conditional_open_alias_states: dict[str, set[str]] = {}
+    for conditional in ast.walk(func):
+        if not isinstance(conditional, ast.If):
+            continue
+        for assignment in ast.walk(conditional):
+            if not isinstance(assignment, (ast.Assign, ast.AnnAssign)) or assignment.value is None:
+                continue
+            targets = (
+                assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+            )
+            state = (
+                "builtin"
+                if (
+                    isinstance(assignment.value, ast.Name)
+                    and assignment.value.id in (builtin_open_import_aliases or set()) | {"open"}
+                )
+                or (
+                    isinstance(assignment.value, ast.Attribute)
+                    and assignment.value.attr == "open"
+                    and isinstance(assignment.value.value, ast.Name)
+                    and assignment.value.value.id == "builtins"
+                )
+                else "other"
+            )
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    conditional_open_alias_states.setdefault(target.id, set()).add(state)
     control_flow_imported_class_instances = {
         target.id
         for conditional in ast.walk(func)
@@ -1405,6 +1553,20 @@ def _analyse_function(
             return "ambiguous"
         return "non-docs"
 
+    def _builtin_open_alias_state(value: ast.expr) -> str:
+        """Return whether an assignment retains exact builtin-open provenance."""
+
+        if isinstance(value, ast.Name) and value.id in builtin_open_aliases | {"open"}:
+            return "builtin"
+        if (
+            isinstance(value, ast.Attribute)
+            and value.attr == "open"
+            and isinstance(value.value, ast.Name)
+            and value.value.id == "builtins"
+        ):
+            return "builtin"
+        return "other"
+
     def _imported_class_instance_state(value: ast.expr) -> str:
         """Return exact or ambiguous imported-class-instance provenance for an assignment."""
         if isinstance(value, ast.Name) and value.id in imported_class_instances:
@@ -1447,6 +1609,7 @@ def _analyse_function(
             )
             call_result = _call_key(node.value)
             reader_alias_state = _reader_alias_state(node.value)
+            builtin_open_alias_state = _builtin_open_alias_state(node.value)
             imported_class_instance_state = _imported_class_instance_state(node.value)
             for target in targets:
                 if isinstance(target, ast.Name):
@@ -1459,7 +1622,10 @@ def _analyse_function(
                     elif target.id not in control_flow_imported_class_instances:
                         imported_class_instances.discard(target.id)
                         ambiguous_imported_class_instances.discard(target.id)
-                    if reader_alias_state == "docs":
+                    if builtin_open_alias_state == "builtin":
+                        reader_aliases.discard(target.id)
+                        ambiguous_reader_aliases.discard(target.id)
+                    elif reader_alias_state == "docs":
                         reader_aliases.add(target.id)
                         ambiguous_reader_aliases.discard(target.id)
                     elif reader_alias_state == "ambiguous":
@@ -1472,6 +1638,15 @@ def _analyse_function(
                     elif target.id not in control_flow_reader_aliases:
                         reader_aliases.discard(target.id)
                         ambiguous_reader_aliases.discard(target.id)
+                    if len(conditional_open_alias_states.get(target.id, set())) > 1:
+                        builtin_open_aliases.discard(target.id)
+                        ambiguous_builtin_open_aliases.add(target.id)
+                    elif builtin_open_alias_state == "builtin":
+                        builtin_open_aliases.add(target.id)
+                        ambiguous_builtin_open_aliases.discard(target.id)
+                    else:
+                        builtin_open_aliases.discard(target.id)
+                        ambiguous_builtin_open_aliases.discard(target.id)
                     if (
                         isinstance(node.value, ast.Attribute)
                         and node.value.attr == "param"
@@ -1560,7 +1735,11 @@ def _analyse_function(
                 unresolved.append(
                     f"{filename}:{node.lineno}: bound reader alias `{node.func.id}` is ambiguous"
                 )
-            elif node.func.id == "open":
+            elif node.func.id in ambiguous_builtin_open_aliases:
+                unresolved.append(
+                    f"{filename}:{node.lineno}: builtin open alias `{node.func.id}` is ambiguous"
+                )
+            elif node.func.id in builtin_open_aliases | {"open"}:
                 try:
                     target = _builtin_open_target(node)
                 except AssertionError as error:
@@ -1694,6 +1873,7 @@ def _docs_reading_test_modules(
 
     tree = ast.parse(source)
     _assert_no_aliased_qualified_open_calls(tree, filename)
+    builtin_open_import_aliases = _builtin_open_import_aliases(tree)
     (
         imported_analyses,
         ambiguous_imports,
@@ -1709,6 +1889,9 @@ def _docs_reading_test_modules(
         raise AssertionError(
             f"{filename}: wildcard repository-local import provenance is ambiguous"
         )
+    _assert_no_imported_collected_test_callables(
+        tree, filename, imported_analyses, ambiguous_imports
+    )
     module_value_sources = _module_value_sources(tree)
     module_aliases: set[str] = set()
     module_partial_aliases: set[str] = set()
@@ -1872,6 +2055,7 @@ def _docs_reading_test_modules(
             module_docs_values,
             ambiguous_module_values,
             imported_classes,
+            builtin_open_import_aliases,
         )
         analyses[name] = analysis
         if name not in local_keys:
@@ -2236,6 +2420,31 @@ def test_docs_governance_discovers_nested_test_modules(tmp_path: Path) -> None:
         "nested/test_nested.py",
         "test_top_level.py",
     ]
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_imported_collected_test_callables(tmp_path: Path) -> None:
+    """Repository-local imports cannot create unanalysed pytest test callables."""
+
+    (tmp_path / "helpers.py").write_text(
+        "def test_docs() -> None:\n    pass\n\ndef docs_helper() -> None:\n    pass\n",
+        encoding="utf-8",
+    )
+    for source in (
+        "from helpers import test_docs\n",
+        "from helpers import docs_helper as test_docs\n",
+        "from helpers import docs_helper as test_docs\ntest_docs = lambda: None\n",
+    ):
+        with pytest.raises(AssertionError, match="imported callable `test_docs`|reassigned"):
+            _docs_reading_test_modules(source, filename="test_import.py", repository_root=tmp_path)
+    assert (
+        _docs_reading_test_modules(
+            "from helpers import docs_helper as helper\n",
+            filename="test_import.py",
+            repository_root=tmp_path,
+        )
+        == set()
+    )
 
 
 @pytest.mark.docs_ci
@@ -3216,6 +3425,44 @@ def test_docs_governance_tracks_exact_qualified_open_calls() -> None:
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_tracks_unambiguous_builtin_open_aliases() -> None:
+    """Builtin-open aliases retain docs provenance and sequential rebinds clear it."""
+
+    source = (
+        "import builtins\nfrom builtins import open as imported_open\n\n"
+        "def test_plain_alias() -> None:\n"
+        "    reader = open\n    reader('docs/plain.md')\n\n"
+        "def test_qualified_alias() -> None:\n"
+        "    reader = builtins.open\n    reader('docs/qualified.md')\n\n"
+        "def test_imported_alias() -> None:\n"
+        "    imported_open('docs/imported.md')\n\n"
+        "def test_non_docs() -> None:\n"
+        "    reader = open\n    reader('config/plain.md')\n\n"
+        "def test_reassigned_non_reader() -> None:\n"
+        "    reader = open\n    reader = print\n    reader('docs/not-read.md')\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_imported_alias",
+        "test_plain_alias",
+        "test_qualified_alias",
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_ambiguous_builtin_open_aliases() -> None:
+    """A conditional builtin-open rebind cannot silently skip a docs marker."""
+
+    source = (
+        "def test_branch(enabled: bool) -> None:\n"
+        "    if enabled:\n        reader = open\n"
+        "    else:\n        reader = print\n"
+        "    reader('docs/branch.md')\n"
+    )
+    with pytest.raises(AssertionError, match="builtin open alias `reader` is ambiguous"):
+        _docs_reading_test_modules(source, filename="open_alias.py")
+
+
+@pytest.mark.docs_ci
 @pytest.mark.parametrize(
     ("source", "message"),
     [
@@ -3223,11 +3470,6 @@ def test_docs_governance_tracks_exact_qualified_open_calls() -> None:
             "import io as io_module\n\n"
             "def test_alias() -> None:\n    io_module.open('docs/alias.md')\n",
             "aliased qualified open is ambiguous",
-        ),
-        (
-            "from builtins import open as governed_open\n\n"
-            "def test_alias() -> None:\n    governed_open('docs/alias.md')\n",
-            "imported open alias is ambiguous",
         ),
         (
             "import io\n\n"

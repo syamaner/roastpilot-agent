@@ -124,6 +124,32 @@ def test_ci_normalizes_coverage_filenames_before_codecov_upload() -> None:
     assert combine_index < xml_index < normalize_index < upload_index
     normalize_step = coverage_steps[normalize_index]
     assert normalize_step["run"] == "python scripts/tooling_coverage.py coverage.xml codecov-input"
+    docs_job = _mapping(jobs["docs-fastpath"])
+    docs_steps = [_mapping(step) for step in cast(list[object], docs_job["steps"])]
+    staged_artifacts = {
+        step["name"]: _mapping(step["with"])
+        for step in [coverage_steps[upload_index], *docs_steps]
+        if step.get("uses") == "actions/upload-artifact@v4"
+        and step.get("name")
+        in {
+            "Upload normalized full coverage artifact",
+            "Upload normalized docs coverage artifact",
+        }
+    }
+    assert staged_artifacts == {
+        "Upload normalized full coverage artifact": {
+            "name": "codecov-coverage-full",
+            "path": "codecov-input",
+            "if-no-files-found": "error",
+            "include-hidden-files": True,
+        },
+        "Upload normalized docs coverage artifact": {
+            "name": "codecov-coverage-docs",
+            "path": "codecov-input",
+            "if-no-files-found": "error",
+            "include-hidden-files": True,
+        },
+    }
 
     codecov_steps: list[tuple[str, dict[str, object]]] = []
     pytest_runs: list[str] = []

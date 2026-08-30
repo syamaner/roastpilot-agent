@@ -12,6 +12,7 @@ import argparse
 import os
 import re
 import subprocess
+import threading
 import time
 from collections.abc import Sequence
 from contextlib import suppress
@@ -36,10 +37,30 @@ _REGULAR_FILE_MODES = frozenset({b"100644", b"100755"})
 #: is environment-configurable: a PR cannot widen its own classifier budget.
 _GIT_CALL_TIMEOUT_SECONDS = 20.0
 _TOTAL_BUDGET_SECONDS = 60.0
+_MAX_GIT_OUTPUT_BYTES = 1_000_000
+_GIT_POLL_INTERVAL_SECONDS = 0.01
 
 
 class _BudgetExceeded(Exception):
     """Internal signal that the total classifier worktime budget elapsed."""
+
+
+class _GitOutputLimitExceeded(Exception):
+    """Internal signal that a Git command exceeded the closed output cap."""
+
+
+def _terminate_git_process(process: subprocess.Popen[bytes]) -> None:
+    """Stop one local Git child without letting cleanup mask the fail-closed result."""
+
+    with suppress(OSError):
+        process.terminate()
+    try:
+        process.wait(timeout=_GIT_POLL_INTERVAL_SECONDS)
+    except subprocess.TimeoutExpired:
+        with suppress(OSError):
+            process.kill()
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=_GIT_POLL_INTERVAL_SECONDS)
 
 
 def _run_git(arguments: Sequence[str], *, deadline: float | None = None) -> bytes:
@@ -67,14 +88,63 @@ def _run_git(arguments: Sequence[str], *, deadline: float | None = None) -> byte
         if remaining <= 0:
             raise _BudgetExceeded
         timeout = min(timeout, remaining)
-    completed = subprocess.run(
-        ["git", *arguments],
-        check=True,
+    command = ["git", *arguments]
+    process = subprocess.Popen(
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-        timeout=timeout,
+        shell=False,
     )
-    return completed.stdout
+    stdout = process.stdout
+    assert stdout is not None
+    output: list[bytes] = []
+    output_size = 0
+    output_limit_exceeded = threading.Event()
+    drain_complete = threading.Event()
+
+    def drain_stdout() -> None:
+        """Drain the child pipe while retaining no more than the closed cap."""
+
+        nonlocal output_size
+        try:
+            while chunk := stdout.read(65_536):
+                if output_limit_exceeded.is_set():
+                    continue
+                output_size += len(chunk)
+                if output_size > _MAX_GIT_OUTPUT_BYTES:
+                    output.clear()
+                    output_limit_exceeded.set()
+                else:
+                    output.append(chunk)
+        finally:
+            drain_complete.set()
+
+    drain_thread = threading.Thread(target=drain_stdout, daemon=True)
+    drain_thread.start()
+    started = time.monotonic()
+    try:
+        while process.poll() is None or not drain_complete.is_set():
+            if output_limit_exceeded.is_set():
+                _terminate_git_process(process)
+                raise _GitOutputLimitExceeded
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                _terminate_git_process(process)
+                raise _BudgetExceeded
+            if now - started >= timeout:
+                _terminate_git_process(process)
+                raise subprocess.TimeoutExpired(command, timeout)
+            time.sleep(_GIT_POLL_INTERVAL_SECONDS)
+    except BaseException:
+        _terminate_git_process(process)
+        drain_thread.join(timeout=_GIT_POLL_INTERVAL_SECONDS)
+        raise
+    drain_thread.join()
+    if output_limit_exceeded.is_set():
+        raise _GitOutputLimitExceeded
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(process.returncode, command)
+    return b"".join(output)
 
 
 def _is_docs_markdown_path(path: bytes) -> bool:
