@@ -432,6 +432,38 @@ def test_stage_codecov_input_directory_rejects_a_symlinked_repository_root(tmp_p
         )
 
 
+def test_stage_codecov_input_directory_rejects_a_symlinked_coverage_xml(tmp_path: Path) -> None:
+    """The top-level normalized report must not traverse a symlink."""
+    report_target = _write_coverage_xml(tmp_path, ("scripts/child.py",))
+    coverage_xml = tmp_path / "coverage-link.xml"
+    coverage_xml.symlink_to(report_target)
+    (tmp_path / "codecov.yml").touch()
+    staging_directory = tmp_path / "codecov-input"
+
+    with pytest.raises(ValueError, match="coverage XML must be a regular non-symlink file"):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+
+    assert not staging_directory.exists()
+
+
+def test_stage_codecov_input_directory_rejects_a_symlinked_codecov_configuration(
+    tmp_path: Path,
+) -> None:
+    """The top-level Codecov configuration must not traverse a symlink."""
+    coverage_xml = _write_coverage_xml(tmp_path, ("scripts/child.py",))
+    config_target = tmp_path / "config-target.yml"
+    config_target.touch()
+    (tmp_path / "codecov.yml").symlink_to(config_target)
+    staging_directory = tmp_path / "codecov-input"
+
+    with pytest.raises(
+        ValueError, match="codecov configuration must be a regular non-symlink file"
+    ):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+
+    assert not staging_directory.exists()
+
+
 def test_stage_codecov_input_directory_rejects_a_symlink_in_existing_output(tmp_path: Path) -> None:
     """A stale symlink prevents replacement instead of being silently removed."""
     coverage_xml = _write_coverage_xml(tmp_path, ("scripts/child.py",))

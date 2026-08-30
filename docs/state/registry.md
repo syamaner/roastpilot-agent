@@ -2,6 +2,16 @@
 
 ## Active Epic
 
+**30 Aug 2026 — #702 (D180) exact-head evidence addendum:** The earlier
+`3f0bf47` closure addendum is superseded only for later evidence. `998c29c`
+hardened the docs CI fast-path governance; `803327d` added hidden-Codecov-
+artifact coverage; `3d313ea` added deterministic live Git polling guard
+coverage; and `4e7eb35` made the existing live per-call-timeout proof unable
+to fall through clock exhaustion. The current exact-head Python suite recorded
+**6525 passed, 4 skipped**. That is local gate evidence, not an assertion that
+the hosted docs-only/mixed proof runs or Codecov coverage status are current at
+this later head; final review and merge remain in progress.
+
 **30 Aug 2026 — #702 (D180) slice-3 exact-head closure addendum (head
 `3f0bf4752e30f68875900d8c520d4bbcc166dda7`; supersedes the overlapping
 same-day mutation catalogues below):** The ratified M1-M28 table remains
