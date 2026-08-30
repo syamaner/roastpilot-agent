@@ -112,6 +112,18 @@ class _LiveOutput:
         return self.chunks[self.reads - 1] if self.reads <= len(self.chunks) else b""
 
 
+class _FailingLiveOutput(_LiveOutput):
+    """A live stream that returns one valid prefix before its next read fails."""
+
+    def read(self, size: int) -> bytes:
+        """Return the configured prefix once, then model an OS-level drain failure."""
+
+        result = super().read(size)
+        if self.reads > len(self.chunks):
+            raise OSError("stdout drain failed")
+        return result
+
+
 class _Clock:
     """Monotonic deterministic clock without exhausted iterator behaviour."""
 
@@ -356,6 +368,53 @@ def test_run_git_raises_for_a_completed_nonzero_live_process(
 
     assert error.value.returncode == 7
     assert process.polls >= 2
+
+
+@pytest.mark.docs_ci
+def test_run_git_drain_failure_after_docs_prefix_makes_classification_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drain error after a plausible docs prefix cannot yield a trusted classification."""
+
+    output = _name_status(b"A", b"docs/guide.md")
+    process = _LiveGitProcess(output)
+    process.stdout = _FailingLiveOutput(output)
+    regular_file = _FakeGitProcess(b"100644 blob " + b"0" * 40 + b"\tdocs/guide.md\0")
+    processes = [process, regular_file]
+
+    def fake_popen(_arguments: list[str], **_kwargs: object) -> _FakeGitProcess:
+        return processes.pop(0)
+
+    def complete_after_release() -> int | None:
+        process.polls += 1
+        if process.polls == 1:
+            process.stdout.release.set()
+            return None
+        process.returncode = 0
+        return 0
+
+    monkeypatch.setattr(process, "poll", complete_after_release)
+    monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen)
+    assert classifier.classify_change("pull_request", _BASE, _HEAD) is classifier.ChangeMode.FULL
+    assert process.stdout.reads == 2
+
+
+@pytest.mark.docs_ci
+def test_run_git_reraises_a_drain_failure_after_a_valid_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller cannot consume a partially drained, otherwise valid Git payload."""
+
+    process = _LiveGitProcess(_name_status(b"A", b"docs/guide.md"))
+    process.stdout = _FailingLiveOutput(_name_status(b"A", b"docs/guide.md"))
+    process.returncode = 0
+
+    def fake_popen(_arguments: list[str], **_kwargs: object) -> _LiveGitProcess:
+        return process
+
+    monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen)
+    with pytest.raises(OSError, match="stdout drain failed"):
+        classifier._run_git(["diff", "--name-status"])  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.parametrize("status", [b"A", b"M", b"D"])
@@ -1301,6 +1360,44 @@ class _FunctionAnalysis:
     call_result_assignments: dict[str, str]
     read_names: set[str]
     read_calls: set[str]
+    parameter_names: tuple[str, ...]
+    has_variadic_parameters: bool
+    call_arguments: list[tuple[str, tuple[str, ...], dict[str, str]]]
+
+
+def _function_parameter_names(func: _FunctionNode) -> tuple[str, ...]:
+    """Return the statically bindable named parameters of one helper."""
+
+    if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return ()
+    arguments = func.args
+    return tuple(
+        argument.arg
+        for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)
+    )
+
+
+def _function_has_variadic_parameters(func: _FunctionNode) -> bool:
+    """Return whether a helper admits unbounded positional or keyword binding."""
+
+    return isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+        func.args.vararg is not None or func.args.kwarg is not None
+    )
+
+
+def _imported_parameter_read_names(func: _FunctionNode) -> set[str]:
+    """Return direct reader parameters from one repository-local imported helper."""
+
+    parameters = set(_function_parameter_names(func))
+    return {
+        call.func.value.id
+        for call in ast.walk(func)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr in _READ_METHOD_NAMES
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id in parameters
+    }
 
 
 def _repository_imported_function_analyses(
@@ -1383,8 +1480,11 @@ def _repository_imported_function_analyses(
                 return_calls=set(),
                 return_names=set(),
                 call_result_assignments={},
-                read_names=set(),
+                read_names=_imported_parameter_read_names(function),
                 read_calls=set(),
+                parameter_names=_function_parameter_names(function),
+                has_variadic_parameters=_function_has_variadic_parameters(function),
+                call_arguments=[],
             )
             module_calls[key] = qualified
         for member, value in assignments.items():
@@ -1473,8 +1573,11 @@ def _repository_imported_function_analyses(
                 return_calls=set(),
                 return_names=set(),
                 call_result_assignments={},
-                read_names=set(),
+                read_names=_imported_parameter_read_names(functions[imported.name]),
                 read_calls=set(),
+                parameter_names=_function_parameter_names(functions[imported.name]),
+                has_variadic_parameters=_function_has_variadic_parameters(functions[imported.name]),
+                call_arguments=[],
             )
     return (
         analyses,
@@ -1523,6 +1626,33 @@ def _assert_no_imported_collected_test_callables(
                     f"{filename}:{target.lineno}: imported collected test callable `{target.id}` "
                     "is reassigned"
                 )
+
+
+def _local_collected_callable_aliases(
+    tree: ast.Module, functions: dict[str, _FunctionNode], filename: str
+) -> dict[str, str]:
+    """Resolve direct local callable aliases whose exported name pytest collects."""
+
+    aliases: dict[str, str] = {}
+    for statement in tree.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)) or statement.value is None:
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        for target in targets:
+            if not isinstance(target, ast.Name) or not target.id.startswith("test_"):
+                continue
+            if target.id in aliases or not isinstance(statement.value, ast.Name):
+                raise AssertionError(
+                    f"{filename}:{target.lineno}: collected local callable alias `{target.id}` "
+                    "is ambiguous"
+                )
+            if statement.value.id not in functions:
+                raise AssertionError(
+                    f"{filename}:{target.lineno}: collected local callable alias `{target.id}` "
+                    "does not resolve to one local function"
+                )
+            aliases[target.id] = statement.value.id
+    return aliases
 
 
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
@@ -1612,6 +1742,7 @@ def _analyse_function(
     call_result_assignments: dict[str, str] = {}
     read_names: set[str] = set()
     read_calls: set[str] = set()
+    call_arguments: list[tuple[str, tuple[str, ...], dict[str, str]]] = []
     reader_aliases: set[str] = set()
     ambiguous_reader_aliases: set[str] = set()
     builtin_open_aliases: set[str] = set(builtin_open_import_aliases or set())
@@ -1732,6 +1863,28 @@ def _analyse_function(
         if key in (ambiguous_module_values or set()):
             return "ambiguous"
         return "none"
+
+    def _argument_state(value: ast.expr) -> str:
+        """Classify one helper argument under the existing closed path grammar."""
+
+        if _receiver_is_docs(value) or _module_receiver_state(value) == "docs":
+            return "docs"
+        if _receiver_is_partial(value) or _module_receiver_state(value) == "ambiguous":
+            return "ambiguous"
+        return "non-docs"
+
+    def _record_call(callee: str, call: ast.Call) -> None:
+        """Record one resolved helper edge with bounded argument provenance."""
+
+        calls.add(callee)
+        positional = tuple(
+            "ambiguous" if isinstance(argument, ast.Starred) else _argument_state(argument)
+            for argument in call.args
+        )
+        keywords = {
+            keyword.arg or "**": _argument_state(keyword.value) for keyword in call.keywords
+        }
+        call_arguments.append((callee, positional, keywords))
 
     def _reader_alias_state(value: ast.expr) -> str:
         """Return the fail-closed docs provenance of one bound reader method."""
@@ -1959,13 +2112,13 @@ def _analyse_function(
                         "or is not a docs read"
                     )
             elif node.func.id in (local_functions or {}):
-                calls.add((local_functions or {})[node.func.id])
+                _record_call((local_functions or {})[node.func.id], node)
             elif node.func.id in (ambiguous_local_functions or set()):
                 unresolved.append(
                     f"{filename}:{node.lineno}: unresolved local helper edge `{node.func.id}()`"
                 )
             elif node.func.id in known_functions:
-                calls.add(node.func.id)
+                _record_call(node.func.id, node)
         elif isinstance(node.func, ast.Attribute) and _is_imported_class_instance(node.func.value):
             unresolved.append(
                 f"{filename}:{node.lineno}: imported class instance method call provenance "
@@ -1981,6 +2134,13 @@ def _analyse_function(
             )
         elif isinstance(node.func, ast.Attribute) and node.func.attr in _READ_METHOD_NAMES:
             target = node.func.value
+            if isinstance(target, ast.Name) and target.id == "Path":
+                if not node.args or isinstance(node.args[0], ast.Starred):
+                    unresolved.append(
+                        f"{filename}:{node.lineno}: unbound pathlib reader receiver is ambiguous"
+                    )
+                    continue
+                target = node.args[0]
             if (call_key := _call_key(target)) is not None:
                 read_calls.add(call_key)
             if isinstance(target, ast.Name):
@@ -2010,7 +2170,7 @@ def _analyse_function(
                 continue
             module_key = (node.func.value.id, node.func.attr)
             if module_key in (module_calls or {}):
-                calls.add((module_calls or {})[module_key])
+                _record_call((module_calls or {})[module_key], node)
                 continue
             if module_key in (ambiguous_module_calls or set()):
                 unresolved.append(
@@ -2027,7 +2187,7 @@ def _analyse_function(
                     f"`{receiver}.{node.func.attr}()`"
                 )
             else:
-                calls.add(callee)
+                _record_call(callee, node)
     return _FunctionAnalysis(
         reads_directly=reads,
         calls=calls,
@@ -2038,6 +2198,9 @@ def _analyse_function(
         call_result_assignments=call_result_assignments,
         read_names=read_names,
         read_calls=read_calls,
+        parameter_names=_function_parameter_names(func),
+        has_variadic_parameters=_function_has_variadic_parameters(func),
+        call_arguments=call_arguments,
     )
 
 
@@ -2183,6 +2346,8 @@ def _docs_reading_test_modules(
         for statement in tree.body
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
+    local_callable_aliases = _local_collected_callable_aliases(tree, functions, filename)
+    functions.update({alias: functions[target] for alias, target in local_callable_aliases.items()})
     _assert_no_unaudited_collected_test_bases(tree, filename)
     _assert_no_unattributable_module_docs_reads(tree, module_aliases, functions, filename)
     class_methods: dict[str, dict[str, str]] = {}
@@ -2282,7 +2447,11 @@ def _docs_reading_test_modules(
     ambiguous_local_targets: dict[str, set[str]] = {}
     local_keys: set[str] = set()
     for owner, node in list(functions.items()):
-        helpers, ambiguous = _local_helpers(node)
+        helpers, ambiguous = (
+            _local_helpers(node)
+            if owner.startswith("test_") or "::test_" in owner
+            else ({}, set[str]())
+        )
         targets = {name: f"{owner}::<local>::{name}" for name in helpers}
         local_targets[owner] = targets
         ambiguous_local_targets[owner] = ambiguous
@@ -2324,6 +2493,47 @@ def _docs_reading_test_modules(
             f"could hide an unmarked docs read: {unresolved}"
         )
     analyses.update(imported_analyses)
+
+    def bound_argument_state(
+        callee: _FunctionAnalysis,
+        parameter: str,
+        positional: tuple[str, ...],
+        keywords: dict[str, str],
+    ) -> str:
+        """Return a closed binding state for one reader parameter at one call site."""
+
+        if "**" in keywords or any(state == "ambiguous" for state in positional):
+            return "ambiguous"
+        try:
+            position = callee.parameter_names.index(parameter)
+        except ValueError:
+            return "ambiguous"
+        positional_state = positional[position] if position < len(positional) else None
+        keyword_state = keywords.get(parameter)
+        unknown_keywords = set(keywords) - set(callee.parameter_names)
+        if unknown_keywords and not callee.has_variadic_parameters:
+            return "ambiguous"
+        if positional_state is not None and keyword_state is not None:
+            return "ambiguous"
+        if positional_state is not None:
+            return positional_state
+        if keyword_state is not None:
+            return keyword_state
+        return "non-docs"
+
+    for analysis in analyses.values():
+        for callee_name, positional, keywords in analysis.call_arguments:
+            callee = analyses.get(callee_name)
+            if callee is None:
+                continue
+            for parameter in callee.read_names & set(callee.parameter_names):
+                state = bound_argument_state(callee, parameter, positional, keywords)
+                if state == "docs":
+                    analysis.reads_directly = True
+                elif state == "ambiguous":
+                    analysis.unresolved.append(
+                        f"{filename}: helper argument binding for `{callee_name}` is ambiguous"
+                    )
     for name, node in functions.items():
         if (
             name in local_keys
@@ -2443,6 +2653,11 @@ def _marked_docs_test_prefixes(tree: ast.Module) -> set[str]:
     """Return exact test prefixes carrying a method- or class-level docs marker."""
 
     marked: set[str] = set()
+    local_markers = {
+        statement.name: _function_has_docs_marker(statement)
+        for statement in tree.body
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
     for statement in tree.body:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if statement.name.startswith("test_") and _function_has_docs_marker(statement):
@@ -2460,6 +2675,17 @@ def _marked_docs_test_prefixes(tree: ast.Module) -> set[str]:
                 class_marked or _function_has_docs_marker(member)
             ):
                 marked.add(f"{statement.name}::{member.name}")
+    for statement in tree.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)) or statement.value is None:
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        if not isinstance(statement.value, ast.Name) or not local_markers.get(statement.value.id):
+            continue
+        marked.update(
+            target.id
+            for target in targets
+            if isinstance(target, ast.Name) and target.id.startswith("test_")
+        )
     return marked
 
 
@@ -2735,6 +2961,69 @@ def test_docs_governance_follows_repository_local_imported_helpers(tmp_path: Pat
             filename=str(tests_root / "test_imported.py"),
             repository_root=tmp_path,
         )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_propagates_helper_reader_parameters(tmp_path: Path) -> None:
+    """Resolved local and imported helper parameter bindings retain docs provenance."""
+
+    (tmp_path / "helpers.py").write_text(
+        "def imported_reader(path):\n    return path.read_text()\n", encoding="utf-8"
+    )
+    source = (
+        "from pathlib import Path\nfrom helpers import imported_reader\n\n"
+        "def local_reader(path):\n    return path.read_text()\n\n"
+        "def test_local_positional() -> None:\n    local_reader(Path('docs/local.md'))\n\n"
+        "def test_imported_keyword() -> None:\n"
+        "    imported_reader(path=Path('docs/imported.md'))\n\n"
+        "def test_non_docs() -> None:\n    local_reader(Path('config/local.md'))\n"
+    )
+    assert _docs_reading_test_modules(source, repository_root=tmp_path) == {
+        "test_imported_keyword",
+        "test_local_positional",
+    }
+    ambiguous = (
+        source + "\ndef test_ambiguous(name) -> None:\n    local_reader(Path('docs', name))\n"
+    )
+    with pytest.raises(AssertionError, match="helper argument binding"):
+        _docs_reading_test_modules(ambiguous, repository_root=tmp_path)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_detects_unbound_pathlib_readers() -> None:
+    """Unbound pathlib reader calls retain their explicit receiver provenance."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def test_text() -> None:\n    Path.read_text(Path('docs/text.md'))\n\n"
+        "def test_bytes() -> None:\n    Path.read_bytes(Path('docs/bytes.md'))\n\n"
+        "def test_open() -> None:\n    Path.open(Path('docs/open.md')).read()\n\n"
+        "def test_non_docs() -> None:\n    Path.read_text(Path('config/plain.md'))\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_bytes", "test_open", "test_text"}
+    with pytest.raises(AssertionError, match="cannot prove|ambiguous"):
+        _docs_reading_test_modules(
+            "from pathlib import Path\n\ndef test_dynamic(name) -> None:\n"
+            "    Path.read_text(Path('docs', name))\n"
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_audits_locally_assigned_collected_callables() -> None:
+    """Collected local aliases share their function provenance and marker audit."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.mark.docs\ndef verify_doc() -> None:\n    Path('docs/alias.md').read_text()\n\n"
+        "def verify_config() -> None:\n    Path('config/alias.md').read_text()\n\n"
+        "test_doc = verify_doc\ntest_config = verify_config\n"
+    )
+    tree = ast.parse(source)
+    assert _docs_reading_test_modules(source) == {"test_doc"}
+    assert _marked_docs_test_prefixes(tree) == {"test_doc"}
+    _assert_exact_docs_markers(tree, {"test_doc"}, "alias.py")
+    with pytest.raises(AssertionError, match="collected local callable alias"):
+        _docs_reading_test_modules(source + "test_doc = verify_config\n", filename="alias.py")
 
 
 @pytest.mark.docs_ci

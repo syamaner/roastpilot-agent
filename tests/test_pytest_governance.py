@@ -200,7 +200,7 @@ def _marked_test_prefixes(marker: str) -> set[str]:
     """Return exact test-node prefixes bearing one function-level marker."""
 
     prefixes: set[str] = set()
-    for path in (REPO_ROOT / "tests").glob("test_*.py"):
+    for path in _governed_test_module_paths(REPO_ROOT / "tests"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         assert not _module_has_docs_ci_marker(tree)
         relative = path.relative_to(REPO_ROOT).as_posix()
@@ -230,6 +230,32 @@ def _marked_test_prefixes(marker: str) -> set[str]:
                     ):
                         prefixes.add(f"{relative}::{statement.name}::{method.name}")
     return prefixes
+
+
+def _governed_test_module_paths(tests_root: Path) -> list[Path]:
+    """Return both configured recursive pytest module filename forms."""
+
+    return sorted(
+        {path for pattern in ("test_*.py", "*_test.py") for path in tests_root.rglob(pattern)}
+    )
+
+
+def test_marker_prefix_inventory_covers_nested_suffix_modules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nested ``*_test.py`` markers cannot evade docs-ci or stress partition inventory."""
+
+    tests_root = tmp_path / "tests" / "nested"
+    tests_root.mkdir(parents=True)
+    (tests_root / "suffix_test.py").write_text(
+        "import pytest\n\n@pytest.mark.docs_ci\n@pytest.mark.stress\n"
+        "def test_nested() -> None:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+    expected = {"tests/nested/suffix_test.py::test_nested"}
+    assert _marked_test_prefixes("docs_ci") == expected
+    assert _marked_test_prefixes("stress") == expected
 
 
 @pytest.mark.docs_ci

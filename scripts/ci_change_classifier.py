@@ -101,6 +101,7 @@ def _run_git(arguments: Sequence[str], *, deadline: float | None = None) -> byte
     output_size = 0
     output_limit_exceeded = threading.Event()
     drain_complete = threading.Event()
+    drain_errors: list[BaseException] = []
 
     def drain_stdout() -> None:
         """Drain the child pipe while retaining no more than the closed cap."""
@@ -116,6 +117,8 @@ def _run_git(arguments: Sequence[str], *, deadline: float | None = None) -> byte
                     output_limit_exceeded.set()
                 else:
                     output.append(chunk)
+        except BaseException as error:
+            drain_errors.append(error)
         finally:
             drain_complete.set()
 
@@ -124,6 +127,9 @@ def _run_git(arguments: Sequence[str], *, deadline: float | None = None) -> byte
     started = time.monotonic()
     try:
         while process.poll() is None or not drain_complete.is_set():
+            if drain_errors:
+                _terminate_git_process(process)
+                raise drain_errors[0]
             if output_limit_exceeded.is_set():
                 _terminate_git_process(process)
                 raise _GitOutputLimitExceeded
@@ -140,6 +146,8 @@ def _run_git(arguments: Sequence[str], *, deadline: float | None = None) -> byte
         drain_thread.join(timeout=_GIT_POLL_INTERVAL_SECONDS)
         raise
     drain_thread.join()
+    if drain_errors:
+        raise drain_errors[0]
     if output_limit_exceeded.is_set():
         raise _GitOutputLimitExceeded
     if process.returncode != 0:
