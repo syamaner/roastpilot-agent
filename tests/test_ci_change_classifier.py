@@ -1105,6 +1105,17 @@ def _analyse_function(
     call_result_assignments: dict[str, str] = {}
     read_names: set[str] = set()
     read_calls: set[str] = set()
+    control_flow_docs_aliases = {
+        target.id
+        for conditional in ast.walk(func)
+        if isinstance(conditional, ast.If)
+        for assignment in ast.walk(conditional)
+        if isinstance(assignment, (ast.Assign, ast.AnnAssign)) and assignment.value is not None
+        for target in (
+            assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+        )
+        if isinstance(target, ast.Name) and _expression_is_docs_markdown(assignment.value, set())
+    }
 
     def _call_key(expression: ast.expr) -> str | None:
         """Resolve one admitted local, module, or containing-class call expression."""
@@ -1167,7 +1178,7 @@ def _analyse_function(
                         partial_aliases.discard(target.id)
                     elif partial_match:
                         partial_aliases.add(target.id)
-                    else:
+                    elif target.id not in control_flow_docs_aliases:
                         aliases.discard(target.id)
                         partial_aliases.discard(target.id)
         docs_root_aliases = aliases | partial_aliases
@@ -2322,6 +2333,35 @@ def test_docs_governance_propagates_staged_docs_root_aliases() -> None:
         "    path.read_text()\n"
     )
     assert _docs_reading_test_modules(source) == {"test_joinpath", "test_slash"}
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    "branches",
+    [
+        "if enabled:\n        path = Path('docs/branch.md')\n"
+        "    else:\n        path = Path('config/branch.md')",
+        "if enabled:\n        path = Path('config/branch.md')\n"
+        "    else:\n        path = Path('docs/branch.md')",
+    ],
+)
+def test_docs_governance_unions_docs_aliases_across_if_branches(branches: str) -> None:
+    """A docs alias from either branch remains sensitive at the later read."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def test_branch(enabled: bool) -> None:\n"
+        f"    {branches}\n"
+        "    path.read_text()\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_branch"}
+    non_docs = (
+        "from pathlib import Path\n\n"
+        "def test_non_docs() -> None:\n"
+        "    path = Path('config/only.md')\n"
+        "    path.read_text()\n"
+    )
+    assert _docs_reading_test_modules(non_docs) == set()
 
 
 @pytest.mark.docs_ci
