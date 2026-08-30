@@ -1,7 +1,7 @@
 # Agent-Team Worktree Isolation — operational runbook
 
-How to run a parallel agent-team fan-out (e.g. E10's S3/S4/S5 page teammates)
-without the teammates colliding in one working directory.
+This runbook explains how to run a parallel agent-team fan-out (e.g. E10's
+S3/S4/S5 page teammates) without the teammates colliding in one working directory.
 
 ## Why this exists
 
