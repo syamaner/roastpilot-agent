@@ -664,7 +664,7 @@ def _expression_completes_partial_docs_alias(expression: ast.expr, aliases: set[
 
 
 def _is_docs_markdown_glob_call(node: ast.AST, root_aliases: set[str]) -> bool:
-    """Return whether a call is a ``*.md`` glob/rglob rooted at ``docs/``.
+    """Return whether a call is the closed docs ``rglob('*.md')`` shape.
 
     ``root_aliases`` names any variable already known to carry a docs-rooted
     directory (full or partial evidence alike — a directory root never itself
@@ -675,17 +675,49 @@ def _is_docs_markdown_glob_call(node: ast.AST, root_aliases: set[str]) -> bool:
     if not (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr in _GLOB_METHOD_NAMES
-        and any(
-            isinstance(argument, ast.Constant) and argument.value == "*.md"
-            for argument in node.args
-        )
+        and node.func.attr == "rglob"
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "*.md"
     ):
         return False
     root = node.func.value
     if isinstance(root, ast.Name):
         return root.id in root_aliases
     return _expression_has_docs_root(root)
+
+
+def _is_docs_rooted_glob_call(node: ast.AST, root_aliases: set[str]) -> bool:
+    """Return whether a glob-like call has static docs-root evidence."""
+
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _GLOB_METHOD_NAMES
+    ):
+        return False
+    root = node.func.value
+    return (isinstance(root, ast.Name) and root.id in root_aliases) or _expression_has_docs_root(
+        root
+    )
+
+
+def _builtin_open_target(node: ast.Call) -> ast.expr:
+    """Return builtin ``open``'s sole file receiver or fail closed on shape drift."""
+
+    file_keywords = [keyword for keyword in node.keywords if keyword.arg == "file"]
+    if any(keyword.arg is None for keyword in node.keywords):
+        raise AssertionError("builtin open has dynamic keyword expansion")
+    if len(file_keywords) > 1:
+        raise AssertionError("builtin open has duplicate file keywords")
+    if node.args and file_keywords:
+        raise AssertionError("builtin open has conflicting positional and file keyword receivers")
+    if not node.args and not file_keywords:
+        raise AssertionError("builtin open has no statically unique file receiver")
+    if node.args and isinstance(node.args[0], ast.Starred):
+        raise AssertionError("builtin open has dynamic positional receiver")
+    return node.args[0] if node.args else file_keywords[0].value
 
 
 def _is_pytest_fixture_decorator(decorator: ast.expr) -> bool:
@@ -945,25 +977,106 @@ class _FunctionAnalysis:
 
 def _repository_imported_function_analyses(
     tree: ast.Module, filename: str, repository_root: Path
-) -> tuple[dict[str, _FunctionAnalysis], set[str], set[str], set[str]]:
+) -> tuple[
+    dict[str, _FunctionAnalysis],
+    set[str],
+    set[str],
+    set[str],
+    dict[tuple[str, str], str],
+    set[tuple[str, str]],
+    set[tuple[str, str]],
+    set[tuple[str, str]],
+]:
     """Return static analyses for direct imports from confined first-party modules."""
 
     analyses: dict[str, _FunctionAnalysis] = {}
     ambiguous: set[str] = set()
     docs_values: set[str] = set()
     ambiguous_values: set[str] = set()
-    for statement in tree.body:
-        if not isinstance(statement, ast.ImportFrom) or statement.module is None:
-            continue
+    module_calls: dict[tuple[str, str], str] = {}
+    ambiguous_module_calls: set[tuple[str, str]] = set()
+    module_docs_values: set[tuple[str, str]] = set()
+    ambiguous_module_values: set[tuple[str, str]] = set()
+
+    def candidates_for(module: str) -> set[Path]:
+        """Return confined importer-relative/repository-root candidates for one module."""
+
         importer = Path(filename)
         if not importer.is_absolute():
             importer = repository_root / importer
         candidates: set[Path] = set()
         for base in (importer.parent, repository_root):
-            module_path = base.joinpath(*statement.module.split("."))
+            module_path = base.joinpath(*module.split("."))
             for path in (module_path.with_suffix(".py"), module_path / "__init__.py"):
                 if path.is_file() and path.is_relative_to(repository_root):
                     candidates.add(path)
+        return candidates
+
+    def add_module_members(module_alias: str, source_path: Path) -> None:
+        """Expose local module members through one explicitly imported alias."""
+
+        imported_tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        functions = {
+            node.name: node
+            for node in imported_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        assignments = {
+            target.id: node.value
+            for node in imported_tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            if isinstance(target, ast.Name)
+        }
+        for member, function in functions.items():
+            key = (module_alias, member)
+            qualified = f"{module_alias}.{member}"
+            if key in module_calls:
+                ambiguous_module_calls.add(key)
+                continue
+            source = source_path.read_text(encoding="utf-8")
+            proxy = (
+                source
+                + "\n\ndef test_import_direct() -> None:\n"
+                + f"    {function.name}()\n\n"
+                + "def test_import_return() -> None:\n"
+                + f"    {function.name}().read_text()\n"
+            )
+            readers = _docs_reading_test_modules(
+                proxy, filename=str(source_path), repository_root=repository_root
+            )
+            analyses[qualified] = _FunctionAnalysis(
+                reads_directly="test_import_direct" in readers,
+                calls=set(),
+                unresolved=[],
+                returns_docs="test_import_return" in readers,
+                return_calls=set(),
+                return_names=set(),
+                call_result_assignments={},
+                read_names=set(),
+                read_calls=set(),
+            )
+            module_calls[key] = qualified
+        for member, value in assignments.items():
+            key = (module_alias, member)
+            if _expression_is_docs_markdown(value, set()):
+                module_docs_values.add(key)
+            elif _expression_has_docs_root(value) or not _string_constants(value):
+                ambiguous_module_values.add(key)
+
+    for statement in tree.body:
+        if isinstance(statement, ast.Import):
+            for imported in statement.names:
+                alias = imported.asname or imported.name.partition(".")[0]
+                candidates = candidates_for(imported.name)
+                if len(candidates) > 1:
+                    ambiguous.add(alias)
+                elif candidates:
+                    add_module_members(alias, candidates.pop())
+            continue
+        if not isinstance(statement, ast.ImportFrom) or statement.module is None:
+            continue
+        candidates = candidates_for(statement.module)
         if len(candidates) > 1:
             ambiguous.update(imported.asname or imported.name for imported in statement.names)
             continue
@@ -994,7 +1107,7 @@ def _repository_imported_function_analyses(
                     value = assignments[imported.name]
                     if _expression_is_docs_markdown(value, set()):
                         docs_values.add(alias)
-                    elif not _string_constants(value):
+                    elif _expression_has_docs_root(value) or not _string_constants(value):
                         ambiguous_values.add(alias)
                 elif imported.name not in classes:
                     ambiguous.add(alias)
@@ -1021,7 +1134,16 @@ def _repository_imported_function_analyses(
                 read_names=set(),
                 read_calls=set(),
             )
-    return analyses, ambiguous, docs_values, ambiguous_values
+    return (
+        analyses,
+        ambiguous,
+        docs_values,
+        ambiguous_values,
+        module_calls,
+        ambiguous_module_calls,
+        module_docs_values,
+        ambiguous_module_values,
+    )
 
 
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
@@ -1071,6 +1193,10 @@ def _analyse_function(
     class_methods: dict[str, str] | None = None,
     local_functions: dict[str, str] | None = None,
     ambiguous_local_functions: set[str] | None = None,
+    module_calls: dict[tuple[str, str], str] | None = None,
+    ambiguous_module_calls: set[tuple[str, str]] | None = None,
+    module_docs_values: set[tuple[str, str]] | None = None,
+    ambiguous_module_values: set[tuple[str, str]] | None = None,
 ) -> _FunctionAnalysis:
     """Walk one function body for a direct docs read, calls, and unresolved reads.
 
@@ -1131,6 +1257,12 @@ def _analyse_function(
         if (
             isinstance(expression.func, ast.Attribute)
             and isinstance(expression.func.value, ast.Name)
+            and (expression.func.value.id, expression.func.attr) in (module_calls or {})
+        ):
+            return (module_calls or {})[(expression.func.value.id, expression.func.attr)]
+        if (
+            isinstance(expression.func, ast.Attribute)
+            and isinstance(expression.func.value, ast.Name)
             and expression.func.value.id in {"self", "cls", class_name}
         ):
             return (class_methods or {}).get(expression.func.attr)
@@ -1145,6 +1277,18 @@ def _analyse_function(
         if isinstance(target, ast.Name):
             return target.id in partial_aliases
         return _expression_has_docs_root(target)
+
+    def _module_receiver_state(target: ast.expr) -> str:
+        """Return local imported-module receiver provenance, if applicable."""
+
+        if not (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)):
+            return "none"
+        key = (target.value.id, target.attr)
+        if key in (module_docs_values or set()):
+            return "docs"
+        if key in (ambiguous_module_values or set()):
+            return "ambiguous"
+        return "none"
 
     nodes: list[ast.AST] = list(func.body) if not isinstance(func, ast.Lambda) else [func.body]
     while nodes:
@@ -1182,6 +1326,13 @@ def _analyse_function(
                         aliases.discard(target.id)
                         partial_aliases.discard(target.id)
         docs_root_aliases = aliases | partial_aliases
+        if _is_docs_rooted_glob_call(node, docs_root_aliases) and not _is_docs_markdown_glob_call(
+            node, docs_root_aliases
+        ):
+            unresolved.append(
+                f"{filename}:{getattr(node, 'lineno', 0)}: docs-rooted glob must be exactly "
+                "rglob('*.md')"
+            )
         if isinstance(node, ast.For) and _is_docs_markdown_glob_call(node.iter, docs_root_aliases):
             has_docs_glob = True
             if isinstance(node.target, ast.Name):
@@ -1216,12 +1367,20 @@ def _analyse_function(
                     return_calls.add(call_key)
             continue
         if isinstance(node.func, ast.Name):
-            if node.func.id == "open" and node.args:
-                target = node.args[0]
+            if node.func.id == "open":
+                try:
+                    target = _builtin_open_target(node)
+                except AssertionError as error:
+                    unresolved.append(f"{filename}:{node.lineno}: {error}")
+                    continue
                 if (call_key := _call_key(target)) is not None:
                     read_calls.add(call_key)
-                if _receiver_is_docs(target):
+                if _receiver_is_docs(target) or _module_receiver_state(target) == "docs":
                     reads = True
+                elif _module_receiver_state(target) == "ambiguous":
+                    unresolved.append(
+                        f"{filename}:{node.lineno}: imported module value provenance is ambiguous"
+                    )
                 elif _receiver_is_partial(target):
                     unresolved.append(
                         f"{filename}:{node.lineno}: `open(...)` receiver folds a 'docs' "
@@ -1247,8 +1406,12 @@ def _analyse_function(
                         f"{filename}:{node.lineno}: parametrized receiver `{target.id}` "
                         "is ambiguous"
                     )
-            if _receiver_is_docs(target):
+            if _receiver_is_docs(target) or _module_receiver_state(target) == "docs":
                 reads = True
+            elif _module_receiver_state(target) == "ambiguous":
+                unresolved.append(
+                    f"{filename}:{node.lineno}: imported module value provenance is ambiguous"
+                )
             elif _receiver_is_partial(target):
                 unresolved.append(
                     f"{filename}:{node.lineno}: `.{node.func.attr}()` receiver folds a "
@@ -1256,6 +1419,15 @@ def _analyse_function(
                     "is or is not a docs read"
                 )
         elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+            module_key = (node.func.value.id, node.func.attr)
+            if module_key in (module_calls or {}):
+                calls.add((module_calls or {})[module_key])
+                continue
+            if module_key in (ambiguous_module_calls or set()):
+                unresolved.append(
+                    f"{filename}:{node.lineno}: imported module callable provenance is ambiguous"
+                )
+                continue
             receiver = node.func.value.id
             if receiver not in {"self", "cls", class_name}:
                 continue
@@ -1310,9 +1482,16 @@ def _docs_reading_test_modules(
     """
 
     tree = ast.parse(source)
-    imported_analyses, ambiguous_imports, imported_docs_values, ambiguous_imported_values = (
-        _repository_imported_function_analyses(tree, filename, repository_root)
-    )
+    (
+        imported_analyses,
+        ambiguous_imports,
+        imported_docs_values,
+        ambiguous_imported_values,
+        module_calls,
+        ambiguous_module_calls,
+        module_docs_values,
+        ambiguous_module_values,
+    ) = _repository_imported_function_analyses(tree, filename, repository_root)
     module_value_sources = _module_value_sources(tree)
     module_aliases: set[str] = set()
     module_partial_aliases: set[str] = set()
@@ -1471,6 +1650,10 @@ def _docs_reading_test_modules(
             class_methods.get(class_name) if class_name else None,
             local_targets.get(name),
             ambiguous_local_targets.get(name),
+            module_calls,
+            ambiguous_module_calls,
+            module_docs_values,
+            ambiguous_module_values,
         )
         analyses[name] = analysis
         if name not in local_keys:
@@ -1620,20 +1803,53 @@ def _marked_docs_test_prefixes(tree: ast.Module) -> set[str]:
     return marked
 
 
-def _marked_test_prefixes(tree: ast.Module, marker: str) -> set[str]:
-    """Return tests carrying one exact function- or class-level marker."""
+def _mark_value_has_marker(value: ast.expr, marker: str) -> bool:
+    """Return whether a literal pytest mark expression carries one marker."""
 
-    marker_text = f"pytest.mark.{marker}"
+    if isinstance(value, (ast.List, ast.Set, ast.Tuple)):
+        return any(_mark_value_has_marker(item, marker) for item in value.elts)
+    target = value.func if isinstance(value, ast.Call) else value
+    return (
+        isinstance(target, ast.Attribute)
+        and target.attr == marker
+        and isinstance(target.value, ast.Attribute)
+        and target.value.attr == "mark"
+        and isinstance(target.value.value, ast.Name)
+        and target.value.value.id == "pytest"
+    )
+
+
+def _pytestmark_has_marker(statements: Iterable[ast.stmt], marker: str) -> bool:
+    """Return whether a module/class body gives tests an effective marker."""
+
+    return any(
+        isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "pytestmark"
+            for target in statement.targets
+        )
+        and _mark_value_has_marker(statement.value, marker)
+        for statement in statements
+    )
+
+
+def _effective_marked_test_prefixes(tree: ast.Module, marker: str) -> set[str]:
+    """Return test prefixes inheriting ``marker`` from all supported scopes."""
+
+    module_marked = _pytestmark_has_marker(tree.body, marker)
     marked: set[str] = set()
     for statement in tree.body:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if statement.name.startswith("test_") and any(
-                ast.unparse(decorator) == marker_text for decorator in statement.decorator_list
+            if statement.name.startswith("test_") and (
+                module_marked
+                or any(_mark_value_has_marker(item, marker) for item in statement.decorator_list)
             ):
                 marked.add(statement.name)
         elif isinstance(statement, ast.ClassDef):
-            class_marked = any(
-                ast.unparse(decorator) == marker_text for decorator in statement.decorator_list
+            class_marked = (
+                module_marked
+                or _pytestmark_has_marker(statement.body, marker)
+                or any(_mark_value_has_marker(item, marker) for item in statement.decorator_list)
             )
             for member in statement.body:
                 if (
@@ -1642,8 +1858,7 @@ def _marked_test_prefixes(tree: ast.Module, marker: str) -> set[str]:
                     and (
                         class_marked
                         or any(
-                            ast.unparse(decorator) == marker_text
-                            for decorator in member.decorator_list
+                            _mark_value_has_marker(item, marker) for item in member.decorator_list
                         )
                     )
                 ):
@@ -1659,7 +1874,7 @@ def _assert_exact_docs_markers(tree: ast.Module, readers: set[str], filename: st
         f"{filename}: @pytest.mark.docs must sit on exactly the readers "
         f"{sorted(readers)}, found {sorted(marked)}"
     )
-    assert not readers & _marked_test_prefixes(tree, "stress"), (
+    assert not readers & _effective_marked_test_prefixes(tree, "stress"), (
         f"{filename}: docs readers cannot carry pytest.mark.stress because the docs selector "
         "excludes stress"
     )
@@ -1866,6 +2081,38 @@ def test_docs_governance_fails_closed_on_imported_non_function_receivers(tmp_pat
         _docs_reading_test_modules(
             "from helpers import DOCS_PATH\n\n"
             "def test_path() -> None:\n    DOCS_PATH.read_text()\n",
+            repository_root=tmp_path,
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_follows_repository_local_module_import_aliases(tmp_path: Path) -> None:
+    """Local module aliases preserve callable and read-receiver provenance."""
+
+    tests_root = tmp_path / "tests"
+    tests_root.mkdir()
+    (tests_root / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "def read_docs() -> str:\n    return Path('docs/aliased.md').read_text()\n\n"
+        "DOCS_PATH = Path('docs/value.md')\nCONFIG_PATH = Path('config/value.md')\n"
+    )
+    source = (
+        "import tests.helpers as helpers\n\n"
+        "def test_call() -> None:\n    assert helpers.read_docs()\n\n"
+        "def test_value() -> None:\n    helpers.DOCS_PATH.read_text()\n\n"
+        "def test_non_docs() -> None:\n    helpers.CONFIG_PATH.read_text()\n"
+    )
+    assert _docs_reading_test_modules(
+        source, filename=str(tests_root / "test_alias.py"), repository_root=tmp_path
+    ) == {"test_call", "test_value"}
+    (tests_root / "helpers.py").write_text(
+        "from pathlib import Path\nDOCS_PATH = Path('docs') / name\n"
+    )
+    with pytest.raises(AssertionError, match="imported module value provenance"):
+        _docs_reading_test_modules(
+            "import tests.helpers as helpers\n\n"
+            "def test_value():\n    helpers.DOCS_PATH.read_text()\n",
+            filename=str(tests_root / "test_alias.py"),
             repository_root=tmp_path,
         )
 
@@ -2090,6 +2337,31 @@ def test_docs_governance_rejects_unsafe_module_docs_markers(source: str, expecte
 
 @pytest.mark.docs_ci
 @pytest.mark.parametrize(
+    "source",
+    [
+        "from pathlib import Path\nimport pytest\npytestmark = pytest.mark.stress\n\n"
+        "@pytest.mark.docs\ndef test_reader():\n    Path('docs/a.md').read_text()\n",
+        "from pathlib import Path\nimport pytest\n\nclass TestReader:\n"
+        "    pytestmark = pytest.mark.stress\n    @pytest.mark.docs\n"
+        "    def test_reader(self):\n        Path('docs/a.md').read_text()\n",
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.mark.stress\nclass TestReader:\n"
+        "    @pytest.mark.docs\n    def test_reader(self):\n"
+        "        Path('docs/a.md').read_text()\n",
+        "from pathlib import Path\nimport pytest\n\n@pytest.mark.docs\n@pytest.mark.stress\n"
+        "def test_reader():\n    Path('docs/a.md').read_text()\n",
+    ],
+)
+def test_docs_governance_rejects_effective_stress_inheritance(source: str) -> None:
+    """Docs readers cannot be excluded by module, class, or function stress marks."""
+
+    tree = ast.parse(source)
+    with pytest.raises(AssertionError, match="cannot carry pytest.mark.stress"):
+        _assert_exact_docs_markers(tree, _docs_reading_test_modules(source), "stress_reader.py")
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
     ("source", "expected"),
     [
         pytest.param(
@@ -2182,10 +2454,10 @@ def test_docs_governance_rejects_unsafe_module_docs_markers(source: str, expecte
         pytest.param(
             "from pathlib import Path\n\n"
             "def test_a() -> None:\n"
-            '    for entry in Path("docs").glob("*.md"):\n'
+            '    for entry in Path("docs").rglob("*.md"):\n'
             "        entry.read_text()\n",
             {"test_a"},
-            id="glob-star-md",
+            id="rglob-star-md",
         ),
         pytest.param(
             "from pathlib import Path\n\n"
@@ -2199,10 +2471,10 @@ def test_docs_governance_rejects_unsafe_module_docs_markers(source: str, expecte
         pytest.param(
             "from pathlib import Path\n\n"
             "def test_a() -> None:\n"
-            '    texts = [entry.read_text() for entry in Path("docs").glob("*.md")]\n'
+            '    texts = [entry.read_text() for entry in Path("docs").rglob("*.md")]\n'
             "    assert texts\n",
             {"test_a"},
-            id="list-comprehension-docs-glob",
+            id="list-comprehension-docs-rglob",
         ),
         pytest.param(
             "from pathlib import Path\n\n"
@@ -2233,6 +2505,62 @@ def test_docs_governance_detects_non_literal_construction(source: str, expected:
     """Non-literal docs-path construction is detected by folded-constant proof."""
 
     assert _docs_reading_test_modules(source) == expected
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_accepts_builtin_open_file_keyword() -> None:
+    """The unique builtin ``file=`` receiver is equivalent to positional input."""
+
+    source = (
+        "def test_keyword() -> None:\n"
+        "    with open(file='docs/keyword.md', encoding='utf-8') as handle:\n"
+        "        assert handle.read()\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_keyword"}
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    "call",
+    [
+        "open('docs/a.md', file='docs/b.md')",
+        "open(**kwargs)",
+    ],
+)
+def test_docs_governance_fails_closed_on_ambiguous_builtin_open_shapes(call: str) -> None:
+    """Duplicate, conflicting, and dynamic builtin-open shapes cannot hide readers."""
+
+    source = f"def test_open() -> None:\n    {call}\n"
+    with pytest.raises(AssertionError, match="builtin open"):
+        _docs_reading_test_modules(source)
+
+    duplicate = ast.Call(
+        func=ast.Name(id="open"),
+        args=[],
+        keywords=[
+            ast.keyword(arg="file", value=ast.Constant(value="docs/a.md")),
+            ast.keyword(arg="file", value=ast.Constant(value="docs/b.md")),
+        ],
+    )
+    with pytest.raises(AssertionError, match="duplicate"):
+        _builtin_open_target(duplicate)
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    "call",
+    [
+        "Path('docs').glob('*.md')",
+        "Path('docs').rglob('*.rst')",
+        "Path('docs').rglob(pattern)",
+    ],
+)
+def test_docs_governance_fails_closed_on_ambiguous_docs_rooted_globs(call: str) -> None:
+    """Only the exact recursive Markdown glob may establish docs provenance."""
+
+    source = f"from pathlib import Path\n\ndef test_glob() -> None:\n    list({call})\n"
+    with pytest.raises(AssertionError, match="docs-rooted glob"):
+        _docs_reading_test_modules(source)
 
 
 @pytest.mark.docs_ci
@@ -3039,6 +3367,7 @@ _EXACT_CLASSIFY_CONSUMERS = frozenset(
         "package",
         "coverage",
         "docs-fastpath",
+        "codecov-upload",
         "checks",
         "web-unit-worker",
         "web",
@@ -3118,5 +3447,7 @@ def test_ci_classifier_job_uses_closed_checkout_settings_and_base_trusted_execut
             assert job.get("if") == _DOCS_FASTPATH_CONDITION, (
                 "docs-fastpath: wrong worker condition"
             )
+        elif name == "codecov-upload":
+            assert job.get("if") == "always()", "codecov-upload: wrong worker condition"
 
     assert actual_consumers == _EXACT_CLASSIFY_CONSUMERS
