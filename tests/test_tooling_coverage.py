@@ -122,7 +122,7 @@ def test_ci_normalizes_coverage_filenames_before_codecov_upload() -> None:
 
     assert combine_index < xml_index < normalize_index < upload_index
     normalize_step = coverage_steps[normalize_index]
-    assert normalize_step["run"] == "python scripts/tooling_coverage.py coverage.xml"
+    assert normalize_step["run"] == "python scripts/tooling_coverage.py coverage.xml codecov-input"
 
     codecov_steps: list[tuple[str, dict[str, object]]] = []
     pytest_runs: list[str] = []
@@ -142,7 +142,10 @@ def test_ci_normalizes_coverage_filenames_before_codecov_upload() -> None:
     for _, codecov_step in codecov_steps:
         codecov_with = _mapping(codecov_step["with"])
         assert codecov_with["files"] == "./coverage.xml"
+        assert codecov_with["root_dir"] == "."
+        assert codecov_with["working-directory"] == "./codecov-input"
         assert codecov_with["disable_search"] is True
+        assert codecov_with["disable_file_fixes"] is True
         assert codecov_with["token"] == "${{ secrets.CODECOV_TOKEN }}"
     upload_job = _mapping(jobs["codecov-upload"])
     assert upload_job["needs"] == ["classify", "coverage", "docs-fastpath"]
@@ -189,6 +192,110 @@ def test_ci_normalizes_coverage_filenames_before_codecov_upload() -> None:
         )
         for run in pytest_runs
     )
+
+
+def test_stage_codecov_input_directory_contains_only_inert_required_inputs(tmp_path: Path) -> None:
+    """The uploader artifact has the report, configuration, and zero-byte path skeleton only."""
+    coverage_xml = _coverage_fixture(
+        tmp_path, ("src/roastpilot_agent/app.py", "script_only.py", "skill_only.py")
+    )
+    (tmp_path / "codecov.yml").write_text("coverage:\n  status: {}\n", encoding="utf-8")
+    tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+
+    staging_directory = tmp_path / "codecov-input"
+    tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+
+    expected_paths = {
+        ".agents/skills/demo/scripts/skill_only.py",
+        "codecov.yml",
+        "coverage.xml",
+        "scripts/script_only.py",
+        "src/roastpilot_agent/app.py",
+    }
+    actual_paths = {
+        path.relative_to(staging_directory).as_posix()
+        for path in staging_directory.rglob("*")
+        if path.is_file()
+    }
+    assert actual_paths == expected_paths
+    assert (staging_directory / "coverage.xml").read_bytes() == coverage_xml.read_bytes()
+    assert (staging_directory / "codecov.yml").read_text(encoding="utf-8") == (
+        "coverage:\n  status: {}\n"
+    )
+    for path in actual_paths - {"coverage.xml", "codecov.yml"}:
+        assert (staging_directory / path).stat().st_size == 0
+    assert all(not path.is_symlink() for path in staging_directory.rglob("*"))
+
+
+def test_stage_codecov_input_directory_replaces_stale_safe_output(tmp_path: Path) -> None:
+    """A rerun removes stale files instead of adding a second artifact tree."""
+    coverage_xml = _coverage_fixture(tmp_path, ("script_only.py", "skill_only.py"))
+    (tmp_path / "codecov.yml").touch()
+    tooling_coverage.normalize_coverage_xml(coverage_xml, tmp_path)
+    staging_directory = tmp_path / "codecov-input"
+    tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+    (staging_directory / "stale.txt").touch()
+
+    tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
+
+    assert not (staging_directory / "stale.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "filename",
+    (
+        "/absolute.py",
+        "../traversal.py",
+        "scripts\\windows.py",
+        "scripts//empty.py",
+        "codecov.yml/x.py",
+    ),
+)
+def test_stage_codecov_input_directory_rejects_unsafe_normalized_paths(
+    tmp_path: Path, filename: str
+) -> None:
+    """Unsafe post-normalization XML paths cannot enter the artifact skeleton."""
+    coverage_xml = _write_coverage_xml(tmp_path, (filename,))
+    (tmp_path / "codecov.yml").touch()
+
+    with pytest.raises(ValueError, match="unsafe"):
+        tooling_coverage.stage_codecov_input_directory(
+            coverage_xml, tmp_path, tmp_path / "codecov-input"
+        )
+
+
+def test_stage_codecov_input_directory_rejects_path_conflicts_and_symlinked_output(
+    tmp_path: Path,
+) -> None:
+    """File/directory collisions and symlink output state fail before replacement."""
+    coverage_xml = _write_coverage_xml(tmp_path, ("scripts", "scripts/child.py"))
+    (tmp_path / "codecov.yml").touch()
+    with pytest.raises(ValueError, match="conflicts"):
+        tooling_coverage.stage_codecov_input_directory(
+            coverage_xml, tmp_path, tmp_path / "codecov-input"
+        )
+
+    safe_xml = _write_coverage_xml(tmp_path, ("scripts/child.py",))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    staging_directory = tmp_path / "codecov-input"
+    staging_directory.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="non-symlink directory"):
+        tooling_coverage.stage_codecov_input_directory(safe_xml, tmp_path, staging_directory)
+
+
+def test_stage_codecov_input_directory_rejects_a_symlink_in_existing_output(tmp_path: Path) -> None:
+    """A stale symlink prevents replacement instead of being silently removed."""
+    coverage_xml = _write_coverage_xml(tmp_path, ("scripts/child.py",))
+    (tmp_path / "codecov.yml").touch()
+    staging_directory = tmp_path / "codecov-input"
+    staging_directory.mkdir()
+    outside = tmp_path / "outside"
+    outside.touch()
+    (staging_directory / "linked.py").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="symlink"):
+        tooling_coverage.stage_codecov_input_directory(coverage_xml, tmp_path, staging_directory)
 
 
 def test_each_discovered_skill_root_is_registered_in_flattened_settings() -> None:
@@ -557,10 +664,12 @@ def test_main_normalizes_coverage_xml_from_current_repository(
 ) -> None:
     """The CI command entry point normalizes exactly one local report."""
     coverage_xml = _coverage_fixture(tmp_path, ("script_only.py", "skill_only.py"))
+    (tmp_path / "codecov.yml").touch()
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, "argv", ["tooling_coverage.py", str(coverage_xml)])
+    monkeypatch.setattr(sys, "argv", ["tooling_coverage.py", str(coverage_xml), "codecov-input"])
 
     assert tooling_coverage.main() == 0
+    assert (tmp_path / "codecov-input" / "coverage.xml").is_file()
 
 
 def test_script_entrypoint_normalizes_coverage_xml(
@@ -568,8 +677,9 @@ def test_script_entrypoint_normalizes_coverage_xml(
 ) -> None:
     """The direct CI script command exits successfully after normalization."""
     coverage_xml = _coverage_fixture(tmp_path, ("script_only.py", "skill_only.py"))
+    (tmp_path / "codecov.yml").touch()
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, "argv", ["tooling_coverage.py", str(coverage_xml)])
+    monkeypatch.setattr(sys, "argv", ["tooling_coverage.py", str(coverage_xml), "codecov-input"])
 
     with pytest.raises(SystemExit) as exit_status:
         runpy.run_path(str(REPO_ROOT / "scripts" / "tooling_coverage.py"), run_name="__main__")
@@ -594,6 +704,11 @@ def _coverage_fixture(tmp_path: Path, filenames: tuple[str, ...]) -> Path:
     app = tmp_path / "src" / "roastpilot_agent"
     app.mkdir(parents=True)
     (app / "app.py").touch()
+    return _write_coverage_xml(tmp_path, filenames)
+
+
+def _write_coverage_xml(tmp_path: Path, filenames: tuple[str, ...]) -> Path:
+    """Write a minimal Coverage.py XML report with the supplied class paths."""
     coverage_xml = tmp_path / "coverage.xml"
     root = ElementTree.Element("coverage")
     classes = ElementTree.SubElement(ElementTree.SubElement(root, "packages"), "classes")
