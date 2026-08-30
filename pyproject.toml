@@ -273,6 +273,7 @@ path = "src/roastpilot_agent/__init__.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+python_functions = ["test_*"]
 addopts = "-q --strict-markers --durations=25 --durations-min=1.0"
 pythonpath = ["src", "scripts", ".agents/skills/capture-agent-usage/scripts"]
 asyncio_mode = "strict"

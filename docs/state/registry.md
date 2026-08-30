@@ -2,6 +2,14 @@
 
 ## Active Epic
 
+**30 Aug 2026 — #702 (D180) collection-governance addendum:** Following
+`c5342b1`, pytest function collection is pinned to `test_*` and the
+docs-reader audit enforces that exact shape. The audit also fails closed on
+un-attributable module-scope docs reads and collected test classes with
+unaudited inherited bases. This is local governance coverage only; hosted
+proof, coverage status, final review, and merge remain separate in-progress
+evidence.
+
 **30 Aug 2026 — #702 (D180) test-coverage addendum:** Following `7bef8e3`,
 the exact-head repair adds direct docs-only gate-result mapping coverage in
 both modes and multi-chunk live-output coverage after the closed Git-output

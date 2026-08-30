@@ -2041,6 +2041,63 @@ def _analyse_function(
     )
 
 
+def _assert_no_unattributable_module_docs_reads(
+    tree: ast.Module,
+    module_aliases: set[str],
+    functions: dict[str, _FunctionNode],
+    filename: str,
+) -> None:
+    """Reject import-time docs reads that cannot be assigned to one collected test."""
+
+    collected = {name for name in functions if name.startswith("test_")}
+    collected.update(
+        f"{statement.name}::{member.name}"
+        for statement in tree.body
+        if isinstance(statement, ast.ClassDef) and statement.name.startswith("Test")
+        for member in statement.body
+        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and member.name.startswith("test_")
+    )
+    if not collected:
+        return
+    for statement in tree.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for node in ast.walk(statement):
+            if not isinstance(node, ast.Call):
+                continue
+            receiver: ast.expr | None = None
+            if isinstance(node.func, ast.Attribute) and node.func.attr in _READ_METHOD_NAMES:
+                receiver = node.func.value
+            elif isinstance(node.func, ast.Name) and node.func.id == "open":
+                receiver = _builtin_open_target(node)
+            if receiver is None:
+                continue
+            if _expression_is_docs_markdown(receiver, module_aliases):
+                raise AssertionError(
+                    f"{filename}:{node.lineno}: module-scope docs read cannot be attributed "
+                    "to an exact collected test"
+                )
+            if _expression_has_docs_root(receiver):
+                raise AssertionError(
+                    f"{filename}:{node.lineno}: module-scope docs read receiver is ambiguous"
+                )
+
+
+def _assert_no_unaudited_collected_test_bases(tree: ast.Module, filename: str) -> None:
+    """Reject collected test classes whose inherited methods are outside this module audit."""
+
+    for statement in tree.body:
+        if not isinstance(statement, ast.ClassDef) or not statement.name.startswith("Test"):
+            continue
+        if statement.bases:
+            bases = ", ".join(ast.unparse(base) for base in statement.bases)
+            raise AssertionError(
+                f"{filename}:{statement.lineno}: collected pytest class `{statement.name}` has "
+                f"unaudited inherited base(s): {bases}"
+            )
+
+
 def _docs_reading_test_modules(
     source: str, filename: str = "<module>", repository_root: Path = _REPO
 ) -> set[str]:
@@ -2126,6 +2183,8 @@ def _docs_reading_test_modules(
         for statement in tree.body
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
+    _assert_no_unaudited_collected_test_bases(tree, filename)
+    _assert_no_unattributable_module_docs_reads(tree, module_aliases, functions, filename)
     class_methods: dict[str, dict[str, str]] = {}
     for statement in tree.body:
         if not isinstance(statement, ast.ClassDef):
@@ -2564,6 +2623,9 @@ def _assert_default_pytest_collection_options(options: dict[str, object]) -> Non
 
     assert "python_files" not in options, "pytest python_files must remain unset"
     assert options.get("testpaths") == ["tests"], "pytest testpaths must remain exactly ['tests']"
+    assert options.get("python_functions") == ["test_*"], (
+        "pytest python_functions must remain exactly ['test_*']"
+    )
 
 
 @pytest.mark.docs_ci
@@ -3082,6 +3144,10 @@ def test_docs_governance_binds_test_discovery_to_pytest_configuration() -> None:
         )
     with pytest.raises(AssertionError, match="testpaths"):
         _assert_default_pytest_collection_options({"testpaths": ["integration"]})
+    with pytest.raises(AssertionError, match="python_functions"):
+        _assert_default_pytest_collection_options(
+            {"testpaths": ["tests"], "python_functions": ["test*"]}
+        )
 
 
 @pytest.mark.docs_ci
@@ -4086,6 +4152,40 @@ def test_docs_governance_detects_direct_class_readers_without_siblings() -> None
         "        assert True\n"
     )
     assert _docs_reading_test_modules(source) == {"TestDocs::test_reader"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_module_scope_docs_reads_with_collected_tests() -> None:
+    """Import-time docs content cannot be hidden behind marked or unmarked tests."""
+    no_test = 'from pathlib import Path\ncached = Path("docs/cache.md").read_text()\n'
+    assert _docs_reading_test_modules(no_test) == set()
+
+    for source in (
+        no_test + "\ndef test_unmarked() -> None:\n    assert cached\n",
+        "from pathlib import Path\nimport pytest\n"
+        'cached = Path("docs/cache.md").read_text()\n\n'
+        "@pytest.mark.docs\ndef test_marked() -> None:\n    assert cached\n",
+    ):
+        with pytest.raises(AssertionError, match="module-scope docs read cannot be attributed"):
+            _docs_reading_test_modules(source, filename="module_cache.py")
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_unaudited_inherited_collected_test_methods() -> None:
+    """A collected subclass cannot silently inherit a local docs reader."""
+    standalone = "class TestStandalone:\n    def test_plain(self) -> None:\n        assert True\n"
+    assert _docs_reading_test_modules(standalone) == set()
+
+    for source in (
+        "from pathlib import Path\n\nclass LocalBase:\n"
+        "    def test_reader(self) -> None:\n        Path('docs/base.md').read_text()\n\n"
+        "class TestChild(LocalBase):\n    pass\n",
+        "from pathlib import Path\nimport pytest\n\nclass LocalBase:\n"
+        "    def test_reader(self) -> None:\n        Path('docs/base.md').read_text()\n\n"
+        "@pytest.mark.docs\nclass TestChild(LocalBase):\n    pass\n",
+    ):
+        with pytest.raises(AssertionError, match="unaudited inherited base"):
+            _docs_reading_test_modules(source, filename="inherited_test.py")
 
 
 @pytest.mark.docs_ci
