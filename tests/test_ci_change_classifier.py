@@ -3045,6 +3045,45 @@ def test_docs_governance_detects_unbound_pathlib_readers() -> None:
 
 
 @pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    "call",
+    (
+        "Path.read_text()",
+        "Path.read_bytes()",
+        "Path.open()",
+        "Path.read_text(*paths)",
+        "Path.read_bytes(*paths)",
+        "Path.open(*paths)",
+    ),
+)
+def test_docs_governance_rejects_unbound_pathlib_readers_without_an_explicit_receiver(
+    call: str,
+) -> None:
+    """Unbound pathlib readers require one statically inspectable receiver argument."""
+
+    source = f"from pathlib import Path\n\ndef test_unbound() -> None:\n    {call}\n"
+    if "*paths" in call:
+        source = "from pathlib import Path\npaths = [Path('docs/guide.md')]\n\n" + (
+            f"def test_unbound() -> None:\n    {call}\n"
+        )
+    with pytest.raises(AssertionError, match="unbound pathlib reader receiver is ambiguous"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_allows_variadic_helper_unknown_keywords_for_non_docs_paths() -> None:
+    """A ``**kwargs`` helper binding does not overmark a proven non-doc receiver."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def helper(path, **kwargs):\n    return path.read_text()\n\n"
+        "def test_non_docs() -> None:\n"
+        "    helper(Path('config/guide.md'), extra=Path('docs/guide.md'))\n"
+    )
+    assert _docs_reading_test_modules(source) == set()
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_audits_locally_assigned_collected_callables() -> None:
     """Collected local aliases share their function provenance and marker audit."""
 
@@ -4754,9 +4793,9 @@ def test_ci_classifier_job_uses_closed_checkout_settings_and_base_trusted_execut
     steps = cast(list[dict[str, object]], classify["steps"])
     assert len(steps) == 3
     head_checkout, base_checkout, classifier_step = steps
-    assert head_checkout["uses"] == "actions/checkout@v6.0.2"
+    assert head_checkout["uses"] == "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
     assert head_checkout["with"] == {"fetch-depth": 0, "persist-credentials": False}
-    assert base_checkout["uses"] == "actions/checkout@v6.0.2"
+    assert base_checkout["uses"] == "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
     assert cast(dict[str, object], base_checkout["with"])["path"] == ".ci-gate-base"
     assert cast(dict[str, object], base_checkout["with"])["persist-credentials"] is False
     assert classifier_step["run"] == (
