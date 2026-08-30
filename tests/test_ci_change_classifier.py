@@ -735,6 +735,29 @@ def _fixture_parameter_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> se
     return {argument.arg for argument in [*node.args.args, *node.args.kwonlyargs]}
 
 
+def _fixture_params_state(
+    node: ast.FunctionDef | ast.AsyncFunctionDef, sources: dict[str, ast.expr]
+) -> str:
+    """Return ``none``, ``docs``, ``non-doc``, or ``ambiguous`` fixture params state."""
+
+    decorators = [
+        decorator for decorator in node.decorator_list if _is_pytest_fixture_decorator(decorator)
+    ]
+    if len(decorators) != 1 or not isinstance(decorators[0], ast.Call):
+        return "none"
+    params = [keyword.value for keyword in decorators[0].keywords if keyword.arg == "params"]
+    if not params:
+        return "none"
+    if len(params) != 1:
+        return "ambiguous"  # pragma: no cover - duplicate call keywords cannot be parsed
+    values = _resolve_module_values(params[0], sources)
+    if values is None or not values:
+        return "ambiguous"
+    if any(_expression_is_docs_markdown(value, set()) for value in values):
+        return "docs"
+    return "non-doc" if all(_string_constants(value) for value in values) else "ambiguous"
+
+
 def _module_value_sources(tree: ast.Module) -> dict[str, ast.expr]:
     """Return uniquely assigned module names; rebinds intentionally stay unresolved."""
 
@@ -792,11 +815,21 @@ def _parametrized_docs_and_ambiguous_parameters(
             and isinstance(decorator.func, ast.Attribute)
             and decorator.func.attr == "parametrize"
             and len(decorator.args) >= 2
-            and isinstance(decorator.args[0], ast.Constant)
-            and isinstance(decorator.args[0].value, str)
         ):
             continue
-        names = [name.strip() for name in decorator.args[0].value.split(",")]
+        argnames = decorator.args[0]
+        if isinstance(argnames, ast.Constant) and isinstance(argnames.value, str):
+            names = [name.strip() for name in argnames.value.split(",")]
+        elif isinstance(argnames, (ast.List, ast.Tuple)) and all(
+            isinstance(value, ast.Constant) and isinstance(value.value, str)
+            for value in argnames.elts
+        ):
+            names = [
+                cast(str, value.value) for value in argnames.elts if isinstance(value, ast.Constant)
+            ]
+        else:
+            ambiguous.update(_fixture_parameter_names(node))
+            continue
         values = _resolve_module_values(decorator.args[1], sources)
         if values is None or len(names) != 1:
             ambiguous.update(names)
@@ -894,6 +927,12 @@ def _analyse_function(
     has_docs_glob = False
     reads = False
     returns_docs = False
+    fixture_params = (
+        _fixture_params_state(func, module_value_sources)
+        if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef))
+        else "none"
+    )
+    request_param_aliases: set[str] = set()
     return_calls: set[str] = set()
     return_names: set[str] = set()
     call_result_assignments: dict[str, str] = {}
@@ -947,6 +986,13 @@ def _analyse_function(
             call_result = _call_key(node.value)
             for target in targets:
                 if isinstance(target, ast.Name):
+                    if (
+                        isinstance(node.value, ast.Attribute)
+                        and node.value.attr == "param"
+                        and isinstance(node.value.value, ast.Name)
+                        and node.value.value.id == "request"
+                    ):
+                        request_param_aliases.add(target.id)
                     if call_result is not None:
                         call_result_assignments[target.id] = call_result
                     if full_match:
@@ -971,8 +1017,20 @@ def _analyse_function(
         if _is_docs_markdown_glob_call(node, docs_root_aliases):
             has_docs_glob = True
         if not isinstance(node, ast.Call):
-            if isinstance(node, ast.Return) and node.value is not None:
-                if _receiver_is_docs(node.value):
+            if isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)) and node.value is not None:
+                is_request_param = (
+                    isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "param"
+                    and isinstance(node.value.value, ast.Name)
+                    and node.value.value.id == "request"
+                ) or (isinstance(node.value, ast.Name) and node.value.id in request_param_aliases)
+                if is_request_param and fixture_params == "docs":
+                    returns_docs = True
+                elif is_request_param and fixture_params in {"ambiguous", "none"}:
+                    unresolved.append(
+                        f"{filename}:{node.lineno}: fixture request.param provenance is ambiguous"
+                    )
+                elif _receiver_is_docs(node.value):
                     returns_docs = True
                 elif isinstance(node.value, ast.Name):
                     return_names.add(node.value.id)
@@ -1519,6 +1577,34 @@ def test_docs_governance_fails_closed_at_call_depth_but_not_cycles() -> None:
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_call_depth_last_admitted_and_first_exhausted() -> None:
+    """Seven total call edges are admitted; the eighth fails closed."""
+
+    admitted = "\n\n".join(
+        [
+            *(f"def helper_{index}():\n    return helper_{index + 1}()" for index in range(6)),
+            "def helper_6():\n    return Path('docs/bound.md').read_text()",
+            "def test_admitted():\n    assert helper_0()",
+        ]
+    )
+    assert _docs_reading_test_modules("from pathlib import Path\n\n" + admitted) == {
+        "test_admitted"
+    }
+    exhausted = "\n\n".join(
+        [
+            *(f"def helper_{index}():\n    return helper_{index + 1}()" for index in range(7)),
+            "def helper_7():\n    return 1",
+            "def test_exhausted():\n    assert helper_0()",
+        ]
+    )
+    with pytest.raises(AssertionError, match="exceeded the bounded"):
+        _docs_reading_test_modules("from pathlib import Path\n\n" + exhausted)
+
+    with pytest.raises(AssertionError, match="exceeded the bounded"):
+        _docs_reading_test_modules(exhausted.replace("return 1", "return 2"))
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_binds_test_discovery_to_pytest_configuration() -> None:
     """The path self-audit fails closed when pytest collection settings drift."""
 
@@ -1762,6 +1848,62 @@ def test_docs_governance_tracks_bounded_parametrized_path_sources() -> None:
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_fails_closed_on_rebound_parametrization_sources() -> None:
+    """Only uniquely named module sources may feed parametrized read receivers."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "DOCS = [Path('docs/a.md')]\nDOCS = [Path('docs/b.md')]\n"
+        "(ignored, ) = [Path('docs/ignored.md')]\n\n"
+        "@pytest.mark.parametrize('path', DOCS)\n"
+        "def test_reader(path: Path) -> None:\n    path.read_text()\n"
+    )
+    with pytest.raises(AssertionError, match="parametrized receiver `path` is ambiguous"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    "argnames",
+    ["('path', 'label')", "['path', 'label']", "'path,label'"],
+)
+def test_docs_governance_fails_closed_on_multi_value_parametrized_receivers(
+    argnames: str,
+) -> None:
+    """Multi-value parametrization cannot silently omit a path receiver."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        f"@pytest.mark.parametrize({argnames}, [(Path('docs/a.md'), 'x')])\n"
+        "def test_reader(path: Path, label: str) -> None:\n"
+        "    path.read_text()\n"
+    )
+    with pytest.raises(AssertionError, match="parametrized receiver `path` is ambiguous"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    "argnames_source",
+    ["ARGNAMES", "('path', DYNAMIC_NAME)"],
+)
+def test_docs_governance_fails_closed_on_dynamic_parametrized_argnames(
+    argnames_source: str,
+) -> None:
+    """Dynamic or unsupported argname forms cannot omit a read receiver."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "ARGNAMES = 'path'\nDYNAMIC_NAME = 'label'\n\n"
+        f"@pytest.mark.parametrize({argnames_source}, [Path('docs/a.md')])\n"
+        "def test_reader(path: Path) -> None:\n"
+        "    path.read_text()\n"
+    )
+    with pytest.raises(AssertionError, match="parametrized receiver `path` is ambiguous"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_propagates_staged_docs_root_aliases() -> None:
     """Partial docs roots remain known through slash and joinpath composition."""
 
@@ -1831,8 +1973,10 @@ def test_docs_governance_tracks_docs_paths_returned_by_helpers_and_fixtures() ->
         "    path = path_leaf()\n"
         "    path.read_text()\n\n"
         "async def test_async_read() -> None:\n"
-        "    path = path_middle()\n"
+        "    path = await path_middle()\n"
         "    path.read_bytes()\n\n"
+        "def test_direct_return_read() -> None:\n"
+        "    path_leaf().read_text()\n\n"
         "def test_receives_without_read() -> None:\n"
         "    assert path_leaf()\n\n"
         "@pytest.fixture\n"
@@ -1845,9 +1989,42 @@ def test_docs_governance_tracks_docs_paths_returned_by_helpers_and_fixtures() ->
     )
     assert _docs_reading_test_modules(source) == {
         "test_async_read",
+        "test_direct_return_read",
         "test_fixture_read",
         "test_helper_read",
     }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_docs_paths_returned_by_local_helpers() -> None:
+    """Invoked local helpers retain docs-path provenance at direct read receivers."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def test_local_path() -> None:\n"
+        "    def local_path() -> Path:\n"
+        "        return Path('docs/local-return.md')\n\n"
+        "    local_path().read_text()\n\n"
+        "def test_local_non_docs_path() -> None:\n"
+        "    def local_path() -> Path:\n"
+        "        return Path('config/local-return.md')\n\n"
+        "    local_path().read_text()\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_local_path"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_open_on_a_returned_path() -> None:
+    """A returned docs path is also traced through builtin ``open`` receivers."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def docs_path() -> Path:\n    return Path('docs/open.md')\n\n"
+        "def config_path() -> Path:\n    return Path('config/open.md')\n\n"
+        "def test_docs() -> None:\n    open(docs_path())\n\n"
+        "def test_non_docs() -> None:\n    open(config_path())\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_docs"}
 
 
 @pytest.mark.docs_ci
@@ -1869,6 +2046,115 @@ def test_docs_governance_follows_a_same_module_fixture() -> None:
         "    assert unrelated == 1\n"
     )
     assert _docs_reading_test_modules(source) == {"test_uses_fixture"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_yielded_fixture_paths_only_when_read() -> None:
+    """Yielded docs paths retain provenance without over-marking non-read consumers."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture\n"
+        "def docs_path() -> Path:\n"
+        '    yield Path("docs/yielded.md")\n\n'
+        "def test_reads(docs_path: Path) -> None:\n"
+        "    docs_path.read_text()\n\n"
+        "def test_does_not_read(docs_path: Path) -> None:\n"
+        "    assert docs_path\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_reads"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_alias_transitive_and_async_yielded_paths() -> None:
+    """Yield provenance crosses aliases, fixture dependencies, and async generators."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture\n"
+        "def leaf():\n    path = Path('docs/alias-yield.md')\n    yield path\n\n"
+        "@pytest.fixture\n"
+        "def middle(leaf: Path):\n    yield leaf\n\n"
+        "@pytest.fixture\n"
+        "async def async_leaf():\n    yield Path('docs/async-yield.md')\n\n"
+        "def test_alias(leaf: Path):\n    leaf.read_text()\n\n"
+        "def test_transitive(middle: Path):\n    middle.read_bytes()\n\n"
+        "async def test_async(async_leaf: Path):\n    async_leaf.open()\n\n"
+        "def test_leaf_no_read(leaf: Path):\n    assert leaf\n\n"
+        "def test_middle_no_read(middle: Path):\n    assert middle\n\n"
+        "async def test_async_no_read(async_leaf: Path):\n    assert async_leaf\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_alias",
+        "test_async",
+        "test_transitive",
+    }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_fixture_params_request_provenance() -> None:
+    """Literal fixture params propagate only to consumers that read the value."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture(params=[Path('docs/param.md')])\n"
+        "def direct(request) -> Path:\n    return request.param\n\n"
+        "@pytest.fixture(params=[Path('docs/alias.md')])\n"
+        "def alias(request):\n    value = request.param\n    yield value\n\n"
+        "def test_direct(direct: Path) -> None:\n    direct.read_text()\n\n"
+        "def test_alias(alias: Path) -> None:\n    alias.read_bytes()\n\n"
+        "def test_no_read(direct: Path) -> None:\n    assert direct\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_alias", "test_direct"}
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize("params", ["[Path('config/no.md')]", "unknown", "VALUES"])
+def test_docs_governance_handles_non_docs_and_ambiguous_fixture_params(params: str) -> None:
+    """Non-doc fixture params pass; unresolved or rebound params fail closed."""
+
+    prefix = (
+        "VALUES = [Path('docs/first.md')]\nVALUES = [Path('docs/second.md')]\n\n"
+        if params == "VALUES"
+        else ""
+    )
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        + prefix
+        + f"@pytest.fixture(params={params})\n"
+        "def value(request) -> Path:\n    return request.param\n\n"
+        "def test_value(value: Path) -> None:\n    value.read_text()\n"
+    )
+    if params.startswith("["):
+        assert _docs_reading_test_modules(source) == set()
+    else:
+        with pytest.raises(AssertionError, match="request.param provenance is ambiguous"):
+            _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_unsafe_conftest_fixture_params(tmp_path: Path) -> None:
+    """Shared fixture params cannot hide docs or unresolved path provenance."""
+
+    tests_root = tmp_path / "tests"
+    tests_root.mkdir()
+    cases = {
+        "docs": "[Path('docs/a.md')]",
+        "unknown": "unknown",
+        "non_docs": "[Path('config/a.md')]",
+    }
+    for name, params in cases.items():
+        case = tests_root / name
+        case.mkdir()
+        (case / "conftest.py").write_text(
+            "from pathlib import Path\nimport pytest\n\n"
+            f"@pytest.fixture(params={params})\n"
+            "def value(request):\n    return request.param\n"
+        )
+    for name in ("docs", "unknown"):
+        with pytest.raises(AssertionError, match="conftest"):
+            _assert_conftests_docs_free(tests_root / name)
+    _assert_conftests_docs_free(tests_root / "non_docs")
 
 
 @pytest.mark.docs_ci
@@ -2230,10 +2516,23 @@ def test_docs_governance_follows_class_qualified_helpers() -> None:
         "    @classmethod\n"
         "    def middle(cls) -> str:\n"
         "        return TestDocs.leaf()\n\n"
+        "    @staticmethod\n"
+        "    def path() -> Path:\n"
+        '        return Path("docs/class-return.md")\n\n'
+        "    @staticmethod\n"
+        "    def non_docs_path() -> Path:\n"
+        '        return Path("config/class-return.md")\n\n'
         "    def test_reader(self) -> None:\n"
-        "        assert TestDocs.middle()\n"
+        "        assert TestDocs.middle()\n\n"
+        "    def test_returned_path(self) -> None:\n"
+        "        TestDocs.path().read_text()\n\n"
+        "    def test_non_docs_path(self) -> None:\n"
+        "        TestDocs.non_docs_path().read_text()\n"
     )
-    assert _docs_reading_test_modules(source) == {"TestDocs::test_reader"}
+    assert _docs_reading_test_modules(source) == {
+        "TestDocs::test_reader",
+        "TestDocs::test_returned_path",
+    }
 
 
 @pytest.mark.docs_ci
