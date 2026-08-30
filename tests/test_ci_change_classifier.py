@@ -616,13 +616,11 @@ def test_worktime_constants_are_module_level_literals_not_environment_configurab
 def test_a_slow_git_call_past_the_per_call_timeout_is_full(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A per-call ``TimeoutExpired`` (already swallowed broadly) still resolves FULL.
+    """The live Popen polling loop turns a per-call expiry into ``FULL``.
 
-    The observed ``timeout=`` kwarg is captured outside the classifier's own
-    broad exception handler (an in-fixture assertion failure would itself be
-    swallowed to FULL and silently pass regardless of the real value — this
-    would make an M18 mutation, dropping ``timeout=`` from ``_run_git``, go
-    undetected).
+    The deterministic clock stays below the total deadline while advancing
+    beyond the per-call interval, so iterator exhaustion cannot reach the
+    classifier's broad exception boundary instead of the timeout guard.
     """
 
     calls: list[list[str]] = []
@@ -631,8 +629,8 @@ def test_a_slow_git_call_past_the_per_call_timeout_is_full(
         calls.append(arguments)
         return _FakeGitProcess(running=True)
 
-    responses = iter([0.0, 1.0, 22.0])
-    monkeypatch.setattr(classifier.time, "monotonic", lambda: next(responses))
+    clock = _Clock(11.0)
+    monkeypatch.setattr(classifier.time, "monotonic", clock)
 
     def no_sleep(_seconds: float) -> None:
         """Avoid a real delay while exercising the bounded timeout path."""
@@ -641,6 +639,7 @@ def test_a_slow_git_call_past_the_per_call_timeout_is_full(
     monkeypatch.setattr(classifier.subprocess, "Popen", fake_popen)
     assert classifier.classify_change("pull_request", _BASE, _HEAD) is classifier.ChangeMode.FULL
     assert calls == [["git", "cat-file", "-e", f"{_BASE}^{{commit}}"]]
+    assert 22.0 <= clock.value < classifier._TOTAL_BUDGET_SECONDS  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.docs_ci
