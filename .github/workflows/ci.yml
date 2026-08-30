@@ -397,8 +397,9 @@ jobs:
   # partial coverage report.
   # A closed-grammar
   # Markdown-only diff (D180 §2.2's residual: the classifier and gate helper
-  # execute from trusted base bytes, so this job's own admission condition
-  # cannot be forged from a pull request's own copy) runs lightweight
+  # execute from trusted base bytes. This protects their script bytes, not the
+  # PR-editable workflow job structure; workflow/helper edits remain
+  # privileged-review changes) runs lightweight
   # repository/document validation plus the focused docs/docs_ci pytest lane
   # with a real coverage artifact — never a synthetic status —
   # instead of the full Python test suite, wheel build/smoke, web unit suite,

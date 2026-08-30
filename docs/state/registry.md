@@ -2,6 +2,16 @@
 
 ## Active Epic
 
+**30 Aug 2026 — #702 (D180) slice-3 exact-head closure addendum (head
+`3f0bf4752e30f68875900d8c520d4bbcc166dda7`; supersedes the overlapping
+same-day mutation catalogues below):** The ratified M1-M28 table remains
+historical evidence and is not renumbered. Later, separate AST-governance
+mutations covered a direct imported-class method, a chained imported-class
+instance, an assigned/re-aliased imported-class instance, and an invoked
+bound-reader alias; each was proven RED before byte-exact restoration and
+GREEN after restoration. The later Codecov executable-guard mutation was
+likewise proven RED, restored byte-exactly, and GREEN after restoration.
+
 **29 Aug 2026 (second lead audit correction, supersedes the entry directly
 below) — #702 (D180) slice 3: the exact, literal ratified section 3.9 M1-M28
 table (not a self-reconstructed catalogue) was executed on the same commit
