@@ -66,6 +66,7 @@ _TIMEOUT_BEARING_JOBS = (
     "docs-fastpath",
     "codecov-upload",
 )
+_CHECKOUT_PIN = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
 
 
 def _pytest_options() -> dict[str, object]:
@@ -475,7 +476,7 @@ def test_checks_is_a_fail_closed_aggregate_of_every_python_gate() -> None:
     check_steps = _steps(checks_job)
     assert len(check_steps) == 2
     checkout_step, gate_step = check_steps
-    assert checkout_step["uses"] == "actions/checkout@v6.0.2"
+    assert checkout_step["uses"] == _CHECKOUT_PIN
     checkout_with = _mapping(checkout_step["with"])
     assert checkout_with["path"] == ".ci-gate-base"
     assert checkout_with["persist-credentials"] is False
@@ -548,7 +549,7 @@ def test_required_gates_run_exactly_one_base_checkout_and_one_gate_invocation() 
         steps = _steps(job)
         assert len(steps) == 2, f"{job_id}: a gate job must have exactly one checkout + one run"
         checkout_step, gate_step = steps
-        assert checkout_step["uses"] == "actions/checkout@v6.0.2"
+        assert checkout_step["uses"] == _CHECKOUT_PIN
         checkout_with = _mapping(checkout_step["with"])
         assert checkout_with["path"] == ".ci-gate-base"
         gate_run = gate_step["run"]
@@ -556,6 +557,23 @@ def test_required_gates_run_exactly_one_base_checkout_and_one_gate_invocation() 
         assert gate_run.startswith("python3 .ci-gate-base/scripts/ci_gate_result.py")
         assert "${{" not in gate_run
         assert job["if"] == "always()"
+
+
+@pytest.mark.docs_ci
+def test_ci_checkout_actions_are_immutably_pinned() -> None:
+    """Every CI checkout action uses the approved immutable v6.0.2 commit."""
+
+    workflow = _workflow()
+    jobs = _mapping(workflow["jobs"])
+    checkout_uses = [
+        step["uses"]
+        for job in jobs.values()
+        for step in _steps(_mapping(job))
+        if isinstance(step.get("uses"), str) and str(step["uses"]).startswith("actions/checkout@")
+    ]
+    assert checkout_uses
+    assert all(use == _CHECKOUT_PIN for use in checkout_uses)
+    assert "actions/checkout@v6.0.2" not in (REPO_ROOT / ".github/workflows/ci.yml").read_text()
 
 
 @pytest.mark.docs_ci
