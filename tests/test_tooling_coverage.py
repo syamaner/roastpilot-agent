@@ -154,6 +154,21 @@ def test_ci_normalizes_coverage_filenames_before_codecov_upload() -> None:
         "Download normalized docs coverage artifact",
         "Upload docs coverage to Codecov",
     ]
+    expected_step_conditions = {
+        "Download normalized full coverage artifact": (
+            "needs.classify.outputs.mode == 'full' && needs.coverage.result == 'success'"
+        ),
+        "Upload full coverage to Codecov": (
+            "needs.classify.outputs.mode == 'full' && needs.coverage.result == 'success'"
+        ),
+        "Download normalized docs coverage artifact": (
+            "needs.classify.outputs.mode == 'docs-only' && needs.docs-fastpath.result == 'success'"
+        ),
+        "Upload docs coverage to Codecov": (
+            "needs.classify.outputs.mode == 'docs-only' && needs.docs-fastpath.result == 'success'"
+        ),
+    }
+    assert {step["name"]: step.get("if") for step in upload_steps} == expected_step_conditions
     assert all(
         "run" not in step and step.get("uses") != "actions/checkout@v6.0.2" for step in upload_steps
     )
