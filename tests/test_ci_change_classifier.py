@@ -1239,23 +1239,24 @@ _APPLICABLE_PYTEST_ITEM_HOOKS = frozenset(
 def _shutil_copy_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
     """Return exact and rebound aliases for the admitted ``shutil`` copy entry points."""
 
+    scoped_statements = _control_flow_scoped_statements(tree.body)
     modules = {
         alias.asname or alias.name
-        for statement in tree.body
+        for statement in scoped_statements
         if isinstance(statement, ast.Import)
         for alias in statement.names
         if alias.name == "shutil"
     }
     calls = {
         alias.asname or alias.name
-        for statement in tree.body
+        for statement in scoped_statements
         if isinstance(statement, ast.ImportFrom) and statement.module == "shutil"
         for alias in statement.names
         if alias.name in _SHUTIL_COPY_ENTRY_POINTS
     }
     rebound = {
         target.id
-        for statement in tree.body
+        for statement in scoped_statements
         if isinstance(statement, (ast.Assign, ast.AnnAssign))
         for target in (
             statement.targets if isinstance(statement, ast.Assign) else [statement.target]
@@ -1268,23 +1269,24 @@ def _shutil_copy_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str]
 def _os_walk_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
     """Return exact and rebound aliases for the admitted ``os.walk`` call."""
 
+    scoped_statements = _control_flow_scoped_statements(tree.body)
     modules = {
         alias.asname or alias.name
-        for statement in tree.body
+        for statement in scoped_statements
         if isinstance(statement, ast.Import)
         for alias in statement.names
         if alias.name == "os"
     }
     calls = {
         alias.asname or alias.name
-        for statement in tree.body
+        for statement in scoped_statements
         if isinstance(statement, ast.ImportFrom) and statement.module == "os"
         for alias in statement.names
         if alias.name == "walk"
     }
     rebound = {
         target.id
-        for statement in tree.body
+        for statement in scoped_statements
         if isinstance(statement, (ast.Assign, ast.AnnAssign))
         for target in (
             statement.targets if isinstance(statement, ast.Assign) else [statement.target]
@@ -2748,6 +2750,12 @@ def _analyse_function(
     scoped_codecs_modules: set[str] = set()
     scoped_codecs_calls: set[str] = set()
     scoped_ambiguous_codecs: set[str] = set()
+    scoped_shutil_modules: set[str] = set()
+    scoped_shutil_calls: set[str] = set()
+    scoped_ambiguous_shutil: set[str] = set()
+    scoped_os_walk_modules: set[str] = set()
+    scoped_os_walk_calls: set[str] = set()
+    scoped_ambiguous_os_walk: set[str] = set()
     if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
         parameter_docs, ambiguous_parameters = _parametrized_docs_and_ambiguous_parameters(
             func, module_value_sources
@@ -2760,11 +2768,23 @@ def _analyse_function(
             scoped_codecs_calls,
             scoped_ambiguous_codecs,
         ) = _codecs_open_aliases(ast.Module(body=list(func.body), type_ignores=[]))
+        scoped_shutil_modules, scoped_shutil_calls, scoped_ambiguous_shutil = _shutil_copy_aliases(
+            ast.Module(body=list(func.body), type_ignores=[])
+        )
+        scoped_os_walk_modules, scoped_os_walk_calls, scoped_ambiguous_os_walk = _os_walk_aliases(
+            ast.Module(body=list(func.body), type_ignores=[])
+        )
     else:
         ambiguous_parameters: set[str] = set()
     codecs_module_aliases = (codecs_module_aliases or set()) | scoped_codecs_modules
     codecs_call_aliases = (codecs_call_aliases or set()) | scoped_codecs_calls
     ambiguous_codecs_aliases = (ambiguous_codecs_aliases or set()) | scoped_ambiguous_codecs
+    shutil_module_aliases = (shutil_module_aliases or set()) | scoped_shutil_modules
+    shutil_call_aliases = (shutil_call_aliases or set()) | scoped_shutil_calls
+    ambiguous_shutil_aliases = (ambiguous_shutil_aliases or set()) | scoped_ambiguous_shutil
+    os_walk_module_aliases = (os_walk_module_aliases or set()) | scoped_os_walk_modules
+    os_walk_call_aliases = (os_walk_call_aliases or set()) | scoped_os_walk_calls
+    ambiguous_os_walk_aliases = (ambiguous_os_walk_aliases or set()) | scoped_ambiguous_os_walk
     calls: set[str] = set()
     unresolved: list[str] = []
     has_docs_glob = False
@@ -6096,6 +6116,31 @@ def test_docs_governance_propagates_os_walk_docs_provenance() -> None:
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_tracks_os_walk_import_forms_and_rejects_ambiguous_shapes() -> None:
+    """Direct/module walk forms preserve docs roots and reject dynamic call shapes."""
+
+    source = (
+        "import os as operating_system\nfrom os import walk as walk_files\n"
+        "from pathlib import Path\n\n"
+        "def test_direct() -> None:\n"
+        "    for root, _, files in walk_files('docs'):\n"
+        "        for name in files: Path(root, name).read_text()\n\n"
+        "def test_alias() -> None:\n"
+        "    for root, _, files in operating_system.walk('docs'):\n"
+        "        for name in files: Path(root, name).read_text()\n\n"
+        "def test_non_docs() -> None:\n"
+        "    for root, _, files in walk_files('config'):\n"
+        "        for name in files: Path(root, name).read_text()\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_alias", "test_direct"}
+    for call in ("walk_files(*paths)", "walk_files(**kwargs)", "walk_files('docs', top='x')"):
+        with pytest.raises(AssertionError, match="os.walk root provenance is ambiguous"):
+            _docs_reading_test_modules(
+                f"from os import walk as walk_files\n\ndef test_bad():\n    for x in {call}: pass\n"
+            )
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_traces_positional_indirect_fixture_params() -> None:
     """The third positional ``parametrize`` argument carries indirect provenance."""
 
@@ -7327,6 +7372,23 @@ def test_docs_governance_tracks_static_shutil_copy_sources() -> None:
             "def test_ambiguous_docs_root() -> None:\n"
             "    shutil.copytree('docs', 'out/docs')\n"
         )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_function_local_os_and_shutil_imports() -> None:
+    """Nested function-local admitted imports retain docs-source provenance."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def test_local_walk() -> None:\n"
+        "    if True:\n        from os import walk\n"
+        "    for root, _, files in walk('docs'):\n"
+        "        for name in files: Path(root, name).read_text()\n\n"
+        "def test_local_copy() -> None:\n"
+        "    if True:\n        import shutil as sh\n"
+        "    sh.copyfile('docs/a.md', 'out/a.md')\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_local_copy", "test_local_walk"}
 
 
 @pytest.mark.docs_ci
