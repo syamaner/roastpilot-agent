@@ -1142,6 +1142,7 @@ def _subprocess_docs_call_state(
     command_docs_aliases: set[str] | None = None,
     command_partial_aliases: set[str] | None = None,
     command_ambiguous_aliases: set[str] | None = None,
+    command_non_docs_aliases: set[str] | None = None,
 ) -> str:
     """Return ``docs``, ``ambiguous``, or ``none`` for one admitted subprocess call."""
 
@@ -1182,6 +1183,16 @@ def _subprocess_docs_call_state(
         return "docs"
     if any(
         isinstance(argument, ast.Name) and argument.id in (command_partial_aliases or set())
+        for argument in arguments
+    ):
+        return "ambiguous"
+    if any(
+        isinstance(argument, ast.Name) and argument.id in (command_non_docs_aliases or set())
+        for argument in arguments
+    ):
+        return "none"
+    if any(
+        not isinstance(argument, (ast.Constant, ast.List, ast.Tuple, ast.Name))
         for argument in arguments
     ):
         return "ambiguous"
@@ -2377,6 +2388,7 @@ def _analyse_function(
     subprocess_command_docs_aliases: set[str] = set()
     subprocess_command_partial_aliases: set[str] = set()
     subprocess_command_ambiguous_aliases: set[str] = set()
+    subprocess_command_non_docs_aliases: set[str] = set()
     subprocess_entry_aliases = set(subprocess_call_aliases or set())
     ambiguous_subprocess_entry_aliases = set(ambiguous_subprocess_aliases or set())
     helper_class_instances: dict[str, str] = {}
@@ -2668,6 +2680,7 @@ def _analyse_function(
                         subprocess_command_docs_aliases.discard(target.id)
                         subprocess_command_partial_aliases.discard(target.id)
                         subprocess_command_ambiguous_aliases.add(target.id)
+                        subprocess_command_non_docs_aliases.discard(target.id)
                     elif isinstance(node.value, (ast.List, ast.Tuple)):
                         static_container = all(
                             isinstance(element, ast.Constant) and isinstance(element.value, str)
@@ -2677,22 +2690,27 @@ def _analyse_function(
                             subprocess_command_docs_aliases.add(target.id)
                             subprocess_command_partial_aliases.discard(target.id)
                             subprocess_command_ambiguous_aliases.discard(target.id)
+                            subprocess_command_non_docs_aliases.discard(target.id)
                         elif _expression_has_docs_root(node.value):
                             subprocess_command_docs_aliases.discard(target.id)
                             subprocess_command_partial_aliases.add(target.id)
                             subprocess_command_ambiguous_aliases.discard(target.id)
+                            subprocess_command_non_docs_aliases.discard(target.id)
                         elif static_container:
                             subprocess_command_docs_aliases.discard(target.id)
                             subprocess_command_partial_aliases.discard(target.id)
                             subprocess_command_ambiguous_aliases.discard(target.id)
+                            subprocess_command_non_docs_aliases.add(target.id)
                         else:
                             subprocess_command_docs_aliases.discard(target.id)
                             subprocess_command_partial_aliases.discard(target.id)
                             subprocess_command_ambiguous_aliases.add(target.id)
+                            subprocess_command_non_docs_aliases.discard(target.id)
                     else:
                         subprocess_command_docs_aliases.discard(target.id)
                         subprocess_command_partial_aliases.discard(target.id)
                         subprocess_command_ambiguous_aliases.add(target.id)
+                        subprocess_command_non_docs_aliases.discard(target.id)
                     if helper_class_instance is not None:
                         helper_class_instances[target.id] = helper_class_instance
                         ambiguous_helper_class_instances.discard(target.id)
@@ -2818,6 +2836,7 @@ def _analyse_function(
             subprocess_command_docs_aliases,
             subprocess_command_partial_aliases,
             subprocess_command_ambiguous_aliases,
+            subprocess_command_non_docs_aliases,
         )
         if subprocess_state == "docs":
             reads = True
@@ -6148,6 +6167,8 @@ def test_docs_governance_tracks_static_subprocess_command_aliases() -> None:
         _docs_reading_test_modules(
             source.replace("runner(command)", "command = dynamic_command\n    runner(command)")
         )
+    with pytest.raises(AssertionError, match="subprocess docs-path provenance is ambiguous"):
+        _docs_reading_test_modules(source.replace("runner(command)", "runner(build_command())"))
     with pytest.raises(AssertionError, match="subprocess docs-path provenance is ambiguous"):
         _docs_reading_test_modules(
             source.replace(
