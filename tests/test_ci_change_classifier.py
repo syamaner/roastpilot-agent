@@ -2880,6 +2880,9 @@ def _analyse_function(
         ):
             for callback in node.args:
                 if not isinstance(callback, ast.Lambda):
+                    unresolved.append(
+                        f"{filename}:{node.lineno}: addfinalizer callback provenance is ambiguous"
+                    )
                     continue
                 for callback_call in (
                     nested for nested in ast.walk(callback.body) if isinstance(nested, ast.Call)
@@ -6102,6 +6105,14 @@ def test_docs_governance_traces_import_time_decorators_literal_loops_and_finaliz
     ):
         with pytest.raises(AssertionError, match="ambiguous|cannot prove"):
             _docs_reading_test_modules(ambiguous)
+    with pytest.raises(AssertionError, match="addfinalizer callback provenance is ambiguous"):
+        _docs_reading_test_modules(
+            "from pathlib import Path\n\n"
+            "def named_callback() -> None:\n"
+            "    Path('docs/named-finalizer.md').read_text()\n\n"
+            "def test_named_finalizer(request) -> None:\n"
+            "    request.addfinalizer(named_callback)\n"
+        )
 
 
 @pytest.mark.docs_ci
