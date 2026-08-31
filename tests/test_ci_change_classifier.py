@@ -6141,6 +6141,67 @@ def test_docs_governance_tracks_os_walk_import_forms_and_rejects_ambiguous_shape
 
 
 @pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    ("imports", "rebind", "call"),
+    (
+        (
+            "import os as operating_system",
+            "operating_system = replacement",
+            "operating_system.walk('docs')",
+        ),
+        (
+            "from os import walk as walk_files",
+            "walk_files = replacement",
+            "walk_files('docs')",
+        ),
+    ),
+)
+def test_docs_governance_rejects_rebound_os_walk_aliases(
+    imports: str, rebind: str, call: str
+) -> None:
+    """Rebound module and direct aliases cannot make an ``os.walk`` read invisible."""
+
+    source = (
+        f"{imports}\n{rebind}\nfrom pathlib import Path\n\n"
+        "def test_rebound_walk() -> None:\n"
+        f"    for root, _, files in {call}:\n"
+        "        for name in files:\n"
+        "            Path(root, name).read_text()\n"
+    )
+    with pytest.raises(AssertionError, match="os.walk root provenance is ambiguous"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    "source",
+    (
+        "def scope(flag, item):\n    while flag:\n        import codecs\n",
+        "def scope(manager):\n    with manager:\n        import codecs\n",
+        "async def scope(manager):\n    async with manager:\n        import codecs\n",
+        "async def scope(items):\n    async for item in items:\n        import codecs\n",
+        "def scope():\n"
+        "    try:\n"
+        "        raise ValueError()\n"
+        "    except* ValueError:\n"
+        "        import codecs\n",
+        "def scope(value):\n    match value:\n        case _:\n            import codecs\n",
+    ),
+)
+def test_control_flow_scoped_statements_flattens_every_admitted_nested_branch(source: str) -> None:
+    """Nested statement forms expose their imports to the bounded alias analysis."""
+
+    scope = ast.parse(source).body[0]
+    assert isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
+    flattened = _control_flow_scoped_statements(scope.body)
+    assert any(
+        isinstance(statement, ast.Import)
+        and any(alias.name == "codecs" for alias in statement.names)
+        for statement in flattened
+    )
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_traces_positional_indirect_fixture_params() -> None:
     """The third positional ``parametrize`` argument carries indirect provenance."""
 
@@ -7375,6 +7436,38 @@ def test_docs_governance_tracks_static_shutil_copy_sources() -> None:
 
 
 @pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    "source",
+    (
+        "import shutil as copier\n"
+        "copier = replacement\n\n"
+        "def test_rebound_module() -> None:\n"
+        "    copier.copy('docs/guide.md', 'out/guide.md')\n",
+        "from shutil import copy as copy_file\n"
+        "copy_file = replacement\n\n"
+        "def test_rebound_direct() -> None:\n"
+        "    copy_file('docs/guide.md', 'out/guide.md')\n",
+        "from shutil import copy2\n"
+        "arguments = ('docs/guide.md', 'out/guide.md')\n\n"
+        "def test_starred() -> None:\n"
+        "    copy2(*arguments)\n",
+        "import shutil\n"
+        "arguments = {'src': 'docs/guide.md', 'dst': 'out/guide.md'}\n\n"
+        "def test_keyword_expansion() -> None:\n"
+        "    shutil.copy(**arguments)\n",
+        "import shutil\n\n"
+        "def test_conflicting_source() -> None:\n"
+        "    shutil.copy('docs/guide.md', src='scripts/tool.py', dst='out/guide.md')\n",
+    ),
+)
+def test_docs_governance_rejects_ambiguous_shutil_copy_shapes(source: str) -> None:
+    """Rebound and expanded ``shutil`` copy calls cannot hide a docs source."""
+
+    with pytest.raises(AssertionError, match="shutil copy source provenance is ambiguous"):
+        _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_tracks_function_local_os_and_shutil_imports() -> None:
     """Nested function-local admitted imports retain docs-source provenance."""
 
@@ -7945,6 +8038,28 @@ def test_docs_governance_traces_context_manager_enter_and_exit_edges() -> None:
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_traces_async_context_manager_edges_without_overreaching() -> None:
+    """``AsyncWith`` inherits docs context edges but ignores irrelevant helpers."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsAsyncContext:\n"
+        "    def __enter__(self) -> Path:\n"
+        "        return Path('docs/async-context.md')\n\n"
+        "class IrrelevantContext:\n"
+        "    def load(self) -> str:\n"
+        "        return 'ready'\n\n"
+        "async def test_async_context() -> None:\n"
+        "    async with DocsAsyncContext() as reader:\n"
+        "        reader.read_text()\n\n"
+        "async def test_irrelevant_context() -> None:\n"
+        "    async with IrrelevantContext() as context:\n"
+        "        assert context\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_async_context"}
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_boundary_mutations_red_against_exact_markers(tmp_path: Path) -> None:
     """Each of the six admitted provenance boundaries has a direct red mutation proof."""
 
@@ -8076,6 +8191,42 @@ def test_docs_governance_fails_closed_on_a_docs_reading_plugin_item_hook(tmp_pat
         )
         == set()
     )
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    "hook_name",
+    (
+        "pytest_runtest_protocol",
+        "pytest_runtest_setup",
+        "pytest_runtest_call",
+        "pytest_runtest_teardown",
+        "pytest_runtest_makereport",
+    ),
+)
+def test_docs_governance_covers_every_repository_plugin_item_hook(
+    tmp_path: Path, hook_name: str
+) -> None:
+    """Every admitted plugin item hook remains a fail-closed docs-reader edge."""
+
+    assert {
+        "pytest_runtest_protocol",
+        "pytest_runtest_setup",
+        "pytest_runtest_call",
+        "pytest_runtest_teardown",
+        "pytest_runtest_makereport",
+    } == _APPLICABLE_PYTEST_ITEM_HOOKS
+    (tmp_path / "plugin.py").write_text(
+        "from pathlib import Path\n\n"
+        f"def {hook_name}(item) -> None:\n"
+        "    Path('docs/plugin-hook.md').read_text()\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="repository plugin hook"):
+        _docs_reading_test_modules(
+            "pytest_plugins = 'plugin'\n\ndef test_plain() -> None:\n    assert True\n",
+            repository_root=tmp_path,
+        )
 
 
 @pytest.mark.docs_ci
