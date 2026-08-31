@@ -1036,6 +1036,17 @@ def _is_docs_markdown_glob_call(node: ast.AST, root_aliases: set[str]) -> bool:
     conclusive proof for a glob root).
     """
 
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "iterdir"
+        and not node.args
+        and not node.keywords
+    ):
+        root = node.func.value
+        return (
+            isinstance(root, ast.Name) and root.id in root_aliases
+        ) or _expression_has_docs_root(root)
     if not (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -1058,7 +1069,7 @@ def _is_docs_rooted_glob_call(node: ast.AST, root_aliases: set[str]) -> bool:
     if not (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr in _GLOB_METHOD_NAMES
+        and node.func.attr in _GLOB_METHOD_NAMES | {"iterdir"}
     ):
         return False
     root = node.func.value
@@ -1653,6 +1664,53 @@ def _parametrized_docs_and_ambiguous_parameters(
             docs.add(parameter.arg)
         elif not _string_constants(default):
             ambiguous.add(parameter.arg)
+    return docs, ambiguous
+
+
+def _indirect_fixture_parameter_states(
+    node: ast.FunctionDef | ast.AsyncFunctionDef, sources: dict[str, ast.expr]
+) -> tuple[set[str], set[str]]:
+    """Return docs and ambiguous fixture names from admitted indirect parametrization."""
+
+    docs: set[str] = set()
+    ambiguous: set[str] = set()
+    for decorator in node.decorator_list:
+        if not (
+            isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Attribute)
+            and decorator.func.attr == "parametrize"
+            and len(decorator.args) >= 2
+        ):
+            continue
+        indirect = [keyword.value for keyword in decorator.keywords if keyword.arg == "indirect"]
+        if not indirect:
+            continue
+        if (
+            len(indirect) != 1
+            or not isinstance(decorator.args[0], ast.Constant)
+            or not isinstance(decorator.args[0].value, str)
+        ):
+            ambiguous.update(_fixture_parameter_names(node))
+            continue
+        names = [name.strip() for name in decorator.args[0].value.split(",")]
+        if len(names) != 1 or not names[0]:
+            ambiguous.update(_fixture_parameter_names(node))
+            continue
+        indirect_value = indirect[0]
+        admitted = (isinstance(indirect_value, ast.Constant) and indirect_value.value is True) or (
+            isinstance(indirect_value, (ast.List, ast.Tuple, ast.Set))
+            and len(indirect_value.elts) == 1
+            and isinstance(indirect_value.elts[0], ast.Constant)
+            and indirect_value.elts[0].value == names[0]
+        )
+        if not admitted:
+            ambiguous.add(names[0])
+            continue
+        values = _resolve_module_values(decorator.args[1], sources)
+        if values is None or not values or any(not _string_constants(value) for value in values):
+            ambiguous.add(names[0])
+        elif any(_expression_is_docs_markdown(value, set()) for value in values):
+            docs.add(names[0])
     return docs, ambiguous
 
 
@@ -3229,6 +3287,16 @@ def _docs_reading_test_modules(
 
     tree = ast.parse(source)
     _assert_no_aliased_qualified_open_calls(tree, filename)
+    for statement in ast.walk(tree):
+        if not isinstance(statement, ast.Assign):
+            continue
+        if any(
+            isinstance(target, ast.Attribute) and target.attr == "__test__"
+            for target in statement.targets
+        ):
+            raise AssertionError(
+                f"{filename}:{statement.lineno}: explicit __test__ callable provenance is ambiguous"
+            )
     builtin_open_import_aliases = _builtin_open_import_aliases(tree)
     subprocess_module_aliases, subprocess_call_aliases, ambiguous_subprocess_aliases = (
         _subprocess_call_aliases(tree)
@@ -3857,6 +3925,31 @@ def _docs_reading_test_modules(
             if parameter in available_fixture_nodes
         }
         fixture_edges |= activated_fixture_nodes(name, node)
+        indirect_docs, indirect_ambiguous = _indirect_fixture_parameter_states(
+            node, module_value_sources
+        )
+        reads_indirect_fixture_param = False
+        for parameter, fixture_name in available_fixture_nodes.items():
+            if fixture_name not in functions or not isinstance(
+                functions[fixture_name], (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                continue
+            consumes_request_param = any(
+                isinstance(candidate, ast.Attribute)
+                and candidate.attr == "param"
+                and isinstance(candidate.value, ast.Name)
+                and candidate.value.id == "request"
+                for candidate in ast.walk(functions[fixture_name])
+            )
+            if not consumes_request_param:
+                continue
+            if parameter in indirect_ambiguous:
+                raise AssertionError(
+                    f"{filename}: indirect fixture parameter provenance is ambiguous for "
+                    f"`{parameter}`"
+                )
+            if parameter in indirect_docs:
+                reads_indirect_fixture_param = True
         reads_fixture_value = any(
             parameter in analyses[name].read_names
             and fixture_name in analyses
@@ -3864,7 +3957,8 @@ def _docs_reading_test_modules(
             for parameter, fixture_name in available_fixture_nodes.items()
         )
         if (
-            reads_fixture_value
+            reads_indirect_fixture_param
+            or reads_fixture_value
             or reads_transitively(name, frozenset())
             or any(reads_transitively(fixture_name, frozenset()) for fixture_name in fixture_edges)
         ):
@@ -5022,6 +5116,38 @@ def test_docs_governance_tracks_bounded_parametrized_path_sources() -> None:
     assert _docs_reading_test_modules(source.rsplit("@pytest.mark.parametrize", 1)[0]) == {
         "test_docs"
     }
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_indirect_fixture_params() -> None:
+    """Literal indirect fixture params reach fixtures that consume ``request.param``."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture\ndef path(request):\n    request.param.read_text()\n\n"
+        "@pytest.mark.parametrize('path', [Path('docs/indirect.md')], indirect=True)\n"
+        "def test_docs(path):\n    assert path\n\n"
+        "@pytest.mark.parametrize('path', [Path('config/indirect.md')], indirect=['path'])\n"
+        "def test_non_reader(path):\n    assert path\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_docs"}
+    with pytest.raises(AssertionError, match="indirect fixture parameter provenance is ambiguous"):
+        _docs_reading_test_modules(source.replace("indirect=True", "indirect=dynamic_indirect"))
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_docs_iterdir_and_explicit_test_flags() -> None:
+    """Docs ``iterdir`` and explicit pytest collection cannot hide readers."""
+
+    assert _docs_reading_test_modules(
+        "from pathlib import Path\n\ndef test_iterdir():\n"
+        "    [entry.read_text() for entry in Path('docs').iterdir()]\n"
+    ) == {"test_iterdir"}
+    with pytest.raises(AssertionError, match="explicit __test__ callable provenance is ambiguous"):
+        _docs_reading_test_modules(
+            "from pathlib import Path\n\ndef reader():\n"
+            "    Path('docs/explicit.md').read_text()\n\nreader.__test__ = True\n"
+        )
 
 
 @pytest.mark.docs_ci
