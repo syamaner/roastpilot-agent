@@ -1078,6 +1078,18 @@ def _is_docs_rooted_glob_call(node: ast.AST, root_aliases: set[str]) -> bool:
     )
 
 
+def _is_plain_iterdir_call(node: ast.AST) -> bool:
+    """Return whether ``node`` is the exact no-argument ``Path.iterdir`` form."""
+
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "iterdir"
+        and not node.args
+        and not node.keywords
+    )
+
+
 def _builtin_open_target(node: ast.Call) -> ast.expr:
     """Return an ``open`` call's sole file receiver or fail closed on shape drift."""
 
@@ -1683,6 +1695,8 @@ def _indirect_fixture_parameter_states(
         ):
             continue
         indirect = [keyword.value for keyword in decorator.keywords if keyword.arg == "indirect"]
+        if len(decorator.args) >= 3:
+            indirect.append(decorator.args[2])
         if not indirect:
             continue
         if (
@@ -2461,7 +2475,13 @@ def _analyse_function(
     ambiguous_reader_aliases: set[str] = set()
     builtin_open_aliases: set[str] = set(builtin_open_import_aliases or set())
     ambiguous_builtin_open_aliases: set[str] = set()
-    non_docs_aliases: set[str] = set()
+    non_docs_aliases = {
+        name
+        for name, value in module_value_sources.items()
+        if _string_constants(value)
+        and not _expression_is_docs_markdown(value, aliases)
+        and not _expression_has_docs_root(value)
+    }
     working_directory_state = "none"
     imported_class_instances: set[str] = set()
     ambiguous_imported_class_instances: set[str] = set()
@@ -2879,6 +2899,20 @@ def _analyse_function(
             has_docs_glob = True
             if isinstance(node.target, ast.Name):
                 aliases.add(node.target.id)
+        elif (
+            isinstance(node, ast.For)
+            and isinstance(node.target, ast.Name)
+            and _is_plain_iterdir_call(node.iter)
+        ):
+            assert isinstance(node.iter, ast.Call)
+            assert isinstance(node.iter.func, ast.Attribute)
+            if (
+                isinstance(node.iter.func.value, ast.Name)
+                and node.iter.func.value.id in non_docs_aliases
+            ) or _string_constants(node.iter.func.value):
+                non_docs_aliases.add(node.target.id)
+            else:
+                partial_aliases.add(node.target.id)
         if (
             isinstance(node, ast.For)
             and isinstance(node.target, ast.Name)
@@ -2908,6 +2942,18 @@ def _analyse_function(
                     generator.target, ast.Name
                 ):
                     aliases.add(generator.target.id)
+                elif isinstance(generator.target, ast.Name) and _is_plain_iterdir_call(
+                    generator.iter
+                ):
+                    assert isinstance(generator.iter, ast.Call)
+                    assert isinstance(generator.iter.func, ast.Attribute)
+                    if (
+                        isinstance(generator.iter.func.value, ast.Name)
+                        and generator.iter.func.value.id in non_docs_aliases
+                    ) or _string_constants(generator.iter.func.value):
+                        non_docs_aliases.add(generator.target.id)
+                    else:
+                        partial_aliases.add(generator.target.id)
                 if not (
                     isinstance(generator.target, ast.Name)
                     and isinstance(generator.iter, (ast.List, ast.Tuple, ast.Set))
@@ -3296,6 +3342,20 @@ def _docs_reading_test_modules(
         ):
             raise AssertionError(
                 f"{filename}:{statement.lineno}: explicit __test__ callable provenance is ambiguous"
+            )
+    for class_node in (statement for statement in tree.body if isinstance(statement, ast.ClassDef)):
+        for statement in class_node.body:
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)) or statement.value is None:
+                continue
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            if not any(
+                isinstance(target, ast.Name) and target.id == "__test__" for target in targets
+            ):
+                continue
+            if isinstance(statement.value, ast.Constant) and statement.value.value is False:
+                continue
+            raise AssertionError(
+                f"{filename}:{statement.lineno}: explicit __test__ class provenance is ambiguous"
             )
     builtin_open_import_aliases = _builtin_open_import_aliases(tree)
     subprocess_module_aliases, subprocess_call_aliases, ambiguous_subprocess_aliases = (
@@ -5147,6 +5207,91 @@ def test_docs_governance_traces_docs_iterdir_and_explicit_test_flags() -> None:
         _docs_reading_test_modules(
             "from pathlib import Path\n\ndef reader():\n"
             "    Path('docs/explicit.md').read_text()\n\nreader.__test__ = True\n"
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_fails_closed_on_class_scope_test_overrides() -> None:
+    """Class collection overrides cannot hide readers outside pytest's name grammar."""
+
+    reader = (
+        "from pathlib import Path\n\nclass Reader:\n"
+        "    __test__ = True\n\n"
+        "    def test_docs(self) -> None:\n"
+        "        Path('docs/class-override.md').read_text()\n"
+    )
+    with pytest.raises(AssertionError, match="explicit __test__ class provenance is ambiguous"):
+        _docs_reading_test_modules(reader)
+    with pytest.raises(AssertionError, match="explicit __test__ class provenance is ambiguous"):
+        _docs_reading_test_modules(reader.replace("True", "collection_enabled"))
+
+    assert (
+        _docs_reading_test_modules(
+            "class Disabled:\n    __test__ = False\n\n"
+            "    def test_control(self) -> None:\n        assert True\n"
+        )
+        == set()
+    )
+    assert _docs_reading_test_modules(
+        "from pathlib import Path\n\n__test__ = collection_enabled\n\n"
+        "def test_module_scope() -> None:\n"
+        "    Path('docs/module-scope.md').read_text()\n"
+    ) == {"test_module_scope"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_positional_indirect_fixture_params() -> None:
+    """The third positional ``parametrize`` argument carries indirect provenance."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture\ndef path(request):\n    request.param.read_text()\n\n"
+        "@pytest.mark.parametrize('path', [Path('docs/positional.md')], True)\n"
+        "def test_docs(path):\n    assert path\n\n"
+        "@pytest.mark.parametrize('path', [Path('config/positional.md')], ['path'])\n"
+        "def test_non_reader(path):\n    assert path\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_docs"}
+    for indirect in ("dynamic_indirect", "True, indirect=True"):
+        with pytest.raises(
+            AssertionError, match="indirect fixture parameter provenance is ambiguous"
+        ):
+            _docs_reading_test_modules(source.replace("True", indirect))
+    with pytest.raises(AssertionError, match="indirect fixture parameter provenance is ambiguous"):
+        _docs_reading_test_modules(
+            source.replace("'path'", "'path, other'", 1).replace(
+                "def test_docs(path)", "def test_docs(path, other)"
+            )
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_iterdir_aliases_and_fails_closed_on_dynamic_roots() -> None:
+    """Static docs roots, non-doc roots, and unknown ``iterdir`` roots stay distinct."""
+
+    assert _docs_reading_test_modules(
+        "from pathlib import Path\n\nDOCS = Path('docs')\n\n"
+        "def test_docs_alias() -> None:\n"
+        "    for entry in DOCS.iterdir():\n        entry.read_text()\n"
+    ) == {"test_docs_alias"}
+    assert (
+        _docs_reading_test_modules(
+            "from pathlib import Path\n\nCONFIG = Path('config')\n\n"
+            "def test_non_docs_alias() -> None:\n"
+            "    for entry in CONFIG.iterdir():\n        entry.read_text()\n"
+        )
+        == set()
+    )
+    assert _docs_reading_test_modules(
+        "from pathlib import Path\n\n"
+        "def test_dynamic_docs_root(segment: str) -> None:\n"
+        "    for entry in (Path('docs') / segment).iterdir():\n        entry.read_text()\n"
+    ) == {"test_dynamic_docs_root"}
+    with pytest.raises(AssertionError, match="dynamic read receiver"):
+        _docs_reading_test_modules(
+            "from pathlib import Path\n\n"
+            "def test_unknown_root(root: str) -> None:\n"
+            "    for entry in Path(root).iterdir():\n        entry.read_text()\n"
         )
 
 
