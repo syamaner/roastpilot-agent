@@ -1186,6 +1186,35 @@ def _fileinput_input_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[
     return modules - rebound, calls - rebound, rebound
 
 
+def _codecs_open_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
+    """Return exact and rebound aliases for the admitted ``codecs.open`` call."""
+
+    modules = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "codecs"
+    }
+    calls = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.ImportFrom) and statement.module == "codecs"
+        for alias in statement.names
+        if alias.name == "open"
+    }
+    rebound = {
+        target.id
+        for statement in tree.body
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        )
+        if isinstance(target, ast.Name) and target.id in modules | calls
+    }
+    return modules - rebound, calls - rebound, rebound
+
+
 def _subprocess_docs_call_state(
     node: ast.Call,
     module_aliases: set[str],
@@ -2459,6 +2488,9 @@ def _analyse_function(
     fileinput_module_aliases: set[str] | None = None,
     fileinput_call_aliases: set[str] | None = None,
     ambiguous_fileinput_aliases: set[str] | None = None,
+    codecs_module_aliases: set[str] | None = None,
+    codecs_call_aliases: set[str] | None = None,
+    ambiguous_codecs_aliases: set[str] | None = None,
 ) -> _FunctionAnalysis:
     """Walk one function body for a direct docs read, calls, and unresolved reads.
 
@@ -2751,6 +2783,49 @@ def _analyse_function(
         if "docs" in states:
             return "docs"
         if "ambiguous" in states:
+            return "ambiguous"
+        return "none"
+
+    def _codecs_open_state(call: ast.Call) -> str:
+        """Return the closed docs provenance of one admitted ``codecs.open`` call."""
+
+        target_is_codecs = (
+            isinstance(call.func, ast.Name) and call.func.id in (codecs_call_aliases or set())
+        ) or (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == "open"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id in (codecs_module_aliases or set())
+        )
+        target_is_rebound = (
+            isinstance(call.func, ast.Name) and call.func.id in (ambiguous_codecs_aliases or set())
+        ) or (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id in (ambiguous_codecs_aliases or set())
+            and call.func.attr == "open"
+        )
+        if target_is_rebound:
+            return "ambiguous"
+        if not target_is_codecs:
+            return "none"
+        if any(keyword.arg is None for keyword in call.keywords) or any(
+            isinstance(argument, ast.Starred) for argument in call.args
+        ):
+            return "ambiguous"
+        filename_keywords = [keyword for keyword in call.keywords if keyword.arg == "filename"]
+        if len(filename_keywords) > 1 or (call.args and filename_keywords):
+            return "ambiguous"
+        if not call.args and not filename_keywords:
+            return "ambiguous"
+        target = call.args[0] if call.args else filename_keywords[0].value
+        if _receiver_is_docs(target) or _module_receiver_state(target) == "docs":
+            return "docs"
+        if (
+            _receiver_is_partial(target)
+            or _module_receiver_state(target) == "ambiguous"
+            or not _string_constants(target)
+        ):
             return "ambiguous"
         return "none"
 
@@ -3135,6 +3210,13 @@ def _analyse_function(
         elif fileinput_state == "ambiguous":
             unresolved.append(
                 f"{filename}:{node.lineno}: fileinput.input files provenance is ambiguous"
+            )
+        codecs_state = _codecs_open_state(node)
+        if codecs_state == "docs":
+            reads = True
+        elif codecs_state == "ambiguous":
+            unresolved.append(
+                f"{filename}:{node.lineno}: codecs.open filename provenance is ambiguous"
             )
         subprocess_state = _subprocess_docs_call_state(
             node,
@@ -3531,6 +3613,9 @@ def _docs_reading_test_modules(
     fileinput_module_aliases, fileinput_call_aliases, ambiguous_fileinput_aliases = (
         _fileinput_input_aliases(tree)
     )
+    codecs_module_aliases, codecs_call_aliases, ambiguous_codecs_aliases = _codecs_open_aliases(
+        tree
+    )
     (
         imported_analyses,
         ambiguous_imports,
@@ -3857,6 +3942,9 @@ def _docs_reading_test_modules(
             fileinput_module_aliases,
             fileinput_call_aliases,
             ambiguous_fileinput_aliases,
+            codecs_module_aliases,
+            codecs_call_aliases,
+            ambiguous_codecs_aliases,
         )
         analyses[name] = analysis
         if name not in local_keys:
@@ -5787,6 +5875,48 @@ def test_docs_governance_tracks_exact_qualified_open_calls() -> None:
         "def test_non_docs() -> None:\n    io.open('config/no.md')\n"
     )
     assert _docs_reading_test_modules(source) == {"test_builtins_keyword", "test_io_positional"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_static_codecs_open_calls() -> None:
+    """Closed ``codecs.open`` imports cannot hide committed Markdown reads."""
+
+    source = (
+        "import codecs\nimport codecs as codec_module\n"
+        "from codecs import open\nfrom codecs import open as codec_open\n\n"
+        "def test_module_open() -> None:\n"
+        "    codecs.open('docs/module.md')\n\n"
+        "def test_module_alias_open() -> None:\n"
+        "    codec_module.open('docs/module-alias.md')\n\n"
+        "def test_direct_open() -> None:\n"
+        "    open('docs/direct.md')\n\n"
+        "def test_direct_alias_open() -> None:\n"
+        "    codec_open('docs/direct-alias.md')\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_direct_alias_open",
+        "test_direct_open",
+        "test_module_alias_open",
+        "test_module_open",
+    }
+    assert (
+        _docs_reading_test_modules(
+            "import codecs\n\n"
+            "def test_non_docs_codecs_open() -> None:\n"
+            "    codecs.open('config/no.md')\n"
+        )
+        == set()
+    )
+    for source in (
+        "import codecs\n\n"
+        "def test_dynamic_codecs_open(path: str) -> None:\n"
+        "    codecs.open(path)\n",
+        "import codecs as codec_module\ncodec_module = object()\n\n"
+        "def test_rebound_codecs_open() -> None:\n"
+        "    codec_module.open('docs/rebound.md')\n",
+    ):
+        with pytest.raises(AssertionError, match="codecs.open filename provenance is ambiguous"):
+            _docs_reading_test_modules(source)
 
 
 @pytest.mark.docs_ci
