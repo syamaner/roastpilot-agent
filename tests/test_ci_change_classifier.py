@@ -1125,6 +1125,41 @@ def _qualified_open_target(node: ast.Call) -> ast.expr | None:
     return _builtin_open_target(node)
 
 
+def _control_flow_scoped_statements(statements: Sequence[ast.stmt]) -> list[ast.stmt]:
+    """Flatten statements reachable through nested control-flow blocks.
+
+    Recurses into ``if``/``for``/``while``/``try``/``with`` bodies (and their
+    ``async``, ``except*``, and ``match`` case equivalents) so an import or
+    assignment nested inside control flow is visible the same as one written
+    at the immediate top level of the given statement list. Does not descend
+    into nested function or class definitions, which receive their own scoped
+    analysis elsewhere.
+    """
+
+    flattened: list[ast.stmt] = []
+    pending: list[ast.stmt] = list(statements)
+    while pending:
+        statement = pending.pop(0)
+        flattened.append(statement)
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(statement, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+            pending.extend(statement.body)
+            pending.extend(statement.orelse)
+        elif isinstance(statement, (ast.With, ast.AsyncWith)):
+            pending.extend(statement.body)
+        elif isinstance(statement, (ast.Try, ast.TryStar)):
+            pending.extend(statement.body)
+            pending.extend(statement.orelse)
+            pending.extend(statement.finalbody)
+            for handler in statement.handlers:
+                pending.extend(handler.body)
+        elif isinstance(statement, ast.Match):
+            for case in statement.cases:
+                pending.extend(case.body)
+    return flattened
+
+
 _SUBPROCESS_ENTRY_POINTS = frozenset({"Popen", "call", "check_call", "check_output", "run"})
 
 
@@ -1186,26 +1221,106 @@ def _fileinput_input_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[
     return modules - rebound, calls - rebound, rebound
 
 
-def _codecs_open_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
-    """Return exact and rebound aliases for the admitted ``codecs.open`` call."""
+_SHUTIL_COPY_ENTRY_POINTS = frozenset({"copy", "copy2", "copyfile", "copytree"})
+
+#: Repository-plugin pytest hooks that run around every collected test item,
+#: not just tests that explicitly request a fixture (mechanism D15-702 item 3).
+_APPLICABLE_PYTEST_ITEM_HOOKS = frozenset(
+    {
+        "pytest_runtest_protocol",
+        "pytest_runtest_setup",
+        "pytest_runtest_call",
+        "pytest_runtest_teardown",
+        "pytest_runtest_makereport",
+    }
+)
+
+
+def _shutil_copy_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
+    """Return exact and rebound aliases for the admitted ``shutil`` copy entry points."""
 
     modules = {
         alias.asname or alias.name
         for statement in tree.body
         if isinstance(statement, ast.Import)
         for alias in statement.names
-        if alias.name == "codecs"
+        if alias.name == "shutil"
     }
     calls = {
         alias.asname or alias.name
         for statement in tree.body
+        if isinstance(statement, ast.ImportFrom) and statement.module == "shutil"
+        for alias in statement.names
+        if alias.name in _SHUTIL_COPY_ENTRY_POINTS
+    }
+    rebound = {
+        target.id
+        for statement in tree.body
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        )
+        if isinstance(target, ast.Name) and target.id in modules | calls
+    }
+    return modules - rebound, calls - rebound, rebound
+
+
+def _os_walk_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
+    """Return exact and rebound aliases for the admitted ``os.walk`` call."""
+
+    modules = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "os"
+    }
+    calls = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.ImportFrom) and statement.module == "os"
+        for alias in statement.names
+        if alias.name == "walk"
+    }
+    rebound = {
+        target.id
+        for statement in tree.body
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        )
+        if isinstance(target, ast.Name) and target.id in modules | calls
+    }
+    return modules - rebound, calls - rebound, rebound
+
+
+def _codecs_open_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
+    """Return exact and rebound aliases for the admitted ``codecs.open`` call.
+
+    Scans every statement reachable through nested control flow (``if``,
+    ``for``, ``while``, ``try``, ``with``, and their variants), not only the
+    immediate top level, so a ``codecs`` import nested anywhere inside a
+    function's control flow cannot evade this governance rule.
+    """
+
+    scoped_statements = _control_flow_scoped_statements(tree.body)
+    modules = {
+        alias.asname or alias.name
+        for statement in scoped_statements
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "codecs"
+    }
+    calls = {
+        alias.asname or alias.name
+        for statement in scoped_statements
         if isinstance(statement, ast.ImportFrom) and statement.module == "codecs"
         for alias in statement.names
         if alias.name == "open"
     }
     rebound = {
         target.id
-        for statement in tree.body
+        for statement in scoped_statements
         if isinstance(statement, (ast.Assign, ast.AnnAssign))
         for target in (
             statement.targets if isinstance(statement, ast.Assign) else [statement.target]
@@ -1985,6 +2100,20 @@ def _repository_imported_fixture_analyses(
                 ambiguous_pytest_module_aliases,
             ):
                 autouse.add(fixture_name)
+        for hook_function in (
+            node
+            for node in imported_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in _APPLICABLE_PYTEST_ITEM_HOOKS
+        ):
+            proxy = (
+                source + "\n\ndef test_import_direct() -> None:\n" + f"    {hook_function.name}()\n"
+            )
+            readers = _docs_reading_test_modules(
+                proxy, filename=str(source_path), repository_root=repository_root
+            )
+            if "test_import_direct" in readers:
+                ambiguous.add("__pytest_plugin_hook__")
     return analyses, ambiguous, autouse
 
 
@@ -2191,6 +2320,7 @@ def _repository_imported_function_analyses(
     module_docs_values: set[tuple[str, str]] = set()
     ambiguous_module_values: set[tuple[str, str]] = set()
     imported_collected_test_classes: set[str] = set()
+    module_testcase_classes: set[tuple[str, str]] = set()
 
     def add_module_members(module_alias: str, source_path: Path, members: set[str]) -> None:
         """Expose local module members through one explicitly imported alias."""
@@ -2208,6 +2338,48 @@ def _repository_imported_function_analyses(
             for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
             if isinstance(target, ast.Name)
         }
+        classes = {node.name: node for node in imported_tree.body if isinstance(node, ast.ClassDef)}
+        testcase_names = {
+            alias.asname or alias.name
+            for node in imported_tree.body
+            if isinstance(node, ast.ImportFrom) and node.module == "unittest"
+            for alias in node.names
+            if alias.name == "TestCase"
+        }
+        unittest_modules = {
+            alias.asname or alias.name
+            for node in imported_tree.body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+            if alias.name == "unittest"
+        }
+
+        def is_testcase_class(class_node: ast.ClassDef, seen: set[str]) -> bool:
+            """Return whether one confined imported class statically inherits TestCase."""
+
+            if class_node.name in seen:
+                return False
+            seen.add(class_node.name)
+            for base in class_node.bases:
+                if isinstance(base, ast.Name):
+                    if base.id in testcase_names:
+                        return True
+                    if base.id in classes and is_testcase_class(classes[base.id], seen):
+                        return True
+                elif (
+                    isinstance(base, ast.Attribute)
+                    and base.attr == "TestCase"
+                    and isinstance(base.value, ast.Name)
+                    and base.value.id in unittest_modules
+                ):
+                    return True
+            return False
+
+        for member, class_node in classes.items():
+            if member not in members:
+                continue
+            if is_testcase_class(class_node, set()):
+                module_testcase_classes.add((module_alias, member))
         for member, function in functions.items():
             if member not in members:
                 continue
@@ -2393,6 +2565,20 @@ def _repository_imported_function_analyses(
                 has_variadic_parameters=_function_has_variadic_parameters(functions[imported.name]),
                 call_arguments=[],
             )
+    for statement in tree.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)) or statement.value is None:
+            continue
+        value = statement.value
+        if not (
+            isinstance(value, ast.Attribute)
+            and isinstance(value.value, ast.Name)
+            and (value.value.id, value.attr) in module_testcase_classes
+        ):
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                imported_collected_test_classes.add(target.id)
     return (
         analyses,
         ambiguous,
@@ -2542,6 +2728,12 @@ def _analyse_function(
     codecs_module_aliases: set[str] | None = None,
     codecs_call_aliases: set[str] | None = None,
     ambiguous_codecs_aliases: set[str] | None = None,
+    shutil_module_aliases: set[str] | None = None,
+    shutil_call_aliases: set[str] | None = None,
+    ambiguous_shutil_aliases: set[str] | None = None,
+    os_walk_module_aliases: set[str] | None = None,
+    os_walk_call_aliases: set[str] | None = None,
+    ambiguous_os_walk_aliases: set[str] | None = None,
 ) -> _FunctionAnalysis:
     """Walk one function body for a direct docs read, calls, and unresolved reads.
 
@@ -2619,6 +2811,9 @@ def _analyse_function(
     ambiguous_subprocess_entry_aliases = set(ambiguous_subprocess_aliases or set())
     helper_class_instances: dict[str, str] = {}
     ambiguous_helper_class_instances: set[str] = set()
+    walk_root_aliases: set[str] = set()
+    walk_files_aliases: set[str] = set()
+    walk_name_aliases: set[str] = set()
     control_flow_docs_aliases = {
         target.id
         for conditional in ast.walk(func)
@@ -2737,6 +2932,21 @@ def _analyse_function(
                 return (all_class_methods or {}).get(helper_class, {}).get(expression.func.attr)
         return None
 
+    def _is_walk_rooted_path_call(target: ast.expr) -> bool:
+        """Return whether ``target`` is the closed ``Path(root, name)`` walk-read shape."""
+
+        return (
+            isinstance(target, ast.Call)
+            and isinstance(target.func, ast.Name)
+            and target.func.id == "Path"
+            and len(target.args) == 2
+            and not target.keywords
+            and isinstance(target.args[0], ast.Name)
+            and isinstance(target.args[1], ast.Name)
+            and target.args[0].id in walk_root_aliases
+            and target.args[1].id in walk_name_aliases
+        )
+
     def _receiver_is_docs(target: ast.expr) -> bool:
         if isinstance(target, ast.Name):
             return target.id in aliases or has_docs_glob
@@ -2746,6 +2956,8 @@ def _analyse_function(
             and target.value.id in {"self", "cls", class_name}
             and target.attr in (class_docs_attributes or {}).get(class_name or "", set())
         ):
+            return True
+        if _is_walk_rooted_path_call(target):
             return True
         return _expression_is_docs_markdown(target, aliases)
 
@@ -2759,7 +2971,40 @@ def _analyse_function(
             and target.attr in (class_ambiguous_attributes or {}).get(class_name or "", set())
         ):
             return True
+        if (
+            isinstance(target, ast.Call)
+            and isinstance(target.func, ast.Name)
+            and target.func.id == "Path"
+            and any(
+                isinstance(argument, ast.Name) and argument.id in walk_root_aliases
+                for argument in target.args
+            )
+            and not _is_walk_rooted_path_call(target)
+        ):
+            return True
         return _expression_has_docs_root(target)
+
+    def _os_walk_root_state(argument: ast.expr) -> str:
+        """Return ``docs``/``ambiguous``/``none`` for one ``os.walk`` root argument.
+
+        Unlike a Markdown-file receiver, a walk root is a bare directory, so
+        exact ``"docs"``/``"docs/..."`` literal evidence (or a tracked
+        docs-rooted alias) is already conclusive — no ``.md`` suffix is
+        required or expected.
+        """
+
+        if isinstance(argument, ast.Name):
+            if argument.id in aliases or argument.id in partial_aliases:
+                return "docs"
+            if argument.id in non_docs_aliases:
+                return "none"
+            return "ambiguous"
+        strings = _string_constants(argument)
+        if not strings:
+            return "ambiguous"
+        if any(value.rstrip("/") == "docs" or value.startswith("docs/") for value in strings):
+            return "docs"
+        return "none"
 
     def _helper_class_instance(value: ast.expr) -> str | None:
         """Return one exact same-module helper-class instance provenance."""
@@ -2888,6 +3133,51 @@ def _analyse_function(
             or _module_receiver_state(target) == "ambiguous"
             or not _string_constants(target)
         ):
+            return "ambiguous"
+        return "none"
+
+    def _shutil_copy_state(call: ast.Call) -> str:
+        """Return the closed docs provenance of one admitted ``shutil`` copy call's source.
+
+        Only the source argument is inspected — the destination is never
+        treated as a read regardless of its own path shape, and an unrelated
+        dynamic or non-docs source is deliberately left ``"none"`` rather than
+        ``"ambiguous"`` so ordinary file-copying code is not overmarked.
+        """
+
+        target_is_shutil_copy = (
+            isinstance(call.func, ast.Name) and call.func.id in (shutil_call_aliases or set())
+        ) or (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr in _SHUTIL_COPY_ENTRY_POINTS
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id in (shutil_module_aliases or set())
+        )
+        target_is_rebound = (
+            isinstance(call.func, ast.Name) and call.func.id in (ambiguous_shutil_aliases or set())
+        ) or (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id in (ambiguous_shutil_aliases or set())
+            and call.func.attr in _SHUTIL_COPY_ENTRY_POINTS
+        )
+        if target_is_rebound:
+            return "ambiguous"
+        if not target_is_shutil_copy:
+            return "none"
+        if any(keyword.arg is None for keyword in call.keywords) or any(
+            isinstance(argument, ast.Starred) for argument in call.args
+        ):
+            return "ambiguous"
+        source_keywords = [keyword for keyword in call.keywords if keyword.arg == "src"]
+        if len(source_keywords) > 1 or (call.args and source_keywords):
+            return "ambiguous"
+        if not call.args and not source_keywords:
+            return "ambiguous"
+        source = call.args[0] if call.args else source_keywords[0].value
+        if _receiver_is_docs(source) or _module_receiver_state(source) == "docs":
+            return "docs"
+        if _receiver_is_partial(source) or _module_receiver_state(source) == "ambiguous":
             return "ambiguous"
         return "none"
 
@@ -3109,6 +3399,76 @@ def _analyse_function(
                         non_docs_aliases.add(target.id)
                     else:
                         non_docs_aliases.discard(target.id)
+        if isinstance(node, ast.For) and isinstance(node.iter, ast.Call):
+            walk_call = node.iter
+            target_is_os_walk = (
+                isinstance(walk_call.func, ast.Name)
+                and walk_call.func.id in (os_walk_call_aliases or set())
+            ) or (
+                isinstance(walk_call.func, ast.Attribute)
+                and walk_call.func.attr == "walk"
+                and isinstance(walk_call.func.value, ast.Name)
+                and walk_call.func.value.id in (os_walk_module_aliases or set())
+            )
+            target_is_rebound_walk = (
+                isinstance(walk_call.func, ast.Name)
+                and walk_call.func.id in (ambiguous_os_walk_aliases or set())
+            ) or (
+                isinstance(walk_call.func, ast.Attribute)
+                and isinstance(walk_call.func.value, ast.Name)
+                and walk_call.func.value.id in (ambiguous_os_walk_aliases or set())
+                and walk_call.func.attr == "walk"
+            )
+            if target_is_rebound_walk:
+                unresolved.append(f"{filename}:{node.lineno}: os.walk root provenance is ambiguous")
+            elif target_is_os_walk:
+                dynamic_shape = any(keyword.arg is None for keyword in walk_call.keywords) or any(
+                    isinstance(argument, ast.Starred) for argument in walk_call.args
+                )
+                top_keywords = [keyword for keyword in walk_call.keywords if keyword.arg == "top"]
+                if (
+                    dynamic_shape
+                    or len(top_keywords) > 1
+                    or (walk_call.args and top_keywords)
+                    or (not walk_call.args and not top_keywords)
+                ):
+                    unresolved.append(
+                        f"{filename}:{node.lineno}: os.walk root provenance is ambiguous"
+                    )
+                else:
+                    root_argument = walk_call.args[0] if walk_call.args else top_keywords[0].value
+                    root_state = _os_walk_root_state(root_argument)
+                    if root_state == "docs":
+                        if (
+                            isinstance(node.target, ast.Tuple)
+                            and len(node.target.elts) == 3
+                            and all(isinstance(element, ast.Name) for element in node.target.elts)
+                        ):
+                            root_element, _dirs_element, files_element = node.target.elts
+                            assert isinstance(root_element, ast.Name)
+                            assert isinstance(files_element, ast.Name)
+                            walk_root_aliases.add(root_element.id)
+                            walk_files_aliases.add(files_element.id)
+                        else:
+                            unresolved.append(
+                                f"{filename}:{node.lineno}: os.walk loop target must unpack "
+                                "exactly (root, dirs, files)"
+                            )
+                    elif root_state == "ambiguous":
+                        unresolved.append(
+                            f"{filename}:{node.lineno}: os.walk root provenance is ambiguous"
+                        )
+        elif (
+            isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Name)
+            and node.iter.id in walk_files_aliases
+        ):
+            if isinstance(node.target, ast.Name):
+                walk_name_aliases.add(node.target.id)
+            else:
+                unresolved.append(
+                    f"{filename}:{node.lineno}: os.walk files loop target is ambiguous"
+                )
         docs_root_aliases = aliases | partial_aliases
         if _is_docs_rooted_glob_call(node, docs_root_aliases) and not _is_docs_markdown_glob_call(
             node, docs_root_aliases
@@ -3223,6 +3583,25 @@ def _analyse_function(
                     return_names.add(node.value.id)
                 elif (call_key := _call_key(node.value)) is not None:
                     return_calls.add(call_key)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    helper_class = _helper_class_instance(item.context_expr)
+                    if helper_class is None:
+                        continue
+                    enter_name = (all_class_methods or {}).get(helper_class, {}).get("__enter__")
+                    if enter_name is None:
+                        if helper_class in (relevant_helper_classes or set()):
+                            unresolved.append(
+                                f"{filename}:{node.lineno}: unresolved context-manager "
+                                f"`__enter__` edge for `{helper_class}`"
+                            )
+                    else:
+                        calls.add(enter_name)
+                        if isinstance(item.optional_vars, ast.Name):
+                            call_result_assignments[item.optional_vars.id] = enter_name
+                    exit_name = (all_class_methods or {}).get(helper_class, {}).get("__exit__")
+                    if exit_name is not None:
+                        calls.add(exit_name)
             continue
         if (
             isinstance(node.func, ast.Attribute)
@@ -3279,6 +3658,13 @@ def _analyse_function(
         elif codecs_state == "ambiguous":
             unresolved.append(
                 f"{filename}:{node.lineno}: codecs.open filename provenance is ambiguous"
+            )
+        shutil_copy_state = _shutil_copy_state(node)
+        if shutil_copy_state == "docs":
+            reads = True
+        elif shutil_copy_state == "ambiguous":
+            unresolved.append(
+                f"{filename}:{node.lineno}: shutil copy source provenance is ambiguous"
             )
         subprocess_state = _subprocess_docs_call_state(
             node,
@@ -3678,6 +4064,10 @@ def _docs_reading_test_modules(
     codecs_module_aliases, codecs_call_aliases, ambiguous_codecs_aliases = _codecs_open_aliases(
         tree
     )
+    shutil_module_aliases, shutil_call_aliases, ambiguous_shutil_aliases = _shutil_copy_aliases(
+        tree
+    )
+    os_walk_module_aliases, os_walk_call_aliases, ambiguous_os_walk_aliases = _os_walk_aliases(tree)
     (
         imported_analyses,
         ambiguous_imports,
@@ -3726,6 +4116,11 @@ def _docs_reading_test_modules(
     ) = _repository_imported_fixture_analyses(tree, filename, repository_root, plugin_modules)
     if "__pytest_plugins__" in ambiguous_imported_fixtures:
         raise AssertionError("pytest_plugins repository fixture provenance is ambiguous")
+    if "__pytest_plugin_hook__" in ambiguous_imported_fixtures:
+        raise AssertionError(
+            "pytest_plugins repository plugin hook reads committed docs and affects "
+            "every collected test in this module"
+        )
     imported_fixture_nodes = {
         fixture_name: f"<imported-fixture>::{fixture_name}"
         for fixture_name in imported_fixture_by_name
@@ -4013,6 +4408,12 @@ def _docs_reading_test_modules(
             codecs_module_aliases,
             codecs_call_aliases,
             ambiguous_codecs_aliases,
+            shutil_module_aliases,
+            shutil_call_aliases,
+            ambiguous_shutil_aliases,
+            os_walk_module_aliases,
+            os_walk_call_aliases,
+            ambiguous_os_walk_aliases,
         )
         analyses[name] = analysis
         if name not in local_keys:
@@ -5640,6 +6041,53 @@ def test_docs_governance_fails_closed_on_class_scope_test_overrides() -> None:
         )
         == set()
     )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_propagates_os_walk_docs_provenance() -> None:
+    """An ``os.walk('docs')`` loop cannot hide a later ``Path(root, name).read_text()``."""
+
+    assert _docs_reading_test_modules(
+        "import os\nfrom pathlib import Path\n\n"
+        "def test_walk_docs() -> None:\n"
+        "    for root, dirs, files in os.walk('docs'):\n"
+        "        del dirs\n"
+        "        for name in files:\n"
+        "            Path(root, name).read_text()\n"
+    ) == {"test_walk_docs"}
+    assert (
+        _docs_reading_test_modules(
+            "import os\nfrom pathlib import Path\n\n"
+            "def test_walk_non_docs() -> None:\n"
+            "    for root, dirs, files in os.walk('scripts'):\n"
+            "        del dirs\n"
+            "        for name in files:\n"
+            "            Path(root, name).read_text()\n"
+        )
+        == set()
+    )
+    with pytest.raises(AssertionError, match="os.walk loop target must unpack"):
+        _docs_reading_test_modules(
+            "import os\n\n"
+            "def test_walk_bad_target() -> None:\n"
+            "    for entry in os.walk('docs'):\n"
+            "        assert entry\n"
+        )
+    with pytest.raises(AssertionError, match="os.walk root provenance is ambiguous"):
+        _docs_reading_test_modules(
+            "import os\n\n"
+            "def test_walk_dynamic_root(base: str) -> None:\n"
+            "    for root, dirs, files in os.walk(base):\n"
+            "        assert root and dirs and files\n"
+        )
+    with pytest.raises(AssertionError, match="receiver folds a"):
+        _docs_reading_test_modules(
+            "import os\nfrom pathlib import Path\n\n"
+            "def test_walk_partial_path() -> None:\n"
+            "    for root, dirs, files in os.walk('docs'):\n"
+            "        del dirs, files\n"
+            "        Path(root).read_text()\n"
+        )
     assert _docs_reading_test_modules(
         "from pathlib import Path\n\n__test__ = collection_enabled\n\n"
         "def test_module_scope() -> None:\n"
@@ -6017,6 +6465,51 @@ def test_docs_governance_tracks_function_scoped_codecs_open_calls() -> None:
     ):
         with pytest.raises(AssertionError, match="codecs.open filename provenance is ambiguous"):
             _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_nested_control_flow_codecs_open_calls() -> None:
+    """A ``codecs`` import nested inside function control flow cannot evade governance."""
+
+    source = (
+        "def test_if_branch(flag: bool) -> None:\n"
+        "    if flag:\n"
+        "        import codecs\n"
+        "    else:\n"
+        "        import codecs\n"
+        "    codecs.open('docs/if-branch.md')\n\n"
+        "def test_for_loop() -> None:\n"
+        "    for _ in range(1):\n"
+        "        import codecs as codec_module\n"
+        "    codec_module.open('docs/for-loop.md')\n\n"
+        "def test_try_block() -> None:\n"
+        "    try:\n"
+        "        from codecs import open as codec_open\n"
+        "    except ImportError:\n"
+        "        raise\n"
+        "    codec_open('docs/try-block.md')\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_for_loop",
+        "test_if_branch",
+        "test_try_block",
+    }
+    assert (
+        _docs_reading_test_modules(
+            "def test_plain(flag: bool) -> None:\n"
+            "    if flag:\n"
+            "        import codecs\n"
+            "    codecs.open('config/plain.md')\n"
+        )
+        == set()
+    )
+    with pytest.raises(AssertionError, match="codecs.open filename provenance is ambiguous"):
+        _docs_reading_test_modules(
+            "def test_dynamic_nested(path: str) -> None:\n"
+            "    if path:\n"
+            "        import codecs\n"
+            "    codecs.open(path)\n"
+        )
 
 
 @pytest.mark.docs_ci
@@ -6678,6 +7171,42 @@ def test_docs_governance_rejects_imported_unittest_collected_classes(tmp_path: P
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_rejects_module_qualified_testcase_alias(tmp_path: Path) -> None:
+    """A plain module import re-aliased to a qualified TestCase class cannot evade audit."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\nfrom unittest import TestCase\n\n"
+        "class LocalBase:\n"
+        "    def test_reader(self) -> None:\n"
+        "        Path('docs/inherited.md').read_text()\n\n"
+        "class DocsCase(LocalBase, TestCase):\n    pass\n\n"
+        "class PlainHelper:\n"
+        "    def test_plain(self) -> None:\n        assert True\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="imported unittest.TestCase class provenance"):
+        _docs_reading_test_modules(
+            "import helpers\n\nDocsCase = helpers.DocsCase\n",
+            filename=str(tmp_path / "test_import.py"),
+            repository_root=tmp_path,
+        )
+    with pytest.raises(AssertionError, match="imported unittest.TestCase class provenance"):
+        _docs_reading_test_modules(
+            "import helpers as h\n\nDocsCase = h.DocsCase\n",
+            filename=str(tmp_path / "test_import.py"),
+            repository_root=tmp_path,
+        )
+    assert (
+        _docs_reading_test_modules(
+            "import helpers\n\nPlain = helpers.PlainHelper\n",
+            filename=str(tmp_path / "test_import.py"),
+            repository_root=tmp_path,
+        )
+        == set()
+    )
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_tracks_static_path_reader_callbacks() -> None:
     """A static pathlib reader callback cannot hide docs content in ``map``."""
 
@@ -6742,6 +7271,62 @@ def test_docs_governance_tracks_static_fileinput_inputs() -> None:
     ):
         with pytest.raises(AssertionError, match="fileinput.input files provenance is ambiguous"):
             _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_static_shutil_copy_sources() -> None:
+    """Closed ``shutil`` copy imports cannot hide a committed-docs read via their source."""
+
+    source = (
+        "import shutil\nimport shutil as sh\n"
+        "from shutil import copy2\nfrom shutil import copyfile as copy_file\n\n"
+        "def test_module_copy() -> None:\n"
+        "    shutil.copy('docs/guide.md', 'out/guide.md')\n\n"
+        "def test_module_alias_copytree() -> None:\n"
+        "    sh.copytree('docs/section.md', 'out/section.md')\n\n"
+        "def test_direct_copy2() -> None:\n"
+        "    copy2('docs/direct.md', 'out/direct.md')\n\n"
+        "def test_direct_alias_copyfile() -> None:\n"
+        "    copy_file(src='docs/direct-alias.md', dst='out/direct-alias.md')\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_direct_alias_copyfile",
+        "test_direct_copy2",
+        "test_module_alias_copytree",
+        "test_module_copy",
+    }
+    # The destination alone must never trigger a docs read: only the source matters.
+    assert (
+        _docs_reading_test_modules(
+            "import shutil\n\n"
+            "def test_writes_into_docs() -> None:\n"
+            "    shutil.copy('build/report.md', 'docs/report.md')\n"
+        )
+        == set()
+    )
+    # An unrelated non-docs, non-literal source must remain unmarked — not ambiguous.
+    assert (
+        _docs_reading_test_modules(
+            "import shutil\nfrom pathlib import Path\n\n"
+            "def test_dynamic_non_docs_copy(source: Path, name: str) -> None:\n"
+            "    shutil.copy2(source.parent / name, Path('scripts') / name)\n"
+        )
+        == set()
+    )
+    assert (
+        _docs_reading_test_modules(
+            "import shutil\n\n"
+            "def test_non_docs_copy() -> None:\n"
+            "    shutil.copy2('scripts/tool.py', 'out/tool.py')\n"
+        )
+        == set()
+    )
+    with pytest.raises(AssertionError, match="shutil copy source provenance is ambiguous"):
+        _docs_reading_test_modules(
+            "import shutil\n\n"
+            "def test_ambiguous_docs_root() -> None:\n"
+            "    shutil.copytree('docs', 'out/docs')\n"
+        )
 
 
 @pytest.mark.docs_ci
@@ -7246,6 +7831,58 @@ def test_docs_governance_traces_same_module_helper_class_dispatch() -> None:
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_traces_context_manager_enter_and_exit_edges() -> None:
+    """A repository-local helper's implicit ``__enter__``/``__exit__`` cannot hide a read."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "class DocsReader:\n"
+        "    def __enter__(self) -> Path:\n"
+        "        return Path('docs/context.md')\n\n"
+        "    def __exit__(self, *exc_info: object) -> None:\n"
+        "        return None\n\n"
+        "class ConfigReader:\n"
+        "    def __enter__(self) -> Path:\n"
+        "        return Path('config/context.md')\n\n"
+        "    def __exit__(self, *exc_info: object) -> None:\n"
+        "        return None\n\n"
+        "def test_context_manager() -> None:\n"
+        "    with DocsReader() as reader:\n"
+        "        reader.read_text()\n\n"
+        "def test_bound_instance() -> None:\n"
+        "    instance = DocsReader()\n"
+        "    with instance as reader:\n"
+        "        reader.read_text()\n\n"
+        "def test_non_reader() -> None:\n"
+        "    with ConfigReader() as reader:\n"
+        "        reader.read_text()\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_bound_instance", "test_context_manager"}
+
+    exiting_reads_source = (
+        "from pathlib import Path\n\n"
+        "class LoggingDocsReader:\n"
+        "    def __enter__(self) -> str:\n        return 'ready'\n\n"
+        "    def __exit__(self, *exc_info: object) -> None:\n"
+        "        Path('docs/on-exit.md').read_text()\n\n"
+        "def test_exit_reads() -> None:\n"
+        "    with LoggingDocsReader() as ready:\n        assert ready\n"
+    )
+    assert _docs_reading_test_modules(exiting_reads_source) == {"test_exit_reads"}
+
+    unresolved_source = (
+        "class RelevantHelper:\n"
+        "    def load(self) -> str:\n"
+        "        from pathlib import Path\n"
+        "        return Path('docs/relevant.md').read_text()\n\n"
+        "def test_missing_enter() -> None:\n"
+        "    with RelevantHelper() as helper:\n        assert helper\n"
+    )
+    with pytest.raises(AssertionError, match="unresolved context-manager"):
+        _docs_reading_test_modules(unresolved_source)
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_boundary_mutations_red_against_exact_markers(tmp_path: Path) -> None:
     """Each of the six admitted provenance boundaries has a direct red mutation proof."""
 
@@ -7349,6 +7986,34 @@ def test_docs_governance_traces_literal_pytest_plugin_fixtures(
                 invalid + "\n\ndef test_docs(docs_fixture):\n    assert docs_fixture\n",
                 repository_root=tmp_path,
             )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_fails_closed_on_a_docs_reading_plugin_item_hook(tmp_path: Path) -> None:
+    """A repository plugin's ``pytest_runtest_call`` cannot silently skip docs governance."""
+
+    (tmp_path / "plugin.py").write_text(
+        "from pathlib import Path\n\n"
+        "def pytest_runtest_call(item) -> None:\n"
+        "    Path('docs/plugin-hook.md').read_text()\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="repository plugin hook"):
+        _docs_reading_test_modules(
+            "pytest_plugins = 'plugin'\n\ndef test_plain() -> None:\n    assert True\n",
+            repository_root=tmp_path,
+        )
+    (tmp_path / "plugin_clean.py").write_text(
+        "def pytest_runtest_call(item) -> None:\n    pass\n",
+        encoding="utf-8",
+    )
+    assert (
+        _docs_reading_test_modules(
+            "pytest_plugins = 'plugin_clean'\n\ndef test_plain() -> None:\n    assert True\n",
+            repository_root=tmp_path,
+        )
+        == set()
+    )
 
 
 @pytest.mark.docs_ci
