@@ -1163,6 +1163,8 @@ def _subprocess_docs_call_state(
         return "none"
     if any(keyword.arg is None for keyword in node.keywords):
         return "ambiguous"
+    if any(isinstance(argument, ast.Starred) for argument in node.args):
+        return "ambiguous"
     arguments = (
         [node.args[0]]
         if node.args
@@ -6132,6 +6134,10 @@ def test_docs_governance_tracks_static_subprocess_command_aliases() -> None:
         _docs_reading_test_modules(source.replace("'docs/assigned.md'", "'docs', dynamic_name"))
     with pytest.raises(AssertionError, match="subprocess docs-path provenance is ambiguous"):
         _docs_reading_test_modules(source.replace("runner(command)", "runner(*command)"))
+    with pytest.raises(AssertionError, match="subprocess docs-path provenance is ambiguous"):
+        _docs_reading_test_modules(
+            source.replace("runner(command)", "runner(*['cat', 'docs/starred.md'])")
+        )
     with pytest.raises(AssertionError, match="subprocess docs-path provenance is ambiguous"):
         _docs_reading_test_modules(source.replace("runner(command)", "runner(command, **options)"))
     with pytest.raises(AssertionError, match="subprocess docs-path provenance is ambiguous"):
