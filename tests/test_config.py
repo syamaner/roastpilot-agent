@@ -5,6 +5,8 @@ Documented defaults, env-var loading (``ROASTPILOT_`` prefix with ``__``
 nesting), validation rejections, and the guidance-vs-safety-bound link.
 """
 
+# Disposable CI-classifier proof fixture: this comment intentionally changes no behaviour.
+
 import inspect
 import json
 import os
