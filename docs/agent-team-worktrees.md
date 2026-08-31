@@ -672,4 +672,6 @@ Rule: **opening the PR is the branch-ownership handoff — WHOEVER opens it.**
    always an explicit lead instruction naming what to fold.
 3. If a push lands after the review trigger fired, the verdict is stale by
    definition — the lead re-runs the cycle on the final head and never merges
-   on a verdict predating it (the AGENTS.md codex-wait clause).
+on a verdict predating it (the AGENTS.md codex-wait clause).
+
+Disposable CI-proof note: this documentation-only sentence exercises the docs fast path.
