@@ -2177,6 +2177,7 @@ def _repository_imported_function_analyses(
     set[tuple[str, str]],
     set[tuple[str, str]],
     set[tuple[str, str]],
+    set[str],
 ]:
     """Return static analyses for direct imports from confined first-party modules."""
 
@@ -2189,6 +2190,7 @@ def _repository_imported_function_analyses(
     ambiguous_module_calls: set[tuple[str, str]] = set()
     module_docs_values: set[tuple[str, str]] = set()
     ambiguous_module_values: set[tuple[str, str]] = set()
+    imported_collected_test_classes: set[str] = set()
 
     def add_module_members(module_alias: str, source_path: Path, members: set[str]) -> None:
         """Expose local module members through one explicitly imported alias."""
@@ -2291,6 +2293,48 @@ def _repository_imported_function_analyses(
             if isinstance(target, ast.Name)
         }
         classes = {node.name: node for node in imported_tree.body if isinstance(node, ast.ClassDef)}
+        imported_testcase_names = {
+            alias.asname or alias.name
+            for node in imported_tree.body
+            if isinstance(node, ast.ImportFrom) and node.module == "unittest"
+            for alias in node.names
+            if alias.name == "TestCase"
+        }
+        imported_unittest_modules = {
+            alias.asname or alias.name
+            for node in imported_tree.body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+            if alias.name == "unittest"
+        }
+
+        def is_testcase_class(
+            class_node: ast.ClassDef,
+            seen: set[str],
+            classes: dict[str, ast.ClassDef] = classes,
+            testcase_names: set[str] = imported_testcase_names,
+            unittest_modules: set[str] = imported_unittest_modules,
+        ) -> bool:
+            """Return whether one confined imported class statically inherits TestCase."""
+
+            if class_node.name in seen:
+                return False
+            seen.add(class_node.name)
+            for base in class_node.bases:
+                if isinstance(base, ast.Name):
+                    if base.id in testcase_names:
+                        return True
+                    if base.id in classes and is_testcase_class(classes[base.id], seen):
+                        return True
+                elif (
+                    isinstance(base, ast.Attribute)
+                    and base.attr == "TestCase"
+                    and isinstance(base.value, ast.Name)
+                    and base.value.id in unittest_modules
+                ):
+                    return True
+            return False
+
         for imported in statement.names:
             alias = imported.asname or imported.name
             if imported.name == "*" or alias in analyses:
@@ -2305,18 +2349,24 @@ def _repository_imported_function_analyses(
                         ambiguous_values.add(alias)
                 elif imported.name not in classes:
                     ambiguous.add(alias)
-                elif any(
-                    isinstance(candidate, ast.Call)
-                    and (
-                        (
-                            isinstance(candidate.func, ast.Attribute)
-                            and candidate.func.attr in _READ_METHOD_NAMES
+                else:
+                    imported_class = classes[imported.name]
+                    if is_testcase_class(imported_class, set()):
+                        imported_collected_test_classes.add(alias)
+                    if any(
+                        isinstance(candidate, ast.Call)
+                        and (
+                            (
+                                isinstance(candidate.func, ast.Attribute)
+                                and candidate.func.attr in _READ_METHOD_NAMES
+                            )
+                            or (
+                                isinstance(candidate.func, ast.Name) and candidate.func.id == "open"
+                            )
                         )
-                        or (isinstance(candidate.func, ast.Name) and candidate.func.id == "open")
-                    )
-                    for candidate in ast.walk(classes[imported.name])
-                ):
-                    imported_classes.add(alias)
+                        for candidate in ast.walk(imported_class)
+                    ):
+                        imported_classes.add(alias)
                 continue
             source = source_path.read_text(encoding="utf-8")
             proxy = (
@@ -2353,6 +2403,7 @@ def _repository_imported_function_analyses(
         ambiguous_module_calls,
         module_docs_values,
         ambiguous_module_values,
+        imported_collected_test_classes,
     )
 
 
@@ -2502,6 +2553,9 @@ def _analyse_function(
 
     aliases = set(module_aliases)
     partial_aliases = set(module_partial_aliases)
+    scoped_codecs_modules: set[str] = set()
+    scoped_codecs_calls: set[str] = set()
+    scoped_ambiguous_codecs: set[str] = set()
     if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
         parameter_docs, ambiguous_parameters = _parametrized_docs_and_ambiguous_parameters(
             func, module_value_sources
@@ -2509,8 +2563,16 @@ def _analyse_function(
         aliases.update(parameter_docs)
         aliases.update(generated_docs_parameters or set())
         ambiguous_parameters.update(generated_ambiguous_parameters or set())
+        (
+            scoped_codecs_modules,
+            scoped_codecs_calls,
+            scoped_ambiguous_codecs,
+        ) = _codecs_open_aliases(ast.Module(body=list(func.body), type_ignores=[]))
     else:
         ambiguous_parameters: set[str] = set()
+    codecs_module_aliases = (codecs_module_aliases or set()) | scoped_codecs_modules
+    codecs_call_aliases = (codecs_call_aliases or set()) | scoped_codecs_calls
+    ambiguous_codecs_aliases = (ambiguous_codecs_aliases or set()) | scoped_ambiguous_codecs
     calls: set[str] = set()
     unresolved: list[str] = []
     has_docs_glob = False
@@ -3626,10 +3688,16 @@ def _docs_reading_test_modules(
         ambiguous_module_calls,
         module_docs_values,
         ambiguous_module_values,
+        imported_collected_test_classes,
     ) = _repository_imported_function_analyses(tree, filename, repository_root)
     if "*" in ambiguous_imports:
         raise AssertionError(
             f"{filename}: wildcard repository-local import provenance is ambiguous"
+        )
+    if imported_collected_test_classes:
+        raise AssertionError(
+            f"{filename}: imported unittest.TestCase class provenance is ambiguous for "
+            f"{sorted(imported_collected_test_classes)}"
         )
     for statement in tree.body:
         if not isinstance(statement, (ast.Assign, ast.AnnAssign)) or statement.value is None:
@@ -4113,17 +4181,17 @@ def _docs_reading_test_modules(
                 f"{filename}:{node.lineno}: decorator read provenance is ambiguous"
             )
 
-    module_xunit_hooks = {
-        name
-        for name in ("setup_module", "teardown_module", "setup_function", "teardown_function")
-        if name in analyses
+    module_xunit_hooks = {name for name in ("setup_module", "teardown_module") if name in analyses}
+    module_function_xunit_hooks = module_xunit_hooks | {
+        name for name in ("setup_function", "teardown_function") if name in analyses
     }
     for name in functions:
         if name.startswith("test_"):
-            analyses[name].calls.update(module_xunit_hooks)
+            analyses[name].calls.update(module_function_xunit_hooks)
         if "::test_" not in name:
             continue
         class_name = name.partition("::")[0]
+        analyses[name].calls.update(module_xunit_hooks)
         analyses[name].calls.update(
             f"{class_name}::{hook}"
             for hook in ("setup_class", "teardown_class", "setup_method", "teardown_method")
@@ -5920,6 +5988,38 @@ def test_docs_governance_tracks_static_codecs_open_calls() -> None:
 
 
 @pytest.mark.docs_ci
+def test_docs_governance_tracks_function_scoped_codecs_open_calls() -> None:
+    """Function-local ``codecs`` imports retain closed reader provenance."""
+
+    source = (
+        "def test_module() -> None:\n    import codecs\n    codecs.open('docs/module.md')\n\n"
+        "def test_module_alias() -> None:\n"
+        "    import codecs as codec_module\n    codec_module.open('docs/alias.md')\n\n"
+        "def test_direct() -> None:\n"
+        "    from codecs import open as codec_open\n    codec_open('docs/direct.md')\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_direct",
+        "test_module",
+        "test_module_alias",
+    }
+    assert (
+        _docs_reading_test_modules(
+            "def test_plain() -> None:\n    import codecs\n    codecs.open('config/plain.md')\n"
+        )
+        == set()
+    )
+    for source in (
+        "def test_dynamic(path: str) -> None:\n    import codecs\n    codecs.open(path)\n",
+        "def test_rebound() -> None:\n"
+        "    import codecs as codec_module\n    codec_module = object()\n"
+        "    codec_module.open('docs/rebound.md')\n",
+    ):
+        with pytest.raises(AssertionError, match="codecs.open filename provenance is ambiguous"):
+            _docs_reading_test_modules(source)
+
+
+@pytest.mark.docs_ci
 def test_docs_governance_tracks_unambiguous_builtin_open_aliases() -> None:
     """Builtin-open aliases retain docs provenance and sequential rebinds clear it."""
 
@@ -6020,6 +6120,21 @@ def test_docs_governance_tracks_applicable_xunit_lifecycle_hooks() -> None:
         "    def test_method_hook(self) -> None:\n        assert True\n"
     )
     assert _docs_reading_test_modules(source) == {"TestHooks::test_method_hook", "test_module_hook"}
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_scopes_module_xunit_hooks_to_class_tests() -> None:
+    """Module hooks apply to class tests, unlike module function hooks."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def setup_module() -> None:\n    Path('docs/module.md').read_text()\n\n"
+        "def setup_function() -> None:\n    Path('docs/function.md').read_text()\n\n"
+        "class TestHooks:\n"
+        "    def test_class() -> None:\n        assert True\n\n"
+        "def test_module() -> None:\n    assert True\n"
+    )
+    assert _docs_reading_test_modules(source) == {"TestHooks::test_class", "test_module"}
 
 
 @pytest.mark.docs_ci
@@ -6529,6 +6644,34 @@ def test_docs_governance_rejects_unaudited_inherited_collected_test_methods() ->
         _docs_reading_test_modules(
             "class LocalBase:\n    def test_plain(self) -> None:\n        assert True\n\n"
             "class DocsCase(LocalBase):\n    pass\n"
+        )
+        == set()
+    )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_rejects_imported_unittest_collected_classes(tmp_path: Path) -> None:
+    """A repository-local TestCase import cannot evade inherited-reader audit."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\nfrom unittest import TestCase\n\n"
+        "class LocalBase:\n"
+        "    def test_reader(self) -> None:\n"
+        "        Path('docs/inherited.md').read_text()\n\n"
+        "class DocsCase(LocalBase, TestCase):\n    pass\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="imported unittest.TestCase class provenance"):
+        _docs_reading_test_modules(
+            "from helpers import DocsCase\n",
+            filename=str(tmp_path / "test_import.py"),
+            repository_root=tmp_path,
+        )
+    assert (
+        _docs_reading_test_modules(
+            "from helpers import LocalBase\n",
+            filename=str(tmp_path / "test_import.py"),
+            repository_root=tmp_path,
         )
         == set()
     )
