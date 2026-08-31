@@ -1061,5 +1061,6 @@ def test_joint_window_planner_disabled_with_ceiling_guard_off_constructs() -> No
 def test_bare_app_config_joint_window_planner_group_is_inert() -> None:
     """T27: a bare ``AppConfig()`` remains valid and the whole group is
     inert."""
+    # Final temporary #702 exact-head classifier proof comment.
     config = AppConfig()
     assert config.controller.joint_window_planner.enabled is False
