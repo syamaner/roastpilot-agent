@@ -6286,6 +6286,17 @@ def test_docs_governance_rejects_unaudited_inherited_collected_test_methods() ->
     )
     with pytest.raises(AssertionError, match="unaudited inherited base"):
         _docs_reading_test_modules(unittest_source, filename="unittest_inherited_test.py")
+    for imported, testcase_name in (
+        ("from unittest import TestCase", "TestCase"),
+        ("from unittest import TestCase as TC", "TC"),
+    ):
+        with pytest.raises(AssertionError, match="unaudited inherited base"):
+            _docs_reading_test_modules(
+                unittest_source.replace("import unittest", imported).replace(
+                    "unittest.TestCase", testcase_name
+                ),
+                filename="unittest_direct_import_test.py",
+            )
     assert (
         _docs_reading_test_modules(
             "class LocalBase:\n    def test_plain(self) -> None:\n        assert True\n\n"
