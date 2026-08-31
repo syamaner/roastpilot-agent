@@ -1163,7 +1163,11 @@ def _subprocess_docs_call_state(
         return "none"
     if any(keyword.arg is None for keyword in node.keywords):
         return "ambiguous"
-    arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
+    arguments = (
+        [node.args[0]]
+        if node.args
+        else [keyword.value for keyword in node.keywords if keyword.arg == "args"]
+    )
     if any(
         isinstance(argument, ast.Name) and argument.id in (command_ambiguous_aliases or set())
         for argument in arguments
@@ -2386,6 +2390,17 @@ def _analyse_function(
         )
         if isinstance(target, ast.Name) and _expression_is_docs_markdown(assignment.value, set())
     }
+    control_flow_subprocess_command_aliases = {
+        target.id
+        for conditional in ast.walk(func)
+        if isinstance(conditional, ast.If)
+        for assignment in ast.walk(conditional)
+        if isinstance(assignment, (ast.Assign, ast.AnnAssign)) and assignment.value is not None
+        for target in (
+            assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+        )
+        if isinstance(target, ast.Name)
+    }
     control_flow_reader_aliases = {
         target.id
         for conditional in ast.walk(func)
@@ -2647,7 +2662,11 @@ def _analyse_function(
                     elif target.id in subprocess_entry_aliases:
                         subprocess_entry_aliases.discard(target.id)
                         ambiguous_subprocess_entry_aliases.add(target.id)
-                    if isinstance(node.value, (ast.List, ast.Tuple)):
+                    if target.id in control_flow_subprocess_command_aliases:
+                        subprocess_command_docs_aliases.discard(target.id)
+                        subprocess_command_partial_aliases.discard(target.id)
+                        subprocess_command_ambiguous_aliases.add(target.id)
+                    elif isinstance(node.value, (ast.List, ast.Tuple)):
                         static_container = all(
                             isinstance(element, ast.Constant) and isinstance(element.value, str)
                             for element in node.value.elts
@@ -2668,11 +2687,7 @@ def _analyse_function(
                             subprocess_command_docs_aliases.discard(target.id)
                             subprocess_command_partial_aliases.discard(target.id)
                             subprocess_command_ambiguous_aliases.add(target.id)
-                    elif target.id in (
-                        subprocess_command_docs_aliases
-                        | subprocess_command_partial_aliases
-                        | subprocess_command_ambiguous_aliases
-                    ):
+                    else:
                         subprocess_command_docs_aliases.discard(target.id)
                         subprocess_command_partial_aliases.discard(target.id)
                         subprocess_command_ambiguous_aliases.add(target.id)
@@ -3393,6 +3408,16 @@ def _docs_reading_test_modules(
             continue
         targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
         if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+            for target in (
+                name
+                for assigned in targets
+                for name in ast.walk(assigned)
+                if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)
+            ):
+                decorator_aliases.pop(target.id, None)
+                pytest_marker_aliases.discard(target.id)
+                pytest_marker_module_aliases.discard(target.id)
+                ambiguous_decorator_names.add(target.id)
             continue
         target = targets[0].id
         if target in (
@@ -3408,6 +3433,9 @@ def _docs_reading_test_modules(
             ambiguous_decorator_names.add(target)
             continue
         if isinstance(statement.value, ast.Name):
+            if statement.value.id in ambiguous_decorator_names:
+                ambiguous_decorator_names.add(target)
+                continue
             if statement.value.id in local_decorator_functions:
                 decorator_aliases[target] = statement.value.id
                 continue
@@ -6039,6 +6067,11 @@ def test_docs_governance_resolves_bare_decorator_aliases_fail_closed() -> None:
             "docs_chain = docs_alias", "docs_chain = docs_alias\ndocs_chain = config_wrapper"
         ),
         source.replace("docs_chain = docs_alias", "docs_chain = build_wrapper()"),
+        source.replace(
+            "docs_alias = docs_wrapper",
+            "docs_wrapper = other = dynamic_value\ndocs_alias = docs_wrapper",
+        ),
+        source.replace("docs_alias = docs_wrapper", "docs_alias = second_alias = docs_wrapper"),
     ):
         with pytest.raises(AssertionError, match="decorator provenance"):
             _docs_reading_test_modules(ambiguous)
@@ -6109,6 +6142,32 @@ def test_docs_governance_tracks_static_subprocess_command_aliases() -> None:
         _docs_reading_test_modules(
             source.replace("runner(command)", "command = dynamic_command\n    runner(command)")
         )
+    with pytest.raises(AssertionError, match="subprocess docs-path provenance is ambiguous"):
+        _docs_reading_test_modules(
+            source.replace(
+                "def test_non_docs() -> None:\n    command = ['cat', 'config/assigned.md']",
+                "def test_non_docs() -> None:\n    command = build_command()",
+            )
+        )
+    with pytest.raises(AssertionError, match="subprocess docs-path provenance is ambiguous"):
+        _docs_reading_test_modules(source.replace("'config/assigned.md'", "dynamic_name"))
+    conditional_source = (
+        "import subprocess\n\n"
+        "def test_branch(condition: bool) -> None:\n"
+        "    command = ['cat', 'docs/branch.md']\n"
+        "    if condition:\n"
+        "        command = ['cat', 'config/branch.md']\n"
+        "    subprocess.run(command)\n\n"
+        "def test_branch_call_order(condition: bool) -> None:\n"
+        "    command = ['cat', 'docs/branch-order.md']\n"
+        "    if condition:\n"
+        "        command = ['cat', 'config/branch-order.md']\n"
+        "        subprocess.run(command)\n"
+        "    else:\n"
+        "        subprocess.run(command)\n"
+    )
+    with pytest.raises(AssertionError, match="subprocess docs-path provenance is ambiguous"):
+        _docs_reading_test_modules(conditional_source)
 
 
 @pytest.mark.docs_ci
