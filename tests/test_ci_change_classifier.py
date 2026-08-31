@@ -1102,6 +1102,72 @@ def _qualified_open_target(node: ast.Call) -> ast.expr | None:
     return _builtin_open_target(node)
 
 
+_SUBPROCESS_ENTRY_POINTS = frozenset({"Popen", "call", "check_call", "check_output", "run"})
+
+
+def _subprocess_call_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
+    """Return exact and rebound aliases for admitted subprocess entry points."""
+
+    modules = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "subprocess"
+    }
+    calls = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.ImportFrom) and statement.module == "subprocess"
+        for alias in statement.names
+        if alias.name in _SUBPROCESS_ENTRY_POINTS
+    }
+    rebound = {
+        target.id
+        for statement in tree.body
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        )
+        if isinstance(target, ast.Name) and target.id in modules | calls
+    }
+    return modules - rebound, calls - rebound, rebound
+
+
+def _subprocess_docs_call_state(
+    node: ast.Call, module_aliases: set[str], call_aliases: set[str], rebound: set[str]
+) -> str:
+    """Return ``docs``, ``ambiguous``, or ``none`` for one admitted subprocess call."""
+
+    target_is_subprocess = (isinstance(node.func, ast.Name) and node.func.id in call_aliases) or (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr in _SUBPROCESS_ENTRY_POINTS
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in module_aliases
+    )
+    target_is_rebound = (isinstance(node.func, ast.Name) and node.func.id in rebound) or (
+        isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in rebound
+        and node.func.attr in _SUBPROCESS_ENTRY_POINTS
+    )
+    if target_is_rebound:
+        return "ambiguous"
+    if not target_is_subprocess:
+        return "none"
+    arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
+    strings = [value for argument in arguments for value in _string_constants(argument)]
+    if any(value.startswith("docs/") and value.endswith(".md") for value in strings):
+        return "docs"
+    if any(value == "docs" or value.startswith("docs/") for value in strings):
+        return "ambiguous"
+    if any(isinstance(argument, ast.Starred) for argument in node.args) or any(
+        keyword.arg is None for keyword in node.keywords
+    ):
+        return "ambiguous"
+    return "none"
+
+
 def _assert_no_aliased_qualified_open_calls(tree: ast.Module, filename: str) -> None:
     """Reject invoked module aliases that cannot retain qualified-open provenance."""
 
@@ -1437,6 +1503,40 @@ def _module_value_sources(tree: ast.Module) -> dict[str, ast.expr]:
     return sources
 
 
+def _pytest_plugin_modules(tree: ast.Module, sources: dict[str, ast.expr]) -> set[str]:
+    """Return literal repository plugin module names or fail closed on drift."""
+
+    declarations = [
+        statement.value
+        for statement in tree.body
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        and statement.value is not None
+        and any(
+            isinstance(target, ast.Name) and target.id == "pytest_plugins"
+            for target in (
+                statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            )
+        )
+    ]
+    if not declarations:
+        return set()
+    if len(declarations) != 1:
+        raise AssertionError("pytest_plugins provenance is ambiguous after rebinding")
+    values = _resolve_module_values(declarations[0], sources)
+    if values is None or not values:
+        raise AssertionError("pytest_plugins provenance requires literal module names")
+    modules: set[str] = set()
+    for value in values:
+        if (
+            not isinstance(value, ast.Constant)
+            or not isinstance(value.value, str)
+            or not value.value
+        ):
+            raise AssertionError("pytest_plugins provenance requires literal module names")
+        modules.add(value.value)
+    return modules
+
+
 def _resolve_module_values(
     expression: ast.expr, sources: dict[str, ast.expr], seen: frozenset[str] = frozenset()
 ) -> list[ast.expr] | None:
@@ -1550,7 +1650,10 @@ def _repository_module_candidates(module: str, filename: str, repository_root: P
 
 
 def _repository_imported_fixture_analyses(
-    tree: ast.Module, filename: str, repository_root: Path
+    tree: ast.Module,
+    filename: str,
+    repository_root: Path,
+    plugin_modules: set[str] | None = None,
 ) -> tuple[dict[str, _FunctionAnalysis], set[str]]:
     """Return synthetic analyses for directly imported first-party fixtures.
 
@@ -1630,6 +1733,66 @@ def _repository_imported_fixture_analyses(
                     analyses.pop(name, None)
                 else:
                     analyses[name] = analysis
+    for module in plugin_modules or set():
+        candidates = _repository_module_candidates(module, filename, repository_root)
+        if len(candidates) != 1:
+            ambiguous.add("__pytest_plugins__")
+            continue
+        source_path = next(iter(candidates))
+        source = source_path.read_text(encoding="utf-8")
+        imported_tree = ast.parse(source)
+        (
+            fixture_aliases,
+            ambiguous_fixture_aliases,
+            pytest_module_aliases,
+            ambiguous_pytest_module_aliases,
+        ) = _pytest_fixture_aliases(imported_tree)
+        functions = (
+            node
+            for node in imported_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        for function in functions:
+            fixture_name = _fixture_exposed_name(
+                function.name,
+                function.decorator_list,
+                fixture_aliases,
+                ambiguous_fixture_aliases,
+                pytest_module_aliases,
+                ambiguous_pytest_module_aliases,
+            )
+            if fixture_name is None:
+                continue
+            proxy = (
+                source
+                + "\n\ndef test_import_direct() -> None:\n"
+                + f"    {function.name}()\n\n"
+                + "def test_import_return() -> None:\n"
+                + f"    {function.name}().read_text()\n"
+            )
+            readers = _docs_reading_test_modules(
+                proxy, filename=str(source_path), repository_root=repository_root
+            )
+            analysis = _FunctionAnalysis(
+                reads_directly="test_import_direct" in readers,
+                calls=set(),
+                unresolved=[],
+                returns_docs="test_import_return" in readers,
+                return_calls=set(),
+                return_names=set(),
+                call_result_assignments={},
+                read_names=set(),
+                read_calls=set(),
+                parameter_names=(),
+                has_variadic_parameters=False,
+                call_arguments=[],
+            )
+            previous = analyses.get(fixture_name)
+            if previous is not None and previous != analysis:
+                ambiguous.add(fixture_name)
+                analyses.pop(fixture_name, None)
+            else:
+                analyses[fixture_name] = analysis
     return analyses, ambiguous
 
 
@@ -2128,6 +2291,9 @@ def _analyse_function(
     class_ambiguous_attributes: dict[str, set[str]] | None = None,
     all_class_methods: dict[str, dict[str, str]] | None = None,
     relevant_helper_classes: set[str] | None = None,
+    subprocess_module_aliases: set[str] | None = None,
+    subprocess_call_aliases: set[str] | None = None,
+    ambiguous_subprocess_aliases: set[str] | None = None,
 ) -> _FunctionAnalysis:
     """Walk one function body for a direct docs read, calls, and unresolved reads.
 
@@ -2556,6 +2722,18 @@ def _analyse_function(
                 elif (call_key := _call_key(node.value)) is not None:
                     return_calls.add(call_key)
             continue
+        subprocess_state = _subprocess_docs_call_state(
+            node,
+            subprocess_module_aliases or set(),
+            subprocess_call_aliases or set(),
+            ambiguous_subprocess_aliases or set(),
+        )
+        if subprocess_state == "docs":
+            reads = True
+        elif subprocess_state == "ambiguous":
+            unresolved.append(
+                f"{filename}:{node.lineno}: subprocess docs-path provenance is ambiguous"
+            )
         qualified_target = _qualified_open_target(node)
         if qualified_target is not None:
             target = qualified_target
@@ -2820,6 +2998,9 @@ def _docs_reading_test_modules(
     tree = ast.parse(source)
     _assert_no_aliased_qualified_open_calls(tree, filename)
     builtin_open_import_aliases = _builtin_open_import_aliases(tree)
+    subprocess_module_aliases, subprocess_call_aliases, ambiguous_subprocess_aliases = (
+        _subprocess_call_aliases(tree)
+    )
     (
         imported_analyses,
         ambiguous_imports,
@@ -2838,9 +3019,13 @@ def _docs_reading_test_modules(
     _assert_no_imported_collected_test_callables(
         tree, filename, imported_analyses, ambiguous_imports
     )
+    module_value_sources = _module_value_sources(tree)
+    plugin_modules = _pytest_plugin_modules(tree, module_value_sources)
     imported_fixture_by_name, ambiguous_imported_fixtures = _repository_imported_fixture_analyses(
-        tree, filename, repository_root
+        tree, filename, repository_root, plugin_modules
     )
+    if "__pytest_plugins__" in ambiguous_imported_fixtures:
+        raise AssertionError("pytest_plugins repository fixture provenance is ambiguous")
     imported_fixture_nodes = {
         fixture_name: f"<imported-fixture>::{fixture_name}"
         for fixture_name in imported_fixture_by_name
@@ -2849,7 +3034,6 @@ def _docs_reading_test_modules(
         imported_fixture_nodes[fixture_name]: analysis
         for fixture_name, analysis in imported_fixture_by_name.items()
     }
-    module_value_sources = _module_value_sources(tree)
     (
         fixture_aliases,
         ambiguous_fixture_aliases,
@@ -2988,7 +3172,9 @@ def _docs_reading_test_modules(
         class_name = function_key.partition("::")[0] if "::" in function_key else None
         if class_name is None:
             return module_fixture_nodes | imported_fixture_nodes
-        return module_fixture_nodes | class_fixture_nodes.get(class_name, {})
+        return (
+            module_fixture_nodes | imported_fixture_nodes | class_fixture_nodes.get(class_name, {})
+        )
 
     def activated_fixture_nodes(
         function_key: str, node: ast.FunctionDef | ast.AsyncFunctionDef
@@ -3081,6 +3267,9 @@ def _docs_reading_test_modules(
             class_ambiguous_attributes,
             all_class_methods,
             relevant_helper_classes,
+            subprocess_module_aliases,
+            subprocess_call_aliases,
+            ambiguous_subprocess_aliases,
         )
         analyses[name] = analysis
         if name not in local_keys:
@@ -3092,6 +3281,44 @@ def _docs_reading_test_modules(
         )
     analyses.update(imported_analyses)
     analyses.update(imported_fixture_analyses)
+
+    rebound_decorator_names = {
+        target.id
+        for statement in tree.body
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        )
+        if isinstance(target, ast.Name) and target.id in known_functions
+    }
+    pytest_decorator_modules = pytest_module_aliases | {"pytest"}
+    for name, node in functions.items():
+        if name in local_keys or (not name.startswith("test_") and "::test_" not in name):
+            continue
+        assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for decorator in node.decorator_list:
+            target = decorator.func if isinstance(decorator, ast.Call) else decorator
+            if isinstance(target, ast.Name):
+                if target.id in rebound_decorator_names:
+                    raise AssertionError(
+                        f"{filename}:{decorator.lineno}: decorator provenance for "
+                        f"`{target.id}` is ambiguous"
+                    )
+                if target.id in analyses:
+                    analyses[name].calls.add(target.id)
+                continue
+            if not (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)):
+                continue
+            if target.value.id in pytest_decorator_modules:
+                continue
+            key = (target.value.id, target.attr)
+            if key in module_calls:
+                analyses[name].calls.add(module_calls[key])
+            elif key in ambiguous_module_calls:
+                raise AssertionError(
+                    f"{filename}:{decorator.lineno}: decorator provenance for "
+                    f"`{target.value.id}.{target.attr}` is ambiguous"
+                )
 
     module_xunit_hooks = {
         name
@@ -5578,6 +5805,142 @@ def test_docs_governance_boundary_mutations_red_against_exact_markers(tmp_path: 
             ast.parse(imported),
             _docs_reading_test_modules(imported, repository_root=tmp_path),
             "imported.py",
+        )
+
+
+@pytest.mark.docs_ci
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        pytest.param("pytest_plugins = 'plugin'", id="string"),
+        pytest.param("pytest_plugins = ['plugin']", id="list"),
+        pytest.param(
+            "plugin_modules = ('plugin',)\npytest_plugins = plugin_modules", id="tuple-name"
+        ),
+    ],
+)
+def test_docs_governance_traces_literal_pytest_plugin_fixtures(
+    tmp_path: Path, declaration: str
+) -> None:
+    """Literal local plugin declarations expose only their docs fixture consumers."""
+
+    (tmp_path / "plugin.py").write_text(
+        "from pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture\ndef docs_fixture() -> str:\n"
+        "    return Path('docs/plugin.md').read_text()\n\n"
+        "@pytest.fixture\ndef config_fixture() -> str:\n"
+        "    return Path('config/plugin.md').read_text()\n"
+    )
+    source = (
+        f"{declaration}\n\n"
+        "def test_docs(docs_fixture: str) -> None:\n    assert docs_fixture\n\n"
+        "def test_non_reader(config_fixture: str) -> None:\n    assert config_fixture\n"
+    )
+    assert _docs_reading_test_modules(source, repository_root=tmp_path) == {"test_docs"}
+    for invalid in (
+        "pytest_plugins = build_plugins()",
+        "pytest_plugins = 'plugin'\npytest_plugins = ('plugin',)",
+        "pytest_plugins = 'missing_plugin'",
+    ):
+        with pytest.raises(AssertionError, match="pytest_plugins"):
+            _docs_reading_test_modules(
+                invalid + "\n\ndef test_docs(docs_fixture):\n    assert docs_fixture\n",
+                repository_root=tmp_path,
+            )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_resolved_test_decorators_only() -> None:
+    """Local wrapper and factory decorators add docs edges without marking pytest metadata."""
+
+    source = (
+        "from pathlib import Path\nimport pytest\n\n"
+        "def docs_wrapper(func):\n    Path('docs/wrapper.md').read_text()\n    return func\n\n"
+        "def docs_factory():\n    Path('docs/factory.md').read_text()\n"
+        "    return lambda func: func\n\n"
+        "def config_wrapper(func):\n    Path('config/wrapper.md').read_text()\n    return func\n\n"
+        "@docs_wrapper\ndef test_wrapped() -> None:\n    assert True\n\n"
+        "@docs_factory()\ndef test_factory() -> None:\n    assert True\n\n"
+        "@config_wrapper\ndef test_non_reader() -> None:\n    assert True\n\n"
+        "@pytest.mark.parametrize('value', [1])\ndef test_pytest_marker(value: int) -> None:\n"
+        "    assert value\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_factory", "test_wrapped"}
+    with pytest.raises(AssertionError, match="decorator provenance"):
+        _docs_reading_test_modules(
+            source.replace("@docs_wrapper", "docs_wrapper = object()\n\n@docs_wrapper")
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_literal_subprocess_docs_paths() -> None:
+    """Admitted subprocess aliases retain literal docs Markdown argument provenance."""
+
+    source = (
+        "import subprocess as sp\nfrom subprocess import check_output as output\n\n"
+        "def test_qualified() -> None:\n    sp.run(['cat', 'docs/qualified.md'])\n\n"
+        "def test_alias() -> None:\n    output(('cat', 'docs/alias.md'))\n\n"
+        "def test_non_reader() -> None:\n    sp.run(['cat', 'config/value.md'])\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_alias", "test_qualified"}
+    for ambiguous in (
+        source.replace("'docs/qualified.md'", "'docs' / dynamic_name"),
+        source.replace("import subprocess as sp", "import subprocess as sp\nsp = object()"),
+        source.replace("check_output as output", "check_output as output\noutput = object()"),
+    ):
+        with pytest.raises(AssertionError, match="subprocess docs-path provenance is ambiguous"):
+            _docs_reading_test_modules(ambiguous)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_new_boundary_mutations_red_against_exact_markers(
+    tmp_path: Path,
+) -> None:
+    """Plugin, decorator, and subprocess provenance mutations each red exact markers."""
+
+    cases = [
+        (
+            "from pathlib import Path\nimport pytest\n\n"
+            "def wrapper(func):\n    Path('docs/decorator.md').read_text()\n    return func\n\n"
+            "@wrapper\n@pytest.mark.docs\ndef test_decorator():\n    assert True\n",
+            "decorator",
+        ),
+        (
+            "import subprocess\nimport pytest\n\n@pytest.mark.docs\n"
+            "def test_subprocess():\n    subprocess.run(['cat', 'docs/subprocess.md'])\n",
+            "subprocess",
+        ),
+    ]
+    for source, label in cases:
+        readers = _docs_reading_test_modules(source)
+        _assert_exact_docs_markers(ast.parse(source), readers, f"{label}.py")
+        mutated = source.replace("docs/", "config/", 1)
+        with pytest.raises(AssertionError, match="must sit on exactly the readers"):
+            _assert_exact_docs_markers(
+                ast.parse(mutated), _docs_reading_test_modules(mutated), f"{label}-mutated.py"
+            )
+
+    (tmp_path / "plugin.py").write_text(
+        "from pathlib import Path\nimport pytest\n\n@pytest.fixture\ndef plugin_path():\n"
+        "    return Path('docs/plugin-mutation.md').read_text()\n"
+    )
+    plugin_source = (
+        "pytest_plugins = 'plugin'\nimport pytest\n\n@pytest.mark.docs\n"
+        "def test_plugin(plugin_path):\n    assert plugin_path\n"
+    )
+    _assert_exact_docs_markers(
+        ast.parse(plugin_source),
+        _docs_reading_test_modules(plugin_source, repository_root=tmp_path),
+        "plugin.py",
+    )
+    (tmp_path / "plugin.py").write_text(
+        (tmp_path / "plugin.py").read_text().replace("docs/", "config/", 1)
+    )
+    with pytest.raises(AssertionError, match="must sit on exactly the readers"):
+        _assert_exact_docs_markers(
+            ast.parse(plugin_source),
+            _docs_reading_test_modules(plugin_source, repository_root=tmp_path),
+            "plugin-mutated.py",
         )
 
 
