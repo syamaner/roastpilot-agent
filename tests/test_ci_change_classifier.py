@@ -1157,6 +1157,35 @@ def _subprocess_call_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[
     return modules - rebound, calls - rebound, rebound
 
 
+def _fileinput_input_aliases(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
+    """Return exact and rebound aliases for the admitted ``fileinput.input`` call."""
+
+    modules = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "fileinput"
+    }
+    calls = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.ImportFrom) and statement.module == "fileinput"
+        for alias in statement.names
+        if alias.name == "input"
+    }
+    rebound = {
+        target.id
+        for statement in tree.body
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        for target in (
+            statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        )
+        if isinstance(target, ast.Name) and target.id in modules | calls
+    }
+    return modules - rebound, calls - rebound, rebound
+
+
 def _subprocess_docs_call_state(
     node: ast.Call,
     module_aliases: set[str],
@@ -2427,6 +2456,9 @@ def _analyse_function(
     subprocess_module_aliases: set[str] | None = None,
     subprocess_call_aliases: set[str] | None = None,
     ambiguous_subprocess_aliases: set[str] | None = None,
+    fileinput_module_aliases: set[str] | None = None,
+    fileinput_call_aliases: set[str] | None = None,
+    ambiguous_fileinput_aliases: set[str] | None = None,
 ) -> _FunctionAnalysis:
     """Walk one function body for a direct docs read, calls, and unresolved reads.
 
@@ -2668,6 +2700,59 @@ def _analyse_function(
         if _receiver_is_partial(value) or _module_receiver_state(value) == "ambiguous":
             return "ambiguous"
         return "non-docs"
+
+    def _fileinput_input_state(call: ast.Call) -> str:
+        """Return the closed docs provenance of one admitted ``fileinput.input`` call."""
+
+        target_is_fileinput = (
+            isinstance(call.func, ast.Name) and call.func.id in (fileinput_call_aliases or set())
+        ) or (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == "input"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id in (fileinput_module_aliases or set())
+        )
+        target_is_rebound = (
+            isinstance(call.func, ast.Name)
+            and call.func.id in (ambiguous_fileinput_aliases or set())
+        ) or (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id in (ambiguous_fileinput_aliases or set())
+            and call.func.attr == "input"
+        )
+        if target_is_rebound:
+            return "ambiguous"
+        if not target_is_fileinput:
+            return "none"
+        if any(keyword.arg is None for keyword in call.keywords) or any(
+            isinstance(argument, ast.Starred) for argument in call.args
+        ):
+            return "ambiguous"
+        files_keywords = [keyword for keyword in call.keywords if keyword.arg == "files"]
+        if len(call.args) > 1 or len(files_keywords) > 1 or (call.args and files_keywords):
+            return "ambiguous"
+        if not call.args and not files_keywords:
+            return "ambiguous"
+        files = call.args[0] if call.args else files_keywords[0].value
+        values = files.elts if isinstance(files, (ast.List, ast.Tuple, ast.Set)) else [files]
+        if not values:
+            return "none"
+        states: list[str] = []
+        for value in values:
+            state = _argument_state(value)
+            if (
+                state == "non-docs"
+                and not (isinstance(value, ast.Constant) and isinstance(value.value, str))
+                and not (isinstance(value, ast.Name) and value.id in non_docs_aliases)
+            ):
+                state = "ambiguous"
+            states.append(state)
+        if "docs" in states:
+            return "docs"
+        if "ambiguous" in states:
+            return "ambiguous"
+        return "none"
 
     def _record_call(callee: str, call: ast.Call) -> None:
         """Record one resolved helper edge with bounded argument provenance."""
@@ -3044,6 +3129,13 @@ def _analyse_function(
                 )
             else:
                 working_directory_state = "ambiguous"
+        fileinput_state = _fileinput_input_state(node)
+        if fileinput_state == "docs":
+            reads = True
+        elif fileinput_state == "ambiguous":
+            unresolved.append(
+                f"{filename}:{node.lineno}: fileinput.input files provenance is ambiguous"
+            )
         subprocess_state = _subprocess_docs_call_state(
             node,
             subprocess_module_aliases or set(),
@@ -3436,6 +3528,9 @@ def _docs_reading_test_modules(
     subprocess_module_aliases, subprocess_call_aliases, ambiguous_subprocess_aliases = (
         _subprocess_call_aliases(tree)
     )
+    fileinput_module_aliases, fileinput_call_aliases, ambiguous_fileinput_aliases = (
+        _fileinput_input_aliases(tree)
+    )
     (
         imported_analyses,
         ambiguous_imports,
@@ -3759,6 +3854,9 @@ def _docs_reading_test_modules(
             subprocess_module_aliases,
             subprocess_call_aliases,
             ambiguous_subprocess_aliases,
+            fileinput_module_aliases,
+            fileinput_call_aliases,
+            ambiguous_fileinput_aliases,
         )
         analyses[name] = analysis
         if name not in local_keys:
@@ -6329,6 +6427,48 @@ def test_docs_governance_tracks_static_path_reader_callbacks() -> None:
             "def test_dynamic_reader_callback(root: str) -> None:\n"
             "    list(map(Path.read_text, [Path(root)]))\n"
         )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_static_fileinput_inputs() -> None:
+    """Closed ``fileinput.input`` imports cannot hide committed Markdown reads."""
+
+    source = (
+        "import fileinput\nimport fileinput as fin\n"
+        "from fileinput import input\nfrom fileinput import input as file_input\n\n"
+        "def test_module_input() -> None:\n"
+        "    list(fileinput.input(['docs/guide.md']))\n\n"
+        "def test_module_alias_input() -> None:\n"
+        "    list(fin.input(['docs/alias.md']))\n\n"
+        "def test_direct_input() -> None:\n"
+        "    list(input(['docs/direct.md']))\n\n"
+        "def test_direct_alias_input() -> None:\n"
+        "    list(file_input(['docs/direct-alias.md']))\n"
+    )
+    assert _docs_reading_test_modules(source) == {
+        "test_direct_alias_input",
+        "test_direct_input",
+        "test_module_alias_input",
+        "test_module_input",
+    }
+    assert (
+        _docs_reading_test_modules(
+            "import fileinput\n\n"
+            "def test_non_docs_fileinput() -> None:\n"
+            "    list(fileinput.input(['config/guide.md']))\n"
+        )
+        == set()
+    )
+    for source in (
+        "import fileinput\n\n"
+        "def test_dynamic_files(files: list[str]) -> None:\n"
+        "    list(fileinput.input(files))\n",
+        "from fileinput import input\n\n"
+        "def test_dynamic_iterable(root: str) -> None:\n"
+        "    list(input(['docs/' + root]))\n",
+    ):
+        with pytest.raises(AssertionError, match="fileinput.input files provenance is ambiguous"):
+            _docs_reading_test_modules(source)
 
 
 @pytest.mark.docs_ci
