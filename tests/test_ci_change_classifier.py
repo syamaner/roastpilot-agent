@@ -2404,6 +2404,7 @@ def _analyse_function(
     builtin_open_aliases: set[str] = set(builtin_open_import_aliases or set())
     ambiguous_builtin_open_aliases: set[str] = set()
     non_docs_aliases: set[str] = set()
+    working_directory_state = "none"
     imported_class_instances: set[str] = set()
     ambiguous_imported_class_instances: set[str] = set()
     subprocess_command_docs_aliases: set[str] = set()
@@ -2849,6 +2850,31 @@ def _analyse_function(
                     generator.target, ast.Name
                 ):
                     aliases.add(generator.target.id)
+                if not (
+                    isinstance(generator.target, ast.Name)
+                    and isinstance(generator.iter, (ast.List, ast.Tuple, ast.Set))
+                ):
+                    continue
+                elements = generator.iter.elts
+                if elements and all(
+                    _expression_is_docs_markdown(element, aliases) for element in elements
+                ):
+                    aliases.add(generator.target.id)
+                    partial_aliases.discard(generator.target.id)
+                    non_docs_aliases.discard(generator.target.id)
+                elif any(
+                    _expression_is_docs_markdown(element, aliases) for element in elements
+                ) or any(
+                    _expression_has_docs_root(element) or not _string_constants(element)
+                    for element in elements
+                ):
+                    aliases.discard(generator.target.id)
+                    partial_aliases.add(generator.target.id)
+                    non_docs_aliases.discard(generator.target.id)
+                else:
+                    aliases.discard(generator.target.id)
+                    partial_aliases.discard(generator.target.id)
+                    non_docs_aliases.add(generator.target.id)
         if _is_docs_markdown_glob_call(node, docs_root_aliases):
             has_docs_glob = True
         if not isinstance(node, ast.Call):
@@ -2900,6 +2926,20 @@ def _analyse_function(
                             f"{filename}:{callback_call.lineno}: addfinalizer callback receiver "
                             "is ambiguous"
                         )
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "chdir"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "monkeypatch"
+        ):
+            if not node.args or isinstance(node.args[0], ast.Starred):
+                working_directory_state = "ambiguous"
+            elif isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                working_directory_state = (
+                    "docs" if node.args[0].value.rstrip("/") in {"docs", "./docs"} else "non-docs"
+                )
+            else:
+                working_directory_state = "ambiguous"
         subprocess_state = _subprocess_docs_call_state(
             node,
             subprocess_module_aliases or set(),
@@ -3016,7 +3056,17 @@ def _analyse_function(
                         f"{filename}:{node.lineno}: parametrized receiver `{target.id}` "
                         "is ambiguous"
                     )
-            if _receiver_is_docs(target) or _module_receiver_state(target) == "docs":
+            relative_markdown_read = any(
+                value.endswith(".md") and not value.startswith("/")
+                for value in _string_constants(target)
+            )
+            if relative_markdown_read and working_directory_state == "docs":
+                reads = True
+            elif relative_markdown_read and working_directory_state == "ambiguous":
+                unresolved.append(
+                    f"{filename}:{node.lineno}: working-directory provenance is ambiguous"
+                )
+            elif _receiver_is_docs(target) or _module_receiver_state(target) == "docs":
                 reads = True
             elif _module_receiver_state(target) == "ambiguous":
                 unresolved.append(
@@ -3198,6 +3248,21 @@ def _docs_reading_test_modules(
         raise AssertionError(
             f"{filename}: wildcard repository-local import provenance is ambiguous"
         )
+    for statement in tree.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)) or statement.value is None:
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        for target in targets:
+            if (
+                isinstance(target, ast.Name)
+                and target.id.startswith("Test")
+                and isinstance(statement.value, ast.Name)
+                and statement.value.id in imported_classes
+            ):
+                raise AssertionError(
+                    f"{filename}:{target.lineno}: imported test-class alias `{target.id}` "
+                    "has unresolved reader provenance"
+                )
     _assert_no_imported_collected_test_callables(
         tree, filename, imported_analyses, ambiguous_imports
     )
@@ -6112,6 +6177,89 @@ def test_docs_governance_traces_import_time_decorators_literal_loops_and_finaliz
             "    Path('docs/named-finalizer.md').read_text()\n\n"
             "def test_named_finalizer(request) -> None:\n"
             "    request.addfinalizer(named_callback)\n"
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_traces_literal_comprehension_targets() -> None:
+    """Literal comprehension iterables preserve docs provenance for their targets."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def test_list() -> None:\n"
+        "    assert [path.read_text() for path in ['docs/list-a.md', 'docs/list-b.md']]\n\n"
+        "def test_tuple() -> None:\n"
+        "    assert [path.read_text() for path in ('docs/tuple.md',)]\n\n"
+        "def test_set() -> None:\n"
+        "    assert [path.read_text() for path in {'docs/set.md'}]\n\n"
+        "def test_non_reader() -> None:\n"
+        "    assert [path.read_text() for path in ['config/non-reader.md']]\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_list", "test_set", "test_tuple"}
+    for ambiguous in (
+        source.replace("'docs/list-b.md'", "'config/list.md'"),
+        source.replace("'docs/list-b.md'", "dynamic_path"),
+    ):
+        with pytest.raises(AssertionError, match="cannot prove|unresolved"):
+            _docs_reading_test_modules(ambiguous)
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_fails_closed_on_imported_collected_test_class_aliases(
+    tmp_path: Path,
+) -> None:
+    """Relevant imported classes cannot be re-exposed as unanalysed pytest classes."""
+
+    (tmp_path / "helpers.py").write_text(
+        "from pathlib import Path\n\n"
+        "class DocsCase:\n"
+        "    def test_reader(self) -> None:\n"
+        "        Path('docs/imported-test-class.md').read_text()\n\n"
+        "class ConfigCase:\n"
+        "    def test_reader(self) -> None:\n"
+        "        assert True\n"
+    )
+    with pytest.raises(AssertionError, match="imported test-class alias"):
+        _docs_reading_test_modules(
+            "from helpers import ConfigCase, DocsCase\n\n"
+            "TestDocs = DocsCase\n"
+            "TestConfig = ConfigCase\n",
+            repository_root=tmp_path,
+        )
+    assert (
+        _docs_reading_test_modules(
+            "from helpers import ConfigCase, DocsCase\n\n"
+            "TestConfig = ConfigCase\n"
+            "DocsAlias = DocsCase\n",
+            repository_root=tmp_path,
+        )
+        == set()
+    )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_tracks_monkeypatch_working_directory_provenance() -> None:
+    """A local static ``chdir`` cannot hide a subsequent relative Markdown read."""
+
+    source = (
+        "from pathlib import Path\n\n"
+        "def test_docs(monkeypatch) -> None:\n"
+        "    monkeypatch.chdir('docs')\n"
+        "    Path('guide.md').read_text()\n\n"
+        "def test_restored(monkeypatch) -> None:\n"
+        "    monkeypatch.chdir('docs')\n"
+        "    monkeypatch.chdir('..')\n"
+        "    Path('guide.md').read_text()\n\n"
+        "def test_config(monkeypatch) -> None:\n"
+        "    monkeypatch.chdir('config')\n"
+        "    Path('guide.md').read_text()\n\n"
+        "def test_other_scope() -> None:\n"
+        "    Path('guide.md').read_text()\n"
+    )
+    assert _docs_reading_test_modules(source) == {"test_docs"}
+    with pytest.raises(AssertionError, match="working-directory provenance is ambiguous"):
+        _docs_reading_test_modules(
+            source.replace("monkeypatch.chdir('docs')", "monkeypatch.chdir(dynamic_directory)", 1)
         )
 
 
