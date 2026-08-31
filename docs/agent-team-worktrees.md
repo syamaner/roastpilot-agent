@@ -3,6 +3,8 @@
 How to run a parallel agent-team fan-out (e.g. E10's S3/S4/S5 page teammates)
 without the teammates colliding in one working directory.
 
+Proof fixture: disposable validation branches retain one isolated worktree per branch.
+
 ## Why this exists
 
 During E10 (the agent-team SPA build, 9 Jun 2026), spawning teammates with the
