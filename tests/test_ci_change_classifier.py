@@ -6013,6 +6013,12 @@ def test_docs_governance_traces_source_root_imports_and_imported_autouse_fixture
         )
     plugin_source = "pytest_plugins = 'plugin'\n\ndef test_autouse() -> None:\n    assert True\n"
     assert _docs_reading_test_modules(plugin_source, repository_root=tmp_path) == {"test_autouse"}
+    direct_import_source = (
+        "from plugin import docs_auto\n\ndef test_direct_autouse() -> None:\n    assert True\n"
+    )
+    assert _docs_reading_test_modules(direct_import_source, repository_root=tmp_path) == {
+        "test_direct_autouse"
+    }
     assert (
         _docs_reading_test_modules(
             "pytest_plugins = 'manual_plugin'\n\n"
@@ -6021,6 +6027,33 @@ def test_docs_governance_traces_source_root_imports_and_imported_autouse_fixture
         )
         == set()
     )
+    with pytest.raises(AssertionError, match="imported fixture provenance is ambiguous"):
+        _docs_reading_test_modules(
+            "from .missing import docs_auto\n\n"
+            "def test_missing_fixture(docs_auto) -> None:\n    assert docs_auto\n",
+            filename="tests/test_missing_fixture.py",
+            repository_root=tmp_path,
+        )
+
+
+@pytest.mark.docs_ci
+def test_docs_governance_bounds_source_root_production_package_exclusion(tmp_path: Path) -> None:
+    """Only the exact production package root stays outside static ``src`` resolution."""
+
+    source_root = tmp_path / "src"
+    source_root.mkdir()
+    production_package = source_root / "roastpilot_agent.py"
+    similarly_prefixed_module = source_root / "roastpilot_agent_tools.py"
+    production_package.write_text("VALUE = 'production'\n")
+    similarly_prefixed_module.write_text("VALUE = 'helper'\n")
+
+    assert (
+        _repository_module_candidates("roastpilot_agent", "tests/test_example.py", tmp_path)
+        == set()
+    )
+    assert _repository_module_candidates(
+        "roastpilot_agent_tools", "tests/test_example.py", tmp_path
+    ) == {similarly_prefixed_module}
 
 
 @pytest.mark.docs_ci
@@ -6037,6 +6070,9 @@ def test_docs_governance_traces_import_time_decorators_literal_loops_and_finaliz
         "class TestDecorators:\n"
         "    @Path('docs/method-decorator.md').read_text()\n"
         "    def test_method(self) -> None:\n        assert True\n\n"
+        "@Path('docs/class-only-decorator.md').read_text()\n"
+        "class TestClassDecoratorOnly:\n"
+        "    def test_method(self) -> None:\n        assert True\n\n"
         "def test_literal_loop() -> None:\n"
         "    for path in ['docs/loop-a.md', 'docs/loop-b.md']:\n"
         "        path.read_text()\n\n"
@@ -6052,6 +6088,7 @@ def test_docs_governance_traces_import_time_decorators_literal_loops_and_finaliz
         "    assert callback\n"
     )
     assert _docs_reading_test_modules(source) == {
+        "TestClassDecoratorOnly::test_method",
         "TestDecorators::test_method",
         "test_async_decorator",
         "test_finalizer",
